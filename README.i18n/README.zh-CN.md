@@ -70,6 +70,17 @@ Claude Code 和 Codex 现在都支持两种接入方式：CLI 和 SDK。
 
 这是一个个人项目。我自己几乎没写代码——它基本由 [Claude Code](https://github.com/anthropics/claude-code) 构建完成，[Codex](https://github.com/openai/codex) 和 [Gemini CLI](https://github.com/google-gemini/gemini-cli) 也提供了大量贡献。
 
+## 共享代理上下文与记忆
+
+这已经是 IM.codes 的核心产品能力，不再只是内部实现细节。IM.codes 会持续把已完成的代理工作沉淀成可复用记忆，并在后续会话中自动回灌这些上下文。
+
+- **保存的是问题 → 解决方案，不是日志噪音。** 只有最终 `assistant.text` 会进入记忆；流式 delta、tool call、tool result 和中间噪音都会被排除。
+- **个人记忆支持可选云同步。** 原始和处理后的记忆始终保留在本地；处理后的摘要可以按需同步到用户级云端池，在多台设备之间共享。
+- **企业共享上下文可查询、可检查。** 团队可以把经验发布到 workspace/project 作用域，在 UI 里查询、查看统计，而不是把上下文藏在不可见的 prompt 里。
+- **多语言召回。** 本地语义搜索和基于 pgvector 的服务端召回使用多语言 embedding，可以跨中英日韩西俄等语言找到相关修复经验。
+- **按消息和按会话启动自动注入。** 相关历史会在发送消息前和 session 启动时自动注入，并通过 timeline 卡片显示召回内容、原因、相关性分数、召回次数和最后使用时间。
+- **用户可见、可控。** Shared Context UI 分离 raw events、processed summaries、cloud memory 和 enterprise memory，并提供查询、预览、archive/restore 与处理配置控制。
+
 ## 功能
 
 ### 远程终端
@@ -278,6 +289,8 @@ git clone https://github.com/im4codes/imcodes.git && cd imcodes
 ./gen-env.sh imc.example.com        # generates .env with random secrets, prints admin password
 docker compose up -d
 ```
+
+生成的 `docker-compose.yml` 已经默认使用 `pgvector/pgvector:pg16` 作为 PostgreSQL 镜像。
 
 然后访问 `https://your-domain`，使用 `admin` 和打印出来的密码登录。之后使用 `imcodes bind` 绑定你的开发机。
 

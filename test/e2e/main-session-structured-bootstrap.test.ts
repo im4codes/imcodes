@@ -35,7 +35,7 @@ const mocks = vi.hoisted(() => {
     ensureCodexSessionFile: vi.fn().mockResolvedValue('/mock/codex-rollout.jsonl'),
     findRolloutPathByUuid: vi.fn((uuid: string) => Promise.resolve(`/mock/${uuid}.jsonl`)),
     resolveGeminiSessionId: vi.fn().mockResolvedValue('gemini-main-e2e-uuid'),
-    injectGeminiMemory: vi.fn().mockResolvedValue(undefined),
+    injectGeminiMemoryWithTimeline: vi.fn().mockResolvedValue(undefined),
     nextUuid: vi.fn(() => uuidQueue.shift() ?? `uuid-${Math.random().toString(36).slice(2, 10)}`),
   };
 });
@@ -105,7 +105,7 @@ vi.mock('../../src/daemon/gemini-watcher.js', () => ({
 }));
 
 vi.mock('../../src/daemon/memory-inject.js', () => ({
-  injectGeminiMemory: mocks.injectGeminiMemory,
+  injectGeminiMemoryWithTimeline: mocks.injectGeminiMemoryWithTimeline,
 }));
 
 vi.mock('../../src/agent/drivers/claude-code.js', () => ({

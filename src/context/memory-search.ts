@@ -6,8 +6,10 @@ import type {
   LocalContextEvent,
   ProcessedContextClass,
   ProcessedContextProjection,
+  ProcessedContextProjectionStatus,
   ContextMemoryStatsView,
 } from '../../shared/context-types.js';
+import { computeRelevanceScore, type ProjectionClass } from '../../shared/memory-scoring.js';
 import {
   listContextEvents,
   listDirtyTargets,
@@ -45,15 +47,21 @@ export interface MemorySearchResultItem {
   id: string;
   projectId: string;
   scope: string;
+  enterpriseId?: string;
   eventType?: string;
   projectionClass?: ProcessedContextClass;
   summary: string;
   content?: string;
   createdAt: number;
   updatedAt?: number;
+  hitCount?: number;
+  lastUsedAt?: number;
+  status?: ProcessedContextProjectionStatus;
   sourceEventCount?: number;
   processingModel?: string;
+  relevanceScore?: number;
 }
+
 
 export interface MemorySearchResult {
   items: MemorySearchResultItem[];
@@ -79,11 +87,29 @@ export async function searchLocalMemorySemantic(query: MemorySearchQuery): Promi
 
     // Score each candidate by cosine similarity
     const scored: Array<{ item: MemorySearchResultItem; score: number }> = [];
+    const currentProjectId = query.repo ?? '__unknown_current_project__';
     for (const item of candidates.items) {
       const text = `${item.summary} ${item.content ?? ''}`.slice(0, 500);
       const itemEmb = await generateEmbedding(text);
       if (itemEmb) {
-        scored.push({ item, score: cosineSimilarity(queryEmb, itemEmb) });
+        const similarity = cosineSimilarity(queryEmb, itemEmb);
+        const projectionClass = (item.projectionClass ?? 'recent_summary') as ProjectionClass;
+        const relevanceScore = computeRelevanceScore({
+          similarity,
+          lastUsedAt: item.lastUsedAt ?? item.updatedAt ?? item.createdAt,
+          hitCount: item.hitCount ?? 0,
+          projectionClass,
+          memoryProjectId: item.projectId,
+          currentProjectId,
+          memoryEnterpriseId: item.enterpriseId,
+        });
+        scored.push({
+          item: {
+            ...item,
+            relevanceScore,
+          },
+          score: relevanceScore,
+        });
       } else {
         scored.push({ item, score: 0 });
       }
@@ -241,11 +267,15 @@ function projectionToItem(projection: ProcessedContextProjection): MemorySearchR
     id: projection.id,
     projectId: projection.namespace.projectId,
     scope: projection.namespace.scope,
+    enterpriseId: projection.namespace.enterpriseId,
     projectionClass: projection.class,
     summary: projection.summary,
     content: typeof content === 'object' ? JSON.stringify(content) : undefined,
     createdAt: projection.createdAt,
     updatedAt: projection.updatedAt,
+    hitCount: projection.hitCount,
+    lastUsedAt: projection.lastUsedAt,
+    status: projection.status,
     sourceEventCount: typeof content?.eventCount === 'number' ? content.eventCount : undefined,
     processingModel: typeof content?.primaryContextModel === 'string' ? content.primaryContextModel : undefined,
   };

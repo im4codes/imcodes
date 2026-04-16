@@ -10,6 +10,9 @@ import { readFile, writeFile, readdir } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
 import { randomUUID } from 'node:crypto';
+import { timelineEmitter } from './timeline-emitter.js';
+import { buildMemoryContextTimelinePayload } from './memory-context-timeline.js';
+import type { MemorySearchResultItem } from '../context/memory-search.js';
 import logger from '../util/logger.js';
 
 const GEMINI_TMP_DIR = join(homedir(), '.gemini', 'tmp');
@@ -99,6 +102,19 @@ export async function injectGeminiMemory(sessionId: string, cwd: string, project
   logger.info({ sessionId, filePath }, 'memory-inject: injected project memory into Gemini session');
 }
 
+export async function injectGeminiMemoryWithTimeline(
+  sessionName: string,
+  sessionId: string,
+  cwd: string,
+  projectName?: string,
+): Promise<void> {
+  await injectGeminiMemory(sessionId, cwd, projectName);
+  const items = await readProcessedMemoryItems(projectName ?? '');
+  const payload = buildMemoryContextTimelinePayload(undefined, items, 'startup');
+  if (!payload) return;
+  timelineEmitter.emit(sessionName, 'memory.context', payload, { source: 'daemon', confidence: 'high' });
+}
+
 // ── Inter-agent communication docs ──────────────────────────────────────────────
 
 /**
@@ -133,6 +149,15 @@ Notes:
  * Returns a formatted string with recent problem→solution pairs, or null if none.
  */
 export async function readProcessedMemory(projectName: string): Promise<string | null> {
+  const items = await readProcessedMemoryItems(projectName);
+  if (items.length === 0) return null;
+  const entries = items.map((item) =>
+    `- ${item.summary.split('\n')[0].slice(0, 300)}`,
+  );
+  return `# Recent project memory\n\n${entries.join('\n')}`;
+}
+
+export async function readProcessedMemoryItems(projectName: string): Promise<MemorySearchResultItem[]> {
   try {
     const { searchLocalMemory } = await import('../context/memory-search.js');
     const result = searchLocalMemory({
@@ -140,13 +165,9 @@ export async function readProcessedMemory(projectName: string): Promise<string |
       limit: 10,
       projectionClass: 'recent_summary',
     });
-    if (result.items.length === 0) return null;
-    const entries = result.items.map((item) =>
-      `- ${item.summary.split('\n')[0].slice(0, 300)}`,
-    );
-    return `# Recent project memory\n\n${entries.join('\n')}`;
+    return result.items.filter((item): item is MemorySearchResultItem => item.type === 'processed');
   } catch {
-    return null;
+    return [];
   }
 }
 

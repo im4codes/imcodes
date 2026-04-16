@@ -9,7 +9,7 @@ import {
   W_FREQUENCY,
   W_PROJECT,
   type MemoryScoringInput,
-} from '../../src/context/memory-scoring.js';
+} from '../../shared/memory-scoring.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 

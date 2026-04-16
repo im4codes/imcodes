@@ -78,6 +78,27 @@ jobs:
       - run: npm run build
       - run: npm run test:unit
 
+  embedding-real-tests:
+    name: Embedding Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION_PRIMARY }}
+          cache: 'npm'
+      - run: npm ci
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: .cache/imcodes-embeddings
+          key: embedding-${{ runner.os }}-${{ env.NODE_VERSION_PRIMARY }}-${{ hashFiles('package-lock.json', 'shared/embedding-config.ts') }}
+      - name: Run real transformers.js embedding integration test
+        run: npx vitest run test/context/embedding-real.test.ts
+        env:
+          RUN_REAL_EMBEDDING_TESTS: '1'
+          IMCODES_EMBEDDING_CACHE_DIR: ${{ github.workspace }}/.cache/imcodes-embeddings
+
   # ── macOS daemon unit tests ─────────────────────────────────────────────
 
   macos-unit-tests:

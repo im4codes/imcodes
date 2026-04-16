@@ -49,6 +49,8 @@ FROM public.ecr.aws/docker/library/node:24-bookworm-slim AS runtime
 
 WORKDIR /app
 
+ENV IMCODES_EMBEDDING_CACHE_DIR=/app/embedding-cache
+
 # Install production deps only
 COPY server/package.json server/package-lock.json* ./
 RUN npm ci --omit=dev --ignore-scripts
@@ -67,6 +69,9 @@ COPY landing/ ./landing/
 
 # Copy OTA update bundle
 COPY --from=builder /app/updates ./updates
+
+ARG PRELOAD_EMBEDDING_MODEL=1
+RUN if [ "$PRELOAD_EMBEDDING_MODEL" = "1" ]; then node dist/server/src/scripts/preload-embedding-model.js; fi
 
 EXPOSE 3000
 

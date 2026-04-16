@@ -111,7 +111,7 @@ vi.mock('../../src/agent/drivers/gemini.js', () => ({
 }));
 
 vi.mock('../../src/daemon/memory-inject.js', () => ({
-  injectGeminiMemory: injectGeminiMemoryMock,
+  injectGeminiMemoryWithTimeline: injectGeminiMemoryMock,
 }));
 
 vi.mock('../../src/daemon/timeline-store.js', () => ({
@@ -347,7 +347,7 @@ describe('startSubSession — geminiSessionId stored in session-store', () => {
 
     const call = vi.mocked(upsertSession).mock.calls[0]?.[0] as Record<string, unknown>;
     expect(call.geminiSessionId).toBe('resolved-gemini-uuid');
-    expect(injectGeminiMemoryMock).toHaveBeenCalledWith('resolved-gemini-uuid', '/proj', 'proj');
+    expect(injectGeminiMemoryMock).toHaveBeenCalledWith('deck_sub_gem-sub2', 'resolved-gemini-uuid', '/proj', 'proj');
   });
 });
 

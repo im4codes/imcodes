@@ -10,7 +10,7 @@ import {
   computeRelevanceScore,
   computeProjectBoost,
   type MemoryScoringInput,
-} from '../../src/context/memory-scoring.js';
+} from '../../shared/memory-scoring.js';
 import {
   compileAgentContextArtifact,
   buildProviderContextPayload,

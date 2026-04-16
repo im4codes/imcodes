@@ -15,6 +15,8 @@ const buildCodexMemoryEntryMock = vi.hoisted(() => vi.fn((memory: string, timest
   type: 'response_item',
   payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: memory }] },
 })));
+const readProcessedMemoryItemsMock = vi.hoisted(() => vi.fn().mockResolvedValue([]));
+const timelineEmitMock = vi.hoisted(() => vi.fn());
 
 vi.mock('fs/promises', () => ({
   watch: vi.fn(),
@@ -38,6 +40,13 @@ vi.mock('../../src/daemon/memory-inject.js', () => ({
   appendAgentSendDocs: appendAgentSendDocsMock,
   buildSessionBootstrapContext: buildSessionBootstrapContextMock,
   buildCodexMemoryEntry: buildCodexMemoryEntryMock,
+  readProcessedMemoryItems: readProcessedMemoryItemsMock,
+}));
+
+vi.mock('../../src/daemon/timeline-emitter.js', () => ({
+  timelineEmitter: {
+    emit: timelineEmitMock,
+  },
 }));
 
 import { ensureSessionFile } from '../../src/daemon/codex-watcher.js';
@@ -46,6 +55,7 @@ describe('ensureSessionFile', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     readdirMock.mockRejectedValue(new Error('missing'));
+    readProcessedMemoryItemsMock.mockResolvedValue([]);
     delete process.env.IMCODES_SHARED_CONTEXT_LEGACY_INJECTION_DISABLED;
   });
 
@@ -65,6 +75,33 @@ describe('ensureSessionFile', () => {
     expect(buildCodexMemoryEntryMock).toHaveBeenCalledWith(
       'Shared context bootstrap deferred to runtime assembly.',
       expect.any(String),
+    );
+  });
+
+  it('emits a startup memory.context timeline event when processed memory exists', async () => {
+    readProcessedMemoryItemsMock.mockResolvedValue([
+      {
+        id: 'mem-1',
+        type: 'processed',
+        projectId: 'proj',
+        scope: 'personal',
+        summary: 'Fix websocket reconnect loop',
+        createdAt: 1,
+        hitCount: 3,
+        relevanceScore: 0.77,
+      },
+    ]);
+
+    await ensureSessionFile('uuid-3', '/proj', 'deck_proj_brain');
+
+    expect(timelineEmitMock).toHaveBeenCalledWith(
+      'deck_proj_brain',
+      'memory.context',
+      expect.objectContaining({
+        reason: 'startup',
+        injectedText: '[Related past work]\n- [proj] Fix websocket reconnect loop',
+      }),
+      expect.any(Object),
     );
   });
 });

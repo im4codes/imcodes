@@ -66,6 +66,17 @@ iPhone、iPad、Apple Watch に対応しています。[Web App](https://app.im.
 
 これは別の AI IDE ではなく、単なる遠隔ターミナルでもありません。端末ベースの coding agents を取り巻くメッセージング / 制御レイヤーです。
 
+## Shared Agent Context とメモリ
+
+これはもう内部実装の詳細ではなく、IM.codes の中核機能です。IM.codes は完了済みのエージェント作業を継続的に再利用可能な記憶へ変換し、そのコンテキストを後続セッションへ戻します。
+
+- **保存するのは 問題 → 解決 の要約であり、ログのノイズではありません。** 記憶化されるのは最終的な `assistant.text` のみで、ストリーミング delta、tool call、tool result、中間ノイズは除外されます。
+- **個人メモリは任意でクラウド同期できます。** 生データと処理済みメモリは常にローカルに残り、処理済み要約だけをユーザー単位のクラウドプールへ同期してデバイス間で共有できます。
+- **Enterprise Shared Context は検索・閲覧可能です。** チームは知見を workspace / project スコープに公開し、UI 上で検索・統計確認できるため、見えない prompt 文字列として埋め込まれたままになりません。
+- **多言語リコール。** ローカルのセマンティック検索と pgvector ベースのサーバーリコールは多言語 embedding を使うため、日本語・英語・中国語・韓国語・スペイン語・ロシア語をまたいで関連修正を見つけられます。
+- **メッセージ送信時とセッション起動時に自動注入。** 関連履歴は送信前と起動時の両方で自動注入され、timeline カードに注入理由、関連度スコア、再利用回数、最終使用時刻まで表示されます。
+- **ユーザーから見えて制御できる。** Shared Context UI では raw events、processed summaries、cloud memory、enterprise memory を分けて表示し、検索、プレビュー、archive/restore、処理設定を操作できます。
+
 ## 主な機能
 
 ### リモートターミナル
@@ -232,6 +243,8 @@ git clone https://github.com/im4codes/imcodes.git && cd imcodes
 ./gen-env.sh imc.example.com        # generates .env with random secrets, prints admin password
 docker compose up -d
 ```
+
+生成される `docker-compose.yml` は PostgreSQL に `pgvector/pgvector:pg16` を使用します。
 
 ## Windows（実験的）
 

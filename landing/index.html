@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>IM.codes — The IM for agents</title>
-<meta name="description" content="A specialized instant messenger for AI agents. Keep long-running coding-agent sessions within reach from mobile or web, with terminal, files, git, localhost preview, notifications, and multi-agent workflows built in.">
+<meta name="description" content="A specialized instant messenger for AI agents. Keep long-running coding-agent sessions within reach from mobile or web, with terminal, files, git, localhost preview, notifications, multi-agent workflows, and shared agent memory built in.">
 <style>
 :root {
   --bg: #0a0a0a;
@@ -236,7 +236,7 @@ footer {
 </header>
 
 <section>
-  <p class="lead" data-i18n="hero_intro">Keep long-running coding-agent sessions within reach from iPhone, iPad, Apple Watch, mobile, or web, with terminal access, file browsing, git views, localhost preview, notifications, and multi-agent workflows built in.</p>
+  <p class="lead" data-i18n="hero_intro">Keep long-running coding-agent sessions within reach from iPhone, iPad, Apple Watch, mobile, or web, with terminal access, file browsing, git views, localhost preview, notifications, multi-agent workflows, and shared agent memory built in.</p>
   <div class="prompt">imcodes bind https://app.im.codes/bind/&lt;key&gt;<span class="cursor"></span></div>
   <div class="output" data-i18n="hero_output">bound to app.im.codes &middot; daemon started &middot; registered as system service</div>
 </section>
@@ -287,6 +287,17 @@ footer {
 </section>
 
 <section>
+  <h2 data-i18n="h_memory">shared agent context</h2>
+  <p style="color:var(--fg); margin-bottom:12px;" data-i18n="memory_intro">IM.codes keeps a searchable memory of solved work — structured problem→solution summaries instead of raw prompt logs. Relevant history is recalled automatically for new prompts and session startup, and every injection stays visible in the timeline.</p>
+  <ul class="reqs">
+    <li data-i18n="memory_1">Personal memory stays local by default, with optional cloud sync for processed summaries across your devices.</li>
+    <li data-i18n="memory_2">Enterprise shared context lets teams reuse fixes across workspaces and projects with queryable memory, stats, and inspection UI.</li>
+    <li data-i18n="memory_3">Multilingual recall uses local embeddings plus pgvector-backed server search, so related fixes can be found across different languages.</li>
+    <li data-i18n="memory_4">Timeline cards show exactly what was injected, with relevance score, recall count, and last-used metadata.</li>
+  </ul>
+</section>
+
+<section>
   <h2 data-i18n="h_not">what it is not</h2>
   <ul class="reqs">
     <li data-i18n="not_1">Not another AI IDE</li>
@@ -300,6 +311,7 @@ footer {
 <section>
   <h2 data-i18n="h_features">features</h2>
   <div class="features">
+    <div class="feat"><div class="feat-name" data-i18n="f_memory_name">shared agent context</div><div class="feat-desc" data-i18n="f_memory_desc">problem→solution memory, multilingual recall, automatic per-message and startup injection with visible timeline cards</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_remote_name">remote terminal</div><div class="feat-desc" data-i18n="f_remote_desc">browser & mobile, no SSH/VPN, real-time PTY streaming at 12fps</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_file_name">file browser & git</div><div class="feat-desc" data-i18n="f_file_desc">tree view, upload/download, +/- stats, floating preview</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_preview_name">local web preview</div><div class="feat-desc" data-i18n="f_preview_desc">preview localhost from any device via secure tunnel, supports HMR</div></div>
@@ -393,6 +405,7 @@ imcodes bind https://imc.example.com/bind/&lt;api-key&gt;</div>
   <div class="code-block">git clone https://github.com/im4codes/imcodes.git && cd imcodes
 ./gen-env.sh imc.example.com <span class="comment"># generates .env, prints admin password</span>
 docker compose up -d</div>
+  <p style="color:var(--dim); font-size:12px; margin-top:8px;" data-i18n="sh_manual_pgvector">Generated docker-compose.yml uses pgvector/pgvector:pg16 for PostgreSQL.</p>
 </section>
 
 <section>
@@ -457,6 +470,14 @@ const I18N = {
     watch_badge: 'iPhone · iPad · Apple Watch',
     watch_download: 'Watch app includes session list, unread counts, and quick replies.',
     agents_intro: 'Claude Code and Codex support both CLI and SDK integrations.',
+    h_memory: 'shared agent context',
+    memory_intro: 'IM.codes keeps a searchable memory of solved work — structured problem→solution summaries instead of raw prompt logs. Relevant history is recalled automatically for new prompts and session startup, and every injection stays visible in the timeline.',
+    memory_1: 'Personal memory stays local by default, with optional cloud sync for processed summaries across your devices.',
+    memory_2: 'Enterprise shared context lets teams reuse fixes across workspaces and projects with queryable memory, stats, and inspection UI.',
+    memory_3: 'Multilingual recall uses local embeddings plus pgvector-backed server search, so related fixes can be found across different languages.',
+    memory_4: 'Timeline cards show exactly what was injected, with relevance score, recall count, and last-used metadata.',
+    f_memory_name: 'shared agent context',
+    f_memory_desc: 'problem→solution memory, multilingual recall, automatic per-message and startup injection with visible timeline cards',
     h_openclaw: 'openclaw connect',
     oc_intro: 'If OpenClaw is running on the same machine as the daemon, connect IM.codes to the local OpenClaw gateway with:',
     oc_1: 'Default gateway URL: <code>ws://127.0.0.1:18789</code>',
@@ -465,15 +486,23 @@ const I18N = {
     oc_4: 'Saved to <code>~/.imcodes/openclaw.json</code> so the daemon can reconnect automatically',
     oc_5: 'Use <code>imcodes disconnect openclaw</code> to remove the saved config',
     oc_note: 'Only tested on macOS so far. Remote plain-text <code>ws://</code> URLs require <code>--insecure</code>.',
+    sh_manual_pgvector: 'Generated docker-compose.yml uses pgvector/pgvector:pg16 for PostgreSQL.',
   },
   'zh-CN': {
     tagline: '为 AI 代理而生的即时通讯',
-    hero_intro: '让长时间运行的 coding agent 会话始终触手可及：iPhone、iPad、Apple Watch、手机或网页即可查看终端、文件、Git、localhost 预览、通知和多代理工作流。',
+    hero_intro: '让长时间运行的 coding agent 会话始终触手可及：iPhone、iPad、Apple Watch、手机或网页即可查看终端、文件、Git、localhost 预览、通知、多代理工作流和共享代理记忆。',
     hero_output: '已绑定 app.im.codes · 守护进程已启动 · 已注册为系统服务',
     self_host_warning: '<strong>强烈建议自行部署。</strong><code>app.im.codes</code> 是共享测试实例，无可用性保证，可能被限流、攻击或不可用。这是个人项目，不提供商用保障。正式使用请部署到自己的服务器。',
-    h_screenshots: '截图', h_why: '为什么', h_not: '它不是什么', h_features: '功能', h_arch: '架构', h_download: '下载', h_install: '安装', h_quick: '快速开始', h_selfhost: '自托管部署', h_agents: '支持的代理', h_reqs: '系统要求', h_about: '关于',
+    h_screenshots: '截图', h_why: '为什么', h_memory: '共享代理上下文', h_not: '它不是什么', h_features: '功能', h_arch: '架构', h_download: '下载', h_install: '安装', h_quick: '快速开始', h_selfhost: '自托管部署', h_agents: '支持的代理', h_reqs: '系统要求', h_about: '关于',
     also_web: '也可作为 <a href="https://app.im.codes">网页版</a> 使用', watch_intro: 'Watch 支持可在手腕上快速查看会话、未读数、OTA 更新状态、推送通知和快捷回复。', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'Watch App 提供会话列表、未读计数和快捷回复。',
     agents_intro: 'Claude Code 和 Codex 现在都支持 CLI 和 SDK 两种接入方式。',
+    memory_intro: 'IM.codes 会把已完成的工作持续沉淀成可搜索的记忆——保存的是结构化的问题→解决方案摘要，而不是原始 prompt 日志。相关历史会在新消息和会话启动时自动召回，并且每次注入都会在时间线里可见。',
+    memory_1: '个人记忆默认保留在本地，也可以把处理后的摘要可选同步到云端，在你的多台设备之间共享。',
+    memory_2: '企业共享上下文让团队可以在 workspace / project 范围内复用修复经验，并通过可查询的记忆、统计和检查界面管理它。',
+    memory_3: '多语言召回结合本地 embedding 和基于 pgvector 的服务端搜索，可以跨不同语言找到相关历史修复。',
+    memory_4: '时间线卡片会明确显示注入了什么内容，以及相关性分数、召回次数和上次使用时间。',
+    f_memory_name: '共享代理上下文',
+    f_memory_desc: '问题→解决方案记忆、多语言召回、按消息/启动自动注入，并在时间线中可见',
     why_text: '离开桌面后，大多数 coding agent 工作流就断了。代理还在终端里运行，但你通常只能靠 SSH、tmux attach、远程桌面，或者等回到电脑前。IM.codes 让这些会话在手机和网页上保持触手可及：打开终端、查看文件和 Git 变更、从另一台设备预览 localhost、在任务完成时收到通知，并在自己的基础设施上同时推进多个代理。',
     not_1: '不是另一个 AI IDE', not_2: '不只是聊天壳', not_3: '不只是远程终端客户端', not_4: '不是 Claude Code、Codex、Gemini CLI、OpenClaw 或 Qwen 的替代品', not_5: '它是围绕这些 agent 的消息/控制层',
     f_remote_name: '远程终端', f_remote_desc: '浏览器和手机访问，无需 SSH/VPN，实时 PTY 推流',
@@ -519,7 +548,7 @@ const I18N = {
     oc_note: '目前只在 macOS 上测试过。远程明文 <code>ws://</code> 地址需要加 <code>--insecure</code>。',
     sh_intro: '在一台机器上部署服务端和守护进程。需要 Docker 和指向该服务器的域名。',
     sh_desc: '自动生成配置、启动 PostgreSQL + 服务端 + Caddy（自动 HTTPS）、创建管理员账户并绑定本地守护进程。凭证在最后打印。',
-    sh_connect: '连接其他机器：', sh_manual: '手动部署：',
+    sh_connect: '连接其他机器：', sh_manual: '手动部署：', sh_manual_pgvector: '生成的 docker-compose.yml 已默认使用 pgvector/pgvector:pg16 作为 PostgreSQL 镜像。',
     req_os: 'macOS、Linux 或 Windows（原生试验性；<a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> 完全支持）',
     req_mux: 'tmux（Linux/macOS/WSL）。Windows 原生使用 ConPTY（内置）。',
     about_text: '个人项目。几乎完全由 <a href="https://github.com/anthropics/claude-code">Claude Code</a> 构建，<a href="https://github.com/openai/codex">Codex</a> 和 <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a> 也有重要贡献。',
@@ -527,12 +556,19 @@ const I18N = {
   },
   'zh-TW': {
     tagline: '為 AI 代理而生的即時通訊',
-    hero_intro: '讓長時間運行的 coding agent 會話始終觸手可及：iPhone、iPad、Apple Watch、手機或網頁即可查看終端、檔案、Git、localhost 預覽、通知和多代理工作流。',
+    hero_intro: '讓長時間運行的 coding agent 會話始終觸手可及：iPhone、iPad、Apple Watch、手機或網頁即可查看終端、檔案、Git、localhost 預覽、通知、多代理工作流和共享代理記憶。',
     hero_output: '已綁定 app.im.codes · 守護程序已啟動 · 已註冊為系統服務',
     self_host_warning: '<strong>強烈建議自行部署。</strong><code>app.im.codes</code> 是共享測試實例，無可用性保證，可能被限流、攻擊或不可用。這是個人專案，不提供商用保障。正式使用請部署到自己的伺服器。',
-    h_screenshots: '截圖', h_why: '為什麼', h_not: '它不是什麼', h_features: '功能', h_arch: '架構', h_download: '下載', h_install: '安裝', h_quick: '快速開始', h_selfhost: '自託管部署', h_agents: '支援的代理', h_reqs: '系統需求', h_about: '關於',
+    h_screenshots: '截圖', h_why: '為什麼', h_memory: '共享代理上下文', h_not: '它不是什麼', h_features: '功能', h_arch: '架構', h_download: '下載', h_install: '安裝', h_quick: '快速開始', h_selfhost: '自託管部署', h_agents: '支援的代理', h_reqs: '系統需求', h_about: '關於',
     also_web: '也可作為 <a href="https://app.im.codes">網頁版</a> 使用', watch_intro: 'Watch 支援可在手腕上快速查看會話、未讀數、OTA 更新狀態、推送通知和快捷回覆。', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'Watch App 提供會話列表、未讀計數和快捷回覆。',
     agents_intro: 'Claude Code 和 Codex 現在都支援 CLI 和 SDK 兩種接入方式。',
+    memory_intro: 'IM.codes 會把已完成的工作持續沉澱成可搜尋的記憶——保存的是結構化的問題→解決方案摘要，而不是原始 prompt 日誌。相關歷史會在新訊息和工作階段啟動時自動召回，而且每次注入都會在時間線中可見。',
+    memory_1: '個人記憶預設保留在本地，也可以選擇把處理後的摘要同步到雲端，在你的多台裝置之間共享。',
+    memory_2: '企業共享上下文讓團隊能在 workspace / project 範圍內重用修復經驗，並透過可查詢的記憶、統計和檢視介面管理它。',
+    memory_3: '多語言召回結合本地 embedding 與基於 pgvector 的伺服器搜尋，可以跨不同語言找到相關歷史修復。',
+    memory_4: '時間線卡片會明確顯示注入了什麼內容，以及相關性分數、召回次數和上次使用時間。',
+    f_memory_name: '共享代理上下文',
+    f_memory_desc: '問題→解決方案記憶、多語言召回、按訊息/啟動自動注入，並在時間線中可見',
     why_text: '離開桌面後，大多數 coding agent 工作流就斷了。代理還在終端機裡運行，但你通常只能靠 SSH、tmux attach、遠端桌面，或者等回到電腦前。IM.codes 讓這些會話在手機和網頁上保持觸手可及：打開終端機、查看檔案和 Git 變更、從另一台裝置預覽 localhost、在任務完成時收到通知，並在自己的基礎設施上同時推進多個代理。',
     not_1: '不是另一個 AI IDE', not_2: '不只是聊天殼', not_3: '不只是遠端終端客戶端', not_4: '不是 Claude Code、Codex、Gemini CLI、OpenClaw 或 Qwen 的替代品', not_5: '它是圍繞這些 agent 的訊息/控制層',
     f_remote_name: '遠端終端機', f_remote_desc: '瀏覽器和手機存取，無需 SSH/VPN，即時 PTY 串流',
@@ -578,7 +614,7 @@ const I18N = {
     oc_note: '目前只在 macOS 上測試過。遠端明文 <code>ws://</code> 位址需要加上 <code>--insecure</code>。',
     sh_intro: '在一台機器上部署伺服器和守護程序。需要 Docker 和指向該伺服器的網域。',
     sh_desc: '自動產生設定、啟動 PostgreSQL + 伺服器 + Caddy（自動 HTTPS）、建立管理員帳戶並綁定本地守護程序。憑證在最後列印。',
-    sh_connect: '連接其他機器：', sh_manual: '手動部署：',
+    sh_connect: '連接其他機器：', sh_manual: '手動部署：', sh_manual_pgvector: '產生的 docker-compose.yml 已經預設使用 pgvector/pgvector:pg16 作為 PostgreSQL 映像。',
     req_os: 'macOS、Linux 或 Windows（原生試驗性；<a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> 完全支援）',
     req_mux: 'tmux（Linux/macOS/WSL）。Windows 原生使用 ConPTY（內建）。',
     about_text: '個人專案。幾乎完全由 <a href="https://github.com/anthropics/claude-code">Claude Code</a> 建構，<a href="https://github.com/openai/codex">Codex</a> 和 <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a> 也有重要貢獻。',
@@ -586,11 +622,19 @@ const I18N = {
   },
   ja: {
     tagline: 'AIエージェントのためのIM',
-    hero_intro: '長時間動く coding agent セッションを、iPhone、iPad、Apple Watch、モバイルやWebから常に手の届く場所に。ターミナル、ファイル、Git、localhost プレビュー、通知、マルチエージェントワークフローをまとめて提供します。',
+    hero_intro: '長時間動く coding agent セッションを、iPhone、iPad、Apple Watch、モバイルやWebから常に手の届く場所に。ターミナル、ファイル、Git、localhost プレビュー、通知、マルチエージェントワークフロー、共有エージェントメモリをまとめて提供します。',
     hero_output: 'app.im.codes にバインド完了 · デーモン起動 · システムサービスとして登録',
     self_host_warning: '<strong>セルフホスティングを強く推奨します。</strong><code>app.im.codes</code> は共有テストインスタンスであり、稼働保証はありません。レート制限、攻撃対象、利用不可の可能性があります。個人プロジェクトのため商用サポートはありません。評価以外の用途では自社インフラにデプロイしてください。',
-    h_screenshots: 'スクリーンショット', h_why: '背景', h_not: 'これは何ではないか', h_features: '機能', h_arch: 'アーキテクチャ', h_download: 'ダウンロード', h_install: 'インストール', h_quick: 'クイックスタート', h_selfhost: 'セルフホスト', h_agents: '対応エージェント', h_reqs: '要件', h_about: '概要',
+    h_screenshots: 'スクリーンショット', h_why: '背景', h_memory: '共有エージェントコンテキスト', h_not: 'これは何ではないか', h_features: '機能', h_arch: 'アーキテクチャ', h_download: 'ダウンロード', h_install: 'インストール', h_quick: 'クイックスタート', h_selfhost: 'セルフホスト', h_agents: '対応エージェント', h_reqs: '要件', h_about: '概要',
     also_web: '<a href="https://app.im.codes">ウェブ版</a>もあります',
+    agents_intro: 'Claude Code と Codex は CLI と SDK の両方に対応しています。',
+    memory_intro: 'IM.codes は完了済みの作業を検索可能な記憶として蓄積します。保存されるのは生のプロンプトログではなく、構造化された問題→解決の要約です。関連履歴は新しいメッセージ送信時やセッション起動時に自動で再利用され、その注入内容はタイムラインで確認できます。',
+    memory_1: '個人メモリは既定でローカルに保持され、処理済み要約だけを任意でクラウド同期してデバイス間で共有できます。',
+    memory_2: 'Enterprise Shared Context により、チームは workspace / project 単位で修正知見を再利用し、検索・統計・閲覧 UI から管理できます。',
+    memory_3: '多言語リコールはローカル embedding と pgvector ベースのサーバー検索を組み合わせ、異なる言語間でも関連修正を見つけます。',
+    memory_4: 'タイムラインカードには注入内容、関連度スコア、再利用回数、最終使用時刻が表示されます。',
+    f_memory_name: '共有エージェントコンテキスト',
+    f_memory_desc: '問題→解決の記憶、多言語リコール、メッセージ時/起動時の自動注入をタイムラインで可視化',
     why_text: 'デスクを離れると、多くの coding agent ワークフローは途切れます。エージェントはまだターミナルで動いていても、作業を続けるには SSH、tmux attach、リモートデスクトップ、あるいはラップトップに戻るまで待つしかありません。IM.codes はそのセッションをモバイルやWebから手の届く場所に保ちます。ターミナルを開く、ファイルや Git の変更を見る、別デバイスから localhost を確認する、作業完了時に通知を受ける、そして自分のインフラ上で複数のエージェントを並行して進めることができます。',
     not_1: '別の AI IDE ではありません', not_2: '単なるチャットラッパーではありません', not_3: '単なるリモートターミナルクライアントではありません', not_4: 'Claude Code、Codex、Gemini CLI、OpenClaw、Qwen の置き換えではありません', not_5: 'それらを取り巻くメッセージング／コントロール層です',
     f_remote_name: 'リモートターミナル', f_remote_desc: 'ブラウザ＆モバイル、SSH/VPN不要、リアルタイムPTYストリーミング',
@@ -636,7 +680,7 @@ const I18N = {
     oc_note: 'Only tested on macOS so far. Remote plain-text <code>ws://</code> URLs require <code>--insecure</code>.',
     sh_intro: '1台のマシンにサーバーとデーモンをデプロイ。DockerとDNS設定済みのドメインが必要です。',
     sh_desc: '設定を自動生成、PostgreSQL + サーバー + Caddy（自動HTTPS）を起動、管理者アカウントを作成しローカルデーモンをバインド。認証情報は最後に表示されます。',
-    sh_connect: '追加マシンの接続：', sh_manual: '手動セットアップ：',
+    sh_connect: '追加マシンの接続：', sh_manual: '手動セットアップ：', sh_manual_pgvector: '生成される docker-compose.yml は PostgreSQL に pgvector/pgvector:pg16 を使用します。',
     req_os: 'macOS、Linux、または Windows（ネイティブは実験的、<a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> は完全対応）',
     req_mux: 'tmux（Linux/macOS/WSL）。Windows ネイティブは ConPTY（組み込み）を使用。',
     about_text: '個人プロジェクト。ほぼ全てを <a href="https://github.com/anthropics/claude-code">Claude Code</a> が構築、<a href="https://github.com/openai/codex">Codex</a> と <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a> も重要な貢献。',
@@ -644,12 +688,19 @@ const I18N = {
   },
   ko: {
     tagline: 'AI 에이전트를 위한 IM',
-    hero_intro: '오래 실행되는 coding agent 세션을 iPhone, iPad, Apple Watch, 모바일이나 웹에서 항상 닿는 곳에 두세요. 터미널, 파일, Git, localhost 미리보기, 알림, 멀티 에이전트 워크플로우가 함께 제공됩니다.',
+    hero_intro: '오래 실행되는 coding agent 세션을 iPhone, iPad, Apple Watch, 모바일이나 웹에서 항상 닿는 곳에 두세요. 터미널, 파일, Git, localhost 미리보기, 알림, 멀티 에이전트 워크플로우, 공유 에이전트 메모리가 함께 제공됩니다.',
     hero_output: 'app.im.codes에 바인딩 완료 · 데몬 시작됨 · 시스템 서비스로 등록됨',
     self_host_warning: '<strong>셀프 호스팅을 강력히 권장합니다.</strong> <code>app.im.codes</code>는 공유 테스트 인스턴스로 가동 보장이 없으며, 속도 제한, 공격 대상이 되거나 사용 불가할 수 있습니다. 개인 프로젝트로 상업적 지원은 제공되지 않습니다. 평가 이외의 용도에는 자체 인프라에 배포하세요.',
-    h_screenshots: '스크린샷', h_why: '배경', h_not: '무엇이 아닌가', h_features: '기능', h_arch: '아키텍처', h_download: '다운로드', h_install: '설치', h_quick: '빠른 시작', h_selfhost: '셀프 호스팅', h_agents: '지원 에이전트', h_reqs: '요구사항', h_about: '소개',
+    h_screenshots: '스크린샷', h_why: '배경', h_memory: '공유 에이전트 컨텍스트', h_not: '무엇이 아닌가', h_features: '기능', h_arch: '아키텍처', h_download: '다운로드', h_install: '설치', h_quick: '빠른 시작', h_selfhost: '셀프 호스팅', h_agents: '지원 에이전트', h_reqs: '요구사항', h_about: '소개',
     also_web: '<a href="https://app.im.codes">웹 앱</a>으로도 이용 가능', watch_intro: 'Watch 지원으로 손목에서 세션 목록, 읽지 않음 수, OTA 업데이트 상태, 푸시 알림, 빠른 답장을 확인할 수 있습니다.', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'Watch 앱은 세션 목록, 읽지 않음 수, 빠른 답장을 제공합니다.',
     agents_intro: 'Claude Code와 Codex는 이제 CLI와 SDK 두 방식 모두로 연결할 수 있습니다.',
+    memory_intro: 'IM.codes는 완료된 작업을 검색 가능한 메모리로 계속 축적합니다. 저장되는 것은 원시 프롬프트 로그가 아니라 구조화된 문제→해결 요약입니다. 관련 기록은 새 메시지 전송과 세션 시작 시 자동으로 재사용되며, 어떤 내용이 주입됐는지도 타임라인에서 확인할 수 있습니다.',
+    memory_1: '개인 메모리는 기본적으로 로컬에 남고, 처리된 요약만 선택적으로 클라우드에 동기화해 여러 기기에서 공유할 수 있습니다.',
+    memory_2: 'Enterprise Shared Context를 통해 팀은 workspace / project 범위에서 수정 경험을 재사용하고, 검색·통계·조회 UI로 관리할 수 있습니다.',
+    memory_3: '다국어 리콜은 로컬 embedding과 pgvector 기반 서버 검색을 결합해 서로 다른 언어 사이에서도 관련 수정 이력을 찾습니다.',
+    memory_4: '타임라인 카드는 무엇이 주입됐는지와 함께 관련성 점수, 재호출 횟수, 마지막 사용 시각을 보여줍니다.',
+    f_memory_name: '공유 에이전트 컨텍스트',
+    f_memory_desc: '문제→해결 메모리, 다국어 리콜, 메시지/시작 시 자동 주입을 타임라인에서 가시화',
     why_text: '책상을 떠나면 대부분의 coding agent 워크플로우는 끊깁니다. 에이전트는 여전히 터미널에서 돌아가지만, 작업을 이어가려면 보통 SSH, tmux attach, 원격 데스크톱을 쓰거나 노트북 앞으로 돌아갈 때까지 기다려야 합니다. IM.codes는 이런 세션을 모바일과 웹에서 계속 닿는 곳에 둡니다. 터미널을 열고, 파일과 Git 변경을 보고, 다른 기기에서 localhost를 미리 보고, 작업이 끝나면 알림을 받고, 자신의 인프라에서 여러 에이전트를 병렬로 계속 진행할 수 있습니다.',
     not_1: '또 다른 AI IDE가 아닙니다', not_2: '단순한 채팅 래퍼가 아닙니다', not_3: '단순한 원격 터미널 클라이언트가 아닙니다', not_4: 'Claude Code, Codex, Gemini CLI, OpenClaw, Qwen의 대체품이 아닙니다', not_5: '그들을 둘러싼 메시징/컨트롤 레이어입니다',
     f_remote_name: '원격 터미널', f_remote_desc: '브라우저 & 모바일, SSH/VPN 불필요, 실시간 PTY 스트리밍',
@@ -695,7 +746,7 @@ const I18N = {
     oc_note: 'Only tested on macOS so far. Remote plain-text <code>ws://</code> URLs require <code>--insecure</code>.',
     sh_intro: '단일 머신에 서버와 데몬을 배포합니다. Docker와 서버를 가리키는 도메인이 필요합니다.',
     sh_desc: '모든 설정 자동 생성, PostgreSQL + 서버 + Caddy(자동 HTTPS) 시작, 관리자 계정 생성 및 로컬 데몬 바인딩. 자격 증명은 마지막에 출력됩니다.',
-    sh_connect: '추가 머신 연결:', sh_manual: '수동 설정:',
+    sh_connect: '추가 머신 연결:', sh_manual: '수동 설정:', sh_manual_pgvector: '생성되는 docker-compose.yml 은 PostgreSQL 이미지로 pgvector/pgvector:pg16 을 사용합니다.',
     req_os: 'macOS, Linux 또는 Windows (네이티브 실험적; <a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> 완전 지원)',
     req_mux: 'tmux (Linux/macOS/WSL). Windows 네이티브는 ConPTY (기본 내장) 사용.',
     about_text: '개인 프로젝트. 거의 전적으로 <a href="https://github.com/anthropics/claude-code">Claude Code</a>가 구축, <a href="https://github.com/openai/codex">Codex</a>와 <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a>도 중요한 기여.',
@@ -703,12 +754,19 @@ const I18N = {
   },
   es: {
     tagline: 'El IM para agentes',
-    hero_intro: 'Mantén las sesiones de coding agents de larga duración al alcance desde iPhone, iPad, Apple Watch, móvil o web, con terminal, archivos, vistas Git, vista previa de localhost, notificaciones y flujos multiagente integrados.',
+    hero_intro: 'Mantén las sesiones de coding agents de larga duración al alcance desde iPhone, iPad, Apple Watch, móvil o web, con terminal, archivos, vistas Git, vista previa de localhost, notificaciones, flujos multiagente y memoria compartida de agentes integrada.',
     hero_output: 'vinculado a app.im.codes · daemon iniciado · registrado como servicio del sistema',
     self_host_warning: '<strong>Se recomienda encarecidamente el autoalojamiento.</strong> <code>app.im.codes</code> es una instancia de prueba compartida sin garantías de disponibilidad — puede tener límites, ser objetivo de ataques o no estar disponible. Este es un proyecto personal sin soporte comercial. Para uso más allá de la evaluación, despliega en tu propia infraestructura.',
-    h_screenshots: 'capturas', h_why: 'por qué', h_not: 'qué no es', h_features: 'características', h_arch: 'arquitectura', h_download: 'descargar', h_install: 'instalar', h_quick: 'inicio rápido', h_selfhost: 'autoalojamiento', h_agents: 'agentes compatibles', h_reqs: 'requisitos', h_about: 'acerca de',
+    h_screenshots: 'capturas', h_why: 'por qué', h_memory: 'contexto compartido para agentes', h_not: 'qué no es', h_features: 'características', h_arch: 'arquitectura', h_download: 'descargar', h_install: 'instalar', h_quick: 'inicio rápido', h_selfhost: 'autoalojamiento', h_agents: 'agentes compatibles', h_reqs: 'requisitos', h_about: 'acerca de',
     also_web: 'También disponible como <a href="https://app.im.codes">app web</a>', watch_intro: 'La compatibilidad con Watch cubre monitoreo rápido de sesiones, contadores de no leídos, visibilidad de actualizaciones OTA, notificaciones push y respuestas rápidas desde la muñeca.', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'La app de Watch incluye lista de sesiones, contadores de no leídos y respuestas rápidas.',
     agents_intro: 'Claude Code y Codex ahora admiten integración tanto por CLI como por SDK.',
+    memory_intro: 'IM.codes convierte el trabajo ya resuelto en memoria reutilizable y buscable. Guarda resúmenes estructurados de problema→solución en lugar de logs crudos de prompts. El historial relevante se recupera automáticamente para nuevos mensajes y al iniciar sesiones, y cada inyección queda visible en la línea de tiempo.',
+    memory_1: 'La memoria personal permanece local por defecto, con sincronización opcional a la nube solo para resúmenes procesados entre tus dispositivos.',
+    memory_2: 'El contexto compartido empresarial permite reutilizar soluciones entre workspaces y proyectos con memoria consultable, estadísticas y UI de inspección.',
+    memory_3: 'La recuperación multilingüe combina embeddings locales con búsqueda del lado del servidor basada en pgvector para encontrar soluciones relacionadas entre distintos idiomas.',
+    memory_4: 'Las tarjetas de la línea de tiempo muestran exactamente qué se inyectó, junto con puntuación de relevancia, número de recuperaciones y último uso.',
+    f_memory_name: 'contexto compartido para agentes',
+    f_memory_desc: 'memoria problema→solución, recuperación multilingüe e inyección automática por mensaje y al iniciar, visible en la línea de tiempo',
     why_text: 'Cuando te alejas del escritorio, la mayoría de los flujos con coding agents se rompen. El agente sigue ejecutándose en una terminal, pero continuar el trabajo suele significar usar SSH, tmux attach, escritorio remoto o esperar a volver al portátil. IM.codes mantiene esas sesiones al alcance desde móvil o web: abre la terminal, inspecciona archivos y cambios Git, previsualiza localhost desde otro dispositivo, recibe notificaciones cuando el trabajo termina y mantén varios agentes avanzando en paralelo sobre tu propia infraestructura.',
     not_1: 'No es otro AI IDE', not_2: 'No es solo un wrapper de chat', not_3: 'No es solo un cliente de terminal remota', not_4: 'No reemplaza a Claude Code, Codex, Gemini CLI, OpenClaw ni Qwen', not_5: 'Es la capa de mensajería/control alrededor de ellos',
     f_remote_name: 'terminal remota', f_remote_desc: 'navegador y móvil, sin SSH/VPN, streaming PTY en tiempo real',
@@ -754,7 +812,7 @@ const I18N = {
     oc_note: 'Only tested on macOS so far. Remote plain-text <code>ws://</code> URLs require <code>--insecure</code>.',
     sh_intro: 'Despliega servidor + daemon en una sola máquina. Requiere Docker y un dominio con DNS apuntando al servidor.',
     sh_desc: 'Genera toda la configuración, inicia PostgreSQL + servidor + Caddy con HTTPS automático, crea la cuenta admin y vincula el daemon local. Las credenciales se imprimen al final.',
-    sh_connect: 'Para conectar máquinas adicionales:', sh_manual: 'Configuración manual:',
+    sh_connect: 'Para conectar máquinas adicionales:', sh_manual: 'Configuración manual:', sh_manual_pgvector: 'El docker-compose.yml generado ya usa pgvector/pgvector:pg16 para PostgreSQL.',
     req_os: 'macOS, Linux o Windows (nativo experimental; <a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> totalmente soportado)',
     req_mux: 'tmux (Linux/macOS/WSL). Windows nativo usa ConPTY (integrado).',
     about_text: 'Proyecto personal. Construido casi en su totalidad por <a href="https://github.com/anthropics/claude-code">Claude Code</a>, con contribuciones de <a href="https://github.com/openai/codex">Codex</a> y <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a>.',
@@ -762,12 +820,19 @@ const I18N = {
   },
   ru: {
     tagline: 'IM для агентов',
-    hero_intro: 'Держите долгоживущие coding agent-сессии под рукой с iPhone, iPad, Apple Watch, телефона или из браузера: терминал, файлы, Git, localhost-превью, уведомления и мульти-агентные сценарии уже встроены.',
+    hero_intro: 'Держите долгоживущие coding agent-сессии под рукой с iPhone, iPad, Apple Watch, телефона или из браузера: терминал, файлы, Git, localhost-превью, уведомления, мульти-агентные сценарии и общая память агентов уже встроены.',
     hero_output: 'привязан к app.im.codes · демон запущен · зарегистрирован как системная служба',
     self_host_warning: '<strong>Настоятельно рекомендуется самостоятельный хостинг.</strong> <code>app.im.codes</code> — общий тестовый экземпляр без гарантий доступности. Может быть ограничен, атакован или недоступен. Это личный проект без коммерческой поддержки. Для использования помимо тестирования разверните на собственной инфраструктуре.',
-    h_screenshots: 'скриншоты', h_why: 'зачем', h_not: 'чем это не является', h_features: 'возможности', h_arch: 'архитектура', h_download: 'скачать', h_install: 'установка', h_quick: 'быстрый старт', h_selfhost: 'свой сервер', h_agents: 'поддерживаемые агенты', h_reqs: 'требования', h_about: 'о проекте',
+    h_screenshots: 'скриншоты', h_why: 'зачем', h_memory: 'общий контекст агентов', h_not: 'чем это не является', h_features: 'возможности', h_arch: 'архитектура', h_download: 'скачать', h_install: 'установка', h_quick: 'быстрый старт', h_selfhost: 'свой сервер', h_agents: 'поддерживаемые агенты', h_reqs: 'требования', h_about: 'о проекте',
     also_web: 'Также доступно как <a href="https://app.im.codes">веб-приложение</a>', watch_intro: 'Поддержка Watch даёт быстрый просмотр сессий, счётчики непрочитанного, статус OTA-обновлений, push-уведомления и быстрые ответы прямо с запястья.', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'Приложение для Watch показывает список сессий, счётчики непрочитанного и быстрые ответы.',
     agents_intro: 'Claude Code и Codex теперь поддерживают интеграции как через CLI, так и через SDK.',
+    memory_intro: 'IM.codes превращает уже решённую работу в переиспользуемую и доступную для поиска память. Сохраняются не сырые логи промптов, а структурированные сводки проблема→решение. Релевантная история автоматически подмешивается в новые сообщения и при старте сессии, а каждая инъекция видна в таймлайне.',
+    memory_1: 'Личная память по умолчанию остаётся локальной; при желании в облако синхронизируются только обработанные сводки между вашими устройствами.',
+    memory_2: 'Enterprise Shared Context позволяет командам переиспользовать решения между workspace / project с поиском по памяти, статистикой и интерфейсом просмотра.',
+    memory_3: 'Многоязычный recall сочетает локальные embedding и серверный поиск на pgvector, поэтому связанные решения находятся даже между разными языками.',
+    memory_4: 'Карточки таймлайна показывают, что именно было подмешано, а также score релевантности, число recall и время последнего использования.',
+    f_memory_name: 'общий контекст агентов',
+    f_memory_desc: 'память проблема→решение, многоязычный recall и автоматическая инъекция при сообщении и старте сессии с видимостью в таймлайне',
     why_text: 'Когда вы отходите от рабочего стола, большинство workflows с coding agents ломается. Агент всё ещё работает в терминале, но продолжение работы обычно означает SSH, tmux attach, удалённый рабочий стол или ожидание, пока вы вернётесь к ноутбуку. IM.codes держит эти сессии под рукой на телефоне и в браузере: откройте терминал, посмотрите файлы и Git-изменения, превью localhost с другого устройства, получите уведомление по завершении работы и ведите несколько агентов параллельно на своей инфраструктуре.',
     not_1: 'Это не ещё один AI IDE', not_2: 'Это не просто чат-обёртка', not_3: 'Это не просто клиент удалённого терминала', not_4: 'Это не замена Claude Code, Codex, Gemini CLI, OpenClaw или Qwen', not_5: 'Это слой сообщений/управления вокруг них',
     f_remote_name: 'удалённый терминал', f_remote_desc: 'браузер и мобильный, без SSH/VPN, PTY-стриминг в реальном времени',
@@ -813,7 +878,7 @@ const I18N = {
     oc_note: 'Only tested on macOS so far. Remote plain-text <code>ws://</code> URLs require <code>--insecure</code>.',
     sh_intro: 'Разверните сервер + демон на одной машине. Требуется Docker и домен с DNS, указывающим на сервер.',
     sh_desc: 'Автоматически генерирует конфигурацию, запускает PostgreSQL + сервер + Caddy с автоматическим HTTPS, создаёт учётную запись администратора и привязывает локальный демон. Данные для входа выводятся в конце.',
-    sh_connect: 'Подключение дополнительных машин:', sh_manual: 'Ручная настройка:',
+    sh_connect: 'Подключение дополнительных машин:', sh_manual: 'Ручная настройка:', sh_manual_pgvector: 'Сгенерированный docker-compose.yml уже использует pgvector/pgvector:pg16 для PostgreSQL.',
     req_os: 'macOS, Linux или Windows (нативная поддержка экспериментальная; <a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> полностью поддерживается)',
     req_mux: 'tmux (Linux/macOS/WSL). Нативный Windows использует ConPTY (встроенный).',
     about_text: 'Личный проект. Почти полностью создан <a href="https://github.com/anthropics/claude-code">Claude Code</a>, со значительным вкладом <a href="https://github.com/openai/codex">Codex</a> и <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a>.',

@@ -4,7 +4,7 @@
 
 **The IM for agents.**
 
-A specialized instant messenger for AI agents. Keep long-running coding-agent sessions within reach from iPhone, iPad, Apple Watch, mobile, or web, with terminal access, file browsing, git views, localhost preview, notifications, and multi-agent workflows built in. Works with [Claude Code](https://github.com/anthropics/claude-code) and [Codex](https://github.com/openai/codex) via both CLI and SDK integrations, plus [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more — including native streaming output for transport-backed agents.
+A specialized instant messenger for AI agents. Keep long-running coding-agent sessions within reach from iPhone, iPad, Apple Watch, mobile, or web, with terminal access, file browsing, git views, localhost preview, notifications, multi-agent workflows, and shared agent memory built in. Works with [Claude Code](https://github.com/anthropics/claude-code) and [Codex](https://github.com/openai/codex) via both CLI and SDK integrations, plus [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more — including native streaming output for transport-backed agents.
 
 > **Disclaimer:** This is an actively developed personal open-source project. There are no warranties, no SLA, and no guarantees of stability, security, or backward compatibility. Use at your own risk. Breaking changes may happen at any time without notice.
 
@@ -74,6 +74,17 @@ When you leave your desk, most coding-agent workflows fall apart. The agent is s
 It is not another AI IDE or a generic remote terminal. It is the messaging/control layer around terminal-based coding agents.
 
 This is a personal project. I haven't written any code myself — it was built almost entirely by [Claude Code](https://github.com/anthropics/claude-code), with significant contributions from [Codex](https://github.com/openai/codex) and [Gemini CLI](https://github.com/google-gemini/gemini-cli).
+
+## Shared Agent Context & Memory
+
+This is now a core product feature, not an internal implementation detail. IM.codes continuously turns completed agent work into reusable memory and feeds that context back into future sessions.
+
+- **Problem → solution memory, not log spam.** Only final `assistant.text` outputs are materialized. Streaming deltas, tool calls, and intermediate noise are excluded.
+- **Personal memory with optional cloud sync.** Raw and processed memory always stay local; processed summaries can optionally sync to a user-scoped cloud pool shared across your devices.
+- **Enterprise shared context.** Teams can publish reusable memory into workspace/project scopes, inspect it in the UI, query it, and see stats instead of treating context as hidden prompt text.
+- **Multilingual recall.** Local semantic search and server-side pgvector recall use multilingual embeddings, so related fixes can be found across English, Chinese, Japanese, Korean, Spanish, Russian, and mixed-language repos.
+- **Automatic injection where it matters.** Relevant past work is injected both per-message and at session startup, with timeline cards that show what was recalled, why, the relevance score, recall count, and last-used time.
+- **User-visible inspection and control.** Shared Context UI separates raw events, processed summaries, cloud memory, and enterprise memory, with query, preview, archive/restore, and processing configuration controls.
 
 ## Features
 
@@ -281,6 +292,8 @@ git clone https://github.com/im4codes/imcodes.git && cd imcodes
 ./gen-env.sh imc.example.com        # generates .env with random secrets, prints admin password
 docker compose up -d
 ```
+
+The generated `docker-compose.yml` already uses `pgvector/pgvector:pg16` for PostgreSQL.
 
 Login at `https://your-domain` with `admin` and the printed password. Bind your dev machine with `imcodes bind`.
 

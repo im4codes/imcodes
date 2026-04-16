@@ -70,6 +70,17 @@ No es otro IDE de IA ni un cliente genérico de terminal remota. Es la capa de m
 
 Este es un proyecto personal. Yo prácticamente no escribí código: fue construido casi por completo por [Claude Code](https://github.com/anthropics/claude-code), con contribuciones importantes de [Codex](https://github.com/openai/codex) y [Gemini CLI](https://github.com/google-gemini/gemini-cli).
 
+## Shared Agent Context y memoria
+
+Esto ya es una función central del producto, no un detalle interno de implementación. IM.codes convierte continuamente el trabajo ya resuelto de los agentes en memoria reutilizable y vuelve a inyectar ese contexto en sesiones futuras.
+
+- **Se guarda problema → solución, no ruido de logs.** Solo se materializan las salidas finales `assistant.text`; se excluyen deltas en streaming, tool calls, tool results y ruido intermedio.
+- **Memoria personal con sincronización opcional en la nube.** La memoria cruda y la procesada permanecen siempre en local; los resúmenes procesados pueden sincronizarse opcionalmente con un pool en la nube a nivel de usuario compartido entre tus dispositivos.
+- **Enterprise Shared Context consultable.** Los equipos pueden publicar memoria reutilizable en ámbitos workspace/project, inspeccionarla desde la UI, consultarla y ver estadísticas, en lugar de esconder contexto dentro de prompts invisibles.
+- **Recuperación multilingüe.** La búsqueda semántica local y el recall del servidor con pgvector usan embeddings multilingües para encontrar soluciones relacionadas entre inglés, chino, japonés, coreano, español, ruso y repos mixtos.
+- **Inyección automática donde importa.** El historial relevante se inyecta tanto por mensaje como al iniciar la sesión, con tarjetas en la timeline que muestran qué se recuperó, por qué, la puntuación de relevancia, el número de recalls y el último uso.
+- **Visible y controlable por el usuario.** La UI de Shared Context separa raw events, processed summaries, cloud memory y enterprise memory, con controles de consulta, vista previa, archive/restore y configuración de procesamiento.
+
 ## Funciones
 
 ### Terminal remota
@@ -239,6 +250,8 @@ git clone https://github.com/im4codes/imcodes.git && cd imcodes
 ./gen-env.sh imc.example.com        # generates .env with random secrets, prints admin password
 docker compose up -d
 ```
+
+El `docker-compose.yml` generado ya usa `pgvector/pgvector:pg16` para PostgreSQL.
 
 ## Windows (experimental)
 

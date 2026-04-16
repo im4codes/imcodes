@@ -12,6 +12,10 @@ import logger from '../util/logger.js';
 // Re-export shared constants for backward compatibility with existing imports
 export { EMBEDDING_DIM, cosineSimilarity } from '../../shared/embedding-config.js';
 
+function resolveEmbeddingCacheDir(): string {
+  return process.env.IMCODES_EMBEDDING_CACHE_DIR?.trim() || '';
+}
+
 // Lazy-loaded pipeline singleton
 let pipelineInstance: any = null;
 let loadingPromise: Promise<any> | null = null;
@@ -22,8 +26,10 @@ async function getPipeline(): Promise<any> {
 
   loadingPromise = (async () => {
     try {
-      const { pipeline } = await import('@huggingface/transformers');
-      logger.info({ model: EMBEDDING_MODEL, dtype: EMBEDDING_DTYPE }, 'Loading embedding model...');
+      const { pipeline, env } = await import('@huggingface/transformers');
+      const cacheDir = resolveEmbeddingCacheDir();
+      if (cacheDir) env.cacheDir = cacheDir;
+      logger.info({ model: EMBEDDING_MODEL, dtype: EMBEDDING_DTYPE, cacheDir: env.cacheDir }, 'Loading embedding model...');
       const p = await pipeline('feature-extraction', EMBEDDING_MODEL, {
         dtype: EMBEDDING_DTYPE,
       });

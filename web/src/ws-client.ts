@@ -95,6 +95,8 @@ export type ServerMessage =
 
 export type {
   TimelineEvent,
+  MemoryContextTimelinePayload,
+  MemoryContextTimelineItem,
 } from '../../src/shared/timeline/types.js';
 
 export type {

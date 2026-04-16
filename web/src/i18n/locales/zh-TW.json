@@ -48,7 +48,12 @@
     "tool_detail_input": "輸入",
     "tool_detail_output": "輸出",
     "tool_detail_meta": "中繼資訊",
-    "tool_detail_raw": "原始資料"
+    "tool_detail_raw": "原始資料",
+    "memory_context_title": "相關歷史",
+    "memory_context_summary": "召回 {{count}} 條",
+    "memory_context_query": "查詢：{{query}}",
+    "memory_context_score": "分數 {{score}}",
+    "memory_context_startup_reason": "在工作階段啟動時注入"
   },
   "session": {
     "restart": "↺ 重新啟動",

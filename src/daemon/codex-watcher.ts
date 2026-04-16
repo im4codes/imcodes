@@ -9,9 +9,10 @@ import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 const execAsync = promisify(exec);
 import { timelineEmitter } from './timeline-emitter.js';
-import { buildSessionBootstrapContext, buildCodexMemoryEntry } from './memory-inject.js';
+import { buildSessionBootstrapContext, buildCodexMemoryEntry, readProcessedMemoryItems } from './memory-inject.js';
 import { legacyInjectionDisabled } from '../context/shared-context-flags.js';
 import logger from '../util/logger.js';
+import { buildMemoryContextTimelinePayload } from './memory-context-timeline.js';
 import { updateSessionState } from '../store/session-store.js';
 import { resolveContextWindow } from '../util/model-context.js';
 import { registerWatcherControl, unregisterWatcherControl, type WatcherControl } from './watcher-controls.js';
@@ -413,7 +414,7 @@ export async function findRolloutPathByUuid(uuid: string): Promise<string | null
  * If one already exists, returns its path. Otherwise creates a minimal
  * session_meta file so `codex resume <uuid>` can find and use it.
  */
-export async function ensureSessionFile(uuid: string, cwd: string): Promise<string> {
+export async function ensureSessionFile(uuid: string, cwd: string, sessionName?: string): Promise<string> {
   const existing = await findRolloutPathByUuid(uuid);
   if (existing) return existing;
 
@@ -453,6 +454,14 @@ export async function ensureSessionFile(uuid: string, cwd: string): Promise<stri
 
   await writeFile(filePath, lines.join('\n') + '\n', 'utf8');
   logger.info({ uuid, filePath, hasMemory: !!memory }, 'codex-watcher: created bootstrapped session file');
+
+  if (sessionName && !legacyInjectionDisabled()) {
+    const items = await readProcessedMemoryItems(basename(cwd));
+    const payload = buildMemoryContextTimelinePayload(undefined, items, 'startup');
+    if (payload) {
+      timelineEmitter.emit(sessionName, 'memory.context', payload, { source: 'daemon', confidence: 'high' });
+    }
+  }
 
   // Upsert into Codex's SQLite threads table so `codex resume <uuid>` finds proper metadata.
   await upsertCodexThread(uuid, cwd, filePath, cliVersion).catch((e) =>

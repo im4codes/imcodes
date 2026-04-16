@@ -1,5 +1,5 @@
 /**
- * I.5: Server recall endpoint returns pg_trgm ranked results.
+ * I.5/J.13: Server recall endpoint returns vector/pg_trgm ranked results.
  *
  * Tests the POST /:id/shared-context/memory/recall route in shared-context.ts.
  * Mocks the DB layer (no real PostgreSQL needed) — follows the same pattern
@@ -13,6 +13,8 @@ import type { Database } from '../src/db/client.js';
 // ── Hoisted mock state ─────────────────────────────────────────────────────
 
 const mockResolveServerRole = vi.fn<() => Promise<string>>();
+const generateEmbeddingMock = vi.hoisted(() => vi.fn());
+const embeddingToSqlMock = vi.hoisted(() => vi.fn());
 
 vi.mock('../src/security/authorization.js', () => ({
   requireAuth: () => async (c: { set: (key: string, value: string) => void }, next: () => Promise<void>) => {
@@ -29,8 +31,8 @@ vi.mock('../src/security/audit.js', () => ({
 
 // Mock embedding module — return null to trigger pg_trgm fallback path
 vi.mock('../src/util/embedding.js', () => ({
-  generateEmbedding: vi.fn().mockResolvedValue(null),
-  embeddingToSql: vi.fn(),
+  generateEmbedding: generateEmbeddingMock,
+  embeddingToSql: embeddingToSqlMock,
   isEmbeddingAvailable: vi.fn().mockResolvedValue(false),
 }));
 
@@ -48,6 +50,9 @@ interface MockRow {
   summary: string;
   updated_at: number;
   score: number;
+  hit_count?: number;
+  last_used_at?: number;
+  status?: 'active' | 'archived';
   enterprise_id?: string;
 }
 
@@ -79,7 +84,7 @@ function makeMockDb(opts: {
     query: async <T = unknown>(sql: string, _params: unknown[] = []) => {
       const normalized = sql.toLowerCase().replace(/\s+/g, ' ').trim();
       // Personal memory query
-      if (normalized.includes("where scope = 'personal' and user_id =")) {
+      if (normalized.includes("where scope = 'personal' and user_id =") || normalized.includes("where p.scope = 'personal' and p.user_id =")) {
         return (opts.personalRows ?? []) as T[];
       }
       // Enterprise memory query (joined with team_members)
@@ -128,6 +133,8 @@ describe('memory recall endpoint — I.5', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockResolveServerRole.mockResolvedValue('owner');
+    generateEmbeddingMock.mockResolvedValue(null);
+    embeddingToSqlMock.mockImplementation((value: unknown) => String(value));
   });
 
   it('returns 403 when user has no server role', async () => {
@@ -350,7 +357,7 @@ describe('memory recall endpoint — I.5', () => {
     expect(item).toHaveProperty('class', 'durable_memory_candidate');
     expect(item).toHaveProperty('summary', 'A durable memory');
     expect(item).toHaveProperty('updatedAt', 1700000000000);
-    expect(item).toHaveProperty('score', 0.75);
+    expect(typeof item.score).toBe('number');
     expect(item).toHaveProperty('source', 'personal');
   });
 
@@ -362,5 +369,91 @@ describe('memory recall endpoint — I.5', () => {
     expect(res.status).toBe(200);
     const json = await res.json() as { results: unknown[] };
     expect(json.results).toHaveLength(0);
+  });
+
+  it('reranks by composite relevance so same-project high-hit memories can beat slightly higher raw similarity', async () => {
+    const now = Date.now();
+    const { db } = makeMockDb({
+      personalRows: [
+        {
+          id: 'same-project',
+          project_id: 'proj-a',
+          projection_class: 'recent_summary',
+          summary: 'Same project memory',
+          updated_at: now - 20 * 24 * 60 * 60 * 1000,
+          last_used_at: now - 1 * 24 * 60 * 60 * 1000,
+          hit_count: 12,
+          score: 0.78,
+        },
+        {
+          id: 'other-project',
+          project_id: 'proj-b',
+          projection_class: 'recent_summary',
+          summary: 'Cross project memory',
+          updated_at: now - 1 * 24 * 60 * 60 * 1000,
+          last_used_at: now - 1 * 24 * 60 * 60 * 1000,
+          hit_count: 0,
+          score: 0.82,
+        },
+      ],
+    });
+    const app = await buildTestApp(db);
+
+    const res = await postRecall(app, { query: 'test', projectId: 'proj-a' });
+    expect(res.status).toBe(200);
+    const json = await res.json() as { results: Array<{ id: string }> };
+    expect(json.results[0].id).toBe('same-project');
+  });
+
+  it('uses vector search for English query returning Chinese memory', async () => {
+    generateEmbeddingMock.mockResolvedValueOnce(new Float32Array([0.1, 0.2, 0.3]));
+    embeddingToSqlMock.mockReturnValue('[0.1,0.2,0.3]');
+
+    const { db } = makeMockDb({
+      personalRows: [
+        {
+          id: 'zh-result',
+          project_id: 'proj-a',
+          projection_class: 'recent_summary',
+          summary: '修复文件浏览器下载文件名乱码问题',
+          updated_at: Date.now(),
+          score: 0.91,
+        },
+      ],
+    });
+    const app = await buildTestApp(db);
+
+    const res = await postRecall(app, { query: 'fix garbled download filename', projectId: 'proj-a' });
+    expect(res.status).toBe(200);
+    const json = await res.json() as { vectorSearch: boolean; results: Array<{ id: string; summary: string }> };
+    expect(json.vectorSearch).toBe(true);
+    expect(json.results[0].id).toBe('zh-result');
+    expect(json.results[0].summary).toContain('修复文件浏览器下载文件名乱码问题');
+  });
+
+  it('uses vector search for Chinese query returning English memory', async () => {
+    generateEmbeddingMock.mockResolvedValueOnce(new Float32Array([0.3, 0.2, 0.1]));
+    embeddingToSqlMock.mockReturnValue('[0.3,0.2,0.1]');
+
+    const { db } = makeMockDb({
+      personalRows: [
+        {
+          id: 'en-result',
+          project_id: 'proj-a',
+          projection_class: 'recent_summary',
+          summary: 'Resolved WebSocket reconnect race during session restore',
+          updated_at: Date.now(),
+          score: 0.89,
+        },
+      ],
+    });
+    const app = await buildTestApp(db);
+
+    const res = await postRecall(app, { query: '修复会话恢复时的 websocket 重连竞争', projectId: 'proj-a' });
+    expect(res.status).toBe(200);
+    const json = await res.json() as { vectorSearch: boolean; results: Array<{ id: string; summary: string }> };
+    expect(json.vectorSearch).toBe(true);
+    expect(json.results[0].id).toBe('en-result');
+    expect(json.results[0].summary).toContain('Resolved WebSocket reconnect race');
   });
 });

@@ -712,6 +712,20 @@ body {
 .chat-tool-detail-section { margin-top: 6px; }
 .chat-tool-detail-label { color: #64748b; font-size: 11px; margin-bottom: 2px; text-transform: uppercase; letter-spacing: 0.04em; }
 .chat-tool-detail-pre { margin: 0; padding: 6px 8px; background: #0f172a; border-radius: 4px; color: #cbd5e1; font-size: 11px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; overflow-x: auto; }
+.chat-memory-context { margin-left: 18px; background: #0f172a; border: 1px solid #233044; border-left: 3px solid #6366f1; border-radius: 8px; }
+.chat-memory-context-toggle { width: 100%; display: flex; align-items: center; gap: 8px; background: none; border: none; color: #cbd5e1; padding: 8px 10px; cursor: pointer; text-align: left; }
+.chat-memory-context-toggle:hover { background: rgba(99,102,241,0.08); }
+.chat-memory-context-title { font-size: 12px; font-weight: 600; color: #c4b5fd; }
+.chat-memory-context-summary { font-size: 11px; color: #94a3b8; }
+.chat-memory-context-caret { margin-left: auto; font-size: 11px; color: #64748b; }
+.chat-memory-context-body { display: flex; flex-direction: column; gap: 8px; padding: 0 10px 10px; }
+.chat-memory-context-query { font-size: 11px; color: #94a3b8; white-space: pre-wrap; word-break: break-word; }
+.chat-memory-context-list { display: flex; flex-direction: column; gap: 8px; }
+.chat-memory-context-item { background: #111827; border: 1px solid #1f2937; border-radius: 6px; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+.chat-memory-context-item-summary { font-size: 12px; line-height: 1.5; color: #e2e8f0; white-space: pre-wrap; word-break: break-word; }
+.chat-memory-context-item-meta { display: flex; flex-wrap: wrap; gap: 6px; }
+.chat-memory-context-chip { display: inline-flex; align-items: center; padding: 2px 7px; border-radius: 999px; background: rgba(30,41,59,0.9); border: 1px solid #334155; color: #94a3b8; font-size: 10px; }
+.chat-memory-context-chip-muted { color: #64748b; }
 .chat-mode { display: inline-block; background: #1e1338; color: #a78bfa; padding: 2px 8px; border-radius: 4px; font-size: 11px; }
 .chat-system { text-align: center; color: #475569; font-size: 11px; padding: 4px 0; }
 .chat-loading { text-align: center; color: #475569; padding: 24px; }

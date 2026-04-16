@@ -48,7 +48,12 @@
     "tool_detail_input": "input",
     "tool_detail_output": "output",
     "tool_detail_meta": "meta",
-    "tool_detail_raw": "raw"
+    "tool_detail_raw": "raw",
+    "memory_context_title": "Related history",
+    "memory_context_summary": "{{count}} recalled",
+    "memory_context_query": "Query: {{query}}",
+    "memory_context_score": "Score {{score}}",
+    "memory_context_startup_reason": "Injected during session startup"
   },
   "session": {
     "restart": "↺ Restart",

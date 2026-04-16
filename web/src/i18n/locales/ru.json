@@ -48,7 +48,12 @@
     "tool_detail_input": "ввод",
     "tool_detail_output": "вывод",
     "tool_detail_meta": "мета",
-    "tool_detail_raw": "raw"
+    "tool_detail_raw": "raw",
+    "memory_context_title": "Связанная история",
+    "memory_context_summary": "{{count}} найдено",
+    "memory_context_query": "Запрос: {{query}}",
+    "memory_context_score": "Оценка {{score}}",
+    "memory_context_startup_reason": "Вставлено при запуске сессии"
   },
   "session": {
     "restart": "↺ Перезапустить",

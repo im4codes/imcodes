@@ -7,7 +7,7 @@ import { h } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from 'preact/hooks';
 import { memo } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
-import type { TimelineEvent, WsClient } from '../ws-client.js';
+import type { TimelineEvent, WsClient, MemoryContextTimelinePayload, MemoryContextTimelineItem } from '../ws-client.js';
 import { FileBrowser } from './FileBrowser.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
@@ -77,6 +77,16 @@ function trimDetectedUrl(url: string): string {
   let next = hardStop >= 0 ? url.slice(0, hardStop) : url;
   while (next.length > 1 && /[.,;:!?)}\]>）】》」』，。；：！？⬇]$/u.test(next)) next = next.slice(0, -1);
   return next;
+}
+
+function formatMemoryContextScore(score: number | undefined): string | null {
+  if (typeof score !== 'number' || Number.isNaN(score)) return null;
+  return score >= 1 ? score.toFixed(2) : score.toFixed(3);
+}
+
+function formatMemoryContextTimestamp(ts: number | undefined): string | null {
+  if (typeof ts !== 'number' || !Number.isFinite(ts)) return null;
+  return new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
 const TOOL_INPUT_SUMMARY_KEYS = [
@@ -1285,6 +1295,9 @@ const ChatEvent = memo(function ChatEvent({
     case 'assistant.thinking':
       return <ThinkingEvent event={event} endTs={nextTs} />;
 
+    case 'memory.context':
+      return <MemoryContextEvent event={event} />;
+
     case 'terminal.snapshot':
       return <SnapshotEvent event={event} />;
 
@@ -1320,6 +1333,58 @@ const ThinkingEvent = memo(function ThinkingEvent({ event, endTs }: { event: Tim
         </span>
         {hasText && <span class="chat-thinking-text">{expanded ? text : preview}</span>}
       </button>
+    </div>
+  );
+});
+
+const MemoryContextEvent = memo(function MemoryContextEvent({ event }: { event: TimelineEvent }) {
+  const { t } = useTranslation();
+  const [expanded, setExpanded] = useState(false);
+  const payload = event.payload as unknown as MemoryContextTimelinePayload;
+  const items = Array.isArray(payload.items) ? payload.items as MemoryContextTimelineItem[] : [];
+  const query = typeof payload.query === 'string' ? payload.query : '';
+  const reason = payload.reason ?? 'message';
+
+  return (
+    <div class="chat-event chat-memory-context" data-related-to={String(payload.relatedToEventId ?? '')}>
+      <button class="chat-memory-context-toggle" onClick={() => setExpanded((value) => !value)}>
+        <span class="chat-memory-context-title">{t('chat.memory_context_title')}</span>
+        <span class="chat-memory-context-summary">{t('chat.memory_context_summary', { count: items.length })}</span>
+        <span class="chat-memory-context-caret">{expanded ? '▲' : '▼'}</span>
+      </button>
+      {expanded && (
+        <div class="chat-memory-context-body">
+          {reason === 'startup' ? (
+            <div class="chat-memory-context-query">{t('chat.memory_context_startup_reason')}</div>
+          ) : null}
+          {query && (
+            <div class="chat-memory-context-query">{t('chat.memory_context_query', { query })}</div>
+          )}
+          <div class="chat-memory-context-list">
+            {items.map((item) => {
+              const score = formatMemoryContextScore(item.relevanceScore);
+              const recalledAt = formatMemoryContextTimestamp(item.lastUsedAt);
+              return (
+                <div key={item.id} class="chat-memory-context-item">
+                  <div class="chat-memory-context-item-summary">{item.summary}</div>
+                  <div class="chat-memory-context-item-meta">
+                    <span class="chat-memory-context-chip">{item.projectId}</span>
+                    {score && <span class="chat-memory-context-chip">{t('chat.memory_context_score', { score })}</span>}
+                    {typeof item.hitCount === 'number' && item.hitCount > 0 ? (
+                      <span class="chat-memory-context-chip">{t('sharedContext.management.memoryRecalls', { count: item.hitCount })}</span>
+                    ) : null}
+                    <span class="chat-memory-context-chip chat-memory-context-chip-muted">
+                      {recalledAt
+                        ? t('sharedContext.management.memoryLastRecalled', { time: recalledAt })
+                        : t('sharedContext.management.memoryNeverRecalled')}
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
     </div>
   );
 });

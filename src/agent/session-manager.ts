@@ -1400,6 +1400,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
   let opencodeSessionId = opts.opencodeSessionId;
   if (agentType === 'opencode' && !opencodeSessionId) opencodeSessionId = getSession(name)?.opencodeSessionId;
   ({ ccSessionId, codexSessionId, geminiSessionId } = await resolveStructuredSessionBootstrap({
+    sessionName: name,
     agentType,
     projectDir,
     isNewSession: !exists,

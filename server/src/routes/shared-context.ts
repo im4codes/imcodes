@@ -7,6 +7,7 @@ import { parseRemoteUrl } from '../../../src/repo/detector.js';
 import { parseCanonicalRepositoryKey } from '../../../src/agent/repository-identity-service.js';
 import { classifyTimestampFreshness } from '../../../shared/context-freshness.js';
 import type { ContextMemoryRecordView, ContextMemoryStatsView } from '../../../shared/context-types.js';
+import { computeRelevanceScore, type ProjectionClass } from '../../../shared/memory-scoring.js';
 
 type EnterpriseRole = 'owner' | 'admin' | 'member';
 type BindingMode = 'required' | 'advisory';
@@ -869,12 +870,37 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
     return c.json({ error: 'query_required' }, 400);
   }
   const limit = typeof rawLimit === 'number' && rawLimit > 0 ? Math.min(rawLimit, 20) : 5;
+  const candidateLimit = Math.max(limit * 4, 20);
 
   // Try vector search first, fall back to pg_trgm
   const { generateEmbedding, embeddingToSql } = await import('../util/embedding.js');
   const queryEmbedding = await generateEmbedding(query);
 
-  type RecallRow = { id: string; project_id: string; projection_class: string; summary: string; updated_at: number; score: number; enterprise_id?: string };
+  type RecallRow = {
+    id: string;
+    project_id: string;
+    projection_class: ProjectionClass;
+    summary: string;
+    updated_at: number;
+    score: number;
+    hit_count?: number | null;
+    last_used_at?: number | null;
+    enterprise_id?: string | null;
+  };
+
+  let currentEnterpriseId: string | undefined;
+  if (projectId) {
+    const enterpriseRow = await c.env.DB.queryOne<{ enterprise_id: string }>(
+      `SELECT e.enterprise_id
+       FROM shared_project_enrollments e
+       JOIN team_members tm ON tm.team_id = e.enterprise_id AND tm.user_id = $1
+       WHERE e.canonical_repo_id = $2
+         AND e.status = 'active'
+       LIMIT 1`,
+      [userId, projectId],
+    );
+    currentEnterpriseId = enterpriseRow?.enterprise_id;
+  }
 
   let personalRows: RecallRow[];
   let enterpriseRows: RecallRow[];
@@ -885,68 +911,109 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
     // pgvector cosine distance: <=> returns distance (0 = identical), convert to similarity
     personalRows = await c.env.DB.query<RecallRow>(
       `SELECT p.id, p.project_id, p.projection_class, p.summary, p.updated_at,
+              p.hit_count, p.last_used_at, p.enterprise_id,
               1 - (e.embedding <=> $1::vector) AS score
        FROM shared_context_projections p
        JOIN shared_context_embeddings e ON e.source_id = p.id AND e.source_kind = 'projection'
        WHERE p.scope = 'personal' AND p.user_id = $2
+         AND COALESCE(p.status, 'active') = 'active'
          ${projectId ? 'AND p.project_id = $3' : ''}
        ORDER BY e.embedding <=> $1::vector
        LIMIT $${projectId ? 4 : 3}`,
-      [vecSql, userId, ...(projectId ? [projectId] : []), limit],
+      [vecSql, userId, ...(projectId ? [projectId] : []), candidateLimit],
     );
 
     enterpriseRows = await c.env.DB.query<RecallRow>(
       `SELECT p.id, p.project_id, p.projection_class, p.summary, p.updated_at,
+              p.hit_count, p.last_used_at,
               1 - (e.embedding <=> $1::vector) AS score, p.enterprise_id
        FROM shared_context_projections p
        JOIN shared_context_embeddings e ON e.source_id = p.id AND e.source_kind = 'projection'
        JOIN team_members tm ON tm.team_id = p.enterprise_id AND tm.user_id = $2
        WHERE p.scope IN ('project_shared', 'workspace_shared', 'org_shared')
+         AND COALESCE(p.status, 'active') = 'active'
          ${projectId ? 'AND p.project_id = $3' : ''}
        ORDER BY e.embedding <=> $1::vector
        LIMIT $${projectId ? 4 : 3}`,
-      [vecSql, userId, ...(projectId ? [projectId] : []), limit],
+      [vecSql, userId, ...(projectId ? [projectId] : []), candidateLimit],
     );
   } else {
     // Fallback: pg_trgm text similarity (for when embedding model is unavailable)
     personalRows = await c.env.DB.query<RecallRow>(
       `SELECT id, project_id, projection_class, summary, updated_at,
+              hit_count, last_used_at, enterprise_id,
               similarity(summary, $1) AS score
        FROM shared_context_projections
        WHERE scope = 'personal' AND user_id = $2
+         AND COALESCE(status, 'active') = 'active'
          ${projectId ? 'AND project_id = $3' : ''}
          AND summary % $1
        ORDER BY score DESC
        LIMIT $${projectId ? 4 : 3}`,
-      [query, userId, ...(projectId ? [projectId] : []), limit],
+      [query, userId, ...(projectId ? [projectId] : []), candidateLimit],
     );
 
     enterpriseRows = await c.env.DB.query<RecallRow>(
       `SELECT p.id, p.project_id, p.projection_class, p.summary, p.updated_at,
+              p.hit_count, p.last_used_at,
               similarity(p.summary, $1) AS score, p.enterprise_id
        FROM shared_context_projections p
        JOIN team_members tm ON tm.team_id = p.enterprise_id AND tm.user_id = $2
        WHERE p.scope IN ('project_shared', 'workspace_shared', 'org_shared')
+         AND COALESCE(p.status, 'active') = 'active'
          ${projectId ? 'AND p.project_id = $3' : ''}
          AND p.summary % $1
        ORDER BY score DESC
        LIMIT $${projectId ? 4 : 3}`,
-      [query, userId, ...(projectId ? [projectId] : []), limit],
+      [query, userId, ...(projectId ? [projectId] : []), candidateLimit],
     );
   }
 
-  // Merge, deduplicate by id, sort by score
+  // Merge, deduplicate by id, sort by composite relevance score
   const seen = new Set<string>();
+  const currentProjectId = projectId ?? '__unknown_current_project__';
   const results: Array<{ id: string; projectId: string; class: string; summary: string; updatedAt: number; score: number; source: 'personal' | 'enterprise' }> = [];
   for (const row of personalRows) {
     if (seen.has(row.id)) continue;
     seen.add(row.id);
-    results.push({ id: row.id, projectId: row.project_id, class: row.projection_class, summary: row.summary, updatedAt: row.updated_at, score: row.score, source: 'personal' });
+    results.push({
+      id: row.id,
+      projectId: row.project_id,
+      class: row.projection_class,
+      summary: row.summary,
+      updatedAt: row.updated_at,
+      score: computeRelevanceScore({
+        similarity: row.score,
+        lastUsedAt: row.last_used_at ?? row.updated_at,
+        hitCount: row.hit_count ?? 0,
+        projectionClass: row.projection_class,
+        memoryProjectId: row.project_id,
+        currentProjectId,
+      }),
+      source: 'personal',
+    });
   }
   for (const row of enterpriseRows) {
     if (seen.has(row.id)) continue;
     seen.add(row.id);
-    results.push({ id: row.id, projectId: row.project_id, class: row.projection_class, summary: row.summary, updatedAt: row.updated_at, score: row.score, source: 'enterprise' });
+    results.push({
+      id: row.id,
+      projectId: row.project_id,
+      class: row.projection_class,
+      summary: row.summary,
+      updatedAt: row.updated_at,
+      score: computeRelevanceScore({
+        similarity: row.score,
+        lastUsedAt: row.last_used_at ?? row.updated_at,
+        hitCount: row.hit_count ?? 0,
+        projectionClass: row.projection_class,
+        memoryProjectId: row.project_id,
+        currentProjectId,
+        memoryEnterpriseId: row.enterprise_id ?? undefined,
+        currentEnterpriseId,
+      }),
+      source: 'enterprise',
+    });
   }
   results.sort((a, b) => b.score - a.score);
   const topResults = results.slice(0, limit);

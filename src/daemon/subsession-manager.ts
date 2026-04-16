@@ -115,6 +115,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   if (await sessionExists(sessionName)) return;
 
   const resolved = await resolveStructuredSessionBootstrap({
+    sessionName,
     agentType,
     projectDir: sub.cwd ?? process.cwd(),
     isNewSession: true,

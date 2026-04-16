@@ -1,0 +1,75 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { ContextNamespace, ContextTargetRef } from '../../shared/context-types.js';
+import { searchLocalMemorySemantic } from '../../src/context/memory-search.js';
+import { MaterializationCoordinator } from '../../src/context/materialization-coordinator.js';
+import { localOnlyCompressor } from '../../src/context/summary-compressor.js';
+import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
+import { queryProcessedProjections, recordMemoryHits } from '../../src/store/context-store.js';
+
+const generateEmbeddingMock = vi.hoisted(() => vi.fn());
+const cosineSimilarityMock = vi.hoisted(() => vi.fn());
+
+vi.mock('../../src/context/embedding.js', () => ({
+  generateEmbedding: generateEmbeddingMock,
+  cosineSimilarity: cosineSimilarityMock,
+}));
+
+describe('memory-search semantic ranking', () => {
+  let tempDir: string;
+  let namespace: ContextNamespace;
+  let targetA: ContextTargetRef;
+  let targetB: ContextTargetRef;
+
+  beforeEach(async () => {
+    tempDir = await createIsolatedSharedContextDb('memory-search-semantic');
+    namespace = { scope: 'personal', projectId: 'github.com/acme/repo', userId: 'user-1' };
+    targetA = { namespace, kind: 'session', sessionName: 'deck_repo_a' };
+    targetB = { namespace, kind: 'session', sessionName: 'deck_repo_b' };
+    vi.clearAllMocks();
+    cosineSimilarityMock.mockImplementation((_query: Float32Array, emb: Float32Array) => emb[0] ?? 0);
+  });
+
+  afterEach(async () => {
+    await cleanupIsolatedSharedContextDb(tempDir);
+  });
+
+  it('reranks semantic candidates with shared composite scoring instead of raw similarity only', async () => {
+    const coordinator = new MaterializationCoordinator({
+      compressor: localOnlyCompressor,
+      thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
+    });
+
+    coordinator.ingestEvent({ target: targetA, eventType: 'user.turn', content: 'fix download filename bug', createdAt: 100 });
+    coordinator.ingestEvent({ target: targetA, eventType: 'assistant.text', content: 'resolved filename encoding for downloads', createdAt: 101 });
+    await coordinator.materializeTarget(targetA, 'manual', 500);
+
+    coordinator.ingestEvent({ target: targetB, eventType: 'user.turn', content: 'fix websocket reconnect bug', createdAt: 200 });
+    coordinator.ingestEvent({ target: targetB, eventType: 'assistant.text', content: 'resolved websocket reconnect race condition', createdAt: 201 });
+    await coordinator.materializeTarget(targetB, 'manual', 600);
+
+    const projections = queryProcessedProjections({ projectId: namespace.projectId, limit: 10 });
+    const downloadProjection = projections.find((p) => p.summary.includes('download'));
+    const websocketProjection = projections.find((p) => p.summary.includes('websocket'));
+    expect(downloadProjection).toBeDefined();
+    expect(websocketProjection).toBeDefined();
+
+    recordMemoryHits([downloadProjection!.id, downloadProjection!.id, downloadProjection!.id, downloadProjection!.id, downloadProjection!.id]);
+
+    generateEmbeddingMock.mockImplementation(async (text: string) => {
+      if (text === 'bug') return new Float32Array([1]);
+      if (text.includes('download')) return new Float32Array([0.7]);
+      if (text.includes('websocket')) return new Float32Array([0.78]);
+      return null;
+    });
+
+    const result = await searchLocalMemorySemantic({
+      query: 'bug',
+      repo: namespace.projectId,
+      limit: 2,
+    });
+
+    expect(result.items).toHaveLength(2);
+    expect(result.items[0].summary.toLowerCase()).toContain('download');
+    expect(new Set(result.items.map((item) => item.id)).size).toBe(2);
+  });
+});

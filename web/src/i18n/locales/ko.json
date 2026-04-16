@@ -48,7 +48,12 @@
     "tool_detail_input": "입력",
     "tool_detail_output": "출력",
     "tool_detail_meta": "메타",
-    "tool_detail_raw": "원본"
+    "tool_detail_raw": "원본",
+    "memory_context_title": "관련 기록",
+    "memory_context_summary": "{{count}}개 회수",
+    "memory_context_query": "질의: {{query}}",
+    "memory_context_score": "점수 {{score}}",
+    "memory_context_startup_reason": "세션 시작 시 주입됨"
   },
   "session": {
     "restart": "↺ 재시작",

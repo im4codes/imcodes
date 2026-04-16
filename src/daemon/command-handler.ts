@@ -11,6 +11,7 @@ import { terminalStreamer, type StreamSubscriber } from './terminal-streamer.js'
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { timelineStore } from './timeline-store.js';
+import type { MemoryContextTimelinePayload } from '../shared/timeline/types.js';
 import { emitSessionInlineError } from './session-error.js';
 import {
   startSubSession,
@@ -214,8 +215,10 @@ import { resolveContextWindow } from '../util/model-context.js';
 import { QWEN_MODEL_IDS } from '../../shared/qwen-models.js';
 import { getQwenRuntimeConfig } from '../agent/qwen-runtime-config.js';
 import { getQwenDisplayMetadata } from '../agent/provider-display.js';
+import { buildRelatedPastWorkText } from '../../shared/memory-recall-format.js';
 import { getQwenOAuthQuotaUsageLabel, recordQwenOAuthRequest } from '../agent/provider-quota.js';
 import { listProviderSessions as listProviderSessionsImpl } from './provider-sessions.js';
+import { buildMemoryContextTimelinePayload } from './memory-context-timeline.js';
 
 function describeTransportSendError(err: unknown): string {
   if (err && typeof err === 'object') {
@@ -1692,12 +1695,19 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     }
 
     // Inject relevant memories from local processed context for process agents
-    sendText = await prependLocalMemory(sendText, sessionName);
+    const memoryContext = await prependLocalMemory(sendText, sessionName);
+    sendText = memoryContext.text;
 
     await sendShellAwareCommand(sessionName, sendText, agentType);
     const payload: Record<string, unknown> = { text };
     if (attachments.length > 0) payload.attachments = attachments;
-    timelineEmitter.emit(sessionName, 'user.message', payload);
+    const userEvent = timelineEmitter.emit(sessionName, 'user.message', payload);
+    if (memoryContext.timelinePayload && userEvent) {
+      timelineEmitter.emit(sessionName, 'memory.context', {
+        ...memoryContext.timelinePayload,
+        relatedToEventId: userEvent.eventId,
+      });
+    }
     // Emit accepted ack (accepted_legacy for fallback IDs so callers can distinguish)
     const status = isLegacy ? 'accepted_legacy' : 'accepted';
     timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
@@ -3983,22 +3993,34 @@ async function handleMemoryRestore(cmd: Record<string, unknown>, serverLink: Ser
 
 // ── Process agent memory injection (text prepend) ────────────────────────
 
-async function prependLocalMemory(prompt: string, sessionName: string): Promise<string> {
-  if (prompt.length < 10) return prompt; // skip greetings / confirmations
+async function prependLocalMemory(
+  prompt: string,
+  sessionName: string,
+): Promise<{ text: string; timelinePayload?: Omit<MemoryContextTimelinePayload, 'relatedToEventId'> }> {
+  if (prompt.length < 10) return { text: prompt }; // skip greetings / confirmations
   try {
     const { searchLocalMemorySemantic } = await import('../context/memory-search.js');
     const record = getSession(sessionName);
+    const query = prompt.slice(0, 200);
     const result = await searchLocalMemorySemantic({
-      query: prompt.slice(0, 200),
+      query,
       repo: record?.projectName ?? undefined,
       limit: 5,
     });
-    if (result.items.length === 0) return prompt;
-    const lines = result.items.map((item) =>
-      `- [${item.projectId}] ${item.summary.split('\n')[0].slice(0, 200)}`,
-    );
-    return `[Related past work]\n${lines.join('\n')}\n\n${prompt}`;
+    if (result.items.length === 0) return { text: prompt };
+    const injectedText = buildRelatedPastWorkText(result.items);
+    const timelinePayload = buildMemoryContextTimelinePayload(query, result.items);
+    return {
+      text: `${injectedText}\n\n${prompt}`,
+      timelinePayload: timelinePayload
+        ? {
+            query: timelinePayload.query,
+            injectedText: timelinePayload.injectedText,
+            items: timelinePayload.items,
+          }
+        : undefined,
+    };
   } catch {
-    return prompt; // non-fatal
+    return { text: prompt }; // non-fatal
   }
 }
