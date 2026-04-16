@@ -51,6 +51,9 @@ import { ChatMarkdown } from './ChatMarkdown.js';
 import type { WsClient } from '../ws-client.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../../../src/shared/models/options.js';
 
+// ── Mobile detection ────────────────────────────────────────────────────────
+const SC_IS_MOBILE = typeof navigator !== 'undefined' && /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+
 // ── Design tokens ────────────────────────────────────────────────────────────
 // Unified palette and spacing system. All component styles below reference these.
 
@@ -88,19 +91,20 @@ const DT = {
 const shellStyle = {
   display: 'flex',
   flexDirection: 'column',
-  gap: DT.space.lg,
-  padding: DT.space.lg,
+  gap: SC_IS_MOBILE ? DT.space.md : DT.space.lg,
+  padding: SC_IS_MOBILE ? DT.space.sm : DT.space.lg,
   color: DT.text.primary,
   overflow: 'auto',
+  WebkitOverflowScrolling: 'touch',
   background: `radial-gradient(ellipse at top, rgba(37,99,235,0.08), transparent 40%), ${DT.bg.base}`,
-  fontSize: 13,
+  fontSize: SC_IS_MOBILE ? 12 : 13,
   lineHeight: 1.5,
 } as const;
 
 const sectionStyle = {
   border: `1px solid ${DT.border.subtle}`,
-  borderRadius: DT.radius.xl,
-  padding: `${DT.space.lg}px ${DT.space.xl}px`,
+  borderRadius: SC_IS_MOBILE ? DT.radius.md : DT.radius.xl,
+  padding: SC_IS_MOBILE ? `${DT.space.md}px ${DT.space.md}px` : `${DT.space.lg}px ${DT.space.xl}px`,
   display: 'flex',
   flexDirection: 'column',
   gap: DT.space.md,
@@ -124,14 +128,14 @@ const rowStyle = {
 } as const;
 
 const inputStyle = {
-  flex: '1 1 180px',
+  flex: SC_IS_MOBILE ? '1 1 100%' : '1 1 180px',
   minWidth: 0,
   background: DT.bg.input,
   color: DT.text.primary,
   border: `1px solid ${DT.border.default}`,
   borderRadius: DT.radius.sm,
-  padding: '8px 12px',
-  fontSize: 13,
+  padding: SC_IS_MOBILE ? '10px 12px' : '8px 12px',
+  fontSize: SC_IS_MOBILE ? 14 : 13,
   transition: 'border-color 0.15s, box-shadow 0.15s',
   outline: 'none',
 } as const;
@@ -141,11 +145,12 @@ const buttonStyle = {
   color: '#ffffff',
   border: 'none',
   borderRadius: DT.radius.sm,
-  padding: '8px 14px',
+  padding: SC_IS_MOBILE ? '10px 16px' : '8px 14px',
   cursor: 'pointer',
-  fontSize: 13,
+  fontSize: SC_IS_MOBILE ? 14 : 13,
   fontWeight: 500,
   transition: 'background 0.15s, transform 0.1s',
+  ...(SC_IS_MOBILE ? { width: '100%' } : {}),
 } as const;
 
 const subtleButtonStyle = {
@@ -159,14 +164,16 @@ const tabStyle = {
   background: 'transparent',
   color: DT.text.secondary,
   border: 'none',
-  padding: '8px 14px',
-  fontSize: 13,
+  padding: SC_IS_MOBILE ? '8px 10px' : '8px 14px',
+  fontSize: SC_IS_MOBILE ? 12 : 13,
   fontWeight: 500,
   borderRadius: DT.radius.md,
   cursor: 'pointer',
   transition: 'background 0.15s, color 0.15s',
   display: 'inline-flex',
   alignItems: 'center',
+  whiteSpace: 'nowrap',
+  flexShrink: 0,
 } as const;
 
 const tabActiveStyle = {
@@ -178,13 +185,14 @@ const tabActiveStyle = {
 
 const tabBarStyle = {
   display: 'flex',
-  gap: DT.space.xs,
-  flexWrap: 'wrap',
+  gap: SC_IS_MOBILE ? 2 : DT.space.xs,
+  flexWrap: SC_IS_MOBILE ? 'nowrap' as const : 'wrap' as const,
   alignItems: 'center',
-  padding: DT.space.xs,
+  padding: SC_IS_MOBILE ? 2 : DT.space.xs,
   borderRadius: DT.radius.md,
   background: DT.bg.input,
   border: `1px solid ${DT.border.subtle}`,
+  ...(SC_IS_MOBILE ? { overflowX: 'auto' as const, WebkitOverflowScrolling: 'touch' as const, scrollbarWidth: 'none' as const } : {}),
 } as const;
 
 const tabBadgeStyle = {
@@ -220,8 +228,8 @@ const checkboxRowStyle = {
 } as const;
 
 const policyOptionStyle = {
-  flex: '1 1 260px',
-  minWidth: 240,
+  flex: SC_IS_MOBILE ? '1 1 100%' : '1 1 260px',
+  minWidth: SC_IS_MOBILE ? 0 : 240,
   padding: DT.space.md,
   borderRadius: DT.radius.md,
   border: `1px solid ${DT.border.subtle}`,
@@ -258,18 +266,18 @@ const processingModelInputStyle = {
 
 const statGridStyle = {
   display: 'grid',
-  gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))',
-  gap: DT.space.sm,
+  gridTemplateColumns: SC_IS_MOBILE ? 'repeat(2, 1fr)' : 'repeat(auto-fit, minmax(160px, 1fr))',
+  gap: SC_IS_MOBILE ? DT.space.xs : DT.space.sm,
 } as const;
 
 const statCardStyle = {
   borderRadius: DT.radius.md,
-  padding: `${DT.space.md}px ${DT.space.lg}px`,
+  padding: SC_IS_MOBILE ? `${DT.space.sm}px ${DT.space.md}px` : `${DT.space.md}px ${DT.space.lg}px`,
   border: `1px solid ${DT.border.subtle}`,
   background: DT.bg.input,
   display: 'flex',
   flexDirection: 'column',
-  gap: DT.space.xs,
+  gap: 2,
   transition: 'border-color 0.15s',
 } as const;
 
@@ -279,8 +287,8 @@ const resourceListStyle = {
 } as const;
 
 const resourceCardStyle = {
-  borderRadius: DT.radius.lg,
-  padding: DT.space.lg,
+  borderRadius: SC_IS_MOBILE ? DT.radius.md : DT.radius.lg,
+  padding: SC_IS_MOBILE ? DT.space.md : DT.space.lg,
   border: `1px solid ${DT.border.subtle}`,
   background: DT.bg.surfaceElev,
   display: 'flex',
@@ -292,12 +300,12 @@ const resourceCardStyle = {
 const memoryContentCollapsedStyle = {
   maxHeight: '4.8em',
   overflowY: 'hidden',
-  padding: `${DT.space.md}px ${DT.space.lg}px`,
+  padding: SC_IS_MOBILE ? `${DT.space.sm}px ${DT.space.md}px` : `${DT.space.md}px ${DT.space.lg}px`,
   borderRadius: DT.radius.md,
   border: `1px solid ${DT.border.subtle}`,
   background: DT.bg.input,
   lineHeight: 1.6,
-  fontSize: 13,
+  fontSize: SC_IS_MOBILE ? 12 : 13,
   color: DT.text.primary,
   position: 'relative',
   maskImage: 'linear-gradient(to bottom, black 60%, transparent 100%)',
@@ -314,21 +322,21 @@ const memoryContentExpandedStyle = {
 
 const splitSectionStyle = {
   display: 'grid',
-  gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))',
+  gridTemplateColumns: SC_IS_MOBILE ? '1fr' : 'repeat(auto-fit, minmax(320px, 1fr))',
   gap: DT.space.md,
   alignItems: 'start',
 } as const;
 
 const cardGridStyle = {
   display: 'grid',
-  gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
+  gridTemplateColumns: SC_IS_MOBILE ? '1fr' : 'repeat(auto-fit, minmax(260px, 1fr))',
   gap: DT.space.md,
 } as const;
 
 const metaGridStyle = {
   display: 'grid',
-  gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))',
-  gap: DT.space.sm,
+  gridTemplateColumns: SC_IS_MOBILE ? 'repeat(2, 1fr)' : 'repeat(auto-fit, minmax(120px, 1fr))',
+  gap: SC_IS_MOBILE ? DT.space.xs : DT.space.sm,
 } as const;
 
 const metaCardStyle = {
@@ -358,15 +366,15 @@ const memoryProcessedNoteStyle = {
 
 const processingGridStyle = {
   display: 'grid',
-  gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))',
+  gridTemplateColumns: SC_IS_MOBILE ? '1fr' : 'repeat(auto-fit, minmax(300px, 1fr))',
   gap: DT.space.md,
   alignItems: 'start',
 } as const;
 
 const processingCardStyle = {
   border: `1px solid ${DT.border.subtle}`,
-  borderRadius: DT.radius.lg,
-  padding: DT.space.lg,
+  borderRadius: SC_IS_MOBILE ? DT.radius.md : DT.radius.lg,
+  padding: SC_IS_MOBILE ? DT.space.md : DT.space.lg,
   background: DT.bg.surface,
   display: 'flex',
   flexDirection: 'column',
@@ -506,9 +514,9 @@ function LabeledValue({ label, value }: { label: string; value: string }) {
 function StatCard({ label, value, detail }: { label: string; value: string | number; detail?: string }) {
   return (
     <div style={statCardStyle}>
-      <span style={{ color: DT.text.muted, fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.06em', fontWeight: 500 }}>{label}</span>
-      <strong style={{ fontSize: 22, lineHeight: 1.1, color: DT.text.primary, fontWeight: 600 }}>{value}</strong>
-      {detail ? <span style={{ color: DT.text.secondary, fontSize: 11 }}>{detail}</span> : null}
+      <span style={{ color: DT.text.muted, fontSize: SC_IS_MOBILE ? 10 : 11, textTransform: 'uppercase', letterSpacing: '0.06em', fontWeight: 500 }}>{label}</span>
+      <strong style={{ fontSize: SC_IS_MOBILE ? 16 : 22, lineHeight: 1.1, color: DT.text.primary, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{value}</strong>
+      {detail ? <span style={{ color: DT.text.secondary, fontSize: SC_IS_MOBILE ? 10 : 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{detail}</span> : null}
     </div>
   );
 }
@@ -516,8 +524,8 @@ function StatCard({ label, value, detail }: { label: string; value: string | num
 function SectionHeading({ title, description, action }: { title: string; description?: string; action?: ComponentChildren }) {
   return (
     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: DT.space.md, flexWrap: 'wrap' }}>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 3, flex: '1 1 auto', minWidth: 200 }}>
-        <strong style={{ fontSize: 15, fontWeight: 600, color: DT.text.primary }}>{title}</strong>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 3, flex: '1 1 auto', minWidth: SC_IS_MOBILE ? 0 : 200 }}>
+        <strong style={{ fontSize: SC_IS_MOBILE ? 14 : 15, fontWeight: 600, color: DT.text.primary }}>{title}</strong>
         {description ? <span style={helperTextStyle}>{description}</span> : null}
       </div>
       {action ? <div style={{ flexShrink: 0 }}>{action}</div> : null}
@@ -1016,8 +1024,8 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     <div style={shellStyle}>
       <div style={heroStyle}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: DT.space.md, flexWrap: 'wrap' }}>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: DT.space.xs, flex: '1 1 auto', minWidth: 240 }}>
-            <strong style={{ fontSize: 20, fontWeight: 600, letterSpacing: '-0.01em', color: DT.text.primary }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: DT.space.xs, flex: '1 1 auto', minWidth: SC_IS_MOBILE ? 0 : 240 }}>
+            <strong style={{ fontSize: SC_IS_MOBILE ? 16 : 20, fontWeight: 600, letterSpacing: '-0.01em', color: DT.text.primary }}>
               {t('sharedContext.management.title')}
             </strong>
             <span style={{ ...helperTextStyle, fontSize: 13 }}>

@@ -10,20 +10,24 @@ import {
   type TeamSummary,
 } from '../api.js';
 
+const CD_IS_MOBILE = typeof navigator !== 'undefined' && /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+
 const shellStyle = {
   display: 'flex',
   flexDirection: 'column',
-  gap: 14,
-  padding: 12,
+  gap: CD_IS_MOBILE ? 10 : 14,
+  padding: CD_IS_MOBILE ? 8 : 12,
   color: '#e2e8f0',
   overflow: 'auto',
+  WebkitOverflowScrolling: 'touch',
   background: 'radial-gradient(circle at top left, rgba(14,165,233,0.12), transparent 30%), #0b1220',
+  fontSize: CD_IS_MOBILE ? 12 : 13,
 } as const;
 
 const sectionStyle = {
   border: '1px solid #334155',
-  borderRadius: 16,
-  padding: 14,
+  borderRadius: CD_IS_MOBILE ? 10 : 16,
+  padding: CD_IS_MOBILE ? 10 : 14,
   display: 'flex',
   flexDirection: 'column',
   gap: 10,
@@ -46,13 +50,14 @@ const rowStyle = {
 } as const;
 
 const inputStyle = {
-  flex: '1 1 180px',
+  flex: CD_IS_MOBILE ? '1 1 100%' : '1 1 180px',
   minWidth: 0,
   background: '#0f172a',
   color: '#e2e8f0',
   border: '1px solid #334155',
   borderRadius: 8,
-  padding: '8px 10px',
+  padding: CD_IS_MOBILE ? '10px 12px' : '8px 10px',
+  fontSize: CD_IS_MOBILE ? 14 : 13,
 } as const;
 
 const buttonStyle = {
@@ -60,9 +65,11 @@ const buttonStyle = {
   color: '#eff6ff',
   border: 'none',
   borderRadius: 8,
-  padding: '8px 12px',
+  padding: CD_IS_MOBILE ? '10px 16px' : '8px 12px',
   cursor: 'pointer',
   fontWeight: 700,
+  fontSize: CD_IS_MOBILE ? 14 : 13,
+  ...(CD_IS_MOBILE ? { width: '100%' as const } : {}),
 } as const;
 
 const helperTextStyle = {
@@ -73,8 +80,8 @@ const helperTextStyle = {
 
 const statGridStyle = {
   display: 'grid',
-  gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
-  gap: 10,
+  gridTemplateColumns: CD_IS_MOBILE ? 'repeat(2, 1fr)' : 'repeat(auto-fit, minmax(140px, 1fr))',
+  gap: CD_IS_MOBILE ? 6 : 10,
 } as const;
 
 const statCardStyle = {
@@ -89,7 +96,7 @@ const statCardStyle = {
 
 const splitSectionStyle = {
   display: 'grid',
-  gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))',
+  gridTemplateColumns: CD_IS_MOBILE ? '1fr' : 'repeat(auto-fit, minmax(320px, 1fr))',
   gap: 12,
   alignItems: 'start',
 } as const;
@@ -111,8 +118,8 @@ const resourceCardStyle = {
 
 const metaGridStyle = {
   display: 'grid',
-  gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
-  gap: 8,
+  gridTemplateColumns: CD_IS_MOBILE ? 'repeat(2, 1fr)' : 'repeat(auto-fit, minmax(140px, 1fr))',
+  gap: CD_IS_MOBILE ? 6 : 8,
 } as const;
 
 const metaCardStyle = {
