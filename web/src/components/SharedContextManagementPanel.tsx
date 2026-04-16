@@ -1138,7 +1138,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         </div>
       </div>
 
-      <div style={{ ...tabBarStyle, position: 'sticky', top: 0, zIndex: 10 }}>
+      <div style={{ ...tabBarStyle, position: 'sticky', top: 0, zIndex: 10, background: DT.bg.base, boxShadow: '0 2px 8px rgba(0,0,0,0.4)' }}>
         {tabs.map((tab) => (
           <button
             key={tab.id}
@@ -2066,6 +2066,52 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   );
 }
 
+function CornerFold({ expanded, onClick }: { expanded: boolean; onClick: (e: Event) => void }) {
+  const size = 22;
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      style={{
+        position: 'absolute',
+        bottom: 0,
+        right: 0,
+        width: size,
+        height: size,
+        padding: 0,
+        margin: 0,
+        background: 'transparent',
+        border: 'none',
+        cursor: 'pointer',
+        overflow: 'hidden',
+      }}
+      title={expanded ? 'Collapse' : 'Expand'}
+    >
+      <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} style={{ display: 'block' }}>
+        {/* Corner dashed lines */}
+        <path
+          d={expanded
+            ? `M${size} 0 L${size} ${size} L0 ${size}`   // ┘ collapse
+            : `M${size - 2} 2 L${size - 2} ${size - 2} L2 ${size - 2}`}  // ┘ expand
+          fill="none"
+          stroke={DT.text.muted}
+          strokeWidth="1.5"
+          strokeDasharray="3 2"
+          strokeLinecap="round"
+        />
+        {/* Small triangle hint */}
+        <polygon
+          points={expanded
+            ? `${size},${size - 6} ${size},${size} ${size - 6},${size}`
+            : `${size},${size - 8} ${size},${size} ${size - 8},${size}`}
+          fill={DT.text.muted}
+          opacity="0.5"
+        />
+      </svg>
+    </button>
+  );
+}
+
 function MemoryRecordContent({
   id,
   text,
@@ -2093,28 +2139,7 @@ function MemoryRecordContent({
         <ChatMarkdown text={text} />
       </div>
       {collapsible ? (
-        <button
-          type="button"
-          onClick={(e) => { e.stopPropagation(); onToggle(); }}
-          style={{
-            position: 'absolute',
-            bottom: 6,
-            right: 6,
-            padding: '3px 10px',
-            borderRadius: DT.radius.pill,
-            border: `1px solid ${DT.border.subtle}`,
-            background: 'rgba(15,23,42,0.85)',
-            backdropFilter: 'blur(4px)',
-            WebkitBackdropFilter: 'blur(4px)',
-            color: DT.text.accent,
-            fontSize: 10,
-            fontWeight: 600,
-            cursor: 'pointer',
-            transition: 'background 0.15s',
-          }}
-        >
-          {expanded ? '▲' : '▼'}
-        </button>
+        <CornerFold expanded={expanded} onClick={(e) => { e.stopPropagation(); onToggle(); }} />
       ) : null}
     </div>
   );

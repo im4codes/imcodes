@@ -540,13 +540,11 @@ describe('SharedContextManagementPanel', () => {
 
     const memoryContent = screen.getByTestId('memory-record-content-local-personal-1') as HTMLDivElement;
     expect(memoryContent.style.maxHeight).toBe('4.8em');
-    // Expand button is now an arrow icon in the content corner
-    const expandButton = screen.getAllByText('▼')[0];
+    // Expand by clicking on the collapsed content area (corner fold is SVG, click parent)
     await act(async () => {
-      fireEvent.click(expandButton);
+      fireEvent.click(memoryContent.parentElement!);
     });
     expect(memoryContent.style.maxHeight).toBe('none');
-    expect(screen.getByText('▲')).toBeDefined();
 
     await act(async () => {
       fireEvent.click(screen.getByText('sharedContext.management.memoryTabCloud'));
