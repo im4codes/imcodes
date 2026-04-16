@@ -1,0 +1,12 @@
+{
+  "toolName": "Write",
+  "toolCallId": "qw-1",
+  "input": {
+    "file_path": "src/qwen.ts",
+    "content": "console.log(1);"
+  },
+  "raw": {
+    "file_path": "src/qwen.ts",
+    "content": "console.log(1);"
+  }
+}

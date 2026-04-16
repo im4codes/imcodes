@@ -4,6 +4,7 @@
  */
 
 import type { ProcessedContextClass, ProcessedContextProjectionStatus } from '../../../shared/context-types.js';
+import { TIMELINE_EVENT_FILE_CHANGE } from '../../../shared/file-change.js';
 
 export type TimelineEventType =
   | 'user.message'
@@ -11,6 +12,7 @@ export type TimelineEventType =
   | 'assistant.thinking'
   | 'tool.call'
   | 'tool.result'
+  | typeof TIMELINE_EVENT_FILE_CHANGE
   | 'mode.state'
   | 'session.state'
   | 'terminal.snapshot'

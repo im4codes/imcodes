@@ -3,6 +3,8 @@ import { createHash } from 'node:crypto';
 import { promisify } from 'node:util';
 import logger from '../util/logger.js';
 import type { TimelineEvent } from './timeline-event.js';
+import { TIMELINE_EVENT_FILE_CHANGE } from '../../shared/file-change.js';
+import { normalizeOpenCodeFileChange } from './file-change-normalizer.js';
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -297,6 +299,7 @@ export function buildTimelineEventsFromOpenCodeExport(
     payload: Record<string, unknown>,
     ts: number,
     key: string,
+    hidden = false,
   ) => {
     seq += 1;
     events.push({
@@ -309,6 +312,7 @@ export function buildTimelineEventsFromOpenCodeExport(
       confidence: 'medium',
       type,
       payload,
+      ...(hidden ? { hidden: true } : {}),
     });
   };
 
@@ -348,10 +352,28 @@ export function buildTimelineEventsFromOpenCodeExport(
         const time = (state.time ?? {}) as Record<string, unknown>;
         const startTs = Number(time.start ?? createdTs);
         const endTs = Number(time.end ?? startTs);
-        push('tool.call', {
+        const completed = state.status === 'completed';
+        const batch = completed ? normalizeOpenCodeFileChange(part) : null;
+        const callPayload: Record<string, unknown> = {
           tool: String(part.tool),
           ...(state.input ? { input: state.input } : {}),
-        }, startTs, `${messageId}:${partId}:tool.call`);
+        };
+        if (batch) {
+          push('tool.call', callPayload, startTs, `${messageId}:${partId}:tool.call`, true);
+          if (state.status === 'completed' || state.status === 'error') {
+            const rawOut = typeof state.output === 'string' ? state.output.trim() : '';
+            const truncOut = state.status !== 'error' && rawOut
+              ? (rawOut.length > 200 ? rawOut.slice(0, 197) + '...' : rawOut)
+              : undefined;
+            push('tool.result', {
+              ...(state.status === 'error' && state.error ? { error: state.error } : {}),
+              ...(truncOut ? { output: truncOut } : {}),
+            }, endTs, `${messageId}:${partId}:tool.result`, true);
+          }
+          push(TIMELINE_EVENT_FILE_CHANGE, { batch }, endTs, `${messageId}:${partId}:file.change`);
+          continue;
+        }
+        push('tool.call', callPayload, startTs, `${messageId}:${partId}:tool.call`);
         if (state.status === 'completed' || state.status === 'error') {
           const rawOut = typeof state.output === 'string' ? state.output.trim() : '';
           const truncOut = state.status !== 'error' && rawOut

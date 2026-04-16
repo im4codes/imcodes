@@ -44,7 +44,7 @@ export class TimelineEmitter {
     sessionId: string,
     type: TimelineEventType,
     payload: Record<string, unknown>,
-    opts?: { source?: TimelineSource; confidence?: TimelineConfidence; eventId?: string; ts?: number },
+    opts?: { source?: TimelineSource; confidence?: TimelineConfidence; eventId?: string; ts?: number; hidden?: boolean },
   ): TimelineEvent | null {
     // Deduplicate session.state — skip repeated same-state events to avoid UI flicker,
     // but still return a synthetic event so callers (store updates, idle callbacks) proceed.
@@ -107,6 +107,7 @@ export class TimelineEmitter {
       confidence: opts?.confidence ?? 'high',
       type,
       payload,
+      ...(opts?.hidden ? { hidden: true } : {}),
     };
 
     // Ring buffer — stable eventId events replace in-place (streaming delta updates)

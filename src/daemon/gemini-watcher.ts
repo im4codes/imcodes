@@ -12,12 +12,48 @@ import logger from '../util/logger.js';
 import { updateSessionState, getSession, upsertSession } from '../store/session-store.js';
 import { resolveContextWindow } from '../util/model-context.js';
 import { registerWatcherControl, unregisterWatcherControl, refreshSessionWatcher, type WatcherControl } from './watcher-controls.js';
+import { TIMELINE_EVENT_FILE_CHANGE } from '../../shared/file-change.js';
+import { normalizeGeminiFileChange } from './file-change-normalizer.js';
 
 const GEMINI_TMP_DIR = join(homedir(), '.gemini', 'tmp');
 const POLL_INTERVAL_MS = 1500; // Balanced: responsive enough without causing state flicker
 const IDLE_LOCK_MS = 2000;    // After emitting idle, ignore terminal noise for this long
 const RUNNING_LOCK_MS = 3000; // After emitting running, don't transition to idle for this long
 const RETRY_DELAY_MS = 100;
+const pendingGeminiFileTools = new Map<string, { id: string; name: string; args?: unknown; ts?: number }>();
+const completedGeminiFileTools = new Set<string>();
+const MAX_TRACKED_GEMINI_FILE_TOOLS = 512;
+
+function rememberCompletedGeminiFileTool(key: string): void {
+  completedGeminiFileTools.add(key);
+  if (completedGeminiFileTools.size <= MAX_TRACKED_GEMINI_FILE_TOOLS) return;
+  const overflow = completedGeminiFileTools.size - MAX_TRACKED_GEMINI_FILE_TOOLS;
+  let removed = 0;
+  for (const existing of completedGeminiFileTools) {
+    completedGeminiFileTools.delete(existing);
+    removed += 1;
+    if (removed >= overflow) break;
+  }
+}
+
+function rememberPendingGeminiFileTool(
+  key: string,
+  value: { id: string; name: string; args?: unknown; ts?: number },
+): void {
+  pendingGeminiFileTools.set(key, value);
+  if (pendingGeminiFileTools.size <= MAX_TRACKED_GEMINI_FILE_TOOLS) return;
+  const oldestKey = pendingGeminiFileTools.keys().next().value;
+  if (oldestKey) pendingGeminiFileTools.delete(oldestKey);
+}
+
+function clearGeminiFileToolTracking(sessionName: string): void {
+  for (const key of pendingGeminiFileTools.keys()) {
+    if (key.startsWith(`${sessionName}:`)) pendingGeminiFileTools.delete(key);
+  }
+  for (const key of completedGeminiFileTools) {
+    if (key.startsWith(`${sessionName}:`)) completedGeminiFileTools.delete(key);
+  }
+}
 
 // ── Path helpers ───────────────────────────────────────────────────────────────
 
@@ -90,7 +126,58 @@ function parseMessage(sessionName: string, msg: any, hist?: any, streaming = fal
     if (msg.toolCalls) {
       for (const tc of msg.toolCalls) {
         if (!tc.name) continue;
+        const toolKey = `${sessionName}:${tc.id}`;
+        const normalizedToolName = String(tc.name).toLowerCase();
+        const looksLikeFileTool = normalizedToolName !== 'run_shell_command'
+          && /(?:write|edit|file|rename|delete|patch|save)/i.test(normalizedToolName);
+        if (completedGeminiFileTools.has(toolKey)) continue;
+        if (looksLikeFileTool && tc.status === 'running') {
+          rememberPendingGeminiFileTool(toolKey, { id: tc.id, name: tc.name, args: tc.args, ts: stableTs });
+          continue;
+        }
+
+        const pending = pendingGeminiFileTools.get(toolKey);
+        if (tc.status !== 'running') pendingGeminiFileTools.delete(toolKey);
+        const effectiveArgs = tc.args ?? pending?.args;
         const input = extractToolInput(tc.name, tc.args);
+        const normalized = tc.status !== 'error'
+          ? normalizeGeminiFileChange({
+            toolName: tc.name,
+            toolCallId: tc.id,
+            args: effectiveArgs,
+            result: tc.result?.[0]?.functionResponse?.response,
+            status: tc.status,
+          })
+          : null;
+        if (normalized) {
+          rememberCompletedGeminiFileTool(toolKey);
+          const effectiveInput = extractToolInput(tc.name, effectiveArgs);
+          timelineEmitter.emit(sessionName, 'tool.call', { tool: tc.name, ...(effectiveInput ? { input: effectiveInput } : {}) }, { source: 'daemon', confidence: 'high', eventId: stableId('tc'), ts: pending?.ts ?? stableTs, hidden: true });
+          const rawOutput = tc.result?.[0]?.functionResponse?.response?.output;
+          timelineEmitter.emit(sessionName, 'tool.result', {
+            ...(tc.status === 'error' ? { error: rawOutput ?? 'error' } : {}),
+            ...(typeof rawOutput === 'string' && rawOutput.trim() ? { output: rawOutput.length > 200 ? rawOutput.slice(0, 197) + '...' : rawOutput } : {}),
+          }, { source: 'daemon', confidence: 'high', eventId: stableId('tr'), ts: stableTs, hidden: true });
+          timelineEmitter.emit(sessionName, TIMELINE_EVENT_FILE_CHANGE, { batch: normalized }, { source: 'daemon', confidence: 'high', eventId: stableId('fc'), ts: stableTs });
+          continue;
+        }
+        if (looksLikeFileTool) {
+          rememberCompletedGeminiFileTool(toolKey);
+        }
+        const shouldEmitDeferredCall = !!pending || looksLikeFileTool;
+        if (shouldEmitDeferredCall) {
+          const effectiveInput = extractToolInput(tc.name, effectiveArgs);
+          timelineEmitter.emit(sessionName, 'tool.call', { tool: tc.name, ...(effectiveInput ? { input: effectiveInput } : {}) }, { source: 'daemon', confidence: 'high', eventId: stableId('tc'), ts: pending?.ts ?? stableTs });
+        }
+        if (shouldEmitDeferredCall && (tc.status === 'complete' || tc.status === 'success' || tc.status === 'error')) {
+          const rawOutput = tc.result?.[0]?.functionResponse?.response?.output;
+          const isErr = tc.status === 'error';
+          const truncOutput = !isErr && typeof rawOutput === 'string' && rawOutput.trim()
+            ? (rawOutput.length > 200 ? rawOutput.slice(0, 197) + '...' : rawOutput)
+            : undefined;
+          timelineEmitter.emit(sessionName, 'tool.result', { ...(isErr ? { error: rawOutput ?? 'error' } : {}), ...(truncOutput ? { output: truncOutput } : {}) }, { source: 'daemon', confidence: 'high', eventId: stableId('tr'), ts: stableTs });
+          continue;
+        }
         timelineEmitter.emit(sessionName, 'tool.call', { tool: tc.name, ...(input ? { input } : {}) }, { source: 'daemon', confidence: 'high', eventId: stableId('tc'), ts: stableTs });
         const rawOutput = tc.result?.[0]?.functionResponse?.response?.output;
         const isErr = tc.status === 'error';
@@ -729,6 +816,7 @@ export function stopWatching(sessionName: string): void {
   if (state.pollTimer) clearInterval(state.pollTimer);
   if (state.idleDebounceTimer) clearTimeout(state.idleDebounceTimer);
   watchers.delete(sessionName);
+  clearGeminiFileToolTracking(sessionName);
   unregisterWatcherControl(sessionName);
   for (const [fp, sn] of claimedFiles) { if (sn === sessionName) claimedFiles.delete(fp); }
 }

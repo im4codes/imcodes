@@ -1,0 +1,20 @@
+{
+  "toolCallId": "cx-1",
+  "detail": {
+    "input": {
+      "changes": [
+        {
+          "path": "src/a.ts",
+          "op": "update",
+          "beforeText": "a",
+          "afterText": "b"
+        },
+        {
+          "path": "src/b.ts",
+          "op": "create",
+          "content": "new file"
+        }
+      ]
+    }
+  }
+}

@@ -6,7 +6,7 @@
  * ChatView (rendering) to keep classification consistent.
  *
  * Classification:
- *   Visible:     user.message, assistant.text, ask.question
+ *   Visible:     user.message, assistant.text, ask.question, file.change
  *   Not visible: assistant.thinking (streaming partial — merged into indicator),
  *                session.state, usage.update, tool.result, tool.call, command.ack,
  *                agent.status, mode.state, terminal.snapshot
@@ -20,6 +20,7 @@ const VISIBLE_TYPES = new Set([
   'assistant.text',
   // assistant.thinking is streaming partial — merged into indicator, not a separate message row
   'ask.question',
+  'file.change',
 ]);
 
 export function isUserVisible(event: { type: string; payload?: { streaming?: boolean } }): boolean {

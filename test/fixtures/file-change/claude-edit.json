@@ -1,0 +1,9 @@
+{
+  "toolName": "Edit",
+  "toolCallId": "tool-1",
+  "input": {
+    "file_path": "src/app.ts",
+    "old_string": "before",
+    "new_string": "after"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "toolName": "Write",
+  "toolCallId": "qw-3",
+  "input": {
+    "file_path": "assets/logo.png",
+    "content": {
+      "binary": true
+    }
+  },
+  "raw": {
+    "file_path": "assets/logo.png",
+    "content": {
+      "binary": true
+    }
+  }
+}

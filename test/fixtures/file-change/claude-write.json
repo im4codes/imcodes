@@ -1,0 +1,15 @@
+{
+  "toolName": "Write",
+  "toolCallId": "tool-2",
+  "input": {
+    "file_path": "src/new.ts",
+    "content": "export const value = 1;"
+  },
+  "toolResult": {
+    "toolUseResult": {
+      "type": "create",
+      "filePath": "src/new.ts",
+      "content": "export const value = 1;"
+    }
+  }
+}

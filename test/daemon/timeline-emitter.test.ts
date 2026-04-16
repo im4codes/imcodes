@@ -58,6 +58,11 @@ describe('TimelineEmitter — seq counter', () => {
     expect(event.eventId).toHaveLength(24); // sha1 hex prefix
   });
 
+  it('preserves hidden events when requested', () => {
+    const event = emitter.emit('session-hidden', 'tool.call', { tool: 'Edit' }, { hidden: true });
+    expect(event?.hidden).toBe(true);
+  });
+
   it('defaults source to daemon and confidence to high', () => {
     const event = emitter.emit('session-x', 'session.state', { state: 'idle' });
     expect(event.source).toBe('daemon');

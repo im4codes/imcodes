@@ -34,4 +34,15 @@ describe('shared timeline event shape compatibility', () => {
     expect(ev.type).toBe('assistant.text');
     expect(ev.payload.text).toBe('hello');
   });
+
+  it('accepts file.change events consumed by ChatView', () => {
+    const ev = makeEvent('file.change', {
+      batch: {
+        provider: 'claude-code',
+        patches: [{ filePath: 'src/app.ts', operation: 'update', confidence: 'exact', beforeText: 'a', afterText: 'b' }],
+      },
+    });
+    expect(ev.type).toBe('file.change');
+    expect((ev.payload.batch as any).patches[0].filePath).toBe('src/app.ts');
+  });
 });

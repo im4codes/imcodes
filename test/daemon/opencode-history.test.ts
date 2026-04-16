@@ -198,4 +198,120 @@ describe('opencode-history', () => {
     expect(events[4].payload.text).toBe('done');
     expect(events.every((event) => event.epoch === 999)).toBe(true);
   });
+
+  it('emits hidden raw events plus file.change for normalized OpenCode edits', () => {
+    const events = buildTimelineEventsFromOpenCodeExport('deck_oc_brain', {
+      info: { id: 's1' },
+      messages: [
+        {
+          info: { id: 'a1', role: 'assistant', time: { created: 110 } },
+          parts: [
+            {
+              id: 'p-edit',
+              type: 'tool',
+              tool: 'edit',
+              state: {
+                status: 'completed',
+                input: { filePath: 'src/app.ts', oldString: 'before', newString: 'after' },
+                metadata: {
+                  exists: true,
+                  filediff: { before: 'before', after: 'after' },
+                },
+                output: 'ok',
+                time: { start: 111, end: 112 },
+              },
+            },
+          ],
+        },
+      ],
+    }, 1234);
+
+    expect(events.map((event) => event.type)).toEqual([
+      'tool.call',
+      'tool.result',
+      'file.change',
+    ]);
+    expect(events[0].hidden).toBe(true);
+    expect(events[1].hidden).toBe(true);
+    expect(events[2].payload.batch.provider).toBe('opencode');
+    expect(events[2].payload.batch.patches[0]).toEqual(expect.objectContaining({
+      filePath: 'src/app.ts',
+      beforeText: 'before',
+      afterText: 'after',
+      confidence: 'exact',
+    }));
+  });
+
+  it('preserves repeated file patches inside the same OpenCode batch when present', () => {
+    const events = buildTimelineEventsFromOpenCodeExport('deck_oc_brain', {
+      info: { id: 's1' },
+      messages: [
+        {
+          info: { id: 'a1', role: 'assistant', time: { created: 110 } },
+          parts: [
+            {
+              id: 'p-edit',
+              type: 'tool',
+              tool: 'edit',
+              state: {
+                status: 'completed',
+                input: { filePath: 'src/app.ts', oldString: 'before', newString: 'after' },
+                metadata: {
+                  exists: true,
+                  filediff: { before: 'before', after: 'after' },
+                },
+                output: 'ok',
+                time: { start: 111, end: 112 },
+              },
+            },
+            {
+              id: 'p-write',
+              type: 'tool',
+              tool: 'write',
+              state: {
+                status: 'completed',
+                input: { filePath: 'src/app.ts', content: 'after-2' },
+                metadata: { exists: true },
+                output: 'ok',
+                time: { start: 113, end: 114 },
+              },
+            },
+          ],
+        },
+      ],
+    }, 1234);
+
+    const fileChanges = events.filter((event) => event.type === 'file.change');
+    expect(fileChanges).toHaveLength(2);
+    expect(fileChanges[0].payload.batch.patches[0].filePath).toBe('src/app.ts');
+    expect(fileChanges[1].payload.batch.patches[0].filePath).toBe('src/app.ts');
+  });
+
+  it('keeps raw OpenCode tool rows visible when an edit tool errors', () => {
+    const events = buildTimelineEventsFromOpenCodeExport('deck_oc_brain', {
+      info: { id: 's1' },
+      messages: [
+        {
+          info: { id: 'a1', role: 'assistant', time: { created: 110 } },
+          parts: [
+            {
+              id: 'p-edit-error',
+              type: 'tool',
+              tool: 'edit',
+              state: {
+                status: 'error',
+                input: { filePath: 'src/app.ts', oldString: 'before', newString: 'after' },
+                error: 'permission denied',
+                time: { start: 111, end: 112 },
+              },
+            },
+          ],
+        },
+      ],
+    }, 1234);
+
+    expect(events.map((event) => event.type)).toEqual(['tool.call', 'tool.result']);
+    expect(events[0].hidden).not.toBe(true);
+    expect(events[1].hidden).not.toBe(true);
+  });
 });

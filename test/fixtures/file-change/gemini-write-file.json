@@ -1,0 +1,9 @@
+{
+  "toolName": "write_file",
+  "toolCallId": "gm-1",
+  "args": {
+    "file_path": "src/gemini.ts",
+    "content": "hello"
+  },
+  "status": "success"
+}

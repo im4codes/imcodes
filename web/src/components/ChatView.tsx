@@ -8,6 +8,7 @@ import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } fr
 import { memo } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { TimelineEvent, WsClient, MemoryContextTimelinePayload, MemoryContextTimelineItem } from '../ws-client.js';
+import type { FileChangeBatch, FileChangePatch } from '@shared/file-change.js';
 import { FileBrowser } from './file-browser-lazy.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
@@ -104,6 +105,29 @@ const TOOL_INPUT_SUMMARY_KEYS = [
   'description',
   'name',
 ] as const;
+
+type FileBrowserTarget = {
+  path: string;
+  preferDiff: boolean;
+};
+
+type GroupedFileChange = {
+  filePath: string;
+  patches: FileChangePatch[];
+};
+
+function isFileChangeEvent(event: TimelineEvent): event is TimelineEvent & { payload: { batch?: FileChangeBatch } } {
+  return event.type === 'file.change' && !!event.payload && typeof event.payload === 'object';
+}
+
+function getFileChangeBatch(event: TimelineEvent): FileChangeBatch | null {
+  if (!isFileChangeEvent(event)) return null;
+  const batch = event.payload.batch;
+  if (!batch || typeof batch !== 'object') return null;
+  const payload = batch as FileChangeBatch;
+  if (!Array.isArray(payload.patches)) return null;
+  return payload;
+}
 
 function truncateToolText(text: string, max = 240): string {
   return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
@@ -374,7 +398,7 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
   const { t } = useTranslation();
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
-  const [fileBrowserPath, setFileBrowserPath] = useState<string | null>(null);
+  const [fileBrowserTarget, setFileBrowserTarget] = useState<FileBrowserTarget | null>(null);
   const [selMenu, setSelMenu] = useState<SelectionMenu | null>(null);
   const [copied, setCopied] = useState(false);
   const [pendingUrl, setPendingUrl] = useState<string | null>(null);
@@ -394,13 +418,13 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
     suppressLoadOlderUntilRef.current = Date.now() + durationMs;
   }, []);
 
-  // Track tool.call events to trigger file panel refresh
+  // Track tool.call and normalized file.change events to trigger file panel refresh
   const [filePanelRefreshTrigger, setFilePanelRefreshTrigger] = useState(0);
   const lastToolCallTsRef = useRef(0);
   useEffect(() => {
     for (let i = events.length - 1; i >= 0; i--) {
       const e = events[i];
-      if (e.type === 'tool.call') {
+      if (e.type === 'tool.call' || e.type === 'file.change') {
         if (e.ts > lastToolCallTsRef.current) {
           lastToolCallTsRef.current = e.ts;
           const id = setTimeout(() => setFilePanelRefreshTrigger((n) => n + 1), 1000);
@@ -455,9 +479,17 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
     document.addEventListener('mouseup', onUp);
   }, [sessionId]);
 
-  const handlePathClick = useCallback((path: string) => {
-    setFileBrowserPath(path.replace(/^`+|`+$/g, ''));
+  const openFileBrowserTarget = useCallback((path: string, preferDiff = false) => {
+    setFileBrowserTarget({ path: path.replace(/^`+|`+$/g, ''), preferDiff });
   }, []);
+
+  const handlePathClick = useCallback((path: string) => {
+    openFileBrowserTarget(path, false);
+  }, [openFileBrowserTarget]);
+
+  const handleFileChangeOpen = useCallback((path: string, preferDiff = false) => {
+    openFileBrowserTarget(path, preferDiff);
+  }, [openFileBrowserTarget]);
 
   const handleUrlClick = useCallback((url: string) => {
     setPendingUrl(url);
@@ -859,7 +891,7 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
             ) : item.type === 'tool-group' ? (
               <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onDownload={downloadHandler} serverId={serverId} />
             ) : (
-              <ChatEvent key={item.key} event={item.event!} nextTs={nextTs} onPathClick={pathClickHandler} onDownload={downloadHandler} serverId={serverId} />
+              <ChatEvent key={item.key} event={item.event!} nextTs={nextTs} onPathClick={pathClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} />
             );
           })}
           {!loading && <div ref={bottomRef} />}
@@ -997,31 +1029,39 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
           </div>
         </div>
       )}
-      {fileBrowserPath && ws && (
-        <FloatingPanel id="chat-file-preview" title={`📄 ${fileBrowserPath.split(/[/\\]/).pop() ?? 'File'}`} onClose={() => setFileBrowserPath(null)} defaultW={600} defaultH={500}>
+      {fileBrowserTarget && ws && (
+        <FloatingPanel
+          id="chat-file-preview"
+          title={`📄 ${fileBrowserTarget.path.split(/[/\\]/).pop() ?? fileBrowserTarget.path}`}
+          onClose={() => setFileBrowserTarget(null)}
+          defaultW={600}
+          defaultH={500}
+        >
           <FileBrowser
             ws={ws}
             serverId={serverId}
             mode="file-single"
             layout="panel"
             initialPath={(() => {
-              const isAbsolute = fileBrowserPath.startsWith('/') || fileBrowserPath.startsWith('~') || /^[A-Za-z]:[/\\]/.test(fileBrowserPath);
-              const resolved = isAbsolute ? fileBrowserPath : `${workdir ?? '~'}/${fileBrowserPath}`;
+              const path = fileBrowserTarget.path;
+              const isAbsolute = path.startsWith('/') || path.startsWith('~') || /^[A-Za-z]:[/\\]/.test(path);
+              const resolved = isAbsolute ? path : `${workdir ?? '~'}/${path}`;
               return resolved.includes('.') && !resolved.endsWith('/')
                 ? resolved.split(/[/\\]/).slice(0, -1).join('/') || '~'
                 : resolved;
             })()}
-            highlightPath={fileBrowserPath.startsWith('/') || fileBrowserPath.startsWith('~') || /^[A-Za-z]:[/\\]/.test(fileBrowserPath)
-              ? fileBrowserPath
-              : `${workdir ?? '~'}/${fileBrowserPath}`}
-            autoPreviewPath={fileBrowserPath.startsWith('/') || fileBrowserPath.startsWith('~') || /^[A-Za-z]:[/\\]/.test(fileBrowserPath)
-              ? fileBrowserPath
-              : `${workdir ?? '~'}/${fileBrowserPath}`}
+            highlightPath={fileBrowserTarget.path.startsWith('/') || fileBrowserTarget.path.startsWith('~') || /^[A-Za-z]:[/\\]/.test(fileBrowserTarget.path)
+              ? fileBrowserTarget.path
+              : `${workdir ?? '~'}/${fileBrowserTarget.path}`}
+            autoPreviewPath={fileBrowserTarget.path.startsWith('/') || fileBrowserTarget.path.startsWith('~') || /^[A-Za-z]:[/\\]/.test(fileBrowserTarget.path)
+              ? fileBrowserTarget.path
+              : `${workdir ?? '~'}/${fileBrowserTarget.path}`}
+            autoPreviewPreferDiff={fileBrowserTarget.preferDiff}
             onConfirm={(paths) => {
               if (paths[0]) onInsertPath?.(paths[0]);
-              setFileBrowserPath(null);
+              setFileBrowserTarget(null);
             }}
-            onClose={() => setFileBrowserPath(null)}
+            onClose={() => setFileBrowserTarget(null)}
           />
         </FloatingPanel>
       )}
@@ -1173,12 +1213,14 @@ const ChatEvent = memo(function ChatEvent({
   event,
   nextTs,
   onPathClick,
+  onFileChangeOpen,
   onDownload,
   serverId,
 }: {
   event: TimelineEvent;
   nextTs?: number;
   onPathClick?: (p: string) => void;
+  onFileChangeOpen?: (path: string, preferDiff?: boolean) => void;
   onDownload?: (path: string) => void;
   serverId?: string;
 }) {
@@ -1301,10 +1343,209 @@ const ChatEvent = memo(function ChatEvent({
     case 'terminal.snapshot':
       return <SnapshotEvent event={event} />;
 
+    case 'file.change':
+      return <FileChangeCard event={event} onOpenFile={onFileChangeOpen} />;
+
     default:
       return null;
   }
 });
+
+function groupFileChangePatches(batch: FileChangeBatch): GroupedFileChange[] {
+  const groups = new Map<string, GroupedFileChange>();
+  const order: string[] = [];
+  for (const patch of batch.patches ?? []) {
+    if (!patch?.filePath) continue;
+    let group = groups.get(patch.filePath);
+    if (!group) {
+      group = { filePath: patch.filePath, patches: [] };
+      groups.set(patch.filePath, group);
+      order.push(patch.filePath);
+    }
+    group.patches.push(patch);
+  }
+  return order.map((filePath) => groups.get(filePath)!).filter(Boolean);
+}
+
+function fileChangeOperationKey(operation: string): string {
+  switch (operation) {
+    case 'create': return 'chat.file_change_operation_create';
+    case 'update': return 'chat.file_change_operation_update';
+    case 'delete': return 'chat.file_change_operation_delete';
+    case 'rename': return 'chat.file_change_operation_rename';
+    default: return 'chat.file_change_operation_unknown';
+  }
+}
+
+function fileChangeConfidenceKey(confidence: string): string {
+  switch (confidence) {
+    case 'exact': return 'chat.file_change_confidence_exact';
+    case 'derived': return 'chat.file_change_confidence_derived';
+    default: return 'chat.file_change_confidence_coarse';
+  }
+}
+
+function fileChangeProviderKey(provider: string): string {
+  switch (provider) {
+    case 'claude-code': return 'chat.file_change_provider_claude_code';
+    case 'opencode': return 'chat.file_change_provider_opencode';
+    case 'codex-sdk': return 'chat.file_change_provider_codex_sdk';
+    case 'qwen': return 'chat.file_change_provider_qwen';
+    case 'gemini': return 'chat.file_change_provider_gemini';
+    default: return provider;
+  }
+}
+
+function clampPreviewText(text: string, maxLines = 14, maxChars = 1200): { text: string; truncated: boolean } {
+  const normalized = text.replace(/\r\n/g, '\n');
+  const lines = normalized.split('\n');
+  const clippedByLines = lines.length > maxLines;
+  const clipped = clippedByLines ? lines.slice(0, maxLines).join('\n') : normalized;
+  const truncated = clippedByLines || clipped.length > maxChars;
+  const textOut = clipped.length > maxChars ? clipped.slice(0, maxChars) : clipped;
+  return { text: textOut, truncated };
+}
+
+function extractStackedPreviewFromUnifiedDiff(diff: string): { before: string; after: string } | null {
+  const beforeLines: string[] = [];
+  const afterLines: string[] = [];
+  for (const rawLine of diff.replace(/\r\n/g, '\n').split('\n')) {
+    if (!rawLine) continue;
+    if (rawLine.startsWith('---') || rawLine.startsWith('+++') || rawLine.startsWith('@@')) continue;
+    if (rawLine.startsWith('-')) {
+      beforeLines.push(rawLine.slice(1));
+      continue;
+    }
+    if (rawLine.startsWith('+')) {
+      afterLines.push(rawLine.slice(1));
+    }
+  }
+  if (beforeLines.length === 0 && afterLines.length === 0) return null;
+  return {
+    before: beforeLines.join('\n'),
+    after: afterLines.join('\n'),
+  };
+}
+
+const FileChangeCard = memo(function FileChangeCard({
+  event,
+  onOpenFile,
+}: {
+  event: TimelineEvent;
+  onOpenFile?: (path: string, preferDiff?: boolean) => void;
+}) {
+  const { t } = useTranslation();
+  const batch = getFileChangeBatch(event);
+  if (!batch) return null;
+  const fileGroups = groupFileChangePatches(batch);
+  if (fileGroups.length === 0) return null;
+
+  return (
+    <div class="chat-event chat-file-change">
+      <div class="chat-file-change-header">
+        <div class="chat-file-change-title">
+          {t('chat.file_change_title', { count: fileGroups.length })}
+        </div>
+        <div class="chat-file-change-meta">
+          <span class="chat-file-change-chip">{t(fileChangeProviderKey(batch.provider))}</span>
+          {batch.title && <span class="chat-file-change-chip chat-file-change-chip-muted">{batch.title}</span>}
+        </div>
+      </div>
+      <div class="chat-file-change-body">
+        {fileGroups.map((group) => {
+          const operations = Array.from(new Set(group.patches.map((patch) => patch.operation)));
+          const confidences = Array.from(new Set(group.patches.map((patch) => patch.confidence)));
+          const first = group.patches[0];
+          const hasExactPreview = group.patches.some((patch) => patch.confidence === 'exact' && (patch.beforeText || patch.afterText || patch.unifiedDiff));
+          const fileLabel = first?.oldPath && first.oldPath !== group.filePath
+            ? `${first.oldPath} → ${group.filePath}`
+            : group.filePath;
+          return (
+            <div class="chat-file-change-file" key={group.filePath}>
+              <div
+                class="chat-file-change-path"
+                role="button"
+                tabIndex={0}
+                onClick={() => onOpenFile?.(group.filePath, hasExactPreview)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') onOpenFile?.(group.filePath, hasExactPreview);
+                }}
+                title={group.filePath}
+              >
+                {fileLabel}
+              </div>
+              <div class="chat-file-change-badges">
+                <span class="chat-file-change-chip">{operations.length === 1 ? t(fileChangeOperationKey(operations[0])) : t('chat.file_change_operation_mixed')}</span>
+                <span class="chat-file-change-chip chat-file-change-chip-muted">{confidences.length === 1 ? t(fileChangeConfidenceKey(confidences[0])) : t('chat.file_change_confidence_mixed')}</span>
+                <span class="chat-file-change-chip chat-file-change-chip-muted">{t('chat.file_change_patch_count', { count: group.patches.length })}</span>
+              </div>
+              <div class="chat-file-change-patches">
+                {group.patches.map((patch, idx) => (
+                  <div class="chat-file-change-patch" key={`${group.filePath}:${idx}`}>
+                    {patch.confidence === 'exact' ? (
+                      <ExactFilePatch patch={patch} />
+                    ) : patch.confidence === 'derived' ? (
+                      <DerivedFilePatch patch={patch} />
+                    ) : (
+                      <CoarseFilePatch patch={patch} />
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+});
+
+function ExactFilePatch({ patch }: { patch: FileChangePatch }) {
+  const { t } = useTranslation();
+  const unifiedPreview = patch.unifiedDiff ? extractStackedPreviewFromUnifiedDiff(patch.unifiedDiff) : null;
+  const before = patch.beforeText ?? unifiedPreview?.before ?? '';
+  const after = patch.afterText ?? unifiedPreview?.after ?? '';
+  const beforePreview = clampPreviewText(before || t('chat.file_change_no_before'));
+  const afterPreview = clampPreviewText(after || t('chat.file_change_no_after'));
+  return (
+    <div class="chat-file-change-diff">
+      <div class="chat-file-change-diff-block">
+        <div class="chat-file-change-diff-label chat-file-change-diff-label-removed">{t('chat.file_change_removed')}</div>
+        <pre class="chat-file-change-diff-pre chat-file-change-diff-pre-removed">{beforePreview.text}{beforePreview.truncated ? `\n${t('chat.file_change_truncated')}` : ''}</pre>
+      </div>
+      <div class="chat-file-change-diff-block">
+        <div class="chat-file-change-diff-label chat-file-change-diff-label-added">{t('chat.file_change_added')}</div>
+        <pre class="chat-file-change-diff-pre chat-file-change-diff-pre-added">{afterPreview.text}{afterPreview.truncated ? `\n${t('chat.file_change_truncated')}` : ''}</pre>
+      </div>
+    </div>
+  );
+}
+
+function DerivedFilePatch({ patch }: { patch: FileChangePatch }) {
+  const { t } = useTranslation();
+  const previewText = patch.afterText ?? patch.beforeText ?? patch.unifiedDiff ?? '';
+  const preview = clampPreviewText(previewText || t('chat.file_change_derived_no_preview'));
+  return (
+    <div class="chat-file-change-diff">
+      <div class="chat-file-change-diff-label">{t('chat.file_change_confidence_derived')}</div>
+      <pre class="chat-file-change-diff-pre">{preview.text}{preview.truncated ? `\n${t('chat.file_change_truncated')}` : ''}</pre>
+    </div>
+  );
+}
+
+function CoarseFilePatch({ patch }: { patch: FileChangePatch }) {
+  const { t } = useTranslation();
+  return (
+    <div class="chat-file-change-diff chat-file-change-diff-coarse">
+      <div class="chat-file-change-diff-label">{t('chat.file_change_confidence_coarse')}</div>
+      <div class="chat-file-change-coarse-text">
+        {patch.oldPath && patch.oldPath !== patch.filePath
+          ? t('chat.file_change_renamed_from', { oldPath: patch.oldPath, newPath: patch.filePath })
+          : t('chat.file_change_coarse_hint')}
+      </div>
+    </div>
+  );
+}
 
 function ActiveThinkingLabel({ startTs }: { startTs: number }) {
   const { t } = useTranslation();

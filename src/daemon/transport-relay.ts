@@ -13,6 +13,8 @@ import { timelineEmitter } from './timeline-emitter.js';
 import { appendTransportEvent } from './transport-history.js';
 import logger from '../util/logger.js';
 import { resolveContextWindow } from '../util/model-context.js';
+import { TIMELINE_EVENT_FILE_CHANGE } from '../../shared/file-change.js';
+import { normalizeCodexSdkFileChange, normalizeQwenFileChange } from './file-change-normalizer.js';
 
 let sendToServer: ((msg: Record<string, unknown>) => void) | null = null;
 const inFlightMessages = new Map<string, { messageId: string; eventId: string; text: string }>();
@@ -24,6 +26,28 @@ const pendingStreamUpdates = new Map<string, {
   timer: ReturnType<typeof setTimeout> | null;
 }>();
 const STREAM_UPDATE_INTERVAL_MS = 80;
+const pendingFileLikeTools = new Map<string, ToolCallEvent>();
+const completedFileLikeTools = new Set<string>();
+const MAX_TRACKED_FILE_TOOLS = 512;
+
+function rememberCompletedFileLikeTool(key: string): void {
+  completedFileLikeTools.add(key);
+  if (completedFileLikeTools.size <= MAX_TRACKED_FILE_TOOLS) return;
+  const overflow = completedFileLikeTools.size - MAX_TRACKED_FILE_TOOLS;
+  let removed = 0;
+  for (const existing of completedFileLikeTools) {
+    completedFileLikeTools.delete(existing);
+    removed += 1;
+    if (removed >= overflow) break;
+  }
+}
+
+function rememberPendingFileLikeTool(key: string, tool: ToolCallEvent): void {
+  pendingFileLikeTools.set(key, tool);
+  if (pendingFileLikeTools.size <= MAX_TRACKED_FILE_TOOLS) return;
+  const oldestKey = pendingFileLikeTools.keys().next().value;
+  if (oldestKey) pendingFileLikeTools.delete(oldestKey);
+}
 
 function emitStreamingAssistantText(sessionName: string, eventId: string, text: string): void {
   timelineEmitter.emit(sessionName, 'assistant.text', {
@@ -219,6 +243,121 @@ export function wireProviderToRelay(provider: TransportProvider): void {
   provider.onToolCall?.((providerSid: string, tool: ToolCallEvent) => {
     const sessionName = resolveSessionName(providerSid);
     if (!sessionName) return;
+    const fileChangeKey = `${sessionName}:${tool.id}`;
+
+    const initialToolKind = String(tool.detail?.kind ?? '').toLowerCase();
+    const looksLikeStructuredFileTool = initialToolKind === 'filechange'
+      || /(?:write|edit|update|create|rename|delete|patch|save)/i.test(tool.name);
+    if (tool.status === 'running' && looksLikeStructuredFileTool) {
+      rememberPendingFileLikeTool(fileChangeKey, tool);
+      return;
+    }
+
+    const pending = pendingFileLikeTools.get(fileChangeKey);
+    if (tool.status !== 'running') pendingFileLikeTools.delete(fileChangeKey);
+    const effectiveTool: ToolCallEvent = pending ? {
+      ...pending,
+      ...tool,
+      input: tool.input ?? pending.input,
+      detail: tool.detail ?? pending.detail,
+      output: tool.output ?? pending.output,
+    } : tool;
+    const effectiveToolKind = String(effectiveTool.detail?.kind ?? '').toLowerCase();
+
+    const codexBatch = tool.status !== 'error' && effectiveToolKind === 'filechange'
+      ? normalizeCodexSdkFileChange({
+        toolCallId: effectiveTool.id,
+        detail: effectiveTool.detail,
+        raw: effectiveTool.detail?.raw ?? effectiveTool.input,
+      })
+      : null;
+    const qwenBatch = tool.status !== 'error' && !codexBatch && looksLikeStructuredFileTool
+      ? normalizeQwenFileChange({
+        toolName: effectiveTool.name,
+        toolCallId: effectiveTool.id,
+        input: effectiveTool.input,
+        raw: effectiveTool.detail?.raw ?? effectiveTool.detail,
+      })
+      : null;
+    const fileChangeBatch = codexBatch ?? qwenBatch;
+
+    if (looksLikeStructuredFileTool && completedFileLikeTools.has(fileChangeKey)) {
+      return;
+    }
+    if (looksLikeStructuredFileTool && tool.status !== 'running') {
+      rememberCompletedFileLikeTool(fileChangeKey);
+    }
+
+    if (fileChangeBatch) {
+      timelineEmitter.emit(sessionName, 'tool.call', {
+        tool: effectiveTool.name,
+        ...(effectiveTool.input !== undefined ? { input: effectiveTool.input } : {}),
+        ...(effectiveTool.detail !== undefined ? { detail: effectiveTool.detail } : {}),
+      }, {
+        source: 'daemon',
+        confidence: 'high',
+        eventId: `transport-tool:${sessionName}:${effectiveTool.id}:call`,
+        hidden: true,
+      });
+      void appendTransportEvent(sessionName, {
+        type: 'tool.call',
+        sessionId: sessionName,
+        tool: effectiveTool.name,
+        ...(effectiveTool.input !== undefined ? { input: effectiveTool.input } : {}),
+        ...(effectiveTool.detail !== undefined ? { detail: effectiveTool.detail } : {}),
+        hidden: true,
+      });
+      timelineEmitter.emit(sessionName, 'tool.result', {
+        ...(effectiveTool.status === 'error'
+          ? { error: effectiveTool.output ?? 'error' }
+          : effectiveTool.output !== undefined
+            ? { output: effectiveTool.output }
+            : {}),
+        ...(effectiveTool.detail !== undefined ? { detail: effectiveTool.detail } : {}),
+      }, {
+        source: 'daemon',
+        confidence: 'high',
+        eventId: `transport-tool:${sessionName}:${effectiveTool.id}:result`,
+        hidden: true,
+      });
+      void appendTransportEvent(sessionName, {
+        type: 'tool.result',
+        sessionId: sessionName,
+        tool: effectiveTool.name,
+        ...(effectiveTool.detail !== undefined ? { detail: effectiveTool.detail } : {}),
+        ...(effectiveTool.status === 'error'
+          ? { error: effectiveTool.output ?? 'error' }
+          : effectiveTool.output !== undefined
+            ? { output: effectiveTool.output }
+            : {}),
+        hidden: true,
+      });
+      timelineEmitter.emit(sessionName, TIMELINE_EVENT_FILE_CHANGE, { batch: fileChangeBatch }, {
+        source: 'daemon',
+        confidence: 'high',
+        eventId: `transport-file-change:${sessionName}:${effectiveTool.id}`,
+      });
+      return;
+    }
+
+    if (pending && looksLikeStructuredFileTool) {
+      timelineEmitter.emit(sessionName, 'tool.call', {
+        tool: effectiveTool.name,
+        ...(effectiveTool.input !== undefined ? { input: effectiveTool.input } : {}),
+        ...(effectiveTool.detail !== undefined ? { detail: effectiveTool.detail } : {}),
+      }, {
+        source: 'daemon',
+        confidence: 'high',
+        eventId: `transport-tool:${sessionName}:${effectiveTool.id}:call`,
+      });
+      void appendTransportEvent(sessionName, {
+        type: 'tool.call',
+        sessionId: sessionName,
+        tool: effectiveTool.name,
+        ...(effectiveTool.input !== undefined ? { input: effectiveTool.input } : {}),
+        ...(effectiveTool.detail !== undefined ? { detail: effectiveTool.detail } : {}),
+      });
+    }
 
     if (tool.status === 'running') {
       timelineEmitter.emit(sessionName, 'tool.call', {

@@ -23,6 +23,8 @@ import logger from '../util/logger.js';
 import { resolveContextWindow } from '../util/model-context.js';
 import { getSessionContextWindow } from './cc-presets.js';
 import { registerWatcherControl, unregisterWatcherControl, type WatcherControl } from './watcher-controls.js';
+import { TIMELINE_EVENT_FILE_CHANGE, type FileChangeBatch } from '../../shared/file-change.js';
+import { normalizeClaudeFileChange } from './file-change-normalizer.js';
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
 
@@ -153,6 +155,86 @@ interface ContentBlock {
   input?: Record<string, unknown>;
   content?: unknown;
   is_error?: boolean;
+  tool_use_id?: string;
+  toolUseResult?: Record<string, unknown>;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function extractToolInput(name: string, input?: Record<string, unknown>): string {
+  if (!input) return '';
+  if (name === 'Grep') {
+    const pattern = input.pattern ?? input.query ?? input.text;
+    const path = input.path ?? input.file_path ?? input.filePath;
+    if (pattern && path) return `${String(pattern).split('\n')[0]} in ${String(path).split('\n')[0]}`;
+  }
+  const val = input.command
+    ?? input.path
+    ?? input.file_path
+    ?? input.pattern
+    ?? input.description
+    ?? input.query
+    ?? input.objective
+    ?? input.text
+    ?? '';
+  const text = String(val);
+  return text.split('\n')[0] ?? '';
+}
+
+interface PendingClaudeToolCall {
+  id: string;
+  name: string;
+  input?: Record<string, unknown>;
+  ts?: number;
+}
+
+const pendingClaudeToolCalls = new Map<string, Map<string, PendingClaudeToolCall>>();
+
+function getPendingClaudeTools(sessionName: string): Map<string, PendingClaudeToolCall> {
+  let pending = pendingClaudeToolCalls.get(sessionName);
+  if (!pending) {
+    pending = new Map();
+    pendingClaudeToolCalls.set(sessionName, pending);
+  }
+  return pending;
+}
+
+function rememberClaudeToolCall(sessionName: string, pending: PendingClaudeToolCall): void {
+  getPendingClaudeTools(sessionName).set(pending.id, pending);
+}
+
+function takeClaudeToolCall(sessionName: string, toolUseId?: string): PendingClaudeToolCall | undefined {
+  if (!toolUseId) return undefined;
+  const pending = pendingClaudeToolCalls.get(sessionName);
+  if (!pending) return undefined;
+  const tool = pending.get(toolUseId);
+  if (tool) pending.delete(toolUseId);
+  if (pending.size === 0) pendingClaudeToolCalls.delete(sessionName);
+  return tool;
+}
+
+function emitClaudeFileChange(
+  sessionName: string,
+  batch: FileChangeBatch,
+  eventId: string,
+  ts?: number,
+): void {
+  timelineEmitter.emit(sessionName, TIMELINE_EVENT_FILE_CHANGE, { batch }, {
+    source: 'daemon',
+    confidence: 'high',
+    eventId,
+    ...(ts ? { ts } : {}),
+  });
+}
+
+function buildClaudeToolEventId(sessionName: string, toolUseId: string, phase: 'call' | 'result'): string {
+  return `cc-tool:${sessionName}:${toolUseId}:${phase}`;
+}
+
+function isClaudeFileChangeTool(name?: string): boolean {
+  return name === 'Edit' || name === 'MultiEdit' || name === 'Write' || name === 'NotebookEdit';
 }
 
 /** Patterns for system-injected messages that should not display as user messages. */
@@ -189,6 +271,112 @@ function emitAssistantStringContent(
     text,
     streaming: false,
   }, { source: 'daemon', confidence: 'high', ...(stableId ? { eventId: stableId('at') } : {}), ...(ts ? { ts } : {}) });
+}
+
+function emitClaudeToolCallBlock(
+  sessionName: string,
+  block: ContentBlock,
+  stableId?: (suffix: string) => string,
+  ts?: number,
+): void {
+  if (!block.name) return;
+  if (block.name === 'AskUserQuestion') {
+    const inp = block.input as Record<string, unknown> | undefined;
+    timelineEmitter.emit(sessionName, 'ask.question', {
+      toolUseId: block.id,
+      questions: inp?.['questions'] ?? [],
+    }, { source: 'daemon', confidence: 'high', ...(stableId ? { eventId: stableId('aq') } : {}), ...(ts ? { ts } : {}) });
+    return;
+  }
+
+  const input = block.input as Record<string, unknown> | undefined;
+  const toolUseId = block.id;
+  const isDeferredFileTool = isClaudeFileChangeTool(block.name) && !!toolUseId;
+
+  if (toolUseId) {
+    rememberClaudeToolCall(sessionName, {
+      id: toolUseId,
+      name: block.name,
+      input,
+      ...(ts ? { ts } : {}),
+    });
+  }
+
+  if (isDeferredFileTool) return;
+
+  const callEventId = toolUseId ? buildClaudeToolEventId(sessionName, toolUseId, 'call') : (stableId ? stableId('tc') : undefined);
+  const summaryInput = extractToolInput(block.name, input);
+  timelineEmitter.emit(sessionName, 'tool.call', {
+    tool: block.name,
+    ...(summaryInput ? { input: summaryInput } : (input ? { input } : {})),
+  }, {
+    source: 'daemon',
+    confidence: 'high',
+    ...(callEventId ? { eventId: callEventId } : {}),
+    ...(ts ? { ts } : {}),
+  });
+}
+
+function emitClaudeToolResultBlock(
+  sessionName: string,
+  block: ContentBlock,
+  stableId?: (suffix: string) => string,
+  ts?: number,
+): void {
+  const toolUseId = block.tool_use_id;
+  const pending = takeClaudeToolCall(sessionName, toolUseId);
+  const toolUseResult = asRecord(block.toolUseResult);
+  const contentResult = asRecord(block.content);
+  const normalized = pending
+    && !block.is_error
+    ? normalizeClaudeFileChange({
+      toolName: pending.name,
+      toolCallId: pending.id,
+      input: pending.input,
+      toolResult: toolUseResult ?? contentResult ?? undefined,
+    })
+    : null;
+
+  if (pending && isClaudeFileChangeTool(pending.name)) {
+    const summaryInput = extractToolInput(pending.name, pending.input);
+    timelineEmitter.emit(sessionName, 'tool.call', {
+      tool: pending.name,
+      ...(summaryInput ? { input: summaryInput } : (pending.input ? { input: pending.input } : {})),
+    }, {
+      source: 'daemon',
+      confidence: 'high',
+      eventId: buildClaudeToolEventId(sessionName, pending.id, 'call'),
+      ...(pending.ts ? { ts: pending.ts } : {}),
+      ...(normalized ? { hidden: true } : {}),
+    });
+  }
+
+  if (normalized && pending) {
+    timelineEmitter.emit(sessionName, 'tool.result', {
+      ...(block.is_error ? { error: String(block.content ?? 'error') } : {}),
+      ...(toolUseResult?.content ? { output: toolUseResult.content } : {}),
+    }, {
+      source: 'daemon',
+      confidence: 'high',
+      eventId: buildClaudeToolEventId(sessionName, pending.id, 'result'),
+      ...(ts ? { ts } : {}),
+      hidden: true,
+    });
+    emitClaudeFileChange(sessionName, normalized, `cc-file-change:${sessionName}:${pending.id}`, ts);
+    return;
+  }
+
+  const error = block.is_error ? String(block.content ?? 'error') : undefined;
+  const output = !error ? extractToolResultOutput(block) : undefined;
+  timelineEmitter.emit(sessionName, 'tool.result', {
+    ...(error ? { error } : {}),
+    ...(output ? { output } : {}),
+  }, {
+    source: 'daemon',
+    confidence: 'high',
+    ...(toolUseId ? { eventId: buildClaudeToolEventId(sessionName, toolUseId, 'result') } : stableId ? { eventId: stableId('tr') } : {}),
+    ...(ts ? { ts } : {}),
+  });
 }
 
 /**
@@ -316,19 +504,9 @@ function parseLine(sessionName: string, line: string, lineByteOffset?: number): 
           text: block.thinking,
         }, { source: 'daemon', confidence: 'high', ...(stableId ? { eventId: stableId('th') } : {}), ...(ts ? { ts } : {}) });
       } else if (block.type === 'tool_use' && block.name) {
-        if (block.name === 'AskUserQuestion') {
-          const inp = block.input as Record<string, unknown> | undefined;
-          timelineEmitter.emit(sessionName, 'ask.question', {
-            toolUseId: block.id,
-            questions: inp?.['questions'] ?? [],
-          }, { source: 'daemon', confidence: 'high', ...(stableId ? { eventId: stableId('aq') } : {}), ...(ts ? { ts } : {}) });
-        } else {
-          const input = extractToolInput(block.name, block.input);
-          timelineEmitter.emit(sessionName, 'tool.call', {
-            tool: block.name,
-            ...(input ? { input } : {}),
-          }, { source: 'daemon', confidence: 'high', ...(stableId ? { eventId: stableId('tc') } : {}), ...(ts ? { ts } : {}) });
-        }
+        emitClaudeToolCallBlock(sessionName, block, stableId, ts);
+      } else if (block.type === 'tool_result') {
+        emitClaudeToolResultBlock(sessionName, block, stableId, ts);
       }
     }
     // Emit token usage + model for context bar (transient, no stable ID needed)
@@ -356,36 +534,8 @@ function parseLine(sessionName: string, line: string, lineByteOffset?: number): 
       if (block.type === 'text' && block.text?.trim()) {
         emitUserStringContent(sessionName, block.text, stableId, ts);
       } else if (block.type === 'tool_result') {
-        const error = block.is_error ? String(block.content ?? 'error') : undefined;
-        const output = !error ? extractToolResultOutput(block) : undefined;
-        timelineEmitter.emit(sessionName, 'tool.result', {
-          ...(error ? { error } : {}),
-          ...(output ? { output } : {}),
-        }, { source: 'daemon', confidence: 'high', ...(stableId ? { eventId: stableId('tr') } : {}), ...(ts ? { ts } : {}) });
+        emitClaudeToolResultBlock(sessionName, block, stableId, ts);
       }
-    }
-  }
-}
-
-/** Extract a short summary of tool input for display. */
-function extractToolInput(tool: string, input?: Record<string, unknown>): string {
-  if (!input) return '';
-  switch (tool) {
-    case 'Bash': return String(input['command'] ?? '').split('\n').find((l) => l.trim()) ?? '';
-    case 'Read': case 'Write': case 'Edit': return String(input['file_path'] ?? '');
-    case 'Glob': return String(input['pattern'] ?? '');
-    case 'Grep': return `${input['pattern'] ?? ''}${input['path'] ? ` in ${input['path']}` : ''}`;
-    case 'Agent': return String(input['description'] ?? '');
-    case 'WebSearch': return String(input['query'] ?? '');
-    case 'WebFetch': return String(input['url'] ?? '');
-    case 'Skill': return String(input['skill'] ?? '');
-    case 'TodoWrite': return input['todos'] ? `${(input['todos'] as unknown[]).length} items` : '';
-    default: {
-      // Generic fallback: show first non-empty string value, truncated
-      for (const v of Object.values(input)) {
-        if (typeof v === 'string' && v.trim()) return v.length > 80 ? v.slice(0, 77) + '...' : v;
-      }
-      return '';
     }
   }
 }
@@ -599,10 +749,9 @@ export async function emitRecentHistory(sessionName: string, filePath: string): 
               text: block.thinking,
             }, { source: 'daemon', confidence: 'high', eventId: stableId('th'), ...(ts ? { ts } : {}) });
           } else if (block.type === 'tool_use' && block.name) {
-            const input = extractToolInput(block.name, block.input);
-            timelineEmitter.emit(sessionName, 'tool.call', {
-              tool: block.name, ...(input ? { input } : {}),
-            }, { source: 'daemon', confidence: 'high', eventId: stableId('tc'), ...(ts ? { ts } : {}) });
+            emitClaudeToolCallBlock(sessionName, block, stableId, ts);
+          } else if (block.type === 'tool_result') {
+            emitClaudeToolResultBlock(sessionName, block, stableId, ts);
           }
         }
       } else if (raw['type'] === 'user') {
@@ -616,12 +765,7 @@ export async function emitRecentHistory(sessionName: string, filePath: string): 
           if (block.type === 'text' && block.text?.trim()) {
             emitUserStringContent(sessionName, block.text, stableId, ts);
           } else if (block.type === 'tool_result') {
-            const error = block.is_error ? String(block.content ?? 'error') : undefined;
-            const output = !error ? extractToolResultOutput(block) : undefined;
-            timelineEmitter.emit(sessionName, 'tool.result', {
-              ...(error ? { error } : {}),
-              ...(output ? { output } : {}),
-            }, { source: 'daemon', confidence: 'high', eventId: stableId('tr'), ...(ts ? { ts } : {}) });
+            emitClaudeToolResultBlock(sessionName, block, stableId, ts);
           }
         }
       }
@@ -720,6 +864,7 @@ export function stopWatching(sessionName: string): void {
   unregisterWatcherControl(sessionName);
   releaseFiles(sessionName);
   releaseOwnership(sessionName);
+  pendingClaudeToolCalls.delete(sessionName);
 }
 
 /**

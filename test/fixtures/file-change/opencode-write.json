@@ -1,0 +1,13 @@
+{
+  "id": "oc-1",
+  "tool": "write",
+  "state": {
+    "input": {
+      "filePath": "src/new.ts",
+      "content": "export {};"
+    },
+    "metadata": {
+      "exists": false
+    }
+  }
+}

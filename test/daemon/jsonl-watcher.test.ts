@@ -83,6 +83,35 @@ function assistantToolUse(name: string, input: Record<string, unknown> = {}): st
   });
 }
 
+/** Build an assistant line with a stable tool_use id. */
+function assistantToolUseWithId(name: string, toolUseId: string, input: Record<string, unknown> = {}): string {
+  return jsonlLine({
+    type: 'assistant',
+    timestamp: new Date().toISOString(),
+    message: {
+      content: [{ type: 'tool_use', name, id: toolUseId, input }],
+      model: 'claude-opus-4-6',
+      usage: { input_tokens: 120, cache_creation_input_tokens: 0, cache_read_input_tokens: 20 },
+    },
+  });
+}
+
+/** Build a user tool_result line with a stable tool_use id. */
+function userToolResult(toolUseId: string, toolUseResult: Record<string, unknown>, isError = false): string {
+  return jsonlLine({
+    type: 'user',
+    timestamp: new Date().toISOString(),
+    message: {
+      content: [{
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        is_error: isError,
+        toolUseResult,
+      }],
+    },
+  });
+}
+
 /** Build a user line with text block. */
 function userMessage(text: string): string {
   return jsonlLine({
@@ -449,6 +478,122 @@ describe('extractToolInput — tool-specific input extraction', () => {
 
     const calls = emittedEvents.filter((e) => e.type === 'tool.call' && e.payload.tool === 'Agent');
     expect(calls[calls.length - 1].payload.input).toBe('Search for config files');
+  });
+});
+
+// ── file.change emission coverage ───────────────────────────────────────────
+
+describe('file.change emission', () => {
+  it('emits hidden raw tool events and a visible file.change for Claude Edit', async () => {
+    const filePath = join(testDir, 'claude-edit.jsonl');
+    await writeFile(filePath, '');
+    await startWatchingFile('test_session', filePath);
+    await new Promise((r) => setTimeout(r, 200));
+
+    await appendFile(filePath, assistantToolUseWithId('Edit', 'tool-edit-1', {
+      file_path: 'src/app.ts',
+      old_string: 'before',
+      new_string: 'after',
+    }));
+    await appendFile(filePath, userToolResult('tool-edit-1', {
+      type: 'update',
+      filePath: 'src/app.ts',
+      content: 'after',
+    }));
+    await new Promise((r) => setTimeout(r, 2500));
+
+    const fileChanges = emittedEvents.filter((e) => e.type === 'file.change');
+    expect(fileChanges.length).toBeGreaterThanOrEqual(1);
+    expect(fileChanges[fileChanges.length - 1].payload.batch.provider).toBe('claude-code');
+    expect(fileChanges[fileChanges.length - 1].payload.batch.patches[0]).toEqual(expect.objectContaining({
+      filePath: 'src/app.ts',
+      beforeText: 'before',
+      afterText: 'after',
+      confidence: 'exact',
+    }));
+
+    const hiddenCalls = emittedEvents.filter((e) => e.type === 'tool.call' && e.opts?.hidden);
+    const hiddenResults = emittedEvents.filter((e) => e.type === 'tool.result' && e.opts?.hidden);
+    expect(hiddenCalls.length).toBeGreaterThanOrEqual(1);
+    expect(hiddenResults.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('preserves repeated patches for the same file within a MultiEdit batch', async () => {
+    const filePath = join(testDir, 'claude-multiedit.jsonl');
+    await writeFile(filePath, '');
+    await startWatchingFile('test_session', filePath);
+    await new Promise((r) => setTimeout(r, 200));
+
+    await appendFile(filePath, assistantToolUseWithId('MultiEdit', 'tool-multi-1', {
+      edits: [
+        { file_path: 'src/app.ts', old_string: 'one', new_string: 'two' },
+        { file_path: 'src/app.ts', old_string: 'two', new_string: 'three' },
+        { file_path: 'src/other.ts', old_string: 'x', new_string: 'y' },
+      ],
+    }));
+    await appendFile(filePath, userToolResult('tool-multi-1', {
+      type: 'update',
+      filePath: 'src/app.ts',
+      content: 'three',
+    }));
+    await new Promise((r) => setTimeout(r, 2500));
+
+    const fileChanges = emittedEvents.filter((e) => e.type === 'file.change');
+    expect(fileChanges).toHaveLength(1);
+    const patches = fileChanges[0].payload.batch.patches as Array<Record<string, unknown>>;
+    expect(patches).toHaveLength(3);
+    expect(patches.filter((patch) => patch.filePath === 'src/app.ts')).toHaveLength(2);
+    expect(patches.some((patch) => patch.filePath === 'src/other.ts')).toBe(true);
+  });
+
+  it('does not emit file.change when Claude file identity is missing', async () => {
+    const filePath = join(testDir, 'claude-bad.jsonl');
+    await writeFile(filePath, '');
+    await startWatchingFile('test_session', filePath);
+    await new Promise((r) => setTimeout(r, 200));
+
+    await appendFile(filePath, assistantToolUseWithId('Edit', 'tool-edit-bad', {
+      old_string: 'before',
+      new_string: 'after',
+    }));
+    await appendFile(filePath, userToolResult('tool-edit-bad', {
+      type: 'update',
+      content: 'after',
+    }));
+    await new Promise((r) => setTimeout(r, 2500));
+
+    expect(emittedEvents.some((e) => e.type === 'file.change')).toBe(false);
+    const toolCalls = emittedEvents.filter((e) => e.type === 'tool.call');
+    expect(toolCalls.length).toBeGreaterThan(0);
+    expect(toolCalls[toolCalls.length - 1].opts?.hidden).toBe(undefined);
+  });
+
+  it('keeps raw Claude tool rows visible when the deferred file tool errors', async () => {
+    const filePath = join(testDir, 'claude-error.jsonl');
+    await writeFile(filePath, '');
+    await startWatchingFile('test_session', filePath);
+    await new Promise((r) => setTimeout(r, 200));
+
+    await appendFile(filePath, assistantToolUseWithId('Edit', 'tool-edit-error', {
+      file_path: 'src/error.ts',
+      old_string: 'before',
+      new_string: 'after',
+    }));
+    await appendFile(filePath, JSON.stringify({
+      type: 'user',
+      timestamp: new Date().toISOString(),
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'tool-edit-error', is_error: true, content: 'permission denied' }],
+      },
+    }) + '\n');
+    await new Promise((r) => setTimeout(r, 2500));
+
+    expect(emittedEvents.some((e) => e.type === 'file.change')).toBe(false);
+    const toolCall = emittedEvents.find((e) => e.type === 'tool.call' && e.payload.tool === 'Edit');
+    const toolResult = emittedEvents.find((e) => e.type === 'tool.result' && e.payload.error === 'permission denied');
+    expect(toolCall?.opts?.hidden).not.toBe(true);
+    expect(toolResult?.opts?.hidden).not.toBe(true);
   });
 });
 

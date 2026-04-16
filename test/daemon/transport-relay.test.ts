@@ -649,6 +649,133 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(call![2]).toEqual({ output: 'done', detail: { kind: 'tool_result', output: 'done' } });
       expect(call![3].eventId).toBe('transport-tool:sess-tool:tool-1:result');
     });
+
+    it('normalizes codex-sdk fileChange payloads into hidden raw events plus file.change', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireTool('sess-codex', {
+        id: 'tool-codex-1',
+        name: 'fileChange',
+        status: 'complete',
+        detail: {
+          kind: 'fileChange',
+          input: {
+            changes: [
+              { path: 'src/a.ts', op: 'update', beforeText: 'a', afterText: 'b' },
+              { path: 'src/b.ts', op: 'create', content: 'new file' },
+            ],
+          },
+        },
+      });
+
+      const fileChange = emitMock.mock.calls.find((c) => c[1] === 'file.change');
+      expect(fileChange).toBeDefined();
+      expect(fileChange![0]).toBe('sess-codex');
+      expect(fileChange![2].batch.provider).toBe('codex-sdk');
+      expect(fileChange![2].batch.patches).toHaveLength(2);
+
+      const toolCalls = emitMock.mock.calls.filter((c) => c[1] === 'tool.call');
+      const toolResults = emitMock.mock.calls.filter((c) => c[1] === 'tool.result');
+      expect(toolCalls[0][3].hidden).toBe(true);
+      expect(toolResults[0][3].hidden).toBe(true);
+      expect(appendMock).toHaveBeenCalled();
+      expect(appendMock.mock.calls[0][1].hidden).toBe(true);
+    });
+
+    it('normalizes qwen structured write tools only when a stable file path exists', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireTool('sess-qwen', {
+        id: 'tool-qwen-1',
+        name: 'Write',
+        status: 'complete',
+        input: { file_path: 'src/qwen.ts', content: 'console.log(1);' },
+        detail: { kind: 'tool_use', input: { file_path: 'src/qwen.ts', content: 'console.log(1);' } },
+      });
+
+      expect(emitMock.mock.calls.some((c) => c[1] === 'file.change')).toBe(true);
+      const fileChange = emitMock.mock.calls.find((c) => c[1] === 'file.change');
+      expect(fileChange![2].batch.provider).toBe('qwen');
+      expect(fileChange![2].batch.patches[0]).toEqual(expect.objectContaining({
+        filePath: 'src/qwen.ts',
+        confidence: 'derived',
+      }));
+      expect(emitMock.mock.calls.find((c) => c[1] === 'tool.call')?.[3].hidden).toBe(true);
+      expect(emitMock.mock.calls.find((c) => c[1] === 'tool.result')?.[3].hidden).toBe(true);
+    });
+
+    it('defers file-like transport tools until terminal success instead of rendering a visible running row', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireTool('sess-qwen', {
+        id: 'tool-qwen-2',
+        name: 'Write',
+        status: 'running',
+        input: { file_path: 'src/qwen.ts', content: 'console.log(1);' },
+        detail: { kind: 'tool_use', input: { file_path: 'src/qwen.ts', content: 'console.log(1);' } },
+      });
+
+      expect(emitMock).not.toHaveBeenCalled();
+
+      fireTool('sess-qwen', {
+        id: 'tool-qwen-2',
+        name: 'Write',
+        status: 'complete',
+        output: 'ok',
+        detail: { kind: 'tool_result', output: 'ok' },
+      });
+
+      expect(emitMock.mock.calls.find((c) => c[1] === 'file.change')).toBeDefined();
+      expect(emitMock.mock.calls.find((c) => c[1] === 'tool.call')?.[3]?.hidden).toBe(true);
+      expect(emitMock.mock.calls.find((c) => c[1] === 'tool.result')?.[3]?.hidden).toBe(true);
+    });
+
+    it('falls back to visible raw rows when a deferred file-like transport tool ends in error', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireTool('sess-qwen', {
+        id: 'tool-qwen-3',
+        name: 'Write',
+        status: 'running',
+        input: { file_path: 'src/qwen.ts', content: 'console.log(1);' },
+        detail: { kind: 'tool_use', input: { file_path: 'src/qwen.ts', content: 'console.log(1);' } },
+      });
+
+      fireTool('sess-qwen', {
+        id: 'tool-qwen-3',
+        name: 'Write',
+        status: 'error',
+        output: 'permission denied',
+        detail: { kind: 'tool_result', output: 'permission denied' },
+      });
+
+      expect(emitMock.mock.calls.some((c) => c[1] === 'file.change')).toBe(false);
+      expect(emitMock.mock.calls.find((c) => c[1] === 'tool.call')?.[3]?.hidden).not.toBe(true);
+      expect(emitMock.mock.calls.find((c) => c[1] === 'tool.result')?.[3]?.hidden).not.toBe(true);
+    });
+
+    it('falls back to visible raw tool events when structured file normalization is unavailable', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireTool('sess-raw', {
+        id: 'tool-raw-1',
+        name: 'Bash',
+        status: 'complete',
+        input: { command: 'npm test' },
+        detail: { kind: 'tool_use', input: { command: 'npm test' } },
+      });
+
+      const call = emitMock.mock.calls.find((c) => c[1] === 'tool.call');
+      const result = emitMock.mock.calls.find((c) => c[1] === 'tool.result');
+      expect(call?.[3]?.hidden).not.toBe(true);
+      expect(result?.[3]?.hidden).not.toBe(true);
+      expect(emitMock.mock.calls.some((c) => c[1] === 'file.change')).toBe(false);
+    });
   });
 
   describe('onStatus', () => {
