@@ -1685,9 +1685,6 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       sendText = await rewritePathsForSandbox(sessionName, finalText);
     }
 
-    // Auto-inject relevant memories from local processed context
-    sendText = await injectLocalMemoryIfAvailable(sendText, sessionName);
-
     await sendShellAwareCommand(sessionName, sendText, agentType);
     const payload: Record<string, unknown> = { text };
     if (attachments.length > 0) payload.attachments = attachments;
@@ -3946,33 +3943,3 @@ async function handleMemorySearch(cmd: Record<string, unknown>, serverLink: Serv
   });
 }
 
-// ── Memory auto-inject for process agent sends ───────────────────────────
-
-const MEMORY_INJECT_MIN_QUERY_LENGTH = 10;
-const MEMORY_INJECT_MAX_RESULTS = 5;
-const MEMORY_INJECT_HEADER = '[Related past work from memory]';
-
-async function injectLocalMemoryIfAvailable(prompt: string, sessionName: string): Promise<string> {
-  // Skip very short messages (greetings, confirmations, etc.)
-  if (prompt.length < MEMORY_INJECT_MIN_QUERY_LENGTH) return prompt;
-
-  try {
-    const record = getSession(sessionName);
-    const projectId = record?.projectName ?? undefined;
-    const { searchLocalMemory } = await import('../context/memory-search.js');
-    const result = searchLocalMemory({
-      query: prompt.slice(0, 200), // use first 200 chars as search query
-      repo: projectId,
-      limit: MEMORY_INJECT_MAX_RESULTS,
-    });
-    if (result.items.length === 0) return prompt;
-
-    const memories = result.items
-      .map((item) => `- [${item.projectId}] ${item.summary.split('\n')[0].slice(0, 200)}`)
-      .join('\n');
-    return `${MEMORY_INJECT_HEADER}\n${memories}\n\n${prompt}`;
-  } catch {
-    // Non-fatal — send the original prompt if memory search fails
-    return prompt;
-  }
-}
