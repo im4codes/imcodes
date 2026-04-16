@@ -117,9 +117,9 @@ describe('MaterializationCoordinator', () => {
     const result = await coordinator.materializeTarget(target, 'manual', 500);
 
     // Structured summary with problem → resolution → key decisions
-    expect(result.summaryProjection.summary).toContain('User problem: fix the download button');
-    expect(result.summaryProjection.summary).toContain('Resolution: removed stale constants file and added retry logic');
-    expect(result.summaryProjection.summary).toContain('Key decisions: extend handle TTL to 4 hours');
+    expect(result.summaryProjection.summary).toContain('**User:** fix the download button');
+    expect(result.summaryProjection.summary).toContain('**Assistant:** removed stale constants file and added retry logic');
+    expect(result.summaryProjection.summary).toContain('extend handle TTL to 4 hours');
     expect(result.summaryProjection.content).toEqual(expect.objectContaining({
       primaryContextBackend: 'claude-code-sdk',
       primaryContextModel: 'sonnet',
@@ -151,8 +151,8 @@ describe('MaterializationCoordinator', () => {
     const result = await coordinator.materializeTarget(target, 'manual', 500);
 
     // Summary uses only eligible events
-    expect(result.summaryProjection.summary).toContain('User problem: investigate the bug');
-    expect(result.summaryProjection.summary).toContain('Resolution: found the root cause in the import');
+    expect(result.summaryProjection.summary).toContain('**User:** investigate the bug');
+    expect(result.summaryProjection.summary).toContain('**Assistant:** found the root cause in the import');
     // Tool/delta content should NOT appear in summary
     expect(result.summaryProjection.summary).not.toContain('Let me check');
     expect(result.summaryProjection.summary).not.toContain('readFile');
@@ -207,7 +207,7 @@ describe('MaterializationCoordinator', () => {
 
     const result = await coordinator.materializeTarget(target, 'manual', 500);
 
-    expect(result.summaryProjection.summary).toContain('User problem: fix the flaky build');
-    expect(result.summaryProjection.summary).toContain('Resolution: updated the import and reran the build');
+    expect(result.summaryProjection.summary).toContain('**User:** fix the flaky build');
+    expect(result.summaryProjection.summary).toContain('**Assistant:** updated the import and reran the build');
   });
 });

@@ -51,7 +51,7 @@ describe('LiveContextIngestion', () => {
     expect(queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId, limit: 10 })).toEqual([
       expect.objectContaining({
         class: 'recent_summary',
-        summary: expect.stringContaining('User problem: Investigate memory pipeline'),
+        summary: expect.stringContaining('**User:** Investigate memory pipeline'),
       }),
     ]);
     expect(getProcessedProjectionStats({ scope: 'personal', projectId: namespace.projectId })).toMatchObject({
@@ -81,8 +81,8 @@ describe('LiveContextIngestion', () => {
     await ingestion.handleTimelineEvent(makeEvent('session.state', 130, { state: 'idle' }));
 
     const [summary] = queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId, limit: 10 });
-    expect(summary?.summary).toContain('User problem: Need the final answer only');
-    expect(summary?.summary).toContain('Resolution: final answer');
+    expect(summary?.summary).toContain('**User:** Need the final answer only');
+    expect(summary?.summary).toContain('**Assistant:** final answer');
     expect(summary?.summary).not.toContain('partial');
   });
 
@@ -111,8 +111,8 @@ describe('LiveContextIngestion', () => {
     await ingestion.handleTimelineEvent(makeEvent('session.state', 140, { state: 'idle' }));
 
     const [summary] = queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId, limit: 10 });
-    expect(summary?.summary).toContain('User problem: Find the final fix');
-    expect(summary?.summary).toContain('Resolution: Use the final patch');
+    expect(summary?.summary).toContain('**User:** Find the final fix');
+    expect(summary?.summary).toContain('**Assistant:** Use the final patch');
     expect(summary?.summary).not.toContain('grep');
     expect(summary?.summary).not.toContain('intermediate output');
   });
@@ -131,7 +131,7 @@ describe('LiveContextIngestion', () => {
     expect(queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId, limit: 10 })).toEqual([
       expect.objectContaining({
         class: 'recent_summary',
-        summary: expect.stringContaining('Resolution: Deployment plan captured'),
+        summary: expect.stringContaining('**Assistant:** Deployment plan captured'),
       }),
     ]);
     expect(getProcessedProjectionStats({ scope: 'personal', projectId: namespace.projectId })).toMatchObject({

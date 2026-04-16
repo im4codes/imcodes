@@ -494,16 +494,46 @@ export function buildLocalFallbackSummary(events: LocalContextEvent[], previousS
 
   const sections: string[] = [];
   if (previousSummary) {
-    sections.push(previousSummary.trim(), '', '--- Updated ---');
+    sections.push(previousSummary.trim(), '', '--- Updated ---', '');
   }
+
+  sections.push('> ⚠️ **Structured summary unavailable** — AI compression backend is currently offline. Showing raw event transcripts below. Will retry automatically when backend recovers.');
+  sections.push('');
+
+  // Show each turn pair in full (truncated to reasonable length)
   if (turnPairs.length > 0) {
-    const latest = turnPairs[turnPairs.length - 1];
-    sections.push(`- User problem: ${truncate(latest.user, 200)}`);
-    if (latest.assistant) sections.push(`- Resolution: ${truncate(latest.assistant, 300)}`);
+    sections.push('## Conversation');
+    for (let i = 0; i < turnPairs.length; i++) {
+      const pair = turnPairs[i];
+      sections.push('');
+      sections.push(`**User:** ${truncate(pair.user, 500)}`);
+      if (pair.assistant) {
+        sections.push('');
+        sections.push(`**Assistant:** ${truncate(pair.assistant, 800)}`);
+      } else {
+        sections.push('');
+        sections.push('**Assistant:** _(no response yet — turn in progress)_');
+      }
+    }
+  } else {
+    // No user/assistant pairs — show raw event list
+    sections.push('## Staged events');
+    for (const event of events.slice(0, 10)) {
+      const content = event.content?.trim();
+      if (content) {
+        sections.push(`- \`${event.eventType}\`: ${truncate(content, 300)}`);
+      }
+    }
   }
+
   if (decisions.length > 0) {
-    sections.push(`- Key decisions: ${decisions.map((d) => truncate(d, 120)).join('; ')}`);
+    sections.push('');
+    sections.push('## Key Decisions');
+    for (const d of decisions) {
+      sections.push(`- ${truncate(d, 300)}`);
+    }
   }
+
   return sections.join('\n');
 }
 
