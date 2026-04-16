@@ -14,6 +14,7 @@ type DocumentKind = 'coding_standard' | 'architecture_guideline' | 'repo_playboo
 type RepositoryAliasReason = 'ssh-https-equivalent' | 'explicit-migration';
 
 export const sharedContextRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
+sharedContextRoutes.use('*', requireAuth());
 type SharedContextRouteContext = Context<{ Bindings: Env; Variables: { userId: string; role: string } }>;
 
 async function getEnterpriseRole(db: Env['DB'], enterpriseId: string, userId: string): Promise<EnterpriseRole | null> {
@@ -260,8 +261,6 @@ function matchesRuntimeAuthoredContextRow(
   }
   return true;
 }
-
-sharedContextRoutes.use('*', requireAuth());
 
 sharedContextRoutes.get('/enterprises/:enterpriseId/workspaces', async (c) => {
   const enterpriseId = c.req.param('enterpriseId');
