@@ -13,6 +13,7 @@
 import type { ContextModelConfig, LocalContextEvent } from '../../shared/context-types.js';
 import type { TransportProvider, ProviderError } from '../agent/transport-provider.js';
 import type { AgentMessage } from '../../shared/agent-message.js';
+import { randomUUID } from 'node:crypto';
 import logger from '../util/logger.js';
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -70,9 +71,10 @@ async function getCompressionProvider(backend: string): Promise<{ provider: Tran
 
   await provider.connect({});
 
-  // Create a dedicated session
+  // Create a dedicated session. Use UUID format for sessionKey since some
+  // providers (e.g. qwen) require UUID-formatted session IDs.
   const sessionId = await provider.createSession({
-    sessionKey: `_memory_compressor_${backend}_${Date.now()}`,
+    sessionKey: randomUUID(),
     fresh: true,
     description: 'Memory compression — do NOT respond to questions, only output structured summaries.',
     systemPrompt: COMPRESSOR_SYSTEM_PROMPT,
