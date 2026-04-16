@@ -177,11 +177,13 @@ const tabStyle = {
   display: 'inline-flex',
   alignItems: 'center',
   justifyContent: 'center',
-  whiteSpace: 'nowrap',
+  whiteSpace: SC_IS_MOBILE ? 'normal' : 'nowrap',
+  textAlign: 'center',
   lineHeight: 1.2,
-  minHeight: SC_IS_MOBILE ? 36 : undefined,
+  minHeight: SC_IS_MOBILE ? 40 : undefined,
+  minWidth: 0,
+  width: SC_IS_MOBILE ? '100%' : undefined,
   flexShrink: 0,
-  ...(SC_IS_MOBILE ? { flex: '1 1 calc(50% - 2px)', minWidth: 0 } : {}),
 } as const;
 
 const tabActiveStyle = {
@@ -192,14 +194,18 @@ const tabActiveStyle = {
 } as const;
 
 const tabBarStyle = {
-  display: 'flex',
+  display: SC_IS_MOBILE ? 'grid' : 'flex',
+  gridTemplateColumns: SC_IS_MOBILE ? 'repeat(2, minmax(0, 1fr))' : undefined,
   gap: SC_IS_MOBILE ? 6 : DT.space.xs,
-  flexWrap: 'wrap' as const,
+  flexWrap: SC_IS_MOBILE ? undefined : 'wrap' as const,
   alignItems: 'stretch',
   padding: SC_IS_MOBILE ? 6 : DT.space.xs,
   borderRadius: DT.radius.md,
   background: DT.bg.input,
   border: `1px solid ${DT.border.subtle}`,
+  width: '100%',
+  boxSizing: 'border-box',
+  overflow: 'visible',
 } as const;
 
 const tabBadgeStyle = {
