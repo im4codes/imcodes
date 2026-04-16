@@ -946,18 +946,18 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   ], [t]);
 
   const memoryTopTabs = useMemo(() => [
-    { id: 'personal' as const, label: t('sharedContext.management.memoryTabPersonal'), count: localPersonalMemory.records.length + (localPersonalMemory.pendingRecords?.length ?? 0) + cloudPersonalMemory.records.length },
-    { id: 'enterprise-memory' as const, label: t('sharedContext.management.memoryTabEnterprise'), count: sharedMemory.records.length },
+    { id: 'personal' as const, label: t('sharedContext.management.memoryTabPersonal'), count: localPersonalMemory.stats.totalRecords + (localPersonalMemory.pendingRecords?.length ?? 0) + cloudPersonalMemory.stats.totalRecords },
+    { id: 'enterprise-memory' as const, label: t('sharedContext.management.memoryTabEnterprise'), count: sharedMemory.stats.totalRecords },
   ], [t, localPersonalMemory, cloudPersonalMemory, sharedMemory]);
   const memoryPersonalSubTabs = useMemo(() => [
     { id: 'unprocessed' as const, label: t('sharedContext.management.memoryTabUnprocessed'), count: localPersonalMemory.pendingRecords?.length ?? 0 },
-    { id: 'processed' as const, label: t('sharedContext.management.memoryTabProcessed'), count: localPersonalMemory.records.length },
-    { id: 'cloud' as const, label: t('sharedContext.management.memoryTabCloud'), count: cloudPersonalMemory.records.length },
+    { id: 'processed' as const, label: t('sharedContext.management.memoryTabProcessed'), count: localPersonalMemory.stats.totalRecords },
+    { id: 'cloud' as const, label: t('sharedContext.management.memoryTabCloud'), count: cloudPersonalMemory.stats.totalRecords },
   ], [t, localPersonalMemory, cloudPersonalMemory]);
   const memoryEnterpriseSubTabs = useMemo(() => [
-    { id: 'shared-memory' as const, label: t('sharedContext.management.memoryTabSharedMemory'), count: sharedMemory.records.length },
+    { id: 'shared-memory' as const, label: t('sharedContext.management.memoryTabSharedMemory'), count: sharedMemory.stats.totalRecords },
     { id: 'authored-context' as const, label: t('sharedContext.management.memoryTabAuthoredContext') },
-  ], [t]);
+  ], [t, sharedMemory]);
 
   const refreshEnterpriseData = useCallback(async (nextEnterpriseId = enterpriseId) => {
     if (!nextEnterpriseId) {
