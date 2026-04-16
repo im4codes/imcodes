@@ -4,7 +4,7 @@
  * Storage: ~/.imcodes/timeline/{sessionName}.jsonl
  */
 
-import { mkdirSync, appendFileSync, readFileSync, writeFileSync, readdirSync, statSync, unlinkSync } from 'fs';
+import { mkdirSync, appendFileSync, readFileSync, writeFileSync, readdirSync, statSync, unlinkSync, openSync, readSync, fstatSync, closeSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import type { TimelineEvent } from './timeline-event.js';
@@ -13,6 +13,54 @@ import logger from '../util/logger.js';
 const TIMELINE_DIR = join(homedir(), '.imcodes', 'timeline');
 const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const MAX_EVENTS_PER_FILE = 5000;
+
+/**
+ * Read the last N lines from a file by reading backward from the end in chunks.
+ * Much faster than readFileSync + split for large files when only tail is needed.
+ */
+function readTailLines(filePath: string, maxLines: number): string[] {
+  let fd: number;
+  try {
+    fd = openSync(filePath, 'r');
+  } catch {
+    return [];
+  }
+
+  try {
+    const fileSize = fstatSync(fd).size;
+    if (fileSize === 0) return [];
+
+    const CHUNK_SIZE = 64 * 1024; // 64KB chunks
+    const lines: string[] = [];
+    let remaining = '';
+    let position = fileSize;
+
+    while (position > 0 && lines.length < maxLines) {
+      const readSize = Math.min(CHUNK_SIZE, position);
+      position -= readSize;
+      const buf = Buffer.alloc(readSize);
+      readSync(fd, buf, 0, readSize, position);
+      const chunk = buf.toString('utf-8') + remaining;
+      const parts = chunk.split('\n');
+      // First element is partial (or beginning of file) — save for next iteration
+      remaining = parts[0];
+      // Process complete lines from end to start
+      for (let i = parts.length - 1; i >= 1; i--) {
+        if (parts[i].length > 0) {
+          lines.push(parts[i]);
+          if (lines.length >= maxLines) break;
+        }
+      }
+    }
+    // Don't forget the final remaining piece (beginning of file)
+    if (remaining.length > 0 && lines.length < maxLines) {
+      lines.push(remaining);
+    }
+    return lines; // lines are in reverse order (newest first)
+  } finally {
+    closeSync(fd);
+  }
+}
 
 class TimelineStore {
   private initialized = false;
@@ -44,24 +92,24 @@ class TimelineStore {
   /**
    * Read events for a session, optionally filtering by epoch, afterSeq, and afterTs.
    * Returns events sorted by ts ascending.
+   *
+   * Uses reverse-read from file tail for efficiency — only reads as many lines
+   * as needed instead of loading the entire file.
    */
   read(sessionName: string, opts?: { epoch?: number; afterSeq?: number; afterTs?: number; beforeTs?: number; limit?: number }): TimelineEvent[] {
     const filePath = this.filePath(sessionName);
-    let raw: string;
-    try {
-      raw = readFileSync(filePath, 'utf-8');
-    } catch {
-      return [];
-    }
+    // Read more lines than limit to account for filtered-out events.
+    // For most queries (no epoch/afterTs filter), 2x is plenty.
+    const readLimit = Math.max((opts?.limit ?? 200) * 3, 1000);
+    const rawLines = readTailLines(filePath, readLimit);
+    if (rawLines.length === 0) return [];
 
-    const lines = raw.trimEnd().split('\n');
     const events: TimelineEvent[] = [];
 
-    // Read from the end for efficiency when limit is set
-    for (let i = lines.length - 1; i >= 0; i--) {
-      if (!lines[i]) continue;
+    // rawLines are already in reverse order (newest first) from readTailLines
+    for (const line of rawLines) {
       try {
-        const event = JSON.parse(lines[i]) as TimelineEvent;
+        const event = JSON.parse(line) as TimelineEvent;
         if (opts?.epoch !== undefined && event.epoch !== opts.epoch) continue;
         if (opts?.afterSeq !== undefined && event.seq <= opts.afterSeq) continue;
         if (opts?.afterTs !== undefined && event.ts <= opts.afterTs) continue;
@@ -79,18 +127,10 @@ class TimelineStore {
    */
   getLatest(sessionName: string): { epoch: number; seq: number } | null {
     const filePath = this.filePath(sessionName);
-    let raw: string;
-    try {
-      raw = readFileSync(filePath, 'utf-8');
-    } catch {
-      return null;
-    }
-
-    const lines = raw.trimEnd().split('\n');
-    for (let i = lines.length - 1; i >= 0; i--) {
-      if (!lines[i]) continue;
+    const lines = readTailLines(filePath, 5); // read last few lines in case some are corrupt
+    for (const line of lines) {
       try {
-        const event = JSON.parse(lines[i]) as TimelineEvent;
+        const event = JSON.parse(line) as TimelineEvent;
         return { epoch: event.epoch, seq: event.seq };
       } catch { /* skip */ }
     }
@@ -118,6 +158,23 @@ class TimelineStore {
       logger.info({ sessionName, before: lines.length, after: kept.length }, 'TimelineStore: truncated');
     } catch (err) {
       logger.debug({ err, sessionName }, 'TimelineStore: truncate write failed');
+    }
+  }
+
+  /**
+   * Truncate ALL session files that exceed MAX_EVENTS_PER_FILE.
+   * Called on daemon startup to prevent unbounded growth.
+   */
+  truncateAll(): void {
+    this.ensureDir();
+    try {
+      for (const file of readdirSync(TIMELINE_DIR)) {
+        if (!file.endsWith('.jsonl')) continue;
+        const sessionName = file.replace('.jsonl', '');
+        this.truncate(sessionName);
+      }
+    } catch (err) {
+      logger.debug({ err }, 'TimelineStore: truncateAll failed');
     }
   }
 

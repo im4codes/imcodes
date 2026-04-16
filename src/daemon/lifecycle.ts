@@ -297,8 +297,9 @@ export async function startup(): Promise<DaemonContext> {
   startCleanupTimer();
   logger.info('File transfer initialized');
 
-  // Clean up old timeline files (>7 days)
+  // Clean up old timeline files (>7 days) and truncate oversized ones
   timelineStore.cleanup();
+  timelineStore.truncateAll();
 
   const creds = await loadCredentials();
 
