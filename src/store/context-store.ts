@@ -102,7 +102,10 @@ function ensureDb(): DatabaseSyncInstance {
       summary TEXT NOT NULL,
       content_json TEXT NOT NULL,
       created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
+      updated_at INTEGER NOT NULL,
+      hit_count INTEGER NOT NULL DEFAULT 0,
+      last_used_at INTEGER,
+      status TEXT NOT NULL DEFAULT 'active'
     );
     CREATE INDEX IF NOT EXISTS idx_context_processed_local_namespace
       ON context_processed_local(namespace_key, class, updated_at DESC);
@@ -114,6 +117,10 @@ function ensureDb(): DatabaseSyncInstance {
       last_error TEXT
     );
   `);
+  // Migrate existing DBs — add columns if missing
+  try { db.exec('ALTER TABLE context_processed_local ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0'); } catch { /* already exists */ }
+  try { db.exec('ALTER TABLE context_processed_local ADD COLUMN last_used_at INTEGER'); } catch { /* already exists */ }
+  try { db.exec('ALTER TABLE context_processed_local ADD COLUMN status TEXT NOT NULL DEFAULT \'active\''); } catch { /* already exists */ }
   if (stagedReconciledForPath !== dbPath) {
     reconcileMaterializedStagedEvents(db);
     stagedReconciledForPath = dbPath;
@@ -422,6 +429,9 @@ export function listProcessedProjections(namespace: ContextNamespace, projection
     content: parseJson<Record<string, unknown>>(row.content_json, {}),
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
+    hitCount: typeof row.hit_count === 'number' ? row.hit_count : 0,
+    lastUsedAt: typeof row.last_used_at === 'number' ? row.last_used_at : undefined,
+    status: typeof row.status === 'string' ? row.status as 'active' | 'archived' : 'active',
   }));
 }
 
@@ -459,7 +469,7 @@ export interface ProcessedProjectionStats {
 
 export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}): ProcessedContextProjection[] {
   const database = ensureDb();
-  const rows = database.prepare('SELECT * FROM context_processed_local ORDER BY updated_at DESC').all() as Array<Record<string, unknown>>;
+  const rows = database.prepare("SELECT * FROM context_processed_local WHERE status != 'archived' ORDER BY updated_at DESC").all() as Array<Record<string, unknown>>;
   const normalizedQuery = filters.query?.trim().toLowerCase() ?? '';
   const filtered = rows
     .map((row) => {
@@ -473,6 +483,9 @@ export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}
         content: parseJson<Record<string, unknown>>(row.content_json, {}),
         createdAt: Number(row.created_at),
         updatedAt: Number(row.updated_at),
+        hitCount: typeof row.hit_count === 'number' ? row.hit_count : 0,
+        lastUsedAt: typeof row.last_used_at === 'number' ? row.last_used_at : undefined,
+        status: typeof row.status === 'string' ? row.status as 'active' | 'archived' : 'active',
       } satisfies ProcessedContextProjection;
     })
     .filter((projection) => !filters.scope || projection.namespace.scope === filters.scope)
@@ -485,6 +498,17 @@ export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}
     });
   const limit = typeof filters.limit === 'number' && filters.limit > 0 ? filters.limit : 50;
   return filtered.slice(0, limit);
+}
+
+/** Increment hit_count and update last_used_at for a list of recalled projection IDs. */
+export function recordMemoryHits(ids: string[]): void {
+  if (ids.length === 0) return;
+  const database = ensureDb();
+  const now = Date.now();
+  const stmt = database.prepare('UPDATE context_processed_local SET hit_count = hit_count + 1, last_used_at = ? WHERE id = ?');
+  for (const id of ids) {
+    stmt.run(now, id);
+  }
 }
 
 export function getProcessedProjectionStats(filters: ProcessedProjectionQuery = {}): ProcessedProjectionStats {
@@ -685,4 +709,43 @@ export function parseNamespaceKey(namespaceKey: string): ContextNamespace {
     userId: userId || undefined,
     projectId,
   };
+}
+
+const RECENT_SUMMARY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+/**
+ * Archive stale local memories:
+ * - recent_summary older than 30 days with hit_count=0 → status='archived'
+ * - durable_memory_candidate NEVER auto-archived
+ * - Age measured from last_used_at (falls back to updated_at if never used)
+ */
+export function pruneLocalMemory(now = Date.now()): { archived: number } {
+  const database = ensureDb();
+  const cutoff = now - RECENT_SUMMARY_MAX_AGE_MS;
+
+  const result = database.prepare(`
+    UPDATE context_processed_local
+    SET status = 'archived'
+    WHERE class = 'recent_summary'
+      AND status = 'active'
+      AND hit_count = 0
+      AND COALESCE(last_used_at, updated_at) < ?
+  `).run(cutoff);
+
+  const archived = (result as { changes: number }).changes ?? 0;
+  return { archived };
+}
+
+/**
+ * Restore a previously archived projection back to active status.
+ */
+export function restoreArchivedMemory(id: string): boolean {
+  const database = ensureDb();
+  const result = database.prepare(`
+    UPDATE context_processed_local
+    SET status = 'active'
+    WHERE id = ? AND status = 'archived'
+  `).run(id);
+
+  return ((result as { changes: number }).changes ?? 0) > 0;
 }

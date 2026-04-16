@@ -168,6 +168,8 @@ export interface ContextJobRecord {
 
 export type ProcessedContextClass = 'recent_summary' | 'durable_memory_candidate';
 
+export type ProcessedContextProjectionStatus = 'active' | 'archived';
+
 export interface ProcessedContextProjection {
   id: string;
   namespace: ContextNamespace;
@@ -177,6 +179,9 @@ export interface ProcessedContextProjection {
   content: Record<string, unknown>;
   createdAt: number;
   updatedAt: number;
+  hitCount?: number;
+  lastUsedAt?: number;
+  status?: ProcessedContextProjectionStatus;
 }
 
 export interface ContextReplicationState {

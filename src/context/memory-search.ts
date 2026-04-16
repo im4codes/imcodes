@@ -12,6 +12,7 @@ import {
   listContextEvents,
   listDirtyTargets,
   queryProcessedProjections,
+  recordMemoryHits,
 } from '../store/context-store.js';
 
 // ── Query types ──────────────────────────────────────────────────────────────
@@ -92,6 +93,12 @@ export async function searchLocalMemorySemantic(query: MemorySearchQuery): Promi
     scored.sort((a, b) => b.score - a.score);
     const limit = query.limit ?? 5;
     const topItems = scored.slice(0, limit).map((s) => s.item);
+
+    // Record hits for recalled items (spaced repetition: each recall resets decay clock)
+    const hitIds = topItems.filter((i) => i.type === 'processed').map((i) => i.id);
+    if (hitIds.length > 0) {
+      try { recordMemoryHits(hitIds); } catch { /* non-fatal */ }
+    }
 
     return {
       items: topItems,

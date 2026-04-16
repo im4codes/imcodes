@@ -914,6 +914,18 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
     results.push({ id: row.id, projectId: row.project_id, class: row.projection_class, summary: row.summary, updatedAt: row.updated_at, score: row.score, source: 'enterprise' });
   }
   results.sort((a, b) => b.score - a.score);
+  const topResults = results.slice(0, limit);
 
-  return c.json({ results: results.slice(0, limit) });
+  // Record hits for recalled projections (server-side spaced repetition)
+  const hitIds = topResults.map((r) => r.id);
+  if (hitIds.length > 0) {
+    const now = Date.now();
+    const placeholders = hitIds.map((_, i) => `$${i + 2}`).join(', ');
+    c.env.DB.execute(
+      `UPDATE shared_context_projections SET hit_count = hit_count + 1, last_used_at = $1 WHERE id IN (${placeholders})`,
+      [now, ...hitIds],
+    ).catch(() => { /* non-fatal */ });
+  }
+
+  return c.json({ results: topResults });
 });

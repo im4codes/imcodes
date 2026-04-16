@@ -32,6 +32,7 @@ import { fetchBackendSharedContextRuntimeConfig } from '../context/backend-runti
 import { setContextModelRuntimeConfig } from '../context/context-model-config.js';
 import { LiveContextIngestion } from '../context/live-context-ingestion.js';
 import { resolveTransportContextBootstrap } from '../agent/runtime-context-bootstrap.js';
+import { pruneLocalMemory } from '../context/memory-pruning.js';
 
 /** Get the last assistant.text from a session's timeline (for push notification context). */
 function getLastAssistantText(sessionName: string): string | undefined {
@@ -300,6 +301,9 @@ export async function startup(): Promise<DaemonContext> {
   // Clean up old timeline files (>7 days) and truncate oversized ones
   timelineStore.cleanup();
   timelineStore.truncateAll();
+
+  // Archive stale local memory projections (recent_summary with no hits after 30 days)
+  pruneLocalMemory();
 
   const creds = await loadCredentials();
 
