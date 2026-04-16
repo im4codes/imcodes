@@ -844,11 +844,12 @@ sharedContextRoutes.post('/document-bindings/:bindingId/deactivate', async (c) =
   return c.json({ ok: true, bindingId, status: 'inactive' });
 });
 
-// ── Memory recall — pg_trgm similarity search for auto-inject ──────────────
+// ── Memory recall — pgvector cosine search with pg_trgm fallback ────────────
 
 /**
  * POST /:id/shared-context/memory/recall
- * Searches personal + enterprise memory using pg_trgm similarity.
+ * Searches personal + enterprise memory using pgvector embedding similarity.
+ * Falls back to pg_trgm when embedding model is unavailable.
  * Used by daemon send path to auto-inject relevant memories into agent prompts.
  */
 sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
@@ -869,36 +870,70 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
   }
   const limit = typeof rawLimit === 'number' && rawLimit > 0 ? Math.min(rawLimit, 20) : 5;
 
-  // Search personal memory (user-scoped cloud pool)
-  const personalRows = await c.env.DB.query<{
-    id: string; project_id: string; projection_class: string; summary: string; updated_at: number; score: number;
-  }>(
-    `SELECT id, project_id, projection_class, summary, updated_at,
-            similarity(summary, $1) AS score
-     FROM shared_context_projections
-     WHERE scope = 'personal' AND user_id = $2
-       ${projectId ? 'AND project_id = $3' : ''}
-       AND summary % $1
-     ORDER BY score DESC
-     LIMIT $${projectId ? 4 : 3}`,
-    [query, userId, ...(projectId ? [projectId] : []), limit],
-  );
+  // Try vector search first, fall back to pg_trgm
+  const { generateEmbedding, embeddingToSql } = await import('../util/embedding.js');
+  const queryEmbedding = await generateEmbedding(query);
 
-  // Search enterprise shared memory (for all enterprises user belongs to)
-  const enterpriseRows = await c.env.DB.query<{
-    id: string; project_id: string; projection_class: string; summary: string; updated_at: number; score: number; enterprise_id: string;
-  }>(
-    `SELECT p.id, p.project_id, p.projection_class, p.summary, p.updated_at,
-            similarity(p.summary, $1) AS score, p.enterprise_id
-     FROM shared_context_projections p
-     JOIN team_members tm ON tm.team_id = p.enterprise_id AND tm.user_id = $2
-     WHERE p.scope IN ('project_shared', 'workspace_shared', 'org_shared')
-       ${projectId ? 'AND p.project_id = $3' : ''}
-       AND p.summary % $1
-     ORDER BY score DESC
-     LIMIT $${projectId ? 4 : 3}`,
-    [query, userId, ...(projectId ? [projectId] : []), limit],
-  );
+  type RecallRow = { id: string; project_id: string; projection_class: string; summary: string; updated_at: number; score: number; enterprise_id?: string };
+
+  let personalRows: RecallRow[];
+  let enterpriseRows: RecallRow[];
+
+  if (queryEmbedding) {
+    const vecSql = embeddingToSql(queryEmbedding);
+
+    // pgvector cosine distance: <=> returns distance (0 = identical), convert to similarity
+    personalRows = await c.env.DB.query<RecallRow>(
+      `SELECT p.id, p.project_id, p.projection_class, p.summary, p.updated_at,
+              1 - (e.embedding <=> $1::vector) AS score
+       FROM shared_context_projections p
+       JOIN shared_context_embeddings e ON e.source_id = p.id AND e.source_kind = 'projection'
+       WHERE p.scope = 'personal' AND p.user_id = $2
+         ${projectId ? 'AND p.project_id = $3' : ''}
+       ORDER BY e.embedding <=> $1::vector
+       LIMIT $${projectId ? 4 : 3}`,
+      [vecSql, userId, ...(projectId ? [projectId] : []), limit],
+    );
+
+    enterpriseRows = await c.env.DB.query<RecallRow>(
+      `SELECT p.id, p.project_id, p.projection_class, p.summary, p.updated_at,
+              1 - (e.embedding <=> $1::vector) AS score, p.enterprise_id
+       FROM shared_context_projections p
+       JOIN shared_context_embeddings e ON e.source_id = p.id AND e.source_kind = 'projection'
+       JOIN team_members tm ON tm.team_id = p.enterprise_id AND tm.user_id = $2
+       WHERE p.scope IN ('project_shared', 'workspace_shared', 'org_shared')
+         ${projectId ? 'AND p.project_id = $3' : ''}
+       ORDER BY e.embedding <=> $1::vector
+       LIMIT $${projectId ? 4 : 3}`,
+      [vecSql, userId, ...(projectId ? [projectId] : []), limit],
+    );
+  } else {
+    // Fallback: pg_trgm text similarity (for when embedding model is unavailable)
+    personalRows = await c.env.DB.query<RecallRow>(
+      `SELECT id, project_id, projection_class, summary, updated_at,
+              similarity(summary, $1) AS score
+       FROM shared_context_projections
+       WHERE scope = 'personal' AND user_id = $2
+         ${projectId ? 'AND project_id = $3' : ''}
+         AND summary % $1
+       ORDER BY score DESC
+       LIMIT $${projectId ? 4 : 3}`,
+      [query, userId, ...(projectId ? [projectId] : []), limit],
+    );
+
+    enterpriseRows = await c.env.DB.query<RecallRow>(
+      `SELECT p.id, p.project_id, p.projection_class, p.summary, p.updated_at,
+              similarity(p.summary, $1) AS score, p.enterprise_id
+       FROM shared_context_projections p
+       JOIN team_members tm ON tm.team_id = p.enterprise_id AND tm.user_id = $2
+       WHERE p.scope IN ('project_shared', 'workspace_shared', 'org_shared')
+         ${projectId ? 'AND p.project_id = $3' : ''}
+         AND p.summary % $1
+       ORDER BY score DESC
+       LIMIT $${projectId ? 4 : 3}`,
+      [query, userId, ...(projectId ? [projectId] : []), limit],
+    );
+  }
 
   // Merge, deduplicate by id, sort by score
   const seen = new Set<string>();
@@ -927,5 +962,5 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
     ).catch(() => { /* non-fatal */ });
   }
 
-  return c.json({ results: topResults });
+  return c.json({ results: topResults, vectorSearch: !!queryEmbedding });
 });

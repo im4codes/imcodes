@@ -574,6 +574,11 @@ async function main() {
   await ensureDefaultAdmin(db, envConfig);
   await initializeAuthNonceCleanup(db);
 
+  // Backfill embeddings for projections that don't have one yet (idempotent)
+  import('./util/embedding.js').then(({ backfillEmbeddings }) =>
+    backfillEmbeddings(db).catch((err) => logger.warn({ err }, 'Embedding backfill failed (non-fatal)'))
+  ).catch(() => {});
+
   const app = buildApp(env);
 
   // serve() returns the http.Server — attach WS upgrade to same server

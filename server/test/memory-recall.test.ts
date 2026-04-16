@@ -27,6 +27,13 @@ vi.mock('../src/security/audit.js', () => ({
   logAudit: vi.fn().mockResolvedValue(undefined),
 }));
 
+// Mock embedding module — return null to trigger pg_trgm fallback path
+vi.mock('../src/util/embedding.js', () => ({
+  generateEmbedding: vi.fn().mockResolvedValue(null),
+  embeddingToSql: vi.fn(),
+  isEmbeddingAvailable: vi.fn().mockResolvedValue(false),
+}));
+
 vi.mock('../src/security/crypto.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../src/security/crypto.js')>();
   return { ...real, randomHex: () => 'mock-id' };

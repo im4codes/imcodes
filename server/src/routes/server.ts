@@ -459,6 +459,15 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
     }
   }
 
+  // Fire-and-forget: generate and store embeddings for replicated projections
+  import('../util/embedding.js').then(({ storeProjectionEmbedding }) => {
+    for (const projection of parsed.data.projections) {
+      if (projection.summary) {
+        storeProjectionEmbedding(c.env.DB, projection.id, projection.summary).catch(() => {});
+      }
+    }
+  }).catch(() => {});
+
   return c.json({
     ok: true,
     replicatedAt: now,
