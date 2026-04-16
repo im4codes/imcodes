@@ -256,11 +256,12 @@ describe('SubSessionCard', () => {
     });
   });
 
-  it('does not render the large stop button in transport fallback input mode', () => {
+  it('renders the stop button in transport fallback input mode and sends /stop', async () => {
+    const ws = { sendSessionCommand: vi.fn() } as any;
     const { container } = render(
       <SubSessionCard
         sub={makeSubSession({ runtimeType: 'transport', state: 'running' } as any)}
-        ws={null}
+        ws={ws}
         connected={true}
         isOpen={false}
         onOpen={vi.fn()}
@@ -269,10 +270,16 @@ describe('SubSessionCard', () => {
       />,
     );
 
-    expect(container.querySelector('.subcard-stop-btn')).toBeNull();
+    const stop = container.querySelector('.subcard-stop-btn') as HTMLButtonElement | null;
+    expect(stop).not.toBeNull();
+    fireEvent.click(stop!);
+
+    await waitFor(() => {
+      expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', { sessionName: 'deck_sub_sub-card-1', text: '/stop' });
+    });
   });
 
-  it('does not render the large stop button when the card uses compact SessionControls', async () => {
+  it('renders the stop button when the card uses compact SessionControls', async () => {
     const { container } = render(
       <SubSessionCard
         sub={makeSubSession({ runtimeType: 'transport', state: 'running' } as any)}
@@ -287,8 +294,24 @@ describe('SubSessionCard', () => {
     );
 
     await waitFor(() => {
-      expect(container.querySelector('.subcard-stop-btn')).toBeNull();
+      expect(container.querySelector('.subcard-stop-btn')).not.toBeNull();
     });
+  });
+
+  it('disables the stop button for stopped transport cards', () => {
+    const { container } = render(
+      <SubSessionCard
+        sub={makeSubSession({ runtimeType: 'transport', state: 'stopped' } as any)}
+        ws={{ sendSessionCommand: vi.fn() } as any}
+        connected={true}
+        isOpen={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    expect((container.querySelector('.subcard-stop-btn') as HTMLButtonElement | null)?.disabled).toBe(true);
   });
 
   it('passes queued transport messages through to shared session controls in compact mode', async () => {
