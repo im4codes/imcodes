@@ -76,9 +76,10 @@ async function getCompressionProvider(backend: string): Promise<{ provider: Tran
     activeCompressionBackend = null;
   }
 
-  // Create new provider instance via the provider registry's factory
-  const { ensureProviderConnected } = await import('../agent/provider-registry.js');
-  const provider = await ensureProviderConnected(backend);
+  // Create a PRIVATE provider instance — NOT registered in the provider registry.
+  // This keeps compression sessions out of the user's session list.
+  const provider = await createPrivateProvider(backend);
+  await provider.connect({});
 
   // Create a dedicated session for compression
   const sessionId = await provider.createSession({
@@ -107,6 +108,33 @@ export async function shutdownCompressionProvider(): Promise<void> {
     activeCompressionProvider = null;
     activeCompressionSessionId = null;
     activeCompressionBackend = null;
+  }
+}
+
+/**
+ * Create a standalone provider instance that is NOT registered in the global
+ * provider registry. Its sessions won't appear in the user's session list.
+ */
+async function createPrivateProvider(backend: string): Promise<TransportProvider> {
+  switch (backend) {
+    case 'claude-code-sdk': {
+      const { ClaudeCodeSdkProvider } = await import('../agent/providers/claude-code-sdk.js');
+      return new ClaudeCodeSdkProvider();
+    }
+    case 'codex-sdk': {
+      const { CodexSdkProvider } = await import('../agent/providers/codex-sdk.js');
+      return new CodexSdkProvider();
+    }
+    case 'qwen': {
+      const { QwenProvider } = await import('../agent/providers/qwen.js');
+      return new QwenProvider();
+    }
+    case 'openclaw': {
+      const { OpenClawProvider } = await import('../agent/providers/openclaw.js');
+      return new OpenClawProvider();
+    }
+    default:
+      throw new Error(`Unsupported compression backend: ${backend}`);
   }
 }
 
