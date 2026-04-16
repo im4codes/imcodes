@@ -1,6 +1,6 @@
 import { Hono, type Context } from 'hono';
 import type { Env } from '../env.js';
-import { requireAuth } from '../security/authorization.js';
+import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { randomHex } from '../security/crypto.js';
 import { logAudit } from '../security/audit.js';
 import { parseRemoteUrl } from '../../../src/repo/detector.js';
@@ -842,4 +842,78 @@ sharedContextRoutes.post('/document-bindings/:bindingId/deactivate', async (c) =
   );
   await logAudit({ userId: auth.userId, action: 'shared_context.document_binding_deactivated', details: { enterpriseId: binding.enterprise_id, bindingId } }, c.env.DB);
   return c.json({ ok: true, bindingId, status: 'inactive' });
+});
+
+// ── Memory recall — pg_trgm similarity search for auto-inject ──────────────
+
+/**
+ * POST /:id/shared-context/memory/recall
+ * Searches personal + enterprise memory using pg_trgm similarity.
+ * Used by daemon send path to auto-inject relevant memories into agent prompts.
+ */
+sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id')!;
+  const role = await resolveServerRole(c.env.DB, serverId, userId);
+  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+
+  let body: { query: string; projectId?: string; limit?: number };
+  try {
+    body = await c.req.json() as typeof body;
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400);
+  }
+  const { query, projectId, limit: rawLimit } = body;
+  if (!query || typeof query !== 'string' || query.trim().length === 0) {
+    return c.json({ error: 'query_required' }, 400);
+  }
+  const limit = typeof rawLimit === 'number' && rawLimit > 0 ? Math.min(rawLimit, 20) : 5;
+
+  // Search personal memory (user-scoped cloud pool)
+  const personalRows = await c.env.DB.query<{
+    id: string; project_id: string; projection_class: string; summary: string; updated_at: number; score: number;
+  }>(
+    `SELECT id, project_id, projection_class, summary, updated_at,
+            similarity(summary, $1) AS score
+     FROM shared_context_projections
+     WHERE scope = 'personal' AND user_id = $2
+       ${projectId ? 'AND project_id = $3' : ''}
+       AND summary % $1
+     ORDER BY score DESC
+     LIMIT $${projectId ? 4 : 3}`,
+    [query, userId, ...(projectId ? [projectId] : []), limit],
+  );
+
+  // Search enterprise shared memory (for all enterprises user belongs to)
+  const enterpriseRows = await c.env.DB.query<{
+    id: string; project_id: string; projection_class: string; summary: string; updated_at: number; score: number; enterprise_id: string;
+  }>(
+    `SELECT p.id, p.project_id, p.projection_class, p.summary, p.updated_at,
+            similarity(p.summary, $1) AS score, p.enterprise_id
+     FROM shared_context_projections p
+     JOIN team_members tm ON tm.team_id = p.enterprise_id AND tm.user_id = $2
+     WHERE p.scope IN ('project_shared', 'workspace_shared', 'org_shared')
+       ${projectId ? 'AND p.project_id = $3' : ''}
+       AND p.summary % $1
+     ORDER BY score DESC
+     LIMIT $${projectId ? 4 : 3}`,
+    [query, userId, ...(projectId ? [projectId] : []), limit],
+  );
+
+  // Merge, deduplicate by id, sort by score
+  const seen = new Set<string>();
+  const results: Array<{ id: string; projectId: string; class: string; summary: string; updatedAt: number; score: number; source: 'personal' | 'enterprise' }> = [];
+  for (const row of personalRows) {
+    if (seen.has(row.id)) continue;
+    seen.add(row.id);
+    results.push({ id: row.id, projectId: row.project_id, class: row.projection_class, summary: row.summary, updatedAt: row.updated_at, score: row.score, source: 'personal' });
+  }
+  for (const row of enterpriseRows) {
+    if (seen.has(row.id)) continue;
+    seen.add(row.id);
+    results.push({ id: row.id, projectId: row.project_id, class: row.projection_class, summary: row.summary, updatedAt: row.updated_at, score: row.score, source: 'enterprise' });
+  }
+  results.sort((a, b) => b.score - a.score);
+
+  return c.json({ results: results.slice(0, limit) });
 });

@@ -707,8 +707,32 @@ export function App() {
     }
   }, [selectedServerId, sessions]);
 
-  // IDs of currently-open (non-minimized) sub-session windows
-  const [openSubIds, setOpenSubIds] = useState<Set<string>>(new Set());
+  // IDs of currently-open (non-minimized) sub-session windows.
+  // Persisted per main session in localStorage so open state survives
+  // session switches and page reloads.
+  const [openSubIds, setOpenSubIdsRaw] = useState<Set<string>>(() => {
+    try {
+      const initial = localStorage.getItem('rcc_session');
+      if (initial) {
+        const raw = localStorage.getItem(`rcc_open_subs_${initial}`);
+        if (raw) return new Set(JSON.parse(raw) as string[]);
+      }
+    } catch { /* ignore */ }
+    return new Set();
+  });
+  const setOpenSubIds = useCallback((updater: Set<string> | ((prev: Set<string>) => Set<string>)) => {
+    setOpenSubIdsRaw((prev) => {
+      const next = typeof updater === 'function' ? updater(prev) : updater;
+      // Persist open sub IDs for the current main session
+      const mainSession = localStorage.getItem('rcc_session');
+      if (mainSession) {
+        const ids = Array.from(next);
+        if (ids.length > 0) localStorage.setItem(`rcc_open_subs_${mainSession}`, JSON.stringify(ids));
+        else localStorage.removeItem(`rcc_open_subs_${mainSession}`);
+      }
+      return next;
+    });
+  }, []);
 
   // Panels pinned to the sidebar — synced to server, write-through cache
   const [pinnedPanels, setPinnedPanels] = useSyncedPreference<PinnedPanel[]>('sidebar_pinned_panels', [], 0);
@@ -921,11 +945,21 @@ export function App() {
     if (name) localStorage.setItem('rcc_session', name);
     else localStorage.removeItem('rcc_session');
     setActiveSessionState(name);
-    // Minimize all sub-session windows when switching sessions (unless explicitly kept)
-    if (!opts?.keepSubWindows) setOpenSubIds(new Set());
+    if (!opts?.keepSubWindows) {
+      // Restore saved open sub-sessions for the target main session
+      if (name) {
+        try {
+          const raw = localStorage.getItem(`rcc_open_subs_${name}`);
+          if (raw) { setOpenSubIds(new Set(JSON.parse(raw) as string[])); }
+          else { setOpenSubIds(new Set()); }
+        } catch { setOpenSubIds(new Set()); }
+      } else {
+        setOpenSubIds(new Set());
+      }
+    }
     // scroll chat to bottom on session switch (rAF gives ChatView time to mount)
     if (name) requestAnimationFrame(() => chatScrollFnsRef.current.get(name)?.());
-  }, []);
+  }, [setOpenSubIds]);
 
   const wsRef = useRef<WsClient | null>(null);
   const [daemonStats, setDaemonStats] = useState<{ daemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number } | null>(null);
