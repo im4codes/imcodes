@@ -571,17 +571,12 @@ describe('SharedContextManagementPanel', () => {
     expect((await screen.findAllByText('sharedContext.management.memoryStatDirtyTargets')).length).toBeGreaterThan(0);
     expect((await screen.findAllByText('sharedContext.management.memoryStatPendingJobs')).length).toBeGreaterThan(0);
 
-    const toggle = screen.getByRole('checkbox') as HTMLInputElement;
-    expect(toggle.checked).toBe(false);
+    const toggle = screen.getByRole('switch');
+    expect(toggle.getAttribute('aria-checked')).toBe('false');
 
+    // Click the toggle row — auto-saves
     await act(async () => {
       fireEvent.click(toggle);
-    });
-
-    expect(toggle.checked).toBe(true);
-
-    await act(async () => {
-      fireEvent.click(screen.getByText('sharedContext.management.personalSyncSave'));
     });
 
     await waitFor(() => expect(updateSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1', expect.objectContaining({

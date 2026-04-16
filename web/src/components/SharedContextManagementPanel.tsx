@@ -540,6 +540,44 @@ function SectionHeading({ title, description, action }: { title: string; descrip
   );
 }
 
+function IOSToggle({ checked, disabled }: { checked: boolean; disabled?: boolean }) {
+  const trackW = 44;
+  const trackH = 24;
+  const knobSize = 20;
+  const knobOffset = checked ? trackW - knobSize - 2 : 2;
+  return (
+    <div
+      role="switch"
+      aria-checked={checked}
+      style={{
+        position: 'relative',
+        width: trackW,
+        height: trackH,
+        borderRadius: trackH / 2,
+        background: checked ? '#34c759' : 'rgba(120,120,128,0.32)',
+        transition: 'background 0.25s ease',
+        flexShrink: 0,
+        opacity: disabled ? 0.5 : 1,
+        cursor: disabled ? 'not-allowed' : 'pointer',
+      }}
+    >
+      <div
+        style={{
+          position: 'absolute',
+          top: 2,
+          left: knobOffset,
+          width: knobSize,
+          height: knobSize,
+          borderRadius: '50%',
+          background: '#ffffff',
+          boxShadow: '0 1px 3px rgba(0,0,0,0.3), 0 1px 1px rgba(0,0,0,0.15)',
+          transition: 'left 0.25s ease',
+        }}
+      />
+    </div>
+  );
+}
+
 function MetaCard({ label, value }: { label: string; value: ComponentChildren }) {
   return (
     <div style={{ ...metaCardStyle, overflow: 'hidden', minWidth: 0 }}>
@@ -1750,20 +1788,24 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
               action={serverId ? <span style={pillStyle}>{formatServerScopeValue(serverId)}</span> : undefined}
             />
             {serverId ? (
-              <div style={rowStyle}>
-                <label style={{ ...policyOptionStyle, flex: '1 1 360px' }}>
-                  <span style={{ fontWeight: 600 }}>{t('sharedContext.management.personalSyncToggle')}</span>
-                  <span style={helperTextStyle}>{t('sharedContext.management.personalSyncHelp')}</span>
-                  <input
-                    type="checkbox"
-                    checked={processingPersonalSyncEnabled}
-                    onChange={(e) => setProcessingPersonalSyncEnabled((e.currentTarget as HTMLInputElement).checked)}
-                  />
-                </label>
-                <button
-                  style={buttonStyle}
-                  disabled={processingSaving || !processingSnapshot}
-                  onClick={() => void handleAction(t('sharedContext.notice.processingConfigSaved'), async () => {
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: DT.space.md,
+                  padding: `${DT.space.md}px ${DT.space.lg}px`,
+                  borderRadius: DT.radius.md,
+                  border: `1px solid ${DT.border.subtle}`,
+                  background: DT.bg.input,
+                  cursor: processingSaving ? 'wait' : 'pointer',
+                  transition: 'border-color 0.15s',
+                }}
+                onClick={() => {
+                  if (processingSaving || !processingSnapshot) return;
+                  const next = !processingPersonalSyncEnabled;
+                  setProcessingPersonalSyncEnabled(next);
+                  void handleAction(t('sharedContext.notice.processingConfigSaved'), async () => {
                     setProcessingSaving(true);
                     try {
                       const view = await updateSharedContextRuntimeConfig(serverId, {
@@ -1771,16 +1813,22 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                         primaryContextModel: processingPrimaryModel.trim(),
                         backupContextBackend: processingBackupModel.trim() ? processingBackupBackend : undefined,
                         backupContextModel: processingBackupModel.trim() || undefined,
-                        enablePersonalMemorySync: processingPersonalSyncEnabled,
+                        enablePersonalMemorySync: next,
                       });
                       applyProcessingSnapshot(view);
+                    } catch {
+                      setProcessingPersonalSyncEnabled(!next);
                     } finally {
                       setProcessingSaving(false);
                     }
-                  })}
-                >
-                  {processingSaving ? t('sharedContext.management.processingSaving') : t('sharedContext.management.personalSyncSave')}
-                </button>
+                  });
+                }}
+              >
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 2, flex: '1 1 auto', minWidth: 0 }}>
+                  <span style={{ fontWeight: 600, fontSize: SC_IS_MOBILE ? 13 : 14, color: DT.text.primary }}>{t('sharedContext.management.personalSyncToggle')}</span>
+                  <span style={{ ...helperTextStyle, fontSize: SC_IS_MOBILE ? 11 : 12 }}>{t('sharedContext.management.personalSyncHelp')}</span>
+                </div>
+                <IOSToggle checked={processingPersonalSyncEnabled} disabled={processingSaving} />
               </div>
             ) : (
               <div style={helperTextStyle}>{t('sharedContext.management.processingServerRequired')}</div>
