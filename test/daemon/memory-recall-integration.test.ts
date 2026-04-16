@@ -10,6 +10,14 @@ import {
   computeProjectBoost,
   type MemoryScoringInput,
 } from '../../src/context/memory-scoring.js';
+import {
+  compileAgentContextArtifact,
+  buildProviderContextPayload,
+  dispatchSharedContextSend,
+  type TransportRuntimeAssemblyInput,
+} from '../../src/agent/transport-runtime-assembly.js';
+import type { TransportProvider, ProviderCapabilities } from '../../src/agent/transport-provider.js';
+import type { RuntimeAuthoredContextBinding } from '../../shared/context-types.js';
 
 // ── Hoisted mocks ───────────────────────────────────────────────────────────
 
@@ -522,6 +530,284 @@ describe('memory recall integration', () => {
       // Strict ordering: same project > same enterprise > unrelated
       expect(sameProject).toBeGreaterThan(sameEnterprise);
       expect(sameEnterprise).toBeGreaterThan(unrelated);
+    });
+  });
+
+  // ── I.2: Transport agent send includes processed memory in payload ────────
+
+  describe('I.2: transport agent send includes processed memory in payload', () => {
+    function makeBinding(overrides: Partial<RuntimeAuthoredContextBinding> = {}): RuntimeAuthoredContextBinding {
+      return {
+        bindingId: `binding-${Math.random().toString(16).slice(2, 8)}`,
+        documentVersionId: `docv-${Math.random().toString(16).slice(2, 8)}`,
+        mode: 'required',
+        scope: 'project_shared',
+        content: 'Always use strict null checks in TypeScript code',
+        ...overrides,
+      };
+    }
+
+    function makeMockProvider(overrides: Partial<ProviderCapabilities> = {}): TransportProvider {
+      return {
+        id: 'test-provider',
+        name: 'TestProvider',
+        connectionMode: 'per-request',
+        capabilities: {
+          streaming: true,
+          toolCalling: false,
+          approval: false,
+          sessionRestore: false,
+          multiTurn: true,
+          attachments: false,
+          contextSupport: 'full-normalized-context-injection',
+          ...overrides,
+        },
+        connect: vi.fn(),
+        disconnect: vi.fn(),
+        createSession: vi.fn(),
+        send: vi.fn().mockResolvedValue(undefined),
+        endSession: vi.fn(),
+        onDelta: vi.fn(),
+        onComplete: vi.fn(),
+        onError: vi.fn(),
+      } as unknown as TransportProvider;
+    }
+
+    it('compileAgentContextArtifact includes required authored context in the compiled artifact', () => {
+      const requiredBinding = makeBinding({
+        mode: 'required',
+        content: 'Use dependency injection for all service classes',
+      });
+
+      const input: TransportRuntimeAssemblyInput = {
+        userMessage: 'Refactor the session manager',
+        authoredContext: [requiredBinding],
+      };
+
+      const artifact = compileAgentContextArtifact(input);
+
+      expect(artifact.requiredAuthoredContext).toHaveLength(1);
+      expect(artifact.requiredAuthoredContext[0]).toContain('dependency injection');
+      expect(artifact.appliedDocumentVersionIds).toContain(requiredBinding.documentVersionId);
+      expect(artifact.diagnostics).toContain(`authored-required:${requiredBinding.documentVersionId}`);
+    });
+
+    it('compileAgentContextArtifact includes advisory authored context in the compiled artifact', () => {
+      const advisoryBinding = makeBinding({
+        mode: 'advisory',
+        content: 'Prefer functional composition over class inheritance',
+      });
+
+      const input: TransportRuntimeAssemblyInput = {
+        userMessage: 'Add a new transport provider',
+        authoredContext: [advisoryBinding],
+      };
+
+      const artifact = compileAgentContextArtifact(input);
+
+      expect(artifact.advisoryAuthoredContext).toHaveLength(1);
+      expect(artifact.advisoryAuthoredContext[0]).toContain('functional composition');
+      expect(artifact.requiredAuthoredContext).toHaveLength(0);
+      expect(artifact.appliedDocumentVersionIds).toContain(advisoryBinding.documentVersionId);
+    });
+
+    it('compileAgentContextArtifact separates required and advisory bindings into distinct arrays', () => {
+      const requiredBinding = makeBinding({ mode: 'required', content: 'Required rule: always validate inputs' });
+      const advisoryBinding = makeBinding({ mode: 'advisory', content: 'Advisory: prefer async/await' });
+
+      const input: TransportRuntimeAssemblyInput = {
+        userMessage: 'Implement the auth module',
+        authoredContext: [requiredBinding, advisoryBinding],
+      };
+
+      const artifact = compileAgentContextArtifact(input);
+
+      expect(artifact.requiredAuthoredContext).toHaveLength(1);
+      expect(artifact.requiredAuthoredContext[0]).toContain('always validate inputs');
+      expect(artifact.advisoryAuthoredContext).toHaveLength(1);
+      expect(artifact.advisoryAuthoredContext[0]).toContain('prefer async/await');
+      expect(artifact.appliedDocumentVersionIds).toHaveLength(2);
+    });
+
+    it('compileAgentContextArtifact renders authored context into systemText', () => {
+      const binding = makeBinding({ mode: 'required', content: 'Follow the repository coding standard' });
+
+      const input: TransportRuntimeAssemblyInput = {
+        userMessage: 'Fix the bug',
+        description: 'You are a helpful assistant.',
+        systemPrompt: 'Be concise.',
+        authoredContext: [binding],
+      };
+
+      const artifact = compileAgentContextArtifact(input);
+
+      expect(artifact.systemText).toBeDefined();
+      expect(artifact.systemText).toContain('You are a helpful assistant.');
+      expect(artifact.systemText).toContain('Be concise.');
+      expect(artifact.systemText).toContain('Required shared context');
+      expect(artifact.systemText).toContain('Follow the repository coding standard');
+    });
+
+    it('compileAgentContextArtifact returns empty arrays when no authored context bindings provided', () => {
+      const input: TransportRuntimeAssemblyInput = {
+        userMessage: 'Hello world',
+        authoredContext: [],
+      };
+
+      const artifact = compileAgentContextArtifact(input);
+
+      expect(artifact.requiredAuthoredContext).toHaveLength(0);
+      expect(artifact.advisoryAuthoredContext).toHaveLength(0);
+      expect(artifact.appliedDocumentVersionIds).toHaveLength(0);
+    });
+
+    it('compileAgentContextArtifact filters out inactive and superseded bindings', () => {
+      const activeBinding = makeBinding({ mode: 'required', content: 'Active rule' });
+      const inactiveBinding = makeBinding({ mode: 'required', content: 'Inactive rule', active: false });
+      const supersededBinding = makeBinding({ mode: 'required', content: 'Superseded rule', superseded: true });
+
+      const input: TransportRuntimeAssemblyInput = {
+        userMessage: 'test',
+        authoredContext: [activeBinding, inactiveBinding, supersededBinding],
+      };
+
+      const artifact = compileAgentContextArtifact(input);
+
+      expect(artifact.requiredAuthoredContext).toHaveLength(1);
+      expect(artifact.requiredAuthoredContext[0]).toContain('Active rule');
+    });
+
+    it('buildProviderContextPayload embeds compiled authored context in the payload', () => {
+      const provider = makeMockProvider();
+      const binding = makeBinding({ mode: 'required', content: 'Use strict typing' });
+
+      const input: TransportRuntimeAssemblyInput = {
+        userMessage: 'Fix the type errors',
+        authoredContext: [binding],
+        namespace: { scope: 'personal', projectId: 'test-project' },
+        localProcessedFreshness: 'fresh',
+      };
+
+      const payload = buildProviderContextPayload(provider, input);
+
+      expect(payload.context.requiredAuthoredContext).toHaveLength(1);
+      expect(payload.context.requiredAuthoredContext[0]).toContain('strict typing');
+      expect(payload.userMessage).toBe('Fix the type errors');
+      expect(payload.supportClass).toBe('full-normalized-context-injection');
+    });
+
+    it('buildProviderContextPayload includes authored context diagnostics', () => {
+      const provider = makeMockProvider();
+      const binding = makeBinding({ mode: 'advisory', content: 'Prefer immutable data' });
+
+      const input: TransportRuntimeAssemblyInput = {
+        userMessage: 'Refactor the state store',
+        authoredContext: [binding],
+        namespace: { scope: 'personal', projectId: 'proj-1' },
+        localProcessedFreshness: 'fresh',
+      };
+
+      const payload = buildProviderContextPayload(provider, input);
+
+      const authoredDiagnostic = payload.context.diagnostics.find(
+        (d: string) => d.startsWith('authored-advisory:'),
+      );
+      expect(authoredDiagnostic).toBeDefined();
+    });
+
+    it('dispatchSharedContextSend sends payload with authored context via runtimeSend', async () => {
+      const provider = makeMockProvider();
+      const binding = makeBinding({ mode: 'required', content: 'Memory-recalled coding standard' });
+
+      const input: TransportRuntimeAssemblyInput = {
+        userMessage: 'Implement the feature',
+        authoredContext: [binding],
+        namespace: { scope: 'personal', projectId: 'test-project' },
+        localProcessedFreshness: 'fresh',
+      };
+
+      const result = await dispatchSharedContextSend(provider, 'session-1', input, {
+        flags: {
+          identityShadow: false,
+          localStaging: false,
+          materialization: false,
+          remoteReplication: false,
+          controlPlane: false,
+          runtimeSend: true,
+          legacyInjectionDisabled: false,
+          shadowDiagnostics: false,
+        },
+      });
+
+      expect(result.disposition).toBe('sent');
+      expect(result.payload).toBeDefined();
+      expect(result.payload!.context.requiredAuthoredContext).toHaveLength(1);
+      expect(result.payload!.context.requiredAuthoredContext[0]).toContain('Memory-recalled coding standard');
+
+      // Verify provider.send was called with the payload (not raw string)
+      expect(provider.send).toHaveBeenCalledTimes(1);
+      const sendArg = (provider.send as ReturnType<typeof vi.fn>).mock.calls[0][1];
+      expect(typeof sendArg).toBe('object');
+      expect(sendArg.context.requiredAuthoredContext[0]).toContain('Memory-recalled coding standard');
+    });
+
+    it('dispatchSharedContextSend falls back to legacy send with raw string when runtimeSend is off', async () => {
+      const provider = makeMockProvider();
+      const binding = makeBinding({ mode: 'required', content: 'Some context' });
+
+      const input: TransportRuntimeAssemblyInput = {
+        userMessage: 'Hello',
+        authoredContext: [binding],
+        namespace: { scope: 'personal', projectId: 'test-project' },
+        localProcessedFreshness: 'fresh',
+      };
+
+      const result = await dispatchSharedContextSend(provider, 'session-1', input, {
+        flags: {
+          identityShadow: false,
+          localStaging: false,
+          materialization: false,
+          remoteReplication: false,
+          controlPlane: false,
+          runtimeSend: false,
+          legacyInjectionDisabled: false,
+          shadowDiagnostics: false,
+        },
+      });
+
+      expect(result.disposition).toBe('legacy-sent');
+      expect(result.payload).toBeDefined();
+      // In legacy mode, provider.send receives the raw user message string
+      expect(provider.send).toHaveBeenCalledWith('session-1', 'Hello');
+    });
+
+    it('dispatchSharedContextSend uses resolveAuthoredContext callback when no inline bindings', async () => {
+      const provider = makeMockProvider();
+      const resolvedBinding = makeBinding({ mode: 'advisory', content: 'Resolved from callback' });
+
+      const input: TransportRuntimeAssemblyInput = {
+        userMessage: 'Do the thing',
+        namespace: { scope: 'personal', projectId: 'proj-1' },
+        localProcessedFreshness: 'fresh',
+      };
+
+      const result = await dispatchSharedContextSend(provider, 'session-1', input, {
+        flags: {
+          identityShadow: false,
+          localStaging: false,
+          materialization: false,
+          remoteReplication: false,
+          controlPlane: false,
+          runtimeSend: true,
+          legacyInjectionDisabled: false,
+          shadowDiagnostics: false,
+        },
+        resolveAuthoredContext: vi.fn().mockResolvedValue([resolvedBinding]),
+      });
+
+      expect(result.disposition).toBe('sent');
+      expect(result.payload!.context.advisoryAuthoredContext).toHaveLength(1);
+      expect(result.payload!.context.advisoryAuthoredContext[0]).toContain('Resolved from callback');
     });
   });
 });
