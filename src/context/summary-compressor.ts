@@ -1,9 +1,9 @@
 /**
- * SDK-based memory compression via transport providers.
+ * SDK-based memory compression via dedicated transport provider instances.
  *
- * Uses the daemon's existing transport provider system to compress raw events
- * into structured summaries. The provider manages SDK lifecycle, subprocess,
- * and subscription auth — no API keys needed.
+ * Creates PRIVATE provider instances (not registered in global provider registry)
+ * so compression sessions never appear in the user's session list.
+ * Each backend (claude-code-sdk, codex-sdk, qwen) uses its own subscription auth.
  *
  * Inspired by Hermes Agent's context_compressor.py:
  * - Iterative summary updates: new events merge into previous summary
@@ -46,68 +46,55 @@ export function resetFailureTracking(): void {
   lastPrimaryAttemptAt = 0;
 }
 
-// ── Dedicated compression provider session ───────────────────────────────────
-//
-// We create ONE dedicated provider instance for compression (not the user's
-// agent session provider). This provider is lazily initialized on first use
-// and reused across multiple compressions. If the backend changes in config,
-// we tear down and recreate.
+// ── Dedicated compression provider (private, NOT in global registry) ─────────
 
-let activeCompressionProvider: TransportProvider | null = null;
-let activeCompressionSessionId: string | null = null;
-let activeCompressionBackend: string | null = null;
+let activeProvider: TransportProvider | null = null;
+let activeSessionId: string | null = null;
+let activeBackend: string | null = null;
 
+/**
+ * Get or create a private provider + session for compression.
+ * The provider is lazily initialized and reused across compressions.
+ * If backend changes, old one is torn down and a new one created.
+ */
 async function getCompressionProvider(backend: string): Promise<{ provider: TransportProvider; sessionId: string }> {
-  // Reuse existing provider if backend matches
-  if (activeCompressionProvider && activeCompressionSessionId && activeCompressionBackend === backend) {
-    return { provider: activeCompressionProvider, sessionId: activeCompressionSessionId };
+  if (activeProvider && activeSessionId && activeBackend === backend) {
+    return { provider: activeProvider, sessionId: activeSessionId };
   }
 
-  // Tear down previous if backend changed
-  if (activeCompressionProvider) {
-    try {
-      if (activeCompressionSessionId) {
-        await activeCompressionProvider.endSession(activeCompressionSessionId);
-      }
-      await activeCompressionProvider.disconnect();
-    } catch { /* ignore cleanup errors */ }
-    activeCompressionProvider = null;
-    activeCompressionSessionId = null;
-    activeCompressionBackend = null;
-  }
+  // Tear down previous
+  await shutdownCompressionProvider();
 
-  // Create a PRIVATE provider instance — NOT registered in the provider registry.
-  // This keeps compression sessions out of the user's session list.
+  // Create a PRIVATE provider instance — not in the global registry.
   const provider = await createPrivateProvider(backend);
+
   await provider.connect({});
 
-  // Create a dedicated session for compression
+  // Create a dedicated session
   const sessionId = await provider.createSession({
-    sessionKey: `_memory_compressor_${backend}`,
+    sessionKey: `_memory_compressor_${backend}_${Date.now()}`,
     fresh: true,
-    description: 'Memory compression agent — do NOT respond to questions, only output structured summaries.',
+    description: 'Memory compression — do NOT respond to questions, only output structured summaries.',
     systemPrompt: COMPRESSOR_SYSTEM_PROMPT,
   });
 
-  activeCompressionProvider = provider;
-  activeCompressionSessionId = sessionId;
-  activeCompressionBackend = backend;
+  activeProvider = provider;
+  activeSessionId = sessionId;
+  activeBackend = backend;
 
   return { provider, sessionId };
 }
 
-/** Tear down the compression provider (e.g. on daemon shutdown). */
+/** Tear down the compression provider (e.g. on daemon shutdown or backend change). */
 export async function shutdownCompressionProvider(): Promise<void> {
-  if (activeCompressionProvider) {
+  if (activeProvider) {
     try {
-      if (activeCompressionSessionId) {
-        await activeCompressionProvider.endSession(activeCompressionSessionId);
-      }
-      await activeCompressionProvider.disconnect();
-    } catch { /* ignore */ }
-    activeCompressionProvider = null;
-    activeCompressionSessionId = null;
-    activeCompressionBackend = null;
+      if (activeSessionId) await activeProvider.endSession(activeSessionId);
+      await activeProvider.disconnect();
+    } catch { /* ignore cleanup errors */ }
+    activeProvider = null;
+    activeSessionId = null;
+    activeBackend = null;
   }
 }
 
@@ -142,10 +129,6 @@ const COMPRESSOR_SYSTEM_PROMPT = `You are a memory compression engine. Your outp
 
 // ── Local-only compressor (for tests / offline) ──────────────────────────────
 
-/**
- * Local-only compressor that skips SDK calls.
- * Used in tests and environments without SDK/API access.
- */
 export async function localOnlyCompressor(input: CompressionInput): Promise<CompressionResult> {
   return {
     summary: buildLocalFallbackSummary(input.events, input.previousSummary),
@@ -165,37 +148,30 @@ export async function compressWithSdk(input: CompressionInput): Promise<Compress
   if (events.length === 0) {
     return {
       summary: previousSummary ?? 'No events to compress.',
-      model: '',
-      backend: '',
-      usedBackup: false,
-      fromSdk: false,
+      model: '', backend: '', usedBackup: false, fromSdk: false,
     };
   }
 
   const prompt = buildCompressionPrompt(events, previousSummary, targetTokens);
   const now = Date.now();
 
-  // Try primary (or health-check primary if it was failing)
+  // Try primary (or health-check if it was failing)
   const shouldTryPrimary = primaryConsecutiveFailures < MAX_CONSECUTIVE_FAILURES
     || (now - lastPrimaryAttemptAt > PRIMARY_HEALTH_CHECK_INTERVAL_MS);
 
   if (shouldTryPrimary) {
     lastPrimaryAttemptAt = now;
     try {
-      const result = await sendToProvider(
-        modelConfig.primaryContextBackend,
-        prompt,
-      );
+      const result = await sendToProvider(modelConfig.primaryContextBackend, prompt);
       primaryConsecutiveFailures = 0;
       return {
-        summary: result,
-        model: modelConfig.primaryContextModel,
-        backend: modelConfig.primaryContextBackend,
-        usedBackup: false,
-        fromSdk: true,
+        summary: result, model: modelConfig.primaryContextModel,
+        backend: modelConfig.primaryContextBackend, usedBackup: false, fromSdk: true,
       };
     } catch (err) {
       primaryConsecutiveFailures++;
+      // Tear down failed provider so next attempt starts fresh
+      await shutdownCompressionProvider();
       logger.warn({ err, backend: modelConfig.primaryContextBackend, failures: primaryConsecutiveFailures },
         'Primary SDK compression failed');
     }
@@ -204,32 +180,24 @@ export async function compressWithSdk(input: CompressionInput): Promise<Compress
   // Try backup
   if (modelConfig.backupContextBackend && modelConfig.backupContextModel) {
     try {
-      const result = await sendToProvider(
-        modelConfig.backupContextBackend,
-        prompt,
-      );
+      const result = await sendToProvider(modelConfig.backupContextBackend, prompt);
       backupConsecutiveFailures = 0;
       return {
-        summary: result,
-        model: modelConfig.backupContextModel,
-        backend: modelConfig.backupContextBackend,
-        usedBackup: true,
-        fromSdk: true,
+        summary: result, model: modelConfig.backupContextModel,
+        backend: modelConfig.backupContextBackend, usedBackup: true, fromSdk: true,
       };
     } catch (err) {
       backupConsecutiveFailures++;
+      await shutdownCompressionProvider();
       logger.warn({ err, backend: modelConfig.backupContextBackend, failures: backupConsecutiveFailures },
         'Backup SDK compression failed');
     }
   }
 
-  // All SDK attempts failed — fall back to local extraction
+  // All SDK attempts failed — local fallback
   return {
     summary: buildLocalFallbackSummary(events, previousSummary),
-    model: 'local-fallback',
-    backend: 'none',
-    usedBackup: false,
-    fromSdk: false,
+    model: 'local-fallback', backend: 'none', usedBackup: false, fromSdk: false,
   };
 }
 
@@ -238,44 +206,76 @@ export async function compressWithSdk(input: CompressionInput): Promise<Compress
 const COMPRESSION_TIMEOUT_MS = 60_000;
 
 async function sendToProvider(backend: string, prompt: string): Promise<string> {
+  // claude-code-sdk: use SDK query() directly — the transport provider's spawn
+  // hook adds CLI flags that cause exit code 1 in one-shot compression mode.
+  // SDK query() handles subprocess lifecycle and subscription auth correctly.
+  if (backend === 'claude-code-sdk') {
+    return sendViaSdkQuery(prompt);
+  }
+
+  // Other backends: use the transport provider's send/onComplete flow.
   const { provider, sessionId } = await getCompressionProvider(backend);
 
   return new Promise<string>((resolve, reject) => {
     const timer = setTimeout(() => {
-      offComplete();
-      offError();
+      offComplete(); offError();
       reject(new Error(`Compression timed out after ${COMPRESSION_TIMEOUT_MS}ms`));
     }, COMPRESSION_TIMEOUT_MS);
 
     const offComplete = provider.onComplete((sid: string, message: AgentMessage) => {
       if (sid !== sessionId) return;
-      clearTimeout(timer);
-      offComplete();
-      offError();
+      clearTimeout(timer); offComplete(); offError();
       const text = typeof message.content === 'string' ? message.content.trim() : '';
-      if (!text) {
-        reject(new Error('Provider returned empty response'));
-        return;
-      }
+      if (!text) { reject(new Error('Provider returned empty response')); return; }
       resolve(text);
     });
 
     const offError = provider.onError((sid: string, error: ProviderError) => {
       if (sid !== sessionId) return;
-      clearTimeout(timer);
-      offComplete();
-      offError();
+      clearTimeout(timer); offComplete(); offError();
       reject(new Error(`Provider error: ${error.code} — ${error.message}`));
     });
 
-    // Send the compression prompt
     provider.send(sessionId, prompt).catch((err) => {
-      clearTimeout(timer);
-      offComplete();
-      offError();
+      clearTimeout(timer); offComplete(); offError();
       reject(err);
     });
   });
+}
+
+/**
+ * Use Claude Agent SDK query() directly for one-shot compression.
+ * Strips CLAUDECODE env to avoid nested-session detection.
+ * SDK manages subprocess lifecycle and subscription auth.
+ */
+async function sendViaSdkQuery(prompt: string): Promise<string> {
+  const { query } = await import('@anthropic-ai/claude-agent-sdk');
+  const savedClaudeCode = process.env.CLAUDECODE;
+  delete process.env.CLAUDECODE;
+  try {
+    let result = '';
+    for await (const msg of query({
+      prompt: COMPRESSOR_SYSTEM_PROMPT + '\n\n' + prompt,
+      options: { maxTurns: 1 },
+    })) {
+      if (msg.type === 'assistant') {
+        const content = (msg as { message?: { content?: unknown } }).message?.content;
+        if (Array.isArray(content)) {
+          for (const block of content) {
+            if (typeof block === 'object' && block && 'type' in block && block.type === 'text' && 'text' in block) {
+              result += String(block.text);
+            }
+          }
+        } else if (typeof content === 'string') {
+          result += content;
+        }
+      }
+    }
+    if (!result.trim()) throw new Error('SDK returned empty response');
+    return result.trim();
+  } finally {
+    if (savedClaudeCode !== undefined) process.env.CLAUDECODE = savedClaudeCode;
+  }
 }
 
 // ── Prompt construction ──────────────────────────────────────────────────────
@@ -340,7 +340,7 @@ function serializeEvents(events: LocalContextEvent[]): string {
   return parts.join('\n\n');
 }
 
-// ── Local fallback (no SDK available) ────────────────────────────────────────
+// ── Local fallback ───────────────────────────────────────────────────────────
 
 export function buildLocalFallbackSummary(events: LocalContextEvent[], previousSummary?: string): string {
   const turnPairs = buildTurnPairs(events);
@@ -350,19 +350,13 @@ export function buildLocalFallbackSummary(events: LocalContextEvent[], previousS
     .filter((v): v is string => !!v);
 
   const sections: string[] = [];
-
   if (previousSummary) {
-    sections.push(previousSummary.trim());
-    sections.push('');
-    sections.push('--- Updated ---');
+    sections.push(previousSummary.trim(), '', '--- Updated ---');
   }
-
   if (turnPairs.length > 0) {
     const latest = turnPairs[turnPairs.length - 1];
     sections.push(`- User problem: ${truncate(latest.user, 200)}`);
-    if (latest.assistant) {
-      sections.push(`- Resolution: ${truncate(latest.assistant, 300)}`);
-    }
+    if (latest.assistant) sections.push(`- Resolution: ${truncate(latest.assistant, 300)}`);
   }
   if (decisions.length > 0) {
     sections.push(`- Key decisions: ${decisions.map((d) => truncate(d, 120)).join('; ')}`);
