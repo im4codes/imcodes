@@ -256,12 +256,11 @@ describe('SubSessionCard', () => {
     });
   });
 
-  it('renders a transport stop icon button and sends /stop from the fallback input path', async () => {
-    const ws = { sendSessionCommand: vi.fn() } as any;
+  it('does not render the large stop button in transport fallback input mode', () => {
     const { container } = render(
       <SubSessionCard
         sub={makeSubSession({ runtimeType: 'transport', state: 'running' } as any)}
-        ws={ws}
+        ws={null}
         connected={true}
         isOpen={false}
         onOpen={vi.fn()}
@@ -270,21 +269,14 @@ describe('SubSessionCard', () => {
       />,
     );
 
-    const stopBtn = container.querySelector('.subcard-stop-btn') as HTMLButtonElement;
-    expect(stopBtn).toBeTruthy();
-    fireEvent.click(stopBtn);
-
-    await waitFor(() => {
-      expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', { sessionName: 'deck_sub_sub-card-1', text: '/stop' });
-    });
+    expect(container.querySelector('.subcard-stop-btn')).toBeNull();
   });
 
-  it('keeps the transport stop icon when the card uses compact SessionControls', async () => {
-    const ws = { sendSessionCommand: vi.fn() } as any;
+  it('does not render the large stop button when the card uses compact SessionControls', async () => {
     const { container } = render(
       <SubSessionCard
         sub={makeSubSession({ runtimeType: 'transport', state: 'running' } as any)}
-        ws={ws}
+        ws={null}
         connected={true}
         isOpen={false}
         quickData={{} as any}
@@ -294,12 +286,8 @@ describe('SubSessionCard', () => {
       />,
     );
 
-    const stopBtn = container.querySelector('.subcard-stop-btn') as HTMLButtonElement;
-    expect(stopBtn).toBeTruthy();
-    fireEvent.click(stopBtn);
-
     await waitFor(() => {
-      expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', { sessionName: 'deck_sub_sub-card-1', text: '/stop' });
+      expect(container.querySelector('.subcard-stop-btn')).toBeNull();
     });
   });
 

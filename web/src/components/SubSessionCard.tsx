@@ -73,7 +73,6 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const isShell = sub.type === 'shell' || sub.type === 'script';
-  const isTransport = sub.runtimeType === 'transport';
   const { events, refreshing } = isShell ? { events: [], refreshing: false } : useTimeline(sub.sessionName, ws, serverId);
   const termScrollRef = useRef<(() => void) | null>(null);
   const chatScrollRef = useRef<(() => void) | null>(null);
@@ -120,14 +119,6 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     cardInputRef.current!.value = '';
     requestAnimationFrame(() => { forceFollowLatest(); });
   }, [ws, connected, sub.sessionName, forceFollowLatest]);
-
-  const handleTransportStop = useCallback(() => {
-    if (!ws || !connected || sub.state === 'stopped' || sub.state === 'stopping') return;
-    try {
-      ws.sendSessionCommand('send', { sessionName: sub.sessionName, text: '/stop' });
-    } catch { /* ignore */ }
-  }, [ws, connected, sub.sessionName, sub.state]);
-
 
   const busy = useMemo(() => isVisuallyBusy(sub.state, !!getActiveThinkingTs(events)), [events, sub.state]);
   // Preview cards always follow the latest content.
@@ -273,21 +264,6 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
       {/* Compact input — reuses SessionControls with @picker, ⚡, 📎, paste upload */}
       <div class="subcard-input-area" onClick={(e) => e.stopPropagation()}>
         <div class="subcard-input-row">
-          {isTransport && (
-            <button
-              class="subcard-stop-btn"
-              type="button"
-              title={t('session.stop')}
-              aria-label={t('session.stop')}
-              disabled={!connected || sub.state === 'stopped' || sub.state === 'stopping'}
-              onClick={(e) => {
-                e.stopPropagation();
-                handleTransportStop();
-              }}
-            >
-              ■
-            </button>
-          )}
           <div class="subcard-input-main">
             {quickData ? (
               <SessionControls
