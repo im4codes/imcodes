@@ -224,6 +224,9 @@ export interface ContextMemoryRecordView {
   projectionClass: 'recent_summary' | 'durable_memory_candidate';
   sourceEventCount: number;
   updatedAt: number;
+  hitCount?: number;
+  lastUsedAt?: number;
+  status?: ProcessedContextProjectionStatus;
 }
 
 export interface ContextPendingEventView {

@@ -1036,7 +1036,14 @@
       "memoryProcessedDescription": "這裡顯示的是壓縮後的處理結果。只有本地視圖會同時顯示未處理原始事件；雲端與企業視圖只顯示處理後摘要。",
       "memoryProcessedEmptyPending": "目前還沒有處理後摘要，下方只顯示待處理原始事件。",
       "memoryExpand": "展開",
-      "memoryCollapse": "收起"
+      "memoryCollapse": "收起",
+      "memoryRecalls": "{{count}} 次召回",
+      "memoryNeverRecalled": "從未被召回",
+      "memoryLastRecalled": "上次召回：{{time}}",
+      "memoryArchive": "封存",
+      "memoryRestore": "還原",
+      "memoryArchived": "已封存",
+      "memoryShowArchived": "顯示已封存"
     },
     "diagnostics": {
       "title": "診斷",

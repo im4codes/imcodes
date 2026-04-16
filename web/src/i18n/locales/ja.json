@@ -1035,7 +1035,14 @@
       "memoryProcessedDescription": "These entries are compressed processed memory, not raw chat transcripts.",
       "memoryProcessedEmptyPending": "No processed summaries yet. Only pending raw events are available below.",
       "memoryExpand": "Expand",
-      "memoryCollapse": "Collapse"
+      "memoryCollapse": "Collapse",
+      "memoryRecalls": "{{count}} 回呼出",
+      "memoryNeverRecalled": "未使用",
+      "memoryLastRecalled": "最終呼出: {{time}}",
+      "memoryArchive": "アーカイブ",
+      "memoryRestore": "復元",
+      "memoryArchived": "アーカイブ済み",
+      "memoryShowArchived": "アーカイブを表示"
     },
     "diagnostics": {
       "title": "Diagnostics",

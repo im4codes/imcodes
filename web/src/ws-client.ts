@@ -89,7 +89,9 @@ export type ServerMessage =
     stats: import('../../shared/context-types.js').ContextMemoryStatsView;
     records: Array<import('../../shared/context-types.js').ContextMemoryRecordView>;
     pendingRecords?: Array<import('../../shared/context-types.js').ContextPendingEventView>;
-  };
+  }
+  | { type: 'memory.archive_response'; requestId?: string; success: boolean; error?: string }
+  | { type: 'memory.restore_response'; requestId?: string; success: boolean; error?: string };
 
 export type {
   TimelineEvent,

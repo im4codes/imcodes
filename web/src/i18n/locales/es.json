@@ -1035,7 +1035,14 @@
       "memoryProcessedDescription": "These entries are compressed processed memory, not raw chat transcripts.",
       "memoryProcessedEmptyPending": "No processed summaries yet. Only pending raw events are available below.",
       "memoryExpand": "Expand",
-      "memoryCollapse": "Collapse"
+      "memoryCollapse": "Collapse",
+      "memoryRecalls": "{{count}} recuperaciones",
+      "memoryNeverRecalled": "Nunca recuperado",
+      "memoryLastRecalled": "Última recuperación: {{time}}",
+      "memoryArchive": "Archivar",
+      "memoryRestore": "Restaurar",
+      "memoryArchived": "Archivado",
+      "memoryShowArchived": "Mostrar archivados"
     },
     "diagnostics": {
       "title": "Diagnostics",

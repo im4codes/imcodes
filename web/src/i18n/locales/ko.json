@@ -1035,7 +1035,14 @@
       "memoryProcessedDescription": "These entries are compressed processed memory, not raw chat transcripts.",
       "memoryProcessedEmptyPending": "No processed summaries yet. Only pending raw events are available below.",
       "memoryExpand": "Expand",
-      "memoryCollapse": "Collapse"
+      "memoryCollapse": "Collapse",
+      "memoryRecalls": "{{count}}회 호출",
+      "memoryNeverRecalled": "호출된 적 없음",
+      "memoryLastRecalled": "마지막 호출: {{time}}",
+      "memoryArchive": "보관",
+      "memoryRestore": "복원",
+      "memoryArchived": "보관됨",
+      "memoryShowArchived": "보관된 항목 표시"
     },
     "diagnostics": {
       "title": "Diagnostics",

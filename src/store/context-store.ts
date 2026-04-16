@@ -454,6 +454,7 @@ export interface ProcessedProjectionQuery {
   projectionClass?: ProcessedContextClass;
   query?: string;
   limit?: number;
+  includeArchived?: boolean;
 }
 
 export interface ProcessedProjectionStats {
@@ -469,7 +470,10 @@ export interface ProcessedProjectionStats {
 
 export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}): ProcessedContextProjection[] {
   const database = ensureDb();
-  const rows = database.prepare("SELECT * FROM context_processed_local WHERE status != 'archived' ORDER BY updated_at DESC").all() as Array<Record<string, unknown>>;
+  const sql = filters.includeArchived
+    ? 'SELECT * FROM context_processed_local ORDER BY updated_at DESC'
+    : "SELECT * FROM context_processed_local WHERE status != 'archived' ORDER BY updated_at DESC";
+  const rows = database.prepare(sql).all() as Array<Record<string, unknown>>;
   const normalizedQuery = filters.query?.trim().toLowerCase() ?? '';
   const filtered = rows
     .map((row) => {
@@ -745,6 +749,20 @@ export function restoreArchivedMemory(id: string): boolean {
     UPDATE context_processed_local
     SET status = 'active'
     WHERE id = ? AND status = 'archived'
+  `).run(id);
+
+  return ((result as { changes: number }).changes ?? 0) > 0;
+}
+
+/**
+ * Archive an active projection (manual archive by user).
+ */
+export function archiveMemory(id: string): boolean {
+  const database = ensureDb();
+  const result = database.prepare(`
+    UPDATE context_processed_local
+    SET status = 'archived'
+    WHERE id = ? AND status = 'active'
   `).run(id);
 
   return ((result as { changes: number }).changes ?? 0) > 0;

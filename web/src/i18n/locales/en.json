@@ -1036,7 +1036,14 @@
       "memoryProcessedDescription": "These entries are compressed processed memory. Local views show processed summaries beside local pending events; cloud and enterprise views contain processed summaries only.",
       "memoryProcessedEmptyPending": "No processed summaries yet. Only pending raw events are available below.",
       "memoryExpand": "Expand",
-      "memoryCollapse": "Collapse"
+      "memoryCollapse": "Collapse",
+      "memoryRecalls": "{{count}} recalls",
+      "memoryNeverRecalled": "Never recalled",
+      "memoryLastRecalled": "Last recalled: {{time}}",
+      "memoryArchive": "Archive",
+      "memoryRestore": "Restore",
+      "memoryArchived": "Archived",
+      "memoryShowArchived": "Show archived"
     },
     "diagnostics": {
       "title": "Diagnostics",

@@ -1036,7 +1036,14 @@
       "memoryProcessedDescription": "这里展示的是压缩后的处理结果。只有本地视图会同时显示未处理原始事件；云端和企业视图只显示处理后的摘要。",
       "memoryProcessedEmptyPending": "还没有处理后的摘要，下面只显示待处理原始事件。",
       "memoryExpand": "展开",
-      "memoryCollapse": "收起"
+      "memoryCollapse": "收起",
+      "memoryRecalls": "{{count}} 次召回",
+      "memoryNeverRecalled": "从未被召回",
+      "memoryLastRecalled": "上次召回：{{time}}",
+      "memoryArchive": "归档",
+      "memoryRestore": "恢复",
+      "memoryArchived": "已归档",
+      "memoryShowArchived": "显示已归档"
     },
     "diagnostics": {
       "title": "诊断",

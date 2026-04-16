@@ -497,6 +497,54 @@ function formatServerScopeValue(serverId?: string): string {
   return `${serverId.slice(0, 8)}…${serverId.slice(-4)}`;
 }
 
+function formatRelativeTime(ts: number): string {
+  const diff = Date.now() - ts;
+  if (diff < 60_000) return '<1m ago';
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
+  return `${Math.floor(diff / 86_400_000)}d ago`;
+}
+
+const archiveBadgeStyle = {
+  display: 'inline-flex',
+  alignItems: 'center',
+  padding: '2px 7px',
+  borderRadius: DT.radius.pill,
+  background: 'rgba(251,191,36,0.12)',
+  border: `1px solid rgba(251,191,36,0.3)`,
+  color: DT.text.warn,
+  fontSize: 10,
+  fontWeight: 600,
+  whiteSpace: 'nowrap',
+} as const;
+
+const recallChipStyle = {
+  display: 'inline-flex',
+  alignItems: 'center',
+  padding: '2px 7px',
+  borderRadius: DT.radius.pill,
+  background: 'rgba(239,68,68,0.10)',
+  border: `1px solid rgba(239,68,68,0.25)`,
+  color: DT.text.error,
+  fontSize: 10,
+  fontWeight: 600,
+  whiteSpace: 'nowrap',
+} as const;
+
+const archiveRestoreButtonStyle = {
+  background: 'transparent',
+  color: DT.text.muted,
+  border: `1px solid ${DT.border.subtle}`,
+  borderRadius: DT.radius.sm,
+  padding: '2px 8px',
+  fontSize: 10,
+  fontWeight: 500,
+  cursor: 'pointer',
+  transition: 'color 0.15s, border-color 0.15s',
+  whiteSpace: 'nowrap',
+  flexShrink: 0,
+} as const;
+
 type KindOption = SharedDocument['kind'];
 type ManagementTab = 'enterprise' | 'members' | 'projects' | 'knowledge' | 'processing' | 'memory';
 type MemoryTopTab = 'personal' | 'enterprise-memory';
@@ -744,10 +792,18 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [memoryTopTab, setMemoryTopTab] = useState<MemoryTopTab>('personal');
   const [memoryPersonalSubTab, setMemoryPersonalSubTab] = useState<MemoryPersonalSubTab>('processed');
   const [memoryEnterpriseSubTab, setMemoryEnterpriseSubTab] = useState<MemoryEnterpriseSubTab>('shared-memory');
+  const [showArchived, setShowArchived] = useState(false);
 
-  const renderProcessedMemoryRecords = useCallback((view: ContextMemoryView) => {
-    const recentRecords = view.records.filter((record) => record.projectionClass === 'recent_summary');
-    const durableRecords = view.records.filter((record) => record.projectionClass === 'durable_memory_candidate');
+  const renderProcessedMemoryRecords = useCallback((
+    view: ContextMemoryView,
+    opts?: { allowArchiveRestore?: boolean; onArchive?: (id: string) => void; onRestore?: (id: string) => void },
+  ) => {
+    const allowActions = opts?.allowArchiveRestore ?? false;
+    const onArchive = opts?.onArchive;
+    const onRestore = opts?.onRestore;
+    const visibleRecords = showArchived ? view.records : view.records.filter((r) => r.status !== 'archived');
+    const recentRecords = visibleRecords.filter((record) => record.projectionClass === 'recent_summary');
+    const durableRecords = visibleRecords.filter((record) => record.projectionClass === 'durable_memory_candidate');
     const sections = [
       {
         key: 'recent' as const,
@@ -765,7 +821,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       key: 'recent' | 'durable';
       title: string;
       description: string;
-      records: typeof view.records;
+      records: typeof visibleRecords;
     }>;
 
     if (sections.length === 0) {
@@ -778,41 +834,79 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
           <div key={section.key} style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
             <SectionHeading title={section.title} description={section.description} />
             <div style={resourceListStyle}>
-              {section.records.map((record) => (
-                <div key={record.id} style={resourceCardStyle}>
-                  {/* Compact meta: inline chips */}
-                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
-                    <span style={metaChipStyle} title={record.projectId}>{record.projectId.split('/').pop()}</span>
-                    <span style={metaChipStyle}>{getMemoryRecordClassLabel(t, record.projectionClass)}</span>
-                    <span style={metaChipStyle}>{record.sourceEventCount} {t('sharedContext.management.memoryRecordSources').toLowerCase()}</span>
-                    <span style={{ color: DT.text.muted, fontSize: 10, marginLeft: 'auto', flexShrink: 0 }}>
-                      {new Date(record.updatedAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
-                    </span>
+              {section.records.map((record) => {
+                const isArchived = record.status === 'archived';
+                return (
+                  <div key={record.id} style={{ ...resourceCardStyle, ...(isArchived ? { opacity: 0.6 } : {}) }}>
+                    {/* Compact meta: inline chips */}
+                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                      <span style={metaChipStyle} title={record.projectId}>{record.projectId.split('/').pop()}</span>
+                      <span style={metaChipStyle}>{getMemoryRecordClassLabel(t, record.projectionClass)}</span>
+                      <span style={metaChipStyle}>{record.sourceEventCount} {t('sharedContext.management.memoryRecordSources').toLowerCase()}</span>
+                      {isArchived ? (
+                        <span style={archiveBadgeStyle}>{t('sharedContext.management.memoryArchived')}</span>
+                      ) : null}
+                      {(record.hitCount ?? 0) > 0 ? (
+                        <span style={recallChipStyle}>{t('sharedContext.management.memoryRecalls', { count: record.hitCount })}</span>
+                      ) : null}
+                      <span style={{ color: DT.text.muted, fontSize: 10, marginLeft: 'auto', flexShrink: 0 }}>
+                        {new Date(record.updatedAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                      </span>
+                    </div>
+                    {/* Recall time + archive/restore action row */}
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                      <span style={{ color: DT.text.muted, fontSize: 10 }}>
+                        {record.lastUsedAt
+                          ? t('sharedContext.management.memoryLastRecalled', { time: formatRelativeTime(record.lastUsedAt) })
+                          : t('sharedContext.management.memoryNeverRecalled')}
+                      </span>
+                      {allowActions ? (
+                        <span style={{ marginLeft: 'auto' }}>
+                          {isArchived ? (
+                            <button
+                              type="button"
+                              style={archiveRestoreButtonStyle}
+                              onClick={() => onRestore?.(record.id)}
+                            >
+                              {t('sharedContext.management.memoryRestore')}
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              style={archiveRestoreButtonStyle}
+                              onClick={() => onArchive?.(record.id)}
+                            >
+                              {t('sharedContext.management.memoryArchive')}
+                            </button>
+                          )}
+                        </span>
+                      ) : null}
+                    </div>
+                    {/* Summary with integrated expand */}
+                    {record.summary ? (
+                      <MemoryRecordContent
+                        id={record.id}
+                        text={record.summary}
+                        expanded={expandedMemoryRecordIds.has(record.id)}
+                        onToggle={() => {
+                          setExpandedMemoryRecordIds((current) => {
+                            const next = new Set(current);
+                            if (next.has(record.id)) next.delete(record.id);
+                            else next.add(record.id);
+                            return next;
+                          });
+                        }}
+                      />
+                    ) : null}
                   </div>
-                  {/* Summary with integrated expand */}
-                  {record.summary ? (
-                    <MemoryRecordContent
-                      id={record.id}
-                      text={record.summary}
-                      expanded={expandedMemoryRecordIds.has(record.id)}
-                      onToggle={() => {
-                        setExpandedMemoryRecordIds((current) => {
-                          const next = new Set(current);
-                          if (next.has(record.id)) next.delete(record.id);
-                          else next.add(record.id);
-                          return next;
-                        });
-                      }}
-                    />
-                  ) : null}
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         ))}
       </div>
     );
-  }, [expandedMemoryRecordIds, t]);
+  }, [expandedMemoryRecordIds, t, showArchived]);
 
   const selectedDocument = useMemo(
     () => documents.find((entry) => entry.id === selectedDocumentId) ?? null,
@@ -1043,6 +1137,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
           type: 'shared_context.personal_memory.query',
           requestId,
           ...queryInput,
+          includeArchived: showArchived,
         });
       } else {
         setLocalPersonalMemory(EMPTY_MEMORY_VIEW);
@@ -1065,12 +1160,34 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     } finally {
       setMemoryLoading(false);
     }
-  }, [enterpriseId, memoryProjectId, memoryProjectionClass, memoryQuery, serverId, ws]);
+  }, [enterpriseId, memoryProjectId, memoryProjectionClass, memoryQuery, serverId, ws, showArchived]);
 
   useEffect(() => {
     if (activeTab !== 'memory') return;
     void loadMemoryViews();
   }, [activeTab, loadMemoryViews]);
+
+  const handleMemoryArchive = useCallback((id: string) => {
+    if (!ws) return;
+    const requestId = crypto.randomUUID();
+    ws.send({ type: 'memory.archive', requestId, id });
+    const unsub = ws.onMessage((msg) => {
+      if (msg.type !== 'memory.archive_response' || msg.requestId !== requestId) return;
+      unsub();
+      if (msg.success) void loadMemoryViews();
+    });
+  }, [ws, loadMemoryViews]);
+
+  const handleMemoryRestore = useCallback((id: string) => {
+    if (!ws) return;
+    const requestId = crypto.randomUUID();
+    ws.send({ type: 'memory.restore', requestId, id });
+    const unsub = ws.onMessage((msg) => {
+      if (msg.type !== 'memory.restore_response' || msg.requestId !== requestId) return;
+      unsub();
+      if (msg.success) void loadMemoryViews();
+    });
+  }, [ws, loadMemoryViews]);
 
   const handleProcessingPrimaryBackendChange = useCallback((nextBackend: SharedContextRuntimeBackend) => {
     setProcessingPrimaryBackend((prevBackend) => {
@@ -1954,8 +2071,21 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     detail={`${t('sharedContext.management.memoryStatProjects')}: ${localPersonalMemory.stats.projectCount}`}
                   />
                 </div>
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: DT.space.sm,
+                    cursor: 'pointer',
+                    userSelect: 'none',
+                  }}
+                  onClick={() => setShowArchived((v) => !v)}
+                >
+                  <IOSToggle checked={showArchived} disabled={false} />
+                  <span style={{ ...helperTextStyle, fontSize: 12 }}>{t('sharedContext.management.memoryShowArchived')}</span>
+                </div>
                 {localPersonalMemory.records.length > 0
-                  ? renderProcessedMemoryRecords(localPersonalMemory)
+                  ? renderProcessedMemoryRecords(localPersonalMemory, { allowArchiveRestore: true, onArchive: handleMemoryArchive, onRestore: handleMemoryRestore })
                   : <div style={helperTextStyle}>{t('sharedContext.management.memoryProcessedEmptyPending')}</div>}
               </div>
             ) : null}

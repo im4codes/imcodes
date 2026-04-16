@@ -754,6 +754,12 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case 'memory.search':
       void handleMemorySearch(cmd, serverLink);
       break;
+    case 'memory.archive':
+      void handleMemoryArchive(cmd, serverLink);
+      break;
+    case 'memory.restore':
+      void handleMemoryRestore(cmd, serverLink);
+      break;
     case 'fs.ls':
       void handleFsList(cmd, serverLink);
       break;
@@ -3888,6 +3894,7 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
     : undefined;
   const query = typeof cmd.query === 'string' ? cmd.query.trim() : '';
   const limit = Math.max(1, Math.min(100, typeof cmd.limit === 'number' ? cmd.limit : 20));
+  const includeArchived = cmd.includeArchived === true;
   const stats = getProcessedProjectionStats({
     scope: 'personal',
     projectId: projectId || undefined,
@@ -3900,6 +3907,7 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
     projectionClass,
     query: query || undefined,
     limit,
+    includeArchived,
   }).map((projection) => ({
     id: projection.id,
     scope: projection.namespace.scope,
@@ -3908,6 +3916,9 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
     projectionClass: projection.class,
     sourceEventCount: projection.sourceEventIds.length,
     updatedAt: projection.updatedAt,
+    hitCount: projection.hitCount ?? 0,
+    lastUsedAt: projection.lastUsedAt,
+    status: projection.status ?? 'active' as const,
   }));
   const pendingRecords = queryPendingContextEvents({
     scope: 'personal',
@@ -3944,6 +3955,30 @@ async function handleMemorySearch(cmd: Record<string, unknown>, serverLink: Serv
     items: result.items,
     stats: result.stats,
   });
+}
+
+async function handleMemoryArchive(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
+  const id = typeof cmd.id === 'string' ? cmd.id : '';
+  if (!id) {
+    serverLink.send({ type: 'memory.archive_response', requestId, success: false, error: 'Missing id' });
+    return;
+  }
+  const { archiveMemory } = await import('../store/context-store.js');
+  const success = archiveMemory(id);
+  serverLink.send({ type: 'memory.archive_response', requestId, success });
+}
+
+async function handleMemoryRestore(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
+  const id = typeof cmd.id === 'string' ? cmd.id : '';
+  if (!id) {
+    serverLink.send({ type: 'memory.restore_response', requestId, success: false, error: 'Missing id' });
+    return;
+  }
+  const { restoreArchivedMemory } = await import('../store/context-store.js');
+  const success = restoreArchivedMemory(id);
+  serverLink.send({ type: 'memory.restore_response', requestId, success });
 }
 
 // ── Process agent memory injection (text prepend) ────────────────────────
