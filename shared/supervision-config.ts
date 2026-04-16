@@ -1,0 +1,396 @@
+import type { SharedContextRuntimeBackend } from './context-types.js';
+import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../src/shared/models/options.js';
+import { QWEN_MODEL_IDS } from './qwen-models.js';
+import {
+  DEFAULT_CONTEXT_MODEL_BY_BACKEND,
+  SHARED_CONTEXT_RUNTIME_BACKENDS,
+  getDefaultSharedContextModelForBackend,
+  inferSharedContextRuntimeBackend,
+  isKnownSharedContextModelForBackend,
+  normalizeSharedContextRuntimeBackend,
+} from './shared-context-runtime-config.js';
+import { COMBO_PRESETS } from './p2p-modes.js';
+import { PROCESS_SESSION_AGENT_TYPES, TRANSPORT_SESSION_AGENT_TYPES } from './agent-types.js';
+
+export const SUPERVISION_CONTRACT_IDS = {
+  DECISION: 'supervision_decision_v1',
+  DECISION_REPAIR: 'supervision_decision_repair_v1',
+  TASK_RUN_STATUS: 'task_run_status_v1',
+  OPENSPEC_IMPLEMENTATION_AUDIT: 'openspec_implementation_audit_v1',
+  CONTEXTUAL_AUDIT: 'contextual_audit_v1',
+  REWORK_BRIEF: 'rework_brief_v1',
+} as const;
+
+export const SUPERVISION_MODE = {
+  OFF: 'off',
+  SUPERVISED: 'supervised',
+  SUPERVISED_AUDIT: 'supervised_audit',
+} as const;
+
+export const SUPERVISION_TRANSPORT_CONFIG_KEY = 'supervision' as const;
+export const SUPERVISION_USER_DEFAULT_PREF_KEY = 'supervision.user_default' as const;
+
+export const SUPERVISION_SUPPORTED_BACKENDS = SHARED_CONTEXT_RUNTIME_BACKENDS;
+export const SUPERVISION_SUPPORTED_TARGET_SESSION_TYPES = TRANSPORT_SESSION_AGENT_TYPES;
+export const SUPERVISION_UNSUPPORTED_TARGET_SESSION_TYPES = PROCESS_SESSION_AGENT_TYPES;
+
+const SUPERVISION_AUDIT_MODE_COMPONENTS = new Set(['audit', 'review', 'plan']);
+const SUPERVISION_AUDIT_MODE_COMBOS = COMBO_PRESETS
+  .filter(({ pipeline }) => pipeline.length > 0)
+  .filter(({ pipeline }) => pipeline.every((mode) => SUPERVISION_AUDIT_MODE_COMPONENTS.has(mode)))
+  .filter(({ pipeline }) => pipeline.some((mode) => mode === 'audit' || mode === 'review'))
+  .map(({ key }) => key) as SupervisionAuditMode[];
+
+export const SUPERVISION_AUDIT_MODES = [
+  'audit',
+  'review',
+  ...SUPERVISION_AUDIT_MODE_COMBOS,
+] as SupervisionAuditMode[];
+
+export const SUPERVISION_DEFAULT_TIMEOUT_MS = 12_000;
+export const SUPERVISION_DEFAULT_MAX_PARSE_RETRIES = 1;
+export const SUPERVISION_DEFAULT_AUDIT_MODE: SupervisionAuditMode = 'audit';
+export const SUPERVISION_DEFAULT_MAX_AUDIT_LOOPS = 2;
+export const SUPERVISION_DEFAULT_PROMPT_VERSION = SUPERVISION_CONTRACT_IDS.DECISION;
+export const SUPERVISION_DEFAULT_TASK_RUN_PROMPT_VERSION = SUPERVISION_CONTRACT_IDS.TASK_RUN_STATUS;
+export const DEFAULT_SUPERVISION_TIMEOUT_MS = SUPERVISION_DEFAULT_TIMEOUT_MS;
+
+export const TASK_RUN_STATUS_MARKERS = {
+  COMPLETE: '<!-- IMCODES_TASK_RUN: COMPLETE -->',
+  NEEDS_INPUT: '<!-- IMCODES_TASK_RUN: NEEDS_INPUT -->',
+  BLOCKED: '<!-- IMCODES_TASK_RUN: BLOCKED -->',
+} as const;
+
+export const AUDIT_VERDICT_MARKERS = {
+  PASS: '<!-- P2P_VERDICT: PASS -->',
+  REWORK: '<!-- P2P_VERDICT: REWORK -->',
+} as const;
+
+export type SupervisionMode = typeof SUPERVISION_MODE[keyof typeof SUPERVISION_MODE];
+export type SupervisionAuditMode = 'audit' | 'review' | 'audit>plan' | 'review>plan' | 'audit>review>plan';
+export type TaskRunStatusMarker = keyof typeof TASK_RUN_STATUS_MARKERS;
+export type AuditVerdictMarker = keyof typeof AUDIT_VERDICT_MARKERS;
+export type TaskRunTerminalState = 'complete' | 'needs_input' | 'blocked';
+export type AuditVerdict = 'PASS' | 'REWORK';
+export type SessionSupervisionSnapshotIssue =
+  | 'invalid_shape'
+  | 'invalid_mode'
+  | 'missing_backend'
+  | 'invalid_backend'
+  | 'missing_model'
+  | 'invalid_model'
+  | 'invalid_timeout'
+  | 'invalid_prompt_version'
+  | 'invalid_max_parse_retries'
+  | 'missing_audit_mode'
+  | 'invalid_audit_mode'
+  | 'invalid_max_audit_loops'
+  | 'invalid_task_run_prompt_version';
+export interface ParsedTaskRunTerminalState {
+  state: TaskRunTerminalState | null;
+  markerCount: number;
+}
+
+export interface ParsedAuditVerdict {
+  verdict: AuditVerdict | null;
+  markerCount: number;
+}
+
+export interface SupervisorDefaultConfig {
+  backend: SharedContextRuntimeBackend;
+  model: string;
+  timeoutMs: number;
+  promptVersion: string;
+}
+
+export interface SessionSupervisionSnapshot extends SupervisorDefaultConfig {
+  mode: SupervisionMode;
+  maxParseRetries: number;
+  auditMode: SupervisionAuditMode;
+  maxAuditLoops: number;
+  taskRunPromptVersion: string;
+}
+
+export type SupervisionSessionSnapshot = SessionSupervisionSnapshot;
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function trimString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function normalizePositiveInteger(value: unknown, fallback: number, minimum = 1): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
+  const int = Math.floor(value);
+  return int >= minimum ? int : fallback;
+}
+
+export function isSupportedSupervisionBackend(value: string | null | undefined): value is SharedContextRuntimeBackend {
+  const trimmed = trimString(value);
+  return !!trimmed && SUPERVISION_SUPPORTED_BACKENDS.includes(trimmed as SharedContextRuntimeBackend);
+}
+
+export function isSupportedSupervisionTargetSessionType(value: string | null | undefined): boolean {
+  const trimmed = trimString(value);
+  return !!trimmed && SUPERVISION_SUPPORTED_TARGET_SESSION_TYPES.includes(trimmed as typeof TRANSPORT_SESSION_AGENT_TYPES[number]);
+}
+
+export function isSupportedSupervisionAuditMode(value: string | null | undefined): value is SupervisionAuditMode {
+  const trimmed = trimString(value);
+  return !!trimmed && (SUPERVISION_AUDIT_MODES as readonly string[]).includes(trimmed);
+}
+
+export function normalizeSupervisionMode(
+  value: unknown,
+  fallback: SupervisionMode = SUPERVISION_MODE.OFF,
+): SupervisionMode {
+  if (value === SUPERVISION_MODE.OFF || value === SUPERVISION_MODE.SUPERVISED || value === SUPERVISION_MODE.SUPERVISED_AUDIT) {
+    return value;
+  }
+  return fallback;
+}
+
+export function normalizeSupervisorDefaultConfig(
+  input: Partial<SupervisorDefaultConfig> | null | undefined,
+  fallback?: Partial<SupervisorDefaultConfig> | null,
+): SupervisorDefaultConfig {
+  const merged = {
+    ...(fallback ?? {}),
+    ...(input ?? {}),
+  } as Partial<SupervisorDefaultConfig>;
+
+  const normalizedBackend = normalizeSharedContextRuntimeBackend(merged.backend)
+    ?? inferSharedContextRuntimeBackend(merged.model)
+    ?? SUPERVISION_SUPPORTED_BACKENDS[0];
+  const rawModel = trimString(merged.model);
+  const model = rawModel && isKnownSharedContextModelForBackend(normalizedBackend, rawModel)
+    ? rawModel
+    : getDefaultSharedContextModelForBackend(normalizedBackend);
+  return {
+    backend: normalizedBackend,
+    model,
+    timeoutMs: normalizePositiveInteger(merged.timeoutMs, SUPERVISION_DEFAULT_TIMEOUT_MS, 1),
+    promptVersion: trimString(merged.promptVersion) ?? SUPERVISION_DEFAULT_PROMPT_VERSION,
+  };
+}
+
+export function parseSupervisorDefaultConfig(value: unknown): SupervisorDefaultConfig | null {
+  if (!isPlainObject(value)) return null;
+  return normalizeSupervisorDefaultConfig(value);
+}
+
+export function getSessionSupervisionSnapshotIssues(
+  value: unknown,
+): SessionSupervisionSnapshotIssue[] {
+  if (!isPlainObject(value)) return ['invalid_shape'];
+  const record = value as Record<string, unknown>;
+  const mode = record.mode;
+  if (mode !== SUPERVISION_MODE.OFF && mode !== SUPERVISION_MODE.SUPERVISED && mode !== SUPERVISION_MODE.SUPERVISED_AUDIT) {
+    return ['invalid_mode'];
+  }
+  if (mode === SUPERVISION_MODE.OFF) return [];
+
+  const issues: SessionSupervisionSnapshotIssue[] = [];
+  const backend = trimString(record.backend);
+  if (!backend) issues.push('missing_backend');
+  else if (!isSupportedSupervisionBackend(backend)) issues.push('invalid_backend');
+
+  const model = trimString(record.model);
+  if (!model) {
+    issues.push('missing_model');
+  } else if (backend && isSupportedSupervisionBackend(backend) && backend !== 'openclaw' && !isKnownSharedContextModelForBackend(backend, model)) {
+    issues.push('invalid_model');
+  }
+
+  if (typeof record.timeoutMs !== 'number' || !Number.isFinite(record.timeoutMs) || record.timeoutMs <= 0) {
+    issues.push('invalid_timeout');
+  }
+  if (!trimString(record.promptVersion)) issues.push('invalid_prompt_version');
+  if (typeof record.maxParseRetries !== 'number' || !Number.isFinite(record.maxParseRetries) || Math.floor(record.maxParseRetries) < 1) {
+    issues.push('invalid_max_parse_retries');
+  }
+
+  if (mode === SUPERVISION_MODE.SUPERVISED_AUDIT) {
+    if (record.auditMode == null || record.auditMode === '') issues.push('missing_audit_mode');
+    else if (!isSupportedSupervisionAuditMode(String(record.auditMode))) issues.push('invalid_audit_mode');
+    if (typeof record.maxAuditLoops !== 'number' || !Number.isFinite(record.maxAuditLoops) || Math.floor(record.maxAuditLoops) < 1) {
+      issues.push('invalid_max_audit_loops');
+    }
+    if (!trimString(record.taskRunPromptVersion)) issues.push('invalid_task_run_prompt_version');
+  }
+
+  return issues;
+}
+
+export function normalizeSessionSupervisionSnapshot(
+  input: Partial<SessionSupervisionSnapshot> | null | undefined,
+  fallback?: Partial<SessionSupervisionSnapshot> | null,
+): SessionSupervisionSnapshot {
+  const merged = {
+    ...(fallback ?? {}),
+    ...(input ?? {}),
+  } as Partial<SessionSupervisionSnapshot>;
+
+  const supervisorDefaults = normalizeSupervisorDefaultConfig(merged, fallback);
+  const mode = normalizeSupervisionMode(merged.mode, SUPERVISION_MODE.OFF);
+  const maxParseRetries = normalizePositiveInteger(merged.maxParseRetries, SUPERVISION_DEFAULT_MAX_PARSE_RETRIES, 1);
+  const auditMode = isSupportedSupervisionAuditMode(merged.auditMode) ? merged.auditMode : SUPERVISION_DEFAULT_AUDIT_MODE;
+  const maxAuditLoops = normalizePositiveInteger(merged.maxAuditLoops, SUPERVISION_DEFAULT_MAX_AUDIT_LOOPS, 1);
+  return {
+    ...supervisorDefaults,
+    mode,
+    maxParseRetries,
+    auditMode,
+    maxAuditLoops,
+    taskRunPromptVersion: trimString(merged.taskRunPromptVersion) ?? SUPERVISION_DEFAULT_TASK_RUN_PROMPT_VERSION,
+  };
+}
+
+export function parseSessionSupervisionSnapshot(value: unknown): SessionSupervisionSnapshot | null {
+  if (getSessionSupervisionSnapshotIssues(value).length > 0) return null;
+  return normalizeSessionSupervisionSnapshot(value as Partial<SessionSupervisionSnapshot>);
+}
+
+export function extractSessionSupervisionSnapshot(
+  transportConfig: Record<string, unknown> | null | undefined,
+): SessionSupervisionSnapshot | null {
+  if (!transportConfig || typeof transportConfig !== 'object' || Array.isArray(transportConfig)) return null;
+  return parseSessionSupervisionSnapshot(transportConfig[SUPERVISION_TRANSPORT_CONFIG_KEY]);
+}
+
+export function embedSessionSupervisionSnapshot(
+  transportConfig: Record<string, unknown> | null | undefined,
+  snapshot: Partial<SessionSupervisionSnapshot> | null | undefined,
+): Record<string, unknown> {
+  const normalized = normalizeSessionSupervisionSnapshot(snapshot);
+  return {
+    ...(transportConfig ?? {}),
+    [SUPERVISION_TRANSPORT_CONFIG_KEY]: normalized,
+  };
+}
+
+export function readSupervisionSnapshotFromTransportConfig(
+  transportConfig: Record<string, unknown> | null | undefined,
+): SessionSupervisionSnapshot {
+  return extractSessionSupervisionSnapshot(transportConfig)
+    ?? normalizeSessionSupervisionSnapshot({ mode: SUPERVISION_MODE.OFF });
+}
+
+export function hasInvalidSessionSupervisionSnapshot(
+  transportConfig: Record<string, unknown> | null | undefined,
+): boolean {
+  if (!transportConfig || typeof transportConfig !== 'object' || Array.isArray(transportConfig)) return false;
+  if (!(SUPERVISION_TRANSPORT_CONFIG_KEY in transportConfig)) return false;
+  return parseSessionSupervisionSnapshot(transportConfig[SUPERVISION_TRANSPORT_CONFIG_KEY]) == null;
+}
+
+export function buildTransportConfigWithSupervision(
+  transportConfig: Record<string, unknown> | null | undefined,
+  snapshot: Partial<SessionSupervisionSnapshot> | null | undefined,
+): Record<string, unknown> | null {
+  const normalized = normalizeSessionSupervisionSnapshot(snapshot);
+  if (normalized.mode === SUPERVISION_MODE.OFF) {
+    if (!transportConfig) return null;
+    const next = { ...transportConfig };
+    delete next[SUPERVISION_TRANSPORT_CONFIG_KEY];
+    return Object.keys(next).length > 0 ? next : null;
+  }
+  return embedSessionSupervisionSnapshot(transportConfig, normalized);
+}
+
+export function getSupportedSupervisionBackendOptions(): readonly SharedContextRuntimeBackend[] {
+  return SUPERVISION_SUPPORTED_BACKENDS;
+}
+
+export function getSupervisionModelOptions(backend: SharedContextRuntimeBackend): readonly string[] {
+  switch (backend) {
+    case 'claude-code-sdk':
+      return CLAUDE_CODE_MODEL_IDS;
+    case 'codex-sdk':
+      return CODEX_MODEL_IDS;
+    case 'qwen':
+      return QWEN_MODEL_IDS;
+    case 'openclaw':
+      return [];
+  }
+}
+
+export function resolveSupervisionModelForBackend(
+  nextBackend: SharedContextRuntimeBackend,
+  currentModel: string,
+  previousBackend?: SharedContextRuntimeBackend,
+): string {
+  const trimmed = currentModel.trim();
+  if (!trimmed) return getDefaultSharedContextModelForBackend(nextBackend);
+  if (previousBackend && trimmed === getDefaultSharedContextModelForBackend(previousBackend)) {
+    return getDefaultSharedContextModelForBackend(nextBackend);
+  }
+  if (nextBackend === 'openclaw') return trimmed;
+  if (!isKnownSharedContextModelForBackend(nextBackend, trimmed)) {
+    return getDefaultSharedContextModelForBackend(nextBackend);
+  }
+  return trimmed;
+}
+
+export function getAutomationAuditModeOptions(): readonly SupervisionAuditMode[] {
+  return SUPERVISION_AUDIT_MODES;
+}
+
+export const SUPERVISION_MODES = Object.values(SUPERVISION_MODE) as readonly SupervisionMode[];
+export const SUPERVISION_PROMPT_VERSION = SUPERVISION_DEFAULT_PROMPT_VERSION;
+export const SUPERVISION_REPAIR_PROMPT_VERSION = SUPERVISION_CONTRACT_IDS.DECISION_REPAIR;
+export const TASK_RUN_PROMPT_VERSION = SUPERVISION_DEFAULT_TASK_RUN_PROMPT_VERSION;
+export const DEFAULT_SUPERVISION_AUDIT_MODE = SUPERVISION_DEFAULT_AUDIT_MODE;
+export const DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS = SUPERVISION_DEFAULT_MAX_AUDIT_LOOPS;
+export const DEFAULT_SUPERVISION_MAX_PARSE_RETRIES = SUPERVISION_DEFAULT_MAX_PARSE_RETRIES;
+
+export function parseTaskRunTerminalStateDetailsFromText(text: string): ParsedTaskRunTerminalState {
+  const matches = [...text.matchAll(/<!--\s*IMCODES_TASK_RUN:\s*(COMPLETE|NEEDS_INPUT|BLOCKED)\s*-->/g)];
+  if (matches.length !== 1) return { state: null, markerCount: matches.length };
+  const state = matches[0]?.[1];
+  switch (state) {
+    case 'COMPLETE':
+      return { state: 'complete', markerCount: 1 };
+    case 'NEEDS_INPUT':
+      return { state: 'needs_input', markerCount: 1 };
+    case 'BLOCKED':
+      return { state: 'blocked', markerCount: 1 };
+    default:
+      return { state: null, markerCount: matches.length };
+  }
+}
+
+export function parseTaskRunTerminalStateFromText(text: string): TaskRunTerminalState | null {
+  return parseTaskRunTerminalStateDetailsFromText(text).state;
+}
+
+export function parseAuditVerdictDetailsFromText(text: string): ParsedAuditVerdict {
+  const matches = [...text.matchAll(/<!--\s*P2P_VERDICT:\s*(PASS|REWORK)\s*-->/g)];
+  if (matches.length !== 1) return { verdict: null, markerCount: matches.length };
+  const verdict = matches[0]?.[1];
+  switch (verdict) {
+    case 'PASS':
+      return { verdict: 'PASS', markerCount: 1 };
+    case 'REWORK':
+      return { verdict: 'REWORK', markerCount: 1 };
+    default:
+      return { verdict: null, markerCount: matches.length };
+  }
+}
+
+export function parseAuditVerdictFromText(text: string): AuditVerdict | null {
+  return parseAuditVerdictDetailsFromText(text).verdict;
+}
+
+export function getSupportedSupervisionAuditModes(): readonly SupervisionAuditMode[] {
+  return SUPERVISION_AUDIT_MODES;
+}
+
+export function isSupportedSupervisionSessionType(value: string | null | undefined): boolean {
+  return isSupportedSupervisionTargetSessionType(value);
+}
+
+export const DEFAULT_SUPERVISION_BACKEND: SharedContextRuntimeBackend = SUPERVISION_SUPPORTED_BACKENDS[0];
+export const DEFAULT_SUPERVISION_MODEL_BY_BACKEND: Record<SharedContextRuntimeBackend, string> = DEFAULT_CONTEXT_MODEL_BY_BACKEND;

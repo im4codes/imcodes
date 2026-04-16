@@ -759,7 +759,7 @@ export function App() {
   // z-index per sub-session window
   const [subZIndexes, setSubZIndexes] = useState<Map<string, number>>(new Map());
   const [showSubDialog, setShowSubDialog] = useState(false);
-  const [settingsTarget, setSettingsTarget] = useState<{ sessionName: string; subId?: string; label: string; description: string; cwd: string; type: string; parentSession?: string | null } | null>(null);
+  const [settingsTarget, setSettingsTarget] = useState<{ sessionName: string; subId?: string; label: string; description: string; cwd: string; type: string; parentSession?: string | null; transportConfig?: Record<string, unknown> | null } | null>(null);
 
   // Derive focused (topmost) sub-session from z-indexes + open set
   const focusedSubId = useMemo(() => {
@@ -1347,6 +1347,7 @@ export function App() {
             quotaUsageLabel: s.quotaUsageLabel,
             quotaMeta: s.quotaMeta ?? existing?.quotaMeta,
             effort: s.effort ?? existing?.effort,
+            transportConfig: s.transportConfig ?? existing?.transportConfig ?? null,
             transportPendingMessages: (s.state === 'queued' || s.state === 'running')
               ? (() => {
                   const nextPending = extractTransportPendingMessages((s as { transportPendingMessages?: unknown }).transportPendingMessages);
@@ -2828,7 +2829,7 @@ export function App() {
                 onHistory={(apply) => registerHistoryApplyer(s.name, apply)}
                 onStopProject={handleStopProject}
                 onRenameSession={() => setRenameRequest(s.name)}
-                onSettings={() => setSettingsTarget({ sessionName: s.name, label: s.label || '', description: s.description || '', cwd: s.projectDir || '', type: s.agentType || '', parentSession: null })}
+                onSettings={() => setSettingsTarget({ sessionName: s.name, label: s.label || '', description: s.description || '', cwd: s.projectDir || '', type: s.agentType || '', parentSession: null, transportConfig: s.transportConfig ?? null })}
                 onAfterAction={focusTerminal}
                 mobileFileBrowserOpen={s.name === activeSession ? showMobileFileBrowser : false}
                 onMobileFileBrowserClose={() => setShowMobileFileBrowser(false)}
@@ -3407,7 +3408,7 @@ export function App() {
                 const label = prompt('Rename sub-session:', sub.label ?? '');
                 if (label !== null) renameSubSession(sub.id, label);
               }}
-              onSettings={() => setSettingsTarget({ sessionName: sub.sessionName, subId: sub.id, label: sub.label || '', description: sub.description || '', cwd: sub.cwd || '', type: sub.type, parentSession: sub.parentSession })}
+              onSettings={() => setSettingsTarget({ sessionName: sub.sessionName, subId: sub.id, label: sub.label || '', description: sub.description || '', cwd: sub.cwd || '', type: sub.type, parentSession: sub.parentSession, transportConfig: sub.transportConfig ?? null })}
               zIndex={subZIndexes.get(sub.id) ?? 6000}
               onFocus={() => bringSubToFront(sub.id)}
               onPin={(vm) => pinPanel('subsession', { sessionName: sub.sessionName, viewMode: vm, label: sub.label, serverId: selectedServerId }, () => setOpenSubIds((prev) => { const s = new Set(prev); s.delete(sub.id); return s; }))}
@@ -3501,6 +3502,7 @@ export function App() {
           cwd={settingsTarget.cwd}
           type={settingsTarget.type}
           parentSession={settingsTarget.parentSession}
+          transportConfig={settingsTarget.transportConfig}
           onClose={() => setSettingsTarget(null)}
           onSaved={(fields) => {
             if (settingsTarget.subId) {
@@ -3511,6 +3513,7 @@ export function App() {
                 label: fields.label !== undefined ? (fields.label ?? null) : undefined,
                 description: fields.description !== undefined ? (fields.description ?? null) : undefined,
                 cwd: fields.cwd !== undefined ? (fields.cwd ?? null) : undefined,
+                transportConfig: fields.transportConfig !== undefined ? fields.transportConfig : undefined,
               });
             } else {
               // Main session: update sessions list with saved fields
@@ -3524,6 +3527,7 @@ export function App() {
                 if (fields.label !== undefined) updated.label = fields.label ?? null;
                 if (fields.description !== undefined) updated.description = fields.description ?? null;
                 if (fields.cwd !== undefined) updated.projectDir = fields.cwd ?? updated.projectDir;
+                if (fields.transportConfig !== undefined) updated.transportConfig = fields.transportConfig;
                 return updated;
               }));
             }

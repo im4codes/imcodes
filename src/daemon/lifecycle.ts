@@ -10,6 +10,7 @@ import { notifySessionIdle, listP2pRuns, serializeP2pRun } from './p2p-orchestra
 import { handlePreviewBinaryFrame } from './preview-relay.js';
 import { buildSessionList } from './session-list.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import { supervisionAutomation } from './supervision-automation.js';
 import { timelineStore } from './timeline-store.js';
 import { startHookServer, drainQueue } from './hook-server.js';
 import { initTempFileStore } from '../store/temp-file-store.js';
@@ -660,6 +661,9 @@ export async function startup(): Promise<DaemonContext> {
   hookServer = hookResult.server;
   // Rewrite all CC hook scripts with the actual port (may differ from last run)
   await setupCCHooks().catch((e) => logger.warn({ err: e }, 'CC hook setup failed'));
+
+  supervisionAutomation.init();
+  supervisionAutomation.setServerLink(serverLink);
 
   ctx = { config, serverLink, persistBinding, removeBinding, sendSessionEvent };
   setupSignalHandlers();

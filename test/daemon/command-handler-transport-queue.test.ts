@@ -1,6 +1,19 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { getSessionMock, getTransportRuntimeMock, emitMock, relaunchSessionWithSettingsMock, stopTransportRuntimeSessionMock, resizeSessionMock, terminalSubscribeMock, terminalRequestSnapshotMock } = vi.hoisted(() => ({
+const {
+  getSessionMock,
+  getTransportRuntimeMock,
+  emitMock,
+  relaunchSessionWithSettingsMock,
+  stopTransportRuntimeSessionMock,
+  resizeSessionMock,
+  terminalSubscribeMock,
+  terminalRequestSnapshotMock,
+  supervisionDecideMock,
+  queueTaskIntentMock,
+  updateQueuedTaskIntentMock,
+  removeQueuedTaskIntentMock,
+} = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
   getTransportRuntimeMock: vi.fn(),
   emitMock: vi.fn(),
@@ -9,6 +22,10 @@ const { getSessionMock, getTransportRuntimeMock, emitMock, relaunchSessionWithSe
   resizeSessionMock: vi.fn(),
   terminalSubscribeMock: vi.fn(() => vi.fn()),
   terminalRequestSnapshotMock: vi.fn(),
+  supervisionDecideMock: vi.fn(async () => ({ decision: 'approve', reason: 'ok', confidence: 0.9 })),
+  queueTaskIntentMock: vi.fn(),
+  updateQueuedTaskIntentMock: vi.fn(),
+  removeQueuedTaskIntentMock: vi.fn(),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -123,6 +140,24 @@ vi.mock('../../src/util/imc-dir.js', () => ({
   imcSubDir: vi.fn((dir: string, sub: string) => `${dir}/.imc/${sub}`),
 }));
 
+vi.mock('../../src/daemon/supervision-broker.js', () => ({
+  supervisionBroker: {
+    decide: supervisionDecideMock,
+  },
+}));
+
+vi.mock('../../src/daemon/supervision-automation.js', () => ({
+  supervisionAutomation: {
+    init: vi.fn(),
+    setServerLink: vi.fn(),
+    cancelSession: vi.fn(),
+    queueTaskIntent: queueTaskIntentMock,
+    updateQueuedTaskIntent: updateQueuedTaskIntentMock,
+    removeQueuedTaskIntent: removeQueuedTaskIntentMock,
+    registerTaskIntent: vi.fn(),
+  },
+}));
+
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
 
 const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -137,6 +172,7 @@ describe('handleWebCommand transport queue behavior', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    supervisionDecideMock.mockResolvedValue({ decision: 'approve', reason: 'ok', confidence: 0.9 });
     getSessionMock.mockReturnValue({
       name: 'deck_transport_brain',
       projectName: 'transport',
@@ -364,6 +400,131 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-after-restart', status: 'accepted' });
   });
 
+  it('appends the heavy-mode task-run contract only for eligible task messages', async () => {
+    const transportSend = vi.fn(() => 'sent');
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+      transportConfig: {
+        supervision: {
+          mode: 'supervised_audit',
+          backend: 'codex-sdk',
+          model: 'gpt-5.3-codex-spark',
+          timeoutMs: 12_000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+          auditMode: 'audit',
+          maxAuditLoops: 2,
+          taskRunPromptVersion: 'task_run_status_v1',
+        },
+      },
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send: transportSend,
+      pendingCount: 0,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'implement the feature',
+      commandId: 'cmd-heavy',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(String(transportSend.mock.calls[0]?.[0])).toContain('IMCODES_TASK_RUN: COMPLETE');
+    expect(queueTaskIntentMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'cmd-heavy',
+      'implement the feature',
+      expect.objectContaining({ mode: 'supervised_audit' }),
+    );
+  });
+
+  it('does not create a heavy-mode task run for slash commands', async () => {
+    const transportSend = vi.fn(() => 'sent');
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+      transportConfig: {
+        supervision: {
+          mode: 'supervised_audit',
+          backend: 'codex-sdk',
+          model: 'gpt-5.3-codex-spark',
+          timeoutMs: 12_000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+          auditMode: 'audit',
+          maxAuditLoops: 2,
+          taskRunPromptVersion: 'task_run_status_v1',
+        },
+      },
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send: transportSend,
+      pendingCount: 0,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/status',
+      commandId: 'cmd-status',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(transportSend).toHaveBeenCalledWith('/status', 'cmd-status');
+    expect(queueTaskIntentMock).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the normal manual send path when the persisted supervision snapshot is invalid', async () => {
+    const transportSend = vi.fn(() => 'sent');
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+      transportConfig: {
+        supervision: {
+          mode: 'supervised',
+          backend: 'bad-backend',
+          model: '',
+          timeoutMs: 0,
+          promptVersion: '',
+          maxParseRetries: 0,
+        },
+      },
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send: transportSend,
+      pendingCount: 0,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'normal message',
+      commandId: 'cmd-invalid-supervision',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(supervisionDecideMock).not.toHaveBeenCalled();
+    expect(transportSend).toHaveBeenCalledWith('normal message', 'cmd-invalid-supervision');
+  });
+
   it('edits a queued transport message by clientMessageId', async () => {
     const editPendingMessage = vi.fn(() => true);
     getTransportRuntimeMock.mockReturnValue({
@@ -385,6 +546,7 @@ describe('handleWebCommand transport queue behavior', () => {
     await flushAsync();
 
     expect(editPendingMessage).toHaveBeenCalledWith('cmd-queued', 'edited queued');
+    expect(updateQueuedTaskIntentMock).toHaveBeenCalledWith('deck_transport_brain', 'cmd-queued', 'edited queued');
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'session.state',
@@ -418,6 +580,7 @@ describe('handleWebCommand transport queue behavior', () => {
     await flushAsync();
 
     expect(removePendingMessage).toHaveBeenCalledWith('cmd-queued');
+    expect(removeQueuedTaskIntentMock).toHaveBeenCalledWith('deck_transport_brain', 'cmd-queued');
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'session.state',

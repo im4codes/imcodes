@@ -8,6 +8,12 @@ import { COOKIE_SESSION, COOKIE_CSRF, HEADER_CSRF } from '@shared/cookie-names.j
 import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM } from '@shared/preview-types.js';
 import type { ContextMemoryView, ContextModelConfig } from '@shared/context-types.js';
 import type { SharedContextRuntimeConfigSnapshot } from '@shared/shared-context-runtime-config.js';
+import {
+  SUPERVISION_USER_DEFAULT_PREF_KEY,
+  normalizeSupervisorDefaultConfig,
+  parseSupervisorDefaultConfig,
+  type SupervisorDefaultConfig,
+} from '@shared/supervision-config.js';
 
 let _baseUrl = '';
 let _onAuthExpired: ((reason?: string) => void) | null = null;
@@ -703,7 +709,16 @@ export async function patchSubSession(
 export async function patchSession(
   serverId: string,
   sessionName: string,
-  body: { label?: string | null; description?: string | null; cwd?: string | null; agentType?: string | null },
+  body: {
+    label?: string | null;
+    description?: string | null;
+    cwd?: string | null;
+    agentType?: string | null;
+    requestedModel?: string | null;
+    activeModel?: string | null;
+    effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null;
+    transportConfig?: Record<string, unknown> | null;
+  },
 ): Promise<void> {
   await apiFetch(`/api/server/${serverId}/sessions/${sessionName}`, {
     method: 'PATCH',
@@ -821,6 +836,17 @@ export async function getUserPref(key: string): Promise<unknown | null> {
   } catch {
     return null;
   }
+}
+
+export async function fetchSupervisorDefaults(): Promise<SupervisorDefaultConfig | null> {
+  const raw = await getUserPref(SUPERVISION_USER_DEFAULT_PREF_KEY);
+  return parseSupervisorDefaultConfig(raw);
+}
+
+export async function saveSupervisorDefaults(config: Partial<SupervisorDefaultConfig> | null | undefined): Promise<SupervisorDefaultConfig> {
+  const normalized = normalizeSupervisorDefaultConfig(config);
+  await saveUserPref(SUPERVISION_USER_DEFAULT_PREF_KEY, normalized);
+  return normalized;
 }
 
 const USER_PREF_CHANGED_EVENT = 'imcodes:user-pref-changed';

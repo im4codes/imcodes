@@ -482,7 +482,7 @@ export function useSubSessions(
   }, [serverId]);
 
   /** Update local state for a sub-session (does NOT write to DB — caller handles that). */
-  const updateLocal = useCallback((id: string, fields: Partial<Pick<SubSession, 'type' | 'runtimeType' | 'label' | 'description' | 'cwd'>>) => {
+  const updateLocal = useCallback((id: string, fields: Partial<Pick<SubSession, 'type' | 'runtimeType' | 'label' | 'description' | 'cwd' | 'transportConfig'>>) => {
     setSubSessions((prev) => prev.map((s) =>
       s.id === id ? { ...s, ...fields } : s,
     ));

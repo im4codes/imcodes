@@ -32,6 +32,9 @@ const execAsync = promisify(execCb);
 const execFileAsync = promisify(execFileCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, type P2pTarget } from './p2p-orchestrator.js';
 import { buildSessionList } from './session-list.js';
+import { supervisionBroker } from './supervision-broker.js';
+import { supervisionAutomation } from './supervision-automation.js';
+import { appendTaskRunContract } from './supervision-prompts.js';
 import { getComboRoundCount, parseModePipeline, P2P_CONFIG_MODE, isP2pSavedConfig, type P2pSessionConfig } from '../../shared/p2p-modes.js';
 import type { P2pAdvancedRound, P2pContextReducerConfig } from '../../shared/p2p-advanced.js';
 import { CRON_MSG } from '../../shared/cron-types.js';
@@ -66,8 +69,18 @@ import {
   normalizeSharedContextRuntimeBackend,
   SHARED_CONTEXT_RUNTIME_CONFIG_MSG,
 } from '../../shared/shared-context-runtime-config.js';
+import {
+  SUPERVISION_MODE,
+  extractSessionSupervisionSnapshot,
+  isSupportedSupervisionTargetSessionType,
+} from '../../shared/supervision-config.js';
 
 const MAX_P2P_FILE_PULL_COUNT = 20;
+
+function isEligibleHeavySupervisionTaskText(text: string): boolean {
+  const trimmed = text.trim();
+  return trimmed.length > 0 && !trimmed.startsWith('/');
+}
 
 /**
  * Build a unified subsession.sync payload from the session store record.
@@ -1441,6 +1454,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     if (text.trim() === '/stop') {
       emitTransportUserMessage(text);
       try {
+        supervisionAutomation.cancelSession(sessionName);
         await transportRuntime.cancel();
         // Mark session for fresh start so daemon restart doesn't resume the stuck conversation
         if (record?.agentType === 'qwen') {
@@ -1616,13 +1630,59 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted', session: sessionName }); } catch {}
         return;
       }
+      const supervisionSnapshot = isSupportedSupervisionTargetSessionType(record?.agentType)
+        ? extractSessionSupervisionSnapshot(record?.transportConfig ?? null)
+        : null;
+      if (supervisionSnapshot && supervisionSnapshot.mode !== SUPERVISION_MODE.OFF) {
+        const decision = await supervisionBroker.decide({
+          snapshot: supervisionSnapshot,
+          prompt: text,
+          cwd: record?.projectDir,
+          description: record?.description,
+        });
+        if (decision.decision !== 'approve') {
+          emitTransportUserMessage(
+            text,
+            { clientMessageId: effectiveId },
+            transportUserEventId(effectiveId),
+          );
+          timelineEmitter.emit(sessionName, 'assistant.text', {
+            text: `⚠️ Supervision ${decision.decision}: ${decision.reason}`,
+            streaming: false,
+          }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(sessionName, 'command.ack', {
+            commandId: effectiveId,
+            status: 'error',
+            error: decision.reason,
+          });
+          try {
+            serverLink.send({
+              type: 'command.ack',
+              commandId: effectiveId,
+              status: 'error',
+              session: sessionName,
+              error: decision.reason,
+            });
+          } catch { /* not connected */ }
+          return;
+        }
+      }
       if (record?.agentType === 'qwen' && record.qwenAuthType === 'qwen-oauth') {
         recordQwenOAuthRequest();
         refreshQwenQuotaUsageLabels(serverLink);
       }
+      const shouldTrackHeavyTaskRun = supervisionSnapshot?.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
+        && isEligibleHeavySupervisionTaskText(text);
+      const dispatchText = shouldTrackHeavyTaskRun
+        ? appendTaskRunContract(text, supervisionSnapshot.taskRunPromptVersion)
+        : text;
+
       // send() is synchronous: dispatches immediately if idle, queues if busy.
       // Status changes come from transport runtime's onStatusChange callback.
-      const result = transportRuntime.send(text, effectiveId);
+      const result = transportRuntime.send(dispatchText, effectiveId);
+      if (shouldTrackHeavyTaskRun) {
+        supervisionAutomation.queueTaskIntent(sessionName, effectiveId, text, supervisionSnapshot);
+      }
       if (result === 'sent') {
         emitTransportUserMessage(
           text,
@@ -1748,6 +1808,7 @@ async function handleEditQueuedTransportMessage(cmd: Record<string, unknown>, se
       try { serverLink.send({ type: 'command.ack', commandId, status: 'error', session: sessionName, error: 'Queued message not found' }); } catch {}
       return;
     }
+    supervisionAutomation.updateQueuedTaskIntent(sessionName, clientMessageId, text);
     timelineEmitter.emit(sessionName, 'session.state', {
       state: runtime.sending ? 'queued' : 'idle',
       pendingCount: runtime.pendingCount,
@@ -1783,6 +1844,7 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
       try { serverLink.send({ type: 'command.ack', commandId, status: 'error', session: sessionName, error: 'Queued message not found' }); } catch {}
       return;
     }
+    supervisionAutomation.removeQueuedTaskIntent(sessionName, clientMessageId);
     timelineEmitter.emit(sessionName, 'session.state', {
       state: runtime.sending ? 'queued' : 'idle',
       pendingCount: runtime.pendingCount,

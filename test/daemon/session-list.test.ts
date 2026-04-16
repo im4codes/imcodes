@@ -81,4 +81,47 @@ describe('buildSessionList', () => {
       quotaLabel: expect.stringContaining('5h 11%'),
     });
   });
+
+  it('preserves the session transportConfig snapshot in the list surface', async () => {
+    const store = await import('../../src/store/session-store.js');
+    store.upsertSession({
+      name: 'deck_qwen_brain',
+      projectName: 'demo',
+      role: 'brain',
+      agentType: 'qwen',
+      runtimeType: 'transport',
+      providerId: 'qwen',
+      providerSessionId: 'sid-transport',
+      state: 'running',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      transportConfig: {
+        supervision: {
+          mode: 'supervised_audit',
+          backend: 'qwen',
+          model: 'qwen3-coder-plus',
+          timeoutMs: 12_000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+          auditMode: 'audit>plan',
+          maxAuditLoops: 2,
+          taskRunPromptVersion: 'task_run_status_v1',
+        },
+      },
+    });
+
+    const { buildSessionList } = await import('../../src/daemon/session-list.js');
+    const sessions = await buildSessionList();
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]).toMatchObject({
+      transportConfig: expect.objectContaining({
+        supervision: expect.objectContaining({
+          mode: 'supervised_audit',
+          auditMode: 'audit>plan',
+        }),
+      }),
+    });
+  });
 });

@@ -148,7 +148,50 @@
     "qwen_model_title": "Qwen 來源：{{tier}} · 模型：{{model}}",
     "p2p_tag": "P2P",
     "thinking": "等級",
-    "thinking_title": "等級：{{value}}"
+    "thinking_title": "等級：{{value}}",
+    "supervision": {
+      "title": "Session supervision",
+      "help": "Choose a backend and model before enabling supervision.",
+      "mode": {
+        "off": "Off",
+        "supervised": "Supervised",
+        "supervised_audit": "Supervised + audit"
+      },
+      "backend": "Backend",
+      "model": "Model",
+      "timeout": "Timeout (ms)",
+      "selectBackend": "Select backend",
+      "selectModel": "Select model",
+      "auditMode": {
+        "audit": "Audit",
+        "review": "Review",
+        "audit_plan": "Audit → plan",
+        "review_plan": "Review → plan",
+        "audit_review_plan": "Audit → review → plan"
+      },
+      "selectAuditMode": "Select audit mode",
+      "maxAuditLoops": "Max audit loops",
+      "summaryTitle": "Resolved supervision",
+      "summaryMode": "Mode: {{value}}",
+      "summaryBackendModel": "Backend: {{backend}} · Model: {{model}}",
+      "summaryUnset": "unset",
+      "summaryDisabled": "Supervision off",
+      "summaryTimeout": "Timeout: {{value}}",
+      "summaryAudit": "Audit: {{auditMode}} · loops {{loops}}",
+      "summaryMeta": "Prompt {{promptVersion}}, repair {{repairVersion}}, parse retries {{parseRetries}}, task-run {{taskRunVersion}}",
+      "disabledHint": "Supervision is only available for transport sessions.",
+      "unsupported": "Supervision settings are not available for process sessions.",
+      "validation": {
+        "backendRequired": "Select a supervision backend.",
+        "modelRequired": "Select or enter a supervision model.",
+        "modelInvalid": "Model is not valid for {{backend}}.",
+        "auditModeRequired": "Select an audit mode."
+      },
+      "modeLabel": "Mode",
+      "auditModeLabel": "Audit mode",
+      "invalidStoredConfig": "已儲存的監督設定無效。修復並儲存前，自動化會保持停用。"
+    },
+    "workingDirPlaceholder": "~/projects/myapp"
   },
   "server": {
     "upgrade_daemon": "↑ 升級 Daemon",

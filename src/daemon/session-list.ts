@@ -34,6 +34,7 @@ export interface SessionListItem {
   effort?: import('../../shared/effort-levels.js').TransportEffortLevel;
   description?: string;
   label?: string;
+  transportConfig?: Record<string, unknown>;
   transportPendingMessages?: string[];
   transportPendingMessageEntries?: Array<{ clientMessageId: string; text: string }>;
 }
@@ -66,6 +67,7 @@ function baseItem(s: SessionRecord): SessionListItem {
     effort: s.effort,
     description: s.description,
     label: s.label,
+    transportConfig: s.transportConfig,
     transportPendingMessages: runtime?.pendingMessages ?? [],
     transportPendingMessageEntries: runtime?.pendingEntries ?? [],
   };
