@@ -930,11 +930,11 @@
       "pathPattern": "路径模式",
       "createBinding": "创建绑定",
       "tabs": {
-        "enterprise": "Enterprise",
-        "members": "Members",
-        "projects": "Projects",
-        "knowledge": "Knowledge",
-        "processing": "Processing",
+        "enterprise": "企业",
+        "members": "成员",
+        "projects": "项目",
+        "knowledge": "知识库",
+        "processing": "处理",
         "memory": "记忆"
       },
       "policyTitle": "Project policy",

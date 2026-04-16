@@ -929,12 +929,12 @@
       "pathPattern": "Path pattern",
       "createBinding": "Create binding",
       "tabs": {
-        "enterprise": "Enterprise",
-        "members": "Members",
-        "projects": "Projects",
-        "knowledge": "Knowledge",
-        "processing": "Processing",
-        "memory": "Memory"
+        "enterprise": "Организация",
+        "members": "Участники",
+        "projects": "Проекты",
+        "knowledge": "Знания",
+        "processing": "Обработка",
+        "memory": "Память"
       },
       "policyTitle": "Project policy",
       "policyLoading": "Loading saved policy…",

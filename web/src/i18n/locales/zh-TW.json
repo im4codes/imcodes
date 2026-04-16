@@ -930,11 +930,11 @@
       "pathPattern": "路徑模式",
       "createBinding": "建立綁定",
       "tabs": {
-        "enterprise": "Enterprise",
-        "members": "Members",
-        "projects": "Projects",
-        "knowledge": "Knowledge",
-        "processing": "Processing",
+        "enterprise": "企業",
+        "members": "成員",
+        "projects": "專案",
+        "knowledge": "知識庫",
+        "processing": "處理",
         "memory": "記憶"
       },
       "policyTitle": "Project policy",

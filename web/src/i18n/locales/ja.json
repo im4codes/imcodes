@@ -929,12 +929,12 @@
       "pathPattern": "Path pattern",
       "createBinding": "Create binding",
       "tabs": {
-        "enterprise": "Enterprise",
-        "members": "Members",
-        "projects": "Projects",
-        "knowledge": "Knowledge",
-        "processing": "Processing",
-        "memory": "Memory"
+        "enterprise": "組織",
+        "members": "メンバー",
+        "projects": "プロジェクト",
+        "knowledge": "ナレッジ",
+        "processing": "処理",
+        "memory": "メモリ"
       },
       "policyTitle": "Project policy",
       "policyLoading": "Loading saved policy…",
