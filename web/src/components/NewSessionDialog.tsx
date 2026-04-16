@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { WsClient } from '../ws-client.js';
-import { FileBrowser } from './FileBrowser.js';
+import { FileBrowser } from './file-browser-lazy.js';
 import { getUserPref, saveUserPref } from '../api.js';
 import { sanitizeProjectName } from '@shared/sanitize-project-name.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '@shared/effort-levels.js';
@@ -271,7 +271,7 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
           <select
             value={agentType}
             disabled={starting}
-            onChange={(e) => setAgentType((e.target as HTMLSelectElement).value as AgentType)}
+            onInput={(e) => setAgentType((e.target as HTMLSelectElement).value as AgentType)}
             style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#e2e8f0', padding: '8px 12px', borderRadius: 4, fontFamily: 'inherit' }}
           >
             <option value="claude-code-sdk">{t('session.agentType.claude_code_sdk')}</option>
@@ -296,7 +296,7 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
             <select
               value={thinking}
               disabled={starting}
-              onChange={(e) => setThinking((e.target as HTMLSelectElement).value as TransportEffortLevel)}
+              onInput={(e) => setThinking((e.target as HTMLSelectElement).value as TransportEffortLevel)}
               style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#e2e8f0', padding: '8px 12px', borderRadius: 4, fontFamily: 'inherit' }}
             >
               {thinkingLevels.map((level) => (
@@ -320,7 +320,7 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
                 <select
                   value={ccPreset}
                   disabled={starting}
-                  onChange={(e) => setCcPreset((e.target as HTMLSelectElement).value)}
+                  onInput={(e) => setCcPreset((e.target as HTMLSelectElement).value)}
                   style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#e2e8f0', padding: '8px 12px', borderRadius: 4, fontFamily: 'inherit' }}
                 >
                   <option value="">Default (Anthropic)</option>
@@ -502,7 +502,7 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
                   <select
                     value={ocSelectedSession}
                     disabled={starting}
-                    onChange={(e) => setOcSelectedSession((e.target as HTMLSelectElement).value)}
+                    onInput={(e) => setOcSelectedSession((e.target as HTMLSelectElement).value)}
                     style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#e2e8f0', padding: '8px 12px', borderRadius: 4, fontFamily: 'inherit' }}
                   >
                     <option value="">{t('session.selectSession')}</option>
@@ -557,7 +557,7 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
             <select
               value={shellBin}
               disabled={starting}
-              onChange={(e) => setShellBin((e.target as HTMLSelectElement).value)}
+              onInput={(e) => setShellBin((e.target as HTMLSelectElement).value)}
               style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#e2e8f0', padding: '8px 12px', borderRadius: 4, fontFamily: 'inherit' }}
             >
               {shells.map((s) => <option key={s} value={s}>{s}</option>)}

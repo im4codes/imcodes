@@ -8,7 +8,7 @@ import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } fr
 import { memo } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { TimelineEvent, WsClient, MemoryContextTimelinePayload, MemoryContextTimelineItem } from '../ws-client.js';
-import { FileBrowser } from './FileBrowser.js';
+import { FileBrowser } from './file-browser-lazy.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';

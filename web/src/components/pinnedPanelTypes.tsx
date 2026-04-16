@@ -5,7 +5,7 @@
 import { registerPanelType, getPanelType } from './PinnedPanelRegistry.js';
 import { ChatView } from './ChatView.js';
 import { TerminalView } from './TerminalView.js';
-import { FileBrowser } from './FileBrowser.js';
+import { FileBrowser } from './file-browser-lazy.js';
 import { RepoPage } from '../pages/RepoPage.js';
 import { CronManager } from '../pages/CronManager.js';
 import { LocalWebPreviewPanel } from './LocalWebPreviewPanel.js';

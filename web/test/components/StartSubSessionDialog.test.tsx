@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, cleanup, fireEvent } from '@testing-library/preact';
+import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/preact';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -103,7 +103,7 @@ describe('StartSubSessionDialog', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /codex_sdk/i }));
     const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
-    fireEvent.change(selects[0], { target: { value: 'high' } });
+    fireEvent.input(selects[0], { target: { value: 'high' } });
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
     expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, { thinking: 'high' });
@@ -137,7 +137,7 @@ describe('StartSubSessionDialog', () => {
     expect(screen.queryByText('API Provider')).toBeNull();
   });
 
-  it('shows CC preset controls and passes preset for qwen sub-sessions', () => {
+  it('shows CC preset controls and passes preset for qwen sub-sessions', async () => {
     const onStart = vi.fn();
     const ws = makeWs();
     ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
@@ -163,11 +163,12 @@ describe('StartSubSessionDialog', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
-    expect(screen.getByText('API Provider')).toBeDefined();
+    await waitFor(() => expect(screen.getByText('API Provider')).toBeDefined());
     const presetSelect = (screen.getAllByRole('combobox') as HTMLSelectElement[])
       .find((select) => Array.from(select.options).some((option) => option.value === 'MiniMax'));
     expect(presetSelect).toBeDefined();
-    fireEvent.change(presetSelect!, { target: { value: 'MiniMax' } });
+    presetSelect!.value = 'MiniMax';
+    fireEvent.input(presetSelect!, { target: { value: presetSelect!.value } });
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
     expect(onStart).toHaveBeenCalledWith('qwen', undefined, '/tmp', undefined, {
@@ -192,7 +193,7 @@ describe('StartSubSessionDialog', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
     const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
-    fireEvent.change(selects[0], { target: { value: 'high' } });
+    fireEvent.input(selects[0], { target: { value: 'high' } });
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
     expect(onStart).toHaveBeenCalledWith('qwen', undefined, '/tmp', undefined, { thinking: 'high' });

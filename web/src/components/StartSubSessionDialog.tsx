@@ -5,7 +5,7 @@ import { useState, useEffect } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { WsClient } from '../ws-client.js';
 import type { RemoteSession } from '../hooks/useProviderStatus.js';
-import { FileBrowser } from './FileBrowser.js';
+import { FileBrowser } from './file-browser-lazy.js';
 import { getUserPref, saveUserPref } from '../api.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '@shared/effort-levels.js';
 
@@ -224,7 +224,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                 <select
                   class="input"
                   value={shellBin}
-                  onChange={(e) => setShellBin((e.target as HTMLSelectElement).value)}
+                  onInput={(e) => setShellBin((e.target as HTMLSelectElement).value)}
                   style={{ width: '100%' }}
                 >
                   {shells.map((s) => <option key={s} value={s}>{s}</option>)}
@@ -282,7 +282,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                     <select
                       class="input"
                       value={ocSelectedSession}
-                      onChange={(e) => setOcSelectedSession((e.target as HTMLSelectElement).value)}
+                      onInput={(e) => setOcSelectedSession((e.target as HTMLSelectElement).value)}
                       style={{ width: '100%' }}
                     >
                       <option value="">{t('session.selectSession')}</option>
@@ -330,7 +330,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                   </button>
                 </div>
                 {ccPresets.length > 0 ? (
-                  <select class="input" value={ccPreset} onChange={(e) => setCcPreset((e.target as HTMLSelectElement).value)} style={{ width: '100%' }}>
+                  <select class="input" value={ccPreset} onInput={(e) => setCcPreset((e.target as HTMLSelectElement).value)} style={{ width: '100%' }}>
                     <option value="">Default (Anthropic)</option>
                     {ccPresets.map((p) => <option key={p.name} value={p.name}>{p.name}{p.env['ANTHROPIC_MODEL'] ? ` (${p.env['ANTHROPIC_MODEL']})` : ''}</option>)}
                   </select>
@@ -428,7 +428,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
               <select
                 class="input"
                 value={thinking}
-                onChange={(e) => setThinking((e.target as HTMLSelectElement).value as TransportEffortLevel)}
+                onInput={(e) => setThinking((e.target as HTMLSelectElement).value as TransportEffortLevel)}
                 style={{ width: '100%' }}
               >
                 {thinkingLevels.map((level) => (

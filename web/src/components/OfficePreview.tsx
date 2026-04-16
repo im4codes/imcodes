@@ -3,6 +3,7 @@
  * Libraries are dynamically imported on first render to avoid bloating the main bundle.
  */
 import { useEffect, useRef, useState } from 'preact/hooks';
+import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 
 interface Props {
   /** Base64-encoded file content. */
@@ -67,12 +68,7 @@ function PdfPreview({ data }: { data: string }) {
     (async () => {
       try {
         const pdfjsLib = await import('pdfjs-dist');
-        try {
-          const workerModule = await import('pdfjs-dist/build/pdf.worker.min.mjs');
-          (globalThis as any).pdfjsWorker = workerModule;
-        } catch {
-          console.warn('PDF worker module failed to load, using main-thread fallback');
-        }
+        pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
         pdfDoc = await pdfjsLib.getDocument({ data: base64ToArrayBuffer(data) }).promise;
         if (cancelled) return;
         // Initial render at current width

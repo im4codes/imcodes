@@ -1,17 +1,17 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'preact/hooks';
+import { lazy, Suspense } from 'preact/compat';
 import {
   FileBrowser,
   type FileBrowserPreviewRequest,
   type FileBrowserPreviewState,
   type FileBrowserPreviewUpdate,
-} from './components/FileBrowser.js';
+} from './components/file-browser-lazy.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate } from './p2p-run-mapping.js';
 import { useTranslation } from 'react-i18next';
 import { ErrorBoundary } from './components/ErrorBoundary.js';
 import { LanguageSwitcher } from './components/LanguageSwitcher.js';
 import { LoginPage } from './pages/LoginPage.js';
-import { DashboardPage } from './pages/DashboardPage.js';
 import { SessionTabs } from './components/SessionTabs.js';
 // TransportChatView removed — transport sessions use unified ChatView via timelineEmitter
 import { SessionPane } from './components/SessionPane.js';
@@ -24,7 +24,6 @@ import { SessionSettingsDialog } from './components/SessionSettingsDialog.js';
 import { StartDiscussionDialog, type DiscussionPrefs, type SubSessionOption } from './components/StartDiscussionDialog.js';
 import { AskQuestionDialog, type PendingQuestion } from './components/AskQuestionDialog.js';
 import { ServerContextMenu, DeleteServerDialog } from './components/ServerContextMenu.js';
-import { DiscussionsPage } from './pages/DiscussionsPage.js';
 import { RepoPage } from './pages/RepoPage.js';
 import { FloatingPanel } from './components/FloatingPanel.js';
 import { SettingsPage } from './pages/SettingsPage.js';
@@ -84,6 +83,10 @@ import {
   shouldResetSelectedServer,
   shouldShowInitialConnectingGate,
 } from './server-selection.js';
+
+const DashboardPage = lazy(() => import('./pages/DashboardPage.js').then((m) => ({ default: m.DashboardPage })));
+const DiscussionsPage = lazy(() => import('./pages/DiscussionsPage.js').then((m) => ({ default: m.DiscussionsPage })));
+
 
 // On web: if opened by the native app for passkey auth, render the bridge page.
 const nativeCallback = typeof window !== 'undefined'
@@ -2667,7 +2670,9 @@ export function App() {
       <main class="main">
         {!selectedServerId ? (
           <div style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
-            <DashboardPage onSelectServer={handleSelectServer} onLogout={handleLogout} onServersLoaded={setServers} />
+            <Suspense fallback={<div style={{ textAlign: 'center', padding: 48, color: '#64748b' }}>Loading...</div>}>
+              <DashboardPage onSelectServer={handleSelectServer} onLogout={handleLogout} onServersLoaded={setServers} />
+            </Suspense>
           </div>
         ) : (
           <>
@@ -3139,20 +3144,22 @@ export function App() {
 
       {showDiscussionsPage && selectedServerId && (
         <FloatingPanel id="discussions" title={trans('p2p.discussions.title')} onClose={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }} defaultW={800} defaultH={600}>
-          <DiscussionsPage
-            ws={wsRef.current}
-            onBack={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }}
-            initialSelectedId={discussionInitialId}
-            liveDiscussions={discussions}
-            onStopDiscussion={(id) => {
-              if (id.startsWith('p2p_')) {
-                wsRef.current?.send({ type: 'p2p.cancel', runId: id.slice(4) });
-                setDiscussions((prev) => prev.filter((d) => d.id !== id));
-              } else {
-                wsRef.current?.discussionStop(id);
-              }
-            }}
-          />
+          <Suspense fallback={<div style={{ textAlign: 'center', padding: 48, color: '#64748b' }}>Loading...</div>}>
+            <DiscussionsPage
+              ws={wsRef.current}
+              onBack={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }}
+              initialSelectedId={discussionInitialId}
+              liveDiscussions={discussions}
+              onStopDiscussion={(id) => {
+                if (id.startsWith('p2p_')) {
+                  wsRef.current?.send({ type: 'p2p.cancel', runId: id.slice(4) });
+                  setDiscussions((prev) => prev.filter((d) => d.id !== id));
+                } else {
+                  wsRef.current?.discussionStop(id);
+                }
+              }}
+            />
+          </Suspense>
         </FloatingPanel>
       )}
 

@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useMemo } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import { apiFetch } from '../api.js';
-import { FileBrowser } from './FileBrowser.js';
+import { FileBrowser } from './file-browser-lazy.js';
 import type { WsClient } from '../ws-client.js';
 import type { JSX, RefObject } from 'preact';
 

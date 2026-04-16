@@ -7,7 +7,7 @@ import type { SessionInfo } from '../types.js';
 import { QuickInputPanel } from './QuickInputPanel.js';
 import { getNavigableHistory } from './QuickInputPanel.js';
 import type { UseQuickDataResult } from './QuickInputPanel.js';
-import { FileBrowser } from './FileBrowser.js';
+import { FileBrowser } from './file-browser-lazy.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';

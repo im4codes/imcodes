@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, fireEvent, cleanup } from '@testing-library/preact';
+import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/preact';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -125,13 +125,14 @@ describe('NewSessionDialog', () => {
     expect(screen.getByText('daemon_offline')).toBeDefined();
   });
 
-  it('agent type changes when selector is updated', () => {
+  it('agent type changes when selector is updated', async () => {
     const ws = makeWs();
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
     const select = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
-    fireEvent.change(select, { target: { value: 'codex' } });
-    expect(select.value).toBe('codex');
+    select.value = 'codex';
+    fireEvent.input(select, { target: { value: select.value } });
+    await waitFor(() => expect(select.value).toBe('codex'));
 
     fireEvent.input(screen.getByPlaceholderText('my-project'), {
       target: { value: 'test-proj' },
@@ -192,27 +193,30 @@ describe('NewSessionDialog', () => {
     expect(onClose).toHaveBeenCalledOnce();
   });
 
-  it('shows cli/sdk difference hint when switching agent type', () => {
+  it('shows cli/sdk difference hint when switching agent type', async () => {
     const ws = makeWs();
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
     expect(screen.getByText('agent_flavor_sdk')).toBeDefined();
 
     const select = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
-    fireEvent.change(select, { target: { value: 'claude-code' } });
+    select.value = 'claude-code';
+    fireEvent.input(select, { target: { value: select.value } });
 
-    expect(screen.getByText('agent_flavor_cli')).toBeDefined();
+    await waitFor(() => expect(screen.getByText('agent_flavor_cli')).toBeDefined());
   });
 
-  it('includes thinking level when starting codex-sdk', () => {
+  it('includes thinking level when starting codex-sdk', async () => {
     const ws = makeWs();
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
     fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
-    fireEvent.change(screen.getAllByRole('combobox')[0], { target: { value: 'codex-sdk' } });
+    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    agentTypeSelect.value = 'codex-sdk';
+    fireEvent.input(agentTypeSelect, { target: { value: agentTypeSelect.value } });
     const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
-    fireEvent.change(selects[1], { target: { value: 'high' } });
+    fireEvent.input(selects[1], { target: { value: 'high' } });
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
@@ -238,7 +242,7 @@ describe('NewSessionDialog', () => {
     expect(screen.queryByText('API Provider')).toBeNull();
   });
 
-  it('shows CC preset controls and submits preset for qwen', () => {
+  it('shows CC preset controls and submits preset for qwen', async () => {
     const ws = makeWs();
     ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
       handler({
@@ -252,15 +256,18 @@ describe('NewSessionDialog', () => {
 
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
-    fireEvent.change(screen.getAllByRole('combobox')[0], { target: { value: 'qwen' } });
-    expect(screen.getByText('API Provider')).toBeDefined();
+    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    agentTypeSelect.value = 'qwen';
+    fireEvent.input(agentTypeSelect, { target: { value: agentTypeSelect.value } });
+    await waitFor(() => expect(screen.getByText('API Provider')).toBeDefined());
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
     fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
 
     const presetSelect = (screen.getAllByRole('combobox') as HTMLSelectElement[])
       .find((select) => Array.from(select.options).some((option) => option.value === 'MiniMax'));
     expect(presetSelect).toBeDefined();
-    fireEvent.change(presetSelect!, { target: { value: 'MiniMax' } });
+    presetSelect!.value = 'MiniMax';
+    fireEvent.input(presetSelect!, { target: { value: presetSelect!.value } });
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
@@ -270,15 +277,17 @@ describe('NewSessionDialog', () => {
     }));
   });
 
-  it('includes thinking level when starting qwen', () => {
+  it('includes thinking level when starting qwen', async () => {
     const ws = makeWs();
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
     fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
-    fireEvent.change(screen.getAllByRole('combobox')[0], { target: { value: 'qwen' } });
+    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    agentTypeSelect.value = 'qwen';
+    fireEvent.input(agentTypeSelect, { target: { value: agentTypeSelect.value } });
     const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
-    fireEvent.change(selects[1], { target: { value: 'high' } });
+    fireEvent.input(selects[1], { target: { value: 'high' } });
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
