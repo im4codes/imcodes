@@ -1895,7 +1895,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               <span class="shortcut-btn-auto-caret" aria-hidden="true">▾</span>
             </button>
             {autoOpen && (
-              <div class="menu-dropdown">
+              <div class="menu-dropdown menu-dropdown-auto">
                 <button
                   class={`menu-item ${quickSupervisionMode === SUPERVISION_MODE.OFF ? 'menu-item-active' : ''}`}
                   onClick={() => { void handleQuickSupervisionModeSelect(SUPERVISION_MODE.OFF); }}

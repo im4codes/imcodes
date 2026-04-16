@@ -1864,6 +1864,7 @@ afterEach(() => {
     expect(autoBtn.textContent).toContain('Auto');
     expect(autoBtn.textContent).not.toContain('Supervised');
     fireEvent.click(autoBtn);
+    expect(document.querySelector('.menu-dropdown-auto')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: /supervised$/i }));
 
     await waitFor(() => {

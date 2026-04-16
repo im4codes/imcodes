@@ -272,6 +272,7 @@ body {
 /* Menu dropdown */
 .menu-wrap { position: relative; }
 .menu-dropdown { position: absolute; bottom: calc(100% + 4px); right: 0; background: #1e293b; border: 1px solid #334155; border-radius: 6px; min-width: 200px; max-width: calc(100vw - 16px); max-height: 60vh; overflow-y: auto; box-shadow: 0 4px 16px #00000060; z-index: 50; }
+.menu-dropdown-auto { left: 0; right: auto; min-width: 168px; max-width: min(220px, calc(100vw - 24px)); }
 .menu-dropdown-models { min-width: min(260px, calc(100vw - 24px)); max-width: min(320px, calc(100vw - 24px)); }
 .menu-dropdown-openspec { width: max-content; min-width: min(320px, calc(100vw - 24px)); max-width: calc(100vw - 24px); overscroll-behavior: contain; display: flex; flex-direction: column; z-index: 2147483646; }
 .menu-dropdown-openspec-inline { position: absolute; right: 0; bottom: calc(100% + 4px); }
