@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ContextNamespace, ContextTargetRef } from '../../shared/context-types.js';
 import {
+  archiveMemory,
   clearDirtyTarget,
   enqueueContextJob,
   getLocalProcessedFreshness,
@@ -12,7 +13,9 @@ import {
   queryPendingContextEvents,
   queryProcessedProjections,
   recordContextEvent,
+  recordMemoryHits,
   resetContextStoreForTests,
+  restoreArchivedMemory,
   deleteStagedEventsByIds,
   setReplicationState,
   updateContextJob,
@@ -222,5 +225,181 @@ describe('context-store', () => {
     expect(listDirtyTargets(namespace)).toHaveLength(1);
     clearDirtyTarget(target);
     expect(listDirtyTargets(namespace)).toHaveLength(0);
+  });
+
+  // ── Memory hit tracking ──────────────────────────────────────────────────
+
+  describe('Memory hit tracking', () => {
+    it('recordMemoryHits increments hit_count and sets last_used_at', () => {
+      const now = Date.now();
+      const projection = writeProcessedProjection({
+        namespace,
+        class: 'recent_summary',
+        sourceEventIds: ['evt-1'],
+        summary: 'Test summary',
+        content: {},
+        createdAt: now - 100,
+        updatedAt: now,
+      });
+
+      recordMemoryHits([projection.id]);
+
+      const results = listProcessedProjections(namespace, 'recent_summary');
+      expect(results).toHaveLength(1);
+      expect(results[0].hitCount).toBe(1);
+      expect(results[0].lastUsedAt).toBeTypeOf('number');
+      expect(results[0].lastUsedAt).toBeGreaterThanOrEqual(now);
+    });
+
+    it('recordMemoryHits handles multiple IDs in one call', () => {
+      const now = Date.now();
+      const p1 = writeProcessedProjection({
+        namespace,
+        class: 'recent_summary',
+        sourceEventIds: ['evt-1'],
+        summary: 'First',
+        content: {},
+        createdAt: now - 100,
+        updatedAt: now,
+      });
+      const p2 = writeProcessedProjection({
+        namespace,
+        class: 'durable_memory_candidate',
+        sourceEventIds: ['evt-2'],
+        summary: 'Second',
+        content: {},
+        createdAt: now - 50,
+        updatedAt: now,
+      });
+
+      recordMemoryHits([p1.id, p2.id]);
+
+      const all = listProcessedProjections(namespace);
+      const map = new Map(all.map((p) => [p.id, p]));
+      expect(map.get(p1.id)!.hitCount).toBe(1);
+      expect(map.get(p2.id)!.hitCount).toBe(1);
+    });
+
+    it('recordMemoryHits is idempotent on repeated calls (increments each time)', () => {
+      const now = Date.now();
+      const projection = writeProcessedProjection({
+        namespace,
+        class: 'recent_summary',
+        sourceEventIds: ['evt-1'],
+        summary: 'Repeated hits',
+        content: {},
+        createdAt: now - 100,
+        updatedAt: now,
+      });
+
+      recordMemoryHits([projection.id]);
+      recordMemoryHits([projection.id]);
+      recordMemoryHits([projection.id]);
+
+      const results = listProcessedProjections(namespace, 'recent_summary');
+      expect(results).toHaveLength(1);
+      expect(results[0].hitCount).toBe(3);
+    });
+
+    it('archiveMemory sets status to archived', () => {
+      const now = Date.now();
+      const projection = writeProcessedProjection({
+        namespace,
+        class: 'recent_summary',
+        sourceEventIds: ['evt-1'],
+        summary: 'To archive',
+        content: {},
+        createdAt: now - 100,
+        updatedAt: now,
+      });
+
+      const result = archiveMemory(projection.id);
+      expect(result).toBe(true);
+
+      const all = listProcessedProjections(namespace);
+      expect(all).toHaveLength(1);
+      expect(all[0].status).toBe('archived');
+    });
+
+    it('archiveMemory returns false for already-archived item', () => {
+      const now = Date.now();
+      const projection = writeProcessedProjection({
+        namespace,
+        class: 'recent_summary',
+        sourceEventIds: ['evt-1'],
+        summary: 'Already archived',
+        content: {},
+        createdAt: now - 100,
+        updatedAt: now,
+      });
+
+      expect(archiveMemory(projection.id)).toBe(true);
+      expect(archiveMemory(projection.id)).toBe(false);
+    });
+
+    it('queryProcessedProjections excludes archived by default', () => {
+      const now = Date.now();
+      const active = writeProcessedProjection({
+        namespace,
+        class: 'recent_summary',
+        sourceEventIds: ['evt-1'],
+        summary: 'Active projection',
+        content: {},
+        createdAt: now - 100,
+        updatedAt: now,
+      });
+      const toArchive = writeProcessedProjection({
+        namespace,
+        class: 'recent_summary',
+        sourceEventIds: ['evt-2'],
+        summary: 'Archived projection',
+        content: {},
+        createdAt: now - 50,
+        updatedAt: now,
+      });
+
+      archiveMemory(toArchive.id);
+
+      const results = queryProcessedProjections({
+        scope: 'personal',
+        projectId: 'repo',
+      });
+      expect(results).toHaveLength(1);
+      expect(results[0].id).toBe(active.id);
+    });
+
+    it('queryProcessedProjections includes archived when includeArchived is true', () => {
+      const now = Date.now();
+      writeProcessedProjection({
+        namespace,
+        class: 'recent_summary',
+        sourceEventIds: ['evt-1'],
+        summary: 'Active projection',
+        content: {},
+        createdAt: now - 100,
+        updatedAt: now,
+      });
+      const toArchive = writeProcessedProjection({
+        namespace,
+        class: 'recent_summary',
+        sourceEventIds: ['evt-2'],
+        summary: 'Archived projection',
+        content: {},
+        createdAt: now - 50,
+        updatedAt: now,
+      });
+
+      archiveMemory(toArchive.id);
+
+      const results = queryProcessedProjections({
+        scope: 'personal',
+        projectId: 'repo',
+        includeArchived: true,
+      });
+      expect(results).toHaveLength(2);
+      const statuses = results.map((r) => r.status);
+      expect(statuses).toContain('active');
+      expect(statuses).toContain('archived');
+    });
   });
 });

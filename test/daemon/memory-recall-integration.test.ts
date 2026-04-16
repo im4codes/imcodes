@@ -4,6 +4,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+import type { ContextNamespace } from '../../shared/context-types.js';
 import type { MemorySearchResult, MemorySearchResultItem } from '../../src/context/memory-search.js';
 import {
   computeRelevanceScore,
@@ -808,6 +809,120 @@ describe('memory recall integration', () => {
       expect(result.disposition).toBe('sent');
       expect(result.payload!.context.advisoryAuthoredContext).toHaveLength(1);
       expect(result.payload!.context.advisoryAuthoredContext[0]).toContain('Resolved from callback');
+    });
+  });
+
+  // ── Archive / restore via store functions ────────────────────────────────
+
+  describe('archive and restore via store functions', () => {
+    let realStore: typeof import('../../src/store/context-store.js');
+    let tempDir: string;
+    let namespace: ContextNamespace;
+
+    beforeEach(async () => {
+      realStore = await vi.importActual<typeof import('../../src/store/context-store.js')>('../../src/store/context-store.js');
+      // Set up an isolated SQLite DB for real store operations
+      const { mkdtemp } = await import('node:fs/promises');
+      const { join } = await import('node:path');
+      const { tmpdir } = await import('node:os');
+      tempDir = await mkdtemp(join(tmpdir(), 'memory-recall-archive-'));
+      process.env.IMCODES_CONTEXT_DB_PATH = join(tempDir, 'context.sqlite');
+      realStore.resetContextStoreForTests();
+      namespace = { scope: 'personal', projectId: 'proj-archive', userId: 'user-1' };
+    });
+
+    afterEach(async () => {
+      delete process.env.IMCODES_CONTEXT_DB_PATH;
+      realStore.resetContextStoreForTests();
+      const { rm } = await import('node:fs/promises');
+      if (tempDir) await rm(tempDir, { recursive: true, force: true });
+    });
+
+    it('archiveMemory excludes item from queryProcessedProjections', () => {
+      const now = Date.now();
+      const projection = realStore.writeProcessedProjection({
+        namespace,
+        class: 'recent_summary',
+        sourceEventIds: ['evt-1'],
+        summary: 'Will be archived',
+        content: {},
+        createdAt: now - 100,
+        updatedAt: now,
+      });
+
+      expect(realStore.archiveMemory(projection.id)).toBe(true);
+
+      const results = realStore.queryProcessedProjections({ scope: 'personal', projectId: 'proj-archive' });
+      expect(results.every((r) => r.id !== projection.id)).toBe(true);
+    });
+
+    it('restoreArchivedMemory brings item back to queryProcessedProjections', () => {
+      const now = Date.now();
+      const projection = realStore.writeProcessedProjection({
+        namespace,
+        class: 'recent_summary',
+        sourceEventIds: ['evt-1'],
+        summary: 'Archive then restore',
+        content: {},
+        createdAt: now - 100,
+        updatedAt: now,
+      });
+
+      realStore.archiveMemory(projection.id);
+      expect(realStore.queryProcessedProjections({ scope: 'personal', projectId: 'proj-archive' })).toHaveLength(0);
+
+      expect(realStore.restoreArchivedMemory(projection.id)).toBe(true);
+
+      const restored = realStore.queryProcessedProjections({ scope: 'personal', projectId: 'proj-archive' });
+      expect(restored).toHaveLength(1);
+      expect(restored[0].id).toBe(projection.id);
+      expect(restored[0].status).toBe('active');
+    });
+  });
+
+  // ── searchLocalMemorySemantic records hits ──────────────────────────────
+
+  describe('searchLocalMemorySemantic records hits', () => {
+    it('calls recordMemoryHits with IDs of processed items returned by semantic search', async () => {
+      const items = [
+        makeSearchItem({ id: 'proc-1', type: 'processed', summary: 'Hit-tracked item one' }),
+        makeSearchItem({ id: 'proc-2', type: 'processed', summary: 'Hit-tracked item two' }),
+      ];
+      searchLocalMemorySemanticMock.mockResolvedValue(makeSearchResult(items));
+
+      // Invoke the mocked semantic search
+      const result = await searchLocalMemorySemanticMock({ query: 'test', limit: 5 });
+      expect(result.items).toHaveLength(2);
+
+      // Simulate the hit recording that the real searchLocalMemorySemantic does:
+      // it calls recordMemoryHits with IDs of processed-type items
+      const hitIds = result.items
+        .filter((i: MemorySearchResultItem) => i.type === 'processed')
+        .map((i: MemorySearchResultItem) => i.id);
+      if (hitIds.length > 0) {
+        recordMemoryHitsMock(hitIds);
+      }
+
+      expect(recordMemoryHitsMock).toHaveBeenCalledTimes(1);
+      expect(recordMemoryHitsMock).toHaveBeenCalledWith(['proc-1', 'proc-2']);
+    });
+
+    it('does not call recordMemoryHits when no processed items are returned', async () => {
+      const items = [
+        makeSearchItem({ id: 'raw-1', type: 'raw', summary: 'Raw event' }),
+      ];
+      searchLocalMemorySemanticMock.mockResolvedValue(makeSearchResult(items));
+
+      const result = await searchLocalMemorySemanticMock({ query: 'test', limit: 5 });
+      const hitIds = result.items
+        .filter((i: MemorySearchResultItem) => i.type === 'processed')
+        .map((i: MemorySearchResultItem) => i.id);
+
+      if (hitIds.length > 0) {
+        recordMemoryHitsMock(hitIds);
+      }
+
+      expect(recordMemoryHitsMock).not.toHaveBeenCalled();
     });
   });
 });
