@@ -402,4 +402,69 @@ describe('context-store', () => {
       expect(statuses).toContain('archived');
     });
   });
+
+  describe('SQLite schema — H.2 migration columns', () => {
+    it('context_processed_local has hit_count column with default 0', () => {
+      const projection = writeProcessedProjection({
+        namespace, class: 'recent_summary',
+        sourceEventIds: ['e1'], summary: 'schema test', content: {},
+      });
+      const rows = queryProcessedProjections({ projectId: namespace.projectId });
+      const row = rows.find((r) => r.id === projection.id);
+      expect(row).toBeDefined();
+      expect(row!.hitCount).toBe(0);
+    });
+
+    it('context_processed_local has last_used_at column (null by default)', () => {
+      const projection = writeProcessedProjection({
+        namespace, class: 'recent_summary',
+        sourceEventIds: ['e2'], summary: 'last_used_at test', content: {},
+      });
+      const rows = queryProcessedProjections({ projectId: namespace.projectId });
+      const row = rows.find((r) => r.id === projection.id);
+      expect(row).toBeDefined();
+      expect(row!.lastUsedAt).toBeUndefined(); // null maps to undefined
+    });
+
+    it('context_processed_local has status column with default active', () => {
+      const projection = writeProcessedProjection({
+        namespace, class: 'recent_summary',
+        sourceEventIds: ['e3'], summary: 'status test', content: {},
+      });
+      const rows = queryProcessedProjections({ projectId: namespace.projectId });
+      const row = rows.find((r) => r.id === projection.id);
+      expect(row).toBeDefined();
+      expect(row!.status).toBe('active');
+    });
+
+    it('hit_count and last_used_at are updated by recordMemoryHits', () => {
+      const projection = writeProcessedProjection({
+        namespace, class: 'recent_summary',
+        sourceEventIds: ['e4'], summary: 'roundtrip test', content: {},
+      });
+      recordMemoryHits([projection.id]);
+      const rows = queryProcessedProjections({ projectId: namespace.projectId });
+      const row = rows.find((r) => r.id === projection.id);
+      expect(row!.hitCount).toBe(1);
+      expect(row!.lastUsedAt).toBeGreaterThan(0);
+    });
+
+    it('status column survives archive + restore roundtrip', () => {
+      const projection = writeProcessedProjection({
+        namespace, class: 'recent_summary',
+        sourceEventIds: ['e5'], summary: 'archive roundtrip', content: {},
+      });
+      archiveMemory(projection.id);
+      // Archived — excluded from default query
+      const afterArchive = queryProcessedProjections({ projectId: namespace.projectId });
+      expect(afterArchive.find((r) => r.id === projection.id)).toBeUndefined();
+
+      restoreArchivedMemory(projection.id);
+      // Restored — visible again
+      const afterRestore = queryProcessedProjections({ projectId: namespace.projectId });
+      const restored = afterRestore.find((r) => r.id === projection.id);
+      expect(restored).toBeDefined();
+      expect(restored!.status).toBe('active');
+    });
+  });
 });

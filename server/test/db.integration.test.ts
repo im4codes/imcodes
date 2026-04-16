@@ -198,6 +198,51 @@ describe('runMigrations', () => {
     expect(names.has('source_kind')).toBe(true);
     expect(names.has('source_id')).toBe(true);
   });
+
+  it('pg_trgm extension is enabled (migration 040)', async () => {
+    const ext = await db.queryOne<{ extname: string }>(
+      "SELECT extname FROM pg_extension WHERE extname = 'pg_trgm'",
+      [],
+    );
+    expect(ext?.extname).toBe('pg_trgm');
+  });
+
+  it('shared_context_projections has trigram GIN index on summary (migration 040)', async () => {
+    const idx = await db.queryOne<{ indexname: string }>(
+      `SELECT indexname FROM pg_indexes
+       WHERE tablename = 'shared_context_projections'
+         AND indexname = 'idx_shared_context_projections_summary_trgm'`,
+      [],
+    );
+    expect(idx?.indexname).toBe('idx_shared_context_projections_summary_trgm');
+  });
+
+  it('shared_context_projections has hit_count, last_used_at, status columns (migration 041)', async () => {
+    const columns = await db.query<{ column_name: string; column_default: string | null }>(
+      `SELECT column_name, column_default
+       FROM information_schema.columns
+       WHERE table_name = 'shared_context_projections'
+         AND column_name IN ('hit_count', 'last_used_at', 'status')`,
+      [],
+    );
+    const byName = new Map(columns.map((c) => [c.column_name, c.column_default]));
+    expect(byName.has('hit_count')).toBe(true);
+    expect(byName.has('last_used_at')).toBe(true);
+    expect(byName.has('status')).toBe(true);
+    // Verify defaults
+    expect(byName.get('hit_count')).toContain('0');
+    expect(byName.get('status')).toContain('active');
+  });
+
+  it('shared_context_projections has status index (migration 041)', async () => {
+    const idx = await db.queryOne<{ indexname: string }>(
+      `SELECT indexname FROM pg_indexes
+       WHERE tablename = 'shared_context_projections'
+         AND indexname = 'idx_shared_context_projections_status'`,
+      [],
+    );
+    expect(idx?.indexname).toBe('idx_shared_context_projections_status');
+  });
 });
 
 // ── 2. Database wrapper ─────────────────────────────────────────────────────
