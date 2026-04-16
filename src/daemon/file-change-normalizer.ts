@@ -1,10 +1,12 @@
 import type {
   FileChangeBatch,
   FileChangeConfidence,
+  FileChangeHunk,
   FileChangeOperation,
   FileChangePatch,
   FileChangeProviderKind,
 } from '../../shared/file-change.js';
+import { extractUnifiedDiffHunks } from '../../shared/unified-diff.js';
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -24,6 +26,15 @@ function asStringAny(...values: unknown[]): string | undefined {
   return undefined;
 }
 
+function asNumber(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number.parseInt(value, 10);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
+
 function detectOperation(value: unknown, fallback: FileChangeOperation = 'unknown'): FileChangeOperation {
   const normalized = String(value ?? '').toLowerCase();
   if (!normalized) return fallback;
@@ -38,12 +49,44 @@ function sanitizePatch(patch: FileChangePatch | null | undefined): FileChangePat
   if (!patch?.filePath) return null;
   const confidence: FileChangeConfidence = patch.confidence
     ?? (patch.beforeText || patch.afterText || patch.unifiedDiff ? 'derived' : 'coarse');
+  const hunks = patch.hunks && patch.hunks.length > 0
+    ? patch.hunks
+    : patch.unifiedDiff
+      ? extractUnifiedDiffHunks(patch.unifiedDiff)
+      : undefined;
   return {
     ...patch,
     filePath: patch.filePath,
     operation: patch.operation ?? 'unknown',
     confidence,
+    ...(hunks && hunks.length > 0 ? { hunks } : {}),
   };
+}
+
+function normalizeHunks(value: unknown): FileChangeHunk[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const hunks = value
+    .map((entry) => {
+      const record = asRecord(entry);
+      if (!record) return null;
+      const oldStart = asNumber(record.oldStart ?? record.old_start ?? record.beforeStart ?? record.before_start ?? record.startLine ?? record.start_line);
+      const oldLines = asNumber(record.oldLines ?? record.old_lines ?? record.beforeLines ?? record.before_lines ?? record.lineCount ?? record.line_count);
+      const newStart = asNumber(record.newStart ?? record.new_start ?? record.afterStart ?? record.after_start ?? record.targetStart ?? record.target_start);
+      const newLines = asNumber(record.newLines ?? record.new_lines ?? record.afterLines ?? record.after_lines ?? record.targetLines ?? record.target_lines);
+      const header = asString(record.header ?? record.text ?? record.rawHeader ?? record.raw_header);
+      if (oldStart === undefined || oldLines === undefined || newStart === undefined || newLines === undefined) return null;
+      return { oldStart, oldLines, newStart, newLines, header: header ?? `@@ -${oldStart},${oldLines} +${newStart},${newLines} @@` };
+    })
+    .filter((entry): entry is FileChangeHunk => !!entry);
+  return hunks.length > 0 ? hunks : undefined;
+}
+
+function firstDefinedHunks(...values: unknown[]): FileChangeHunk[] | undefined {
+  for (const value of values) {
+    const hunks = normalizeHunks(value);
+    if (hunks) return hunks;
+  }
+  return undefined;
 }
 
 function toBatch(
@@ -125,6 +168,16 @@ function normalizeGenericToolPatch(
     rawRecord?.diff,
     rawRecord?.patch,
   );
+  const hunks = firstDefinedHunks(
+    inputRecord?.hunks,
+    inputRecord?.ranges,
+    rawRecord?.hunks,
+    rawRecord?.ranges,
+    asRecord(rawRecord?.result)?.hunks,
+    asRecord(rawRecord?.result)?.ranges,
+    asRecord(rawRecord?.toolUseResult)?.hunks,
+    asRecord(rawRecord?.toolUseResult)?.ranges,
+  );
   const operation = detectOperation(
     inputRecord?.operation ?? inputRecord?.op ?? inputRecord?.type ?? rawRecord?.operation ?? rawRecord?.op ?? rawRecord?.type ?? toolName,
     beforeText && afterText ? 'update' : afterText ? 'update' : 'unknown',
@@ -145,6 +198,7 @@ function normalizeGenericToolPatch(
     ...(beforeText ? { beforeText } : {}),
     ...(afterText ? { afterText } : {}),
     ...(unifiedDiff ? { unifiedDiff } : {}),
+    ...(hunks ? { hunks } : {}),
     ...(toolCallId ? { toolCallId } : {}),
     raw,
   };
@@ -164,6 +218,7 @@ function normalizeCodexFileChangePatch(change: unknown, toolCallId?: string): Fi
   const beforeText = asStringAny(record.beforeText, record.before, record.oldText, record.oldContent);
   const afterText = asStringAny(record.afterText, record.after, record.newText, record.newContent, record.content);
   const unifiedDiff = asStringAny(record.unifiedDiff, record.patch, record.diff);
+  const hunks = normalizeHunks(record.hunks ?? record.ranges);
   const oldPath = asStringAny(record.oldPath, record.previousPath, record.fromPath);
   const operation = detectOperation(record.operation ?? record.op ?? record.kind ?? record.type,
     oldPath ? 'rename' : beforeText || afterText || unifiedDiff ? 'update' : 'unknown');
@@ -183,6 +238,7 @@ function normalizeCodexFileChangePatch(change: unknown, toolCallId?: string): Fi
     ...(beforeText ? { beforeText } : {}),
     ...(afterText ? { afterText } : {}),
     ...(unifiedDiff ? { unifiedDiff } : {}),
+    ...(hunks ? { hunks } : {}),
     ...(toolCallId ? { toolCallId } : {}),
     raw: change,
   };
@@ -262,6 +318,13 @@ export function normalizeOpenCodeFileChange(part: UnknownRecord): FileChangeBatc
   if (!filePath || typeof part.tool !== 'string') return null;
 
   if (part.tool === 'edit') {
+    const hunks = firstDefinedHunks(
+      metadata.hunks,
+      metadata.ranges,
+      fileDiff.hunks,
+      fileDiff.ranges,
+      fileDiff.chunks,
+    );
     return toBatch('opencode', [{
       filePath,
       operation: 'update',
@@ -273,6 +336,7 @@ export function normalizeOpenCodeFileChange(part: UnknownRecord): FileChangeBatc
       beforeText: asStringAny(fileDiff.before, input.oldString),
       afterText: asStringAny(fileDiff.after, input.newString),
       unifiedDiff: asString(metadata.diff),
+      ...(hunks ? { hunks } : {}),
       raw: part,
     }], {
       sourceToolCallId: asString(part.id),

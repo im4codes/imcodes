@@ -107,6 +107,7 @@ describe('ChatView file-change cards', () => {
     expect(container.textContent).toContain('exact');
     expect(container.querySelector('.chat-file-change-diff-label-removed')?.textContent).toBe('-');
     expect(container.querySelector('.chat-file-change-diff-label-added')?.textContent).toBe('+');
+    expect(Array.from(container.querySelectorAll('.chat-file-change-diff-ln')).every((node) => (node.textContent ?? '').trim() === '')).toBe(true);
 
     fireEvent.click(container.querySelector('.chat-file-change-path') as HTMLElement);
 
@@ -179,8 +180,10 @@ describe('ChatView file-change cards', () => {
 
     expect(container.textContent).toContain('OpenCode');
     expect(container.querySelector('.chat-file-change-diff-label-removed')?.textContent).toBe('-');
+    expect(Array.from(container.querySelectorAll('.chat-file-change-diff-pre-removed .chat-file-change-diff-ln')).map((node) => node.textContent)).toContain('1');
     expect(container.textContent).toContain('const before = 1;');
     expect(container.querySelector('.chat-file-change-diff-label-added')?.textContent).toBe('+');
+    expect(Array.from(container.querySelectorAll('.chat-file-change-diff-pre-added .chat-file-change-diff-ln')).map((node) => node.textContent)).toContain('1');
     expect(container.textContent).toContain('const after = 2;');
     expect(container.textContent).toContain('2 patch(s)');
     expect(container.querySelectorAll('.chat-file-change-file')).toHaveLength(1);

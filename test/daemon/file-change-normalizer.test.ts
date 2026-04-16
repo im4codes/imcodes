@@ -70,6 +70,61 @@ describe('file-change-normalizer', () => {
     }));
   });
 
+  it('derives structured hunks from unified diff payloads', () => {
+    const batch = normalizeCodexSdkFileChange({
+      toolCallId: 'cx-hunk',
+      detail: {
+        input: {
+          changes: [
+            {
+              path: 'src/a.ts',
+              op: 'update',
+              diff: '@@ -12,2 +12,3 @@\n-oldLine\n-oldTail\n+newLine\n+newTail\n+extra',
+            },
+          ],
+        },
+      },
+    });
+
+    expect(batch?.patches[0]?.hunks).toEqual([
+      {
+        oldStart: 12,
+        oldLines: 2,
+        newStart: 12,
+        newLines: 3,
+        header: '@@ -12,2 +12,3 @@',
+      },
+    ]);
+  });
+
+  it('preserves explicit range metadata when providers include it directly', () => {
+    const batch = normalizeOpenCodeFileChange({
+      id: 'oc-range',
+      tool: 'edit',
+      state: {
+        status: 'completed',
+        input: { filePath: 'src/ranged.ts', oldString: 'before', newString: 'after' },
+        metadata: {
+          filediff: {
+            before: 'before',
+            after: 'after',
+            ranges: [{ oldStart: 40, oldLines: 1, newStart: 40, newLines: 1 }],
+          },
+        },
+      },
+    } as any);
+
+    expect(batch?.patches[0]?.hunks).toEqual([
+      {
+        oldStart: 40,
+        oldLines: 1,
+        newStart: 40,
+        newLines: 1,
+        header: '@@ -40,1 +40,1 @@',
+      },
+    ]);
+  });
+
   it('normalizes Qwen file tools from structured input', () => {
     const batch = normalizeQwenFileChange(loadFixture('qwen-write.json'));
 

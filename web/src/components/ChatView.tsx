@@ -9,6 +9,7 @@ import { memo } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { TimelineEvent, WsClient, MemoryContextTimelinePayload, MemoryContextTimelineItem } from '../ws-client.js';
 import type { FileChangeBatch, FileChangePatch } from '@shared/file-change.js';
+import { parseUnifiedDiff } from '@shared/unified-diff.js';
 import { FileBrowser } from './file-browser-lazy.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
@@ -1412,25 +1413,84 @@ function clampPreviewText(text: string, maxLines = 14, maxChars = 1200): { text:
   return { text: textOut, truncated };
 }
 
-function extractStackedPreviewFromUnifiedDiff(diff: string): { before: string; after: string } | null {
-  const beforeLines: string[] = [];
-  const afterLines: string[] = [];
-  for (const rawLine of diff.replace(/\r\n/g, '\n').split('\n')) {
-    if (!rawLine) continue;
-    if (rawLine.startsWith('---') || rawLine.startsWith('+++') || rawLine.startsWith('@@')) continue;
-    if (rawLine.startsWith('-')) {
-      beforeLines.push(rawLine.slice(1));
+type FileChangePreviewLine = { text: string; lineNumber?: number };
+
+function extractStackedPreviewFromUnifiedDiff(
+  diff: string,
+): { before: FileChangePreviewLine[]; after: FileChangePreviewLine[] } | null {
+  const beforeLines: FileChangePreviewLine[] = [];
+  const afterLines: FileChangePreviewLine[] = [];
+  for (const line of parseUnifiedDiff(diff)) {
+    if (line.kind === 'del') {
+      beforeLines.push({ text: line.text, lineNumber: line.oldLineNumber });
       continue;
     }
-    if (rawLine.startsWith('+')) {
-      afterLines.push(rawLine.slice(1));
+    if (line.kind === 'add') {
+      afterLines.push({ text: line.text, lineNumber: line.newLineNumber });
     }
   }
   if (beforeLines.length === 0 && afterLines.length === 0) return null;
-  return {
-    before: beforeLines.join('\n'),
-    after: afterLines.join('\n'),
-  };
+  return { before: beforeLines, after: afterLines };
+}
+
+function buildPlainPreviewLines(text: string): FileChangePreviewLine[] {
+  return text.replace(/\r\n/g, '\n').split('\n').map((line) => ({ text: line }));
+}
+
+function clampPreviewLines(lines: FileChangePreviewLine[], maxLines = 14, maxChars = 1200): { lines: FileChangePreviewLine[]; truncated: boolean } {
+  const clippedByLines = lines.length > maxLines;
+  const visible = clippedByLines ? lines.slice(0, maxLines) : lines.slice();
+  let usedChars = 0;
+  const output: FileChangePreviewLine[] = [];
+  for (const line of visible) {
+    const prefix = output.length === 0 ? 0 : 1;
+    if (usedChars + prefix + line.text.length > maxChars) {
+      const remaining = Math.max(0, maxChars - usedChars - prefix);
+      output.push({ ...line, text: remaining > 0 ? line.text.slice(0, remaining) : '' });
+      return { lines: output, truncated: true };
+    }
+    usedChars += prefix + line.text.length;
+    output.push(line);
+  }
+  return { lines: output, truncated: clippedByLines };
+}
+
+function FileChangePreviewBlock({
+  marker,
+  markerTitle,
+  lines,
+  truncated,
+  emptyText,
+  className,
+}: {
+  marker: string;
+  markerTitle: string;
+  lines: FileChangePreviewLine[];
+  truncated: boolean;
+  emptyText: string;
+  className: string;
+}) {
+  const { t } = useTranslation();
+  const visibleLines = lines.length > 0 ? lines : [{ text: emptyText }];
+  return (
+    <div class="chat-file-change-diff-block">
+      <div class={className} title={markerTitle} aria-label={markerTitle}>{marker}</div>
+      <div class={`chat-file-change-diff-pre ${className.includes('added') ? 'chat-file-change-diff-pre-added' : 'chat-file-change-diff-pre-removed'}`}>
+        {visibleLines.map((line, index) => (
+          <div class="chat-file-change-diff-row" key={`${marker}:${line.lineNumber ?? 'na'}:${index}`}>
+            <span class="chat-file-change-diff-ln">{line.lineNumber ?? ''}</span>
+            <span class="chat-file-change-diff-code">{line.text}</span>
+          </div>
+        ))}
+        {truncated && (
+          <div class="chat-file-change-diff-row">
+            <span class="chat-file-change-diff-ln"></span>
+            <span class="chat-file-change-diff-code">{t('chat.file_change_truncated')}</span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
 
 const FileChangeCard = memo(function FileChangeCard({
@@ -1509,32 +1569,28 @@ const FileChangeCard = memo(function FileChangeCard({
 function ExactFilePatch({ patch }: { patch: FileChangePatch }) {
   const { t } = useTranslation();
   const unifiedPreview = patch.unifiedDiff ? extractStackedPreviewFromUnifiedDiff(patch.unifiedDiff) : null;
-  const before = patch.beforeText ?? unifiedPreview?.before ?? '';
-  const after = patch.afterText ?? unifiedPreview?.after ?? '';
-  const beforePreview = clampPreviewText(before || t('chat.file_change_no_before'));
-  const afterPreview = clampPreviewText(after || t('chat.file_change_no_after'));
+  const beforeLines = unifiedPreview?.before ?? buildPlainPreviewLines(patch.beforeText ?? '');
+  const afterLines = unifiedPreview?.after ?? buildPlainPreviewLines(patch.afterText ?? '');
+  const beforePreview = clampPreviewLines(beforeLines);
+  const afterPreview = clampPreviewLines(afterLines);
   return (
     <div class="chat-file-change-diff">
-      <div class="chat-file-change-diff-block">
-        <div
-          class="chat-file-change-diff-label chat-file-change-diff-label-removed"
-          title={t('chat.file_change_removed')}
-          aria-label={t('chat.file_change_removed')}
-        >
-          -
-        </div>
-        <pre class="chat-file-change-diff-pre chat-file-change-diff-pre-removed">{beforePreview.text}{beforePreview.truncated ? `\n${t('chat.file_change_truncated')}` : ''}</pre>
-      </div>
-      <div class="chat-file-change-diff-block">
-        <div
-          class="chat-file-change-diff-label chat-file-change-diff-label-added"
-          title={t('chat.file_change_added')}
-          aria-label={t('chat.file_change_added')}
-        >
-          +
-        </div>
-        <pre class="chat-file-change-diff-pre chat-file-change-diff-pre-added">{afterPreview.text}{afterPreview.truncated ? `\n${t('chat.file_change_truncated')}` : ''}</pre>
-      </div>
+      <FileChangePreviewBlock
+        marker="-"
+        markerTitle={t('chat.file_change_removed')}
+        lines={beforePreview.lines}
+        truncated={beforePreview.truncated}
+        emptyText={t('chat.file_change_no_before')}
+        className="chat-file-change-diff-label chat-file-change-diff-label-removed"
+      />
+      <FileChangePreviewBlock
+        marker="+"
+        markerTitle={t('chat.file_change_added')}
+        lines={afterPreview.lines}
+        truncated={afterPreview.truncated}
+        emptyText={t('chat.file_change_no_after')}
+        className="chat-file-change-diff-label chat-file-change-diff-label-added"
+      />
     </div>
   );
 }

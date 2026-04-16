@@ -15,6 +15,7 @@ import { useState, useRef, useEffect, useCallback, useMemo } from 'preact/hooks'
 import { useTranslation } from 'react-i18next';
 import type { WsClient, ServerMessage } from '../ws-client.js';
 import { lazy, Suspense } from 'preact/compat';
+import { parseUnifiedDiff } from '@shared/unified-diff.js';
 import { FileEditor, FileEditorContent } from './file-editor-lazy.js';
 const FilePreviewPane = lazy(() => import('./FilePreviewPane.js'));
 const OfficePreview = lazy(() => import('./OfficePreview.js'));
@@ -31,34 +32,7 @@ function escapeHtml(s: string): string {
 
 /** Render a unified diff as a split (side-by-side) HTML table, GitHub-style */
 function renderDiff(diff: string): string {
-  const lines = diff.split('\n');
-  let oldLine = 0;
-  let newLine = 0;
-
-  // Collect raw parsed lines
-  type RawLine = { kind: 'file' | 'hunk' | 'add' | 'del' | 'ctx'; text: string; oldLn?: number; newLn?: number };
-  const parsed: RawLine[] = [];
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (i === lines.length - 1 && line === '') continue;
-    if (line.startsWith('diff ') || line.startsWith('index ') || line.startsWith('---') || line.startsWith('+++') || line.startsWith('old mode') || line.startsWith('new mode')) {
-      parsed.push({ kind: 'file', text: line });
-    } else if (line.startsWith('@@')) {
-      const m = line.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-      if (m) { oldLine = parseInt(m[1]) - 1; newLine = parseInt(m[2]) - 1; }
-      parsed.push({ kind: 'hunk', text: line });
-    } else if (line.startsWith('+')) {
-      newLine++;
-      parsed.push({ kind: 'add', text: line.slice(1), newLn: newLine });
-    } else if (line.startsWith('-')) {
-      oldLine++;
-      parsed.push({ kind: 'del', text: line.slice(1), oldLn: oldLine });
-    } else {
-      oldLine++; newLine++;
-      parsed.push({ kind: 'ctx', text: line.startsWith(' ') ? line.slice(1) : line, oldLn: oldLine, newLn: newLine });
-    }
-  }
+  const parsed = parseUnifiedDiff(diff);
 
   // Build split rows: pair del+add lines from same hunk for side-by-side
   const rows: string[] = [];
@@ -72,21 +46,21 @@ function renderDiff(diff: string): string {
       rows.push(`<tr class="diff-row-hunk"><td colspan="4" class="diff-hunk-header">${escapeHtml(p.text)}</td></tr>`);
       i++;
     } else if (p.kind === 'ctx') {
-      const ln = p.oldLn ?? '';
-      rows.push(`<tr class="diff-row-ctx"><td class="diff-ln">${ln}</td><td class="diff-cell diff-ctx">${escapeHtml(p.text)}</td><td class="diff-ln">${p.newLn ?? ''}</td><td class="diff-cell diff-ctx">${escapeHtml(p.text)}</td></tr>`);
+      const ln = p.oldLineNumber ?? '';
+      rows.push(`<tr class="diff-row-ctx"><td class="diff-ln">${ln}</td><td class="diff-cell diff-ctx">${escapeHtml(p.text)}</td><td class="diff-ln">${p.newLineNumber ?? ''}</td><td class="diff-cell diff-ctx">${escapeHtml(p.text)}</td></tr>`);
       i++;
     } else if (p.kind === 'del') {
       // Collect consecutive del/add pairs
-      const dels: RawLine[] = [];
-      const adds: RawLine[] = [];
+      const dels = [];
+      const adds = [];
       while (i < parsed.length && parsed[i].kind === 'del') { dels.push(parsed[i]); i++; }
       while (i < parsed.length && parsed[i].kind === 'add') { adds.push(parsed[i]); i++; }
       const maxLen = Math.max(dels.length, adds.length);
       for (let j = 0; j < maxLen; j++) {
         const d = dels[j];
         const a = adds[j];
-        const oldLn = d ? String(d.oldLn ?? '') : '';
-        const newLn = a ? String(a.newLn ?? '') : '';
+        const oldLn = d ? String(d.oldLineNumber ?? '') : '';
+        const newLn = a ? String(a.newLineNumber ?? '') : '';
         const oldCode = d ? escapeHtml(d.text) : '';
         const newCode = a ? escapeHtml(a.text) : '';
         const leftCls = d ? 'diff-cell diff-del' : 'diff-cell diff-empty';
@@ -94,7 +68,7 @@ function renderDiff(diff: string): string {
         rows.push(`<tr class="diff-row-change"><td class="diff-ln diff-ln-del">${oldLn}</td><td class="${leftCls}">${oldCode}</td><td class="diff-ln diff-ln-add">${newLn}</td><td class="${rightCls}">${newCode}</td></tr>`);
       }
     } else if (p.kind === 'add') {
-      rows.push(`<tr class="diff-row-change"><td class="diff-ln"></td><td class="diff-cell diff-empty"></td><td class="diff-ln diff-ln-add">${p.newLn ?? ''}</td><td class="diff-cell diff-add">${escapeHtml(p.text)}</td></tr>`);
+      rows.push(`<tr class="diff-row-change"><td class="diff-ln"></td><td class="diff-cell diff-empty"></td><td class="diff-ln diff-ln-add">${p.newLineNumber ?? ''}</td><td class="diff-cell diff-add">${escapeHtml(p.text)}</td></tr>`);
       i++;
     } else {
       i++;

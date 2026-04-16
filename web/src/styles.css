@@ -737,6 +737,9 @@ body {
 .chat-file-change-diff-pre { margin: 0; padding: 8px; border-radius: 4px; color: #dbeafe; font-size: 11px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; overflow-x: auto; background: #0b1220; max-height: 260px; overflow-y: auto; }
 .chat-file-change-diff-pre-removed { background: rgba(127, 29, 29, 0.22); color: #fee2e2; }
 .chat-file-change-diff-pre-added { background: rgba(20, 83, 45, 0.22); color: #dcfce7; }
+.chat-file-change-diff-row { display: grid; grid-template-columns: 42px minmax(0, 1fr); gap: 8px; align-items: start; }
+.chat-file-change-diff-ln { color: #94a3b8; text-align: right; user-select: none; font-variant-numeric: tabular-nums; opacity: 0.9; }
+.chat-file-change-diff-code { white-space: pre-wrap; word-break: break-word; min-width: 0; }
 .chat-file-change-diff-coarse { gap: 4px; }
 .chat-file-change-coarse-text { color: #94a3b8; font-size: 11px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
 .chat-memory-context { margin-left: 18px; background: #0f172a; border: 1px solid #233044; border-left: 3px solid #6366f1; border-radius: 8px; }

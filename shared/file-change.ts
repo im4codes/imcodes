@@ -28,6 +28,14 @@ export const FILE_CHANGE_CONFIDENCE_LEVELS = [
 
 export type FileChangeConfidence = (typeof FILE_CHANGE_CONFIDENCE_LEVELS)[number];
 
+export interface FileChangeHunk {
+  oldStart: number;
+  oldLines: number;
+  newStart: number;
+  newLines: number;
+  header: string;
+}
+
 export interface FileChangePatch {
   filePath: string;
   operation: FileChangeOperation;
@@ -36,6 +44,7 @@ export interface FileChangePatch {
   beforeText?: string;
   afterText?: string;
   unifiedDiff?: string;
+  hunks?: FileChangeHunk[];
   toolCallId?: string;
   raw?: unknown;
 }
