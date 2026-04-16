@@ -56,9 +56,8 @@ async function findGeminiSessionFile(sessionId: string): Promise<string | null> 
  * never appears as a sent message in the UI but is part of the history.
  * Retries for up to 3s to handle Gemini's async file write timing.
  */
-export async function injectGeminiMemory(sessionId: string, cwd: string): Promise<void> {
-  const rawMemory = await readProjectMemory(cwd);
-  const memory = appendAgentSendDocs(rawMemory);
+export async function injectGeminiMemory(sessionId: string, cwd: string, projectName?: string): Promise<void> {
+  const memory = await buildSessionBootstrapContext(cwd, projectName ?? '');
   // memory is always non-null now since appendAgentSendDocs guarantees content
 
   // Retry: Gemini writes the session file slightly after emitting 'init'
@@ -128,6 +127,41 @@ Notes:
 - The \`--files\` flag attaches file references; format depends on the target agent type.
 - Your session identity is auto-detected from $IMCODES_SESSION.
 `.trim();
+
+/**
+ * Read processed memory summaries relevant to this project from local context store.
+ * Returns a formatted string with recent problem→solution pairs, or null if none.
+ */
+export async function readProcessedMemory(projectName: string): Promise<string | null> {
+  try {
+    const { searchLocalMemory } = await import('../context/memory-search.js');
+    const result = searchLocalMemory({
+      repo: projectName,
+      limit: 10,
+      projectionClass: 'recent_summary',
+    });
+    if (result.items.length === 0) return null;
+    const entries = result.items.map((item) =>
+      `- ${item.summary.split('\n')[0].slice(0, 300)}`,
+    );
+    return `# Recent project memory\n\n${entries.join('\n')}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build full session bootstrap context: project files + processed memory + send docs.
+ */
+export async function buildSessionBootstrapContext(cwd: string, projectName: string): Promise<string> {
+  const projectContext = await readProjectMemory(cwd);
+  const processedMemory = await readProcessedMemory(projectName);
+  const parts: string[] = [];
+  if (projectContext) parts.push(projectContext);
+  if (processedMemory) parts.push(processedMemory);
+  parts.push(AGENT_SEND_DOCS);
+  return parts.join('\n\n');
+}
 
 /**
  * Append inter-agent communication docs to a memory string.

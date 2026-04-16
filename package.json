@@ -39,6 +39,7 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.92",
+    "@huggingface/transformers": "^4.1.0",
     "@openai/codex-sdk": "^0.118.0",
     "commander": "^12.1.0",
     "croner": "^10.0.1",

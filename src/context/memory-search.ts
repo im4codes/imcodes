@@ -61,6 +61,48 @@ export interface MemorySearchResult {
 
 // ── Search implementation ────────────────────────────────────────────────────
 
+/**
+ * Semantic search: fetch candidates via substring match, then re-rank by embedding similarity.
+ * Falls back to plain searchLocalMemory if embedding model is unavailable.
+ */
+export async function searchLocalMemorySemantic(query: MemorySearchQuery): Promise<MemorySearchResult> {
+  // First, get candidates with relaxed text match (or no query filter for broader recall)
+  const broadQuery = { ...query, limit: Math.max((query.limit ?? 5) * 4, 40) };
+  const candidates = searchLocalMemory(broadQuery);
+  if (candidates.items.length === 0 || !query.query) return searchLocalMemory(query);
+
+  try {
+    const { generateEmbedding, cosineSimilarity } = await import('./embedding.js');
+    const queryEmb = await generateEmbedding(query.query);
+    if (!queryEmb) return searchLocalMemory(query); // model unavailable, fallback
+
+    // Score each candidate by cosine similarity
+    const scored: Array<{ item: MemorySearchResultItem; score: number }> = [];
+    for (const item of candidates.items) {
+      const text = `${item.summary} ${item.content ?? ''}`.slice(0, 500);
+      const itemEmb = await generateEmbedding(text);
+      if (itemEmb) {
+        scored.push({ item, score: cosineSimilarity(queryEmb, itemEmb) });
+      } else {
+        scored.push({ item, score: 0 });
+      }
+    }
+
+    // Sort by semantic similarity
+    scored.sort((a, b) => b.score - a.score);
+    const limit = query.limit ?? 5;
+    const topItems = scored.slice(0, limit).map((s) => s.item);
+
+    return {
+      items: topItems,
+      stats: candidates.stats,
+    };
+  } catch {
+    // Embedding failed — fall back to plain search
+    return searchLocalMemory(query);
+  }
+}
+
 export function searchLocalMemory(query: MemorySearchQuery): MemorySearchResult {
   const allItems: MemorySearchResultItem[] = [];
 

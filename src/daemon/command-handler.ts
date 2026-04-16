@@ -3951,9 +3951,9 @@ async function handleMemorySearch(cmd: Record<string, unknown>, serverLink: Serv
 async function prependLocalMemory(prompt: string, sessionName: string): Promise<string> {
   if (prompt.length < 10) return prompt; // skip greetings / confirmations
   try {
-    const { searchLocalMemory } = await import('../context/memory-search.js');
+    const { searchLocalMemorySemantic } = await import('../context/memory-search.js');
     const record = getSession(sessionName);
-    const result = searchLocalMemory({
+    const result = await searchLocalMemorySemantic({
       query: prompt.slice(0, 200),
       repo: record?.projectName ?? undefined,
       limit: 5,

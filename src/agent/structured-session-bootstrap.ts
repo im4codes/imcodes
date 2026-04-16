@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { basename } from 'node:path';
 import type { AgentType } from './detect.js';
 import { findRolloutPathByUuid, ensureSessionFile as ensureCodexSessionFile } from '../daemon/codex-watcher.js';
 import { injectGeminiMemory } from '../daemon/memory-inject.js';
@@ -63,7 +64,7 @@ export async function resolveStructuredSessionBootstrap({
       resolvedGeminiSessionId = await new GeminiDriver().resolveSessionId(projectDir);
       logger.info({ projectDir, geminiSessionId: resolvedGeminiSessionId }, 'Resolved Gemini session ID');
       if (resolvedGeminiSessionId && !legacyInjectionDisabled()) {
-        injectGeminiMemory(resolvedGeminiSessionId, projectDir).catch((e) =>
+        injectGeminiMemory(resolvedGeminiSessionId, projectDir, basename(projectDir)).catch((e) =>
           logger.warn({ err: e, projectDir, geminiSessionId: resolvedGeminiSessionId }, 'Gemini memory injection failed (non-fatal)'),
         );
       }

@@ -3,13 +3,13 @@
  */
 
 import { watch, readdir, stat, open, mkdir, writeFile } from 'fs/promises';
-import { join } from 'path';
+import { join, basename } from 'path';
 import { homedir } from 'os';
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 const execAsync = promisify(exec);
 import { timelineEmitter } from './timeline-emitter.js';
-import { readProjectMemory, buildCodexMemoryEntry, appendAgentSendDocs } from './memory-inject.js';
+import { buildSessionBootstrapContext, buildCodexMemoryEntry } from './memory-inject.js';
 import { legacyInjectionDisabled } from '../context/shared-context-flags.js';
 import logger from '../util/logger.js';
 import { updateSessionState } from '../store/session-store.js';
@@ -448,7 +448,7 @@ export async function ensureSessionFile(uuid: string, cwd: string): Promise<stri
   // Also required: `codex resume` needs at least one entry beyond session_meta.
   const memory = legacyInjectionDisabled()
     ? 'Shared context bootstrap deferred to runtime assembly.'
-    : appendAgentSendDocs(await readProjectMemory(cwd));
+    : await buildSessionBootstrapContext(cwd, basename(cwd));
   const lines = [meta, buildCodexMemoryEntry(memory, isoNow)];
 
   await writeFile(filePath, lines.join('\n') + '\n', 'utf8');
