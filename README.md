@@ -77,7 +77,7 @@ This is a personal project. I haven't written any code myself — it was built a
 
 ## Shared Agent Context & Memory
 
-This is now a core product feature, not an internal implementation detail. IM.codes continuously turns completed agent work into reusable memory and feeds that context back into future sessions.
+IM.codes continuously turns completed agent work into reusable memory and feeds that context back into future sessions.
 
 - **Problem → solution memory, not log spam.** Only final `assistant.text` outputs are materialized. Streaming deltas, tool calls, and intermediate noise are excluded.
 - **Personal memory with optional cloud sync.** Raw and processed memory always stay local; processed summaries can optionally sync to a user-scoped cloud pool shared across your devices.

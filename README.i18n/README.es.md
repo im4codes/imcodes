@@ -72,7 +72,7 @@ Este es un proyecto personal. Yo prácticamente no escribí código: fue constru
 
 ## Shared Agent Context y memoria
 
-Esto ya es una función central del producto, no un detalle interno de implementación. IM.codes convierte continuamente el trabajo ya resuelto de los agentes en memoria reutilizable y vuelve a inyectar ese contexto en sesiones futuras.
+IM.codes convierte continuamente el trabajo ya resuelto de los agentes en memoria reutilizable y vuelve a inyectar ese contexto en sesiones futuras.
 
 - **Se guarda problema → solución, no ruido de logs.** Solo se materializan las salidas finales `assistant.text`; se excluyen deltas en streaming, tool calls, tool results y ruido intermedio.
 - **Memoria personal con sincronización opcional en la nube.** La memoria cruda y la procesada permanecen siempre en local; los resúmenes procesados pueden sincronizarse opcionalmente con un pool en la nube a nivel de usuario compartido entre tus dispositivos.
