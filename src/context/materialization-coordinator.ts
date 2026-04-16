@@ -10,7 +10,7 @@ import type {
 } from '../../shared/context-types.js';
 import { isMemoryEligibleEvent } from '../../shared/context-types.js';
 import { getContextModelConfig } from './context-model-config.js';
-import { compressWithSdk, type CompressionResult } from './summary-compressor.js';
+import { buildLocalFallbackSummary, compressWithSdk, type CompressionResult } from './summary-compressor.js';
 import {
   clearDirtyTarget,
   countConsecutiveFailedJobs,
@@ -129,7 +129,7 @@ export class MaterializationCoordinator {
         modelConfig: this.modelConfig,
         targetTokens: 500,
       });
-    } catch (err) {
+    } catch {
       // SDK completely failed — use local fallback summary
       compression = {
         summary: buildLocalFallback(events, previousSummary),
@@ -275,10 +275,9 @@ export class MaterializationCoordinator {
   }
 }
 
-// Local fallback — reused when SDK compression is not called (e.g. tests, offline)
+// Local fallback — reused when SDK compression is not called (e.g. tests, offline).
+// Delegates to summary-compressor's shared fallback to keep logic in one place.
 function buildLocalFallback(events: LocalContextEvent[], previousSummary?: string): string {
-  // Delegate to summary-compressor's local fallback to keep logic in one place
-  const { buildLocalFallbackSummary } = require('./summary-compressor.js') as { buildLocalFallbackSummary: (events: LocalContextEvent[], prev?: string) => string };
   return buildLocalFallbackSummary(events, previousSummary);
 }
 

@@ -1,7 +1,7 @@
 import type { ContextTargetRef, LocalContextEvent } from '../../shared/context-types.js';
 import type { TimelineEvent } from '../daemon/timeline-event.js';
 import type { SessionRecord } from '../store/session-store.js';
-import { listDirtyTargets, listProcessedProjections } from '../store/context-store.js';
+import { listProcessedProjections } from '../store/context-store.js';
 import type { TransportContextBootstrap } from '../agent/runtime-context-bootstrap.js';
 import { MaterializationCoordinator, type MaterializationCoordinatorOptions } from './materialization-coordinator.js';
 
@@ -182,18 +182,3 @@ function stringifyContent(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
-function stringifyUnknown(value: unknown): string | undefined {
-  if (typeof value === 'string') return value.trim() || undefined;
-  if (value == null) return undefined;
-  try {
-    const serialized = JSON.stringify(value);
-    return serialized === '{}' ? undefined : serialized;
-  } catch {
-    return String(value);
-  }
-}
-
-function joinParts(parts: Array<string | undefined>): string | undefined {
-  const filtered = parts.filter((part): part is string => !!part);
-  return filtered.length > 0 ? filtered.join(' — ') : undefined;
-}

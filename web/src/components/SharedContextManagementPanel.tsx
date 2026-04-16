@@ -51,37 +51,74 @@ import { ChatMarkdown } from './ChatMarkdown.js';
 import type { WsClient } from '../ws-client.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../../../src/shared/models/options.js';
 
-const sectionStyle = {
-  border: '1px solid #334155',
-  borderRadius: 16,
-  padding: 14,
-  display: 'flex',
-  flexDirection: 'column',
-  gap: 10,
-  background: 'linear-gradient(180deg, #111827 0%, #0f172a 100%)',
-  boxShadow: 'inset 0 1px 0 rgba(148,163,184,0.06)',
+// ── Design tokens ────────────────────────────────────────────────────────────
+// Unified palette and spacing system. All component styles below reference these.
+
+const DT = {
+  bg: {
+    base: '#0a0e1a',          // deep canvas
+    surface: '#111827',       // card background
+    surfaceElev: '#162033',   // elevated card
+    input: '#0d1423',         // input fields
+    muted: 'rgba(148,163,184,0.06)', // subtle overlay
+  },
+  border: {
+    subtle: 'rgba(51,65,85,0.55)',
+    default: 'rgba(71,85,105,0.6)',
+    strong: 'rgba(96,165,250,0.3)',
+  },
+  text: {
+    primary: '#e6edf3',
+    secondary: '#9ca3af',
+    muted: '#6b7280',
+    accent: '#60a5fa',
+    success: '#34d399',
+    warn: '#fbbf24',
+    error: '#f87171',
+  },
+  radius: { sm: 6, md: 10, lg: 14, xl: 18, pill: 999 },
+  space: { xs: 4, sm: 8, md: 12, lg: 16, xl: 20, xxl: 24 },
+  shadow: {
+    sm: '0 1px 2px rgba(0,0,0,0.3)',
+    md: '0 4px 16px rgba(0,0,0,0.35)',
+    accent: '0 8px 24px rgba(37,99,235,0.2)',
+  },
 } as const;
 
 const shellStyle = {
   display: 'flex',
   flexDirection: 'column',
-  gap: 14,
-  padding: 12,
-  color: '#e2e8f0',
+  gap: DT.space.lg,
+  padding: DT.space.lg,
+  color: DT.text.primary,
   overflow: 'auto',
-  background: 'radial-gradient(circle at top left, rgba(37,99,235,0.12), transparent 32%), #0b1220',
+  background: `radial-gradient(ellipse at top, rgba(37,99,235,0.08), transparent 40%), ${DT.bg.base}`,
+  fontSize: 13,
+  lineHeight: 1.5,
+} as const;
+
+const sectionStyle = {
+  border: `1px solid ${DT.border.subtle}`,
+  borderRadius: DT.radius.xl,
+  padding: `${DT.space.lg}px ${DT.space.xl}px`,
+  display: 'flex',
+  flexDirection: 'column',
+  gap: DT.space.md,
+  background: DT.bg.surface,
+  boxShadow: DT.shadow.sm,
 } as const;
 
 const heroStyle = {
   ...sectionStyle,
-  gap: 14,
-  background: 'linear-gradient(145deg, rgba(30,41,59,0.98) 0%, rgba(15,23,42,0.98) 100%)',
-  border: '1px solid rgba(96,165,250,0.18)',
+  gap: DT.space.md,
+  background: `linear-gradient(135deg, rgba(37,99,235,0.08) 0%, ${DT.bg.surface} 60%)`,
+  border: `1px solid ${DT.border.strong}`,
+  boxShadow: DT.shadow.accent,
 } as const;
 
 const rowStyle = {
   display: 'flex',
-  gap: 8,
+  gap: DT.space.sm,
   flexWrap: 'wrap',
   alignItems: 'center',
 } as const;
@@ -89,79 +126,92 @@ const rowStyle = {
 const inputStyle = {
   flex: '1 1 180px',
   minWidth: 0,
-  background: '#0f172a',
-  color: '#e2e8f0',
-  border: '1px solid #334155',
-  borderRadius: 6,
-  padding: '6px 8px',
+  background: DT.bg.input,
+  color: DT.text.primary,
+  border: `1px solid ${DT.border.default}`,
+  borderRadius: DT.radius.sm,
+  padding: '8px 12px',
+  fontSize: 13,
+  transition: 'border-color 0.15s, box-shadow 0.15s',
+  outline: 'none',
 } as const;
 
 const buttonStyle = {
-  background: '#1d4ed8',
-  color: '#eff6ff',
+  background: '#2563eb',
+  color: '#ffffff',
   border: 'none',
-  borderRadius: 6,
-  padding: '6px 10px',
+  borderRadius: DT.radius.sm,
+  padding: '8px 14px',
   cursor: 'pointer',
+  fontSize: 13,
+  fontWeight: 500,
+  transition: 'background 0.15s, transform 0.1s',
 } as const;
 
 const subtleButtonStyle = {
   ...buttonStyle,
-  background: '#334155',
-  color: '#e2e8f0',
+  background: 'rgba(71,85,105,0.4)',
+  color: DT.text.primary,
+  border: `1px solid ${DT.border.subtle}`,
 } as const;
 
 const tabStyle = {
-  ...subtleButtonStyle,
-  padding: '10px 14px',
-  fontWeight: 600,
-  borderRadius: 999,
-  background: '#172033',
+  background: 'transparent',
+  color: DT.text.secondary,
+  border: 'none',
+  padding: '8px 14px',
+  fontSize: 13,
+  fontWeight: 500,
+  borderRadius: DT.radius.md,
+  cursor: 'pointer',
+  transition: 'background 0.15s, color 0.15s',
+  display: 'inline-flex',
+  alignItems: 'center',
 } as const;
 
 const tabActiveStyle = {
-  ...buttonStyle,
-  padding: '10px 14px',
+  ...tabStyle,
+  background: 'rgba(37,99,235,0.15)',
+  color: DT.text.primary,
   fontWeight: 600,
-  borderRadius: 999,
-  boxShadow: '0 10px 30px rgba(29,78,216,0.28)',
 } as const;
 
 const tabBarStyle = {
   display: 'flex',
-  gap: 8,
+  gap: DT.space.xs,
   flexWrap: 'wrap',
   alignItems: 'center',
-  padding: 6,
-  borderRadius: 999,
-  background: 'rgba(15,23,42,0.72)',
-  border: '1px solid rgba(51,65,85,0.9)',
+  padding: DT.space.xs,
+  borderRadius: DT.radius.md,
+  background: DT.bg.input,
+  border: `1px solid ${DT.border.subtle}`,
 } as const;
 
 const tabBadgeStyle = {
   display: 'inline-flex',
   alignItems: 'center',
   justifyContent: 'center',
-  marginLeft: 6,
-  padding: '1px 6px',
-  borderRadius: 10,
+  marginLeft: DT.space.sm,
+  padding: '2px 7px',
+  borderRadius: DT.radius.pill,
   fontSize: 11,
   fontWeight: 600,
-  background: 'rgba(96,165,250,0.15)',
-  color: '#93c5fd',
-  minWidth: 18,
+  background: 'rgba(96,165,250,0.18)',
+  color: DT.text.accent,
+  minWidth: 20,
 } as const;
 
 const pillStyle = {
   display: 'inline-flex',
   alignItems: 'center',
-  gap: 6,
-  padding: '4px 8px',
-  borderRadius: 999,
-  background: '#0f172a',
-  border: '1px solid #334155',
-  color: '#cbd5e1',
+  gap: DT.space.xs,
+  padding: '3px 10px',
+  borderRadius: DT.radius.pill,
+  background: DT.bg.input,
+  border: `1px solid ${DT.border.subtle}`,
+  color: DT.text.secondary,
   fontSize: 12,
+  fontWeight: 500,
 } as const;
 
 const checkboxRowStyle = {
@@ -172,21 +222,24 @@ const checkboxRowStyle = {
 const policyOptionStyle = {
   flex: '1 1 260px',
   minWidth: 240,
-  padding: '10px 12px',
-  borderRadius: 10,
-  border: '1px solid #334155',
-  background: '#0f172a',
+  padding: DT.space.md,
+  borderRadius: DT.radius.md,
+  border: `1px solid ${DT.border.subtle}`,
+  background: DT.bg.input,
   display: 'flex',
   flexDirection: 'column',
-  gap: 6,
+  gap: DT.space.xs,
 } as const;
 
 const fieldLabelStyle = {
   display: 'flex',
   flexDirection: 'column',
-  gap: 6,
-  color: '#cbd5e1',
-  fontSize: 13,
+  gap: DT.space.xs,
+  color: DT.text.secondary,
+  fontSize: 12,
+  fontWeight: 500,
+  textTransform: 'uppercase',
+  letterSpacing: '0.03em',
 } as const;
 
 const fieldInputStyle = {
@@ -205,109 +258,119 @@ const processingModelInputStyle = {
 
 const statGridStyle = {
   display: 'grid',
-  gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
-  gap: 10,
+  gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))',
+  gap: DT.space.sm,
 } as const;
 
 const statCardStyle = {
-  borderRadius: 12,
-  padding: '12px 14px',
-  border: '1px solid rgba(51,65,85,0.9)',
-  background: 'rgba(15,23,42,0.75)',
+  borderRadius: DT.radius.md,
+  padding: `${DT.space.md}px ${DT.space.lg}px`,
+  border: `1px solid ${DT.border.subtle}`,
+  background: DT.bg.input,
   display: 'flex',
   flexDirection: 'column',
-  gap: 4,
+  gap: DT.space.xs,
+  transition: 'border-color 0.15s',
 } as const;
 
 const resourceListStyle = {
   display: 'grid',
-  gap: 10,
+  gap: DT.space.md,
 } as const;
 
 const resourceCardStyle = {
-  borderRadius: 12,
-  padding: '12px 14px',
-  border: '1px solid rgba(51,65,85,0.9)',
-  background: 'rgba(15,23,42,0.78)',
+  borderRadius: DT.radius.lg,
+  padding: DT.space.lg,
+  border: `1px solid ${DT.border.subtle}`,
+  background: DT.bg.surfaceElev,
   display: 'flex',
   flexDirection: 'column',
-  gap: 8,
+  gap: DT.space.md,
+  transition: 'border-color 0.15s, transform 0.1s',
 } as const;
 
 const memoryContentCollapsedStyle = {
-  maxHeight: '4.5em',
-  overflowY: 'auto',
-  padding: '10px 12px',
-  borderRadius: 10,
-  border: '1px solid rgba(51,65,85,0.9)',
-  background: 'rgba(2,6,23,0.55)',
-  lineHeight: 1.5,
+  maxHeight: '4.8em',
+  overflowY: 'hidden',
+  padding: `${DT.space.md}px ${DT.space.lg}px`,
+  borderRadius: DT.radius.md,
+  border: `1px solid ${DT.border.subtle}`,
+  background: DT.bg.input,
+  lineHeight: 1.6,
+  fontSize: 13,
+  color: DT.text.primary,
+  position: 'relative',
+  maskImage: 'linear-gradient(to bottom, black 60%, transparent 100%)',
+  WebkitMaskImage: 'linear-gradient(to bottom, black 60%, transparent 100%)',
 } as const;
 
 const memoryContentExpandedStyle = {
   ...memoryContentCollapsedStyle,
   maxHeight: 'none',
   overflowY: 'visible',
+  maskImage: 'none',
+  WebkitMaskImage: 'none',
 } as const;
 
 const splitSectionStyle = {
   display: 'grid',
   gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))',
-  gap: 12,
+  gap: DT.space.md,
   alignItems: 'start',
 } as const;
 
 const cardGridStyle = {
   display: 'grid',
-  gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
-  gap: 10,
+  gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
+  gap: DT.space.md,
 } as const;
 
 const metaGridStyle = {
   display: 'grid',
-  gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
-  gap: 8,
+  gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))',
+  gap: DT.space.sm,
 } as const;
 
 const metaCardStyle = {
-  borderRadius: 10,
-  border: '1px solid rgba(51,65,85,0.9)',
-  background: 'rgba(2,6,23,0.55)',
-  padding: '8px 10px',
+  borderRadius: DT.radius.sm,
+  border: `1px solid ${DT.border.subtle}`,
+  background: DT.bg.input,
+  padding: `${DT.space.sm}px ${DT.space.md}px`,
   display: 'flex',
   flexDirection: 'column',
-  gap: 4,
+  gap: 3,
 } as const;
 
 const helperTextStyle = {
-  color: '#94a3b8',
-  fontSize: 13,
+  color: DT.text.secondary,
+  fontSize: 12,
   lineHeight: 1.5,
 } as const;
 
 const memoryProcessedNoteStyle = {
   ...helperTextStyle,
-  padding: '10px 12px',
-  borderRadius: 10,
-  border: '1px solid rgba(51,65,85,0.9)',
-  background: 'rgba(15,23,42,0.5)',
+  padding: `${DT.space.sm}px ${DT.space.md}px`,
+  borderRadius: DT.radius.sm,
+  border: `1px solid ${DT.border.subtle}`,
+  background: DT.bg.input,
+  fontSize: 12,
 } as const;
 
 const processingGridStyle = {
   display: 'grid',
-  gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
-  gap: 12,
+  gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))',
+  gap: DT.space.md,
   alignItems: 'start',
 } as const;
 
 const processingCardStyle = {
-  border: '1px solid #334155',
-  borderRadius: 12,
-  padding: 12,
-  background: '#0f172a',
+  border: `1px solid ${DT.border.subtle}`,
+  borderRadius: DT.radius.lg,
+  padding: DT.space.lg,
+  background: DT.bg.surface,
   display: 'flex',
   flexDirection: 'column',
-  gap: 10,
+  gap: DT.space.md,
 } as const;
 
 const backendChipRowStyle = {
@@ -422,9 +485,9 @@ type SharedScopeValue = 'project_shared' | 'workspace_shared' | 'org_shared';
 
 function InfoCard(props: { title: string; children: ComponentChildren }) {
   return (
-    <div style={{ ...sectionStyle, background: '#111827' }}>
-      <strong>{props.title}</strong>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, color: '#cbd5e1', fontSize: 13, lineHeight: 1.5 }}>
+    <div style={{ ...sectionStyle, background: DT.bg.surface }}>
+      <strong style={{ fontSize: 14, fontWeight: 600, color: DT.text.primary }}>{props.title}</strong>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: DT.space.xs, color: DT.text.secondary, fontSize: 12, lineHeight: 1.5 }}>
         {props.children}
       </div>
     </div>
@@ -433,9 +496,9 @@ function InfoCard(props: { title: string; children: ComponentChildren }) {
 
 function LabeledValue({ label, value }: { label: string; value: string }) {
   return (
-    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
-      <span style={{ color: '#94a3b8' }}>{label}</span>
-      <code style={{ color: '#e2e8f0' }}>{value}</code>
+    <div style={{ display: 'flex', justifyContent: 'space-between', gap: DT.space.md, flexWrap: 'wrap', alignItems: 'baseline' }}>
+      <span style={{ color: DT.text.muted }}>{label}</span>
+      <code style={{ color: DT.text.primary, fontSize: 12, fontFamily: 'ui-monospace, Menlo, monospace' }}>{value}</code>
     </div>
   );
 }
@@ -443,18 +506,18 @@ function LabeledValue({ label, value }: { label: string; value: string }) {
 function StatCard({ label, value, detail }: { label: string; value: string | number; detail?: string }) {
   return (
     <div style={statCardStyle}>
-      <span style={{ color: '#94a3b8', fontSize: 12, textTransform: 'uppercase', letterSpacing: '0.08em' }}>{label}</span>
-      <strong style={{ fontSize: 24, lineHeight: 1.1 }}>{value}</strong>
-      {detail ? <span style={{ color: '#94a3b8', fontSize: 12 }}>{detail}</span> : null}
+      <span style={{ color: DT.text.muted, fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.06em', fontWeight: 500 }}>{label}</span>
+      <strong style={{ fontSize: 22, lineHeight: 1.1, color: DT.text.primary, fontWeight: 600 }}>{value}</strong>
+      {detail ? <span style={{ color: DT.text.secondary, fontSize: 11 }}>{detail}</span> : null}
     </div>
   );
 }
 
 function SectionHeading({ title, description, action }: { title: string; description?: string; action?: ComponentChildren }) {
   return (
-    <div style={{ ...rowStyle, justifyContent: 'space-between', alignItems: 'flex-start' }}>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-        <strong>{title}</strong>
+    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: DT.space.md, flexWrap: 'wrap' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 3, flex: '1 1 auto', minWidth: 200 }}>
+        <strong style={{ fontSize: 15, fontWeight: 600, color: DT.text.primary }}>{title}</strong>
         {description ? <span style={helperTextStyle}>{description}</span> : null}
       </div>
       {action ? <div style={{ flexShrink: 0 }}>{action}</div> : null}
@@ -465,8 +528,8 @@ function SectionHeading({ title, description, action }: { title: string; descrip
 function MetaCard({ label, value }: { label: string; value: ComponentChildren }) {
   return (
     <div style={metaCardStyle}>
-      <span style={{ color: '#94a3b8', fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.06em' }}>{label}</span>
-      <span style={{ color: '#e2e8f0', fontSize: 13, lineHeight: 1.4 }}>{value}</span>
+      <span style={{ color: DT.text.muted, fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.04em', fontWeight: 500 }}>{label}</span>
+      <span style={{ color: DT.text.primary, fontSize: 12, lineHeight: 1.4, fontWeight: 500 }}>{value}</span>
     </div>
   );
 }
@@ -952,14 +1015,18 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   return (
     <div style={shellStyle}>
       <div style={heroStyle}>
-        <div style={{ ...rowStyle, justifyContent: 'space-between', alignItems: 'flex-start' }}>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-            <strong style={{ fontSize: 22, lineHeight: 1.1 }}>{t('sharedContext.management.title')}</strong>
-            <span style={helperTextStyle}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: DT.space.md, flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: DT.space.xs, flex: '1 1 auto', minWidth: 240 }}>
+            <strong style={{ fontSize: 20, fontWeight: 600, letterSpacing: '-0.01em', color: DT.text.primary }}>
+              {t('sharedContext.management.title')}
+            </strong>
+            <span style={{ ...helperTextStyle, fontSize: 13 }}>
               {t('sharedContext.management.heroDescription')}
             </span>
           </div>
-          <button style={subtleButtonStyle} onClick={() => void refreshEnterpriseData()}>{t('sharedContext.refresh')}</button>
+          <button style={subtleButtonStyle} onClick={() => void refreshEnterpriseData()}>
+            {t('sharedContext.refresh')}
+          </button>
         </div>
         <div style={rowStyle}>
           <select value={enterpriseId} onChange={(e) => setEnterpriseId((e.currentTarget as HTMLSelectElement).value)} style={inputStyle}>
