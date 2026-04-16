@@ -425,6 +425,19 @@ export function listProcessedProjections(namespace: ContextNamespace, projection
   }));
 }
 
+/** Returns a map of namespace_key → projection IDs for all local projections. */
+export function listAllProcessedProjectionsByNamespace(): Map<string, string[]> {
+  const database = ensureDb();
+  const rows = database.prepare('SELECT namespace_key, id FROM context_processed_local').all() as Array<{ namespace_key: string; id: string }>;
+  const result = new Map<string, string[]>();
+  for (const row of rows) {
+    const ids = result.get(row.namespace_key) ?? [];
+    ids.push(row.id);
+    result.set(row.namespace_key, ids);
+  }
+  return result;
+}
+
 export interface ProcessedProjectionQuery {
   scope?: ContextScope;
   projectId?: string;
@@ -663,7 +676,7 @@ function mapJobRecord(row: Record<string, unknown>, namespace: ContextNamespace)
   };
 }
 
-function parseNamespaceKey(namespaceKey: string): ContextNamespace {
+export function parseNamespaceKey(namespaceKey: string): ContextNamespace {
   const [scope, enterpriseId, workspaceId, userId, projectId] = namespaceKey.split('::');
   return {
     scope: scope as ContextNamespace['scope'],

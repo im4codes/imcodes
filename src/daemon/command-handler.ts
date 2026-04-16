@@ -3865,8 +3865,15 @@ async function handleSharedContextRuntimeConfigApply(cmd: Record<string, unknown
     logger.warn({ cmd }, 'invalid shared-context runtime config apply command');
     return;
   }
-  const { setContextModelRuntimeConfig } = await import('../context/context-model-config.js');
+  const { getContextModelConfig, setContextModelRuntimeConfig } = await import('../context/context-model-config.js');
+  const wasSyncEnabled = getContextModelConfig().enablePersonalMemorySync === true;
   setContextModelRuntimeConfig(normalized);
+  // If personal sync was just turned ON, re-queue all projections to ensure
+  // any that were previously "replicated" while sync was off get sent.
+  if (normalized.enablePersonalMemorySync && !wasSyncEnabled) {
+    const { requeueAllForReplication } = await import('../context/processed-context-replication.js');
+    requeueAllForReplication();
+  }
 }
 
 async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {

@@ -98,7 +98,7 @@ describe('shared-agent-context continuity integration', () => {
     let replicatedBody: ProcessedContextReplicationBody | null = null;
     vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
       replicatedBody = JSON.parse(String(init?.body)) as ProcessedContextReplicationBody;
-      return { ok: true };
+      return { ok: true, json: async () => ({ ok: true, projectionCount: replicatedBody!.projections.length }), text: async () => '' };
     }));
 
     const replication = await replicatePendingProcessedContext({
@@ -168,7 +168,7 @@ describe('shared-agent-context continuity integration', () => {
     vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
       if (url.includes('/shared-context/processed')) {
         replicationBody = JSON.parse(String(init?.body)) as ProcessedContextReplicationBody;
-        return { ok: true };
+        return { ok: true, json: async () => ({ ok: true, projectionCount: replicationBody!.projections.length }), text: async () => '' };
       }
       if (url.includes('/shared-context/authored-bindings')) {
         return {

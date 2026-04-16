@@ -40,7 +40,10 @@ describe('processed-context replication', () => {
       lastError: 'stale-error',
     });
 
-    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      return { ok: true, json: async () => ({ ok: true, projectionCount: body.projections.length }), text: async () => '' };
+    });
     vi.stubGlobal('fetch', fetchMock);
 
     const result = await replicatePendingProcessedContext({
@@ -85,7 +88,7 @@ describe('processed-context replication', () => {
       pendingProjectionIds: [projection.id],
     });
 
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 503 }));
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 503, text: async () => '' }));
 
     const result = await replicatePendingProcessedContext({
       workerUrl: 'http://localhost:3000',
@@ -97,13 +100,13 @@ describe('processed-context replication', () => {
     expect(result.failures).toEqual([
       {
         namespace,
-        error: 'processed_remote_replication_failed:503',
+        error: 'processed_remote_replication_failed:503:',
       },
     ]);
     expect(getReplicationState(namespace)).toEqual({
       namespace,
       pendingProjectionIds: [projection.id],
-      lastError: 'processed_remote_replication_failed:503',
+      lastError: 'processed_remote_replication_failed:503:',
       lastReplicatedAt: undefined,
     });
   });
@@ -123,7 +126,10 @@ describe('processed-context replication', () => {
       pendingProjectionIds: [projection.id],
     });
 
-    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      return { ok: true, json: async () => ({ ok: true, projectionCount: body.projections.length }), text: async () => '' };
+    });
     vi.stubGlobal('fetch', fetchMock);
 
     const skipped = await replicatePendingProcessedContext({

@@ -9,8 +9,11 @@ import {
   listProcessedProjections,
   listReplicationStates,
   setReplicationState,
+  listAllProcessedProjectionsByNamespace,
+  parseNamespaceKey,
 } from '../store/context-store.js';
 import { getContextModelConfig } from './context-model-config.js';
+import logger from '../util/logger.js';
 
 export interface ProcessedContextReplicationCredentials {
   workerUrl: string;
@@ -31,6 +34,9 @@ export async function replicatePendingProcessedContext(
   const config = getContextModelConfig();
   const personalSyncEnabled = config.enablePersonalMemorySync === true;
   const states = resolveStates(namespaces);
+  if (states.length > 0) {
+    logger.info({ personalSyncEnabled, stateCount: states.length }, 'Replication poller: found pending states');
+  }
   let replicatedNamespaces = 0;
   let replicatedProjections = 0;
   const failures: Array<{ namespace: ContextNamespace; error: string }> = [];
@@ -87,6 +93,28 @@ export async function replicatePendingProcessedContext(
   };
 }
 
+/**
+ * Re-queue ALL local processed projections for replication, ignoring
+ * what was previously marked as sent. Use when the server-side data is
+ * suspected to be missing despite the daemon believing it was replicated.
+ */
+export function requeueAllForReplication(): number {
+  const allProjections = listAllProcessedProjectionsByNamespace();
+  let requeued = 0;
+  for (const [namespaceKey, ids] of allProjections) {
+    if (ids.length === 0) continue;
+    const existing = getReplicationState(parseNamespaceKey(namespaceKey));
+    setReplicationState(parseNamespaceKey(namespaceKey), {
+      pendingProjectionIds: ids,
+      lastReplicatedAt: existing?.lastReplicatedAt,
+      lastError: undefined,
+    });
+    requeued += ids.length;
+  }
+  logger.info({ requeued }, 'Re-queued all projections for replication');
+  return requeued;
+}
+
 function resolveStates(namespaces?: ContextNamespace[]): ContextReplicationState[] {
   const allowPersonalSync = getContextModelConfig().enablePersonalMemorySync === true;
   if (!namespaces || namespaces.length === 0) {
@@ -109,10 +137,18 @@ function selectPendingProjections(namespace: ContextNamespace, pendingIds: strin
   return listProcessedProjections(namespace).filter((projection) => wanted.has(projection.id));
 }
 
+interface ReplicationAck {
+  ok: boolean;
+  projectionCount?: number;
+  replicatedAt?: number;
+  error?: string;
+}
+
 async function postProcessedContext(
   credentials: ProcessedContextReplicationCredentials,
   body: ProcessedContextReplicationBody,
-): Promise<void> {
+): Promise<ReplicationAck> {
+  const sentCount = body.projections.length;
   const response = await fetch(`${credentials.workerUrl}/api/server/${credentials.serverId}/shared-context/processed`, {
     method: 'POST',
     headers: {
@@ -122,6 +158,15 @@ async function postProcessedContext(
     body: JSON.stringify(body),
   });
   if (!response.ok) {
-    throw new Error(`processed_remote_replication_failed:${response.status}`);
+    const text = await response.text().catch(() => '');
+    throw new Error(`processed_remote_replication_failed:${response.status}:${text}`);
   }
+  const ack = await response.json().catch(() => ({})) as ReplicationAck;
+  if (typeof ack.projectionCount === 'number' && ack.projectionCount !== sentCount) {
+    logger.warn({ sentCount, ackCount: ack.projectionCount, scope: body.namespace.scope, projectId: body.namespace.projectId },
+      'Replication ACK count mismatch — server accepted fewer projections than sent');
+  }
+  logger.info({ scope: body.namespace.scope, projectId: body.namespace.projectId, sentCount, ackCount: ack.projectionCount ?? 'unknown' },
+    'Processed context replicated');
+  return ack;
 }
