@@ -69,8 +69,14 @@ export function mergeTransportPendingMessagesForRunningState(
 ): string[] {
   const existingMessages = Array.isArray(existing) ? existing.filter((entry) => typeof entry === 'string' && entry.length > 0) : [];
   if (!hasPendingMessagesField) return existingMessages;
-  // Trust the event's pending list — even when empty (messages were drained/dispatched)
-  return extractTransportPendingMessages(pendingFromEvent);
+  const fromEvent = extractTransportPendingMessages(pendingFromEvent);
+  // When the event says pending=[] but the session had queued messages, keep
+  // them visible.  The agent just picked up the message — it hasn't appeared
+  // in the timeline yet (no assistant.text event).  Clearing now would flash-
+  // remove the queue before the user sees any response.  The queue will be
+  // cleared by the next authoritative idle event (with pending=[]).
+  if (fromEvent.length === 0 && existingMessages.length > 0) return existingMessages;
+  return fromEvent;
 }
 
 export function mergeTransportPendingEntriesForRunningState(
@@ -80,16 +86,17 @@ export function mergeTransportPendingEntriesForRunningState(
   hasPendingMessagesField: boolean,
   scopeKey: string,
 ): TransportPendingMessageEntry[] {
-  if (!hasPendingMessagesField) {
-    const existingEntries = Array.isArray(existing)
-      ? existing.filter((entry) => typeof entry?.clientMessageId === 'string' && entry.clientMessageId && typeof entry?.text === 'string' && entry.text)
-      : [];
-    return existingEntries;
-  }
-  // Trust the event's pending list — even when empty (messages were drained/dispatched)
-  return normalizeTransportPendingEntries(
+  const existingEntries = Array.isArray(existing)
+    ? existing.filter((entry) => typeof entry?.clientMessageId === 'string' && entry.clientMessageId && typeof entry?.text === 'string' && entry.text)
+    : [];
+  if (!hasPendingMessagesField) return existingEntries;
+  const fromEvent = normalizeTransportPendingEntries(
     pendingFromEvent,
     pendingMessagesFromEvent,
     scopeKey,
   );
+  // Keep existing entries when event says empty but we had queued messages —
+  // same rationale as mergeTransportPendingMessagesForRunningState.
+  if (fromEvent.length === 0 && existingEntries.length > 0) return existingEntries;
+  return fromEvent;
 }

@@ -299,7 +299,7 @@ describe('sub-session metadata via subsession.sync', () => {
     expect(captured[0].transportPendingMessageEntries).toEqual([]);
   });
 
-  it('clears queue when running event carries authoritative empty pending (edit/delete)', async () => {
+  it('preserves queue when running event carries empty pending (agent picked up message)', async () => {
     const { ws, send } = createMockWs();
     render(<Harness ws={ws} connected={true} />);
     await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
@@ -327,13 +327,27 @@ describe('sub-session metadata via subsession.sync', () => {
 
     expect(captured[0].transportPendingMessages).toEqual(['msg']);
 
-    // Running with explicit empty pending (e.g., user deleted all queued messages) → clears
+    // Running with explicit empty pending — agent picked up the message but
+    // it hasn't appeared in timeline yet. Queue must stay visible.
     act(() => send({
       type: 'timeline.event',
       event: {
         type: 'session.state',
         sessionId: 'deck_sub_q5',
         payload: { state: 'running', pendingMessages: [], pendingMessageEntries: [] },
+      },
+    }));
+
+    expect(captured[0].transportPendingMessages).toEqual(['msg']);
+    expect(captured[0].transportPendingMessageEntries).toEqual([{ clientMessageId: 'msg-1', text: 'msg' }]);
+
+    // Only authoritative idle clears the queue
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_q5',
+        payload: { state: 'idle', pendingMessages: [], pendingMessageEntries: [] },
       },
     }));
 
@@ -777,19 +791,31 @@ describe('queue visibility e2e — queued messages must stay visible until turn 
     expectQueueCleared();
   });
 
-  it('clears on running with authoritative empty pending (delete all queued)', async () => {
+  it('preserves queue on running with empty pending — clears on idle', async () => {
     const { ws, send } = createMockWs();
     await setupSession(ws, send);
     queueMessages(send);
     expectQueueVisible();
 
-    // User deleted all queued messages via edit/delete → running with explicit empty
+    // Agent picks up message → running with empty pending. Queue must stay
+    // visible until the message appears in the timeline (authoritative idle).
     act(() => send({
       type: 'timeline.event',
       event: {
         type: 'session.state',
         sessionId: 'deck_sub_eq1',
         payload: { state: 'running', pendingMessages: [], pendingMessageEntries: [] },
+      },
+    }));
+    expectQueueVisible();
+
+    // Authoritative idle clears
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_eq1',
+        payload: { state: 'idle', pendingMessages: [], pendingMessageEntries: [] },
       },
     }));
     expectQueueCleared();
