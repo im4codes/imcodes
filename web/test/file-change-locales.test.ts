@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const LOCALES = ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko'] as const;
 const REQUIRED_CHAT_KEYS = [
@@ -31,8 +32,10 @@ const REQUIRED_CHAT_KEYS = [
   'file_change_renamed_from',
 ] as const;
 
+const TEST_DIR = dirname(fileURLToPath(import.meta.url));
+
 function loadLocale(locale: typeof LOCALES[number]): Record<string, unknown> {
-  const filePath = join(process.cwd(), 'src', 'i18n', 'locales', `${locale}.json`);
+  const filePath = join(TEST_DIR, '..', 'src', 'i18n', 'locales', `${locale}.json`);
   return JSON.parse(readFileSync(filePath, 'utf8')) as Record<string, unknown>;
 }
 
