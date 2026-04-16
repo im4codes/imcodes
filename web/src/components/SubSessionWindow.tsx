@@ -341,13 +341,7 @@ export function SubSessionWindow({
     const subBar = Array.from(document.querySelectorAll('.subsession-bar'))
       .find((el) => !(el as HTMLElement).closest('.subsession-window')) as HTMLElement | undefined;
     if (!controls && !subBar) return;
-    const measure = (el: HTMLElement | undefined) => {
-      if (!el) return 0;
-      const style = window.getComputedStyle(el);
-      if (style.display == 'none' || style.visibility == 'hidden') return 0;
-      return el.offsetHeight;
-    };
-    const update = () => setControlsHeight(measure(controls) + measure(subBar));
+    const update = () => setControlsHeight(subBar?.offsetHeight ?? controls?.offsetHeight ?? 0);
     update();
     if (typeof ResizeObserver === 'undefined') return;
     const ro = new ResizeObserver(update);

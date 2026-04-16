@@ -334,8 +334,8 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     await waitFor(() => {
       const panel = container.querySelector('.subsession-window') as HTMLElement | null;
       expect(panel).toBeTruthy();
-      expect(panel?.style.bottom).toBe('180px');
-      expect(panel?.style.height).toContain('180px');
+      expect(panel?.style.bottom).toBe('48px');
+      expect(panel?.style.height).toContain('48px');
       expect(panel?.style.zIndex).toBe('6000');
     });
 
@@ -380,8 +380,8 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
       const internalControls = container.querySelector('.subsession-window .controls-wrapper') as HTMLElement | null;
       const panel = container.querySelector('.subsession-window') as HTMLElement | null;
       expect(internalControls).toBeTruthy();
-      expect(panel?.style.bottom).toBe('192px');
-      expect(panel?.style.height).toContain('192px');
+      expect(panel?.style.bottom).toBe('44px');
+      expect(panel?.style.height).toContain('44px');
     });
 
     unmount();
@@ -426,55 +426,6 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     controls.remove();
     Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
   });
-
-
-  it('on mobile reserves only the collapsed sub-session button row, not the whole bar wrapper', async () => {
-    const originalUserAgent = navigator.userAgent;
-    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
-    const controls = document.createElement('div');
-    controls.className = 'controls-wrapper';
-    Object.defineProperty(controls, 'offsetHeight', { configurable: true, value: 132 });
-    const subcardBar = document.createElement('div');
-    subcardBar.className = 'subcard-bar';
-    Object.defineProperty(subcardBar, 'offsetHeight', { configurable: true, value: 76 });
-    const collapsedOnlyBar = document.createElement('div');
-    collapsedOnlyBar.className = 'subsession-bar';
-    Object.defineProperty(collapsedOnlyBar, 'offsetHeight', { configurable: true, value: 48 });
-    subcardBar.appendChild(collapsedOnlyBar);
-    document.body.appendChild(controls);
-    document.body.appendChild(subcardBar);
-
-    const sub = makeSubSession();
-    const { container, unmount } = render(
-      <SubSessionWindow
-        sub={sub}
-        ws={ws}
-        connected={true}
-        active={true}
-        onDiff={vi.fn()}
-        onHistory={vi.fn()}
-        onMinimize={vi.fn()}
-        onClose={vi.fn()}
-        onRestart={vi.fn()}
-        onRename={vi.fn()}
-        zIndex={6000}
-        onFocus={vi.fn()}
-      />,
-    );
-
-    await waitFor(() => {
-      const panel = container.querySelector('.subsession-window') as HTMLElement | null;
-      expect(panel?.style.bottom).toBe('180px');
-      expect(panel?.style.height).toContain('180px');
-    });
-
-    unmount();
-    controls.remove();
-    subcardBar.remove();
-    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
-  });
-
-
   it('clamps a persisted off-screen window back into the visible viewport', async () => {
     localStorage.setItem('rcc_subsession_sub-1', JSON.stringify({
       geom: { x: 5000, y: 5000, w: 620, h: 480 },
