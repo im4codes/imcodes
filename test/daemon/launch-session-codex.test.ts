@@ -96,7 +96,7 @@ describe('launchSession — Codex ID handling', () => {
       projectDir: '/proj',
     });
 
-    expect(mocks.ensureSessionFile).toHaveBeenCalledWith('new-codex-uuid', '/proj');
+    expect(mocks.ensureSessionFile).toHaveBeenCalledWith('new-codex-uuid', '/proj', 'deck_codex_brain');
 
     const launchCmd = mocks.newSession.mock.calls[0]?.[1];
     expect(launchCmd).toContain('resume new-codex-uuid');
