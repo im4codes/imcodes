@@ -33,13 +33,89 @@ export interface CompressionResult {
   fromSdk: boolean;
 }
 
-// ── Failure tracking for primary/backup failover ─────────────────────────────
+// ── Circuit breaker — per-backend state machine ──────────────────────────────
+//
+// States:
+// - CLOSED: normal operation, requests flow through
+// - OPEN: too many failures, requests short-circuit to next tier (backup/fallback)
+// - HALF_OPEN: cooldown elapsed, let one probe through to test recovery
+//
+// On repeated HALF_OPEN failures, cooldown extends exponentially to avoid
+// hammering a down service.
 
-let primaryConsecutiveFailures = 0;
-let backupConsecutiveFailures = 0;
+type BreakerState = 'closed' | 'open' | 'half_open';
+
+interface BreakerStats {
+  state: BreakerState;
+  consecutiveFailures: number;
+  consecutiveHalfOpenFailures: number;
+  openedAt: number;
+  cooldownMs: number;
+}
+
 const MAX_CONSECUTIVE_FAILURES = 3;
-const PRIMARY_HEALTH_CHECK_INTERVAL_MS = 5 * 60_000;
-let lastPrimaryAttemptAt = 0;
+const BASE_COOLDOWN_MS = 60_000;        // 1 minute initial cooldown
+const MAX_COOLDOWN_MS = 30 * 60_000;    // 30 minute cap
+const COOLDOWN_MULTIPLIER = 2;          // double each failed half-open probe
+
+const breakers = new Map<string, BreakerStats>();
+
+function getBreaker(backend: string): BreakerStats {
+  let b = breakers.get(backend);
+  if (!b) {
+    b = {
+      state: 'closed',
+      consecutiveFailures: 0,
+      consecutiveHalfOpenFailures: 0,
+      openedAt: 0,
+      cooldownMs: BASE_COOLDOWN_MS,
+    };
+    breakers.set(backend, b);
+  }
+  return b;
+}
+
+function canCall(backend: string, now: number): boolean {
+  const b = getBreaker(backend);
+  if (b.state === 'closed') return true;
+  if (b.state === 'half_open') return true; // allow probe (only one concurrent; per-call retry serializes)
+  // OPEN: check if cooldown elapsed → transition to half_open
+  if (now - b.openedAt >= b.cooldownMs) {
+    b.state = 'half_open';
+    logger.info({ backend }, 'Circuit breaker half-open — allowing probe');
+    return true;
+  }
+  return false;
+}
+
+function recordSuccess(backend: string): void {
+  const b = getBreaker(backend);
+  b.state = 'closed';
+  b.consecutiveFailures = 0;
+  b.consecutiveHalfOpenFailures = 0;
+  b.cooldownMs = BASE_COOLDOWN_MS; // reset cooldown on full recovery
+}
+
+function recordFailure(backend: string, now: number): void {
+  const b = getBreaker(backend);
+  b.consecutiveFailures++;
+  if (b.state === 'half_open') {
+    // Probe failed — extend cooldown exponentially
+    b.consecutiveHalfOpenFailures++;
+    b.cooldownMs = Math.min(b.cooldownMs * COOLDOWN_MULTIPLIER, MAX_COOLDOWN_MS);
+    b.state = 'open';
+    b.openedAt = now;
+    logger.warn({ backend, cooldownMs: b.cooldownMs, halfOpenFailures: b.consecutiveHalfOpenFailures },
+      'Circuit breaker reopened with extended cooldown');
+    return;
+  }
+  if (b.state === 'closed' && b.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+    b.state = 'open';
+    b.openedAt = now;
+    logger.warn({ backend, failures: b.consecutiveFailures, cooldownMs: b.cooldownMs },
+      'Circuit breaker opened');
+  }
+}
 
 // Per-call retry config (transient errors)
 const MAX_RETRIES_PER_BACKEND = 2; // total attempts = 1 initial + 2 retries = 3
@@ -88,10 +164,24 @@ async function sendWithRetry(backend: string, prompt: string): Promise<string> {
 }
 
 export function resetFailureTracking(): void {
-  primaryConsecutiveFailures = 0;
-  backupConsecutiveFailures = 0;
-  lastPrimaryAttemptAt = 0;
+  breakers.clear();
 }
+
+/** Get current circuit breaker state for observability/diagnostics. */
+export function getCircuitBreakerStats(): Record<string, BreakerStats> {
+  const result: Record<string, BreakerStats> = {};
+  for (const [backend, stats] of breakers) {
+    result[backend] = { ...stats };
+  }
+  return result;
+}
+
+/** @internal For tests only — direct access to breaker operations. */
+export const __testing__ = {
+  canCall,
+  recordSuccess,
+  recordFailure,
+};
 
 // ── Dedicated compression provider (private, NOT in global registry) ─────────
 
@@ -205,46 +295,49 @@ export async function compressWithSdk(input: CompressionInput): Promise<Compress
   const prompt = buildCompressionPrompt(events, previousSummary, targetTokens);
   const now = Date.now();
 
-  // Try primary (or health-check if it was failing)
-  const shouldTryPrimary = primaryConsecutiveFailures < MAX_CONSECUTIVE_FAILURES
-    || (now - lastPrimaryAttemptAt > PRIMARY_HEALTH_CHECK_INTERVAL_MS);
-
-  if (shouldTryPrimary) {
-    lastPrimaryAttemptAt = now;
+  // Try primary (gated by circuit breaker)
+  if (canCall(modelConfig.primaryContextBackend, now)) {
     try {
       const result = await sendWithRetry(modelConfig.primaryContextBackend, prompt);
-      primaryConsecutiveFailures = 0;
+      recordSuccess(modelConfig.primaryContextBackend);
       return {
         summary: result, model: modelConfig.primaryContextModel,
         backend: modelConfig.primaryContextBackend, usedBackup: false, fromSdk: true,
       };
     } catch (err) {
-      primaryConsecutiveFailures++;
-      // Tear down failed provider so next attempt starts fresh
+      recordFailure(modelConfig.primaryContextBackend, now);
       await shutdownCompressionProvider();
-      logger.warn({ err, backend: modelConfig.primaryContextBackend, failures: primaryConsecutiveFailures },
-        'Primary SDK compression failed after retries');
+      logger.warn({ err, backend: modelConfig.primaryContextBackend },
+        'Primary SDK compression failed; circuit breaker updated');
     }
+  } else {
+    logger.debug({ backend: modelConfig.primaryContextBackend },
+      'Primary skipped — circuit breaker open');
   }
 
-  // Try backup
+  // Try backup (gated by its own circuit breaker)
   if (modelConfig.backupContextBackend && modelConfig.backupContextModel) {
-    try {
-      const result = await sendWithRetry(modelConfig.backupContextBackend, prompt);
-      backupConsecutiveFailures = 0;
-      return {
-        summary: result, model: modelConfig.backupContextModel,
-        backend: modelConfig.backupContextBackend, usedBackup: true, fromSdk: true,
-      };
-    } catch (err) {
-      backupConsecutiveFailures++;
-      await shutdownCompressionProvider();
-      logger.warn({ err, backend: modelConfig.backupContextBackend, failures: backupConsecutiveFailures },
-        'Backup SDK compression failed');
+    if (canCall(modelConfig.backupContextBackend, now)) {
+      try {
+        const result = await sendWithRetry(modelConfig.backupContextBackend, prompt);
+        recordSuccess(modelConfig.backupContextBackend);
+        return {
+          summary: result, model: modelConfig.backupContextModel,
+          backend: modelConfig.backupContextBackend, usedBackup: true, fromSdk: true,
+        };
+      } catch (err) {
+        recordFailure(modelConfig.backupContextBackend, now);
+        await shutdownCompressionProvider();
+        logger.warn({ err, backend: modelConfig.backupContextBackend },
+          'Backup SDK compression failed; circuit breaker updated');
+      }
+    } else {
+      logger.debug({ backend: modelConfig.backupContextBackend },
+        'Backup skipped — circuit breaker open');
     }
   }
 
-  // All SDK attempts failed — local fallback
+  // All SDK attempts failed / circuits open — local fallback
   return {
     summary: buildLocalFallbackSummary(events, previousSummary),
     model: 'local-fallback', backend: 'none', usedBackup: false, fromSdk: false,
