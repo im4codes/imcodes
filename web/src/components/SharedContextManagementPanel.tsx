@@ -118,6 +118,7 @@ const heroStyle = {
   background: `linear-gradient(135deg, rgba(37,99,235,0.08) 0%, ${DT.bg.surface} 60%)`,
   border: `1px solid ${DT.border.strong}`,
   boxShadow: DT.shadow.accent,
+  overflow: 'hidden',
 } as const;
 
 const rowStyle = {
@@ -288,18 +289,21 @@ const resourceListStyle = {
 
 const resourceCardStyle = {
   borderRadius: SC_IS_MOBILE ? DT.radius.md : DT.radius.lg,
-  padding: SC_IS_MOBILE ? DT.space.md : DT.space.lg,
+  padding: SC_IS_MOBILE ? DT.space.sm : DT.space.lg,
   border: `1px solid ${DT.border.subtle}`,
   background: DT.bg.surfaceElev,
   display: 'flex',
   flexDirection: 'column',
-  gap: DT.space.md,
+  gap: SC_IS_MOBILE ? DT.space.sm : DT.space.md,
   transition: 'border-color 0.15s, transform 0.1s',
+  overflow: 'hidden',
+  minWidth: 0,
 } as const;
 
 const memoryContentCollapsedStyle = {
   maxHeight: '4.8em',
   overflowY: 'hidden',
+  overflowX: 'hidden',
   padding: SC_IS_MOBILE ? `${DT.space.sm}px ${DT.space.md}px` : `${DT.space.md}px ${DT.space.lg}px`,
   borderRadius: DT.radius.md,
   border: `1px solid ${DT.border.subtle}`,
@@ -308,6 +312,7 @@ const memoryContentCollapsedStyle = {
   fontSize: SC_IS_MOBILE ? 12 : 13,
   color: DT.text.primary,
   position: 'relative',
+  wordBreak: 'break-word',
   maskImage: 'linear-gradient(to bottom, black 60%, transparent 100%)',
   WebkitMaskImage: 'linear-gradient(to bottom, black 60%, transparent 100%)',
 } as const;
@@ -343,10 +348,12 @@ const metaCardStyle = {
   borderRadius: DT.radius.sm,
   border: `1px solid ${DT.border.subtle}`,
   background: DT.bg.input,
-  padding: `${DT.space.sm}px ${DT.space.md}px`,
+  padding: SC_IS_MOBILE ? `${DT.space.xs}px ${DT.space.sm}px` : `${DT.space.sm}px ${DT.space.md}px`,
   display: 'flex',
   flexDirection: 'column',
-  gap: 3,
+  gap: 2,
+  overflow: 'hidden',
+  minWidth: 0,
 } as const;
 
 const helperTextStyle = {
@@ -535,9 +542,9 @@ function SectionHeading({ title, description, action }: { title: string; descrip
 
 function MetaCard({ label, value }: { label: string; value: ComponentChildren }) {
   return (
-    <div style={metaCardStyle}>
+    <div style={{ ...metaCardStyle, overflow: 'hidden', minWidth: 0 }}>
       <span style={{ color: DT.text.muted, fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.04em', fontWeight: 500 }}>{label}</span>
-      <span style={{ color: DT.text.primary, fontSize: 12, lineHeight: 1.4, fontWeight: 500 }}>{value}</span>
+      <span style={{ color: DT.text.primary, fontSize: SC_IS_MOBILE ? 11 : 12, lineHeight: 1.4, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{value}</span>
     </div>
   );
 }
