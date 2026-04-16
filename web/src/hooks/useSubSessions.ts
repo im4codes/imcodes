@@ -318,10 +318,9 @@ export function useSubSessions(
           next[idx] = { ...next[idx], state: 'running' };
           return next;
         }
-        // For idle: only clear pending when the event carries authoritative pending data.
-        // transport-relay's onComplete emits idle WITHOUT pending fields — clearing here
-        // would flash-remove queued messages before drain dispatches them.
-        const shouldClearPending = state !== 'idle' || hasPendingMessagesField;
+        // Always clear pending on idle — the turn is complete and messages are in the
+        // timeline. If a new drain starts, the next queued event will re-populate.
+        const shouldClearPending = true;
         if (prev[idx].state === state && !shouldClearPending && (prev[idx].transportPendingMessages?.length ?? 0) === 0 && (prev[idx].transportPendingMessageEntries?.length ?? 0) === 0) return prev;
         const next = [...prev];
         next[idx] = {

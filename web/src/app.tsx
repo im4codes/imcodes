@@ -1458,13 +1458,15 @@ export function App() {
                 ? {
                     ...s,
                     state: liveState as SessionInfo['state'],
-                    // Only clear pending when the event carries authoritative pending data.
-                    // transport-relay's onComplete emits idle WITHOUT pending fields — clearing
-                    // here would flash-remove queued messages before drain dispatches them.
-                    // The subsequent runtime idle (with pending=[]) or drain running event will clear.
-                    ...(hasPendingMessagesField
-                      ? { transportPendingMessages: extractTransportPendingMessages(event.payload.pendingMessages), transportPendingMessageEntries: normalizeTransportPendingEntries(event.payload.pendingMessageEntries, extractTransportPendingMessages(event.payload.pendingMessages), event.sessionId) }
-                      : {}),
+                    // Always clear pending on idle — the turn is complete and messages
+                    // are in the timeline. If a new drain starts, the next queued/running
+                    // event will re-populate the queue.
+                    transportPendingMessages: hasPendingMessagesField
+                      ? extractTransportPendingMessages(event.payload.pendingMessages)
+                      : [],
+                    transportPendingMessageEntries: hasPendingMessagesField
+                      ? normalizeTransportPendingEntries(event.payload.pendingMessageEntries, extractTransportPendingMessages(event.payload.pendingMessages), event.sessionId)
+                      : [],
                   }
                 : s,
             ));

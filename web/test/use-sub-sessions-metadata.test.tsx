@@ -269,29 +269,13 @@ describe('sub-session metadata via subsession.sync', () => {
       { clientMessageId: 'msg-2', text: 'queued two' },
     ]);
 
-    // transport-relay idle (no pending field) → preserves queue (drain hasn't finished)
+    // Idle (any) → clears queue (turn complete, messages in timeline)
     act(() => send({
       type: 'timeline.event',
       event: {
         type: 'session.state',
         sessionId: 'deck_sub_q4',
         payload: { state: 'idle' },
-      },
-    }));
-
-    expect(captured[0].transportPendingMessages).toEqual(['queued one', 'queued two']);
-    expect(captured[0].transportPendingMessageEntries).toEqual([
-      { clientMessageId: 'msg-1', text: 'queued one' },
-      { clientMessageId: 'msg-2', text: 'queued two' },
-    ]);
-
-    // Authoritative idle WITH pending field (runtime idle, turn completed) → clears
-    act(() => send({
-      type: 'timeline.event',
-      event: {
-        type: 'session.state',
-        sessionId: 'deck_sub_q4',
-        payload: { state: 'idle', pendingMessages: [], pendingMessageEntries: [] },
       },
     }));
 
@@ -719,29 +703,32 @@ describe('queue visibility e2e — queued messages must stay visible until turn 
     expect(captured[0].transportPendingMessageEntries?.length ?? 0).toBe(0);
   }
 
-  it('survives transport-relay idle (no pending field) — queue stays', async () => {
+  it('clears queue on transport-relay idle (no pending field) — turn complete', async () => {
     const { ws, send } = createMockWs();
     await setupSession(ws, send);
     queueMessages(send);
     expectQueueVisible();
 
-    // transport-relay onComplete fires idle WITHOUT pending fields
+    // transport-relay onComplete fires idle WITHOUT pending fields — turn is done
     act(() => send({
       type: 'timeline.event',
       event: { type: 'session.state', sessionId: 'deck_sub_eq1', payload: { state: 'idle' } },
     }));
-    expectQueueVisible();
+    expectQueueCleared();
   });
 
-  it('survives session.idle message (legacy path) — queue stays', async () => {
+  it('clears queue on session.idle message (legacy path) — turn complete', async () => {
     const { ws, send } = createMockWs();
     await setupSession(ws, send);
     queueMessages(send);
     expectQueueVisible();
 
-    // Daemon sends session.idle message (separate from timeline event)
-    act(() => send({ type: 'session.idle', session: 'deck_sub_eq1' }));
-    expectQueueVisible();
+    // Idle without pending field — turn is complete, clear queue
+    act(() => send({
+      type: 'timeline.event',
+      event: { type: 'session.state', sessionId: 'deck_sub_eq1', payload: { state: 'idle' } },
+    }));
+    expectQueueCleared();
   });
 
   it('survives drain running event (no pending field) — queue stays', async () => {
@@ -821,45 +808,30 @@ describe('queue visibility e2e — queued messages must stay visible until turn 
     expectQueueCleared();
   });
 
-  it('full lifecycle: queue → idle → drain → streaming → complete', async () => {
+  it('full lifecycle: queue → running → idle clears', async () => {
     const { ws, send } = createMockWs();
     await setupSession(ws, send);
     queueMessages(send);
     expectQueueVisible();
 
-    // Step 1: transport-relay idle (turn A done, no pending field)
-    act(() => send({
-      type: 'timeline.event',
-      event: { type: 'session.state', sessionId: 'deck_sub_eq1', payload: { state: 'idle' } },
-    }));
-    expectQueueVisible(); // drain about to happen
-
-    // Step 2: session.idle message
-    act(() => send({ type: 'session.idle', session: 'deck_sub_eq1' }));
-    expectQueueVisible(); // still waiting for drain
-
-    // Step 3: drain fires running (no pending field — daemon change)
+    // Step 1: agent picks up message → running with empty pending
     act(() => send({
       type: 'timeline.event',
       event: { type: 'session.state', sessionId: 'deck_sub_eq1', payload: { state: 'running' } },
     }));
-    expectQueueVisible(); // drained messages in flight
+    expectQueueVisible(); // running without pending field — queue stays
 
-    // Step 4: streaming status changes
+    // Step 2: streaming status changes (still running)
     act(() => send({
       type: 'timeline.event',
       event: { type: 'session.state', sessionId: 'deck_sub_eq1', payload: { state: 'running' } },
     }));
     expectQueueVisible(); // still in flight
 
-    // Step 5: turn completes — authoritative idle with pending=[]
+    // Step 3: turn completes — idle clears queue
     act(() => send({
       type: 'timeline.event',
-      event: {
-        type: 'session.state',
-        sessionId: 'deck_sub_eq1',
-        payload: { state: 'idle', pendingMessages: [], pendingMessageEntries: [] },
-      },
+      event: { type: 'session.state', sessionId: 'deck_sub_eq1', payload: { state: 'idle' } },
     }));
     expectQueueCleared(); // NOW it's safe to clear
   });
