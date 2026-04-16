@@ -86,6 +86,7 @@
     "new": "+ 新規",
     "confirm_new": "新規作成しますか？",
     "stop": "✕ 停止",
+    "stop_plain": "停止",
     "confirm_stop": "停止しますか？",
     "confirm_stop_dialog": "このセッションを停止してもよろしいですか？この操作は元に戻せません。",
     "confirm_sub_stop_2": "⚠ 本当に {{label}} を停止しますか？",

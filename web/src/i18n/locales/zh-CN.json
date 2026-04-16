@@ -86,6 +86,7 @@
     "new": "+ 新建",
     "confirm_new": "确认新建?",
     "stop": "✕ 停止",
+    "stop_plain": "停止",
     "confirm_stop": "确认停止?",
     "confirm_stop_dialog": "确定要停止此会话吗？此操作无法撤销。",
     "confirm_sub_stop_2": "⚠ 确定停止 {{label}}？",

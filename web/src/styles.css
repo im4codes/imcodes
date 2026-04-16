@@ -116,6 +116,7 @@ body {
 .shortcut-btn:hover:not(:disabled) { background: #1e3a5f; border-color: #3b82f6; color: #93c5fd; }
 .shortcut-btn:disabled { opacity: 0.4; cursor: default; }
 .shortcut-btn-wide { padding-left: 14px; padding-right: 14px; }
+.shortcut-btn-icon { width: 28px; min-width: 28px; padding: 4px 0; display: inline-flex; align-items: center; justify-content: center; }
 .shortcut-btn-auto { display: inline-flex; align-items: center; gap: 5px; padding-left: 8px; padding-right: 8px; font-weight: 600; }
 .shortcut-btn-auto-dot { width: 6px; height: 6px; border-radius: 999px; flex-shrink: 0; }
 .shortcut-btn-auto-label { letter-spacing: 0.01em; }

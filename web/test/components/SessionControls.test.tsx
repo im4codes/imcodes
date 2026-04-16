@@ -53,6 +53,7 @@ vi.mock('react-i18next', () => ({
       if (key === 'session.send_placeholder_desktop_upload') {
         return `${String(opts?.placeholder ?? '')} Supports fast multi-file paste upload`;
       }
+      if (key === 'session.stop_plain') return 'Stop';
       if (key === 'session.supervision.quickLabel') return 'Auto';
       if (key === 'session.supervision.quickTitle') return 'Auto mode';
       if (key === 'common.hide') return 'hide';
@@ -1827,6 +1828,7 @@ afterEach(() => {
     );
 
     const stopBtn = screen.getByRole('button', { name: /^stop$/i }) as HTMLButtonElement;
+    expect(stopBtn.textContent).toBe('■');
     expect(stopBtn.disabled).toBe(false);
     fireEvent.click(stopBtn);
     expectSendPayload(ws, {

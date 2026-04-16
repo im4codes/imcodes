@@ -1853,15 +1853,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           {/* Transport sessions: single Stop button instead of terminal shortcuts */}
           {isTransport ? (
             <button
-              class="shortcut-btn shortcut-btn-wide"
-              title="Stop (/stop)"
+              class="shortcut-btn shortcut-btn-icon"
+              title={`${t('session.stop_plain')} (/stop)`}
+              aria-label={t('session.stop_plain')}
               disabled={disabled || activeSession?.state === 'stopped'}
               onClick={() => {
                 sendSessionMessage('/stop');
               }}
               style={activeSession?.state === 'running' ? { color: '#f87171' } : undefined}
             >
-              Stop
+              <span aria-hidden="true">■</span>
             </button>
           ) : SHORTCUTS.map((s) => (
             <button
