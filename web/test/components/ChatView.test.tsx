@@ -48,12 +48,18 @@ vi.mock('../../src/components/FloatingPanel.js', () => ({
 
 describe('ChatView', () => {
   const originalVisualViewport = window.visualViewport;
+  const clipboardWriteText = vi.fn().mockResolvedValue(undefined);
 
   (window as Window & { visualViewport?: typeof visualViewportMock }).visualViewport = visualViewportMock as any;
+  Object.defineProperty(navigator, 'clipboard', {
+    configurable: true,
+    value: { writeText: clipboardWriteText },
+  });
 
   afterEach(() => {
     cleanup();
     chatMarkdownRenderSpy.mockClear();
+    clipboardWriteText.mockClear();
     visualViewportMock.height = 800;
     visualViewportListeners.clear();
   });
@@ -583,5 +589,37 @@ describe('ChatView', () => {
     const text = toolEl!.textContent ?? '';
     // Must show the prompt, not just "Agent ✓"
     expect(text).toContain('Find the bug in auth module');
+  });
+
+  it('copies a chat message without the trailing timestamp from the context menu', async () => {
+    const hadTouchStart = 'ontouchstart' in window;
+    const originalTouchStart = (window as Window & { ontouchstart?: unknown }).ontouchstart;
+    if (hadTouchStart) delete (window as Window & { ontouchstart?: unknown }).ontouchstart;
+    try {
+      const { container, getByText } = render(
+        <ChatView
+          events={[
+            {
+              eventId: 'evt-user-copy',
+              type: 'user.message',
+              ts: new Date('2026-04-17T12:34:00Z').getTime(),
+              payload: { text: 'Fix reconnect logic' },
+            },
+          ] as any}
+          loading={false}
+          sessionId="deck_main_brain"
+        />,
+      );
+
+      const chatEvent = container.querySelector('.chat-event.chat-user') as HTMLElement;
+      fireEvent.contextMenu(chatEvent, { clientX: 40, clientY: 40 });
+      fireEvent.click(getByText('common.copy'));
+
+      await waitFor(() => {
+        expect(clipboardWriteText).toHaveBeenCalledWith('Fix reconnect logic');
+      });
+    } finally {
+      if (hadTouchStart) (window as Window & { ontouchstart?: unknown }).ontouchstart = originalTouchStart;
+    }
   });
 });

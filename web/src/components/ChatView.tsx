@@ -64,6 +64,12 @@ interface AssistantBlockProps {
   onDownload?: (path: string) => void;
 }
 
+function extractChatEventText(target: HTMLElement): string {
+  const clone = target.cloneNode(true) as HTMLElement;
+  for (const el of clone.querySelectorAll('.chat-bubble-time')) el.remove();
+  return (clone.textContent ?? '').trim();
+}
+
 function hasFileExtension(path: string): boolean {
   const basename = path.split(/[/\\]/).pop() ?? '';
   return /\.\w{1,10}$/.test(basename);
@@ -754,7 +760,7 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
     if (highlightElRef.current) highlightElRef.current.classList.remove('chat-highlight');
     target.classList.add('chat-highlight');
     setHighlightEl(target);
-    const text = (target.textContent ?? '').trim();
+    const text = extractChatEventText(target);
     if (!text) return;
     const mainEl = scrollRef.current?.closest('.chat-main') as HTMLElement | null;
     const mainRect = (mainEl ?? scrollRef.current!).getBoundingClientRect();
