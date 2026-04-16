@@ -517,7 +517,7 @@ export function recordMemoryHits(ids: string[]): void {
 
 export function getProcessedProjectionStats(filters: ProcessedProjectionQuery = {}): ProcessedProjectionStats {
   const database = ensureDb();
-  const rows = database.prepare('SELECT namespace_key, class, summary, content_json FROM context_processed_local').all() as Array<Record<string, unknown>>;
+  const rows = database.prepare('SELECT namespace_key, class, summary, content_json, status FROM context_processed_local').all() as Array<Record<string, unknown>>;
   const normalizedQuery = filters.query?.trim().toLowerCase() ?? '';
   let totalRecords = 0;
   let matchedRecords = 0;
@@ -530,6 +530,8 @@ export function getProcessedProjectionStats(filters: ProcessedProjectionQuery = 
     if (filters.projectId && namespace.projectId !== filters.projectId) continue;
     const projectionClass = String(row.class) as ProcessedContextClass;
     if (filters.projectionClass && projectionClass !== filters.projectionClass) continue;
+    const status = typeof row.status === 'string' ? row.status : 'active';
+    if (!filters.includeArchived && status === 'archived') continue;
     totalRecords += 1;
     projectIds.add(namespace.projectId);
     if (projectionClass === 'recent_summary') recentSummaryCount += 1;

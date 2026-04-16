@@ -36,6 +36,8 @@ export interface MemorySearchQuery {
   before?: number;
   /** Maximum number of results to return. */
   limit?: number;
+  /** Include archived processed projections. */
+  includeArchived?: boolean;
   /** Result offset for pagination. */
   offset?: number;
 }
@@ -76,7 +78,7 @@ export interface MemorySearchResult {
  */
 export async function searchLocalMemorySemantic(query: MemorySearchQuery): Promise<MemorySearchResult> {
   // First, get candidates with relaxed text match (or no query filter for broader recall)
-  const broadQuery = { ...query, limit: Math.max((query.limit ?? 5) * 4, 40) };
+  const broadQuery = { ...query, query: undefined, limit: Math.max((query.limit ?? 5) * 4, 40) };
   const candidates = searchLocalMemory(broadQuery);
   if (candidates.items.length === 0 || !query.query) return searchLocalMemory(query);
 
@@ -243,6 +245,7 @@ function collectProcessedProjections(query: MemorySearchQuery): ProcessedContext
     projectId: query.repo,
     projectionClass: query.projectionClass,
     query: query.query,
+    includeArchived: query.includeArchived,
   });
 }
 

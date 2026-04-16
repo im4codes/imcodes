@@ -168,7 +168,7 @@ const tabStyle = {
   background: 'transparent',
   color: DT.text.secondary,
   border: 'none',
-  padding: SC_IS_MOBILE ? '8px 10px' : '8px 14px',
+  padding: SC_IS_MOBILE ? '10px 12px' : '8px 14px',
   fontSize: SC_IS_MOBILE ? 12 : 13,
   fontWeight: 500,
   borderRadius: DT.radius.md,
@@ -176,8 +176,12 @@ const tabStyle = {
   transition: 'background 0.15s, color 0.15s',
   display: 'inline-flex',
   alignItems: 'center',
+  justifyContent: 'center',
   whiteSpace: 'nowrap',
+  lineHeight: 1.2,
+  minHeight: SC_IS_MOBILE ? 36 : undefined,
   flexShrink: 0,
+  ...(SC_IS_MOBILE ? { flex: '1 1 calc(50% - 2px)', minWidth: 0 } : {}),
 } as const;
 
 const tabActiveStyle = {
@@ -189,14 +193,13 @@ const tabActiveStyle = {
 
 const tabBarStyle = {
   display: 'flex',
-  gap: SC_IS_MOBILE ? 2 : DT.space.xs,
-  flexWrap: SC_IS_MOBILE ? 'nowrap' as const : 'wrap' as const,
-  alignItems: 'center',
-  padding: SC_IS_MOBILE ? 2 : DT.space.xs,
+  gap: SC_IS_MOBILE ? 6 : DT.space.xs,
+  flexWrap: 'wrap' as const,
+  alignItems: 'stretch',
+  padding: SC_IS_MOBILE ? 6 : DT.space.xs,
   borderRadius: DT.radius.md,
   background: DT.bg.input,
   border: `1px solid ${DT.border.subtle}`,
-  ...(SC_IS_MOBILE ? { overflowX: 'auto' as const, WebkitOverflowScrolling: 'touch' as const, scrollbarWidth: 'none' as const } : {}),
 } as const;
 
 const tabBadgeStyle = {
@@ -1254,7 +1257,14 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         </div>
       </div>
 
-      <div style={{ ...tabBarStyle, position: 'sticky', top: 0, zIndex: 10, background: DT.bg.base, boxShadow: '0 2px 8px rgba(0,0,0,0.4)' }}>
+      <div style={{
+        ...tabBarStyle,
+        position: SC_IS_MOBILE ? 'relative' : 'sticky',
+        top: SC_IS_MOBILE ? undefined : 0,
+        zIndex: 10,
+        background: DT.bg.base,
+        boxShadow: SC_IS_MOBILE ? 'none' : '0 2px 8px rgba(0,0,0,0.4)',
+      }}>
         {tabs.map((tab) => (
           <button
             key={tab.id}

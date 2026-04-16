@@ -30,6 +30,7 @@ import {
   normalizeSharedContextRuntimeConfig,
   SHARED_CONTEXT_RUNTIME_CONFIG_MSG,
 } from '../../../shared/shared-context-runtime-config.js';
+import { searchSemanticMemoryView } from '../util/semantic-memory-view.js';
 
 export const serverRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -481,9 +482,25 @@ serverRoutes.get('/:id/shared-context/personal-memory', requireAuth(), async (c)
   const server = await getServerById(c.env.DB, serverId);
   if (!server || server.user_id !== userId) return c.json({ error: 'not_found' }, 404);
   const projectId = c.req.query('projectId')?.trim();
-  const projectionClass = c.req.query('projectionClass')?.trim();
+  const projectionClass = c.req.query('projectionClass') === 'recent_summary' || c.req.query('projectionClass') === 'durable_memory_candidate'
+    ? c.req.query('projectionClass') as 'recent_summary' | 'durable_memory_candidate'
+    : undefined;
   const query = c.req.query('query')?.trim();
   const limit = Math.max(1, Math.min(100, Number.parseInt(c.req.query('limit') ?? '20', 10) || 20));
+
+  if (query) {
+    const semanticView = await searchSemanticMemoryView({
+      db: c.env.DB,
+      userId,
+      scope: 'personal',
+      query,
+      projectId: projectId || undefined,
+      projectionClass,
+      limit,
+    });
+    if (semanticView) return c.json(semanticView);
+  }
+
   const rows = await c.env.DB.query<{
     id: string;
     scope: 'personal';

@@ -1,10 +1,17 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import { sha256Hex } from '../src/security/crypto.js';
 import { serverRoutes } from '../src/routes/server.js';
 import { sharedContextRoutes } from '../src/routes/shared-context.js';
 import type { Env } from '../src/env.js';
 import type { Database } from '../src/db/client.js';
+
+const generateEmbeddingMock = vi.hoisted(() => vi.fn());
+
+vi.mock('../src/util/embedding.js', () => ({
+  generateEmbedding: generateEmbeddingMock,
+  embeddingToSql: (embedding: Float32Array) => `[${Array.from(embedding).join(',')}]`,
+}));
 
 vi.mock('../src/security/authorization.js', () => ({
   requireAuth: () => async (c: { set: (key: string, value: string) => void }, next: () => Promise<void>) => {
@@ -13,6 +20,11 @@ vi.mock('../src/security/authorization.js', () => ({
     await next();
   },
 }));
+
+beforeEach(() => {
+  generateEmbeddingMock.mockReset();
+  generateEmbeddingMock.mockResolvedValue(null);
+});
 
 function makeMockDb() {
   const projectionRows: Array<Record<string, unknown>> = [];
@@ -103,6 +115,31 @@ function makeMockDb() {
         }
         return null;
       }
+      if (normalized.includes('select role from team_members where team_id = $1 and user_id = $2')) {
+        if (params[0] === 'ent-1' && params[1] === 'user-1') {
+          return { role: 'owner' } as T;
+        }
+        return null;
+      }
+      if (normalized.includes('select count(*)::int as total_records') && normalized.includes('from shared_context_projections')) {
+        if (normalized.includes("scope = 'personal'")) {
+          return {
+            total_records: 1,
+            recent_summary_count: 1,
+            durable_candidate_count: 0,
+            project_count: 1,
+          } as T;
+        }
+        if (normalized.includes("scope in ('project_shared', 'workspace_shared', 'org_shared')")) {
+          return {
+            total_records: 1,
+            recent_summary_count: 0,
+            durable_candidate_count: 1,
+            project_count: 1,
+          } as T;
+        }
+        return null;
+      }
       return null;
     },
     query: async <T = unknown>(sql: string, params: unknown[] = []) => {
@@ -110,6 +147,44 @@ function makeMockDb() {
       if (normalized.includes('from shared_context_document_bindings b join shared_context_document_versions v on v.id = b.version_id')) {
         if (params[0] !== 'ent-1' || params[2] !== 'github.com/acme/repo') return [] as T[];
         return authoredBindingRows as T[];
+      }
+      if (normalized.includes("join shared_context_embeddings e on e.source_id = p.id and e.source_kind = 'projection'")) {
+        if (normalized.includes("p.scope = 'personal'")) {
+          return [
+            {
+              id: 'personal-projection-1',
+              scope: 'personal',
+              project_id: 'github.com/acme/repo',
+              projection_class: 'recent_summary',
+              source_event_ids_json: ['evt-1', 'evt-2'],
+              summary: 'Cloud personal summary',
+              updated_at: 1700000000000,
+              hit_count: 4,
+              last_used_at: 1700000001000,
+              status: 'active',
+              enterprise_id: null,
+              similarity: 0.91,
+            },
+          ] as T[];
+        }
+        if (normalized.includes("p.scope in ('project_shared', 'workspace_shared', 'org_shared')")) {
+          return [
+            {
+              id: 'shared-projection-1',
+              scope: 'project_shared',
+              project_id: 'github.com/acme/repo',
+              projection_class: 'durable_memory_candidate',
+              source_event_ids_json: ['evt-9'],
+              summary: 'Shared deployment guidance',
+              updated_at: 1700000002000,
+              hit_count: 7,
+              last_used_at: 1700000003000,
+              status: 'active',
+              enterprise_id: 'ent-1',
+              similarity: 0.88,
+            },
+          ] as T[];
+        }
       }
       if (normalized.includes("from shared_context_projections where user_id = $1 and scope = 'personal'")) {
         return [
@@ -122,6 +197,20 @@ function makeMockDb() {
             summary: 'Cloud personal summary',
             content_json: { note: 'personal cloud memory' },
             updated_at: 1700000000000,
+          },
+        ] as T[];
+      }
+      if (normalized.includes('from shared_context_projections where enterprise_id = $1')) {
+        return [
+          {
+            id: 'shared-projection-1',
+            scope: 'project_shared',
+            project_id: 'github.com/acme/repo',
+            projection_class: 'durable_memory_candidate',
+            source_event_ids_json: ['evt-9'],
+            summary: 'Shared deployment guidance',
+            content_json: { note: 'enterprise shared memory' },
+            updated_at: 1700000002000,
           },
         ] as T[];
       }
@@ -551,6 +640,87 @@ describe('shared-context processed remote route', () => {
           projectionClass: 'recent_summary',
           sourceEventCount: 2,
           updatedAt: 1700000000000,
+        },
+      ],
+    });
+  });
+
+
+  it('uses semantic/vector search for server-scoped personal memory queries when embeddings are available', async () => {
+    generateEmbeddingMock.mockResolvedValue(new Float32Array([0.1, 0.2, 0.3]));
+
+    const { db } = makeMockDb();
+    const app = new Hono<{ Bindings: Env }>();
+    app.route('/api/server', serverRoutes);
+
+    const response = await app.request('/api/server/srv-1/shared-context/personal-memory?query=deploy%20fix&limit=10', {
+      method: 'GET',
+    }, makeEnv(db));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      stats: {
+        totalRecords: 1,
+        matchedRecords: 1,
+        recentSummaryCount: 1,
+        durableCandidateCount: 0,
+        projectCount: 1,
+        stagedEventCount: 0,
+        dirtyTargetCount: 0,
+        pendingJobCount: 0,
+      },
+      records: [
+        {
+          id: 'personal-projection-1',
+          scope: 'personal',
+          projectId: 'github.com/acme/repo',
+          summary: 'Cloud personal summary',
+          projectionClass: 'recent_summary',
+          sourceEventCount: 2,
+          updatedAt: 1700000000000,
+          hitCount: 4,
+          lastUsedAt: 1700000001000,
+          status: 'active',
+        },
+      ],
+    });
+  });
+
+  it('uses semantic/vector search for enterprise shared memory queries when embeddings are available', async () => {
+    generateEmbeddingMock.mockResolvedValue(new Float32Array([0.3, 0.2, 0.1]));
+
+    const { db } = makeMockDb();
+    const app = new Hono<{ Bindings: Env }>();
+    app.route('/api/shared-context', sharedContextRoutes);
+
+    const response = await app.request('/api/shared-context/enterprises/ent-1/memory?query=deployment&limit=10', {
+      method: 'GET',
+    }, makeEnv(db));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      stats: {
+        totalRecords: 1,
+        matchedRecords: 1,
+        recentSummaryCount: 0,
+        durableCandidateCount: 1,
+        projectCount: 1,
+        stagedEventCount: 0,
+        dirtyTargetCount: 0,
+        pendingJobCount: 0,
+      },
+      records: [
+        {
+          id: 'shared-projection-1',
+          scope: 'project_shared',
+          projectId: 'github.com/acme/repo',
+          summary: 'Shared deployment guidance',
+          projectionClass: 'durable_memory_candidate',
+          sourceEventCount: 1,
+          updatedAt: 1700000002000,
+          hitCount: 7,
+          lastUsedAt: 1700000003000,
+          status: 'active',
         },
       ],
     });

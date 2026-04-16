@@ -3,6 +3,13 @@ import { Hono } from 'hono';
 import type { Env } from '../src/env.js';
 import type { Database } from '../src/db/client.js';
 
+const generateEmbeddingMock = vi.hoisted(() => vi.fn());
+
+vi.mock('../src/util/embedding.js', () => ({
+  generateEmbedding: generateEmbeddingMock,
+  embeddingToSql: (embedding: Float32Array) => `[${Array.from(embedding).join(',')}]`,
+}));
+
 const logAuditMock = vi.fn().mockResolvedValue(undefined);
 
 vi.mock('../src/security/authorization.js', () => ({

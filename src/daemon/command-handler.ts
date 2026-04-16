@@ -3905,31 +3905,77 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
   const query = typeof cmd.query === 'string' ? cmd.query.trim() : '';
   const limit = Math.max(1, Math.min(100, typeof cmd.limit === 'number' ? cmd.limit : 20));
   const includeArchived = cmd.includeArchived === true;
-  const stats = getProcessedProjectionStats({
+  const baseStats = getProcessedProjectionStats({
     scope: 'personal',
     projectId: projectId || undefined,
     projectionClass,
-    query: query || undefined,
-  });
-  const records = queryProcessedProjections({
-    scope: 'personal',
-    projectId: projectId || undefined,
-    projectionClass,
-    query: query || undefined,
-    limit,
     includeArchived,
-  }).map((projection) => ({
-    id: projection.id,
-    scope: projection.namespace.scope,
-    projectId: projection.namespace.projectId,
-    summary: projection.summary,
-    projectionClass: projection.class,
-    sourceEventCount: projection.sourceEventIds.length,
-    updatedAt: projection.updatedAt,
-    hitCount: projection.hitCount ?? 0,
-    lastUsedAt: projection.lastUsedAt,
-    status: projection.status ?? 'active' as const,
-  }));
+  });
+
+  let records: Array<{
+    id: string;
+    scope: 'personal';
+    projectId: string;
+    summary: string;
+    projectionClass: 'recent_summary' | 'durable_memory_candidate';
+    sourceEventCount: number;
+    updatedAt: number;
+    hitCount: number;
+    lastUsedAt: number | undefined;
+    status: 'active' | 'archived';
+  }>;
+  let matchedRecords: number;
+
+  if (query) {
+    const { searchLocalMemorySemantic } = await import('../context/memory-search.js');
+    const semantic = await searchLocalMemorySemantic({
+      query,
+      repo: projectId || undefined,
+      projectionClass,
+      limit,
+      includeArchived,
+    });
+    records = semantic.items
+      .filter((item) => item.type === 'processed')
+      .map((item) => ({
+        id: item.id,
+        scope: 'personal' as const,
+        projectId: item.projectId,
+        summary: item.summary,
+        projectionClass: item.projectionClass ?? 'recent_summary',
+        sourceEventCount: item.sourceEventCount ?? 0,
+        updatedAt: item.updatedAt ?? item.createdAt,
+        hitCount: item.hitCount ?? 0,
+        lastUsedAt: item.lastUsedAt,
+        status: item.status ?? 'active',
+      }));
+    matchedRecords = records.length;
+  } else {
+    records = queryProcessedProjections({
+      scope: 'personal',
+      projectId: projectId || undefined,
+      projectionClass,
+      limit,
+      includeArchived,
+    }).map((projection) => ({
+      id: projection.id,
+      scope: projection.namespace.scope as 'personal',
+      projectId: projection.namespace.projectId,
+      summary: projection.summary,
+      projectionClass: projection.class,
+      sourceEventCount: projection.sourceEventIds.length,
+      updatedAt: projection.updatedAt,
+      hitCount: projection.hitCount ?? 0,
+      lastUsedAt: projection.lastUsedAt,
+      status: projection.status ?? 'active' as const,
+    }));
+    matchedRecords = baseStats.matchedRecords;
+  }
+
+  const stats = {
+    ...baseStats,
+    matchedRecords,
+  };
   const pendingRecords = queryPendingContextEvents({
     scope: 'personal',
     projectId: projectId || undefined,

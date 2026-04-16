@@ -8,6 +8,7 @@ import { parseCanonicalRepositoryKey } from '../../../src/agent/repository-ident
 import { classifyTimestampFreshness } from '../../../shared/context-freshness.js';
 import type { ContextMemoryRecordView, ContextMemoryStatsView } from '../../../shared/context-types.js';
 import { computeRelevanceScore, type ProjectionClass } from '../../../shared/memory-scoring.js';
+import { searchSemanticMemoryView } from '../util/semantic-memory-view.js';
 
 type EnterpriseRole = 'owner' | 'admin' | 'member';
 type BindingMode = 'required' | 'advisory';
@@ -198,9 +199,25 @@ function buildSharedMemoryResponse(
 sharedContextRoutes.get('/personal-memory', async (c) => {
   const userId = c.get('userId' as never) as string;
   const projectId = c.req.query('projectId')?.trim();
-  const projectionClass = c.req.query('projectionClass')?.trim();
+  const projectionClass = c.req.query('projectionClass') === 'recent_summary' || c.req.query('projectionClass') === 'durable_memory_candidate'
+    ? c.req.query('projectionClass') as 'recent_summary' | 'durable_memory_candidate'
+    : undefined;
   const query = c.req.query('query')?.trim();
   const limit = Math.max(1, Math.min(100, Number.parseInt(c.req.query('limit') ?? '20', 10) || 20));
+
+  if (query) {
+    const semanticView = await searchSemanticMemoryView({
+      db: c.env.DB,
+      userId,
+      scope: 'personal',
+      query,
+      projectId: projectId || undefined,
+      projectionClass,
+      limit,
+    });
+    if (semanticView) return c.json(semanticView);
+  }
+
   const rows = await c.env.DB.query<{
     id: string;
     scope: 'personal';
@@ -675,9 +692,26 @@ sharedContextRoutes.get('/enterprises/:enterpriseId/memory', async (c) => {
   const auth = await requireEnterpriseRole(c, enterpriseId, 'member');
   if (auth instanceof Response) return auth;
   const canonicalRepoId = c.req.query('canonicalRepoId')?.trim();
-  const projectionClass = c.req.query('projectionClass')?.trim();
+  const projectionClass = c.req.query('projectionClass') === 'recent_summary' || c.req.query('projectionClass') === 'durable_memory_candidate'
+    ? c.req.query('projectionClass') as 'recent_summary' | 'durable_memory_candidate'
+    : undefined;
   const query = c.req.query('query')?.trim();
   const limit = Math.max(1, Math.min(100, Number.parseInt(c.req.query('limit') ?? '20', 10) || 20));
+
+  if (query) {
+    const semanticView = await searchSemanticMemoryView({
+      db: c.env.DB,
+      userId: auth.userId,
+      scope: 'enterprise',
+      enterpriseId,
+      query,
+      projectId: canonicalRepoId || undefined,
+      projectionClass,
+      limit,
+    });
+    if (semanticView) return c.json(semanticView);
+  }
+
   const rows = await c.env.DB.query<{
     id: string;
     scope: 'project_shared' | 'workspace_shared' | 'org_shared';
