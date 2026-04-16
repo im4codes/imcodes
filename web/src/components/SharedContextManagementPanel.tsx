@@ -1117,21 +1117,22 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
           <StatCard label="Knowledge Docs" value={documents.length} />
           <StatCard label="Server" value={formatServerScopeValue(serverId)} detail={serverId ? 'Cloud-synced runtime settings' : 'Select a server to sync processing config'} />
         </div>
-        <div style={tabBarStyle}>
-          {tabs.map((tab) => (
-            <button
-              key={tab.id}
-              style={activeTab === tab.id ? tabActiveStyle : tabStyle}
-              onClick={() => setActiveTab(tab.id)}
-            >
-              {tab.label}
-            </button>
-          ))}
-        </div>
-        {loading && <div style={helperTextStyle}>{t('sharedContext.loading')}</div>}
-        {error && <div style={{ color: '#fca5a5' }}>{error}</div>}
-        {notice && <div style={{ color: '#86efac' }}>{notice}</div>}
       </div>
+
+      <div style={{ ...tabBarStyle, position: 'sticky', top: 0, zIndex: 10 }}>
+        {tabs.map((tab) => (
+          <button
+            key={tab.id}
+            style={activeTab === tab.id ? tabActiveStyle : tabStyle}
+            onClick={() => setActiveTab(tab.id)}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+      {loading && <div style={helperTextStyle}>{t('sharedContext.loading')}</div>}
+      {error && <div style={{ color: '#fca5a5' }}>{error}</div>}
+      {notice && <div style={{ color: '#86efac' }}>{notice}</div>}
 
       {activeTab === 'enterprise' && (
         <div style={splitSectionStyle}>
