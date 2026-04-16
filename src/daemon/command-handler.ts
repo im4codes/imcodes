@@ -3859,6 +3859,7 @@ async function handleSharedContextRuntimeConfigApply(cmd: Record<string, unknown
       typeof config?.backupContextBackend === 'string' ? config.backupContextBackend : undefined,
     ),
     backupContextModel: typeof config?.backupContextModel === 'string' ? config.backupContextModel : undefined,
+    enablePersonalMemorySync: config?.enablePersonalMemorySync === true,
   });
   if (!normalized.primaryContextBackend || !normalized.primaryContextModel) {
     logger.warn({ cmd }, 'invalid shared-context runtime config apply command');
