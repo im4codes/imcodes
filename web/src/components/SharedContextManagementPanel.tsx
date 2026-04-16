@@ -2063,7 +2063,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 />
                 <div style={statGridStyle}>
                   <StatCard label={t('sharedContext.management.memoryStatTotal')} value={localPersonalMemory.stats.totalRecords} />
-                  <StatCard label={t('sharedContext.management.memoryStatHits')} value={localPersonalMemory.stats.matchedRecords} />
+                  {memoryQuery.trim() ? <StatCard label={t('sharedContext.management.memoryStatHits')} value={localPersonalMemory.stats.matchedRecords} /> : null}
                   <StatCard label={t('sharedContext.management.memoryStatRecent')} value={localPersonalMemory.stats.recentSummaryCount} />
                   <StatCard
                     label={t('sharedContext.management.memoryStatDurable')}
@@ -2143,7 +2143,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 />
                 <div style={statGridStyle}>
                   <StatCard label={t('sharedContext.management.memoryStatTotal')} value={cloudPersonalMemory.stats.totalRecords} />
-                  <StatCard label={t('sharedContext.management.memoryStatHits')} value={cloudPersonalMemory.stats.matchedRecords} />
+                  {memoryQuery.trim() ? <StatCard label={t('sharedContext.management.memoryStatHits')} value={cloudPersonalMemory.stats.matchedRecords} /> : null}
                   <StatCard label={t('sharedContext.management.memoryStatRecent')} value={cloudPersonalMemory.stats.recentSummaryCount} />
                   <StatCard
                     label={t('sharedContext.management.memoryStatDurable')}
@@ -2164,7 +2164,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 />
                 <div style={statGridStyle}>
                   <StatCard label={t('sharedContext.management.memoryStatTotal')} value={sharedMemory.stats.totalRecords} />
-                  <StatCard label={t('sharedContext.management.memoryStatHits')} value={sharedMemory.stats.matchedRecords} />
+                  {memoryQuery.trim() ? <StatCard label={t('sharedContext.management.memoryStatHits')} value={sharedMemory.stats.matchedRecords} /> : null}
                   <StatCard label={t('sharedContext.management.memoryStatRecent')} value={sharedMemory.stats.recentSummaryCount} />
                   <StatCard
                     label={t('sharedContext.management.memoryStatDurable')}
