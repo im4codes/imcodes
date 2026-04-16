@@ -269,13 +269,30 @@ describe('sub-session metadata via subsession.sync', () => {
       { clientMessageId: 'msg-2', text: 'queued two' },
     ]);
 
-    // Idle (any) → clears queue (turn complete, messages in timeline)
+    // Idle without queue fields is state-only; queue must stay visible until
+    // an authoritative empty queue snapshot arrives.
     act(() => send({
       type: 'timeline.event',
       event: {
         type: 'session.state',
         sessionId: 'deck_sub_q4',
         payload: { state: 'idle' },
+      },
+    }));
+
+    expect(captured[0].transportPendingMessages).toEqual(['queued one', 'queued two']);
+    expect(captured[0].transportPendingMessageEntries).toEqual([
+      { clientMessageId: 'msg-1', text: 'queued one' },
+      { clientMessageId: 'msg-2', text: 'queued two' },
+    ]);
+
+    // Authoritative idle with empty queue clears
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_q4',
+        payload: { state: 'idle', pendingMessages: [], pendingMessageEntries: [] },
       },
     }));
 
@@ -703,32 +720,66 @@ describe('queue visibility e2e — queued messages must stay visible until turn 
     expect(captured[0].transportPendingMessageEntries?.length ?? 0).toBe(0);
   }
 
-  it('clears queue on transport-relay idle (no pending field) — turn complete', async () => {
+  it('preserves queue on idle without pending fields until authoritative empty idle arrives', async () => {
     const { ws, send } = createMockWs();
     await setupSession(ws, send);
     queueMessages(send);
     expectQueueVisible();
 
-    // transport-relay onComplete fires idle WITHOUT pending fields — turn is done
+    // State-only idle must not clear the queue.
     act(() => send({
       type: 'timeline.event',
       event: { type: 'session.state', sessionId: 'deck_sub_eq1', payload: { state: 'idle' } },
+    }));
+    expectQueueVisible();
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_eq1',
+        payload: { state: 'idle', pendingMessages: [], pendingMessageEntries: [] },
+      },
     }));
     expectQueueCleared();
   });
 
-  it('clears queue on session.idle message (legacy path) — turn complete', async () => {
+  it('does not clear queue on session.idle notification', async () => {
     const { ws, send } = createMockWs();
     await setupSession(ws, send);
     queueMessages(send);
     expectQueueVisible();
 
-    // Idle without pending field — turn is complete, clear queue
+    act(() => send({
+      type: 'session.idle',
+      session: 'deck_sub_eq1',
+      project: 'proj',
+      agentType: 'codex-sdk',
+    }));
+    expectQueueVisible();
+  });
+
+  it('preserves queue on idle with attached pending snapshot', async () => {
+    const { ws, send } = createMockWs();
+    await setupSession(ws, send);
+    queueMessages(send);
+
     act(() => send({
       type: 'timeline.event',
-      event: { type: 'session.state', sessionId: 'deck_sub_eq1', payload: { state: 'idle' } },
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_eq1',
+        payload: {
+          state: 'idle',
+          pendingMessages: ['fix the bug', 'then add tests'],
+          pendingMessageEntries: [
+            { clientMessageId: 'q1', text: 'fix the bug' },
+            { clientMessageId: 'q2', text: 'then add tests' },
+          ],
+        },
+      },
     }));
-    expectQueueCleared();
+    expectQueueVisible();
   });
 
   it('survives drain running event (no pending field) — queue stays', async () => {
@@ -828,12 +879,23 @@ describe('queue visibility e2e — queued messages must stay visible until turn 
     }));
     expectQueueVisible(); // still in flight
 
-    // Step 3: turn completes — idle clears queue
+    // Step 3: state-only idle does not clear queue
     act(() => send({
       type: 'timeline.event',
       event: { type: 'session.state', sessionId: 'deck_sub_eq1', payload: { state: 'idle' } },
     }));
-    expectQueueCleared(); // NOW it's safe to clear
+    expectQueueVisible();
+
+    // Step 4: authoritative empty idle clears queue
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_eq1',
+        payload: { state: 'idle', pendingMessages: [], pendingMessageEntries: [] },
+      },
+    }));
+    expectQueueCleared();
   });
 
   it('updates queue when new queued event arrives mid-flight', async () => {

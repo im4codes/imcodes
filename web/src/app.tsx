@@ -68,7 +68,9 @@ import { watchProjectionStore } from './watch-projection.js';
 import { isIdleSessionStateTimelineEvent, isRunningTimelineEvent } from './timeline-running.js';
 import {
   extractTransportPendingMessages,
+  mergeTransportPendingEntriesForIdleState,
   mergeTransportPendingEntriesForRunningState,
+  mergeTransportPendingMessagesForIdleState,
   mergeTransportPendingMessagesForRunningState,
   normalizeTransportPendingEntries,
 } from './transport-queue.js';
@@ -1461,15 +1463,18 @@ export function App() {
                 ? {
                     ...s,
                     state: liveState as SessionInfo['state'],
-                    // Always clear pending on idle — the turn is complete and messages
-                    // are in the timeline. If a new drain starts, the next queued/running
-                    // event will re-populate the queue.
-                    transportPendingMessages: hasPendingMessagesField
-                      ? extractTransportPendingMessages(event.payload.pendingMessages)
-                      : [],
-                    transportPendingMessageEntries: hasPendingMessagesField
-                      ? normalizeTransportPendingEntries(event.payload.pendingMessageEntries, extractTransportPendingMessages(event.payload.pendingMessages), event.sessionId)
-                      : [],
+                    transportPendingMessages: mergeTransportPendingMessagesForIdleState(
+                      s.transportPendingMessages,
+                      event.payload.pendingMessages,
+                      hasPendingMessagesField,
+                    ),
+                    transportPendingMessageEntries: mergeTransportPendingEntriesForIdleState(
+                      s.transportPendingMessageEntries,
+                      event.payload.pendingMessageEntries,
+                      event.payload.pendingMessages,
+                      hasPendingMessagesField,
+                      event.sessionId,
+                    ),
                   }
                 : s,
             ));

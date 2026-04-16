@@ -13,7 +13,9 @@ import type { WsClient } from '../ws-client.js';
 import { isRunningTimelineEvent } from '../timeline-running.js';
 import {
   extractTransportPendingMessages,
+  mergeTransportPendingEntriesForIdleState,
   mergeTransportPendingEntriesForRunningState,
+  mergeTransportPendingMessagesForIdleState,
   mergeTransportPendingMessagesForRunningState,
   normalizeTransportPendingEntries,
 } from '../transport-queue.js';
@@ -263,13 +265,19 @@ export function useSubSessions(
       const hasPendingMessagesField = msg.type === 'timeline.event'
         && msg.event.type === 'session.state'
         && Object.prototype.hasOwnProperty.call(msg.event.payload ?? {}, 'pendingMessages');
+      const pendingEntriesPayload = msg.type === 'timeline.event' && msg.event.type === 'session.state'
+        ? msg.event.payload.pendingMessageEntries
+        : undefined;
+      const pendingMessagesPayload = msg.type === 'timeline.event' && msg.event.type === 'session.state'
+        ? msg.event.payload.pendingMessages
+        : undefined;
       if (state === 'queued') {
         const pendingMessages = msg.type === 'timeline.event' && msg.event.type === 'session.state'
-          ? extractTransportPendingMessages(msg.event.payload.pendingMessages)
+          ? extractTransportPendingMessages(pendingMessagesPayload)
           : [];
         const pendingEntries = msg.type === 'timeline.event' && msg.event.type === 'session.state'
           ? normalizeTransportPendingEntries(
-              msg.event.payload.pendingMessageEntries,
+              pendingEntriesPayload,
               pendingMessages,
               sessionName,
             )
@@ -312,23 +320,39 @@ export function useSubSessions(
       setSubSessions((prev) => {
         const idx = prev.findIndex((s) => s.sessionName === sessionName);
         if (idx === -1) return prev;
+        const nextPendingMessages = state === 'idle'
+          ? mergeTransportPendingMessagesForIdleState(
+              prev[idx].transportPendingMessages,
+              pendingMessagesPayload,
+              hasPendingMessagesField,
+            )
+          : prev[idx].transportPendingMessages ?? [];
+        const nextPendingEntries = state === 'idle'
+          ? mergeTransportPendingEntriesForIdleState(
+              prev[idx].transportPendingMessageEntries,
+              pendingEntriesPayload,
+              pendingMessagesPayload,
+              hasPendingMessagesField,
+              sessionName,
+            )
+          : prev[idx].transportPendingMessageEntries ?? [];
         if (state === 'running') {
           if (prev[idx].state === 'running') return prev;
           const next = [...prev];
           next[idx] = { ...next[idx], state: 'running' };
           return next;
         }
-        // Always clear pending on idle — the turn is complete and messages are in the
-        // timeline. If a new drain starts, the next queued event will re-populate.
-        const shouldClearPending = true;
-        if (prev[idx].state === state && !shouldClearPending && (prev[idx].transportPendingMessages?.length ?? 0) === 0 && (prev[idx].transportPendingMessageEntries?.length ?? 0) === 0) return prev;
+        if (
+          prev[idx].state === state
+          && (prev[idx].transportPendingMessages ?? []).join('\u0000') === nextPendingMessages.join('\u0000')
+          && JSON.stringify(prev[idx].transportPendingMessageEntries ?? []) === JSON.stringify(nextPendingEntries)
+        ) return prev;
         const next = [...prev];
         next[idx] = {
           ...next[idx],
           state: state as SubSession['state'],
-          ...(shouldClearPending
-            ? { transportPendingMessages: [], transportPendingMessageEntries: [] }
-            : {}),
+          transportPendingMessages: nextPendingMessages,
+          transportPendingMessageEntries: nextPendingEntries,
         };
         return next;
       });

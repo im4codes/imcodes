@@ -4,7 +4,9 @@ import {
   extractTransportPendingMessageEntries,
   extractTransportPendingMessages,
   isLegacyTransportPendingMessageId,
+  mergeTransportPendingEntriesForIdleState,
   mergeTransportPendingEntriesForRunningState,
+  mergeTransportPendingMessagesForIdleState,
   mergeTransportPendingMessagesForRunningState,
   normalizeTransportPendingEntries,
   synthesizeTransportPendingMessageEntries,
@@ -165,6 +167,46 @@ describe('mergeTransportPendingEntriesForRunningState', () => {
       { clientMessageId: 'msg-1', text: 'keep' },
     ], [], [], false, 'deck_test')).toEqual([
       { clientMessageId: 'msg-1', text: 'keep' },
+    ]);
+  });
+});
+
+describe('mergeTransportPendingMessagesForIdleState', () => {
+  it('preserves the existing queue when idle reports no pendingMessages field', () => {
+    expect(mergeTransportPendingMessagesForIdleState(['queued one'], undefined, false)).toEqual(['queued one']);
+  });
+
+  it('clears the queue when idle reports explicit empty pending', () => {
+    expect(mergeTransportPendingMessagesForIdleState(['queued one'], [], true)).toEqual([]);
+  });
+
+  it('replaces the queue when idle reports explicit pending messages', () => {
+    expect(mergeTransportPendingMessagesForIdleState(['queued one'], ['queued two'], true)).toEqual(['queued two']);
+  });
+});
+
+describe('mergeTransportPendingEntriesForIdleState', () => {
+  it('preserves existing queued entries when idle reports no queue fields', () => {
+    expect(mergeTransportPendingEntriesForIdleState([
+      { clientMessageId: 'msg-1', text: 'queued one' },
+    ], undefined, undefined, false, 'deck_test')).toEqual([
+      { clientMessageId: 'msg-1', text: 'queued one' },
+    ]);
+  });
+
+  it('clears entries when idle reports explicit empty queue', () => {
+    expect(mergeTransportPendingEntriesForIdleState([
+      { clientMessageId: 'msg-1', text: 'queued one' },
+    ], [], [], true, 'deck_test')).toEqual([]);
+  });
+
+  it('replaces entries when idle reports an explicit queue snapshot', () => {
+    expect(mergeTransportPendingEntriesForIdleState([
+      { clientMessageId: 'msg-1', text: 'queued one' },
+    ], [
+      { clientMessageId: 'msg-2', text: 'queued two' },
+    ], ['queued two'], true, 'deck_test')).toEqual([
+      { clientMessageId: 'msg-2', text: 'queued two' },
     ]);
   });
 });

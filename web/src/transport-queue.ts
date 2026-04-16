@@ -100,3 +100,31 @@ export function mergeTransportPendingEntriesForRunningState(
   if (fromEvent.length === 0 && existingEntries.length > 0) return existingEntries;
   return fromEvent;
 }
+
+export function mergeTransportPendingMessagesForIdleState(
+  existing: string[] | null | undefined,
+  pendingFromEvent: unknown,
+  hasPendingMessagesField: boolean,
+): string[] {
+  const existingMessages = Array.isArray(existing) ? existing.filter((entry) => typeof entry === 'string' && entry.length > 0) : [];
+  if (!hasPendingMessagesField) return existingMessages;
+  return extractTransportPendingMessages(pendingFromEvent);
+}
+
+export function mergeTransportPendingEntriesForIdleState(
+  existing: TransportPendingMessageEntry[] | null | undefined,
+  pendingFromEvent: unknown,
+  pendingMessagesFromEvent: unknown,
+  hasPendingMessagesField: boolean,
+  scopeKey: string,
+): TransportPendingMessageEntry[] {
+  const existingEntries = Array.isArray(existing)
+    ? existing.filter((entry) => typeof entry?.clientMessageId === 'string' && entry.clientMessageId && typeof entry?.text === 'string' && entry.text)
+    : [];
+  if (!hasPendingMessagesField) return existingEntries;
+  return normalizeTransportPendingEntries(
+    pendingFromEvent,
+    pendingMessagesFromEvent,
+    scopeKey,
+  );
+}
