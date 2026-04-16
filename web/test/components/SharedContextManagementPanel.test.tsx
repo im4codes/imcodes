@@ -536,17 +536,17 @@ describe('SharedContextManagementPanel', () => {
     await waitFor(() => {
       expect(screen.getAllByText('sharedContext.management.memoryLocalTitle').length).toBeGreaterThan(0);
     });
-    expect((await screen.findAllByText('sharedContext.management.memoryStatusProcessed')).length).toBeGreaterThan(0);
     expect((await screen.findAllByText('sharedContext.management.memoryRecentDescription')).length).toBeGreaterThan(0);
 
     const memoryContent = screen.getByTestId('memory-record-content-local-personal-1') as HTMLDivElement;
     expect(memoryContent.style.maxHeight).toBe('4.8em');
-    const expandButton = screen.getAllByText('sharedContext.management.memoryExpand')[0];
+    // Expand button is now an arrow icon in the content corner
+    const expandButton = screen.getAllByText('▼')[0];
     await act(async () => {
       fireEvent.click(expandButton);
     });
     expect(memoryContent.style.maxHeight).toBe('none');
-    expect(screen.getByText('sharedContext.management.memoryCollapse')).toBeDefined();
+    expect(screen.getByText('▲')).toBeDefined();
 
     await act(async () => {
       fireEvent.click(screen.getByText('sharedContext.management.memoryTabCloud'));

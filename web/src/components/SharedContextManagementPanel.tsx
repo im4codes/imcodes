@@ -365,6 +365,22 @@ const helperTextStyle = {
   lineHeight: 1.5,
 } as const;
 
+const metaChipStyle = {
+  display: 'inline-flex',
+  alignItems: 'center',
+  padding: '2px 8px',
+  borderRadius: DT.radius.pill,
+  background: DT.bg.muted,
+  border: `1px solid ${DT.border.subtle}`,
+  color: DT.text.secondary,
+  fontSize: 10,
+  fontWeight: 500,
+  whiteSpace: 'nowrap',
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  maxWidth: SC_IS_MOBILE ? 120 : 180,
+} as const;
+
 const memoryProcessedNoteStyle = {
   ...helperTextStyle,
   padding: `${DT.space.sm}px ${DT.space.md}px`,
@@ -764,13 +780,16 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
             <div style={resourceListStyle}>
               {section.records.map((record) => (
                 <div key={record.id} style={resourceCardStyle}>
-                  <div style={metaGridStyle}>
-                    <MetaCard label={t('sharedContext.management.memoryRecordProject')} value={record.projectId} />
-                    <MetaCard label={t('sharedContext.management.memoryRecordStatus')} value={t('sharedContext.management.memoryStatusProcessed')} />
-                    <MetaCard label={t('sharedContext.management.memoryRecordClass')} value={getMemoryRecordClassLabel(t, record.projectionClass)} />
-                    <MetaCard label={t('sharedContext.management.memoryRecordSources')} value={record.sourceEventCount} />
-                    <MetaCard label={t('sharedContext.management.memoryRecordUpdated')} value={new Date(record.updatedAt).toLocaleString()} />
+                  {/* Compact meta: inline chips */}
+                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                    <span style={metaChipStyle} title={record.projectId}>{record.projectId.split('/').pop()}</span>
+                    <span style={metaChipStyle}>{getMemoryRecordClassLabel(t, record.projectionClass)}</span>
+                    <span style={metaChipStyle}>{record.sourceEventCount} {t('sharedContext.management.memoryRecordSources').toLowerCase()}</span>
+                    <span style={{ color: DT.text.muted, fontSize: 10, marginLeft: 'auto', flexShrink: 0 }}>
+                      {new Date(record.updatedAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                    </span>
                   </div>
+                  {/* Summary with integrated expand */}
                   {record.summary ? (
                     <MemoryRecordContent
                       id={record.id}
@@ -2063,7 +2082,10 @@ function MemoryRecordContent({
   const collapsible = shouldCollapseMemoryContent(text);
   const showExpanded = expanded || !collapsible;
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+    <div
+      style={{ position: 'relative', cursor: collapsible ? 'pointer' : undefined }}
+      onClick={collapsible ? onToggle : undefined}
+    >
       <div
         data-testid={`memory-record-content-${id}`}
         style={showExpanded ? memoryContentExpandedStyle : memoryContentCollapsedStyle}
@@ -2071,11 +2093,28 @@ function MemoryRecordContent({
         <ChatMarkdown text={text} />
       </div>
       {collapsible ? (
-        <div>
-          <button type="button" style={subtleButtonStyle} onClick={onToggle}>
-            {expanded ? t('sharedContext.management.memoryCollapse') : t('sharedContext.management.memoryExpand')}
-          </button>
-        </div>
+        <button
+          type="button"
+          onClick={(e) => { e.stopPropagation(); onToggle(); }}
+          style={{
+            position: 'absolute',
+            bottom: 6,
+            right: 6,
+            padding: '3px 10px',
+            borderRadius: DT.radius.pill,
+            border: `1px solid ${DT.border.subtle}`,
+            background: 'rgba(15,23,42,0.85)',
+            backdropFilter: 'blur(4px)',
+            WebkitBackdropFilter: 'blur(4px)',
+            color: DT.text.accent,
+            fontSize: 10,
+            fontWeight: 600,
+            cursor: 'pointer',
+            transition: 'background 0.15s',
+          }}
+        >
+          {expanded ? '▲' : '▼'}
+        </button>
       ) : null}
     </div>
   );
