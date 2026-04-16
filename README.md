@@ -8,6 +8,15 @@ A specialized instant messenger for AI agents. Keep long-running coding-agent se
 
 > **Disclaimer:** This is an actively developed personal open-source project. There are no warranties, no SLA, and no guarantees of stability, security, or backward compatibility. Use at your own risk. Breaking changes may happen at any time without notice.
 
+### Breaking Changes
+
+- **PostgreSQL image changed to `pgvector/pgvector:pg16`** (was `postgres:16-alpine`). Required for multilingual vector search in shared agent memory. Existing self-hosted deployments must update their `docker-compose.yml`:
+  ```yaml
+  postgres:
+    image: pgvector/pgvector:pg16   # was: postgres:16-alpine
+  ```
+  This is a drop-in replacement — data volumes are fully compatible. The pgvector extension is enabled automatically by the server migration on first startup.
+
 ## Screenshots
 
 ### Desktop
