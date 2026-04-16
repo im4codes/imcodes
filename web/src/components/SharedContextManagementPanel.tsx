@@ -803,7 +803,6 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                           return next;
                         });
                       }}
-                      t={t}
                     />
                   ) : null}
                 </div>
@@ -1997,7 +1996,6 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                               return next;
                             });
                           }}
-                          t={t}
                         />
                       </div>
                     ))}
@@ -2117,13 +2115,11 @@ function MemoryRecordContent({
   text,
   expanded,
   onToggle,
-  t,
 }: {
   id: string;
   text: string;
   expanded: boolean;
   onToggle: () => void;
-  t: (key: string) => string;
 }) {
   const collapsible = shouldCollapseMemoryContent(text);
   const showExpanded = expanded || !collapsible;
