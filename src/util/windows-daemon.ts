@@ -20,7 +20,10 @@ function isPidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
+  } catch (err: any) {
+    // EPERM on Windows means the process IS alive but was spawned in a
+    // different security context (e.g. via VBS/watchdog detached launch).
+    if (err?.code === 'EPERM') return true;
     return false;
   }
 }

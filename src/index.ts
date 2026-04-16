@@ -258,7 +258,19 @@ program
       if (storedPid) {
         daemonPid = storedPid;
         // Check if process is actually running
-        try { process.kill(parseInt(storedPid, 10), 0); daemonRunning = true; } catch { /* not running */ }
+        try {
+          process.kill(parseInt(storedPid, 10), 0);
+          daemonRunning = true;
+        } catch (err: any) {
+          // On Windows, EPERM means the process IS alive but was spawned in
+          // a different security context (e.g. VBS/watchdog detached launch).
+          // Treating EPERM as "dead" causes `imcodes status` to show "stopped"
+          // when the daemon is actually running fine.
+          if (err?.code === 'EPERM') {
+            daemonRunning = true;
+          }
+          // ESRCH = no such process = actually dead
+        }
       }
     } catch { /* no PID file */ }
     // Fallback: systemd (Linux only)
