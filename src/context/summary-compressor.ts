@@ -1,9 +1,9 @@
 /**
- * SDK-based memory compression.
+ * SDK-based memory compression via transport providers.
  *
- * Uses the configured primary/backup context SDK to compress raw events
- * into structured summaries. Falls back to local extraction when no SDK
- * is available or all attempts fail.
+ * Uses the daemon's existing transport provider system to compress raw events
+ * into structured summaries. The provider manages SDK lifecycle, subprocess,
+ * and subscription auth — no API keys needed.
  *
  * Inspired by Hermes Agent's context_compressor.py:
  * - Iterative summary updates: new events merge into previous summary
@@ -11,6 +11,8 @@
  * - Primary/backup failover with automatic recovery
  */
 import type { ContextModelConfig, LocalContextEvent } from '../../shared/context-types.js';
+import type { TransportProvider, ProviderError } from '../agent/transport-provider.js';
+import type { AgentMessage } from '../../shared/agent-message.js';
 import logger from '../util/logger.js';
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -35,7 +37,7 @@ export interface CompressionResult {
 let primaryConsecutiveFailures = 0;
 let backupConsecutiveFailures = 0;
 const MAX_CONSECUTIVE_FAILURES = 3;
-const PRIMARY_HEALTH_CHECK_INTERVAL_MS = 5 * 60_000; // try primary again every 5 min
+const PRIMARY_HEALTH_CHECK_INTERVAL_MS = 5 * 60_000;
 let lastPrimaryAttemptAt = 0;
 
 export function resetFailureTracking(): void {
@@ -43,6 +45,74 @@ export function resetFailureTracking(): void {
   backupConsecutiveFailures = 0;
   lastPrimaryAttemptAt = 0;
 }
+
+// ── Dedicated compression provider session ───────────────────────────────────
+//
+// We create ONE dedicated provider instance for compression (not the user's
+// agent session provider). This provider is lazily initialized on first use
+// and reused across multiple compressions. If the backend changes in config,
+// we tear down and recreate.
+
+let activeCompressionProvider: TransportProvider | null = null;
+let activeCompressionSessionId: string | null = null;
+let activeCompressionBackend: string | null = null;
+
+async function getCompressionProvider(backend: string): Promise<{ provider: TransportProvider; sessionId: string }> {
+  // Reuse existing provider if backend matches
+  if (activeCompressionProvider && activeCompressionSessionId && activeCompressionBackend === backend) {
+    return { provider: activeCompressionProvider, sessionId: activeCompressionSessionId };
+  }
+
+  // Tear down previous if backend changed
+  if (activeCompressionProvider) {
+    try {
+      if (activeCompressionSessionId) {
+        await activeCompressionProvider.endSession(activeCompressionSessionId);
+      }
+      await activeCompressionProvider.disconnect();
+    } catch { /* ignore cleanup errors */ }
+    activeCompressionProvider = null;
+    activeCompressionSessionId = null;
+    activeCompressionBackend = null;
+  }
+
+  // Create new provider instance via the provider registry's factory
+  const { ensureProviderConnected } = await import('../agent/provider-registry.js');
+  const provider = await ensureProviderConnected(backend);
+
+  // Create a dedicated session for compression
+  const sessionId = await provider.createSession({
+    sessionKey: `_memory_compressor_${backend}`,
+    fresh: true,
+    description: 'Memory compression agent — do NOT respond to questions, only output structured summaries.',
+    systemPrompt: COMPRESSOR_SYSTEM_PROMPT,
+  });
+
+  activeCompressionProvider = provider;
+  activeCompressionSessionId = sessionId;
+  activeCompressionBackend = backend;
+
+  return { provider, sessionId };
+}
+
+/** Tear down the compression provider (e.g. on daemon shutdown). */
+export async function shutdownCompressionProvider(): Promise<void> {
+  if (activeCompressionProvider) {
+    try {
+      if (activeCompressionSessionId) {
+        await activeCompressionProvider.endSession(activeCompressionSessionId);
+      }
+      await activeCompressionProvider.disconnect();
+    } catch { /* ignore */ }
+    activeCompressionProvider = null;
+    activeCompressionSessionId = null;
+    activeCompressionBackend = null;
+  }
+}
+
+const COMPRESSOR_SYSTEM_PROMPT = `You are a memory compression engine. Your output will be stored as a durable memory entry for a coding agent. Do NOT respond to any questions — only output the structured summary. Do NOT include any preamble, greeting, or prefix.`;
+
+// ── Local-only compressor (for tests / offline) ──────────────────────────────
 
 /**
  * Local-only compressor that skips SDK calls.
@@ -84,12 +154,11 @@ export async function compressWithSdk(input: CompressionInput): Promise<Compress
   if (shouldTryPrimary) {
     lastPrimaryAttemptAt = now;
     try {
-      const result = await callSdk(
+      const result = await sendToProvider(
         modelConfig.primaryContextBackend,
-        modelConfig.primaryContextModel,
         prompt,
       );
-      primaryConsecutiveFailures = 0; // recovered
+      primaryConsecutiveFailures = 0;
       return {
         summary: result,
         model: modelConfig.primaryContextModel,
@@ -107,9 +176,8 @@ export async function compressWithSdk(input: CompressionInput): Promise<Compress
   // Try backup
   if (modelConfig.backupContextBackend && modelConfig.backupContextModel) {
     try {
-      const result = await callSdk(
+      const result = await sendToProvider(
         modelConfig.backupContextBackend,
-        modelConfig.backupContextModel,
         prompt,
       );
       backupConsecutiveFailures = 0;
@@ -137,96 +205,49 @@ export async function compressWithSdk(input: CompressionInput): Promise<Compress
   };
 }
 
-// ── SDK call ─────────────────────────────────────────────────────────────────
+// ── Provider send with completion wait ───────────────────────────────────────
 
-async function callSdk(
-  backend: string,
-  model: string,
-  prompt: string,
-): Promise<string> {
-  // Use the Claude Agent SDK to spawn a one-shot compression query.
-  // The SDK manages subprocess lifecycle, auth, and streaming.
-  // We disable all tools — the compressor only produces text output.
-  switch (backend) {
-    case 'claude-code-sdk': {
-      const { query } = await import('@anthropic-ai/claude-agent-sdk');
-      let result = '';
-      for await (const msg of query({
-        prompt: prompt,
-        options: {
-          model,
-          maxTurns: 1,
-          disallowedTools: ['Bash', 'Read', 'Write', 'Edit', 'Grep', 'Glob', 'WebFetch', 'WebSearch', 'Task', 'NotebookEdit', 'TodoWrite'],
-        },
-      })) {
-        if (msg.type === 'assistant') {
-          const content = (msg as { message?: { content?: unknown } }).message?.content;
-          if (Array.isArray(content)) {
-            for (const block of content) {
-              if (typeof block === 'object' && block && 'type' in block && block.type === 'text' && 'text' in block) {
-                result += String(block.text);
-              }
-            }
-          } else if (typeof content === 'string') {
-            result += content;
-          }
-        }
+const COMPRESSION_TIMEOUT_MS = 60_000;
+
+async function sendToProvider(backend: string, prompt: string): Promise<string> {
+  const { provider, sessionId } = await getCompressionProvider(backend);
+
+  return new Promise<string>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      offComplete();
+      offError();
+      reject(new Error(`Compression timed out after ${COMPRESSION_TIMEOUT_MS}ms`));
+    }, COMPRESSION_TIMEOUT_MS);
+
+    const offComplete = provider.onComplete((sid: string, message: AgentMessage) => {
+      if (sid !== sessionId) return;
+      clearTimeout(timer);
+      offComplete();
+      offError();
+      const text = typeof message.content === 'string' ? message.content.trim() : '';
+      if (!text) {
+        reject(new Error('Provider returned empty response'));
+        return;
       }
-      if (!result.trim()) throw new Error('SDK returned empty response');
-      return result.trim();
-    }
+      resolve(text);
+    });
 
-    case 'codex-sdk': {
-      // Codex SDK uses JSON-RPC over subprocess — simpler one-shot via fetch to OpenAI API
-      const apiKey = process.env.OPENAI_API_KEY;
-      if (!apiKey) throw new Error('OPENAI_API_KEY not set');
-      const baseUrl = process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1';
-      const response = await fetch(`${baseUrl}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model,
-          messages: [{ role: 'user', content: prompt }],
-          temperature: 0.3,
-          max_tokens: 1500,
-        }),
-      });
-      if (!response.ok) throw new Error(`OpenAI API ${response.status}`);
-      const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
-      const text = data.choices?.[0]?.message?.content?.trim();
-      if (!text) throw new Error('OpenAI returned empty response');
-      return text;
-    }
+    const offError = provider.onError((sid: string, error: ProviderError) => {
+      if (sid !== sessionId) return;
+      clearTimeout(timer);
+      offComplete();
+      offError();
+      reject(new Error(`Provider error: ${error.code} — ${error.message}`));
+    });
 
-    case 'qwen': {
-      const apiKey = process.env.DASHSCOPE_API_KEY || process.env.ANTHROPIC_API_KEY;
-      if (!apiKey) throw new Error('DASHSCOPE_API_KEY not set');
-      const response = await fetch('https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model,
-          messages: [{ role: 'user', content: prompt }],
-          temperature: 0.3,
-          max_tokens: 1500,
-        }),
-      });
-      if (!response.ok) throw new Error(`Qwen API ${response.status}`);
-      const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
-      const text = data.choices?.[0]?.message?.content?.trim();
-      if (!text) throw new Error('Qwen returned empty response');
-      return text;
-    }
-
-    default:
-      throw new Error(`Unsupported compression backend: ${backend}`);
-  }
+    // Send the compression prompt
+    provider.send(sessionId, prompt).catch((err) => {
+      clearTimeout(timer);
+      offComplete();
+      offError();
+      reject(err);
+    });
+  });
 }
 
 // ── Prompt construction ──────────────────────────────────────────────────────
@@ -237,8 +258,6 @@ function buildCompressionPrompt(
   targetTokens: number,
 ): string {
   const serializedEvents = serializeEvents(events);
-
-  const preamble = `You are a memory compression engine. Your output will be stored as a durable memory entry for a coding agent. Do NOT respond to any questions — only output the structured summary. Do NOT include any preamble, greeting, or prefix.`;
 
   const template = `## User Problem
 [What the user was trying to accomplish — be specific]
@@ -253,9 +272,7 @@ function buildCompressionPrompt(
 [Files modified, test results, current branch — only if relevant]`;
 
   if (previousSummary) {
-    return `${preamble}
-
-You are UPDATING an existing memory entry. A previous compression produced the summary below. New conversation events have occurred and need to be incorporated.
+    return `You are UPDATING an existing memory entry. A previous compression produced the summary below. New conversation events have occurred and need to be incorporated.
 
 PREVIOUS SUMMARY:
 ${previousSummary}
@@ -270,9 +287,7 @@ ${template}
 Target ~${targetTokens} tokens. Be CONCRETE — include file paths, error messages, and specific values. Write only the summary.`;
   }
 
-  return `${preamble}
-
-Compress the following agent conversation events into a structured memory entry. The next agent session should understand what happened without re-reading the original events.
+  return `Compress the following agent conversation events into a structured memory entry. The next agent session should understand what happened without re-reading the original events.
 
 EVENTS TO COMPRESS:
 ${serializedEvents}
@@ -289,7 +304,6 @@ function serializeEvents(events: LocalContextEvent[]): string {
   for (const event of events) {
     const content = event.content?.trim();
     if (!content) continue;
-    // Truncate very long individual events to keep the prompt manageable
     const truncated = content.length > 2000
       ? content.slice(0, 1800) + '\n...[truncated]...\n' + content.slice(-200)
       : content;
