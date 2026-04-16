@@ -1686,7 +1686,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     }
 
     // Inject relevant memories from local processed context for process agents
-    sendText = prependLocalMemory(sendText, sessionName);
+    sendText = await prependLocalMemory(sendText, sessionName);
 
     await sendShellAwareCommand(sessionName, sendText, agentType);
     const payload: Record<string, unknown> = { text };
@@ -3948,12 +3948,10 @@ async function handleMemorySearch(cmd: Record<string, unknown>, serverLink: Serv
 
 // ── Process agent memory injection (text prepend) ────────────────────────
 
-function prependLocalMemory(prompt: string, sessionName: string): string {
+async function prependLocalMemory(prompt: string, sessionName: string): Promise<string> {
   if (prompt.length < 10) return prompt; // skip greetings / confirmations
   try {
-    // Lazy import to avoid circular deps at module load
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { searchLocalMemory } = require('../context/memory-search.js') as typeof import('../context/memory-search.js');
+    const { searchLocalMemory } = await import('../context/memory-search.js');
     const record = getSession(sessionName);
     const result = searchLocalMemory({
       query: prompt.slice(0, 200),
