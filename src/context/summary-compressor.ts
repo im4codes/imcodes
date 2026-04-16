@@ -41,6 +41,52 @@ const MAX_CONSECUTIVE_FAILURES = 3;
 const PRIMARY_HEALTH_CHECK_INTERVAL_MS = 5 * 60_000;
 let lastPrimaryAttemptAt = 0;
 
+// Per-call retry config (transient errors)
+const MAX_RETRIES_PER_BACKEND = 2; // total attempts = 1 initial + 2 retries = 3
+const RETRY_BASE_DELAY_MS = 1000;
+const RETRY_MAX_DELAY_MS = 8000;
+
+/** Classify error as retryable (transient) or permanent. */
+function isRetryableError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
+  // Permanent errors — don't retry
+  if (msg.includes('invalid api key') || msg.includes('401') || msg.includes('unauthorized')) return false;
+  if (msg.includes('model not found') || msg.includes('not supported')) return false;
+  if (msg.includes('invalid session')) return false;
+  // Everything else (network, timeout, 5xx, empty response) is retryable
+  return true;
+}
+
+async function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Try a backend with transient-error retries.
+ * Retries with exponential backoff + jitter on transient errors.
+ * Permanent errors (auth, model not found) fail fast.
+ */
+async function sendWithRetry(backend: string, prompt: string): Promise<string> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= MAX_RETRIES_PER_BACKEND; attempt++) {
+    try {
+      return await sendToProvider(backend, prompt);
+    } catch (err) {
+      lastErr = err;
+      if (!isRetryableError(err) || attempt === MAX_RETRIES_PER_BACKEND) {
+        throw err;
+      }
+      // Tear down and retry with fresh provider
+      await shutdownCompressionProvider();
+      const delay = Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, attempt), RETRY_MAX_DELAY_MS)
+        + Math.random() * 500;
+      logger.warn({ err, backend, attempt: attempt + 1, delay }, 'SDK compression retry after transient error');
+      await sleep(delay);
+    }
+  }
+  throw lastErr;
+}
+
 export function resetFailureTracking(): void {
   primaryConsecutiveFailures = 0;
   backupConsecutiveFailures = 0;
@@ -164,7 +210,7 @@ export async function compressWithSdk(input: CompressionInput): Promise<Compress
   if (shouldTryPrimary) {
     lastPrimaryAttemptAt = now;
     try {
-      const result = await sendToProvider(modelConfig.primaryContextBackend, prompt);
+      const result = await sendWithRetry(modelConfig.primaryContextBackend, prompt);
       primaryConsecutiveFailures = 0;
       return {
         summary: result, model: modelConfig.primaryContextModel,
@@ -175,14 +221,14 @@ export async function compressWithSdk(input: CompressionInput): Promise<Compress
       // Tear down failed provider so next attempt starts fresh
       await shutdownCompressionProvider();
       logger.warn({ err, backend: modelConfig.primaryContextBackend, failures: primaryConsecutiveFailures },
-        'Primary SDK compression failed');
+        'Primary SDK compression failed after retries');
     }
   }
 
   // Try backup
   if (modelConfig.backupContextBackend && modelConfig.backupContextModel) {
     try {
-      const result = await sendToProvider(modelConfig.backupContextBackend, prompt);
+      const result = await sendWithRetry(modelConfig.backupContextBackend, prompt);
       backupConsecutiveFailures = 0;
       return {
         summary: result, model: modelConfig.backupContextModel,
