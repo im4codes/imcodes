@@ -189,7 +189,9 @@
       },
       "modeLabel": "Mode",
       "auditModeLabel": "Audit mode",
-      "invalidStoredConfig": "已儲存的監督設定無效。修復並儲存前，自動化會保持停用。"
+      "invalidStoredConfig": "已儲存的監督設定無效。修復並儲存前，自動化會保持停用。",
+      "quickLabel": "Auto",
+      "quickTitle": "自動模式"
     },
     "workingDirPlaceholder": "~/projects/myapp"
   },

@@ -53,6 +53,8 @@ vi.mock('react-i18next', () => ({
       if (key === 'session.send_placeholder_desktop_upload') {
         return `${String(opts?.placeholder ?? '')} Supports fast multi-file paste upload`;
       }
+      if (key === 'session.supervision.quickLabel') return 'Auto';
+      if (key === 'session.supervision.quickTitle') return 'Auto mode';
       if (key === 'common.hide') return 'hide';
       if (key === 'common.show') return 'show';
       const parts = key.split('.');
@@ -131,6 +133,9 @@ vi.mock('../../src/components/AtPicker.js', () => ({
 const uploadFileMock = vi.fn();
 const getUserPrefMock = vi.fn().mockResolvedValue(null);
 const saveUserPrefMock = vi.fn().mockResolvedValue(undefined);
+const fetchSupervisorDefaultsMock = vi.fn().mockResolvedValue(null);
+const patchSessionMock = vi.fn().mockResolvedValue(undefined);
+const patchSubSessionMock = vi.fn().mockResolvedValue(undefined);
 const onUserPrefChangedMock = vi.fn((cb: (key: string, value: unknown) => void) => {
   const handler = (event: Event) => {
     const detail = (event as CustomEvent<{ key?: string; value?: unknown }>).detail;
@@ -144,6 +149,9 @@ vi.mock('../../src/api.js', () => ({
   uploadFile: (...args: unknown[]) => uploadFileMock(...args),
   getUserPref: (...args: unknown[]) => getUserPrefMock(...args),
   saveUserPref: (...args: unknown[]) => saveUserPrefMock(...args),
+  fetchSupervisorDefaults: (...args: unknown[]) => fetchSupervisorDefaultsMock(...args),
+  patchSession: (...args: unknown[]) => patchSessionMock(...args),
+  patchSubSession: (...args: unknown[]) => patchSubSessionMock(...args),
   onUserPrefChanged: (...args: unknown[]) => onUserPrefChangedMock(...args as Parameters<typeof onUserPrefChangedMock>),
 }));
 
@@ -225,6 +233,12 @@ const makeSession = (overrides: Partial<SessionInfo> = {}): SessionInfo => ({
   ...overrides,
 });
 
+const makeTransportSession = (overrides: Partial<SessionInfo> = {}): SessionInfo => makeSession({
+  agentType: 'codex-sdk',
+  runtimeType: 'transport',
+  ...overrides,
+});
+
 const mainSession = makeSession({
   name: 'deck_my-project_brain',
   project: 'my-project',
@@ -251,6 +265,9 @@ afterEach(() => {
     vi.clearAllMocks();
     sessionStorage.clear();
     localStorage.clear();
+    fetchSupervisorDefaultsMock.mockResolvedValue(null);
+    patchSessionMock.mockResolvedValue(undefined);
+    patchSubSessionMock.mockResolvedValue(undefined);
     getUserPrefMock.mockImplementation(async (key: unknown) => {
       if (typeof key === 'string' && key.startsWith('p2p_session_config:')) {
         const sessionKey = key.slice('p2p_session_config:'.length);
@@ -1816,6 +1833,88 @@ afterEach(() => {
       sessionName: 'codex-sdk-session',
       text: '/stop',
     });
+  });
+
+  it('shows a compact Auto dropdown for supported transport sessions and enables supervised mode from saved defaults', async () => {
+    const ws = makeWs();
+    fetchSupervisorDefaultsMock.mockResolvedValue({
+      backend: 'codex-sdk',
+      model: 'gpt-5.4',
+      timeoutMs: 12000,
+      promptVersion: 'supervision_decision_v1',
+    });
+    const onTransportConfigSaved = vi.fn();
+    render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({
+          name: 'codex-sdk-session',
+          state: 'idle',
+        })}
+        onSettings={vi.fn()}
+        onTransportConfigSaved={onTransportConfigSaved}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const autoBtn = screen.getByRole('button', { name: /^Auto$/ });
+    expect(autoBtn.textContent).toContain('Auto');
+    expect(autoBtn.textContent).not.toContain('Supervised');
+    fireEvent.click(autoBtn);
+    fireEvent.click(screen.getByRole('button', { name: /supervised$/i }));
+
+    await waitFor(() => {
+      expect(patchSessionMock).toHaveBeenCalledWith('srv1', 'codex-sdk-session', expect.objectContaining({
+        transportConfig: expect.objectContaining({
+          supervision: expect.objectContaining({
+            mode: 'supervised',
+            backend: 'codex-sdk',
+            model: 'gpt-5.4',
+          }),
+        }),
+      }));
+    });
+    expect(onTransportConfigSaved).toHaveBeenCalledWith(expect.objectContaining({
+      supervision: expect.objectContaining({
+        mode: 'supervised',
+      }),
+    }));
+  });
+
+  it('falls back to Settings when heavy mode needs audit config', async () => {
+    const ws = makeWs();
+    const onSettings = vi.fn();
+    render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({
+          name: 'codex-sdk-session',
+          state: 'idle',
+          transportConfig: {
+            supervision: {
+              mode: 'supervised',
+              backend: 'codex-sdk',
+              model: 'gpt-5.4',
+              timeoutMs: 12000,
+              promptVersion: 'supervision_decision_v1',
+              maxParseRetries: 1,
+            },
+          },
+        })}
+        onSettings={onSettings}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /^Auto$/ }));
+    fireEvent.click(screen.getByRole('button', { name: /supervised_audit$/i }));
+
+    await waitFor(() => {
+      expect(onSettings).toHaveBeenCalled();
+    });
+    expect(patchSessionMock).not.toHaveBeenCalled();
   });
 
   it('pressing Shift+Enter does not submit', () => {

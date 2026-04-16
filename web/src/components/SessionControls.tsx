@@ -15,6 +15,7 @@ import { AtPicker } from './AtPicker.js';
 import { P2pConfigPanel } from './P2pConfigPanel.js';
 import { useP2pCustomCombos } from './p2p-combos.js';
 import { uploadFile, getUserPref, saveUserPref, onUserPrefChanged } from '../api.js';
+import { fetchSupervisorDefaults, patchSession, patchSubSession } from '../api.js';
 import { isRunningSessionState } from '../thinking-utils.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { isLegacyTransportPendingMessageId, normalizeTransportPendingEntries } from '../transport-queue.js';
@@ -30,6 +31,15 @@ import { getQwenAuthTier, QWEN_AUTH_TIERS } from '@shared/qwen-auth.js';
 import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/qwen-models.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, normalizeClaudeCodeModelId } from '../../../src/shared/models/options.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '@shared/effort-levels.js';
+import {
+  buildTransportConfigWithSupervision,
+  extractSessionSupervisionSnapshot,
+  hasInvalidSessionSupervisionSnapshot,
+  isSupportedSupervisionTargetSessionType,
+  SUPERVISION_MODE,
+  type SessionSupervisionSnapshot,
+  type SupervisionMode,
+} from '@shared/supervision-config.js';
 
 interface Props {
   ws: WsClient | null;
@@ -43,6 +53,8 @@ interface Props {
   onRenameSession?: () => void;
   /** Called when Settings is selected in the menu. */
   onSettings?: () => void;
+  /** Sub-session id when the active control surface belongs to a sub-session. */
+  subSessionId?: string;
   /** Display name (rename label) for the active session — shown in placeholder. */
   sessionDisplayName?: string | null;
   /** Quick data hook result from parent (loaded once at app level). */
@@ -82,6 +94,8 @@ interface Props {
   onQuickOpenChange?: (open: boolean) => void;
   /** Notifies parent when any floating overlay/dropdown is open. */
   onOverlayOpenChange?: (open: boolean) => void;
+  /** Optional local optimistic update when transport config changes through quick controls. */
+  onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
 }
 
 type MenuAction = 'restart' | 'new' | 'stop';
@@ -335,7 +349,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking: _activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking: _activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved }: Props) {
   const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -348,6 +362,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const atSelectionLockRef = useRef(false);
   const atSelectionSnapshotRef = useRef('');
   const [modelOpen, setModelOpen] = useState(false);
+  const [autoOpen, setAutoOpen] = useState(false);
   const [thinkingOpen, setThinkingOpen] = useState(false);
   const [quickOpen, setQuickOpen] = useState(false);
   const [p2pMode, setP2pMode] = useState<P2pMode>('solo');
@@ -379,6 +394,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [rememberComboSendChoice, setRememberComboSendChoice] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const modelRef = useRef<HTMLDivElement>(null);
+  const autoRef = useRef<HTMLDivElement>(null);
   const thinkingRef = useRef<HTMLDivElement>(null);
   const p2pRef = useRef<HTMLDivElement>(null);
   const openSpecRef = useRef<HTMLDivElement>(null);
@@ -421,6 +437,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [sendWarning, setSendWarning] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<Array<{ path: string; name: string }>>([]);
   const sendWarningTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [localTransportConfig, setLocalTransportConfig] = useState<Record<string, unknown> | null>(activeSession?.transportConfig ?? null);
 
   // Keep external inputRef in sync so parent can call .focus()
   useEffect(() => {
@@ -480,6 +497,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (sendWarningTimerRef.current) clearTimeout(sendWarningTimerRef.current);
   }, []);
 
+  useEffect(() => {
+    setLocalTransportConfig(activeSession?.transportConfig ?? null);
+  }, [activeSession?.name, activeSession?.transportConfig]);
+
   // Auto-sync model selector with detected model from terminal/ctx
   // Detection is the real-time truth — always override the selector
   useEffect(() => {
@@ -514,6 +535,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const isClaudeCode = activeSession?.agentType === 'claude-code' || activeSession?.agentType === 'claude-code-sdk';
   const isShellLike = activeSession?.agentType === 'shell' || activeSession?.agentType === 'script';
   const isTransport = activeSession?.runtimeType === 'transport';
+  const currentTransportConfig = localTransportConfig ?? activeSession?.transportConfig ?? null;
+  const hasInvalidSupervisionConfig = hasInvalidSessionSupervisionSnapshot(currentTransportConfig);
+  const supervisionSnapshot = extractSessionSupervisionSnapshot(currentTransportConfig);
+  const quickSupervisionMode = supervisionSnapshot?.mode ?? SUPERVISION_MODE.OFF;
+  const canQuickControlSupervision = !!(
+    activeSession
+    && serverId
+    && isTransport
+    && isSupportedSupervisionTargetSessionType(activeSession.agentType)
+  );
   const isCodex = activeSession?.agentType === 'codex' || activeSession?.agentType === 'codex-sdk';
   const isQwen = activeSession?.agentType === 'qwen';
   const thinkingLevels = useMemo((): readonly TransportEffortLevel[] => (
@@ -579,6 +610,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const overlayOpen = quickOpen
     || menuOpen
     || modelOpen
+    || autoOpen
     || thinkingOpen
     || atPickerOpen
     || p2pOpen
@@ -650,7 +682,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   // Close menus when clicking outside
   useEffect(() => {
-    if (!menuOpen && !modelOpen && !p2pOpen && !thinkingOpen && !openSpecOpen) return;
+    if (!menuOpen && !modelOpen && !autoOpen && !p2pOpen && !thinkingOpen && !openSpecOpen) return;
     const handleClick = (e: MouseEvent) => {
       if (menuOpen && menuRef.current && !menuRef.current.contains(e.target as Node)) {
         setMenuOpen(false);
@@ -659,6 +691,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       }
       if (modelOpen && modelRef.current && !modelRef.current.contains(e.target as Node)) {
         setModelOpen(false);
+      }
+      if (autoOpen && autoRef.current && !autoRef.current.contains(e.target as Node)) {
+        setAutoOpen(false);
       }
       if (thinkingOpen && thinkingRef.current && !thinkingRef.current.contains(e.target as Node)) {
         setThinkingOpen(false);
@@ -680,7 +715,100 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     };
     document.addEventListener('mousedown', handleClick);
     return () => document.removeEventListener('mousedown', handleClick);
-  }, [menuOpen, modelOpen, openSpecOpen, p2pOpen, thinkingOpen]);
+  }, [autoOpen, menuOpen, modelOpen, openSpecOpen, p2pOpen, thinkingOpen]);
+
+  const quickAutoColor = quickSupervisionMode === SUPERVISION_MODE.SUPERVISED
+    ? '#34d399'
+    : quickSupervisionMode === SUPERVISION_MODE.SUPERVISED_AUDIT
+      ? '#f59e0b'
+      : '#94a3b8';
+
+  const persistTransportConfig = useCallback(async (transportConfig: Record<string, unknown> | null) => {
+    if (!serverId || !activeSession) return;
+    if (subSessionId) {
+      await patchSubSession(serverId, subSessionId, { transportConfig });
+    } else {
+      await patchSession(serverId, activeSession.name, { transportConfig });
+    }
+    setLocalTransportConfig(transportConfig);
+    onTransportConfigSaved?.(transportConfig);
+  }, [activeSession, onTransportConfigSaved, serverId, subSessionId]);
+
+  const handleQuickSupervisionModeSelect = useCallback(async (nextMode: SupervisionMode) => {
+    if (!activeSession || !serverId || !canQuickControlSupervision) return;
+    setAutoOpen(false);
+
+    if (nextMode === SUPERVISION_MODE.OFF) {
+      const nextTransportConfig = buildTransportConfigWithSupervision(currentTransportConfig, { mode: SUPERVISION_MODE.OFF });
+      try {
+        await persistTransportConfig(nextTransportConfig);
+      } catch {
+        showSendWarning(t('upload.upload_failed'));
+      }
+      return;
+    }
+
+    if (hasInvalidSupervisionConfig) {
+      onSettings?.();
+      return;
+    }
+
+    const rawSupervision = currentTransportConfig && typeof currentTransportConfig === 'object' && !Array.isArray(currentTransportConfig)
+      ? (currentTransportConfig.supervision as Record<string, unknown> | undefined)
+      : undefined;
+    const hasPersistedAuditConfig = !!(
+      rawSupervision
+      && typeof rawSupervision === 'object'
+      && !Array.isArray(rawSupervision)
+      && typeof rawSupervision.auditMode === 'string'
+      && rawSupervision.auditMode.trim()
+    );
+
+    let nextSnapshot: Partial<SessionSupervisionSnapshot> | null = null;
+    if (supervisionSnapshot) {
+      if (nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT && !hasPersistedAuditConfig) {
+        onSettings?.();
+        return;
+      }
+      nextSnapshot = { ...supervisionSnapshot, mode: nextMode };
+    } else {
+      const defaults = await fetchSupervisorDefaults();
+      if (!defaults) {
+        onSettings?.();
+        return;
+      }
+      if (nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT) {
+        onSettings?.();
+        return;
+      }
+      nextSnapshot = {
+        mode: nextMode,
+        backend: defaults.backend,
+        model: defaults.model,
+        timeoutMs: defaults.timeoutMs,
+        promptVersion: defaults.promptVersion,
+      };
+    }
+
+    const nextTransportConfig = buildTransportConfigWithSupervision(currentTransportConfig, nextSnapshot);
+    try {
+      await persistTransportConfig(nextTransportConfig);
+    } catch {
+      showSendWarning(t('upload.upload_failed'));
+    }
+  }, [
+    activeSession,
+    canQuickControlSupervision,
+    currentTransportConfig,
+    hasInvalidSupervisionConfig,
+    onSettings,
+    persistTransportConfig,
+    quickSupervisionMode,
+    serverId,
+    showSendWarning,
+    supervisionSnapshot,
+    t,
+  ]);
 
   const getText = () => (divRef.current?.textContent ?? '').trim();
 
@@ -1747,6 +1875,62 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             </button>
           ))}
         </div>}
+
+        {canQuickControlSupervision && (
+          <div class="shortcuts-model" ref={autoRef}>
+            <button
+              class="shortcut-btn shortcut-btn-auto"
+              onClick={() => setAutoOpen((open) => !open)}
+              disabled={disabled}
+              title={t('session.supervision.quickTitle')}
+              aria-label={t('session.supervision.quickLabel')}
+            >
+              <span
+                class="shortcut-btn-auto-dot"
+                aria-hidden="true"
+                style={{ background: quickAutoColor }}
+              />
+              <span class="shortcut-btn-auto-label">{t('session.supervision.quickLabel')}</span>
+              <span class="shortcut-btn-auto-caret" aria-hidden="true">▾</span>
+            </button>
+            {autoOpen && (
+              <div class="menu-dropdown">
+                <button
+                  class={`menu-item ${quickSupervisionMode === SUPERVISION_MODE.OFF ? 'menu-item-active' : ''}`}
+                  onClick={() => { void handleQuickSupervisionModeSelect(SUPERVISION_MODE.OFF); }}
+                >
+                  {quickSupervisionMode === SUPERVISION_MODE.OFF ? '● ' : '○ '}{t('session.supervision.mode.off')}
+                </button>
+                <button
+                  class={`menu-item ${quickSupervisionMode === SUPERVISION_MODE.SUPERVISED ? 'menu-item-active' : ''}`}
+                  onClick={() => { void handleQuickSupervisionModeSelect(SUPERVISION_MODE.SUPERVISED); }}
+                >
+                  {quickSupervisionMode === SUPERVISION_MODE.SUPERVISED ? '● ' : '○ '}{t('session.supervision.mode.supervised')}
+                </button>
+                <button
+                  class={`menu-item ${quickSupervisionMode === SUPERVISION_MODE.SUPERVISED_AUDIT ? 'menu-item-active' : ''}`}
+                  onClick={() => { void handleQuickSupervisionModeSelect(SUPERVISION_MODE.SUPERVISED_AUDIT); }}
+                >
+                  {quickSupervisionMode === SUPERVISION_MODE.SUPERVISED_AUDIT ? '● ' : '○ '}{t('session.supervision.mode.supervised_audit')}
+                </button>
+                {(hasInvalidSupervisionConfig || (!supervisionSnapshot && !!onSettings)) && (
+                  <>
+                    <div class="menu-divider" />
+                    <button
+                      class="menu-item"
+                      onClick={() => {
+                        setAutoOpen(false);
+                        onSettings?.();
+                      }}
+                    >
+                      {t('session.settings')}
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Model selector — outside overflow-x scroll area so dropdown isn't clipped */}
         {openSpecChangesPath && (

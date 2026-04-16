@@ -2830,6 +2830,11 @@ export function App() {
                 onStopProject={handleStopProject}
                 onRenameSession={() => setRenameRequest(s.name)}
                 onSettings={() => setSettingsTarget({ sessionName: s.name, label: s.label || '', description: s.description || '', cwd: s.projectDir || '', type: s.agentType || '', parentSession: null, transportConfig: s.transportConfig ?? null })}
+                onTransportConfigSaved={(transportConfig) => {
+                  setSessions((prev) => prev.map((session) => (
+                    session.name === s.name ? { ...session, transportConfig } : session
+                  )));
+                }}
                 onAfterAction={focusTerminal}
                 mobileFileBrowserOpen={s.name === activeSession ? showMobileFileBrowser : false}
                 onMobileFileBrowserClose={() => setShowMobileFileBrowser(false)}
@@ -2955,6 +2960,7 @@ export function App() {
                 sessions={sessions}
                 allSubSessions={subSessionsSlim}
                 p2pSessionLabels={p2pSessionLabels}
+                onSubTransportConfigSaved={(subId, transportConfig) => updateSubLocal(subId, { transportConfig })}
               />
             )}
           </>
@@ -3409,6 +3415,7 @@ export function App() {
                 if (label !== null) renameSubSession(sub.id, label);
               }}
               onSettings={() => setSettingsTarget({ sessionName: sub.sessionName, subId: sub.id, label: sub.label || '', description: sub.description || '', cwd: sub.cwd || '', type: sub.type, parentSession: sub.parentSession, transportConfig: sub.transportConfig ?? null })}
+              onTransportConfigSaved={(transportConfig) => updateSubLocal(sub.id, { transportConfig })}
               zIndex={subZIndexes.get(sub.id) ?? 6000}
               onFocus={() => bringSubToFront(sub.id)}
               onPin={(vm) => pinPanel('subsession', { sessionName: sub.sessionName, viewMode: vm, label: sub.label, serverId: selectedServerId }, () => setOpenSubIds((prev) => { const s = new Set(prev); s.delete(sub.id); return s; }))}

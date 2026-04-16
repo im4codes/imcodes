@@ -77,6 +77,7 @@ interface Props {
   allSubSessions?: Array<{ sessionName: string; type: string; label?: string | null; state: string; parentSession?: string | null }>;
   /** Set of sub-session labels participating in active P2P discussions. */
   p2pSessionLabels?: Set<string>;
+  onSubTransportConfigSaved?: (subId: string, transportConfig: Record<string, unknown> | null) => void;
 }
 
 const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
@@ -152,7 +153,7 @@ function CollapsedSubSessionButton({ sub, isOpen, idleFlashToken, usage, inP2p, 
   );
 }
 
-export function SubSessionBar({ subSessions, openIds, idleFlashTokens, onOpen, onClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, focusedSubId, quickData, sessions, allSubSessions, p2pSessionLabels }: Props) {
+export function SubSessionBar({ subSessions, openIds, idleFlashTokens, onOpen, onClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, focusedSubId, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
   const { t } = useTranslation();
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
   const [collapsed, setCollapsed] = useState(() => load('rcc_subcard_collapsed', isMobile));
@@ -588,6 +589,7 @@ export function SubSessionBar({ subSessions, openIds, idleFlashTokens, onOpen, o
                 sessions={sessions}
                 subSessions={allSubSessions}
                 serverId={serverId}
+                onTransportConfigSaved={onSubTransportConfigSaved}
                 inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
               />
             </div>

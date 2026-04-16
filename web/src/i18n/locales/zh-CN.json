@@ -189,7 +189,9 @@
       },
       "modeLabel": "Mode",
       "auditModeLabel": "Audit mode",
-      "invalidStoredConfig": "已保存的监督配置无效。修复并保存前，自动化将保持禁用。"
+      "invalidStoredConfig": "已保存的监督配置无效。修复并保存前，自动化将保持禁用。",
+      "quickLabel": "Auto",
+      "quickTitle": "自动模式"
     },
     "workingDirPlaceholder": "~/projects/myapp"
   },

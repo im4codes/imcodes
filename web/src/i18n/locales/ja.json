@@ -189,7 +189,9 @@
       },
       "modeLabel": "Mode",
       "auditModeLabel": "Audit mode",
-      "invalidStoredConfig": "Stored supervision config is invalid. Automation is disabled until you repair and save it."
+      "invalidStoredConfig": "Stored supervision config is invalid. Automation is disabled until you repair and save it.",
+      "quickLabel": "Auto",
+      "quickTitle": "自動モード"
     },
     "workingDirPlaceholder": "~/projects/myapp"
   },

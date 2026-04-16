@@ -38,6 +38,7 @@ interface Props {
   onRestart: () => void;
   onRename: () => void;
   onSettings?: () => void;
+  onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
   zIndex: number;
   onFocus: () => void;
   /** Optional: called to pin this sub-session to the sidebar. Passes current viewMode. */
@@ -90,7 +91,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, onSettings, zIndex, onFocus, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, inP2p,
+  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, onSettings, onTransportConfigSaved, zIndex, onFocus, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, inP2p,
 }: Props) {
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
@@ -164,6 +165,7 @@ export function SubSessionWindow({
     quotaMeta: sub.quotaMeta ?? undefined,
     effort: sub.effort ?? undefined,
     runtimeType: sub.runtimeType ?? undefined,
+    transportConfig: sub.transportConfig ?? undefined,
     transportPendingMessages: sub.transportPendingMessages ?? undefined,
     transportPendingMessageEntries: sub.transportPendingMessageEntries ?? undefined,
   };
@@ -339,7 +341,13 @@ export function SubSessionWindow({
     const subBar = Array.from(document.querySelectorAll('.subsession-bar'))
       .find((el) => !(el as HTMLElement).closest('.subsession-window')) as HTMLElement | undefined;
     if (!controls && !subBar) return;
-    const update = () => setControlsHeight(subBar?.offsetHeight ?? controls?.offsetHeight ?? 0);
+    const measure = (el: HTMLElement | undefined) => {
+      if (!el) return 0;
+      const style = window.getComputedStyle(el);
+      if (style.display == 'none' || style.visibility == 'hidden') return 0;
+      return el.offsetHeight;
+    };
+    const update = () => setControlsHeight(measure(controls) + measure(subBar));
     update();
     if (typeof ResizeObserver === 'undefined') return;
     const ro = new ResizeObserver(update);
@@ -450,6 +458,8 @@ export function SubSessionWindow({
         onSubStop={onClose}
         onRenameSession={onRename}
         onSettings={onSettings}
+        subSessionId={sub.id}
+        onTransportConfigSaved={onTransportConfigSaved}
         sessionDisplayName={sub.label ? formatLabel(sub.label) : agentTag}
         activeThinking={!!activeThinkingTs}
         sessions={sessions}

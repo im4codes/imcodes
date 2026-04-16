@@ -57,6 +57,7 @@ interface Props {
   sessions?: import('../types.js').SessionInfo[];
   subSessions?: Array<{ sessionName: string; type: string; label?: string | null; state: string; parentSession?: string | null }>;
   serverId?: string;
+  onTransportConfigSaved?: (subId: string, transportConfig: Record<string, unknown> | null) => void;
   /** Whether this sub-session is participating in an active P2P discussion. */
   inP2p?: boolean;
 }
@@ -69,7 +70,7 @@ function loadCardW(id: string, fallback: number): number {
   return fallback;
 }
 
-export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlashToken, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId, inP2p }: Props) {
+export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlashToken, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId, onTransportConfigSaved, inP2p }: Props) {
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const isShell = sub.type === 'shell' || sub.type === 'script';
@@ -96,9 +97,10 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     label: sub.label ?? null,
     projectDir: sub.cwd ?? undefined,
     runtimeType: sub.runtimeType ?? undefined,
+    transportConfig: sub.transportConfig ?? undefined,
     transportPendingMessages: sub.transportPendingMessages ?? undefined,
     transportPendingMessageEntries: sub.transportPendingMessageEntries ?? undefined,
-  }), [sub.sessionName, sub.type, sub.state, sub.label, sub.cwd, sub.runtimeType, sub.transportPendingMessages, sub.transportPendingMessageEntries]);
+  }), [sub.sessionName, sub.type, sub.state, sub.label, sub.cwd, sub.runtimeType, sub.transportConfig, sub.transportPendingMessages, sub.transportPendingMessageEntries]);
 
   const forceFollowLatest = useCallback(() => {
     if (isShell) termScrollRef.current?.();
@@ -293,11 +295,13 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
                 activeSession={sessionInfo}
                 quickData={quickData}
                 compact
+                subSessionId={sub.id}
                 onSubStop={onClose}
                 onSubRestart={onRestart}
                 sessions={sessions}
                 subSessions={subSessions}
                 serverId={serverId}
+                onTransportConfigSaved={(transportConfig) => onTransportConfigSaved?.(sub.id, transportConfig)}
                 onQuickOpenChange={setQuickPanelOpen}
                 onOverlayOpenChange={setOverlayOpen}
               />
