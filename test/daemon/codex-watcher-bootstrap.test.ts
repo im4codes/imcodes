@@ -9,6 +9,7 @@ const execMock = vi.hoisted(() => vi.fn((cmd: string, cb?: (err: Error | null, r
 }));
 const readProjectMemoryMock = vi.hoisted(() => vi.fn().mockResolvedValue('# Project context'));
 const appendAgentSendDocsMock = vi.hoisted(() => vi.fn((memory: string | null) => `${memory ?? ''}\n\nAGENT_SEND_DOCS`.trim()));
+const buildSessionBootstrapContextMock = vi.hoisted(() => vi.fn().mockResolvedValue('# Project context\n\nAGENT_SEND_DOCS'));
 const buildCodexMemoryEntryMock = vi.hoisted(() => vi.fn((memory: string, timestamp: string) => JSON.stringify({
   timestamp,
   type: 'response_item',
@@ -35,6 +36,7 @@ vi.mock('node:child_process', () => ({
 vi.mock('../../src/daemon/memory-inject.js', () => ({
   readProjectMemory: readProjectMemoryMock,
   appendAgentSendDocs: appendAgentSendDocsMock,
+  buildSessionBootstrapContext: buildSessionBootstrapContextMock,
   buildCodexMemoryEntry: buildCodexMemoryEntryMock,
 }));
 
@@ -47,12 +49,11 @@ describe('ensureSessionFile', () => {
     delete process.env.IMCODES_SHARED_CONTEXT_LEGACY_INJECTION_DISABLED;
   });
 
-  it('uses legacy bootstrapped memory before legacy injection is disabled', async () => {
+  it('uses buildSessionBootstrapContext before legacy injection is disabled', async () => {
     await ensureSessionFile('uuid-1', '/proj');
 
-    expect(readProjectMemoryMock).toHaveBeenCalledWith('/proj');
-    expect(appendAgentSendDocsMock).toHaveBeenCalled();
-    expect(buildCodexMemoryEntryMock).toHaveBeenCalledWith(expect.stringContaining('AGENT_SEND_DOCS'), expect.any(String));
+    expect(buildSessionBootstrapContextMock).toHaveBeenCalledWith('/proj', 'proj');
+    expect(buildCodexMemoryEntryMock).toHaveBeenCalledWith(expect.any(String), expect.any(String));
   });
 
   it('uses a neutral bootstrap message instead of legacy memory when legacy injection is disabled', async () => {
@@ -60,8 +61,7 @@ describe('ensureSessionFile', () => {
 
     await ensureSessionFile('uuid-2', '/proj');
 
-    expect(readProjectMemoryMock).not.toHaveBeenCalled();
-    expect(appendAgentSendDocsMock).not.toHaveBeenCalled();
+    expect(buildSessionBootstrapContextMock).not.toHaveBeenCalled();
     expect(buildCodexMemoryEntryMock).toHaveBeenCalledWith(
       'Shared context bootstrap deferred to runtime assembly.',
       expect.any(String),

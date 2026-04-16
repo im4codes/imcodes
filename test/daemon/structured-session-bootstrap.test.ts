@@ -70,7 +70,7 @@ describe('resolveStructuredSessionBootstrap', () => {
     });
 
     expect(result.geminiSessionId).toBe('gemini-uuid-1');
-    expect(mocks.injectGeminiMemory).toHaveBeenCalledWith('gemini-uuid-1', '/proj');
+    expect(mocks.injectGeminiMemory).toHaveBeenCalledWith('gemini-uuid-1', '/proj', 'proj');
   });
 
   it('skips Gemini legacy memory injection when legacy injection is disabled', async () => {

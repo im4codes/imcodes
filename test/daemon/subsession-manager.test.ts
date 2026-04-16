@@ -347,7 +347,7 @@ describe('startSubSession — geminiSessionId stored in session-store', () => {
 
     const call = vi.mocked(upsertSession).mock.calls[0]?.[0] as Record<string, unknown>;
     expect(call.geminiSessionId).toBe('resolved-gemini-uuid');
-    expect(injectGeminiMemoryMock).toHaveBeenCalledWith('resolved-gemini-uuid', '/proj');
+    expect(injectGeminiMemoryMock).toHaveBeenCalledWith('resolved-gemini-uuid', '/proj', 'proj');
   });
 });
 
