@@ -105,8 +105,8 @@ describe('ChatView file-change cards', () => {
     expect(container.textContent).toContain('File changes (1)');
     expect(container.textContent).toContain('Claude Code');
     expect(container.textContent).toContain('exact');
-    expect(container.textContent).toContain('Removed');
-    expect(container.textContent).toContain('Added');
+    expect(container.querySelector('.chat-file-change-diff-label-removed')?.textContent).toBe('-');
+    expect(container.querySelector('.chat-file-change-diff-label-added')?.textContent).toBe('+');
 
     fireEvent.click(container.querySelector('.chat-file-change-path') as HTMLElement);
 
@@ -178,9 +178,9 @@ describe('ChatView file-change cards', () => {
     const { container, getAllByTestId } = render(<ChatView events={events} loading={false} ws={{} as any} workdir="/repo" sessionId="session-a" />);
 
     expect(container.textContent).toContain('OpenCode');
-    expect(container.textContent).toContain('Removed');
+    expect(container.querySelector('.chat-file-change-diff-label-removed')?.textContent).toBe('-');
     expect(container.textContent).toContain('const before = 1;');
-    expect(container.textContent).toContain('Added');
+    expect(container.querySelector('.chat-file-change-diff-label-added')?.textContent).toBe('+');
     expect(container.textContent).toContain('const after = 2;');
     expect(container.textContent).toContain('2 patch(s)');
     expect(container.querySelectorAll('.chat-file-change-file')).toHaveLength(1);

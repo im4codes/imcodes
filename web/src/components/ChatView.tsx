@@ -1516,11 +1516,23 @@ function ExactFilePatch({ patch }: { patch: FileChangePatch }) {
   return (
     <div class="chat-file-change-diff">
       <div class="chat-file-change-diff-block">
-        <div class="chat-file-change-diff-label chat-file-change-diff-label-removed">{t('chat.file_change_removed')}</div>
+        <div
+          class="chat-file-change-diff-label chat-file-change-diff-label-removed"
+          title={t('chat.file_change_removed')}
+          aria-label={t('chat.file_change_removed')}
+        >
+          -
+        </div>
         <pre class="chat-file-change-diff-pre chat-file-change-diff-pre-removed">{beforePreview.text}{beforePreview.truncated ? `\n${t('chat.file_change_truncated')}` : ''}</pre>
       </div>
       <div class="chat-file-change-diff-block">
-        <div class="chat-file-change-diff-label chat-file-change-diff-label-added">{t('chat.file_change_added')}</div>
+        <div
+          class="chat-file-change-diff-label chat-file-change-diff-label-added"
+          title={t('chat.file_change_added')}
+          aria-label={t('chat.file_change_added')}
+        >
+          +
+        </div>
         <pre class="chat-file-change-diff-pre chat-file-change-diff-pre-added">{afterPreview.text}{afterPreview.truncated ? `\n${t('chat.file_change_truncated')}` : ''}</pre>
       </div>
     </div>
