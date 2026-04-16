@@ -540,7 +540,7 @@ describe('SharedContextManagementPanel', () => {
     expect((await screen.findAllByText('sharedContext.management.memoryRecentDescription')).length).toBeGreaterThan(0);
 
     const memoryContent = screen.getByTestId('memory-record-content-local-personal-1') as HTMLDivElement;
-    expect(memoryContent.style.maxHeight).toBe('4.5em');
+    expect(memoryContent.style.maxHeight).toBe('4.8em');
     const expandButton = screen.getAllByText('sharedContext.management.memoryExpand')[0];
     await act(async () => {
       fireEvent.click(expandButton);
