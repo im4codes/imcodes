@@ -1685,6 +1685,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       sendText = await rewritePathsForSandbox(sessionName, finalText);
     }
 
+    // Inject relevant memories from local processed context for process agents
+    sendText = prependLocalMemory(sendText, sessionName);
+
     await sendShellAwareCommand(sessionName, sendText, agentType);
     const payload: Record<string, unknown> = { text };
     if (attachments.length > 0) payload.attachments = attachments;
@@ -3943,3 +3946,26 @@ async function handleMemorySearch(cmd: Record<string, unknown>, serverLink: Serv
   });
 }
 
+// ── Process agent memory injection (text prepend) ────────────────────────
+
+function prependLocalMemory(prompt: string, sessionName: string): string {
+  if (prompt.length < 10) return prompt; // skip greetings / confirmations
+  try {
+    // Lazy import to avoid circular deps at module load
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { searchLocalMemory } = require('../context/memory-search.js') as typeof import('../context/memory-search.js');
+    const record = getSession(sessionName);
+    const result = searchLocalMemory({
+      query: prompt.slice(0, 200),
+      repo: record?.projectName ?? undefined,
+      limit: 5,
+    });
+    if (result.items.length === 0) return prompt;
+    const lines = result.items.map((item) =>
+      `- [${item.projectId}] ${item.summary.split('\n')[0].slice(0, 200)}`,
+    );
+    return `[Related past work]\n${lines.join('\n')}\n\n${prompt}`;
+  } catch {
+    return prompt; // non-fatal
+  }
+}
