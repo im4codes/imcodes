@@ -32,7 +32,7 @@ const REQUIRED_CHAT_KEYS = [
 ] as const;
 
 function loadLocale(locale: typeof LOCALES[number]): Record<string, unknown> {
-  const filePath = join(process.cwd(), 'web', 'src', 'i18n', 'locales', `${locale}.json`);
+  const filePath = join(process.cwd(), 'src', 'i18n', 'locales', `${locale}.json`);
   return JSON.parse(readFileSync(filePath, 'utf8')) as Record<string, unknown>;
 }
 
