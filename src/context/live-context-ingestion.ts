@@ -152,7 +152,7 @@ function mapTimelineEvent(event: TimelineEvent): Pick<LocalContextEvent, 'eventT
         metadata: { timelineType: event.type },
       };
     case 'assistant.text':
-      if (event.payload.streaming === true) return null;
+      if (event.payload.streaming === true || event.payload.memoryExcluded === true) return null;
       return {
         eventType: 'assistant.turn',
         content: stringifyContent(event.payload.text),
@@ -181,4 +181,3 @@ function mapTimelineEvent(event: TimelineEvent): Pick<LocalContextEvent, 'eventT
 function stringifyContent(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
-

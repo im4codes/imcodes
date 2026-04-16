@@ -221,6 +221,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     timelineEmitter.emit(sessionName, 'assistant.text', {
       text: errorText,
       streaming: false,
+      ...(!tracked?.text ? { memoryExcluded: true } : {}),
     }, {
       source: 'daemon',
       confidence: 'high',

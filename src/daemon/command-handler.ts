@@ -1432,7 +1432,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     const errMsg = `Provider ${record.providerId ?? 'unknown'} not connected. Reconnecting...`;
     logger.warn({ sessionName, providerId: record.providerId }, 'session.send: transport session has no runtime');
     emitTransportUserMessage(text);
-    timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ ${errMsg}`, streaming: false }, { source: 'daemon', confidence: 'high' });
+    timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
     timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
     const errStatus = 'error';
     timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: errStatus, error: errMsg });
@@ -1444,7 +1444,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     const errMsg = `Provider ${record?.providerId ?? 'unknown'} restarting. Please resend in a moment.`;
     logger.warn({ sessionName, providerId: record?.providerId }, 'session.send: transport runtime missing provider session id');
     emitTransportUserMessage(text);
-    timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ ${errMsg}`, streaming: false }, { source: 'daemon', confidence: 'high' });
+    timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
     timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
     timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
     try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg }); } catch {}
@@ -1468,7 +1468,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       } catch (err) {
         const errMsg = describeTransportSendError(err);
         logger.error({ sessionName, err }, 'session.stop (transport) failed');
-        timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Stop failed: ${errMsg}`, streaming: false }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Stop failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
         try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg }); } catch { /* */ }
       }
@@ -1493,6 +1493,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
             timelineEmitter.emit(sessionName, 'assistant.text', {
               text: `⚠️ Unknown Qwen model: ${nextModel}${authHint}`,
               streaming: false,
+              memoryExcluded: true,
             }, { source: 'daemon', confidence: 'high' });
             timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Qwen model: ${nextModel}${authHint}` });
             try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: `Unknown Qwen model: ${nextModel}${authHint}` }); } catch { /* */ }
@@ -1539,7 +1540,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         const selectedModel = normalizeClaudeCodeModelId(requestedModel);
         if (!selectedModel) {
           emitTransportUserMessage(text);
-          timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Unknown Claude model: ${requestedModel}`, streaming: false }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Unknown Claude model: ${requestedModel}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
           timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Claude model: ${requestedModel}` });
           try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: `Unknown Claude model: ${requestedModel}` }); } catch {}
           return;
@@ -1569,7 +1570,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         const nextModel = modelMatch[1];
         if (!CODEX_MODEL_IDS.includes(nextModel as any)) {
           emitTransportUserMessage(text);
-          timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Unknown Codex model: ${nextModel}`, streaming: false }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Unknown Codex model: ${nextModel}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
           timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Codex model: ${nextModel}` });
           try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: `Unknown Codex model: ${nextModel}` }); } catch {}
           return;
@@ -1606,6 +1607,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           timelineEmitter.emit(sessionName, 'assistant.text', {
             text: `⚠️ Unsupported thinking level: ${nextEffort}. Supported: ${supported}`,
             streaming: false,
+            memoryExcluded: true,
           }, { source: 'daemon', confidence: 'high' });
           timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unsupported thinking level: ${nextEffort}` });
           try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: `Unsupported thinking level: ${nextEffort}` }); } catch {}
@@ -1649,6 +1651,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           timelineEmitter.emit(sessionName, 'assistant.text', {
             text: `⚠️ Supervision ${decision.decision}: ${decision.reason}`,
             streaming: false,
+            memoryExcluded: true,
           }, { source: 'daemon', confidence: 'high' });
           timelineEmitter.emit(sessionName, 'command.ack', {
             commandId: effectiveId,
@@ -1710,7 +1713,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     } catch (err) {
       const errMsg = describeTransportSendError(err);
       logger.error({ sessionName, err }, 'session.send (transport) failed');
-      timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Send failed: ${errMsg}`, streaming: false }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Send failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
       timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
       try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg }); } catch { /* */ }
     } finally {

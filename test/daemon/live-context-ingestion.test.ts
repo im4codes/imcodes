@@ -86,6 +86,32 @@ describe('LiveContextIngestion', () => {
     expect(summary?.summary).not.toContain('partial');
   });
 
+  it('ignores memory-excluded assistant warnings so runtime errors do not enter processed memory', async () => {
+    const ingestion = new LiveContextIngestion({ compressor: localOnlyCompressor,
+      thresholds: { eventCount: 99, idleMs: 60_000, scheduleMs: 60_000 },
+      sessionLookup: () => session,
+      resolveBootstrap: async () => ({ namespace, diagnostics: ['test'] }),
+    });
+
+    await ingestion.handleTimelineEvent(makeEvent('user.message', 100, { text: 'Continue the run' }));
+    await ingestion.handleTimelineEvent(makeEvent('assistant.text', 110, {
+      text: '⚠️ Error: Terminal stream unavailable after max retries',
+      streaming: false,
+      memoryExcluded: true,
+    }));
+
+    expect(getProcessedProjectionStats({ scope: 'personal', projectId: namespace.projectId })).toMatchObject({
+      stagedEventCount: 1,
+      dirtyTargetCount: 1,
+    });
+
+    await ingestion.handleTimelineEvent(makeEvent('session.state', 120, { state: 'idle' }));
+
+    const [summary] = queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId, limit: 10 });
+    expect(summary?.summary).toContain('**User:** Continue the run');
+    expect(summary?.summary).not.toContain('Terminal stream unavailable');
+  });
+
   it('ignores tool calls and tool results when building memory', async () => {
     const ingestion = new LiveContextIngestion({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 60_000, scheduleMs: 60_000 },

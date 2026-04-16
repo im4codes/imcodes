@@ -226,7 +226,7 @@ class SupervisionAutomation {
     timelineEmitter.emit(
       sessionName,
       'assistant.text',
-      { text: `⚠️ ${text}`, streaming: false, automation: true, automationKind: 'supervision-warning' },
+      { text: `⚠️ ${text}`, streaming: false, automation: true, automationKind: 'supervision-warning', memoryExcluded: true },
       { source: 'daemon', confidence: 'high', eventId: `supervision-warning:${randomUUID()}` },
     );
   }

@@ -13,5 +13,6 @@ export function emitSessionInlineError(
   timelineEmitter.emit(sessionId, 'assistant.text', {
     text: formatSessionErrorMessage(message),
     streaming: false,
+    memoryExcluded: true,
   }, { source, confidence: 'high' });
 }
