@@ -101,17 +101,11 @@ export class TimelineDB {
         const upper = [sessionId, epoch, Infinity];
         const range = IDBKeyRange.bound(lower, upper);
 
-        const results: TimelineEvent[] = [];
-        const req = index.openCursor(range);
-
+        // getAll is a single IDB round-trip — much faster than cursor iteration
+        const req = index.getAll(range);
         req.onsuccess = () => {
-          const cursor = req.result;
-          if (cursor && results.length < limit) {
-            results.push(cursor.value as TimelineEvent);
-            cursor.continue();
-          } else {
-            resolve(results);
-          }
+          const all = req.result as TimelineEvent[];
+          resolve(limit < all.length ? all.slice(0, limit) : all);
         };
         req.onerror = () => reject(req.error);
       });
@@ -145,18 +139,11 @@ export class TimelineDB {
         const upper = [sessionId, Infinity];
         const range = IDBKeyRange.bound(lower, upper);
 
-        // Walk in reverse to get the most recent events, then reverse at end
-        const results: TimelineEvent[] = [];
-        const req = index.openCursor(range, 'prev');
-
+        // getAll is a single IDB round-trip — much faster than cursor iteration
+        const req = index.getAll(range);
         req.onsuccess = () => {
-          const cursor = req.result;
-          if (cursor && results.length < limit) {
-            results.push(cursor.value as TimelineEvent);
-            cursor.continue();
-          } else {
-            resolve(results.reverse());
-          }
+          const all = req.result as TimelineEvent[];
+          resolve(limit < all.length ? all.slice(-limit) : all);
         };
         req.onerror = () => reject(req.error);
       });
