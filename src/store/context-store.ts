@@ -330,6 +330,53 @@ export function updateContextJob(jobId: string, status: ContextJobStatus, update
   `).run(status, now, updates?.error ?? null, updates?.attemptIncrement ? 1 : 0, jobId);
 }
 
+/**
+ * Count consecutive materialization_failed jobs for a target since the last
+ * completed job. Used to decide when to give up retrying SDK compression.
+ */
+export function countConsecutiveFailedJobs(target: ContextTargetRef): number {
+  const database = ensureDb();
+  const targetKey = serializeContextTarget(target);
+  // Get all jobs for this target in descending order; count failed ones until
+  // we hit a completed/non-failed job or the end.
+  const rows = database.prepare(`
+    SELECT status FROM context_jobs
+    WHERE target_key = ? AND job_type IN ('materialize_session', 'materialize_project')
+    ORDER BY created_at DESC
+    LIMIT 20
+  `).all(targetKey) as Array<{ status: string }>;
+  let count = 0;
+  for (const row of rows) {
+    if (row.status === 'materialization_failed') count++;
+    else if (row.status === 'completed') break;
+    // 'pending' / 'running' states are skipped (shouldn't count as failure yet)
+  }
+  return count;
+}
+
+/**
+ * Delete tentative (retry-pending) projections for a namespace+class.
+ * Called before committing a successful SDK compression to remove the
+ * placeholder local-fallback summary from prior failed attempts.
+ */
+export function deleteTentativeProjections(namespace: ContextNamespace, projectionClass: ProcessedContextClass): number {
+  const database = ensureDb();
+  const namespaceKey = serializeContextNamespace(namespace);
+  // Scan matching rows and delete those with content.tentative === true
+  const rows = database.prepare(
+    'SELECT id, content_json FROM context_processed_local WHERE namespace_key = ? AND class = ?',
+  ).all(namespaceKey, projectionClass) as Array<{ id: string; content_json: string }>;
+  let deleted = 0;
+  for (const row of rows) {
+    const content = parseJson<Record<string, unknown>>(row.content_json, {});
+    if (content.tentative === true) {
+      database.prepare('DELETE FROM context_processed_local WHERE id = ?').run(row.id);
+      deleted++;
+    }
+  }
+  return deleted;
+}
+
 export function writeProcessedProjection(input: Omit<ProcessedContextProjection, 'id' | 'createdAt' | 'updatedAt'> & Partial<Pick<ProcessedContextProjection, 'id' | 'createdAt' | 'updatedAt'>>): ProcessedContextProjection {
   const database = ensureDb();
   const now = Date.now();

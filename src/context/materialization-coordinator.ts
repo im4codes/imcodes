@@ -13,6 +13,8 @@ import { getContextModelConfig } from './context-model-config.js';
 import { compressWithSdk, type CompressionResult } from './summary-compressor.js';
 import {
   clearDirtyTarget,
+  countConsecutiveFailedJobs,
+  deleteTentativeProjections,
   enqueueContextJob,
   getReplicationState,
   deleteStagedEventsByIds,
@@ -52,6 +54,13 @@ const DEFAULT_THRESHOLDS: MaterializationThresholds = {
   scheduleMs: 15 * 60_000,
   minIntervalMs: 10_000,
 };
+
+/**
+ * Max consecutive SDK failures before committing the local fallback.
+ * Beyond this, we accept the fallback summary and delete staged events
+ * to avoid unbounded growth.
+ */
+const MAX_SDK_RETRY_ATTEMPTS = 3;
 
 export class MaterializationCoordinator {
   readonly thresholds: MaterializationThresholds;
@@ -131,6 +140,25 @@ export class MaterializationCoordinator {
       };
     }
 
+    // Decide whether this is a "final commit" or a "tentative save".
+    // - SDK succeeded → commit (delete raw events, clear dirty, mark completed)
+    // - SDK failed but retry budget remaining → tentative save (keep raw events,
+    //   mark materialization_failed so next trigger retries with SDK)
+    // - SDK failed AND retry budget exhausted → commit the fallback anyway
+    //   (accept the coarse local summary to avoid unbounded growth)
+    const priorFailures = countConsecutiveFailedJobs(target);
+    const sdkFailed = !compression.fromSdk;
+    const retryBudgetExhausted = priorFailures >= MAX_SDK_RETRY_ATTEMPTS;
+    const shouldRetry = sdkFailed && !retryBudgetExhausted;
+
+    // Remove prior tentative summaries before writing the new result.
+    // - SDK succeeded on retry → replace tentative with proper summary
+    // - SDK still failed → replace prior tentative with new tentative
+    // - Retry budget exhausted → replace tentative with committed fallback
+    if (priorFailures > 0) {
+      deleteTentativeProjections(target.namespace, 'recent_summary');
+    }
+
     const summaryProjection = writeProcessedProjection({
       namespace: target.namespace,
       class: 'recent_summary',
@@ -150,29 +178,41 @@ export class MaterializationCoordinator {
         compressionFromSdk: compression.fromSdk,
         eventCount: events.length,
         hadPreviousSummary: !!previousSummary,
+        tentative: shouldRetry,                    // marked as tentative when retrying
+        retryAttempt: shouldRetry ? priorFailures + 1 : undefined,
       },
       createdAt: now,
       updatedAt: now,
     });
     const durableProjection = buildDurableProjection(target.namespace, events, now);
-    const replicationState = getReplicationState(target.namespace);
-    const pendingProjectionIds = [
-      ...(replicationState?.pendingProjectionIds ?? []),
-      summaryProjection.id,
-      ...(durableProjection ? [durableProjection.id] : []),
-    ];
-    setReplicationState(target.namespace, {
-      pendingProjectionIds: Array.from(new Set(pendingProjectionIds)),
-      lastReplicatedAt: replicationState?.lastReplicatedAt,
-      lastError: replicationState?.lastError,
-    });
-    deleteStagedEventsByIds(sourceEventIds);
-    updateContextJob(job.id, 'completed', { now });
-    clearDirtyTarget(target);
+
+    // Only queue for replication if this is a final commit (not tentative)
+    if (!shouldRetry) {
+      const replicationState = getReplicationState(target.namespace);
+      const pendingProjectionIds = [
+        ...(replicationState?.pendingProjectionIds ?? []),
+        summaryProjection.id,
+        ...(durableProjection ? [durableProjection.id] : []),
+      ];
+      setReplicationState(target.namespace, {
+        pendingProjectionIds: Array.from(new Set(pendingProjectionIds)),
+        lastReplicatedAt: replicationState?.lastReplicatedAt,
+        lastError: replicationState?.lastError,
+      });
+      deleteStagedEventsByIds(sourceEventIds);
+      updateContextJob(job.id, 'completed', { now });
+      clearDirtyTarget(target);
+    } else {
+      // Tentative: keep staged events for next retry. Don't clear dirty target.
+      updateContextJob(job.id, 'materialization_failed', { now,
+        error: `SDK compression unavailable (attempt ${priorFailures + 1}/${MAX_SDK_RETRY_ATTEMPTS}) — kept raw events for retry`,
+      });
+    }
+
     return {
       summaryProjection,
       durableProjection,
-      replicationQueued: true,
+      replicationQueued: !shouldRetry,
       compression,
     };
   }

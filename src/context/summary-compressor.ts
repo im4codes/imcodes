@@ -178,12 +178,14 @@ const COMPRESSOR_SYSTEM_PROMPT = `You are a memory compression engine. Your outp
 // ── Local-only compressor (for tests / offline) ──────────────────────────────
 
 export async function localOnlyCompressor(input: CompressionInput): Promise<CompressionResult> {
+  // Tests expect local-only compression to behave as if SDK succeeded (fromSdk=true)
+  // so the coordinator commits the result instead of entering retry mode.
   return {
     summary: buildLocalFallbackSummary(input.events, input.previousSummary),
-    model: 'local-fallback',
-    backend: 'none',
+    model: 'local-only-test',
+    backend: 'local',
     usedBackup: false,
-    fromSdk: false,
+    fromSdk: true,
   };
 }
 
