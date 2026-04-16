@@ -45,6 +45,7 @@ import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM, PREVIEW_LIMITS } from '../../shared/p
 import { COOKIE_SESSION, COOKIE_PREVIEW_ACCESS } from '../../shared/cookie-names.js';
 import { healthCheckCron } from './cron/health-check.js';
 import { jobDispatchCron } from './cron/job-dispatch.js';
+import { memoryPruningCron } from './cron/memory-pruning.js';
 import { WsBridge } from './ws/bridge.js';
 import { MemoryRateLimiter } from './ws/rate-limiter.js';
 import { rateLimiter } from './security/lockout.js';
@@ -516,6 +517,8 @@ function scheduleCrons(env: Env) {
     // Clean up expired auth lockout records older than 1 day
     env.DB.exec("DELETE FROM auth_lockout WHERE locked_until < NOW() - INTERVAL '1 day'")
       .catch((err) => logger.error({ err }, 'Auth lockout cleanup failed'));
+    // Delete archived cloud memory projections older than 90 days
+    memoryPruningCron(env).catch((err) => logger.error({ err }, 'Memory pruning cron failed'));
   });
   cron.schedule('* * * * *', () => {
     jobDispatchCron(env).catch((err) => logger.error({ err }, 'Job dispatch cron failed'));

@@ -79,7 +79,12 @@ describe('context-store', () => {
       lastReplicatedAt: 100,
     });
 
-    expect(listProcessedProjections(namespace, 'recent_summary')).toEqual([projection]);
+    expect(listProcessedProjections(namespace, 'recent_summary')).toEqual([{
+      ...projection,
+      hitCount: 0,
+      lastUsedAt: undefined,
+      status: 'active',
+    }]);
     expect(getReplicationState(namespace)).toEqual({
       namespace,
       pendingProjectionIds: [projection.id],
