@@ -75,6 +75,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           workdir={liveSub.cwd ?? null}
           serverId={ctx.serverId}
           onQuote={ctx.onQuote}
+          agentType={liveSub.type}
         />
       )}
       {(lastUsage || activeThinkingTs || activeToolCall || statusText || liveSessionState === 'running' || liveSessionState === 'idle' || liveSub.planLabel || liveSub.quotaLabel || liveSub.quotaUsageLabel || liveSub.quotaMeta) && (

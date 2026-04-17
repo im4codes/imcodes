@@ -119,6 +119,69 @@ describe('ChatView file-change cards', () => {
     expect(fileBrowserProps[0]?.initialPath).toBe('/repo/src');
   });
 
+  it('hides the provider badge when it matches the current chat agent family', () => {
+    const events = [
+      makeEvent('file.change', {
+        batch: {
+          provider: 'codex-sdk',
+          patches: [
+            {
+              filePath: '/repo/src/app.ts',
+              operation: 'update',
+              confidence: 'derived',
+              afterText: 'export const value = 2;',
+            },
+          ],
+        },
+      }),
+    ];
+
+    const { container } = render(
+      <ChatView
+        events={events}
+        loading={false}
+        ws={{} as any}
+        workdir="/repo"
+        sessionId="session-a"
+        agentType="codex-sdk"
+      />,
+    );
+
+    expect(container.textContent).toContain('File changes (1)');
+    expect(container.textContent).not.toContain('Codex SDK');
+  });
+
+  it('keeps the provider badge when the file-change source differs from the current chat agent', () => {
+    const events = [
+      makeEvent('file.change', {
+        batch: {
+          provider: 'qwen',
+          patches: [
+            {
+              filePath: '/repo/src/app.ts',
+              operation: 'update',
+              confidence: 'derived',
+              afterText: 'export const value = 2;',
+            },
+          ],
+        },
+      }),
+    ];
+
+    const { container } = render(
+      <ChatView
+        events={events}
+        loading={false}
+        ws={{} as any}
+        workdir="/repo"
+        sessionId="session-a"
+        agentType="codex-sdk"
+      />,
+    );
+
+    expect(container.textContent).toContain('Qwen');
+  });
+
   it('renders derived and coarse file-change states honestly and does not show hidden raw tool rows', () => {
     const events = [
       makeEvent('tool.call', { tool: 'Edit', input: { file_path: '/repo/src/hidden.ts' } }, { hidden: true }),

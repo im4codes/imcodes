@@ -262,6 +262,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
               sessionId={sub.sessionName}
               onScrollBottomFn={(fn) => { chatScrollRef.current = fn; }}
               preview
+              agentType={sub.type}
             />
           )}
         </div>

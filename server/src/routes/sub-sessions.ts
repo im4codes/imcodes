@@ -12,6 +12,7 @@ import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { WsBridge } from '../ws/bridge.js';
 import logger from '../util/logger.js';
 import { isSessionAgentType } from '../../../shared/agent-types.js';
+import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 
 export const subSessionRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -196,6 +197,18 @@ subSessionRoutes.patch('/:id/sub-sessions/:subId', async (c) => {
       }));
     } catch (err) {
       logger.error({ serverId, subId, err }, 'WsBridge sub-session rename relay failed');
+      return c.json({ error: 'relay_failed' }, 502);
+    }
+  }
+  if (body.type == null && body.transportConfig !== undefined) {
+    try {
+      WsBridge.get(serverId).sendToDaemon(JSON.stringify({
+        type: DAEMON_COMMAND_TYPES.SUBSESSION_UPDATE_TRANSPORT_CONFIG,
+        sessionName: `deck_sub_${subId}`,
+        transportConfig: body.transportConfig ?? null,
+      }));
+    } catch (err) {
+      logger.error({ serverId, subId, err }, 'WsBridge sub-session transportConfig relay failed');
       return c.json({ error: 'relay_failed' }, 502);
     }
   }

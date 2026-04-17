@@ -11,18 +11,21 @@ import logger from '../util/logger.js';
 import {
   SUPERVISION_CONTRACT_IDS,
   SUPERVISION_MODE,
+  extractSessionSupervisionSnapshot,
   parseAuditVerdictDetailsFromText,
-  parseTaskRunTerminalStateDetailsFromText,
   type SessionSupervisionSnapshot,
   type TaskRunTerminalState,
 } from '../../shared/supervision-config.js';
 import {
+  buildSupervisionContinuePrompt,
   buildContextualAutomationAuditPromptAppend,
   buildOpenSpecAutomationAuditPromptAppend,
   buildReworkBriefPrompt,
 } from './supervision-prompts.js';
 
 type TaskRunPhase = 'execution' | 'auditing';
+
+const MAX_AUTO_CONTINUE_STEPS = 8;
 
 interface ActiveTaskRunState {
   generation: number;
@@ -31,7 +34,9 @@ interface ActiveTaskRunState {
   snapshot: SessionSupervisionSnapshot;
   userText: string;
   phase: TaskRunPhase;
-  awaitingMarker: boolean;
+  continueLoops: number;
+  evaluating: boolean;
+  sawAssistantOutput: boolean;
   lastAssistantText?: string;
   terminalState?: TaskRunTerminalState;
   auditRunId?: string;
@@ -43,6 +48,17 @@ interface PendingTaskIntent {
   commandId: string;
   text: string;
   snapshot: SessionSupervisionSnapshot;
+}
+
+interface RecentTaskCandidate {
+  commandId: string;
+  text: string;
+  sequence: number;
+}
+
+interface LatestAssistantText {
+  text: string;
+  sequence: number;
 }
 
 interface AuditBaseline {
@@ -163,7 +179,6 @@ async function resolveAuditBaseline(sessionName: string, run: ActiveTaskRunState
       fileContents: candidate.mdFiles,
       userText: [
         `OpenSpec implementation audit for change: ${changeName}`,
-        `Task run marker contract: ${SUPERVISION_CONTRACT_IDS.TASK_RUN_STATUS}`,
         `Audit verdict contract: ${SUPERVISION_CONTRACT_IDS.OPENSPEC_IMPLEMENTATION_AUDIT}`,
         `Selected automation audit mode: ${run.snapshot.auditMode}`,
         '',
@@ -175,7 +190,6 @@ async function resolveAuditBaseline(sessionName: string, run: ActiveTaskRunState
 
   const summary = [
     `Contextual implementation audit for session ${sessionName}.`,
-    `Task run marker contract: ${SUPERVISION_CONTRACT_IDS.TASK_RUN_STATUS}`,
     `Audit verdict contract: ${SUPERVISION_CONTRACT_IDS.CONTEXTUAL_AUDIT}`,
     `Selected automation audit mode: ${run.snapshot.auditMode}`,
     `Task request: ${run.userText}`,
@@ -218,9 +232,12 @@ function isFinalAssistantPayload(payload: Record<string, unknown>): boolean {
 class SupervisionAutomation {
   private activeRuns = new Map<string, ActiveTaskRunState>();
   private pendingTaskIntents = new Map<string, PendingTaskIntent>();
+  private recentTaskCandidates = new Map<string, RecentTaskCandidate>();
+  private latestAssistantTexts = new Map<string, LatestAssistantText>();
   private pollers = new Map<string, ReturnType<typeof setInterval>>();
   private initialized = false;
   private serverLink: ServerLink | null = null;
+  private eventSequence = 0;
 
   private emitWarning(sessionName: string, text: string): void {
     timelineEmitter.emit(
@@ -245,13 +262,14 @@ class SupervisionAutomation {
 
   cancelSession(sessionName: string): void {
     const state = this.activeRuns.get(sessionName);
-    if (!state) return;
-    if (state.auditRunId) {
+    if (state?.auditRunId) {
       cancelP2pRun(state.auditRunId, this.serverLink);
     }
     this.clearPoller(sessionName);
     this.activeRuns.delete(sessionName);
     this.pendingTaskIntents.delete(sessionName);
+    this.recentTaskCandidates.delete(sessionName);
+    this.latestAssistantTexts.delete(sessionName);
   }
 
   queueTaskIntent(
@@ -260,7 +278,7 @@ class SupervisionAutomation {
     text: string,
     snapshot: SessionSupervisionSnapshot,
   ): void {
-    if (snapshot.mode !== SUPERVISION_MODE.SUPERVISED_AUDIT) return;
+    if (snapshot.mode === SUPERVISION_MODE.OFF) return;
     this.cancelSession(sessionName);
     this.pendingTaskIntents.set(sessionName, { commandId, text, snapshot });
   }
@@ -283,7 +301,7 @@ class SupervisionAutomation {
     text: string,
     snapshot: SessionSupervisionSnapshot,
   ): ActiveTaskRunState | null {
-    if (snapshot.mode !== SUPERVISION_MODE.SUPERVISED_AUDIT) return null;
+    if (snapshot.mode === SUPERVISION_MODE.OFF) return null;
     const existing = this.activeRuns.get(sessionName);
     if (existing?.auditRunId) {
       cancelP2pRun(existing.auditRunId, this.serverLink);
@@ -296,10 +314,13 @@ class SupervisionAutomation {
       snapshot,
       userText: text,
       phase: 'execution',
-      awaitingMarker: false,
+      continueLoops: 0,
+      evaluating: false,
+      sawAssistantOutput: false,
       auditLoops: 0,
       startedAt: Date.now(),
     };
+    this.recentTaskCandidates.delete(sessionName);
     this.activeRuns.set(sessionName, next);
     return next;
   }
@@ -309,61 +330,125 @@ class SupervisionAutomation {
   }
 
   private handleTimelineEvent(event: { sessionId: string; type: string; payload: Record<string, unknown> }): void {
+    const sequence = ++this.eventSequence;
+
     if (event.type === 'user.message') {
       const pending = this.pendingTaskIntents.get(event.sessionId);
       const clientMessageId = trimString(event.payload.clientMessageId);
       const automation = event.payload.automation === true;
+      const text = trimString(event.payload.text);
+      if (!automation && text && !text.startsWith('/')) {
+        this.recentTaskCandidates.set(event.sessionId, {
+          commandId: clientMessageId ?? `implicit:${Date.now()}`,
+          text,
+          sequence,
+        });
+      }
       if (pending && !automation && clientMessageId === pending.commandId) {
         this.pendingTaskIntents.delete(event.sessionId);
         this.registerTaskIntent(event.sessionId, pending.commandId, pending.text, pending.snapshot);
       }
     }
 
-    const run = this.activeRuns.get(event.sessionId);
-    if (!run) return;
-
     if (event.type === 'assistant.text' && isFinalAssistantPayload(event.payload)) {
       const text = trimString(event.payload.text) ?? '';
       if (!text) return;
+      this.latestAssistantTexts.set(event.sessionId, { text, sequence });
+      const run = this.activeRuns.get(event.sessionId);
+      if (!run) return;
       run.lastAssistantText = text;
-      if (run.phase !== 'execution') return;
-      const parsedMarker = parseTaskRunTerminalStateDetailsFromText(text);
-      const terminalState = parsedMarker.state;
-      if (!terminalState) {
-        run.awaitingMarker = true;
-        if (parsedMarker.markerCount > 1) {
-          this.emitWarning(run.sessionName, 'Heavy supervision expected exactly one task-run marker but received multiple markers. Automation returned to manual control.');
-          this.finishRun(run.sessionName, 'needs_input');
+      run.sawAssistantOutput = true;
+      return;
+    }
+
+    if (event.type === 'session.state') {
+      const run = this.activeRuns.get(event.sessionId);
+      const state = trimString(event.payload.state);
+      if (state === 'idle' && !run) {
+        const candidate = this.recentTaskCandidates.get(event.sessionId);
+        const record = getSession(event.sessionId);
+        const snapshot = record?.agentType
+          ? extractSessionSupervisionSnapshot(record.transportConfig ?? null)
+          : null;
+        const latestAssistant = this.latestAssistantTexts.get(event.sessionId);
+        if (candidate && snapshot && snapshot.mode !== SUPERVISION_MODE.OFF && latestAssistant && latestAssistant.sequence > candidate.sequence) {
+          const implicitRun = this.registerTaskIntent(event.sessionId, candidate.commandId, candidate.text, snapshot);
+          if (implicitRun) {
+            implicitRun.lastAssistantText = latestAssistant.text;
+            implicitRun.sawAssistantOutput = true;
+            implicitRun.evaluating = true;
+            void this.evaluateExecutionTurn(implicitRun).catch((error) => {
+              logger.warn({ session: implicitRun.sessionName, err: error }, 'Supervision implicit execution evaluation failed');
+              this.emitWarning(implicitRun.sessionName, 'Automation could not determine whether the task is complete. Manual continuation is required.');
+              this.finishRun(implicitRun.sessionName, 'needs_input');
+            });
+          }
+        } else if (candidate) {
+          this.recentTaskCandidates.delete(event.sessionId);
         }
         return;
       }
-      run.terminalState = terminalState;
-      run.awaitingMarker = false;
-      if (terminalState === 'complete') {
-        if (run.snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT) {
-          void this.startAudit(run).catch((error) => {
-            logger.warn({ session: run.sessionName, err: error }, 'Supervision audit start failed');
-            this.emitWarning(run.sessionName, 'Automation audit could not be started. Manual continuation is required.');
-            this.finishRun(run.sessionName, 'blocked');
-          });
+      if (!run) return;
+      if (state === 'idle' && run.phase === 'execution' && !run.evaluating) {
+        if (!run.sawAssistantOutput || !run.lastAssistantText?.trim()) {
+          this.emitWarning(run.sessionName, 'Automation did not capture a completed assistant response for the current task. Manual continuation is required.');
+          this.finishRun(run.sessionName, 'needs_input');
+          return;
+        }
+        run.evaluating = true;
+        void this.evaluateExecutionTurn(run).catch((error) => {
+          logger.warn({ session: run.sessionName, err: error }, 'Supervision execution evaluation failed');
+          this.emitWarning(run.sessionName, 'Automation could not determine whether the task is complete. Manual continuation is required.');
+          this.finishRun(run.sessionName, 'needs_input');
+        });
+      }
+      if ((state === 'stopped' || state === 'error') && run.phase === 'execution') {
+        this.emitWarning(run.sessionName, 'Supervision stopped because the session entered a blocked state.');
+        this.finishRun(run.sessionName, 'blocked');
+      }
+    }
+  }
+
+  private async evaluateExecutionTurn(run: ActiveTaskRunState): Promise<void> {
+    const current = this.activeRuns.get(run.sessionName);
+    if (!current || current.generation !== run.generation || current.phase !== 'execution') return;
+
+    const record = getSession(run.sessionName);
+    const decision = await supervisionBroker.decide({
+      snapshot: current.snapshot,
+      taskRequest: current.userText,
+      assistantResponse: current.lastAssistantText,
+      cwd: record?.projectDir,
+      description: record?.description,
+    });
+
+    const latest = this.activeRuns.get(run.sessionName);
+    if (!latest || latest.generation !== run.generation || latest.phase !== 'execution') return;
+    latest.evaluating = false;
+
+    switch (decision.decision) {
+      case 'complete': {
+        latest.terminalState = 'complete';
+        if (latest.snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT) {
+          await this.startAudit(latest);
         } else {
           this.finishRun(run.sessionName, 'complete');
         }
         return;
       }
-      this.finishRun(run.sessionName, terminalState);
-      return;
-    }
-
-    if (event.type === 'session.state') {
-      const state = trimString(event.payload.state);
-      if (state === 'idle' && run.phase === 'execution' && run.awaitingMarker && !run.terminalState) {
-        this.emitWarning(run.sessionName, 'Heavy supervision expected a terminal task-run marker but none was found. Automation returned to manual control.');
-        this.finishRun(run.sessionName, 'needs_input');
+      case 'continue': {
+        if (latest.continueLoops >= MAX_AUTO_CONTINUE_STEPS) {
+          this.emitWarning(run.sessionName, 'Automation reached the maximum auto-continue limit. Manual continuation is required.');
+          this.finishRun(run.sessionName, 'needs_input');
+          return;
+        }
+        await this.dispatchContinue(latest, decision.reason);
+        return;
       }
-      if ((state === 'stopped' || state === 'error') && run.phase === 'execution') {
-        this.emitWarning(run.sessionName, 'Heavy supervision stopped because the session entered a blocked state.');
-        this.finishRun(run.sessionName, 'blocked');
+      case 'ask_human':
+      default: {
+        this.emitWarning(run.sessionName, `Automation returned control to the human: ${decision.reason}`);
+        this.finishRun(run.sessionName, 'needs_input');
       }
     }
   }
@@ -383,7 +468,7 @@ class SupervisionAutomation {
     if (!current || current.generation !== run.generation) return;
 
     current.phase = 'auditing';
-    current.awaitingMarker = false;
+    current.evaluating = false;
     const auditRound = {
       id: 'implementation_audit',
       title: 'Implementation Audit',
@@ -477,26 +562,12 @@ class SupervisionAutomation {
     }
 
     const reworkBrief = buildReworkBrief(current, resultSummary);
-    const record = getSession(state.sessionName);
-    const decision = await supervisionBroker.decide({
-      snapshot: current.snapshot,
-      prompt: reworkBrief,
-      cwd: record?.projectDir,
-      description: record?.description,
-    });
-    if (decision.decision !== 'approve') {
-      this.emitWarning(
-        state.sessionName,
-        `Automation rework was not auto-dispatched because supervision returned ${decision.decision}: ${decision.reason}`,
-      );
-      this.activeRuns.delete(state.sessionName);
-      return;
-    }
-
     current.phase = 'execution';
     current.auditRunId = undefined;
-    current.awaitingMarker = false;
+    current.evaluating = false;
+    current.sawAssistantOutput = false;
     current.terminalState = undefined;
+    current.lastAssistantText = undefined;
 
     timelineEmitter.emit(
       state.sessionName,
@@ -510,6 +581,41 @@ class SupervisionAutomation {
       logger.warn({ session: state.sessionName, err: error }, 'Supervision rework dispatch failed');
       this.emitWarning(state.sessionName, 'Automation could not send the rework brief back into the session. Manual continuation is required.');
       this.activeRuns.delete(state.sessionName);
+    }
+  }
+
+  private async dispatchContinue(run: ActiveTaskRunState, reason: string): Promise<void> {
+    const current = this.activeRuns.get(run.sessionName);
+    if (!current || current.generation !== run.generation || current.phase !== 'execution') return;
+    const transportRuntime = getTransportRuntime(run.sessionName);
+    if (!transportRuntime) {
+      this.finishRun(run.sessionName, 'blocked');
+      return;
+    }
+
+    const continuePrompt = buildSupervisionContinuePrompt(
+      current.userText,
+      current.lastAssistantText,
+      reason,
+    );
+    current.continueLoops += 1;
+    current.sawAssistantOutput = false;
+    current.lastAssistantText = undefined;
+    current.terminalState = undefined;
+
+    timelineEmitter.emit(
+      run.sessionName,
+      'user.message',
+      { text: continuePrompt, allowDuplicate: true, automation: true, automationKind: 'supervision-continue' },
+      { source: 'daemon', confidence: 'high', eventId: `supervision-continue:${run.generation}:${current.continueLoops}:${randomUUID()}` },
+    );
+
+    try {
+      transportRuntime.send(continuePrompt, `supervision-continue-${run.generation}-${current.continueLoops}`);
+    } catch (error) {
+      logger.warn({ session: run.sessionName, err: error }, 'Supervision continue dispatch failed');
+      this.emitWarning(run.sessionName, 'Automation could not continue the task. Manual continuation is required.');
+      this.finishRun(run.sessionName, 'blocked');
     }
   }
 }

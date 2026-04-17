@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
+import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 
 const SESSION_CC = `deck_ccsdk_${Math.random().toString(36).slice(2, 8)}_brain`;
 const SESSION_CX = `deck_cxsdk_${Math.random().toString(36).slice(2, 8)}_brain`;
@@ -381,10 +382,10 @@ describe('sdk transport flow e2e', () => {
     expect(mocks.emitted).toContainEqual(expect.objectContaining({
       session: 'deck_restart_fail_brain',
       type: 'assistant.text',
-      payload: {
+      payload: expect.objectContaining({
         text: '⚠️ Error: tmux create failed',
         streaming: false,
-      },
+      }),
     }));
   });
 
@@ -421,6 +422,70 @@ describe('sdk transport flow e2e', () => {
       name: 'deck_settings_switch_brain',
       agentType: 'claude-code-sdk',
       runtimeType: 'transport',
+    });
+  });
+
+  it('applies live main-session transportConfig supervision updates without restart and re-syncs session_list', async () => {
+    mocks.store.set('deck_live_supervision_brain', {
+      name: 'deck_live_supervision_brain',
+      projectName: 'live_supervision',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/live-supervision-main',
+      state: 'idle',
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'deck_live_supervision_brain',
+      codexSessionId: 'thread-codex-live-main',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({
+      type: DAEMON_COMMAND_TYPES.SESSION_UPDATE_TRANSPORT_CONFIG,
+      sessionName: 'deck_live_supervision_brain',
+      transportConfig: {
+        supervision: {
+          mode: 'supervised',
+          backend: 'codex-sdk',
+          model: 'gpt-5.3-codex-spark',
+          timeoutMs: 12000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+        },
+      },
+    }, serverLink);
+    await flushAsync();
+    await waitForCondition(() => serverLink.send.mock.calls.some((call) => call[0]?.type === 'session_list'));
+
+    const record = mocks.store.get('deck_live_supervision_brain');
+    expect(record).toMatchObject({
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'deck_live_supervision_brain',
+      codexSessionId: 'thread-codex-live-main',
+      transportConfig: {
+        supervision: {
+          mode: 'supervised',
+          backend: 'codex-sdk',
+          model: 'gpt-5.3-codex-spark',
+        },
+      },
+    });
+
+    const sessionListPayload = serverLink.send.mock.calls
+      .map((call) => call[0])
+      .find((msg) => msg?.type === 'session_list');
+    const synced = sessionListPayload?.sessions?.find((session: any) => session.name === 'deck_live_supervision_brain');
+    expect(synced?.transportConfig).toMatchObject({
+      supervision: {
+        mode: 'supervised',
+        backend: 'codex-sdk',
+        model: 'gpt-5.3-codex-spark',
+      },
     });
   });
 
@@ -617,6 +682,82 @@ describe('sdk transport flow e2e', () => {
     expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'subsession.sync',
       id: 'cxsdk_rebuild',
+    }));
+  });
+
+  it('applies live sub-session transportConfig supervision updates without restart and re-syncs the sub-session', async () => {
+    const sessionName = 'deck_sub_live_supervision';
+    mocks.store.set(sessionName, {
+      name: sessionName,
+      projectName: sessionName,
+      role: 'w1',
+      label: 'LiveAuto',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/live-supervision-sub',
+      state: 'idle',
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: sessionName,
+      parentSession: 'deck_parent_brain',
+      codexSessionId: 'thread-codex-live-sub',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({
+      type: DAEMON_COMMAND_TYPES.SUBSESSION_UPDATE_TRANSPORT_CONFIG,
+      sessionName,
+      transportConfig: {
+        supervision: {
+          mode: 'supervised_audit',
+          backend: 'codex-sdk',
+          model: 'gpt-5.3-codex-spark',
+          timeoutMs: 12000,
+          promptVersion: 'supervision_decision_v1',
+          taskRunPromptVersion: 'supervision_continue_v1',
+          maxParseRetries: 1,
+          auditConfig: {
+            mode: 'audit',
+            maxAuditLoops: 2,
+          },
+        },
+      },
+    }, serverLink);
+    await flushAsync();
+    await waitForCondition(() => serverLink.send.mock.calls.some((call) => call[0]?.type === 'subsession.sync' && call[0]?.id === 'live_supervision'));
+
+    const record = mocks.store.get(sessionName);
+    expect(record).toMatchObject({
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: sessionName,
+      codexSessionId: 'thread-codex-live-sub',
+      transportConfig: {
+        supervision: {
+          mode: 'supervised_audit',
+          backend: 'codex-sdk',
+          model: 'gpt-5.3-codex-spark',
+          auditConfig: {
+            mode: 'audit',
+            maxAuditLoops: 2,
+          },
+        },
+      },
+    });
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'subsession.sync',
+      id: 'live_supervision',
+      transportConfig: expect.objectContaining({
+        supervision: expect.objectContaining({
+          mode: 'supervised_audit',
+          backend: 'codex-sdk',
+          model: 'gpt-5.3-codex-spark',
+        }),
+      }),
     }));
   });
 

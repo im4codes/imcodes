@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Hono } from 'hono';
+import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 
 const createSubSessionMock = vi.fn();
 const updateSubSessionMock = vi.fn();
@@ -216,6 +217,38 @@ describe('sub-session routes', () => {
       type: 'subsession.rename',
       sessionName: 'deck_sub_sub12345',
       label: 'Worker Label',
+    });
+  });
+
+  it('PATCH /sub-sessions/:id relays transport-config updates without a restart', async () => {
+    const { getSubSessionById } = await import('../src/db/queries.js');
+    vi.mocked(getSubSessionById).mockResolvedValue({
+      id: 'sub12345',
+      server_id: 'srv1',
+      type: 'codex-sdk',
+    } as any);
+
+    const res = await app.request('/api/server/srv1/sub-sessions/sub12345', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        transportConfig: { supervision: { mode: 'supervised' } },
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(updateSubSessionMock).toHaveBeenCalledWith(
+      {},
+      'sub12345',
+      'srv1',
+      {
+        transport_config: { supervision: { mode: 'supervised' } },
+      },
+    );
+    expect(JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]))).toEqual({
+      type: DAEMON_COMMAND_TYPES.SUBSESSION_UPDATE_TRANSPORT_CONFIG,
+      sessionName: 'deck_sub_sub12345',
+      transportConfig: { supervision: { mode: 'supervised' } },
     });
   });
 });

@@ -12,7 +12,7 @@ import {
   buildSupervisionDecisionRepairPrompt,
 } from './supervision-prompts.js';
 
-export type SupervisionDecisionKind = 'approve' | 'deny' | 'ask_human';
+export type SupervisionDecisionKind = 'complete' | 'continue' | 'ask_human';
 
 export interface SupervisionDecision {
   decision: SupervisionDecisionKind;
@@ -22,7 +22,8 @@ export interface SupervisionDecision {
 
 export interface SupervisionBrokerRequest {
   snapshot: SessionSupervisionSnapshot | null | undefined;
-  prompt: string;
+  taskRequest: string;
+  assistantResponse?: string;
   cwd?: string;
   description?: string;
 }
@@ -32,7 +33,7 @@ export interface SupervisionBrokerDeps {
   now?: () => number;
 }
 
-const DECISIONS = new Set<SupervisionDecisionKind>(['approve', 'deny', 'ask_human']);
+const DECISIONS = new Set<SupervisionDecisionKind>(['complete', 'continue', 'ask_human']);
 
 function clampConfidence(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value)

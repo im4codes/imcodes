@@ -736,12 +736,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const handleQuickSupervisionModeSelect = useCallback(async (nextMode: SupervisionMode) => {
     if (!activeSession || !serverId || !canQuickControlSupervision) return;
-    setAutoOpen(false);
 
     if (nextMode === SUPERVISION_MODE.OFF) {
       const nextTransportConfig = buildTransportConfigWithSupervision(currentTransportConfig, { mode: SUPERVISION_MODE.OFF });
       try {
         await persistTransportConfig(nextTransportConfig);
+        setAutoOpen(false);
       } catch {
         showSendWarning(t('upload.upload_failed'));
       }
@@ -749,6 +749,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     }
 
     if (hasInvalidSupervisionConfig) {
+      setAutoOpen(false);
       onSettings?.();
       return;
     }
@@ -767,6 +768,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     let nextSnapshot: Partial<SessionSupervisionSnapshot> | null = null;
     if (supervisionSnapshot) {
       if (nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT && !hasPersistedAuditConfig) {
+        setAutoOpen(false);
         onSettings?.();
         return;
       }
@@ -774,10 +776,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     } else {
       const defaults = await fetchSupervisorDefaults();
       if (!defaults) {
+        setAutoOpen(false);
         onSettings?.();
         return;
       }
       if (nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT) {
+        setAutoOpen(false);
         onSettings?.();
         return;
       }
@@ -793,6 +797,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     const nextTransportConfig = buildTransportConfigWithSupervision(currentTransportConfig, nextSnapshot);
     try {
       await persistTransportConfig(nextTransportConfig);
+      setAutoOpen(false);
     } catch {
       showSendWarning(t('upload.upload_failed'));
     }

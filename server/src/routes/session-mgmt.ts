@@ -8,6 +8,7 @@ import logger from '../util/logger.js';
 import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
 import { getPodIdentity } from '../util/pod-identity.js';
 import { isSessionAgentType } from '../../../shared/agent-types.js';
+import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 
 export const sessionMgmtRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -206,6 +207,18 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
       }));
     } catch (err) {
       logger.error({ serverId, sessionName, err }, 'WsBridge session relabel relay failed');
+      return c.json({ error: 'relay_failed' }, 502);
+    }
+  }
+  if (body.agentType == null && body.transportConfig !== undefined) {
+    try {
+      WsBridge.get(serverId).sendToDaemon(JSON.stringify({
+        type: DAEMON_COMMAND_TYPES.SESSION_UPDATE_TRANSPORT_CONFIG,
+        sessionName,
+        transportConfig: body.transportConfig ?? null,
+      }));
+    } catch (err) {
+      logger.error({ serverId, sessionName, err }, 'WsBridge session transportConfig relay failed');
       return c.json({ error: 'relay_failed' }, 502);
     }
   }

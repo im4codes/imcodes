@@ -71,14 +71,14 @@ beforeEach(() => {
 
 describe('parseSupervisionDecision', () => {
   it('parses raw and fenced JSON candidates', () => {
-    expect(parseSupervisionDecision('{"decision":"approve","reason":"ok","confidence":0.9}')).toEqual({
-      decision: 'approve',
+    expect(parseSupervisionDecision('{"decision":"complete","reason":"ok","confidence":0.9}')).toEqual({
+      decision: 'complete',
       reason: 'ok',
       confidence: 0.9,
     });
-    expect(parseSupervisionDecision('```json\n{"decision":"deny","reason":"unsafe","confidence":0.1}\n```')).toEqual({
-      decision: 'deny',
-      reason: 'unsafe',
+    expect(parseSupervisionDecision('```json\n{"decision":"continue","reason":"keep going","confidence":0.1}\n```')).toEqual({
+      decision: 'continue',
+      reason: 'keep going',
       confidence: 0.1,
     });
   });
@@ -92,7 +92,7 @@ describe('SupervisionBroker', () => {
     ['openclaw', 'openclaw-custom-model'],
   ] as const)('accepts supported backend %s through the common provider contract', async (backend, model) => {
     const provider = new FakeProvider([
-      '{"decision":"approve","reason":"ok","confidence":0.5}',
+      '{"decision":"complete","reason":"ok","confidence":0.5}',
     ]);
     const broker = new SupervisionBroker({
       resolveProvider: async () => provider,
@@ -111,10 +111,11 @@ describe('SupervisionBroker', () => {
 
     const result = await broker.decide({
       snapshot,
-      prompt: 'Should I continue?',
+      taskRequest: 'Implement the task',
+      assistantResponse: 'I implemented part of it.',
     });
 
-    expect(result.decision).toBe('approve');
+    expect(result.decision).toBe('complete');
     expect(provider.createSession).toHaveBeenCalledWith(expect.objectContaining({
       agentId: model,
       fresh: true,
@@ -123,7 +124,7 @@ describe('SupervisionBroker', () => {
 
   it('uses the session snapshot promptVersion in the decision prompt contract header', async () => {
     const provider = new FakeProvider([
-      '{"decision":"approve","reason":"ok","confidence":0.5}',
+      '{"decision":"complete","reason":"ok","confidence":0.5}',
     ]);
     const broker = new SupervisionBroker({
       resolveProvider: async () => provider,
@@ -142,7 +143,8 @@ describe('SupervisionBroker', () => {
 
     await broker.decide({
       snapshot,
-      prompt: 'Should I continue?',
+      taskRequest: 'Implement the task',
+      assistantResponse: 'Latest assistant response',
     });
 
     expect(String(provider.send.mock.calls[0]?.[1])).toContain('[Contract: custom_supervision_contract_v2]');
@@ -151,7 +153,7 @@ describe('SupervisionBroker', () => {
   it('retries once when the first supervisor reply is not valid JSON', async () => {
     const provider = new FakeProvider([
       'not valid json',
-      '{"decision":"approve","reason":"looks good","confidence":0.91}',
+      '{"decision":"continue","reason":"looks good","confidence":0.91}',
     ]);
     const broker = new SupervisionBroker({
       resolveProvider: async () => provider,
@@ -170,13 +172,14 @@ describe('SupervisionBroker', () => {
 
     const result = await broker.decide({
       snapshot,
-      prompt: 'Should I continue?',
+      taskRequest: 'Implement the task',
+      assistantResponse: 'Partial output',
       cwd: '/tmp/project',
       description: 'test session',
     });
 
     expect(result).toEqual({
-      decision: 'approve',
+      decision: 'continue',
       reason: 'looks good',
       confidence: 0.91,
     });
@@ -187,8 +190,8 @@ describe('SupervisionBroker', () => {
 
   it('creates a fresh provider session for each supervision decision', async () => {
     const provider = new FakeProvider([
-      '{"decision":"approve","reason":"first","confidence":0.8}',
-      '{"decision":"approve","reason":"second","confidence":0.9}',
+      '{"decision":"complete","reason":"first","confidence":0.8}',
+      '{"decision":"complete","reason":"second","confidence":0.9}',
     ]);
     const broker = new SupervisionBroker({
       resolveProvider: async () => provider,
@@ -205,8 +208,8 @@ describe('SupervisionBroker', () => {
       taskRunPromptVersion: 'task_run_status_v1',
     });
 
-    await broker.decide({ snapshot, prompt: 'first' });
-    await broker.decide({ snapshot, prompt: 'second' });
+    await broker.decide({ snapshot, taskRequest: 'first', assistantResponse: 'first reply' });
+    await broker.decide({ snapshot, taskRequest: 'second', assistantResponse: 'second reply' });
 
     expect(provider.createSession).toHaveBeenCalledTimes(2);
     const firstSessionKey = provider.createSession.mock.calls[0]?.[0]?.sessionKey;
@@ -233,7 +236,8 @@ describe('SupervisionBroker', () => {
 
     const result = await broker.decide({
       snapshot,
-      prompt: 'Should I continue?',
+      taskRequest: 'Implement the task',
+      assistantResponse: 'Partial output',
       cwd: '/tmp/project',
       description: 'test session',
     });
@@ -247,7 +251,7 @@ describe('SupervisionBroker', () => {
     const provider = new FakeProvider([
       'invalid-1',
       'invalid-2',
-      '{"decision":"approve","reason":"third time works","confidence":0.7}',
+      '{"decision":"complete","reason":"third time works","confidence":0.7}',
     ]);
     const broker = new SupervisionBroker({
       resolveProvider: async () => provider,
@@ -266,11 +270,12 @@ describe('SupervisionBroker', () => {
 
     const result = await broker.decide({
       snapshot,
-      prompt: 'Should I continue?',
+      taskRequest: 'Implement the task',
+      assistantResponse: 'Partial output',
     });
 
     expect(result).toMatchObject({
-      decision: 'approve',
+      decision: 'complete',
       reason: 'third time works',
     });
     expect(provider.send).toHaveBeenCalledTimes(3);
@@ -283,7 +288,8 @@ describe('SupervisionBroker', () => {
 
     const result = await broker.decide({
       snapshot: { mode: SUPERVISION_MODE.SUPERVISED } as never,
-      prompt: 'Should I continue?',
+      taskRequest: 'Implement the task',
+      assistantResponse: 'Partial output',
     });
 
     expect(result).toEqual({
@@ -334,7 +340,8 @@ describe('SupervisionBroker', () => {
 
     const promise = broker.decide({
       snapshot,
-      prompt: 'Should I continue?',
+      taskRequest: 'Implement the task',
+      assistantResponse: 'Partial output',
       cwd: '/tmp/project',
       description: 'test session',
     });
@@ -371,8 +378,8 @@ describe('SupervisionBroker', () => {
     }
 
     const provider = new SlowProvider([
-      '{"decision":"approve","reason":"first","confidence":0.8}',
-      '{"decision":"approve","reason":"second","confidence":0.8}',
+      '{"decision":"complete","reason":"first","confidence":0.8}',
+      '{"decision":"complete","reason":"second","confidence":0.8}',
     ]);
     const broker = new SupervisionBroker({
       resolveProvider: async () => provider,
@@ -389,11 +396,11 @@ describe('SupervisionBroker', () => {
       taskRunPromptVersion: 'task_run_status_v1',
     });
 
-    const first = broker.decide({ snapshot, prompt: 'first' });
-    const second = broker.decide({ snapshot, prompt: 'second' });
+    const first = broker.decide({ snapshot, taskRequest: 'first', assistantResponse: 'first reply' });
+    const second = broker.decide({ snapshot, taskRequest: 'second', assistantResponse: 'second reply' });
     await vi.advanceTimersByTimeAsync(50);
 
-    await expect(first).resolves.toMatchObject({ decision: 'approve' });
+    await expect(first).resolves.toMatchObject({ decision: 'complete' });
     await expect(second).resolves.toMatchObject({ decision: 'ask_human' });
     await expect(second).resolves.toHaveProperty('reason');
     vi.useRealTimers();

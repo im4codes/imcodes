@@ -252,6 +252,7 @@ export function SessionPane({
           ws={connected ? ws : null}
           serverId={serverId}
           onQuote={addQuote}
+          agentType={session.agentType}
         />
       )}
 

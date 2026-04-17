@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
+import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 
 const mockResolveServerRole = vi.fn<() => Promise<string>>().mockResolvedValue('owner');
 const mockUpsertDbSession = vi.fn();
@@ -161,6 +162,32 @@ describe('session-mgmt persistence routes', () => {
       agentType: 'codex-sdk',
       cwd: '/tmp/next',
       description: 'next persona',
+    });
+  });
+
+  it('PATCH /sessions/:name relays transport-config updates to the daemon without a restart', async () => {
+    const app = await buildApp();
+    const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        transportConfig: { supervision: { mode: 'supervised' } },
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(mockUpdateSession).toHaveBeenCalledWith(
+      {},
+      'srv-1',
+      'deck_proj_brain',
+      {
+        transport_config: { supervision: { mode: 'supervised' } },
+      },
+    );
+    expect(JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]))).toEqual({
+      type: DAEMON_COMMAND_TYPES.SESSION_UPDATE_TRANSPORT_CONFIG,
+      sessionName: 'deck_proj_brain',
+      transportConfig: { supervision: { mode: 'supervised' } },
     });
   });
 

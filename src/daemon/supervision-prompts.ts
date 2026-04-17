@@ -12,14 +12,17 @@ export function buildSupervisionDecisionPrompt(
   return [
     `[Contract: ${contractId}]`,
     'You are a supervision arbiter for a coding session.',
+    'Judge the most recent assistant turn for the current task.',
     'Return exactly one JSON object and nothing else.',
-    '{"decision":"approve|deny|ask_human","reason":"...","confidence":0.0}',
-    'Approve only when continuing is reasonable and low-risk for the stated task.',
-    'Deny when the requested continuation is clearly unsafe or out of scope.',
-    'Use ask_human when uncertain.',
+    '{"decision":"complete|continue|ask_human","reason":"...","confidence":0.0}',
+    'Use complete only when the task is sufficiently done for the current request.',
+    'Use continue only when the task is not done yet and the agent should keep working autonomously.',
+    'Use ask_human when the agent needs clarification, approval, or manual intervention.',
     request.description ? `Context: ${request.description}` : '',
-    'Request:',
-    request.prompt,
+    'Task request:',
+    request.taskRequest,
+    'Most recent assistant response:',
+    request.assistantResponse?.trim() || '(no assistant response captured)',
   ].filter(Boolean).join('\n\n');
 }
 
@@ -32,12 +35,36 @@ export function buildSupervisionDecisionRepairPrompt(
     `[Contract: ${contractId}]`,
     'Your previous response was invalid.',
     'Return exactly one valid JSON object and nothing else.',
-    '{"decision":"approve|deny|ask_human","reason":"...","confidence":0.0}',
+    '{"decision":"complete|continue|ask_human","reason":"...","confidence":0.0}',
     'Previous invalid output:',
     previousOutput,
-    'Original request:',
-    request.prompt,
+    'Task request:',
+    request.taskRequest,
+    'Most recent assistant response:',
+    request.assistantResponse?.trim() || '(no assistant response captured)',
   ].join('\n\n');
+}
+
+export function buildSupervisionContinuePrompt(
+  taskRequest: string,
+  assistantResponse: string | undefined,
+  reason: string,
+  contractId: string = SUPERVISION_CONTRACT_IDS.CONTINUE,
+): string {
+  return [
+    `[Contract: ${contractId}]`,
+    'Continue working on the same task.',
+    `Supervisor reason: ${reason}`,
+    'Do not restart from scratch or restate completed work.',
+    'Focus only on the remaining steps needed to finish the task.',
+    'If you are truly blocked or need clarification, say that explicitly.',
+    '',
+    'Original task request:',
+    taskRequest,
+    '',
+    'Most recent assistant response:',
+    assistantResponse?.trim() || '(no assistant response captured)',
+  ].join('\n');
 }
 
 export function appendTaskRunContract(
@@ -105,7 +132,6 @@ export function buildReworkBriefPrompt(
     'Audit feedback:',
     verdictText,
     '',
-    'Apply the required fixes and finish the task again.',
-    'End the next terminal response with exactly one valid task-run marker.',
+    'Apply the required fixes and continue the same task.',
   ].join('\n');
 }

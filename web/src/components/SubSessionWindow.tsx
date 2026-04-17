@@ -415,6 +415,7 @@ export function SubSessionWindow({
             workdir={sub.cwd ?? null}
             serverId={serverId}
             onQuote={addQuote}
+            agentType={sessionInfo?.agentType ?? sub.type}
           />
         )}
       </div>

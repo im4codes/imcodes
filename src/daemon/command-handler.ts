@@ -32,9 +32,7 @@ const execAsync = promisify(execCb);
 const execFileAsync = promisify(execFileCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, type P2pTarget } from './p2p-orchestrator.js';
 import { buildSessionList } from './session-list.js';
-import { supervisionBroker } from './supervision-broker.js';
 import { supervisionAutomation } from './supervision-automation.js';
-import { appendTaskRunContract } from './supervision-prompts.js';
 import { getComboRoundCount, parseModePipeline, P2P_CONFIG_MODE, isP2pSavedConfig, type P2pSessionConfig } from '../../shared/p2p-modes.js';
 import type { P2pAdvancedRound, P2pContextReducerConfig } from '../../shared/p2p-advanced.js';
 import { CRON_MSG } from '../../shared/cron-types.js';
@@ -53,6 +51,7 @@ import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG } from '../../shared/p2p-config-events.js';
+import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import {
   CLAUDE_SDK_EFFORT_LEVELS,
   CODEX_SDK_EFFORT_LEVELS,
@@ -77,7 +76,7 @@ import {
 
 const MAX_P2P_FILE_PULL_COUNT = 20;
 
-function isEligibleHeavySupervisionTaskText(text: string): boolean {
+function isEligibleSupervisionTaskText(text: string): boolean {
   const trimmed = text.trim();
   return trimmed.length > 0 && !trimmed.startsWith('/');
 }
@@ -141,6 +140,63 @@ async function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord
     quotaMeta: freshDisplay.quotaMeta ?? r?.quotaMeta ?? null,
     effort: r?.effort ?? null,
   };
+}
+
+function normalizeTransportConfigUpdate(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+async function handleSessionTransportConfigUpdate(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const sessionName = cmd.sessionName as string | undefined;
+  if (!sessionName) {
+    logger.warn('session.update_transport_config: missing sessionName');
+    return;
+  }
+  const record = getSession(sessionName);
+  if (!record) {
+    logger.warn({ sessionName }, 'session.update_transport_config: session not found in store');
+    return;
+  }
+  const nextTransportConfig = normalizeTransportConfigUpdate(cmd.transportConfig);
+  upsertSession({
+    ...record,
+    transportConfig: nextTransportConfig,
+    updatedAt: Date.now(),
+  });
+  if (!extractSessionSupervisionSnapshot(nextTransportConfig ?? null)) {
+    supervisionAutomation.cancelSession(sessionName);
+  }
+  await handleGetSessions(serverLink);
+}
+
+async function handleSubSessionTransportConfigUpdate(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const sessionName = cmd.sessionName as string | undefined;
+  if (!sessionName) {
+    logger.warn('subsession.update_transport_config: missing sessionName');
+    return;
+  }
+  const record = getSession(sessionName);
+  if (!record) {
+    logger.warn({ sessionName }, 'subsession.update_transport_config: session not found in store');
+    return;
+  }
+  const nextTransportConfig = normalizeTransportConfigUpdate(cmd.transportConfig);
+  upsertSession({
+    ...record,
+    transportConfig: nextTransportConfig,
+    updatedAt: Date.now(),
+  });
+  if (!extractSessionSupervisionSnapshot(nextTransportConfig ?? null)) {
+    supervisionAutomation.cancelSession(sessionName);
+  }
+  const id = sessionName.replace(/^deck_sub_/, '');
+  try {
+    serverLink.send(await buildSubSessionSync(id, { transportConfig: nextTransportConfig }));
+  } catch {
+    // not connected
+  }
 }
 
 function supportsEffort(agentType: string | undefined): agentType is 'claude-code-sdk' | 'codex-sdk' | 'openclaw' | 'qwen' {
@@ -614,6 +670,9 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case 'session.restart':
       void handleRestart(cmd, serverLink);
       break;
+    case DAEMON_COMMAND_TYPES.SESSION_UPDATE_TRANSPORT_CONFIG:
+      void handleSessionTransportConfigUpdate(cmd, serverLink);
+      break;
     case 'session.send':
       void handleSend(cmd, serverLink);
       break;
@@ -658,6 +717,9 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
       break;
     case 'subsession.restart':
       void handleSubSessionRestart(cmd, serverLink);
+      break;
+    case DAEMON_COMMAND_TYPES.SUBSESSION_UPDATE_TRANSPORT_CONFIG:
+      void handleSubSessionTransportConfigUpdate(cmd, serverLink);
       break;
     case 'subsession.rebuild_all':
       void handleSubSessionRebuildAll(cmd, serverLink);
@@ -1635,55 +1697,18 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       const supervisionSnapshot = isSupportedSupervisionTargetSessionType(record?.agentType)
         ? extractSessionSupervisionSnapshot(record?.transportConfig ?? null)
         : null;
-      if (supervisionSnapshot && supervisionSnapshot.mode !== SUPERVISION_MODE.OFF) {
-        const decision = await supervisionBroker.decide({
-          snapshot: supervisionSnapshot,
-          prompt: text,
-          cwd: record?.projectDir,
-          description: record?.description,
-        });
-        if (decision.decision !== 'approve') {
-          emitTransportUserMessage(
-            text,
-            { clientMessageId: effectiveId },
-            transportUserEventId(effectiveId),
-          );
-          timelineEmitter.emit(sessionName, 'assistant.text', {
-            text: `⚠️ Supervision ${decision.decision}: ${decision.reason}`,
-            streaming: false,
-            memoryExcluded: true,
-          }, { source: 'daemon', confidence: 'high' });
-          timelineEmitter.emit(sessionName, 'command.ack', {
-            commandId: effectiveId,
-            status: 'error',
-            error: decision.reason,
-          });
-          try {
-            serverLink.send({
-              type: 'command.ack',
-              commandId: effectiveId,
-              status: 'error',
-              session: sessionName,
-              error: decision.reason,
-            });
-          } catch { /* not connected */ }
-          return;
-        }
-      }
       if (record?.agentType === 'qwen' && record.qwenAuthType === 'qwen-oauth') {
         recordQwenOAuthRequest();
         refreshQwenQuotaUsageLabels(serverLink);
       }
-      const shouldTrackHeavyTaskRun = supervisionSnapshot?.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
-        && isEligibleHeavySupervisionTaskText(text);
-      const dispatchText = shouldTrackHeavyTaskRun
-        ? appendTaskRunContract(text, supervisionSnapshot.taskRunPromptVersion)
-        : text;
+      const shouldTrackSupervisionTaskRun = supervisionSnapshot != null
+        && supervisionSnapshot.mode !== SUPERVISION_MODE.OFF
+        && isEligibleSupervisionTaskText(text);
 
       // send() is synchronous: dispatches immediately if idle, queues if busy.
       // Status changes come from transport runtime's onStatusChange callback.
-      const result = transportRuntime.send(dispatchText, effectiveId);
-      if (shouldTrackHeavyTaskRun) {
+      const result = transportRuntime.send(text, effectiveId);
+      if (shouldTrackSupervisionTaskRun) {
         supervisionAutomation.queueTaskIntent(sessionName, effectiveId, text, supervisionSnapshot);
       }
       if (result === 'sent') {

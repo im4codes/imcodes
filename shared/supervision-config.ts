@@ -15,6 +15,7 @@ import { PROCESS_SESSION_AGENT_TYPES, TRANSPORT_SESSION_AGENT_TYPES } from './ag
 export const SUPERVISION_CONTRACT_IDS = {
   DECISION: 'supervision_decision_v1',
   DECISION_REPAIR: 'supervision_decision_repair_v1',
+  CONTINUE: 'supervision_continue_v1',
   TASK_RUN_STATUS: 'task_run_status_v1',
   OPENSPEC_IMPLEMENTATION_AUDIT: 'openspec_implementation_audit_v1',
   CONTEXTUAL_AUDIT: 'contextual_audit_v1',
