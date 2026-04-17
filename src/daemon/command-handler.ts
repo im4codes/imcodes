@@ -127,6 +127,12 @@ async function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord
     providerSessionId: r?.providerSessionId ?? null,
     requestedModel: r?.requestedModel ?? null,
     activeModel: r?.activeModel ?? r?.modelDisplay ?? null,
+    contextNamespace: r?.contextNamespace ?? null,
+    contextNamespaceDiagnostics: r?.contextNamespaceDiagnostics ?? null,
+    contextRemoteProcessedFreshness: r?.contextRemoteProcessedFreshness ?? null,
+    contextLocalProcessedFreshness: r?.contextLocalProcessedFreshness ?? null,
+    contextRetryExhausted: r?.contextRetryExhausted ?? null,
+    contextSharedPolicyOverride: r?.contextSharedPolicyOverride ?? null,
     transportConfig: r?.transportConfig ?? null,
     // Qwen metadata — freshly computed display fields + stored config fields
     qwenModel: r?.qwenModel ?? null,
@@ -178,9 +184,7 @@ async function handleSessionTransportConfigUpdate(cmd: Record<string, unknown>, 
   // The server persist callback is a no-op when not yet wired; the next `persistSessionToWorker`
   // loop in lifecycle will retry from the local store.
   persistSessionRecord(nextRecord, sessionName);
-  if (!extractSessionSupervisionSnapshot(nextTransportConfig ?? null)) {
-    supervisionAutomation.cancelSession(sessionName);
-  }
+  supervisionAutomation.applySnapshotUpdate(sessionName, extractSessionSupervisionSnapshot(nextTransportConfig ?? null));
   await handleGetSessions(serverLink);
 }
 
@@ -207,9 +211,7 @@ async function handleSubSessionTransportConfigUpdate(cmd: Record<string, unknown
   };
   upsertSession(nextRecord);
   persistSessionRecord(nextRecord, sessionName);
-  if (!extractSessionSupervisionSnapshot(nextTransportConfig ?? null)) {
-    supervisionAutomation.cancelSession(sessionName);
-  }
+  supervisionAutomation.applySnapshotUpdate(sessionName, extractSessionSupervisionSnapshot(nextTransportConfig ?? null));
   const id = sessionName.replace(/^deck_sub_/, '');
   try {
     serverLink.send(await buildSubSessionSync(id, { transportConfig: nextTransportConfig }));
@@ -1785,7 +1787,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       // Status changes come from transport runtime's onStatusChange callback.
       const result = transportRuntime.send(text, effectiveId);
       if (shouldTrackSupervisionTaskRun) {
-        supervisionAutomation.queueTaskIntent(sessionName, effectiveId, text, supervisionSnapshot);
+        if (result === 'queued') {
+          supervisionAutomation.queueTaskIntent(sessionName, effectiveId, text, supervisionSnapshot);
+        } else if (result === 'sent') {
+          supervisionAutomation.registerTaskIntent(sessionName, effectiveId, text, supervisionSnapshot);
+        }
       }
       if (result === 'sent') {
         emitTransportUserMessage(

@@ -426,6 +426,46 @@ describe('sdk transport flow e2e', () => {
     });
   });
 
+
+  it('surfaces resolved transport bootstrap context in session_list for main transport sessions', async () => {
+    const sessionName = 'deck_context_visible_brain';
+    await launchSession({
+      name: sessionName,
+      projectName: 'context_visible',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/context-visible-main',
+      transportConfig: {
+        sharedContextNamespace: {
+          scope: 'personal',
+          projectId: 'sdk-context-visible-main',
+        },
+      },
+    });
+
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({ type: 'get_sessions' }, serverLink);
+    await flushAsync();
+    await waitForCondition(() => serverLink.send.mock.calls.some((call) => call[0]?.type === 'session_list'));
+
+    const payload = serverLink.send.mock.calls
+      .map((call) => call[0])
+      .find((msg) => msg?.type === 'session_list');
+    const synced = payload?.sessions?.find((session: any) => session.name === sessionName);
+
+    expect(synced).toMatchObject({
+      name: sessionName,
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      contextNamespace: {
+        scope: 'personal',
+        projectId: 'sdk-context-visible-main',
+      },
+      contextNamespaceDiagnostics: ['namespace:explicit'],
+      contextLocalProcessedFreshness: 'missing',
+    });
+  });
+
   it('applies live main-session transportConfig supervision updates without restart and re-syncs session_list', async () => {
     mocks.store.set('deck_live_supervision_brain', {
       name: 'deck_live_supervision_brain',
@@ -747,6 +787,51 @@ describe('sdk transport flow e2e', () => {
       type: 'subsession.sync',
       id: 'cxsdk_rebuild',
     }));
+  });
+
+
+  it('surfaces resolved transport bootstrap context in subsession.sync for transport sub-sessions', async () => {
+    const serverLink = { send: vi.fn() } as any;
+
+    handleWebCommand({
+      type: 'subsession.start',
+      id: 'context_visible_sub',
+      sessionType: 'codex-sdk',
+      cwd: '/tmp/context-visible-sub',
+      parentSession: 'deck_parent_brain',
+      transportConfig: {
+        sharedContextNamespace: {
+          scope: 'personal',
+          projectId: 'sdk-context-visible-sub',
+        },
+      },
+    }, serverLink);
+    await flushAsync();
+    await waitForCondition(() => serverLink.send.mock.calls.some((call) => call[0]?.type === 'subsession.sync' && call[0]?.id === 'context_visible_sub'));
+
+    const synced = serverLink.send.mock.calls
+      .map((call) => call[0])
+      .find((msg) => msg?.type === 'subsession.sync' && msg?.id === 'context_visible_sub');
+
+    expect(synced).toMatchObject({
+      type: 'subsession.sync',
+      id: 'context_visible_sub',
+      sessionType: 'codex-sdk',
+      contextNamespace: {
+        scope: 'personal',
+        projectId: 'sdk-context-visible-sub',
+      },
+      contextNamespaceDiagnostics: ['namespace:explicit'],
+      contextLocalProcessedFreshness: 'missing',
+    });
+    expect(mocks.store.get('deck_sub_context_visible_sub')).toMatchObject({
+      contextNamespace: {
+        scope: 'personal',
+        projectId: 'sdk-context-visible-sub',
+      },
+      contextNamespaceDiagnostics: ['namespace:explicit'],
+      contextLocalProcessedFreshness: 'missing',
+    });
   });
 
   it('applies live sub-session transportConfig supervision updates without restart and re-syncs the sub-session', async () => {
@@ -1171,6 +1256,9 @@ describe('sdk transport flow e2e', () => {
     const record = mocks.store.get(SESSION_CX);
     expect(record?.runtimeType).toBe('transport');
     expect(record?.providerId).toBe('codex-sdk');
+    expect(record?.contextNamespace).toEqual({ scope: 'personal', projectId: 'sdk-cxsdk-recall-repo' });
+    expect(record?.contextNamespaceDiagnostics).toEqual(['namespace:explicit']);
+    expect(record?.contextLocalProcessedFreshness).toBe('fresh');
 
     const recallMemoryEvent = mocks.emitted.find((e) => e.session === SESSION_CX && e.type === 'memory.context' && e.payload.reason === 'message');
     expect(recallMemoryEvent).toEqual(expect.objectContaining({
@@ -1215,6 +1303,8 @@ describe('sdk transport flow e2e', () => {
     const record = mocks.store.get(SESSION_CX);
     expect(record?.runtimeType).toBe('transport');
     expect(record?.providerId).toBe('codex-sdk');
+    expect(record?.contextNamespace).toMatchObject({ scope: 'personal' });
+    expect(record?.contextNamespaceDiagnostics).toBeTruthy();
     expect(record?.codexSessionId).toBe('thread-codex-e2e');
 
     const streaming = mocks.emitted.filter((e) => e.session === SESSION_CX && e.type === 'assistant.text' && e.payload.streaming === true);

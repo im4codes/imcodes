@@ -180,7 +180,7 @@ describe('sdk transport session restore', () => {
       requestedModel: 'sonnet',
       activeModel: 'sonnet',
       effort: 'high',
-      transportConfig: { provider: { mode: 'safe' } },
+      transportConfig: { provider: { mode: 'safe' }, sharedContextNamespace: { scope: 'personal', projectId: 'sdk-cc-restore' } },
     });
 
     await connectProvider('claude-code-sdk', {});
@@ -201,6 +201,8 @@ describe('sdk transport session restore', () => {
     expect(mocks.store.get('deck_sdk_cc_brain')?.modelDisplay).toBe('claude-sonnet-4-6');
     expect(mocks.store.get('deck_sdk_cc_brain')?.requestedModel).toBe('sonnet');
     expect(mocks.store.get('deck_sdk_cc_brain')?.effort).toBe('high');
+    expect(mocks.store.get('deck_sdk_cc_brain')?.contextNamespace).toEqual({ scope: 'personal', projectId: 'sdk-cc-restore' });
+    expect(mocks.store.get('deck_sdk_cc_brain')?.contextNamespaceDiagnostics).toEqual(['namespace:explicit']);
   });
 
   it('restores codex-sdk sessions with persisted thread id and sends via resumeThread()', async () => {
@@ -222,7 +224,7 @@ describe('sdk transport session restore', () => {
       requestedModel: 'gpt-5.4',
       activeModel: 'gpt-5.4',
       effort: 'medium',
-      transportConfig: { provider: { mode: 'balanced' } },
+      transportConfig: { provider: { mode: 'balanced' }, sharedContextNamespace: { scope: 'personal', projectId: 'sdk-cx-restore' } },
     });
 
     await connectProvider('codex-sdk', {});
@@ -240,6 +242,8 @@ describe('sdk transport session restore', () => {
     expect(mocks.store.get('deck_sdk_cx_brain')?.state).toBe('idle');
     expect(mocks.store.get('deck_sdk_cx_brain')?.requestedModel).toBe('gpt-5.4');
     expect(mocks.store.get('deck_sdk_cx_brain')?.effort).toBe('medium');
+    expect(mocks.store.get('deck_sdk_cx_brain')?.contextNamespace).toEqual({ scope: 'personal', projectId: 'sdk-cx-restore' });
+    expect(mocks.store.get('deck_sdk_cx_brain')?.contextNamespaceDiagnostics).toEqual(['namespace:explicit']);
   });
 
   it('emits started idle when launching a new transport session', async () => {
@@ -255,9 +259,17 @@ describe('sdk transport session restore', () => {
       projectDir: '/tmp/sdk-new',
       requestedModel: 'sonnet',
       effort: 'high',
+      transportConfig: {
+        sharedContextNamespace: {
+          scope: 'personal',
+          projectId: 'sdk-launch-visible',
+        },
+      },
     });
 
     expect(mocks.store.get('deck_sdk_new_brain')?.state).toBe('idle');
+    expect(mocks.store.get('deck_sdk_new_brain')?.contextNamespace).toEqual({ scope: 'personal', projectId: 'sdk-launch-visible' });
+    expect(mocks.store.get('deck_sdk_new_brain')?.contextNamespaceDiagnostics).toEqual(['namespace:explicit']);
     expect(onSessionEvent).toHaveBeenCalledWith('started', 'deck_sdk_new_brain', 'idle');
   });
 

@@ -12,6 +12,7 @@
 
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
+import type { SessionContextBootstrapState } from '../../shared/session-context-bootstrap.js';
 import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
 import type {
   ProviderContextPayload,
@@ -191,7 +192,7 @@ export interface ApprovalRequest {
 }
 
 /** Provider-reported session metadata updates (e.g. learned resume/thread ID). */
-export interface SessionInfoUpdate {
+export interface SessionInfoUpdate extends SessionContextBootstrapState {
   /** Durable session/thread identifier used for restoring continuity. */
   resumeId?: string;
   /** Human-readable active model identifier, if known. */

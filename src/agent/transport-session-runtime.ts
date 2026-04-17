@@ -405,6 +405,14 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._contextAuthoredContextLanguage = bootstrap.authoredContextLanguage;
     this._contextAuthoredContextFilePath = bootstrap.authoredContextFilePath;
     if (!this._startupMemoryEmitted) this._startupMemory = bootstrap.startupMemory ?? null;
+    this._onSessionInfoChange?.({
+      contextNamespace: this._contextNamespace,
+      contextNamespaceDiagnostics: [...this._contextNamespaceDiagnostics],
+      contextRemoteProcessedFreshness: this._contextRemoteProcessedFreshness,
+      contextLocalProcessedFreshness: this._contextLocalProcessedFreshness,
+      contextRetryExhausted: this._contextRetryExhausted,
+      contextSharedPolicyOverride: this._contextSharedPolicyOverride,
+    });
   }
 
   private async buildTransportMessageRecall(message: string): Promise<TransportMemoryRecallArtifact | null> {

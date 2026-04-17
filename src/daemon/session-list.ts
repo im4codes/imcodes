@@ -1,4 +1,5 @@
 import type { SessionRecord } from '../store/session-store.js';
+import type { SessionContextBootstrapState } from '../../shared/session-context-bootstrap.js';
 import { listSessions, upsertSession } from '../store/session-store.js';
 import { getQwenRuntimeConfig } from '../agent/qwen-runtime-config.js';
 import { getQwenDisplayMetadata } from '../agent/provider-display.js';
@@ -8,7 +9,7 @@ import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
 
-export interface SessionListItem {
+export interface SessionListItem extends SessionContextBootstrapState {
   name: string;
   project: string;
   role: string;
@@ -79,6 +80,12 @@ function baseItem(s: SessionRecord): SessionListItem {
     quotaUsageLabel: s.quotaUsageLabel,
     quotaMeta: s.quotaMeta,
     effort: s.effort,
+    contextNamespace: s.contextNamespace,
+    contextNamespaceDiagnostics: s.contextNamespaceDiagnostics,
+    contextRemoteProcessedFreshness: s.contextRemoteProcessedFreshness,
+    contextLocalProcessedFreshness: s.contextLocalProcessedFreshness,
+    contextRetryExhausted: s.contextRetryExhausted,
+    contextSharedPolicyOverride: s.contextSharedPolicyOverride,
     description: s.description,
     label: s.label,
     transportConfig: s.transportConfig,

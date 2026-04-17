@@ -4,6 +4,7 @@ import { homedir } from 'os';
 import type { QwenAuthType } from '../../shared/qwen-auth.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
+import type { SessionContextBootstrapState } from '../../shared/session-context-bootstrap.js';
 
 const STORE_DIR = join(homedir(), '.imcodes');
 const STORE_PATH = join(STORE_DIR, 'sessions.json');
@@ -14,7 +15,7 @@ export type SessionState = 'running' | 'idle' | 'error' | 'stopped';
 // TODO: import from '../agent/session-runtime.js' when available
 type RuntimeType = 'process' | 'transport';
 
-export interface SessionRecord {
+export interface SessionRecord extends SessionContextBootstrapState {
   name: string;
   projectName: string;
   role: 'brain' | `w${number}`;

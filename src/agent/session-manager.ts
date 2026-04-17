@@ -11,6 +11,7 @@ import { isTransportAgent } from './detect.js';
 import { RUNTIME_TYPES } from './session-runtime.js';
 import { TransportSessionRuntime } from './transport-session-runtime.js';
 import { ensureProviderConnected, getProvider } from './provider-registry.js';
+import type { SessionInfoUpdate } from './transport-provider.js';
 import { setupCCStopHook } from './signal.js';
 import { setupCodexNotify, setupOpenCodePlugin } from './notify-setup.js';
 import {
@@ -934,6 +935,51 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
   };
 }
 
+function mergeSessionContextBootstrap(next: SessionRecord, info: SessionInfoUpdate): boolean {
+  let changed = false;
+
+  const sameDiagnostics = (a: string[] | undefined, b: string[] | undefined): boolean => {
+    if (!a && !b) return true;
+    if (!a || !b) return false;
+    if (a.length !== b.length) return false;
+    return a.every((value, index) => value === b[index]);
+  };
+
+  if ('contextNamespace' in info) {
+    const incomingNamespace = info.contextNamespace;
+    if (JSON.stringify(next.contextNamespace ?? null) !== JSON.stringify(incomingNamespace ?? null)) {
+      next.contextNamespace = incomingNamespace;
+      changed = true;
+    }
+  }
+  if ('contextNamespaceDiagnostics' in info) {
+    if (!sameDiagnostics(next.contextNamespaceDiagnostics, info.contextNamespaceDiagnostics)) {
+      next.contextNamespaceDiagnostics = info.contextNamespaceDiagnostics ? [...info.contextNamespaceDiagnostics] : undefined;
+      changed = true;
+    }
+  }
+  if ('contextRemoteProcessedFreshness' in info && next.contextRemoteProcessedFreshness !== info.contextRemoteProcessedFreshness) {
+    next.contextRemoteProcessedFreshness = info.contextRemoteProcessedFreshness;
+    changed = true;
+  }
+  if ('contextLocalProcessedFreshness' in info && next.contextLocalProcessedFreshness !== info.contextLocalProcessedFreshness) {
+    next.contextLocalProcessedFreshness = info.contextLocalProcessedFreshness;
+    changed = true;
+  }
+  if ('contextRetryExhausted' in info && next.contextRetryExhausted !== info.contextRetryExhausted) {
+    next.contextRetryExhausted = info.contextRetryExhausted;
+    changed = true;
+  }
+  if ('contextSharedPolicyOverride' in info) {
+    if (JSON.stringify(next.contextSharedPolicyOverride ?? null) !== JSON.stringify(info.contextSharedPolicyOverride ?? null)) {
+      next.contextSharedPolicyOverride = info.contextSharedPolicyOverride;
+      changed = true;
+    }
+  }
+
+  return changed;
+}
+
 function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName: string, agentType: string): void {
   runtime.onSessionInfoChange = (info) => {
     const existing = getSession(sessionName);
@@ -993,6 +1039,8 @@ function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName:
       next.effort = info.effort;
       changed = true;
     }
+
+    changed = mergeSessionContextBootstrap(next, info) || changed;
 
     if (!changed) return;
     upsertSession(next);
@@ -1139,6 +1187,12 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         ...((freshAfterCancel || s.providerSessionId !== actualProviderSid)
           ? { providerSessionId: actualProviderSid, ...(freshAfterCancel ? { qwenFreshOnResume: undefined } : {}) }
           : {}),
+        contextNamespace: contextBootstrap.namespace,
+        contextNamespaceDiagnostics: contextBootstrap.diagnostics,
+        contextRemoteProcessedFreshness: contextBootstrap.remoteProcessedFreshness,
+        contextLocalProcessedFreshness: contextBootstrap.localProcessedFreshness,
+        contextRetryExhausted: contextBootstrap.retryExhausted,
+        contextSharedPolicyOverride: contextBootstrap.sharedPolicyOverride,
         requestedModel: effectiveRequestedModel ?? s.requestedModel,
         activeModel: effectiveRequestedModel ?? s.activeModel ?? s.modelDisplay,
         modelDisplay: effectiveRequestedModel ?? s.modelDisplay,
@@ -1326,6 +1380,12 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
         providerSessionId: runtime.providerSessionId ?? undefined,
         ...(agentType === 'claude-code-sdk' && transportResumeId ? { ccSessionId: transportResumeId } : {}),
         ...(agentType === 'codex-sdk' && transportResumeId ? { codexSessionId: transportResumeId } : {}),
+        contextNamespace: contextBootstrap.namespace,
+        contextNamespaceDiagnostics: contextBootstrap.diagnostics,
+        contextRemoteProcessedFreshness: contextBootstrap.remoteProcessedFreshness,
+        contextLocalProcessedFreshness: contextBootstrap.localProcessedFreshness,
+        contextRetryExhausted: contextBootstrap.retryExhausted,
+        contextSharedPolicyOverride: contextBootstrap.sharedPolicyOverride,
         requestedModel: requestedTransportModel,
         activeModel: requestedTransportModel,
         modelDisplay: requestedTransportModel,

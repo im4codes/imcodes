@@ -217,6 +217,56 @@ describe('TransportSessionRuntime', () => {
     expect(r.getStatus()).toBe('error');
   });
 
+
+  it('surfaces refreshed context bootstrap metadata through onSessionInfoChange for live inspection', async () => {
+    const infoUpdates: Array<Record<string, unknown>> = [];
+    const r = new TransportSessionRuntime(mock.provider, 'x');
+    r.onSessionInfoChange = (info) => { infoUpdates.push(info as Record<string, unknown>); };
+    await r.initialize({
+      ...defaultConfig,
+      contextNamespace: {
+        scope: 'personal',
+        projectId: 'launch-snapshot',
+      },
+      contextNamespaceDiagnostics: ['namespace:launch'],
+      contextLocalProcessedFreshness: 'stale',
+    });
+    r.setContextBootstrapResolver(async () => ({
+      namespace: {
+        scope: 'project_shared',
+        projectId: 'github.com/acme/repo',
+        enterpriseId: 'ent-1',
+      },
+      diagnostics: ['namespace:server-control-plane'],
+      remoteProcessedFreshness: 'fresh',
+      localProcessedFreshness: 'fresh',
+      retryExhausted: true,
+      sharedPolicyOverride: { allowDegraded: false, allowLocalFallback: true },
+    }));
+
+    r.send('refresh bootstrap metadata please');
+    await flushDispatch();
+
+    expect(infoUpdates.at(0)).toMatchObject({
+      contextNamespace: { scope: 'personal', projectId: 'launch-snapshot' },
+      contextNamespaceDiagnostics: ['namespace:launch'],
+      contextLocalProcessedFreshness: 'stale',
+      contextRetryExhausted: false,
+    });
+    expect(infoUpdates.at(-1)).toMatchObject({
+      contextNamespace: {
+        scope: 'project_shared',
+        projectId: 'github.com/acme/repo',
+        enterpriseId: 'ent-1',
+      },
+      contextNamespaceDiagnostics: ['namespace:server-control-plane'],
+      contextRemoteProcessedFreshness: 'fresh',
+      contextLocalProcessedFreshness: 'fresh',
+      contextRetryExhausted: true,
+      contextSharedPolicyOverride: { allowDegraded: false, allowLocalFallback: true },
+    });
+  });
+
   it('refreshes shared-context bootstrap on each dispatch turn instead of freezing launch-time namespace state', async () => {
     const localMock = makeMockProvider();
     const r = new TransportSessionRuntime(localMock.provider, 'x');
