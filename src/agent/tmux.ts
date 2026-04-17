@@ -117,14 +117,30 @@ function requireTmux(feature: string): void {
 
 /** Ensure tmux server is running. Auto-starts if dead. */
 let tmuxServerChecked = false;
+function getTmuxErrorText(error: unknown): string {
+  if (!error || typeof error !== 'object') return String(error ?? '');
+  const e = error as { stderr?: unknown; message?: unknown };
+  return String(e.stderr || e.message || '');
+}
+
+function isRecoverableTmuxServerError(error: unknown): boolean {
+  const stderr = getTmuxErrorText(error);
+  return (
+    stderr.includes('no server running')
+    || stderr.includes('No such file or directory')
+    || stderr.includes('error connecting')
+    || stderr.includes('server exited unexpectedly')
+  );
+}
+
 async function ensureTmuxServer(): Promise<void> {
   if (tmuxServerChecked) return;
   try {
     await execFile('tmux', ['list-sessions']);
     tmuxServerChecked = true;
   } catch (e: any) {
-    const stderr = String(e.stderr || e.message || '');
-    if (stderr.includes('no server running') || stderr.includes('No such file or directory') || stderr.includes('error connecting')) {
+    const stderr = getTmuxErrorText(e);
+    if (isRecoverableTmuxServerError(e)) {
       // tmux server is dead — start it
       await execFile('tmux', ['new-session', '-d', '-s', 'imcodes_init']);
       // Kill the temp session, server stays alive
@@ -142,8 +158,19 @@ async function ensureTmuxServer(): Promise<void> {
 /** Run a tmux command with array args (no shell — safe from injection). */
 async function tmuxRun(...args: string[]): Promise<string> {
   await ensureTmuxServer();
-  const { stdout } = await execFile('tmux', args);
-  return stdout.trim();
+  try {
+    const { stdout } = await execFile('tmux', args);
+    return stdout.trim();
+  } catch (error) {
+    if (!isRecoverableTmuxServerError(error)) throw error;
+    // tmux exits when the last session dies. Under rapid create/kill loops,
+    // a cached "server exists" assumption can race with the server shutting
+    // down between commands. Re-prime once, then retry the original command.
+    tmuxServerChecked = false;
+    await ensureTmuxServer();
+    const { stdout } = await execFile('tmux', args);
+    return stdout.trim();
+  }
 }
 
 // ── Raw send primitives (backend-dispatched) ────────────────────────────────────
