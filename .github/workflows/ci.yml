@@ -304,10 +304,14 @@ jobs:
       - run: npm run build
       - run: npm run test:coverage
       - name: Upload to Codecov
+        if: ${{ secrets.CODECOV_TOKEN != '' }}
         uses: codecov/codecov-action@v4
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
+      - name: Skip Codecov upload when token is unavailable
+        if: ${{ secrets.CODECOV_TOKEN == '' }}
+        run: echo "Skipping Codecov upload because CODECOV_TOKEN is not configured for this workflow context."
       - name: Comment PR with coverage diff
         if: github.event_name == 'pull_request'
         uses: davelosert/vitest-coverage-report-action@v2
