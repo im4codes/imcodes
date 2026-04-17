@@ -1,18 +1,37 @@
 import { readFile } from 'node:fs/promises';
+import { pathToFileURL } from 'node:url';
 
 function readEnv(name) {
   const value = process.env[name]?.trim();
   return value ? value : null;
 }
 
-async function resolveEmbeddingConfig() {
+export async function resolveEmbeddingConfig() {
   const modelFromEnv = readEnv('EMBEDDING_MODEL');
   const dtypeFromEnv = readEnv('EMBEDDING_DTYPE');
   if (modelFromEnv && dtypeFromEnv) {
     return { model: modelFromEnv, dtype: dtypeFromEnv };
   }
 
-  const source = await readFile(new URL('../../shared/embedding-config.ts', import.meta.url), 'utf8');
+  const candidateUrls = [
+    new URL('../../shared/embedding-config.ts', import.meta.url), // repo layout
+    new URL('../shared/embedding-config.ts', import.meta.url),    // docker preload stage
+  ];
+  let source = null;
+  for (const url of candidateUrls) {
+    try {
+      source = await readFile(url, 'utf8');
+      break;
+    } catch (error) {
+      if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
+        continue;
+      }
+      throw error;
+    }
+  }
+  if (!source) {
+    throw new Error('Failed to locate shared/embedding-config.ts for embedding preload');
+  }
   const modelMatch = source.match(/export const EMBEDDING_MODEL = '([^']+)'/);
   const dtypeMatch = source.match(/export const EMBEDDING_DTYPE = '([^']+)'/);
   if (!modelMatch?.[1] || !dtypeMatch?.[1]) {
@@ -33,7 +52,11 @@ async function main() {
   console.log('[embedding] preload complete');
 }
 
-main().catch((err) => {
-  console.error('[embedding] preload failed', err);
-  process.exit(1);
-});
+const isEntrypoint = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isEntrypoint) {
+  main().catch((err) => {
+    console.error('[embedding] preload failed', err);
+    process.exit(1);
+  });
+}
