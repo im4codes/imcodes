@@ -1357,6 +1357,21 @@ describe('WsBridge', () => {
       expect(msg.state).toBe('idle');
     });
 
+    it('ignores leaked test subsession.sync payloads', async () => {
+      const { daemonWs, browserWs } = await setupAuthBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'subsession.sync',
+        id: 'ignored-sub',
+        sessionType: 'codex-sdk',
+        cwd: '/tmp/cxsdk-sub-e2e',
+        parentSession: 'deck_bootmainabc123_brain',
+      }));
+      await flushAsync();
+
+      expect(browserWs.sentStrings).toHaveLength(0);
+    });
+
     it('subsession.closed from daemon → updates DB + broadcasts subsession.removed to browsers', async () => {
       const { daemonWs, browserWs } = await setupAuthBridge();
 

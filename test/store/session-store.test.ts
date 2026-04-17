@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { readFile } from 'node:fs/promises';
 import { vi } from 'vitest';
 
 // We need to test with a temp path — patch the store path
@@ -80,5 +81,38 @@ describe('session-store', () => {
     expect(sessions.length).toBeGreaterThanOrEqual(2);
     expect(sessions.some((s) => s.name === 's1')).toBe(true);
     expect(sessions.some((s) => s.name === 's2')).toBe(true);
+  });
+
+  it('does not persist known leaked e2e sessions to sessions.json', async () => {
+    const { upsertSession, flushStore } = await import('../../src/store/session-store.js');
+    upsertSession({
+      name: 'deck_bootmainabc123_brain',
+      projectName: 'bootmainabc123',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/bootmain-e2e',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    upsertSession({
+      name: 'deck_cd_brain',
+      projectName: 'cd',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/Users/me/cd',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+
+    await flushStore();
+    const raw = await readFile(join(tempDir, '.imcodes', 'sessions.json'), 'utf8');
+    expect(raw).not.toContain('deck_bootmainabc123_brain');
+    expect(raw).toContain('deck_cd_brain');
   });
 });

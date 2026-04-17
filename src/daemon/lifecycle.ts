@@ -34,6 +34,7 @@ import { setContextModelRuntimeConfig } from '../context/context-model-config.js
 import { LiveContextIngestion } from '../context/live-context-ingestion.js';
 import { resolveTransportContextBootstrap } from '../agent/runtime-context-bootstrap.js';
 import { pruneLocalMemory } from '../context/memory-pruning.js';
+import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 
 /** Get the last assistant.text from a session's timeline (for push notification context). */
 function getLastAssistantText(sessionName: string): string | undefined {
@@ -107,6 +108,14 @@ async function persistSessionToWorker(
   name: string,
   record: import('../store/session-store.js').SessionRecord,
 ): Promise<void> {
+  if (isKnownTestSessionLike({
+    name,
+    projectName: record.projectName,
+    projectDir: record.projectDir,
+    parentSession: record.parentSession,
+  })) {
+    return;
+  }
   try {
     const payload = buildWorkerSessionPersistBody(record);
     const res = await fetch(`${workerUrl}/api/server/${serverId}/sessions/${encodeURIComponent(name)}`, {
@@ -129,6 +138,18 @@ async function deleteSessionFromWorker(workerUrl: string, serverId: string, toke
     if (!res.ok) logger.warn({ status: res.status, name }, 'deleteSessionFromWorker: non-ok response');
   } catch (e) {
     logger.warn({ err: e, name }, 'deleteSessionFromWorker: fetch failed');
+  }
+}
+
+async function deleteSubSessionFromWorker(workerUrl: string, serverId: string, token: string, id: string): Promise<void> {
+  try {
+    const res = await fetch(`${workerUrl}/api/server/${serverId}/sub-sessions/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token}`, 'X-Server-Id': serverId },
+    });
+    if (!res.ok) logger.warn({ status: res.status, id }, 'deleteSubSessionFromWorker: non-ok response');
+  } catch (e) {
+    logger.warn({ err: e, id }, 'deleteSubSessionFromWorker: fetch failed');
   }
 }
 
@@ -178,13 +199,32 @@ async function syncSessionsFromWorker(workerUrl: string, serverId: string, token
     }
 
     const data = await sessionRes.json() as { sessions: Array<{ name: string; project_name: string; role: string; agent_type: string; project_dir: string; state: string; label?: string | null; requested_model?: string | null; active_model?: string | null; effort?: SessionRecord['effort'] | null; transport_config?: Record<string, unknown> | string | null }> };
-    const subData = await subRes.json() as { subSessions: Array<{ id: string }> };
+    const subData = await subRes.json() as { subSessions: Array<{ id: string; cwd?: string | null; parent_session?: string | null }> };
+    const remoteTestSessions = data.sessions.filter((session) => isKnownTestSessionLike({
+      name: session.name,
+      projectName: session.project_name,
+      projectDir: session.project_dir,
+    }));
+    const remoteTestSubSessions = subData.subSessions.filter((subSession) => isKnownTestSessionLike({
+      name: subSession.id ? `deck_sub_${subSession.id}` : undefined,
+      cwd: subSession.cwd,
+      parentSession: subSession.parent_session,
+    }));
+    await Promise.all([
+      ...remoteTestSessions.map((session) => deleteSessionFromWorker(workerUrl, serverId, token, session.name)),
+      ...remoteTestSubSessions.map((subSession) => deleteSubSessionFromWorker(workerUrl, serverId, token, subSession.id)),
+    ]);
     const remoteSessionNames = new Set(
       data.sessions
+        .filter((s) => !isKnownTestSessionLike({ name: s.name, projectName: s.project_name, projectDir: s.project_dir }))
         .filter((s) => s.state !== 'stopped')
         .map((s) => s.name),
     );
-    const remoteSubSessionNames = new Set(subData.subSessions.map((s) => `deck_sub_${s.id}`));
+    const remoteSubSessionNames = new Set(
+      subData.subSessions
+        .filter((s) => !isKnownTestSessionLike({ name: s.id ? `deck_sub_${s.id}` : undefined, cwd: s.cwd, parentSession: s.parent_session }))
+        .map((s) => `deck_sub_${s.id}`),
+    );
 
     const localSessions = listSessions();
     const staleLocal = localSessions.filter((session) => {
@@ -201,6 +241,7 @@ async function syncSessionsFromWorker(workerUrl: string, serverId: string, token
 
     let count = 0;
     for (const s of data.sessions) {
+      if (isKnownTestSessionLike({ name: s.name, projectName: s.project_name, projectDir: s.project_dir })) continue;
       if (s.state === 'stopped') continue; // skip stopped sessions
       const existing = getSession(s.name);
       upsertSession(mergeWorkerSessionSnapshot(existing, s));
@@ -489,7 +530,12 @@ export async function startup(): Promise<DaemonContext> {
     // (or route was misconfigured and persists silently failed).
     const localSessions = listSessions();
     for (const s of localSessions) {
-      if (s.state !== 'stopped') {
+      if (s.state !== 'stopped' && !isKnownTestSessionLike({
+        name: s.name,
+        projectName: s.projectName,
+        projectDir: s.projectDir,
+        parentSession: s.parentSession,
+      })) {
         await persistSessionToWorker(workerUrl!, serverId, token, s.name, s);
       }
     }

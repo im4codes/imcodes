@@ -5,6 +5,7 @@ import type { QwenAuthType } from '../../shared/qwen-auth.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
 import type { SessionContextBootstrapState } from '../../shared/session-context-bootstrap.js';
+import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 
 const STORE_DIR = join(homedir(), '.imcodes');
 const STORE_PATH = join(STORE_DIR, 'sessions.json');
@@ -95,6 +96,30 @@ export interface SessionStore {
 let writeTimer: ReturnType<typeof setTimeout> | null = null;
 let store: SessionStore = { sessions: {} };
 
+function isPersistableSessionRecord(record: SessionRecord): boolean {
+  return !isKnownTestSessionLike({
+    name: record.name,
+    projectName: record.projectName,
+    projectDir: record.projectDir,
+    parentSession: record.parentSession,
+  });
+}
+
+function serializeStore(): string {
+  const persistableSessions = Object.fromEntries(
+    Object.entries(store.sessions).filter(([, record]) => isPersistableSessionRecord(record)),
+  );
+  return JSON.stringify({ sessions: persistableSessions }, null, 2);
+}
+
+function pruneNonPersistableSessions(): boolean {
+  const before = Object.keys(store.sessions).length;
+  store.sessions = Object.fromEntries(
+    Object.entries(store.sessions).filter(([, record]) => isPersistableSessionRecord(record)),
+  );
+  return Object.keys(store.sessions).length !== before;
+}
+
 export async function loadStore(): Promise<SessionStore> {
   await mkdir(STORE_DIR, { recursive: true });
   try {
@@ -103,6 +128,7 @@ export async function loadStore(): Promise<SessionStore> {
   } catch {
     store = { sessions: {} };
   }
+  if (pruneNonPersistableSessions()) scheduleWrite();
   // Probe actual state of each session via terminal detection.
   // Without this, stale "running" states from before daemon restart persist
   // and cause UI animations to trigger for idle agents.
@@ -144,7 +170,7 @@ function scheduleWrite(): void {
   writeTimer = setTimeout(async () => {
     try {
       await mkdir(STORE_DIR, { recursive: true });
-      await writeFile(STORE_PATH, JSON.stringify(store, null, 2), 'utf8');
+      await writeFile(STORE_PATH, serializeStore(), 'utf8');
     } catch {
       // Tests may tear down temp HOME dirs while a debounced write is pending.
       // Losing that best-effort write is fine; a later flush/load will recreate it.
@@ -191,5 +217,5 @@ export async function flushStore(): Promise<void> {
     writeTimer = null;
   }
   await mkdir(STORE_DIR, { recursive: true });
-  await writeFile(STORE_PATH, JSON.stringify(store, null, 2), 'utf8');
+  await writeFile(STORE_PATH, serializeStore(), 'utf8');
 }

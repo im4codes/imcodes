@@ -106,6 +106,25 @@ describe('session-mgmt persistence routes', () => {
     );
   });
 
+  it('PUT /sessions/:name ignores known test sessions', async () => {
+    const app = await buildApp();
+    const res = await app.request('/api/server/srv-1/sessions/deck_bootmainabc123_brain', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        projectName: 'bootmainabc123',
+        projectRole: 'brain',
+        agentType: 'claude-code-sdk',
+        projectDir: '/tmp/bootmain-e2e',
+        state: 'idle',
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, ignored: 'test_session' });
+    expect(mockUpsertDbSession).not.toHaveBeenCalled();
+  });
+
   it('PATCH /sessions/:name updates requestedModel/activeModel/effort/transportConfig', async () => {
     const app = await buildApp();
     const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain', {

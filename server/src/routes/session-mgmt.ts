@@ -9,6 +9,7 @@ import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
 import { getPodIdentity } from '../util/pod-identity.js';
 import { isSessionAgentType } from '../../../shared/agent-types.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
+import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
 
 export const sessionMgmtRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -76,6 +77,13 @@ sessionMgmtRoutes.put('/:id/sessions/:name', async (c) => {
   } = body;
   if (!projectName || !projectRole || !agentType || !projectDir || !state) {
     return c.json({ error: 'missing_fields' }, 400);
+  }
+  if (isKnownTestSessionLike({
+    name: sessionName,
+    projectName: String(projectName),
+    projectDir: String(projectDir),
+  })) {
+    return c.json({ ok: true, ignored: 'test_session' });
   }
 
   await upsertDbSession(

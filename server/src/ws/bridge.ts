@@ -40,6 +40,7 @@ import { LocalWebPreviewRegistry } from '../preview/registry.js';
 import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions } from '../db/queries.js';
 import logger from '../util/logger.js';
 import { pickReadableSessionDisplay } from '../../../shared/session-display.js';
+import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
 
 const AUTH_TIMEOUT_MS = 5000;
 const MAX_QUEUE_SIZE = 100;
@@ -949,6 +950,13 @@ export class WsBridge {
 
     // ── Sub-session sync: daemon creates sub-sessions → persist to DB ────────
     if (type === 'subsession.sync' && this.db) {
+      if (isKnownTestSessionLike({
+        name: typeof msg.id === 'string' ? `deck_sub_${msg.id}` : undefined,
+        cwd: typeof msg.cwd === 'string' ? msg.cwd : undefined,
+        parentSession: typeof msg.parentSession === 'string' ? msg.parentSession : undefined,
+      })) {
+        return;
+      }
       const subSessionName = `deck_sub_${String(msg.id ?? '')}`;
       if (subSessionName !== 'deck_sub_') {
         const label = typeof msg.label === 'string' && msg.label.trim() ? msg.label.trim() : undefined;
