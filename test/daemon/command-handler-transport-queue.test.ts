@@ -6,6 +6,7 @@ const {
   upsertSessionMock,
   getTransportRuntimeMock,
   emitMock,
+  launchTransportSessionMock,
   relaunchSessionWithSettingsMock,
   stopTransportRuntimeSessionMock,
   resizeSessionMock,
@@ -20,6 +21,7 @@ const {
   upsertSessionMock: vi.fn(),
   getTransportRuntimeMock: vi.fn(),
   emitMock: vi.fn(),
+  launchTransportSessionMock: vi.fn().mockResolvedValue(undefined),
   relaunchSessionWithSettingsMock: vi.fn(),
   stopTransportRuntimeSessionMock: vi.fn().mockResolvedValue(undefined),
   resizeSessionMock: vi.fn(),
@@ -44,7 +46,7 @@ vi.mock('../../src/agent/session-manager.js', () => ({
   stopProject: vi.fn(),
   teardownProject: vi.fn(),
   getTransportRuntime: getTransportRuntimeMock,
-  launchTransportSession: vi.fn(),
+  launchTransportSession: launchTransportSessionMock,
   isProviderSessionBound: vi.fn(() => false),
   persistSessionRecord: vi.fn(),
   relaunchSessionWithSettings: relaunchSessionWithSettingsMock,
@@ -222,6 +224,174 @@ describe('handleWebCommand transport queue behavior', () => {
       expect.anything(),
     );
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-queued', status: 'accepted' });
+  });
+
+  it('dispatches /clear as a fresh claude-code-sdk relaunch', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+      projectDir: '/proj',
+      label: 'Brain',
+      description: 'desc',
+      requestedModel: 'sonnet',
+      effort: 'high',
+      transportConfig: { supervision: { mode: 'off' } },
+      ccPreset: 'preset-a',
+      ccSessionId: 'cc-old',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      cancel: vi.fn(),
+      send: vi.fn(() => 'queued'),
+      pendingCount: 2,
+      pendingMessages: ['a', 'b'],
+    });
+
+    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: '/clear', commandId: 'cmd-clear-cc' }, serverLink as any);
+    await flushAsync();
+
+    expect(stopTransportRuntimeSessionMock).toHaveBeenCalledWith('deck_transport_brain');
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_transport_brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/proj',
+      label: 'Brain',
+      description: 'desc',
+      requestedModel: 'sonnet',
+      effort: 'high',
+      transportConfig: { supervision: { mode: 'off' } },
+      ccPreset: 'preset-a',
+      fresh: true,
+      ccSessionId: expect.any(String),
+    }));
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'user.message', { text: '/clear', allowDuplicate: true }, undefined);
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'assistant.text', {
+      text: 'Started a fresh conversation',
+      streaming: false,
+      memoryExcluded: true,
+    }, expect.objectContaining({ source: 'daemon' }));
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-clear-cc', status: 'accepted' });
+    expect(emitMock).not.toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'session.state',
+      expect.objectContaining({ state: 'queued' }),
+      expect.anything(),
+    );
+  });
+
+  it('dispatches /clear as a fresh openclaw relaunch that preserves the provider key', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'openclaw',
+      runtimeType: 'transport',
+      state: 'running',
+      projectDir: '/proj',
+      providerSessionId: 'agent___main___discord___chan',
+      requestedModel: 'oc-model',
+      effort: 'medium',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'agent___main___discord___chan',
+      send: vi.fn(() => 'queued'),
+      pendingCount: 1,
+      pendingMessages: ['a'],
+    });
+
+    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: '/clear', commandId: 'cmd-clear-oc' }, serverLink as any);
+    await flushAsync();
+
+    expect(stopTransportRuntimeSessionMock).toHaveBeenCalledWith('deck_transport_brain');
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_transport_brain',
+      agentType: 'openclaw',
+      projectDir: '/proj',
+      requestedModel: 'oc-model',
+      effort: 'medium',
+      bindExistingKey: 'agent___main___discord___chan',
+      fresh: true,
+    }));
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-clear-oc', status: 'accepted' });
+  });
+
+  it('dispatches /clear as a fresh qwen relaunch without preserving the provider key', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'qwen',
+      runtimeType: 'transport',
+      state: 'running',
+      projectDir: '/proj',
+      providerSessionId: 'qwen-route-old',
+      requestedModel: 'qwen-plus',
+      effort: 'low',
+      ccPreset: 'preset-q',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'qwen-route-old',
+      send: vi.fn(() => 'queued'),
+      pendingCount: 1,
+      pendingMessages: ['a'],
+    });
+
+    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: '/clear', commandId: 'cmd-clear-qwen' }, serverLink as any);
+    await flushAsync();
+
+    expect(stopTransportRuntimeSessionMock).toHaveBeenCalledWith('deck_transport_brain');
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_transport_brain',
+      agentType: 'qwen',
+      projectDir: '/proj',
+      requestedModel: 'qwen-plus',
+      effort: 'low',
+      ccPreset: 'preset-q',
+      fresh: true,
+    }));
+    expect(launchTransportSessionMock.mock.calls.at(-1)?.[0]).not.toHaveProperty('bindExistingKey');
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-clear-qwen', status: 'accepted' });
+  });
+
+  it('dispatches /clear as a fresh codex-sdk relaunch', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+      projectDir: '/proj',
+      requestedModel: 'gpt-5.4-codex',
+      effort: 'medium',
+      codexSessionId: 'thread-old',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-codex-old',
+      send: vi.fn(() => 'queued'),
+      pendingCount: 1,
+      pendingMessages: ['a'],
+    });
+
+    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: '/clear', commandId: 'cmd-clear-codex' }, serverLink as any);
+    await flushAsync();
+
+    expect(stopTransportRuntimeSessionMock).toHaveBeenCalledWith('deck_transport_brain');
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_transport_brain',
+      agentType: 'codex-sdk',
+      projectDir: '/proj',
+      requestedModel: 'gpt-5.4-codex',
+      effort: 'medium',
+      fresh: true,
+    }));
+    expect(launchTransportSessionMock.mock.calls.at(-1)?.[0]).not.toHaveProperty('bindExistingKey');
+    expect(launchTransportSessionMock.mock.calls.at(-1)?.[0]).not.toHaveProperty('codexSessionId');
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-clear-codex', status: 'accepted' });
   });
 
   it('dispatches /stop immediately for transport sessions without emitting queued state', async () => {

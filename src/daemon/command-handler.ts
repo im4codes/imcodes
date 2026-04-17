@@ -203,6 +203,32 @@ function supportsEffort(agentType: string | undefined): agentType is 'claude-cod
   return agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'openclaw' || agentType === 'qwen';
 }
 
+function supportsTransportClear(agentType: string | undefined): agentType is 'claude-code-sdk' | 'codex-sdk' | 'openclaw' | 'qwen' {
+  return agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'openclaw' || agentType === 'qwen';
+}
+
+async function relaunchFreshTransportConversation(record: SessionRecord): Promise<void> {
+  await stopTransportRuntimeSession(record.name);
+  await launchTransportSession({
+    name: record.name,
+    projectName: record.projectName,
+    role: record.role,
+    agentType: record.agentType as 'claude-code-sdk' | 'codex-sdk' | 'openclaw' | 'qwen',
+    projectDir: record.projectDir,
+    label: record.label,
+    description: record.description,
+    requestedModel: record.requestedModel,
+    effort: record.effort,
+    transportConfig: record.transportConfig,
+    ccPreset: (record.agentType === 'claude-code-sdk' || record.agentType === 'qwen') ? record.ccPreset : undefined,
+    ...(record.agentType === 'claude-code-sdk' ? { ccSessionId: randomUUID() } : {}),
+    ...(record.agentType === 'openclaw' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
+    ...(record.parentSession ? { parentSession: record.parentSession } : {}),
+    ...(record.userCreated ? { userCreated: true } : {}),
+    fresh: true,
+  });
+}
+
 function getSupportedEffortLevels(agentType: string | undefined): readonly TransportEffortLevel[] {
   return agentType === 'claude-code-sdk'
     ? CLAUDE_SDK_EFFORT_LEVELS
@@ -1531,6 +1557,33 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         const errMsg = describeTransportSendError(err);
         logger.error({ sessionName, err }, 'session.stop (transport) failed');
         timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Stop failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
+        try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg }); } catch { /* */ }
+      }
+      return;
+    }
+    if (text.trim() === '/clear' && supportsTransportClear(record?.agentType)) {
+      emitTransportUserMessage(text);
+      try {
+        await runExclusiveSessionRelaunch(sessionName, async () => {
+          await relaunchFreshTransportConversation(record);
+        });
+        await handleGetSessions(serverLink);
+        await syncSubSessionIfNeeded(sessionName, serverLink);
+        timelineEmitter.emit(sessionName, 'assistant.text', {
+          text: 'Started a fresh conversation',
+          streaming: false,
+          memoryExcluded: true,
+        }, { source: 'daemon', confidence: 'high' });
+        const clearStatus = isLegacy ? 'accepted_legacy' : 'accepted';
+        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: clearStatus });
+        try {
+          serverLink.send({ type: 'command.ack', commandId: effectiveId, status: clearStatus, session: sessionName });
+        } catch { /* */ }
+      } catch (err) {
+        const errMsg = describeTransportSendError(err);
+        logger.error({ sessionName, err }, 'session.clear (transport) failed');
+        timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Clear failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
         try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg }); } catch { /* */ }
       }
