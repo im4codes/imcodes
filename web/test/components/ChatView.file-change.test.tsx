@@ -103,7 +103,6 @@ describe('ChatView file-change cards', () => {
     const { container } = render(<ChatView events={events} loading={false} ws={{} as any} workdir="/repo" sessionId="session-a" />);
 
     expect(container.textContent).toContain('File changes (1)');
-    expect(container.textContent).toContain('Claude Code');
     expect(container.textContent).toContain('exact');
     expect(container.querySelector('.chat-file-change-diff-label-removed')?.textContent).toBe('-');
     expect(container.querySelector('.chat-file-change-diff-label-added')?.textContent).toBe('+');
@@ -119,39 +118,7 @@ describe('ChatView file-change cards', () => {
     expect(fileBrowserProps[0]?.initialPath).toBe('/repo/src');
   });
 
-  it('hides the provider badge when it matches the current chat agent family', () => {
-    const events = [
-      makeEvent('file.change', {
-        batch: {
-          provider: 'codex-sdk',
-          patches: [
-            {
-              filePath: '/repo/src/app.ts',
-              operation: 'update',
-              confidence: 'derived',
-              afterText: 'export const value = 2;',
-            },
-          ],
-        },
-      }),
-    ];
-
-    const { container } = render(
-      <ChatView
-        events={events}
-        loading={false}
-        ws={{} as any}
-        workdir="/repo"
-        sessionId="session-a"
-        agentType="codex-sdk"
-      />,
-    );
-
-    expect(container.textContent).toContain('File changes (1)');
-    expect(container.textContent).not.toContain('Codex SDK');
-  });
-
-  it('keeps the provider badge when the file-change source differs from the current chat agent', () => {
+  it('does not render provider badges on file-change cards', () => {
     const events = [
       makeEvent('file.change', {
         batch: {
@@ -175,11 +142,13 @@ describe('ChatView file-change cards', () => {
         ws={{} as any}
         workdir="/repo"
         sessionId="session-a"
-        agentType="codex-sdk"
+        agentType="claude-code-sdk"
       />,
     );
 
-    expect(container.textContent).toContain('Qwen');
+    expect(container.textContent).toContain('File changes (1)');
+    expect(container.textContent).not.toContain('Qwen');
+    expect(container.querySelectorAll('.chat-file-change-header .chat-file-change-chip')).toHaveLength(0);
   });
 
   it('renders derived and coarse file-change states honestly and does not show hidden raw tool rows', () => {
@@ -241,7 +210,6 @@ describe('ChatView file-change cards', () => {
 
     const { container, getAllByTestId } = render(<ChatView events={events} loading={false} ws={{} as any} workdir="/repo" sessionId="session-a" />);
 
-    expect(container.textContent).toContain('OpenCode');
     expect(container.querySelector('.chat-file-change-diff-label-removed')?.textContent).toBe('-');
     expect(Array.from(container.querySelectorAll('.chat-file-change-diff-pre-removed .chat-file-change-diff-ln')).map((node) => node.textContent)).toContain('1');
     expect(container.textContent).toContain('const before = 1;');

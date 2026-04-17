@@ -7,7 +7,6 @@ import { h } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from 'preact/hooks';
 import { memo } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
-import { isClaudeCodeFamily, isCodexFamily } from '@shared/agent-types.js';
 import type { TimelineEvent, WsClient, MemoryContextTimelinePayload, MemoryContextTimelineItem } from '../ws-client.js';
 import type { FileChangeBatch, FileChangePatch } from '@shared/file-change.js';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
@@ -41,10 +40,9 @@ interface Props {
   workdir?: string | null;
   /** Called when user quotes selected text. */
   onQuote?: (text: string) => void;
+  agentType?: string | null;
   /** Server ID for file transfer download API. */
   serverId?: string;
-  /** Current session agent type, used to suppress redundant provider badges in file-change cards. */
-  agentType?: string | null;
 }
 
 /** A merged view item — either a single event, merged assistant text, or collapsed tool group. */
@@ -404,7 +402,7 @@ function readPanelOpen(id: string | null | undefined): boolean {
   try { return localStorage.getItem(panelOpenKey(id)) === '1'; } catch { return false; }
 }
 
-export function ChatView({ events, loading, refreshing: _refreshing, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir, serverId, onQuote, agentType }: Props) {
+export function ChatView({ events, loading, refreshing: _refreshing, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir, serverId, onQuote, agentType: _agentType }: Props) {
   const { t } = useTranslation();
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -901,7 +899,7 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
             ) : item.type === 'tool-group' ? (
               <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onDownload={downloadHandler} serverId={serverId} />
             ) : (
-              <ChatEvent key={item.key} event={item.event!} nextTs={nextTs} onPathClick={pathClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} currentAgentType={agentType} />
+              <ChatEvent key={item.key} event={item.event!} nextTs={nextTs} onPathClick={pathClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} />
             );
           })}
           {!loading && <div ref={bottomRef} />}
@@ -1226,7 +1224,6 @@ const ChatEvent = memo(function ChatEvent({
   onFileChangeOpen,
   onDownload,
   serverId,
-  currentAgentType,
 }: {
   event: TimelineEvent;
   nextTs?: number;
@@ -1234,7 +1231,6 @@ const ChatEvent = memo(function ChatEvent({
   onFileChangeOpen?: (path: string, preferDiff?: boolean) => void;
   onDownload?: (path: string) => void;
   serverId?: string;
-  currentAgentType?: string | null;
 }) {
   const { t } = useTranslation();
   switch (event.type) {
@@ -1356,7 +1352,7 @@ const ChatEvent = memo(function ChatEvent({
       return <SnapshotEvent event={event} />;
 
     case 'file.change':
-      return <FileChangeCard event={event} onOpenFile={onFileChangeOpen} currentAgentType={currentAgentType} />;
+      return <FileChangeCard event={event} onOpenFile={onFileChangeOpen} />;
 
     default:
       return null;
@@ -1395,25 +1391,6 @@ function fileChangeConfidenceKey(confidence: string): string {
     case 'derived': return 'chat.file_change_confidence_derived';
     default: return 'chat.file_change_confidence_coarse';
   }
-}
-
-function fileChangeProviderKey(provider: string): string {
-  switch (provider) {
-    case 'claude-code': return 'chat.file_change_provider_claude_code';
-    case 'opencode': return 'chat.file_change_provider_opencode';
-    case 'codex-sdk': return 'chat.file_change_provider_codex_sdk';
-    case 'qwen': return 'chat.file_change_provider_qwen';
-    case 'gemini': return 'chat.file_change_provider_gemini';
-    default: return provider;
-  }
-}
-
-function shouldShowFileChangeProvider(provider: string, currentAgentType: string | null | undefined): boolean {
-  if (!currentAgentType) return true;
-  if (provider === currentAgentType) return false;
-  if (provider === 'codex-sdk' && isCodexFamily(currentAgentType)) return false;
-  if (provider === 'claude-code' && isClaudeCodeFamily(currentAgentType)) return false;
-  return true;
 }
 
 function clampPreviewText(text: string, maxLines = 14, maxChars = 1200): { text: string; truncated: boolean } {
@@ -1509,11 +1486,9 @@ function FileChangePreviewBlock({
 const FileChangeCard = memo(function FileChangeCard({
   event,
   onOpenFile,
-  currentAgentType,
 }: {
   event: TimelineEvent;
   onOpenFile?: (path: string, preferDiff?: boolean) => void;
-  currentAgentType?: string | null;
 }) {
   const { t } = useTranslation();
   const batch = getFileChangeBatch(event);
@@ -1528,9 +1503,6 @@ const FileChangeCard = memo(function FileChangeCard({
           {t('chat.file_change_title', { count: fileGroups.length })}
         </div>
         <div class="chat-file-change-meta">
-          {shouldShowFileChangeProvider(batch.provider, currentAgentType) && (
-            <span class="chat-file-change-chip">{t(fileChangeProviderKey(batch.provider))}</span>
-          )}
           {batch.title && <span class="chat-file-change-chip chat-file-change-chip-muted">{batch.title}</span>}
         </div>
       </div>
