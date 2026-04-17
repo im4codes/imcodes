@@ -118,7 +118,9 @@
       "claude_code_sdk": "Claude Code SDK",
       "codex_sdk": "Codex SDK",
       "claude_code_cli": "Claude Code CLI",
-      "codex_cli": "Codex CLI"
+      "codex_cli": "Codex CLI",
+      "copilot_sdk": "GitHub Copilot SDK",
+      "cursor_headless": "Cursor Headless"
     },
     "openclaw_not_connected": "未连接",
     "openclaw_connect_hint": "OpenClaw 网关未连接。请在 daemon 机器上运行以下命令连接：",
@@ -194,6 +196,12 @@
       "invalidStoredConfig": "已保存的监督配置无效。修复并保存前，自动化将保持禁用。",
       "quickLabel": "自动",
       "quickTitle": "自动模式"
+    },
+    "approval": {
+      "pending": "需要审批",
+      "allow": "允许",
+      "deny": "拒绝",
+      "tool": "{{tool}} 需要审批"
     },
     "workingDirPlaceholder": "~/projects/myapp"
   },

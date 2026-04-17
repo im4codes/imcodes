@@ -762,6 +762,8 @@ export interface LaunchOpts {
   geminiSessionId?: string;
   /** OpenCode session ID for `opencode -s <ID>`. */
   opencodeSessionId?: string;
+  /** Provider-side durable resume identifier for shared local-sdk providers. */
+  providerResumeId?: string;
   /** Qwen model ID for `qwen --model <ID>`. */
   qwenModel?: string;
   /** Unified requested transport model for launch/restore. */
@@ -857,6 +859,8 @@ export async function relaunchSessionWithSettings(
     // codexSessionId and therefore use a fresh local route key on relaunch.
     && targetAgentType !== 'claude-code-sdk'
     && targetAgentType !== 'codex-sdk'
+    && targetAgentType !== 'copilot-sdk'
+    && targetAgentType !== 'cursor-headless'
     && typeof record.providerSessionId === 'string'
     && record.providerSessionId.length > 0;
 
@@ -996,6 +1000,10 @@ function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName:
         next.codexSessionId = info.resumeId;
         changed = true;
       }
+      if ((agentType === 'cursor-headless' || agentType === 'copilot-sdk') && next.providerResumeId !== info.resumeId) {
+        next.providerResumeId = info.resumeId;
+        changed = true;
+      }
       if (agentType === 'qwen' && next.providerSessionId !== info.resumeId) {
         if (next.providerSessionId) unregisterProviderRoute(next.providerSessionId);
         next.providerSessionId = info.resumeId;
@@ -1119,13 +1127,18 @@ export async function restoreTransportSessions(providerId: string): Promise<void
       wireTransportSessionInfo(runtime, s.name, s.agentType);
       // After cancel, qwenFreshOnResume is set — don't resume the stuck conversation.
       const freshAfterCancel = !!(s.qwenFreshOnResume && s.providerId === 'qwen');
-      const needsEphemeralRouteKey = s.providerId === 'claude-code-sdk' || s.providerId === 'codex-sdk';
+      const needsEphemeralRouteKey = s.providerId === 'claude-code-sdk'
+        || s.providerId === 'codex-sdk'
+        || s.providerId === 'cursor-headless'
+        || s.providerId === 'copilot-sdk';
       const effectiveSessionKey = freshAfterCancel || needsEphemeralRouteKey ? randomUUID() : s.providerSessionId;
       const resumeId = s.providerId === 'claude-code-sdk'
         ? s.ccSessionId
         : s.providerId === 'codex-sdk'
           ? s.codexSessionId
-          : undefined;
+          : (s.providerId === 'cursor-headless' || s.providerId === 'copilot-sdk')
+            ? s.providerResumeId
+            : undefined;
       let extraEnv: Record<string, string> | undefined;
       let systemPrompt: string | undefined;
       let transportSettings: string | Record<string, unknown> | undefined;
@@ -1155,8 +1168,8 @@ export async function restoreTransportSessions(providerId: string): Promise<void
       }
       await runtime.initialize({
         sessionKey: effectiveSessionKey,
-        bindExistingKey: freshAfterCancel ? undefined : s.providerSessionId,
-        skipCreate: !freshAfterCancel,
+        bindExistingKey: freshAfterCancel ? undefined : (needsEphemeralRouteKey ? s.providerSessionId : s.providerSessionId),
+        skipCreate: !freshAfterCancel && !!s.providerSessionId,
         ...(extraEnv ? { env: extraEnv } : {}),
         cwd: s.projectDir,
         label: s.label ?? s.name,
@@ -1255,6 +1268,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   let transportSystemPrompt: string | undefined;
   let transportSettings: string | Record<string, unknown> | undefined;
   const storedRequestedModel = !opts.fresh ? existing?.requestedModel : undefined;
+  const storedProviderResumeId = !opts.fresh ? existing?.providerResumeId : undefined;
   let requestedTransportModel = opts.requestedModel ?? storedRequestedModel ?? (agentType === 'qwen' ? (opts.qwenModel ?? existing?.qwenModel) : undefined);
   // Preserve existing transportConfig (including supervision) when opts doesn't override.
   // Only fall through to `undefined` if nothing is set — never force `{}`, which would
@@ -1333,6 +1347,13 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
       effectiveSkipCreate = true;
     }
     sdkDisplay = await getCodexRuntimeConfig().catch(() => ({}));
+  } else if (agentType === 'cursor-headless' || agentType === 'copilot-sdk') {
+    effectiveSessionKey = randomUUID();
+    effectiveBindExistingKey = undefined;
+    transportResumeId = opts.providerResumeId ?? storedProviderResumeId;
+    if (transportResumeId) {
+      effectiveSkipCreate = true;
+    }
   }
 
   // Create session on provider
@@ -1378,6 +1399,9 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
         runtimeType: RUNTIME_TYPES.TRANSPORT,
         providerId: provider.id,
         providerSessionId: runtime.providerSessionId ?? undefined,
+        ...((agentType === 'copilot-sdk' || agentType === 'cursor-headless') && transportResumeId
+          ? { providerResumeId: transportResumeId }
+          : {}),
         ...(agentType === 'claude-code-sdk' && transportResumeId ? { ccSessionId: transportResumeId } : {}),
         ...(agentType === 'codex-sdk' && transportResumeId ? { codexSessionId: transportResumeId } : {}),
         contextNamespace: contextBootstrap.namespace,

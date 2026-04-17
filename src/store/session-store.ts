@@ -78,6 +78,8 @@ export interface SessionRecord extends SessionContextBootstrapState {
   providerId?: string;
   /** Provider-side session ID/key. For OpenClaw this is the OC session key. */
   providerSessionId?: string;
+  /** Provider-side durable resume/session identifier for shared local-sdk providers. */
+  providerResumeId?: string;
   /** Session description — used for persona/system prompt injection. */
   description?: string;
   /** CC env preset name — persisted so respawn can re-inject the same env vars. */

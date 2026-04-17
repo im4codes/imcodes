@@ -26,6 +26,7 @@ function makeMockProvider() {
   let deltaCb: ((sid: string, d: MessageDelta) => void) | null = null;
   let completeCb: ((sid: string, m: AgentMessage) => void) | null = null;
   let errorCb: ((sid: string, e: ProviderError) => void) | null = null;
+  let approvalCb: ((sid: string, req: { id: string; description: string; tool?: string }) => void) | null = null;
 
   const fireDelta = (sid: string) =>
     deltaCb?.(sid, { messageId: 'msg', type: 'text', delta: 'x', role: 'assistant' });
@@ -33,6 +34,8 @@ function makeMockProvider() {
     completeCb?.(sid, { id: 'msg-1', sessionId: sid, kind: 'text', role: 'assistant', content: 'done', timestamp: Date.now(), status: 'complete' });
   const fireError = (sid: string, err?: ProviderError) =>
     errorCb?.(sid, err ?? { code: 'PROVIDER_ERROR', message: 'err', recoverable: false });
+  const fireApproval = (sid: string, req: { id: string; description: string; tool?: string }) =>
+    approvalCb?.(sid, req);
 
   return {
     provider: {
@@ -43,8 +46,10 @@ function makeMockProvider() {
       onDelta: (cb: (sid: string, d: MessageDelta) => void) => { deltaCb = cb; return () => { deltaCb = null; }; },
       onComplete: (cb: (sid: string, m: AgentMessage) => void) => { completeCb = cb; return () => { completeCb = null; }; },
       onError: (cb: (sid: string, e: ProviderError) => void) => { errorCb = cb; return () => { errorCb = null; }; },
+      onApprovalRequest: (cb: (sid: string, req: { id: string; description: string; tool?: string }) => void) => { approvalCb = cb; },
+      respondApproval: vi.fn().mockResolvedValue(undefined),
     } as unknown as TransportProvider,
-    fireDelta, fireComplete, fireError,
+    fireDelta, fireComplete, fireError, fireApproval,
   };
 }
 
@@ -267,6 +272,34 @@ describe('TransportSessionRuntime', () => {
     });
   });
 
+  it('forwards approval requests through runtime callbacks', async () => {
+    const approvalMock = makeMockProvider();
+    const runtimeWithApproval = new TransportSessionRuntime(approvalMock.provider, 'deck_test_brain');
+    const approvalEvents: Array<Record<string, unknown>> = [];
+    runtimeWithApproval.onApprovalRequest = (request) => approvalEvents.push(request as Record<string, unknown>);
+    await runtimeWithApproval.initialize(defaultConfig);
+
+    approvalMock.fireApproval('sess-1', {
+      id: 'approval-1',
+      description: 'Allow file write',
+      tool: 'shell',
+    });
+
+    expect(approvalEvents).toEqual([
+      { id: 'approval-1', description: 'Allow file write', tool: 'shell' },
+    ]);
+  });
+
+  it('forwards approval responses to the provider', async () => {
+    const approvalMock = makeMockProvider();
+    const runtimeWithApproval = new TransportSessionRuntime(approvalMock.provider, 'deck_test_brain');
+    await runtimeWithApproval.initialize(defaultConfig);
+
+    await runtimeWithApproval.respondApproval('approval-2', true);
+
+    expect((approvalMock.provider as any).respondApproval).toHaveBeenCalledWith('sess-1', 'approval-2', true);
+  });
+
   it('refreshes shared-context bootstrap on each dispatch turn instead of freezing launch-time namespace state', async () => {
     const localMock = makeMockProvider();
     const r = new TransportSessionRuntime(localMock.provider, 'x');
@@ -395,7 +428,8 @@ describe('TransportSessionRuntime', () => {
       query: expect.stringContaining('Please recall recent transport memory'),
       namespace: { scope: 'personal', projectId: 'repo-1' },
       repo: 'repo-1',
-      limit: 5,
+      currentEnterpriseId: undefined,
+      limit: 10,
     }));
     expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
       memoryRecall: expect.objectContaining({

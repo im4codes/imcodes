@@ -26,6 +26,7 @@ import {
   isComboMode,
 } from '@shared/p2p-modes.js';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
+import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import type { P2pSavedConfig } from '@shared/p2p-modes.js';
 import { getQwenAuthTier, QWEN_AUTH_TIERS } from '@shared/qwen-auth.js';
 import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/qwen-models.js';
@@ -240,6 +241,13 @@ type PendingP2pConfigSave = {
   timer: ReturnType<typeof setTimeout>;
 };
 
+type PendingTransportApproval = {
+  sessionId: string;
+  requestId: string;
+  description: string;
+  tool?: string;
+};
+
 function appendOptionalAdvancedP2pConfig(extra: Record<string, unknown>, config: P2pSavedConfig): void {
   const advanced = config as P2pSavedConfig & OptionalP2pAdvancedConfig;
   if (advanced.advancedPresetKey) extra.p2pAdvancedPresetKey = advanced.advancedPresetKey;
@@ -393,6 +401,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [skipComboSendConfirm, setSkipComboSendConfirm] = useState(false);
   const [pendingComboSendConfirm, setPendingComboSendConfirm] = useState<PendingComboSendConfirmation | null>(null);
   const [rememberComboSendChoice, setRememberComboSendChoice] = useState(false);
+  const [pendingTransportApproval, setPendingTransportApproval] = useState<PendingTransportApproval | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const modelRef = useRef<HTMLDivElement>(null);
   const autoRef = useRef<HTMLDivElement>(null);
@@ -502,6 +511,54 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setLocalTransportConfig(activeSession?.transportConfig ?? null);
   }, [activeSession?.name, activeSession?.transportConfig]);
 
+  useEffect(() => {
+    if (!activeSession?.runtimeType || activeSession.runtimeType !== 'transport') {
+      setPendingTransportApproval(null);
+    }
+  }, [activeSession?.name, activeSession?.runtimeType]);
+
+  const connected = !!ws?.connected;
+
+  useEffect(() => {
+    if (!ws || !connected || !activeSession || activeSession.runtimeType !== 'transport') return;
+    const sessionId = activeSession.name;
+    try {
+      ws.subscribeTransportSession(sessionId);
+    } catch {
+      // ignore — approval UI will remain inert until the next reconnect
+    }
+    return () => {
+      try {
+        ws.unsubscribeTransportSession(sessionId);
+      } catch {
+        // ignore
+      }
+    };
+  }, [activeSession?.name, activeSession?.runtimeType, connected, ws]);
+
+  useEffect(() => {
+    if (!ws) return;
+    return ws.onMessage((msg) => {
+      if (!activeSession || activeSession.runtimeType !== 'transport') return;
+      if (msg.type === TRANSPORT_MSG.CHAT_APPROVAL && msg.sessionId === activeSession.name) {
+        setPendingTransportApproval({
+          sessionId: msg.sessionId,
+          requestId: msg.requestId,
+          description: msg.description,
+          ...(msg.tool ? { tool: msg.tool } : {}),
+        });
+        return;
+      }
+      if (msg.type === TRANSPORT_MSG.APPROVAL_RESPONSE && msg.sessionId === activeSession.name) {
+        setPendingTransportApproval((current) => (
+          current?.sessionId === msg.sessionId && current.requestId === msg.requestId
+            ? null
+            : current
+        ));
+      }
+    });
+  }, [activeSession, ws]);
+
   // Auto-sync model selector with detected model from terminal/ctx
   // Detection is the real-time truth — always override the selector
   useEffect(() => {
@@ -527,7 +584,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     }
   }, [activeSession?.agentType, activeSession?.qwenModel, qwenModel]);
 
-  const connected = !!ws?.connected;
   const hasSession = !!activeSession;
   // Input only disabled when there's no session at all (can type while disconnected)
   const inputDisabled = !hasSession;
@@ -2324,6 +2380,68 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           )}
         </div>}
       </div>}
+
+      {pendingTransportApproval && activeSession?.runtimeType === 'transport' && (
+        <div
+          class="transport-approval-banner"
+          style={{
+            margin: '0 8px 4px',
+            padding: '6px 8px',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            borderRadius: 8,
+            border: '1px solid rgba(96,165,250,0.35)',
+            background: 'rgba(30,41,59,0.82)',
+            color: '#e2e8f0',
+            fontSize: 12,
+            lineHeight: 1.25,
+          }}
+        >
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontWeight: 600, marginBottom: 2 }}>{t('session.approval.pending')}</div>
+            <div style={{ color: '#cbd5e1', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+              {pendingTransportApproval.tool
+                ? t('session.approval.tool', { tool: pendingTransportApproval.tool })
+                : pendingTransportApproval.description}
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+            <button
+              class="btn btn-secondary"
+              style={{ minWidth: 64, padding: '4px 8px', fontSize: 12 }}
+              disabled={disabled}
+              onClick={() => {
+                if (!ws || !activeSession || activeSession.runtimeType !== 'transport') return;
+                try {
+                  ws.respondTransportApproval(activeSession.name, pendingTransportApproval.requestId, true);
+                  setPendingTransportApproval(null);
+                } catch {
+                  // leave the approval visible so the user can retry
+                }
+              }}
+            >
+              {t('session.approval.allow')}
+            </button>
+            <button
+              class="btn btn-secondary"
+              style={{ minWidth: 64, padding: '4px 8px', fontSize: 12 }}
+              disabled={disabled}
+              onClick={() => {
+                if (!ws || !activeSession || activeSession.runtimeType !== 'transport') return;
+                try {
+                  ws.respondTransportApproval(activeSession.name, pendingTransportApproval.requestId, false);
+                  setPendingTransportApproval(null);
+                } catch {
+                  // leave the approval visible so the user can retry
+                }
+              }}
+            >
+              {t('session.approval.deny')}
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Upload progress bar */}
       {uploading && (

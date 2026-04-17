@@ -129,7 +129,7 @@ export interface ProviderContextPayload {
   assembledMessage: string;
   systemText?: string;
   messagePreamble?: string;
-  attachments?: unknown[];
+  attachments?: TransportAttachment[];
   startupMemory?: TransportMemoryRecallArtifact;
   memoryRecall?: TransportMemoryRecallArtifact;
   context: CompiledAgentContextArtifact;
@@ -287,3 +287,4 @@ export interface ProcessedContextReplicationBody {
   namespace: ContextNamespace;
   projections: ProcessedContextProjection[];
 }
+import type { TransportAttachment } from './transport-attachments.js';

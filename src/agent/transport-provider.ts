@@ -14,6 +14,7 @@ import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/age
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import type { SessionContextBootstrapState } from '../../shared/session-context-bootstrap.js';
 import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
+import type { TransportAttachment } from '../../shared/transport-attachments.js';
 import type {
   ProviderContextPayload,
   ProviderSupportClass,
@@ -269,7 +270,7 @@ export interface TransportProvider {
    * @param message    - The user's text message.
    * @param attachments - Optional file/image attachments (only when capabilities.attachments is true).
    */
-  send(sessionId: string, payload: string | ProviderContextPayload, attachments?: unknown[], extraSystemPrompt?: string): Promise<void>;
+  send(sessionId: string, payload: string | ProviderContextPayload, attachments?: TransportAttachment[], extraSystemPrompt?: string): Promise<void>;
 
   /**
    * Best-effort cancellation of the current in-flight turn for a session.
@@ -373,7 +374,7 @@ export interface TransportProvider {
 
 export function normalizeProviderPayload(
   payload: string | ProviderContextPayload,
-  attachments?: unknown[],
+  attachments?: TransportAttachment[],
   extraSystemPrompt?: string,
 ): ProviderContextPayload {
   if (typeof payload !== 'string') {

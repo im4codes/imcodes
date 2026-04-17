@@ -33,6 +33,7 @@ import {
   PROVIDER_ERROR_CODES,
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
+import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 import logger from '../../util/logger.js';
 
 // TODO: Replace 'your-provider' with the unique stable id for your provider.
@@ -133,7 +134,7 @@ export class YourProvider implements TransportProvider {
    * @param message     - Plain string or ProviderContextPayload.
    * @param attachments - Only present when capabilities.attachments is true.
    */
-  async send(sessionId: string, _message: string, _attachments?: unknown[]): Promise<void> {
+  async send(sessionId: string, _message: string, _attachments?: TransportAttachment[]): Promise<void> {
     if (!this.config) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Not connected', false);
     }

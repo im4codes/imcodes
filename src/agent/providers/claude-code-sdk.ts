@@ -21,6 +21,7 @@ import {
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
+import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 import logger from '../../util/logger.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
@@ -232,7 +233,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     this.emitSessionInfo(sessionId, { effort });
   }
 
-  async send(sessionId: string, payloadOrMessage: string | ProviderContextPayload, _attachments?: unknown[], extraSystemPrompt?: string): Promise<void> {
+  async send(sessionId: string, payloadOrMessage: string | ProviderContextPayload, _attachments?: TransportAttachment[], extraSystemPrompt?: string): Promise<void> {
     if (!this.config) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Claude Code SDK provider not connected', false);
     }

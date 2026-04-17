@@ -20,8 +20,10 @@ export const EMPTY_QUICK_DATA: QuickData = { history: [], sessionHistory: {}, co
 const DEFAULT_COMMANDS: Record<string, string[]> = {
   'claude-code': ['/compact', '/clear', '/usage', '/cost', '/status', '/help'],
   'claude-code-sdk': ['/clear', '/model', '/thinking'],
+  'copilot-sdk': ['/clear', '/model', '/thinking'],
   'codex':       ['/compact', '/help', '/model', '/approval', '/clear'],
   'codex-sdk':   ['/clear', '/model', '/thinking'],
+  'cursor-headless': ['/clear', '/model'],
   'opencode':    ['/compact', '/clear', '/model', '/help'],
   'qwen':        ['/stop', '/clear', '/model', '/thinking'],
   'openclaw':    ['/stop', '/clear', '/thinking'],

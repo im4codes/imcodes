@@ -409,4 +409,62 @@ describe('QuickInputPanel history scope', () => {
     expect(removeCommand).toHaveBeenCalledWith('/custom');
     expect(addCommand).toHaveBeenCalledWith('/updated');
   });
+
+  it('uses explicit default commands for copilot-sdk instead of the claude fallback', () => {
+    render(
+      <QuickInputPanel
+        open
+        onClose={vi.fn()}
+        onSelect={vi.fn()}
+        onSend={vi.fn()}
+        agentType="copilot-sdk"
+        sessionName="session-copilot"
+        data={{ history: [], sessionHistory: {}, commands: [], phrases: [] }}
+        loaded
+        onAddCommand={vi.fn()}
+        onAddPhrase={vi.fn()}
+        onRemoveCommand={vi.fn()}
+        onRemovePhrase={vi.fn()}
+        onRemoveHistory={vi.fn()}
+        onRemoveSessionHistory={vi.fn()}
+        onClearHistory={vi.fn()}
+        onClearSessionHistory={vi.fn()}
+      />,
+    );
+
+    const commandPills = Array.from(document.querySelectorAll('.qp-section-header + .qp-pills .qp-pill-default')).map((el) => el.textContent?.trim());
+    expect(commandPills).toContain('/clear');
+    expect(commandPills).toContain('/model');
+    expect(commandPills).toContain('/thinking');
+    expect(commandPills).not.toContain('/compact');
+  });
+
+  it('uses explicit default commands for cursor-headless instead of the claude fallback', () => {
+    render(
+      <QuickInputPanel
+        open
+        onClose={vi.fn()}
+        onSelect={vi.fn()}
+        onSend={vi.fn()}
+        agentType="cursor-headless"
+        sessionName="session-cursor"
+        data={{ history: [], sessionHistory: {}, commands: [], phrases: [] }}
+        loaded
+        onAddCommand={vi.fn()}
+        onAddPhrase={vi.fn()}
+        onRemoveCommand={vi.fn()}
+        onRemovePhrase={vi.fn()}
+        onRemoveHistory={vi.fn()}
+        onRemoveSessionHistory={vi.fn()}
+        onClearHistory={vi.fn()}
+        onClearSessionHistory={vi.fn()}
+      />,
+    );
+
+    const commandPills = Array.from(document.querySelectorAll('.qp-section-header + .qp-pills .qp-pill-default')).map((el) => el.textContent?.trim());
+    expect(commandPills).toContain('/clear');
+    expect(commandPills).toContain('/model');
+    expect(commandPills).not.toContain('/compact');
+    expect(commandPills).not.toContain('/thinking');
+  });
 });

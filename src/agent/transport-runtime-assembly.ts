@@ -1,4 +1,5 @@
 import type { TransportProvider } from './transport-provider.js';
+import type { TransportAttachment } from '../../shared/transport-attachments.js';
 import { selectRuntimeAuthoredContext } from './authored-context.js';
 import { evaluateContextAuthority } from './context-authority.js';
 import { buildContextDiagnostics } from './context-diagnostics.js';
@@ -20,7 +21,7 @@ export interface TransportRuntimeAssemblyInput {
   description?: string;
   systemPrompt?: string;
   messagePreamble?: string;
-  attachments?: unknown[];
+  attachments?: TransportAttachment[];
   namespace?: ContextNamespace;
   namespaceDiagnostics?: string[];
   remoteProcessedFreshness?: 'fresh' | 'stale' | 'missing';

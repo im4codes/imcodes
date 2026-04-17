@@ -118,7 +118,9 @@
       "claude_code_sdk": "Claude Code SDK",
       "codex_sdk": "Codex SDK",
       "claude_code_cli": "Claude Code CLI",
-      "codex_cli": "Codex CLI"
+      "codex_cli": "Codex CLI",
+      "copilot_sdk": "GitHub Copilot SDK",
+      "cursor_headless": "Cursor Headless"
     },
     "openclaw_not_connected": "no conectado",
     "openclaw_connect_hint": "El gateway de OpenClaw no está conectado. Ejecuta el siguiente comando en tu máquina daemon:",
@@ -194,6 +196,12 @@
       "invalidStoredConfig": "La configuración guardada de supervisión no es válida. La automatización seguirá desactivada hasta que la repares y la guardes.",
       "quickLabel": "Auto",
       "quickTitle": "Modo automático"
+    },
+    "approval": {
+      "pending": "Se requiere aprobación",
+      "allow": "Permitir",
+      "deny": "Denegar",
+      "tool": "{{tool}} requiere aprobación"
     },
     "workingDirPlaceholder": "~/projects/myapp"
   },

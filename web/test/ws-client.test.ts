@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { WsClient } from '../src/ws-client.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
+import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import type { MessageHandler } from '../src/ws-client.js';
 
 // Mock WebSocket implementation
@@ -278,6 +279,49 @@ describe('WsClient', () => {
         client.disconnect();
         vi.useRealTimers();
       }
+    });
+  });
+
+  describe('transport chat subscriptions', () => {
+    it('subscribeTransportSession sends chat.subscribe and replays on reconnect', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      const firstWs = lastWs!;
+
+      client.subscribeTransportSession('transport-session');
+      expect(JSON.parse(firstWs.send.mock.calls.at(-1)[0] as string)).toEqual({
+        type: 'chat.subscribe',
+        sessionId: 'transport-session',
+      });
+
+      firstWs.send.mockClear();
+      firstWs.emit('close');
+      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(0);
+      const secondWs = lastWs!;
+      secondWs.emit('open');
+
+      expect(secondWs.send).toHaveBeenCalledWith(expect.stringContaining('"chat.subscribe"'));
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('respondTransportApproval sends chat.approval_response', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+
+      client.respondTransportApproval('transport-session', 'req-1', true);
+
+      expect(JSON.parse(lastWs!.send.mock.calls[0][0] as string)).toEqual({
+        type: TRANSPORT_MSG.APPROVAL_RESPONSE,
+        sessionId: 'transport-session',
+        requestId: 'req-1',
+        approved: true,
+      });
+      client.disconnect();
     });
   });
 

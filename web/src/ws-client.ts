@@ -8,6 +8,7 @@ import type { TimelineEvent } from '../../src/shared/timeline/types.js';
 import { REPO_MSG } from '@shared/repo-types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
+import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import type {
   FsLsResponse,
   FsReadResponse,
@@ -28,6 +29,8 @@ export type ServerMessage =
   | { type: 'session.idle'; session: string; project: string; agentType: string; label?: string; parentLabel?: string }
   | { type: 'session.notification'; session: string; project: string; title: string; message: string; agentType?: string; label?: string; parentLabel?: string }
   | { type: 'session.tool'; session: string; tool: string | null }
+  | { type: typeof TRANSPORT_MSG.CHAT_APPROVAL; sessionId: string; requestId: string; description: string; tool?: string }
+  | { type: typeof TRANSPORT_MSG.APPROVAL_RESPONSE; sessionId: string; requestId: string; approved: boolean }
   | { type: typeof DAEMON_MSG.RECONNECTED }
   | { type: typeof DAEMON_MSG.DISCONNECTED }
   | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'p2p_active'; activeRunIds?: string[] }
@@ -81,6 +84,8 @@ export type ServerMessage =
   | { type: 'repo.issue_detail_response'; requestId?: string; projectDir: string; detail: any }
   | { type: 'repo.error'; requestId: string; projectDir?: string; error: string }
   | { type: 'repo.detected'; projectDir: string; context: any }
+  | { type: typeof TRANSPORT_MSG.CHAT_APPROVAL; sessionId: string; requestId: string; description: string; tool?: string }
+  | { type: typeof TRANSPORT_MSG.APPROVAL_RESPONSE; sessionId: string; requestId: string; approved: boolean }
   | { type: 'provider.status'; providerId: string; connected: boolean }
   | { type: 'provider.sessions_response'; providerId: string; sessions: Array<{ key: string; displayName?: string; agentId?: string; updatedAt?: number; percentUsed?: number }>; error?: string }
   | {
@@ -133,6 +138,9 @@ export class WsClient {
 
   /** Desired terminal subscription mode per session. Replayed on browser reconnect. */
   private terminalSubscriptions = new Map<string, boolean>();
+
+  /** Desired transport-chat subscriptions per session. Replayed on browser reconnect. */
+  private transportSubscriptions = new Set<string>();
 
   /** Per-session stream reset recovery state. */
   private resetState = new Map<string, {
@@ -224,6 +232,30 @@ export class WsClient {
     this.terminalSubscriptions.delete(sessionName);
     if (!this._connected) return;
     this.send({ type: 'terminal.unsubscribe', session: sessionName });
+  }
+
+  /** Subscribe to transport chat events for a session (history replay + live approval/tool updates). */
+  subscribeTransportSession(sessionId: string): void {
+    if (!sessionId) return;
+    if (this.transportSubscriptions.has(sessionId)) return;
+    this.transportSubscriptions.add(sessionId);
+    if (!this._connected) return;
+    this.send({ type: TRANSPORT_MSG.CHAT_SUBSCRIBE, sessionId });
+  }
+
+  /** Unsubscribe from transport chat events for a session. */
+  unsubscribeTransportSession(sessionId: string): void {
+    if (!sessionId) return;
+    if (!this.transportSubscriptions.has(sessionId)) return;
+    this.transportSubscriptions.delete(sessionId);
+    if (!this._connected) return;
+    this.send({ type: TRANSPORT_MSG.CHAT_UNSUBSCRIBE, sessionId });
+  }
+
+  /** Respond to a transport approval request. */
+  respondTransportApproval(sessionId: string, requestId: string, approved: boolean): void {
+    if (!sessionId || !requestId) return;
+    this.send({ type: TRANSPORT_MSG.APPROVAL_RESPONSE, sessionId, requestId, approved });
   }
 
   sendSessionCommand(command: 'start' | 'stop' | 'send' | 'restart', payload: object = {}): void {
@@ -507,6 +539,13 @@ export class WsClient {
       for (const [session, raw] of this.terminalSubscriptions) {
         try {
           this.send({ type: 'terminal.subscribe', session, raw });
+        } catch {
+          break;
+        }
+      }
+      for (const sessionId of this.transportSubscriptions) {
+        try {
+          this.send({ type: TRANSPORT_MSG.CHAT_SUBSCRIBE, sessionId });
         } catch {
           break;
         }

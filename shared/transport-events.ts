@@ -9,7 +9,7 @@
  * that uniquely identifies the message kind.
  */
 
-import type { ToolCallEvent } from './agent-message.js';
+import type { ToolCallEvent } from "./agent-message.js";
 
 // ── Agent status ──────────────────────────────────────────────────────────────
 
@@ -28,22 +28,30 @@ import type { ToolCallEvent } from './agent-message.js';
  * - `unknown`     — status cannot be determined
  */
 export type TransportAgentStatus =
-  | 'idle'
-  | 'streaming'
-  | 'thinking'
-  | 'tool_running'
-  | 'permission'
-  | 'error'
-  | 'unknown';
+  | "idle"
+  | "streaming"
+  | "thinking"
+  | "tool_running"
+  | "permission"
+  | "error"
+  | "unknown";
 
 /** All valid TransportAgentStatus values for runtime validation. */
 export const TRANSPORT_AGENT_STATUSES = new Set<TransportAgentStatus>([
-  'idle', 'streaming', 'thinking', 'tool_running', 'permission', 'error', 'unknown',
+  "idle",
+  "streaming",
+  "thinking",
+  "tool_running",
+  "permission",
+  "error",
+  "unknown",
 ]);
 
 /** Statuses that indicate the agent is actively doing work. */
 export const TRANSPORT_ACTIVE_STATUSES = new Set<TransportAgentStatus>([
-  'streaming', 'thinking', 'tool_running',
+  "streaming",
+  "thinking",
+  "tool_running",
 ]);
 
 // ── Event type constant object ────────────────────────────────────────────────
@@ -57,21 +65,22 @@ export const TRANSPORT_ACTIVE_STATUSES = new Set<TransportAgentStatus>([
  */
 export const TRANSPORT_EVENT = {
   /** Incremental token/tool delta from the agent. */
-  CHAT_DELTA:    'chat.delta',
+  CHAT_DELTA: "chat.delta",
   /** A message has finished streaming (no more deltas). */
-  CHAT_COMPLETE: 'chat.complete',
+  CHAT_COMPLETE: "chat.complete",
   /** A non-recoverable error occurred for a message. */
-  CHAT_ERROR:    'chat.error',
+  CHAT_ERROR: "chat.error",
   /** Agent status changed (idle / streaming / tool_running / …). */
-  CHAT_STATUS:   'chat.status',
+  CHAT_STATUS: "chat.status",
   /** A tool call started or completed. */
-  CHAT_TOOL:     'chat.tool',
+  CHAT_TOOL: "chat.tool",
   /** Agent is requesting user approval before proceeding. */
-  CHAT_APPROVAL: 'chat.approval',
+  CHAT_APPROVAL: "chat.approval",
 } as const;
 
 /** Union of all TRANSPORT_EVENT values (for exhaustive type checks). */
-export type TransportEventType = (typeof TRANSPORT_EVENT)[keyof typeof TRANSPORT_EVENT];
+export type TransportEventType =
+  (typeof TRANSPORT_EVENT)[keyof typeof TRANSPORT_EVENT];
 
 // ── Browser relay message name constant object ────────────────────────────────
 
@@ -84,19 +93,24 @@ export type TransportEventType = (typeof TRANSPORT_EVENT)[keyof typeof TRANSPORT
  */
 export const TRANSPORT_MSG = {
   /** Browser → Bridge: subscribe to transport events for a session. */
-  CHAT_SUBSCRIBE:   'chat.subscribe',
+  CHAT_SUBSCRIBE: "chat.subscribe",
   /** Browser → Bridge: stop receiving transport events for a session. */
-  CHAT_UNSUBSCRIBE: 'chat.unsubscribe',
+  CHAT_UNSUBSCRIBE: "chat.unsubscribe",
+  /** Bridge → Browser: agent is requesting approval before continuing. */
+  CHAT_APPROVAL: "chat.approval",
+  /** Browser → Daemon: answer a pending transport approval request. */
+  APPROVAL_RESPONSE: "chat.approval_response",
   /** Bridge → Browser: broadcast of agent/provider availability status. */
-  PROVIDER_STATUS:  'provider.status',
+  PROVIDER_STATUS: "provider.status",
   /** Browser → Daemon: request list of remote sessions from a provider. */
-  LIST_SESSIONS:    'provider.list_sessions',
+  LIST_SESSIONS: "provider.list_sessions",
   /** Daemon → Browser: response with remote sessions list. */
-  SESSIONS_RESPONSE:'provider.sessions_response',
+  SESSIONS_RESPONSE: "provider.sessions_response",
 } as const;
 
 /** Union of all TRANSPORT_MSG values. */
-export type TransportMsgType = (typeof TRANSPORT_MSG)[keyof typeof TRANSPORT_MSG];
+export type TransportMsgType =
+  (typeof TRANSPORT_MSG)[keyof typeof TRANSPORT_MSG];
 
 /** All relay message types that should be forwarded from bridge to browser. */
 export const TRANSPORT_RELAY_TYPES = new Set([
@@ -106,6 +120,7 @@ export const TRANSPORT_RELAY_TYPES = new Set([
   TRANSPORT_EVENT.CHAT_STATUS,
   TRANSPORT_EVENT.CHAT_TOOL,
   TRANSPORT_EVENT.CHAT_APPROVAL,
+  TRANSPORT_MSG.APPROVAL_RESPONSE,
   TRANSPORT_MSG.PROVIDER_STATUS,
 ]);
 
@@ -124,7 +139,7 @@ export type TransportEvent =
       /** The incremental text fragment. */
       delta: string;
       /** Whether this delta is a plain text fragment or tool-use input fragment. */
-      deltaType?: 'text' | 'tool_use';
+      deltaType?: "text" | "tool_use";
     }
   | {
       /** The message has finished — no more deltas will follow. */
@@ -162,4 +177,13 @@ export type TransportEvent =
       requestId: string;
       /** Human-readable description of what the agent is asking permission to do. */
       description: string;
+      /** Tool name that triggered the approval request, if available. */
+      tool?: string;
+    }
+  | {
+      /** Browser-originated approval response broadcast back to transport subscribers. */
+      type: typeof TRANSPORT_MSG.APPROVAL_RESPONSE;
+      sessionId: string;
+      requestId: string;
+      approved: boolean;
     };

@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
+import type { ChildProcess } from 'node:child_process';
 
 export function normalizeTransportCwd(cwd?: string): string | undefined {
   if (typeof cwd !== 'string' || !cwd.trim()) return undefined;
@@ -49,6 +50,14 @@ export function resolveBinaryOnWindows(name: string): string {
   return name;
 }
 
+export function resolveBinaryWithWindowsFallbacks(name: string, windowsCandidates: string[] = []): string {
+  if (process.platform !== 'win32') return name;
+  for (const candidate of windowsCandidates) {
+    if (candidate && existsSync(candidate)) return candidate;
+  }
+  return resolveBinaryOnWindows(name);
+}
+
 /** Result of resolving a binary that may be an npm .cmd shim.
  *  When the resolved path is a real .exe, just `{ executable }`.
  *  When it's a Windows .cmd shim, returns the underlying node script so
@@ -92,6 +101,15 @@ export function resolveExecutableForSpawn(name: string): ResolvedExecutable {
   }
   // Fallback: pass through.
   return { executable: resolved, prependArgs: [] };
+}
+
+export function terminateChildProcess(child: ChildProcess, escalationMs = 1_500): void {
+  if (child.killed) return;
+  child.kill('SIGTERM');
+  const timer = setTimeout(() => {
+    if (!child.killed) child.kill('SIGKILL');
+  }, escalationMs);
+  child.once('close', () => clearTimeout(timer));
 }
 
 /** Parse an npm-generated `.cmd` shim and return the absolute path of the

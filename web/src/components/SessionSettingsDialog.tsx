@@ -75,6 +75,8 @@ function labelForBackend(t: (key: string, params?: Record<string, unknown>) => s
     'codex-sdk': 'session.agentType.codex_sdk',
     qwen: 'session.agentType.qwen',
     openclaw: 'session.agentType.openclaw',
+    'copilot-sdk': 'session.agentType.copilot_sdk',
+    'cursor-headless': 'session.agentType.cursor_headless',
   }[backend]);
 }
 
@@ -232,6 +234,8 @@ export function SessionSettingsDialog({
       case 'codex': return t('session.agentType.codex_cli');
       case 'qwen': return t('session.agentType.qwen');
       case 'openclaw': return t('session.agentType.openclaw');
+      case 'copilot-sdk': return t('session.agentType.copilot_sdk');
+      case 'cursor-headless': return t('session.agentType.cursor_headless');
       default: return value;
     }
   };

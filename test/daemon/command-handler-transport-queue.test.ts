@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
+import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 
 const {
   getSessionMock,
@@ -887,5 +888,37 @@ describe('handleWebCommand transport queue behavior', () => {
     await flushAsync();
 
     expect(resizeSessionMock).not.toHaveBeenCalled();
+  });
+
+  it('forwards transport approval responses to the live runtime and rebroadcasts them', async () => {
+    const respondApproval = vi.fn().mockResolvedValue(undefined);
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'copilot-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'provider-route-1',
+      respondApproval,
+    });
+
+    await handleWebCommand({
+      type: TRANSPORT_MSG.APPROVAL_RESPONSE,
+      sessionId: 'deck_transport_brain',
+      requestId: 'approval-1',
+      approved: true,
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(respondApproval).toHaveBeenCalledWith('approval-1', true);
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: TRANSPORT_MSG.APPROVAL_RESPONSE,
+      sessionId: 'deck_transport_brain',
+      requestId: 'approval-1',
+      approved: true,
+    }));
   });
 });

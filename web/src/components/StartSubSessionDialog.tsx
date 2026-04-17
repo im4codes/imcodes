@@ -7,7 +7,7 @@ import type { WsClient } from '../ws-client.js';
 import type { RemoteSession } from '../hooks/useProviderStatus.js';
 import { FileBrowser } from './file-browser-lazy.js';
 import { getUserPref, saveUserPref } from '../api.js';
-import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '@shared/effort-levels.js';
+import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '@shared/effort-levels.js';
 
 interface Props {
   ws: WsClient | null;
@@ -24,6 +24,8 @@ const BASE_AGENT_TYPES = [
   { id: 'claude-code', label: 'Claude Code', icon: '⚡' },
   { id: 'codex-sdk', label: 'Codex SDK', icon: '📦' },
   { id: 'codex', label: 'Codex', icon: '📦' },
+  { id: 'copilot-sdk', label: 'GitHub Copilot SDK', icon: '🐙' },
+  { id: 'cursor-headless', label: 'Cursor Headless', icon: '⌘' },
   { id: 'opencode', label: 'OpenCode', icon: '🔆' },
   { id: 'gemini', label: 'Gemini CLI', icon: '♊' },
   { id: 'qwen', label: 'Qwen Code', icon: '千' },
@@ -142,7 +144,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     if (desc) extra.description = desc;
     if (ccPreset && (type === 'claude-code' || type === 'qwen')) extra.ccPreset = ccPreset;
     if (ccInitPrompt.trim() && type === 'claude-code') extra.ccInitPrompt = ccInitPrompt.trim();
-    if (type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'qwen') extra.thinking = thinking;
+    if (type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'qwen') extra.thinking = thinking;
     onStart(type, selectedShell, cwd || undefined, label || undefined, Object.keys(extra).length > 0 ? extra : undefined);
   };
 
@@ -150,11 +152,13 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     ? CLAUDE_SDK_EFFORT_LEVELS
     : type === 'codex-sdk'
       ? CODEX_SDK_EFFORT_LEVELS
-      : type === 'qwen'
-        ? QWEN_EFFORT_LEVELS
-      : type === 'openclaw'
-        ? OPENCLAW_THINKING_LEVELS
-        : [];
+      : type === 'copilot-sdk'
+        ? COPILOT_SDK_EFFORT_LEVELS
+        : type === 'qwen'
+          ? QWEN_EFFORT_LEVELS
+          : type === 'openclaw'
+            ? OPENCLAW_THINKING_LEVELS
+            : [];
   const supportsCcPreset = type === 'claude-code' || type === 'qwen';
 
   return (
@@ -184,7 +188,11 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                         ? t('session.agentType.claude_code_sdk')
                         : at.id === 'codex-sdk'
                           ? t('session.agentType.codex_sdk')
-                          : at.label}
+                          : at.id === 'copilot-sdk'
+                            ? t('session.agentType.copilot_sdk')
+                            : at.id === 'cursor-headless'
+                              ? t('session.agentType.cursor_headless')
+                              : at.label}
                 </button>
               ))}
             </div>

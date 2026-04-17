@@ -40,7 +40,7 @@ import { appendTransportEvent } from '../../src/daemon/transport-history.js';
 
 import type { TransportProvider } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
-import { TRANSPORT_MSG } from '../../shared/transport-events.js';
+import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
 
 // ── Mock provider factory ────────────────────────────────────────────────────
 
@@ -49,6 +49,7 @@ type CompleteCb = (sessionId: string, message: AgentMessage) => void;
 type ErrorCb = (sessionId: string, error: { code: string; message: string; recoverable: boolean }) => void;
 type ToolCb = (sessionId: string, tool: ToolCallEvent) => void;
 type StatusCb = (sessionId: string, status: { status: string | null; label?: string | null }) => void;
+type ApprovalCb = (sessionId: string, request: { id: string; description: string; tool?: string }) => void;
 
 function makeMockProvider() {
   let deltaCb: DeltaCb | undefined;
@@ -56,6 +57,7 @@ function makeMockProvider() {
   let errorCb: ErrorCb | undefined;
   let toolCb: ToolCb | undefined;
   let statusCb: StatusCb | undefined;
+  let approvalCb: ApprovalCb | undefined;
 
   return {
     provider: {
@@ -64,12 +66,14 @@ function makeMockProvider() {
       onError: (cb: ErrorCb) => { errorCb = cb; return () => { errorCb = undefined; }; },
       onToolCall: (cb: ToolCb) => { toolCb = cb; },
       onStatus: (cb: StatusCb) => { statusCb = cb; return () => { statusCb = undefined; }; },
+      onApprovalRequest: (cb: ApprovalCb) => { approvalCb = cb; },
     } as unknown as TransportProvider,
     fireDelta: (sid: string, delta: MessageDelta) => deltaCb?.(sid, delta),
     fireComplete: (sid: string, msg: AgentMessage) => completeCb?.(sid, msg),
     fireError: (sid: string, err: { code: string; message: string; recoverable: boolean }) => errorCb?.(sid, err),
     fireTool: (sid: string, tool: ToolCallEvent) => toolCb?.(sid, tool),
     fireStatus: (sid: string, status: { status: string | null; label?: string | null }) => statusCb?.(sid, status),
+    fireApproval: (sid: string, request: { id: string; description: string; tool?: string }) => approvalCb?.(sid, request),
   };
 }
 
@@ -798,6 +802,32 @@ describe('transport-relay (timeline-emitter based)', () => {
         { status: null, label: null },
         expect.objectContaining({ source: 'daemon', confidence: 'high' }),
       );
+    });
+  });
+
+  describe('onApprovalRequest', () => {
+    it('broadcasts approval requests to transport subscribers and caches them', async () => {
+      const { provider, fireApproval } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireApproval('sess-approval', {
+        id: 'approval-1',
+        description: 'Allow file write',
+        tool: 'shell',
+      });
+      await Promise.resolve();
+
+      expect(send).toHaveBeenCalledWith(expect.objectContaining({
+        type: TRANSPORT_EVENT.CHAT_APPROVAL,
+        sessionId: 'sess-approval',
+        requestId: 'approval-1',
+        description: 'Allow file write',
+        tool: 'shell',
+      }));
+      expect(appendMock).toHaveBeenCalledWith('sess-approval', expect.objectContaining({
+        type: TRANSPORT_EVENT.CHAT_APPROVAL,
+        requestId: 'approval-1',
+      }));
     });
   });
 });

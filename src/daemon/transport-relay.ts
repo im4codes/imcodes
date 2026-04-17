@@ -7,7 +7,7 @@
  */
 import type { TransportProvider, ProviderError, ProviderStatusUpdate } from '../agent/transport-provider.js';
 import type { MessageDelta, AgentMessage, ToolCallEvent } from '../../shared/agent-message.js';
-import { TRANSPORT_MSG } from '../../shared/transport-events.js';
+import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { resolveSessionName } from '../agent/session-manager.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { appendTransportEvent } from './transport-history.js';
@@ -413,6 +413,24 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       status: status.status,
       ...(status.label !== undefined ? { label: status.label } : {}),
     }, { source: 'daemon', confidence: 'high' });
+  });
+
+  provider.onApprovalRequest?.((providerSid: string, request) => {
+    const sessionName = resolveSessionName(providerSid);
+    if (!sessionName) {
+      logger.debug({ providerSid }, 'transport-relay: unresolved route for approval — dropped');
+      return;
+    }
+
+    const payload = {
+      type: TRANSPORT_EVENT.CHAT_APPROVAL,
+      sessionId: sessionName,
+      requestId: request.id,
+      description: request.description,
+      ...(request.tool ? { tool: request.tool } : {}),
+    } as const;
+    sendToServer?.(payload);
+    void appendTransportEvent(sessionName, payload);
   });
 }
 

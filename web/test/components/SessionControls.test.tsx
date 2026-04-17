@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, fireEvent, cleanup, within, waitFor } from '@testing-library/preact';
+import { render, screen, fireEvent, cleanup, within, waitFor, act } from '@testing-library/preact';
 import { useState } from 'preact/hooks';
 
 const DEFAULT_INNER_WIDTH = 1280;
@@ -56,6 +56,10 @@ vi.mock('react-i18next', () => ({
       if (key === 'session.stop_plain') return 'Stop';
       if (key === 'session.supervision.quickLabel') return 'Auto';
       if (key === 'session.supervision.quickTitle') return 'Auto mode';
+      if (key === 'session.approval.pending') return 'Approval required';
+      if (key === 'session.approval.allow') return 'Allow';
+      if (key === 'session.approval.deny') return 'Deny';
+      if (key === 'session.approval.tool') return `${String(opts?.tool ?? 'tool')} wants approval`;
       if (key === 'common.hide') return 'hide';
       if (key === 'common.show') return 'show';
       const parts = key.split('.');
@@ -160,6 +164,7 @@ import { SessionControls } from '../../src/components/SessionControls.js';
 import type { SessionInfo } from '../../src/types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
+import { TRANSPORT_MSG } from '@shared/transport-events.js';
 
 const flushAsync = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -184,6 +189,9 @@ const makeWs = () => {
     send: vi.fn(),
     sendSessionCommand: vi.fn(),
     sendInput: vi.fn(),
+    subscribeTransportSession: vi.fn(),
+    unsubscribeTransportSession: vi.fn(),
+    respondTransportApproval: vi.fn(),
     connected: true,
     subSessionSetModel: vi.fn(),
     fsListDir: vi.fn(() => 'openspec-request'),
@@ -1955,6 +1963,51 @@ afterEach(() => {
       expect(onSettings).toHaveBeenCalled();
     });
     expect(patchSessionMock).not.toHaveBeenCalled();
+  });
+
+  it('subscribes to active transport chat events and renders approval controls', async () => {
+    const ws = makeWs();
+    const { unmount } = render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({
+          name: 'codex-sdk-session',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(ws.subscribeTransportSession).toHaveBeenCalledWith('codex-sdk-session');
+    await waitFor(() => {
+      expect(ws.onMessage).toHaveBeenCalled();
+    });
+    await flushAsync();
+
+    await act(async () => {
+      for (const call of ws.onMessage.mock.calls) {
+        const handler = call[0] as ((msg: unknown) => void) | undefined;
+        handler?.({
+          type: TRANSPORT_MSG.CHAT_APPROVAL,
+          sessionId: 'codex-sdk-session',
+          requestId: 'approval-1',
+          description: 'Allow file write',
+          tool: 'shell',
+        });
+      }
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('Approval required')).toBeDefined();
+      expect(screen.getByText('shell wants approval')).toBeDefined();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /^Allow$/ }));
+    expect(ws.respondTransportApproval).toHaveBeenCalledWith('codex-sdk-session', 'approval-1', true);
+
+    unmount();
+    expect(ws.unsubscribeTransportSession).toHaveBeenCalledWith('codex-sdk-session');
   });
 
   it('pressing Shift+Enter does not submit', () => {

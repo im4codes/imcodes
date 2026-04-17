@@ -118,7 +118,9 @@
       "claude_code_sdk": "Claude Code SDK",
       "codex_sdk": "Codex SDK",
       "claude_code_cli": "Claude Code CLI",
-      "codex_cli": "Codex CLI"
+      "codex_cli": "Codex CLI",
+      "copilot_sdk": "GitHub Copilot SDK",
+      "cursor_headless": "Cursor Headless"
     },
     "openclaw_not_connected": "未接続",
     "openclaw_connect_hint": "OpenClaw ゲートウェイに接続されていません。デーモンマシンで以下のコマンドを実行してください：",
@@ -194,6 +196,12 @@
       "invalidStoredConfig": "保存済みの監督設定が無効です。修正して保存するまで自動化は無効のままです。",
       "quickLabel": "自動",
       "quickTitle": "自動モード"
+    },
+    "approval": {
+      "pending": "承認が必要",
+      "allow": "許可",
+      "deny": "拒否",
+      "tool": "{{tool}} の承認が必要"
     },
     "workingDirPlaceholder": "~/projects/myapp"
   },

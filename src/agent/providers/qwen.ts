@@ -23,6 +23,7 @@ import {
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
+import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 import { DEFAULT_TRANSPORT_EFFORT, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import logger from '../../util/logger.js';
 import { inferContextWindow } from '../../util/model-context.js';
@@ -311,7 +312,7 @@ export class QwenProvider implements TransportProvider {
   async send(
     sessionId: string,
     payloadOrMessage: string | ProviderContextPayload,
-    _attachments?: unknown[],
+    _attachments?: TransportAttachment[],
     extraSystemPrompt?: string,
     allowResumeFallback = true,
   ): Promise<void> {
