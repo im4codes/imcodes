@@ -63,7 +63,7 @@ describe('memory-search semantic ranking', () => {
     });
 
     const result = await searchLocalMemorySemantic({
-      query: 'bug',
+      query: 'download bug',
       repo: namespace.projectId,
       limit: 2,
     });

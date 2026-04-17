@@ -123,9 +123,11 @@ export function isTrivialRecallQuery(text: string | undefined | null): boolean {
   // CJK: each ideograph/hangul/kana counts as a unit
   const cjkMatches = trimmed.match(/[\u3400-\u9FFF\uF900-\uFAFF\u3040-\u30FF\uAC00-\uD7AF]/gu);
   unitCount += cjkMatches?.length ?? 0;
-  // <= 2 units is trivial (single CJK word like "好的" = 2 chars, but meaningless)
-  if (unitCount <= 2) return true;
-  // Require at least 4 non-whitespace/punctuation characters
+  // Single unit (one word or one CJK char) is always trivial
+  if (unitCount < 2) return true;
+  // Require at least 4 non-whitespace/punctuation characters.
+  // Catches "好的" (2 CJK, 2 chars) but allows "fix bug" (2 words, 6 chars)
+  // and "enterprise bug" (2 words, 13 chars).
   const contentChars = trimmed.replace(/[\s\p{P}]/gu, '').length;
   if (contentChars < 4) return true;
   return false;
