@@ -238,7 +238,7 @@ describe('OC streaming integration: provider → relay → emitter', () => {
     expect(forwarded[3].payload.streaming).toBe(false);
   });
 
-  it('session.state idle is emitted after final assistant.text', () => {
+  it('lifecycle end emits only the final assistant.text and leaves idle transitions to the runtime', () => {
     const runId = 'int-run-idle';
 
     emitAgentEvent({ runId, stream: 'lifecycle', data: { phase: 'start' }, key: 'test:idle' });
@@ -254,7 +254,7 @@ describe('OC streaming integration: provider → relay → emitter', () => {
     );
 
     expect(finalTextIdx).toBeGreaterThanOrEqual(0);
-    expect(idleIdx).toBeGreaterThan(finalTextIdx);
+    expect(idleIdx).toBe(-1);
   });
 
   it('tool stream emits transport tool.call + tool.result timeline events', () => {

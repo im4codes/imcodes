@@ -214,7 +214,7 @@ function makeMockDb() {
           title: entry.title,
         })) as T[];
       }
-      if (s.includes('select id, scope, project_id, projection_class, source_event_ids_json, summary, content_json, updated_at from shared_context_projections where enterprise_id = $1')) {
+      if (s.includes('from shared_context_projections where enterprise_id = $1') && s.includes('select id, scope, project_id, projection_class, source_event_ids_json, summary, content_json, updated_at')) {
         return [...projections.values()]
           .filter((entry) => entry.enterprise_id === params[0])
           .filter((entry) => !s.includes('and project_id = $2') || entry.project_id === params[1])
@@ -233,6 +233,9 @@ function makeMockDb() {
             summary: entry.summary ?? `${entry.project_id} summary`,
             content_json: entry.content_json ?? { note: 'shared memory' },
             updated_at: entry.updated_at ?? Date.now(),
+            hit_count: 0,
+            last_used_at: null,
+            status: 'active',
           })) as T[];
       }
       if (s.includes('select id, version_number, status from shared_context_document_versions where document_id = $1')) {
@@ -851,6 +854,8 @@ describe('shared-agent-context server control plane', () => {
           projectionClass: 'recent_summary',
           sourceEventCount: 2,
           updatedAt: 1700000000500,
+          hitCount: 0,
+          status: 'active',
         },
         {
           id: 'proj-1',
@@ -860,6 +865,8 @@ describe('shared-agent-context server control plane', () => {
           projectionClass: 'recent_summary',
           sourceEventCount: 2,
           updatedAt: 1700000000000,
+          hitCount: 0,
+          status: 'active',
         },
       ],
     });
@@ -970,6 +977,8 @@ describe('shared-agent-context server control plane', () => {
           projectionClass: 'durable_memory_candidate',
           sourceEventCount: 1,
           updatedAt: 1700000000100,
+          hitCount: 0,
+          status: 'active',
         },
       ],
     });
