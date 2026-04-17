@@ -25,8 +25,8 @@ import {
 } from '../shared/supervision-config.js';
 
 describe('supervision config helpers', () => {
-  it('uses 30 seconds as the default supervision timeout', () => {
-    expect(DEFAULT_SUPERVISION_TIMEOUT_MS).toBe(30_000);
+  it('uses 12 seconds as the default supervision timeout (design.md §5)', () => {
+    expect(DEFAULT_SUPERVISION_TIMEOUT_MS).toBe(12_000);
   });
 
   it('normalizes supervisor defaults with backend inference and defaults', () => {

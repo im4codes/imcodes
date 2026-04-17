@@ -48,12 +48,31 @@ export const SUPERVISION_AUDIT_MODES = [
   ...SUPERVISION_AUDIT_MODE_COMBOS,
 ] as SupervisionAuditMode[];
 
-export const SUPERVISION_DEFAULT_TIMEOUT_MS = 30_000;
+// Default supervisor timeout aligns with design.md §5 (12_000 ms). Queue wait time
+// counts against the same budget, so this must stay conservative.
+export const SUPERVISION_DEFAULT_TIMEOUT_MS = 12_000;
 export const SUPERVISION_DEFAULT_MAX_PARSE_RETRIES = 1;
 export const SUPERVISION_DEFAULT_AUDIT_MODE: SupervisionAuditMode = 'audit';
 export const SUPERVISION_DEFAULT_MAX_AUDIT_LOOPS = 2;
 export const SUPERVISION_DEFAULT_PROMPT_VERSION = SUPERVISION_CONTRACT_IDS.DECISION;
 export const SUPERVISION_DEFAULT_TASK_RUN_PROMPT_VERSION = SUPERVISION_CONTRACT_IDS.TASK_RUN_STATUS;
+
+// Reasons surfaced when the supervision layer cannot produce a structured model
+// decision (provider, snapshot, or queue failure). Kept distinct from model-issued
+// ask_human verdicts so UI/UX can present a "repair required" path.
+export const SUPERVISION_UNAVAILABLE_REASONS = {
+  PROVIDER_NOT_CONNECTED: 'provider_not_connected',
+  INVALID_SNAPSHOT: 'invalid_snapshot',
+  QUEUE_TIMEOUT: 'queue_timeout',
+  DECISION_TIMEOUT: 'decision_timeout',
+  INVALID_OUTPUT: 'invalid_output',
+  PROVIDER_ERROR: 'provider_error',
+} as const;
+export type SupervisionUnavailableReason =
+  typeof SUPERVISION_UNAVAILABLE_REASONS[keyof typeof SUPERVISION_UNAVAILABLE_REASONS];
+
+// Backwards-compatible alias: retained because `web/` still imports this name.
+// Prefer `SUPERVISION_DEFAULT_TIMEOUT_MS` in new code.
 export const DEFAULT_SUPERVISION_TIMEOUT_MS = SUPERVISION_DEFAULT_TIMEOUT_MS;
 
 export const TASK_RUN_STATUS_MARKERS = {

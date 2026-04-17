@@ -11,11 +11,15 @@ import logger from '../util/logger.js';
 import {
   SUPERVISION_CONTRACT_IDS,
   SUPERVISION_MODE,
+  SUPERVISION_UNAVAILABLE_REASONS,
   extractSessionSupervisionSnapshot,
   parseAuditVerdictDetailsFromText,
   type SessionSupervisionSnapshot,
+  type SupervisionUnavailableReason,
   type TaskRunTerminalState,
 } from '../../shared/supervision-config.js';
+import { parseModePipeline } from '../../shared/p2p-modes.js';
+import type { P2pAdvancedRound, P2pRoundVerdictPolicy } from '../../shared/p2p-advanced.js';
 import {
   buildSupervisionContinuePrompt,
   buildContextualAutomationAuditPromptAppend,
@@ -42,7 +46,10 @@ interface ActiveTaskRunState {
   lastAssistantText?: string;
   terminalState?: TaskRunTerminalState;
   auditRunId?: string;
-  auditLoops: number;
+  // Number of rework briefs that have been dispatched back into the session
+  // since the run started. `maxAuditLoops = N` permits up to N rework dispatches
+  // per supervised-task-audit-loop spec; see `handleCompletedAudit`.
+  reworkDispatches: number;
   startedAt: number;
 }
 
@@ -223,6 +230,65 @@ function buildAuditRoundPromptAppend(baseline: AuditBaseline, run: ActiveTaskRun
   }
 }
 
+// Expand a user-selected `auditMode` (single mode or combo like `audit>review>plan`)
+// into a concrete P2P advanced-round pipeline. Each step becomes one advanced round;
+// the last non-plan step owns the authoritative `smart_gate` verdict so the existing
+// rework-loop path still fires on REWORK. Plan rounds never produce a verdict — they
+// append context for the auditor to consume.
+// See openspec/changes/supervised-task-automation/specs/session-supervision-modes/spec.md
+// and supervised-task-audit-loop/spec.md for the contract.
+function buildAutomationAuditRounds(
+  auditMode: string,
+  basePromptAppend: string,
+  opts: { timeoutMinutes: number } = { timeoutMinutes: 6 },
+): P2pAdvancedRound[] {
+  const steps = parseModePipeline(auditMode).filter(Boolean);
+  if (steps.length === 0) {
+    // Shouldn't happen — snapshot normalization rejects empty auditMode — but guard
+    // against malformed input so downstream P2P validation gets a useful shape.
+    return [{
+      id: 'implementation_audit',
+      title: 'Implementation Audit',
+      preset: 'implementation_audit',
+      executionMode: 'single_main',
+      permissionScope: 'analysis_only',
+      timeoutMinutes: opts.timeoutMinutes,
+      verdictPolicy: 'smart_gate',
+      promptAppend: basePromptAppend,
+    }];
+  }
+
+  // The authoritative verdict must come from an audit-style round. Plan rounds
+  // accumulate context without voting. Locate the last audit/review index — that's
+  // where we attach `smart_gate`. If the pipeline is only plan rounds (not valid per
+  // SUPERVISION_AUDIT_MODES, but defensively), fall back to the last round.
+  const verdictStepIndex = (() => {
+    for (let i = steps.length - 1; i >= 0; i -= 1) {
+      if (steps[i] === 'audit' || steps[i] === 'review') return i;
+    }
+    return steps.length - 1;
+  })();
+
+  return steps.map((step, idx) => {
+    const verdictPolicy: P2pRoundVerdictPolicy = idx === verdictStepIndex ? 'smart_gate' : 'none';
+    const title = step === 'plan'
+      ? `Plan Round ${idx + 1}`
+      : step === 'review'
+        ? `Implementation Review ${idx + 1}`
+        : `Implementation Audit ${idx + 1}`;
+    return {
+      id: `automation_${step}_${idx + 1}`,
+      title,
+      preset: step === 'plan' ? 'custom' : 'implementation_audit',
+      executionMode: 'single_main',
+      permissionScope: 'analysis_only',
+      timeoutMinutes: opts.timeoutMinutes,
+      verdictPolicy,
+      promptAppend: basePromptAppend,
+    };
+  });
+}
+
 function buildReworkBrief(run: ActiveTaskRunState, verdictText: string): string {
   return buildReworkBriefPrompt(run.sessionName, run.userText, run.lastAssistantText, verdictText);
 }
@@ -338,7 +404,7 @@ class SupervisionAutomation {
       continueLoops: 0,
       evaluating: false,
       sawAssistantOutput: false,
-      auditLoops: 0,
+      reworkDispatches: 0,
       startedAt: Date.now(),
     };
     this.recentTaskCandidates.delete(sessionName);
@@ -499,16 +565,17 @@ class SupervisionAutomation {
     current.phase = 'auditing';
     current.evaluating = false;
     this.emitStatus(current.sessionName, 'supervision_audit_waiting', SUPERVISION_AUDIT_WAITING_LABEL);
-    const auditRound = {
-      id: 'implementation_audit',
-      title: 'Implementation Audit',
-      preset: 'implementation_audit' as const,
-      executionMode: 'single_main' as const,
-      permissionScope: 'analysis_only' as const,
-      timeoutMinutes: 6,
-      verdictPolicy: 'smart_gate' as const,
-      promptAppend: buildAuditRoundPromptAppend(baseline, current),
-    };
+
+    // Build the advanced-round pipeline from the stored auditMode so combo modes
+    // like `audit>plan` and `audit>review>plan` actually expand into multiple rounds.
+    // Prior to this, `modeOverride` was silently ignored whenever `advancedRounds`
+    // was non-empty (see shared/p2p-advanced.ts:349-369), collapsing every combo
+    // mode to a single `implementation_audit` round.
+    const auditRounds = buildAutomationAuditRounds(
+      current.snapshot.auditMode,
+      buildAuditRoundPromptAppend(baseline, current),
+      { timeoutMinutes: 6 },
+    );
 
     try {
       const started = await startP2pRun({
@@ -517,9 +584,11 @@ class SupervisionAutomation {
         userText: baseline.userText,
         fileContents: baseline.fileContents,
         serverLink: this.serverLink,
-        modeOverride: current.snapshot.auditMode,
-        rounds: 1,
-        advancedRounds: [auditRound],
+        // modeOverride is intentionally omitted — resolveP2pRoundPlan ignores it
+        // whenever advancedRounds is non-empty, so leaving it undefined makes the
+        // single source of routing truth explicit.
+        rounds: auditRounds.length,
+        advancedRounds: auditRounds,
       });
       current.auditRunId = started.id;
       this.startAuditPoller(current.sessionName, current.generation, started.id);
@@ -580,13 +649,16 @@ class SupervisionAutomation {
       return;
     }
 
-    current.auditLoops += 1;
+    // `maxAuditLoops = N` means "up to N rework dispatches". Per the audit-loop spec,
+    // we must check BEFORE incrementing so a max of N allows exactly N dispatches.
+    // (Previous code incremented first, which yielded N-1 dispatches in practice.)
     this.clearPoller(state.sessionName);
-    if (current.auditLoops >= current.snapshot.maxAuditLoops) {
+    if (current.reworkDispatches >= current.snapshot.maxAuditLoops) {
       this.emitWarning(state.sessionName, 'Automation audit reached the configured rework-loop limit. Manual review is required.');
       this.activeRuns.delete(state.sessionName);
       return;
     }
+    current.reworkDispatches += 1;
 
     const transportRuntime = getTransportRuntime(state.sessionName);
     if (!transportRuntime) {
@@ -606,10 +678,10 @@ class SupervisionAutomation {
       state.sessionName,
       'user.message',
       { text: reworkBrief, allowDuplicate: true, automation: true, automationKind: 'supervision-rework' },
-      { source: 'daemon', confidence: 'high', eventId: `supervision-rework:${state.generation}:${current.auditLoops}:${randomUUID()}` },
+      { source: 'daemon', confidence: 'high', eventId: `supervision-rework:${state.generation}:${current.reworkDispatches}:${randomUUID()}` },
     );
     try {
-      transportRuntime.send(reworkBrief, `supervision-rework-${state.generation}-${current.auditLoops}`);
+      transportRuntime.send(reworkBrief, `supervision-rework-${state.generation}-${current.reworkDispatches}`);
     } catch (error) {
       logger.warn({ session: state.sessionName, err: error }, 'Supervision rework dispatch failed');
       this.emitWarning(state.sessionName, 'Automation could not send the rework brief back into the session. Manual continuation is required.');

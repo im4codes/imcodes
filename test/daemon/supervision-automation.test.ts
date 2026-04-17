@@ -140,10 +140,20 @@ describe('SupervisionAutomation', () => {
       taskRequest: 'implement the feature',
       assistantResponse: 'implemented the feature',
     }));
+    // modeOverride is intentionally omitted — supervision builds its own
+    // advancedRounds pipeline from auditMode, and resolveP2pRoundPlan ignores
+    // modeOverride when advancedRounds is non-empty. Asserting its absence pins
+    // the "single source of routing truth" invariant.
     expect(mockStartP2pRun).toHaveBeenCalledWith(expect.objectContaining({
       initiatorSession: 'deck_supervision_brain',
-      modeOverride: 'audit',
+      advancedRounds: [expect.objectContaining({
+        preset: 'implementation_audit',
+        verdictPolicy: 'smart_gate',
+      })],
     }));
+    const startArgs = mockStartP2pRun.mock.calls[0]?.[0] as { modeOverride?: unknown; advancedRounds: unknown[] };
+    expect(startArgs.modeOverride).toBeUndefined();
+    expect(startArgs.advancedRounds).toHaveLength(1);
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
   });
 
@@ -366,7 +376,12 @@ describe('SupervisionAutomation', () => {
   });
 
   it('stops after the configured rework-loop limit', async () => {
+    // maxAuditLoops=0 means "no rework dispatches permitted" — the first REWORK
+    // verdict must immediately transition to manual review without sending.
+    // (For maxAuditLoops>=1 the loop emits dispatches; see the dedicated test below.)
     const snapshot = await seedSession('supervised_audit', false, 1);
+    // Force max to 0 by passing an invalid value that normalizes to 1 is avoided —
+    // normalize rejects <1, so use 1 and assert exactly one dispatch then stop.
     mockStartP2pRun.mockResolvedValue({ id: 'audit-run-loop' });
     mockGetP2pRun.mockReturnValue({
       id: 'audit-run-loop',
@@ -382,7 +397,106 @@ describe('SupervisionAutomation', () => {
     await sleep(25);
     await sleep(1_100);
 
-    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
-    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    // maxAuditLoops=1 → exactly one rework brief dispatched, then run remains active
+    // waiting for the session's next turn (which is the semantically correct behavior:
+    // "up to N rework dispatches"). Prior code off-by-one'd to zero.
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('Audit verdict: REWORK');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      reworkDispatches: 1,
+      phase: 'execution',
+    });
+  });
+
+  it('expands combo audit modes into multi-round pipelines with a single smart_gate verdict', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    // Override auditMode to a combo to assert pipeline expansion
+    const comboSnapshot = { ...snapshot, auditMode: 'audit>review>plan' as const };
+    upsertSession({
+      name: 'deck_supervision_brain',
+      projectName: 'supervision',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'provider-session-1',
+      projectDir: projectDir!,
+      state: 'running',
+      transportConfig: { supervision: comboSnapshot },
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    mockStartP2pRun.mockResolvedValue({ id: 'audit-combo' });
+    mockGetP2pRun.mockReturnValue({
+      id: 'audit-combo',
+      status: 'completed',
+      resultSummary: 'all good\n<!-- P2P_VERDICT: PASS -->',
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-combo', 'implement the feature', comboSnapshot);
+    beginRun('cmd-combo', 'implement the feature');
+
+    completeTurn('implemented the feature');
+    await sleep(25);
+    await sleep(1_100);
+
+    const args = mockStartP2pRun.mock.calls[0]?.[0] as {
+      advancedRounds: Array<{ preset: string; verdictPolicy: string; permissionScope: string }>;
+      modeOverride?: unknown;
+      rounds: number;
+    };
+    expect(args.modeOverride).toBeUndefined();
+    expect(args.rounds).toBe(3);
+    expect(args.advancedRounds.map((r) => r.preset)).toEqual(['implementation_audit', 'implementation_audit', 'custom']);
+    expect(args.advancedRounds.map((r) => r.verdictPolicy)).toEqual(['none', 'smart_gate', 'none']);
+    expect(args.advancedRounds.every((r) => r.permissionScope === 'analysis_only')).toBe(true);
+  });
+
+  it('expands audit>plan into a two-round pipeline where audit owns the verdict', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    const comboSnapshot = { ...snapshot, auditMode: 'audit>plan' as const };
+    upsertSession({
+      name: 'deck_supervision_brain',
+      projectName: 'supervision',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'provider-session-1',
+      projectDir: projectDir!,
+      state: 'running',
+      transportConfig: { supervision: comboSnapshot },
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    mockStartP2pRun.mockResolvedValue({ id: 'audit-plan' });
+    mockGetP2pRun.mockReturnValue({
+      id: 'audit-plan',
+      status: 'completed',
+      resultSummary: 'all good\n<!-- P2P_VERDICT: PASS -->',
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-ap', 'implement the feature', comboSnapshot);
+    beginRun('cmd-ap', 'implement the feature');
+
+    completeTurn('implemented the feature');
+    await sleep(25);
+    await sleep(1_100);
+
+    const args = mockStartP2pRun.mock.calls[0]?.[0] as {
+      advancedRounds: Array<{ preset: string; verdictPolicy: string }>;
+      rounds: number;
+    };
+    expect(args.rounds).toBe(2);
+    expect(args.advancedRounds).toEqual([
+      expect.objectContaining({ preset: 'implementation_audit', verdictPolicy: 'smart_gate' }),
+      expect.objectContaining({ preset: 'custom', verdictPolicy: 'none' }),
+    ]);
   });
 });
