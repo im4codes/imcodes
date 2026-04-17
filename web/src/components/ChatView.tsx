@@ -1734,6 +1734,9 @@ const MemoryContextEvent = memo(function MemoryContextEvent({ event }: { event: 
               );
             })}
           </div>
+          <button class="chat-memory-context-collapse-bottom" onClick={() => setExpanded(false)}>
+            {t('chat.memory_context_collapse_bottom')}
+          </button>
         </div>
       )}
     </div>

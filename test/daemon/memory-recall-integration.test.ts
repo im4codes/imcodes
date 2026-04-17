@@ -176,6 +176,26 @@ describe('memory recall integration', () => {
   // ── I.3: Session startup (Gemini) includes processed memory ───────────────
 
   describe('I.3: session startup includes processed memory (Gemini path)', () => {
+
+    it('buildSessionBootstrapContext includes both important and recent startup memories', async () => {
+      searchLocalMemoryMock.mockImplementation((query: { projectionClass?: string }) => {
+        if (query.projectionClass === 'durable_memory_candidate') {
+          return makeSearchResult([
+            makeSearchItem({ id: 'dur-1', projectionClass: 'durable_memory_candidate', summary: 'Persist enterprise binding decisions as durable memory' }),
+          ]);
+        }
+        return makeSearchResult([
+          makeSearchItem({ id: 'rec-1', projectionClass: 'recent_summary', summary: 'Recent fix for transport memory recall cards' }),
+        ]);
+      });
+
+      const { buildSessionBootstrapContext } = await import('../../src/daemon/memory-inject.js');
+      const context = await buildSessionBootstrapContext('/tmp/fake-project', 'my-project');
+
+      expect(context).toContain('[important] Persist enterprise binding decisions as durable memory');
+      expect(context).toContain('[recent] Recent fix for transport memory recall cards');
+    });
+
     it('buildSessionBootstrapContext includes "# Recent project memory" when memories exist', async () => {
       searchLocalMemoryMock.mockReturnValue(makeSearchResult([
         makeSearchItem({ summary: 'Refactored agent driver interface for transport providers' }),

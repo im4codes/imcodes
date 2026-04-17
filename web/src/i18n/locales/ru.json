@@ -54,6 +54,7 @@
     "memory_context_query": "Запрос: {{query}}",
     "memory_context_score": "Оценка {{score}}",
     "memory_context_startup_reason": "Вставлено при запуске сессии",
+    "memory_context_collapse_bottom": "Свернуть",
     "file_change_title": "Изменения файлов ({{count}})",
     "file_change_patch_count": "{{count}} патч(ей)",
     "file_change_provider_claude_code": "Claude Code",

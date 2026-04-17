@@ -13,6 +13,8 @@ import { randomUUID } from 'node:crypto';
 import { timelineEmitter } from './timeline-emitter.js';
 import { buildMemoryContextTimelinePayload } from './memory-context-timeline.js';
 import type { MemorySearchResultItem } from '../context/memory-search.js';
+import { selectStartupMemoryItems } from '../context/startup-memory.js';
+import { buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
 import logger from '../util/logger.js';
 
 const GEMINI_TMP_DIR = join(homedir(), '.gemini', 'tmp');
@@ -151,24 +153,14 @@ Notes:
 export async function readProcessedMemory(projectName: string): Promise<string | null> {
   const items = await readProcessedMemoryItems(projectName);
   if (items.length === 0) return null;
-  const entries = items.map((item) =>
-    `- ${item.summary.split('\n')[0].slice(0, 300)}`,
-  );
-  return `# Recent project memory (reference only)\n<recent-project-memory advisory="true">\n${entries.join('\n')}\n</recent-project-memory>`;
+  return buildStartupProjectMemoryText(items);
 }
 
 export async function readProcessedMemoryItems(projectName: string): Promise<MemorySearchResultItem[]> {
   const normalizedProjectName = projectName.trim();
   if (!normalizedProjectName) return [];
   try {
-    const { searchLocalMemory } = await import('../context/memory-search.js');
-    const result = searchLocalMemory({
-      namespace: { scope: 'personal', projectId: normalizedProjectName },
-      repo: normalizedProjectName,
-      limit: 5,
-      projectionClass: 'recent_summary',
-    });
-    return result.items.filter((item): item is MemorySearchResultItem => item.type === 'processed');
+    return selectStartupMemoryItems({ scope: 'personal', projectId: normalizedProjectName });
   } catch {
     return [];
   }

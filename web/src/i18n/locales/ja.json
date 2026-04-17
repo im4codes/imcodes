@@ -54,6 +54,7 @@
     "memory_context_query": "クエリ: {{query}}",
     "memory_context_score": "スコア {{score}}",
     "memory_context_startup_reason": "セッション起動時に注入",
+    "memory_context_collapse_bottom": "折りたたむ",
     "file_change_title": "ファイル変更 ({{count}})",
     "file_change_patch_count": "{{count}} 件のパッチ",
     "file_change_provider_claude_code": "Claude Code",

@@ -9,8 +9,10 @@ import { GitOriginRepositoryIdentityService } from './repository-identity-servic
 import { detectRepo } from '../repo/detector.js';
 import { fetchBackendSharedContextNamespace } from '../context/backend-context-namespace.js';
 import { getSharedContextRuntimeCredentials } from '../context/shared-context-runtime.js';
-import { searchLocalMemory, type MemorySearchResultItem } from '../context/memory-search.js';
+import type { MemorySearchResultItem } from '../context/memory-search.js';
+import { STARTUP_MEMORY_TOTAL_LIMIT, selectStartupMemoryItems } from '../context/startup-memory.js';
 import { getLocalProcessedFreshness } from '../store/context-store.js';
+import { buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
 
 export interface TransportContextBootstrapInput {
   projectDir?: string;
@@ -109,17 +111,10 @@ export async function resolveTransportContextBootstrap(
 
 export function buildTransportStartupMemory(
   namespace: ContextNamespace,
-  limit = 5,
+  limit = STARTUP_MEMORY_TOTAL_LIMIT,
 ): TransportMemoryRecallArtifact | undefined {
   try {
-    const result = searchLocalMemory({
-      namespace,
-      projectionClass: 'recent_summary',
-      limit,
-    });
-    const items = result.items
-      .filter((item): item is MemorySearchResultItem => item.type === 'processed')
-      .slice(0, limit)
+    const items = selectStartupMemoryItems(namespace, { totalLimit: limit })
       .map(toTransportMemoryRecallItem);
     if (items.length === 0) return undefined;
     return {
@@ -157,8 +152,7 @@ function toTransportMemoryRecallItem(item: MemorySearchResultItem): TransportMem
 }
 
 function renderStartupMemoryText(items: TransportMemoryRecallItem[]): string {
-  const entries = items.map((item) => `- ${item.summary.split('\n')[0].slice(0, 300)}`);
-  return `# Recent project memory (reference only)\n<recent-project-memory advisory=\"true\">\n${entries.join('\n')}\n</recent-project-memory>`;
+  return buildStartupProjectMemoryText(items);
 }
 
 function parseExplicitContextNamespace(

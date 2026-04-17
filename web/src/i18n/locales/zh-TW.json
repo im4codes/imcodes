@@ -54,6 +54,7 @@
     "memory_context_query": "查詢：{{query}}",
     "memory_context_score": "分數 {{score}}",
     "memory_context_startup_reason": "在工作階段啟動時注入",
+    "memory_context_collapse_bottom": "收起",
     "file_change_title": "檔案變更（{{count}}）",
     "file_change_patch_count": "{{count}} 個修補",
     "file_change_provider_claude_code": "Claude Code",

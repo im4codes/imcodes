@@ -317,6 +317,80 @@ describe('resolveTransportContextBootstrap', () => {
     expect(result.startupMemory).toBeUndefined();
   });
 
+
+
+  it('buildTransportStartupMemory keeps up to 7 durable plus 8 recent memories', () => {
+    const now = Date.now();
+    const namespace = {
+      scope: 'personal' as const,
+      projectId: 'github.com/acme/repo-limit',
+    };
+    for (let i = 0; i < 10; i++) {
+      writeProcessedProjection({
+        namespace,
+        class: 'durable_memory_candidate',
+        sourceEventIds: [`evt-durable-${i}`],
+        summary: `Durable memory ${i}`,
+        content: {},
+        createdAt: now - (2000 + i),
+        updatedAt: now - (1000 + i),
+      });
+    }
+    for (let i = 0; i < 12; i++) {
+      writeProcessedProjection({
+        namespace,
+        class: 'recent_summary',
+        sourceEventIds: [`evt-recent-${i}`],
+        summary: `Recent memory ${i}`,
+        content: {},
+        createdAt: now - (500 + i),
+        updatedAt: now - i,
+      });
+    }
+
+    const startup = buildTransportStartupMemory(namespace);
+
+    expect(startup?.items).toHaveLength(15);
+    expect(startup?.items.filter((item) => item.projectionClass === 'durable_memory_candidate')).toHaveLength(7);
+    expect(startup?.items.filter((item) => item.projectionClass === 'recent_summary')).toHaveLength(8);
+    expect(startup?.items.slice(0, 7).every((item) => item.projectionClass === 'durable_memory_candidate')).toBe(true);
+  });
+
+  it('buildTransportStartupMemory mixes important and recent startup memories with durable entries first', () => {
+    const now = Date.now();
+    const namespace = {
+      scope: 'personal' as const,
+      projectId: 'github.com/acme/repo',
+    };
+    writeProcessedProjection({
+      namespace,
+      class: 'recent_summary',
+      sourceEventIds: ['evt-recent'],
+      summary: 'Recent startup memory',
+      content: {},
+      createdAt: now - 100,
+      updatedAt: now - 80,
+    });
+    writeProcessedProjection({
+      namespace,
+      class: 'durable_memory_candidate',
+      sourceEventIds: ['evt-durable'],
+      summary: 'Important architecture memory',
+      content: {},
+      createdAt: now - 200,
+      updatedAt: now - 50,
+    });
+
+    const startup = buildTransportStartupMemory(namespace);
+
+    expect(startup?.items.map((item) => ({ summary: item.summary, projectionClass: item.projectionClass }))).toEqual([
+      { summary: 'Important architecture memory', projectionClass: 'durable_memory_candidate' },
+      { summary: 'Recent startup memory', projectionClass: 'recent_summary' },
+    ]);
+    expect(startup?.injectedText).toContain('[important] Important architecture memory');
+    expect(startup?.injectedText).toContain('[recent] Recent startup memory');
+  });
+
   it('buildTransportStartupMemory filters by full namespace instead of project id only', () => {
     const now = Date.now();
     writeProcessedProjection({

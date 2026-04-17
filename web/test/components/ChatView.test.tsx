@@ -221,6 +221,12 @@ describe('ChatView', () => {
       expect(container.textContent).toContain('chat.memory_context_score');
       expect(container.textContent).toContain('sharedContext.management.memoryRecalls');
       expect(container.textContent).toContain('sharedContext.management.memoryLastRecalled');
+      expect(container.textContent).toContain('chat.memory_context_collapse_bottom');
+    });
+
+    fireEvent.click(getByText('chat.memory_context_collapse_bottom'));
+    await waitFor(() => {
+      expect(container.textContent).not.toContain('Fix websocket reconnect loop');
     });
   });
 

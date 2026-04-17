@@ -54,6 +54,7 @@
     "memory_context_query": "Query: {{query}}",
     "memory_context_score": "Score {{score}}",
     "memory_context_startup_reason": "Injected during session startup",
+    "memory_context_collapse_bottom": "Collapse",
     "file_change_title": "File changes ({{count}})",
     "file_change_patch_count": "{{count}} patch(s)",
     "file_change_provider_claude_code": "Claude Code",

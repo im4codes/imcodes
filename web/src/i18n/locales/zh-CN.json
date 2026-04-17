@@ -54,6 +54,7 @@
     "memory_context_query": "查询：{{query}}",
     "memory_context_score": "分数 {{score}}",
     "memory_context_startup_reason": "在会话启动时注入",
+    "memory_context_collapse_bottom": "收起",
     "file_change_title": "文件变更（{{count}}）",
     "file_change_patch_count": "{{count}} 个补丁",
     "file_change_provider_claude_code": "Claude Code",

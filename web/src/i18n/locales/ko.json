@@ -54,6 +54,7 @@
     "memory_context_query": "질의: {{query}}",
     "memory_context_score": "점수 {{score}}",
     "memory_context_startup_reason": "세션 시작 시 주입됨",
+    "memory_context_collapse_bottom": "접기",
     "file_change_title": "파일 변경 ({{count}})",
     "file_change_patch_count": "{{count}}개 패치",
     "file_change_provider_claude_code": "Claude Code",
