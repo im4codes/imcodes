@@ -44,6 +44,22 @@ RUN mkdir -p /app/updates \
 # Build server TypeScript
 RUN cd server && npm run build
 
+# ── Stage 1.5: Stable embedding-model cache ──────────────────────────────────
+FROM public.ecr.aws/docker/library/node:24-bookworm-slim AS embedding-model
+
+WORKDIR /app
+
+ENV IMCODES_EMBEDDING_CACHE_DIR=/app/embedding-cache
+
+COPY server/package.json server/package-lock.json* ./
+RUN npm ci --omit=dev --ignore-scripts
+
+COPY server/scripts/preload-embedding-model.mjs ./scripts/preload-embedding-model.mjs
+COPY shared/embedding-config.ts ./shared/embedding-config.ts
+
+ARG PRELOAD_EMBEDDING_MODEL=1
+RUN if [ "$PRELOAD_EMBEDDING_MODEL" = "1" ]; then node ./scripts/preload-embedding-model.mjs; fi
+
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────
 FROM public.ecr.aws/docker/library/node:24-bookworm-slim AS runtime
 
@@ -54,6 +70,10 @@ ENV IMCODES_EMBEDDING_CACHE_DIR=/app/embedding-cache
 # Install production deps only
 COPY server/package.json server/package-lock.json* ./
 RUN npm ci --omit=dev --ignore-scripts
+
+# Copy preloaded embedding cache from the stable pre-app layer so normal code/web
+# changes do not invalidate the model artifacts.
+COPY --from=embedding-model /app/embedding-cache ./embedding-cache
 
 # Copy compiled server (rootDir=".." puts output under dist/server/src/ and dist/shared/)
 COPY --from=builder /app/server/dist ./dist
@@ -69,9 +89,6 @@ COPY landing/ ./landing/
 
 # Copy OTA update bundle
 COPY --from=builder /app/updates ./updates
-
-ARG PRELOAD_EMBEDDING_MODEL=1
-RUN if [ "$PRELOAD_EMBEDDING_MODEL" = "1" ]; then node dist/server/src/scripts/preload-embedding-model.js; fi
 
 EXPOSE 3000
 
