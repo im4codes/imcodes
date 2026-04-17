@@ -82,7 +82,51 @@ export interface MemorySearchResult {
  * Semantic search: fetch candidates via substring match, then re-rank by embedding similarity.
  * Falls back to plain searchLocalMemory if embedding model is unavailable.
  */
+/**
+ * Returns true when the query text is too trivial to drive meaningful recall.
+ * Language-agnostic: counts tokens (whitespace + punctuation separated) and
+ * total non-whitespace characters. Covers short continuation words in any
+ * language ("continue", "继续", "好", "ok", "next", single emoji, etc.) without
+ * maintaining a blacklist.
+ */
+export function isTrivialRecallQuery(text: string | undefined | null): boolean {
+  if (!text) return true;
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+  // Count semantic units: space-separated tokens + individual CJK characters.
+  // CJK has no word boundaries, so each ideograph counts as its own unit.
+  // This avoids language-specific blacklists.
+  let unitCount = 0;
+  // Non-CJK tokens (Latin, Cyrillic, etc. — split on whitespace + punctuation)
+  const nonCjk = trimmed.replace(/[\u3400-\u9FFF\uF900-\uFAFF\u3040-\u30FF\uAC00-\uD7AF]/gu, ' ');
+  unitCount += nonCjk.split(/[\s\p{P}]+/u).filter(Boolean).length;
+  // CJK: each ideograph/hangul/kana counts as a unit
+  const cjkMatches = trimmed.match(/[\u3400-\u9FFF\uF900-\uFAFF\u3040-\u30FF\uAC00-\uD7AF]/gu);
+  unitCount += cjkMatches?.length ?? 0;
+  // <= 2 units is trivial (single CJK word like "好的" = 2 chars, but meaningless)
+  if (unitCount <= 2) return true;
+  // Require at least 4 non-whitespace/punctuation characters
+  const contentChars = trimmed.replace(/[\s\p{P}]/gu, '').length;
+  if (contentChars < 4) return true;
+  return false;
+}
+
 export async function searchLocalMemorySemantic(query: MemorySearchQuery): Promise<MemorySearchResult> {
+  // Skip recall entirely for trivial queries (single-word "continue", "好", etc.)
+  // These pollute context with irrelevant top-match-by-default results.
+  if (isTrivialRecallQuery(query.query)) {
+    const emptyStats = computeStats([]);
+    return {
+      items: [],
+      stats: {
+        ...emptyStats,
+        matchedRecords: 0,
+        stagedEventCount: 0,
+        dirtyTargetCount: 0,
+        pendingJobCount: 0,
+      },
+    };
+  }
   // First, get candidates with relaxed text match (or no query filter for broader recall)
   const broadQuery = { ...query, query: undefined, limit: Math.max((query.limit ?? 5) * 4, 40) };
   const candidates = searchLocalMemory(broadQuery);
