@@ -195,6 +195,14 @@ describe('SupervisionAutomation', () => {
     const events = timelineEmitter.replay('deck_supervision_brain', 0).events;
     expect(events).toEqual(expect.arrayContaining([
       expect.objectContaining({
+        type: 'assistant.text',
+        payload: expect.objectContaining({
+          automation: true,
+          automationKind: 'supervision-status',
+          text: 'Auto: checking whether the task is complete...',
+        }),
+      }),
+      expect.objectContaining({
         type: 'agent.status',
         payload: expect.objectContaining({
           status: 'supervision_waiting',
@@ -206,6 +214,47 @@ describe('SupervisionAutomation', () => {
         payload: { status: null, label: null },
       }),
     ]));
+  });
+
+  it('updates an in-flight run to the latest supervision snapshot when Auto settings change live', async () => {
+    const supervised = await seedSession('supervised');
+    const upgraded = normalizeSessionSupervisionSnapshot({
+      ...supervised,
+      mode: 'supervised_audit',
+      auditMode: 'audit>plan',
+    });
+    mockStartP2pRun.mockResolvedValue({ id: 'audit-run-live-update' });
+    mockGetP2pRun.mockReturnValue({
+      id: 'audit-run-live-update',
+      status: 'completed',
+      resultSummary: 'all good\n<!-- P2P_VERDICT: PASS -->',
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-live', 'implement the feature', supervised);
+    supervisionAutomation.applySnapshotUpdate('deck_supervision_brain', upgraded);
+    beginRun('cmd-live', 'implement the feature');
+
+    completeTurn('implemented the feature');
+    await sleep(25);
+    await sleep(1_100);
+
+    expect(mockStartP2pRun).toHaveBeenCalledWith(expect.objectContaining({
+      advancedRounds: [
+        expect.objectContaining({ preset: 'implementation_audit', verdictPolicy: 'smart_gate' }),
+        expect.objectContaining({ preset: 'custom', verdictPolicy: 'none' }),
+      ],
+    }));
+  });
+
+  it('cancels active automation immediately when supervision is turned off live', async () => {
+    const snapshot = await seedSession('supervised');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-off', 'implement the feature', snapshot);
+
+    supervisionAutomation.applySnapshotUpdate('deck_supervision_brain', null);
+
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
   });
 
   it('returns control to the human when the completion decision asks for human input', async () => {
@@ -331,6 +380,20 @@ describe('SupervisionAutomation', () => {
       'finish openspec/changes/supervised-task-automation implementation',
       snapshot,
     );
+    timelineEmitter.emit('deck_supervision_brain', 'file.change', {
+      batch: {
+        provider: 'codex-sdk',
+        patches: [{
+          filePath: 'src/demo.ts',
+          operation: 'update',
+          confidence: 'exact',
+          unifiedDiff: '@@ -1 +1 @@\n-console.log(\"old\")\n+console.log(\"new\")',
+        }],
+      },
+    });
+    timelineEmitter.emit('deck_supervision_brain', 'tool.result', {
+      text: 'npm test\nPASS src/demo.test.ts',
+    });
     beginRun('cmd-4', 'finish openspec/changes/supervised-task-automation implementation');
 
     completeTurn('implemented the change');
@@ -339,6 +402,10 @@ describe('SupervisionAutomation', () => {
 
     expect(mockStartP2pRun).toHaveBeenCalledWith(expect.objectContaining({
       userText: expect.stringContaining('OpenSpec implementation audit for change: supervised-task-automation'),
+      fileContents: expect.arrayContaining([
+        expect.objectContaining({ path: 'changed-files.txt', content: expect.stringContaining('src/demo.ts') }),
+        expect.objectContaining({ path: 'validation-output.txt', content: expect.stringContaining('PASS src/demo.test.ts') }),
+      ]),
       advancedRounds: [expect.objectContaining({
         promptAppend: expect.stringContaining('Do not rerun discussion or proposal phases.'),
       })],

@@ -1,5 +1,9 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { normalizeSessionSupervisionSnapshot, SUPERVISION_MODE } from '../../shared/supervision-config.js';
+import {
+  normalizeSessionSupervisionSnapshot,
+  SUPERVISION_MODE,
+  SUPERVISION_UNAVAILABLE_REASONS,
+} from '../../shared/supervision-config.js';
 import { SupervisionBroker, parseSupervisionDecision } from '../../src/daemon/supervision-broker.js';
 import type { TransportProvider, ProviderError, SessionConfig } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
@@ -81,6 +85,12 @@ describe('parseSupervisionDecision', () => {
       reason: 'keep going',
       confidence: 0.1,
     });
+  });
+
+  it('rejects prose-wrapped JSON and invalid confidence values', () => {
+    expect(parseSupervisionDecision('Decision:\n{"decision":"complete","reason":"ok","confidence":0.9}')).toBeNull();
+    expect(parseSupervisionDecision('{"decision":"complete","reason":"ok"}')).toBeNull();
+    expect(parseSupervisionDecision('{"decision":"complete","reason":"ok","confidence":1.1}')).toBeNull();
   });
 });
 
@@ -244,6 +254,7 @@ describe('SupervisionBroker', () => {
 
     expect(result.decision).toBe('ask_human');
     expect(result.reason).toMatch(/invalid supervisor decision|supervision/i);
+    expect(result.unavailableReason).toBe(SUPERVISION_UNAVAILABLE_REASONS.INVALID_OUTPUT);
     expect(provider.send).toHaveBeenCalledTimes(2);
   });
 
@@ -296,6 +307,7 @@ describe('SupervisionBroker', () => {
       decision: 'ask_human',
       reason: 'invalid supervision snapshot',
       confidence: 0,
+      unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.INVALID_SNAPSHOT,
     });
   });
 
@@ -350,6 +362,7 @@ describe('SupervisionBroker', () => {
 
     expect(result.decision).toBe('ask_human');
     expect(result.reason).toMatch(/timeout/i);
+    expect(result.unavailableReason).toBe(SUPERVISION_UNAVAILABLE_REASONS.DECISION_TIMEOUT);
     expect(provider.cancel).toHaveBeenCalled();
     vi.useRealTimers();
   });
@@ -401,8 +414,39 @@ describe('SupervisionBroker', () => {
     await vi.advanceTimersByTimeAsync(50);
 
     await expect(first).resolves.toMatchObject({ decision: 'complete' });
-    await expect(second).resolves.toMatchObject({ decision: 'ask_human' });
-    await expect(second).resolves.toHaveProperty('reason');
+    await expect(second).resolves.toMatchObject({
+      decision: 'ask_human',
+      unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.QUEUE_TIMEOUT,
+    });
     vi.useRealTimers();
+  });
+
+  it('classifies provider-side failures with the shared unavailable reason enum', async () => {
+    const provider = new FakeProvider([]);
+    const broker = new SupervisionBroker({
+      resolveProvider: async () => provider,
+    });
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk',
+      model: 'gpt-5.3-codex-spark',
+      timeoutMs: 2_000,
+      promptVersion: 'supervision_decision_v1',
+      maxParseRetries: 1,
+      auditMode: 'audit',
+      maxAuditLoops: 2,
+      taskRunPromptVersion: 'task_run_status_v1',
+    });
+
+    const result = await broker.decide({
+      snapshot,
+      taskRequest: 'Implement the task',
+      assistantResponse: 'Partial output',
+    });
+
+    expect(result).toMatchObject({
+      decision: 'ask_human',
+      unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
+    });
   });
 });

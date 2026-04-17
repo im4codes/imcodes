@@ -5,7 +5,9 @@ import type { SharedContextRuntimeBackend } from '../../shared/context-types.js'
 import {
   SUPERVISION_DEFAULT_TIMEOUT_MS,
   SUPERVISION_MODE,
+  SUPERVISION_UNAVAILABLE_REASONS,
   type SessionSupervisionSnapshot,
+  type SupervisionUnavailableReason,
 } from '../../shared/supervision-config.js';
 import {
   buildSupervisionDecisionPrompt,
@@ -18,6 +20,7 @@ export interface SupervisionDecision {
   decision: SupervisionDecisionKind;
   reason: string;
   confidence: number;
+  unavailableReason?: SupervisionUnavailableReason;
 }
 
 export interface SupervisionBrokerRequest {
@@ -34,27 +37,19 @@ export interface SupervisionBrokerDeps {
 }
 
 const DECISIONS = new Set<SupervisionDecisionKind>(['complete', 'continue', 'ask_human']);
+const MIN_SUPERVISION_EXECUTION_BUDGET_MS = 5;
 
-function clampConfidence(value: unknown): number {
-  return typeof value === 'number' && Number.isFinite(value)
-    ? Math.min(1, Math.max(0, value))
-    : 0;
-}
-
-function extractCandidateJson(text: string): string | null {
+function extractRawOrFencedJson(text: string): string | null {
   const trimmed = text.trim();
   if (!trimmed) return null;
   if (trimmed.startsWith('{') && trimmed.endsWith('}')) return trimmed;
   const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
   if (fenced?.[1]) return fenced[1].trim();
-  const firstBrace = trimmed.indexOf('{');
-  const lastBrace = trimmed.lastIndexOf('}');
-  if (firstBrace >= 0 && lastBrace > firstBrace) return trimmed.slice(firstBrace, lastBrace + 1);
   return null;
 }
 
 export function parseSupervisionDecision(text: string): SupervisionDecision | null {
-  const json = extractCandidateJson(text);
+  const json = extractRawOrFencedJson(text);
   if (!json) return null;
   let parsed: unknown;
   try {
@@ -66,15 +61,18 @@ export function parseSupervisionDecision(text: string): SupervisionDecision | nu
   const record = parsed as Record<string, unknown>;
   if (!DECISIONS.has(record.decision as SupervisionDecisionKind)) return null;
   if (typeof record.reason !== 'string' || !record.reason.trim()) return null;
+  if (typeof record.confidence !== 'number' || !Number.isFinite(record.confidence) || record.confidence < 0 || record.confidence > 1) return null;
   return {
     decision: record.decision as SupervisionDecisionKind,
     reason: record.reason.trim(),
-    confidence: clampConfidence(record.confidence),
+    confidence: record.confidence,
   };
 }
 
-export function askHuman(reason: string): SupervisionDecision {
-  return { decision: 'ask_human', reason, confidence: 0 };
+export function askHuman(reason: string, unavailableReason?: SupervisionUnavailableReason): SupervisionDecision {
+  return unavailableReason
+    ? { decision: 'ask_human', reason, confidence: 0, unavailableReason }
+    : { decision: 'ask_human', reason, confidence: 0 };
 }
 
 export class SupervisionBroker {
@@ -93,7 +91,7 @@ export class SupervisionBroker {
       return askHuman('supervision disabled');
     }
     if (!snapshot.backend || !snapshot.model) {
-      return askHuman('invalid supervision snapshot');
+      return askHuman('invalid supervision snapshot', SUPERVISION_UNAVAILABLE_REASONS.INVALID_SNAPSHOT);
     }
 
     const startedAt = this.now();
@@ -106,17 +104,22 @@ export class SupervisionBroker {
 
     await previous.catch(() => {});
     const elapsed = this.now() - startedAt;
-    if (elapsed >= timeoutMs) {
+    const remainingBudget = timeoutMs - elapsed;
+    if (elapsed >= timeoutMs || remainingBudget <= MIN_SUPERVISION_EXECUTION_BUDGET_MS) {
       release();
       if (this.queueChains.get(key) === current) this.queueChains.delete(key);
-      return askHuman('supervision queue timeout');
+      return askHuman('supervision queue timeout', SUPERVISION_UNAVAILABLE_REASONS.QUEUE_TIMEOUT);
     }
 
     try {
       const provider = await this.resolveProvider(snapshot.backend);
-      return await this.evaluateWithProvider(provider, request, timeoutMs - elapsed, snapshot.model, request.cwd);
+      return await this.evaluateWithProvider(provider, request, remainingBudget, snapshot.model, request.cwd);
     } catch (error) {
-      return askHuman(error instanceof Error ? error.message : String(error));
+      const message = error instanceof Error ? error.message : String(error);
+      const unavailableReason = (error && typeof error === 'object' && 'supervisionUnavailableReason' in error
+        ? (error as { supervisionUnavailableReason?: SupervisionUnavailableReason }).supervisionUnavailableReason
+        : undefined) ?? SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_NOT_CONNECTED;
+      return askHuman(message, unavailableReason);
     } finally {
       release();
       if (this.queueChains.get(key) === current) this.queueChains.delete(key);
@@ -160,7 +163,7 @@ export class SupervisionBroker {
         parsed = parseSupervisionDecision(output);
         if (parsed) return parsed;
       }
-      return askHuman('invalid supervisor decision');
+      return askHuman('invalid supervisor decision', SUPERVISION_UNAVAILABLE_REASONS.INVALID_OUTPUT);
     } finally {
       await provider.endSession(providerSessionId).catch(() => {});
     }
@@ -184,11 +187,11 @@ export class SupervisionBroker {
       }));
       cleanups.push(provider.onError((sid, error: ProviderError) => {
         if (sid !== providerSessionId) return;
-        finish(() => reject(new Error(error.message)));
+        finish(() => reject(Object.assign(new Error(error.message), { supervisionUnavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR })));
       }));
       const timeout = setTimeout(() => {
         void provider.cancel?.(providerSessionId).catch(() => {});
-        finish(() => reject(new Error('supervision timeout')));
+        finish(() => reject(Object.assign(new Error('supervision timeout'), { supervisionUnavailableReason: SUPERVISION_UNAVAILABLE_REASONS.DECISION_TIMEOUT })));
       }, timeoutMs);
       cleanups.push(() => clearTimeout(timeout));
     });

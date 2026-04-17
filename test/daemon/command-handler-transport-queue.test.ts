@@ -14,6 +14,8 @@ const {
   terminalRequestSnapshotMock,
   supervisionDecideMock,
   queueTaskIntentMock,
+  registerTaskIntentMock,
+  applySnapshotUpdateMock,
   updateQueuedTaskIntentMock,
   removeQueuedTaskIntentMock,
 } = vi.hoisted(() => ({
@@ -29,6 +31,8 @@ const {
   terminalRequestSnapshotMock: vi.fn(),
   supervisionDecideMock: vi.fn(async () => ({ decision: 'complete', reason: 'ok', confidence: 0.9 })),
   queueTaskIntentMock: vi.fn(),
+  registerTaskIntentMock: vi.fn(),
+  applySnapshotUpdateMock: vi.fn(),
   updateQueuedTaskIntentMock: vi.fn(),
   removeQueuedTaskIntentMock: vi.fn(),
 }));
@@ -157,9 +161,10 @@ vi.mock('../../src/daemon/supervision-automation.js', () => ({
     setServerLink: vi.fn(),
     cancelSession: vi.fn(),
     queueTaskIntent: queueTaskIntentMock,
+    registerTaskIntent: registerTaskIntentMock,
+    applySnapshotUpdate: applySnapshotUpdateMock,
     updateQueuedTaskIntent: updateQueuedTaskIntentMock,
     removeQueuedTaskIntent: removeQueuedTaskIntentMock,
-    registerTaskIntent: vi.fn(),
   },
 }));
 
@@ -623,7 +628,7 @@ describe('handleWebCommand transport queue behavior', () => {
     }));
   });
 
-  it('tracks eligible supervised task messages without rewriting the outbound text', async () => {
+  it('registers eligible supervised task messages immediately when the transport send dispatches now', async () => {
     const transportSend = vi.fn(() => 'sent');
     getSessionMock.mockReturnValue({
       name: 'deck_transport_brain',
@@ -661,11 +666,48 @@ describe('handleWebCommand transport queue behavior', () => {
     await flushAsync();
 
     expect(transportSend).toHaveBeenCalledWith('implement the feature', 'cmd-heavy');
-    expect(queueTaskIntentMock).toHaveBeenCalledWith(
+    expect(registerTaskIntentMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'cmd-heavy',
       'implement the feature',
       expect.objectContaining({ mode: 'supervised_audit' }),
+    );
+    expect(queueTaskIntentMock).not.toHaveBeenCalled();
+  });
+
+  it('updates live supervision state when the browser patches transportConfig', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+      transportConfig: null,
+    });
+
+    handleWebCommand({
+      type: DAEMON_COMMAND_TYPES.SESSION_UPDATE_TRANSPORT_CONFIG,
+      sessionName: 'deck_transport_brain',
+      transportConfig: {
+        supervision: {
+          mode: 'supervised',
+          backend: 'codex-sdk',
+          model: 'gpt-5.3-codex-spark',
+          timeoutMs: 12_000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+        },
+      },
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(applySnapshotUpdateMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      expect.objectContaining({
+        mode: 'supervised',
+        backend: 'codex-sdk',
+      }),
     );
   });
 

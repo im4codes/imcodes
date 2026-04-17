@@ -1920,6 +1920,43 @@ afterEach(() => {
     expect(patchSessionMock).not.toHaveBeenCalled();
   });
 
+  it('falls back to Settings when heavy mode snapshot is present but audit config is invalid', async () => {
+    const ws = makeWs();
+    const onSettings = vi.fn();
+    render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({
+          name: 'codex-sdk-session',
+          state: 'idle',
+          transportConfig: {
+            supervision: {
+              mode: 'supervised',
+              backend: 'codex-sdk',
+              model: 'gpt-5.4',
+              timeoutMs: 12000,
+              promptVersion: 'supervision_decision_v1',
+              maxParseRetries: 1,
+              auditMode: 'audit',
+              maxAuditLoops: 0,
+            },
+          },
+        })}
+        onSettings={onSettings}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /^Auto$/ }));
+    fireEvent.click(screen.getByRole('button', { name: /supervised_audit$/i }));
+
+    await waitFor(() => {
+      expect(onSettings).toHaveBeenCalled();
+    });
+    expect(patchSessionMock).not.toHaveBeenCalled();
+  });
+
   it('pressing Shift+Enter does not submit', () => {
     const ws = makeWs();
     render(<SessionControls ws={ws as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);

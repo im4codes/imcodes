@@ -26,6 +26,7 @@ import {
   buildOpenSpecAutomationAuditPromptAppend,
   buildReworkBriefPrompt,
 } from './supervision-prompts.js';
+import { TIMELINE_EVENT_FILE_CHANGE, type FileChangePatch } from '../../shared/file-change.js';
 
 type TaskRunPhase = 'execution' | 'auditing';
 
@@ -77,6 +78,11 @@ interface AuditBaseline {
   changeDir?: string;
 }
 
+interface TimelineAuditArtifacts {
+  changedFiles: Array<{ path: string; content: string }>;
+  validationOutputs: Array<{ path: string; content: string }>;
+}
+
 type DirEntryLike = {
   name: string;
   isDirectory(): boolean;
@@ -85,6 +91,25 @@ type DirEntryLike = {
 
 function trimString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function formatUnavailableReason(reason: SupervisionUnavailableReason | undefined): string | null {
+  switch (reason) {
+    case SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_NOT_CONNECTED:
+      return 'Automation could not reach the configured supervisor provider. Manual continuation is required.';
+    case SUPERVISION_UNAVAILABLE_REASONS.INVALID_SNAPSHOT:
+      return 'Automation configuration is invalid. Repair the Auto settings before continuing.';
+    case SUPERVISION_UNAVAILABLE_REASONS.QUEUE_TIMEOUT:
+      return 'Automation timed out waiting for supervisor capacity. Manual continuation is required.';
+    case SUPERVISION_UNAVAILABLE_REASONS.DECISION_TIMEOUT:
+      return 'Automation timed out waiting for a supervisor decision. Manual continuation is required.';
+    case SUPERVISION_UNAVAILABLE_REASONS.INVALID_OUTPUT:
+      return 'Automation could not parse a valid supervisor decision. Manual continuation is required.';
+    case SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR:
+      return 'Automation failed because the supervisor provider returned an error. Manual continuation is required.';
+    default:
+      return null;
+  }
 }
 
 async function fileExists(filePath: string): Promise<boolean> {
@@ -130,6 +155,78 @@ async function readMarkdownTree(root: string, maxFiles = 50): Promise<Array<{ pa
   return results;
 }
 
+function stringifyAuditValue(value: unknown): string | null {
+  if (typeof value === 'string') return value.trim() || null;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) {
+    const parts = value
+      .map((entry) => stringifyAuditValue(entry))
+      .filter((entry): entry is string => !!entry);
+    return parts.length > 0 ? parts.join('\n') : null;
+  }
+  if (value && typeof value === 'object') {
+    try {
+      const text = JSON.stringify(value, null, 2);
+      return text === '{}' ? null : text;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function summarizeFileChangePatch(patch: FileChangePatch): string {
+  const header = [
+    `${patch.operation.toUpperCase()} ${patch.filePath}`,
+    patch.oldPath ? `(from ${patch.oldPath})` : '',
+    `[${patch.confidence}]`,
+  ].filter(Boolean).join(' ');
+  const body = patch.unifiedDiff
+    ?? patch.afterText
+    ?? patch.beforeText
+    ?? stringifyAuditValue(patch.raw)
+    ?? '(no diff payload)';
+  return `${header}\n${body}`.trim();
+}
+
+function collectTimelineAuditArtifacts(sessionName: string): TimelineAuditArtifacts {
+  const events = timelineEmitter.replay(sessionName, 0).events.slice(-200);
+  const changedFileEntries: string[] = [];
+  const validationEntries: string[] = [];
+
+  for (const event of events) {
+    if (event.type === TIMELINE_EVENT_FILE_CHANGE) {
+      const batch = event.payload.batch as { patches?: FileChangePatch[] } | undefined;
+      for (const patch of batch?.patches ?? []) {
+        changedFileEntries.push(summarizeFileChangePatch(patch));
+      }
+      continue;
+    }
+    if (event.type === 'tool.result') {
+      const text = stringifyAuditValue(
+        event.payload.output
+        ?? event.payload.result
+        ?? event.payload.text
+        ?? event.payload.content,
+      );
+      if (text) validationEntries.push(text);
+      continue;
+    }
+    if (event.type === 'command.ack' && typeof event.payload.error === 'string' && event.payload.error.trim()) {
+      validationEntries.push(`Command error: ${event.payload.error.trim()}`);
+    }
+  }
+
+  return {
+    changedFiles: changedFileEntries.length > 0
+      ? [{ path: 'changed-files.txt', content: changedFileEntries.join('\n\n---\n\n') }]
+      : [],
+    validationOutputs: validationEntries.length > 0
+      ? [{ path: 'validation-output.txt', content: validationEntries.join('\n\n---\n\n') }]
+      : [],
+  };
+}
+
 function resolveReferencedOpenSpecChangeName(
   run: ActiveTaskRunState,
   changeNames: string[],
@@ -147,6 +244,7 @@ function resolveReferencedOpenSpecChangeName(
 }
 
 async function resolveAuditBaseline(sessionName: string, run: ActiveTaskRunState): Promise<AuditBaseline> {
+  const timelineArtifacts = collectTimelineAuditArtifacts(sessionName);
   const record = getSession(sessionName);
   const projectDir = record?.projectDir?.trim();
   const openspecChangesDir = projectDir ? path.join(projectDir, 'openspec', 'changes') : undefined;
@@ -185,7 +283,7 @@ async function resolveAuditBaseline(sessionName: string, run: ActiveTaskRunState
     return {
       kind: 'openspec',
       changeDir: candidate.dir,
-      fileContents: candidate.mdFiles,
+      fileContents: [...candidate.mdFiles, ...timelineArtifacts.changedFiles, ...timelineArtifacts.validationOutputs],
       userText: [
         `OpenSpec implementation audit for change: ${changeName}`,
         `Audit verdict contract: ${SUPERVISION_CONTRACT_IDS.OPENSPEC_IMPLEMENTATION_AUDIT}`,
@@ -209,7 +307,11 @@ async function resolveAuditBaseline(sessionName: string, run: ActiveTaskRunState
   return {
     kind: 'contextual',
     userText: summary,
-    fileContents: [{ path: 'contextual-audit-summary.md', content: summary }],
+    fileContents: [
+      { path: 'contextual-audit-summary.md', content: summary },
+      ...timelineArtifacts.changedFiles,
+      ...timelineArtifacts.validationOutputs,
+    ],
   };
 }
 
@@ -316,6 +418,15 @@ class SupervisionAutomation {
     );
   }
 
+  private emitAutomationNote(sessionName: string, text: string, kind: string): void {
+    timelineEmitter.emit(
+      sessionName,
+      'assistant.text',
+      { text, streaming: false, automation: true, automationKind: kind, memoryExcluded: true },
+      { source: 'daemon', confidence: 'high', eventId: `supervision-note:${kind}:${randomUUID()}` },
+    );
+  }
+
   private emitStatus(sessionName: string, status: string, label: string): void {
     timelineEmitter.emit(
       sessionName,
@@ -357,6 +468,21 @@ class SupervisionAutomation {
     this.recentTaskCandidates.delete(sessionName);
     this.latestAssistantTexts.delete(sessionName);
     this.clearStatus(sessionName);
+  }
+
+  applySnapshotUpdate(sessionName: string, snapshot: SessionSupervisionSnapshot | null | undefined): void {
+    if (!snapshot || snapshot.mode === SUPERVISION_MODE.OFF) {
+      this.cancelSession(sessionName);
+      return;
+    }
+    const active = this.activeRuns.get(sessionName);
+    if (active) {
+      active.snapshot = snapshot;
+    }
+    const pending = this.pendingTaskIntents.get(sessionName);
+    if (pending) {
+      this.pendingTaskIntents.set(sessionName, { ...pending, snapshot });
+    }
   }
 
   queueTaskIntent(
@@ -438,6 +564,7 @@ class SupervisionAutomation {
     }
 
     if (event.type === 'assistant.text' && isFinalAssistantPayload(event.payload)) {
+      if (event.payload.automation === true) return;
       const text = trimString(event.payload.text) ?? '';
       if (!text) return;
       this.latestAssistantTexts.set(event.sessionId, { text, sequence });
@@ -483,6 +610,7 @@ class SupervisionAutomation {
           return;
         }
         this.emitStatus(run.sessionName, 'supervision_waiting', SUPERVISION_WAITING_LABEL);
+        this.emitAutomationNote(run.sessionName, 'Auto: checking whether the task is complete...', 'supervision-status');
         run.evaluating = true;
         void this.evaluateExecutionTurn(run).catch((error) => {
           logger.warn({ session: run.sessionName, err: error }, 'Supervision execution evaluation failed');
@@ -541,7 +669,8 @@ class SupervisionAutomation {
       }
       case 'ask_human':
       default: {
-        this.emitWarning(run.sessionName, `Automation returned control to the human: ${decision.reason}`);
+        const unavailableText = formatUnavailableReason(decision.unavailableReason);
+        this.emitWarning(run.sessionName, unavailableText ?? `Automation returned control to the human: ${decision.reason}`);
         this.finishRun(run.sessionName, 'needs_input');
       }
     }
@@ -565,6 +694,7 @@ class SupervisionAutomation {
     current.phase = 'auditing';
     current.evaluating = false;
     this.emitStatus(current.sessionName, 'supervision_audit_waiting', SUPERVISION_AUDIT_WAITING_LABEL);
+    this.emitAutomationNote(current.sessionName, 'Auto: running the configured audit pipeline...', 'supervision-audit');
 
     // Build the advanced-round pipeline from the stored auditMode so combo modes
     // like `audit>plan` and `audit>review>plan` actually expand into multiple rounds.

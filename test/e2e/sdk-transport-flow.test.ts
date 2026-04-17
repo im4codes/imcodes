@@ -866,12 +866,10 @@ describe('sdk transport flow e2e', () => {
           model: 'gpt-5.3-codex-spark',
           timeoutMs: 12000,
           promptVersion: 'supervision_decision_v1',
-          taskRunPromptVersion: 'supervision_continue_v1',
+          taskRunPromptVersion: 'task_run_status_v1',
           maxParseRetries: 1,
-          auditConfig: {
-            mode: 'audit',
-            maxAuditLoops: 2,
-          },
+          auditMode: 'audit',
+          maxAuditLoops: 2,
         },
       },
     }, serverLink);
@@ -889,10 +887,9 @@ describe('sdk transport flow e2e', () => {
           mode: 'supervised_audit',
           backend: 'codex-sdk',
           model: 'gpt-5.3-codex-spark',
-          auditConfig: {
-            mode: 'audit',
-            maxAuditLoops: 2,
-          },
+          taskRunPromptVersion: 'task_run_status_v1',
+          auditMode: 'audit',
+          maxAuditLoops: 2,
         },
       },
     });
@@ -905,6 +902,9 @@ describe('sdk transport flow e2e', () => {
           mode: 'supervised_audit',
           backend: 'codex-sdk',
           model: 'gpt-5.3-codex-spark',
+          taskRunPromptVersion: 'task_run_status_v1',
+          auditMode: 'audit',
+          maxAuditLoops: 2,
         }),
       }),
     }));

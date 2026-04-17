@@ -35,6 +35,7 @@ import {
   buildTransportConfigWithSupervision,
   extractSessionSupervisionSnapshot,
   hasInvalidSessionSupervisionSnapshot,
+  parseSessionSupervisionSnapshot,
   isSupportedSupervisionTargetSessionType,
   SUPERVISION_MODE,
   type SessionSupervisionSnapshot,
@@ -757,17 +758,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     const rawSupervision = currentTransportConfig && typeof currentTransportConfig === 'object' && !Array.isArray(currentTransportConfig)
       ? (currentTransportConfig.supervision as Record<string, unknown> | undefined)
       : undefined;
-    const hasPersistedAuditConfig = !!(
-      rawSupervision
-      && typeof rawSupervision === 'object'
-      && !Array.isArray(rawSupervision)
-      && typeof rawSupervision.auditMode === 'string'
-      && rawSupervision.auditMode.trim()
-    );
-
     let nextSnapshot: Partial<SessionSupervisionSnapshot> | null = null;
     if (supervisionSnapshot) {
-      if (nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT && !hasPersistedAuditConfig) {
+      const auditCandidate = nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT && rawSupervision
+        ? parseSessionSupervisionSnapshot({ ...rawSupervision, mode: SUPERVISION_MODE.SUPERVISED_AUDIT })
+        : null;
+      if (nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT && !auditCandidate) {
         setAutoOpen(false);
         onSettings?.();
         return;

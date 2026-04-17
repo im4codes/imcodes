@@ -35,18 +35,18 @@ export const SUPERVISION_SUPPORTED_BACKENDS = SHARED_CONTEXT_RUNTIME_BACKENDS;
 export const SUPERVISION_SUPPORTED_TARGET_SESSION_TYPES = TRANSPORT_SESSION_AGENT_TYPES;
 export const SUPERVISION_UNSUPPORTED_TARGET_SESSION_TYPES = PROCESS_SESSION_AGENT_TYPES;
 
-const SUPERVISION_AUDIT_MODE_COMPONENTS = new Set(['audit', 'review', 'plan']);
-const SUPERVISION_AUDIT_MODE_COMBOS = COMBO_PRESETS
-  .filter(({ pipeline }) => pipeline.length > 0)
-  .filter(({ pipeline }) => pipeline.every((mode) => SUPERVISION_AUDIT_MODE_COMPONENTS.has(mode)))
-  .filter(({ pipeline }) => pipeline.some((mode) => mode === 'audit' || mode === 'review'))
-  .map(({ key }) => key) as SupervisionAuditMode[];
-
-export const SUPERVISION_AUDIT_MODES = [
+const SUPERVISION_AUDIT_MODE_ALLOWLIST = [
   'audit',
+  'audit>plan',
   'review',
-  ...SUPERVISION_AUDIT_MODE_COMBOS,
-] as SupervisionAuditMode[];
+  'review>plan',
+  'audit>review>plan',
+] as const;
+
+export const SUPERVISION_AUDIT_MODES = SUPERVISION_AUDIT_MODE_ALLOWLIST.filter((mode) => {
+  if (!mode.includes('>')) return true;
+  return COMBO_PRESETS.some((preset) => preset.key === mode);
+}) as SupervisionAuditMode[];
 
 // Default supervisor timeout aligns with design.md §5 (12_000 ms). Queue wait time
 // counts against the same budget, so this must stay conservative.
