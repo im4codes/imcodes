@@ -3,7 +3,13 @@
  * Used by daemon emitters and web timeline consumers.
  */
 
-import type { ProcessedContextClass, ProcessedContextProjectionStatus } from '../../../shared/context-types.js';
+import type {
+  ContextAuthorityDecision,
+  MemoryRecallInjectionSurface,
+  MemoryRecallRuntimeFamily,
+  ProcessedContextClass,
+  ProcessedContextProjectionStatus,
+} from '../../../shared/context-types.js';
 import { TIMELINE_EVENT_FILE_CHANGE } from '../../../shared/file-change.js';
 
 export type TimelineEventType =
@@ -55,4 +61,8 @@ export interface MemoryContextTimelinePayload {
   injectedText: string;
   items: MemoryContextTimelineItem[];
   reason?: 'message' | 'startup';
+  runtimeFamily?: MemoryRecallRuntimeFamily;
+  injectionSurface?: MemoryRecallInjectionSurface;
+  authoritySource?: ContextAuthorityDecision['authoritySource'];
+  sourceKind?: 'local_processed' | 'remote_processed';
 }

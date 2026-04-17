@@ -3,6 +3,22 @@ import { TransportSessionRuntime } from '../../src/agent/transport-session-runti
 import { RUNTIME_TYPES } from '../../src/agent/session-runtime.js';
 import type { TransportProvider, ProviderError, SessionConfig } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
+import type { MemorySearchResult, MemorySearchResultItem } from '../../src/context/memory-search.js';
+
+const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
+const searchLocalMemoryMock = vi.hoisted(() => vi.fn());
+const searchLocalMemorySemanticMock = vi.hoisted(() => vi.fn());
+
+vi.mock('../../src/daemon/timeline-emitter.js', () => ({
+  timelineEmitter: {
+    emit: timelineEmitterEmitMock,
+  },
+}));
+
+vi.mock('../../src/context/memory-search.js', () => ({
+  searchLocalMemory: searchLocalMemoryMock,
+  searchLocalMemorySemantic: searchLocalMemorySemanticMock,
+}));
 
 // ── Mock provider factory ──────────────────────────────────────────────────────
 
@@ -32,6 +48,35 @@ function makeMockProvider() {
   };
 }
 
+function makeSearchItem(overrides: Partial<MemorySearchResultItem> = {}): MemorySearchResultItem {
+  return {
+    type: 'processed',
+    id: `mem-${Math.random().toString(16).slice(2, 8)}`,
+    projectId: 'my-project',
+    scope: 'personal',
+    summary: 'Fixed a race condition in the WebSocket reconnect logic',
+    createdAt: Date.now() - 1_000,
+    updatedAt: Date.now() - 1_000,
+    ...overrides,
+  };
+}
+
+function makeSearchResult(items: MemorySearchResultItem[]): MemorySearchResult {
+  return {
+    items,
+    stats: {
+      totalRecords: items.length,
+      matchedRecords: items.length,
+      recentSummaryCount: items.filter((i) => i.projectionClass === 'recent_summary').length,
+      durableCandidateCount: items.filter((i) => i.projectionClass === 'durable_memory_candidate').length,
+      projectCount: new Set(items.map((i) => i.projectId)).size,
+      stagedEventCount: 0,
+      dirtyTargetCount: 0,
+      pendingJobCount: 0,
+    },
+  };
+}
+
 const defaultConfig: SessionConfig = { sessionKey: 'deck_test_brain' };
 const flushDispatch = async () => {
   await Promise.resolve();
@@ -46,6 +91,9 @@ describe('TransportSessionRuntime', () => {
   let runtime: TransportSessionRuntime;
 
   beforeEach(async () => {
+    timelineEmitterEmitMock.mockReset();
+    searchLocalMemoryMock.mockReset();
+    searchLocalMemorySemanticMock.mockReset();
     mock = makeMockProvider();
     runtime = new TransportSessionRuntime(mock.provider, 'deck_test_brain');
     await runtime.initialize(defaultConfig);
@@ -225,6 +273,151 @@ describe('TransportSessionRuntime', () => {
       diagnostics: expect.arrayContaining(['namespace:server-personal-fallback']),
     }));
     expect(refreshBootstrap).toHaveBeenCalledTimes(2);
+  });
+
+  it('carries startup memory into the first transport payload', async () => {
+    const startupItem = makeSearchItem({
+      projectId: 'repo-1',
+      summary: 'Remember to keep transport recall parity visible',
+    });
+    const startupMemory = {
+      reason: 'startup' as const,
+      runtimeFamily: 'transport' as const,
+      authoritySource: 'processed_local' as const,
+      sourceKind: 'local_processed' as const,
+      injectionSurface: 'system-text' as const,
+      injectedText: '# Recent project memory\n\n- Remember to keep transport recall parity visible',
+      items: [startupItem],
+    };
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:explicit'],
+      startupMemory,
+    }));
+
+    await r.initialize(defaultConfig);
+    await flushDispatch();
+
+    r.send('Need a transport recall test');
+    await flushDispatch();
+
+    expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      startupMemory: expect.objectContaining({
+        reason: 'startup',
+        injectedText: expect.stringContaining('transport recall parity visible'),
+        authoritySource: 'processed_local',
+        sourceKind: 'local_processed',
+        injectionSurface: 'normalized-payload',
+      }),
+    }));
+  });
+
+  it('send() adds transport recall to the payload and emits linked memory.context evidence', async () => {
+    const memoryItem = makeSearchItem({
+      projectId: 'repo-1',
+      summary: 'Fixed transport recall latency by emitting explicit memory.context cards',
+      relevanceScore: 0.92,
+    });
+    searchLocalMemorySemanticMock.mockResolvedValue(makeSearchResult([memoryItem]));
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:explicit'],
+    }));
+    await r.initialize(defaultConfig);
+    timelineEmitterEmitMock.mockClear();
+
+    r.send('Please recall recent transport memory around recall runtime', 'client-turn-1');
+    await flushDispatch();
+
+    expect(searchLocalMemorySemanticMock).toHaveBeenCalledWith(expect.objectContaining({
+      query: expect.stringContaining('Please recall recent transport memory'),
+      repo: 'repo-1',
+      limit: 5,
+    }));
+    expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      memoryRecall: expect.objectContaining({
+        reason: 'message',
+        runtimeFamily: 'transport',
+        authoritySource: 'processed_local',
+        sourceKind: 'local_processed',
+        injectionSurface: 'normalized-payload',
+        query: expect.stringContaining('Please recall recent transport memory'),
+      }),
+      messagePreamble: expect.stringContaining('[Related past work]'),
+      assembledMessage: expect.stringContaining('[Related past work]'),
+    }));
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+      'deck_test_brain',
+      'memory.context',
+      expect.objectContaining({
+        reason: 'message',
+        relatedToEventId: 'transport-user:client-turn-1',
+        runtimeFamily: 'transport',
+        authoritySource: 'processed_local',
+        sourceKind: 'local_processed',
+      }),
+      expect.objectContaining({ source: 'daemon', confidence: 'high' }),
+    );
+  });
+
+  it('skips transport recall for control and short messages without emitting memory.context', async () => {
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:explicit'],
+    }));
+    await r.initialize(defaultConfig);
+    timelineEmitterEmitMock.mockClear();
+
+    r.send('/status', 'client-turn-control');
+    await flushDispatch();
+    localMock.fireComplete('sess-1');
+    r.send('hi', 'client-turn-short');
+    await flushDispatch();
+
+    expect(searchLocalMemorySemanticMock).not.toHaveBeenCalled();
+    expect(localMock.provider.send).toHaveBeenNthCalledWith(1, 'sess-1', expect.not.objectContaining({
+      memoryRecall: expect.anything(),
+    }));
+    expect(localMock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.not.objectContaining({
+      memoryRecall: expect.anything(),
+    }));
+    expect(timelineEmitterEmitMock).not.toHaveBeenCalledWith(
+      'deck_test_brain',
+      'memory.context',
+      expect.objectContaining({ reason: 'message' }),
+      expect.anything(),
+    );
+  });
+
+  it('transport memory recall fails open when lookup fails', async () => {
+    searchLocalMemorySemanticMock.mockRejectedValue(new Error('lookup failed'));
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:explicit'],
+    }));
+    await r.initialize(defaultConfig);
+    timelineEmitterEmitMock.mockClear();
+
+    r.send('Please recall recent transport memory around recall runtime', 'client-turn-2');
+    await flushDispatch();
+
+    expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.not.objectContaining({
+      memoryRecall: expect.anything(),
+    }));
+    expect(timelineEmitterEmitMock).not.toHaveBeenCalledWith(
+      'deck_test_brain',
+      'memory.context',
+      expect.objectContaining({ reason: 'message' }),
+      expect.anything(),
+    );
   });
 
   it('onComplete sets status to idle and appends to history', () => {

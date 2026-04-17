@@ -8,9 +8,11 @@ import type {
   CompiledAgentContextArtifact,
   ContextNamespace,
   ContextSendSurface,
+  MemoryRecallInjectionSurface,
   ProviderContextPayload,
   ProviderSupportClass,
   RuntimeAuthoredContextBinding,
+  TransportMemoryRecallArtifact,
 } from '../../shared/context-types.js';
 
 export interface TransportRuntimeAssemblyInput {
@@ -36,6 +38,8 @@ export interface TransportRuntimeAssemblyInput {
   maxRequiredAuthoredChars?: number;
   maxAdvisoryAuthoredChars?: number;
   sourceSurface?: ContextSendSurface;
+  startupMemory?: TransportMemoryRecallArtifact;
+  memoryRecall?: TransportMemoryRecallArtifact;
 }
 
 export interface DispatchSharedContextSendOptions {
@@ -91,7 +95,8 @@ export function buildProviderContextPayload(
   provider: TransportProvider,
   input: TransportRuntimeAssemblyInput,
 ): ProviderContextPayload {
-  const compiledContext = compileAgentContextArtifact(input);
+  const compiledContextInput = composeTransportMemoryInputs(input);
+  const compiledContext = compileAgentContextArtifact(compiledContextInput);
   const namespace = input.namespace ?? {
     scope: 'personal',
     projectId: 'transport-default',
@@ -119,12 +124,25 @@ export function buildProviderContextPayload(
   for (const entry of input.namespaceDiagnostics ?? []) {
     if (!diagnostics.includes(entry)) diagnostics.push(entry);
   }
+  if (input.startupMemory) diagnostics.push('memory:start');
+  if (input.memoryRecall) diagnostics.push('memory:message');
+  const recallInjectionSurface: MemoryRecallInjectionSurface = supportClass === 'degraded-message-side-context-mapping'
+    ? 'degraded-message-side'
+    : 'normalized-payload';
+  const startupMemory = input.startupMemory
+    ? { ...input.startupMemory, injectionSurface: recallInjectionSurface }
+    : undefined;
+  const memoryRecall = input.memoryRecall
+    ? { ...input.memoryRecall, injectionSurface: recallInjectionSurface }
+    : undefined;
   return {
     userMessage: input.userMessage,
     assembledMessage: renderAssembledMessage(input.userMessage, compiledContext.messagePreamble),
     systemText: compiledContext.systemText,
     messagePreamble: compiledContext.messagePreamble,
     attachments: input.attachments,
+    ...(startupMemory ? { startupMemory } : {}),
+    ...(memoryRecall ? { memoryRecall } : {}),
     context: compiledContext,
     authority,
     supportClass,
@@ -174,6 +192,37 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
     appliedDocumentVersionIds: authoredContext.appliedDocumentVersionIds,
     diagnostics: authoredContext.diagnostics,
   };
+}
+
+function composeTransportMemoryInputs(input: TransportRuntimeAssemblyInput): TransportRuntimeAssemblyInput {
+  const startupMemoryText = input.startupMemory?.injectedText?.trim();
+  const memoryRecallText = input.memoryRecall?.injectedText?.trim();
+  const uniqueMessagePreambleParts = dedupeTransportMemorySections([
+    input.messagePreamble?.trim(),
+    memoryRecallText,
+  ]);
+  const uniqueSystemPromptParts = dedupeTransportMemorySections([
+    input.systemPrompt?.trim(),
+    startupMemoryText,
+  ]);
+  return {
+    ...input,
+    systemPrompt: uniqueSystemPromptParts.join('\n\n') || undefined,
+    messagePreamble: uniqueMessagePreambleParts.join('\n\n') || undefined,
+  };
+}
+
+function dedupeTransportMemorySections(parts: Array<string | undefined>): string[] {
+  const seen = new Set<string>();
+  const resolved: string[] = [];
+  for (const part of parts) {
+    const trimmed = part?.trim();
+    if (!trimmed) continue;
+    if (seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    resolved.push(trimmed);
+  }
+  return resolved;
 }
 
 export function getProviderSupportClass(provider: TransportProvider): ProviderSupportClass {

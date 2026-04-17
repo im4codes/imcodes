@@ -159,12 +159,25 @@ async function handleSessionTransportConfigUpdate(cmd: Record<string, unknown>, 
     logger.warn({ sessionName }, 'session.update_transport_config: session not found in store');
     return;
   }
+  // Distinguish "cmd did not include transportConfig" from "cmd set transportConfig=null".
+  // If the key is missing entirely, we must not wipe the existing config — earlier
+  // versions were silently dropping supervision whenever this handler ran with a
+  // malformed payload.
+  if (!('transportConfig' in cmd)) {
+    logger.warn({ sessionName }, 'session.update_transport_config: missing transportConfig field — ignoring');
+    return;
+  }
   const nextTransportConfig = normalizeTransportConfigUpdate(cmd.transportConfig);
-  upsertSession({
+  const nextRecord: SessionRecord = {
     ...record,
     transportConfig: nextTransportConfig,
     updatedAt: Date.now(),
-  });
+  };
+  upsertSession(nextRecord);
+  // Push the updated record to the server so daemon-side edits survive a restart+sync.
+  // The server persist callback is a no-op when not yet wired; the next `persistSessionToWorker`
+  // loop in lifecycle will retry from the local store.
+  persistSessionRecord(nextRecord, sessionName);
   if (!extractSessionSupervisionSnapshot(nextTransportConfig ?? null)) {
     supervisionAutomation.cancelSession(sessionName);
   }
@@ -182,12 +195,18 @@ async function handleSubSessionTransportConfigUpdate(cmd: Record<string, unknown
     logger.warn({ sessionName }, 'subsession.update_transport_config: session not found in store');
     return;
   }
+  if (!('transportConfig' in cmd)) {
+    logger.warn({ sessionName }, 'subsession.update_transport_config: missing transportConfig field — ignoring');
+    return;
+  }
   const nextTransportConfig = normalizeTransportConfigUpdate(cmd.transportConfig);
-  upsertSession({
+  const nextRecord: SessionRecord = {
     ...record,
     transportConfig: nextTransportConfig,
     updatedAt: Date.now(),
-  });
+  };
+  upsertSession(nextRecord);
+  persistSessionRecord(nextRecord, sessionName);
   if (!extractSessionSupervisionSnapshot(nextTransportConfig ?? null)) {
     supervisionAutomation.cancelSession(sessionName);
   }

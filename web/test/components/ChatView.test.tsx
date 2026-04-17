@@ -256,6 +256,103 @@ describe('ChatView', () => {
     });
   });
 
+  it('renders transport-origin memory.context cards the same as process recall cards', async () => {
+    const { container, getByText } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-user-transport',
+            type: 'user.message',
+            ts: 1000,
+            payload: { text: 'Recall the transport fix' },
+          },
+          {
+            eventId: 'evt-memory-transport',
+            type: 'memory.context',
+            ts: 1001,
+            payload: {
+              relatedToEventId: 'evt-user-transport',
+              reason: 'message',
+              runtimeFamily: 'transport',
+              injectionSurface: 'normalized-payload',
+              authoritySource: 'processed_local',
+              sourceKind: 'local_processed',
+              query: 'Recall the transport fix',
+              injectedText: '[Related past work]\n- [repo-1] Fixed transport recall visibility',
+              items: [
+                {
+                  id: 'mem-transport-1',
+                  projectId: 'repo-1',
+                  summary: 'Fixed transport recall visibility',
+                  relevanceScore: 0.91,
+                  hitCount: 2,
+                  lastUsedAt: 1710000000000,
+                },
+              ],
+            },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_transport_brain"
+      />,
+    );
+
+    fireEvent.click(getByText('chat.memory_context_title'));
+
+    await waitFor(() => {
+      expect(container.textContent).toContain('Fixed transport recall visibility');
+      expect(container.querySelector('.chat-memory-context')?.getAttribute('data-related-to')).toBe('evt-user-transport');
+    });
+  });
+
+  it('renders transport memory.context events with linked evidence', async () => {
+    const { container, getByText } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-user-transport',
+            type: 'user.message',
+            ts: 1000,
+            payload: { text: 'Recall transport memory' },
+          },
+          {
+            eventId: 'evt-memory-transport',
+            type: 'memory.context',
+            ts: 1001,
+            payload: {
+              reason: 'message',
+              runtimeFamily: 'transport',
+              injectionSurface: 'normalized-payload',
+              relatedToEventId: 'evt-user-transport',
+              query: 'Recall transport memory',
+              injectedText: '[Related past work]\n- [codedeck] Transport recall parity reached',
+              items: [
+                {
+                  id: 'mem-transport-1',
+                  projectId: 'codedeck',
+                  summary: 'Transport recall parity reached',
+                  relevanceScore: 0.9,
+                  hitCount: 2,
+                },
+              ],
+            },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    expect(container.querySelector('.chat-memory-context')).not.toBeNull();
+    fireEvent.click(getByText('chat.memory_context_title'));
+
+    await waitFor(() => {
+      expect(container.textContent).toContain('Transport recall parity reached');
+      expect(container.textContent).toContain('codedeck');
+      expect(container.textContent).toContain('chat.memory_context_query');
+    });
+  });
+
   it('does not rerender an unchanged assistant block when the parent chat rerenders', async () => {
     const { rerender } = render(
       <ChatView

@@ -6,9 +6,19 @@ import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { TransportProvider, ProviderError, SessionConfig, SessionInfoUpdate } from './transport-provider.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import { SharedContextDispatchError, dispatchSharedContextSend } from './transport-runtime-assembly.js';
-import type { ContextFreshness, ContextNamespace, SharedScopePolicyOverride } from '../../shared/context-types.js';
+import type {
+  ContextFreshness,
+  ContextNamespace,
+  SharedScopePolicyOverride,
+  TransportMemoryRecallArtifact,
+  TransportMemoryRecallItem,
+} from '../../shared/context-types.js';
+import { buildMemoryContextTimelinePayload } from '../daemon/memory-context-timeline.js';
+import { timelineEmitter } from '../daemon/timeline-emitter.js';
+import { searchLocalMemorySemantic, type MemorySearchResultItem } from '../context/memory-search.js';
 import { resolveRuntimeAuthoredContext } from '../context/shared-context-runtime.js';
 import type { TransportContextBootstrap } from './runtime-context-bootstrap.js';
+import logger from '../util/logger.js';
 
 export interface PendingTransportMessage {
   clientMessageId: string;
@@ -51,6 +61,8 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _contextSharedPolicyOverride: SharedScopePolicyOverride | undefined;
   private _contextAuthoredContextLanguage: string | undefined;
   private _contextAuthoredContextFilePath: string | undefined;
+  private _startupMemory: TransportMemoryRecallArtifact | null = null;
+  private _startupMemoryEmitted = false;
   private _contextBootstrapResolver: (() => Promise<TransportContextBootstrap>) | undefined;
   private _unsubscribes: Array<() => void> = [];
   private _onStatusChange?: (status: AgentStatus) => void;
@@ -166,6 +178,8 @@ export class TransportSessionRuntime implements SessionRuntime {
       authoredContextLanguage: config.contextAuthoredContextLanguage,
       authoredContextFilePath: config.contextAuthoredContextFilePath,
     });
+    await this.refreshContextBootstrap();
+    this._startupMemoryEmitted = false;
   }
 
   /**
@@ -190,7 +204,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       return 'queued';
     }
 
-    this._dispatchTurn(message);
+    this._dispatchTurn(message, clientMessageId);
     return 'sent';
   }
 
@@ -249,7 +263,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   /** Dispatch a single turn to the provider. Assumes _sending is false. */
-  private _dispatchTurn(message: string): void {
+  private _dispatchTurn(message: string, clientMessageId?: string): void {
     this._history.push({
       id: randomUUID(),
       sessionId: this._providerSessionId!,
@@ -273,28 +287,39 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeTurn = { promise, resolve, reject };
 
     void this.refreshContextBootstrap()
-      .then(() => dispatchSharedContextSend(this.provider, this._providerSessionId!, {
-        userMessage: message,
-        description: this._description,
-        systemPrompt: this._systemPrompt,
-        namespace: this._contextNamespace,
-        namespaceDiagnostics: this._contextNamespaceDiagnostics,
-        remoteProcessedFreshness: this._contextRemoteProcessedFreshness,
-        localProcessedFreshness: this._contextLocalProcessedFreshness,
-        retryExhausted: this._contextRetryExhausted,
-        sharedPolicyOverride: this._contextSharedPolicyOverride,
-        authoredContextRepository: this.resolveAuthoredContextRepository(),
-        authoredContextLanguage: this._contextAuthoredContextLanguage,
-        authoredContextFilePath: this._contextAuthoredContextFilePath,
-      }, {
-        resolveAuthoredContext: (input) => {
-          if (!input.namespace) return Promise.resolve([]);
-          return resolveRuntimeAuthoredContext(input.namespace, {
-            language: input.authoredContextLanguage,
-            filePath: input.authoredContextFilePath,
-          });
-        },
-      }))
+      .then(async () => {
+        const memoryRecall = await this.buildTransportMessageRecall(message);
+        const dispatchResult = await dispatchSharedContextSend(this.provider, this._providerSessionId!, {
+          userMessage: message,
+          description: this._description,
+          systemPrompt: this._systemPrompt,
+          namespace: this._contextNamespace,
+          namespaceDiagnostics: this._contextNamespaceDiagnostics,
+          remoteProcessedFreshness: this._contextRemoteProcessedFreshness,
+          localProcessedFreshness: this._contextLocalProcessedFreshness,
+          retryExhausted: this._contextRetryExhausted,
+          sharedPolicyOverride: this._contextSharedPolicyOverride,
+          authoredContextRepository: this.resolveAuthoredContextRepository(),
+          authoredContextLanguage: this._contextAuthoredContextLanguage,
+          authoredContextFilePath: this._contextAuthoredContextFilePath,
+          ...(this._startupMemory ? { startupMemory: this._startupMemory } : {}),
+          ...(memoryRecall ? { memoryRecall } : {}),
+        }, {
+          resolveAuthoredContext: (input) => {
+            if (!input.namespace) return Promise.resolve([]);
+            return resolveRuntimeAuthoredContext(input.namespace, {
+              language: input.authoredContextLanguage,
+              filePath: input.authoredContextFilePath,
+            });
+          },
+        });
+        if (dispatchResult.payload?.memoryRecall) {
+          this.emitMemoryContextEvent(dispatchResult.payload.memoryRecall, clientMessageId);
+        }
+        if (!this._startupMemoryEmitted && dispatchResult.payload?.startupMemory) {
+          this.emitStartupMemoryContext(dispatchResult.payload.startupMemory);
+        }
+      })
       .catch((err) => {
         // Only handle if the provider didn't already fire onError callback.
         // Shared-context dispatch denial is surfaced here as a send failure
@@ -330,7 +355,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     const messages = this._pendingMessages.splice(0);
     const merged = messages.map((entry) => entry.text).join('\n\n');
     this._onDrain?.(messages, merged, messages.length);
-    this._dispatchTurn(merged);
+    this._dispatchTurn(merged, messages.length === 1 ? messages[0]?.clientMessageId : undefined);
     return true;
   }
 
@@ -356,5 +381,118 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._contextSharedPolicyOverride = bootstrap.sharedPolicyOverride;
     this._contextAuthoredContextLanguage = bootstrap.authoredContextLanguage;
     this._contextAuthoredContextFilePath = bootstrap.authoredContextFilePath;
+    if (!this._startupMemoryEmitted) {
+      this._startupMemory = bootstrap.startupMemory ?? null;
+    }
   }
+
+  private async buildTransportMessageRecall(message: string): Promise<TransportMemoryRecallArtifact | null> {
+    const trimmed = message.trim();
+    if (!trimmed) {
+      logger.debug({ sessionKey: this.sessionKey }, 'transport message recall skipped: empty message');
+      return null;
+    }
+    if (trimmed.startsWith('/')) {
+      logger.debug({ sessionKey: this.sessionKey }, 'transport message recall skipped: control message');
+      return null;
+    }
+    if (trimmed.length < 10) {
+      logger.debug({ sessionKey: this.sessionKey, length: trimmed.length }, 'transport message recall skipped: short message');
+      return null;
+    }
+    try {
+      const query = trimmed.slice(0, 200);
+      const result = await searchLocalMemorySemantic({
+        query,
+        repo: this._contextNamespace?.projectId ?? this.resolveAuthoredContextRepository(),
+        limit: 5,
+      });
+      const items = result.items
+        .filter((item): item is MemorySearchResultItem => item.type === 'processed')
+        .map(toTransportMemoryRecallItem);
+      if (items.length === 0) {
+        logger.debug({ sessionKey: this.sessionKey, query }, 'transport message recall skipped: no processed matches');
+        return null;
+      }
+      const supportClass = this.provider.capabilities.contextSupport ?? 'full-normalized-context-injection';
+      const injectionSurface = supportClass === 'full-normalized-context-injection'
+        ? 'normalized-payload'
+        : 'degraded-message-side';
+      const payload = buildMemoryContextTimelinePayload(query, items, 'message', {
+        runtimeFamily: 'transport',
+        injectionSurface,
+        authoritySource: 'processed_local',
+        sourceKind: 'local_processed',
+      });
+      if (!payload) return null;
+      return {
+        reason: 'message',
+        runtimeFamily: 'transport',
+        authoritySource: 'processed_local',
+        sourceKind: 'local_processed',
+        injectionSurface,
+        query,
+        items,
+        injectedText: payload.injectedText,
+      };
+    } catch (err) {
+      logger.warn({ err, sessionKey: this.sessionKey }, 'transport message recall failed; continuing without recall');
+      return null;
+    }
+  }
+
+  private emitStartupMemoryContext(startupMemory: TransportMemoryRecallArtifact): void {
+    if (this._startupMemoryEmitted || startupMemory.items.length === 0) return;
+    const payload = buildMemoryContextTimelinePayload(undefined, startupMemory.items, 'startup', {
+      runtimeFamily: 'transport',
+      injectionSurface: startupMemory.injectionSurface,
+      injectedText: startupMemory.injectedText,
+      authoritySource: startupMemory.authoritySource,
+      sourceKind: startupMemory.sourceKind,
+    });
+    if (!payload) return;
+    timelineEmitter.emit(this.sessionKey, 'memory.context', payload, { source: 'daemon', confidence: 'high' });
+    this._startupMemory = null;
+    this._startupMemoryEmitted = true;
+  }
+
+  private emitMemoryContextEvent(
+    memoryRecall: TransportMemoryRecallArtifact,
+    clientMessageId?: string,
+  ): void {
+    const payload = buildMemoryContextTimelinePayload(memoryRecall.query, memoryRecall.items, memoryRecall.reason, {
+      runtimeFamily: 'transport',
+      injectionSurface: memoryRecall.injectionSurface,
+      injectedText: memoryRecall.injectedText,
+      authoritySource: memoryRecall.authoritySource,
+      sourceKind: memoryRecall.sourceKind,
+    });
+    if (!payload) return;
+    timelineEmitter.emit(
+      this.sessionKey,
+      'memory.context',
+      {
+        ...payload,
+        ...(clientMessageId ? { relatedToEventId: `transport-user:${clientMessageId}` } : {}),
+      },
+      { source: 'daemon', confidence: 'high' },
+    );
+  }
+}
+
+function toTransportMemoryRecallItem(item: MemorySearchResultItem): TransportMemoryRecallItem {
+  return {
+    id: item.id,
+    type: item.type,
+    projectId: item.projectId,
+    scope: item.scope,
+    summary: item.summary,
+    ...(item.projectionClass ? { projectionClass: item.projectionClass } : {}),
+    ...(typeof item.hitCount === 'number' ? { hitCount: item.hitCount } : {}),
+    ...(typeof item.lastUsedAt === 'number' ? { lastUsedAt: item.lastUsedAt } : {}),
+    ...(item.status ? { status: item.status } : {}),
+    ...(typeof item.relevanceScore === 'number' ? { relevanceScore: item.relevanceScore } : {}),
+    createdAt: item.createdAt,
+    ...(typeof item.updatedAt === 'number' ? { updatedAt: item.updatedAt } : {}),
+  };
 }

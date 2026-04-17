@@ -56,6 +56,22 @@ export function mergeWorkerSessionSnapshot(
   existing: SessionRecord | undefined,
   snapshot: WorkerSessionSnapshot,
 ): SessionRecord {
+  const rawServerConfig = typeof snapshot.transport_config === 'string'
+    ? JSON.parse(snapshot.transport_config)
+    : snapshot.transport_config;
+  const serverConfig = (rawServerConfig && typeof rawServerConfig === 'object' && !Array.isArray(rawServerConfig))
+    ? rawServerConfig as Record<string, unknown>
+    : undefined;
+  // Merge strategy: the server's `transport_config` column defaults to `{}` at row
+  // creation and stays there until someone explicitly pushes supervision settings.
+  // A plain overwrite (`serverConfig ?? existing`) would wipe client-set supervision
+  // every time the daemon syncs on startup — the reason users reported auto-mode
+  // "turning itself off". Instead, layer the existing config underneath the server's
+  // so server-side edits still win key-by-key while untouched keys (like `supervision`)
+  // survive the round-trip.
+  const mergedTransportConfig: Record<string, unknown> | undefined = serverConfig
+    ? { ...(existing?.transportConfig ?? {}), ...serverConfig }
+    : existing?.transportConfig;
   return {
     ...(existing ?? {}),
     name: snapshot.name,
@@ -69,9 +85,7 @@ export function mergeWorkerSessionSnapshot(
     activeModel: snapshot.active_model ?? existing?.activeModel,
     modelDisplay: snapshot.active_model ?? existing?.modelDisplay,
     effort: snapshot.effort ?? existing?.effort,
-    transportConfig: (typeof snapshot.transport_config === 'string'
-      ? JSON.parse(snapshot.transport_config)
-      : (snapshot.transport_config ?? existing?.transportConfig)) as Record<string, unknown> | undefined,
+    transportConfig: mergedTransportConfig,
     restarts: existing?.restarts ?? 0,
     restartTimestamps: existing?.restartTimestamps ?? [],
     createdAt: existing?.createdAt ?? Date.now(),

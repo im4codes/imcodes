@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { buildProviderContextPayload, dispatchSharedContextSend } from '../../src/agent/transport-runtime-assembly.js';
 import type { TransportProvider } from '../../src/agent/transport-provider.js';
+import type { TransportMemoryRecallArtifact } from '../../shared/context-types.js';
 
 function makeProvider(contextSupport: NonNullable<TransportProvider['capabilities']['contextSupport']>): TransportProvider {
   const send = vi.fn(async () => {});
@@ -28,6 +29,24 @@ function makeProvider(contextSupport: NonNullable<TransportProvider['capabilitie
   };
 }
 
+function makeRecall(overrides: Partial<TransportMemoryRecallArtifact> = {}): TransportMemoryRecallArtifact {
+  return {
+    reason: 'message',
+    runtimeFamily: 'transport',
+    authoritySource: 'processed_local',
+    sourceKind: 'local_processed',
+    injectedText: '[Related past work]\n- [repo-1] Fix transport recall visibility',
+    items: [
+      {
+        id: 'mem-1',
+        projectId: 'repo-1',
+        summary: 'Fix transport recall visibility',
+      },
+    ],
+    ...overrides,
+  };
+}
+
 describe('buildProviderContextPayload', () => {
   it('assembles normalized system context from description and runtime prompt', () => {
     const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
@@ -45,6 +64,27 @@ describe('buildProviderContextPayload', () => {
     });
   });
 
+  it('renders startup memory into systemText and message recall into messagePreamble without mutating userMessage', () => {
+    const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+      userMessage: 'Run tests',
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      startupMemory: makeRecall({
+        reason: 'startup',
+        injectedText: '# Recent project memory\n\n- Prior fix for transport bootstrap',
+      }),
+      memoryRecall: makeRecall(),
+    });
+
+    expect(payload.userMessage).toBe('Run tests');
+    expect(payload.systemText).toContain('# Recent project memory');
+    expect(payload.messagePreamble).toContain('[Related past work]');
+    expect(payload.assembledMessage).toContain('[Related past work]');
+    expect(payload.startupMemory?.injectionSurface).toBe('normalized-payload');
+    expect(payload.memoryRecall?.injectionSurface).toBe('normalized-payload');
+    expect(payload.startupMemory?.authoritySource).toBe('processed_local');
+    expect(payload.memoryRecall?.sourceKind).toBe('local_processed');
+  });
+
   it('marks degraded providers in authority and payload diagnostics', () => {
     const payload = buildProviderContextPayload(makeProvider('degraded-message-side-context-mapping'), {
       userMessage: 'Run tests',
@@ -54,6 +94,18 @@ describe('buildProviderContextPayload', () => {
     expect(payload.supportClass).toBe('degraded-message-side-context-mapping');
     expect(payload.authority.diagnostics).toContain('personal-no-processed-context');
     expect(payload.diagnostics).toContain('support:degraded-message-side-context-mapping');
+  });
+
+  it('marks recalled memory as degraded-message-side when provider support is degraded', () => {
+    const payload = buildProviderContextPayload(makeProvider('degraded-message-side-context-mapping'), {
+      userMessage: 'Run tests',
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      memoryRecall: makeRecall(),
+    });
+
+    expect(payload.supportClass).toBe('degraded-message-side-context-mapping');
+    expect(payload.memoryRecall?.injectionSurface).toBe('degraded-message-side');
+    expect(payload.assembledMessage).toContain('[Related past work]');
   });
 
   it('blocks degraded providers in shared scope by default and only allows them when policy explicitly permits', () => {

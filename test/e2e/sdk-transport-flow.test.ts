@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
+import { writeProcessedProjection } from '../../src/store/context-store.js';
 
 const SESSION_CC = `deck_ccsdk_${Math.random().toString(36).slice(2, 8)}_brain`;
 const SESSION_CX = `deck_cxsdk_${Math.random().toString(36).slice(2, 8)}_brain`;
@@ -267,7 +268,7 @@ vi.mock('../../src/agent/codex-runtime-config.js', () => ({
 }));
 vi.mock('../../src/agent/brain-dispatcher.js', () => ({ BrainDispatcher: vi.fn().mockImplementation(() => ({ start: vi.fn(), stop: vi.fn() })) }));
 
-import { launchSession } from '../../src/agent/session-manager.js';
+import { getTransportRuntime, launchSession } from '../../src/agent/session-manager.js';
 import { disconnectAll } from '../../src/agent/provider-registry.js';
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
 import { newSession } from '../../src/agent/tmux.js';
@@ -1009,6 +1010,127 @@ describe('sdk transport flow e2e', () => {
     expect(ack?.payload.status).toBe('accepted');
   });
 
+  it('launches codex-sdk session and emits startup memory.context for transport bootstrap', async () => {
+    writeProcessedProjection({
+      namespace: {
+        scope: 'personal',
+        projectId: 'sdk-cxsdk-startup-repo',
+      },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-cxsdk-startup'],
+      summary: 'Seeded transport startup memory for e2e observability',
+      content: { kind: 'startup' },
+      createdAt: Date.now() - 1_000,
+      updatedAt: Date.now(),
+    });
+
+    await launchSession({
+      name: SESSION_CX,
+      projectName: 'cxsdk',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/cxsdk-e2e',
+      transportConfig: {
+        sharedContextNamespace: {
+          scope: 'personal',
+          projectId: 'sdk-cxsdk-startup-repo',
+        },
+      },
+    });
+
+    const runtime = getTransportRuntime(SESSION_CX);
+    expect(runtime).toBeDefined();
+    runtime!.send('/status');
+
+    await flushAsync();
+    await waitForCondition(() => mocks.emitted.some((event) => event.session === SESSION_CX && event.type === 'memory.context' && event.payload.reason === 'startup'));
+
+    const startupMemoryEvent = mocks.emitted.find((e) => e.session === SESSION_CX && e.type === 'memory.context' && e.payload.reason === 'startup');
+
+    expect(startupMemoryEvent).toEqual(expect.objectContaining({
+      session: SESSION_CX,
+      type: 'memory.context',
+      payload: expect.objectContaining({
+        reason: 'startup',
+        runtimeFamily: 'transport',
+        authoritySource: 'processed_local',
+        sourceKind: 'local_processed',
+        injectionSurface: expect.stringMatching(/^(system-text|normalized-payload|degraded-message-side)$/),
+        injectedText: expect.stringContaining('# Recent project memory'),
+        items: expect.arrayContaining([
+          expect.objectContaining({
+            projectId: 'sdk-cxsdk-startup-repo',
+            summary: 'Seeded transport startup memory for e2e observability',
+          }),
+        ]),
+      }),
+    }));
+  });
+
+  it('launches codex-sdk session and surfaces transport memory recall through timeline evidence', async () => {
+    writeProcessedProjection({
+      namespace: {
+        scope: 'personal',
+        projectId: 'sdk-cxsdk-recall-repo',
+      },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-cxsdk-recall'],
+      summary: 'Fixed transport recall latency by emitting explicit memory.context cards',
+      content: { kind: 'recall' },
+      createdAt: Date.now() - 1_000,
+      updatedAt: Date.now(),
+    });
+
+    await launchSession({
+      name: SESSION_CX,
+      projectName: 'cxsdk',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/cxsdk-e2e',
+      transportConfig: {
+        sharedContextNamespace: {
+          scope: 'personal',
+          projectId: 'sdk-cxsdk-recall-repo',
+        },
+      },
+    });
+
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({
+      type: 'session.send',
+      session: SESSION_CX,
+      text: 'Please recall recent transport memory around recall runtime',
+      commandId: 'cmd-cxsdk-recall',
+    }, serverLink);
+    await flushAsync();
+    await waitForCondition(() => mocks.emitted.some((event) => event.session === SESSION_CX && event.type === 'memory.context' && event.payload.reason === 'message'));
+
+    const record = mocks.store.get(SESSION_CX);
+    expect(record?.runtimeType).toBe('transport');
+    expect(record?.providerId).toBe('codex-sdk');
+
+    const recallMemoryEvent = mocks.emitted.find((e) => e.session === SESSION_CX && e.type === 'memory.context' && e.payload.reason === 'message');
+    expect(recallMemoryEvent).toEqual(expect.objectContaining({
+      session: SESSION_CX,
+      type: 'memory.context',
+      payload: expect.objectContaining({
+        reason: 'message',
+        runtimeFamily: 'transport',
+        authoritySource: 'processed_local',
+        sourceKind: 'local_processed',
+        injectionSurface: expect.stringMatching(/^(normalized-payload|degraded-message-side)$/),
+        relatedToEventId: 'transport-user:cmd-cxsdk-recall',
+        query: 'Please recall recent transport memory around recall runtime',
+        items: expect.arrayContaining([
+          expect.objectContaining({
+            projectId: 'sdk-cxsdk-recall-repo',
+            summary: 'Fixed transport recall latency by emitting explicit memory.context cards',
+          }),
+        ]),
+      }),
+    }));
+  });
+
   it('launches codex-sdk session and emits final/tool timeline events with learned thread id', async () => {
     await launchSession({
       name: SESSION_CX,
@@ -1019,7 +1141,12 @@ describe('sdk transport flow e2e', () => {
     });
 
     const serverLink = { send: vi.fn() } as any;
-    handleWebCommand({ type: 'session.send', session: SESSION_CX, text: 'hello', commandId: 'cmd-cxsdk-e2e' }, serverLink);
+    handleWebCommand({
+      type: 'session.send',
+      session: SESSION_CX,
+      text: 'hello',
+      commandId: 'cmd-cxsdk-e2e',
+    }, serverLink);
     await flushAsync();
 
     const record = mocks.store.get(SESSION_CX);

@@ -382,7 +382,11 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         quotaUsageLabel: stored?.quotaUsageLabel,
         quotaMeta: stored?.quotaMeta,
         effort: sub.effort ?? stored?.effort,
-        transportConfig: sub.transportConfig ?? stored?.transportConfig,
+        // Layer existing under server-provided so supervision set locally survives
+        // a rebuild even when the server row still holds the default `{}`.
+        transportConfig: sub.transportConfig
+          ? { ...(stored?.transportConfig ?? {}), ...sub.transportConfig }
+          : stored?.transportConfig,
         // Preserve existing diagnostic fields instead of resetting
         restarts: stored?.restarts ?? 0,
         restartTimestamps: stored?.restartTimestamps ?? [],

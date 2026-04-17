@@ -92,6 +92,7 @@ describe('resolveTransportContextBootstrap', () => {
     expect(result.namespace.projectId).toMatch(/^local\//);
     expect(result.diagnostics).toEqual(['namespace:local-fallback']);
     expect(result.localProcessedFreshness).toBe('missing');
+    expect(result.startupMemory).toBeUndefined();
   });
 
   it('promotes to a shared namespace from server control-plane resolution when runtime credentials are configured', async () => {
@@ -251,13 +252,27 @@ describe('resolveTransportContextBootstrap', () => {
       transportConfig: {},
     });
 
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       namespace: {
         scope: 'personal',
         projectId: 'github.com/acme/repo',
       },
       diagnostics: ['namespace:git-origin'],
       localProcessedFreshness: 'fresh',
+      startupMemory: {
+        reason: 'startup',
+        runtimeFamily: 'transport',
+        authoritySource: 'processed_local',
+        sourceKind: 'local_processed',
+        injectedText: expect.stringContaining('# Recent project memory'),
+        items: [
+          expect.objectContaining({
+            id: expect.any(String),
+            projectId: 'github.com/acme/repo',
+            summary: 'summary',
+          }),
+        ],
+      },
     });
   });
 
@@ -286,13 +301,40 @@ describe('resolveTransportContextBootstrap', () => {
       transportConfig: {},
     });
 
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       namespace: {
         scope: 'personal',
         projectId: 'github.com/acme/repo',
       },
       diagnostics: ['namespace:git-origin'],
       localProcessedFreshness: 'stale',
+      startupMemory: {
+        reason: 'startup',
+        runtimeFamily: 'transport',
+        authoritySource: 'processed_local',
+        sourceKind: 'local_processed',
+        injectedText: expect.stringContaining('# Recent project memory'),
+      },
     });
+  });
+
+  it('omits transport startup memory when the resolved namespace has no processed memory', async () => {
+    detectRepoMock.mockResolvedValue({
+      info: {
+        remoteUrl: 'git@github.com:acme/repo.git',
+      },
+    });
+
+    const result = await resolveTransportContextBootstrap({
+      projectDir: '/tmp/project',
+      transportConfig: {},
+    });
+
+    expect(result.namespace).toEqual({
+      scope: 'personal',
+      projectId: 'github.com/acme/repo',
+    });
+    expect(result.localProcessedFreshness).toBe('missing');
+    expect(result.startupMemory).toBeUndefined();
   });
 });

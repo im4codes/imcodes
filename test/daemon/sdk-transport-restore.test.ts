@@ -261,7 +261,7 @@ describe('sdk transport session restore', () => {
     expect(onSessionEvent).toHaveBeenCalledWith('started', 'deck_sdk_new_brain', 'idle');
   });
 
-  it('emits startup memory.context when transport bootstrap finds recent processed memory', async () => {
+  it('emits startup memory.context on first successful transport dispatch when bootstrap finds recent processed memory', async () => {
     writeProcessedProjection({
       namespace: {
         scope: 'personal',
@@ -290,23 +290,31 @@ describe('sdk transport session restore', () => {
       },
     });
 
-    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
-      'deck_sdk_startup_brain',
-      'memory.context',
-      expect.objectContaining({
-        reason: 'startup',
-        runtimeFamily: 'transport',
-        injectionSurface: 'system-text',
-        injectedText: expect.stringContaining('Seeded transport startup memory for observability'),
-        items: expect.arrayContaining([
-          expect.objectContaining({
-            projectId: 'sdk-startup-repo',
-            summary: 'Seeded transport startup memory for observability',
-          }),
-        ]),
-      }),
-      expect.objectContaining({ source: 'daemon', confidence: 'high' }),
+    const runtime = getTransportRuntime('deck_sdk_startup_brain');
+    expect(runtime).toBeDefined();
+    runtime!.send('/status');
+    await flush();
+
+    const startupCall = timelineEmitterEmitMock.mock.calls.find(([session, type, payload]) =>
+      session === 'deck_sdk_startup_brain'
+      && type === 'memory.context'
+      && (payload as Record<string, unknown>).reason === 'startup',
     );
+    expect(startupCall).toBeDefined();
+    expect(startupCall?.[2]).toEqual(expect.objectContaining({
+      reason: 'startup',
+      runtimeFamily: 'transport',
+      authoritySource: 'processed_local',
+      sourceKind: 'local_processed',
+      injectionSurface: expect.stringMatching(/^(system-text|normalized-payload|degraded-message-side)$/),
+      injectedText: expect.stringContaining('# Recent project memory'),
+      items: expect.arrayContaining([
+        expect.objectContaining({
+          projectId: 'sdk-startup-repo',
+          summary: 'Seeded transport startup memory for observability',
+        }),
+      ]),
+    }));
   });
 
   it('removes stale transport runtime from the map before awaiting a fresh kill', async () => {

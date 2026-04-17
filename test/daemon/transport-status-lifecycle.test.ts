@@ -19,6 +19,37 @@ import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { AgentStatus } from '../../src/agent/detect.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 
+const searchLocalMemorySemanticMock = vi.hoisted(() => vi.fn(async () => ({
+  items: [],
+  stats: {
+    totalRecords: 0,
+    matchedRecords: 0,
+    recentSummaryCount: 0,
+    durableCandidateCount: 0,
+    projectCount: 0,
+    stagedEventCount: 0,
+    dirtyTargetCount: 0,
+    pendingJobCount: 0,
+  },
+})));
+
+vi.mock('../../src/context/memory-search.js', () => ({
+  searchLocalMemory: vi.fn(() => ({
+    items: [],
+    stats: {
+      totalRecords: 0,
+      matchedRecords: 0,
+      recentSummaryCount: 0,
+      durableCandidateCount: 0,
+      projectCount: 0,
+      stagedEventCount: 0,
+      dirtyTargetCount: 0,
+      pendingJobCount: 0,
+    },
+  })),
+  searchLocalMemorySemantic: searchLocalMemorySemanticMock,
+}));
+
 // ── Mock provider ──────────────────────────────────────────────────────────────
 
 function makeMockProvider() {

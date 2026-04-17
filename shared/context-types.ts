@@ -73,6 +73,40 @@ export interface ContextAuthorityDecision {
   diagnostics: string[];
 }
 
+export interface TransportMemoryRecallItem {
+  id: string;
+  type?: 'raw' | 'processed';
+  projectId: string;
+  scope?: string;
+  summary: string;
+  projectionClass?: ProcessedContextClass;
+  hitCount?: number;
+  lastUsedAt?: number;
+  status?: ProcessedContextProjectionStatus;
+  relevanceScore?: number;
+  createdAt?: number;
+  updatedAt?: number;
+}
+
+export type MemoryRecallRuntimeFamily = 'process' | 'transport';
+export type MemoryRecallInjectionSurface =
+  | 'text-prepend'
+  | 'normalized-payload'
+  | 'degraded-message-side'
+  | 'system-text'
+  | 'message-preamble';
+
+export interface TransportMemoryRecallArtifact {
+  reason: 'message' | 'startup';
+  injectedText: string;
+  items: TransportMemoryRecallItem[];
+  query?: string;
+  runtimeFamily?: MemoryRecallRuntimeFamily;
+  injectionSurface?: MemoryRecallInjectionSurface;
+  authoritySource?: ContextAuthorityDecision['authoritySource'];
+  sourceKind?: 'local_processed' | 'remote_processed';
+}
+
 export interface CompiledAgentContextArtifact {
   systemText?: string;
   messagePreamble?: string;
@@ -93,6 +127,8 @@ export interface ProviderContextPayload {
   systemText?: string;
   messagePreamble?: string;
   attachments?: unknown[];
+  startupMemory?: TransportMemoryRecallArtifact;
+  memoryRecall?: TransportMemoryRecallArtifact;
   context: CompiledAgentContextArtifact;
   authority: ContextAuthorityDecision;
   supportClass: ProviderSupportClass;
