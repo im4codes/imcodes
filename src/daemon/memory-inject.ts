@@ -154,15 +154,18 @@ export async function readProcessedMemory(projectName: string): Promise<string |
   const entries = items.map((item) =>
     `- ${item.summary.split('\n')[0].slice(0, 300)}`,
   );
-  return `# Recent project memory\n\n${entries.join('\n')}`;
+  return `# Recent project memory (reference only)\n<recent-project-memory advisory="true">\n${entries.join('\n')}\n</recent-project-memory>`;
 }
 
 export async function readProcessedMemoryItems(projectName: string): Promise<MemorySearchResultItem[]> {
+  const normalizedProjectName = projectName.trim();
+  if (!normalizedProjectName) return [];
   try {
     const { searchLocalMemory } = await import('../context/memory-search.js');
     const result = searchLocalMemory({
-      repo: projectName,
-      limit: 10,
+      namespace: { scope: 'personal', projectId: normalizedProjectName },
+      repo: normalizedProjectName,
+      limit: 5,
       projectionClass: 'recent_summary',
     });
     return result.items.filter((item): item is MemorySearchResultItem => item.type === 'processed');

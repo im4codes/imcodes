@@ -5,7 +5,11 @@ import type { AgentStatus } from './detect.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { TransportProvider, ProviderError, SessionConfig, SessionInfoUpdate } from './transport-provider.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
-import { SharedContextDispatchError, dispatchSharedContextSend } from './transport-runtime-assembly.js';
+import {
+  SharedContextDispatchError,
+  dispatchSharedContextSend,
+  resolveTransportDispatchAuthority,
+} from './transport-runtime-assembly.js';
 import type {
   ContextFreshness,
   ContextNamespace,
@@ -17,7 +21,8 @@ import { buildMemoryContextTimelinePayload } from '../daemon/memory-context-time
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
 import { searchLocalMemorySemantic, type MemorySearchResultItem } from '../context/memory-search.js';
 import { resolveRuntimeAuthoredContext } from '../context/shared-context-runtime.js';
-import type { TransportContextBootstrap } from './runtime-context-bootstrap.js';
+import { buildTransportStartupMemory, type TransportContextBootstrap } from './runtime-context-bootstrap.js';
+import { recordMemoryHits } from '../store/context-store.js';
 import logger from '../util/logger.js';
 
 export interface PendingTransportMessage {
@@ -288,7 +293,21 @@ export class TransportSessionRuntime implements SessionRuntime {
 
     void this.refreshContextBootstrap()
       .then(async () => {
-        const memoryRecall = await this.buildTransportMessageRecall(message);
+        const authority = resolveTransportDispatchAuthority(this.provider, {
+          namespace: this._contextNamespace,
+          remoteProcessedFreshness: this._contextRemoteProcessedFreshness,
+          localProcessedFreshness: this._contextLocalProcessedFreshness,
+          retryExhausted: this._contextRetryExhausted,
+          sharedPolicyOverride: this._contextSharedPolicyOverride,
+        }).authority;
+        const startupMemory = this._startupMemory ?? (
+          !this._startupMemoryEmitted && authority.authoritySource === 'processed_local' && this._contextNamespace
+            ? buildTransportStartupMemory(this._contextNamespace)
+            : null
+        );
+        const memoryRecall = authority.authoritySource === 'processed_local'
+          ? await this.buildTransportMessageRecall(message)
+          : null;
         const dispatchResult = await dispatchSharedContextSend(this.provider, this._providerSessionId!, {
           userMessage: message,
           description: this._description,
@@ -302,7 +321,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           authoredContextRepository: this.resolveAuthoredContextRepository(),
           authoredContextLanguage: this._contextAuthoredContextLanguage,
           authoredContextFilePath: this._contextAuthoredContextFilePath,
-          ...(this._startupMemory ? { startupMemory: this._startupMemory } : {}),
+          ...(startupMemory ? { startupMemory } : {}),
           ...(memoryRecall ? { memoryRecall } : {}),
         }, {
           resolveAuthoredContext: (input) => {
@@ -314,6 +333,10 @@ export class TransportSessionRuntime implements SessionRuntime {
           },
         });
         if (dispatchResult.payload?.memoryRecall) {
+          const hitIds = dispatchResult.payload.memoryRecall.items.map((item) => item.id);
+          if (hitIds.length > 0) {
+            try { recordMemoryHits(hitIds); } catch { /* non-fatal */ }
+          }
           this.emitMemoryContextEvent(dispatchResult.payload.memoryRecall, clientMessageId);
         }
         if (!this._startupMemoryEmitted && dispatchResult.payload?.startupMemory) {
@@ -381,9 +404,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._contextSharedPolicyOverride = bootstrap.sharedPolicyOverride;
     this._contextAuthoredContextLanguage = bootstrap.authoredContextLanguage;
     this._contextAuthoredContextFilePath = bootstrap.authoredContextFilePath;
-    if (!this._startupMemoryEmitted) {
-      this._startupMemory = bootstrap.startupMemory ?? null;
-    }
+    if (!this._startupMemoryEmitted) this._startupMemory = bootstrap.startupMemory ?? null;
   }
 
   private async buildTransportMessageRecall(message: string): Promise<TransportMemoryRecallArtifact | null> {
@@ -404,6 +425,8 @@ export class TransportSessionRuntime implements SessionRuntime {
       const query = trimmed.slice(0, 200);
       const result = await searchLocalMemorySemantic({
         query,
+        namespace: this._contextNamespace,
+        currentEnterpriseId: this._contextNamespace?.enterpriseId,
         repo: this._contextNamespace?.projectId ?? this.resolveAuthoredContextRepository(),
         limit: 5,
       });
@@ -486,6 +509,9 @@ function toTransportMemoryRecallItem(item: MemorySearchResultItem): TransportMem
     type: item.type,
     projectId: item.projectId,
     scope: item.scope,
+    ...(item.enterpriseId ? { enterpriseId: item.enterpriseId } : {}),
+    ...(item.workspaceId ? { workspaceId: item.workspaceId } : {}),
+    ...(item.userId ? { userId: item.userId } : {}),
     summary: item.summary,
     ...(item.projectionClass ? { projectionClass: item.projectionClass } : {}),
     ...(typeof item.hitCount === 'number' ? { hitCount: item.hitCount } : {}),

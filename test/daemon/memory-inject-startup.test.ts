@@ -99,13 +99,14 @@ describe('injectGeminiMemoryWithTimeline', () => {
       'memory.context',
       expect.objectContaining({
         reason: 'startup',
-        injectedText: '[Related past work]\n- [proj] Fix websocket reconnect loop',
+        injectedText: '[Related past work]\n<related-past-work advisory="true">\n- [proj] Fix websocket reconnect loop\n</related-past-work>',
         items: [
           expect.objectContaining({
             id: 'mem-1',
             projectId: 'proj',
             hitCount: 2,
             relevanceScore: 0.81,
+            scope: 'personal',
           }),
         ],
       }),

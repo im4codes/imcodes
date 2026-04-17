@@ -3,6 +3,7 @@
  * Used by CLI (`imcodes memory`), WS command (`memory.search`), and web UI.
  */
 import type {
+  ContextNamespace,
   LocalContextEvent,
   ProcessedContextClass,
   ProcessedContextProjection,
@@ -14,7 +15,6 @@ import {
   listContextEvents,
   listDirtyTargets,
   queryProcessedProjections,
-  recordMemoryHits,
 } from '../store/context-store.js';
 
 // ── Query types ──────────────────────────────────────────────────────────────
@@ -22,6 +22,10 @@ import {
 export interface MemorySearchQuery {
   /** Substring to match in summary/content text. */
   query?: string;
+  /** Filter by effective namespace. When provided, namespace fields are matched exactly. */
+  namespace?: ContextNamespace;
+  /** Optional enterprise context used for ranking when search scope is broader than one namespace. */
+  currentEnterpriseId?: string;
   /** Filter by canonical repository ID (matches namespace.projectId). */
   repo?: string;
   /** Filter by projection class. */
@@ -50,6 +54,8 @@ export interface MemorySearchResultItem {
   projectId: string;
   scope: string;
   enterpriseId?: string;
+  workspaceId?: string;
+  userId?: string;
   eventType?: string;
   projectionClass?: ProcessedContextClass;
   summary: string;
@@ -89,7 +95,8 @@ export async function searchLocalMemorySemantic(query: MemorySearchQuery): Promi
 
     // Score each candidate by cosine similarity
     const scored: Array<{ item: MemorySearchResultItem; score: number }> = [];
-    const currentProjectId = query.repo ?? '__unknown_current_project__';
+    const currentProjectId = query.namespace?.projectId ?? query.repo ?? '__unknown_current_project__';
+    const currentEnterpriseId = query.currentEnterpriseId ?? query.namespace?.enterpriseId;
     for (const item of candidates.items) {
       const text = `${item.summary} ${item.content ?? ''}`.slice(0, 500);
       const itemEmb = await generateEmbedding(text);
@@ -104,6 +111,7 @@ export async function searchLocalMemorySemantic(query: MemorySearchQuery): Promi
           memoryProjectId: item.projectId,
           currentProjectId,
           memoryEnterpriseId: item.enterpriseId,
+          currentEnterpriseId,
         });
         scored.push({
           item: {
@@ -121,12 +129,6 @@ export async function searchLocalMemorySemantic(query: MemorySearchQuery): Promi
     scored.sort((a, b) => b.score - a.score);
     const limit = query.limit ?? 5;
     const topItems = scored.slice(0, limit).map((s) => s.item);
-
-    // Record hits for recalled items (spaced repetition: each recall resets decay clock)
-    const hitIds = topItems.filter((i) => i.type === 'processed').map((i) => i.id);
-    if (hitIds.length > 0) {
-      try { recordMemoryHits(hitIds); } catch { /* non-fatal */ }
-    }
 
     return {
       items: topItems,
@@ -242,7 +244,11 @@ function formatAge(timestamp: number): string {
 
 function collectProcessedProjections(query: MemorySearchQuery): ProcessedContextProjection[] {
   return queryProcessedProjections({
-    projectId: query.repo,
+    scope: query.namespace?.scope,
+    enterpriseId: query.namespace?.enterpriseId,
+    workspaceId: query.namespace?.workspaceId,
+    userId: query.namespace?.userId,
+    projectId: query.namespace?.projectId ?? query.repo,
     projectionClass: query.projectionClass,
     query: query.query,
     includeArchived: query.includeArchived,
@@ -253,7 +259,7 @@ function collectRawEvents(query: MemorySearchQuery): MemorySearchResultItem[] {
   const items: MemorySearchResultItem[] = [];
   const dirtyTargets = listDirtyTargets();
   for (const dt of dirtyTargets) {
-    if (query.repo && dt.target.namespace.projectId !== query.repo) continue;
+    if (!matchesNamespace(dt.target.namespace, query)) continue;
     const events = listContextEvents(dt.target);
     for (const event of events) {
       if (query.eventType && event.eventType !== query.eventType) continue;
@@ -271,6 +277,8 @@ function projectionToItem(projection: ProcessedContextProjection): MemorySearchR
     projectId: projection.namespace.projectId,
     scope: projection.namespace.scope,
     enterpriseId: projection.namespace.enterpriseId,
+    workspaceId: projection.namespace.workspaceId,
+    userId: projection.namespace.userId,
     projectionClass: projection.class,
     summary: projection.summary,
     content: typeof content === 'object' ? JSON.stringify(content) : undefined,
@@ -290,6 +298,9 @@ function eventToItem(event: LocalContextEvent): MemorySearchResultItem {
     id: event.id,
     projectId: event.target.namespace.projectId,
     scope: event.target.namespace.scope,
+    enterpriseId: event.target.namespace.enterpriseId,
+    workspaceId: event.target.namespace.workspaceId,
+    userId: event.target.namespace.userId,
     eventType: event.eventType,
     summary: event.content ?? event.eventType,
     createdAt: event.createdAt,
@@ -297,7 +308,7 @@ function eventToItem(event: LocalContextEvent): MemorySearchResultItem {
 }
 
 function matchesQuery(item: MemorySearchResultItem, query: MemorySearchQuery): boolean {
-  if (query.repo && item.projectId !== query.repo) return false;
+  if (!matchesNamespace(item, query)) return false;
   if (query.projectionClass && item.projectionClass !== query.projectionClass) return false;
   if (query.eventType && item.type === 'raw' && item.eventType !== query.eventType) return false;
   if (query.after && item.createdAt < query.after) return false;
@@ -307,6 +318,24 @@ function matchesQuery(item: MemorySearchResultItem, query: MemorySearchQuery): b
     const haystack = `${item.summary} ${item.content ?? ''}`.toLowerCase();
     if (!haystack.includes(needle)) return false;
   }
+  return true;
+}
+
+function matchesNamespace(
+  item: Pick<MemorySearchResultItem, 'projectId' | 'scope' | 'enterpriseId' | 'workspaceId' | 'userId'>
+    | ContextNamespace,
+  query: MemorySearchQuery,
+): boolean {
+  const namespace = query.namespace;
+  if (namespace) {
+    if (item.projectId !== namespace.projectId) return false;
+    if (item.scope !== namespace.scope) return false;
+    if ((item.enterpriseId ?? undefined) !== (namespace.enterpriseId ?? undefined)) return false;
+    if ((item.workspaceId ?? undefined) !== (namespace.workspaceId ?? undefined)) return false;
+    if ((item.userId ?? undefined) !== (namespace.userId ?? undefined)) return false;
+    return true;
+  }
+  if (query.repo && item.projectId !== query.repo) return false;
   return true;
 }
 

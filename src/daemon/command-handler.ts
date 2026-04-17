@@ -62,7 +62,7 @@ import {
   type TransportEffortLevel,
 } from '../../shared/effort-levels.js';
 import { getSavedP2pConfig, upsertSavedP2pConfig } from '../store/p2p-config-store.js';
-import { getProcessedProjectionStats, queryPendingContextEvents, queryProcessedProjections } from '../store/context-store.js';
+import { getProcessedProjectionStats, queryPendingContextEvents, queryProcessedProjections, recordMemoryHits } from '../store/context-store.js';
 import {
   normalizeSharedContextRuntimeConfig,
   normalizeSharedContextRuntimeBackend,
@@ -4242,10 +4242,17 @@ async function prependLocalMemory(
     const query = prompt.slice(0, 200);
     const result = await searchLocalMemorySemantic({
       query,
+      namespace: record?.projectName
+        ? { scope: 'personal', projectId: record.projectName }
+        : undefined,
       repo: record?.projectName ?? undefined,
       limit: 5,
     });
     if (result.items.length === 0) return { text: prompt };
+    const hitIds = result.items.filter((item) => item.type === 'processed').map((item) => item.id);
+    if (hitIds.length > 0) {
+      try { recordMemoryHits(hitIds); } catch { /* non-fatal */ }
+    }
     const injectedText = buildRelatedPastWorkText(result.items);
     const timelinePayload = buildMemoryContextTimelinePayload(query, result.items);
     return {

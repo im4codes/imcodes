@@ -13,7 +13,7 @@ vi.mock('../../src/repo/detector.js', async (importOriginal) => {
   };
 });
 
-import { resolveTransportContextBootstrap } from '../../src/agent/runtime-context-bootstrap.js';
+import { buildTransportStartupMemory, resolveTransportContextBootstrap } from '../../src/agent/runtime-context-bootstrap.js';
 
 describe('resolveTransportContextBootstrap', () => {
   let tempDir: string;
@@ -259,20 +259,6 @@ describe('resolveTransportContextBootstrap', () => {
       },
       diagnostics: ['namespace:git-origin'],
       localProcessedFreshness: 'fresh',
-      startupMemory: {
-        reason: 'startup',
-        runtimeFamily: 'transport',
-        authoritySource: 'processed_local',
-        sourceKind: 'local_processed',
-        injectedText: expect.stringContaining('# Recent project memory'),
-        items: [
-          expect.objectContaining({
-            id: expect.any(String),
-            projectId: 'github.com/acme/repo',
-            summary: 'summary',
-          }),
-        ],
-      },
     });
   });
 
@@ -308,13 +294,6 @@ describe('resolveTransportContextBootstrap', () => {
       },
       diagnostics: ['namespace:git-origin'],
       localProcessedFreshness: 'stale',
-      startupMemory: {
-        reason: 'startup',
-        runtimeFamily: 'transport',
-        authoritySource: 'processed_local',
-        sourceKind: 'local_processed',
-        injectedText: expect.stringContaining('# Recent project memory'),
-      },
     });
   });
 
@@ -336,5 +315,54 @@ describe('resolveTransportContextBootstrap', () => {
     });
     expect(result.localProcessedFreshness).toBe('missing');
     expect(result.startupMemory).toBeUndefined();
+  });
+
+  it('buildTransportStartupMemory filters by full namespace instead of project id only', () => {
+    const now = Date.now();
+    writeProcessedProjection({
+      namespace: {
+        scope: 'personal',
+        projectId: 'github.com/acme/repo',
+        userId: 'user-1',
+      },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-personal'],
+      summary: 'Personal startup memory',
+      content: {},
+      createdAt: now - 100,
+      updatedAt: now - 50,
+    });
+    writeProcessedProjection({
+      namespace: {
+        scope: 'project_shared',
+        projectId: 'github.com/acme/repo',
+        enterpriseId: 'ent-1',
+        workspaceId: 'ws-1',
+      },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-shared'],
+      summary: 'Shared startup memory',
+      content: {},
+      createdAt: now - 90,
+      updatedAt: now - 40,
+    });
+
+    const personalStartup = buildTransportStartupMemory({
+      scope: 'personal',
+      projectId: 'github.com/acme/repo',
+      userId: 'user-1',
+    });
+    const sharedStartup = buildTransportStartupMemory({
+      scope: 'project_shared',
+      projectId: 'github.com/acme/repo',
+      enterpriseId: 'ent-1',
+      workspaceId: 'ws-1',
+    });
+
+    expect(personalStartup?.items).toHaveLength(1);
+    expect(personalStartup?.items[0]?.summary).toContain('Personal');
+    expect(personalStartup?.injectedText).toContain('reference only');
+    expect(sharedStartup?.items).toHaveLength(1);
+    expect(sharedStartup?.items[0]?.summary).toContain('Shared');
   });
 });

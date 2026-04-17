@@ -24,6 +24,10 @@ export function buildMemoryContextTimelinePayload(
   const timelineItems: MemoryContextTimelineItem[] = items.map((item) => ({
     id: item.id,
     projectId: item.projectId,
+    ...('scope' in item && item.scope ? { scope: item.scope } : {}),
+    ...('enterpriseId' in item && item.enterpriseId ? { enterpriseId: item.enterpriseId } : {}),
+    ...('workspaceId' in item && item.workspaceId ? { workspaceId: item.workspaceId } : {}),
+    ...('userId' in item && item.userId ? { userId: item.userId } : {}),
     summary: item.summary,
     projectionClass: item.projectionClass,
     hitCount: item.hitCount,

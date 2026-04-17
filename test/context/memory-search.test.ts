@@ -3,6 +3,7 @@ import type { ContextNamespace, ContextTargetRef } from '../../shared/context-ty
 import { searchLocalMemory, formatSearchResults } from '../../src/context/memory-search.js';
 import { MaterializationCoordinator } from '../../src/context/materialization-coordinator.js';
 import { localOnlyCompressor } from '../../src/context/summary-compressor.js';
+import { writeProcessedProjection } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 
 describe('memory-search', () => {
@@ -48,6 +49,35 @@ describe('memory-search', () => {
 
     const noMatchResult = searchLocalMemory({ repo: 'github.com/other/repo' });
     expect(noMatchResult.items).toHaveLength(0);
+  });
+
+  it('filters by full namespace instead of mixing scopes for the same repo', () => {
+    writeProcessedProjection({
+      namespace: { scope: 'personal', projectId: 'github.com/acme/repo', userId: 'user-1' },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-personal'],
+      summary: 'Personal fix',
+      content: {},
+    });
+    writeProcessedProjection({
+      namespace: { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1', workspaceId: 'ws-1' },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-shared'],
+      summary: 'Shared fix',
+      content: {},
+    });
+
+    const personalResult = searchLocalMemory({
+      namespace: { scope: 'personal', projectId: 'github.com/acme/repo', userId: 'user-1' },
+    });
+    const sharedResult = searchLocalMemory({
+      namespace: { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1', workspaceId: 'ws-1' },
+    });
+
+    expect(personalResult.items).toHaveLength(1);
+    expect(personalResult.items[0]?.summary).toContain('Personal');
+    expect(sharedResult.items).toHaveLength(1);
+    expect(sharedResult.items[0]?.summary).toContain('Shared');
   });
 
   it('includes raw events when includeRaw is set', async () => {

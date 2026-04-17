@@ -78,6 +78,9 @@ export interface TransportMemoryRecallItem {
   type?: 'raw' | 'processed';
   projectId: string;
   scope?: string;
+  enterpriseId?: string;
+  workspaceId?: string;
+  userId?: string;
   summary: string;
   projectionClass?: ProcessedContextClass;
   hitCount?: number;

@@ -21,5 +21,5 @@ export function formatRelatedPastWorkLine(item: Pick<RelatedPastWorkRenderableIt
 }
 
 export function buildRelatedPastWorkText(items: ReadonlyArray<Pick<RelatedPastWorkRenderableItem, 'projectId' | 'summary'>>): string {
-  return `${RELATED_PAST_WORK_HEADER}\n${items.map((item) => formatRelatedPastWorkLine(item)).join('\n')}`;
+  return `${RELATED_PAST_WORK_HEADER}\n<related-past-work advisory="true">\n${items.map((item) => formatRelatedPastWorkLine(item)).join('\n')}\n</related-past-work>`;
 }

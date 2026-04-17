@@ -450,6 +450,9 @@ export function listAllProcessedProjectionsByNamespace(): Map<string, string[]> 
 
 export interface ProcessedProjectionQuery {
   scope?: ContextScope;
+  enterpriseId?: string;
+  workspaceId?: string;
+  userId?: string;
   projectId?: string;
   projectionClass?: ProcessedContextClass;
   query?: string;
@@ -493,6 +496,9 @@ export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}
       } satisfies ProcessedContextProjection;
     })
     .filter((projection) => !filters.scope || projection.namespace.scope === filters.scope)
+    .filter((projection) => (filters.enterpriseId ?? undefined) === undefined || projection.namespace.enterpriseId === filters.enterpriseId)
+    .filter((projection) => (filters.workspaceId ?? undefined) === undefined || projection.namespace.workspaceId === filters.workspaceId)
+    .filter((projection) => (filters.userId ?? undefined) === undefined || projection.namespace.userId === filters.userId)
     .filter((projection) => !filters.projectId || projection.namespace.projectId === filters.projectId)
     .filter((projection) => !filters.projectionClass || projection.class === filters.projectionClass)
     .filter((projection) => {

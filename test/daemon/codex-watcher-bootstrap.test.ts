@@ -99,7 +99,7 @@ describe('ensureSessionFile', () => {
       'memory.context',
       expect.objectContaining({
         reason: 'startup',
-        injectedText: '[Related past work]\n- [proj] Fix websocket reconnect loop',
+        injectedText: '[Related past work]\n<related-past-work advisory="true">\n- [proj] Fix websocket reconnect loop\n</related-past-work>',
       }),
       expect.any(Object),
     );

@@ -210,13 +210,14 @@ describe('handleWebCommand memory context timeline', () => {
       expect.objectContaining({
         relatedToEventId: 'evt-user-1',
         query: 'Fix reconnect issues in websocket client',
-        injectedText: '[Related past work]\n- [codedeck] Fix websocket reconnect loop',
+        injectedText: '[Related past work]\n<related-past-work advisory="true">\n- [codedeck] Fix websocket reconnect loop\n</related-past-work>',
         items: [
           expect.objectContaining({
             id: 'mem-1',
             projectId: 'codedeck',
             relevanceScore: 0.812,
             hitCount: 4,
+            scope: 'personal',
           }),
         ],
       }),

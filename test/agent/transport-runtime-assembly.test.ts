@@ -68,6 +68,7 @@ describe('buildProviderContextPayload', () => {
     const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
       userMessage: 'Run tests',
       namespace: { scope: 'personal', projectId: 'repo-1' },
+      localProcessedFreshness: 'fresh',
       startupMemory: makeRecall({
         reason: 'startup',
         injectedText: '# Recent project memory\n\n- Prior fix for transport bootstrap',
@@ -100,6 +101,7 @@ describe('buildProviderContextPayload', () => {
     const payload = buildProviderContextPayload(makeProvider('degraded-message-side-context-mapping'), {
       userMessage: 'Run tests',
       namespace: { scope: 'personal', projectId: 'repo-1' },
+      localProcessedFreshness: 'fresh',
       memoryRecall: makeRecall(),
     });
 
@@ -172,6 +174,28 @@ describe('buildProviderContextPayload', () => {
 
     expect(payload.authority.authoritySource).toBe('none');
     expect(payload.authority.fallbackAllowed).toBe(false);
+  });
+
+  it('suppresses local recall artifacts when authority resolves to processed_remote', () => {
+    const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+      userMessage: 'Run tests',
+      namespace: { scope: 'project_shared', projectId: 'repo-1', enterpriseId: 'ent-1' },
+      remoteProcessedFreshness: 'fresh',
+      retryExhausted: true,
+      startupMemory: makeRecall({
+        reason: 'startup',
+        injectedText: '# Recent project memory (reference only)\n<recent-project-memory advisory=\"true\">\n- Prior fix\n</recent-project-memory>',
+      }),
+      memoryRecall: makeRecall(),
+    });
+
+    expect(payload.authority.authoritySource).toBe('processed_remote');
+    expect(payload.startupMemory).toBeUndefined();
+    expect(payload.memoryRecall).toBeUndefined();
+    expect(payload.systemText ?? '').not.toContain('Recent project memory');
+    expect(payload.messagePreamble).toBeUndefined();
+    expect(payload.diagnostics).toContain('memory:start:suppressed-authority');
+    expect(payload.diagnostics).toContain('memory:message:suppressed-authority');
   });
 
   it('allows shared local processed fallback only when explicit policy permits it', () => {

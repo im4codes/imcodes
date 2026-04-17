@@ -4,7 +4,7 @@ import { searchLocalMemorySemantic } from '../../src/context/memory-search.js';
 import { MaterializationCoordinator } from '../../src/context/materialization-coordinator.js';
 import { localOnlyCompressor } from '../../src/context/summary-compressor.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
-import { queryProcessedProjections, recordMemoryHits } from '../../src/store/context-store.js';
+import { queryProcessedProjections, recordMemoryHits, writeProcessedProjection } from '../../src/store/context-store.js';
 
 const generateEmbeddingMock = vi.hoisted(() => vi.fn());
 const cosineSimilarityMock = vi.hoisted(() => vi.fn());
@@ -71,5 +71,48 @@ describe('memory-search semantic ranking', () => {
     expect(result.items).toHaveLength(2);
     expect(result.items[0].summary.toLowerCase()).toContain('download');
     expect(new Set(result.items.map((item) => item.id)).size).toBe(2);
+  });
+
+  it('passes current enterprise context into scoring so same-enterprise recall beats unrelated recall', async () => {
+    writeProcessedProjection({
+      namespace: {
+        scope: 'project_shared',
+        projectId: 'github.com/acme/repo-a',
+        enterpriseId: 'ent-1',
+        workspaceId: 'ws-1',
+      },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-1'],
+      summary: 'Same enterprise fix',
+      content: {},
+    });
+    writeProcessedProjection({
+      namespace: {
+        scope: 'project_shared',
+        projectId: 'github.com/other/repo-b',
+        enterpriseId: 'ent-2',
+        workspaceId: 'ws-2',
+      },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-2'],
+      summary: 'Different enterprise fix',
+      content: {},
+    });
+
+    generateEmbeddingMock.mockImplementation(async (text: string) => {
+      if (text === 'enterprise bug') return new Float32Array([1]);
+      if (text.includes('Same enterprise')) return new Float32Array([0.5]);
+      if (text.includes('Different enterprise')) return new Float32Array([0.5]);
+      return null;
+    });
+
+    const result = await searchLocalMemorySemantic({
+      query: 'enterprise bug',
+      currentEnterpriseId: 'ent-1',
+      limit: 2,
+    });
+
+    expect(result.items).toHaveLength(2);
+    expect(result.items[0]?.summary).toContain('Same enterprise');
   });
 });

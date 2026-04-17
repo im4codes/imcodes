@@ -53,6 +53,11 @@ export interface DispatchSharedContextSendResult {
   payload?: ProviderContextPayload;
 }
 
+export interface EvaluatedTransportDispatchAuthority {
+  supportClass: ProviderSupportClass;
+  authority: ProviderContextPayload['authority'];
+}
+
 export class SharedContextDispatchError extends Error {
   readonly providerError: ProviderError;
   readonly payload?: ProviderContextPayload;
@@ -95,8 +100,74 @@ export function buildProviderContextPayload(
   provider: TransportProvider,
   input: TransportRuntimeAssemblyInput,
 ): ProviderContextPayload {
-  const compiledContextInput = composeTransportMemoryInputs(input);
+  const namespace = input.namespace ?? {
+    scope: 'personal',
+    projectId: 'transport-default',
+  };
+  const { supportClass, authority } = resolveTransportDispatchAuthority(provider, input);
+  const sanitizedRecall = authority.authoritySource === 'processed_local'
+    ? {
+        startupMemory: input.startupMemory,
+        memoryRecall: input.memoryRecall,
+      }
+    : {
+        startupMemory: undefined,
+        memoryRecall: undefined,
+      };
+  const compiledContextInput = composeTransportMemoryInputs({
+    ...input,
+    startupMemory: sanitizedRecall.startupMemory,
+    memoryRecall: sanitizedRecall.memoryRecall,
+  });
   const compiledContext = compileAgentContextArtifact(compiledContextInput);
+  const diagnostics = buildContextDiagnostics({
+    authority,
+    supportClass,
+    artifact: compiledContext,
+  });
+  if (input.sourceSurface) {
+    diagnostics.push(`surface:${input.sourceSurface}`);
+  }
+  for (const entry of input.namespaceDiagnostics ?? []) {
+    if (!diagnostics.includes(entry)) diagnostics.push(entry);
+  }
+  if (input.startupMemory) diagnostics.push(authority.authoritySource === 'processed_local' ? 'memory:start' : 'memory:start:suppressed-authority');
+  if (input.memoryRecall) diagnostics.push(authority.authoritySource === 'processed_local' ? 'memory:message' : 'memory:message:suppressed-authority');
+  const recallInjectionSurface: MemoryRecallInjectionSurface = supportClass === 'degraded-message-side-context-mapping'
+    ? 'degraded-message-side'
+    : 'normalized-payload';
+  const startupMemory = sanitizedRecall.startupMemory
+    ? { ...sanitizedRecall.startupMemory, injectionSurface: recallInjectionSurface }
+    : undefined;
+  const memoryRecall = sanitizedRecall.memoryRecall
+    ? { ...sanitizedRecall.memoryRecall, injectionSurface: recallInjectionSurface }
+    : undefined;
+  return {
+    userMessage: input.userMessage,
+    assembledMessage: renderAssembledMessage(input.userMessage, compiledContext.messagePreamble),
+    systemText: compiledContext.systemText,
+    messagePreamble: compiledContext.messagePreamble,
+    attachments: input.attachments,
+    ...(startupMemory ? { startupMemory } : {}),
+    ...(memoryRecall ? { memoryRecall } : {}),
+    context: compiledContext,
+    authority,
+    supportClass,
+    diagnostics,
+  };
+}
+
+export function resolveTransportDispatchAuthority(
+  provider: TransportProvider,
+  input: Pick<
+    TransportRuntimeAssemblyInput,
+    'namespace'
+    | 'remoteProcessedFreshness'
+    | 'localProcessedFreshness'
+    | 'retryExhausted'
+    | 'sharedPolicyOverride'
+  >,
+): EvaluatedTransportDispatchAuthority {
   const namespace = input.namespace ?? {
     scope: 'personal',
     projectId: 'transport-default',
@@ -113,41 +184,7 @@ export function buildProviderContextPayload(
     allowSharedDegraded,
     allowSharedLocalFallback: sharedPolicyOverride?.allowLocalProcessedFallback ?? false,
   });
-  const diagnostics = buildContextDiagnostics({
-    authority,
-    supportClass,
-    artifact: compiledContext,
-  });
-  if (input.sourceSurface) {
-    diagnostics.push(`surface:${input.sourceSurface}`);
-  }
-  for (const entry of input.namespaceDiagnostics ?? []) {
-    if (!diagnostics.includes(entry)) diagnostics.push(entry);
-  }
-  if (input.startupMemory) diagnostics.push('memory:start');
-  if (input.memoryRecall) diagnostics.push('memory:message');
-  const recallInjectionSurface: MemoryRecallInjectionSurface = supportClass === 'degraded-message-side-context-mapping'
-    ? 'degraded-message-side'
-    : 'normalized-payload';
-  const startupMemory = input.startupMemory
-    ? { ...input.startupMemory, injectionSurface: recallInjectionSurface }
-    : undefined;
-  const memoryRecall = input.memoryRecall
-    ? { ...input.memoryRecall, injectionSurface: recallInjectionSurface }
-    : undefined;
-  return {
-    userMessage: input.userMessage,
-    assembledMessage: renderAssembledMessage(input.userMessage, compiledContext.messagePreamble),
-    systemText: compiledContext.systemText,
-    messagePreamble: compiledContext.messagePreamble,
-    attachments: input.attachments,
-    ...(startupMemory ? { startupMemory } : {}),
-    ...(memoryRecall ? { memoryRecall } : {}),
-    context: compiledContext,
-    authority,
-    supportClass,
-    diagnostics,
-  };
+  return { supportClass, authority };
 }
 
 function resolveTransportRuntimeAssemblyInput(

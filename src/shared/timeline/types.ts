@@ -47,6 +47,10 @@ export interface TimelineEvent {
 export interface MemoryContextTimelineItem {
   id: string;
   projectId: string;
+  scope?: string;
+  enterpriseId?: string;
+  workspaceId?: string;
+  userId?: string;
   summary: string;
   projectionClass?: ProcessedContextClass;
   hitCount?: number;

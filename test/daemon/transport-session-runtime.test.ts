@@ -175,7 +175,8 @@ describe('TransportSessionRuntime', () => {
   });
 
   it('send() uses bootstrap-provided local processed freshness for personal continuity authority', async () => {
-    const r = new TransportSessionRuntime(mock.provider, 'x');
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'x');
     await r.initialize({
       ...defaultConfig,
       contextNamespace: {
@@ -187,8 +188,9 @@ describe('TransportSessionRuntime', () => {
 
     r.send('help');
     await flushDispatch();
+    await flushDispatch();
 
-    expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+    expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
       authority: expect.objectContaining({
         authoritySource: 'processed_local',
         freshness: 'fresh',
@@ -216,7 +218,8 @@ describe('TransportSessionRuntime', () => {
   });
 
   it('refreshes shared-context bootstrap on each dispatch turn instead of freezing launch-time namespace state', async () => {
-    const r = new TransportSessionRuntime(mock.provider, 'x');
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'x');
     const refreshBootstrap = vi.fn()
       .mockResolvedValueOnce({
         namespace: {
@@ -247,7 +250,8 @@ describe('TransportSessionRuntime', () => {
 
     r.send('first');
     await flushDispatch();
-    expect(mock.provider.send).toHaveBeenNthCalledWith(1, 'sess-1', expect.objectContaining({
+    await flushDispatch();
+    expect(localMock.provider.send).toHaveBeenNthCalledWith(1, 'sess-1', expect.objectContaining({
       authority: expect.objectContaining({
         namespace: {
           scope: 'project_shared',
@@ -259,10 +263,11 @@ describe('TransportSessionRuntime', () => {
       diagnostics: expect.arrayContaining(['namespace:server-control-plane']),
     }));
 
-    mock.fireComplete('sess-1');
+    localMock.fireComplete('sess-1');
     r.send('second');
     await flushDispatch();
-    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+    await flushDispatch();
+    expect(localMock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
       authority: expect.objectContaining({
         namespace: {
           scope: 'personal',
@@ -294,6 +299,7 @@ describe('TransportSessionRuntime', () => {
     r.setContextBootstrapResolver(async () => ({
       namespace: { scope: 'personal', projectId: 'repo-1' },
       diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
       startupMemory,
     }));
 
@@ -326,15 +332,18 @@ describe('TransportSessionRuntime', () => {
     r.setContextBootstrapResolver(async () => ({
       namespace: { scope: 'personal', projectId: 'repo-1' },
       diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
     }));
     await r.initialize(defaultConfig);
     timelineEmitterEmitMock.mockClear();
 
     r.send('Please recall recent transport memory around recall runtime', 'client-turn-1');
     await flushDispatch();
+    await flushDispatch();
 
     expect(searchLocalMemorySemanticMock).toHaveBeenCalledWith(expect.objectContaining({
       query: expect.stringContaining('Please recall recent transport memory'),
+      namespace: { scope: 'personal', projectId: 'repo-1' },
       repo: 'repo-1',
       limit: 5,
     }));
@@ -361,6 +370,43 @@ describe('TransportSessionRuntime', () => {
         sourceKind: 'local_processed',
       }),
       expect.objectContaining({ source: 'daemon', confidence: 'high' }),
+    );
+  });
+
+  it('does not inject local recall when authority resolves to processed_remote for shared scope', async () => {
+    const memoryItem = makeSearchItem({
+      projectId: 'repo-1',
+      scope: 'project_shared',
+      enterpriseId: 'ent-1',
+      workspaceId: 'ws-1',
+      summary: 'Should not be injected while remote authority is active',
+    });
+    searchLocalMemorySemanticMock.mockResolvedValue(makeSearchResult([memoryItem]));
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'project_shared', projectId: 'repo-1', enterpriseId: 'ent-1', workspaceId: 'ws-1' },
+      diagnostics: ['namespace:server-control-plane'],
+      remoteProcessedFreshness: 'fresh',
+      localProcessedFreshness: 'fresh',
+      retryExhausted: true,
+    }));
+    await r.initialize(defaultConfig);
+    timelineEmitterEmitMock.mockClear();
+
+    r.send('Please recall recent transport memory around recall runtime', 'client-turn-remote');
+    await flushDispatch();
+
+    expect(searchLocalMemorySemanticMock).not.toHaveBeenCalled();
+    expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.not.objectContaining({
+      memoryRecall: expect.anything(),
+      startupMemory: expect.anything(),
+    }));
+    expect(timelineEmitterEmitMock).not.toHaveBeenCalledWith(
+      'deck_test_brain',
+      'memory.context',
+      expect.objectContaining({ reason: 'message' }),
+      expect.anything(),
     );
   });
 
