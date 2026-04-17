@@ -44,7 +44,7 @@ export interface SessionRecord {
   qwenFreshOnResume?: boolean;
   /** Qwen auth source detected from local CLI config/status. */
   qwenAuthType?: QwenAuthType;
-  /** Human-readable auth limit from `qwen auth status` (e.g. Up to 1,000 requests/day). */
+  /** Human-readable auth limit text from `qwen auth status`. */
   qwenAuthLimit?: string;
   /** Qwen models available for the current auth source. */
   qwenAvailableModels?: string[];

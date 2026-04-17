@@ -61,6 +61,8 @@ async function seedProjection(opts: {
   projectId: string;
   summary: string;
   projectionClass?: string;
+  hitCount?: number;
+  lastUsedAt?: number | null;
 }): Promise<string> {
   const id = randomHex(16);
   const now = Date.now();
@@ -68,12 +70,12 @@ async function seedProjection(opts: {
     `INSERT INTO shared_context_projections
        (id, server_id, scope, enterprise_id, workspace_id, user_id, project_id,
         projection_class, source_event_ids_json, summary, content_json,
-        created_at, updated_at, replicated_at)
-     VALUES ($1, $2, 'personal', NULL, NULL, $3, $4, $5, $6::jsonb, $7, $8::jsonb, $9, $10, $11)`,
+        created_at, updated_at, replicated_at, hit_count, last_used_at)
+     VALUES ($1, $2, 'personal', NULL, NULL, $3, $4, $5, $6::jsonb, $7, $8::jsonb, $9, $10, $11, $12, $13)`,
     [id, opts.serverId, opts.userId, opts.projectId,
      opts.projectionClass ?? 'recent_summary',
      JSON.stringify(['evt-1']), opts.summary, JSON.stringify({ test: true }),
-     now, now, now],
+     now, now, now, opts.hitCount ?? 0, opts.lastUsedAt ?? null],
   );
   return id;
 }
@@ -198,6 +200,52 @@ describe('personal cloud memory — auth and data isolation', () => {
     expect(body.stats.totalRecords).toBe(1);
     expect(body.records[0].summary).toBe('Decision');
   });
+
+  it('does not increment recall metrics when personal memory is searched from the UI query route', async () => {
+    const lastUsedAt = Date.now() - 60_000;
+    const projectionId = await seedProjection({
+      userId: userA,
+      serverId: serverA,
+      projectId: 'repo-1',
+      summary: 'Deploy fix memory',
+      hitCount: 2,
+      lastUsedAt,
+    });
+
+    const app = makeApp();
+    const headers = csrfHeaders(makeToken(userA));
+
+    const first = await app.request('/api/shared-context/personal-memory?query=deploy&limit=10', {
+      method: 'GET',
+      headers,
+    });
+    expect(first.status).toBe(200);
+    const firstBody = await first.json() as { records: Array<{ id: string; hitCount?: number; lastUsedAt?: number }> };
+    expect(firstBody.records[0]).toEqual(expect.objectContaining({
+      id: projectionId,
+      hitCount: 2,
+      lastUsedAt,
+    }));
+
+    const second = await app.request('/api/shared-context/personal-memory?query=deploy&limit=10', {
+      method: 'GET',
+      headers,
+    });
+    expect(second.status).toBe(200);
+    const secondBody = await second.json() as { records: Array<{ id: string; hitCount?: number; lastUsedAt?: number }> };
+    expect(secondBody.records[0]).toEqual(expect.objectContaining({
+      id: projectionId,
+      hitCount: 2,
+      lastUsedAt,
+    }));
+
+    const persisted = await db.queryOne<{ hit_count: number; last_used_at: number | null }>(
+      'SELECT hit_count, last_used_at FROM shared_context_projections WHERE id = $1',
+      [projectionId],
+    );
+    expect(persisted).toEqual({ hit_count: 2, last_used_at: lastUsedAt });
+  });
+
 
   // ── Daemon replication → cloud query round-trip ───────────────────
 

@@ -207,7 +207,9 @@ describe('ChatView', () => {
       />,
     );
 
-    expect(container.querySelector('.chat-memory-context')).not.toBeNull();
+    expect(container.querySelectorAll('.chat-event.chat-user')).toHaveLength(1);
+    expect(container.querySelectorAll('.chat-memory-context')).toHaveLength(1);
+    expect(container.querySelector('.chat-linked-event-group')).not.toBeNull();
     expect(getByText('chat.memory_context_title')).toBeTruthy();
     expect(container.textContent).not.toContain('Fix websocket reconnect loop');
 
@@ -248,6 +250,7 @@ describe('ChatView', () => {
       />,
     );
 
+    expect(container.querySelector('.chat-linked-event-group')).toBeNull();
     fireEvent.click(getByText('chat.memory_context_title'));
 
     await waitFor(() => {
@@ -297,6 +300,7 @@ describe('ChatView', () => {
       />,
     );
 
+    expect(container.querySelector('.chat-linked-event-group')).not.toBeNull();
     fireEvent.click(getByText('chat.memory_context_title'));
 
     await waitFor(() => {

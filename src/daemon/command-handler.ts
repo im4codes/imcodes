@@ -1897,6 +1897,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         ...memoryContext.timelinePayload,
         relatedToEventId: userEvent.eventId,
       });
+      if (memoryContext.hitIds && memoryContext.hitIds.length > 0) {
+        try { recordMemoryHits(memoryContext.hitIds); } catch { /* non-fatal */ }
+      }
     }
     // Emit accepted ack (accepted_legacy for fallback IDs so callers can distinguish)
     const status = isLegacy ? 'accepted_legacy' : 'accepted';
@@ -4234,7 +4237,11 @@ async function handleMemoryRestore(cmd: Record<string, unknown>, serverLink: Ser
 async function prependLocalMemory(
   prompt: string,
   sessionName: string,
-): Promise<{ text: string; timelinePayload?: Omit<MemoryContextTimelinePayload, 'relatedToEventId'> }> {
+): Promise<{
+  text: string;
+  timelinePayload?: Omit<MemoryContextTimelinePayload, 'relatedToEventId'>;
+  hitIds?: string[];
+}> {
   if (prompt.length < 10) return { text: prompt }; // skip greetings / confirmations
   try {
     const { searchLocalMemorySemantic } = await import('../context/memory-search.js');
@@ -4250,9 +4257,6 @@ async function prependLocalMemory(
     });
     if (result.items.length === 0) return { text: prompt };
     const hitIds = result.items.filter((item) => item.type === 'processed').map((item) => item.id);
-    if (hitIds.length > 0) {
-      try { recordMemoryHits(hitIds); } catch { /* non-fatal */ }
-    }
     const injectedText = buildRelatedPastWorkText(result.items);
     const timelinePayload = buildMemoryContextTimelinePayload(query, result.items);
     return {
@@ -4264,6 +4268,7 @@ async function prependLocalMemory(
             items: timelinePayload.items,
           }
         : undefined,
+      hitIds: hitIds.length > 0 ? hitIds : undefined,
     };
   } catch {
     return { text: prompt }; // non-fatal

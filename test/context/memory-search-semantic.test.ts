@@ -73,6 +73,42 @@ describe('memory-search semantic ranking', () => {
     expect(new Set(result.items.map((item) => item.id)).size).toBe(2);
   });
 
+  it('does not increment hitCount when semantic search is used for browsing', async () => {
+    writeProcessedProjection({
+      namespace,
+      class: 'recent_summary',
+      sourceEventIds: ['evt-1'],
+      summary: 'Search-only memory entry',
+      content: {},
+    });
+
+    generateEmbeddingMock.mockImplementation(async (text: string) => {
+      if (text === 'search memory') return new Float32Array([1]);
+      if (text.includes('Search-only memory entry')) return new Float32Array([0.9]);
+      return null;
+    });
+
+    const before = queryProcessedProjections({ projectId: namespace.projectId, limit: 10 });
+    expect(before[0]?.hitCount ?? 0).toBe(0);
+    expect(before[0]?.lastUsedAt).toBeUndefined();
+
+    await searchLocalMemorySemantic({
+      query: 'search memory',
+      namespace,
+      limit: 5,
+    });
+    await searchLocalMemorySemantic({
+      query: 'search memory',
+      namespace,
+      limit: 5,
+    });
+
+    const after = queryProcessedProjections({ projectId: namespace.projectId, limit: 10 });
+    expect(after[0]?.hitCount ?? 0).toBe(0);
+    expect(after[0]?.lastUsedAt).toBeUndefined();
+  });
+
+
   it('passes current enterprise context into scoring so same-enterprise recall beats unrelated recall', async () => {
     writeProcessedProjection({
       namespace: {

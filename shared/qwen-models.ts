@@ -6,7 +6,7 @@ export interface QwenModelOption {
 }
 
 export const QWEN_OAUTH_MODEL_OPTIONS: QwenModelOption[] = [
-  { id: 'coder-model', description: 'Qwen latest model via OAuth free tier' },
+  { id: 'coder-model', description: 'Qwen latest model via OAuth' },
 ] as const;
 
 export const QWEN_CODING_PLAN_MODEL_OPTIONS: QwenModelOption[] = [

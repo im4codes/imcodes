@@ -114,8 +114,6 @@ Built-in modes include `audit` (structured audit → review → plan pipeline), 
 
 Native streaming output support for transport-backed agents like [Claude Code SDK](https://github.com/anthropics/claude-agent-sdk-typescript), [Codex SDK](https://github.com/openai/codex/tree/main/sdk/typescript), [OpenClaw](https://openclaw.com), and [Qwen](https://github.com/QwenLM/qwen-agent). These agents connect via network protocols or local SDKs instead of terminal scraping, delivering structured event streams with real-time delta updates, tool call tracking, and session restore.
 
-> **Note on Qwen:** Qwen currently offers a free tier (1,000 requests/day) provided by Alibaba Cloud. This is an Alibaba Cloud policy, not an IM.codes offering — terms, limits, and availability may change at any time without notice. Check the [Qwen documentation](https://qwen.readthedocs.io/) for current details.
-
 > **Note on OpenClaw:** `imcodes connect openclaw` has only been tested on macOS so far.
 
 ### Agent-to-Agent Communication

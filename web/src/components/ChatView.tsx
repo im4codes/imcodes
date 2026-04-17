@@ -54,6 +54,8 @@ interface ViewItem {
   text?: string;
   /** All events in a collapsed tool group (first, middle..., last) */
   toolEvents?: TimelineEvent[];
+  /** memory.context events linked to this event via relatedToEventId */
+  linkedEvents?: TimelineEvent[];
   ts?: number;
   lastTs?: number;
 }
@@ -309,6 +311,24 @@ function buildViewItems(events: TimelineEvent[]): ViewItem[] {
     consolidated.push(ev);
   }
 
+  const linkedMemoryEvents = new Map<string, TimelineEvent[]>();
+  const attachableEventIds = new Set(
+    consolidated
+      .filter((event) => event.type === 'user.message')
+      .map((event) => event.eventId),
+  );
+  const renderable = consolidated.filter((event) => {
+    if (event.type !== 'memory.context') return true;
+    const relatedToEventId = typeof event.payload.relatedToEventId === 'string'
+      ? event.payload.relatedToEventId
+      : undefined;
+    if (!relatedToEventId || !attachableEventIds.has(relatedToEventId)) return true;
+    const group = linkedMemoryEvents.get(relatedToEventId) ?? [];
+    group.push(event);
+    linkedMemoryEvents.set(relatedToEventId, group);
+    return false;
+  });
+
   // Main pass: merge assistant.text blocks + group consecutive tool.call runs
   const items: ViewItem[] = [];
   let pendingText: string[] = [];
@@ -349,7 +369,7 @@ function buildViewItems(events: TimelineEvent[]): ViewItem[] {
     deferredEvents = [];
   };
 
-  for (const event of consolidated) {
+  for (const event of renderable) {
     if (event.type === 'assistant.text') {
       flushTools();
       // Trim and collapse 3+ consecutive blank lines to 1 (CC output often has many trailing newlines)
@@ -374,7 +394,14 @@ function buildViewItems(events: TimelineEvent[]): ViewItem[] {
     } else {
       flushPending();
       flushTools();
-      items.push({ key: event.eventId, type: 'event', event });
+      items.push({
+        key: event.eventId,
+        type: 'event',
+        event,
+        ...(event.type === 'user.message' && linkedMemoryEvents.has(event.eventId)
+          ? { linkedEvents: linkedMemoryEvents.get(event.eventId) }
+          : {}),
+      });
     }
   }
   flushPending();
@@ -887,19 +914,39 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
           {!loading && viewItems.map((item, idx) => {
             const nextItem = viewItems[idx + 1];
             const nextTs = nextItem?.ts ?? nextItem?.event?.ts;
-            return item.type === 'assistant-block' ? (
-              <AssistantBlock
-                key={item.key}
-                text={item.text!}
-                ts={item.lastTs ?? item.ts ?? 0}
-                onPathClick={pathClickHandler}
-                onUrlClick={urlClickHandler}
-                onDownload={downloadHandler}
-              />
-            ) : item.type === 'tool-group' ? (
-              <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onDownload={downloadHandler} serverId={serverId} />
-            ) : (
-              <ChatEvent key={item.key} event={item.event!} nextTs={nextTs} onPathClick={pathClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} />
+            if (item.type === 'assistant-block') {
+              return (
+                <AssistantBlock
+                  key={item.key}
+                  text={item.text!}
+                  ts={item.lastTs ?? item.ts ?? 0}
+                  onPathClick={pathClickHandler}
+                  onUrlClick={urlClickHandler}
+                  onDownload={downloadHandler}
+                />
+              );
+            }
+            if (item.type === 'tool-group') {
+              return <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onDownload={downloadHandler} serverId={serverId} />;
+            }
+            const linkedEvents = item.linkedEvents ?? [];
+            if (linkedEvents.length === 0) {
+              return <ChatEvent key={item.key} event={item.event!} nextTs={nextTs} onPathClick={pathClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} />;
+            }
+            return (
+              <div key={item.key} class="chat-linked-event-group">
+                <ChatEvent event={item.event!} nextTs={nextTs} onPathClick={pathClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} />
+                {linkedEvents.map((linkedEvent) => (
+                  <ChatEvent
+                    key={linkedEvent.eventId}
+                    event={linkedEvent}
+                    onPathClick={pathClickHandler}
+                    onFileChangeOpen={handleFileChangeOpen}
+                    onDownload={downloadHandler}
+                    serverId={serverId}
+                  />
+                ))}
+              </div>
             );
           })}
           {!loading && <div ref={bottomRef} />}

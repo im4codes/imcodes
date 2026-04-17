@@ -160,6 +160,9 @@ function buildSharedMemoryResponse(
     summary: string;
     content_json: string | Record<string, unknown> | null;
     updated_at: number;
+    hit_count?: number | null;
+    last_used_at?: number | null;
+    status?: 'active' | 'archived' | null;
   }>,
   query?: string,
   limit = 20,
@@ -192,6 +195,9 @@ function buildSharedMemoryResponse(
         ? row.source_event_ids_json.length
         : JSON.parse(row.source_event_ids_json || '[]').length,
       updatedAt: row.updated_at,
+      hitCount: row.hit_count ?? 0,
+      lastUsedAt: row.last_used_at ?? undefined,
+      status: row.status ?? 'active',
     })),
   };
 }
@@ -227,8 +233,11 @@ sharedContextRoutes.get('/personal-memory', async (c) => {
     summary: string;
     content_json: string | Record<string, unknown> | null;
     updated_at: number;
+    hit_count?: number | null;
+    last_used_at?: number | null;
+    status?: 'active' | 'archived' | null;
   }>(
-    `SELECT id, scope, project_id, projection_class, source_event_ids_json, summary, content_json, updated_at
+    `SELECT id, scope, project_id, projection_class, source_event_ids_json, summary, content_json, updated_at, hit_count, last_used_at, status
      FROM shared_context_projections
      WHERE user_id = $1
        AND scope = 'personal'
@@ -721,8 +730,11 @@ sharedContextRoutes.get('/enterprises/:enterpriseId/memory', async (c) => {
     summary: string;
     content_json: string | Record<string, unknown> | null;
     updated_at: number;
+    hit_count?: number | null;
+    last_used_at?: number | null;
+    status?: 'active' | 'archived' | null;
   }>(
-    `SELECT id, scope, project_id, projection_class, source_event_ids_json, summary, content_json, updated_at
+    `SELECT id, scope, project_id, projection_class, source_event_ids_json, summary, content_json, updated_at, hit_count, last_used_at, status
      FROM shared_context_projections
      WHERE enterprise_id = $1
        ${canonicalRepoId ? 'AND project_id = $2' : ''}

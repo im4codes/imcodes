@@ -6,12 +6,14 @@ const {
   emitMock,
   sendKeysDelayedEnterMock,
   searchLocalMemorySemanticMock,
+  recordMemoryHitsMock,
 } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
   getTransportRuntimeMock: vi.fn(),
   emitMock: vi.fn(),
   sendKeysDelayedEnterMock: vi.fn().mockResolvedValue(undefined),
   searchLocalMemorySemanticMock: vi.fn(),
+  recordMemoryHitsMock: vi.fn(),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -19,6 +21,23 @@ vi.mock('../../src/store/session-store.js', () => ({
   getSession: getSessionMock,
   upsertSession: vi.fn(),
   removeSession: vi.fn(),
+}));
+
+
+vi.mock('../../src/store/context-store.js', () => ({
+  getProcessedProjectionStats: vi.fn(() => ({
+    totalRecords: 0,
+    matchedRecords: 0,
+    recentSummaryCount: 0,
+    durableCandidateCount: 0,
+    projectCount: 0,
+    stagedEventCount: 0,
+    dirtyTargetCount: 0,
+    pendingJobCount: 0,
+  })),
+  queryPendingContextEvents: vi.fn(() => []),
+  queryProcessedProjections: vi.fn(() => []),
+  recordMemoryHits: recordMemoryHitsMock,
 }));
 
 vi.mock('../../src/agent/session-manager.js', () => ({
@@ -221,6 +240,28 @@ describe('handleWebCommand memory context timeline', () => {
           }),
         ],
       }),
+    );
+    expect(recordMemoryHitsMock).toHaveBeenCalledWith(['mem-1']);
+    expect(recordMemoryHitsMock.mock.invocationCallOrder[0]).toBeGreaterThan(sendKeysDelayedEnterMock.mock.invocationCallOrder[0]);
+  });
+
+  it('does not increment recall hits when the process send fails before the linked memory card is emitted', async () => {
+    sendKeysDelayedEnterMock.mockRejectedValueOnce(new Error('tmux failed'));
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_process_brain',
+      text: 'Fix reconnect issues in websocket client',
+      commandId: 'cmd-memory-fail',
+    }, serverLink as any);
+
+    await flushAsync();
+
+    expect(recordMemoryHitsMock).not.toHaveBeenCalled();
+    expect(emitMock).not.toHaveBeenCalledWith(
+      'deck_process_brain',
+      'memory.context',
+      expect.anything(),
     );
   });
 });

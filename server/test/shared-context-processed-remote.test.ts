@@ -30,6 +30,7 @@ function makeMockDb() {
   const projectionRows: Array<Record<string, unknown>> = [];
   const recordRows: Array<Record<string, unknown>> = [];
   const aliasRows: Array<Record<string, unknown>> = [];
+  const executeSql: string[] = [];
   const authoredBindingRows = [
     {
       binding_id: 'binding-project',
@@ -217,6 +218,7 @@ function makeMockDb() {
       return [] as T[];
     },
     execute: async (sql: string, params: unknown[] = []) => {
+      executeSql.push(sql);
       const normalized = sql.toLowerCase().replace(/\s+/g, ' ').trim();
       if (normalized.includes('insert into shared_context_projections')) {
         projectionRows.push({
@@ -255,7 +257,7 @@ function makeMockDb() {
     close: async () => {},
   } as unknown as Database;
 
-  return { db, projectionRows, recordRows, aliasRows };
+  return { db, projectionRows, recordRows, aliasRows, executeSql };
 }
 
 function makeEnv(db: Database): Env {
@@ -605,6 +607,8 @@ describe('shared-context processed remote route', () => {
           projectionClass: 'recent_summary',
           sourceEventCount: 2,
           updatedAt: 1700000000000,
+          hitCount: 0,
+          status: 'active',
         },
       ],
     });
@@ -640,9 +644,33 @@ describe('shared-context processed remote route', () => {
           projectionClass: 'recent_summary',
           sourceEventCount: 2,
           updatedAt: 1700000000000,
+          hitCount: 0,
+          status: 'active',
         },
       ],
     });
+  });
+
+
+  it('does not treat personal-memory query routes as recall events', async () => {
+    const { db, executeSql } = makeMockDb();
+    const app = new Hono<{ Bindings: Env }>();
+    app.route('/api/server', serverRoutes);
+
+    const first = await app.request('/api/server/srv-1/shared-context/personal-memory?query=summary&limit=10', {
+      method: 'GET',
+    }, makeEnv(db));
+    expect(first.status).toBe(200);
+    const firstBody = await first.json();
+
+    const second = await app.request('/api/server/srv-1/shared-context/personal-memory?query=summary&limit=10', {
+      method: 'GET',
+    }, makeEnv(db));
+    expect(second.status).toBe(200);
+    const secondBody = await second.json();
+
+    expect(firstBody).toEqual(secondBody);
+    expect(executeSql.some((sql) => sql.toLowerCase().includes('hit_count = hit_count + 1'))).toBe(false);
   });
 
 
