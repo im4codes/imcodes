@@ -493,6 +493,42 @@ class SupervisionAutomation {
     if (pending) {
       this.pendingTaskIntents.set(sessionName, { ...pending, snapshot });
     }
+    // Regression fix: if supervision was freshly enabled on an already-idle
+    // session (user flipped Auto ON after the assistant had already finished a
+    // turn), we must evaluate the most recent turn NOW. Waiting for the next
+    // idle boundary would mean "nothing ever happens" until the user sends
+    // another message — which is exactly the symptom reported as
+    // "idle 后依旧不触发任何动作和效果".
+    //
+    // We reuse the same implicit-idle preconditions as `handleTimelineEvent`
+    // (recent task candidate + newer assistant response) so the guardrails
+    // against stale turns stay identical.
+    if (!active) {
+      this.maybeTriggerImplicitRun(sessionName, snapshot);
+    }
+  }
+
+  private maybeTriggerImplicitRun(
+    sessionName: string,
+    snapshot: SessionSupervisionSnapshot,
+  ): void {
+    const candidate = this.recentTaskCandidates.get(sessionName);
+    const latestAssistant = this.latestAssistantTexts.get(sessionName);
+    if (!candidate || !latestAssistant) return;
+    if (latestAssistant.sequence <= candidate.sequence) return;
+    const implicitRun = this.registerTaskIntent(sessionName, candidate.commandId, candidate.text, snapshot);
+    if (!implicitRun) return;
+    implicitRun.lastAssistantText = latestAssistant.text;
+    implicitRun.sawAssistantOutput = true;
+    implicitRun.evaluating = true;
+    this.emitStatus(sessionName, 'supervision_waiting', SUPERVISION_WAITING_LABEL);
+    this.emitAutomationNote(sessionName, 'Auto: checking whether the task is complete...', 'supervision-status');
+    void this.evaluateExecutionTurn(implicitRun).catch((error) => {
+      logger.warn({ session: sessionName, err: error }, 'Supervision implicit execution evaluation failed on snapshot update');
+      this.clearStatus(sessionName);
+      this.emitWarning(sessionName, 'Automation could not determine whether the task is complete. Manual continuation is required.');
+      this.finishRun(sessionName, 'needs_input');
+    });
   }
 
   queueTaskIntent(
@@ -607,9 +643,18 @@ class SupervisionAutomation {
               this.finishRun(implicitRun.sessionName, 'needs_input');
             });
           }
-        } else if (candidate) {
+        } else if (candidate && snapshot && snapshot.mode !== SUPERVISION_MODE.OFF) {
+          // Supervision IS on but the preconditions for an implicit run failed
+          // (missing/stale assistant response). Those failures won't self-heal,
+          // so drop the candidate to avoid re-firing on later idle events.
           this.recentTaskCandidates.delete(event.sessionId);
         }
+        // Intentionally: do NOT delete the candidate when supervision is OFF
+        // at idle. The user may enable Auto afterwards, and
+        // `applySnapshotUpdate` uses this candidate to kick off an implicit
+        // run against the most recent completed turn. Clearing here was the
+        // reason "idle 后依旧不触发任何动作和效果" when Auto was turned on
+        // against an already-idle session.
         return;
       }
       if (!run) return;
