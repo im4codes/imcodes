@@ -197,6 +197,25 @@ describe('MaterializationCoordinator', () => {
     expect(coordinator.canMaterializeTarget(target, 10_200)).toBe(true);
   });
 
+  it('records template-prompt content at ingestion (filtering is a recall-side concern, not ingestion)', async () => {
+    // Built-in / templated prompts (OpenSpec workflow invocations, slash
+    // commands, harness command tags) are still written to memory — the
+    // template filter applies only on the recall path, not at record time.
+    // See shared/template-prompt-patterns.ts and Phase L.
+    const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
+      thresholds: { eventCount: 1, idleMs: 1000, scheduleMs: 10_000 },
+    });
+
+    const openspec = coordinator.ingestEvent({
+      target,
+      eventType: 'assistant.text',
+      content: 'Drove the implementation of @openspec/changes/my-feature by orchestrating subagents.',
+      createdAt: 100,
+    });
+    expect(openspec.filtered).toBeUndefined();
+    expect(openspec.queuedJob).toEqual(expect.objectContaining({ trigger: 'threshold' }));
+  });
+
   it('pairs final assistant.text output with the user request in structured summaries', async () => {
     const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },

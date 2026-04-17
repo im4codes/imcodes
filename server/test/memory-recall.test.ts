@@ -172,40 +172,113 @@ describe('memory recall endpoint — I.5', () => {
     expect(json.error).toBe('invalid_json');
   });
 
-  it('merges personal and enterprise results into a single response', async () => {
-    const { db } = makeMockDb({
+  it('returns empty with skipped:template_prompt when the query is a built-in template', async () => {
+    // Query-side filter: OpenSpec workflow prompts never hit the DB — the
+    // endpoint short-circuits with `skipped: 'template_prompt'`.
+    const { db, executeLog } = makeMockDb({
       personalRows: [
-        { id: 'p1', project_id: 'proj-a', projection_class: 'recent_summary', summary: 'Personal memory A', updated_at: 1000, score: 0.9 },
-        { id: 'p2', project_id: 'proj-a', projection_class: 'durable_memory_candidate', summary: 'Personal memory B', updated_at: 2000, score: 0.5 },
-      ],
-      enterpriseRows: [
-        { id: 'e1', project_id: 'proj-b', projection_class: 'recent_summary', summary: 'Enterprise memory C', updated_at: 3000, score: 0.7, enterprise_id: 'ent-1' },
+        { id: 'p1', project_id: 'proj', projection_class: 'recent_summary', summary: 'Irrelevant', updated_at: 1, score: 0.9 },
       ],
     });
     const app = await buildTestApp(db);
 
-    const res = await postRecall(app, { query: 'memory test' });
+    const res = await postRecall(app, {
+      query: 'Drive the implementation of openspec/changes/my-feature aggressively.',
+    });
+    expect(res.status).toBe(200);
+    const json = await res.json() as { results: unknown[]; skipped?: string };
+    expect(json.results).toEqual([]);
+    expect(json.skipped).toBe('template_prompt');
+    // No query-side DB work and no hit_count update for skipped queries
+    const hit = executeLog.find((e) => e.sql.toLowerCase().includes('hit_count'));
+    expect(hit).toBeUndefined();
+  });
+
+  it('short-circuits for localized template queries across supported languages', async () => {
+    const { db } = makeMockDb({ personalRows: [] });
+    const app = await buildTestApp(db);
+
+    const templates = [
+      '强力推进 openspec/changes/foo 的实施。',
+      'P2P 讨论已经完成。请直接落实原始请求。',
+      'Проведи строгий аудит реализации.',
+      '厳格な実装監査を実施してください。',
+      '엄격한 구현 감사를 수행하세요.',
+    ];
+    for (const q of templates) {
+      const res = await postRecall(app, { query: q });
+      expect(res.status).toBe(200);
+      const json = await res.json() as { results: unknown[]; skipped?: string };
+      expect(json.skipped).toBe('template_prompt');
+      expect(json.results).toEqual([]);
+    }
+  });
+
+  it('drops template-origin rows from merged results even for a normal query', async () => {
+    const now = Date.now();
+    const { db, executeLog } = makeMockDb({
+      personalRows: [
+        { id: 'ok-1', project_id: 'proj-a', projection_class: 'recent_summary', summary: '## Problem → Resolution: fixed retry', updated_at: now, score: 0.9 },
+        { id: 'bad-1', project_id: 'proj-a', projection_class: 'recent_summary', summary: 'User orchestrated openspec/changes/feature-x via subagents.', updated_at: now, score: 0.85 },
+      ],
+      enterpriseRows: [
+        { id: 'bad-2', project_id: 'proj-b', projection_class: 'recent_summary', summary: 'Drive the implementation of change Y.', updated_at: now, score: 0.8, enterprise_id: 'ent-1' },
+      ],
+    });
+    const app = await buildTestApp(db);
+
+    const res = await postRecall(app, { query: 'retry behavior', projectId: 'proj-a' });
+    expect(res.status).toBe(200);
+    const json = await res.json() as { results: Array<{ id: string; summary: string }> };
+    const ids = json.results.map((r) => r.id);
+    expect(ids).toContain('ok-1');
+    expect(ids).not.toContain('bad-1');
+    expect(ids).not.toContain('bad-2');
+    // Hit-count update should reference only the surviving row
+    await new Promise((r) => setTimeout(r, 50));
+    const hit = executeLog.find((e) => e.sql.toLowerCase().includes('hit_count = hit_count + 1'));
+    expect(hit).toBeDefined();
+    expect(hit!.params).toContain('ok-1');
+    expect(hit!.params).not.toContain('bad-1');
+    expect(hit!.params).not.toContain('bad-2');
+  });
+
+  it('merges personal and enterprise results into a single response', async () => {
+    const now = Date.now();
+    const { db } = makeMockDb({
+      personalRows: [
+        { id: 'p1', project_id: 'proj-a', projection_class: 'recent_summary', summary: 'Personal memory A', updated_at: now, score: 0.95 },
+        { id: 'p2', project_id: 'proj-a', projection_class: 'durable_memory_candidate', summary: 'Personal memory B', updated_at: now, score: 0.85 },
+      ],
+      enterpriseRows: [
+        { id: 'e1', project_id: 'proj-a', projection_class: 'recent_summary', summary: 'Enterprise memory C', updated_at: now, score: 0.9, enterprise_id: 'ent-1' },
+      ],
+    });
+    const app = await buildTestApp(db);
+
+    const res = await postRecall(app, { query: 'memory test', projectId: 'proj-a' });
     expect(res.status).toBe(200);
     const json = await res.json() as { results: Array<{ id: string; source: string }> };
+    // All 3 survive floor + cap (top 3, all well above 0.6 extend bar)
     expect(json.results).toHaveLength(3);
-    // Should contain both personal and enterprise
     const sources = json.results.map((r) => r.source);
     expect(sources).toContain('personal');
     expect(sources).toContain('enterprise');
   });
 
   it('deduplicates results by id (personal wins over enterprise for same id)', async () => {
+    const now = Date.now();
     const { db } = makeMockDb({
       personalRows: [
-        { id: 'shared-1', project_id: 'proj-a', projection_class: 'recent_summary', summary: 'Personal version', updated_at: 1000, score: 0.8 },
+        { id: 'shared-1', project_id: 'proj-a', projection_class: 'recent_summary', summary: 'Personal version', updated_at: now, score: 0.85 },
       ],
       enterpriseRows: [
-        { id: 'shared-1', project_id: 'proj-a', projection_class: 'recent_summary', summary: 'Enterprise version', updated_at: 2000, score: 0.9, enterprise_id: 'ent-1' },
+        { id: 'shared-1', project_id: 'proj-a', projection_class: 'recent_summary', summary: 'Enterprise version', updated_at: now, score: 0.9, enterprise_id: 'ent-1' },
       ],
     });
     const app = await buildTestApp(db);
 
-    const res = await postRecall(app, { query: 'test' });
+    const res = await postRecall(app, { query: 'test', projectId: 'proj-a' });
     expect(res.status).toBe(200);
     const json = await res.json() as { results: Array<{ id: string; source: string; summary: string }> };
     expect(json.results).toHaveLength(1);
@@ -215,18 +288,19 @@ describe('memory recall endpoint — I.5', () => {
   });
 
   it('sorts merged results by score descending', async () => {
+    const now = Date.now();
     const { db } = makeMockDb({
       personalRows: [
-        { id: 'low', project_id: 'proj-a', projection_class: 'recent_summary', summary: 'Low score', updated_at: 1000, score: 0.3 },
-        { id: 'high', project_id: 'proj-a', projection_class: 'recent_summary', summary: 'High score', updated_at: 2000, score: 0.95 },
+        { id: 'low', project_id: 'proj-a', projection_class: 'recent_summary', summary: 'Low score', updated_at: now, score: 0.75 },
+        { id: 'high', project_id: 'proj-a', projection_class: 'recent_summary', summary: 'High score', updated_at: now, score: 0.98 },
       ],
       enterpriseRows: [
-        { id: 'mid', project_id: 'proj-b', projection_class: 'recent_summary', summary: 'Mid score', updated_at: 3000, score: 0.6, enterprise_id: 'ent-1' },
+        { id: 'mid', project_id: 'proj-a', projection_class: 'recent_summary', summary: 'Mid score', updated_at: now, score: 0.85, enterprise_id: 'ent-1' },
       ],
     });
     const app = await buildTestApp(db);
 
-    const res = await postRecall(app, { query: 'test' });
+    const res = await postRecall(app, { query: 'test', projectId: 'proj-a' });
     const json = await res.json() as { results: Array<{ id: string; score: number }> };
     expect(json.results).toHaveLength(3);
     expect(json.results[0].id).toBe('high');
@@ -237,27 +311,29 @@ describe('memory recall endpoint — I.5', () => {
     expect(json.results[1].score).toBeGreaterThanOrEqual(json.results[2].score);
   });
 
-  it('limits results to the requested count', async () => {
+  it('shrinks the default cap when client requests fewer than 3', async () => {
+    const now = Date.now();
     const { db } = makeMockDb({
       personalRows: [
-        { id: 'p1', project_id: 'proj', projection_class: 'recent_summary', summary: 'A', updated_at: 1, score: 0.9 },
-        { id: 'p2', project_id: 'proj', projection_class: 'recent_summary', summary: 'B', updated_at: 2, score: 0.8 },
-        { id: 'p3', project_id: 'proj', projection_class: 'recent_summary', summary: 'C', updated_at: 3, score: 0.7 },
-        { id: 'p4', project_id: 'proj', projection_class: 'recent_summary', summary: 'D', updated_at: 4, score: 0.6 },
-        { id: 'p5', project_id: 'proj', projection_class: 'recent_summary', summary: 'E', updated_at: 5, score: 0.5 },
+        { id: 'p1', project_id: 'proj', projection_class: 'recent_summary', summary: 'A', updated_at: now, score: 0.95 },
+        { id: 'p2', project_id: 'proj', projection_class: 'recent_summary', summary: 'B', updated_at: now, score: 0.9 },
+        { id: 'p3', project_id: 'proj', projection_class: 'recent_summary', summary: 'C', updated_at: now, score: 0.85 },
       ],
     });
     const app = await buildTestApp(db);
 
-    const res = await postRecall(app, { query: 'test', limit: 2 });
+    const res = await postRecall(app, { query: 'test', limit: 2, projectId: 'proj' });
     const json = await res.json() as { results: Array<{ id: string }> };
+    // Client-supplied limit 2 shrinks defaultCap+extendCap to 2.
     expect(json.results).toHaveLength(2);
-    // Top 2 by score
     expect(json.results[0].id).toBe('p1');
     expect(json.results[1].id).toBe('p2');
   });
 
-  it('defaults to limit 5 when not specified', async () => {
+  it('defaults to top 3 when no limit is specified', async () => {
+    // Under the recall cap rule, default behavior is 3 unless every top-3
+    // item is above the extend bar (0.6 composite).
+    const now = Date.now();
     const rows: MockRow[] = [];
     for (let i = 0; i < 10; i++) {
       rows.push({
@@ -265,48 +341,75 @@ describe('memory recall endpoint — I.5', () => {
         project_id: 'proj',
         projection_class: 'recent_summary',
         summary: `Memory ${i}`,
-        updated_at: i,
-        score: 1 - i * 0.05,
+        updated_at: now,
+        score: 1 - i * 0.05, // 1.0, 0.95, 0.9, 0.85, 0.8, ...
       });
     }
     const { db } = makeMockDb({ personalRows: rows });
     const app = await buildTestApp(db);
 
-    const res = await postRecall(app, { query: 'test' });
+    const res = await postRecall(app, { query: 'test', projectId: 'proj' });
     const json = await res.json() as { results: Array<{ id: string }> };
+    // All items are well above the extend bar → extend kicks in up to 5.
     expect(json.results).toHaveLength(5);
+    expect(json.results.map((r) => r.id)).toEqual(['p0', 'p1', 'p2', 'p3', 'p4']);
   });
 
-  it('caps limit at 20 even if client requests more', async () => {
-    const rows: MockRow[] = [];
-    for (let i = 0; i < 25; i++) {
-      rows.push({
-        id: `p${i}`,
-        project_id: 'proj',
-        projection_class: 'recent_summary',
-        summary: `Memory ${i}`,
-        updated_at: i,
-        score: 1 - i * 0.01,
-      });
-    }
+  it('extends up to 5 only when every top-3 item is above the extend bar', async () => {
+    // Build a set where the top 3 include one at exactly 0.59 composite
+    // (below 0.6 extend bar) — extension must NOT kick in.
+    const now = Date.now();
+    const rows: MockRow[] = [
+      { id: 'strong-1', project_id: 'proj', projection_class: 'recent_summary', summary: 'A', updated_at: now, score: 0.98 },
+      { id: 'strong-2', project_id: 'proj', projection_class: 'recent_summary', summary: 'B', updated_at: now, score: 0.95 },
+      // similarity 0.5 + project-boost 0.2 + recency ~0.225 → ~0.625 (borderline; we pick 0.35 to stay under)
+      { id: 'borderline', project_id: 'proj', projection_class: 'recent_summary', summary: 'C', updated_at: now, score: 0.35 },
+      { id: 'extra-1', project_id: 'proj', projection_class: 'recent_summary', summary: 'D', updated_at: now, score: 0.9 },
+      { id: 'extra-2', project_id: 'proj', projection_class: 'recent_summary', summary: 'E', updated_at: now, score: 0.88 },
+    ];
     const { db } = makeMockDb({ personalRows: rows });
     const app = await buildTestApp(db);
 
-    const res = await postRecall(app, { query: 'test', limit: 100 });
-    const json = await res.json() as { results: Array<{ id: string }> };
-    expect(json.results).toHaveLength(20);
+    const res = await postRecall(app, { query: 'test', projectId: 'proj' });
+    const json = await res.json() as { results: Array<{ id: string; score: number }> };
+    // Top 3 by composite: strong-1, strong-2, extra-1 (all >= 0.6) → extend,
+    // then extra-2 (>= 0.6) → 4th, then borderline (< 0.6) → stop.
+    // So we get 4 results: strong-1, strong-2, extra-1, extra-2.
+    const ids = json.results.map((r) => r.id);
+    expect(ids).not.toContain('borderline');
+    expect(ids).toContain('strong-1');
+    expect(ids).toContain('strong-2');
+    expect(ids).toContain('extra-1');
   });
 
-  it('fires hit_count UPDATE for recalled projection ids', async () => {
-    const { db, executeLog } = makeMockDb({
+  it('drops rows that fail the 0.5 composite floor even for a normal query', async () => {
+    // Ancient timestamps + no project match → composite scores collapse
+    // below floor regardless of raw similarity.
+    const { db } = makeMockDb({
       personalRows: [
-        { id: 'hit-a', project_id: 'proj', projection_class: 'recent_summary', summary: 'A', updated_at: 1, score: 0.9 },
-        { id: 'hit-b', project_id: 'proj', projection_class: 'recent_summary', summary: 'B', updated_at: 2, score: 0.8 },
+        { id: 'old-1', project_id: 'unrelated', projection_class: 'recent_summary', summary: 'Old memory', updated_at: 1000, score: 0.9 },
+        { id: 'old-2', project_id: 'unrelated', projection_class: 'recent_summary', summary: 'Another old memory', updated_at: 1000, score: 0.85 },
       ],
     });
     const app = await buildTestApp(db);
 
+    // No matching projectId → projectBoost = 0.1, old updated_at → recency ≈ 0
     const res = await postRecall(app, { query: 'test' });
+    const json = await res.json() as { results: unknown[] };
+    expect(json.results).toEqual([]);
+  });
+
+  it('fires hit_count UPDATE for recalled projection ids', async () => {
+    const now = Date.now();
+    const { db, executeLog } = makeMockDb({
+      personalRows: [
+        { id: 'hit-a', project_id: 'proj', projection_class: 'recent_summary', summary: 'A', updated_at: now, score: 0.9 },
+        { id: 'hit-b', project_id: 'proj', projection_class: 'recent_summary', summary: 'B', updated_at: now, score: 0.85 },
+      ],
+    });
+    const app = await buildTestApp(db);
+
+    const res = await postRecall(app, { query: 'test', projectId: 'proj' });
     expect(res.status).toBe(200);
 
     // The hit_count UPDATE is fire-and-forget (catch-ignored), but it should
@@ -341,14 +444,15 @@ describe('memory recall endpoint — I.5', () => {
   });
 
   it('returns correct shape for each result item', async () => {
+    const now = Date.now();
     const { db } = makeMockDb({
       personalRows: [
-        { id: 'shape-1', project_id: 'my-proj', projection_class: 'durable_memory_candidate', summary: 'A durable memory', updated_at: 1700000000000, score: 0.75 },
+        { id: 'shape-1', project_id: 'my-proj', projection_class: 'durable_memory_candidate', summary: 'A durable memory', updated_at: now, score: 0.9 },
       ],
     });
     const app = await buildTestApp(db);
 
-    const res = await postRecall(app, { query: 'test' });
+    const res = await postRecall(app, { query: 'test', projectId: 'my-proj' });
     const json = await res.json() as { results: Array<Record<string, unknown>> };
     expect(json.results).toHaveLength(1);
     const item = json.results[0];
@@ -356,7 +460,7 @@ describe('memory recall endpoint — I.5', () => {
     expect(item).toHaveProperty('projectId', 'my-proj');
     expect(item).toHaveProperty('class', 'durable_memory_candidate');
     expect(item).toHaveProperty('summary', 'A durable memory');
-    expect(item).toHaveProperty('updatedAt', 1700000000000);
+    expect(item).toHaveProperty('updatedAt', now);
     expect(typeof item.score).toBe('number');
     expect(item).toHaveProperty('source', 'personal');
   });

@@ -20,6 +20,13 @@ export function selectStartupMemoryItems(
   const recentLimit = options.recentLimit ?? STARTUP_MEMORY_RECENT_LIMIT;
   const totalLimit = options.totalLimit ?? STARTUP_MEMORY_TOTAL_LIMIT;
 
+  // Startup bootstrap is project-scoped memory loading, NOT a query-driven
+  // recall. Any memory that belongs to the project's timeline is valid
+  // context for session startup, including entries whose source turn was a
+  // templated workflow prompt — the user still worked on this project and
+  // the resulting summary is part of the project's history. Template-prompt
+  // filtering is applied only on the recall/search paths.
+
   const durable = searchLocalMemory({
     namespace,
     projectionClass: 'durable_memory_candidate',

@@ -7,7 +7,8 @@ import { parseRemoteUrl } from '../../../src/repo/detector.js';
 import { parseCanonicalRepositoryKey } from '../../../src/agent/repository-identity-service.js';
 import { classifyTimestampFreshness } from '../../../shared/context-freshness.js';
 import type { ContextMemoryRecordView, ContextMemoryStatsView } from '../../../shared/context-types.js';
-import { computeRelevanceScore, type ProjectionClass } from '../../../shared/memory-scoring.js';
+import { computeRelevanceScore, applyRecallCapRule, type ProjectionClass } from '../../../shared/memory-scoring.js';
+import { isTemplatePrompt, isTemplateOriginSummary } from '../../../shared/template-prompt-patterns.js';
 import { searchSemanticMemoryView } from '../util/semantic-memory-view.js';
 
 type EnterpriseRole = 'owner' | 'admin' | 'member';
@@ -915,6 +916,12 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
   if (!query || typeof query !== 'string' || query.trim().length === 0) {
     return c.json({ error: 'query_required' }, 400);
   }
+  // Template-prompt skip: OpenSpec / slash-command / skill-template queries
+  // are not natural-language requests; a recall over them returns noise.
+  // See shared/template-prompt-patterns.ts.
+  if (isTemplatePrompt(query)) {
+    return c.json({ results: [], vectorSearch: false, skipped: 'template_prompt' });
+  }
   const limit = typeof rawLimit === 'number' && rawLimit > 0 ? Math.min(rawLimit, 20) : 5;
   const candidateLimit = Math.max(limit * 4, 20);
 
@@ -1015,13 +1022,16 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
     );
   }
 
-  // Merge, deduplicate by id, sort by composite relevance score
+  // Merge, deduplicate by id, sort by composite relevance score.
+  // Result-side template filter: legacy projections whose summary reflects
+  // a templated workflow origin must not leak back through recall.
   const seen = new Set<string>();
   const currentProjectId = projectId ?? '__unknown_current_project__';
   const results: Array<{ id: string; projectId: string; class: string; summary: string; updatedAt: number; score: number; source: 'personal' | 'enterprise' }> = [];
   for (const row of personalRows) {
     if (seen.has(row.id)) continue;
     seen.add(row.id);
+    if (isTemplateOriginSummary(row.summary)) continue;
     results.push({
       id: row.id,
       projectId: row.project_id,
@@ -1042,6 +1052,7 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
   for (const row of enterpriseRows) {
     if (seen.has(row.id)) continue;
     seen.add(row.id);
+    if (isTemplateOriginSummary(row.summary)) continue;
     results.push({
       id: row.id,
       projectId: row.project_id,
@@ -1061,10 +1072,20 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
       source: 'enterprise',
     });
   }
-  results.sort((a, b) => b.score - a.score);
-  const topResults = results.slice(0, limit);
+  // Cap rule: floor 0.5, top 3, extend to 5 iff all >= 0.6.
+  // See shared/memory-scoring.ts. The client-supplied `limit` is an upper
+  // bound on the extend cap — a client asking for <=3 shrinks defaultCap;
+  // a client asking for >=5 keeps the default extend cap.
+  const cappedDefault = Math.min(limit, 3);
+  const cappedExtend = Math.min(Math.max(limit, cappedDefault), 5);
+  const topResults = applyRecallCapRule(results, {
+    defaultCap: cappedDefault,
+    extendCap: cappedExtend,
+  });
 
-  // Record hits for recalled projections (server-side spaced repetition)
+  // Record hits only for projections that actually survived the cap rule —
+  // items dropped by floor or session-side filtering never reached the
+  // user's prompt and should not receive a spaced-repetition credit.
   const hitIds = topResults.map((r) => r.id);
   if (hitIds.length > 0) {
     const now = Date.now();

@@ -45,6 +45,13 @@ import { buildWindowsCleanupScript, buildWindowsCleanupVbs, buildWindowsUpgradeB
 import { UPGRADE_LOCK_FILE, encodeVbsAsUtf16, encodeCmdAsUtf8Bom } from '../util/windows-launch-artifacts.js';
 import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
 import { sanitizeProjectName } from '../../shared/sanitize-project-name.js';
+import { isTemplatePrompt, isTemplateOriginSummary } from '../../shared/template-prompt-patterns.js';
+import { applyRecallCapRule } from '../../shared/memory-scoring.js';
+import {
+  filterRecentlyInjected,
+  recordRecentInjection,
+  clearRecentInjectionHistory,
+} from '../context/recent-injection-history.js';
 import { CODEX_MODEL_IDS, normalizeClaudeCodeModelId } from '../shared/models/options.js';
 import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from '../agent/sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
@@ -55,6 +62,7 @@ import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import {
   CLAUDE_SDK_EFFORT_LEVELS,
   CODEX_SDK_EFFORT_LEVELS,
+  COPILOT_SDK_EFFORT_LEVELS,
   DEFAULT_TRANSPORT_EFFORT,
   OPENCLAW_THINKING_LEVELS,
   QWEN_EFFORT_LEVELS,
@@ -220,12 +228,21 @@ async function handleSubSessionTransportConfigUpdate(cmd: Record<string, unknown
   }
 }
 
-function supportsEffort(agentType: string | undefined): agentType is 'claude-code-sdk' | 'codex-sdk' | 'openclaw' | 'qwen' {
-  return agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'openclaw' || agentType === 'qwen';
+function supportsEffort(agentType: string | undefined): agentType is 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'openclaw' | 'qwen' {
+  return agentType === 'claude-code-sdk'
+    || agentType === 'codex-sdk'
+    || agentType === 'copilot-sdk'
+    || agentType === 'openclaw'
+    || agentType === 'qwen';
 }
 
-function supportsTransportClear(agentType: string | undefined): agentType is 'claude-code-sdk' | 'codex-sdk' | 'openclaw' | 'qwen' {
-  return agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'openclaw' || agentType === 'qwen';
+function supportsTransportClear(agentType: string | undefined): agentType is 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'openclaw' | 'qwen' {
+  return agentType === 'claude-code-sdk'
+    || agentType === 'codex-sdk'
+    || agentType === 'copilot-sdk'
+    || agentType === 'cursor-headless'
+    || agentType === 'openclaw'
+    || agentType === 'qwen';
 }
 
 function supportsProcessClear(agentType: string | undefined): agentType is 'claude-code' | 'codex' | 'opencode' {
@@ -238,7 +255,7 @@ async function relaunchFreshTransportConversation(record: SessionRecord): Promis
     name: record.name,
     projectName: record.projectName,
     role: record.role,
-    agentType: record.agentType as 'claude-code-sdk' | 'codex-sdk' | 'openclaw' | 'qwen',
+    agentType: record.agentType as 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'openclaw' | 'qwen',
     projectDir: record.projectDir,
     label: record.label,
     description: record.description,
@@ -259,11 +276,13 @@ function getSupportedEffortLevels(agentType: string | undefined): readonly Trans
     ? CLAUDE_SDK_EFFORT_LEVELS
     : agentType === 'codex-sdk'
       ? CODEX_SDK_EFFORT_LEVELS
-      : agentType === 'qwen'
-        ? QWEN_EFFORT_LEVELS
-      : agentType === 'openclaw'
-        ? OPENCLAW_THINKING_LEVELS
-        : [];
+      : agentType === 'copilot-sdk'
+        ? COPILOT_SDK_EFFORT_LEVELS
+        : agentType === 'qwen'
+          ? QWEN_EFFORT_LEVELS
+          : agentType === 'openclaw'
+            ? OPENCLAW_THINKING_LEVELS
+            : [];
 }
 
 function getDefaultThinkingLevel(agentType: string | undefined): TransportEffortLevel | undefined {
@@ -330,6 +349,7 @@ import { handleFileUpload, handleFileDownload, createProjectFileHandle, lookupAt
 import { REPO_MSG } from '../shared/repo-types.js';
 import { handlePreviewCommand } from './preview-relay.js';
 import { PREVIEW_MSG } from '../../shared/preview-types.js';
+import type { TransportAttachment } from '../../shared/transport-attachments.js';
 
 import { resolveContextWindow } from '../util/model-context.js';
 import { QWEN_MODEL_IDS } from '../../shared/qwen-models.js';
@@ -760,6 +780,9 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case 'chat.subscribe':
       void handleChatSubscribeReplay(cmd, serverLink);
       break;
+    case TRANSPORT_MSG.APPROVAL_RESPONSE:
+      void handleTransportApprovalResponse(cmd, serverLink);
+      break;
     case 'subsession.start':
       void handleSubSessionStart(cmd, serverLink);
       break;
@@ -1076,7 +1099,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       try { serverLink.send({ type: 'session.error', project, message }); } catch { /* ignore */ }
       return;
     }
-    if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk') {
+    if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless') {
       logger.info({ project, agentType }, 'SDK fresh session.start removing stale main-session store record');
       removeSession(`deck_${project}_brain`);
     }
@@ -1113,6 +1136,18 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         projectName: project,
         role: 'brain',
         agentType: 'codex-sdk',
+        projectDir: dir,
+        fresh: true,
+        label,
+        effort,
+      });
+    } else if (agentType === 'copilot-sdk' || agentType === 'cursor-headless') {
+      logger.info({ project, agentType }, 'SDK fresh session.start launching new transport main session');
+      await launchTransportSession({
+        name: `deck_${project}_brain`,
+        projectName: project,
+        role: 'brain',
+        agentType: agentType as 'copilot-sdk' | 'cursor-headless',
         projectDir: dir,
         fresh: true,
         label,
@@ -1531,6 +1566,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   // Transport sessions — route directly to the provider runtime, bypassing tmux.
   const transportRuntime = getTransportRuntime(sessionName);
   const record = (await import('../store/session-store.js')).getSession(sessionName);
+  const attachments: TransportAttachment[] = [];
   const transportUserEventId = (clientMessageId: string) => `transport-user:${clientMessageId}`;
   const emitTransportUserMessage = (payloadText: string, extra?: Record<string, unknown>, eventId?: string) => {
     timelineEmitter.emit(
@@ -1593,6 +1629,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         await runExclusiveSessionRelaunch(sessionName, async () => {
           await relaunchFreshTransportConversation(record);
         });
+        // Reset per-session memory injection history — fresh conversation
+        // should be allowed to re-inject previously-shown memories again.
+        clearRecentInjectionHistory(sessionName);
         await handleGetSessions(serverLink);
         await syncSubSessionIfNeeded(sessionName, serverLink);
         timelineEmitter.emit(sessionName, 'assistant.text', {
@@ -1785,7 +1824,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
 
       // send() is synchronous: dispatches immediately if idle, queues if busy.
       // Status changes come from transport runtime's onStatusChange callback.
-      const result = transportRuntime.send(text, effectiveId);
+      const result = attachments.length > 0
+        ? transportRuntime.send(text, effectiveId, attachments)
+        : transportRuntime.send(text, effectiveId);
       if (shouldTrackSupervisionTaskRun) {
         if (result === 'queued') {
           supervisionAutomation.queueTaskIntent(sessionName, effectiveId, text, supervisionSnapshot);
@@ -1796,7 +1837,10 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       if (result === 'sent') {
         emitTransportUserMessage(
           text,
-          { clientMessageId: effectiveId },
+          {
+            clientMessageId: effectiveId,
+            ...(attachments.length > 0 ? { attachments } : {}),
+          },
           transportUserEventId(effectiveId),
         );
       }
@@ -1838,6 +1882,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       await runExclusiveSessionRelaunch(sessionName, async () => {
         await relaunchSessionWithSettings(record, { fresh: true });
       });
+      // Reset per-session memory injection history — fresh conversation
+      // should be allowed to re-inject previously-shown memories again.
+      clearRecentInjectionHistory(sessionName);
       await handleGetSessions(serverLink);
       await syncSubSessionIfNeeded(sessionName, serverLink);
       timelineEmitter.emit(sessionName, 'assistant.text', {
@@ -1859,7 +1906,6 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   }
 
   // Build attachment refs for any uploaded files referenced in the message
-  const attachments: Array<{ id: string; originalName?: string; mime?: string; size?: number; daemonPath: string }> = [];
   if (tokens.files.length > 0) {
     const record = getSession(sessionName);
     const projectDir = record?.projectDir ?? '';
@@ -3981,6 +4027,30 @@ async function handleServerDelete(): Promise<void> {
 
 // ── Transport chat history replay ─────────────────────────────────────────────
 
+async function handleTransportApprovalResponse(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const sessionId = typeof cmd.sessionId === 'string' ? cmd.sessionId : undefined;
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
+  const approved = typeof cmd.approved === 'boolean' ? cmd.approved : undefined;
+  if (!sessionId || !requestId || approved === undefined) return;
+  const runtime = getTransportRuntime(sessionId);
+  if (!runtime) return;
+  try {
+    await runtime.respondApproval(requestId, approved);
+    try {
+      serverLink.send({
+        type: TRANSPORT_MSG.APPROVAL_RESPONSE,
+        sessionId,
+        requestId,
+        approved,
+      });
+    } catch {
+      // ignore — daemon link disconnected
+    }
+  } catch (err) {
+    logger.warn({ err, sessionId, requestId }, 'transport approval response failed');
+  }
+}
+
 async function handleChatSubscribeReplay(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const sessionId = cmd.sessionId as string | undefined;
   if (!sessionId) return;
@@ -4249,22 +4319,45 @@ async function prependLocalMemory(
   hitIds?: string[];
 }> {
   if (prompt.length < 10) return { text: prompt }; // skip greetings / confirmations
+  // Template-prompt skip: OpenSpec / slash-command / skill-template prompts
+  // are not natural-language questions; a recall over them returns noise.
+  // See shared/template-prompt-patterns.ts.
+  if (isTemplatePrompt(prompt)) return { text: prompt };
   try {
     const { searchLocalMemorySemantic } = await import('../context/memory-search.js');
     const record = getSession(sessionName);
     const query = prompt.slice(0, 200);
-    const result = await searchLocalMemorySemantic({
+    // Broaden the candidate pool — the cap rule trims to 3 (or up to 5 for
+    // all-strong results). We need enough candidates to survive filtering.
+    const searchResult = await searchLocalMemorySemantic({
       query,
       namespace: record?.projectName
         ? { scope: 'personal', projectId: record.projectName }
         : undefined,
       repo: record?.projectName ?? undefined,
-      limit: 5,
+      limit: 10,
     });
-    if (result.items.length === 0) return { text: prompt };
-    const hitIds = result.items.filter((item) => item.type === 'processed').map((item) => item.id);
-    const injectedText = buildRelatedPastWorkText(result.items);
-    const timelinePayload = buildMemoryContextTimelinePayload(query, result.items);
+    // 1) Template-origin legacy summaries never surface through recall.
+    const notTemplate = searchResult.items.filter(
+      (item) => !isTemplateOriginSummary(item.summary),
+    );
+    // 2) Per-session dedup: drop items already injected in the last 10 turns
+    //    of THIS session. Cleared on `session.clear`.
+    const ids = notTemplate.map((item) => item.id);
+    const keepIds = new Set(filterRecentlyInjected(sessionName, ids));
+    const deduped = notTemplate.filter((item) => keepIds.has(item.id));
+    // 3) Cap rule: floor 0.5, top 3, extend to 5 iff all >= 0.6.
+    //    See shared/memory-scoring.ts.
+    const scored = deduped.map((item) => ({ item, score: item.relevanceScore ?? 0 }));
+    const finalScored = applyRecallCapRule(scored);
+    const finalItems = finalScored.map((s) => s.item);
+    if (finalItems.length === 0) return { text: prompt };
+    const hitIds = finalItems.filter((item) => item.type === 'processed').map((item) => item.id);
+    const injectedText = buildRelatedPastWorkText(finalItems);
+    const timelinePayload = buildMemoryContextTimelinePayload(query, finalItems);
+    // 4) Record the injection into the per-session ring buffer so these
+    //    same items do not re-inject on the next 10 turns.
+    recordRecentInjection(sessionName, hitIds);
     return {
       text: `${injectedText}\n\n${prompt}`,
       timelinePayload: timelinePayload

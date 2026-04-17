@@ -4,7 +4,9 @@ import { RUNTIME_TYPES } from './session-runtime.js';
 import type { AgentStatus } from './detect.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { TransportProvider, ProviderError, SessionConfig, SessionInfoUpdate } from './transport-provider.js';
+import type { ApprovalRequest } from './transport-provider.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
+import type { TransportAttachment } from '../../shared/transport-attachments.js';
 import {
   SharedContextDispatchError,
   dispatchSharedContextSend,
@@ -20,6 +22,13 @@ import type {
 import { buildMemoryContextTimelinePayload } from '../daemon/memory-context-timeline.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
 import { searchLocalMemorySemantic, type MemorySearchResultItem } from '../context/memory-search.js';
+import { isTemplatePrompt, isTemplateOriginSummary } from '../../shared/template-prompt-patterns.js';
+import { applyRecallCapRule } from '../../shared/memory-scoring.js';
+import {
+  filterRecentlyInjected,
+  recordRecentInjection,
+  clearRecentInjectionHistory,
+} from '../context/recent-injection-history.js';
 import { resolveRuntimeAuthoredContext } from '../context/shared-context-runtime.js';
 import { buildTransportStartupMemory, type TransportContextBootstrap } from './runtime-context-bootstrap.js';
 import { recordMemoryHits } from '../store/context-store.js';
@@ -28,6 +37,7 @@ import logger from '../util/logger.js';
 export interface PendingTransportMessage {
   clientMessageId: string;
   text: string;
+  attachments?: TransportAttachment[];
 }
 
 /**
@@ -85,6 +95,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   /** Callback fired when pending messages are drained into a new turn. */
   private _onDrain?: (messages: PendingTransportMessage[], mergedMessage: string, count: number) => void;
   private _onSessionInfoChange?: (info: SessionInfoUpdate) => void;
+  private _onApprovalRequest?: (request: ApprovalRequest) => void;
 
   constructor(
     private readonly provider: TransportProvider,
@@ -123,6 +134,12 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._onSessionInfoChange?.(info);
       })] : []),
     );
+    if (this.provider.onApprovalRequest) {
+      this.provider.onApprovalRequest((sid: string, req: ApprovalRequest) => {
+        if (sid !== this._providerSessionId) return;
+        this._onApprovalRequest?.(req);
+      });
+    }
   }
 
   // ── Public API ──────────────────────────────────────────────────────────────
@@ -134,6 +151,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   set onDrain(cb: (messages: PendingTransportMessage[], mergedMessage: string, count: number) => void) { this._onDrain = cb; }
   /** Register a callback for provider session metadata updates. */
   set onSessionInfoChange(cb: (info: SessionInfoUpdate) => void) { this._onSessionInfoChange = cb; }
+  set onApprovalRequest(cb: (request: ApprovalRequest) => void) { this._onApprovalRequest = cb; }
 
   /** Set providerSessionId directly (restore from store without initialize). */
   setProviderSessionId(id: string): void { this._providerSessionId = id; }
@@ -196,7 +214,7 @@ export class TransportSessionRuntime implements SessionRuntime {
    *
    * Returns 'sent' if dispatched immediately, 'queued' if enqueued.
    */
-  send(message: string, clientMessageId?: string): 'sent' | 'queued' {
+  send(message: string, clientMessageId?: string, attachments?: TransportAttachment[]): 'sent' | 'queued' {
     if (!this._providerSessionId) {
       throw new Error('TransportSessionRuntime not initialized — call initialize() first');
     }
@@ -205,11 +223,12 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._pendingMessages.push({
         clientMessageId: clientMessageId ?? randomUUID(),
         text: message,
+        ...(attachments?.length ? { attachments } : {}),
       });
       return 'queued';
     }
 
-    this._dispatchTurn(message, clientMessageId);
+    this._dispatchTurn(message, clientMessageId, attachments);
     return 'sent';
   }
 
@@ -255,6 +274,9 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._sending = false;
     this._activeTurn = null;
     this._pendingMessages = [];
+    // Per-session memory injection history is daemon-scoped to this session;
+    // a kill ends that scope. clear() is called on session.clear separately.
+    clearRecentInjectionHistory(this.sessionKey);
   }
 
   getHistory(): AgentMessage[] { return [...this._history]; }
@@ -268,7 +290,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   /** Dispatch a single turn to the provider. Assumes _sending is false. */
-  private _dispatchTurn(message: string, clientMessageId?: string): void {
+  private _dispatchTurn(message: string, clientMessageId?: string, attachments?: TransportAttachment[]): void {
     this._history.push({
       id: randomUUID(),
       sessionId: this._providerSessionId!,
@@ -312,6 +334,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           userMessage: message,
           description: this._description,
           systemPrompt: this._systemPrompt,
+          attachments,
           namespace: this._contextNamespace,
           namespaceDiagnostics: this._contextNamespaceDiagnostics,
           remoteProcessedFreshness: this._contextRemoteProcessedFreshness,
@@ -377,8 +400,13 @@ export class TransportSessionRuntime implements SessionRuntime {
 
     const messages = this._pendingMessages.splice(0);
     const merged = messages.map((entry) => entry.text).join('\n\n');
+    const attachments = messages.flatMap((entry) => entry.attachments ?? []);
     this._onDrain?.(messages, merged, messages.length);
-    this._dispatchTurn(merged, messages.length === 1 ? messages[0]?.clientMessageId : undefined);
+    this._dispatchTurn(
+      merged,
+      messages.length === 1 ? messages[0]?.clientMessageId : undefined,
+      attachments.length > 0 ? attachments : undefined,
+    );
     return true;
   }
 
@@ -429,22 +457,40 @@ export class TransportSessionRuntime implements SessionRuntime {
       logger.debug({ sessionKey: this.sessionKey, length: trimmed.length }, 'transport message recall skipped: short message');
       return null;
     }
+    if (isTemplatePrompt(trimmed)) {
+      logger.debug({ sessionKey: this.sessionKey }, 'transport message recall skipped: template prompt');
+      return null;
+    }
     try {
       const query = trimmed.slice(0, 200);
+      // Broaden candidate pool — the cap rule trims to 3 (up to 5 if all
+      // results are strong). See shared/memory-scoring.ts.
       const result = await searchLocalMemorySemantic({
         query,
         namespace: this._contextNamespace,
         currentEnterpriseId: this._contextNamespace?.enterpriseId,
         repo: this._contextNamespace?.projectId ?? this.resolveAuthoredContextRepository(),
-        limit: 5,
+        limit: 10,
       });
-      const items = result.items
+      // 1) Template-origin legacy summaries never surface through recall.
+      const processed = result.items
         .filter((item): item is MemorySearchResultItem => item.type === 'processed')
-        .map(toTransportMemoryRecallItem);
+        .filter((item) => !isTemplateOriginSummary(item.summary));
+      // 2) Per-session dedup: skip items injected in this session's last
+      //    10 turns. Cleared on session.clear.
+      const procIds = processed.map((item) => item.id);
+      const keepIds = new Set(filterRecentlyInjected(this.sessionKey, procIds));
+      const deduped = processed.filter((item) => keepIds.has(item.id));
+      // 3) Cap rule: floor 0.5, top 3, extend to 5 iff all >= 0.6.
+      const scored = deduped.map((item) => ({ item, score: item.relevanceScore ?? 0 }));
+      const finalScored = applyRecallCapRule(scored);
+      const items = finalScored.map((s) => toTransportMemoryRecallItem(s.item));
       if (items.length === 0) {
         logger.debug({ sessionKey: this.sessionKey, query }, 'transport message recall skipped: no processed matches');
         return null;
       }
+      // 4) Record injection into the per-session ring buffer.
+      recordRecentInjection(this.sessionKey, items.map((it) => it.id));
       const supportClass = this.provider.capabilities.contextSupport ?? 'full-normalized-context-injection';
       const injectionSurface = supportClass === 'full-normalized-context-injection'
         ? 'normalized-payload'
@@ -508,6 +554,16 @@ export class TransportSessionRuntime implements SessionRuntime {
       },
       { source: 'daemon', confidence: 'high' },
     );
+  }
+
+  async respondApproval(requestId: string, approved: boolean): Promise<void> {
+    if (!this._providerSessionId) {
+      throw new Error('TransportSessionRuntime not initialized — call initialize() first');
+    }
+    if (!this.provider.respondApproval) {
+      throw new Error(`Provider ${this.provider.id} does not support approval responses`);
+    }
+    await this.provider.respondApproval(this._providerSessionId, requestId, approved);
   }
 }
 
