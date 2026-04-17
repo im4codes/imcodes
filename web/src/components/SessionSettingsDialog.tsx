@@ -58,6 +58,17 @@ type SupervisionDraft = {
   taskRunPromptVersion?: string;
 };
 
+function timeoutMsToUiSeconds(timeoutMs: number | undefined): number {
+  const safeMs = typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0
+    ? timeoutMs
+    : DEFAULT_SUPERVISION_TIMEOUT_MS;
+  return Math.max(1, Math.round(safeMs / 1000));
+}
+
+function timeoutUiSecondsToMs(seconds: number): number {
+  return Math.max(1, Math.round(seconds)) * 1000;
+}
+
 function labelForBackend(t: (key: string, params?: Record<string, unknown>) => string, backend: SharedContextRuntimeBackend): string {
   return t({
     'claude-code-sdk': 'session.agentType.claude_code_sdk',
@@ -159,6 +170,7 @@ export function SessionSettingsDialog({
   const supervisionBackend = normalizeBackendValue(String(supervision.backend ?? ''));
   const supervisionModel = typeof supervision.model === 'string' ? supervision.model : '';
   const supervisionTimeout = supervision.timeoutMs ?? DEFAULT_SUPERVISION_TIMEOUT_MS;
+  const supervisionTimeoutSeconds = timeoutMsToUiSeconds(supervisionTimeout);
   const supervisionPromptVersion = supervision.promptVersion ?? SUPERVISION_PROMPT_VERSION;
   const supervisionParseRetries = supervision.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES;
   const supervisionAuditMode = supervision.auditMode;
@@ -420,10 +432,16 @@ export function SessionSettingsDialog({
                 class="input"
                 type="number"
                 min={1}
-                value={String(supervisionTimeout)}
+                step={1}
+                value={String(supervisionTimeoutSeconds)}
                 onInput={(e) => {
                   const value = Number.parseInt((e.target as HTMLInputElement).value, 10);
-                  setSupervision((prev) => ({ ...prev, timeoutMs: Number.isFinite(value) && value > 0 ? value : DEFAULT_SUPERVISION_TIMEOUT_MS }));
+                  setSupervision((prev) => ({
+                    ...prev,
+                    timeoutMs: Number.isFinite(value) && value > 0
+                      ? timeoutUiSecondsToMs(value)
+                      : DEFAULT_SUPERVISION_TIMEOUT_MS,
+                  }));
                 }}
                 style={{ width: '100%' }}
                 disabled={saving}
@@ -479,7 +497,7 @@ export function SessionSettingsDialog({
                 : t('session.supervision.summaryDisabled')}
             </div>
             <div style={{ fontSize: 12, color: '#94a3b8' }}>
-              {t('session.supervision.summaryTimeout', { value: `${supervisionTimeout} ms` })}
+              {t('session.supervision.summaryTimeout', { value: `${supervisionTimeoutSeconds} s` })}
             </div>
             {isAuditMode && (
               <div style={{ fontSize: 12, color: '#94a3b8' }}>

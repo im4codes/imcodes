@@ -172,6 +172,32 @@ describe('SupervisionAutomation', () => {
     });
   });
 
+  it('emits and clears a supervision waiting status around completion evaluation', async () => {
+    const snapshot = await seedSession('supervised');
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-status', 'implement the feature', snapshot);
+    beginRun('cmd-status', 'implement the feature');
+
+    completeTurn('implemented the feature');
+    await sleep(25);
+
+    const events = timelineEmitter.replay('deck_supervision_brain', 0).events;
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'agent.status',
+        payload: expect.objectContaining({
+          status: 'supervision_waiting',
+          label: 'Checking whether the task is complete...',
+        }),
+      }),
+      expect.objectContaining({
+        type: 'agent.status',
+        payload: { status: null, label: null },
+      }),
+    ]));
+  });
+
   it('returns control to the human when the completion decision asks for human input', async () => {
     const snapshot = await seedSession('supervised');
     mockSupervisionDecide.mockResolvedValue({

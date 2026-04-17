@@ -163,6 +163,7 @@ describe('SessionSettingsDialog supervision', () => {
     });
 
     fireEvent.change(screen.getAllByRole('combobox')[1]!, { target: { value: 'supervised' } });
+    expect(screen.getByDisplayValue('18')).toBeDefined();
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
     await waitFor(() => {
@@ -208,7 +209,7 @@ describe('SessionSettingsDialog supervision', () => {
 
     expect(screen.getByText('summaryMode:supervised_audit')).toBeDefined();
     expect(screen.getByText(`summaryBackendModel:codex_sdk:${CODEX_MODEL_IDS[0]}`)).toBeDefined();
-    expect(screen.getByText('summaryTimeout:9000 ms')).toBeDefined();
+    expect(screen.getByText('summaryTimeout:9 s')).toBeDefined();
     expect(screen.getByText('summaryAudit:review_plan:3')).toBeDefined();
     expect(screen.getByText('summaryMeta:supervision_decision_v1')).toBeDefined();
   });

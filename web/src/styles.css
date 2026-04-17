@@ -954,6 +954,7 @@ body {
 .session-live-status-inline.running .session-live-status-emoji.gear { animation: status-gear-spin 0.8s linear infinite; transform-origin: 50% 50%; }
 .session-live-status-inline.thinking .session-live-status-emoji.thought { font-size: 10px; transform: translateY(-2px) translateX(-1px); opacity: 0.94; animation: status-thought-breathe 1.8s ease-in-out infinite; transform-origin: 50% 100%; }
 .session-live-status-inline.tool .session-live-status-emoji.tool { animation: status-tool-peek 1.15s ease-in-out infinite; transform-origin: 50% 50%; }
+.session-live-status-inline.waiting .session-live-status-emoji.wait { animation: status-wait-flip 1.2s ease-in-out infinite; transform-origin: 50% 50%; }
 .session-live-status-inline.idle .session-live-status-emoji.sleep { font-size: 9px; transform: translateY(-3px) translateX(-1px); opacity: 0.9; animation: status-sleep-breathe 1.8s ease-in-out infinite; transform-origin: 50% 100%; }
 .session-usage-model { color: #a78bfa; font-size: 10px; font-weight: 500; margin-right: 6px; }
 .session-usage-tokens { color: #64748b; }
@@ -969,6 +970,10 @@ body {
   0%, 100% { transform: translateX(0) rotate(0deg) scale(0.98); }
   35% { transform: translateX(0.5px) rotate(-8deg) scale(1.03); }
   65% { transform: translateX(0.5px) rotate(8deg) scale(1.03); }
+}
+@keyframes status-wait-flip {
+  0%, 100% { transform: rotate(0deg) scale(0.95); opacity: 0.76; }
+  50% { transform: rotate(180deg) scale(1.08); opacity: 1; }
 }
 @keyframes status-sleep-breathe {
   0%, 100% { transform: translateY(-3px) translateX(-1px) scale(0.88); opacity: 0.72; }

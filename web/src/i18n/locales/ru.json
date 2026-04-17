@@ -160,7 +160,7 @@
       },
       "backend": "Backend",
       "model": "Model",
-      "timeout": "Timeout (ms)",
+      "timeout": "Timeout (s)",
       "selectBackend": "Select backend",
       "selectModel": "Select model",
       "auditMode": {

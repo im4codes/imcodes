@@ -119,6 +119,26 @@ describe('UsageFooter', () => {
     expect((container.querySelector('.session-live-status-inline') as HTMLSpanElement | null)?.getAttribute('aria-label')).toBe('Reading file...');
   });
 
+  it('shows a waiting indicator when idle has an active supervision status', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 0,
+          cacheTokens: 0,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
+        sessionName="deck_test_brain"
+        sessionState="idle"
+        statusText="Checking whether the task is complete..."
+      />,
+    );
+
+    expect(container.querySelector('.session-live-status-inline.waiting')).toBeTruthy();
+    expect(container.querySelector('.session-live-status-inline.waiting .session-live-status-emoji.wait')).toBeTruthy();
+    expect(container.querySelector('.session-live-status-text')?.textContent).toBe('Checking whether the task is complete...');
+  });
+
   it('renders explicit quota label inline in the ctx footer', () => {
     render(
       <UsageFooter

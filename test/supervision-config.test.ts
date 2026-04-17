@@ -25,6 +25,10 @@ import {
 } from '../shared/supervision-config.js';
 
 describe('supervision config helpers', () => {
+  it('uses 30 seconds as the default supervision timeout', () => {
+    expect(DEFAULT_SUPERVISION_TIMEOUT_MS).toBe(30_000);
+  });
+
   it('normalizes supervisor defaults with backend inference and defaults', () => {
     const config = normalizeSupervisorDefaultConfig({
       model: CODEX_MODEL_IDS[0],

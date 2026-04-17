@@ -102,17 +102,20 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     ? (activeToolCall ? 'tool' : 'thinking')
     : sessionState === 'running'
       ? 'running'
-      : sessionState === 'idle' ? 'idle' : null;
+      : sessionState === 'idle'
+        ? (statusText ? 'waiting' : 'idle')
+        : null;
   const liveStatusText = useMemo(() => {
     if (hasActiveLiveWork || sessionState === 'running') {
       if (activeToolCall) return statusText || 'Tool running...';
       if (activeThinkingTs) return t('chat.thinking_running', { sec: Math.max(0, Math.round(((now ?? Date.now()) - activeThinkingTs) / 1000)) });
       return 'Agent working...';
     }
+    if (sessionState === 'idle' && statusText) return statusText;
     if (sessionState === 'idle') return 'Agent idle — waiting for input';
     return null;
   }, [activeThinkingTs, activeToolCall, hasActiveLiveWork, now, sessionState, statusText, t]);
-  const showInlineStatusText = liveStatusMode === 'running' || liveStatusMode === 'thinking' || liveStatusMode === 'tool';
+  const showInlineStatusText = liveStatusMode === 'running' || liveStatusMode === 'thinking' || liveStatusMode === 'tool' || liveStatusMode === 'waiting';
   const codexQuotaLines = (agentType === 'codex' || agentType === 'codex-sdk')
     ? (displayQuotaLabel ?? '').split(' · ').filter(Boolean)
     : [];
@@ -139,6 +142,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
             {liveStatusMode === 'running' && <span class="session-live-status-emoji gear">⚙️</span>}
             {liveStatusMode === 'thinking' && <span class="session-live-status-emoji thought">💭</span>}
             {liveStatusMode === 'tool' && <span class="session-live-status-emoji tool">🔍</span>}
+            {liveStatusMode === 'waiting' && <span class="session-live-status-emoji wait">⏳</span>}
             {liveStatusMode === 'idle' && <span class="session-live-status-emoji sleep">💤</span>}
             {showInlineStatusText && <span class="session-live-status-text">{liveStatusText}</span>}
           </span>

@@ -26,6 +26,8 @@ import {
 type TaskRunPhase = 'execution' | 'auditing';
 
 const MAX_AUTO_CONTINUE_STEPS = 8;
+const SUPERVISION_WAITING_LABEL = 'Checking whether the task is complete...';
+const SUPERVISION_AUDIT_WAITING_LABEL = 'Running automated audit...';
 
 interface ActiveTaskRunState {
   generation: number;
@@ -248,6 +250,24 @@ class SupervisionAutomation {
     );
   }
 
+  private emitStatus(sessionName: string, status: string, label: string): void {
+    timelineEmitter.emit(
+      sessionName,
+      'agent.status',
+      { status, label },
+      { source: 'daemon', confidence: 'high', eventId: `supervision-status:${sessionName}:${status}` },
+    );
+  }
+
+  private clearStatus(sessionName: string): void {
+    timelineEmitter.emit(
+      sessionName,
+      'agent.status',
+      { status: null, label: null },
+      { source: 'daemon', confidence: 'high', eventId: `supervision-status:${sessionName}:clear` },
+    );
+  }
+
   init(): void {
     if (this.initialized) return;
     this.initialized = true;
@@ -270,6 +290,7 @@ class SupervisionAutomation {
     this.pendingTaskIntents.delete(sessionName);
     this.recentTaskCandidates.delete(sessionName);
     this.latestAssistantTexts.delete(sessionName);
+    this.clearStatus(sessionName);
   }
 
   queueTaskIntent(
@@ -395,9 +416,11 @@ class SupervisionAutomation {
           this.finishRun(run.sessionName, 'needs_input');
           return;
         }
+        this.emitStatus(run.sessionName, 'supervision_waiting', SUPERVISION_WAITING_LABEL);
         run.evaluating = true;
         void this.evaluateExecutionTurn(run).catch((error) => {
           logger.warn({ session: run.sessionName, err: error }, 'Supervision execution evaluation failed');
+          this.clearStatus(run.sessionName);
           this.emitWarning(run.sessionName, 'Automation could not determine whether the task is complete. Manual continuation is required.');
           this.finishRun(run.sessionName, 'needs_input');
         });
@@ -414,13 +437,18 @@ class SupervisionAutomation {
     if (!current || current.generation !== run.generation || current.phase !== 'execution') return;
 
     const record = getSession(run.sessionName);
-    const decision = await supervisionBroker.decide({
-      snapshot: current.snapshot,
-      taskRequest: current.userText,
-      assistantResponse: current.lastAssistantText,
-      cwd: record?.projectDir,
-      description: record?.description,
-    });
+    let decision;
+    try {
+      decision = await supervisionBroker.decide({
+        snapshot: current.snapshot,
+        taskRequest: current.userText,
+        assistantResponse: current.lastAssistantText,
+        cwd: record?.projectDir,
+        description: record?.description,
+      });
+    } finally {
+      this.clearStatus(run.sessionName);
+    }
 
     const latest = this.activeRuns.get(run.sessionName);
     if (!latest || latest.generation !== run.generation || latest.phase !== 'execution') return;
@@ -459,6 +487,7 @@ class SupervisionAutomation {
     run.terminalState = state;
     this.clearPoller(sessionName);
     this.activeRuns.delete(sessionName);
+    this.clearStatus(sessionName);
   }
 
   private async startAudit(run: ActiveTaskRunState): Promise<void> {
@@ -469,6 +498,7 @@ class SupervisionAutomation {
 
     current.phase = 'auditing';
     current.evaluating = false;
+    this.emitStatus(current.sessionName, 'supervision_audit_waiting', SUPERVISION_AUDIT_WAITING_LABEL);
     const auditRound = {
       id: 'implementation_audit',
       title: 'Implementation Audit',
@@ -496,6 +526,7 @@ class SupervisionAutomation {
     } catch (error) {
       this.clearPoller(current.sessionName);
       this.activeRuns.delete(current.sessionName);
+      this.clearStatus(current.sessionName);
       throw error;
     }
   }
@@ -515,6 +546,7 @@ class SupervisionAutomation {
           logger.warn({ session: sessionName, err: error }, 'Supervision audit completion handling failed');
           this.activeRuns.delete(sessionName);
           this.clearPoller(sessionName);
+          this.clearStatus(sessionName);
         });
       }
     }, 1_000);
@@ -530,6 +562,7 @@ class SupervisionAutomation {
   private async handleCompletedAudit(state: ActiveTaskRunState, resultSummary: string): Promise<void> {
     const current = this.activeRuns.get(state.sessionName);
     if (!current || current.generation !== state.generation || current.phase !== 'auditing') return;
+    this.clearStatus(state.sessionName);
     const parsedVerdict = parseAuditVerdictDetailsFromText(resultSummary);
     const verdict = parsedVerdict.verdict;
     if (!verdict) {
