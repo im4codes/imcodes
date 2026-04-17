@@ -490,6 +490,69 @@ describe('sdk transport flow e2e', () => {
     });
   });
 
+  it('keeps main-session supervision in later session_list broadcasts after the initial PATCH', async () => {
+    // Regression: the daemon persisted supervision on the in-memory record but a
+    // subsequent session_list rebuild (e.g. sub-session rebuild, state change,
+    // heartbeat) must STILL include the snapshot. If the daemon ever regressed
+    // to rebuilding transportConfig from a stale source, the web would flip back
+    // to off. This is the daemon half of the fix — the web half lives in
+    // `web/test/session-list-merge.test.ts` and `use-sub-sessions-metadata.test.tsx`.
+    const sessionName = 'deck_live_supervision_persistent_brain';
+    mocks.store.set(sessionName, {
+      name: sessionName,
+      projectName: 'live_supervision_persistent',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/live-supervision-persistent',
+      state: 'idle',
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: sessionName,
+      codexSessionId: 'thread-codex-live-persistent',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({
+      type: DAEMON_COMMAND_TYPES.SESSION_UPDATE_TRANSPORT_CONFIG,
+      sessionName,
+      transportConfig: {
+        supervision: {
+          mode: 'supervised',
+          backend: 'codex-sdk',
+          model: 'gpt-5.3-codex-spark',
+          timeoutMs: 12000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+        },
+      },
+    }, serverLink);
+    await flushAsync();
+    await waitForCondition(() => serverLink.send.mock.calls.some((call) => call[0]?.type === 'session_list'));
+
+    // Force a second session_list rebuild — simulate the broadcast chain that used
+    // to cause the Auto dropdown to flip back to off on the web side.
+    serverLink.send.mockClear();
+    handleWebCommand({ type: 'get_sessions' }, serverLink);
+    await flushAsync();
+    await waitForCondition(() => serverLink.send.mock.calls.some((call) => call[0]?.type === 'session_list'));
+
+    const laterPayload = serverLink.send.mock.calls
+      .map((call) => call[0])
+      .find((msg) => msg?.type === 'session_list');
+    const laterEntry = laterPayload?.sessions?.find((session: any) => session.name === sessionName);
+    expect(laterEntry?.transportConfig).toMatchObject({
+      supervision: {
+        mode: 'supervised',
+        backend: 'codex-sdk',
+        model: 'gpt-5.3-codex-spark',
+      },
+    });
+  });
+
   it('preserves cc presets when settings restart switches a main session to claude-code-sdk', async () => {
     mocks.store.set('deck_settings_preset_brain', {
       name: 'deck_settings_preset_brain',

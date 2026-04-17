@@ -18,6 +18,7 @@ import {
   hasInvalidSessionSupervisionSnapshot,
   getSupportedSupervisionAuditModes,
   isSupportedSupervisionAuditMode,
+  mergeTransportConfigPreservingSupervision,
   normalizeSessionSupervisionSnapshot,
   normalizeSupervisorDefaultConfig,
   parseAuditVerdictFromText,
@@ -113,5 +114,58 @@ describe('supervision config helpers', () => {
     expect(parseTaskRunTerminalStateFromText(`${TASK_RUN_STATUS_MARKERS.NEEDS_INPUT}\n${TASK_RUN_STATUS_MARKERS.BLOCKED}`)).toBeNull();
     expect(parseAuditVerdictFromText(`before\n${AUDIT_VERDICT_MARKERS.PASS}`)).toBe('PASS');
     expect(parseAuditVerdictFromText(`${AUDIT_VERDICT_MARKERS.PASS}\n${AUDIT_VERDICT_MARKERS.REWORK}`)).toBeNull();
+  });
+
+  describe('mergeTransportConfigPreservingSupervision', () => {
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'claude-code-sdk',
+      model: DEFAULT_PRIMARY_CONTEXT_MODEL,
+      timeoutMs: DEFAULT_SUPERVISION_TIMEOUT_MS,
+      promptVersion: SUPERVISION_DEFAULT_PROMPT_VERSION,
+    });
+    const existingWithSupervision = embedSessionSupervisionSnapshot(null, snapshot);
+
+    it('returns existing when the incoming payload is null or undefined', () => {
+      expect(mergeTransportConfigPreservingSupervision(null, existingWithSupervision)).toEqual(existingWithSupervision);
+      expect(mergeTransportConfigPreservingSupervision(undefined, existingWithSupervision)).toEqual(existingWithSupervision);
+      expect(mergeTransportConfigPreservingSupervision(null, null)).toBeNull();
+    });
+
+    it('preserves existing supervision when a stale broadcast drops the supervision key', () => {
+      // Regression: users reported the Auto dropdown "自动跳回关闭状态" (auto-reverting
+      // to off). Cause: naive `incoming ?? existing` let a daemon broadcast with an
+      // empty `{}` overwrite the user's freshly-saved supervision before the daemon's
+      // authoritative post-PATCH session_list arrived.
+      const incoming = {};
+      const merged = mergeTransportConfigPreservingSupervision(incoming, existingWithSupervision);
+      expect(merged).toMatchObject({
+        [SUPERVISION_TRANSPORT_CONFIG_KEY]: snapshot,
+      });
+    });
+
+    it('preserves existing supervision when incoming has unrelated keys but no supervision', () => {
+      const incoming = { someOtherKey: 'value' };
+      const merged = mergeTransportConfigPreservingSupervision(incoming, existingWithSupervision);
+      expect(merged).toMatchObject({
+        someOtherKey: 'value',
+        [SUPERVISION_TRANSPORT_CONFIG_KEY]: snapshot,
+      });
+    });
+
+    it('uses incoming as authoritative when it carries its own supervision key (including explicit off)', () => {
+      const incomingWithOffSupervision = embedSessionSupervisionSnapshot(null, { mode: SUPERVISION_MODE.OFF });
+      const merged = mergeTransportConfigPreservingSupervision(incomingWithOffSupervision, existingWithSupervision);
+      expect(merged).toEqual(incomingWithOffSupervision);
+      expect((merged as Record<string, unknown>)[SUPERVISION_TRANSPORT_CONFIG_KEY]).toMatchObject({
+        mode: SUPERVISION_MODE.OFF,
+      });
+    });
+
+    it('returns incoming unchanged when existing has no supervision either', () => {
+      const incoming = { someOtherKey: 'value' };
+      expect(mergeTransportConfigPreservingSupervision(incoming, null)).toEqual(incoming);
+      expect(mergeTransportConfigPreservingSupervision(incoming, {})).toEqual(incoming);
+    });
   });
 });

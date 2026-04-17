@@ -320,6 +320,42 @@ export function buildTransportConfigWithSupervision(
   return embedSessionSupervisionSnapshot(transportConfig, normalized);
 }
 
+/**
+ * Merge an incoming `transportConfig` payload over an existing one without
+ * silently wiping a locally-set supervision snapshot.
+ *
+ * Symmetric to the daemon's `mergeWorkerSessionSnapshot`: the server/daemon
+ * session_list broadcasts that fire _between_ the user's PATCH and the daemon
+ * authoritatively processing it can arrive with a `transportConfig` that lacks
+ * the supervision key (server default `{}`, unrelated hydrator updates, etc.).
+ * A naive `incoming ?? existing` merge would let those stale payloads flash
+ * the Auto dropdown back to `off`. Instead, when the incoming payload does
+ * not carry its own `supervision` key we preserve the one we already had.
+ *
+ * - `incoming == null` → keep existing (broadcast omitted transportConfig entirely).
+ * - `incoming` carries its own supervision key → authoritative, use as-is
+ *   (this is how explicit off / mode changes land).
+ * - `incoming` lacks supervision but existing has one → overlay existing
+ *   supervision on top of incoming keys.
+ */
+export function mergeTransportConfigPreservingSupervision(
+  incoming: Record<string, unknown> | null | undefined,
+  existing: Record<string, unknown> | null | undefined,
+): Record<string, unknown> | null {
+  if (incoming == null) return existing ?? null;
+  if (!isPlainObject(incoming)) return existing ?? null;
+  if (SUPERVISION_TRANSPORT_CONFIG_KEY in incoming) {
+    return incoming;
+  }
+  if (isPlainObject(existing) && SUPERVISION_TRANSPORT_CONFIG_KEY in existing) {
+    return {
+      ...incoming,
+      [SUPERVISION_TRANSPORT_CONFIG_KEY]: existing[SUPERVISION_TRANSPORT_CONFIG_KEY],
+    };
+  }
+  return incoming;
+}
+
 export function getSupportedSupervisionBackendOptions(): readonly SharedContextRuntimeBackend[] {
   return SUPERVISION_SUPPORTED_BACKENDS;
 }
