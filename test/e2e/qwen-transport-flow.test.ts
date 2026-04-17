@@ -416,6 +416,7 @@ describe('qwen transport flow e2e', () => {
       sessions: expect.arrayContaining([
         expect.objectContaining({
           name: SESSION,
+          state: 'running',
           transportPendingMessages: ['queued second'],
           transportPendingMessageEntries: [
             { clientMessageId: 'cmd-qwen-queued', text: 'queued second' },
@@ -437,6 +438,17 @@ describe('qwen transport flow e2e', () => {
       && e.payload.clientMessageId === 'cmd-qwen-queued'
     );
     expect(drainedUser?.payload.text).toBe('queued second');
+
+
+    const idleStateEvents = mocks.emitted.filter((e) =>
+      e.session === SESSION
+      && e.type === 'session.state'
+      && e.payload.state === 'idle'
+    );
+    expect(idleStateEvents.length).toBeGreaterThan(0);
+    for (const event of idleStateEvents) {
+      expect(Object.prototype.hasOwnProperty.call(event.payload, 'pendingMessages')).toBe(true);
+    }
   });
 
 });

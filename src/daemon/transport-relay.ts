@@ -191,10 +191,8 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       timelineEmitter.emit(sessionName, 'usage.update', usagePayload, { source: 'daemon', confidence: 'high' });
     }
 
-    // Emit idle state
-    timelineEmitter.emit(sessionName, 'session.state', {
-      state: 'idle',
-    }, { source: 'daemon', confidence: 'high' });
+    // TransportSessionRuntime owns lifecycle state transitions. Emitting idle here
+    // races the runtime's drain/idle transitions and can desynchronize queue state.
 
     // Cache final text for replay
     void appendTransportEvent(sessionName, {

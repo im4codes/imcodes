@@ -1563,7 +1563,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [buildModeOnlySendPayload, requestSend]);
 
   const handleKeyDown = (e: KeyboardEvent) => {
-    if (e.key === 'Escape' && activeSession?.runtimeType === 'transport' && activeSession.state === 'running') {
+    if (e.key === 'Escape' && activeSession?.runtimeType === 'transport' && isRunningSessionState(activeSession.state)) {
       e.preventDefault();
       sendSessionMessage('/stop');
       return;
@@ -1865,7 +1865,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               onClick={() => {
                 sendSessionMessage('/stop');
               }}
-              style={activeSession?.state === 'running' ? { color: '#f87171' } : undefined}
+              style={isRunningSessionState(activeSession?.state) ? { color: '#f87171' } : undefined}
             >
               <span aria-hidden="true">■</span>
             </button>

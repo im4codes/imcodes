@@ -120,7 +120,7 @@ const STATE_PRIORITY: Record<WatchSessionState, number> = {
 
 function normalizeState(state: string): WatchSessionState {
   const lower = state.toLowerCase();
-  if (lower === 'working' || lower === 'running' || lower === 'busy') return 'working';
+  if (lower === 'working' || lower === 'running' || lower === 'queued' || lower === 'busy') return 'working';
   if (lower === 'idle' || lower === 'waiting') return 'idle';
   if (lower === 'error' || lower === 'failed') return 'error';
   return 'stopped';

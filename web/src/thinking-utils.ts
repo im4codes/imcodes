@@ -103,7 +103,7 @@ export function getTailSessionState(
 }
 
 export function isRunningSessionState(sessionState: string | undefined): boolean {
-  return sessionState === 'running';
+  return sessionState === 'running' || sessionState === 'queued';
 }
 
 export function isVisuallyBusy(sessionState: string | undefined, _activeThinking: boolean): boolean {

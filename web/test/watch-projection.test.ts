@@ -126,6 +126,21 @@ describe('watch projection store', () => {
     });
   });
 
+  it('treats queued sessions as working in the watch projection', () => {
+    const { store } = makeSnapshotStore(2_500);
+    store.updateFromSessionList(
+      { id: 'srv-1', name: 'Main', baseUrl: 'https://main.test' },
+      [
+        { name: 'deck_proj_brain', project: 'Project', role: 'brain', agentType: 'claude-code', state: 'queued' },
+      ],
+    );
+
+    expect(store.getSnapshot().sessions[0]?.state).toBe('working');
+
+    store.updateSessionState('deck_proj_brain', 'queued');
+    expect(store.getSnapshot().sessions[0]?.state).toBe('working');
+  });
+
   it('debounces semantic snapshot pushes and skips identical projections', async () => {
     const { store, pushes } = makeSnapshotStore(2_000);
     store.updateFromSessionList(

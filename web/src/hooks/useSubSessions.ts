@@ -11,6 +11,7 @@ import {
 } from '../api.js';
 import type { WsClient } from '../ws-client.js';
 import { isRunningTimelineEvent } from '../timeline-running.js';
+import { mergeTransportConfigPreservingSupervision } from '@shared/supervision-config.js';
 import {
   extractTransportPendingMessages,
   mergeTransportPendingEntriesForIdleState,
@@ -23,7 +24,7 @@ import {
 export interface SubSession extends SubSessionData {
   sessionName: string;
   /** runtime state from daemon */
-  state: 'running' | 'idle' | 'stopped' | 'stopping' | 'error' | 'starting' | 'unknown';
+  state: 'queued' | 'running' | 'idle' | 'stopped' | 'stopping' | 'error' | 'starting' | 'unknown';
   transportPendingMessages?: string[] | null;
   transportPendingMessageEntries?: import('../transport-queue.js').TransportPendingMessageEntry[] | null;
 }
@@ -145,7 +146,12 @@ export function useSubSessions(
                 ...(m.quotaUsageLabel != null && { quotaUsageLabel: m.quotaUsageLabel }),
                 ...(m.quotaMeta !== undefined && { quotaMeta: m.quotaMeta }),
                 ...(m.effort != null && { effort: m.effort }),
-                ...(m.transportConfig !== undefined && { transportConfig: m.transportConfig }),
+                ...(m.transportConfig !== undefined && {
+                  transportConfig: mergeTransportConfigPreservingSupervision(
+                    m.transportConfig,
+                    updated[existingIdx].transportConfig,
+                  ),
+                }),
                 ...(m.transportPendingMessages !== undefined && { transportPendingMessages: extractTransportPendingMessages(m.transportPendingMessages) }),
                 ...((m.transportPendingMessages !== undefined || m.transportPendingMessageEntries !== undefined) && {
                   transportPendingMessageEntries: normalizeTransportPendingEntries(
@@ -228,7 +234,12 @@ export function useSubSessions(
               ...(m.quotaUsageLabel !== undefined ? { quotaUsageLabel: m.quotaUsageLabel } : {}),
               ...(m.quotaMeta !== undefined ? { quotaMeta: m.quotaMeta } : {}),
               ...(m.effort !== undefined ? { effort: m.effort } : {}),
-              ...(m.transportConfig !== undefined ? { transportConfig: m.transportConfig } : {}),
+              ...(m.transportConfig !== undefined ? {
+                transportConfig: mergeTransportConfigPreservingSupervision(
+                  m.transportConfig,
+                  s.transportConfig,
+                ),
+              } : {}),
               ...(m.transportPendingMessages !== undefined ? { transportPendingMessages: extractTransportPendingMessages(m.transportPendingMessages) } : {}),
               ...((m.transportPendingMessages !== undefined || m.transportPendingMessageEntries !== undefined) ? {
                 transportPendingMessageEntries: normalizeTransportPendingEntries(
@@ -286,7 +297,12 @@ export function useSubSessions(
           const idx = prev.findIndex((s) => s.sessionName === sessionName);
           if (idx === -1) return prev;
           const next = [...prev];
-          next[idx] = { ...next[idx], transportPendingMessages: pendingMessages, transportPendingMessageEntries: pendingEntries };
+          next[idx] = {
+            ...next[idx],
+            state: 'queued',
+            transportPendingMessages: pendingMessages,
+            transportPendingMessageEntries: pendingEntries,
+          };
           return next;
         });
         return;

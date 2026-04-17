@@ -305,20 +305,13 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(textCall![2].streaming).toBe(false);
     });
 
-    it('emits session.state idle after the assistant.text event', () => {
+    it('does not emit session.state on complete; runtime owns lifecycle transitions', () => {
       const { provider, fireComplete } = makeMockProvider();
       wireProviderToRelay(provider);
 
       fireComplete('sess-1', makeMessage({ id: 'msg-3' }));
 
-      const stateCall = emitMock.mock.calls.find(c => c[1] === 'session.state');
-      expect(stateCall).toBeDefined();
-      expect(stateCall![2].state).toBe('idle');
-
-      // session.state must be emitted AFTER assistant.text
-      const textIdx = emitMock.mock.calls.findIndex(c => c[1] === 'assistant.text');
-      const stateIdx = emitMock.mock.calls.findIndex(c => c[1] === 'session.state');
-      expect(stateIdx).toBeGreaterThan(textIdx);
+      expect(emitMock.mock.calls.some(c => c[1] === 'session.state')).toBe(false);
     });
 
     it('uses the same stable eventId as the streaming deltas', () => {

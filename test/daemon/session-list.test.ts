@@ -1,5 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+const { getTransportRuntimeMock } = vi.hoisted(() => ({
+  getTransportRuntimeMock: vi.fn(() => undefined),
+}));
+
 vi.mock('../../src/agent/qwen-runtime-config.js', () => ({
   getQwenRuntimeConfig: vi.fn(async () => ({
     authType: 'qwen-oauth',
@@ -19,9 +23,15 @@ vi.mock('../../src/agent/codex-runtime-config.js', () => ({
   })),
 }));
 
+vi.mock('../../src/agent/session-manager.js', () => ({
+  getTransportRuntime: getTransportRuntimeMock,
+}));
+
 describe('buildSessionList', () => {
   beforeEach(async () => {
     vi.resetModules();
+    getTransportRuntimeMock.mockReset();
+    getTransportRuntimeMock.mockReturnValue(undefined);
     const store = await import('../../src/store/session-store.js');
     for (const s of store.listSessions()) store.removeSession(s.name);
   });
@@ -80,6 +90,40 @@ describe('buildSessionList', () => {
       planLabel: 'Pro',
       quotaLabel: expect.stringContaining('5h 11%'),
     });
+  });
+
+  it('derives transport session state from the live runtime instead of stale persisted store state', async () => {
+    const store = await import('../../src/store/session-store.js');
+    store.upsertSession({
+      name: 'deck_qwen_busy_brain',
+      projectName: 'demo',
+      role: 'brain',
+      agentType: 'qwen',
+      runtimeType: 'transport',
+      providerId: 'qwen',
+      providerSessionId: 'sid-busy',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      getStatus: () => 'streaming',
+      pendingMessages: ['queued second'],
+      pendingEntries: [{ clientMessageId: 'msg-2', text: 'queued second' }],
+    });
+
+    const { buildSessionList } = await import('../../src/daemon/session-list.js');
+    const sessions = await buildSessionList();
+    expect(sessions).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        name: 'deck_qwen_busy_brain',
+        state: 'running',
+        transportPendingMessages: ['queued second'],
+        transportPendingMessageEntries: [{ clientMessageId: 'msg-2', text: 'queued second' }],
+      }),
+    ]));
   });
 
   it('preserves the session transportConfig snapshot in the list surface', async () => {

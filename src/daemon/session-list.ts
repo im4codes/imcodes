@@ -39,6 +39,20 @@ export interface SessionListItem {
   transportPendingMessageEntries?: Array<{ clientMessageId: string; text: string }>;
 }
 
+function resolveTransportSessionListState(
+  record: SessionRecord,
+  runtime: ReturnType<typeof getTransportRuntime> | undefined,
+): SessionListItem['state'] {
+  if (!runtime) return record.state;
+  const status = runtime.getStatus();
+  if (status === 'error') return 'error';
+  if (status === 'streaming' || status === 'thinking' || status === 'tool_running' || status === 'permission') {
+    return 'running';
+  }
+  if (status === 'idle') return 'idle';
+  return record.state;
+}
+
 function baseItem(s: SessionRecord): SessionListItem {
   const runtime = s.runtimeType === 'transport' ? getTransportRuntime(s.name) : undefined;
   return {
@@ -47,7 +61,7 @@ function baseItem(s: SessionRecord): SessionListItem {
     role: s.role,
     agentType: s.agentType,
     agentVersion: s.agentVersion,
-    state: s.state,
+    state: resolveTransportSessionListState(s, runtime),
     projectDir: s.projectDir,
     runtimeType: s.runtimeType,
     providerId: s.providerId,

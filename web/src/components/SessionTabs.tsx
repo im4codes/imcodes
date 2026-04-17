@@ -232,7 +232,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
         const isBrain = s.role === 'brain';
         const isPinned = pinned.has(s.name);
         const hasAlert = idleAlerts?.has(s.name) ?? false;
-        const stateClass = s.state === 'running' ? 'busy' : s.state === 'idle' ? 'idle' : '';
+        const stateClass = s.state === 'running' || s.state === 'queued' ? 'busy' : s.state === 'idle' ? 'idle' : '';
         const classes = ['tab', isBrain ? 'brain' : '', isActive ? 'active' : '', stateClass, hasAlert ? 'alert' : '', isPinned ? 'pinned' : ''].filter(Boolean).join(' ');
         const isDragOver = dragOverIdx === idx;
 

@@ -47,6 +47,7 @@ import {
 } from './components/pinnedPanelTypes.js';
 import { LocalWebPreviewPanel } from './components/LocalWebPreviewPanel.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
+import { mergeSessionListEntry, type IncomingSessionListEntry } from './session-list-merge.js';
 import { useSyncedPreference } from './hooks/useSyncedPreference.js';
 import { resolveInitialServerId, resolveInitialSessionName, writeHashState } from './hooks/useHashState.js';
 import { useSubSessions } from './hooks/useSubSessions.js';
@@ -1324,48 +1325,7 @@ export function App() {
         const newSessions = msg.sessions.filter((s) => !s.name.startsWith('deck_sub_'));
         setSessions((prev) => newSessions.map((s) => {
           const existing = prev.find((p) => p.name === s.name);
-          return {
-            name: s.name,
-            project: s.project,
-            role: s.role as SessionInfo['role'],
-            agentType: s.agentType,
-            agentVersion: s.agentVersion,
-            state: s.state as SessionInfo['state'],
-            projectDir: s.projectDir ?? existing?.projectDir,
-            runtimeType: s.runtimeType,
-            label: s.label ?? existing?.label,
-            description: s.description ?? existing?.description,
-            qwenModel: s.qwenModel ?? existing?.qwenModel,
-            requestedModel: s.requestedModel ?? existing?.requestedModel,
-            activeModel: s.activeModel ?? existing?.activeModel,
-            qwenAuthType: s.qwenAuthType ?? existing?.qwenAuthType,
-            qwenAuthLimit: s.qwenAuthLimit ?? existing?.qwenAuthLimit,
-            qwenAvailableModels: s.qwenAvailableModels ?? existing?.qwenAvailableModels,
-            modelDisplay: s.modelDisplay ?? s.activeModel ?? existing?.modelDisplay,
-            planLabel: s.planLabel,
-            quotaLabel: s.quotaLabel,
-            quotaUsageLabel: s.quotaUsageLabel,
-            quotaMeta: s.quotaMeta ?? existing?.quotaMeta,
-            effort: s.effort ?? existing?.effort,
-            transportConfig: s.transportConfig ?? existing?.transportConfig ?? null,
-            transportPendingMessages: (s.state === 'queued' || s.state === 'running')
-              ? (() => {
-                  const nextPending = extractTransportPendingMessages((s as { transportPendingMessages?: unknown }).transportPendingMessages);
-                  return nextPending.length > 0 ? nextPending : (existing?.transportPendingMessages ?? []);
-                })()
-              : [],
-            transportPendingMessageEntries: (s.state === 'queued' || s.state === 'running')
-              ? (() => {
-                  const nextPendingMessages = extractTransportPendingMessages((s as { transportPendingMessages?: unknown }).transportPendingMessages);
-                  const normalizedEntries = normalizeTransportPendingEntries(
-                    (s as { transportPendingMessageEntries?: unknown }).transportPendingMessageEntries,
-                    nextPendingMessages,
-                    s.name,
-                  );
-                  return normalizedEntries.length > 0 ? normalizedEntries : (existing?.transportPendingMessageEntries ?? []);
-                })()
-              : [],
-          };
+          return mergeSessionListEntry(s as IncomingSessionListEntry, existing);
         }));
         setSessionsLoaded(true);
         // If active session disappeared from the list, navigate back
@@ -1434,7 +1394,12 @@ export function App() {
             );
             setSessions((prev) => prev.map((s) =>
               s.name === event.sessionId
-                ? { ...s, transportPendingMessages: pendingMessages, transportPendingMessageEntries: pendingEntries }
+                ? {
+                    ...s,
+                    state: 'queued' as SessionInfo['state'],
+                    transportPendingMessages: pendingMessages,
+                    transportPendingMessageEntries: pendingEntries,
+                  }
                 : s,
             ));
           } else if (liveState === 'running') {

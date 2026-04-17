@@ -145,8 +145,10 @@ export function SubSessionWindow({
     role: 'w1',
     agentType: sub.type,
     state:
-      sub.state === 'running'
-        ? 'running'
+      sub.state === 'queued'
+        ? 'queued'
+        : sub.state === 'running'
+          ? 'running'
         : sub.state === 'stopped'
           ? 'stopped'
           : sub.state === 'stopping'

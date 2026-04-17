@@ -6,6 +6,10 @@
  */
 import { render, cleanup, waitFor, act } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  SUPERVISION_MODE,
+  SUPERVISION_TRANSPORT_CONFIG_KEY,
+} from '@shared/supervision-config.js';
 import { useSubSessions, type SubSession } from '../src/hooks/useSubSessions.js';
 import { listSubSessions, patchSubSession } from '../src/api.js';
 
@@ -247,6 +251,7 @@ describe('sub-session metadata via subsession.sync', () => {
       },
     }));
 
+    expect(captured[0].state).toBe('queued');
     expect(captured[0].transportPendingMessages).toEqual(['queued one', 'queued two']);
     expect(captured[0].transportPendingMessageEntries).toEqual([
       { clientMessageId: 'msg-1', text: 'queued one' },
@@ -671,6 +676,137 @@ describe('sub-session rename behavior', () => {
     expect(vi.mocked(patchSubSession)).toHaveBeenCalledWith('srv1', 'rename1', { label: 'New Label' });
     expect(captured[0]?.label).toBe('New Label');
     expect((ws as any).subSessionRename).not.toHaveBeenCalled();
+  });
+});
+
+describe('sub-session supervision preservation (regression: Auto dropdown 自动跳回关闭状态)', () => {
+  afterEach(() => { cleanup(); vi.clearAllMocks(); captured = []; });
+
+  const SUPERVISED_SNAPSHOT = {
+    mode: SUPERVISION_MODE.SUPERVISED,
+    backend: 'codex-sdk',
+    model: 'gpt-5.3-codex-spark',
+    timeoutMs: 12_000,
+    promptVersion: 'supervision_decision_v1',
+    maxParseRetries: 1,
+  };
+
+  async function seedSupervisedSubSession(send: (m: any) => void) {
+    act(() => send({
+      type: 'subsession.created',
+      id: 'sup1',
+      sessionName: 'deck_sub_sup1',
+      sessionType: 'codex-sdk',
+      state: 'running',
+      transportConfig: { [SUPERVISION_TRANSPORT_CONFIG_KEY]: SUPERVISED_SNAPSHOT },
+    }));
+  }
+
+  it('keeps supervision when a subsequent subsession.created carries an empty transportConfig', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+    await seedSupervisedSubSession(send);
+    expect((captured[0].transportConfig as any)?.[SUPERVISION_TRANSPORT_CONFIG_KEY]).toMatchObject({
+      mode: SUPERVISION_MODE.SUPERVISED,
+    });
+
+    // Stale broadcast arrives with an empty transportConfig — must not wipe supervision.
+    act(() => send({
+      type: 'subsession.created',
+      id: 'sup1',
+      sessionName: 'deck_sub_sup1',
+      sessionType: 'codex-sdk',
+      state: 'running',
+      transportConfig: {},
+    }));
+
+    expect((captured[0].transportConfig as any)?.[SUPERVISION_TRANSPORT_CONFIG_KEY]).toMatchObject({
+      mode: SUPERVISION_MODE.SUPERVISED,
+    });
+  });
+
+  it('keeps supervision when subsession.sync reports unrelated keys without supervision', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+    await seedSupervisedSubSession(send);
+
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'sup1',
+      transportConfig: { ccPreset: 'MiniMax' },
+    }));
+
+    expect(captured[0].transportConfig).toMatchObject({
+      ccPreset: 'MiniMax',
+      [SUPERVISION_TRANSPORT_CONFIG_KEY]: expect.objectContaining({
+        mode: SUPERVISION_MODE.SUPERVISED,
+      }),
+    });
+  });
+
+  it('replaces supervision when daemon broadcasts an authoritative OFF snapshot', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+    await seedSupervisedSubSession(send);
+
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'sup1',
+      transportConfig: { [SUPERVISION_TRANSPORT_CONFIG_KEY]: { mode: SUPERVISION_MODE.OFF } },
+    }));
+
+    expect((captured[0].transportConfig as any)?.[SUPERVISION_TRANSPORT_CONFIG_KEY]).toMatchObject({
+      mode: SUPERVISION_MODE.OFF,
+    });
+  });
+
+  it('full race: user enables supervised → daemon sends {} via subsession.sync → authoritative sync lands', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    // Created with no supervision yet.
+    act(() => send({
+      type: 'subsession.created',
+      id: 'race1',
+      sessionName: 'deck_sub_race1',
+      sessionType: 'codex-sdk',
+      state: 'running',
+    }));
+    expect(captured[0].transportConfig).toBeNull();
+
+    // User flips to supervised — mirror the optimistic UI path: subsession.sync carries the snapshot.
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'race1',
+      transportConfig: { [SUPERVISION_TRANSPORT_CONFIG_KEY]: SUPERVISED_SNAPSHOT },
+    }));
+    expect((captured[0].transportConfig as any)?.[SUPERVISION_TRANSPORT_CONFIG_KEY]).toMatchObject({
+      mode: SUPERVISION_MODE.SUPERVISED,
+    });
+
+    // Stale broadcast (common symptom: daemon hydrates from DB before PATCH lands).
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'race1',
+      transportConfig: {},
+    }));
+    expect((captured[0].transportConfig as any)?.[SUPERVISION_TRANSPORT_CONFIG_KEY]).toMatchObject({
+      mode: SUPERVISION_MODE.SUPERVISED,
+    });
+
+    // Authoritative post-PATCH broadcast confirms the same snapshot.
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'race1',
+      transportConfig: { [SUPERVISION_TRANSPORT_CONFIG_KEY]: SUPERVISED_SNAPSHOT },
+    }));
+    expect((captured[0].transportConfig as any)?.[SUPERVISION_TRANSPORT_CONFIG_KEY]).toMatchObject({
+      mode: SUPERVISION_MODE.SUPERVISED,
+    });
   });
 });
 
