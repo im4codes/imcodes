@@ -1513,6 +1513,7 @@ body {
 .discussions-nav-row {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   padding: 10px 16px;
   flex-shrink: 0;
@@ -1524,8 +1525,10 @@ body {
 }
 .discussions-nav-controls {
   margin-left: auto;
-  display: inline-flex;
+  display: flex;
   align-items: center;
+  flex: 1 1 260px;
+  flex-wrap: wrap;
   justify-content: flex-end;
   gap: 10px;
   min-width: 0;
@@ -1536,6 +1539,7 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  flex: 1 1 180px;
   min-width: 0;
   color: #cbd5e1;
   font-size: 13px;
@@ -1546,13 +1550,16 @@ body {
   accent-color: #38bdf8;
 }
 .discussions-follow-toggle span {
-  white-space: nowrap;
+  white-space: normal;
+  line-height: 1.2;
 }
 .discussions-scroll-arrows {
   display: flex;
   flex-direction: row;
   align-items: center;
   gap: 8px;
+  flex: 0 0 auto;
+  margin-left: auto;
 }
 .discussions-scroll-btn-floating {
   width: 34px;
@@ -1592,11 +1599,10 @@ body {
   }
   .discussions-nav-row { align-items: flex-start; }
   .discussions-nav-controls {
-    flex-wrap: wrap;
+    flex-basis: 100%;
     row-gap: 8px;
     justify-content: flex-end;
   }
-  .discussions-follow-toggle span { white-space: normal; line-height: 1.2; }
   .discussions-scroll-btn-floating { width: 38px; height: 38px; }
 }
 
