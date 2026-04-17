@@ -23,6 +23,7 @@ import {
 } from '../store/session-store.js';
 import logger from '../util/logger.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
+import { buildMemoryContextTimelinePayload } from '../daemon/memory-context-timeline.js';
 import { emitSessionInlineError } from '../daemon/session-error.js';
 import { startWatching, startWatchingFile, stopWatching, isWatching, findJsonlPathBySessionId } from '../daemon/jsonl-watcher.js';
 import { startWatching as startCodexWatching, startWatchingSpecificFile as startCodexWatchingFile, startWatchingById as startCodexWatchingById, stopWatching as stopCodexWatching, isWatching as isCodexWatching, findRolloutPathByUuid } from '../daemon/codex-watcher.js';
@@ -42,6 +43,7 @@ import { resolveTransportContextBootstrap } from './runtime-context-bootstrap.js
 import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
 import { closeSingleSession, collectProjectCloseTargets, type CloseFailure, type CloseTreeResult } from './session-close.js';
+import type { TransportMemoryRecallArtifact } from '../../shared/context-types.js';
 
 /** Start JSONL watcher for a CC session — uses specific file if ccSessionId known, else directory scan. */
 function startCCWatcher(sessionName: string, projectDir: string, ccSessionId?: string): void {
@@ -787,6 +789,7 @@ export interface LaunchOpts {
 
 export interface SessionRelaunchOverrides {
   agentType?: AgentType;
+  fresh?: boolean | null;
   projectDir?: string;
   label?: string | null;
   description?: string | null;
@@ -839,6 +842,7 @@ export async function relaunchSessionWithSettings(
   overrides: SessionRelaunchOverrides = {},
 ): Promise<void> {
   const targetAgentType = (overrides.agentType ?? record.agentType) as AgentType;
+  const targetFresh = overrides.fresh === true;
   const targetProjectDir = overrides.projectDir ?? record.projectDir;
   const targetLabel = overrides.label !== undefined ? overrides.label : (record.label ?? null);
   const targetDescription = overrides.description !== undefined ? overrides.description : (record.description ?? null);
@@ -846,7 +850,7 @@ export async function relaunchSessionWithSettings(
   const targetEffort = overrides.effort !== undefined ? overrides.effort : (record.effort ?? null);
   const targetTransportConfig = overrides.transportConfig !== undefined ? overrides.transportConfig : (record.transportConfig ?? null);
   const targetCcPreset = overrides.ccPreset !== undefined ? overrides.ccPreset : (record.ccPreset ?? null);
-  const compatibleIds = getCompatibleSessionIds(record, targetAgentType);
+  const compatibleIds = targetFresh ? {} : getCompatibleSessionIds(record, targetAgentType);
   const preserveTransportBinding = record.runtimeType === RUNTIME_TYPES.TRANSPORT
     && record.agentType === targetAgentType
     // Qwen uses providerSessionId as its real resume key, so explicit restart must
@@ -880,6 +884,7 @@ export async function relaunchSessionWithSettings(
     ...compatibleIds,
     ...(record.parentSession ? { parentSession: record.parentSession } : {}),
     ...(record.userCreated ? { userCreated: true } : {}),
+    ...(targetFresh ? { fresh: true } : {}),
   });
 }
 
@@ -990,6 +995,17 @@ function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName:
     upsertSession(next);
     emitSessionPersist(next, sessionName);
   };
+}
+
+function emitTransportStartupMemoryContext(sessionName: string, startupMemory: TransportMemoryRecallArtifact | null | undefined): void {
+  if (!startupMemory || startupMemory.items.length === 0) return;
+  const payload = buildMemoryContextTimelinePayload(undefined, startupMemory.items, 'startup');
+  if (!payload) return;
+  timelineEmitter.emit(sessionName, 'memory.context', {
+    ...payload,
+    runtimeFamily: 'transport',
+    injectionSurface: startupMemory.injectionSurface ?? 'system-text',
+  }, { source: 'daemon', confidence: 'high' });
 }
 
 /** providerSessionId → IM.codes sessionName routing map */
@@ -1117,6 +1133,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         resumeId,
         effort: s.effort,
       });
+      emitTransportStartupMemoryContext(s.name, contextBootstrap.startupMemory);
       if (s.description) runtime.setDescription(s.description);
       if (systemPrompt) runtime.setSystemPrompt(systemPrompt);
       if (effectiveRequestedModel) runtime.setAgentId(effectiveRequestedModel);
@@ -1134,7 +1151,8 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         requestedModel: effectiveRequestedModel ?? s.requestedModel,
         activeModel: effectiveRequestedModel ?? s.activeModel ?? s.modelDisplay,
         modelDisplay: effectiveRequestedModel ?? s.modelDisplay,
-        transportConfig: s.transportConfig ?? {},
+        // Preserve transportConfig exactly via ...s spread — never force `{}` which
+        // would wipe user-set supervision settings on every daemon restart.
         ...(effectiveRequestedModel && s.providerId === 'qwen' ? { qwenModel: effectiveRequestedModel } : {}),
         ...(qwenRuntime?.authType ? { qwenAuthType: qwenRuntime.authType } : {}),
         ...(qwenRuntime?.authLimit ? { qwenAuthLimit: qwenRuntime.authLimit } : {}),
@@ -1193,12 +1211,16 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   let transportSettings: string | Record<string, unknown> | undefined;
   const storedRequestedModel = !opts.fresh ? existing?.requestedModel : undefined;
   let requestedTransportModel = opts.requestedModel ?? storedRequestedModel ?? (agentType === 'qwen' ? (opts.qwenModel ?? existing?.qwenModel) : undefined);
-  const effectiveTransportConfig = opts.transportConfig ?? existing?.transportConfig ?? {};
+  // Preserve existing transportConfig (including supervision) when opts doesn't override.
+  // Only fall through to `undefined` if nothing is set — never force `{}`, which would
+  // strip supervision on restart/relaunch.
+  const effectiveTransportConfig: Record<string, unknown> | undefined =
+    opts.transportConfig ?? existing?.transportConfig;
   let transportResumeId: string | undefined;
   let transportEnv: Record<string, string> | undefined = opts.extraEnv;
   const resolveRuntimeContextBootstrap = () => resolveTransportContextBootstrap({
     projectDir,
-    transportConfig: getSession(name)?.transportConfig ?? effectiveTransportConfig,
+    transportConfig: getSession(name)?.transportConfig ?? effectiveTransportConfig ?? {},
   });
   const contextBootstrap = await resolveRuntimeContextBootstrap();
   runtime.setContextBootstrapResolver(resolveRuntimeContextBootstrap);
@@ -1269,7 +1291,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   }
 
   // Create session on provider
-  await runtime.initialize({
+      await runtime.initialize({
     sessionKey: effectiveSessionKey,
     fresh: !!opts.fresh,
     ...(transportEnv ? { env: transportEnv } : {}),
@@ -1288,8 +1310,9 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     bindExistingKey: effectiveBindExistingKey,
     skipCreate: effectiveSkipCreate,
     resumeId: transportResumeId,
-    effort: opts.effort,
-  });
+        effort: opts.effort,
+      });
+      emitTransportStartupMemoryContext(name, contextBootstrap.startupMemory);
 
   // Atomic: store runtime + register provider route + persist — rollback all on failure
   const providerSid = runtime.providerSessionId;
@@ -1317,7 +1340,10 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
         requestedModel: requestedTransportModel,
         activeModel: requestedTransportModel,
         modelDisplay: requestedTransportModel,
-        transportConfig: effectiveTransportConfig,
+        // Only write transportConfig when we actually have one — avoid writing `{}`
+        // which would clobber a concurrently-set supervision config on the next
+        // load cycle. The existing config is already carried via effectiveTransportConfig.
+        ...(effectiveTransportConfig ? { transportConfig: effectiveTransportConfig } : {}),
         ...(requestedTransportModel && agentType === 'qwen' ? { qwenModel: requestedTransportModel } : {}),
         ...(qwenAuthType ? { qwenAuthType } : {}),
         ...(qwenAuthLimit ? { qwenAuthLimit } : {}),
@@ -1377,7 +1403,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
   const exists = await sessionExists(name);
 
   let ccSessionId = opts.ccSessionId;
-  if (agentType === 'claude-code') {
+  if (agentType === 'claude-code' && !fresh) {
     const stored = getSession(name)?.ccSessionId;
     if (stored) {
       ccSessionId = stored;
@@ -1394,11 +1420,11 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
   // --session-id lets CC create its own JSONL on first interaction.
 
   let codexSessionId = opts.codexSessionId;
-  if (agentType === 'codex' && !codexSessionId) codexSessionId = getSession(name)?.codexSessionId;
+  if (agentType === 'codex' && !fresh && !codexSessionId) codexSessionId = getSession(name)?.codexSessionId;
   let geminiSessionId = opts.geminiSessionId;
-  if (agentType === 'gemini' && !geminiSessionId) geminiSessionId = getSession(name)?.geminiSessionId;
+  if (agentType === 'gemini' && !fresh && !geminiSessionId) geminiSessionId = getSession(name)?.geminiSessionId;
   let opencodeSessionId = opts.opencodeSessionId;
-  if (agentType === 'opencode' && !opencodeSessionId) opencodeSessionId = getSession(name)?.opencodeSessionId;
+  if (agentType === 'opencode' && !fresh && !opencodeSessionId) opencodeSessionId = getSession(name)?.opencodeSessionId;
   ({ ccSessionId, codexSessionId, geminiSessionId } = await resolveStructuredSessionBootstrap({
     sessionName: name,
     agentType,

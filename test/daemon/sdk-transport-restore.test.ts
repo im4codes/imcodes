@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
+import { writeProcessedProjection } from '../../src/store/context-store.js';
 
 const mocks = vi.hoisted(() => {
   const store = new Map<string, Record<string, any>>();
@@ -6,6 +8,8 @@ const mocks = vi.hoisted(() => {
   const codexRuns: Array<{ mode: 'start' | 'resume'; id: string | null; options: Record<string, unknown>; input: string }> = [];
   return { store, claudeRuns, codexRuns };
 });
+
+const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
 
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
@@ -106,7 +110,7 @@ vi.mock('../../src/util/logger.js', () => ({
 }));
 
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({
-  timelineEmitter: { emit: vi.fn(), on: vi.fn(() => () => {}), epoch: 0, replay: vi.fn(() => ({ events: [], truncated: false })) },
+  timelineEmitter: { emit: timelineEmitterEmitMock, on: vi.fn(() => () => {}), epoch: 0, replay: vi.fn(() => ({ events: [], truncated: false })) },
 }));
 
 vi.mock('../../src/agent/tmux.js', () => ({
@@ -139,6 +143,8 @@ const flush = async () => {
 };
 
 describe('sdk transport session restore', () => {
+  let tempDir: string;
+
   beforeEach(() => {
     mocks.store.clear();
     mocks.claudeRuns.length = 0;
@@ -146,8 +152,13 @@ describe('sdk transport session restore', () => {
     setSessionEventCallback(() => {});
   });
 
+  beforeEach(async () => {
+    tempDir = await createIsolatedSharedContextDb('sdk-transport-restore');
+  });
+
   afterEach(async () => {
     await disconnectAll();
+    await cleanupIsolatedSharedContextDb(tempDir);
   });
 
   it('restores claude-code-sdk sessions with persisted resume id and sends via resumed continuity', async () => {
@@ -248,6 +259,54 @@ describe('sdk transport session restore', () => {
 
     expect(mocks.store.get('deck_sdk_new_brain')?.state).toBe('idle');
     expect(onSessionEvent).toHaveBeenCalledWith('started', 'deck_sdk_new_brain', 'idle');
+  });
+
+  it('emits startup memory.context when transport bootstrap finds recent processed memory', async () => {
+    writeProcessedProjection({
+      namespace: {
+        scope: 'personal',
+        projectId: 'sdk-startup-repo',
+      },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-startup'],
+      summary: 'Seeded transport startup memory for observability',
+      content: { kind: 'startup' },
+      createdAt: Date.now() - 1_000,
+      updatedAt: Date.now(),
+    });
+
+    await connectProvider('codex-sdk', {});
+    await launchTransportSession({
+      name: 'deck_sdk_startup_brain',
+      projectName: 'sdkstartup',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-startup',
+      transportConfig: {
+        sharedContextNamespace: {
+          scope: 'personal',
+          projectId: 'sdk-startup-repo',
+        },
+      },
+    });
+
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+      'deck_sdk_startup_brain',
+      'memory.context',
+      expect.objectContaining({
+        reason: 'startup',
+        runtimeFamily: 'transport',
+        injectionSurface: 'system-text',
+        injectedText: expect.stringContaining('Seeded transport startup memory for observability'),
+        items: expect.arrayContaining([
+          expect.objectContaining({
+            projectId: 'sdk-startup-repo',
+            summary: 'Seeded transport startup memory for observability',
+          }),
+        ]),
+      }),
+      expect.objectContaining({ source: 'daemon', confidence: 'high' }),
+    );
   });
 
   it('removes stale transport runtime from the map before awaiting a fresh kill', async () => {
@@ -363,6 +422,52 @@ describe('sdk transport session restore', () => {
 
     expect(mocks.claudeRuns.at(-1)?.options.resume).toBe('cc-session-restart');
     expect(mocks.claudeRuns.at(-1)?.options.sessionId).toBeUndefined();
+  });
+
+  it('starts a fresh claude-code cli conversation when relaunching with fresh', async () => {
+    const name = 'deck_clear_cccli_brain';
+    const record = {
+      name,
+      projectName: 'clearcccli',
+      role: 'brain',
+      agentType: 'claude-code',
+      projectDir: '/tmp/clear-cccli',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      ccSessionId: 'cc-session-old',
+    };
+    mocks.store.set(name, record);
+
+    await relaunchSessionWithSettings(record as any, { fresh: true });
+
+    expect(mocks.store.get(name)?.ccSessionId).not.toBe('cc-session-old');
+    expect(String(vi.mocked(newSession).mock.calls.at(-1)?.[1] ?? '')).not.toContain('cc-session-old');
+  });
+
+  it('starts a fresh codex cli conversation when relaunching with fresh', async () => {
+    const name = 'deck_clear_cxcli_brain';
+    const record = {
+      name,
+      projectName: 'clearcxcli',
+      role: 'brain',
+      agentType: 'codex',
+      projectDir: '/tmp/clear-cxcli',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      codexSessionId: 'codex-thread-old',
+    };
+    mocks.store.set(name, record);
+
+    await relaunchSessionWithSettings(record as any, { fresh: true });
+
+    expect(mocks.store.get(name)?.codexSessionId).not.toBe('codex-thread-old');
+    expect(String(vi.mocked(newSession).mock.calls.at(-1)?.[1] ?? '')).not.toContain('codex-thread-old');
   });
 
   it('preserves Claude resume id when switching from sdk to cli', async () => {

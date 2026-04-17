@@ -207,6 +207,10 @@ function supportsTransportClear(agentType: string | undefined): agentType is 'cl
   return agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'openclaw' || agentType === 'qwen';
 }
 
+function supportsProcessClear(agentType: string | undefined): agentType is 'claude-code' | 'codex' | 'opencode' {
+  return agentType === 'claude-code' || agentType === 'codex' || agentType === 'opencode';
+}
+
 async function relaunchFreshTransportConversation(record: SessionRecord): Promise<void> {
   await stopTransportRuntimeSession(record.name);
   await launchTransportSession({
@@ -1802,6 +1806,32 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
 
   // Preserve raw @file references for normal sends.
   const finalText = text;
+
+  if (text.trim() === '/clear' && record?.runtimeType !== 'transport' && supportsProcessClear(record?.agentType)) {
+    emitTransportUserMessage(text);
+    try {
+      await runExclusiveSessionRelaunch(sessionName, async () => {
+        await relaunchSessionWithSettings(record, { fresh: true });
+      });
+      await handleGetSessions(serverLink);
+      await syncSubSessionIfNeeded(sessionName, serverLink);
+      timelineEmitter.emit(sessionName, 'assistant.text', {
+        text: 'Started a fresh conversation',
+        streaming: false,
+        memoryExcluded: true,
+      }, { source: 'daemon', confidence: 'high' });
+      const clearStatus = isLegacy ? 'accepted_legacy' : 'accepted';
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: clearStatus });
+      try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: clearStatus, session: sessionName }); } catch {}
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      logger.error({ sessionName, err }, 'session.clear failed');
+      timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Clear failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
+      try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg }); } catch {}
+    }
+    return;
+  }
 
   // Build attachment refs for any uploaded files referenced in the message
   const attachments: Array<{ id: string; originalName?: string; mime?: string; size?: number; daemonPath: string }> = [];
