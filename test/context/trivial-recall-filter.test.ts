@@ -6,7 +6,7 @@
  * Language-agnostic via token count + content-char thresholds.
  */
 import { describe, it, expect } from 'vitest';
-import { isTrivialRecallQuery } from '../../src/context/memory-search.js';
+import { isTrivialRecallQuery, isP2pOrchestrationPrompt } from '../../src/context/memory-search.js';
 
 describe('isTrivialRecallQuery', () => {
   describe('trivial (should skip recall)', () => {
@@ -67,6 +67,36 @@ describe('isTrivialRecallQuery', () => {
       ['はい、次のステップは'],
     ])('runs recall for: %s', (input) => {
       expect(isTrivialRecallQuery(input)).toBe(false);
+    });
+  });
+
+  describe('P2P orchestration prompts (should skip)', () => {
+    it('detects [Round N/M] round header', () => {
+      const prompt = '[Round 1/3 — Audit Phase — Initial Analysis] Provide your analysis.';
+      expect(isP2pOrchestrationPrompt(prompt)).toBe(true);
+      expect(isTrivialRecallQuery(prompt)).toBe(true);
+    });
+
+    it('detects [P2P Discussion Task — run XXX]', () => {
+      const prompt = 'Work on [P2P Discussion Task — run 6e5f4c30-b3b] carefully.';
+      expect(isP2pOrchestrationPrompt(prompt)).toBe(true);
+      expect(isTrivialRecallQuery(prompt)).toBe(true);
+    });
+
+    it('detects identity assignment phrase', () => {
+      const prompt = 'Your identity for this discussion run is "abc:codex-sdk".';
+      expect(isP2pOrchestrationPrompt(prompt)).toBe(true);
+    });
+
+    it('detects .imc/discussions path reference', () => {
+      const prompt = 'Append to /Users/k/project/.imc/discussions/6e5f4c30-b3b.md now.';
+      expect(isP2pOrchestrationPrompt(prompt)).toBe(true);
+    });
+
+    it('does not flag unrelated text mentioning rounds or P2P', () => {
+      expect(isP2pOrchestrationPrompt('How does P2P work?')).toBe(false);
+      expect(isP2pOrchestrationPrompt('Round up the results.')).toBe(false);
+      expect(isP2pOrchestrationPrompt('Going for round 2')).toBe(false);
     });
   });
 });
