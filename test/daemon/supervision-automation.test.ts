@@ -180,6 +180,24 @@ describe('SupervisionAutomation', () => {
       phase: 'execution',
       continueLoops: 1,
     });
+    const events = timelineEmitter.replay('deck_supervision_brain', 0).events;
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'assistant.text',
+        payload: expect.objectContaining({
+          automation: true,
+          automationKind: 'supervision-continue-status',
+          text: 'Auto: sent a continue prompt to keep the task moving.',
+        }),
+      }),
+      expect.objectContaining({
+        type: 'agent.status',
+        payload: expect.objectContaining({
+          status: 'supervision_continue_sent',
+          label: 'Supervised: sent a continue prompt.',
+        }),
+      }),
+    ]));
   });
 
   it('emits and clears a supervision waiting status around completion evaluation', async () => {
@@ -206,12 +224,42 @@ describe('SupervisionAutomation', () => {
         type: 'agent.status',
         payload: expect.objectContaining({
           status: 'supervision_waiting',
-          label: 'Checking whether the task is complete...',
+          label: 'Supervised: analyzing completion...',
         }),
       }),
       expect.objectContaining({
         type: 'agent.status',
         payload: { status: null, label: null },
+      }),
+    ]));
+  });
+
+  it('emits a visible completion result and leaves a footer status when supervised execution completes', async () => {
+    const snapshot = await seedSession('supervised');
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-complete', 'implement the feature', snapshot);
+    beginRun('cmd-complete', 'implement the feature');
+
+    completeTurn('implemented the feature');
+    await sleep(25);
+
+    const events = timelineEmitter.replay('deck_supervision_brain', 0).events;
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'assistant.text',
+        payload: expect.objectContaining({
+          automation: true,
+          automationKind: 'supervision-complete',
+          text: 'Auto: task looks complete.',
+        }),
+      }),
+      expect.objectContaining({
+        type: 'agent.status',
+        payload: expect.objectContaining({
+          status: 'supervision_complete',
+          label: 'Supervised: task looks complete.',
+        }),
       }),
     ]));
   });
@@ -245,6 +293,23 @@ describe('SupervisionAutomation', () => {
         expect.objectContaining({ preset: 'custom', verdictPolicy: 'none' }),
       ],
     }));
+  });
+
+  it('picks up an in-flight task at idle when Auto is enabled after the user message was already sent', async () => {
+    const snapshot = await seedSession('supervised');
+
+    supervisionAutomation.init();
+    beginRun('cmd-midturn', 'implement the feature');
+    supervisionAutomation.applySnapshotUpdate('deck_supervision_brain', snapshot);
+
+    completeTurn('implemented the feature');
+    await sleep(25);
+
+    expect(mockSupervisionDecide).toHaveBeenCalledWith(expect.objectContaining({
+      taskRequest: 'implement the feature',
+      assistantResponse: 'implemented the feature',
+    }));
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
   });
 
   it('cancels active automation immediately when supervision is turned off live', async () => {

@@ -265,6 +265,42 @@ describe('ChatView', () => {
     });
   });
 
+  it('renders Auto progress notes as a separate assistant block instead of merging them into the model reply', async () => {
+    const events = [
+      {
+        eventId: 'evt-assistant',
+        type: 'assistant.text',
+        ts: 1000,
+        payload: { text: 'Implemented the feature.', streaming: false },
+      },
+      {
+        eventId: 'evt-auto',
+        type: 'assistant.text',
+        ts: 1001,
+        payload: {
+          text: 'Auto: checking whether the task is complete...',
+          streaming: false,
+          automation: true,
+          automationKind: 'supervision-status',
+        },
+      },
+    ] as any;
+
+    const { container } = render(
+      <ChatView
+        events={events}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    expect(chatMarkdownRenderSpy).toHaveBeenCalledTimes(2);
+    expect(chatMarkdownRenderSpy.mock.calls[0]?.[0]).toBe('Implemented the feature.');
+    expect(chatMarkdownRenderSpy.mock.calls[1]?.[0]).toBe('Auto: checking whether the task is complete...');
+    expect(container.querySelectorAll('.chat-assistant')).toHaveLength(2);
+    expect(container.querySelectorAll('.chat-assistant-automation')).toHaveLength(1);
+  });
+
   it('renders transport-origin memory.context cards the same as process recall cards', async () => {
     const { container, getByText } = render(
       <ChatView

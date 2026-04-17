@@ -52,6 +52,7 @@ interface ViewItem {
   event?: TimelineEvent;
   /** Merged text for assistant-block */
   text?: string;
+  assistantAutomation?: boolean;
   /** All events in a collapsed tool group (first, middle..., last) */
   toolEvents?: TimelineEvent[];
   /** memory.context events linked to this event via relatedToEventId */
@@ -62,6 +63,7 @@ interface ViewItem {
 
 interface AssistantBlockProps {
   text: string;
+  automation?: boolean;
   ts: number;
   onPathClick?: (p: string) => void;
   onUrlClick?: (url: string) => void;
@@ -335,6 +337,7 @@ function buildViewItems(events: TimelineEvent[]): ViewItem[] {
   let pendingFirstTs = 0;
   let pendingLastTs = 0;
   let pendingKey = '';
+  let pendingAssistantAutomation = false;
   let pendingTools: TimelineEvent[] = [];
   let deferredEvents: TimelineEvent[] = [];
 
@@ -344,10 +347,12 @@ function buildViewItems(events: TimelineEvent[]): ViewItem[] {
         key: pendingKey,
         type: 'assistant-block',
         text: pendingText.join('\n'),
+        assistantAutomation: pendingAssistantAutomation,
         ts: pendingFirstTs,
         lastTs: pendingLastTs,
       });
       pendingText = [];
+      pendingAssistantAutomation = false;
     }
   };
 
@@ -375,9 +380,14 @@ function buildViewItems(events: TimelineEvent[]): ViewItem[] {
       // Trim and collapse 3+ consecutive blank lines to 1 (CC output often has many trailing newlines)
       const text = String(event.payload.text ?? '').trim().replace(/\n{3,}/g, '\n\n');
       if (!text) continue;
+      const assistantAutomation = event.payload.automation === true;
+      if (pendingText.length > 0 && pendingAssistantAutomation !== assistantAutomation) {
+        flushPending();
+      }
       if (pendingText.length === 0) {
         pendingKey = event.eventId;
         pendingFirstTs = event.ts;
+        pendingAssistantAutomation = assistantAutomation;
       }
       pendingLastTs = event.ts;
       pendingText.push(text);
@@ -919,6 +929,7 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
                 <AssistantBlock
                   key={item.key}
                   text={item.text!}
+                  automation={item.assistantAutomation === true}
                   ts={item.lastTs ?? item.ts ?? 0}
                   onPathClick={pathClickHandler}
                   onUrlClick={urlClickHandler}
@@ -1201,13 +1212,14 @@ function ToolCallGroup({
 
 const AssistantBlock = memo(function AssistantBlock({
   text,
+  automation,
   ts,
   onPathClick,
   onUrlClick,
   onDownload,
 }: AssistantBlockProps) {
   return (
-    <div class="chat-event chat-assistant">
+    <div class={`chat-event chat-assistant${automation ? ' chat-assistant-automation' : ''}`}>
       <ChatMarkdown text={text} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} />
       <ChatTime ts={ts} />
     </div>

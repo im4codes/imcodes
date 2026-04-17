@@ -693,6 +693,7 @@ body {
 .chat-user { background: #1e3a5f; border-radius: 8px; padding: 6px 12px; align-self: flex-end; max-width: 80%; width: fit-content; text-align: left; word-break: break-all; overflow-wrap: break-word; }
 .chat-user.chat-pending { background: #1e3a5f80; color: #94a3b8; }
 .chat-assistant { padding: 6px 10px; word-break: break-word; overflow-wrap: break-word; line-height: 1.5; background: #161b22; border-radius: 8px; border-left: 2px solid #1e293b; }
+.chat-assistant-automation { border-left-color: #10b981; background: #101a19; }
 .chat-rich-text { white-space: pre-wrap; }
 .chat-code-block { background: #1a1a2e; border-radius: 8px; margin: 8px 0; overflow: hidden; }
 .chat-code-block pre { margin: 0; padding: 12px; overflow-x: auto; -webkit-overflow-scrolling: touch; font-size: 13px; line-height: 1.4; }
@@ -957,6 +958,8 @@ body {
 .session-live-status-inline.thinking .session-live-status-emoji.thought { font-size: 10px; transform: translateY(-2px) translateX(-1px); opacity: 0.94; animation: status-thought-breathe 1.8s ease-in-out infinite; transform-origin: 50% 100%; }
 .session-live-status-inline.tool .session-live-status-emoji.tool { animation: status-tool-peek 1.15s ease-in-out infinite; transform-origin: 50% 50%; }
 .session-live-status-inline.waiting .session-live-status-emoji.wait { animation: status-wait-flip 1.2s ease-in-out infinite; transform-origin: 50% 50%; }
+.session-live-status-inline.result { color: #34d399; }
+.session-live-status-inline.result .session-live-status-emoji.result { filter: saturate(1.2); }
 .session-live-status-inline.idle .session-live-status-emoji.sleep { font-size: 9px; transform: translateY(-3px) translateX(-1px); opacity: 0.9; animation: status-sleep-breathe 1.8s ease-in-out infinite; transform-origin: 50% 100%; }
 .session-usage-model { color: #a78bfa; font-size: 10px; font-weight: 500; margin-right: 6px; }
 .session-usage-tokens { color: #64748b; }

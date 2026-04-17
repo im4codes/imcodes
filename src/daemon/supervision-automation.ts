@@ -31,8 +31,14 @@ import { TIMELINE_EVENT_FILE_CHANGE, type FileChangePatch } from '../../shared/f
 type TaskRunPhase = 'execution' | 'auditing';
 
 const MAX_AUTO_CONTINUE_STEPS = 8;
-const SUPERVISION_WAITING_LABEL = 'Checking whether the task is complete...';
-const SUPERVISION_AUDIT_WAITING_LABEL = 'Running automated audit...';
+const SUPERVISION_WAITING_LABEL = 'Supervised: analyzing completion...';
+const SUPERVISION_AUDIT_WAITING_LABEL = 'Supervised: running automated audit...';
+const SUPERVISION_COMPLETE_LABEL = 'Supervised: task looks complete.';
+const SUPERVISION_CONTINUE_LABEL = 'Supervised: sent a continue prompt.';
+const SUPERVISION_NEEDS_INPUT_LABEL = 'Supervised: returned control to you.';
+const SUPERVISION_AUDIT_PASS_LABEL = 'Supervised: audit passed.';
+const SUPERVISION_REWORK_LABEL = 'Supervised: audit requested rework; brief sent.';
+const SUPERVISION_BLOCKED_LABEL = 'Supervised: stopped because the session is blocked.';
 
 interface ActiveTaskRunState {
   generation: number;
@@ -445,6 +451,10 @@ class SupervisionAutomation {
     );
   }
 
+  private emitTerminalStatus(sessionName: string, status: string, label: string): void {
+    this.emitStatus(sessionName, status, label);
+  }
+
   init(): void {
     if (this.initialized) return;
     this.initialized = true;
@@ -605,8 +615,9 @@ class SupervisionAutomation {
       if (!run) return;
       if (state === 'idle' && run.phase === 'execution' && !run.evaluating) {
         if (!run.sawAssistantOutput || !run.lastAssistantText?.trim()) {
+          this.emitTerminalStatus(run.sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
           this.emitWarning(run.sessionName, 'Automation did not capture a completed assistant response for the current task. Manual continuation is required.');
-          this.finishRun(run.sessionName, 'needs_input');
+          this.finishRun(run.sessionName, 'needs_input', { preserveStatus: true });
           return;
         }
         this.emitStatus(run.sessionName, 'supervision_waiting', SUPERVISION_WAITING_LABEL);
@@ -620,8 +631,9 @@ class SupervisionAutomation {
         });
       }
       if ((state === 'stopped' || state === 'error') && run.phase === 'execution') {
+        this.emitTerminalStatus(run.sessionName, 'supervision_blocked', SUPERVISION_BLOCKED_LABEL);
         this.emitWarning(run.sessionName, 'Supervision stopped because the session entered a blocked state.');
-        this.finishRun(run.sessionName, 'blocked');
+        this.finishRun(run.sessionName, 'blocked', { preserveStatus: true });
       }
     }
   }
@@ -654,7 +666,9 @@ class SupervisionAutomation {
         if (latest.snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT) {
           await this.startAudit(latest);
         } else {
-          this.finishRun(run.sessionName, 'complete');
+          this.emitAutomationNote(run.sessionName, 'Auto: task looks complete.', 'supervision-complete');
+          this.emitTerminalStatus(run.sessionName, 'supervision_complete', SUPERVISION_COMPLETE_LABEL);
+          this.finishRun(run.sessionName, 'complete', { preserveStatus: true });
         }
         return;
       }
@@ -670,19 +684,24 @@ class SupervisionAutomation {
       case 'ask_human':
       default: {
         const unavailableText = formatUnavailableReason(decision.unavailableReason);
+        this.emitTerminalStatus(run.sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
         this.emitWarning(run.sessionName, unavailableText ?? `Automation returned control to the human: ${decision.reason}`);
-        this.finishRun(run.sessionName, 'needs_input');
+        this.finishRun(run.sessionName, 'needs_input', { preserveStatus: true });
       }
     }
   }
 
-  private finishRun(sessionName: string, state: TaskRunTerminalState): void {
+  private finishRun(
+    sessionName: string,
+    state: TaskRunTerminalState,
+    options: { preserveStatus?: boolean } = {},
+  ): void {
     const run = this.activeRuns.get(sessionName);
     if (!run) return;
     run.terminalState = state;
     this.clearPoller(sessionName);
     this.activeRuns.delete(sessionName);
-    this.clearStatus(sessionName);
+    if (!options.preserveStatus) this.clearStatus(sessionName);
   }
 
   private async startAudit(run: ActiveTaskRunState): Promise<void> {
@@ -774,6 +793,8 @@ class SupervisionAutomation {
     }
 
     if (verdict === 'PASS') {
+      this.emitAutomationNote(state.sessionName, 'Auto: audit passed.', 'supervision-audit-pass');
+      this.emitTerminalStatus(state.sessionName, 'supervision_audit_pass', SUPERVISION_AUDIT_PASS_LABEL);
       this.activeRuns.delete(state.sessionName);
       this.clearPoller(state.sessionName);
       return;
@@ -812,6 +833,8 @@ class SupervisionAutomation {
     );
     try {
       transportRuntime.send(reworkBrief, `supervision-rework-${state.generation}-${current.reworkDispatches}`);
+      this.emitAutomationNote(state.sessionName, 'Auto: audit requested rework; rework brief sent.', 'supervision-rework-status');
+      this.emitTerminalStatus(state.sessionName, 'supervision_rework_sent', SUPERVISION_REWORK_LABEL);
     } catch (error) {
       logger.warn({ session: state.sessionName, err: error }, 'Supervision rework dispatch failed');
       this.emitWarning(state.sessionName, 'Automation could not send the rework brief back into the session. Manual continuation is required.');
@@ -847,6 +870,8 @@ class SupervisionAutomation {
 
     try {
       transportRuntime.send(continuePrompt, `supervision-continue-${run.generation}-${current.continueLoops}`);
+      this.emitAutomationNote(run.sessionName, 'Auto: sent a continue prompt to keep the task moving.', 'supervision-continue-status');
+      this.emitTerminalStatus(run.sessionName, 'supervision_continue_sent', SUPERVISION_CONTINUE_LABEL);
     } catch (error) {
       logger.warn({ session: run.sessionName, err: error }, 'Supervision continue dispatch failed');
       this.emitWarning(run.sessionName, 'Automation could not continue the task. Manual continuation is required.');

@@ -103,7 +103,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     : sessionState === 'running'
       ? 'running'
       : sessionState === 'idle'
-        ? (statusText ? 'waiting' : 'idle')
+        ? (statusText ? (/^(?:supervised|auto):/i.test(statusText) ? 'result' : 'waiting') : 'idle')
         : null;
   const liveStatusText = useMemo(() => {
     if (hasActiveLiveWork || sessionState === 'running') {
@@ -115,7 +115,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     if (sessionState === 'idle') return 'Agent idle — waiting for input';
     return null;
   }, [activeThinkingTs, activeToolCall, hasActiveLiveWork, now, sessionState, statusText, t]);
-  const showInlineStatusText = liveStatusMode === 'running' || liveStatusMode === 'thinking' || liveStatusMode === 'tool' || liveStatusMode === 'waiting';
+  const showInlineStatusText = liveStatusMode === 'running' || liveStatusMode === 'thinking' || liveStatusMode === 'tool' || liveStatusMode === 'waiting' || liveStatusMode === 'result';
   const codexQuotaLines = (agentType === 'codex' || agentType === 'codex-sdk')
     ? (displayQuotaLabel ?? '').split(' · ').filter(Boolean)
     : [];
@@ -143,6 +143,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
             {liveStatusMode === 'thinking' && <span class="session-live-status-emoji thought">💭</span>}
             {liveStatusMode === 'tool' && <span class="session-live-status-emoji tool">🔍</span>}
             {liveStatusMode === 'waiting' && <span class="session-live-status-emoji wait">⏳</span>}
+            {liveStatusMode === 'result' && <span class="session-live-status-emoji result">✅</span>}
             {liveStatusMode === 'idle' && <span class="session-live-status-emoji sleep">💤</span>}
             {showInlineStatusText && <span class="session-live-status-text">{liveStatusText}</span>}
           </span>

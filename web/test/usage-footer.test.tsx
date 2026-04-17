@@ -139,6 +139,26 @@ describe('UsageFooter', () => {
     expect(container.querySelector('.session-live-status-text')?.textContent).toBe('Checking whether the task is complete...');
   });
 
+  it('shows a result indicator when idle has a supervised outcome status', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 0,
+          cacheTokens: 0,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
+        sessionName="deck_test_brain"
+        sessionState="idle"
+        statusText="Supervised: task looks complete."
+      />,
+    );
+
+    expect(container.querySelector('.session-live-status-inline.result')).toBeTruthy();
+    expect(container.querySelector('.session-live-status-inline.result .session-live-status-emoji.result')).toBeTruthy();
+    expect(container.querySelector('.session-live-status-text')?.textContent).toBe('Supervised: task looks complete.');
+  });
+
   it('renders explicit quota label inline in the ctx footer', () => {
     render(
       <UsageFooter
