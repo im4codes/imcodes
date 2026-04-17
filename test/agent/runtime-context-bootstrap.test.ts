@@ -317,6 +317,43 @@ describe('resolveTransportContextBootstrap', () => {
     expect(result.startupMemory).toBeUndefined();
   });
 
+  it('includes transport startup memory when the resolved namespace has processed memory', async () => {
+    const now = Date.now();
+    detectRepoMock.mockResolvedValue({
+      info: {
+        remoteUrl: 'git@github.com:acme/repo.git',
+      },
+    });
+    writeProcessedProjection({
+      namespace: {
+        scope: 'personal',
+        projectId: 'github.com/acme/repo',
+      },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-startup'],
+      summary: 'Startup memory should be available at launch',
+      content: { kind: 'startup' },
+      createdAt: now - 100,
+      updatedAt: now - 50,
+    });
+
+    const result = await resolveTransportContextBootstrap({
+      projectDir: '/tmp/project',
+      transportConfig: {},
+    });
+
+    expect(result.startupMemory).toEqual(expect.objectContaining({
+      reason: 'startup',
+      runtimeFamily: 'transport',
+      items: expect.arrayContaining([
+        expect.objectContaining({
+          projectId: 'github.com/acme/repo',
+          summary: 'Startup memory should be available at launch',
+        }),
+      ]),
+    }));
+  });
+
 
 
   it('buildTransportStartupMemory keeps up to 7 durable plus 8 recent memories', () => {

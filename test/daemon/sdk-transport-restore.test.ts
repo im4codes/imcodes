@@ -273,7 +273,7 @@ describe('sdk transport session restore', () => {
     expect(onSessionEvent).toHaveBeenCalledWith('started', 'deck_sdk_new_brain', 'idle');
   });
 
-  it('emits startup memory.context on first successful transport dispatch when bootstrap finds recent processed memory', async () => {
+  it('emits startup memory.context during transport launch when bootstrap finds recent processed memory', async () => {
     writeProcessedProjection({
       namespace: {
         scope: 'personal',
@@ -301,11 +301,6 @@ describe('sdk transport session restore', () => {
         },
       },
     });
-
-    const runtime = getTransportRuntime('deck_sdk_startup_brain');
-    expect(runtime).toBeDefined();
-    runtime!.send('/status');
-    await flush();
 
     const startupCall = timelineEmitterEmitMock.mock.calls.find(([session, type, payload]) =>
       session === 'deck_sdk_startup_brain'

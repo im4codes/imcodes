@@ -77,7 +77,8 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _contextAuthoredContextLanguage: string | undefined;
   private _contextAuthoredContextFilePath: string | undefined;
   private _startupMemory: TransportMemoryRecallArtifact | null = null;
-  private _startupMemoryEmitted = false;
+  private _startupMemoryTimelineEmitted = false;
+  private _startupMemoryInjected = false;
   private _contextBootstrapResolver: (() => Promise<TransportContextBootstrap>) | undefined;
   private _unsubscribes: Array<() => void> = [];
   private _onStatusChange?: (status: AgentStatus) => void;
@@ -202,7 +203,9 @@ export class TransportSessionRuntime implements SessionRuntime {
       authoredContextFilePath: config.contextAuthoredContextFilePath,
     });
     await this.refreshContextBootstrap();
-    this._startupMemoryEmitted = false;
+    this._startupMemoryTimelineEmitted = false;
+    this._startupMemoryInjected = false;
+    this.emitStartupMemoryContext(this._startupMemory);
   }
 
   /**
@@ -323,7 +326,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           sharedPolicyOverride: this._contextSharedPolicyOverride,
         }).authority;
         const startupMemory = this._startupMemory ?? (
-          !this._startupMemoryEmitted && authority.authoritySource === 'processed_local' && this._contextNamespace
+          !this._startupMemoryInjected && authority.authoritySource === 'processed_local' && this._contextNamespace
             ? buildTransportStartupMemory(this._contextNamespace)
             : null
         );
@@ -362,8 +365,9 @@ export class TransportSessionRuntime implements SessionRuntime {
           }
           this.emitMemoryContextEvent(dispatchResult.payload.memoryRecall, clientMessageId);
         }
-        if (!this._startupMemoryEmitted && dispatchResult.payload?.startupMemory) {
-          this.emitStartupMemoryContext(dispatchResult.payload.startupMemory);
+        if (!this._startupMemoryInjected && dispatchResult.payload?.startupMemory) {
+          this._startupMemoryInjected = true;
+          this._startupMemory = null;
         }
       })
       .catch((err) => {
@@ -432,7 +436,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._contextSharedPolicyOverride = bootstrap.sharedPolicyOverride;
     this._contextAuthoredContextLanguage = bootstrap.authoredContextLanguage;
     this._contextAuthoredContextFilePath = bootstrap.authoredContextFilePath;
-    if (!this._startupMemoryEmitted) this._startupMemory = bootstrap.startupMemory ?? null;
+    if (!this._startupMemoryInjected) this._startupMemory = bootstrap.startupMemory ?? null;
     this._onSessionInfoChange?.({
       contextNamespace: this._contextNamespace,
       contextNamespaceDiagnostics: [...this._contextNamespaceDiagnostics],
@@ -518,8 +522,8 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
   }
 
-  private emitStartupMemoryContext(startupMemory: TransportMemoryRecallArtifact): void {
-    if (this._startupMemoryEmitted || startupMemory.items.length === 0) return;
+  private emitStartupMemoryContext(startupMemory: TransportMemoryRecallArtifact | null): void {
+    if (this._startupMemoryTimelineEmitted || !startupMemory || startupMemory.items.length === 0) return;
     const payload = buildMemoryContextTimelinePayload(undefined, startupMemory.items, 'startup', {
       runtimeFamily: 'transport',
       injectionSurface: startupMemory.injectionSurface,
@@ -529,8 +533,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     });
     if (!payload) return;
     timelineEmitter.emit(this.sessionKey, 'memory.context', payload, { source: 'daemon', confidence: 'high' });
-    this._startupMemory = null;
-    this._startupMemoryEmitted = true;
+    this._startupMemoryTimelineEmitted = true;
   }
 
   private emitMemoryContextEvent(

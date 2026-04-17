@@ -389,6 +389,13 @@ describe('TransportSessionRuntime', () => {
     await r.initialize(defaultConfig);
     await flushDispatch();
 
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith('deck_test_brain', 'memory.context', expect.objectContaining({
+      reason: 'startup',
+      injectedText: expect.stringContaining('transport recall parity visible'),
+    }), expect.any(Object));
+
+    timelineEmitterEmitMock.mockClear();
+
     r.send('Need a transport recall test');
     await flushDispatch();
 
@@ -401,6 +408,9 @@ describe('TransportSessionRuntime', () => {
         injectionSurface: 'normalized-payload',
       }),
     }));
+    expect(timelineEmitterEmitMock).not.toHaveBeenCalledWith('deck_test_brain', 'memory.context', expect.objectContaining({
+      reason: 'startup',
+    }), expect.any(Object));
   });
 
   it('send() adds transport recall to the payload and emits linked memory.context evidence', async () => {

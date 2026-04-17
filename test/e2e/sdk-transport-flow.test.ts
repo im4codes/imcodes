@@ -216,6 +216,23 @@ vi.mock('../../src/daemon/transport-history.js', () => ({
   appendTransportEvent: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock('../../src/context/embedding.js', () => ({
+  generateEmbedding: vi.fn(async (text: string) => {
+    const normalized = text.toLowerCase();
+    if (normalized.includes('recall') || normalized.includes('latency') || normalized.includes('memory.context')) {
+      return [1, 0, 0];
+    }
+    return [0, 1, 0];
+  }),
+  cosineSimilarity: vi.fn((a: number[], b: number[]) => {
+    const dot = a.reduce((sum, value, index) => sum + value * (b[index] ?? 0), 0);
+    const magA = Math.sqrt(a.reduce((sum, value) => sum + value * value, 0));
+    const magB = Math.sqrt(b.reduce((sum, value) => sum + value * value, 0));
+    if (!magA || !magB) return 0;
+    return dot / (magA * magB);
+  }),
+}));
+
 vi.mock('../../src/agent/agent-version.js', () => ({
   getAgentVersion: vi.fn().mockResolvedValue('test-version'),
 }));
@@ -1185,10 +1202,6 @@ describe('sdk transport flow e2e', () => {
         },
       },
     });
-
-    const runtime = getTransportRuntime(SESSION_CX);
-    expect(runtime).toBeDefined();
-    runtime!.send('/status');
 
     await flushAsync();
     await waitForCondition(() => mocks.emitted.some((event) => event.session === SESSION_CX && event.type === 'memory.context' && event.payload.reason === 'startup'));

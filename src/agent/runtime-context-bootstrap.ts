@@ -36,11 +36,9 @@ export async function resolveTransportContextBootstrap(
 ): Promise<TransportContextBootstrap> {
   const explicitNamespace = parseExplicitContextNamespace(input.transportConfig);
   if (explicitNamespace) {
-    return {
-      namespace: explicitNamespace,
+    return buildBootstrapResult(explicitNamespace, {
       diagnostics: ['namespace:explicit'],
-      localProcessedFreshness: getLocalProcessedFreshness(explicitNamespace),
-    };
+    });
   }
 
   const projectDir = input.projectDir?.trim();
@@ -64,36 +62,30 @@ export async function resolveTransportContextBootstrap(
         const resolved = await fetchBackendSharedContextNamespace(credentials, canonical.key);
         if (resolved?.namespace) {
           const namespace = resolved.namespace;
-          return {
-            namespace,
+          return buildBootstrapResult(namespace, {
             diagnostics: ['namespace:server-control-plane', ...resolved.diagnostics],
             remoteProcessedFreshness: resolved.remoteProcessedFreshness,
-            localProcessedFreshness: getLocalProcessedFreshness(namespace),
             retryExhausted: resolved.retryExhausted,
             sharedPolicyOverride: resolved.sharedPolicyOverride,
-          };
+          });
         }
         const personalNamespace: ContextNamespace = {
           scope: 'personal',
           projectId: canonical.key,
         };
-        return {
-          namespace: personalNamespace,
+        return buildBootstrapResult(personalNamespace, {
           diagnostics: ['namespace:server-personal-fallback', ...(resolved?.diagnostics ?? [])],
           remoteProcessedFreshness: resolved?.remoteProcessedFreshness,
-          localProcessedFreshness: getLocalProcessedFreshness(personalNamespace),
           retryExhausted: resolved?.retryExhausted,
-        };
+        });
       } catch {
         const personalNamespace: ContextNamespace = {
           scope: 'personal',
           projectId: canonical.key,
         };
-        return {
-          namespace: personalNamespace,
+        return buildBootstrapResult(personalNamespace, {
           diagnostics: ['namespace:server-resolution-failed', 'namespace:git-origin'],
-          localProcessedFreshness: getLocalProcessedFreshness(personalNamespace),
-        };
+        });
       }
     }
   }
@@ -102,10 +94,20 @@ export async function resolveTransportContextBootstrap(
     scope: 'personal',
     projectId: canonical.key,
   };
-  return {
-    namespace: fallbackNamespace,
+  return buildBootstrapResult(fallbackNamespace, {
     diagnostics: [`namespace:${canonical.kind}`],
-    localProcessedFreshness: getLocalProcessedFreshness(fallbackNamespace),
+  });
+}
+
+function buildBootstrapResult(
+  namespace: ContextNamespace,
+  extras: Omit<TransportContextBootstrap, 'namespace' | 'localProcessedFreshness' | 'startupMemory'>,
+): TransportContextBootstrap {
+  return {
+    namespace,
+    ...extras,
+    localProcessedFreshness: getLocalProcessedFreshness(namespace),
+    startupMemory: buildTransportStartupMemory(namespace),
   };
 }
 
