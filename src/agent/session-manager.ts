@@ -23,7 +23,6 @@ import {
 } from '../store/session-store.js';
 import logger from '../util/logger.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
-import { buildMemoryContextTimelinePayload } from '../daemon/memory-context-timeline.js';
 import { emitSessionInlineError } from '../daemon/session-error.js';
 import { startWatching, startWatchingFile, stopWatching, isWatching, findJsonlPathBySessionId } from '../daemon/jsonl-watcher.js';
 import { startWatching as startCodexWatching, startWatchingSpecificFile as startCodexWatchingFile, startWatchingById as startCodexWatchingById, stopWatching as stopCodexWatching, isWatching as isCodexWatching, findRolloutPathByUuid } from '../daemon/codex-watcher.js';
@@ -43,7 +42,6 @@ import { resolveTransportContextBootstrap } from './runtime-context-bootstrap.js
 import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
 import { closeSingleSession, collectProjectCloseTargets, type CloseFailure, type CloseTreeResult } from './session-close.js';
-import type { TransportMemoryRecallArtifact } from '../../shared/context-types.js';
 
 /** Start JSONL watcher for a CC session — uses specific file if ccSessionId known, else directory scan. */
 function startCCWatcher(sessionName: string, projectDir: string, ccSessionId?: string): void {
@@ -923,10 +921,15 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
     if (messages.length === 0) {
       timelineEmitter.emit(sessionName, 'user.message', { text: merged, batchedCount: count, allowDuplicate: true });
     }
-    // Don't include pending data — drained messages should stay visible in the UI
-    // until the turn completes. The runtime's idle event (with pending=[]) will clear.
+    // Include authoritative pending state after drain. The drained messages have
+    // been moved into the timeline via user.message emissions above, so they must
+    // leave the queue UI simultaneously. The runtime's pending queue is now [] (or
+    // contains any NEW messages queued since drain started).
     timelineEmitter.emit(sessionName, 'session.state', {
       state: 'running',
+      pendingCount: runtime.pendingCount,
+      pendingMessages: runtime.pendingMessages,
+      pendingMessageEntries: runtime.pendingEntries,
     }, { source: 'daemon', confidence: 'high' });
   };
 }
@@ -995,17 +998,6 @@ function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName:
     upsertSession(next);
     emitSessionPersist(next, sessionName);
   };
-}
-
-function emitTransportStartupMemoryContext(sessionName: string, startupMemory: TransportMemoryRecallArtifact | null | undefined): void {
-  if (!startupMemory || startupMemory.items.length === 0) return;
-  const payload = buildMemoryContextTimelinePayload(undefined, startupMemory.items, 'startup');
-  if (!payload) return;
-  timelineEmitter.emit(sessionName, 'memory.context', {
-    ...payload,
-    runtimeFamily: 'transport',
-    injectionSurface: startupMemory.injectionSurface ?? 'system-text',
-  }, { source: 'daemon', confidence: 'high' });
 }
 
 /** providerSessionId → IM.codes sessionName routing map */
@@ -1133,7 +1125,6 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         resumeId,
         effort: s.effort,
       });
-      emitTransportStartupMemoryContext(s.name, contextBootstrap.startupMemory);
       if (s.description) runtime.setDescription(s.description);
       if (systemPrompt) runtime.setSystemPrompt(systemPrompt);
       if (effectiveRequestedModel) runtime.setAgentId(effectiveRequestedModel);
@@ -1312,8 +1303,6 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     resumeId: transportResumeId,
         effort: opts.effort,
       });
-      emitTransportStartupMemoryContext(name, contextBootstrap.startupMemory);
-
   // Atomic: store runtime + register provider route + persist — rollback all on failure
   const providerSid = runtime.providerSessionId;
   transportRuntimes.set(name, runtime);

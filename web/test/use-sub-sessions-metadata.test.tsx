@@ -300,7 +300,7 @@ describe('sub-session metadata via subsession.sync', () => {
     expect(captured[0].transportPendingMessageEntries).toEqual([]);
   });
 
-  it('preserves queue when running event carries empty pending (agent picked up message)', async () => {
+  it('clears queue when running event carries explicit empty pending (drain completed)', async () => {
     const { ws, send } = createMockWs();
     render(<Harness ws={ws} connected={true} />);
     await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
@@ -328,8 +328,8 @@ describe('sub-session metadata via subsession.sync', () => {
 
     expect(captured[0].transportPendingMessages).toEqual(['msg']);
 
-    // Running with explicit empty pending — agent picked up the message but
-    // it hasn't appeared in timeline yet. Queue must stay visible.
+    // Running with explicit empty pending — drain dispatched the message.
+    // Daemon emits user.message simultaneously, so queue must clear.
     act(() => send({
       type: 'timeline.event',
       event: {
@@ -339,10 +339,10 @@ describe('sub-session metadata via subsession.sync', () => {
       },
     }));
 
-    expect(captured[0].transportPendingMessages).toEqual(['msg']);
-    expect(captured[0].transportPendingMessageEntries).toEqual([{ clientMessageId: 'msg-1', text: 'msg' }]);
+    expect(captured[0].transportPendingMessages).toEqual([]);
+    expect(captured[0].transportPendingMessageEntries).toEqual([]);
 
-    // Only authoritative idle clears the queue
+    // Subsequent idle is a no-op for queue (already empty)
     act(() => send({
       type: 'timeline.event',
       event: {
@@ -829,31 +829,20 @@ describe('queue visibility e2e — queued messages must stay visible until turn 
     expectQueueCleared();
   });
 
-  it('preserves queue on running with empty pending — clears on idle', async () => {
+  it('clears queue on running with explicit empty pending (drain completed)', async () => {
     const { ws, send } = createMockWs();
     await setupSession(ws, send);
     queueMessages(send);
     expectQueueVisible();
 
-    // Agent picks up message → running with empty pending. Queue must stay
-    // visible until the message appears in the timeline (authoritative idle).
+    // Drain fires → daemon emits running WITH explicit empty pending.
+    // user.message simultaneously appears in timeline. Queue must clear now.
     act(() => send({
       type: 'timeline.event',
       event: {
         type: 'session.state',
         sessionId: 'deck_sub_eq1',
         payload: { state: 'running', pendingMessages: [], pendingMessageEntries: [] },
-      },
-    }));
-    expectQueueVisible();
-
-    // Authoritative idle clears
-    act(() => send({
-      type: 'timeline.event',
-      event: {
-        type: 'session.state',
-        sessionId: 'deck_sub_eq1',
-        payload: { state: 'idle', pendingMessages: [], pendingMessageEntries: [] },
       },
     }));
     expectQueueCleared();

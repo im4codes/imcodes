@@ -23,9 +23,13 @@ describe('mergeTransportPendingMessagesForRunningState', () => {
     expect(mergeTransportPendingMessagesForRunningState(['queued one'], undefined, false)).toEqual(['queued one']);
   });
 
-  it('preserves queue when running reports empty pending but existing has messages', () => {
-    // Agent picked up message — hasn't appeared in timeline yet
-    expect(mergeTransportPendingMessagesForRunningState(['queued one', 'queued two'], [], true)).toEqual(['queued one', 'queued two']);
+  it('clears queue when running reports explicit empty pending (drain completed)', () => {
+    // Daemon emits explicit empty on drain — messages moved to timeline via user.message
+    expect(mergeTransportPendingMessagesForRunningState(['queued one', 'queued two'], [], true)).toEqual([]);
+  });
+
+  it('preserves queue when running event omits pending field (not queue-authoritative)', () => {
+    expect(mergeTransportPendingMessagesForRunningState(['queued one', 'queued two'], undefined, false)).toEqual(['queued one', 'queued two']);
   });
 
   it('replaces the queue when running reports a non-empty pendingMessages array', () => {
@@ -36,8 +40,8 @@ describe('mergeTransportPendingMessagesForRunningState', () => {
     expect(mergeTransportPendingMessagesForRunningState([], [], true)).toEqual([]);
   });
 
-  it('preserves existing queue when running reports empty (message in flight)', () => {
-    expect(mergeTransportPendingMessagesForRunningState(['a', 'b', 'c'], [], true)).toEqual(['a', 'b', 'c']);
+  it('clears when running reports empty after drain (was: preserved, now authoritative)', () => {
+    expect(mergeTransportPendingMessagesForRunningState(['a', 'b', 'c'], [], true)).toEqual([]);
   });
 
   it('updates to remaining queue after partial drain', () => {
@@ -113,12 +117,19 @@ describe('mergeTransportPendingEntriesForRunningState', () => {
     ]);
   });
 
-  it('preserves entries when running reports empty pending but existing has entries', () => {
+  it('clears entries when running reports explicit empty pending (drain completed)', () => {
     const existing = [
       { clientMessageId: 'msg-1', text: 'queued one' },
       { clientMessageId: 'msg-2', text: 'queued two' },
     ];
-    expect(mergeTransportPendingEntriesForRunningState(existing, [], [], true, 'deck_test')).toEqual(existing);
+    expect(mergeTransportPendingEntriesForRunningState(existing, [], [], true, 'deck_test')).toEqual([]);
+  });
+
+  it('preserves entries when running event omits pending field', () => {
+    const existing = [
+      { clientMessageId: 'msg-1', text: 'queued one' },
+    ];
+    expect(mergeTransportPendingEntriesForRunningState(existing, undefined, undefined, false, 'deck_test')).toEqual(existing);
   });
 
   it('replaces the queue when running reports non-empty pendingMessageEntries', () => {
@@ -142,13 +153,13 @@ describe('mergeTransportPendingEntriesForRunningState', () => {
     ]);
   });
 
-  it('preserves entries when running reports empty pending (message in flight)', () => {
+  it('clears entries when running reports empty after drain (authoritative)', () => {
     const existing = [
       { clientMessageId: 'msg-1', text: 'a' },
       { clientMessageId: 'msg-2', text: 'b' },
       { clientMessageId: 'msg-3', text: 'c' },
     ];
-    expect(mergeTransportPendingEntriesForRunningState(existing, [], [], true, 'deck_test')).toEqual(existing);
+    expect(mergeTransportPendingEntriesForRunningState(existing, [], [], true, 'deck_test')).toEqual([]);
   });
 
   it('updates to remaining entries after partial drain', () => {
