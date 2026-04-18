@@ -17,6 +17,8 @@ import { buildStartupProjectMemoryText } from '../../shared/memory-recall-format
 export interface TransportContextBootstrapInput {
   projectDir?: string;
   transportConfig?: Record<string, unknown> | null;
+  /** When true, skip the expensive startup-memory build step entirely. */
+  startupMemoryAlreadyInjected?: boolean;
 }
 
 export interface TransportContextBootstrap {
@@ -38,7 +40,7 @@ export async function resolveTransportContextBootstrap(
   if (explicitNamespace) {
     return buildBootstrapResult(explicitNamespace, {
       diagnostics: ['namespace:explicit'],
-    });
+    }, input.startupMemoryAlreadyInjected);
   }
 
   const projectDir = input.projectDir?.trim();
@@ -67,7 +69,7 @@ export async function resolveTransportContextBootstrap(
             remoteProcessedFreshness: resolved.remoteProcessedFreshness,
             retryExhausted: resolved.retryExhausted,
             sharedPolicyOverride: resolved.sharedPolicyOverride,
-          });
+          }, input.startupMemoryAlreadyInjected);
         }
         const personalNamespace: ContextNamespace = {
           scope: 'personal',
@@ -77,7 +79,7 @@ export async function resolveTransportContextBootstrap(
           diagnostics: ['namespace:server-personal-fallback', ...(resolved?.diagnostics ?? [])],
           remoteProcessedFreshness: resolved?.remoteProcessedFreshness,
           retryExhausted: resolved?.retryExhausted,
-        });
+        }, input.startupMemoryAlreadyInjected);
       } catch {
         const personalNamespace: ContextNamespace = {
           scope: 'personal',
@@ -85,7 +87,7 @@ export async function resolveTransportContextBootstrap(
         };
         return buildBootstrapResult(personalNamespace, {
           diagnostics: ['namespace:server-resolution-failed', 'namespace:git-origin'],
-        });
+        }, input.startupMemoryAlreadyInjected);
       }
     }
   }
@@ -96,18 +98,19 @@ export async function resolveTransportContextBootstrap(
   };
   return buildBootstrapResult(fallbackNamespace, {
     diagnostics: [`namespace:${canonical.kind}`],
-  });
+  }, input.startupMemoryAlreadyInjected);
 }
 
 function buildBootstrapResult(
   namespace: ContextNamespace,
   extras: Omit<TransportContextBootstrap, 'namespace' | 'localProcessedFreshness' | 'startupMemory'>,
+  skipStartupMemory = false,
 ): TransportContextBootstrap {
   return {
     namespace,
     ...extras,
     localProcessedFreshness: getLocalProcessedFreshness(namespace),
-    startupMemory: buildTransportStartupMemory(namespace),
+    startupMemory: skipStartupMemory ? undefined : buildTransportStartupMemory(namespace),
   };
 }
 

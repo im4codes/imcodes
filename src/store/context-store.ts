@@ -670,11 +670,50 @@ export interface ProcessedProjectionStats {
 
 export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}): ProcessedContextProjection[] {
   const database = ensureDb();
-  const sql = filters.includeArchived
-    ? 'SELECT * FROM context_processed_local ORDER BY updated_at DESC'
-    : "SELECT * FROM context_processed_local WHERE status != 'archived' ORDER BY updated_at DESC";
-  const rows = database.prepare(sql).all() as Array<Record<string, unknown>>;
   const normalizedQuery = filters.query?.trim().toLowerCase() ?? '';
+
+  const limit = typeof filters.limit === 'number' && filters.limit > 0 ? filters.limit : 50;
+  // Request slightly more than the limit since noise-filtering + class-filter may
+  // reduce the result set below the requested count.
+  const fetchLimit = limit + 20;
+
+  // Build indexed WHERE predicates.
+  // namespace_key format: scope::enterpriseId::workspaceId::userId::projectId.
+  // The index idx_context_processed_local_namespace covers (namespace_key, class, updated_at).
+  // We can use prefix-match LIKE only when the FIRST field (scope) is provided —
+  // otherwise ":::projectId" would not match "personal::::projectId".
+  const conditions: string[] = [];
+  const params: (string | number)[] = [];
+
+  if (!filters.includeArchived) {
+    conditions.push("status != 'archived'");
+  }
+
+  if (filters.scope) {
+    // Full prefix match — scope is the leading field so the LIKE query hits the index.
+    const nsPrefix = [
+      filters.scope,
+      filters.enterpriseId ?? '',
+      filters.workspaceId ?? '',
+      filters.userId ?? '',
+      filters.projectId ?? '',
+    ].join('::');
+    conditions.push('namespace_key LIKE ?');
+    params.push(nsPrefix + '%');
+  }
+  // If scope is absent but other namespace fields are present, we skip the namespace_key
+  // predicate — the remaining JS filters (applied below) will handle it. This is
+  // intentionally a full-table scan for the uncommon "projectId-only" query path.
+
+  if (filters.projectionClass) {
+    conditions.push('class = ?');
+    params.push(filters.projectionClass);
+  }
+
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const sql = `SELECT * FROM context_processed_local ${where} ORDER BY updated_at DESC LIMIT ${fetchLimit}`;
+  const rows = database.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+
   const filtered = rows
     .map((row) => {
       const namespace = parseNamespaceKey(String(row.namespace_key));
@@ -692,19 +731,23 @@ export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}
         status: typeof row.status === 'string' ? row.status as 'active' | 'archived' : 'active',
       } satisfies ProcessedContextProjection;
     })
-    .filter((projection) => !filters.scope || projection.namespace.scope === filters.scope)
-    .filter((projection) => (filters.enterpriseId ?? undefined) === undefined || projection.namespace.enterpriseId === filters.enterpriseId)
-    .filter((projection) => (filters.workspaceId ?? undefined) === undefined || projection.namespace.workspaceId === filters.workspaceId)
-    .filter((projection) => (filters.userId ?? undefined) === undefined || projection.namespace.userId === filters.userId)
-    .filter((projection) => !filters.projectId || projection.namespace.projectId === filters.projectId)
-    .filter((projection) => !filters.projectionClass || projection.class === filters.projectionClass)
-    .filter((projection) => !isMemoryNoiseSummary(projection.summary))
     .filter((projection) => {
-      if (!normalizedQuery) return true;
-      const haystack = `${projection.summary}\n${JSON.stringify(projection.content)}`.toLowerCase();
-      return haystack.includes(normalizedQuery);
+      // Namespace + class JS filters — applied regardless of SQL predicate coverage.
+      if (filters.scope && projection.namespace.scope !== filters.scope) return false;
+      if (filters.enterpriseId && projection.namespace.enterpriseId !== filters.enterpriseId) return false;
+      if (filters.workspaceId && projection.namespace.workspaceId !== filters.workspaceId) return false;
+      if (filters.userId && projection.namespace.userId !== filters.userId) return false;
+      if (filters.projectId && projection.namespace.projectId !== filters.projectId) return false;
+      // Class was already in SQL (when provided); still safe to double-check.
+      if (filters.projectionClass && projection.class !== filters.projectionClass) return false;
+      if (isMemoryNoiseSummary(projection.summary)) return false;
+      if (normalizedQuery) {
+        const haystack = `${projection.summary}\n${JSON.stringify(projection.content)}`.toLowerCase();
+        if (!haystack.includes(normalizedQuery)) return false;
+      }
+      return true;
     });
-  const limit = typeof filters.limit === 'number' && filters.limit > 0 ? filters.limit : 50;
+
   return filtered.slice(0, limit);
 }
 

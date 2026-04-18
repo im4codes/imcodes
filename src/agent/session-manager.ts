@@ -1154,6 +1154,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
       const resolveRuntimeContextBootstrap = () => resolveTransportContextBootstrap({
         projectDir: s.projectDir,
         transportConfig: getSession(s.name)?.transportConfig ?? s.transportConfig ?? {},
+        startupMemoryAlreadyInjected: s.startupMemoryInjected === true,
       });
       const contextBootstrap = await resolveRuntimeContextBootstrap();
       runtime.setContextBootstrapResolver(resolveRuntimeContextBootstrap);
@@ -1330,6 +1331,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   const resolveRuntimeContextBootstrap = () => resolveTransportContextBootstrap({
     projectDir,
     transportConfig: getSession(name)?.transportConfig ?? effectiveTransportConfig ?? {},
+    startupMemoryAlreadyInjected: preserveStartupMemoryInject,
   });
   const contextBootstrap = await resolveRuntimeContextBootstrap();
   runtime.setContextBootstrapResolver(resolveRuntimeContextBootstrap);
