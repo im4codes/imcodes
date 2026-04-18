@@ -274,7 +274,12 @@ describe('handleWebCommand transport queue behavior', () => {
       fresh: true,
       ccSessionId: expect.any(String),
     }));
-    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'user.message', { text: '/clear', allowDuplicate: true }, undefined);
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'user.message',
+      { text: '/clear', allowDuplicate: true, commandId: 'cmd-clear-cc' },
+      undefined,
+    );
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'assistant.text', {
       text: 'Started a fresh conversation',
       streaming: false,
@@ -452,7 +457,12 @@ describe('handleWebCommand transport queue behavior', () => {
     await flushAsync();
 
     expect(cancel).toHaveBeenCalledTimes(1);
-    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'user.message', { text: '/stop', allowDuplicate: true }, undefined);
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'user.message',
+      { text: '/stop', allowDuplicate: true, commandId: 'cmd-stop' },
+      undefined,
+    );
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-stop', status: 'accepted' });
     expect(emitMock).not.toHaveBeenCalledWith(
       'deck_transport_brain',
@@ -475,7 +485,7 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'user.message',
-      { text: 'sent msg', allowDuplicate: true, clientMessageId: 'cmd-sent' },
+      { text: 'sent msg', allowDuplicate: true, commandId: 'cmd-sent', clientMessageId: 'cmd-sent' },
       expect.objectContaining({ eventId: 'transport-user:cmd-sent' }),
     );
     expect(emitMock).not.toHaveBeenCalledWith(
@@ -527,7 +537,7 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'user.message',
-      { text: '你在用什么模型', allowDuplicate: true, clientMessageId: 'cmd-identity' },
+      { text: '你在用什么模型', allowDuplicate: true, commandId: 'cmd-identity', clientMessageId: 'cmd-identity' },
       expect.objectContaining({ eventId: 'transport-user:cmd-identity' }),
     );
     expect(emitMock).not.toHaveBeenCalledWith(
@@ -580,7 +590,7 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'user.message',
-      { text: 'first msg while offline', allowDuplicate: true, clientMessageId: 'cmd-offline-1' },
+      { text: 'first msg while offline', allowDuplicate: true, commandId: 'cmd-offline-1', clientMessageId: 'cmd-offline-1' },
       expect.objectContaining({ eventId: 'transport-user:cmd-offline-1' }),
     );
 
@@ -655,7 +665,7 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'user.message',
-      { text: 'hello after restart', allowDuplicate: true },
+      { text: 'hello after restart', allowDuplicate: true, commandId: 'cmd-stale-runtime' },
       undefined,
     );
     expect(emitMock).toHaveBeenCalledWith(
@@ -712,7 +722,7 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'user.message',
-      { text: 'after restart', allowDuplicate: true, clientMessageId: 'cmd-after-restart' },
+      { text: 'after restart', allowDuplicate: true, commandId: 'cmd-after-restart', clientMessageId: 'cmd-after-restart' },
       expect.objectContaining({ eventId: 'transport-user:cmd-after-restart' }),
     );
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-after-restart', status: 'accepted' });

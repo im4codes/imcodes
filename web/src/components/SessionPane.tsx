@@ -111,6 +111,7 @@ export function SessionPane({
     loadingOlder: timelineLoadingOlder,
     hasOlderHistory: timelineHasOlderHistory,
     addOptimisticUserMessage,
+    removeOptimisticMessage,
     loadOlderEvents,
   } = useTimeline(sessionName, ws, serverId);
 
@@ -122,6 +123,42 @@ export function SessionPane({
   const removeQuote = useCallback((index: number) => {
     setQuotes((prev) => prev.filter((_, i) => i !== index));
   }, []);
+
+  // ── Retry failed send ─────────────────────────────────────────────────────
+  // Reads the failed optimistic bubble from the timeline cache (it stores the
+  // original text + extras), clears it, and dispatches a fresh session.send
+  // with a new commandId. The new optimistic bubble is added immediately so
+  // the user sees the "sending" state without a round-trip to SessionControls.
+  const timelineEventsRef = useRef(timelineEvents);
+  timelineEventsRef.current = timelineEvents;
+  const handleResendFailed = useCallback((commandId: string, text: string) => {
+    if (!ws || !connected) return;
+    const failedEvent = timelineEventsRef.current.find(
+      (e) => e.type === 'user.message'
+        && e.payload.failed === true
+        && e.payload.commandId === commandId,
+    );
+    const resendExtra = failedEvent && typeof failedEvent.payload._resendExtra === 'object'
+      ? (failedEvent.payload._resendExtra as Record<string, unknown>)
+      : undefined;
+    const attachmentsFromFailure = failedEvent && Array.isArray(failedEvent.payload.attachments)
+      ? (failedEvent.payload.attachments as Array<Record<string, unknown>>)
+      : undefined;
+    // Remove the old failed bubble first so we don't end up with two copies.
+    removeOptimisticMessage(commandId);
+    const newCommandId = globalThis.crypto?.randomUUID?.()
+      ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    ws.sendSessionCommand('send', {
+      sessionName,
+      text,
+      ...(resendExtra ?? {}),
+      commandId: newCommandId,
+    });
+    addOptimisticUserMessage(text, newCommandId, {
+      ...(attachmentsFromFailure ? { attachments: attachmentsFromFailure } : {}),
+      ...(resendExtra ? { resendExtra } : {}),
+    });
+  }, [addOptimisticUserMessage, connected, removeOptimisticMessage, sessionName, ws]);
 
   // ── Usage & thinking state ──────────────────────────────────────────────────
   const lastUsage = useMemo(() => extractLatestUsage(timelineEvents), [timelineEvents]);
@@ -255,6 +292,7 @@ export function SessionPane({
           serverId={serverId}
           onQuote={addQuote}
           agentType={session.agentType}
+          onResendFailed={handleResendFailed}
         />
       )}
 
@@ -285,10 +323,18 @@ export function SessionPane({
           activeSession={session}
           inputRef={inputRef}
           onAfterAction={onAfterAction}
-          onSend={(_name, text) => {
-            if (effectiveRuntimeType !== 'transport') {
-              addOptimisticUserMessage(text);
-            }
+          onSend={(_name, text, meta) => {
+            // Transport sessions already get an authoritative user.message echo
+            // from the daemon (with allowDuplicate=true) that carries the same
+            // commandId via payload.clientMessageId, so the optimistic bubble
+            // reconciles cleanly. Non-transport sessions depend on the JSONL
+            // watcher or terminal scraper, which can lag several seconds — the
+            // optimistic bubble is the whole point of this path. Either way,
+            // attaching commandId lets the "red !" retry path work uniformly.
+            addOptimisticUserMessage(text, meta?.commandId, {
+              ...(meta?.attachments ? { attachments: meta.attachments } : {}),
+              ...(meta?.extra ? { resendExtra: meta.extra } : {}),
+            });
             scrollToBottom();
           }}
           onStopProject={onStopProject}

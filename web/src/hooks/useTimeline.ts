@@ -34,6 +34,10 @@ const ECHO_WINDOW_MS = 500;
 // 5s is enough to catch the JSONL delay without hiding legitimate repeated messages.
 const USER_MSG_DEDUP_WINDOW_MS = 5_000;
 const PROVISIONAL_TRANSPORT_HISTORY_PREFIX = 'transport-history:';
+const OPTIMISTIC_EVENT_ID_PREFIX = 'optimistic:';
+// If no confirmation arrives within this window we auto-flip the pending bubble to
+// "failed" so the user can retry rather than stare at a perpetual spinner.
+const OPTIMISTIC_TIMEOUT_MS = 30_000;
 
 /** Normalize text for echo comparison: strip prompt prefixes, collapse whitespace. */
 function normalizeForEcho(text: string): string {
@@ -215,8 +219,23 @@ export interface UseTimelineResult {
   loadingOlder: boolean;
   /** False when backward pagination returned 0 events (no more history to load) */
   hasOlderHistory: boolean;
-  /** Immediately inject a pending user message (optimistic UI). */
-  addOptimisticUserMessage: (text: string) => void;
+  /** Immediately inject a pending user message (optimistic UI).
+   *  Pass `commandId` to let command.ack and the real user.message echo reconcile
+   *  deterministically; attachments are preserved on the pending bubble so the
+   *  user sees exactly what was sent; `resendExtra` is stashed (non-enumerable
+   *  to the daemon) so the retry path can replay the original command. */
+  addOptimisticUserMessage: (
+    text: string,
+    commandId?: string,
+    opts?: {
+      attachments?: Array<Record<string, unknown>>;
+      resendExtra?: Record<string, unknown>;
+    },
+  ) => void;
+  /** Flip a pending optimistic message to failed state (red "!") keyed by commandId. */
+  markOptimisticFailed: (commandId: string, error?: string) => void;
+  /** Remove an optimistic message by commandId (used by retry before re-sending). */
+  removeOptimisticMessage: (commandId: string) => void;
   /** Load older events before the earliest currently loaded event. */
   loadOlderEvents: () => void;
 }
@@ -333,12 +352,95 @@ export function useTimeline(
     return () => { cancelled = true; };
   }, [sessionId, ws]);
 
+  // Map of commandId → optimistic eventId for O(1) lookup on command.ack / dedup.
+  const optimisticIdsByCommandRef = useRef(new Map<string, string>());
+  // Per-commandId timeout handle so we can flip perpetual-spinner entries to failed.
+  const optimisticTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+
+  const clearOptimisticTimer = useCallback((commandId: string) => {
+    const timer = optimisticTimersRef.current.get(commandId);
+    if (timer) {
+      clearTimeout(timer);
+      optimisticTimersRef.current.delete(commandId);
+    }
+  }, []);
+
+  // Flip a pending optimistic entry to failed state (red "!" bubble with retry).
+  const markOptimisticFailed = useCallback((commandId: string, error?: string) => {
+    if (!commandId) return;
+    const eventId = optimisticIdsByCommandRef.current.get(commandId);
+    if (!eventId) return;
+    clearOptimisticTimer(commandId);
+    setEvents((prev) => {
+      const base = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
+      const idx = base.findIndex((e) => e.eventId === eventId);
+      if (idx < 0) return base;
+      const existing = base[idx]!;
+      const payload: Record<string, unknown> = {
+        ...existing.payload,
+        pending: false,
+        failed: true,
+      };
+      if (error) payload.failureReason = error;
+      const updated = [...base];
+      updated[idx] = { ...existing, payload };
+      if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, updated);
+      return updated;
+    });
+  }, [clearOptimisticTimer]);
+
+  // Remove an optimistic entry entirely — used by the retry button so the retry
+  // doesn't leave behind the failed bubble (the fresh send re-renders it).
+  const removeOptimisticMessage = useCallback((commandId: string) => {
+    if (!commandId) return;
+    const eventId = optimisticIdsByCommandRef.current.get(commandId);
+    optimisticIdsByCommandRef.current.delete(commandId);
+    clearOptimisticTimer(commandId);
+    if (!eventId) return;
+    setEvents((prev) => {
+      const base = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
+      const next = base.filter((e) => e.eventId !== eventId);
+      if (next.length === base.length) return base;
+      if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, next);
+      return next;
+    });
+  }, [clearOptimisticTimer]);
+
   // Immediately show a user message before the daemon confirms it.
   // The real event (from WS) will remove the pending version on arrival.
-  const addOptimisticUserMessage = useCallback((text: string) => {
+  // When `commandId` is provided, the bubble reconciles deterministically with
+  // command.ack (for error → failed) and the echoed user.message (for success).
+  const addOptimisticUserMessage = useCallback((
+    text: string,
+    commandId?: string,
+    opts?: {
+      attachments?: Array<Record<string, unknown>>;
+      resendExtra?: Record<string, unknown>;
+    },
+  ) => {
     if (!sessionId) return;
+    const optimisticId = `${OPTIMISTIC_EVENT_ID_PREFIX}${sessionId}:${commandId ?? Date.now()}`;
+    if (commandId) {
+      // Guard against double-send of the same commandId: if already tracked,
+      // skip — the existing bubble is still valid.
+      if (optimisticIdsByCommandRef.current.has(commandId)) return;
+      optimisticIdsByCommandRef.current.set(commandId, optimisticId);
+      clearOptimisticTimer(commandId);
+      const timer = setTimeout(() => {
+        markOptimisticFailed(commandId, 'timeout');
+      }, OPTIMISTIC_TIMEOUT_MS);
+      optimisticTimersRef.current.set(commandId, timer);
+    }
+    const payload: Record<string, unknown> = { text, pending: true };
+    if (commandId) payload.commandId = commandId;
+    if (opts?.attachments && opts.attachments.length > 0) payload.attachments = opts.attachments;
+    if (opts?.resendExtra && Object.keys(opts.resendExtra).length > 0) {
+      // Prefix with _ so server-side consumers reading user.message payloads
+      // treat it as a client-only hint and don't echo/store it.
+      payload._resendExtra = opts.resendExtra;
+    }
     const event: TimelineEvent = {
-      eventId: `optimistic:${sessionId}:${Date.now()}`,
+      eventId: optimisticId,
       type: 'user.message',
       sessionId,
       ts: Date.now(),
@@ -346,7 +448,7 @@ export function useTimeline(
       seq: 0,
       source: 'daemon',
       confidence: 'high',
-      payload: { text, pending: true },
+      payload,
     };
     setEvents((prev) => {
       const base = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
@@ -354,7 +456,7 @@ export function useTimeline(
       if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, result);
       return result;
     });
-  }, [sessionId]);
+  }, [sessionId, clearOptimisticTimer, markOptimisticFailed]);
 
   const olderTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const resetOlderState = useCallback(() => {
@@ -466,12 +568,39 @@ export function useTimeline(
         if (event.type === 'user.message' && event.payload.text) {
           const text = String(event.payload.text).trim();
           const allowDuplicate = event.payload.allowDuplicate === true;
+          // Transport path already attaches the originating commandId as
+          // `clientMessageId` in the payload; prefer that for reconciliation
+          // since text-based matching loses when the agent echoes a normalized
+          // or retried version of the prompt.
+          const echoCommandId = typeof event.payload.commandId === 'string'
+            ? event.payload.commandId
+            : typeof event.payload.clientMessageId === 'string'
+              ? event.payload.clientMessageId
+              : undefined;
           let skipAppend = false;
           setEvents((prev) => {
             const base = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
-            // Remove pending version of this message (optimistic UI cleanup)
-            const withoutPending = base.filter(
-              (e) => !(e.type === 'user.message' && e.payload.pending && String(e.payload.text ?? '').trim() === text),
+            // 1) Prefer commandId-based reconciliation: remove the optimistic
+            //    bubble that matches this echo's commandId regardless of state
+            //    (pending OR failed — a late echo means the send eventually
+            //    succeeded and the red "!" was spurious).
+            let cleaned = base;
+            if (echoCommandId) {
+              const optimisticId = optimisticIdsByCommandRef.current.get(echoCommandId);
+              if (optimisticId) {
+                cleaned = base.filter((e) => e.eventId !== optimisticId);
+                optimisticIdsByCommandRef.current.delete(echoCommandId);
+                clearOptimisticTimer(echoCommandId);
+              }
+            }
+            // 2) Fallback to text-based cleanup for legacy emit paths (tmux
+            //    JSONL scrapers, etc.) that don't propagate commandId.
+            const withoutPending = cleaned.filter(
+              (e) => !(
+                e.type === 'user.message'
+                && (e.payload.pending || e.payload.failed)
+                && String(e.payload.text ?? '').trim() === text
+              ),
             );
             if (withoutPending.length < base.length) {
               if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, withoutPending);
@@ -483,6 +612,7 @@ export function useTimeline(
                 e.type === 'user.message' &&
                 e.payload.allowDuplicate !== true &&
                 !e.payload.pending &&
+                !e.payload.failed &&
                 Math.abs(e.ts - event.ts) < USER_MSG_DEDUP_WINDOW_MS &&
                 String(e.payload.text ?? '').trim() === text,
             );
@@ -491,6 +621,7 @@ export function useTimeline(
           });
           if (skipAppend) return;
         }
+
 
         // Update epoch tracker — don't clear events on epoch change;
         // history response will merge the authoritative set, and ts-sort handles cross-epoch order.
@@ -601,7 +732,11 @@ export function useTimeline(
       if (msg.type === DAEMON_MSG.RECONNECTED) {
         // Clear pending optimistic messages — they were sent to the old connection
         // and we can't guarantee they reached the agent. The history replay below
-        // will bring back any messages that were actually processed.
+        // will bring back any messages that were actually processed. Failed
+        // bubbles stay put so the user can still retry them.
+        for (const timer of optimisticTimersRef.current.values()) clearTimeout(timer);
+        optimisticTimersRef.current.clear();
+        optimisticIdsByCommandRef.current.clear();
         setEvents((prev) => {
           const base = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
           const cleaned = base.filter((e) => !(e.type === 'user.message' && e.payload.pending));
@@ -625,11 +760,58 @@ export function useTimeline(
           historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
         }
       }
+
+      // ── command.ack: reconcile the optimistic send bubble. Error/conflict
+      //    flips it to the failed "!" state so the user can retry; success-ish
+      //    acks just cancel the 30s failure timeout — the real user.message
+      //    event is still the authoritative "agent saw it" signal and will
+      //    remove the bubble on arrival. ──
+      if (msg.type === 'command.ack') {
+        const ackSession = typeof (msg as { session?: unknown }).session === 'string'
+          ? (msg as { session: string }).session
+          : undefined;
+        if (ackSession && ackSession !== sessionId) return;
+        const commandId = (msg as { commandId?: unknown }).commandId;
+        if (typeof commandId !== 'string' || !commandId) return;
+        const status = typeof (msg as { status?: unknown }).status === 'string'
+          ? (msg as { status: string }).status
+          : '';
+        const isFailure = status === 'error' || status === 'conflict';
+        if (isFailure) {
+          const errorField = (msg as unknown as Record<string, unknown>).error;
+          const reason = typeof errorField === 'string' ? errorField : status;
+          markOptimisticFailed(commandId, reason);
+        } else if (status) {
+          clearOptimisticTimer(commandId);
+        }
+      }
     };
 
     const unsub = ws.onMessage(handler);
     return unsub;
   }, [ws, sessionId, appendEvent, mergeEvents, replaceEvents]);
 
-  return { events, loading, refreshing, loadingOlder, hasOlderHistory, addOptimisticUserMessage, loadOlderEvents };
+  // Clear outstanding optimistic timers on unmount / session change so that a
+  // dismissed chat window can't fire a delayed markOptimisticFailed into an
+  // unmounted component.
+  useEffect(() => {
+    const timers = optimisticTimersRef.current;
+    return () => {
+      for (const timer of timers.values()) clearTimeout(timer);
+      timers.clear();
+      optimisticIdsByCommandRef.current.clear();
+    };
+  }, [sessionId]);
+
+  return {
+    events,
+    loading,
+    refreshing,
+    loadingOlder,
+    hasOlderHistory,
+    addOptimisticUserMessage,
+    markOptimisticFailed,
+    removeOptimisticMessage,
+    loadOlderEvents,
+  };
 }

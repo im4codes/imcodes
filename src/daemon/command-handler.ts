@@ -1611,10 +1611,18 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const attachments: TransportAttachment[] = [];
   const transportUserEventId = (clientMessageId: string) => `transport-user:${clientMessageId}`;
   const emitTransportUserMessage = (payloadText: string, extra?: Record<string, unknown>, eventId?: string) => {
+    // Always thread the client commandId through so the web UI can reconcile
+    // its optimistic "sending" bubble deterministically. Callers that set
+    // `clientMessageId` in `extra` keep their override (legacy path).
+    const base: Record<string, unknown> = {
+      text: payloadText,
+      allowDuplicate: true,
+      commandId: effectiveId,
+    };
     timelineEmitter.emit(
       sessionName,
       'user.message',
-      { text: payloadText, allowDuplicate: true, ...(extra ?? {}) },
+      { ...base, ...(extra ?? {}) },
       eventId ? { source: 'daemon', confidence: 'high', eventId } : undefined,
     );
   };
@@ -2059,6 +2067,11 @@ async function sendProcessSessionMessage(
     await sendShellAwareCommand(sessionName, sendText, agentType);
     const payload: Record<string, unknown> = { text: options?.originalText ?? finalText };
     if (attachments.length > 0) payload.attachments = attachments;
+    // Thread the client commandId through to the user.message event so the
+    // web UI can reconcile its optimistic "sending" bubble deterministically
+    // instead of falling back to text-based matching (which fails when the
+    // agent echoes a normalized or memory-prepended version of the prompt).
+    if (options?.commandId) payload.commandId = options.commandId;
     const userEvent = timelineEmitter.emit(sessionName, 'user.message', payload);
     if (memoryContext.timelinePayload && userEvent) {
       timelineEmitter.emit(sessionName, 'memory.context', {

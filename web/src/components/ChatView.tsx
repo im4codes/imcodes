@@ -43,6 +43,8 @@ interface Props {
   agentType?: string | null;
   /** Server ID for file transfer download API. */
   serverId?: string;
+  /** Retry a failed optimistic send — called with the original commandId and text. */
+  onResendFailed?: (commandId: string, text: string) => void;
 }
 
 /** A merged view item — either a single event, merged assistant text, or collapsed tool group. */
@@ -485,7 +487,7 @@ function readPanelOpen(id: string | null | undefined): boolean {
   try { return localStorage.getItem(panelOpenKey(id)) === '1'; } catch { return false; }
 }
 
-export function ChatView({ events, loading, refreshing: _refreshing, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir, serverId, onQuote, agentType: _agentType }: Props) {
+export function ChatView({ events, loading, refreshing: _refreshing, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir, serverId, onQuote, agentType: _agentType, onResendFailed }: Props) {
   const { t } = useTranslation();
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -988,11 +990,11 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
             }
             const linkedEvents = item.linkedEvents ?? [];
             if (linkedEvents.length === 0) {
-              return <ChatEvent key={item.key} event={item.event!} nextTs={nextTs} onPathClick={pathClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} />;
+              return <ChatEvent key={item.key} event={item.event!} nextTs={nextTs} onPathClick={pathClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />;
             }
             return (
               <div key={item.key} class="chat-linked-event-group">
-                <ChatEvent event={item.event!} nextTs={nextTs} onPathClick={pathClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} />
+                <ChatEvent event={item.event!} nextTs={nextTs} onPathClick={pathClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />
                 {linkedEvents.map((linkedEvent) => (
                   <ChatEvent
                     key={linkedEvent.eventId}
@@ -1001,6 +1003,7 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
                     onFileChangeOpen={handleFileChangeOpen}
                     onDownload={downloadHandler}
                     serverId={serverId}
+                    onResendFailed={onResendFailed}
                   />
                 ))}
               </div>
@@ -1329,6 +1332,7 @@ const ChatEvent = memo(function ChatEvent({
   onFileChangeOpen,
   onDownload,
   serverId,
+  onResendFailed,
 }: {
   event: TimelineEvent;
   nextTs?: number;
@@ -1336,6 +1340,7 @@ const ChatEvent = memo(function ChatEvent({
   onFileChangeOpen?: (path: string, preferDiff?: boolean) => void;
   onDownload?: (path: string) => void;
   serverId?: string;
+  onResendFailed?: (commandId: string, text: string) => void;
 }) {
   const { t } = useTranslation();
   switch (event.type) {
@@ -1348,13 +1353,43 @@ const ChatEvent = memo(function ChatEvent({
           if (att.daemonPath) userText = userText.split(`@${att.daemonPath}`).join('').trim();
         }
       }
+      const isPending = !!event.payload.pending;
+      const isFailed = !!event.payload.failed;
+      const commandId = typeof event.payload.commandId === 'string' ? event.payload.commandId : undefined;
+      const failureReason = typeof event.payload.failureReason === 'string' ? event.payload.failureReason : undefined;
+      const stateClass = isPending ? ' chat-pending' : isFailed ? ' chat-failed' : '';
       return (
-        <div class={`chat-event chat-user${event.payload.pending ? ' chat-pending' : ''}`}>
+        <div class={`chat-event chat-user${stateClass}`}>
           {attachments && serverId && attachments.map((att) => (
             <AttachmentDownloadButton key={att.id} att={att} serverId={serverId} onPathClick={onPathClick} />
           ))}
           {userText && <div class="chat-bubble-content">{splitPathsAndUrls(userText, onPathClick, undefined, onDownload)}</div>}
-          {!event.payload.pending && <ChatTime ts={event.ts} />}
+          {isPending && (
+            <span
+              class="chat-user-status chat-user-status-pending"
+              aria-label={t('chat.sendingLabel', 'Sending')}
+              title={t('chat.sendingLabel', 'Sending')}
+            />
+          )}
+          {isFailed && (
+            <div class="chat-user-status chat-user-status-failed">
+              <span
+                class="chat-user-status-icon"
+                aria-label={t('chat.sendFailedLabel', 'Send failed')}
+                title={failureReason ?? t('chat.sendFailedLabel', 'Send failed')}
+              >!</span>
+              {commandId && onResendFailed && (
+                <button
+                  type="button"
+                  class="chat-user-retry-btn"
+                  onClick={() => onResendFailed(commandId, String(event.payload.text ?? ''))}
+                >
+                  {t('chat.retrySend', 'Retry')}
+                </button>
+              )}
+            </div>
+          )}
+          {!isPending && !isFailed && <ChatTime ts={event.ts} />}
         </div>
       );
     }

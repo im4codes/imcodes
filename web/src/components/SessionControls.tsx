@@ -66,8 +66,22 @@ interface Props {
   detectedModel?: string;
   /** Hide the shortcuts row (e.g. in chat mode). */
   hideShortcuts?: boolean;
-  /** Called after a message is sent — for local UX only (e.g. optimistic display). Does not emit timeline events. */
-  onSend?: (sessionName: string, text: string) => void;
+  /** Called after a message is sent — for local UX only (e.g. optimistic display).
+   *  Does not emit timeline events. The `commandId` lets the consumer reconcile
+   *  the optimistic bubble with the eventual command.ack / echoed user.message.
+   *  `attachments` is the original attachment list so the pending bubble can
+   *  surface the same badges the confirmed message will. `extra` is the raw
+   *  session.send extras (p2p targets, mode, locale, etc.) — kept so the retry
+   *  path can replay the original send faithfully. */
+  onSend?: (
+    sessionName: string,
+    text: string,
+    meta?: {
+      commandId: string;
+      attachments?: Array<Record<string, unknown>>;
+      extra?: Record<string, unknown>;
+    },
+  ) => void;
   /** Sub-session overrides — when set, menu actions use these instead of main session commands. */
   onSubRestart?: () => void;
   onSubNew?: () => void;
@@ -1403,8 +1417,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return { text: cleanText, extra };
   }, [activeSession, applySavedP2pConfigSelection, i18n?.language, p2pExcludeSameType, p2pMode, p2pSavedConfig, sessions, subSessions, ws]);
 
-  const sendSessionMessage = useCallback((text: string, extra: Record<string, unknown> = {}) => {
-    if (!ws || !activeSession) return false;
+  // Returns the commandId on success (so the caller can drive optimistic UI
+  // reconciliation via command.ack / the echoed user.message) or null when the
+  // preconditions (ws, session) aren't satisfied.
+  const sendSessionMessage = useCallback((text: string, extra: Record<string, unknown> = {}): string | null => {
+    if (!ws || !activeSession) return null;
     const commandId = globalThis.crypto?.randomUUID?.() ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     ws.sendSessionCommand('send', {
       sessionName: activeSession.name,
@@ -1412,7 +1429,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       ...extra,
       commandId,
     });
-    return true;
+    return commandId;
   }, [activeSession, ws]);
 
   const sendQueuedMessageMutation = useCallback((type: 'session.edit_queued_message' | 'session.undo_queued_message', payload: Record<string, unknown>) => {
@@ -1467,12 +1484,27 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       return;
     }
     quickData.recordHistory(payload.text, activeSession.name);
+    let commandId: string | null = null;
     try {
-      if (!sendSessionMessage(payload.text, payload.extra)) return;
+      commandId = sendSessionMessage(payload.text, payload.extra);
+      if (!commandId) return;
     } catch {
       return;
     }
-    onSend?.(activeSession.name, payload.text);
+    // Snapshot attachments before clearComposer wipes them so the optimistic
+    // bubble surfaces the same badges the confirmed message will.
+    const attachmentSnapshot = attachments.length > 0
+      ? attachments.map((a) => ({
+          id: a.path,
+          daemonPath: a.path,
+          originalName: a.name,
+        }))
+      : undefined;
+    onSend?.(activeSession.name, payload.text, {
+      commandId,
+      ...(attachmentSnapshot ? { attachments: attachmentSnapshot } : {}),
+      ...(payload.extra && Object.keys(payload.extra).length > 0 ? { extra: payload.extra } : {}),
+    });
     if (options?.clearComposer) {
       pendingAtTargetsRef.current = [];
       pendingConfigOverrideRef.current = null;

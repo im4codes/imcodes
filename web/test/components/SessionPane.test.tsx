@@ -14,12 +14,27 @@ const chatViewSpy = vi.fn(() => null);
 vi.mock('../../src/components/TerminalView.js', () => ({ TerminalView: (props: any) => terminalViewSpy(props) }));
 vi.mock('../../src/components/ChatView.js', () => ({ ChatView: (props: any) => chatViewSpy(props) }));
 vi.mock('../../src/components/SessionControls.js', () => ({
-  SessionControls: (props: { onSend?: (sessionName: string, text: string) => void; activeSession?: { name: string } | null }) => (
-    <button type="button" onClick={() => props.onSend?.(props.activeSession?.name ?? 'session', 'queued text')}>
+  SessionControls: (props: {
+    onSend?: (
+      sessionName: string,
+      text: string,
+      meta?: { commandId: string; attachments?: Array<Record<string, unknown>>; extra?: Record<string, unknown> },
+    ) => void;
+    activeSession?: { name: string } | null;
+  }) => (
+    <button
+      type="button"
+      onClick={() => props.onSend?.(
+        props.activeSession?.name ?? 'session',
+        'queued text',
+        { commandId: 'test-cmd-1' },
+      )}
+    >
       send
     </button>
   ),
 }));
+const removeOptimisticMessageMock = vi.fn();
 vi.mock('../../src/hooks/useTimeline.js', () => ({
   useTimeline: () => ({
     events: timelineEventsMock,
@@ -28,6 +43,7 @@ vi.mock('../../src/hooks/useTimeline.js', () => ({
     loadingOlder: false,
     hasOlderHistory: false,
     addOptimisticUserMessage: addOptimisticUserMessageMock,
+    removeOptimisticMessage: removeOptimisticMessageMock,
     loadOlderEvents: vi.fn(),
   }),
 }));
@@ -92,7 +108,13 @@ describe('SessionPane', () => {
     expect(screen.getByText(/5h 11% 2h03m 4\/6 14:40/)).toBeDefined();
   });
 
-  it('does not add optimistic user messages for transport sessions', () => {
+  it('adds optimistic user messages for transport sessions too', () => {
+    // Previously transport sessions were skipped because the daemon echo was
+    // "close enough". That still introduces a WebSocket round-trip of latency
+    // between the user hitting send and anything appearing on screen, which
+    // feels broken on slow links. The new contract: every send produces an
+    // immediate optimistic bubble and the daemon echo reconciles it via
+    // commandId (see use-timeline-optimistic.test.ts).
     render(
       <SessionPane
         serverId="s1"
@@ -116,7 +138,7 @@ describe('SessionPane', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: 'send' }));
-    expect(addOptimisticUserMessageMock).not.toHaveBeenCalled();
+    expect(addOptimisticUserMessageMock).toHaveBeenCalledWith('queued text', 'test-cmd-1', {});
   });
 
   it('forces copilot-sdk sessions into chat mode when runtimeType is omitted', () => {
@@ -147,7 +169,9 @@ describe('SessionPane', () => {
     const lastTerminalProps = terminalViewSpy.mock.calls.at(-1)?.[0];
     expect(lastTerminalProps?.active).toBe(false);
     fireEvent.click(screen.getByRole('button', { name: 'send' }));
-    expect(addOptimisticUserMessageMock).not.toHaveBeenCalled();
+    // Transport sessions (copilot-sdk) now also receive the optimistic bubble
+    // — the daemon echo reconciles via commandId, not runtime-type gating.
+    expect(addOptimisticUserMessageMock).toHaveBeenCalledWith('queued text', 'test-cmd-1', {});
   });
 
   it('keeps optimistic user messages for process sessions', () => {
@@ -174,7 +198,7 @@ describe('SessionPane', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: 'send' }));
-    expect(addOptimisticUserMessageMock).toHaveBeenCalledWith('queued text');
+    expect(addOptimisticUserMessageMock).toHaveBeenCalledWith('queued text', 'test-cmd-1', {});
   });
 
   it('prefers timeline tail running state over stale outer idle state for footer status', () => {
