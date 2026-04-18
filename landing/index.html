@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>IM.codes — The IM for agents. One memory layer across AI providers. Cross-agent auditing and planning.</title>
-<meta name="description" content="The IM for agents. One memory layer across AI providers — reuse solved work across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, and OpenClaw. Built-in P2P discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.">
+<title>IM.codes — The IM for agents. Shared memory, supervised execution, and cross-agent audit across AI providers.</title>
+<meta name="description" content="The IM for agents. Shared memory, supervised execution, and cross-agent audit across AI providers — reuse solved work, supervise task completion, and run audit/rework loops across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, and OpenClaw.">
 <style>
 :root {
   --bg: #0a0a0a;
@@ -222,7 +222,7 @@ footer {
 <header>
   <div class="header-left">
     <h1>IM<span>.</span>codes</h1>
-    <div class="tagline" data-i18n="tagline">The IM for agents. One memory layer across AI providers. Cross-agent auditing and planning.</div>
+    <div class="tagline" data-i18n="tagline">The IM for agents. Shared memory, supervised execution, and cross-agent audit across AI providers.</div>
   </div>
   <div class="lang-switch">
     <button onclick="setLang('en')" data-lang="en" class="active">EN</button>
@@ -236,7 +236,7 @@ footer {
 </header>
 
 <section>
-  <p class="lead" data-i18n="hero_intro">IM.codes gives coding agents one shared memory layer across providers. It turns completed work into reusable context, then injects the right history back into future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. Built-in P2P discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.</p>
+  <p class="lead" data-i18n="hero_intro">IM.codes gives coding agents one shared memory layer across providers. It turns completed work into reusable context, then injects the right history back into future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. P2P discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.</p>
   <div class="prompt">imcodes bind https://app.im.codes/bind/&lt;key&gt;<span class="cursor"></span></div>
   <div class="output" data-i18n="hero_output">bound to app.im.codes &middot; daemon started &middot; registered as system service</div>
 </section>
@@ -298,6 +298,17 @@ footer {
 </section>
 
 <section>
+  <h2 data-i18n="h_auto">supervised execution</h2>
+  <p style="color:var(--fg); margin-bottom:12px;" data-i18n="auto_intro">IM.codes can supervise supported transport sessions turn by turn instead of relying on blind auto-continue. Auto checks whether the latest turn is done, should continue, or should return control to you.</p>
+  <ul class="reqs">
+    <li data-i18n="auto_1">Per-session Auto modes: Off, Supervised, and Supervised + audit.</li>
+    <li data-i18n="auto_2">At the idle boundary, Auto can classify a turn as complete, continue, or ask_human, then dispatch the next continue prompt in the same session.</li>
+    <li data-i18n="auto_3">Supervised + audit can run an audit→rework loop before handing control back, so finished work is reviewed instead of trusted blindly.</li>
+    <li data-i18n="auto_4">Supervisor backend/model, timeout, audit mode, and custom instructions are configurable per session.</li>
+  </ul>
+</section>
+
+<section>
   <h2 data-i18n="h_not">what it is not</h2>
   <ul class="reqs">
     <li data-i18n="not_1">Not another AI IDE</li>
@@ -312,6 +323,7 @@ footer {
   <h2 data-i18n="h_features">features</h2>
   <div class="features">
     <div class="feat"><div class="feat-name" data-i18n="f_memory_name">shared agent context</div><div class="feat-desc" data-i18n="f_memory_desc">problem→solution memory, multilingual recall, automatic per-message and startup injection with visible timeline cards</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_auto_name">supervised execution</div><div class="feat-desc" data-i18n="f_auto_desc">turn-level completion checks, auto-continue, and optional audit→rework loops for transport-backed agents</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_remote_name">remote terminal</div><div class="feat-desc" data-i18n="f_remote_desc">browser & mobile, no SSH/VPN, real-time PTY streaming at 12fps</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_file_name">file browser & git</div><div class="feat-desc" data-i18n="f_file_desc">tree view, upload/download, +/- stats, floating preview</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_preview_name">local web preview</div><div class="feat-desc" data-i18n="f_preview_desc">preview localhost from any device via secure tunnel, supports HMR</div></div>
@@ -470,8 +482,8 @@ docker compose up -d</div>
 const I18N = {
   en: {
     watch_intro: 'Watch support covers quick session monitoring, unread counts, OTA update visibility, push notifications, and quick replies from the wrist.',
-    tagline: 'The IM for agents. One memory layer across AI providers. Cross-agent auditing and planning.',
-    hero_intro: "IM.codes gives coding agents one shared memory layer across providers. It turns completed work into reusable context, then injects the right history back into future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. Built-in P2P discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.",
+    tagline: 'The IM for agents. Shared memory, supervised execution, and cross-agent audit across AI providers.',
+    hero_intro: "IM.codes gives coding agents one shared memory layer across providers. It turns completed work into reusable context, then injects the right history back into future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. P2P discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.",
     watch_badge: 'iPhone · iPad · Apple Watch',
     watch_download: 'Watch app includes session list, unread counts, and quick replies.',
     agents_intro: 'Multiple agents support both CLI and SDK integrations.',
@@ -481,8 +493,16 @@ const I18N = {
     memory_2: 'Enterprise shared context lets teams reuse fixes across workspaces and projects with queryable memory, stats, and inspection UI. It is still under active development and has not been fully production-tested yet.',
     memory_3: 'Multilingual recall uses local embeddings plus pgvector-backed server search, so related fixes can be found across different languages.',
     memory_4: 'Timeline cards show exactly what was injected, with relevance score, recall count, and last-used metadata.',
+    h_auto: 'supervised execution',
+    auto_intro: 'IM.codes can supervise supported transport sessions turn by turn instead of relying on blind auto-continue. Auto checks whether the latest turn is done, should continue, or should return control to you.',
+    auto_1: 'Per-session Auto modes: Off, Supervised, and Supervised + audit.',
+    auto_2: 'At the idle boundary, Auto can classify a turn as complete, continue, or ask_human, then dispatch the next continue prompt in the same session.',
+    auto_3: 'Supervised + audit can run an audit→rework loop before handing control back, so finished work is reviewed instead of trusted blindly.',
+    auto_4: 'Supervisor backend/model, timeout, audit mode, and custom instructions are configurable per session.',
     f_memory_name: 'shared agent context',
     f_memory_desc: 'problem→solution memory, multilingual recall, automatic per-message and startup injection with visible timeline cards',
+    f_auto_name: 'supervised execution',
+    f_auto_desc: 'turn-level completion checks, auto-continue, and optional audit→rework loops for transport-backed agents',
     h_openclaw: 'openclaw connect',
     oc_intro: 'If OpenClaw is running on the same machine as the daemon, connect IM.codes to the local OpenClaw gateway with:',
     oc_1: 'Default gateway URL: <code>ws://127.0.0.1:18789</code>',
@@ -494,8 +514,8 @@ const I18N = {
     sh_manual_pgvector: 'Generated docker-compose.yml uses pgvector/pgvector:pg16 for PostgreSQL.',
   },
   'zh-CN': {
-    tagline: '给 AI agent 的 IM。一套记忆层，贯通所有 AI 提供方。跨模型审计与规划。',
-    hero_intro: 'IM.codes 为 coding agent 提供一套跨 provider 共享的记忆层。它会把已完成的工作沉淀成可复用上下文，再把合适的历史注入后续 session，贯通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。内置 P2P 讨论功能，让多个模型相互审阅对方的方案和实现——能有效减少单模型的遗漏、盲点和偏差。',
+    tagline: '给 AI agent 的 IM。共享记忆、受监督执行，以及跨模型审计。',
+    hero_intro: 'IM.codes 为 coding agent 提供一套跨 provider 共享的记忆层。它会把已完成的工作沉淀成可复用上下文，再把合适的历史注入后续 session，贯通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。内置 Auto supervision 可在每轮完成后判断任务是否完成、是否继续自动执行，并可选进入审计/返工闭环后再把控制权交还给你。P2P 讨论功能让多个模型相互审阅对方的方案和实现——能有效减少单模型的遗漏、盲点和偏差。',
     hero_output: '已绑定 app.im.codes · 守护进程已启动 · 已注册为系统服务',
     self_host_warning: '<strong>强烈建议自行部署。</strong><code>app.im.codes</code> 是共享测试实例，无可用性保证，可能被限流、攻击或不可用。这是个人项目，不提供商用保障。正式使用请部署到自己的服务器。',
     h_screenshots: '截图', h_why: '为什么', h_memory: '共享代理上下文', h_not: '它不是什么', h_features: '功能', h_arch: '架构', h_download: '下载', h_install: '安装', h_quick: '快速开始', h_selfhost: '自托管部署', h_agents: '支持的代理', h_reqs: '系统要求', h_about: '关于',
@@ -506,8 +526,16 @@ const I18N = {
     memory_2: '企业共享上下文让团队可以在 workspace / project 范围内复用修复经验，并通过可查询的记忆、统计和检查界面管理它。这部分仍在持续开发中，还没有经过完整的生产级测试。',
     memory_3: '多语言召回结合本地 embedding 和基于 pgvector 的服务端搜索，可以跨不同语言找到相关历史修复。',
     memory_4: '时间线卡片会明确显示注入了什么内容，以及相关性分数、召回次数和上次使用时间。',
+    h_auto: '受监督执行',
+    auto_intro: 'IM.codes 可对支持的 transport session 做逐轮监督，而不是盲目自动继续。Auto 会判断最近一轮是已经完成、应该继续自动执行，还是该把控制权交还给你。',
+    auto_1: '按 session 配置 Auto 模式：Off、Supervised、Supervised + audit。',
+    auto_2: '在 idle 边界，Auto 会把一轮判成 complete、continue 或 ask_human，并把后续 continue prompt 直接发回同一 session。',
+    auto_3: 'Supervised + audit 可在交还控制权前自动跑审计→返工闭环，不再盲目信任“看起来完成了”的结果。',
+    auto_4: '监督模型后端/模型、超时、审计模式和自定义提示词都可以按 session 配置。',
     f_memory_name: '共享代理上下文',
     f_memory_desc: '问题→解决方案记忆、多语言召回、按消息/启动自动注入，并在时间线中可见',
+    f_auto_name: '受监督执行',
+    f_auto_desc: '逐轮完成判定、自动继续，以及可选的审计→返工闭环，适用于 transport agent',
     why_text: '离开桌面后，大多数 coding agent 工作流就断了。代理还在终端里运行，但你通常只能靠 SSH、tmux attach、远程桌面，或者等回到电脑前。IM.codes 让这些会话在手机和网页上保持触手可及：打开终端、查看文件和 Git 变更、从另一台设备预览 localhost、在任务完成时收到通知，并在自己的基础设施上同时推进多个代理。',
     not_1: '不是另一个 AI IDE', not_2: '不只是聊天壳', not_3: '不只是远程终端客户端', not_4: '不是 Claude Code、Codex、Gemini CLI、OpenClaw 或 Qwen 的替代品', not_5: '它是围绕这些 agent 的消息/控制层',
     f_remote_name: '远程终端', f_remote_desc: '浏览器和手机访问，无需 SSH/VPN，实时 PTY 推流',
@@ -560,8 +588,8 @@ const I18N = {
     disclaimer: 'IM.codes 是一个独立的开源项目，与 Anthropic、OpenAI、Google、阿里巴巴、OpenClaw 或任何其他被提及的公司无任何关联、认可或赞助关系。所有产品名称和商标均为其各自所有者的财产。',
   },
   'zh-TW': {
-    tagline: '給 AI agent 的 IM。一套記憶層，貫通所有 AI 提供方。跨模型審計與規劃。',
-    hero_intro: 'IM.codes 為 coding agent 提供一套跨 provider 共享的記憶層。它會把已完成的工作沉澱成可重用上下文，再把合適的歷史注入後續 session，貫通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。內建 P2P 討論功能，讓多個模型互相審閱對方的方案和實作——能有效減少單模型的遺漏、盲點和偏差。',
+    tagline: '給 AI agent 的 IM。共享記憶、受監督執行，以及跨模型審計。',
+    hero_intro: 'IM.codes 為 coding agent 提供一套跨 provider 共享的記憶層。它會把已完成的工作沉澱成可重用上下文，再把合適的歷史注入後續 session，貫通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。內建 Auto supervision 可在每輪完成後判斷任務是否完成、是否繼續自動執行，並可選進入審計/返工閉環後再把控制權交還給你。P2P 討論功能讓多個模型互相審閱對方的方案和實作——能有效減少單模型的遺漏、盲點和偏差。',
     hero_output: '已綁定 app.im.codes · 守護程序已啟動 · 已註冊為系統服務',
     self_host_warning: '<strong>強烈建議自行部署。</strong><code>app.im.codes</code> 是共享測試實例，無可用性保證，可能被限流、攻擊或不可用。這是個人專案，不提供商用保障。正式使用請部署到自己的伺服器。',
     h_screenshots: '截圖', h_why: '為什麼', h_memory: '共享代理上下文', h_not: '它不是什麼', h_features: '功能', h_arch: '架構', h_download: '下載', h_install: '安裝', h_quick: '快速開始', h_selfhost: '自託管部署', h_agents: '支援的代理', h_reqs: '系統需求', h_about: '關於',
@@ -572,8 +600,16 @@ const I18N = {
     memory_2: '企業共享上下文讓團隊能在 workspace / project 範圍內重用修復經驗，並透過可查詢的記憶、統計和檢視介面管理它。這部分仍在持續開發中，還沒有經過完整的生產級測試。',
     memory_3: '多語言召回結合本地 embedding 與基於 pgvector 的伺服器搜尋，可以跨不同語言找到相關歷史修復。',
     memory_4: '時間線卡片會明確顯示注入了什麼內容，以及相關性分數、召回次數和上次使用時間。',
+    h_auto: '受監督執行',
+    auto_intro: 'IM.codes 可對支援的 transport session 做逐輪監督，而不是盲目自動繼續。Auto 會判斷最近一輪是已完成、應該繼續自動執行，還是該把控制權交還給你。',
+    auto_1: '按 session 設定 Auto 模式：Off、Supervised、Supervised + audit。',
+    auto_2: '在 idle 邊界，Auto 會把一輪判成 complete、continue 或 ask_human，並把後續 continue prompt 直接送回同一個 session。',
+    auto_3: 'Supervised + audit 可在交還控制權前自動跑審計→返工閉環，不再盲目信任「看起來完成了」的結果。',
+    auto_4: '監督模型後端/模型、逾時、審計模式和自訂提示詞都可以按 session 設定。',
     f_memory_name: '共享代理上下文',
     f_memory_desc: '問題→解決方案記憶、多語言召回、按訊息/啟動自動注入，並在時間線中可見',
+    f_auto_name: '受監督執行',
+    f_auto_desc: '逐輪完成判定、自動繼續，以及可選的審計→返工閉環，適用於 transport agent',
     why_text: '離開桌面後，大多數 coding agent 工作流就斷了。代理還在終端機裡運行，但你通常只能靠 SSH、tmux attach、遠端桌面，或者等回到電腦前。IM.codes 讓這些會話在手機和網頁上保持觸手可及：打開終端機、查看檔案和 Git 變更、從另一台裝置預覽 localhost、在任務完成時收到通知，並在自己的基礎設施上同時推進多個代理。',
     not_1: '不是另一個 AI IDE', not_2: '不只是聊天殼', not_3: '不只是遠端終端客戶端', not_4: '不是 Claude Code、Codex、Gemini CLI、OpenClaw 或 Qwen 的替代品', not_5: '它是圍繞這些 agent 的訊息/控制層',
     f_remote_name: '遠端終端機', f_remote_desc: '瀏覽器和手機存取，無需 SSH/VPN，即時 PTY 串流',
@@ -626,8 +662,8 @@ const I18N = {
     disclaimer: 'IM.codes 是一個獨立的開源專案，與 Anthropic、OpenAI、Google、阿里巴巴、OpenClaw 或任何其他被提及的公司無任何關聯、認可或贊助關係。所有產品名稱和商標均為其各自擁有者的財產。',
   },
   ja: {
-    tagline: 'エージェントのための IM。すべての AI プロバイダーをまたぐ一つのメモリレイヤー。エージェント横断の監査とプランニング。',
-    hero_intro: 'IM.codes は coding agent に、プロバイダーをまたぐ共有メモリレイヤーを提供します。完了した作業を再利用可能なコンテキストとして蓄積し、Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw などの後続 session に適切な履歴を再注入します。P2P ディスカッションを内蔵 — 複数のモデルが互いの計画と実装をレビュー・監査し合い、単一モデルの見落とし・盲点・バイアスを効果的に減らします。',
+    tagline: 'エージェントのための IM。共有メモリ、監督付き実行、そして AI プロバイダー横断の監査。',
+    hero_intro: 'IM.codes は coding agent に、プロバイダーをまたぐ共有メモリレイヤーを提供します。完了した作業を再利用可能なコンテキストとして蓄積し、Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw などの後続 session に適切な履歴を再注入します。Built-in Auto supervision は完了済みターンを判定し、自律的な継続や監査/手戻りループまで行ったうえで制御を返せます。P2P ディスカッションを内蔵 — 複数のモデルが互いの計画と実装をレビュー・監査し合い、単一モデルの見落とし・盲点・バイアスを効果的に減らします。',
     hero_output: 'app.im.codes にバインド完了 · デーモン起動 · システムサービスとして登録',
     self_host_warning: '<strong>セルフホスティングを強く推奨します。</strong><code>app.im.codes</code> は共有テストインスタンスであり、稼働保証はありません。レート制限、攻撃対象、利用不可の可能性があります。個人プロジェクトのため商用サポートはありません。評価以外の用途では自社インフラにデプロイしてください。',
     h_screenshots: 'スクリーンショット', h_why: '背景', h_memory: '共有エージェントコンテキスト', h_not: 'これは何ではないか', h_features: '機能', h_arch: 'アーキテクチャ', h_download: 'ダウンロード', h_install: 'インストール', h_quick: 'クイックスタート', h_selfhost: 'セルフホスト', h_agents: '対応エージェント', h_reqs: '要件', h_about: '概要',
@@ -638,8 +674,16 @@ const I18N = {
     memory_2: 'Enterprise Shared Context により、チームは workspace / project 単位で修正知見を再利用し、検索・統計・閲覧 UI から管理できます。これはまだ継続開発中で、完全な本番テストは終わっていません。',
     memory_3: '多言語リコールはローカル embedding と pgvector ベースのサーバー検索を組み合わせ、異なる言語間でも関連修正を見つけます。',
     memory_4: 'タイムラインカードには注入内容、関連度スコア、再利用回数、最終使用時刻が表示されます。',
+    h_auto: '監督付き実行',
+    auto_intro: 'IM.codes は blind auto-continue に頼らず、対応する transport session をターンごとに監督できます。Auto は直近のターンが完了か、継続か、あなたに制御を返すべきかを判断します。',
+    auto_1: 'セッション単位の Auto モード: Off / Supervised / Supervised + audit。',
+    auto_2: 'idle 境界でターンを complete / continue / ask_human に分類し、次の continue prompt を同じ session に送れます。',
+    auto_3: 'Supervised + audit は制御を返す前に audit→rework ループを回せるので、完了したように見える結果を盲信しません。',
+    auto_4: '監督バックエンド/モデル、タイムアウト、監査モード、カスタム指示はセッションごとに設定できます。',
     f_memory_name: '共有エージェントコンテキスト',
     f_memory_desc: '問題→解決の記憶、多言語リコール、メッセージ時/起動時の自動注入をタイムラインで可視化',
+    f_auto_name: '監督付き実行',
+    f_auto_desc: 'transport 系エージェント向けのターン単位完了判定、自動継続、任意の audit→rework ループ',
     why_text: 'デスクを離れると、多くの coding agent ワークフローは途切れます。エージェントはまだターミナルで動いていても、作業を続けるには SSH、tmux attach、リモートデスクトップ、あるいはラップトップに戻るまで待つしかありません。IM.codes はそのセッションをモバイルやWebから手の届く場所に保ちます。ターミナルを開く、ファイルや Git の変更を見る、別デバイスから localhost を確認する、作業完了時に通知を受ける、そして自分のインフラ上で複数のエージェントを並行して進めることができます。',
     not_1: '別の AI IDE ではありません', not_2: '単なるチャットラッパーではありません', not_3: '単なるリモートターミナルクライアントではありません', not_4: 'Claude Code、Codex、Gemini CLI、OpenClaw、Qwen の置き換えではありません', not_5: 'それらを取り巻くメッセージング／コントロール層です',
     f_remote_name: 'リモートターミナル', f_remote_desc: 'ブラウザ＆モバイル、SSH/VPN不要、リアルタイムPTYストリーミング',
@@ -692,8 +736,8 @@ const I18N = {
     disclaimer: 'IM.codes は独立したオープンソースプロジェクトであり、Anthropic、OpenAI、Google、Alibaba、OpenClaw、またはその他の言及された企業との提携、承認、スポンサーシップはありません。すべての製品名および商標は各所有者に帰属します。',
   },
   ko: {
-    tagline: '에이전트를 위한 IM. 모든 AI 제공자를 가로지르는 하나의 메모리 레이어. 에이전트 간 감사와 플래닝.',
-    hero_intro: 'IM.codes는 coding agent를 위한 provider 간 공유 메모리 레이어를 제공합니다. 완료된 작업을 재사용 가능한 컨텍스트로 축적하고, Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw 등 이후 session에 적절한 기록을 다시 주입합니다. P2P 토론 기능 내장 — 여러 모델이 서로의 계획과 구현을 리뷰하고 감사하여, 단일 모델의 누락·맹점·편향을 효과적으로 줄입니다.',
+    tagline: '에이전트를 위한 IM. 공유 메모리, 감독된 실행, 그리고 AI 제공자 전반의 교차 감사.',
+    hero_intro: 'IM.codes는 coding agent를 위한 provider 간 공유 메모리 레이어를 제공합니다. 완료된 작업을 재사용 가능한 컨텍스트로 축적하고, Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw 등 이후 session에 적절한 기록을 다시 주입합니다. 내장된 Auto supervision은 완료된 턴을 판정하고, 자동 계속과 감사/재작업 루프까지 수행한 뒤 제어를 돌려줄 수 있습니다. P2P 토론 기능 내장 — 여러 모델이 서로의 계획과 구현을 리뷰하고 감사하여, 단일 모델의 누락·맹점·편향을 효과적으로 줄입니다.',
     hero_output: 'app.im.codes에 바인딩 완료 · 데몬 시작됨 · 시스템 서비스로 등록됨',
     self_host_warning: '<strong>셀프 호스팅을 강력히 권장합니다.</strong> <code>app.im.codes</code>는 공유 테스트 인스턴스로 가동 보장이 없으며, 속도 제한, 공격 대상이 되거나 사용 불가할 수 있습니다. 개인 프로젝트로 상업적 지원은 제공되지 않습니다. 평가 이외의 용도에는 자체 인프라에 배포하세요.',
     h_screenshots: '스크린샷', h_why: '배경', h_memory: '공유 에이전트 컨텍스트', h_not: '무엇이 아닌가', h_features: '기능', h_arch: '아키텍처', h_download: '다운로드', h_install: '설치', h_quick: '빠른 시작', h_selfhost: '셀프 호스팅', h_agents: '지원 에이전트', h_reqs: '요구사항', h_about: '소개',
@@ -704,8 +748,16 @@ const I18N = {
     memory_2: 'Enterprise Shared Context를 통해 팀은 workspace / project 범위에서 수정 경험을 재사용하고, 검색·통계·조회 UI로 관리할 수 있습니다. 이 부분은 아직 계속 개발 중이며 완전한 프로덕션 테스트는 끝나지 않았습니다.',
     memory_3: '다국어 리콜은 로컬 embedding과 pgvector 기반 서버 검색을 결합해 서로 다른 언어 사이에서도 관련 수정 이력을 찾습니다.',
     memory_4: '타임라인 카드는 무엇이 주입됐는지와 함께 관련성 점수, 재호출 횟수, 마지막 사용 시각을 보여줍니다.',
+    h_auto: '감독된 실행',
+    auto_intro: 'IM.codes는 blind auto-continue에 의존하지 않고 지원되는 transport session을 턴 단위로 감독할 수 있습니다. Auto는 최근 턴이 끝났는지, 더 진행해야 하는지, 아니면 제어를 사용자에게 돌려줘야 하는지 판단합니다.',
+    auto_1: '세션별 Auto 모드: Off, Supervised, Supervised + audit.',
+    auto_2: 'idle 경계에서 턴을 complete, continue, ask_human으로 분류하고 다음 continue prompt를 같은 session에 보낼 수 있습니다.',
+    auto_3: 'Supervised + audit는 제어를 돌려주기 전에 audit→rework 루프를 실행해, 겉보기 완료 결과를 그대로 믿지 않게 합니다.',
+    auto_4: '감독 백엔드/모델, 제한 시간, 감사 모드, 사용자 지침을 세션별로 설정할 수 있습니다.',
     f_memory_name: '공유 에이전트 컨텍스트',
     f_memory_desc: '문제→해결 메모리, 다국어 리콜, 메시지/시작 시 자동 주입을 타임라인에서 가시화',
+    f_auto_name: '감독된 실행',
+    f_auto_desc: 'transport 에이전트를 위한 턴 단위 완료 판정, 자동 계속, 선택적 audit→rework 루프',
     why_text: '책상을 떠나면 대부분의 coding agent 워크플로우는 끊깁니다. 에이전트는 여전히 터미널에서 돌아가지만, 작업을 이어가려면 보통 SSH, tmux attach, 원격 데스크톱을 쓰거나 노트북 앞으로 돌아갈 때까지 기다려야 합니다. IM.codes는 이런 세션을 모바일과 웹에서 계속 닿는 곳에 둡니다. 터미널을 열고, 파일과 Git 변경을 보고, 다른 기기에서 localhost를 미리 보고, 작업이 끝나면 알림을 받고, 자신의 인프라에서 여러 에이전트를 병렬로 계속 진행할 수 있습니다.',
     not_1: '또 다른 AI IDE가 아닙니다', not_2: '단순한 채팅 래퍼가 아닙니다', not_3: '단순한 원격 터미널 클라이언트가 아닙니다', not_4: 'Claude Code, Codex, Gemini CLI, OpenClaw, Qwen의 대체품이 아닙니다', not_5: '그들을 둘러싼 메시징/컨트롤 레이어입니다',
     f_remote_name: '원격 터미널', f_remote_desc: '브라우저 & 모바일, SSH/VPN 불필요, 실시간 PTY 스트리밍',
@@ -758,8 +810,8 @@ const I18N = {
     disclaimer: 'IM.codes는 독립적인 오픈소스 프로젝트로, Anthropic, OpenAI, Google, Alibaba, OpenClaw 또는 언급된 다른 회사와 제휴, 보증 또는 후원 관계가 없습니다. 모든 제품 이름과 상표는 각 소유자의 자산입니다.',
   },
   es: {
-    tagline: 'El IM para agentes. Una capa de memoria que atraviesa todos los proveedores de IA. Auditoría y planificación multi-agente.',
-    hero_intro: 'IM.codes da a los coding agents una capa de memoria compartida entre proveedores. Convierte el trabajo completado en contexto reutilizable y vuelve a inyectar el historial adecuado en sesiones futuras de Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw y más. Función de discusión P2P integrada: varios modelos revisan y auditan los planes y las implementaciones de los demás, reduciendo de forma eficaz las omisiones, puntos ciegos y sesgos de un solo modelo.',
+    tagline: 'El IM para agentes. Memoria compartida, ejecución supervisada y auditoría cruzada entre proveedores de IA.',
+    hero_intro: 'IM.codes da a los coding agents una capa de memoria compartida entre proveedores. Convierte el trabajo completado en contexto reutilizable y vuelve a inyectar el historial adecuado en sesiones futuras de Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw y más. Auto supervision integrado puede juzgar los turnos completados, seguir trabajando de forma autónoma y, si quieres, ejecutar un bucle de auditoría y retrabajo antes de devolverte el control. La discusión P2P integrada permite que varios modelos revisen y auditen los planes y las implementaciones de los demás, reduciendo de forma eficaz las omisiones, puntos ciegos y sesgos de un solo modelo.',
     hero_output: 'vinculado a app.im.codes · daemon iniciado · registrado como servicio del sistema',
     self_host_warning: '<strong>Se recomienda encarecidamente el autoalojamiento.</strong> <code>app.im.codes</code> es una instancia de prueba compartida sin garantías de disponibilidad — puede tener límites, ser objetivo de ataques o no estar disponible. Este es un proyecto personal sin soporte comercial. Para uso más allá de la evaluación, despliega en tu propia infraestructura.',
     h_screenshots: 'capturas', h_why: 'por qué', h_memory: 'contexto compartido para agentes', h_not: 'qué no es', h_features: 'características', h_arch: 'arquitectura', h_download: 'descargar', h_install: 'instalar', h_quick: 'inicio rápido', h_selfhost: 'autoalojamiento', h_agents: 'agentes compatibles', h_reqs: 'requisitos', h_about: 'acerca de',
@@ -770,8 +822,16 @@ const I18N = {
     memory_2: 'El contexto compartido empresarial permite reutilizar soluciones entre workspaces y proyectos con memoria consultable, estadísticas y UI de inspección. Esta parte sigue en desarrollo activo y todavía no ha pasado pruebas completas de producción.',
     memory_3: 'La recuperación multilingüe combina embeddings locales con búsqueda del lado del servidor basada en pgvector para encontrar soluciones relacionadas entre distintos idiomas.',
     memory_4: 'Las tarjetas de la línea de tiempo muestran exactamente qué se inyectó, junto con puntuación de relevancia, número de recuperaciones y último uso.',
+    h_auto: 'ejecución supervisada',
+    auto_intro: 'IM.codes puede supervisar sesión por sesión los transport sessions compatibles en lugar de depender de un auto-continue ciego. Auto comprueba si el último turno ya terminó, debe continuar o debe devolverte el control.',
+    auto_1: 'Modos Auto por sesión: Off, Supervised y Supervised + audit.',
+    auto_2: 'En el límite idle, Auto puede clasificar un turno como complete, continue o ask_human y enviar el siguiente continue prompt dentro de la misma session.',
+    auto_3: 'Supervised + audit puede ejecutar un bucle audit→rework antes de devolverte el control, así que el trabajo terminado se revisa en lugar de confiarse a ciegas.',
+    auto_4: 'Backend/modelo del supervisor, timeout, modo de auditoría e instrucciones personalizadas se configuran por sesión.',
     f_memory_name: 'contexto compartido para agentes',
     f_memory_desc: 'memoria problema→solución, recuperación multilingüe e inyección automática por mensaje y al iniciar, visible en la línea de tiempo',
+    f_auto_name: 'ejecución supervisada',
+    f_auto_desc: 'comprobaciones de finalización por turno, auto-continue y bucles opcionales audit→rework para agentes transport',
     why_text: 'Cuando te alejas del escritorio, la mayoría de los flujos con coding agents se rompen. El agente sigue ejecutándose en una terminal, pero continuar el trabajo suele significar usar SSH, tmux attach, escritorio remoto o esperar a volver al portátil. IM.codes mantiene esas sesiones al alcance desde móvil o web: abre la terminal, inspecciona archivos y cambios Git, previsualiza localhost desde otro dispositivo, recibe notificaciones cuando el trabajo termina y mantén varios agentes avanzando en paralelo sobre tu propia infraestructura.',
     not_1: 'No es otro AI IDE', not_2: 'No es solo un wrapper de chat', not_3: 'No es solo un cliente de terminal remota', not_4: 'No reemplaza a Claude Code, Codex, Gemini CLI, OpenClaw ni Qwen', not_5: 'Es la capa de mensajería/control alrededor de ellos',
     f_remote_name: 'terminal remota', f_remote_desc: 'navegador y móvil, sin SSH/VPN, streaming PTY en tiempo real',
@@ -824,8 +884,8 @@ const I18N = {
     disclaimer: 'IM.codes es un proyecto de código abierto independiente y no está afiliado, respaldado ni patrocinado por Anthropic, OpenAI, Google, Alibaba, OpenClaw ni ninguna otra empresa mencionada. Todos los nombres de productos y marcas son propiedad de sus respectivos dueños.',
   },
   ru: {
-    tagline: 'IM для агентов. Единый слой памяти у всех AI-провайдеров. Кросс-агентный аудит и планирование.',
-    hero_intro: 'IM.codes даёт coding agents единый слой памяти поверх разных провайдеров. Он превращает завершённую работу в переиспользуемый контекст и подмешивает нужную историю в будущие session для Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw и других. Встроенное P2P-обсуждение — несколько моделей взаимно проверяют и аудируют планы и реализации друг друга, эффективно уменьшая пропуски, «слепые зоны» и смещения одной модели.',
+    tagline: 'IM для агентов. Общая память, supervised execution и кросс-модельный аудит поверх AI-провайдеров.',
+    hero_intro: 'IM.codes даёт coding agents единый слой памяти поверх разных провайдеров. Он превращает завершённую работу в переиспользуемый контекст и подмешивает нужную историю в будущие session для Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw и других. Встроенный Auto supervision умеет оценивать завершённые ходы, продолжать работу автономно и при необходимости запускать цикл audit/rework перед возвратом контроля. P2P-обсуждение — несколько моделей взаимно проверяют и аудируют планы и реализации друг друга, эффективно уменьшая пропуски, «слепые зоны» и смещения одной модели.',
     hero_output: 'привязан к app.im.codes · демон запущен · зарегистрирован как системная служба',
     self_host_warning: '<strong>Настоятельно рекомендуется самостоятельный хостинг.</strong> <code>app.im.codes</code> — общий тестовый экземпляр без гарантий доступности. Может быть ограничен, атакован или недоступен. Это личный проект без коммерческой поддержки. Для использования помимо тестирования разверните на собственной инфраструктуре.',
     h_screenshots: 'скриншоты', h_why: 'зачем', h_memory: 'общий контекст агентов', h_not: 'чем это не является', h_features: 'возможности', h_arch: 'архитектура', h_download: 'скачать', h_install: 'установка', h_quick: 'быстрый старт', h_selfhost: 'свой сервер', h_agents: 'поддерживаемые агенты', h_reqs: 'требования', h_about: 'о проекте',
@@ -836,8 +896,16 @@ const I18N = {
     memory_2: 'Enterprise Shared Context позволяет командам переиспользовать решения между workspace / project с поиском по памяти, статистикой и интерфейсом просмотра. Эта часть всё ещё активно разрабатывается и ещё не прошла полноценное продакшен-тестирование.',
     memory_3: 'Многоязычный recall сочетает локальные embedding и серверный поиск на pgvector, поэтому связанные решения находятся даже между разными языками.',
     memory_4: 'Карточки таймлайна показывают, что именно было подмешано, а также score релевантности, число recall и время последнего использования.',
+    h_auto: 'supervised execution',
+    auto_intro: 'IM.codes может контролировать поддерживаемые transport session ход за ходом вместо слепого auto-continue. Auto определяет, завершён ли последний ход, нужно ли продолжать, или пора вернуть управление вам.',
+    auto_1: 'Режимы Auto на уровне session: Off, Supervised и Supervised + audit.',
+    auto_2: 'На границе idle Auto может классифицировать ход как complete, continue или ask_human и отправить следующий continue prompt в ту же session.',
+    auto_3: 'Supervised + audit может прогнать цикл audit→rework до возврата управления, так что «похоже завершённую» работу не приходится принимать на веру.',
+    auto_4: 'Бэкенд/модель супервизора, timeout, режим аудита и пользовательские инструкции настраиваются отдельно для каждой session.',
     f_memory_name: 'общий контекст агентов',
     f_memory_desc: 'память проблема→решение, многоязычный recall и автоматическая инъекция при сообщении и старте сессии с видимостью в таймлайне',
+    f_auto_name: 'supervised execution',
+    f_auto_desc: 'проверка завершения по ходам, auto-continue и необязательные циклы audit→rework для transport-агентов',
     why_text: 'Когда вы отходите от рабочего стола, большинство workflows с coding agents ломается. Агент всё ещё работает в терминале, но продолжение работы обычно означает SSH, tmux attach, удалённый рабочий стол или ожидание, пока вы вернётесь к ноутбуку. IM.codes держит эти сессии под рукой на телефоне и в браузере: откройте терминал, посмотрите файлы и Git-изменения, превью localhost с другого устройства, получите уведомление по завершении работы и ведите несколько агентов параллельно на своей инфраструктуре.',
     not_1: 'Это не ещё один AI IDE', not_2: 'Это не просто чат-обёртка', not_3: 'Это не просто клиент удалённого терминала', not_4: 'Это не замена Claude Code, Codex, Gemini CLI, OpenClaw или Qwen', not_5: 'Это слой сообщений/управления вокруг них',
     f_remote_name: 'удалённый терминал', f_remote_desc: 'браузер и мобильный, без SSH/VPN, PTY-стриминг в реальном времени',

@@ -2,9 +2,9 @@
 
 [English](README.md) | [简体中文](README.i18n/README.zh-CN.md) | [繁體中文](README.i18n/README.zh-TW.md) | [Español](README.i18n/README.es.md) | [Русский](README.i18n/README.ru.md) | [日本語](README.i18n/README.ja.md) | [한국어](README.i18n/README.ko.md)
 
-**The IM for agents. One memory layer across AI providers. Cross-agent auditing and planning.**
+**The IM for agents. Shared memory, supervised execution, and cross-agent audit across AI providers.**
 
-IM.codes gives coding agents one shared memory layer across providers. It turns completed work into reusable context, then injects the right history back into future sessions across [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more — with terminal access, file browsing, git views, localhost preview, notifications, multi-agent workflows, and native streaming output for transport-backed agents. Built-in P2P discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.
+IM.codes gives coding agents one shared memory layer across providers. It turns completed work into reusable context, then injects the right history back into future sessions across [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more — with terminal access, file browsing, git views, localhost preview, notifications, multi-agent workflows, and native streaming output for transport-backed agents. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. P2P discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.
 
 > **Disclaimer:** This is an actively developed personal open-source project. There are no warranties, no SLA, and no guarantees of stability, security, or backward compatibility. Use at your own risk. Breaking changes may happen at any time without notice.
 
@@ -86,6 +86,17 @@ IM.codes continuously turns completed agent work into reusable memory and feeds 
 - **Automatic injection where it matters.** Relevant past work is injected both per-message and at session startup, with timeline cards that show what was recalled, why, the relevance score, recall count, and last-used time.
 - **User-visible inspection and control.** Shared Context UI separates raw events, processed summaries, cloud memory, and enterprise memory, with query, preview, archive/restore, and processing configuration controls.
 
+## Supervised Execution & Auto Audit
+
+IM.codes can supervise supported transport-backed agent sessions turn by turn instead of relying on blind auto-continue.
+
+- **Per-session Auto modes.** Configure `off`, `supervised`, or `supervised_audit` per session instead of forcing one policy everywhere.
+- **Completion checks at the idle boundary.** When a turn finishes, IM.codes can classify it as `complete`, `continue`, or `ask_human`, then dispatch the next continue prompt inside the same session.
+- **Fail-closed automation.** Auto supervision stays visible in the timeline/footer, uses structured decisions, and returns control to you on timeout, invalid output, or bad config instead of silently guessing.
+- **Optional audit → rework loop.** In `supervised_audit`, a completed turn can automatically enter an audit pipeline and send a rework brief back into the same session before control returns.
+- **Configurable per session.** Choose supervisor backend/model, timeout, audit mode, and custom supervision instructions for each session independently.
+- **Built for real IM.codes workflows.** Auto supervision understands OpenSpec work, P2P discussion/review flows, and `imcodes send`-style cross-agent coordination as valid agent actions, not immediate reasons to stop for a human.
+
 ## Features
 
 ### Remote Terminal
@@ -103,6 +114,12 @@ Preview your local dev server from any device — phone, tablet, or remote brows
 ### Mobile, Watch & Notifications
 
 Full mobile support with biometric auth and push notifications. Shell sessions allow interactive keyboard input on mobile (SSH-like). Sub-session preview cards always show latest messages. Toast notifications navigate directly to the relevant session. Apple Watch support adds quick session monitoring, unread counts, and quick replies from the wrist.
+
+### Supervised Task Automation
+
+Auto supervision adds turn-level control for supported transport-backed agents. Instead of blindly continuing forever, IM.codes evaluates the latest completed turn and decides whether the task looks done, should keep going, or should come back to you. For higher-assurance work, `supervised_audit` can automatically trigger an audit/rework loop before the session is considered finished.
+
+Supervisor backend/model, timeout, audit mode, and custom instructions are all session-scoped. Auto supervision is also aware of IM.codes-native workflows such as OpenSpec changes, P2P discussions, and `imcodes send`, so those actions count as legitimate next steps instead of accidental "ask human" triggers.
 
 ### Multi-Agent Discussions & Cross-Provider Audit
 
