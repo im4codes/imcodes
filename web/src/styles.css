@@ -179,6 +179,37 @@ body {
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.22);
   pointer-events: auto;
 }
+/* Collapsed-state pill: just a count chip, shown only when the user has
+   chosen to hide the full queue list. Keeps vertical space above the
+   composer minimal (the full hint was previously taking 3+ lines). */
+.controls-queued-pill {
+  align-self: flex-start;
+  margin: 0 8px 6px;
+  padding: 3px 10px 3px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: max-content;
+  background: rgba(15, 23, 42, 0.92);
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  border-radius: 999px;
+  color: #fbbf24;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.35;
+  cursor: pointer;
+  pointer-events: auto;
+  font-family: inherit;
+}
+.controls-queued-pill::before {
+  content: '';
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: #fbbf24;
+  flex-shrink: 0;
+}
+.controls-queued-pill:hover { color: #fde68a; border-color: rgba(251, 191, 36, 0.6); }
+.controls-queued-pill:hover::before { background: #fde68a; }
 .controls-queued-header {
   display: flex;
   align-items: center;
@@ -633,6 +664,7 @@ body {
 /* Mobile responsive */
 @media (max-width: 640px) {
   .sidebar { display: none; }
+  .main { padding-top: env(safe-area-inset-top); }
   .mobile-server-bar { display: flex; align-items: center; justify-content: space-between; padding: 4px 10px; background: #1e293b; border-bottom: 1px solid #334155; flex-shrink: 0; position: relative; z-index: 50; }
   .mobile-sidebar-toggle { display: block; background: none; border: none; color: #94a3b8; font-size: 18px; cursor: pointer; padding: 4px 8px 4px 0; line-height: 1; flex-shrink: 0; }
   .mobile-sidebar-toggle:active { color: #e2e8f0; }
@@ -1042,13 +1074,36 @@ body {
 .resize-sw { bottom: 0; left: 0; width: 12px; height: 12px; cursor: sw-resize; }
 
 /* ── Generic dialog overlay ──────────────────────────────────────────────── */
-.dialog-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 9999; padding: 16px; }
-.dialog { background: #1e293b; border: 1px solid #334155; border-radius: 8px; width: 100%; }
-.dialog-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px 0; }
+/* Padding bakes in iOS safe-area insets so the dialog never touches the
+   status bar/notch or the home-indicator. Dialog itself is capped to the
+   remaining vertical space and split into flex-column header/body so the
+   body scrolls while the header stays pinned — required because some
+   dialogs (SessionSettingsDialog) are taller than the viewport on mobile. */
+.dialog-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 9999;
+  padding: calc(var(--sat, 0px) + 16px) 16px calc(env(safe-area-inset-bottom, 0px) + 16px);
+}
+.dialog {
+  background: #1e293b; border: 1px solid #334155; border-radius: 8px;
+  width: 100%;
+  max-height: 100%;
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.dialog-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px 0; flex-shrink: 0; }
 .dialog-header h2 { margin: 0; font-size: 15px; color: #f1f5f9; }
 .dialog-close { background: none; border: none; color: #64748b; font-size: 20px; cursor: pointer; line-height: 1; padding: 0; }
 .dialog-close:hover { color: #e2e8f0; }
-.dialog-body { padding: 16px 20px 20px; }
+.dialog-body {
+  padding: 16px 20px 20px;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  flex: 1 1 auto;
+  min-height: 0;
+}
 
 /* ── Sub-session start dialog extras ─────────────────────────────────────── */
 .subsession-type-groups { display: flex; flex-direction: column; gap: 12px; }
@@ -1652,8 +1707,8 @@ body {
 }
 
 /* AskQuestionDialog */
-.ask-dialog-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 9999; padding: 16px; }
-.ask-dialog { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 20px; width: 100%; max-width: 480px; max-height: 80vh; overflow-y: auto; display: flex; flex-direction: column; gap: 16px; }
+.ask-dialog-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 9999; padding: calc(var(--sat, 0px) + 16px) 16px calc(env(safe-area-inset-bottom, 0px) + 16px); }
+.ask-dialog { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 20px; width: 100%; max-width: 480px; max-height: 100%; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; display: flex; flex-direction: column; gap: 16px; }
 .ask-question-block { display: flex; flex-direction: column; gap: 8px; }
 .ask-header { font-size: 11px; font-weight: 600; color: #818cf8; text-transform: uppercase; letter-spacing: 0.05em; }
 .ask-question { font-size: 14px; color: #e2e8f0; line-height: 1.5; }

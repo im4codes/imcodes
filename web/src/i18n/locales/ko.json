@@ -122,6 +122,7 @@
     "send_queued": "재연결 중… (전송 대기 중)",
     "transport_send_queued": "대기열에 추가됨 — 현재 응답이 끝나면 전송됩니다",
     "transport_send_queued_collapsed": "{{count}}개 대기 중 · 마지막 메시지만 표시",
+    "transport_send_queued_count": "{{count}}개 대기 중",
     "send_placeholder": "{{name}}에게 전송…",
     "send_placeholder_desktop_upload": "{{placeholder}} 여러 파일 붙여넣기 빠른 업로드 지원",
     "actions": "세션 작업",

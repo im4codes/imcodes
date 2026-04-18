@@ -129,8 +129,6 @@ type P2pMode = string; // 'solo' | single modes | combo pipelines like 'brainsto
 const MODEL_STORAGE_KEY = 'imcodes-model';
 const CODEX_MODEL_STORAGE_KEY = 'imcodes-codex-model';
 const QWEN_MODEL_STORAGE_KEY = 'imcodes-qwen-model';
-const QUEUED_HINT_EXPANDED_STORAGE_KEY = 'imcodes-queued-hint-expanded';
-const QUEUED_HINT_EXPANDED_EVENT = 'imcodes:queued-hint-expanded';
 const P2P_COMBO_CONFIRM_SKIP_PREF_KEY = 'p2p_combo_direct_send_skip_confirm';
 const CODEX_MODELS: CodexModelChoice[] = [...CODEX_MODEL_IDS] as CodexModelChoice[];
 const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
@@ -317,12 +315,6 @@ function loadQwenModel(): QwenModelChoice | null {
   return null;
 }
 
-function loadQueuedHintExpanded(): boolean {
-  try {
-    return localStorage.getItem(QUEUED_HINT_EXPANDED_STORAGE_KEY) !== '0';
-  } catch { /* ignore */ }
-  return true;
-}
 
 function normalizeP2pMode(mode: string): string | null {
   const normalized = mode.trim().toLowerCase();
@@ -413,7 +405,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [model, setModel] = useState<ModelChoice | null>(loadModel);
   const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModel);
   const [qwenModel, setQwenModel] = useState<QwenModelChoice | null>(loadQwenModel);
-  const [queuedHintExpanded, setQueuedHintExpanded] = useState(loadQueuedHintExpanded);
   const [editingQueuedMessageId, setEditingQueuedMessageId] = useState<string | null>(null);
   const [optimisticQueuedEntries, setOptimisticQueuedEntries] = useState<Array<{ clientMessageId: string; text: string }> | null>(null);
   const [mobileComposerMultiline, setMobileComposerMultiline] = useState(false);
@@ -703,19 +694,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return () => onOverlayOpenChange?.(false);
   }, [mobileFileBrowserOpen, onOverlayOpenChange, overlayOpen]);
 
-  useEffect(() => {
-    const syncQueuedHintExpanded = () => setQueuedHintExpanded(loadQueuedHintExpanded());
-    const handleStorage = (event: StorageEvent) => {
-      if (event.key && event.key !== QUEUED_HINT_EXPANDED_STORAGE_KEY) return;
-      syncQueuedHintExpanded();
-    };
-    window.addEventListener('storage', handleStorage);
-    window.addEventListener(QUEUED_HINT_EXPANDED_EVENT, syncQueuedHintExpanded);
-    return () => {
-      window.removeEventListener('storage', handleStorage);
-      window.removeEventListener(QUEUED_HINT_EXPANDED_EVENT, syncQueuedHintExpanded);
-    };
-  }, []);
 
   useEffect(() => {
     if (!editingQueuedMessageId) return;
@@ -1533,7 +1511,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (!isEditableQueuedEntry(entry)) return;
     fillInput(entry.text);
     setEditingQueuedMessageId(entry.clientMessageId);
-    setQueuedHintExpanded(true);
   }, [isEditableQueuedEntry]);
 
   const handleQueuedMessageDelete = useCallback((entry: { clientMessageId: string; text: string }) => {
@@ -1877,17 +1854,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     sendSessionMessage(`/thinking ${level}`);
     onAfterAction?.();
   };
-
-  const toggleQueuedHintExpanded = useCallback(() => {
-    setQueuedHintExpanded((current) => {
-      const next = !current;
-      try {
-        localStorage.setItem(QUEUED_HINT_EXPANDED_STORAGE_KEY, next ? '1' : '0');
-        window.dispatchEvent(new CustomEvent(QUEUED_HINT_EXPANDED_EVENT));
-      } catch { /* ignore */ }
-      return next;
-    });
-  }, []);
 
   const isMobileLayout = typeof window !== 'undefined' && window.innerWidth <= 640;
   const showEmbeddedVoiceButton = isMobileLayout && VoiceInput.isAvailable() && !hasText;
@@ -2933,16 +2899,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         </div>}
       </div>
       {queuedTransportMessages.length > 0 && (
-        <div class="controls-queued-hint" role="status" aria-live="polite">
-          <div class="controls-queued-header">
-            <div>{t('session.transport_send_queued')}</div>
-            <button type="button" class="controls-queued-toggle" onClick={toggleQueuedHintExpanded}>
-              {queuedHintExpanded ? t('common.hide') : t('common.show')}
-            </button>
-          </div>
-          <div class="controls-queued-list">
-            {queuedHintExpanded ? (
-              queuedTransportEntries.map((entry) => (
+        queuedHintExpanded ? (
+          <div class="controls-queued-hint" role="status" aria-live="polite">
+            <div class="controls-queued-header">
+              <div>{t('session.transport_send_queued')}</div>
+              <button type="button" class="controls-queued-toggle" onClick={toggleQueuedHintExpanded}>
+                {t('common.hide')}
+              </button>
+            </div>
+            <div class="controls-queued-list">
+              {queuedTransportEntries.map((entry) => (
                 <div class="controls-queued-item" key={entry.clientMessageId}>
                   <span class="controls-queued-item-text">{entry.text}</span>
                   {isEditableQueuedEntry(entry) && (
@@ -2956,19 +2922,23 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                     </span>
                   )}
                 </div>
-              ))
-            ) : (
-              <>
-                <div class="controls-queued-summary">
-                  {t('session.transport_send_queued_collapsed', { count: queuedTransportMessages.length })}
-                </div>
-                <div class="controls-queued-item" key={`${activeSession?.name ?? 'session'}:latest:${queuedTransportLatestMessage}`}>
-                  <span class="controls-queued-item-text">{queuedTransportLatestMessage}</span>
-                </div>
-              </>
-            )}
+              ))}
+            </div>
           </div>
-        </div>
+        ) : (
+          // Collapsed — render a single compact pill (count only) instead of
+          // the full hint. The full header+summary+preview was occupying too
+          // much vertical space above the composer on mobile.
+          <button
+            type="button"
+            class="controls-queued-pill"
+            onClick={toggleQueuedHintExpanded}
+            aria-live="polite"
+            title={queuedTransportLatestMessage}
+          >
+            {t('session.transport_send_queued_count', { count: queuedTransportMessages.length })}
+          </button>
+        )
       )}
       {editingQueuedEntry && (
         <div class="controls-queued-editing">

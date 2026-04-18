@@ -122,6 +122,7 @@
     "send_queued": "重连中… (消息已排队)",
     "transport_send_queued": "已加入队列，当前回复结束后发送",
     "transport_send_queued_collapsed": "共 {{count}} 条队列消息，仅显示最后一条",
+    "transport_send_queued_count": "{{count}} 条队列",
     "send_placeholder": "发送到 {{name}}…",
     "send_placeholder_desktop_upload": "{{placeholder}} 支持多文件粘贴快速上传",
     "actions": "会话操作",

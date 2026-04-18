@@ -47,6 +47,9 @@ vi.mock('react-i18next', () => ({
       if (key === 'session.transport_send_queued_collapsed') {
         return `${opts?.count ?? 0} queued · showing latest only`;
       }
+      if (key === 'session.transport_send_queued_count') {
+        return `${opts?.count ?? 0} queued`;
+      }
       if (key === 'session.send_placeholder') {
         return `Send to ${String(opts?.name ?? 'session')}…`;
       }
@@ -1693,10 +1696,13 @@ afterEach(() => {
 
     fireEvent.click(screen.getByRole('button', { name: 'hide' }));
 
-    expect(screen.getByText('2 queued · showing latest only')).toBeDefined();
+    // Collapsed state is now a compact pill — only a count, no latest-only
+    // summary or message preview (took too much vertical space on mobile).
+    // The pill itself is the button that expands the full list back.
+    expect(screen.getByRole('button', { name: '2 queued' })).toBeDefined();
     expect(screen.queryByText('queued send')).toBeNull();
-    expect(screen.getByText('second queued send')).toBeDefined();
-    expect(screen.getByRole('button', { name: 'show' })).toBeDefined();
+    expect(screen.queryByText('second queued send')).toBeNull();
+    expect(screen.queryByText('2 queued · showing latest only')).toBeNull();
     expect(localStorage.getItem('imcodes-queued-hint-expanded')).toBe('0');
   });
 
@@ -1721,10 +1727,11 @@ afterEach(() => {
       />,
     );
 
-    expect(screen.getByText('2 queued · showing latest only')).toBeDefined();
+    // Loads from localStorage and renders the compact collapsed pill.
+    expect(screen.getByRole('button', { name: '2 queued' })).toBeDefined();
     expect(screen.queryByText('queued send')).toBeNull();
-    expect(screen.getByText('second queued send')).toBeDefined();
-    expect(screen.getByRole('button', { name: 'show' })).toBeDefined();
+    expect(screen.queryByText('second queued send')).toBeNull();
+    expect(screen.queryByText('2 queued · showing latest only')).toBeNull();
   });
 
   it('edits a queued transport message through the queue controls', () => {
