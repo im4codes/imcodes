@@ -439,12 +439,6 @@ const backendChipRowStyle = {
   flexWrap: 'wrap',
 } as const;
 
-const modelChipRowStyle = {
-  display: 'flex',
-  gap: 6,
-  flexWrap: 'wrap',
-} as const;
-
 function processingChipStyle(active: boolean) {
   return active
     ? {
@@ -465,17 +459,19 @@ function modelChipStyle(active: boolean) {
   return active
     ? {
         ...buttonStyle,
-        padding: '4px 8px',
-        fontSize: 12,
+        padding: '3px 8px',
+        fontSize: 11,
         fontWeight: 700,
         background: '#0f766e',
+        lineHeight: 1.35,
       }
     : {
         ...subtleButtonStyle,
-        padding: '4px 8px',
-        fontSize: 12,
+        padding: '3px 8px',
+        fontSize: 11,
         fontWeight: 600,
         background: '#1e293b',
+        lineHeight: 1.35,
       };
 }
 
@@ -485,43 +481,38 @@ function presetChipStyle(active: boolean) {
   return active
     ? {
         ...buttonStyle,
-        padding: '4px 10px',
-        fontSize: 12,
+        padding: '3px 8px',
+        fontSize: 11,
         fontWeight: 700,
         background: '#7c3aed',
         border: '1px solid #a78bfa',
         display: 'inline-flex',
         alignItems: 'center',
-        gap: 4,
+        gap: 3,
+        lineHeight: 1.35,
       }
     : {
         ...subtleButtonStyle,
-        padding: '4px 10px',
-        fontSize: 12,
+        padding: '3px 8px',
+        fontSize: 11,
         fontWeight: 600,
         background: '#1e1b3a',
         border: '1px solid #4c1d95',
         color: '#c4b5fd',
         display: 'inline-flex',
         alignItems: 'center',
-        gap: 4,
+        gap: 3,
+        lineHeight: 1.35,
       };
 }
 
-const chipSectionLabelStyle = {
-  fontSize: 11,
-  fontWeight: 700,
-  letterSpacing: '0.08em',
-  textTransform: 'uppercase',
-  color: DT.text.muted,
-  marginBottom: 4,
-  marginTop: 2,
-} as const;
-
-const chipGroupStyle = {
+/** Shared row for preset + built-in chips. Wraps on narrow widths but never
+ *  grows vertically beyond what the content needs — no decorative container. */
+const compactChipRowStyle = {
   display: 'flex',
-  flexDirection: 'column',
-  gap: 6,
+  gap: 4,
+  flexWrap: 'wrap',
+  alignItems: 'center',
 } as const;
 
 const defaultPolicyState: SharedProjectPolicy = {
@@ -774,67 +765,49 @@ function ModelPresetChipSelector({
   const trimmedModel = model.trim();
   const trimmedPreset = preset.trim();
   if (modelOptions.length === 0 && (!supportsPresets || presets.length === 0)) return null;
+  // One flat row. Presets first (purple ⚙ chips), then built-in models. The
+  // visual kind — color + gear glyph — replaces the old section headers so
+  // the picker stays one line tall on wide screens and wraps minimally on
+  // narrow ones. No wrapping card / no chevron / no giant listbox.
   return (
-    <div style={chipGroupStyle}>
-      {supportsPresets && presets.length > 0 ? (
-        <div>
-          <div style={chipSectionLabelStyle}>{/* eslint-disable-next-line */}Presets</div>
-          <div style={modelChipRowStyle}>
-            {presets.map((p) => {
-              const active = trimmedPreset === p.name;
-              return (
-                <button
-                  key={`${idPrefix}:preset:${p.name}`}
-                  type="button"
-                  aria-label={`${idPrefix}:preset:${p.name}`}
-                  aria-pressed={active}
-                  title={p.env?.ANTHROPIC_MODEL ? `Model: ${p.env.ANTHROPIC_MODEL}` : undefined}
-                  style={presetChipStyle(active)}
-                  onClick={() => {
-                    // Idempotent: clicking the active preset just re-applies
-                    // it. Deselecting is done by picking a different chip
-                    // (model or preset) or switching backend.
-                    const presetModel = p.env?.ANTHROPIC_MODEL?.trim() ?? '';
-                    onChange({ model: presetModel || trimmedModel, preset: p.name });
-                  }}
-                >
-                  <span aria-hidden="true">⚙</span>
-                  <span>{p.name}</span>
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      ) : null}
-      {modelOptions.length > 0 ? (
-        <div>
-          {supportsPresets && presets.length > 0 ? (
-            <div style={chipSectionLabelStyle}>{/* eslint-disable-next-line */}Built-in</div>
-          ) : null}
-          <div style={modelChipRowStyle}>
-            {modelOptions.map((modelId) => {
-              const active = trimmedModel === modelId && !trimmedPreset;
-              return (
-                <button
-                  key={`${backend}:${modelId}`}
-                  type="button"
-                  aria-label={`model:${backend}:${modelId}`}
-                  aria-pressed={active}
-                  style={modelChipStyle(active)}
-                  onClick={() => {
-                    // Idempotent: re-clicking an active model chip reaffirms
-                    // it. Switching away from a preset happens by picking a
-                    // model (or another preset); we don't deselect on click.
-                    onChange({ model: modelId, preset: '' });
-                  }}
-                >
-                  {modelId}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      ) : null}
+    <div style={compactChipRowStyle}>
+      {supportsPresets && presets.length > 0
+        ? presets.map((p) => {
+            const active = trimmedPreset === p.name;
+            return (
+              <button
+                key={`${idPrefix}:preset:${p.name}`}
+                type="button"
+                aria-label={`${idPrefix}:preset:${p.name}`}
+                aria-pressed={active}
+                title={p.env?.ANTHROPIC_MODEL ? `Preset → model: ${p.env.ANTHROPIC_MODEL}` : `Preset: ${p.name}`}
+                style={presetChipStyle(active)}
+                onClick={() => {
+                  const presetModel = p.env?.ANTHROPIC_MODEL?.trim() ?? '';
+                  onChange({ model: presetModel || trimmedModel, preset: p.name });
+                }}
+              >
+                <span aria-hidden="true">⚙</span>
+                <span>{p.name}</span>
+              </button>
+            );
+          })
+        : null}
+      {modelOptions.map((modelId) => {
+        const active = trimmedModel === modelId && !trimmedPreset;
+        return (
+          <button
+            key={`${backend}:${modelId}`}
+            type="button"
+            aria-label={`model:${backend}:${modelId}`}
+            aria-pressed={active}
+            style={modelChipStyle(active)}
+            onClick={() => onChange({ model: modelId, preset: '' })}
+          >
+            {modelId}
+          </button>
+        );
+      })}
     </div>
   );
 }
