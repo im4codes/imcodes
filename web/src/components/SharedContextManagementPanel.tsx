@@ -515,6 +515,46 @@ const compactChipRowStyle = {
   alignItems: 'center',
 } as const;
 
+/** Tiny inline "Preset:" / "Model:" label that sits on the same row as the
+ *  chips. Smaller than the uppercase field label to keep the dimension
+ *  separation visually obvious without adding another stacked heading. */
+const inlineDimensionLabelStyle = {
+  fontSize: 10,
+  fontWeight: 700,
+  letterSpacing: '0.1em',
+  textTransform: 'uppercase',
+  color: DT.text.muted,
+  marginRight: 6,
+  minWidth: 44,
+  flex: '0 0 auto',
+} as const;
+
+/** "(none)" / neutral chip used to clear the preset selection explicitly —
+ *  visually distinct from both preset chips (purple) and model chips (teal)
+ *  so users can see at a glance that it's the "no bundle" state. */
+function neutralChipStyle(active: boolean) {
+  return active
+    ? {
+        ...buttonStyle,
+        padding: '3px 8px',
+        fontSize: 11,
+        fontWeight: 700,
+        background: '#374151',
+        border: '1px solid #6b7280',
+        lineHeight: 1.35,
+      }
+    : {
+        ...subtleButtonStyle,
+        padding: '3px 8px',
+        fontSize: 11,
+        fontWeight: 600,
+        background: '#1f2937',
+        border: '1px solid #374151',
+        color: '#9ca3af',
+        lineHeight: 1.35,
+      };
+}
+
 const defaultPolicyState: SharedProjectPolicy = {
   enrollmentId: '',
   enterpriseId: '',
@@ -765,52 +805,119 @@ function ModelPresetChipSelector({
   const trimmedModel = model.trim();
   const trimmedPreset = preset.trim();
   if (modelOptions.length === 0 && (!supportsPresets || presets.length === 0)) return null;
-  // One flat row. Presets first (purple ⚙ chips), then built-in models. The
-  // visual kind — color + gear glyph — replaces the old section headers so
-  // the picker stays one line tall on wide screens and wraps minimally on
-  // narrow ones. No wrapping card / no chevron / no giant listbox.
+
+  // Preset vs model are two DIFFERENT dimensions, not peers.
+  //
+  //   - A preset is an env bundle (ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY +
+  //     ANTHROPIC_MODEL). Picking a preset routes traffic to the endpoint
+  //     that preset points at, and pins the model that endpoint serves.
+  //   - A model is the identifier the endpoint resolves. Built-in qwen
+  //     models run on the default qwen endpoint (OAuth / coding plan).
+  //
+  // Rendering them as one flat chip list invited users to read the preset
+  // as a "model" alongside the others. Split them into two labeled rows so
+  // the semantic distinction is visible in a glance, still compact:
+  //
+  //   Preset:  [ (none) ] [⚙ minimax] [⚙ team-b]
+  //   Model:   [coder-model] [qwen3-coder-plus] …   (when no preset)
+  //            [MiniMax-M2.5]                         (when preset pins one)
+  const activePreset = supportsPresets
+    ? presets.find((p) => p.name === trimmedPreset)
+    : undefined;
+  const presetPinnedModel = activePreset?.env?.ANTHROPIC_MODEL?.trim() || '';
+  // When a preset is active, model selection collapses to what the preset
+  // endpoint exposes — show ONLY the pinned model as a single read-ish chip.
+  // User can still switch away by clicking a built-in chip, which clears
+  // the preset (the `onChange({ model, preset: '' })` path handles that).
   return (
-    <div style={compactChipRowStyle}>
-      {supportsPresets && presets.length > 0
-        ? presets.map((p) => {
+    <div style={chipGroupStyle}>
+      {supportsPresets && presets.length > 0 ? (
+        <div style={compactChipRowStyle}>
+          <span style={inlineDimensionLabelStyle}>Preset</span>
+          <button
+            key={`${idPrefix}:preset:__none__`}
+            type="button"
+            aria-label={`${idPrefix}:preset:none`}
+            aria-pressed={!trimmedPreset}
+            title="No preset — use the default provider endpoint"
+            style={neutralChipStyle(!trimmedPreset)}
+            onClick={() => onChange({ model: trimmedModel, preset: '' })}
+          >
+            (none)
+          </button>
+          {presets.map((p) => {
             const active = trimmedPreset === p.name;
+            const pinned = p.env?.ANTHROPIC_MODEL?.trim();
             return (
               <button
                 key={`${idPrefix}:preset:${p.name}`}
                 type="button"
                 aria-label={`${idPrefix}:preset:${p.name}`}
                 aria-pressed={active}
-                title={p.env?.ANTHROPIC_MODEL ? `Preset → model: ${p.env.ANTHROPIC_MODEL}` : `Preset: ${p.name}`}
+                title={pinned ? `Preset bundle → model: ${pinned}` : `Preset bundle: ${p.name}`}
                 style={presetChipStyle(active)}
                 onClick={() => {
-                  const presetModel = p.env?.ANTHROPIC_MODEL?.trim() ?? '';
-                  onChange({ model: presetModel || trimmedModel, preset: p.name });
+                  // Picking a preset pins its embedded model. User has to
+                  // explicitly pick a built-in model chip below (or "(none)"
+                  // + another chip) to override, which clears the preset
+                  // so the two dimensions can't drift.
+                  onChange({ model: pinned || trimmedModel, preset: p.name });
                 }}
               >
                 <span aria-hidden="true">⚙</span>
                 <span>{p.name}</span>
               </button>
             );
-          })
-        : null}
-      {modelOptions.map((modelId) => {
-        const active = trimmedModel === modelId && !trimmedPreset;
-        return (
+          })}
+        </div>
+      ) : null}
+      <div style={compactChipRowStyle}>
+        <span style={inlineDimensionLabelStyle}>Model</span>
+        {activePreset ? (
+          // Preset active — this row is read-only: the endpoint dictates
+          // the model. Rendered with the teal "active" style so the user
+          // sees WHICH model the preset pins without a misleading
+          // "click to pick" affordance.
           <button
-            key={`${backend}:${modelId}`}
+            key={`${backend}:preset-pinned`}
             type="button"
-            aria-label={`model:${backend}:${modelId}`}
-            aria-pressed={active}
-            style={modelChipStyle(active)}
-            onClick={() => onChange({ model: modelId, preset: '' })}
+            aria-label={`model:${backend}:${presetPinnedModel || '(preset)'}`}
+            aria-pressed={true}
+            disabled
+            title="Model is set by the active preset. Clear the preset to pick another."
+            style={{ ...modelChipStyle(true), cursor: 'default', opacity: 0.95 }}
           >
-            {modelId}
+            {presetPinnedModel || '(defined by preset)'}
           </button>
-        );
-      })}
+        ) : (
+          modelOptions.map((modelId) => {
+            const active = trimmedModel === modelId;
+            return (
+              <button
+                key={`${backend}:${modelId}`}
+                type="button"
+                aria-label={`model:${backend}:${modelId}`}
+                aria-pressed={active}
+                style={modelChipStyle(active)}
+                onClick={() => onChange({ model: modelId, preset: '' })}
+              >
+                {modelId}
+              </button>
+            );
+          })
+        )}
+      </div>
     </div>
   );
 }
+
+/** Vertical stack for the two-row (Preset / Model) selector. Tighter than
+ *  `fieldLabelStyle`'s flex-column so the rows sit close together. */
+const chipGroupStyle = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 4,
+} as const;
 
 function formatMemberIdentity(member: TeamDetail['members'][number]): string {
   const displayName = member.display_name?.trim();
