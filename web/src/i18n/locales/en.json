@@ -173,7 +173,11 @@
     "thinking_title": "Level: {{value}}",
     "supervision": {
       "title": "Session supervision",
-      "help": "Choose a backend and model before enabling supervision.",
+      "help": "Set global defaults for new Auto-enabled sessions, then override them for this session when needed.",
+      "globalDefaultsTitle": "Global defaults",
+      "globalDefaultsHelp": "Used to prefill new Auto-enabled transport sessions. Saving here updates your default supervisor backend, model, and timeout.",
+      "sessionConfigTitle": "This session",
+      "sessionConfigHelp": "Applies only to the current session. Backend/model/timeout can override the defaults here, while audit mode and custom instructions stay session-only.",
       "intro": {
         "title": "What Auto does",
         "howToUseTitle": "How to use it",

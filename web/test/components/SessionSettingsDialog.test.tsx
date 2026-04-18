@@ -61,13 +61,13 @@ describe('SessionSettingsDialog supervision', () => {
       />,
     );
 
-    fireEvent.change(screen.getAllByRole('combobox')[1]!, { target: { value: 'supervised' } });
-    expect(screen.getByText('backend')).toBeDefined();
-    expect(screen.getByText('model')).toBeDefined();
+    fireEvent.change(screen.getAllByRole('combobox')[3]!, { target: { value: 'supervised' } });
+    expect(screen.getAllByText('backend').length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText('model').length).toBeGreaterThanOrEqual(2);
     expect((screen.getByRole('button', { name: /save/i }) as HTMLButtonElement).disabled).toBe(true);
 
-    fireEvent.change(screen.getAllByRole('combobox')[2]!, { target: { value: 'codex-sdk' } });
-    fireEvent.change(screen.getAllByRole('combobox')[3]!, { target: { value: CODEX_MODEL_IDS[0] } });
+    fireEvent.change(screen.getAllByRole('combobox')[4]!, { target: { value: 'codex-sdk' } });
+    fireEvent.change(screen.getAllByRole('combobox')[5]!, { target: { value: CODEX_MODEL_IDS[0] } });
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
     await waitFor(() => {
@@ -81,10 +81,7 @@ describe('SessionSettingsDialog supervision', () => {
         }),
       }));
     });
-    expect(saveSupervisorDefaultsMock).toHaveBeenCalledWith(expect.objectContaining({
-      backend: 'codex-sdk',
-      model: CODEX_MODEL_IDS[0],
-    }));
+    expect(saveSupervisorDefaultsMock).not.toHaveBeenCalled();
     expect(onSaved).toHaveBeenCalledWith(expect.objectContaining({
       transportConfig: expect.objectContaining({
         supervision: expect.objectContaining({
@@ -115,13 +112,13 @@ describe('SessionSettingsDialog supervision', () => {
       />,
     );
 
-    fireEvent.change(screen.getAllByRole('combobox')[1]!, { target: { value: 'supervised_audit' } });
+    fireEvent.change(screen.getAllByRole('combobox')[3]!, { target: { value: 'supervised_audit' } });
     expect(screen.getByText('auditModeLabel')).toBeDefined();
     expect(screen.getByText('maxAuditLoops')).toBeDefined();
 
-    fireEvent.change(screen.getAllByRole('combobox')[2]!, { target: { value: 'claude-code-sdk' } });
-    fireEvent.change(screen.getAllByRole('combobox')[3]!, { target: { value: CLAUDE_CODE_MODEL_IDS[0] } });
-    fireEvent.change(screen.getAllByRole('combobox')[4]!, { target: { value: 'audit>plan' } });
+    fireEvent.change(screen.getAllByRole('combobox')[4]!, { target: { value: 'claude-code-sdk' } });
+    fireEvent.change(screen.getAllByRole('combobox')[5]!, { target: { value: CLAUDE_CODE_MODEL_IDS[0] } });
+    fireEvent.change(screen.getAllByRole('combobox')[6]!, { target: { value: 'audit>plan' } });
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
     await waitFor(() => {
@@ -162,8 +159,8 @@ describe('SessionSettingsDialog supervision', () => {
       expect(fetchSupervisorDefaultsMock).toHaveBeenCalledTimes(1);
     });
 
-    fireEvent.change(screen.getAllByRole('combobox')[1]!, { target: { value: 'supervised' } });
-    expect(screen.getByDisplayValue('18')).toBeDefined();
+    fireEvent.change(screen.getAllByRole('combobox')[3]!, { target: { value: 'supervised' } });
+    expect(screen.getAllByDisplayValue('18').length).toBeGreaterThanOrEqual(2);
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
     await waitFor(() => {
@@ -231,9 +228,9 @@ describe('SessionSettingsDialog supervision', () => {
       />,
     );
 
-    fireEvent.change(screen.getAllByRole('combobox')[1]!, { target: { value: 'supervised' } });
-    fireEvent.change(screen.getAllByRole('combobox')[2]!, { target: { value: 'codex-sdk' } });
-    fireEvent.change(screen.getAllByRole('combobox')[3]!, { target: { value: CODEX_MODEL_IDS[0] } });
+    fireEvent.change(screen.getAllByRole('combobox')[3]!, { target: { value: 'supervised' } });
+    fireEvent.change(screen.getAllByRole('combobox')[4]!, { target: { value: 'codex-sdk' } });
+    fireEvent.change(screen.getAllByRole('combobox')[5]!, { target: { value: CODEX_MODEL_IDS[0] } });
     fireEvent.input(screen.getByPlaceholderText('customInstructionsPlaceholder'), {
       target: { value: 'Always require tests and clean verification before complete.' },
     });
@@ -269,6 +266,8 @@ describe('SessionSettingsDialog supervision', () => {
     expect(screen.getByText('howToUseTitle')).toBeDefined();
     expect(screen.getByText('purposeTitle')).toBeDefined();
     expect(screen.getByText('howItWorksTitle')).toBeDefined();
+    expect(screen.getByText('globalDefaultsTitle')).toBeDefined();
+    expect(screen.getByText('sessionConfigTitle')).toBeDefined();
   });
 
   it('shows unsupported copy for process sessions', () => {
@@ -334,9 +333,9 @@ describe('SessionSettingsDialog supervision', () => {
       />,
     );
 
-    fireEvent.change(screen.getAllByRole('combobox')[1]!, { target: { value: 'supervised' } });
-    fireEvent.change(screen.getAllByRole('combobox')[2]!, { target: { value: 'codex-sdk' } });
-    fireEvent.change(screen.getAllByRole('combobox')[3]!, { target: { value: CODEX_MODEL_IDS[0] } });
+    fireEvent.change(screen.getAllByRole('combobox')[3]!, { target: { value: 'supervised' } });
+    fireEvent.change(screen.getAllByRole('combobox')[4]!, { target: { value: 'codex-sdk' } });
+    fireEvent.change(screen.getAllByRole('combobox')[5]!, { target: { value: CODEX_MODEL_IDS[0] } });
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
     await waitFor(() => {
@@ -355,5 +354,36 @@ describe('SessionSettingsDialog supervision', () => {
         }),
       }),
     }));
+  });
+
+  it('saves global supervisor defaults without patching the session when only defaults changed', async () => {
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        transportConfig={null}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    fireEvent.change(screen.getAllByRole('combobox')[1]!, { target: { value: 'claude-code-sdk' } });
+    fireEvent.change(screen.getAllByRole('combobox')[2]!, { target: { value: CLAUDE_CODE_MODEL_IDS[0] } });
+    fireEvent.input(screen.getByDisplayValue('12'), { target: { value: '30' } });
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => {
+      expect(saveSupervisorDefaultsMock).toHaveBeenCalledWith(expect.objectContaining({
+        backend: 'claude-code-sdk',
+        model: CLAUDE_CODE_MODEL_IDS[0],
+        timeoutMs: 30_000,
+      }));
+    });
+    expect(patchSessionMock).not.toHaveBeenCalled();
+    expect(patchSubSessionMock).not.toHaveBeenCalled();
   });
 });

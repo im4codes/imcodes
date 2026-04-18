@@ -173,7 +173,11 @@
     "thinking_title": "Nivel: {{value}}",
     "supervision": {
       "title": "Supervisión de sesión",
-      "help": "Elige un backend y un modelo antes de activar la supervisión.",
+      "help": "Primero define los valores globales por defecto para nuevas sesiones con Auto y, cuando haga falta, sobreescríbelos para esta sesión.",
+      "globalDefaultsTitle": "Valores globales por defecto",
+      "globalDefaultsHelp": "Se usan para rellenar nuevas sesiones transport con Auto. Aquí guardas tu backend, modelo y timeout por defecto para supervisión.",
+      "sessionConfigTitle": "Esta sesión",
+      "sessionConfigHelp": "Solo se aplica a la sesión actual. Aquí backend/modelo/timeout pueden sobrescribir los valores globales, mientras que el modo de auditoría y las instrucciones personalizadas siguen siendo solo de esta sesión.",
       "intro": {
         "title": "Qué hace Auto",
         "howToUseTitle": "Cómo usarlo",

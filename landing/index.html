@@ -304,7 +304,7 @@ footer {
     <li data-i18n="auto_1">Per-session Auto modes: Off, Supervised, and Supervised + audit.</li>
     <li data-i18n="auto_2">At the idle boundary, Auto can classify a turn as complete, continue, or ask_human, then dispatch the next continue prompt in the same session.</li>
     <li data-i18n="auto_3">Supervised + audit can run an audit→rework loop before handing control back, so finished work is reviewed instead of trusted blindly.</li>
-    <li data-i18n="auto_4">Supervisor backend/model, timeout, audit mode, and custom instructions are configurable per session.</li>
+    <li data-i18n="auto_4">Set global supervisor defaults for new sessions, then override backend/model/timeout, audit mode, and custom instructions per session.</li>
   </ul>
 </section>
 
@@ -498,7 +498,7 @@ const I18N = {
     auto_1: 'Per-session Auto modes: Off, Supervised, and Supervised + audit.',
     auto_2: 'At the idle boundary, Auto can classify a turn as complete, continue, or ask_human, then dispatch the next continue prompt in the same session.',
     auto_3: 'Supervised + audit can run an audit→rework loop before handing control back, so finished work is reviewed instead of trusted blindly.',
-    auto_4: 'Supervisor backend/model, timeout, audit mode, and custom instructions are configurable per session.',
+    auto_4: 'Set global supervisor defaults for new sessions, then override backend/model/timeout, audit mode, and custom instructions per session.',
     f_memory_name: 'shared agent context',
     f_memory_desc: 'problem→solution memory, multilingual recall, automatic per-message and startup injection with visible timeline cards',
     f_auto_name: 'supervised execution',
@@ -531,7 +531,7 @@ const I18N = {
     auto_1: '按 session 配置 Auto 模式：Off、Supervised、Supervised + audit。',
     auto_2: '在 idle 边界，Auto 会把一轮判成 complete、continue 或 ask_human，并把后续 continue prompt 直接发回同一 session。',
     auto_3: 'Supervised + audit 可在交还控制权前自动跑审计→返工闭环，不再盲目信任“看起来完成了”的结果。',
-    auto_4: '监督模型后端/模型、超时、审计模式和自定义提示词都可以按 session 配置。',
+    auto_4: '先为新 session 设置全局监督默认值，再按 session 覆盖后端/模型/超时、审计模式和自定义提示词。',
     f_memory_name: '共享代理上下文',
     f_memory_desc: '问题→解决方案记忆、多语言召回、按消息/启动自动注入，并在时间线中可见',
     f_auto_name: '受监督执行',
@@ -605,7 +605,7 @@ const I18N = {
     auto_1: '按 session 設定 Auto 模式：Off、Supervised、Supervised + audit。',
     auto_2: '在 idle 邊界，Auto 會把一輪判成 complete、continue 或 ask_human，並把後續 continue prompt 直接送回同一個 session。',
     auto_3: 'Supervised + audit 可在交還控制權前自動跑審計→返工閉環，不再盲目信任「看起來完成了」的結果。',
-    auto_4: '監督模型後端/模型、逾時、審計模式和自訂提示詞都可以按 session 設定。',
+    auto_4: '先為新 session 設定全域監督預設值，再按 session 覆蓋後端/模型/逾時、審計模式和自訂提示詞。',
     f_memory_name: '共享代理上下文',
     f_memory_desc: '問題→解決方案記憶、多語言召回、按訊息/啟動自動注入，並在時間線中可見',
     f_auto_name: '受監督執行',
@@ -679,7 +679,7 @@ const I18N = {
     auto_1: 'セッション単位の Auto モード: Off / Supervised / Supervised + audit。',
     auto_2: 'idle 境界でターンを complete / continue / ask_human に分類し、次の continue prompt を同じ session に送れます。',
     auto_3: 'Supervised + audit は制御を返す前に audit→rework ループを回せるので、完了したように見える結果を盲信しません。',
-    auto_4: '監督バックエンド/モデル、タイムアウト、監査モード、カスタム指示はセッションごとに設定できます。',
+    auto_4: '新しい session 向けにグローバルな監督既定値を設定し、必要に応じて backend/model/timeout・監査モード・カスタム指示を session ごとに上書きできます。',
     f_memory_name: '共有エージェントコンテキスト',
     f_memory_desc: '問題→解決の記憶、多言語リコール、メッセージ時/起動時の自動注入をタイムラインで可視化',
     f_auto_name: '監督付き実行',
@@ -753,7 +753,7 @@ const I18N = {
     auto_1: '세션별 Auto 모드: Off, Supervised, Supervised + audit.',
     auto_2: 'idle 경계에서 턴을 complete, continue, ask_human으로 분류하고 다음 continue prompt를 같은 session에 보낼 수 있습니다.',
     auto_3: 'Supervised + audit는 제어를 돌려주기 전에 audit→rework 루프를 실행해, 겉보기 완료 결과를 그대로 믿지 않게 합니다.',
-    auto_4: '감독 백엔드/모델, 제한 시간, 감사 모드, 사용자 지침을 세션별로 설정할 수 있습니다.',
+    auto_4: '새 session용 전역 supervisor 기본값을 정한 뒤, 필요하면 session별로 백엔드/모델/타임아웃, audit 모드, custom instructions를 덮어쓸 수 있습니다.',
     f_memory_name: '공유 에이전트 컨텍스트',
     f_memory_desc: '문제→해결 메모리, 다국어 리콜, 메시지/시작 시 자동 주입을 타임라인에서 가시화',
     f_auto_name: '감독된 실행',
@@ -827,7 +827,7 @@ const I18N = {
     auto_1: 'Modos Auto por sesión: Off, Supervised y Supervised + audit.',
     auto_2: 'En el límite idle, Auto puede clasificar un turno como complete, continue o ask_human y enviar el siguiente continue prompt dentro de la misma session.',
     auto_3: 'Supervised + audit puede ejecutar un bucle audit→rework antes de devolverte el control, así que el trabajo terminado se revisa en lugar de confiarse a ciegas.',
-    auto_4: 'Backend/modelo del supervisor, timeout, modo de auditoría e instrucciones personalizadas se configuran por sesión.',
+    auto_4: 'Define valores globales del supervisor para nuevas sesiones y, cuando haga falta, sobrescribe backend/modelo/timeout, modo de auditoría e instrucciones personalizadas por sesión.',
     f_memory_name: 'contexto compartido para agentes',
     f_memory_desc: 'memoria problema→solución, recuperación multilingüe e inyección automática por mensaje y al iniciar, visible en la línea de tiempo',
     f_auto_name: 'ejecución supervisada',
@@ -901,7 +901,7 @@ const I18N = {
     auto_1: 'Режимы Auto на уровне session: Off, Supervised и Supervised + audit.',
     auto_2: 'На границе idle Auto может классифицировать ход как complete, continue или ask_human и отправить следующий continue prompt в ту же session.',
     auto_3: 'Supervised + audit может прогнать цикл audit→rework до возврата управления, так что «похоже завершённую» работу не приходится принимать на веру.',
-    auto_4: 'Бэкенд/модель супервизора, timeout, режим аудита и пользовательские инструкции настраиваются отдельно для каждой session.',
+    auto_4: 'Сначала задайте глобальные значения supervisor для новых session, а затем при необходимости переопределяйте backend/model/timeout, режим audit и пользовательские инструкции для конкретной session.',
     f_memory_name: 'общий контекст агентов',
     f_memory_desc: 'память проблема→решение, многоязычный recall и автоматическая инъекция при сообщении и старте сессии с видимостью в таймлайне',
     f_auto_name: 'supervised execution',

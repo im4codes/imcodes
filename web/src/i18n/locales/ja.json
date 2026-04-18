@@ -173,7 +173,11 @@
     "thinking_title": "レベル: {{value}}",
     "supervision": {
       "title": "セッション監督",
-      "help": "監督を有効にする前に、バックエンドとモデルを選択してください。",
+      "help": "まず新しい Auto セッション向けのグローバル既定値を設定し、必要に応じてこのセッション専用の設定で上書きします。",
+      "globalDefaultsTitle": "グローバル既定値",
+      "globalDefaultsHelp": "新しい Auto 対応 transport セッションの初期値として使われます。ここで監督バックエンド、モデル、タイムアウトの既定値を保存します。",
+      "sessionConfigTitle": "このセッション",
+      "sessionConfigHelp": "現在のセッションにだけ適用されます。ここではバックエンド、モデル、タイムアウトで既定値を上書きでき、監査モードとカスタム指示もこのセッション専用です。",
       "intro": {
         "title": "Auto の役割",
         "howToUseTitle": "使い方",

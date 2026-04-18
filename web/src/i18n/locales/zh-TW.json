@@ -173,7 +173,11 @@
     "thinking_title": "等級：{{value}}",
     "supervision": {
       "title": "工作階段監督",
-      "help": "啟用監督前，先選擇後端與模型。",
+      "help": "先設定新 Auto 會話預設使用的全域配置，再依需求覆蓋目前會話配置。",
+      "globalDefaultsTitle": "全域預設配置",
+      "globalDefaultsHelp": "用來預填新的 Auto transport 會話。這裡保存的是你的預設監督後端、模型與逾時。",
+      "sessionConfigTitle": "目前會話配置",
+      "sessionConfigHelp": "只套用到目前會話。這裡的後端、模型、逾時可覆蓋全域預設，審計模式與自訂提示詞也只在目前會話生效。",
       "intro": {
         "title": "Auto 是做什麼的",
         "howToUseTitle": "怎麼用",

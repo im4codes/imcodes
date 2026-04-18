@@ -18,6 +18,7 @@ import {
   hasInvalidSessionSupervisionSnapshot,
   isSupportedSupervisionAuditMode,
   isSupportedSupervisionBackend,
+  normalizeSupervisorDefaultConfig,
   readSupervisionSnapshotFromTransportConfig,
   resolveSupervisionModelForBackend,
   SUPERVISION_PROMPT_VERSION,
@@ -26,7 +27,6 @@ import {
   TASK_RUN_PROMPT_VERSION,
   type SupervisionAuditMode,
   type SupervisionMode,
-  type SessionSupervisionSnapshot,
 } from '@shared/supervision-config.js';
 
 interface Props {
@@ -58,6 +58,8 @@ type SupervisionDraft = {
   maxAuditLoops?: number;
   taskRunPromptVersion?: string;
 };
+
+type SupervisionRuntimeDraft = Pick<SupervisionDraft, 'backend' | 'model' | 'timeoutMs' | 'promptVersion'>;
 
 function timeoutMsToUiSeconds(timeoutMs: number | undefined): number {
   const safeMs = typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0
@@ -140,6 +142,92 @@ function SupervisionIntroCard({ t }: { t: (key: string, params?: Record<string, 
   );
 }
 
+function SupervisionRuntimeFields({
+  t,
+  saving,
+  backend,
+  model,
+  timeoutSeconds,
+  modelOptions,
+  onBackendChange,
+  onModelChange,
+  onTimeoutChange,
+}: {
+  t: (key: string, params?: Record<string, unknown>) => string;
+  saving: boolean;
+  backend: SharedContextRuntimeBackend | '';
+  model: string;
+  timeoutSeconds: number;
+  modelOptions: readonly string[];
+  onBackendChange: (backend: string) => void;
+  onModelChange: (model: string) => void;
+  onTimeoutChange: (seconds: number) => void;
+}) {
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 12 }}>
+      <div>
+        <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.backend')}</div>
+        <select
+          class="input"
+          value={backend}
+          onChange={(e) => onBackendChange((e.target as HTMLSelectElement).value)}
+          style={{ width: '100%' }}
+          disabled={saving}
+        >
+          <option value="">{t('session.supervision.selectBackend')}</option>
+          {getSupportedSupervisionBackendOptions().map((option) => (
+            <option key={option} value={option}>{labelForBackend(t, option)}</option>
+          ))}
+        </select>
+      </div>
+
+      <div>
+        <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.model')}</div>
+        {backend === 'openclaw' ? (
+          <input
+            class="input"
+            value={model}
+            onInput={(e) => onModelChange((e.target as HTMLInputElement).value)}
+            style={{ width: '100%' }}
+            disabled={saving}
+            placeholder={t('session.supervision.selectModel')}
+          />
+        ) : (
+          <select
+            class="input"
+            value={model}
+            onChange={(e) => onModelChange((e.target as HTMLSelectElement).value)}
+            style={{ width: '100%' }}
+            disabled={saving || !backend}
+          >
+            <option value="">{t('session.supervision.selectModel')}</option>
+            {(backend ? modelOptions : []).map((option) => (
+              <option key={option} value={option}>{option}</option>
+            ))}
+          </select>
+        )}
+      </div>
+
+      <div>
+        <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.timeout')}</div>
+        <input
+          class="input"
+          type="number"
+          min={1}
+          step={1}
+          value={String(timeoutSeconds)}
+          onInput={(e) => {
+            const value = Number.parseInt((e.target as HTMLInputElement).value, 10);
+            onTimeoutChange(Number.isFinite(value) && value > 0 ? value : timeoutSeconds);
+          }}
+          style={{ width: '100%' }}
+          disabled={saving}
+        />
+      </div>
+    </div>
+  );
+}
+
 export function SessionSettingsDialog({
   serverId,
   sessionName,
@@ -171,6 +259,8 @@ export function SessionSettingsDialog({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const [supervision, setSupervision] = useState<SupervisionDraft>(initialSupervision);
+  const [supervisorDefaults, setSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
+  const [initialSupervisorDefaults, setInitialSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
 
   useEffect(() => {
     setLabel(initLabel);
@@ -185,20 +275,23 @@ export function SessionSettingsDialog({
   const isAuditMode = supervision.mode === 'supervised_audit';
 
   useEffect(() => {
-    if (!isSupportedTransport || hasPersistedSupervision) return;
+    if (!isSupportedTransport) return;
     let cancelled = false;
     void fetchSupervisorDefaults()
       .then((defaults) => {
-        if (!defaults) return;
         if (cancelled) return;
+        const resolvedDefaults = normalizeSupervisorDefaultConfig(defaults);
+        setSupervisorDefaults(resolvedDefaults);
+        setInitialSupervisorDefaults(resolvedDefaults);
+        if (hasPersistedSupervision) return;
         setSupervision((prev) => {
           if (prev.backend || prev.model) return prev;
           return {
             ...prev,
-            backend: defaults.backend,
-            model: defaults.model,
-            timeoutMs: defaults.timeoutMs,
-            promptVersion: defaults.promptVersion,
+            backend: resolvedDefaults.backend,
+            model: resolvedDefaults.model,
+            timeoutMs: resolvedDefaults.timeoutMs,
+            promptVersion: resolvedDefaults.promptVersion,
             maxParseRetries: prev.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
             maxAuditLoops: prev.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS,
             taskRunPromptVersion: prev.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION,
@@ -221,42 +314,31 @@ export function SessionSettingsDialog({
   const supervisionAuditMode = supervision.auditMode;
   const supervisionAuditLoops = supervision.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS;
   const taskRunPromptVersion = supervision.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION;
-
   const modelOptions = supervisionBackend ? getSupervisionModelOptions(supervisionBackend) : [];
+  const supervisorDefaultsBackend = normalizeBackendValue(String(supervisorDefaults.backend ?? ''));
+  const supervisorDefaultsModel = typeof supervisorDefaults.model === 'string' ? supervisorDefaults.model : '';
+  const supervisorDefaultsTimeout = supervisorDefaults.timeoutMs ?? DEFAULT_SUPERVISION_TIMEOUT_MS;
+  const supervisorDefaultsTimeoutSeconds = timeoutMsToUiSeconds(supervisorDefaultsTimeout);
+  const supervisorDefaultsPromptVersion = supervisorDefaults.promptVersion ?? SUPERVISION_PROMPT_VERSION;
+  const supervisorDefaultsModelOptions = supervisorDefaultsBackend ? getSupervisionModelOptions(supervisorDefaultsBackend) : [];
 
-  const hasChanges = useMemo(() => {
-    const nextTransportConfig = buildTransportConfigWithSupervision(transportConfig, {
-      mode: supervision.mode,
-      backend: supervisionBackend || undefined,
-      model: supervisionModel.trim() || undefined,
-      timeoutMs: supervisionTimeout,
-      promptVersion: supervisionPromptVersion,
-      customInstructions: supervisionCustomInstructions.trim() || undefined,
-      maxParseRetries: supervisionParseRetries,
-      ...(isAuditMode
-        ? {
-            auditMode: supervisionAuditMode,
-            maxAuditLoops: supervisionAuditLoops,
-            taskRunPromptVersion,
-          }
-        : {}),
-    });
-    return (
-      label !== initLabel
-      || description !== initDesc
-      || cwd !== initCwd
-      || agentType !== type
-      || JSON.stringify(nextTransportConfig ?? null) !== JSON.stringify(transportConfig ?? null)
-    );
-  }, [
-    agentType,
-    cwd,
-    description,
-    initCwd,
-    initDesc,
-    initLabel,
+  const nextTransportConfig = useMemo(() => buildTransportConfigWithSupervision(transportConfig, {
+    mode: supervision.mode,
+    backend: supervisionBackend || undefined,
+    model: supervisionModel.trim() || undefined,
+    timeoutMs: supervisionTimeout,
+    promptVersion: supervisionPromptVersion,
+    customInstructions: supervisionCustomInstructions.trim() || undefined,
+    maxParseRetries: supervisionParseRetries,
+    ...(isAuditMode
+      ? {
+          auditMode: supervisionAuditMode,
+          maxAuditLoops: supervisionAuditLoops,
+          taskRunPromptVersion,
+        }
+      : {}),
+  }), [
     isAuditMode,
-    label,
     supervision.mode,
     supervisionAuditLoops,
     supervisionAuditMode,
@@ -268,8 +350,33 @@ export function SessionSettingsDialog({
     supervisionTimeout,
     taskRunPromptVersion,
     transportConfig,
+  ]);
+
+  const hasSessionChanges = useMemo(() => (
+    label !== initLabel
+    || description !== initDesc
+    || cwd !== initCwd
+    || agentType !== type
+    || JSON.stringify(nextTransportConfig ?? null) !== JSON.stringify(transportConfig ?? null)
+  ), [
+    agentType,
+    cwd,
+    description,
+    initCwd,
+    initDesc,
+    initLabel,
+    label,
+    nextTransportConfig,
+    transportConfig,
     type,
   ]);
+
+  const hasGlobalDefaultsChanges = useMemo(() => JSON.stringify(supervisorDefaults) !== JSON.stringify(initialSupervisorDefaults), [
+    initialSupervisorDefaults,
+    supervisorDefaults,
+  ]);
+
+  const hasChanges = hasSessionChanges || hasGlobalDefaultsChanges;
 
   const renderTypeLabel = (value: string): string => {
     switch (value) {
@@ -328,36 +435,32 @@ export function SessionSettingsDialog({
     });
   };
 
+  const updateRuntimeDraft = (
+    previous: SupervisionRuntimeDraft,
+    nextBackendValue: string,
+  ): SupervisionRuntimeDraft => {
+    if (!isSupportedSupervisionBackend(nextBackendValue)) {
+      return { ...previous, backend: undefined, model: undefined };
+    }
+    return {
+      ...previous,
+      backend: nextBackendValue,
+      model: resolveSupervisionModelForBackend(nextBackendValue, previous.model ?? '', previous.backend),
+    };
+  };
+
   const handleSave = async () => {
     setSaving(true);
     setError('');
     try {
-      if (hasSupervision && supervisionBackend && supervisionModel.trim()) {
+      if (hasGlobalDefaultsChanges) {
         await saveSupervisorDefaults({
-          backend: supervisionBackend,
-          model: supervisionModel.trim(),
-          timeoutMs: supervisionTimeout,
-          promptVersion: supervisionPromptVersion,
+          backend: supervisorDefaultsBackend || undefined,
+          model: supervisorDefaultsModel.trim(),
+          timeoutMs: supervisorDefaultsTimeout,
+          promptVersion: supervisorDefaultsPromptVersion,
         });
       }
-
-      const nextSupervision = {
-        mode: supervision.mode,
-        backend: supervisionBackend || undefined,
-        model: supervisionModel.trim() || undefined,
-        timeoutMs: supervisionTimeout,
-        promptVersion: supervisionPromptVersion,
-        customInstructions: supervisionCustomInstructions.trim() || undefined,
-        maxParseRetries: supervisionParseRetries,
-        ...(isAuditMode
-          ? {
-              auditMode: supervisionAuditMode,
-              maxAuditLoops: supervisionAuditLoops,
-              taskRunPromptVersion,
-            }
-          : {}),
-      } satisfies Partial<SessionSupervisionSnapshot>;
-      const nextTransportConfig = buildTransportConfigWithSupervision(transportConfig, nextSupervision);
 
       const fields: {
         label?: string | null;
@@ -376,6 +479,11 @@ export function SessionSettingsDialog({
       }
       if (JSON.stringify(nextTransportConfig ?? null) !== JSON.stringify(transportConfig ?? null)) {
         fields.transportConfig = nextTransportConfig;
+      }
+
+      if (Object.keys(fields).length === 0) {
+        onClose();
+        return;
       }
 
       if (subSessionId) {
@@ -399,6 +507,14 @@ export function SessionSettingsDialog({
   };
 
   const supervisionModeLabel = labelForMode(t, supervision.mode);
+  const globalDefaultsValid = useMemo(() => {
+    if (!isSupportedTransport) return true;
+    if (!supervisorDefaultsBackend) return false;
+    if (!supervisorDefaultsModel.trim()) return false;
+    if (supervisorDefaultsBackend !== 'openclaw' && !isKnownSharedContextModelForBackend(supervisorDefaultsBackend, supervisorDefaultsModel.trim())) return false;
+    if (supervisorDefaultsTimeout <= 0) return false;
+    return true;
+  }, [isSupportedTransport, supervisorDefaultsBackend, supervisorDefaultsModel, supervisorDefaultsTimeout]);
 
   const supervisionPanel = isSupportedTransport ? (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
@@ -408,200 +524,182 @@ export function SessionSettingsDialog({
         {t('session.supervision.help')}
       </div>
 
-      <div>
-        <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.modeLabel')}</div>
-        <select
-          class="input"
-          value={supervision.mode}
-          onChange={(e) => handleModeChange((e.target as HTMLSelectElement).value as SupervisionMode)}
-          style={{ width: '100%' }}
-          disabled={saving}
-        >
-          {SUPERVISION_MODES.map((mode) => (
-            <option key={mode} value={mode}>{t(`session.supervision.mode.${mode}`)}</option>
-          ))}
-        </select>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10, padding: 12, borderRadius: 10, background: 'rgba(15, 23, 42, 0.45)', border: '1px solid rgba(148, 163, 184, 0.16)' }}>
+        <div style={{ fontSize: 12, color: '#e2e8f0', fontWeight: 600 }}>
+          {t('session.supervision.globalDefaultsTitle')}
+        </div>
+        <div style={{ fontSize: 12, color: '#94a3b8' }}>
+          {t('session.supervision.globalDefaultsHelp')}
+        </div>
+        <SupervisionRuntimeFields
+          t={t}
+          saving={saving}
+          backend={supervisorDefaultsBackend}
+          model={supervisorDefaultsModel}
+          timeoutSeconds={supervisorDefaultsTimeoutSeconds}
+          modelOptions={supervisorDefaultsModelOptions}
+          onBackendChange={(nextBackend) => {
+            setSupervisorDefaults((prev) => ({ ...prev, ...updateRuntimeDraft(prev, nextBackend) }));
+          }}
+          onModelChange={(model) => setSupervisorDefaults((prev) => ({ ...prev, model }))}
+          onTimeoutChange={(seconds) => setSupervisorDefaults((prev) => ({ ...prev, timeoutMs: timeoutUiSecondsToMs(seconds) }))}
+        />
+
+        {!supervisorDefaultsBackend && (
+          <div style={{ color: '#fbbf24', fontSize: 12 }}>
+            {t('session.supervision.validation.backendRequired')}
+          </div>
+        )}
+
+        {supervisorDefaultsBackend && !supervisorDefaultsModel.trim() && (
+          <div style={{ color: '#fbbf24', fontSize: 12 }}>
+            {t('session.supervision.validation.modelRequired')}
+          </div>
+        )}
+
+        {supervisorDefaultsBackend && supervisorDefaultsModel.trim() && supervisorDefaultsBackend !== 'openclaw' && !isKnownSharedContextModelForBackend(supervisorDefaultsBackend, supervisorDefaultsModel.trim()) && (
+          <div style={{ color: '#f87171', fontSize: 12 }}>
+            {t('session.supervision.validation.modelInvalid', { backend: labelForBackend(t, supervisorDefaultsBackend) })}
+          </div>
+        )}
       </div>
 
-      {hasSupervision && (
-        <>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 12 }}>
-            <div>
-              <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.backend')}</div>
-              <select
-                class="input"
-                value={supervisionBackend}
-                onChange={(e) => {
-                  const next = (e.target as HTMLSelectElement).value;
-                  setSupervision((prev) => {
-                    if (!isSupportedSupervisionBackend(next)) {
-                      return { ...prev, backend: undefined as never, model: undefined as never };
-                    }
-                    return {
-                      ...prev,
-                      backend: next,
-                      model: resolveSupervisionModelForBackend(next, prev.model ?? '', prev.backend),
-                    };
-                  });
-                }}
-                style={{ width: '100%' }}
-                disabled={saving}
-              >
-                <option value="">{t('session.supervision.selectBackend')}</option>
-                {getSupportedSupervisionBackendOptions().map((backend) => (
-                  <option key={backend} value={backend}>{labelForBackend(t, backend)}</option>
-                ))}
-              </select>
-            </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10, padding: 12, borderRadius: 10, background: 'rgba(15, 23, 42, 0.45)', border: '1px solid rgba(148, 163, 184, 0.16)' }}>
+        <div style={{ fontSize: 12, color: '#e2e8f0', fontWeight: 600 }}>
+          {t('session.supervision.sessionConfigTitle')}
+        </div>
+        <div style={{ fontSize: 12, color: '#94a3b8' }}>
+          {t('session.supervision.sessionConfigHelp')}
+        </div>
 
-            <div>
-              <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.model')}</div>
-                {supervisionBackend === 'openclaw' ? (
-                <input
-                  class="input"
-                  value={supervisionModel}
-                  onInput={(e) => setSupervision((prev) => ({ ...prev, model: (e.target as HTMLInputElement).value }))}
-                  style={{ width: '100%' }}
-                  disabled={saving}
-                  placeholder={t('session.supervision.selectModel')}
-                />
-              ) : (
-                <select
-                  class="input"
-                  value={supervisionModel}
-                  onChange={(e) => setSupervision((prev) => ({ ...prev, model: (e.target as HTMLSelectElement).value }))}
-                  style={{ width: '100%' }}
-                  disabled={saving || !supervisionBackend}
-                >
-                  <option value="">{t('session.supervision.selectModel')}</option>
-                  {(supervisionBackend ? modelOptions : []).map((model) => (
-                    <option key={model} value={model}>{model}</option>
-                  ))}
-                </select>
-              )}
-            </div>
+        <div>
+          <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.modeLabel')}</div>
+          <select
+            class="input"
+            value={supervision.mode}
+            onChange={(e) => handleModeChange((e.target as HTMLSelectElement).value as SupervisionMode)}
+            style={{ width: '100%' }}
+            disabled={saving}
+          >
+            {SUPERVISION_MODES.map((mode) => (
+              <option key={mode} value={mode}>{t(`session.supervision.mode.${mode}`)}</option>
+            ))}
+          </select>
+        </div>
 
-            <div>
-              <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.timeout')}</div>
-              <input
-                class="input"
-                type="number"
-                min={1}
-                step={1}
-                value={String(supervisionTimeoutSeconds)}
-                onInput={(e) => {
-                  const value = Number.parseInt((e.target as HTMLInputElement).value, 10);
-                  setSupervision((prev) => ({
-                    ...prev,
-                    timeoutMs: Number.isFinite(value) && value > 0
-                      ? timeoutUiSecondsToMs(value)
-                      : DEFAULT_SUPERVISION_TIMEOUT_MS,
-                  }));
-                }}
-                style={{ width: '100%' }}
-                disabled={saving}
-              />
-            </div>
-          </div>
-
-          <div>
-            <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.customInstructionsLabel')}</div>
-            <textarea
-              class="input"
-              value={supervisionCustomInstructions}
-              onInput={(e) => setSupervision((prev) => ({ ...prev, customInstructions: (e.target as HTMLTextAreaElement).value }))}
-              rows={4}
-              style={{ width: '100%', resize: 'vertical' }}
-              disabled={saving}
-              placeholder={t('session.supervision.customInstructionsPlaceholder')}
+        {hasSupervision && (
+          <>
+            <SupervisionRuntimeFields
+              t={t}
+              saving={saving}
+              backend={supervisionBackend}
+              model={supervisionModel}
+              timeoutSeconds={supervisionTimeoutSeconds}
+              modelOptions={modelOptions}
+              onBackendChange={(nextBackend) => {
+                setSupervision((prev) => ({ ...prev, ...updateRuntimeDraft(prev, nextBackend) }));
+              }}
+              onModelChange={(model) => setSupervision((prev) => ({ ...prev, model }))}
+              onTimeoutChange={(seconds) => setSupervision((prev) => ({ ...prev, timeoutMs: timeoutUiSecondsToMs(seconds) }))}
             />
-            <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
-              {t('session.supervision.customInstructionsHelp')}
-            </div>
-          </div>
 
-          {isAuditMode && (
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 12 }}>
-              <div>
-                <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.auditModeLabel')}</div>
-                <select
-                  class="input"
-                  value={supervisionAuditMode ?? ''}
-                  onChange={(e) => setSupervision((prev) => ({ ...prev, auditMode: (e.target as HTMLSelectElement).value as SupervisionAuditMode }))}
-                  style={{ width: '100%' }}
-                  disabled={saving}
-                >
-                  <option value="">{t('session.supervision.selectAuditMode')}</option>
-                  {getAuditModeOptions().map((mode) => (
-                    <option key={mode} value={mode}>{labelForAuditMode(t, mode)}</option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.maxAuditLoops')}</div>
-                <input
-                  class="input"
-                  type="number"
-                  min={1}
-                  value={String(supervisionAuditLoops)}
-                  onInput={(e) => {
-                    const value = Number.parseInt((e.target as HTMLInputElement).value, 10);
-                    setSupervision((prev) => ({ ...prev, maxAuditLoops: Number.isFinite(value) && value > 0 ? value : DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS }));
-                  }}
-                  style={{ width: '100%' }}
-                  disabled={saving}
-                />
+            <div>
+              <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.customInstructionsLabel')}</div>
+              <textarea
+                class="input"
+                value={supervisionCustomInstructions}
+                onInput={(e) => setSupervision((prev) => ({ ...prev, customInstructions: (e.target as HTMLTextAreaElement).value }))}
+                rows={4}
+                style={{ width: '100%', resize: 'vertical' }}
+                disabled={saving}
+                placeholder={t('session.supervision.customInstructionsPlaceholder')}
+              />
+              <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
+                {t('session.supervision.customInstructionsHelp')}
               </div>
             </div>
-          )}
 
-          <div style={{ padding: 12, borderRadius: 8, background: 'rgba(15, 23, 42, 0.6)', border: '1px solid rgba(148, 163, 184, 0.18)', display: 'flex', flexDirection: 'column', gap: 4 }}>
-            <div style={{ fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>{t('session.supervision.summaryTitle')}</div>
-            <div style={{ fontSize: 12, color: '#94a3b8' }}>{t('session.supervision.summaryMode', { value: supervisionModeLabel })}</div>
-            <div style={{ fontSize: 12, color: '#94a3b8' }}>
-              {hasSupervision
-                ? t('session.supervision.summaryBackendModel', {
-                    backend: supervisionBackend ? labelForBackend(t, supervisionBackend) : t('session.supervision.summaryUnset'),
-                    model: supervisionModel.trim() || t('session.supervision.summaryUnset'),
-                  })
-                : t('session.supervision.summaryDisabled')}
-            </div>
-            <div style={{ fontSize: 12, color: '#94a3b8' }}>
-              {t('session.supervision.summaryTimeout', { value: `${supervisionTimeoutSeconds} s` })}
-            </div>
-            <div style={{ fontSize: 12, color: '#94a3b8' }}>
-              {t('session.supervision.summaryCustomInstructions', {
-                value: supervisionCustomInstructions.trim()
-                  ? t('session.supervision.summaryCustomInstructionsSet')
-                  : t('session.supervision.summaryUnset'),
-              })}
-            </div>
             {isAuditMode && (
-              <div style={{ fontSize: 12, color: '#94a3b8' }}>
-                {t('session.supervision.summaryAudit', {
-                  auditMode: supervisionAuditMode ? labelForAuditMode(t, supervisionAuditMode) : t('session.supervision.summaryUnset'),
-                  loops: supervisionAuditLoops,
-                })}
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 12 }}>
+                <div>
+                  <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.auditModeLabel')}</div>
+                  <select
+                    class="input"
+                    value={supervisionAuditMode ?? ''}
+                    onChange={(e) => setSupervision((prev) => ({ ...prev, auditMode: (e.target as HTMLSelectElement).value as SupervisionAuditMode }))}
+                    style={{ width: '100%' }}
+                    disabled={saving}
+                  >
+                    <option value="">{t('session.supervision.selectAuditMode')}</option>
+                    {getAuditModeOptions().map((mode) => (
+                      <option key={mode} value={mode}>{labelForAuditMode(t, mode)}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.maxAuditLoops')}</div>
+                  <input
+                    class="input"
+                    type="number"
+                    min={1}
+                    value={String(supervisionAuditLoops)}
+                    onInput={(e) => {
+                      const value = Number.parseInt((e.target as HTMLInputElement).value, 10);
+                      setSupervision((prev) => ({ ...prev, maxAuditLoops: Number.isFinite(value) && value > 0 ? value : DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS }));
+                    }}
+                    style={{ width: '100%' }}
+                    disabled={saving}
+                  />
+                </div>
               </div>
             )}
-            <div style={{ fontSize: 11, color: '#64748b' }}>
-              {t('session.supervision.summaryMeta', {
-                promptVersion: supervisionPromptVersion,
-                repairVersion: SUPERVISION_REPAIR_PROMPT_VERSION,
-                parseRetries: supervisionParseRetries,
-                taskRunVersion: taskRunPromptVersion,
-              })}
-            </div>
-          </div>
-        </>
-      )}
 
-      {!hasSupervision && (
-        <div style={{ fontSize: 12, color: '#64748b' }}>
-          {t('session.supervision.disabledHint')}
-        </div>
-      )}
+            <div style={{ padding: 12, borderRadius: 8, background: 'rgba(15, 23, 42, 0.6)', border: '1px solid rgba(148, 163, 184, 0.18)', display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <div style={{ fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>{t('session.supervision.summaryTitle')}</div>
+              <div style={{ fontSize: 12, color: '#94a3b8' }}>{t('session.supervision.summaryMode', { value: supervisionModeLabel })}</div>
+              <div style={{ fontSize: 12, color: '#94a3b8' }}>
+                {t('session.supervision.summaryBackendModel', {
+                  backend: supervisionBackend ? labelForBackend(t, supervisionBackend) : t('session.supervision.summaryUnset'),
+                  model: supervisionModel.trim() || t('session.supervision.summaryUnset'),
+                })}
+              </div>
+              <div style={{ fontSize: 12, color: '#94a3b8' }}>
+                {t('session.supervision.summaryTimeout', { value: `${supervisionTimeoutSeconds} s` })}
+              </div>
+              <div style={{ fontSize: 12, color: '#94a3b8' }}>
+                {t('session.supervision.summaryCustomInstructions', {
+                  value: supervisionCustomInstructions.trim()
+                    ? t('session.supervision.summaryCustomInstructionsSet')
+                    : t('session.supervision.summaryUnset'),
+                })}
+              </div>
+              {isAuditMode && (
+                <div style={{ fontSize: 12, color: '#94a3b8' }}>
+                  {t('session.supervision.summaryAudit', {
+                    auditMode: supervisionAuditMode ? labelForAuditMode(t, supervisionAuditMode) : t('session.supervision.summaryUnset'),
+                    loops: supervisionAuditLoops,
+                  })}
+                </div>
+              )}
+              <div style={{ fontSize: 11, color: '#64748b' }}>
+                {t('session.supervision.summaryMeta', {
+                  promptVersion: supervisionPromptVersion,
+                  repairVersion: SUPERVISION_REPAIR_PROMPT_VERSION,
+                  parseRetries: supervisionParseRetries,
+                  taskRunVersion: taskRunPromptVersion,
+                })}
+              </div>
+            </div>
+          </>
+        )}
+
+        {!hasSupervision && (
+          <div style={{ fontSize: 12, color: '#64748b' }}>
+            {t('session.supervision.disabledHint')}
+          </div>
+        )}
+      </div>
 
       {hasInvalidPersistedSupervision && (
         <div style={{ color: '#fbbf24', fontSize: 12 }}>
@@ -735,7 +833,7 @@ export function SessionSettingsDialog({
 
         <div class="dialog-footer">
           <button class="btn btn-secondary" onClick={onClose} disabled={saving}>{t('common.cancel')}</button>
-          <button class="btn btn-primary" onClick={handleSave} disabled={saving || !hasChanges || !supervisionValid}>
+          <button class="btn btn-primary" onClick={handleSave} disabled={saving || !hasChanges || !supervisionValid || !globalDefaultsValid}>
             {saving ? t('common.loading') : t('common.save')}
           </button>
         </div>

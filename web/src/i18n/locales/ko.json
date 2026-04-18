@@ -173,7 +173,11 @@
     "thinking_title": "레벨: {{value}}",
     "supervision": {
       "title": "세션 감독",
-      "help": "감독을 켜기 전에 백엔드와 모델을 선택하세요.",
+      "help": "먼저 새 Auto 세션에 쓸 전역 기본값을 설정하고, 필요하면 현재 세션 설정으로 덮어쓰세요.",
+      "globalDefaultsTitle": "전역 기본값",
+      "globalDefaultsHelp": "새 Auto transport 세션을 미리 채우는 데 사용됩니다. 여기서 기본 supervisor 백엔드, 모델, 타임아웃을 저장합니다.",
+      "sessionConfigTitle": "현재 세션",
+      "sessionConfigHelp": "현재 세션에만 적용됩니다. 여기서 백엔드, 모델, 타임아웃으로 전역 기본값을 덮어쓸 수 있고, audit 모드와 custom instructions도 세션 전용입니다.",
       "intro": {
         "title": "Auto의 역할",
         "howToUseTitle": "사용 방법",

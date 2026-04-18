@@ -173,7 +173,11 @@
     "thinking_title": "级别：{{value}}",
     "supervision": {
       "title": "会话监督",
-      "help": "启用监督前，先选择后端和模型。",
+      "help": "先设置新 Auto 会话默认使用的全局配置，再按需覆盖当前会话配置。",
+      "globalDefaultsTitle": "全局默认配置",
+      "globalDefaultsHelp": "用于预填新的 Auto transport 会话。这里保存的是你的默认监督后端、模型和超时。",
+      "sessionConfigTitle": "当前会话配置",
+      "sessionConfigHelp": "只作用于当前会话。这里的后端、模型、超时可覆盖全局默认，审计模式和自定义提示词也仅在当前会话生效。",
       "intro": {
         "title": "Auto 是做什么的",
         "howToUseTitle": "怎么用",

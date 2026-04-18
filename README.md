@@ -94,7 +94,7 @@ IM.codes can supervise supported transport-backed agent sessions turn by turn in
 - **Completion checks at the idle boundary.** When a turn finishes, IM.codes can classify it as `complete`, `continue`, or `ask_human`, then dispatch the next continue prompt inside the same session.
 - **Fail-closed automation.** Auto supervision stays visible in the timeline/footer, uses structured decisions, and returns control to you on timeout, invalid output, or bad config instead of silently guessing.
 - **Optional audit → rework loop.** In `supervised_audit`, a completed turn can automatically enter an audit pipeline and send a rework brief back into the same session before control returns.
-- **Configurable per session.** Choose supervisor backend/model, timeout, audit mode, and custom supervision instructions for each session independently.
+- **Global defaults + per-session overrides.** Set your default supervisor backend/model/timeout once, then override backend/model/timeout, audit mode, and custom supervision instructions per session when needed.
 - **Built for real IM.codes workflows.** Auto supervision understands OpenSpec work, P2P discussion/review flows, and `imcodes send`-style cross-agent coordination as valid agent actions, not immediate reasons to stop for a human.
 
 ## Features
@@ -119,7 +119,7 @@ Full mobile support with biometric auth and push notifications. Shell sessions a
 
 Auto supervision adds turn-level control for supported transport-backed agents. Instead of blindly continuing forever, IM.codes evaluates the latest completed turn and decides whether the task looks done, should keep going, or should come back to you. For higher-assurance work, `supervised_audit` can automatically trigger an audit/rework loop before the session is considered finished.
 
-Supervisor backend/model, timeout, audit mode, and custom instructions are all session-scoped. Auto supervision is also aware of IM.codes-native workflows such as OpenSpec changes, P2P discussions, and `imcodes send`, so those actions count as legitimate next steps instead of accidental "ask human" triggers.
+Auto supervision supports both global defaults and per-session overrides. You can keep a default supervisor backend/model/timeout for new sessions, then override backend/model/timeout, audit mode, and custom instructions on a specific session when the task needs different rules. It is also aware of IM.codes-native workflows such as OpenSpec changes, P2P discussions, and `imcodes send`, so those actions count as legitimate next steps instead of accidental "ask human" triggers.
 
 ### Multi-Agent Discussions & Cross-Provider Audit
 
