@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>IM.codes — The IM for agents. One memory layer across AI providers. Cross-agent auditing and planning.</title>
-<meta name="description" content="The IM for agents. One memory layer across AI providers — reuse solved work across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, and OpenClaw. Cross-agent auditing and planning — have different models review each other before any code ships, cutting single-model rework.">
+<meta name="description" content="The IM for agents. One memory layer across AI providers — reuse solved work across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, and OpenClaw. Cross-agent auditing and planning — different models discuss and audit the approach before any code is written, review and audit the implementation after it's built, and iterate based on what they catch.">
 <style>
 :root {
   --bg: #0a0a0a;
@@ -236,7 +236,7 @@ footer {
 </header>
 
 <section>
-  <p class="lead" data-i18n="hero_intro">IM.codes gives coding agents one shared memory layer across providers. It turns completed work into reusable context, then injects the right history back into future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. Single-model output is unreliable on non-trivial work — pair it with cross-agent auditing and planning (audit / review / brainstorm / plan phases across different models) to catch problems before they ship and cut the rework loop.</p>
+  <p class="lead" data-i18n="hero_intro">IM.codes gives coding agents one shared memory layer across providers. It turns completed work into reusable context, then injects the right history back into future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. Single-model output is unreliable on non-trivial work. Use cross-agent discussion and auditing at both ends of the loop — multiple models plan and audit the approach before any code is written, then review and audit the implementation after it's built, and iterate based on what they catch.</p>
   <div class="prompt">imcodes bind https://app.im.codes/bind/&lt;key&gt;<span class="cursor"></span></div>
   <div class="output" data-i18n="hero_output">bound to app.im.codes &middot; daemon started &middot; registered as system service</div>
 </section>
@@ -471,7 +471,7 @@ const I18N = {
   en: {
     watch_intro: 'Watch support covers quick session monitoring, unread counts, OTA update visibility, push notifications, and quick replies from the wrist.',
     tagline: 'The IM for agents. One memory layer across AI providers. Cross-agent auditing and planning.',
-    hero_intro: 'IM.codes gives coding agents one shared memory layer across providers. It turns completed work into reusable context, then injects the right history back into future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. Single-model output is unreliable on non-trivial work — pair it with cross-agent auditing and planning (audit / review / brainstorm / plan phases across different models) to catch problems before they ship and cut the rework loop.',
+    hero_intro: "IM.codes gives coding agents one shared memory layer across providers. It turns completed work into reusable context, then injects the right history back into future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. Single-model output is unreliable on non-trivial work. Use cross-agent discussion and auditing at both ends of the loop — multiple models plan and audit the approach before any code is written, then review and audit the implementation after it's built, and iterate based on what they catch.",
     watch_badge: 'iPhone · iPad · Apple Watch',
     watch_download: 'Watch app includes session list, unread counts, and quick replies.',
     agents_intro: 'Multiple agents support both CLI and SDK integrations.',
@@ -495,7 +495,7 @@ const I18N = {
   },
   'zh-CN': {
     tagline: '给 AI agent 的 IM。一套记忆层，贯通所有 AI 提供方。跨模型审计与规划。',
-    hero_intro: 'IM.codes 为 coding agent 提供一套跨 provider 共享的记忆层。它会把已完成的工作沉淀成可复用上下文，再把合适的历史注入后续 session，贯通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。同时提供跨模型审计和规划——让不同模型在 audit / review / brainstorm / plan 等阶段相互把关，在动手写代码之前就发现问题，显著降低单模型不可靠带来的返工。',
+    hero_intro: 'IM.codes 为 coding agent 提供一套跨 provider 共享的记忆层。它会把已完成的工作沉淀成可复用上下文，再把合适的历史注入后续 session，贯通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。单模型在有难度的工作上并不可靠，所以跨模型讨论与审计要贯穿整个循环——计划阶段多个模型一起商量并互审方案，实现完成后再做交叉评审，根据结果持续完善。',
     hero_output: '已绑定 app.im.codes · 守护进程已启动 · 已注册为系统服务',
     self_host_warning: '<strong>强烈建议自行部署。</strong><code>app.im.codes</code> 是共享测试实例，无可用性保证，可能被限流、攻击或不可用。这是个人项目，不提供商用保障。正式使用请部署到自己的服务器。',
     h_screenshots: '截图', h_why: '为什么', h_memory: '共享代理上下文', h_not: '它不是什么', h_features: '功能', h_arch: '架构', h_download: '下载', h_install: '安装', h_quick: '快速开始', h_selfhost: '自托管部署', h_agents: '支持的代理', h_reqs: '系统要求', h_about: '关于',
@@ -561,7 +561,7 @@ const I18N = {
   },
   'zh-TW': {
     tagline: '給 AI agent 的 IM。一套記憶層，貫通所有 AI 提供方。跨模型審計與規劃。',
-    hero_intro: 'IM.codes 為 coding agent 提供一套跨 provider 共享的記憶層。它會把已完成的工作沉澱成可重用上下文，再把合適的歷史注入後續 session，貫通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。同時提供跨模型審計和規劃——讓不同模型在 audit / review / brainstorm / plan 等階段互相把關，在動手寫代碼之前就發現問題，顯著降低單模型不可靠帶來的返工。',
+    hero_intro: 'IM.codes 為 coding agent 提供一套跨 provider 共享的記憶層。它會把已完成的工作沉澱成可重用上下文，再把合適的歷史注入後續 session，貫通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。單模型在有難度的工作上並不可靠，所以跨模型討論與審計要貫穿整個循環——計劃階段多個模型一起商量並互審方案，實現完成後再做交叉評審，根據結果持續完善。',
     hero_output: '已綁定 app.im.codes · 守護程序已啟動 · 已註冊為系統服務',
     self_host_warning: '<strong>強烈建議自行部署。</strong><code>app.im.codes</code> 是共享測試實例，無可用性保證，可能被限流、攻擊或不可用。這是個人專案，不提供商用保障。正式使用請部署到自己的伺服器。',
     h_screenshots: '截圖', h_why: '為什麼', h_memory: '共享代理上下文', h_not: '它不是什麼', h_features: '功能', h_arch: '架構', h_download: '下載', h_install: '安裝', h_quick: '快速開始', h_selfhost: '自託管部署', h_agents: '支援的代理', h_reqs: '系統需求', h_about: '關於',
@@ -627,7 +627,7 @@ const I18N = {
   },
   ja: {
     tagline: 'エージェントのための IM。すべての AI プロバイダーをまたぐ一つのメモリレイヤー。エージェント横断の監査とプランニング。',
-    hero_intro: 'IM.codes は coding agent に、プロバイダーをまたぐ共有メモリレイヤーを提供します。完了した作業を再利用可能なコンテキストとして蓄積し、Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw などの後続 session に適切な履歴を再注入します。さらに、エージェント横断の監査・プランニングを提供 — 異なるモデルに audit / review / brainstorm / plan フェーズで相互レビューさせ、コードを書き始める前に問題を検出し、単一モデルの不確実性による手戻りを大きく減らします。',
+    hero_intro: 'IM.codes は coding agent に、プロバイダーをまたぐ共有メモリレイヤーを提供します。完了した作業を再利用可能なコンテキストとして蓄積し、Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw などの後続 session に適切な履歴を再注入します。単一モデルの出力は難度の高い作業では信頼できません。エージェント横断の議論と監査はループの両端で回してください — 計画段階で複数のモデルがアプローチを議論・相互監査し、実装後にもう一度レビューと監査を行い、指摘された結果に基づいて改善し続けます。',
     hero_output: 'app.im.codes にバインド完了 · デーモン起動 · システムサービスとして登録',
     self_host_warning: '<strong>セルフホスティングを強く推奨します。</strong><code>app.im.codes</code> は共有テストインスタンスであり、稼働保証はありません。レート制限、攻撃対象、利用不可の可能性があります。個人プロジェクトのため商用サポートはありません。評価以外の用途では自社インフラにデプロイしてください。',
     h_screenshots: 'スクリーンショット', h_why: '背景', h_memory: '共有エージェントコンテキスト', h_not: 'これは何ではないか', h_features: '機能', h_arch: 'アーキテクチャ', h_download: 'ダウンロード', h_install: 'インストール', h_quick: 'クイックスタート', h_selfhost: 'セルフホスト', h_agents: '対応エージェント', h_reqs: '要件', h_about: '概要',
@@ -693,7 +693,7 @@ const I18N = {
   },
   ko: {
     tagline: '에이전트를 위한 IM. 모든 AI 제공자를 가로지르는 하나의 메모리 레이어. 에이전트 간 감사와 플래닝.',
-    hero_intro: 'IM.codes는 coding agent를 위한 provider 간 공유 메모리 레이어를 제공합니다. 완료된 작업을 재사용 가능한 컨텍스트로 축적하고, Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw 등 이후 session에 적절한 기록을 다시 주입합니다. 또한 에이전트 간 감사·플래닝을 제공합니다 — 서로 다른 모델이 audit / review / brainstorm / plan 단계에서 상호 검토하도록 해 코드 작성 전에 문제를 발견하고, 단일 모델의 불안정성으로 인한 재작업을 크게 줄입니다.',
+    hero_intro: 'IM.codes는 coding agent를 위한 provider 간 공유 메모리 레이어를 제공합니다. 완료된 작업을 재사용 가능한 컨텍스트로 축적하고, Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw 등 이후 session에 적절한 기록을 다시 주입합니다. 단일 모델의 결과는 난이도 있는 작업에서 신뢰하기 어렵습니다. 에이전트 간 토론과 감사를 루프의 양쪽 끝에서 돌리세요 — 계획 단계에서 여러 모델이 접근 방식을 논의하고 상호 감사하고, 구현이 끝난 뒤 다시 리뷰·감사를 거치며, 지적된 결과를 바탕으로 지속적으로 개선합니다.',
     hero_output: 'app.im.codes에 바인딩 완료 · 데몬 시작됨 · 시스템 서비스로 등록됨',
     self_host_warning: '<strong>셀프 호스팅을 강력히 권장합니다.</strong> <code>app.im.codes</code>는 공유 테스트 인스턴스로 가동 보장이 없으며, 속도 제한, 공격 대상이 되거나 사용 불가할 수 있습니다. 개인 프로젝트로 상업적 지원은 제공되지 않습니다. 평가 이외의 용도에는 자체 인프라에 배포하세요.',
     h_screenshots: '스크린샷', h_why: '배경', h_memory: '공유 에이전트 컨텍스트', h_not: '무엇이 아닌가', h_features: '기능', h_arch: '아키텍처', h_download: '다운로드', h_install: '설치', h_quick: '빠른 시작', h_selfhost: '셀프 호스팅', h_agents: '지원 에이전트', h_reqs: '요구사항', h_about: '소개',
@@ -759,7 +759,7 @@ const I18N = {
   },
   es: {
     tagline: 'El IM para agentes. Una capa de memoria que atraviesa todos los proveedores de IA. Auditoría y planificación multi-agente.',
-    hero_intro: 'IM.codes da a los coding agents una capa de memoria compartida entre proveedores. Convierte el trabajo completado en contexto reutilizable y vuelve a inyectar el historial adecuado en sesiones futuras de Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw y más. Además ofrece auditoría y planificación multi-agente — haz que distintos modelos se revisen entre sí en fases de audit / review / brainstorm / plan para detectar problemas antes de escribir código y reducir de forma notable las repeticiones causadas por la incertidumbre de un solo modelo.',
+    hero_intro: 'IM.codes da a los coding agents una capa de memoria compartida entre proveedores. Convierte el trabajo completado en contexto reutilizable y vuelve a inyectar el historial adecuado en sesiones futuras de Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw y más. La salida de un solo modelo no es fiable en tareas exigentes. Usa la discusión y auditoría multi-agente en los dos extremos del ciclo — varios modelos debaten y auditan el enfoque antes de escribir código, luego revisan y auditan la implementación una vez construida, e iteran según lo que detectan.',
     hero_output: 'vinculado a app.im.codes · daemon iniciado · registrado como servicio del sistema',
     self_host_warning: '<strong>Se recomienda encarecidamente el autoalojamiento.</strong> <code>app.im.codes</code> es una instancia de prueba compartida sin garantías de disponibilidad — puede tener límites, ser objetivo de ataques o no estar disponible. Este es un proyecto personal sin soporte comercial. Para uso más allá de la evaluación, despliega en tu propia infraestructura.',
     h_screenshots: 'capturas', h_why: 'por qué', h_memory: 'contexto compartido para agentes', h_not: 'qué no es', h_features: 'características', h_arch: 'arquitectura', h_download: 'descargar', h_install: 'instalar', h_quick: 'inicio rápido', h_selfhost: 'autoalojamiento', h_agents: 'agentes compatibles', h_reqs: 'requisitos', h_about: 'acerca de',
@@ -825,7 +825,7 @@ const I18N = {
   },
   ru: {
     tagline: 'IM для агентов. Единый слой памяти у всех AI-провайдеров. Кросс-агентный аудит и планирование.',
-    hero_intro: 'IM.codes даёт coding agents единый слой памяти поверх разных провайдеров. Он превращает завершённую работу в переиспользуемый контекст и подмешивает нужную историю в будущие session для Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw и других. Поверх этого — кросс-агентный аудит и планирование: разные модели взаимно проверяют друг друга на стадиях audit / review / brainstorm / plan, чтобы отловить проблемы до написания кода и заметно сократить цикл переделок из-за ненадёжности одной модели.',
+    hero_intro: 'IM.codes даёт coding agents единый слой памяти поверх разных провайдеров. Он превращает завершённую работу в переиспользуемый контекст и подмешивает нужную историю в будущие session для Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw и других. Одна модель на сложной задаче ненадёжна. Кросс-агентное обсуждение и аудит нужны с обеих сторон цикла — несколько моделей обсуждают и взаимно аудитируют подход до того, как написан код, затем снова ревьюят и аудитируют реализацию, а вы дорабатываете по их замечаниям.',
     hero_output: 'привязан к app.im.codes · демон запущен · зарегистрирован как системная служба',
     self_host_warning: '<strong>Настоятельно рекомендуется самостоятельный хостинг.</strong> <code>app.im.codes</code> — общий тестовый экземпляр без гарантий доступности. Может быть ограничен, атакован или недоступен. Это личный проект без коммерческой поддержки. Для использования помимо тестирования разверните на собственной инфраструктуре.',
     h_screenshots: 'скриншоты', h_why: 'зачем', h_memory: 'общий контекст агентов', h_not: 'чем это не является', h_features: 'возможности', h_arch: 'архитектура', h_download: 'скачать', h_install: 'установка', h_quick: 'быстрый старт', h_selfhost: 'свой сервер', h_agents: 'поддерживаемые агенты', h_reqs: 'требования', h_about: 'о проекте',
