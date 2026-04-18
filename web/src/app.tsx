@@ -1799,14 +1799,16 @@ export function App() {
     };
   }, [auth, selectedServerId]);
 
-  // Subscribe to terminal for ALL sessions when connected.
-  // Passive/background subscriptions stay raw:false so chat/timeline traffic still flows
-  // without pulling raw PTY bytes into browsers that are not actively rendering terminal output.
+  // Subscribe to terminal for process sessions only when connected.
+  // Transport sessions have their own structured chat/timeline channel and
+  // must never be force-subscribed onto the terminal bus.
   const sessionNamesKey = sessions.map((s) => s.name).sort().join(',');
   useEffect(() => {
     const ws = wsRef.current;
     if (!ws?.connected || sessions.length === 0) return;
-    const names = sessions.map((s) => s.name);
+    const names = sessions
+      .filter((s) => !isTransportRuntime(s))
+      .map((s) => s.name);
     for (const name of names) {
       ws.subscribeTerminal(name, false);
       const mode = viewModesRef.current[name] ?? defaultViewMode;
@@ -1822,13 +1824,15 @@ export function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connected, sessionNamesKey]);
 
-  // Subscribe terminal for ALL sub-sessions in passive mode.
+  // Subscribe terminal for process sub-sessions in passive mode.
   // Active sub-session windows upgrade themselves to raw:true while visible.
   const subSessionNamesKey = subSessions.map((s) => s.sessionName).sort().join(',');
   useEffect(() => {
     const ws = wsRef.current;
     if (!ws?.connected || subSessions.length === 0) return;
-    const names = subSessions.map((s) => s.sessionName);
+    const names = subSessions
+      .filter((s) => !isTransportRuntime(s))
+      .map((s) => s.sessionName);
     for (const name of names) {
       try { ws.subscribeTerminal(name, false); } catch { /* ignore */ }
     }
@@ -1879,6 +1883,8 @@ export function App() {
       const ws = wsRef.current;
       const session = activeSessionRef.current;
       if (!ws?.connected || !session) return;
+      const active = sessionsRef.current.find((entry) => entry.name === session);
+      if (active && isTransportRuntime(active)) return;
       const raw = shouldSubscribeTerminalRaw(true, (viewModesRef.current[session] ?? defaultViewMode) as ViewMode);
       ws.subscribeTerminal(session, raw);
       const mode = viewModesRef.current[session] ?? defaultViewMode;
