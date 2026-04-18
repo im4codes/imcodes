@@ -229,4 +229,50 @@ describe('MaterializationCoordinator', () => {
     expect(result.summaryProjection.summary).toContain('**User:** fix the flaky build');
     expect(result.summaryProjection.summary).toContain('**Assistant:** updated the import and reran the build');
   });
+
+  it('creates durable memory automatically from structured summary key decisions even without explicit durable events', async () => {
+    const coordinator = new MaterializationCoordinator({
+      compressor: async () => ({
+        summary: [
+          '## User Problem',
+          'Need startup memory to preserve key decisions',
+          '',
+          '## Resolution',
+          'Added automatic durable extraction from structured summaries.',
+          '',
+          '## Key Decisions',
+          '- Key decisions: Preserve startup architecture notes',
+          '- Constraints: Do not require manual memory tagging',
+          '- Preferences: Prefer durable-first startup context',
+          '',
+          '## Active State',
+          'Tests pending.',
+        ].join('\n'),
+        model: 'test-model',
+        backend: 'none',
+        usedBackup: false,
+        fromSdk: true,
+      }),
+      thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
+    });
+
+    coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'keep startup notes stable', createdAt: 100 });
+    coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'implemented durable extraction', createdAt: 120 });
+
+    const result = await coordinator.materializeTarget(target, 'manual', 500);
+
+    expect(result.durableProjection?.class).toBe('durable_memory_candidate');
+    expect(result.durableProjection?.summary).toContain('Preserve startup architecture notes');
+    expect(result.durableProjection?.summary).toContain('Do not require manual memory tagging');
+    expect(result.durableProjection?.summary).toContain('Prefer durable-first startup context');
+    expect(result.durableProjection?.sourceEventIds).toEqual(result.summaryProjection.sourceEventIds);
+    expect(result.durableProjection?.content).toEqual(expect.objectContaining({
+      source: 'summary',
+      durableSignals: {
+        decisions: ['Preserve startup architecture notes'],
+        constraints: ['Do not require manual memory tagging'],
+        preferences: ['Prefer durable-first startup context'],
+      },
+    }));
+  });
 });

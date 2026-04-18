@@ -66,6 +66,7 @@ export interface MemorySearchResultItem {
   lastUsedAt?: number;
   status?: ProcessedContextProjectionStatus;
   sourceEventCount?: number;
+  sourceEventIds?: string[];
   processingModel?: string;
   relevanceScore?: number;
 }
@@ -354,6 +355,7 @@ function projectionToItem(projection: ProcessedContextProjection): MemorySearchR
     lastUsedAt: projection.lastUsedAt,
     status: projection.status,
     sourceEventCount: typeof content?.eventCount === 'number' ? content.eventCount : undefined,
+    sourceEventIds: projection.sourceEventIds,
     processingModel: typeof content?.primaryContextModel === 'string' ? content.primaryContextModel : undefined,
   };
 }

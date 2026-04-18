@@ -36,16 +36,31 @@ export function selectStartupMemoryItems(
   const recent = searchLocalMemory({
     namespace,
     projectionClass: 'recent_summary',
-    limit: recentLimit,
+    limit: Math.max(recentLimit, totalLimit),
   }).items.filter((item): item is MemorySearchResultItem => item.type === 'processed');
 
   const deduped: MemorySearchResultItem[] = [];
   const seen = new Set<string>();
-  for (const item of [...durable, ...recent]) {
-    if (seen.has(item.id)) continue;
-    seen.add(item.id);
+  for (const item of durable) {
+    const key = getStartupMemoryDedupKey(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(item);
+    if (deduped.length >= totalLimit || deduped.length >= durableLimit) break;
+  }
+  for (const item of recent) {
+    const key = getStartupMemoryDedupKey(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
     deduped.push(item);
     if (deduped.length >= totalLimit) break;
   }
   return deduped;
+}
+
+function getStartupMemoryDedupKey(item: MemorySearchResultItem): string {
+  if (item.sourceEventIds && item.sourceEventIds.length > 0) {
+    return `events:${[...item.sourceEventIds].sort().join(',')}`;
+  }
+  return `summary:${item.summary.trim().toLowerCase()}`;
 }

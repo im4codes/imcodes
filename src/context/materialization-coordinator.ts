@@ -184,7 +184,13 @@ export class MaterializationCoordinator {
       createdAt: now,
       updatedAt: now,
     });
-    const durableProjection = buildDurableProjection(target.namespace, events, now);
+    const durableProjection = buildDurableProjection(
+      target.namespace,
+      events,
+      compression.summary,
+      sourceEventIds,
+      now,
+    );
 
     // Only queue for replication if this is a final commit (not tentative)
     if (!shouldRetry) {
@@ -281,26 +287,48 @@ function buildLocalFallback(events: LocalContextEvent[], previousSummary?: strin
   return buildLocalFallbackSummary(events, previousSummary);
 }
 
-function buildDurableProjection(namespace: ContextNamespace, events: LocalContextEvent[], now: number): ProcessedContextProjection | undefined {
-  const candidateEvents = events.filter((event) => event.eventType === 'decision' || event.eventType === 'constraint' || event.eventType === 'preference');
-  if (candidateEvents.length === 0) return undefined;
+function buildDurableProjection(
+  namespace: ContextNamespace,
+  events: LocalContextEvent[],
+  summary: string,
+  sourceEventIds: string[],
+  now: number,
+): ProcessedContextProjection | undefined {
+  const extracted = extractDurableSignalsFromSummary(summary);
+  const fallback = extractDurableSignalsFromEvents(events);
+  const signals = {
+    decisions: extracted.decisions.length > 0 ? extracted.decisions : fallback.decisions,
+    constraints: extracted.constraints.length > 0 ? extracted.constraints : fallback.constraints,
+    preferences: extracted.preferences.length > 0 ? extracted.preferences : fallback.preferences,
+  };
+  const candidateCount = signals.decisions.length + signals.constraints.length + signals.preferences.length;
+  if (candidateCount === 0) return undefined;
   return writeProcessedProjection({
     namespace,
     class: 'durable_memory_candidate',
-    sourceEventIds: candidateEvents.map((event) => event.id),
-    summary: buildDurableSummary(candidateEvents),
+    sourceEventIds,
+    summary: buildDurableSummary(signals),
     content: {
-      candidateKinds: candidateEvents.map((event) => event.eventType),
-      count: candidateEvents.length,
+      candidateKinds: [
+        ...(signals.decisions.length > 0 ? ['decision'] : []),
+        ...(signals.constraints.length > 0 ? ['constraint'] : []),
+        ...(signals.preferences.length > 0 ? ['preference'] : []),
+      ],
+      count: candidateCount,
+      durableSignals: signals,
+      source: extracted.decisions.length > 0 || extracted.constraints.length > 0 || extracted.preferences.length > 0
+        ? 'summary'
+        : 'events',
     },
     createdAt: now,
     updatedAt: now,
   });
 }
 
-function buildDurableSummary(events: LocalContextEvent[]): string {
+function extractDurableSignalsFromEvents(events: LocalContextEvent[]): DurableSignals {
   const grouped = new Map<string, string[]>();
   for (const event of events) {
+    if (event.eventType !== 'decision' && event.eventType !== 'constraint' && event.eventType !== 'preference') continue;
     const content = event.content?.trim();
     if (!content) continue;
     const items = grouped.get(event.eventType) ?? [];
@@ -308,10 +336,68 @@ function buildDurableSummary(events: LocalContextEvent[]): string {
     grouped.set(event.eventType, items);
   }
 
+  return {
+    decisions: grouped.get('decision') ?? [],
+    constraints: grouped.get('constraint') ?? [],
+    preferences: grouped.get('preference') ?? [],
+  };
+}
+
+type DurableSignals = {
+  decisions: string[];
+  constraints: string[];
+  preferences: string[];
+};
+
+function extractDurableSignalsFromSummary(summary: string): DurableSignals {
+  const empty: DurableSignals = { decisions: [], constraints: [], preferences: [] };
+  const match = summary.match(/##\s+Key Decisions\s*\n([\s\S]*?)(?:\n##\s+|$)/i);
+  const section = match?.[1]?.trim();
+  if (!section) return empty;
+
+  const signals: DurableSignals = { decisions: [], constraints: [], preferences: [] };
+  const lines = section
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  for (const line of lines) {
+    const normalized = line.replace(/^[*-]\s*/, '').trim();
+    if (!normalized) continue;
+    if (/^key decisions?:/i.test(normalized)) {
+      pushDurableItems(signals.decisions, normalized.replace(/^key decisions?:/i, '').trim());
+      continue;
+    }
+    if (/^constraints?:/i.test(normalized)) {
+      pushDurableItems(signals.constraints, normalized.replace(/^constraints?:/i, '').trim());
+      continue;
+    }
+    if (/^preferences?:/i.test(normalized)) {
+      pushDurableItems(signals.preferences, normalized.replace(/^preferences?:/i, '').trim());
+      continue;
+    }
+    pushUnique(signals.decisions, normalized);
+  }
+  return signals;
+}
+
+function pushDurableItems(bucket: string[], value: string): void {
+  if (!value) return;
+  for (const part of value.split(/\s*;\s*/)) {
+    pushUnique(bucket, part.trim());
+  }
+}
+
+function pushUnique(bucket: string[], value: string): void {
+  if (!value || bucket.includes(value)) return;
+  bucket.push(value);
+}
+
+function buildDurableSummary(signals: DurableSignals): string {
+  const decisions = signals.decisions;
+  const constraints = signals.constraints;
+  const preferences = signals.preferences;
+
   const lines: string[] = [];
-  const preferences = grouped.get('preference') ?? [];
-  const constraints = grouped.get('constraint') ?? [];
-  const decisions = grouped.get('decision') ?? [];
 
   if (decisions.length > 0) {
     lines.push(`- Key decisions: ${decisions.join('; ')}`);
