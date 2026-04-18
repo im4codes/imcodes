@@ -55,6 +55,17 @@
     "memory_context_score": "スコア {{score}}",
     "memory_context_startup_reason": "セッション起動時に注入",
     "memory_context_collapse_bottom": "折りたたむ",
+    "memory_context_status_no_matches": "関連メモリは見つかりませんでした",
+    "memory_context_status_deduped_recently": "{{count}} 件の関連メモリが見つかりましたが、最近すでに注入されています",
+    "memory_context_status_deduped_recently_detail": "{{count}} 件の関連メモリが見つかりました。{{deduped}} 件は直近のターンですでに注入済みのため除外されました。",
+    "memory_context_status_skipped_template_prompt": "内部/テンプレートプロンプトのためメモリ検索をスキップしました",
+    "memory_context_status_skipped_template_prompt_detail": "このメッセージは組み込みワークフローまたはテンプレートプロンプトに一致したため、関連メモリ検索を意図的に行いませんでした。",
+    "memory_context_status_skipped_short_prompt": "プロンプトが短すぎるためメモリ検索をスキップしました",
+    "memory_context_status_skipped_short_prompt_detail": "短いプロンプトでは信頼できる関連メモリを安定して見つけられません。",
+    "memory_context_status_skipped_control_message": "コマンドメッセージのためメモリ検索をスキップしました",
+    "memory_context_status_skipped_control_message_detail": "スラッシュコマンドでは関連メモリ検索は実行されません。",
+    "memory_context_status_failed": "関連メモリ検索は一時的に利用できません",
+    "memory_context_status_failed_detail": "メッセージ自体は送信されましたが、今回はメモリ検索に失敗しました。",
     "file_change_title": "ファイル変更 ({{count}})",
     "file_change_patch_count": "{{count}} 件のパッチ",
     "file_change_provider_claude_code": "Claude Code",
@@ -119,8 +130,12 @@
       "codex_sdk": "Codex SDK",
       "claude_code_cli": "Claude Code CLI",
       "codex_cli": "Codex CLI",
-      "copilot_sdk": "GitHub Copilot SDK",
-      "cursor_headless": "Cursor Headless"
+      "copilot_sdk": "Copilot",
+      "cursor_headless": "Cursor"
+    },
+    "agentGroup": {
+      "transport_sdk": "SDK",
+      "cli_process": "CLI"
     },
     "openclaw_not_connected": "未接続",
     "openclaw_connect_hint": "OpenClaw ゲートウェイに接続されていません。デーモンマシンで以下のコマンドを実行してください：",

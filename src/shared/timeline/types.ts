@@ -59,14 +59,25 @@ export interface MemoryContextTimelineItem {
   relevanceScore?: number;
 }
 
+export type MemoryContextTimelineStatus =
+  | 'no_matches'
+  | 'deduped_recently'
+  | 'skipped_template_prompt'
+  | 'skipped_short_prompt'
+  | 'skipped_control_message'
+  | 'failed';
+
 export interface MemoryContextTimelinePayload {
   relatedToEventId?: string;
   query?: string;
-  injectedText: string;
+  injectedText?: string;
   items: MemoryContextTimelineItem[];
   reason?: 'message' | 'startup';
   runtimeFamily?: MemoryRecallRuntimeFamily;
   injectionSurface?: MemoryRecallInjectionSurface;
   authoritySource?: ContextAuthorityDecision['authoritySource'];
   sourceKind?: 'local_processed' | 'remote_processed';
+  status?: MemoryContextTimelineStatus;
+  matchedCount?: number;
+  dedupedCount?: number;
 }

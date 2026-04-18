@@ -761,6 +761,10 @@ body {
 .chat-memory-context-chip-muted { color: #64748b; }
 .chat-memory-context-collapse-bottom { align-self: flex-start; background: none; border: 1px solid #334155; color: #94a3b8; border-radius: 6px; padding: 6px 10px; font-size: 11px; cursor: pointer; transition: color 0.15s, border-color 0.15s, background 0.15s; }
 .chat-memory-context-collapse-bottom:hover { color: #e2e8f0; border-color: #6366f1; background: rgba(99,102,241,0.08); }
+.chat-memory-context-status { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; }
+.chat-memory-context-status-title { font-size: 12px; font-weight: 600; color: #c4b5fd; }
+.chat-memory-context-status-summary { font-size: 12px; color: #e2e8f0; }
+.chat-memory-context-status-detail { font-size: 11px; color: #94a3b8; white-space: pre-wrap; word-break: break-word; }
 .chat-mode { display: inline-block; background: #1e1338; color: #a78bfa; padding: 2px 8px; border-radius: 4px; font-size: 11px; }
 .chat-system { text-align: center; color: #475569; font-size: 11px; padding: 4px 0; }
 .chat-loading { text-align: center; color: #475569; padding: 24px; }
@@ -1010,6 +1014,10 @@ body {
 .dialog-body { padding: 16px 20px 20px; }
 
 /* ── Sub-session start dialog extras ─────────────────────────────────────── */
+.subsession-type-groups { display: flex; flex-direction: column; gap: 12px; }
+.subsession-type-group { display: flex; flex-direction: column; gap: 8px; }
+.subsession-type-group-title { font-size: 11px; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase; color: #64748b; }
+.subsession-type-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .subsession-type-btn { display: flex; align-items: center; gap: 6px; padding: 8px 12px; background: #1e293b; border: 1px solid #334155; border-radius: 6px; color: #94a3b8; cursor: pointer; font-size: 13px; font-family: inherit; transition: all 0.15s; }
 .subsession-type-btn:hover { background: #253348; border-color: #475569; color: #e2e8f0; }
 .subsession-type-btn.active { background: #1e3a5f; border-color: #3b82f6; color: #93c5fd; }

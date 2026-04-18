@@ -149,6 +149,7 @@ vi.mock('../../src/context/memory-search.js', () => ({
 }));
 
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
+import { resetAllRecentInjectionHistories } from '../../src/context/recent-injection-history.js';
 
 const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
@@ -162,6 +163,7 @@ describe('handleWebCommand memory context timeline', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    resetAllRecentInjectionHistories();
     getSessionMock.mockReturnValue({
       name: 'deck_process_brain',
       projectName: 'codedeck',
@@ -262,6 +264,105 @@ describe('handleWebCommand memory context timeline', () => {
       'deck_process_brain',
       'memory.context',
       expect.anything(),
+    );
+  });
+
+  it('emits a no-matches status when no related process memory is found', async () => {
+    searchLocalMemorySemanticMock.mockResolvedValue({
+      items: [],
+      stats: {
+        totalRecords: 0,
+        matchedRecords: 0,
+        recentSummaryCount: 0,
+        durableCandidateCount: 0,
+        projectCount: 0,
+        stagedEventCount: 0,
+        dirtyTargetCount: 0,
+        pendingJobCount: 0,
+      },
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_process_brain',
+      text: 'Investigate websocket reconnect behavior',
+      commandId: 'cmd-memory-none',
+    }, serverLink as any);
+
+    await flushAsync();
+
+    expect(sendKeysDelayedEnterMock).toHaveBeenCalledWith(
+      'deck_process_brain',
+      'Investigate websocket reconnect behavior',
+      undefined,
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_process_brain',
+      'memory.context',
+      expect.objectContaining({
+        relatedToEventId: 'evt-user-1',
+        query: 'Investigate websocket reconnect behavior',
+        status: 'no_matches',
+        items: [],
+      }),
+    );
+    expect(recordMemoryHitsMock).not.toHaveBeenCalled();
+  });
+
+  it('emits a recently-injected status when matches were found but all were filtered by recency', async () => {
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_process_brain',
+      text: 'Fix reconnect issues in websocket client',
+      commandId: 'cmd-memory-first',
+    }, serverLink as any);
+    await flushAsync();
+
+    emitMock.mockClear();
+    recordMemoryHitsMock.mockClear();
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_process_brain',
+      text: 'Fix reconnect issues in websocket client',
+      commandId: 'cmd-memory-second',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_process_brain',
+      'memory.context',
+      expect.objectContaining({
+        relatedToEventId: 'evt-user-1',
+        query: 'Fix reconnect issues in websocket client',
+        status: 'deduped_recently',
+        matchedCount: 1,
+        dedupedCount: 1,
+        items: [],
+      }),
+    );
+    expect(recordMemoryHitsMock).not.toHaveBeenCalled();
+  });
+
+  it('emits a template-prompt skip status for built-in workflow prompts', async () => {
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_process_brain',
+      text: 'Implement @openspec/changes/shared-agent-context and continue the template workflow',
+      commandId: 'cmd-memory-template',
+    }, serverLink as any);
+
+    await flushAsync();
+
+    expect(searchLocalMemorySemanticMock).not.toHaveBeenCalled();
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_process_brain',
+      'memory.context',
+      expect.objectContaining({
+        relatedToEventId: 'evt-user-1',
+        status: 'skipped_template_prompt',
+        items: [],
+      }),
     );
   });
 });

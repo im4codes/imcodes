@@ -19,7 +19,8 @@ import type {
   TransportMemoryRecallArtifact,
   TransportMemoryRecallItem,
 } from '../../shared/context-types.js';
-import { buildMemoryContextTimelinePayload } from '../daemon/memory-context-timeline.js';
+import type { MemoryContextTimelinePayload } from '../shared/timeline/types.js';
+import { buildMemoryContextTimelinePayload, buildMemoryContextStatusPayload } from '../daemon/memory-context-timeline.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
 import { searchLocalMemorySemantic, type MemorySearchResultItem } from '../context/memory-search.js';
 import { isTemplatePrompt, isTemplateOriginSummary } from '../../shared/template-prompt-patterns.js';
@@ -330,9 +331,10 @@ export class TransportSessionRuntime implements SessionRuntime {
             ? buildTransportStartupMemory(this._contextNamespace)
             : null
         );
-        const memoryRecall = authority.authoritySource === 'processed_local'
-          ? await this.buildTransportMessageRecall(message)
-          : null;
+        const memoryRecallResult = authority.authoritySource === 'processed_local'
+          ? await this.buildTransportMessageRecallResult(message)
+          : { artifact: null };
+        const memoryRecall = memoryRecallResult.artifact;
         const dispatchResult = await dispatchSharedContextSend(this.provider, this._providerSessionId!, {
           userMessage: message,
           description: this._description,
@@ -364,6 +366,8 @@ export class TransportSessionRuntime implements SessionRuntime {
             try { recordMemoryHits(hitIds); } catch { /* non-fatal */ }
           }
           this.emitMemoryContextEvent(dispatchResult.payload.memoryRecall, clientMessageId);
+        } else if (memoryRecallResult.statusPayload) {
+          this.emitMemoryContextStatusEvent(memoryRecallResult.statusPayload, clientMessageId);
         }
         if (!this._startupMemoryInjected && dispatchResult.payload?.startupMemory) {
           this._startupMemoryInjected = true;
@@ -447,26 +451,52 @@ export class TransportSessionRuntime implements SessionRuntime {
     });
   }
 
-  private async buildTransportMessageRecall(message: string): Promise<TransportMemoryRecallArtifact | null> {
+  private async buildTransportMessageRecallResult(
+    message: string,
+  ): Promise<{
+    artifact: TransportMemoryRecallArtifact | null;
+    statusPayload?: Omit<MemoryContextTimelinePayload, 'relatedToEventId'>;
+  }> {
     const trimmed = message.trim();
+    const query = trimmed.slice(0, 200);
     if (!trimmed) {
       logger.debug({ sessionKey: this.sessionKey }, 'transport message recall skipped: empty message');
-      return null;
+      return { artifact: null };
     }
     if (trimmed.startsWith('/')) {
       logger.debug({ sessionKey: this.sessionKey }, 'transport message recall skipped: control message');
-      return null;
+      return {
+        artifact: null,
+        statusPayload: buildMemoryContextStatusPayload(query, 'skipped_control_message', 'message', {
+          runtimeFamily: 'transport',
+          authoritySource: 'processed_local',
+          sourceKind: 'local_processed',
+        }),
+      };
     }
     if (trimmed.length < 10) {
       logger.debug({ sessionKey: this.sessionKey, length: trimmed.length }, 'transport message recall skipped: short message');
-      return null;
+      return {
+        artifact: null,
+        statusPayload: buildMemoryContextStatusPayload(query, 'skipped_short_prompt', 'message', {
+          runtimeFamily: 'transport',
+          authoritySource: 'processed_local',
+          sourceKind: 'local_processed',
+        }),
+      };
     }
     if (isTemplatePrompt(trimmed)) {
       logger.debug({ sessionKey: this.sessionKey }, 'transport message recall skipped: template prompt');
-      return null;
+      return {
+        artifact: null,
+        statusPayload: buildMemoryContextStatusPayload(query, 'skipped_template_prompt', 'message', {
+          runtimeFamily: 'transport',
+          authoritySource: 'processed_local',
+          sourceKind: 'local_processed',
+        }),
+      };
     }
     try {
-      const query = trimmed.slice(0, 200);
       // Broaden candidate pool — the cap rule trims to 3 (up to 5 if all
       // results are strong). See shared/memory-scoring.ts.
       const result = await searchLocalMemorySemantic({
@@ -485,13 +515,30 @@ export class TransportSessionRuntime implements SessionRuntime {
       const procIds = processed.map((item) => item.id);
       const keepIds = new Set(filterRecentlyInjected(this.sessionKey, procIds));
       const deduped = processed.filter((item) => keepIds.has(item.id));
+      const dedupedCount = Math.max(0, processed.length - deduped.length);
       // 3) Cap rule: floor 0.5, top 3, extend to 5 iff all >= 0.6.
       const scored = deduped.map((item) => ({ item, score: item.relevanceScore ?? 0 }));
       const finalScored = applyRecallCapRule(scored);
       const items = finalScored.map((s) => toTransportMemoryRecallItem(s.item));
       if (items.length === 0) {
         logger.debug({ sessionKey: this.sessionKey, query }, 'transport message recall skipped: no processed matches');
-        return null;
+        return {
+          artifact: null,
+          statusPayload: deduped.length === 0 && processed.length > 0
+            ? buildMemoryContextStatusPayload(query, 'deduped_recently', 'message', {
+                runtimeFamily: 'transport',
+                authoritySource: 'processed_local',
+                sourceKind: 'local_processed',
+                matchedCount: processed.length,
+                dedupedCount,
+              })
+            : buildMemoryContextStatusPayload(query, 'no_matches', 'message', {
+                runtimeFamily: 'transport',
+                authoritySource: 'processed_local',
+                sourceKind: 'local_processed',
+                matchedCount: processed.length,
+              }),
+        };
       }
       // 4) Record injection into the per-session ring buffer.
       recordRecentInjection(this.sessionKey, items.map((it) => it.id));
@@ -505,20 +552,29 @@ export class TransportSessionRuntime implements SessionRuntime {
         authoritySource: 'processed_local',
         sourceKind: 'local_processed',
       });
-      if (!payload) return null;
+      if (!payload?.injectedText) return { artifact: null };
       return {
-        reason: 'message',
-        runtimeFamily: 'transport',
-        authoritySource: 'processed_local',
-        sourceKind: 'local_processed',
-        injectionSurface,
-        query,
-        items,
-        injectedText: payload.injectedText,
+        artifact: {
+          reason: 'message',
+          runtimeFamily: 'transport',
+          authoritySource: 'processed_local',
+          sourceKind: 'local_processed',
+          injectionSurface,
+          query,
+          items,
+          injectedText: payload.injectedText,
+        },
       };
     } catch (err) {
       logger.warn({ err, sessionKey: this.sessionKey }, 'transport message recall failed; continuing without recall');
-      return null;
+      return {
+        artifact: null,
+        statusPayload: buildMemoryContextStatusPayload(query, 'failed', 'message', {
+          runtimeFamily: 'transport',
+          authoritySource: 'processed_local',
+          sourceKind: 'local_processed',
+        }),
+      };
     }
   }
 
@@ -548,6 +604,21 @@ export class TransportSessionRuntime implements SessionRuntime {
       sourceKind: memoryRecall.sourceKind,
     });
     if (!payload) return;
+    timelineEmitter.emit(
+      this.sessionKey,
+      'memory.context',
+      {
+        ...payload,
+        ...(clientMessageId ? { relatedToEventId: `transport-user:${clientMessageId}` } : {}),
+      },
+      { source: 'daemon', confidence: 'high' },
+    );
+  }
+
+  private emitMemoryContextStatusEvent(
+    payload: Omit<MemoryContextTimelinePayload, 'relatedToEventId'>,
+    clientMessageId?: string,
+  ): void {
     timelineEmitter.emit(
       this.sessionKey,
       'memory.context',

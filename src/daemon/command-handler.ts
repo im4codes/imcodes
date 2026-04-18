@@ -358,7 +358,7 @@ import { getQwenDisplayMetadata } from '../agent/provider-display.js';
 import { buildRelatedPastWorkText } from '../../shared/memory-recall-format.js';
 import { getQwenOAuthQuotaUsageLabel, recordQwenOAuthRequest } from '../agent/provider-quota.js';
 import { listProviderSessions as listProviderSessionsImpl } from './provider-sessions.js';
-import { buildMemoryContextTimelinePayload } from './memory-context-timeline.js';
+import { buildMemoryContextTimelinePayload, buildMemoryContextStatusPayload } from './memory-context-timeline.js';
 
 function describeTransportSendError(err: unknown): string {
   if (err && typeof err === 'object') {
@@ -4318,15 +4318,31 @@ async function prependLocalMemory(
   timelinePayload?: Omit<MemoryContextTimelinePayload, 'relatedToEventId'>;
   hitIds?: string[];
 }> {
-  if (prompt.length < 10) return { text: prompt }; // skip greetings / confirmations
+  const query = prompt.slice(0, 200);
+  if (prompt.trim().startsWith('/')) {
+    return {
+      text: prompt,
+      timelinePayload: buildMemoryContextStatusPayload(query, 'skipped_control_message'),
+    };
+  }
+  if (prompt.length < 10) {
+    return {
+      text: prompt,
+      timelinePayload: buildMemoryContextStatusPayload(query, 'skipped_short_prompt'),
+    };
+  }
   // Template-prompt skip: OpenSpec / slash-command / skill-template prompts
   // are not natural-language questions; a recall over them returns noise.
   // See shared/template-prompt-patterns.ts.
-  if (isTemplatePrompt(prompt)) return { text: prompt };
+  if (isTemplatePrompt(prompt)) {
+    return {
+      text: prompt,
+      timelinePayload: buildMemoryContextStatusPayload(query, 'skipped_template_prompt'),
+    };
+  }
   try {
     const { searchLocalMemorySemantic } = await import('../context/memory-search.js');
     const record = getSession(sessionName);
-    const query = prompt.slice(0, 200);
     // Broaden the candidate pool — the cap rule trims to 3 (or up to 5 for
     // all-strong results). We need enough candidates to survive filtering.
     const searchResult = await searchLocalMemorySemantic({
@@ -4346,12 +4362,25 @@ async function prependLocalMemory(
     const ids = notTemplate.map((item) => item.id);
     const keepIds = new Set(filterRecentlyInjected(sessionName, ids));
     const deduped = notTemplate.filter((item) => keepIds.has(item.id));
+    const dedupedCount = Math.max(0, notTemplate.length - deduped.length);
     // 3) Cap rule: floor 0.5, top 3, extend to 5 iff all >= 0.6.
     //    See shared/memory-scoring.ts.
     const scored = deduped.map((item) => ({ item, score: item.relevanceScore ?? 0 }));
     const finalScored = applyRecallCapRule(scored);
     const finalItems = finalScored.map((s) => s.item);
-    if (finalItems.length === 0) return { text: prompt };
+    if (finalItems.length === 0) {
+      return {
+        text: prompt,
+        timelinePayload: deduped.length === 0 && notTemplate.length > 0
+          ? buildMemoryContextStatusPayload(query, 'deduped_recently', 'message', {
+              matchedCount: notTemplate.length,
+              dedupedCount,
+            })
+          : buildMemoryContextStatusPayload(query, 'no_matches', 'message', {
+              matchedCount: notTemplate.length,
+            }),
+      };
+    }
     const hitIds = finalItems.filter((item) => item.type === 'processed').map((item) => item.id);
     const injectedText = buildRelatedPastWorkText(finalItems);
     const timelinePayload = buildMemoryContextTimelinePayload(query, finalItems);
@@ -4370,6 +4399,9 @@ async function prependLocalMemory(
       hitIds: hitIds.length > 0 ? hitIds : undefined,
     };
   } catch {
-    return { text: prompt }; // non-fatal
+    return {
+      text: prompt,
+      timelinePayload: buildMemoryContextStatusPayload(query, 'failed'),
+    }; // non-fatal
   }
 }

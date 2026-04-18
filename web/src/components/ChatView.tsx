@@ -102,6 +102,52 @@ function formatMemoryContextTimestamp(ts: number | undefined): string | null {
   return new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
+function getMemoryContextStatusSummary(
+  t: (key: string, options?: Record<string, unknown>) => string,
+  payload: MemoryContextTimelinePayload,
+  itemCount: number,
+): string {
+  switch (payload.status) {
+    case 'no_matches':
+      return t('chat.memory_context_status_no_matches');
+    case 'deduped_recently':
+      return t('chat.memory_context_status_deduped_recently', { count: payload.matchedCount ?? 0 });
+    case 'skipped_template_prompt':
+      return t('chat.memory_context_status_skipped_template_prompt');
+    case 'skipped_short_prompt':
+      return t('chat.memory_context_status_skipped_short_prompt');
+    case 'skipped_control_message':
+      return t('chat.memory_context_status_skipped_control_message');
+    case 'failed':
+      return t('chat.memory_context_status_failed');
+    default:
+      return t('chat.memory_context_summary', { count: itemCount });
+  }
+}
+
+function getMemoryContextStatusDetail(
+  t: (key: string, options?: Record<string, unknown>) => string,
+  payload: MemoryContextTimelinePayload,
+): string | null {
+  switch (payload.status) {
+    case 'deduped_recently':
+      return t('chat.memory_context_status_deduped_recently_detail', {
+        count: payload.matchedCount ?? 0,
+        deduped: payload.dedupedCount ?? payload.matchedCount ?? 0,
+      });
+    case 'skipped_template_prompt':
+      return t('chat.memory_context_status_skipped_template_prompt_detail');
+    case 'skipped_short_prompt':
+      return t('chat.memory_context_status_skipped_short_prompt_detail');
+    case 'skipped_control_message':
+      return t('chat.memory_context_status_skipped_control_message_detail');
+    case 'failed':
+      return t('chat.memory_context_status_failed_detail');
+    default:
+      return null;
+  }
+}
+
 const TOOL_INPUT_SUMMARY_KEYS = [
   'query',
   'command',
@@ -1707,12 +1753,30 @@ const MemoryContextEvent = memo(function MemoryContextEvent({ event }: { event: 
   const items = Array.isArray(payload.items) ? payload.items as MemoryContextTimelineItem[] : [];
   const query = typeof payload.query === 'string' ? payload.query : '';
   const reason = payload.reason ?? 'message';
+  const statusSummary = getMemoryContextStatusSummary(t, payload, items.length);
+  const statusDetail = getMemoryContextStatusDetail(t, payload);
+  const isStatusOnly = items.length === 0 && !!payload.status;
+
+  if (isStatusOnly) {
+    return (
+      <div class="chat-event chat-memory-context chat-memory-context-status" data-related-to={String(payload.relatedToEventId ?? '')}>
+        <div class="chat-memory-context-status-title">{t('chat.memory_context_title')}</div>
+        <div class="chat-memory-context-status-summary">{statusSummary}</div>
+        {query && (
+          <div class="chat-memory-context-query">{t('chat.memory_context_query', { query })}</div>
+        )}
+        {statusDetail && (
+          <div class="chat-memory-context-status-detail">{statusDetail}</div>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div class="chat-event chat-memory-context" data-related-to={String(payload.relatedToEventId ?? '')}>
       <button class="chat-memory-context-toggle" onClick={() => setExpanded((value) => !value)}>
         <span class="chat-memory-context-title">{t('chat.memory_context_title')}</span>
-        <span class="chat-memory-context-summary">{t('chat.memory_context_summary', { count: items.length })}</span>
+        <span class="chat-memory-context-summary">{statusSummary}</span>
         <span class="chat-memory-context-caret">{expanded ? '▲' : '▼'}</span>
       </button>
       {expanded && (

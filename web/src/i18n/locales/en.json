@@ -55,6 +55,17 @@
     "memory_context_score": "Score {{score}}",
     "memory_context_startup_reason": "Injected during session startup",
     "memory_context_collapse_bottom": "Collapse",
+    "memory_context_status_no_matches": "No related memory found",
+    "memory_context_status_deduped_recently": "{{count}} related memories found, but they were already injected recently",
+    "memory_context_status_deduped_recently_detail": "Found {{count}} related memories. {{deduped}} were skipped because they were already injected in recent turns.",
+    "memory_context_status_skipped_template_prompt": "Skipped memory recall for an internal/template prompt",
+    "memory_context_status_skipped_template_prompt_detail": "This message matches a built-in workflow or template prompt, so related-memory lookup was skipped on purpose.",
+    "memory_context_status_skipped_short_prompt": "Skipped memory recall because the prompt is too short",
+    "memory_context_status_skipped_short_prompt_detail": "Short prompts are not specific enough to produce reliable related-memory matches.",
+    "memory_context_status_skipped_control_message": "Skipped memory recall for a command message",
+    "memory_context_status_skipped_control_message_detail": "Slash commands do not trigger related-memory lookup.",
+    "memory_context_status_failed": "Related-memory lookup is temporarily unavailable",
+    "memory_context_status_failed_detail": "The message was still sent, but memory lookup failed this time.",
     "file_change_title": "File changes ({{count}})",
     "file_change_patch_count": "{{count}} patch(s)",
     "file_change_provider_claude_code": "Claude Code",
@@ -119,8 +130,12 @@
       "codex_sdk": "Codex SDK",
       "claude_code_cli": "Claude Code CLI",
       "codex_cli": "Codex CLI",
-      "copilot_sdk": "GitHub Copilot SDK",
-      "cursor_headless": "Cursor Headless"
+      "copilot_sdk": "Copilot",
+      "cursor_headless": "Cursor"
+    },
+    "agentGroup": {
+      "transport_sdk": "SDK",
+      "cli_process": "CLI"
     },
     "openclaw_not_connected": "not connected",
     "openclaw_connect_hint": "OpenClaw gateway is not connected. Run the following command on your daemon machine to connect:",

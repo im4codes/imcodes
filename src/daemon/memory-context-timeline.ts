@@ -1,5 +1,9 @@
 import type { MemorySearchResultItem } from '../context/memory-search.js';
-import type { MemoryContextTimelinePayload, MemoryContextTimelineItem } from '../shared/timeline/types.js';
+import type {
+  MemoryContextTimelinePayload,
+  MemoryContextTimelineItem,
+  MemoryContextTimelineStatus,
+} from '../shared/timeline/types.js';
 import { buildRelatedPastWorkText } from '../../shared/memory-recall-format.js';
 import type {
   ContextAuthorityDecision,
@@ -40,6 +44,33 @@ export function buildMemoryContextTimelinePayload(
     injectedText: options?.injectedText ?? buildRelatedPastWorkText(timelineItems),
     items: timelineItems,
     reason,
+    ...(options?.runtimeFamily ? { runtimeFamily: options.runtimeFamily } : {}),
+    ...(options?.injectionSurface ? { injectionSurface: options.injectionSurface } : {}),
+    ...(options?.authoritySource ? { authoritySource: options.authoritySource } : {}),
+    ...(options?.sourceKind ? { sourceKind: options.sourceKind } : {}),
+  };
+}
+
+export function buildMemoryContextStatusPayload(
+  query: string | undefined,
+  status: MemoryContextTimelineStatus,
+  reason: MemoryContextTimelinePayload['reason'] = 'message',
+  options?: {
+    runtimeFamily?: MemoryRecallRuntimeFamily;
+    injectionSurface?: MemoryRecallInjectionSurface;
+    authoritySource?: ContextAuthorityDecision['authoritySource'];
+    sourceKind?: 'local_processed' | 'remote_processed';
+    matchedCount?: number;
+    dedupedCount?: number;
+  },
+): Omit<MemoryContextTimelinePayload, 'relatedToEventId'> {
+  return {
+    ...(query ? { query } : {}),
+    items: [],
+    reason,
+    status,
+    ...(typeof options?.matchedCount === 'number' ? { matchedCount: options.matchedCount } : {}),
+    ...(typeof options?.dedupedCount === 'number' ? { dedupedCount: options.dedupedCount } : {}),
     ...(options?.runtimeFamily ? { runtimeFamily: options.runtimeFamily } : {}),
     ...(options?.injectionSurface ? { injectionSurface: options.injectionSurface } : {}),
     ...(options?.authoritySource ? { authoritySource: options.authoritySource } : {}),

@@ -265,6 +265,41 @@ describe('ChatView', () => {
     });
   });
 
+  it('renders status-only memory context hints when recall is skipped or empty', async () => {
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-user',
+            type: 'user.message',
+            ts: 1000,
+            payload: { text: 'Continue' },
+          },
+          {
+            eventId: 'evt-memory-status',
+            type: 'memory.context',
+            ts: 1001,
+            payload: {
+              relatedToEventId: 'evt-user',
+              query: 'Continue',
+              status: 'deduped_recently',
+              matchedCount: 2,
+              dedupedCount: 2,
+              items: [],
+            },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    expect(container.querySelector('.chat-memory-context-status')).not.toBeNull();
+    expect(container.textContent).toContain('chat.memory_context_status_deduped_recently');
+    expect(container.textContent).toContain('chat.memory_context_status_deduped_recently_detail');
+    expect(container.textContent).toContain('chat.memory_context_query');
+  });
+
   it('renders Auto progress notes as a separate assistant block instead of merging them into the model reply', async () => {
     const events = [
       {

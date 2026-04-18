@@ -55,6 +55,17 @@
     "memory_context_score": "分数 {{score}}",
     "memory_context_startup_reason": "在会话启动时注入",
     "memory_context_collapse_bottom": "收起",
+    "memory_context_status_no_matches": "没有找到相关记忆",
+    "memory_context_status_deduped_recently": "找到了 {{count}} 条相关记忆，但最近已经注入过了",
+    "memory_context_status_deduped_recently_detail": "共找到 {{count}} 条相关记忆，其中 {{deduped}} 条因为最近几轮已经注入过而被跳过。",
+    "memory_context_status_skipped_template_prompt": "已跳过内置/模板提示词的记忆查找",
+    "memory_context_status_skipped_template_prompt_detail": "这条消息匹配到内置工作流或模板提示词，因此故意不做相关记忆查找。",
+    "memory_context_status_skipped_short_prompt": "提示太短，已跳过记忆查找",
+    "memory_context_status_skipped_short_prompt_detail": "过短的提示无法稳定匹配到可靠的相关记忆。",
+    "memory_context_status_skipped_control_message": "命令消息已跳过记忆查找",
+    "memory_context_status_skipped_control_message_detail": "Slash 命令不会触发相关记忆查找。",
+    "memory_context_status_failed": "相关记忆查找暂时不可用",
+    "memory_context_status_failed_detail": "消息已经正常发出，但这次记忆查找失败了。",
     "file_change_title": "文件变更（{{count}}）",
     "file_change_patch_count": "{{count}} 个补丁",
     "file_change_provider_claude_code": "Claude Code",
@@ -119,8 +130,12 @@
       "codex_sdk": "Codex SDK",
       "claude_code_cli": "Claude Code CLI",
       "codex_cli": "Codex CLI",
-      "copilot_sdk": "GitHub Copilot SDK",
-      "cursor_headless": "Cursor Headless"
+      "copilot_sdk": "Copilot",
+      "cursor_headless": "Cursor"
+    },
+    "agentGroup": {
+      "transport_sdk": "SDK",
+      "cli_process": "CLI"
     },
     "openclaw_not_connected": "未连接",
     "openclaw_connect_hint": "OpenClaw 网关未连接。请在 daemon 机器上运行以下命令连接：",

@@ -55,6 +55,17 @@
     "memory_context_score": "Оценка {{score}}",
     "memory_context_startup_reason": "Вставлено при запуске сессии",
     "memory_context_collapse_bottom": "Свернуть",
+    "memory_context_status_no_matches": "Связанная память не найдена",
+    "memory_context_status_deduped_recently": "Найдено {{count}} связанных записей, но они уже недавно вставлялись",
+    "memory_context_status_deduped_recently_detail": "Найдено {{count}} связанных записей. {{deduped}} были пропущены, потому что уже вставлялись в недавних ходах.",
+    "memory_context_status_skipped_template_prompt": "Поиск памяти пропущен для внутреннего/шаблонного промпта",
+    "memory_context_status_skipped_template_prompt_detail": "Это сообщение совпало со встроенным workflow или шаблонным промптом, поэтому поиск связанной памяти был намеренно пропущен.",
+    "memory_context_status_skipped_short_prompt": "Поиск памяти пропущен, потому что промпт слишком короткий",
+    "memory_context_status_skipped_short_prompt_detail": "Короткие промпты недостаточно конкретны для надёжного поиска связанной памяти.",
+    "memory_context_status_skipped_control_message": "Поиск памяти пропущен для командного сообщения",
+    "memory_context_status_skipped_control_message_detail": "Слэш-команды не запускают поиск связанной памяти.",
+    "memory_context_status_failed": "Поиск связанной памяти временно недоступен",
+    "memory_context_status_failed_detail": "Сообщение было отправлено, но в этот раз поиск памяти не сработал.",
     "file_change_title": "Изменения файлов ({{count}})",
     "file_change_patch_count": "{{count}} патч(ей)",
     "file_change_provider_claude_code": "Claude Code",
@@ -119,8 +130,12 @@
       "codex_sdk": "Codex SDK",
       "claude_code_cli": "Claude Code CLI",
       "codex_cli": "Codex CLI",
-      "copilot_sdk": "GitHub Copilot SDK",
-      "cursor_headless": "Cursor Headless"
+      "copilot_sdk": "Copilot",
+      "cursor_headless": "Cursor"
+    },
+    "agentGroup": {
+      "transport_sdk": "SDK",
+      "cli_process": "CLI"
     },
     "openclaw_not_connected": "не подключено",
     "openclaw_connect_hint": "Шлюз OpenClaw не подключён. Запустите следующую команду на машине с демоном:",

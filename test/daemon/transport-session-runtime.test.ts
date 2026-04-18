@@ -504,12 +504,13 @@ describe('TransportSessionRuntime', () => {
     );
   });
 
-  it('skips transport recall for control and short messages without emitting memory.context', async () => {
+  it('emits explicit skipped-recall statuses for control and short transport messages', async () => {
     const localMock = makeMockProvider();
     const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
     r.setContextBootstrapResolver(async () => ({
       namespace: { scope: 'personal', projectId: 'repo-1' },
       diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
     }));
     await r.initialize(defaultConfig);
     timelineEmitterEmitMock.mockClear();
@@ -527,10 +528,26 @@ describe('TransportSessionRuntime', () => {
     expect(localMock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.not.objectContaining({
       memoryRecall: expect.anything(),
     }));
-    expect(timelineEmitterEmitMock).not.toHaveBeenCalledWith(
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
       'deck_test_brain',
       'memory.context',
-      expect.objectContaining({ reason: 'message' }),
+      expect.objectContaining({
+        reason: 'message',
+        relatedToEventId: 'transport-user:client-turn-control',
+        status: 'skipped_control_message',
+        items: [],
+      }),
+      expect.anything(),
+    );
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+      'deck_test_brain',
+      'memory.context',
+      expect.objectContaining({
+        reason: 'message',
+        relatedToEventId: 'transport-user:client-turn-short',
+        status: 'skipped_short_prompt',
+        items: [],
+      }),
       expect.anything(),
     );
   });
@@ -542,6 +559,7 @@ describe('TransportSessionRuntime', () => {
     r.setContextBootstrapResolver(async () => ({
       namespace: { scope: 'personal', projectId: 'repo-1' },
       diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
     }));
     await r.initialize(defaultConfig);
     timelineEmitterEmitMock.mockClear();
@@ -552,10 +570,46 @@ describe('TransportSessionRuntime', () => {
     expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.not.objectContaining({
       memoryRecall: expect.anything(),
     }));
-    expect(timelineEmitterEmitMock).not.toHaveBeenCalledWith(
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
       'deck_test_brain',
       'memory.context',
-      expect.objectContaining({ reason: 'message' }),
+      expect.objectContaining({
+        reason: 'message',
+        relatedToEventId: 'transport-user:client-turn-2',
+        status: 'failed',
+        items: [],
+      }),
+      expect.anything(),
+    );
+  });
+
+  it('emits a template-prompt skip status before transport recall lookup', async () => {
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
+    }));
+    await r.initialize(defaultConfig);
+    timelineEmitterEmitMock.mockClear();
+
+    r.send('Implement @openspec/changes/shared-agent-context and continue the template workflow', 'client-turn-template');
+    await flushDispatch();
+
+    expect(searchLocalMemorySemanticMock).not.toHaveBeenCalled();
+    expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.not.objectContaining({
+      memoryRecall: expect.anything(),
+    }));
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+      'deck_test_brain',
+      'memory.context',
+      expect.objectContaining({
+        reason: 'message',
+        relatedToEventId: 'transport-user:client-turn-template',
+        status: 'skipped_template_prompt',
+        items: [],
+      }),
       expect.anything(),
     );
   });

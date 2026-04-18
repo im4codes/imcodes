@@ -55,6 +55,17 @@
     "memory_context_score": "Puntuación {{score}}",
     "memory_context_startup_reason": "Inyectado al iniciar la sesión",
     "memory_context_collapse_bottom": "Colapsar",
+    "memory_context_status_no_matches": "No se encontró memoria relacionada",
+    "memory_context_status_deduped_recently": "Se encontraron {{count}} memorias relacionadas, pero ya se inyectaron hace poco",
+    "memory_context_status_deduped_recently_detail": "Se encontraron {{count}} memorias relacionadas. {{deduped}} se omitieron porque ya se inyectaron en turnos recientes.",
+    "memory_context_status_skipped_template_prompt": "Se omitió la búsqueda de memoria para un prompt interno/de plantilla",
+    "memory_context_status_skipped_template_prompt_detail": "Este mensaje coincide con un flujo interno o un prompt de plantilla, así que la búsqueda de memoria relacionada se omitió a propósito.",
+    "memory_context_status_skipped_short_prompt": "Se omitió la búsqueda de memoria porque el prompt es demasiado corto",
+    "memory_context_status_skipped_short_prompt_detail": "Los prompts cortos no son lo bastante específicos para encontrar memoria relacionada de forma fiable.",
+    "memory_context_status_skipped_control_message": "Se omitió la búsqueda de memoria para un mensaje de comando",
+    "memory_context_status_skipped_control_message_detail": "Los comandos con barra no activan la búsqueda de memoria relacionada.",
+    "memory_context_status_failed": "La búsqueda de memoria relacionada no está disponible temporalmente",
+    "memory_context_status_failed_detail": "El mensaje sí se envió, pero esta vez falló la búsqueda de memoria.",
     "file_change_title": "Cambios de archivo ({{count}})",
     "file_change_patch_count": "{{count}} parches",
     "file_change_provider_claude_code": "Claude Code",
@@ -119,8 +130,12 @@
       "codex_sdk": "Codex SDK",
       "claude_code_cli": "Claude Code CLI",
       "codex_cli": "Codex CLI",
-      "copilot_sdk": "GitHub Copilot SDK",
-      "cursor_headless": "Cursor Headless"
+      "copilot_sdk": "Copilot",
+      "cursor_headless": "Cursor"
+    },
+    "agentGroup": {
+      "transport_sdk": "SDK",
+      "cli_process": "CLI"
     },
     "openclaw_not_connected": "no conectado",
     "openclaw_connect_hint": "El gateway de OpenClaw no está conectado. Ejecuta el siguiente comando en tu máquina daemon:",
