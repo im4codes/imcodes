@@ -778,10 +778,21 @@ body {
 .chat-memory-context-chip-muted { color: #64748b; }
 .chat-memory-context-collapse-bottom { align-self: flex-start; background: none; border: 1px solid #334155; color: #94a3b8; border-radius: 6px; padding: 6px 10px; font-size: 11px; cursor: pointer; transition: color 0.15s, border-color 0.15s, background 0.15s; }
 .chat-memory-context-collapse-bottom:hover { color: #e2e8f0; border-color: #6366f1; background: rgba(99,102,241,0.08); }
-.chat-memory-context-status { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; }
+/* Gap shrunk to 0 because the expand toggle owns its own padding; the
+   inner detail block adds its own margin-top below. */
+.chat-memory-context-status { display: flex; flex-direction: column; padding: 0; }
 .chat-memory-context-status-title { font-size: 12px; font-weight: 600; color: #c4b5fd; }
 .chat-memory-context-status-summary { font-size: 12px; color: #e2e8f0; }
-.chat-memory-context-status-detail { font-size: 11px; color: #94a3b8; white-space: pre-wrap; word-break: break-word; }
+/* The single-line summary row for skipped/no-match cards. The title +
+   summary sit side-by-side so the collapsed card reads as "Title — reason"
+   instead of two stacked lines. */
+.chat-memory-context-status-row { display: flex; align-items: center; gap: 8px; padding: 8px 10px; flex-wrap: wrap; }
+/* When a detail body exists we expose the toggle form so the user can
+   expand-on-demand. Reuse chat-memory-context-toggle baseline but add a
+   status-specific alignment override so the caret sits on the right. */
+.chat-memory-context-status-toggle { justify-content: flex-start; }
+.chat-memory-context-status-toggle .chat-memory-context-caret { margin-left: auto; font-size: 11px; color: #64748b; }
+.chat-memory-context-status-detail { font-size: 11px; color: #94a3b8; white-space: pre-wrap; word-break: break-word; padding: 0 10px 10px; }
 .chat-mode { display: inline-block; background: #1e1338; color: #a78bfa; padding: 2px 8px; border-radius: 4px; font-size: 11px; }
 .chat-system { text-align: center; color: #475569; font-size: 11px; padding: 4px 0; }
 .chat-loading { text-align: center; color: #475569; padding: 24px; }

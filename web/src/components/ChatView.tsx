@@ -1808,14 +1808,31 @@ const MemoryContextEvent = memo(function MemoryContextEvent({ event }: { event: 
     : 'chat.memory_context_title';
 
   if (isStatusOnly) {
+    // Skipped/empty recall cards were showing title + summary + query + detail
+    // stacked at once. The query is just the prompt the user already sees one
+    // bubble above — redundant noise. Collapse to a single-line summary with
+    // a caret to expand when the user actually wants the detail.
+    const hasDetail = !!statusDetail;
     return (
       <div class="chat-event chat-memory-context chat-memory-context-status" data-related-to={String(payload.relatedToEventId ?? '')}>
-        <div class="chat-memory-context-status-title">{t(titleKey)}</div>
-        <div class="chat-memory-context-status-summary">{statusSummary}</div>
-        {query && (
-          <div class="chat-memory-context-query">{t('chat.memory_context_query', { query })}</div>
+        {hasDetail ? (
+          <button
+            type="button"
+            class="chat-memory-context-toggle chat-memory-context-status-toggle"
+            onClick={() => setExpanded((value) => !value)}
+            aria-expanded={expanded}
+          >
+            <span class="chat-memory-context-status-title">{t(titleKey)}</span>
+            <span class="chat-memory-context-status-summary">{statusSummary}</span>
+            <span class="chat-memory-context-caret">{expanded ? '▲' : '▼'}</span>
+          </button>
+        ) : (
+          <div class="chat-memory-context-status-row">
+            <span class="chat-memory-context-status-title">{t(titleKey)}</span>
+            <span class="chat-memory-context-status-summary">{statusSummary}</span>
+          </div>
         )}
-        {statusDetail && (
+        {expanded && hasDetail && (
           <div class="chat-memory-context-status-detail">{statusDetail}</div>
         )}
       </div>
