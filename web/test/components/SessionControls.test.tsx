@@ -1965,9 +1965,9 @@ afterEach(() => {
     expect(patchSessionMock).not.toHaveBeenCalled();
   });
 
-  it('subscribes to active transport chat events and renders approval controls', async () => {
+  it('renders approval controls for active transport chat events', async () => {
     const ws = makeWs();
-    const { unmount } = render(
+    render(
       <SessionControls
         ws={ws as any}
         serverId="srv1"
@@ -1979,7 +1979,6 @@ afterEach(() => {
       />,
     );
 
-    expect(ws.subscribeTransportSession).toHaveBeenCalledWith('codex-sdk-session');
     await waitFor(() => {
       expect(ws.onMessage).toHaveBeenCalled();
     });
@@ -2005,9 +2004,6 @@ afterEach(() => {
 
     fireEvent.click(screen.getByRole('button', { name: /^Allow$/ }));
     expect(ws.respondTransportApproval).toHaveBeenCalledWith('codex-sdk-session', 'approval-1', true);
-
-    unmount();
-    expect(ws.unsubscribeTransportSession).toHaveBeenCalledWith('codex-sdk-session');
   });
 
   it('treats copilot-sdk sessions as transport even when runtimeType is omitted', async () => {
@@ -2027,7 +2023,6 @@ afterEach(() => {
       />,
     );
 
-    expect(ws.subscribeTransportSession).toHaveBeenCalledWith('copilot-session');
     expect(screen.getByRole('button', { name: /^Stop$/ })).toBeDefined();
   });
 

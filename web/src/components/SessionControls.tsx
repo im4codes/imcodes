@@ -524,23 +524,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const connected = !!ws?.connected;
 
   useEffect(() => {
-    if (!ws || !connected || !activeSession || effectiveRuntimeType !== 'transport') return;
-    const sessionId = activeSession.name;
-    try {
-      ws.subscribeTransportSession(sessionId);
-    } catch {
-      // ignore — approval UI will remain inert until the next reconnect
-    }
-    return () => {
-      try {
-        ws.unsubscribeTransportSession(sessionId);
-      } catch {
-        // ignore
-      }
-    };
-  }, [activeSession?.name, effectiveRuntimeType, connected, ws]);
-
-  useEffect(() => {
     if (!ws) return;
     return ws.onMessage((msg) => {
       if (!activeSession || effectiveRuntimeType !== 'transport') return;

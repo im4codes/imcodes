@@ -66,6 +66,8 @@ import type { SessionInfo, TerminalDiff } from './types.js';
 import { REPO_MSG } from '@shared/repo-types.js';
 import {
   buildTerminalResubscribePlan,
+  listGlobalTransportSubSessionNames,
+  listGlobalTransportSubscriptionNames,
   listPassiveTerminalSubSessionNames,
   listPassiveTerminalSubscriptionNames,
   shouldSubscribeTerminalRaw,
@@ -1813,6 +1815,22 @@ export function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connected, sessionNamesKey]);
 
+  // Subscribe to structured transport chat/timeline updates for ALL transport sessions.
+  // SDK-backed sessions must remain globally subscribed regardless of which panel is active.
+  useEffect(() => {
+    const ws = wsRef.current;
+    if (!ws?.connected || sessions.length === 0) return;
+    const names = listGlobalTransportSubscriptionNames(sessions);
+    for (const name of names) {
+      try { ws.subscribeTransportSession(name); } catch { /* ignore */ }
+    }
+    return () => {
+      for (const name of names) {
+        try { ws.unsubscribeTransportSession(name); } catch { /* ignore */ }
+      }
+    };
+  }, [connected, sessionNamesKey, sessions]);
+
   // Subscribe terminal for ALL sub-sessions in passive mode.
   // Active sub-session windows upgrade themselves to raw:true while visible.
   const subSessionNamesKey = subSessions.map((s) => s.sessionName).sort().join(',');
@@ -1830,6 +1848,21 @@ export function App() {
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connected, subSessionNamesKey]);
+
+  // Subscribe to structured transport updates for ALL transport sub-sessions too.
+  useEffect(() => {
+    const ws = wsRef.current;
+    if (!ws?.connected || subSessions.length === 0) return;
+    const names = listGlobalTransportSubSessionNames(subSessions);
+    for (const name of names) {
+      try { ws.subscribeTransportSession(name); } catch { /* ignore */ }
+    }
+    return () => {
+      for (const name of names) {
+        try { ws.unsubscribeTransportSession(name); } catch { /* ignore */ }
+      }
+    };
+  }, [connected, subSessionNamesKey, subSessions]);
 
   // When switching to a session in terminal mode, trigger fit.
   // All sessions are subscribed to PTY streaming, so xterm buffer is already current —

@@ -20,12 +20,34 @@ export interface TerminalResubscribeItem {
   mode?: TerminalSubscribeViewMode;
 }
 
+type TransportNamedSessionTarget = {
+  name: string;
+  runtimeType?: 'process' | 'transport' | null;
+};
+
+type TransportNamedSubSessionTarget = {
+  sessionName: string;
+  runtimeType?: 'process' | 'transport' | null;
+};
+
 export function listPassiveTerminalSubscriptionNames<T extends NamedSessionTarget>(targets: readonly T[]): string[] {
   return targets.map((target) => target.name);
 }
 
 export function listPassiveTerminalSubSessionNames<T extends NamedSubSessionTarget>(targets: readonly T[]): string[] {
   return targets.map((target) => target.sessionName);
+}
+
+export function listGlobalTransportSubscriptionNames<T extends TransportNamedSessionTarget>(targets: readonly T[]): string[] {
+  return targets
+    .filter((target) => target.runtimeType === 'transport')
+    .map((target) => target.name);
+}
+
+export function listGlobalTransportSubSessionNames<T extends TransportNamedSubSessionTarget>(targets: readonly T[]): string[] {
+  return targets
+    .filter((target) => target.runtimeType === 'transport')
+    .map((target) => target.sessionName);
 }
 
 export function buildTerminalResubscribePlan(params: {
