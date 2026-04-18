@@ -34,8 +34,19 @@ vi.mock('../../src/components/TerminalView.js', () => ({
   },
 }));
 
+const addOptimisticUserMessageSpy = vi.fn();
+const removeOptimisticMessageSpy = vi.fn();
+
 vi.mock('../../src/hooks/useTimeline.js', () => ({
-  useTimeline: () => ({ events: timelineEvents, refreshing: false }),
+  useTimeline: () => ({
+    events: timelineEvents,
+    refreshing: false,
+    // Exposed so the card's onSend / handleResendFailed handlers exercise
+    // real wiring. Shell sub-sessions deliberately skip useTimeline and the
+    // card falls back to no-op; that path is covered by its own test.
+    addOptimisticUserMessage: addOptimisticUserMessageSpy,
+    removeOptimisticMessage: removeOptimisticMessageSpy,
+  }),
 }));
 
 const sessionControlsSpy = vi.fn((props: any) => (
@@ -376,5 +387,43 @@ describe('SubSessionCard', () => {
     const props = sessionControlsSpy.mock.calls.at(-1)?.[0];
     expect(props.compact).toBe(true);
     expect(props.hideShortcuts).toBeUndefined();
+  });
+
+  it('routes SessionControls.onSend through addOptimisticUserMessage so the card shows the pending bubble immediately', () => {
+    // Regression: the sub-session card used to omit the onSend callback
+    // entirely, so messages typed in the compact card composer never got an
+    // optimistic bubble — the user saw nothing until the daemon echoed back.
+    // Parity with SessionPane + SubSessionWindow is required.
+    render(
+      <SubSessionCard
+        sub={makeSubSession()}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        quickData={{ data: [], recordHistory: vi.fn() } as any}
+      />,
+    );
+
+    const props = sessionControlsSpy.mock.calls.at(-1)?.[0];
+    expect(typeof props.onSend).toBe('function');
+
+    props.onSend('deck_sub_x', 'card-typed message', {
+      commandId: 'cmd-card-1',
+      attachments: [{ kind: 'file', name: 'notes.md' }],
+      extra: { mode: 'quick' },
+    });
+
+    expect(addOptimisticUserMessageSpy).toHaveBeenCalledTimes(1);
+    expect(addOptimisticUserMessageSpy).toHaveBeenCalledWith(
+      'card-typed message',
+      'cmd-card-1',
+      expect.objectContaining({
+        attachments: [{ kind: 'file', name: 'notes.md' }],
+        resendExtra: { mode: 'quick' },
+      }),
+    );
   });
 });
