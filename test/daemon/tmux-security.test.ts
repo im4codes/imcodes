@@ -168,6 +168,29 @@ describe('tmux shell-injection prevention', () => {
     expect(listSessionsCalls.length).toBe(1);
     expect(newSessionCalls.length).toBe(2);
   });
+
+  it('serializes tmux server priming so concurrent calls do not race on imcodes_init', async () => {
+    vi.resetModules();
+    const freshTmux = await import('../../src/agent/tmux.js');
+    execFileCalls.length = 0;
+    failNextTmuxSubcommand = 'list-sessions';
+    failNextTmuxErrorText = 'no server running';
+
+    await Promise.all([
+      freshTmux.newSession('deck_test_brain_a', 'bash'),
+      freshTmux.newSession('deck_test_brain_b', 'bash'),
+    ]);
+
+    const initSessions = execFileCalls.filter(
+      (c) => c.args[0] === 'new-session' && c.args[3] === 'imcodes_init',
+    );
+    expect(initSessions.length).toBe(1);
+
+    const killInit = execFileCalls.filter(
+      (c) => c.args[0] === 'kill-session' && c.args[2] === 'imcodes_init',
+    );
+    expect(killInit.length).toBe(1);
+  });
 });
 
 describe('tmux FIFO open mode', () => {

@@ -117,6 +117,7 @@ function requireTmux(feature: string): void {
 
 /** Ensure tmux server is running. Auto-starts if dead. */
 let tmuxServerChecked = false;
+let tmuxServerCheckInFlight: Promise<void> | null = null;
 function getTmuxErrorText(error: unknown): string {
   if (!error || typeof error !== 'object') return String(error ?? '');
   const e = error as { stderr?: unknown; message?: unknown };
@@ -135,6 +136,11 @@ function isRecoverableTmuxServerError(error: unknown): boolean {
 
 async function ensureTmuxServer(): Promise<void> {
   if (tmuxServerChecked) return;
+  if (tmuxServerCheckInFlight) {
+    await tmuxServerCheckInFlight;
+    return;
+  }
+  tmuxServerCheckInFlight = (async () => {
   try {
     await execFile('tmux', ['list-sessions']);
     tmuxServerChecked = true;
@@ -152,6 +158,12 @@ async function ensureTmuxServer(): Promise<void> {
     } else {
       throw e;
     }
+  }
+  })();
+  try {
+    await tmuxServerCheckInFlight;
+  } finally {
+    tmuxServerCheckInFlight = null;
   }
 }
 
