@@ -3,6 +3,7 @@ import {
   SUPERVISION_CONTRACT_IDS,
   TASK_RUN_STATUS_MARKERS,
 } from '../../shared/supervision-config.js';
+import { SUPERVISION_IMCODES_BACKGROUND_DOCS } from './imcodes-workflow-docs.js';
 import type { SupervisionBrokerRequest } from './supervision-broker.js';
 
 function buildCustomInstructionsSection(customInstructions: string | undefined): string {
@@ -12,6 +13,10 @@ function buildCustomInstructionsSection(customInstructions: string | undefined):
     'Session-specific supervision instructions from the user:',
     trimmed,
   ].join('\n');
+}
+
+function buildImcodesWorkflowBackgroundSection(): string {
+  return SUPERVISION_IMCODES_BACKGROUND_DOCS;
 }
 
 export function buildSupervisionDecisionPrompt(
@@ -31,6 +36,7 @@ export function buildSupervisionDecisionPrompt(
     '- If the assistant says tests, validation, fixes, commit/push, or other implementation work still needs to be done, choose continue.',
     '- If the assistant proposes a concrete next engineering step such as adding tests, fixing issues, verifying results, committing, or pushing, treat that as not complete yet.',
     '- Do not choose complete when the assistant itself indicates remaining work, TODOs, missing validation, or a follow-up implementation step.',
+    buildImcodesWorkflowBackgroundSection(),
     buildCustomInstructionsSection(request.snapshot?.customInstructions),
     request.description ? `Context: ${request.description}` : '',
     'Task request:',
@@ -51,6 +57,7 @@ export function buildSupervisionDecisionRepairPrompt(
     'Return exactly one valid JSON object and nothing else.',
     '{"decision":"complete|continue|ask_human","reason":"...","confidence":0.0}',
     'If the assistant response mentions remaining implementation work like tests, fixes, verification, commit/push, or another concrete next engineering step, return continue instead of complete.',
+    buildImcodesWorkflowBackgroundSection(),
     buildCustomInstructionsSection(request.snapshot?.customInstructions),
     'Previous invalid output:',
     previousOutput,
@@ -75,6 +82,7 @@ export function buildSupervisionContinuePrompt(
     'Do not restart from scratch or restate completed work.',
     'Focus only on the remaining steps needed to finish the task.',
     'If you are truly blocked or need clarification, say that explicitly.',
+    buildImcodesWorkflowBackgroundSection(),
     buildCustomInstructionsSection(customInstructions),
     '',
     'Original task request:',

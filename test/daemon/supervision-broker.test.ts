@@ -188,6 +188,9 @@ describe('SupervisionBroker', () => {
     const prompt = String(provider.send.mock.calls[0]?.[1] ?? '');
     expect(prompt).toContain('If the assistant says tests, validation, fixes, commit/push, or other implementation work still needs to be done, choose continue.');
     expect(prompt).toContain('Do not choose complete when the assistant itself indicates remaining work');
+    expect(prompt).toContain('openspec status --change "<name>" --json');
+    expect(prompt).toContain('@@all(discuss) <message>');
+    expect(prompt).toContain('imcodes send --list');
   });
 
   it('injects custom session instructions into decision and repair prompts', async () => {
