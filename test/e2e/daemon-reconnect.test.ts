@@ -74,6 +74,37 @@ async function collectStream(stream: NodeJS.ReadableStream, ms: number): Promise
   return Buffer.concat(chunks);
 }
 
+async function waitForStreamText(stream: NodeJS.ReadableStream, expected: string, timeoutMs = 5000): Promise<string> {
+  return await new Promise<string>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`Timed out waiting for stream text: ${expected}`));
+    }, timeoutMs);
+
+    const onData = (chunk: unknown) => {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string));
+      const output = Buffer.concat(chunks).toString();
+      if (output.includes(expected)) {
+        cleanup();
+        resolve(output);
+      }
+    };
+    const onError = (error: unknown) => {
+      cleanup();
+      reject(error instanceof Error ? error : new Error(String(error)));
+    };
+    const cleanup = () => {
+      clearTimeout(timer);
+      stream.off('data', onData);
+      stream.off('error', onError);
+    };
+
+    stream.on('data', onData);
+    stream.on('error', onError);
+  });
+}
+
 describe.skipIf(SKIP)('Daemon reconnect resilience (e2e)', () => {
   const createdSessions: string[] = [];
 
@@ -196,10 +227,10 @@ describe.skipIf(SKIP)('Daemon reconnect resilience (e2e)', () => {
     const { stream: stream1, cleanup: cleanup1 } = await startPipePaneStream(name, paneId1);
 
     // Verify stream works
-    const collectPromise1 = collectStream(stream1, 1500);
     await wait(200);
+    const beforePromise = waitForStreamText(stream1, 'BEFORE_RESPAWN', 8000);
     await sendKeys(name, 'echo BEFORE_RESPAWN');
-    const before = (await collectPromise1).toString();
+    const before = await beforePromise;
     expect(before).toContain('BEFORE_RESPAWN');
     await cleanup1();
 
@@ -213,10 +244,10 @@ describe.skipIf(SKIP)('Daemon reconnect resilience (e2e)', () => {
     const paneId2 = await getPaneId(name);
     const { stream: stream2, cleanup: cleanup2 } = await startPipePaneStream(name, paneId2);
 
-    const collectPromise2 = collectStream(stream2, 1500);
     await wait(200);
+    const afterPromise = waitForStreamText(stream2, 'AFTER_RESPAWN', 8000);
     await sendKeys(name, 'echo AFTER_RESPAWN');
-    const after = (await collectPromise2).toString();
+    const after = await afterPromise;
     expect(after).toContain('AFTER_RESPAWN');
     await cleanup2();
   }, 15_000);

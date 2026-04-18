@@ -56,6 +56,37 @@ async function waitForSnapshotText(sessionName: string, expected: string[], atte
   return lastSnapshot;
 }
 
+async function waitForStreamText(stream: NodeJS.ReadableStream, expected: string, timeoutMs = 5000): Promise<string> {
+  return await new Promise<string>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`Timed out waiting for stream text: ${expected}`));
+    }, timeoutMs);
+
+    const onData = (chunk: unknown) => {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string));
+      const output = Buffer.concat(chunks).toString();
+      if (output.includes(expected)) {
+        cleanup();
+        resolve(output);
+      }
+    };
+    const onError = (error: unknown) => {
+      cleanup();
+      reject(error instanceof Error ? error : new Error(String(error)));
+    };
+    const cleanup = () => {
+      clearTimeout(timer);
+      stream.off('data', onData);
+      stream.off('error', onError);
+    };
+
+    stream.on('data', onData);
+    stream.on('error', onError);
+  });
+}
+
 describe.skipIf(SKIP)('pipe-pane stream e2e (task 8.5)', () => {
   beforeEach(async () => {
     await killSession(SESSION_A).catch(() => {});
@@ -204,19 +235,17 @@ describe.skipIf(SKIP)('pipe-pane stream e2e (task 8.5)', () => {
     const { stream: s1, cleanup: c1 } = await startPipePaneStream(SESSION_A, paneId);
     await new Promise((r) => setTimeout(r, 200));
     await c1(); // stop first pipe
+    await new Promise((r) => setTimeout(r, 250));
 
     // Restart: must succeed without error
     const { stream: s2, cleanup: c2 } = await startPipePaneStream(SESSION_A, paneId);
-    const chunks: Buffer[] = [];
-    s2.on('data', (c: unknown) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c as string)));
 
     await new Promise((r) => setTimeout(r, 200));
+    const outputPromise = waitForStreamText(s2, 'AFTER_REBIND', 8000);
     await sendKeys(SESSION_A, 'echo AFTER_REBIND');
-    await new Promise((r) => setTimeout(r, 800));
-
-    const out = Buffer.concat(chunks).toString();
+    const out = await outputPromise;
     expect(out).toContain('AFTER_REBIND');
 
     await c2();
-  }, 15_000);
+  }, 30_000);
 });

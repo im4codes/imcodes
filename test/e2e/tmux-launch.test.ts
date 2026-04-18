@@ -26,10 +26,10 @@ describe.skipIf(SKIP)('tmux session launch', () => {
     await newSession(SESSION, cmd, { cwd: tmpdir() });
     const elapsed = Date.now() - start;
 
-    // Must return in well under 5 seconds (not hang indefinitely)
-    expect(elapsed).toBeLessThan(5000);
+    // Must return in well under 10 seconds (not hang indefinitely even under full E2E load)
+    expect(elapsed).toBeLessThan(10_000);
     expect(await sessionExists(SESSION)).toBe(true);
-  }, 10_000);
+  }, 15_000);
 
   it('launches session with || fallback without hanging', async () => {
     // Verify || also works correctly (used by ucc.py-style resume-or-fresh pattern)

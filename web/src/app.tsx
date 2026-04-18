@@ -48,7 +48,7 @@ import {
 import { LocalWebPreviewPanel } from './components/LocalWebPreviewPanel.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
 import { mergeSessionListEntry, type IncomingSessionListEntry } from './session-list-merge.js';
-import { isTransportRuntime, resolveSessionInfoRuntimeType } from './runtime-type.js';
+import { resolveSessionInfoRuntimeType } from './runtime-type.js';
 import { useSyncedPreference } from './hooks/useSyncedPreference.js';
 import { resolveInitialServerId, resolveInitialSessionName, writeHashState } from './hooks/useHashState.js';
 import { useSubSessions } from './hooks/useSubSessions.js';
@@ -64,7 +64,13 @@ import { ServerSetupPage } from './pages/ServerSetupPage.js';
 import { NativeAuthBridge } from './pages/NativeAuthBridge.js';
 import type { SessionInfo, TerminalDiff } from './types.js';
 import { REPO_MSG } from '@shared/repo-types.js';
-import { shouldSubscribeTerminalRaw, type TerminalSubscribeViewMode } from './terminal-subscribe-mode.js';
+import {
+  buildTerminalResubscribePlan,
+  listPassiveTerminalSubSessionNames,
+  listPassiveTerminalSubscriptionNames,
+  shouldSubscribeTerminalRaw,
+  type TerminalSubscribeViewMode,
+} from './terminal-subscribe-mode.js';
 import { onWatchCommand } from './watch-bridge.js';
 import { watchProjectionStore } from './watch-projection.js';
 import { isIdleSessionStateTimelineEvent, isRunningTimelineEvent } from './timeline-running.js';
@@ -1739,28 +1745,13 @@ export function App() {
         // Re-subscribe active targets first, then stagger the rest to avoid a herd.
         const activeName = activeSessionRef.current;
         const activeMode = activeName ? (viewModesRef.current[activeName] ?? defaultViewMode) as ViewMode : undefined;
-        const focusedSub = focusedSubIdRef.current
-          ? subSessionsRef.current.find((sub) => sub.id === focusedSubIdRef.current)
-          : null;
-        scheduleResubscribe([
-          ...(activeName
-            ? (() => {
-                const active = sessionsRef.current.find((s) => s.name === activeName);
-                return active && !isTransportRuntime(active)
-                  ? [{ name: activeName, mode: activeMode }]
-                  : [];
-              })()
-            : []),
-          ...(focusedSub && !isTransportRuntime(focusedSub)
-            ? [{ name: focusedSub.sessionName, mode: 'chat' as ViewMode }]
-            : []),
-          ...sessionsRef.current
-            .filter((s) => s.name !== activeName && !isTransportRuntime(s))
-            .map((s) => ({ name: s.name, mode: 'chat' as ViewMode })),
-          ...subSessionsRef.current
-            .filter((sub) => !isTransportRuntime(sub))
-            .map((sub) => ({ name: sub.sessionName, mode: 'chat' as ViewMode })),
-        ]);
+        scheduleResubscribe(buildTerminalResubscribePlan({
+          activeName,
+          activeMode,
+          focusedSubId: focusedSubIdRef.current,
+          sessions: sessionsRef.current,
+          subSessions: subSessionsRef.current,
+        }));
         // Refresh discussion list
         ws.discussionList();
       }
@@ -1799,16 +1790,14 @@ export function App() {
     };
   }, [auth, selectedServerId]);
 
-  // Subscribe to terminal for process sessions only when connected.
-  // Transport sessions have their own structured chat/timeline channel and
-  // must never be force-subscribed onto the terminal bus.
+  // Subscribe to terminal for ALL sessions when connected.
+  // SDK/transport sessions must remain passively subscribed so shared timeline
+  // updates keep flowing even when their chat controls are not mounted.
   const sessionNamesKey = sessions.map((s) => s.name).sort().join(',');
   useEffect(() => {
     const ws = wsRef.current;
     if (!ws?.connected || sessions.length === 0) return;
-    const names = sessions
-      .filter((s) => !isTransportRuntime(s))
-      .map((s) => s.name);
+    const names = listPassiveTerminalSubscriptionNames(sessions);
     for (const name of names) {
       ws.subscribeTerminal(name, false);
       const mode = viewModesRef.current[name] ?? defaultViewMode;
@@ -1824,15 +1813,13 @@ export function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connected, sessionNamesKey]);
 
-  // Subscribe terminal for process sub-sessions in passive mode.
+  // Subscribe terminal for ALL sub-sessions in passive mode.
   // Active sub-session windows upgrade themselves to raw:true while visible.
   const subSessionNamesKey = subSessions.map((s) => s.sessionName).sort().join(',');
   useEffect(() => {
     const ws = wsRef.current;
     if (!ws?.connected || subSessions.length === 0) return;
-    const names = subSessions
-      .filter((s) => !isTransportRuntime(s))
-      .map((s) => s.sessionName);
+    const names = listPassiveTerminalSubSessionNames(subSessions);
     for (const name of names) {
       try { ws.subscribeTerminal(name, false); } catch { /* ignore */ }
     }
@@ -1883,8 +1870,6 @@ export function App() {
       const ws = wsRef.current;
       const session = activeSessionRef.current;
       if (!ws?.connected || !session) return;
-      const active = sessionsRef.current.find((entry) => entry.name === session);
-      if (active && isTransportRuntime(active)) return;
       const raw = shouldSubscribeTerminalRaw(true, (viewModesRef.current[session] ?? defaultViewMode) as ViewMode);
       ws.subscribeTerminal(session, raw);
       const mode = viewModesRef.current[session] ?? defaultViewMode;

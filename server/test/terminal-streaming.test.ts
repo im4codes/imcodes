@@ -148,6 +148,36 @@ describe('Terminal streaming integration', () => {
     expect(daemonWs.sent.some((s) => s.includes('terminal.subscribe'))).toBe(true);
   });
 
+  it('routes timeline events to passive subscribers for transport-named sessions', async () => {
+    const { daemonWs, browserWs } = await setupStreamingBridge();
+
+    browserWs.emit('message', JSON.stringify({
+      type: 'terminal.subscribe',
+      session: 'deck_transport_brain',
+      raw: false,
+    }));
+    await flush();
+    browserWs.sent.length = 0;
+
+    daemonWs.emit('message', JSON.stringify({
+      type: 'timeline.event',
+      event: {
+        eventId: 'evt-transport-1',
+        sessionId: 'deck_transport_brain',
+        ts: 123,
+        type: 'assistant.text',
+        payload: { text: 'transport message' },
+      },
+    }));
+    await flush();
+
+    expect(browserWs.sent).toHaveLength(1);
+    const msg = JSON.parse(browserWs.sent[0]) as { type: string; event: { sessionId: string; payload: { text: string } } };
+    expect(msg.type).toBe('timeline.event');
+    expect(msg.event.sessionId).toBe('deck_transport_brain');
+    expect(msg.event.payload.text).toBe('transport message');
+  });
+
   it('raw:false subscribe is forwarded upstream and still preserves non-binary terminal delivery', async () => {
     const { daemonWs, browserWs } = await setupStreamingBridge();
 
