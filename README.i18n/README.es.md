@@ -3,13 +3,13 @@
 [English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
 
-**La capa de mensajería para agentes.**
+**El IM para agentes. Una capa de memoria que atraviesa agentes y proveedores de IA.**
 
-IM.codes es un mensajero especializado para agentes de programación con IA. Te permite seguir sesiones largas desde iPhone, iPad, Apple Watch, móvil o web, con acceso a terminal, navegación de archivos, vistas de Git, vista previa de localhost, notificaciones y flujos multiagente integrados. Funciona con [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com) y [Qwen](https://github.com/QwenLM/qwen-agent).
+IM.codes ofrece a los coding agents una capa de memoria compartida entre proveedores. Convierte el trabajo completado en contexto reutilizable y vuelve a inyectar el historial adecuado en sesiones futuras. Funciona con [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com) y [Qwen](https://github.com/QwenLM/qwen-agent), además de terminal, archivos, vistas Git, localhost preview, notificaciones, flujos multiagente y streaming nativo para agentes transport.
 
 > **Nota:** Este archivo es una traducción. **El README en inglés (`../README.md`) es la versión canónica.** Si hay alguna diferencia, prevalece la versión en inglés.
 
-Claude Code y Codex ahora admiten dos modos de integración: CLI y SDK.
+Varios agentes admiten dos modos de integración: CLI y SDK.
 
 ## Capturas
 
@@ -58,7 +58,7 @@ La compatibilidad con Apple Watch cubre monitorización rápida de sesiones, con
 
 <a href="https://apps.apple.com/us/app/im-codes/id6761014424"><img src="https://developer.apple.com/assets/elements/badges/download-on-the-app-store.svg" height="40" alt="Download on the App Store" /></a>
 
-Compatible con iPhone, iPad y Apple Watch. También disponible como [web app](https://app.im.codes) y mediante `npm install -g imcodes` (CLI del daemon).
+Compatible con iPhone, iPad y Apple Watch. También disponible como [web app](https://app.im.codes).
 
 ## Por qué
 
@@ -76,7 +76,7 @@ IM.codes convierte continuamente el trabajo ya resuelto de los agentes en memori
 
 - **Se guarda problema → solución, no ruido de logs.** Solo se materializan las salidas finales `assistant.text`; se excluyen deltas en streaming, tool calls, tool results y ruido intermedio.
 - **Memoria personal con sincronización opcional en la nube.** La memoria cruda y la procesada permanecen siempre en local; los resúmenes procesados pueden sincronizarse opcionalmente con un pool en la nube a nivel de usuario compartido entre tus dispositivos.
-- **Enterprise Shared Context consultable.** Los equipos pueden publicar memoria reutilizable en ámbitos workspace/project, inspeccionarla desde la UI, consultarla y ver estadísticas, en lugar de esconder contexto dentro de prompts invisibles.
+- **Enterprise Shared Context consultable.** Los equipos pueden publicar memoria reutilizable en ámbitos workspace/project, inspeccionarla desde la UI, consultarla y ver estadísticas, en lugar de esconder contexto dentro de prompts invisibles. Esta parte sigue en desarrollo activo y todavía no ha pasado pruebas completas de producción.
 - **Recuperación multilingüe.** La búsqueda semántica local y el recall del servidor con pgvector usan embeddings multilingües para encontrar soluciones relacionadas entre inglés, chino, japonés, coreano, español, ruso y repos mixtos.
 - **Inyección automática donde importa.** El historial relevante se inyecta tanto por mensaje como al iniciar la sesión, con tarjetas en la timeline que muestran qué se recuperó, por qué, la puntuación de relevancia, el número de recalls y el último uso.
 - **Visible y controlable por el usuario.** La UI de Shared Context separa raw events, processed summaries, cloud memory y enterprise memory, con controles de consulta, vista previa, archive/restore y configuración de procesamiento.

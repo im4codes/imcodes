@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>IM.codes — The IM for agents</title>
-<meta name="description" content="A specialized instant messenger for AI agents. Keep long-running coding-agent sessions within reach from mobile or web, with terminal, files, git, localhost preview, notifications, multi-agent workflows, and shared agent memory built in.">
+<title>IM.codes — The IM for agents. One memory layer across agents and AI providers.</title>
+<meta name="description" content="The IM for agents, with one memory layer across agents and AI providers. Reuse solved work across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more.">
 <style>
 :root {
   --bg: #0a0a0a;
@@ -222,7 +222,7 @@ footer {
 <header>
   <div class="header-left">
     <h1>IM<span>.</span>codes</h1>
-    <div class="tagline" data-i18n="tagline">The IM for agents</div>
+    <div class="tagline" data-i18n="tagline">The IM for agents. One memory layer across agents and AI providers.</div>
   </div>
   <div class="lang-switch">
     <button onclick="setLang('en')" data-lang="en" class="active">EN</button>
@@ -236,7 +236,7 @@ footer {
 </header>
 
 <section>
-  <p class="lead" data-i18n="hero_intro">Keep long-running coding-agent sessions within reach from iPhone, iPad, Apple Watch, mobile, or web, with terminal access, file browsing, git views, localhost preview, notifications, multi-agent workflows, and shared agent memory built in.</p>
+  <p class="lead" data-i18n="hero_intro">IM.codes gives coding agents one shared memory layer across providers. It turns completed work into reusable context, then injects the right history back into future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more.</p>
   <div class="prompt">imcodes bind https://app.im.codes/bind/&lt;key&gt;<span class="cursor"></span></div>
   <div class="output" data-i18n="hero_output">bound to app.im.codes &middot; daemon started &middot; registered as system service</div>
 </section>
@@ -291,7 +291,7 @@ footer {
   <p style="color:var(--fg); margin-bottom:12px;" data-i18n="memory_intro">IM.codes keeps a searchable memory of solved work — structured problem→solution summaries instead of raw prompt logs. Relevant history is recalled automatically for new prompts and session startup, and every injection stays visible in the timeline.</p>
   <ul class="reqs">
     <li data-i18n="memory_1">Personal memory stays local by default, with optional cloud sync for processed summaries across your devices.</li>
-    <li data-i18n="memory_2">Enterprise shared context lets teams reuse fixes across workspaces and projects with queryable memory, stats, and inspection UI.</li>
+    <li data-i18n="memory_2">Enterprise shared context lets teams reuse fixes across workspaces and projects with queryable memory, stats, and inspection UI. It is still under active development and has not been fully production-tested yet.</li>
     <li data-i18n="memory_3">Multilingual recall uses local embeddings plus pgvector-backed server search, so related fixes can be found across different languages.</li>
     <li data-i18n="memory_4">Timeline cards show exactly what was injected, with relevance score, recall count, and last-used metadata.</li>
   </ul>
@@ -317,7 +317,7 @@ footer {
     <div class="feat"><div class="feat-name" data-i18n="f_preview_name">local web preview</div><div class="feat-desc" data-i18n="f_preview_desc">preview localhost from any device via secure tunnel, supports HMR</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_mobile_name">mobile, watch & notifications</div><div class="feat-desc" data-i18n="f_mobile_desc">biometric auth, push notifications, shell keyboard input, watch quick replies</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_discuss_name">cross-provider audit</div><div class="feat-desc" data-i18n="f_discuss_desc">multi-agent P2P discussions with customizable phases (audit, review, brainstorm…) — different models catch different issues before code is written, reducing rework</div></div>
-    <div class="feat"><div class="feat-name" data-i18n="f_streaming_name">CLI + SDK agents</div><div class="feat-desc" data-i18n="f_streaming_desc">Claude Code and Codex work through both CLI and SDK integrations. OpenClaw and Qwen stream natively with real-time deltas, tool tracking, and session restore.</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_streaming_name">CLI + SDK access</div><div class="feat-desc" data-i18n="f_streaming_desc">Access multiple agents through both CLI and SDK integrations. OpenClaw and Qwen also stream natively with real-time deltas, tool tracking, and session restore.</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_chat_name">terminal + chat</div><div class="feat-desc" data-i18n="f_chat_desc">raw CLI or structured view with parsed tool calls</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_sidebar_name">Discord-style sidebar</div><div class="feat-desc" data-i18n="f_sidebar_desc">server icons, session tree, unread badges, idle flash</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_picker_name">@ picker</div><div class="feat-desc" data-i18n="f_picker_desc">@files, @@agents, @@all(config) for group dispatch</div></div>
@@ -342,7 +342,7 @@ footer {
  <span class="arrow">│</span> <span class="proto">WebSocket</span>
 <span class="label">Daemon</span> <span class="arrow">(your machine, manages sessions)</span>
  <span class="arrow">│</span> <span class="proto">tmux / transport</span>
-<span class="label">Agents</span> <span class="arrow">(Claude Code / Codex via CLI + SDK · Gemini CLI · OpenClaw · Qwen)</span></div>
+<span class="label">Agents</span> <span class="arrow">(multiple agents via CLI + SDK · native transport backends)</span></div>
   <p style="color:var(--dim); font-size:13px; margin-top:12px;" data-i18n="arch_desc">The daemon runs on your dev machine and manages process-backed sessions through tmux plus transport-backed sessions through SDKs and network protocols. The server relays connections between your devices and the daemon. Everything stays on your infrastructure.</p>
 </section>
 
@@ -410,13 +410,16 @@ docker compose up -d</div>
 
 <section>
   <h2 data-i18n="h_agents">supported agents</h2>
-  <p style="color:var(--fg); margin-bottom:12px; font-size:13px;" data-i18n="agents_intro">Claude Code and Codex support both CLI and SDK integrations.</p>
+  <p style="color:var(--fg); margin-bottom:12px; font-size:13px;" data-i18n="agents_intro">Multiple agents support both CLI and SDK integrations.</p>
   <div class="agents">
     <a class="agent-tag" href="https://github.com/anthropics/claude-code">Claude Code</a>
     <a class="agent-tag" href="https://github.com/openai/codex">Codex</a>
     <a class="agent-tag" href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a>
     <a class="agent-tag" href="https://openclaw.com">OpenClaw</a>
     <a class="agent-tag" href="https://github.com/QwenLM/qwen-agent">Qwen</a>
+    <span class="agent-tag">GitHub Copilot</span>
+    <span class="agent-tag">Cursor</span>
+    <span class="agent-tag">OpenCode</span>
     <span class="agent-tag">Shell</span>
     <span class="agent-tag" style="color:var(--dim);border-style:dashed">+ more</span>
   </div>
@@ -427,7 +430,7 @@ docker compose up -d</div>
   <ul class="reqs">
     <li data-i18n="req_os">macOS, Linux, or Windows (native experimental; <a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> fully supported)</li>
     <li>Node.js &ge; 20</li>
-    <li data-i18n="req_mux">tmux (Linux/macOS/WSL). Windows native uses ConPTY (built-in). Claude Code and Codex also support SDK-backed sessions.</li>
+    <li data-i18n="req_mux">tmux (Linux/macOS/WSL). Windows native uses ConPTY (built-in). Multiple agents also support SDK-backed sessions.</li>
   </ul>
 </section>
 
@@ -467,13 +470,15 @@ docker compose up -d</div>
 const I18N = {
   en: {
     watch_intro: 'Watch support covers quick session monitoring, unread counts, OTA update visibility, push notifications, and quick replies from the wrist.',
+    tagline: 'The IM for agents. One memory layer across agents and AI providers.',
+    hero_intro: 'IM.codes gives coding agents one shared memory layer across providers. It turns completed work into reusable context, then injects the right history back into future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more.',
     watch_badge: 'iPhone · iPad · Apple Watch',
     watch_download: 'Watch app includes session list, unread counts, and quick replies.',
-    agents_intro: 'Claude Code and Codex support both CLI and SDK integrations.',
+    agents_intro: 'Multiple agents support both CLI and SDK integrations.',
     h_memory: 'shared agent context',
     memory_intro: 'IM.codes keeps a searchable memory of solved work — structured problem→solution summaries instead of raw prompt logs. Relevant history is recalled automatically for new prompts and session startup, and every injection stays visible in the timeline.',
     memory_1: 'Personal memory stays local by default, with optional cloud sync for processed summaries across your devices.',
-    memory_2: 'Enterprise shared context lets teams reuse fixes across workspaces and projects with queryable memory, stats, and inspection UI.',
+    memory_2: 'Enterprise shared context lets teams reuse fixes across workspaces and projects with queryable memory, stats, and inspection UI. It is still under active development and has not been fully production-tested yet.',
     memory_3: 'Multilingual recall uses local embeddings plus pgvector-backed server search, so related fixes can be found across different languages.',
     memory_4: 'Timeline cards show exactly what was injected, with relevance score, recall count, and last-used metadata.',
     f_memory_name: 'shared agent context',
@@ -489,16 +494,16 @@ const I18N = {
     sh_manual_pgvector: 'Generated docker-compose.yml uses pgvector/pgvector:pg16 for PostgreSQL.',
   },
   'zh-CN': {
-    tagline: '为 AI 代理而生的即时通讯',
-    hero_intro: '让长时间运行的 coding agent 会话始终触手可及：iPhone、iPad、Apple Watch、手机或网页即可查看终端、文件、Git、localhost 预览、通知、多代理工作流和共享代理记忆。',
+    tagline: '给 AI agent 的 IM。一套记忆层，贯通 agent 与 AI 提供方。',
+    hero_intro: 'IM.codes 为 coding agent 提供一套跨 provider 共享的记忆层。它会把已完成的工作沉淀成可复用上下文，再把合适的历史注入后续 session，贯通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。',
     hero_output: '已绑定 app.im.codes · 守护进程已启动 · 已注册为系统服务',
     self_host_warning: '<strong>强烈建议自行部署。</strong><code>app.im.codes</code> 是共享测试实例，无可用性保证，可能被限流、攻击或不可用。这是个人项目，不提供商用保障。正式使用请部署到自己的服务器。',
     h_screenshots: '截图', h_why: '为什么', h_memory: '共享代理上下文', h_not: '它不是什么', h_features: '功能', h_arch: '架构', h_download: '下载', h_install: '安装', h_quick: '快速开始', h_selfhost: '自托管部署', h_agents: '支持的代理', h_reqs: '系统要求', h_about: '关于',
     also_web: '也可作为 <a href="https://app.im.codes">网页版</a> 使用', watch_intro: 'Watch 支持可在手腕上快速查看会话、未读数、OTA 更新状态、推送通知和快捷回复。', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'Watch App 提供会话列表、未读计数和快捷回复。',
-    agents_intro: 'Claude Code 和 Codex 现在都支持 CLI 和 SDK 两种接入方式。',
+    agents_intro: '支持多个 agent 通过 CLI 和 SDK 两种方式接入。',
     memory_intro: 'IM.codes 会把已完成的工作持续沉淀成可搜索的记忆——保存的是结构化的问题→解决方案摘要，而不是原始 prompt 日志。相关历史会在新消息和会话启动时自动召回，并且每次注入都会在时间线里可见。',
     memory_1: '个人记忆默认保留在本地，也可以把处理后的摘要可选同步到云端，在你的多台设备之间共享。',
-    memory_2: '企业共享上下文让团队可以在 workspace / project 范围内复用修复经验，并通过可查询的记忆、统计和检查界面管理它。',
+    memory_2: '企业共享上下文让团队可以在 workspace / project 范围内复用修复经验，并通过可查询的记忆、统计和检查界面管理它。这部分仍在持续开发中，还没有经过完整的生产级测试。',
     memory_3: '多语言召回结合本地 embedding 和基于 pgvector 的服务端搜索，可以跨不同语言找到相关历史修复。',
     memory_4: '时间线卡片会明确显示注入了什么内容，以及相关性分数、召回次数和上次使用时间。',
     f_memory_name: '共享代理上下文',
@@ -515,8 +520,8 @@ const I18N = {
     f_ota_name: 'OTA 更新', f_ota_desc: '从 Web UI 升级守护进程',
     f_stream_name: '实时推流', f_stream_desc: '零轮询、零消息限制',
     f_self_name: '自托管', f_self_desc: '你的服务器，你的数据，一键部署',
-    f_streaming_name: 'CLI + SDK 代理',
-    f_streaming_desc: 'Claude Code 和 Codex 现在都支持 CLI 和 SDK 接入。OpenClaw 和 Qwen 继续提供原生流式输出、工具追踪和会话恢复。',
+    f_streaming_name: 'CLI + SDK 接入',
+    f_streaming_desc: '支持多个 agent 通过 CLI 和 SDK 接入。OpenClaw 和 Qwen 继续提供原生流式输出、工具追踪和会话恢复。',
     f_sidebar_name: 'Discord 风格侧边栏',
     f_sidebar_desc: '服务器图标、会话树、未读徽章、空闲闪烁',
     f_picker_name: '@ 选择器',
@@ -555,16 +560,16 @@ const I18N = {
     disclaimer: 'IM.codes 是一个独立的开源项目，与 Anthropic、OpenAI、Google、阿里巴巴、OpenClaw 或任何其他被提及的公司无任何关联、认可或赞助关系。所有产品名称和商标均为其各自所有者的财产。',
   },
   'zh-TW': {
-    tagline: '為 AI 代理而生的即時通訊',
-    hero_intro: '讓長時間運行的 coding agent 會話始終觸手可及：iPhone、iPad、Apple Watch、手機或網頁即可查看終端、檔案、Git、localhost 預覽、通知、多代理工作流和共享代理記憶。',
+    tagline: '給 AI agent 的 IM。一套記憶層，貫通 agent 與 AI 提供方。',
+    hero_intro: 'IM.codes 為 coding agent 提供一套跨 provider 共享的記憶層。它會把已完成的工作沉澱成可重用上下文，再把合適的歷史注入後續 session，貫通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。',
     hero_output: '已綁定 app.im.codes · 守護程序已啟動 · 已註冊為系統服務',
     self_host_warning: '<strong>強烈建議自行部署。</strong><code>app.im.codes</code> 是共享測試實例，無可用性保證，可能被限流、攻擊或不可用。這是個人專案，不提供商用保障。正式使用請部署到自己的伺服器。',
     h_screenshots: '截圖', h_why: '為什麼', h_memory: '共享代理上下文', h_not: '它不是什麼', h_features: '功能', h_arch: '架構', h_download: '下載', h_install: '安裝', h_quick: '快速開始', h_selfhost: '自託管部署', h_agents: '支援的代理', h_reqs: '系統需求', h_about: '關於',
     also_web: '也可作為 <a href="https://app.im.codes">網頁版</a> 使用', watch_intro: 'Watch 支援可在手腕上快速查看會話、未讀數、OTA 更新狀態、推送通知和快捷回覆。', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'Watch App 提供會話列表、未讀計數和快捷回覆。',
-    agents_intro: 'Claude Code 和 Codex 現在都支援 CLI 和 SDK 兩種接入方式。',
+    agents_intro: '支援多個 agent 透過 CLI 和 SDK 兩種方式接入。',
     memory_intro: 'IM.codes 會把已完成的工作持續沉澱成可搜尋的記憶——保存的是結構化的問題→解決方案摘要，而不是原始 prompt 日誌。相關歷史會在新訊息和工作階段啟動時自動召回，而且每次注入都會在時間線中可見。',
     memory_1: '個人記憶預設保留在本地，也可以選擇把處理後的摘要同步到雲端，在你的多台裝置之間共享。',
-    memory_2: '企業共享上下文讓團隊能在 workspace / project 範圍內重用修復經驗，並透過可查詢的記憶、統計和檢視介面管理它。',
+    memory_2: '企業共享上下文讓團隊能在 workspace / project 範圍內重用修復經驗，並透過可查詢的記憶、統計和檢視介面管理它。這部分仍在持續開發中，還沒有經過完整的生產級測試。',
     memory_3: '多語言召回結合本地 embedding 與基於 pgvector 的伺服器搜尋，可以跨不同語言找到相關歷史修復。',
     memory_4: '時間線卡片會明確顯示注入了什麼內容，以及相關性分數、召回次數和上次使用時間。',
     f_memory_name: '共享代理上下文',
@@ -581,8 +586,8 @@ const I18N = {
     f_ota_name: 'OTA 更新', f_ota_desc: '從 Web UI 升級守護程序',
     f_stream_name: '即時串流', f_stream_desc: '零輪詢、零訊息限制',
     f_self_name: '自託管', f_self_desc: '你的伺服器，你的資料，一鍵部署',
-    f_streaming_name: 'CLI + SDK 代理',
-    f_streaming_desc: 'Claude Code 和 Codex 現在都支援 CLI 和 SDK 接入。OpenClaw 和 Qwen 繼續提供原生串流輸出、工具追蹤和會話恢復。',
+    f_streaming_name: 'CLI + SDK 接入',
+    f_streaming_desc: '支援多個 agent 透過 CLI 和 SDK 接入。OpenClaw 和 Qwen 繼續提供原生串流輸出、工具追蹤和會話恢復。',
     f_sidebar_name: 'Discord 風格側邊欄',
     f_sidebar_desc: '伺服器圖示、會話樹、未讀徽章、閒置閃爍',
     f_picker_name: '@ 選擇器',
@@ -621,16 +626,16 @@ const I18N = {
     disclaimer: 'IM.codes 是一個獨立的開源專案，與 Anthropic、OpenAI、Google、阿里巴巴、OpenClaw 或任何其他被提及的公司無任何關聯、認可或贊助關係。所有產品名稱和商標均為其各自擁有者的財產。',
   },
   ja: {
-    tagline: 'AIエージェントのためのIM',
-    hero_intro: '長時間動く coding agent セッションを、iPhone、iPad、Apple Watch、モバイルやWebから常に手の届く場所に。ターミナル、ファイル、Git、localhost プレビュー、通知、マルチエージェントワークフロー、共有エージェントメモリをまとめて提供します。',
+    tagline: 'エージェントのための IM。エージェントと AI プロバイダーをまたぐ一つのメモリレイヤー。',
+    hero_intro: 'IM.codes は coding agent に、プロバイダーをまたぐ共有メモリレイヤーを提供します。完了した作業を再利用可能なコンテキストとして蓄積し、Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw などの後続 session に適切な履歴を再注入します。',
     hero_output: 'app.im.codes にバインド完了 · デーモン起動 · システムサービスとして登録',
     self_host_warning: '<strong>セルフホスティングを強く推奨します。</strong><code>app.im.codes</code> は共有テストインスタンスであり、稼働保証はありません。レート制限、攻撃対象、利用不可の可能性があります。個人プロジェクトのため商用サポートはありません。評価以外の用途では自社インフラにデプロイしてください。',
     h_screenshots: 'スクリーンショット', h_why: '背景', h_memory: '共有エージェントコンテキスト', h_not: 'これは何ではないか', h_features: '機能', h_arch: 'アーキテクチャ', h_download: 'ダウンロード', h_install: 'インストール', h_quick: 'クイックスタート', h_selfhost: 'セルフホスト', h_agents: '対応エージェント', h_reqs: '要件', h_about: '概要',
     also_web: '<a href="https://app.im.codes">ウェブ版</a>もあります',
-    agents_intro: 'Claude Code と Codex は CLI と SDK の両方に対応しています。',
+    agents_intro: '複数のエージェントが CLI と SDK の両方に対応しています。',
     memory_intro: 'IM.codes は完了済みの作業を検索可能な記憶として蓄積します。保存されるのは生のプロンプトログではなく、構造化された問題→解決の要約です。関連履歴は新しいメッセージ送信時やセッション起動時に自動で再利用され、その注入内容はタイムラインで確認できます。',
     memory_1: '個人メモリは既定でローカルに保持され、処理済み要約だけを任意でクラウド同期してデバイス間で共有できます。',
-    memory_2: 'Enterprise Shared Context により、チームは workspace / project 単位で修正知見を再利用し、検索・統計・閲覧 UI から管理できます。',
+    memory_2: 'Enterprise Shared Context により、チームは workspace / project 単位で修正知見を再利用し、検索・統計・閲覧 UI から管理できます。これはまだ継続開発中で、完全な本番テストは終わっていません。',
     memory_3: '多言語リコールはローカル embedding と pgvector ベースのサーバー検索を組み合わせ、異なる言語間でも関連修正を見つけます。',
     memory_4: 'タイムラインカードには注入内容、関連度スコア、再利用回数、最終使用時刻が表示されます。',
     f_memory_name: '共有エージェントコンテキスト',
@@ -647,8 +652,8 @@ const I18N = {
     f_ota_name: 'OTAアップデート', f_ota_desc: 'Web UIからデーモンを更新',
     f_stream_name: 'リアルタイムストリーム', f_stream_desc: 'ポーリングなし、メッセージ制限なし',
     f_self_name: 'セルフホスト', f_self_desc: '自分のインフラ、自分のデータ、ワンコマンドデプロイ',
-    f_streaming_name: 'CLI + SDK エージェント',
-    f_streaming_desc: 'Claude Code と Codex は CLI と SDK の両方に対応しています。OpenClaw と Qwen は引き続きネイティブストリーミング、ツール追跡、セッション復元を提供します。',
+    f_streaming_name: 'CLI + SDK 接続',
+    f_streaming_desc: '複数のエージェントが CLI と SDK の両方に対応しています。OpenClaw と Qwen は引き続きネイティブストリーミング、ツール追跡、セッション復元を提供します。',
     f_sidebar_name: 'Discordスタイルサイドバー',
     f_sidebar_desc: 'サーバーアイコン、セッションツリー、未読バッジ',
     f_picker_name: '@ ピッカー',
@@ -687,16 +692,16 @@ const I18N = {
     disclaimer: 'IM.codes は独立したオープンソースプロジェクトであり、Anthropic、OpenAI、Google、Alibaba、OpenClaw、またはその他の言及された企業との提携、承認、スポンサーシップはありません。すべての製品名および商標は各所有者に帰属します。',
   },
   ko: {
-    tagline: 'AI 에이전트를 위한 IM',
-    hero_intro: '오래 실행되는 coding agent 세션을 iPhone, iPad, Apple Watch, 모바일이나 웹에서 항상 닿는 곳에 두세요. 터미널, 파일, Git, localhost 미리보기, 알림, 멀티 에이전트 워크플로우, 공유 에이전트 메모리가 함께 제공됩니다.',
+    tagline: '에이전트를 위한 IM. 에이전트와 AI 제공자를 가로지르는 하나의 메모리 레이어.',
+    hero_intro: 'IM.codes는 coding agent를 위한 provider 간 공유 메모리 레이어를 제공합니다. 완료된 작업을 재사용 가능한 컨텍스트로 축적하고, Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw 등 이후 session에 적절한 기록을 다시 주입합니다.',
     hero_output: 'app.im.codes에 바인딩 완료 · 데몬 시작됨 · 시스템 서비스로 등록됨',
     self_host_warning: '<strong>셀프 호스팅을 강력히 권장합니다.</strong> <code>app.im.codes</code>는 공유 테스트 인스턴스로 가동 보장이 없으며, 속도 제한, 공격 대상이 되거나 사용 불가할 수 있습니다. 개인 프로젝트로 상업적 지원은 제공되지 않습니다. 평가 이외의 용도에는 자체 인프라에 배포하세요.',
     h_screenshots: '스크린샷', h_why: '배경', h_memory: '공유 에이전트 컨텍스트', h_not: '무엇이 아닌가', h_features: '기능', h_arch: '아키텍처', h_download: '다운로드', h_install: '설치', h_quick: '빠른 시작', h_selfhost: '셀프 호스팅', h_agents: '지원 에이전트', h_reqs: '요구사항', h_about: '소개',
     also_web: '<a href="https://app.im.codes">웹 앱</a>으로도 이용 가능', watch_intro: 'Watch 지원으로 손목에서 세션 목록, 읽지 않음 수, OTA 업데이트 상태, 푸시 알림, 빠른 답장을 확인할 수 있습니다.', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'Watch 앱은 세션 목록, 읽지 않음 수, 빠른 답장을 제공합니다.',
-    agents_intro: 'Claude Code와 Codex는 이제 CLI와 SDK 두 방식 모두로 연결할 수 있습니다.',
+    agents_intro: '여러 에이전트가 CLI와 SDK 두 방식 모두를 지원합니다.',
     memory_intro: 'IM.codes는 완료된 작업을 검색 가능한 메모리로 계속 축적합니다. 저장되는 것은 원시 프롬프트 로그가 아니라 구조화된 문제→해결 요약입니다. 관련 기록은 새 메시지 전송과 세션 시작 시 자동으로 재사용되며, 어떤 내용이 주입됐는지도 타임라인에서 확인할 수 있습니다.',
     memory_1: '개인 메모리는 기본적으로 로컬에 남고, 처리된 요약만 선택적으로 클라우드에 동기화해 여러 기기에서 공유할 수 있습니다.',
-    memory_2: 'Enterprise Shared Context를 통해 팀은 workspace / project 범위에서 수정 경험을 재사용하고, 검색·통계·조회 UI로 관리할 수 있습니다.',
+    memory_2: 'Enterprise Shared Context를 통해 팀은 workspace / project 범위에서 수정 경험을 재사용하고, 검색·통계·조회 UI로 관리할 수 있습니다. 이 부분은 아직 계속 개발 중이며 완전한 프로덕션 테스트는 끝나지 않았습니다.',
     memory_3: '다국어 리콜은 로컬 embedding과 pgvector 기반 서버 검색을 결합해 서로 다른 언어 사이에서도 관련 수정 이력을 찾습니다.',
     memory_4: '타임라인 카드는 무엇이 주입됐는지와 함께 관련성 점수, 재호출 횟수, 마지막 사용 시각을 보여줍니다.',
     f_memory_name: '공유 에이전트 컨텍스트',
@@ -713,8 +718,8 @@ const I18N = {
     f_ota_name: 'OTA 업데이트', f_ota_desc: '웹 UI에서 데몬 업그레이드',
     f_stream_name: '실시간 스트림', f_stream_desc: '폴링 없음, 메시지 제한 없음',
     f_self_name: '셀프 호스팅', f_self_desc: '내 인프라, 내 데이터, 원커맨드 배포',
-    f_streaming_name: 'CLI + SDK 에이전트',
-    f_streaming_desc: 'Claude Code와 Codex는 이제 CLI와 SDK 모두를 지원합니다. OpenClaw와 Qwen은 계속해서 네이티브 스트리밍, 도구 추적, 세션 복원을 제공합니다.',
+    f_streaming_name: 'CLI + SDK 연결',
+    f_streaming_desc: '여러 에이전트가 CLI와 SDK 두 방식 모두를 지원합니다. OpenClaw와 Qwen은 계속해서 네이티브 스트리밍, 도구 추적, 세션 복원을 제공합니다.',
     f_sidebar_name: 'Discord 스타일 사이드바',
     f_sidebar_desc: '서버 아이콘, 세션 트리, 읽지 않은 배지',
     f_picker_name: '@ 피커',
@@ -753,16 +758,16 @@ const I18N = {
     disclaimer: 'IM.codes는 독립적인 오픈소스 프로젝트로, Anthropic, OpenAI, Google, Alibaba, OpenClaw 또는 언급된 다른 회사와 제휴, 보증 또는 후원 관계가 없습니다. 모든 제품 이름과 상표는 각 소유자의 자산입니다.',
   },
   es: {
-    tagline: 'El IM para agentes',
-    hero_intro: 'Mantén las sesiones de coding agents de larga duración al alcance desde iPhone, iPad, Apple Watch, móvil o web, con terminal, archivos, vistas Git, vista previa de localhost, notificaciones, flujos multiagente y memoria compartida de agentes integrada.',
+    tagline: 'El IM para agentes. Una capa de memoria que atraviesa agentes y proveedores de IA.',
+    hero_intro: 'IM.codes da a los coding agents una capa de memoria compartida entre proveedores. Convierte el trabajo completado en contexto reutilizable y vuelve a inyectar el historial adecuado en sesiones futuras de Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw y más.',
     hero_output: 'vinculado a app.im.codes · daemon iniciado · registrado como servicio del sistema',
     self_host_warning: '<strong>Se recomienda encarecidamente el autoalojamiento.</strong> <code>app.im.codes</code> es una instancia de prueba compartida sin garantías de disponibilidad — puede tener límites, ser objetivo de ataques o no estar disponible. Este es un proyecto personal sin soporte comercial. Para uso más allá de la evaluación, despliega en tu propia infraestructura.',
     h_screenshots: 'capturas', h_why: 'por qué', h_memory: 'contexto compartido para agentes', h_not: 'qué no es', h_features: 'características', h_arch: 'arquitectura', h_download: 'descargar', h_install: 'instalar', h_quick: 'inicio rápido', h_selfhost: 'autoalojamiento', h_agents: 'agentes compatibles', h_reqs: 'requisitos', h_about: 'acerca de',
     also_web: 'También disponible como <a href="https://app.im.codes">app web</a>', watch_intro: 'La compatibilidad con Watch cubre monitoreo rápido de sesiones, contadores de no leídos, visibilidad de actualizaciones OTA, notificaciones push y respuestas rápidas desde la muñeca.', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'La app de Watch incluye lista de sesiones, contadores de no leídos y respuestas rápidas.',
-    agents_intro: 'Claude Code y Codex ahora admiten integración tanto por CLI como por SDK.',
+    agents_intro: 'Varios agentes admiten integración tanto por CLI como por SDK.',
     memory_intro: 'IM.codes convierte el trabajo ya resuelto en memoria reutilizable y buscable. Guarda resúmenes estructurados de problema→solución en lugar de logs crudos de prompts. El historial relevante se recupera automáticamente para nuevos mensajes y al iniciar sesiones, y cada inyección queda visible en la línea de tiempo.',
     memory_1: 'La memoria personal permanece local por defecto, con sincronización opcional a la nube solo para resúmenes procesados entre tus dispositivos.',
-    memory_2: 'El contexto compartido empresarial permite reutilizar soluciones entre workspaces y proyectos con memoria consultable, estadísticas y UI de inspección.',
+    memory_2: 'El contexto compartido empresarial permite reutilizar soluciones entre workspaces y proyectos con memoria consultable, estadísticas y UI de inspección. Esta parte sigue en desarrollo activo y todavía no ha pasado pruebas completas de producción.',
     memory_3: 'La recuperación multilingüe combina embeddings locales con búsqueda del lado del servidor basada en pgvector para encontrar soluciones relacionadas entre distintos idiomas.',
     memory_4: 'Las tarjetas de la línea de tiempo muestran exactamente qué se inyectó, junto con puntuación de relevancia, número de recuperaciones y último uso.',
     f_memory_name: 'contexto compartido para agentes',
@@ -779,8 +784,8 @@ const I18N = {
     f_ota_name: 'actualizaciones OTA', f_ota_desc: 'actualiza daemons desde la interfaz web',
     f_stream_name: 'stream en tiempo real', f_stream_desc: 'sin polling, sin límite de mensajes',
     f_self_name: 'autoalojado', f_self_desc: 'tu infraestructura, tus datos, despliegue con un comando',
-    f_streaming_name: 'agentes CLI + SDK',
-    f_streaming_desc: 'Claude Code y Codex ahora funcionan tanto por CLI como por SDK. OpenClaw y Qwen siguen ofreciendo streaming nativo, seguimiento de herramientas y restauración de sesión.',
+    f_streaming_name: 'acceso CLI + SDK',
+    f_streaming_desc: 'Varios agentes admiten integración tanto por CLI como por SDK. OpenClaw y Qwen siguen ofreciendo streaming nativo, seguimiento de herramientas y restauración de sesión.',
     f_sidebar_name: 'barra lateral estilo Discord',
     f_sidebar_desc: 'iconos de servidor, árbol de sesiones, insignias no leídas',
     f_picker_name: 'selector @',
@@ -819,16 +824,16 @@ const I18N = {
     disclaimer: 'IM.codes es un proyecto de código abierto independiente y no está afiliado, respaldado ni patrocinado por Anthropic, OpenAI, Google, Alibaba, OpenClaw ni ninguna otra empresa mencionada. Todos los nombres de productos y marcas son propiedad de sus respectivos dueños.',
   },
   ru: {
-    tagline: 'IM для агентов',
-    hero_intro: 'Держите долгоживущие coding agent-сессии под рукой с iPhone, iPad, Apple Watch, телефона или из браузера: терминал, файлы, Git, localhost-превью, уведомления, мульти-агентные сценарии и общая память агентов уже встроены.',
+    tagline: 'IM для агентов. Единый слой памяти для агентов и AI-провайдеров.',
+    hero_intro: 'IM.codes даёт coding agents единый слой памяти поверх разных провайдеров. Он превращает завершённую работу в переиспользуемый контекст и подмешивает нужную историю в будущие session для Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw и других.',
     hero_output: 'привязан к app.im.codes · демон запущен · зарегистрирован как системная служба',
     self_host_warning: '<strong>Настоятельно рекомендуется самостоятельный хостинг.</strong> <code>app.im.codes</code> — общий тестовый экземпляр без гарантий доступности. Может быть ограничен, атакован или недоступен. Это личный проект без коммерческой поддержки. Для использования помимо тестирования разверните на собственной инфраструктуре.',
     h_screenshots: 'скриншоты', h_why: 'зачем', h_memory: 'общий контекст агентов', h_not: 'чем это не является', h_features: 'возможности', h_arch: 'архитектура', h_download: 'скачать', h_install: 'установка', h_quick: 'быстрый старт', h_selfhost: 'свой сервер', h_agents: 'поддерживаемые агенты', h_reqs: 'требования', h_about: 'о проекте',
     also_web: 'Также доступно как <a href="https://app.im.codes">веб-приложение</a>', watch_intro: 'Поддержка Watch даёт быстрый просмотр сессий, счётчики непрочитанного, статус OTA-обновлений, push-уведомления и быстрые ответы прямо с запястья.', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'Приложение для Watch показывает список сессий, счётчики непрочитанного и быстрые ответы.',
-    agents_intro: 'Claude Code и Codex теперь поддерживают интеграции как через CLI, так и через SDK.',
+    agents_intro: 'Несколько агентов поддерживают интеграции как через CLI, так и через SDK.',
     memory_intro: 'IM.codes превращает уже решённую работу в переиспользуемую и доступную для поиска память. Сохраняются не сырые логи промптов, а структурированные сводки проблема→решение. Релевантная история автоматически подмешивается в новые сообщения и при старте сессии, а каждая инъекция видна в таймлайне.',
     memory_1: 'Личная память по умолчанию остаётся локальной; при желании в облако синхронизируются только обработанные сводки между вашими устройствами.',
-    memory_2: 'Enterprise Shared Context позволяет командам переиспользовать решения между workspace / project с поиском по памяти, статистикой и интерфейсом просмотра.',
+    memory_2: 'Enterprise Shared Context позволяет командам переиспользовать решения между workspace / project с поиском по памяти, статистикой и интерфейсом просмотра. Эта часть всё ещё активно разрабатывается и ещё не прошла полноценное продакшен-тестирование.',
     memory_3: 'Многоязычный recall сочетает локальные embedding и серверный поиск на pgvector, поэтому связанные решения находятся даже между разными языками.',
     memory_4: 'Карточки таймлайна показывают, что именно было подмешано, а также score релевантности, число recall и время последнего использования.',
     f_memory_name: 'общий контекст агентов',
@@ -845,8 +850,8 @@ const I18N = {
     f_ota_name: 'OTA-обновления', f_ota_desc: 'обновление демонов через веб-интерфейс',
     f_stream_name: 'стриминг в реальном времени', f_stream_desc: 'без опроса, без лимитов сообщений',
     f_self_name: 'свой сервер', f_self_desc: 'ваша инфраструктура, ваши данные, развёртывание одной командой',
-    f_streaming_name: 'CLI + SDK агенты',
-    f_streaming_desc: 'Claude Code и Codex теперь работают как через CLI, так и через SDK. OpenClaw и Qwen продолжают давать нативный стриминг, отслеживание инструментов и восстановление сессий.',
+    f_streaming_name: 'доступ через CLI + SDK',
+    f_streaming_desc: 'Несколько агентов поддерживают интеграции как через CLI, так и через SDK. OpenClaw и Qwen продолжают давать нативный стриминг, отслеживание инструментов и восстановление сессий.',
     f_sidebar_name: 'боковая панель в стиле Discord',
     f_sidebar_desc: 'иконки серверов, дерево сессий, бейджи непрочитанных',
     f_picker_name: 'выбор @',

@@ -2,9 +2,9 @@
 
 [English](README.md) | [简体中文](README.i18n/README.zh-CN.md) | [繁體中文](README.i18n/README.zh-TW.md) | [Español](README.i18n/README.es.md) | [Русский](README.i18n/README.ru.md) | [日本語](README.i18n/README.ja.md) | [한국어](README.i18n/README.ko.md)
 
-**The IM for agents.**
+**The IM for agents. One memory layer across agents and AI providers.**
 
-A specialized instant messenger for AI agents. Keep long-running coding-agent sessions within reach from iPhone, iPad, Apple Watch, mobile, or web, with terminal access, file browsing, git views, localhost preview, notifications, multi-agent workflows, and shared agent memory built in. Works with [Claude Code](https://github.com/anthropics/claude-code) and [Codex](https://github.com/openai/codex) via both CLI and SDK integrations, plus [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more — including native streaming output for transport-backed agents.
+IM.codes gives coding agents one shared memory layer across providers. It turns completed work into reusable context, then injects the right history back into future sessions across [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more — with terminal access, file browsing, git views, localhost preview, notifications, multi-agent workflows, and native streaming output for transport-backed agents.
 
 > **Disclaimer:** This is an actively developed personal open-source project. There are no warranties, no SLA, and no guarantees of stability, security, or backward compatibility. Use at your own risk. Breaking changes may happen at any time without notice.
 
@@ -63,7 +63,7 @@ Watch support covers quick session monitoring, unread counts, push notifications
 
 <a href="https://apps.apple.com/us/app/im-codes/id6761014424"><img src="https://developer.apple.com/assets/elements/badges/download-on-the-app-store.svg" height="40" alt="Download on the App Store" /></a>
 
-Supports iPhone, iPad, and Apple Watch. Also available as a [web app](https://app.im.codes) and via `npm install -g imcodes` (daemon CLI).
+Supports iPhone, iPad, and Apple Watch. Also available as a [web app](https://app.im.codes).
 
 ## Why
 
@@ -81,7 +81,7 @@ IM.codes continuously turns completed agent work into reusable memory and feeds 
 
 - **Problem → solution memory, not log spam.** Only final `assistant.text` outputs are materialized. Streaming deltas, tool calls, and intermediate noise are excluded.
 - **Personal memory with optional cloud sync.** Raw and processed memory always stay local; processed summaries can optionally sync to a user-scoped cloud pool shared across your devices.
-- **Enterprise shared context.** Teams can publish reusable memory into workspace/project scopes, inspect it in the UI, query it, and see stats instead of treating context as hidden prompt text.
+- **Enterprise shared context.** Teams can publish reusable memory into workspace/project scopes, inspect it in the UI, query it, and see stats instead of treating context as hidden prompt text. This part is still under active development and has not been fully production-tested yet.
 - **Multilingual recall.** Local semantic search and server-side pgvector recall use multilingual embeddings, so related fixes can be found across English, Chinese, Japanese, Korean, Spanish, Russian, and mixed-language repos.
 - **Automatic injection where it matters.** Relevant past work is injected both per-message and at session startup, with timeline cards that show what was recalled, why, the relevance score, recall count, and last-used time.
 - **User-visible inspection and control.** Shared Context UI separates raw events, processed summaries, cloud memory, and enterprise memory, with query, preview, archive/restore, and processing configuration controls.
