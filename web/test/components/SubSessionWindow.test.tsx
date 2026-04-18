@@ -215,6 +215,35 @@ describe('SubSessionWindow metadata wiring', () => {
     });
   });
 
+  it('skips terminal subscription for copilot-sdk sub-sessions when runtimeType is omitted', async () => {
+    const sub = makeSubSession({
+      type: 'copilot-sdk',
+      runtimeType: undefined,
+    } as any);
+
+    render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(sessionControlsSpy).toHaveBeenCalled();
+    });
+    expect(ws.subscribeTerminal).not.toHaveBeenCalled();
+  });
+
   it('prefers timeline tail running state over stale outer idle state for footer status', async () => {
     timelineEventsMock = [
       { type: 'session.state', payload: { state: 'running' } },

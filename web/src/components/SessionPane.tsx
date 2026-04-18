@@ -20,6 +20,7 @@ import type { WsClient } from '../ws-client.js';
 import type { SessionInfo, TerminalDiff } from '../types.js';
 import { extractLatestUsage } from '../usage-data.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
+import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 
 type ViewMode = 'terminal' | 'chat';
 
@@ -163,7 +164,8 @@ export function SessionPane({
   const thinkingNow = useNowTicker(!!activeThinkingTs);
 
   // Effective view mode: transport sessions are always chat
-  const isTransportSession = session.runtimeType === 'transport';
+  const effectiveRuntimeType = resolveSessionInfoRuntimeType(session);
+  const isTransportSession = effectiveRuntimeType === 'transport';
   const effectiveViewMode: ViewMode = isTransportSession ? 'chat' : viewMode;
 
   // ── Chat scroll + input ref ─────────────────────────────────────────────────
@@ -284,7 +286,7 @@ export function SessionPane({
           inputRef={inputRef}
           onAfterAction={onAfterAction}
           onSend={(_name, text) => {
-            if (session.runtimeType !== 'transport') {
+            if (effectiveRuntimeType !== 'transport') {
               addOptimisticUserMessage(text);
             }
             scrollToBottom();

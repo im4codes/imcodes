@@ -18,6 +18,7 @@ import { SessionControls } from './SessionControls.js';
 import type { SessionInfo } from '../types.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
 import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
+import { isTransportRuntime, resolveSubSessionRuntimeType } from '../runtime-type.js';
 
 const TYPE_ICON: Record<string, string> = {
   'claude-code': '⚡',
@@ -96,7 +97,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     state: (sub.state as SessionInfo['state']) ?? 'unknown',
     label: sub.label ?? null,
     projectDir: sub.cwd ?? undefined,
-    runtimeType: sub.runtimeType ?? undefined,
+    runtimeType: resolveSubSessionRuntimeType(sub),
     transportConfig: sub.transportConfig ?? undefined,
     transportPendingMessages: sub.transportPendingMessages ?? undefined,
     transportPendingMessageEntries: sub.transportPendingMessageEntries ?? undefined,
@@ -274,7 +275,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
       {/* Compact input — reuses SessionControls with @picker, ⚡, 📎, paste upload */}
       <div class="subcard-input-area" onClick={(e) => e.stopPropagation()}>
         <div class="subcard-input-row">
-          {sub.runtimeType === 'transport' && (
+          {isTransportRuntime(sub) && (
             <button
               class="subcard-stop-btn"
               type="button"

@@ -19,6 +19,7 @@ import { fetchSupervisorDefaults, patchSession, patchSubSession } from '../api.j
 import { isRunningSessionState } from '../thinking-utils.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { isLegacyTransportPendingMessageId, normalizeTransportPendingEntries } from '../transport-queue.js';
+import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 import {
   buildP2pConfigSelection,
   P2P_CONFIG_MODE,
@@ -417,11 +418,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const quickWrapRef = useRef<HTMLDivElement>(null);
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const showRunningSweep = !compact && isRunningSessionState(activeSession?.state);
-  const incomingQueuedTransportEntries = activeSession?.runtimeType === 'transport'
+  const effectiveRuntimeType = activeSession ? resolveSessionInfoRuntimeType(activeSession) : undefined;
+  const incomingQueuedTransportEntries = effectiveRuntimeType === 'transport'
     ? normalizeTransportPendingEntries(
-        activeSession.transportPendingMessageEntries,
-        activeSession.transportPendingMessages,
-        activeSession.name,
+        activeSession?.transportPendingMessageEntries,
+        activeSession?.transportPendingMessages,
+        activeSession?.name ?? '',
       )
     : [];
   const queuedTransportEntries = optimisticQueuedEntries ?? incomingQueuedTransportEntries;
@@ -512,15 +514,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [activeSession?.name, activeSession?.transportConfig]);
 
   useEffect(() => {
-    if (!activeSession?.runtimeType || activeSession.runtimeType !== 'transport') {
+    if (effectiveRuntimeType !== 'transport') {
       setPendingTransportApproval(null);
     }
-  }, [activeSession?.name, activeSession?.runtimeType]);
+  }, [activeSession?.name, effectiveRuntimeType]);
 
   const connected = !!ws?.connected;
 
   useEffect(() => {
-    if (!ws || !connected || !activeSession || activeSession.runtimeType !== 'transport') return;
+    if (!ws || !connected || !activeSession || effectiveRuntimeType !== 'transport') return;
     const sessionId = activeSession.name;
     try {
       ws.subscribeTransportSession(sessionId);
@@ -534,12 +536,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         // ignore
       }
     };
-  }, [activeSession?.name, activeSession?.runtimeType, connected, ws]);
+  }, [activeSession?.name, effectiveRuntimeType, connected, ws]);
 
   useEffect(() => {
     if (!ws) return;
     return ws.onMessage((msg) => {
-      if (!activeSession || activeSession.runtimeType !== 'transport') return;
+      if (!activeSession || effectiveRuntimeType !== 'transport') return;
       if (msg.type === TRANSPORT_MSG.CHAT_APPROVAL && msg.sessionId === activeSession.name) {
         setPendingTransportApproval({
           sessionId: msg.sessionId,
@@ -557,7 +559,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         ));
       }
     });
-  }, [activeSession, ws]);
+  }, [activeSession, effectiveRuntimeType, ws]);
 
   // Auto-sync model selector with detected model from terminal/ctx
   // Detection is the real-time truth — always override the selector
@@ -591,7 +593,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const disabled = !connected || !hasSession;
   const isClaudeCode = activeSession?.agentType === 'claude-code' || activeSession?.agentType === 'claude-code-sdk';
   const isShellLike = activeSession?.agentType === 'shell' || activeSession?.agentType === 'script';
-  const isTransport = activeSession?.runtimeType === 'transport';
+  const isTransport = effectiveRuntimeType === 'transport';
   const currentTransportConfig = localTransportConfig ?? activeSession?.transportConfig ?? null;
   const hasInvalidSupervisionConfig = hasInvalidSessionSupervisionSnapshot(currentTransportConfig);
   const supervisionSnapshot = extractSessionSupervisionSnapshot(currentTransportConfig);
@@ -710,7 +712,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   );
   const lastIncomingQueuedTransportEntriesKeyRef = useRef(incomingQueuedTransportEntriesKey);
   useEffect(() => {
-    if (activeSession?.runtimeType !== 'transport') {
+    if (effectiveRuntimeType !== 'transport') {
       setOptimisticQueuedEntries(null);
       lastIncomingQueuedTransportEntriesKeyRef.current = incomingQueuedTransportEntriesKey;
       return;
@@ -719,7 +721,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       setOptimisticQueuedEntries(null);
     }
     lastIncomingQueuedTransportEntriesKeyRef.current = incomingQueuedTransportEntriesKey;
-  }, [activeSession?.name, activeSession?.runtimeType, incomingQueuedTransportEntriesKey]);
+  }, [activeSession?.name, effectiveRuntimeType, incomingQueuedTransportEntriesKey]);
 
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
@@ -1428,7 +1430,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const finalizeSend = useCallback((payload: PendingSendPayload, options?: { clearComposer?: boolean }) => {
     if (!activeSession) return;
-    if (editingQueuedMessageId && activeSession.runtimeType === 'transport') {
+    if (editingQueuedMessageId && effectiveRuntimeType === 'transport') {
       try {
         if (!sendQueuedMessageMutation('session.edit_queued_message', {
           clientMessageId: editingQueuedMessageId,
@@ -1615,7 +1617,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [buildModeOnlySendPayload, requestSend]);
 
   const handleKeyDown = (e: KeyboardEvent) => {
-    if (e.key === 'Escape' && activeSession?.runtimeType === 'transport' && isRunningSessionState(activeSession.state)) {
+    if (e.key === 'Escape' && effectiveRuntimeType === 'transport' && isRunningSessionState(activeSession?.state)) {
       e.preventDefault();
       sendSessionMessage('/stop');
       return;
@@ -2381,7 +2383,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         </div>}
       </div>}
 
-      {pendingTransportApproval && activeSession?.runtimeType === 'transport' && (
+      {pendingTransportApproval && effectiveRuntimeType === 'transport' && (
         <div
           class="transport-approval-banner"
           style={{
@@ -2412,7 +2414,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               style={{ minWidth: 64, padding: '4px 8px', fontSize: 12 }}
               disabled={disabled}
               onClick={() => {
-                if (!ws || !activeSession || activeSession.runtimeType !== 'transport') return;
+                if (!ws || !activeSession || effectiveRuntimeType !== 'transport') return;
                 try {
                   ws.respondTransportApproval(activeSession.name, pendingTransportApproval.requestId, true);
                   setPendingTransportApproval(null);
@@ -2428,7 +2430,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               style={{ minWidth: 64, padding: '4px 8px', fontSize: 12 }}
               disabled={disabled}
               onClick={() => {
-                if (!ws || !activeSession || activeSession.runtimeType !== 'transport') return;
+                if (!ws || !activeSession || effectiveRuntimeType !== 'transport') return;
                 try {
                   ws.respondTransportApproval(activeSession.name, pendingTransportApproval.requestId, false);
                   setPendingTransportApproval(null);

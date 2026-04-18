@@ -2010,6 +2010,27 @@ afterEach(() => {
     expect(ws.unsubscribeTransportSession).toHaveBeenCalledWith('codex-sdk-session');
   });
 
+  it('treats copilot-sdk sessions as transport even when runtimeType is omitted', async () => {
+    const ws = makeWs();
+
+    render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        activeSession={makeSession({
+          name: 'copilot-session',
+          agentType: 'copilot-sdk',
+          state: 'running',
+          runtimeType: undefined,
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(ws.subscribeTransportSession).toHaveBeenCalledWith('copilot-session');
+    expect(screen.getByRole('button', { name: /^Stop$/ })).toBeDefined();
+  });
+
   it('pressing Shift+Enter does not submit', () => {
     const ws = makeWs();
     render(<SessionControls ws={ws as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);

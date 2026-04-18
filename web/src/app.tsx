@@ -48,6 +48,7 @@ import {
 import { LocalWebPreviewPanel } from './components/LocalWebPreviewPanel.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
 import { mergeSessionListEntry, type IncomingSessionListEntry } from './session-list-merge.js';
+import { isTransportRuntime, resolveSessionInfoRuntimeType } from './runtime-type.js';
 import { useSyncedPreference } from './hooks/useSyncedPreference.js';
 import { resolveInitialServerId, resolveInitialSessionName, writeHashState } from './hooks/useHashState.js';
 import { useSubSessions } from './hooks/useSubSessions.js';
@@ -1194,7 +1195,12 @@ export function App() {
     return {};
   });
   // Transport sessions have no terminal backend — force chat mode, no toggle
-  const activeRuntimeType = sessions.find((s) => s.name === activeSession)?.runtimeType;
+  const activeRuntimeType = activeSession
+    ? (() => {
+        const session = sessions.find((s) => s.name === activeSession);
+        return session ? resolveSessionInfoRuntimeType(session) : undefined;
+      })()
+    : undefined;
   const isTransportSession = activeRuntimeType === 'transport';
   const effectiveDefault: ViewMode = isTransportSession ? 'chat' : defaultViewMode;
   const viewMode: ViewMode = isTransportSession ? 'chat' : ((activeSession && viewModes[activeSession]) ? viewModes[activeSession] : effectiveDefault);
@@ -1737,12 +1743,23 @@ export function App() {
           ? subSessionsRef.current.find((sub) => sub.id === focusedSubIdRef.current)
           : null;
         scheduleResubscribe([
-          ...(activeName ? [{ name: activeName, mode: activeMode }] : []),
-          ...(focusedSub ? [{ name: focusedSub.sessionName, mode: 'chat' as ViewMode }] : []),
+          ...(activeName
+            ? (() => {
+                const active = sessionsRef.current.find((s) => s.name === activeName);
+                return active && !isTransportRuntime(active)
+                  ? [{ name: activeName, mode: activeMode }]
+                  : [];
+              })()
+            : []),
+          ...(focusedSub && !isTransportRuntime(focusedSub)
+            ? [{ name: focusedSub.sessionName, mode: 'chat' as ViewMode }]
+            : []),
           ...sessionsRef.current
-            .filter((s) => s.name !== activeName)
+            .filter((s) => s.name !== activeName && !isTransportRuntime(s))
             .map((s) => ({ name: s.name, mode: 'chat' as ViewMode })),
-          ...subSessionsRef.current.map((sub) => ({ name: sub.sessionName, mode: 'chat' as ViewMode })),
+          ...subSessionsRef.current
+            .filter((sub) => !isTransportRuntime(sub))
+            .map((sub) => ({ name: sub.sessionName, mode: 'chat' as ViewMode })),
         ]);
         // Refresh discussion list
         ws.discussionList();
@@ -1789,7 +1806,9 @@ export function App() {
   useEffect(() => {
     const ws = wsRef.current;
     if (!ws?.connected || sessions.length === 0) return;
-    const names = sessions.map((s) => s.name);
+    const names = sessions
+      .filter((s) => !isTransportRuntime(s))
+      .map((s) => s.name);
     for (const name of names) {
       ws.subscribeTerminal(name, false);
       const mode = viewModesRef.current[name] ?? defaultViewMode;
@@ -1811,7 +1830,9 @@ export function App() {
   useEffect(() => {
     const ws = wsRef.current;
     if (!ws?.connected || subSessions.length === 0) return;
-    const names = subSessions.map((s) => s.sessionName);
+    const names = subSessions
+      .filter((s) => !isTransportRuntime(s))
+      .map((s) => s.sessionName);
     for (const name of names) {
       try { ws.subscribeTerminal(name, false); } catch { /* ignore */ }
     }
@@ -1845,7 +1866,7 @@ export function App() {
   // Keep the active session in raw mode only while it is actively rendering terminal output.
   useEffect(() => {
     const ws = wsRef.current;
-    if (!ws?.connected || !activeSession) return;
+    if (!ws?.connected || !activeSession || activeRuntimeType === 'transport') return;
     const raw = shouldSubscribeTerminalRaw(true, viewMode);
     ws.subscribeTerminal(activeSession, raw);
     if (!raw) {
@@ -1854,7 +1875,7 @@ export function App() {
     return () => {
       try { ws.subscribeTerminal(activeSession, false); } catch { /* ignore */ }
     };
-  }, [connected, activeSession, viewMode]);
+  }, [connected, activeRuntimeType, activeSession, viewMode]);
 
   useEffect(() => {
     const handler = () => {
@@ -1862,6 +1883,8 @@ export function App() {
       const ws = wsRef.current;
       const session = activeSessionRef.current;
       if (!ws?.connected || !session) return;
+      const active = sessionsRef.current.find((entry) => entry.name === session);
+      if (active && isTransportRuntime(active)) return;
       const raw = shouldSubscribeTerminalRaw(true, (viewModesRef.current[session] ?? defaultViewMode) as ViewMode);
       ws.subscribeTerminal(session, raw);
       const mode = viewModesRef.current[session] ?? defaultViewMode;

@@ -8,9 +8,11 @@ import { h } from 'preact';
 const addOptimisticUserMessageMock = vi.fn();
 let timelineEventsMock: any[] = [];
 let activeToolCallMock = false;
+const terminalViewSpy = vi.fn(() => null);
+const chatViewSpy = vi.fn(() => null);
 
-vi.mock('../../src/components/TerminalView.js', () => ({ TerminalView: () => null }));
-vi.mock('../../src/components/ChatView.js', () => ({ ChatView: () => null }));
+vi.mock('../../src/components/TerminalView.js', () => ({ TerminalView: (props: any) => terminalViewSpy(props) }));
+vi.mock('../../src/components/ChatView.js', () => ({ ChatView: (props: any) => chatViewSpy(props) }));
 vi.mock('../../src/components/SessionControls.js', () => ({
   SessionControls: (props: { onSend?: (sessionName: string, text: string) => void; activeSession?: { name: string } | null }) => (
     <button type="button" onClick={() => props.onSend?.(props.activeSession?.name ?? 'session', 'queued text')}>
@@ -53,6 +55,8 @@ describe('SessionPane', () => {
     addOptimisticUserMessageMock.mockReset();
     timelineEventsMock = [];
     activeToolCallMock = false;
+    terminalViewSpy.mockClear();
+    chatViewSpy.mockClear();
   });
 
   afterEach(() => {
@@ -111,6 +115,37 @@ describe('SessionPane', () => {
       />,
     );
 
+    fireEvent.click(screen.getByRole('button', { name: 'send' }));
+    expect(addOptimisticUserMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('forces copilot-sdk sessions into chat mode when runtimeType is omitted', () => {
+    render(
+      <SessionPane
+        serverId="s1"
+        session={{
+          name: 'deck_test_brain',
+          project: 'test',
+          role: 'brain',
+          agentType: 'copilot-sdk',
+          state: 'running',
+          runtimeType: undefined,
+          projectDir: '/tmp/test',
+        } as any}
+        sessions={[]}
+        subSessions={[]}
+        ws={null}
+        connected={false}
+        isActive={true}
+        viewMode="terminal"
+        quickData={{} as any}
+      />,
+    );
+
+    expect(chatViewSpy).toHaveBeenCalled();
+    expect(terminalViewSpy).toHaveBeenCalled();
+    const lastTerminalProps = terminalViewSpy.mock.calls.at(-1)?.[0];
+    expect(lastTerminalProps?.active).toBe(false);
     fireEvent.click(screen.getByRole('button', { name: 'send' }));
     expect(addOptimisticUserMessageMock).not.toHaveBeenCalled();
   });

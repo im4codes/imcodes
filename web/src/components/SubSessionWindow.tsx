@@ -21,6 +21,7 @@ import { extractLatestUsage } from '../usage-data.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
 import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
+import { resolveSubSessionRuntimeType } from '../runtime-type.js';
 
 interface WindowGeometry { x: number; y: number; w: number; h: number }
 
@@ -121,7 +122,8 @@ export function SubSessionWindow({
   const thinkingNow = useNowTicker(!!activeThinkingTs && active);
   const isShell = sub.type === 'shell' || sub.type === 'script';
   /** Transport-backed sessions have no tmux terminal — chat only */
-  const isTransport = sub.runtimeType === 'transport';
+  const effectiveRuntimeType = resolveSubSessionRuntimeType(sub);
+  const isTransport = effectiveRuntimeType === 'transport';
   const initial = loadLocal(sub.id);
   const [geom, setGeom] = useState<WindowGeometry>(initial.geom);
   const [viewMode, setViewMode] = useState<ViewMode>(isShell ? 'terminal' : isTransport ? 'chat' : initial.viewMode);
@@ -166,7 +168,7 @@ export function SubSessionWindow({
     quotaUsageLabel: sub.quotaUsageLabel ?? undefined,
     quotaMeta: sub.quotaMeta ?? undefined,
     effort: sub.effort ?? undefined,
-    runtimeType: sub.runtimeType ?? undefined,
+    runtimeType: effectiveRuntimeType,
     transportConfig: sub.transportConfig ?? undefined,
     transportPendingMessages: sub.transportPendingMessages ?? undefined,
     transportPendingMessageEntries: sub.transportPendingMessageEntries ?? undefined,
@@ -203,7 +205,7 @@ export function SubSessionWindow({
   // SubSessionWindow unmounts on minimize, so without this the remounted
   // TerminalView would start empty (no snapshot, only incremental data).
   useEffect(() => {
-    if (!ws || !connected) return;
+    if (!ws || !connected || isTransport) return;
     const raw = active;
     try { ws.subscribeTerminal(sub.sessionName, raw); } catch { /* ignore */ }
     if (!raw) {
@@ -212,7 +214,7 @@ export function SubSessionWindow({
     return () => {
       try { ws.subscribeTerminal(sub.sessionName, false); } catch { /* ignore */ }
     };
-  }, [ws, connected, sub.sessionName, active]);
+  }, [ws, connected, sub.sessionName, active, isTransport]);
 
   const scrollToBottom = useCallback(() => {
     setTimeout(() => {

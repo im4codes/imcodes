@@ -17,6 +17,7 @@ import { useState } from 'preact/hooks';
 import { memo } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { SessionInfo } from '../types.js';
+import { isTransportRuntime } from '../runtime-type.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
 import { formatLabel } from '../format-label.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
@@ -243,7 +244,7 @@ function SessionTreeInner({
       {sessions.map((session) => {
         const sessionLabel = getSessionLabel(session);
         const isActive = session.name === activeSession;
-        const isTransport = session.runtimeType === 'transport';
+        const isTransport = isTransportRuntime(session);
         const unread = unreadCounts.get(session.name) ?? 0;
         const idleFlashToken = idleFlashTokens?.get(session.name) ?? 0;
 
