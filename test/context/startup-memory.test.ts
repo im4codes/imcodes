@@ -52,7 +52,7 @@ describe('startup memory selection', () => {
     expect(items.slice(0, 3).every((item) => item.projectionClass === 'durable_memory_candidate')).toBe(true);
   });
 
-  it('dedupes recent summaries whose source events are already represented by durable memory', () => {
+  it('keeps both durable and recent startup memories even when they share source events', () => {
     const now = Date.now();
     const namespace = {
       scope: 'personal' as const,
@@ -89,8 +89,11 @@ describe('startup memory selection', () => {
 
     const items = selectStartupMemoryItems(namespace);
 
-    expect(items).toHaveLength(2);
+    expect(items).toHaveLength(3);
     expect(items[0]?.summary).toBe('Durable architecture decision');
-    expect(items[1]?.summary).toBe('Recent summary for other work');
+    expect(items.slice(1).map((item) => item.summary)).toEqual([
+      'Recent summary for other work',
+      'Recent summary for the same source events',
+    ]);
   });
 });

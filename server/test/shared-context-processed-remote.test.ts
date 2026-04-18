@@ -337,6 +337,65 @@ describe('shared-context processed remote route', () => {
     expect(aliasRows).toHaveLength(0);
   });
 
+
+  it('skips noisy API error projections during remote replication', async () => {
+    const { db, projectionRows, recordRows } = makeMockDb();
+    const app = new Hono<{ Bindings: Env }>();
+    app.route('/api/server', serverRoutes);
+
+    const response = await app.request('/api/server/srv-1/shared-context/processed', {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer daemon-token',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        namespace: {
+          scope: 'project_shared',
+          projectId: 'github.com/acme/repo',
+          enterpriseId: 'ent-1',
+        },
+        projections: [
+          {
+            id: 'bad-proj',
+            namespace: {
+              scope: 'project_shared',
+              projectId: 'github.com/acme/repo',
+              enterpriseId: 'ent-1',
+            },
+            class: 'recent_summary',
+            sourceEventIds: ['evt-bad'],
+            summary: '**Assistant:** [API Error: Connection error. (cause: fetch failed)]',
+            content: {},
+            createdAt: 100,
+            updatedAt: 101,
+          },
+          {
+            id: 'good-proj',
+            namespace: {
+              scope: 'project_shared',
+              projectId: 'github.com/acme/repo',
+              enterpriseId: 'ent-1',
+            },
+            class: 'recent_summary',
+            sourceEventIds: ['evt-good'],
+            summary: 'useful summary',
+            content: {},
+            createdAt: 110,
+            updatedAt: 111,
+          },
+        ],
+      }),
+    }, makeEnv(db));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(expect.objectContaining({ ok: true, projectionCount: 1 }));
+    expect(projectionRows).toEqual([
+      expect.objectContaining({ id: 'good-proj' }),
+    ]);
+    expect(recordRows).toEqual([]);
+  });
+
   it('sanitizes personal projections to the daemon owner and rejects mismatched namespace users', async () => {
     const { db, projectionRows, recordRows } = makeMockDb();
     const app = new Hono<{ Bindings: Env }>();

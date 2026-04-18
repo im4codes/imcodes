@@ -12,6 +12,7 @@ import {
   listProcessedProjections,
   queryPendingContextEvents,
   queryProcessedProjections,
+  removeMemoryNoiseProjections,
   recordContextEvent,
   recordMemoryHits,
   resetContextStoreForTests,
@@ -200,6 +201,36 @@ describe('context-store', () => {
     deleteStagedEventsByIds([first.id, second.id]);
 
     expect(queryPendingContextEvents({ scope: 'personal', projectId: 'repo', limit: 10 })).toEqual([]);
+  });
+
+
+  it('removes legacy API error memories from the local database', () => {
+    const clean = writeProcessedProjection({
+      namespace,
+      class: 'recent_summary',
+      sourceEventIds: ['evt-1'],
+      summary: 'Useful summary',
+      content: {},
+      createdAt: 10,
+      updatedAt: 10,
+    });
+    const noisy = writeProcessedProjection({
+      namespace,
+      class: 'recent_summary',
+      sourceEventIds: ['evt-2'],
+      summary: '**Assistant:** [API Error: Connection error. (cause: fetch failed)]',
+      content: {},
+      createdAt: 20,
+      updatedAt: 20,
+    });
+    setReplicationState(namespace, {
+      pendingProjectionIds: [clean.id, noisy.id],
+      lastReplicatedAt: 0,
+    });
+
+    expect(removeMemoryNoiseProjections()).toBeLessThanOrEqual(1);
+    expect(listProcessedProjections(namespace).map((row) => row.id)).toEqual([clean.id]);
+    expect(getReplicationState(namespace)?.pendingProjectionIds).toEqual([clean.id]);
   });
 
   it('reconciles stale staged events that were already referenced by processed projections', () => {

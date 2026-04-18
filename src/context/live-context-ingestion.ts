@@ -4,6 +4,7 @@ import type { SessionRecord } from '../store/session-store.js';
 import { listProcessedProjections } from '../store/context-store.js';
 import type { TransportContextBootstrap } from '../agent/runtime-context-bootstrap.js';
 import { MaterializationCoordinator, type MaterializationCoordinatorOptions } from './materialization-coordinator.js';
+import { isMemoryNoiseTurn } from '../../shared/memory-noise-patterns.js';
 
 const BOOTSTRAP_CACHE_MS = 30_000;
 
@@ -151,13 +152,16 @@ function mapTimelineEvent(event: TimelineEvent): Pick<LocalContextEvent, 'eventT
         content: stringifyContent(event.payload.text),
         metadata: { timelineType: event.type },
       };
-    case 'assistant.text':
+    case 'assistant.text': {
+      const text = stringifyContent(event.payload.text);
       if (event.payload.streaming === true || event.payload.memoryExcluded === true) return null;
+      if (isMemoryNoiseTurn(text)) return null;
       return {
         eventType: 'assistant.turn',
-        content: stringifyContent(event.payload.text),
+        content: text,
         metadata: { timelineType: event.type, streaming: false },
       };
+    }
     case 'assistant.thinking':
       return {
         eventType: 'assistant.thinking',

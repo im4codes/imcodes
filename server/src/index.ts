@@ -574,6 +574,10 @@ async function main() {
   await ensureDefaultAdmin(db, envConfig);
   await initializeAuthNonceCleanup(db);
 
+  import('./util/memory-noise-cleanup.js').then(({ purgeRemoteMemoryNoiseProjections }) =>
+    purgeRemoteMemoryNoiseProjections(db).catch((err) => logger.warn({ err }, 'Remote memory-noise cleanup failed (non-fatal)'))
+  ).catch(() => {});
+
   // Backfill embeddings for projections that don't have one yet (idempotent)
   import('./util/embedding.js').then(({ backfillEmbeddings }) =>
     backfillEmbeddings(db).catch((err) => logger.warn({ err }, 'Embedding backfill failed (non-fatal)'))

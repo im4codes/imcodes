@@ -10,6 +10,7 @@ import type { ContextMemoryRecordView, ContextMemoryStatsView } from '../../../s
 import { computeRelevanceScore, applyRecallCapRule, type ProjectionClass } from '../../../shared/memory-scoring.js';
 import { normalizeSharedContextRuntimeConfig } from '../../../shared/shared-context-runtime-config.js';
 import { isTemplatePrompt, isTemplateOriginSummary } from '../../../shared/template-prompt-patterns.js';
+import { isMemoryNoiseSummary } from '../../../shared/memory-noise-patterns.js';
 import { searchSemanticMemoryView } from '../util/semantic-memory-view.js';
 
 type EnterpriseRole = 'owner' | 'admin' | 'member';
@@ -170,18 +171,19 @@ function buildSharedMemoryResponse(
   limit = 20,
 ): { stats: ContextMemoryStatsView; records: ContextMemoryRecordView[] } {
   const normalizedQuery = query?.trim() ?? '';
-  const filtered = rows.filter((row) => matchesMemoryQuery(
+  const cleanRows = rows.filter((row) => !isMemoryNoiseSummary(row.summary));
+  const filtered = cleanRows.filter((row) => matchesMemoryQuery(
     row.summary,
     typeof row.content_json === 'string' ? JSON.parse(row.content_json) : row.content_json,
     normalizedQuery,
   ));
-  const projectIds = new Set(rows.map((row) => row.project_id));
+  const projectIds = new Set(cleanRows.map((row) => row.project_id));
   return {
     stats: {
-      totalRecords: rows.length,
+      totalRecords: cleanRows.length,
       matchedRecords: filtered.length,
-      recentSummaryCount: rows.filter((row) => row.projection_class === 'recent_summary').length,
-      durableCandidateCount: rows.filter((row) => row.projection_class === 'durable_memory_candidate').length,
+      recentSummaryCount: cleanRows.filter((row) => row.projection_class === 'recent_summary').length,
+      durableCandidateCount: cleanRows.filter((row) => row.projection_class === 'durable_memory_candidate').length,
       projectCount: projectIds.size,
       stagedEventCount: 0,
       dirtyTargetCount: 0,
@@ -1041,7 +1043,7 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
   for (const row of personalRows) {
     if (seen.has(row.id)) continue;
     seen.add(row.id);
-    if (isTemplateOriginSummary(row.summary)) continue;
+    if (isTemplateOriginSummary(row.summary) || isMemoryNoiseSummary(row.summary)) continue;
     results.push({
       id: row.id,
       projectId: row.project_id,
@@ -1062,7 +1064,7 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
   for (const row of enterpriseRows) {
     if (seen.has(row.id)) continue;
     seen.add(row.id);
-    if (isTemplateOriginSummary(row.summary)) continue;
+    if (isTemplateOriginSummary(row.summary) || isMemoryNoiseSummary(row.summary)) continue;
     results.push({
       id: row.id,
       projectId: row.project_id,

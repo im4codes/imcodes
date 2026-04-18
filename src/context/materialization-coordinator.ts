@@ -11,6 +11,7 @@ import type {
 import { isMemoryEligibleEvent } from '../../shared/context-types.js';
 import { getContextModelConfig } from './context-model-config.js';
 import { buildLocalFallbackSummary, compressWithSdk, type CompressionResult } from './summary-compressor.js';
+import { isMemoryNoiseSummary, isMemoryNoiseTurn } from '../../shared/memory-noise-patterns.js';
 import {
   clearDirtyTarget,
   countConsecutiveFailedJobs,
@@ -42,10 +43,11 @@ export interface MaterializationCoordinatorOptions {
 }
 
 export interface MaterializationResult {
-  summaryProjection: ProcessedContextProjection;
+  summaryProjection?: ProcessedContextProjection;
   durableProjection?: ProcessedContextProjection;
   replicationQueued: boolean;
   compression?: CompressionResult;
+  filteredOut?: boolean;
 }
 
 const DEFAULT_THRESHOLDS: MaterializationThresholds = {
@@ -112,8 +114,26 @@ export class MaterializationCoordinator {
     const allEvents = listContextEvents(target);
     // Only memory-eligible events are used for summary generation.
     // Streaming deltas, tool calls/results, and system events are excluded.
-    const events = allEvents.filter((e) => isMemoryEligibleEvent(e.eventType));
+    const events = allEvents.filter((e) => {
+      if (!isMemoryEligibleEvent(e.eventType)) return false;
+      if ((e.eventType === 'assistant.text' || e.eventType === 'assistant.turn') && isMemoryNoiseTurn(e.content)) return false;
+      return true;
+    });
     const sourceEventIds = allEvents.map((event) => event.id);
+    const hadNoiseAssistantTurn = allEvents.some((event) =>
+      (event.eventType === 'assistant.text' || event.eventType === 'assistant.turn') && isMemoryNoiseTurn(event.content),
+    );
+    const hasUsableAssistantTurn = events.some((event) => event.eventType === 'assistant.text' || event.eventType === 'assistant.turn');
+
+    if (hadNoiseAssistantTurn && !hasUsableAssistantTurn) {
+      deleteStagedEventsByIds(sourceEventIds);
+      updateContextJob(job.id, 'completed', { now });
+      clearDirtyTarget(target);
+      return {
+        replicationQueued: false,
+        filteredOut: true,
+      };
+    }
 
     // Fetch previous summary for iterative update (like Hermes's _previous_summary)
     const previousProjections = listProcessedProjections(target.namespace, 'recent_summary');
@@ -137,6 +157,17 @@ export class MaterializationCoordinator {
         backend: 'none',
         usedBackup: false,
         fromSdk: false,
+      };
+    }
+
+    if (isMemoryNoiseSummary(compression.summary)) {
+      deleteStagedEventsByIds(sourceEventIds);
+      updateContextJob(job.id, 'completed', { now });
+      clearDirtyTarget(target);
+      return {
+        replicationQueued: false,
+        compression,
+        filteredOut: true,
       };
     }
 

@@ -228,6 +228,22 @@ describe('MaterializationCoordinator', () => {
     expect(openspec.queuedJob).toEqual(expect.objectContaining({ trigger: 'threshold' }));
   });
 
+
+  it('drops pure API connection failure summaries instead of persisting them as memory', async () => {
+    const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
+      thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
+    });
+
+    coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'continue the run', createdAt: 100 });
+    coordinator.ingestEvent({ target, eventType: 'assistant.text', content: '[API Error: Connection error. (cause: fetch failed)]', createdAt: 120 });
+
+    const result = await coordinator.materializeTarget(target, 'manual', 500);
+
+    expect(result.filteredOut).toBe(true);
+    expect(result.summaryProjection).toBeUndefined();
+    expect(getReplicationState(namespace)?.pendingProjectionIds ?? []).toEqual([]);
+  });
+
   it('pairs final assistant.text output with the user request in structured summaries', async () => {
     const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },

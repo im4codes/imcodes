@@ -39,28 +39,16 @@ export function selectStartupMemoryItems(
     limit: Math.max(recentLimit, totalLimit),
   }).items.filter((item): item is MemorySearchResultItem => item.type === 'processed');
 
-  const deduped: MemorySearchResultItem[] = [];
-  const seen = new Set<string>();
-  for (const item of durable) {
-    const key = getStartupMemoryDedupKey(item);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    deduped.push(item);
-    if (deduped.length >= totalLimit || deduped.length >= durableLimit) break;
-  }
+  const selectedDurable = durable.slice(0, Math.min(durableLimit, totalLimit));
+  const remaining = Math.max(0, totalLimit - selectedDurable.length);
+  const selectedRecent: MemorySearchResultItem[] = [];
+  const seenIds = new Set(selectedDurable.map((item) => item.id));
   for (const item of recent) {
-    const key = getStartupMemoryDedupKey(item);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    deduped.push(item);
-    if (deduped.length >= totalLimit) break;
+    if (seenIds.has(item.id)) continue;
+    seenIds.add(item.id);
+    selectedRecent.push(item);
+    if (selectedRecent.length >= remaining) break;
   }
-  return deduped;
-}
 
-function getStartupMemoryDedupKey(item: MemorySearchResultItem): string {
-  if (item.sourceEventIds && item.sourceEventIds.length > 0) {
-    return `events:${[...item.sourceEventIds].sort().join(',')}`;
-  }
-  return `summary:${item.summary.trim().toLowerCase()}`;
+  return [...selectedDurable, ...selectedRecent];
 }

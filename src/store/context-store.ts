@@ -21,6 +21,7 @@ import type {
 } from '../../shared/context-types.js';
 import { classifyTimestampFreshness } from '../../shared/context-freshness.js';
 import { serializeContextNamespace, serializeContextTarget } from '../context/context-keys.js';
+import { isMemoryNoiseSummary } from '../../shared/memory-noise-patterns.js';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
@@ -123,6 +124,7 @@ function ensureDb(): DatabaseSyncInstance {
   try { db.exec('ALTER TABLE context_processed_local ADD COLUMN status TEXT NOT NULL DEFAULT \'active\''); } catch { /* already exists */ }
   if (stagedReconciledForPath !== dbPath) {
     reconcileMaterializedStagedEvents(db);
+    purgeMemoryNoiseProjections(db);
     stagedReconciledForPath = dbPath;
   }
   return db;
@@ -143,6 +145,44 @@ function parseJson<T>(raw: unknown, fallback: T): T {
   } catch {
     return fallback;
   }
+}
+
+function toNullableNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function toNullableString(value: unknown): string | null {
+  return typeof value === 'string' ? value : null;
+}
+
+
+function purgeMemoryNoiseProjections(database: DatabaseSyncInstance): number {
+  const rows = database.prepare('SELECT id, summary FROM context_processed_local').all() as Array<{ id: string; summary: string }>;
+  const badIds = rows.filter((row) => isMemoryNoiseSummary(row.summary)).map((row) => row.id);
+  if (badIds.length === 0) return 0;
+  const placeholders = badIds.map(() => '?').join(', ');
+  database.prepare(`DELETE FROM context_processed_local WHERE id IN (${placeholders})`).run(...badIds);
+  const replicationRows = database.prepare('SELECT namespace_key, pending_projection_ids_json, last_replicated_at, last_error FROM context_replication_state').all() as Array<Record<string, unknown>>;
+  for (const row of replicationRows) {
+    const pending = parseJson<string[]>(row.pending_projection_ids_json, []);
+    const filtered = pending.filter((id) => !badIds.includes(id));
+    if (filtered.length === pending.length) continue;
+    database.prepare(`
+      UPDATE context_replication_state
+      SET pending_projection_ids_json = ?, last_replicated_at = ?, last_error = ?
+      WHERE namespace_key = ?
+    `).run(
+      JSON.stringify(filtered),
+      toNullableNumber(row.last_replicated_at),
+      toNullableString(row.last_error),
+      String(row.namespace_key),
+    );
+  }
+  return badIds.length;
+}
+
+export function removeMemoryNoiseProjections(): number {
+  return purgeMemoryNoiseProjections(ensureDb());
 }
 
 export function resetContextStoreForTests(): void {
@@ -432,7 +472,7 @@ export function listProcessedProjections(namespace: ContextNamespace, projection
     hitCount: typeof row.hit_count === 'number' ? row.hit_count : 0,
     lastUsedAt: typeof row.last_used_at === 'number' ? row.last_used_at : undefined,
     status: typeof row.status === 'string' ? row.status as 'active' | 'archived' : 'active',
-  }));
+  })).filter((projection) => !isMemoryNoiseSummary(projection.summary));
 }
 
 /** Returns a map of namespace_key → projection IDs for all local projections. */
@@ -501,6 +541,7 @@ export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}
     .filter((projection) => (filters.userId ?? undefined) === undefined || projection.namespace.userId === filters.userId)
     .filter((projection) => !filters.projectId || projection.namespace.projectId === filters.projectId)
     .filter((projection) => !filters.projectionClass || projection.class === filters.projectionClass)
+    .filter((projection) => !isMemoryNoiseSummary(projection.summary))
     .filter((projection) => {
       if (!normalizedQuery) return true;
       const haystack = `${projection.summary}\n${JSON.stringify(projection.content)}`.toLowerCase();
@@ -538,6 +579,7 @@ export function getProcessedProjectionStats(filters: ProcessedProjectionQuery = 
     if (filters.projectionClass && projectionClass !== filters.projectionClass) continue;
     const status = typeof row.status === 'string' ? row.status : 'active';
     if (!filters.includeArchived && status === 'archived') continue;
+    if (isMemoryNoiseSummary(String(row.summary))) continue;
     totalRecords += 1;
     projectIds.add(namespace.projectId);
     if (projectionClass === 'recent_summary') recentSummaryCount += 1;

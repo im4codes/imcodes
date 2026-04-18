@@ -31,6 +31,7 @@ import {
   SHARED_CONTEXT_RUNTIME_CONFIG_MSG,
 } from '../../../shared/shared-context-runtime-config.js';
 import { searchSemanticMemoryView } from '../util/semantic-memory-view.js';
+import { isMemoryNoiseSummary } from '../../../shared/memory-noise-patterns.js';
 
 export const serverRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -127,18 +128,19 @@ function buildRemoteMemoryResponse(
   limit = 20,
 ): { stats: ContextMemoryStatsView; records: ContextMemoryRecordView[] } {
   const normalizedQuery = query?.trim() ?? '';
-  const filtered = rows.filter((row) => matchesMemoryQuery(
+  const cleanRows = rows.filter((row) => !isMemoryNoiseSummary(row.summary));
+  const filtered = cleanRows.filter((row) => matchesMemoryQuery(
     row.summary,
     typeof row.content_json === 'string' ? JSON.parse(row.content_json) : row.content_json,
     normalizedQuery,
   ));
-  const projectIds = new Set(rows.map((row) => row.project_id));
+  const projectIds = new Set(cleanRows.map((row) => row.project_id));
   return {
     stats: {
-      totalRecords: rows.length,
+      totalRecords: cleanRows.length,
       matchedRecords: filtered.length,
-      recentSummaryCount: rows.filter((row) => row.projection_class === 'recent_summary').length,
-      durableCandidateCount: rows.filter((row) => row.projection_class === 'durable_memory_candidate').length,
+      recentSummaryCount: cleanRows.filter((row) => row.projection_class === 'recent_summary').length,
+      durableCandidateCount: cleanRows.filter((row) => row.projection_class === 'durable_memory_candidate').length,
       projectCount: projectIds.size,
       stagedEventCount: 0,
       dirtyTargetCount: 0,
@@ -403,7 +405,10 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
 
   const now = Date.now();
+  let acceptedCount = 0;
+  const acceptedProjections: typeof parsed.data.projections = [];
   for (const projection of parsed.data.projections) {
+    if (isMemoryNoiseSummary(projection.summary)) continue;
     const isPersonal = projection.namespace.scope === 'personal';
     if (isPersonal && projection.namespace.userId && projection.namespace.userId !== serverRow.user_id) {
       return c.json({ error: 'namespace_user_mismatch', projectionId: projection.id }, 403);
@@ -450,6 +455,8 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
         now,
       ],
     );
+    acceptedCount += 1;
+    acceptedProjections.push(projection);
 
     if (projection.class === 'durable_memory_candidate') {
       await c.env.DB.execute(
@@ -488,7 +495,7 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
 
   // Fire-and-forget: generate and store embeddings for replicated projections
   import('../util/embedding.js').then(({ storeProjectionEmbedding }) => {
-    for (const projection of parsed.data.projections) {
+    for (const projection of acceptedProjections) {
       if (projection.summary) {
         storeProjectionEmbedding(c.env.DB, projection.id, projection.summary).catch(() => {});
       }
@@ -498,7 +505,7 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
   return c.json({
     ok: true,
     replicatedAt: now,
-    projectionCount: parsed.data.projections.length,
+    projectionCount: acceptedCount,
   });
 });
 

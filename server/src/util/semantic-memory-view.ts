@@ -2,6 +2,7 @@ import type { ContextMemoryView } from '../../../shared/context-types.js';
 import { computeRelevanceScore, type MemoryScoringWeights, type ProjectionClass } from '../../../shared/memory-scoring.js';
 import type { Database } from '../db/client.js';
 import { embeddingToSql, generateEmbedding } from './embedding.js';
+import { isMemoryNoiseSummary } from '../../../shared/memory-noise-patterns.js';
 
 type MemoryScope = 'personal' | 'enterprise';
 type ProjectionClassFilter = 'recent_summary' | 'durable_memory_candidate';
@@ -138,6 +139,7 @@ export async function searchSemanticMemoryView(input: SemanticMemoryViewInput): 
   const stats = await loadScopedStats(input.db, input);
   const currentProjectId = input.projectId ?? '__unknown_current_project__';
   const ranked = rows
+    .filter((row) => !isMemoryNoiseSummary(row.summary))
     .map((row) => ({
       row,
       score: computeRelevanceScore({
