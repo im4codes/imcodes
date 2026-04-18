@@ -189,6 +189,37 @@ describe('WsClient', () => {
     vi.useRealTimers();
   });
 
+
+  it('force reconnect refreshes a stale-open socket and replays subscriptions', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const firstWs = lastWs!;
+
+    client.subscribeTerminal('chat-session', false);
+    client.subscribeTransportSession('transport-session');
+    firstWs.send.mockClear();
+
+    client.reconnectNow(true);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const secondWs = lastWs!;
+    expect(secondWs).not.toBe(firstWs);
+    secondWs.emit('open');
+
+    expect(secondWs.send).toHaveBeenCalledWith(expect.stringContaining('"type":"terminal.subscribe"'));
+    expect(secondWs.send).toHaveBeenCalledWith(expect.stringContaining('"type":"chat.subscribe"'));
+
+    // Late close from the stale socket must not tear down the fresh connection.
+    firstWs.emit('close');
+    expect(client.connected).toBe(true);
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
   it('send() throws when not connected', () => {
     const client = new WsClient('http://localhost:8787', 'srv-1');
     expect(() => client.send({ type: 'ping' })).toThrow('WebSocket not connected');

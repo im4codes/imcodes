@@ -1768,14 +1768,29 @@ export function App() {
     setConnecting(true);
     ws.connect();
 
-    // Reconnect immediately when app returns from background (mobile + desktop tab)
+    // Reconnect immediately when the app returns from background. On mobile/native,
+    // force a fresh socket because the WebView can resume with a stale-open socket
+    // that never receives timeline events even though readyState still says OPEN.
+    const shouldForceResumeReconnect = isNative() || /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
     const onVisibility = () => {
-      if (document.visibilityState === 'visible') ws.reconnectNow();
+      if (document.visibilityState === 'visible') ws.reconnectNow(shouldForceResumeReconnect);
     };
     document.addEventListener('visibilitychange', onVisibility);
 
+    let removeAppStateListener: (() => void) | null = null;
+    if (isNative()) {
+      void import('@capacitor/app').then(({ App }) =>
+        App.addListener('appStateChange', ({ isActive }) => {
+          if (isActive) ws.reconnectNow(true);
+        }).then((listener) => {
+          removeAppStateListener = () => { void listener.remove(); };
+        }).catch(() => {})
+      ).catch(() => {});
+    }
+
     return () => {
       document.removeEventListener('visibilitychange', onVisibility);
+      removeAppStateListener?.();
       unsub();
       unsubStats();
       ws.onLatency(null);

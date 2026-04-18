@@ -532,11 +532,13 @@ export class WsClient {
 
     const url = `${wsUrl}/api/server/${this.serverId}/ws?ticket=${encodeURIComponent(ticket)}`;
 
-    this.ws = new WebSocket(url);
-    this.ws.binaryType = 'arraybuffer';
+    const socket = new WebSocket(url);
+    this.ws = socket;
+    socket.binaryType = 'arraybuffer';
     this._connecting = false;
 
-    this.ws.addEventListener('open', () => {
+    socket.addEventListener('open', () => {
+      if (this.ws !== socket) return;
       this._connected = true;
       this.reconnectAttempt = 0;
       this.startHeartbeat();
@@ -557,7 +559,8 @@ export class WsClient {
       this.dispatch({ type: 'session.event', event: 'connected', session: '', state: 'connected' });
     });
 
-    this.ws.addEventListener('message', (ev) => {
+    socket.addEventListener('message', (ev) => {
+      if (this.ws !== socket) return;
       // Binary frame: raw PTY data
       if (ev.data instanceof ArrayBuffer) {
         this.handleRawFrame(ev.data);
@@ -585,7 +588,8 @@ export class WsClient {
       }
     });
 
-    this.ws.addEventListener('close', () => {
+    socket.addEventListener('close', () => {
+      if (this.ws !== socket) return;
       const wasConnected = this._connected;
       this._connected = false;
       this._connecting = false;
@@ -597,8 +601,9 @@ export class WsClient {
       if (!this._destroyed) this.scheduleReconnect();
     });
 
-    this.ws.addEventListener('error', () => {
-      this.ws?.close();
+    socket.addEventListener('error', () => {
+      if (this.ws !== socket) return;
+      socket.close();
     });
   }
 
@@ -688,11 +693,22 @@ export class WsClient {
   }
 
   /** Force immediate reconnect (e.g. app returning from background). */
-  reconnectNow(): void {
+  reconnectNow(force = false): void {
     if (this._destroyed) return;
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) return; // already connected
+    if (!force && this.ws && this.ws.readyState === WebSocket.OPEN) return; // already connected
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
     this.reconnectAttempt = 0;
+
+    if (force && this.ws) {
+      const staleSocket = this.ws;
+      this.ws = null;
+      this._connected = false;
+      this._connecting = false;
+      this.clearTimers();
+      try { staleSocket.close(4001, 'client refresh'); } catch { /* ignore */ }
+    }
+
     void this.openSocket();
   }
 
