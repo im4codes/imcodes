@@ -2641,4 +2641,52 @@ afterEach(() => {
       text: '/thinking high',
     });
   });
+
+  it('shows a model selector for copilot-sdk and sends /model', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'copilot-sdk-session',
+          agentType: 'copilot-sdk',
+          runtimeType: 'transport',
+          activeModel: 'gpt-5.4',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /^gpt-5.4$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /gpt-5.4-mini/i }));
+
+    expectSendPayload(ws, {
+      sessionName: 'copilot-sdk-session',
+      text: '/model gpt-5.4-mini',
+    });
+  });
+
+  it('shows a model selector for cursor-headless and sends /model', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'cursor-headless-session',
+          agentType: 'cursor-headless',
+          runtimeType: 'transport',
+          activeModel: 'gpt-5.2',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /^gpt-5.2$/i }));
+    fireEvent.click(screen.getAllByRole('button', { name: /gpt-5.2/i })[1]!);
+
+    expectSendPayload(ws, {
+      sessionName: 'cursor-headless-session',
+      text: '/model gpt-5.2',
+    });
+  });
 });

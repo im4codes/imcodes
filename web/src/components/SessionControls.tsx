@@ -32,7 +32,7 @@ import type { P2pSavedConfig } from '@shared/p2p-modes.js';
 import { getQwenAuthTier, QWEN_AUTH_TIERS } from '@shared/qwen-auth.js';
 import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/qwen-models.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, normalizeClaudeCodeModelId } from '../../../src/shared/models/options.js';
-import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '@shared/effort-levels.js';
+import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '@shared/effort-levels.js';
 import {
   buildTransportConfigWithSupervision,
   extractSessionSupervisionSnapshot,
@@ -114,6 +114,8 @@ const QUEUED_HINT_EXPANDED_STORAGE_KEY = 'imcodes-queued-hint-expanded';
 const QUEUED_HINT_EXPANDED_EVENT = 'imcodes:queued-hint-expanded';
 const P2P_COMBO_CONFIRM_SKIP_PREF_KEY = 'p2p_combo_direct_send_skip_confirm';
 const CODEX_MODELS: CodexModelChoice[] = [...CODEX_MODEL_IDS] as CodexModelChoice[];
+const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
+const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
 const P2P_BASE_MODES = ['solo', 'audit', 'review', 'plan', 'brainstorm', 'discuss', P2P_CONFIG_MODE] as const;
 const P2P_MODE_I18N: Record<string, string> = { solo: 'p2p.mode_solo', audit: 'p2p.mode_audit', review: 'p2p.mode_review', plan: 'p2p.mode_plan', brainstorm: 'p2p.mode_brainstorm', discuss: 'p2p.mode_discuss', [P2P_CONFIG_MODE]: 'p2p.mode_config' };
 const P2P_SINGLE_COLORS: Record<string, string> = { solo: '#dbe7f5', audit: '#f59e0b', review: '#3b82f6', plan: '#06b6d4', brainstorm: '#a78bfa', discuss: '#22c55e', [P2P_CONFIG_MODE]: '#94a3b8' };
@@ -606,6 +608,18 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   );
   const isCodex = activeSession?.agentType === 'codex' || activeSession?.agentType === 'codex-sdk';
   const isQwen = activeSession?.agentType === 'qwen';
+  const isCopilot = activeSession?.agentType === 'copilot-sdk';
+  const isCursorHeadless = activeSession?.agentType === 'cursor-headless';
+  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless;
+  const genericTransportModelSuggestions = isCopilot
+    ? COPILOT_SDK_MODEL_SUGGESTIONS
+    : isCursorHeadless
+      ? CURSOR_HEADLESS_MODEL_SUGGESTIONS
+      : [];
+  const genericTransportModel = activeSession?.activeModel
+    ?? activeSession?.requestedModel
+    ?? detectedModel
+    ?? null;
   const thinkingLevels = useMemo((): readonly TransportEffortLevel[] => (
     activeSession?.agentType === 'claude-code-sdk'
       ? CLAUDE_SDK_EFFORT_LEVELS
@@ -613,9 +627,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         ? CODEX_SDK_EFFORT_LEVELS
         : activeSession?.agentType === 'qwen'
           ? QWEN_EFFORT_LEVELS
-        : activeSession?.agentType === 'openclaw'
-          ? OPENCLAW_THINKING_LEVELS
-          : []
+          : activeSession?.agentType === 'copilot-sdk'
+            ? COPILOT_SDK_EFFORT_LEVELS
+          : activeSession?.agentType === 'openclaw'
+            ? OPENCLAW_THINKING_LEVELS
+            : []
   ), [activeSession?.agentType]);
   const supportsThinking = thinkingLevels.length > 0;
   const currentThinking = (activeSession?.effort as TransportEffortLevel | undefined)
@@ -1828,6 +1844,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     onAfterAction?.();
   };
 
+  const handleGenericTransportModelSelect = (m: string) => {
+    if (!activeSession) return;
+    sendSessionMessage(`/model ${m}`);
+    setModelOpen(false);
+    onAfterAction?.();
+  };
+
   const handleThinkingSelect = (level: TransportEffortLevel) => {
     if (!activeSession) return;
     setThinkingOpen(false);
@@ -2267,6 +2290,32 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                     title={m.description || m.id}
                   >
                     {qwenModel === m.id ? '● ' : '○ '}{m.id}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+        {supportsGenericTransportModelSelect && (
+          <div class="shortcuts-model" ref={modelRef}>
+            <button
+              class="shortcut-btn"
+              onClick={() => setModelOpen((o) => !o)}
+              disabled={disabled}
+              title={genericTransportModel ? `Model: ${genericTransportModel}` : 'Model: default — tap to select'}
+              style={{ color: genericTransportModel ? '#34d399' : '#6b7280', fontSize: 10 }}
+            >
+              {genericTransportModel ?? 'default'}
+            </button>
+            {modelOpen && (
+              <div class="menu-dropdown">
+                {genericTransportModelSuggestions.map((m) => (
+                  <button
+                    key={m}
+                    class={`menu-item ${genericTransportModel === m ? 'menu-item-active' : ''}`}
+                    onClick={() => handleGenericTransportModelSelect(m)}
+                  >
+                    {genericTransportModel === m ? '● ' : '○ '}{m}
                   </button>
                 ))}
               </div>

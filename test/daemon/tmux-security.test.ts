@@ -11,6 +11,7 @@ import * as childProcess from 'child_process';
 const execFileCalls: Array<{ cmd: string; args: string[] }> = [];
 let failNextTmuxSubcommand: string | null = null;
 let failNextTmuxErrorText = 'server exited unexpectedly';
+let failNextTmuxCall: ((cmd: string, args: string[]) => Error | null) | null = null;
 const originalExecFile = childProcess.execFile;
 
 // Mock execFile to capture calls and return success
@@ -27,6 +28,13 @@ vi.mock('child_process', async (importOriginal) => {
       // Return mock stdout for commands that need it
       const subCmd = args[0];
       if (cmd === 'tmux') {
+        if (failNextTmuxCall) {
+          const err = failNextTmuxCall(cmd, args);
+          if (err) {
+            if (typeof cb === 'function') cb(err);
+            return;
+          }
+        }
         if (failNextTmuxSubcommand && subCmd === failNextTmuxSubcommand) {
           const err = Object.assign(new Error(failNextTmuxErrorText), {
             stderr: failNextTmuxErrorText,
@@ -70,6 +78,7 @@ describe('tmux shell-injection prevention', () => {
     execFileCalls.length = 0;
     failNextTmuxSubcommand = null;
     failNextTmuxErrorText = 'server exited unexpectedly';
+    failNextTmuxCall = null;
   });
 
   it('uses execFile (not exec) for all tmux commands', async () => {
@@ -190,6 +199,39 @@ describe('tmux shell-injection prevention', () => {
       (c) => c.args[0] === 'kill-session' && c.args[2] === 'imcodes_init',
     );
     expect(killInit.length).toBe(1);
+  });
+
+  it('recovers when tmux priming temp session already exists', async () => {
+    vi.resetModules();
+    const freshTmux = await import('../../src/agent/tmux.js');
+    execFileCalls.length = 0;
+    failNextTmuxSubcommand = 'list-sessions';
+    failNextTmuxErrorText = 'no server running';
+    let initAttempted = false;
+    failNextTmuxCall = (_cmd, args) => {
+      if (!initAttempted && args[0] === 'new-session' && args[3] === 'imcodes_init') {
+        initAttempted = true;
+        return Object.assign(new Error('duplicate session: imcodes_init'), {
+          stderr: 'duplicate session: imcodes_init\n',
+        });
+      }
+      return null;
+    };
+
+    await freshTmux.newSession('deck_test_brain_c', 'bash');
+
+    const initSessions = execFileCalls.filter(
+      (c) => c.args[0] === 'new-session' && c.args[3] === 'imcodes_init',
+    );
+    expect(initSessions.length).toBe(1);
+    const killInit = execFileCalls.filter(
+      (c) => c.args[0] === 'kill-session' && c.args[2] === 'imcodes_init',
+    );
+    expect(killInit.length).toBe(1);
+    const targetSession = execFileCalls.filter(
+      (c) => c.args[0] === 'new-session' && c.args[3] === 'deck_test_brain_c',
+    );
+    expect(targetSession.length).toBe(1);
   });
 });
 

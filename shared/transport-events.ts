@@ -96,6 +96,8 @@ export const TRANSPORT_MSG = {
   CHAT_SUBSCRIBE: "chat.subscribe",
   /** Browser → Bridge: stop receiving transport events for a session. */
   CHAT_UNSUBSCRIBE: "chat.unsubscribe",
+  /** Daemon → Browser: provisional transport chat history replay for an already-running session. */
+  CHAT_HISTORY: "chat.history",
   /** Bridge → Browser: agent is requesting approval before continuing. */
   CHAT_APPROVAL: "chat.approval",
   /** Browser → Daemon: answer a pending transport approval request. */
@@ -120,6 +122,7 @@ export const TRANSPORT_RELAY_TYPES = new Set([
   TRANSPORT_EVENT.CHAT_STATUS,
   TRANSPORT_EVENT.CHAT_TOOL,
   TRANSPORT_EVENT.CHAT_APPROVAL,
+  TRANSPORT_MSG.CHAT_HISTORY,
   TRANSPORT_MSG.APPROVAL_RESPONSE,
   TRANSPORT_MSG.PROVIDER_STATUS,
 ]);

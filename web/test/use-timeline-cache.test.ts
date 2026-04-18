@@ -547,4 +547,109 @@ describe('useTimeline global cache bounds', () => {
       expect(screen.getByTestId('server-a-remount').textContent).toBe('1');
     });
   });
+
+  it('hydrates an empty transport timeline from chat.history before authoritative history arrives', async () => {
+    const sessionName = `deck_transport_history_${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest: () => 'history-transport',
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events, loading } = useTimeline(sessionName, ws, 'srv');
+      return h(
+        'div',
+        {
+          'data-testid': 'probe',
+          'data-loading': String(loading),
+        },
+        events.map((event) => `${event.type}:${String(event.payload.text ?? event.payload.output ?? '')}`).join('|'),
+      );
+    }
+
+    render(h(Probe));
+
+    await act(async () => {
+      handler?.({
+        type: 'chat.history',
+        sessionId: sessionName,
+        events: [
+          { type: 'user.message', sessionId: sessionName, text: 'hello', _ts: 10 },
+          { type: 'assistant.text', sessionId: sessionName, text: 'world', _ts: 11 },
+        ],
+      } as ServerMessage);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').getAttribute('data-loading')).toBe('false');
+      expect(screen.getByTestId('probe').textContent).toBe('user.message:hello|assistant.text:world');
+    });
+  });
+
+  it('replaces provisional transport history with authoritative timeline.history instead of duplicating it', async () => {
+    const sessionName = `deck_transport_history_replace_${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest: () => 'history-transport-replace',
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, ws, 'srv');
+      return h('div', { 'data-testid': 'probe' }, events.map((event) => String(event.payload.text ?? '')).join('|'));
+    }
+
+    render(h(Probe));
+
+    await act(async () => {
+      handler?.({
+        type: 'chat.history',
+        sessionId: sessionName,
+        events: [
+          { type: 'assistant.text', sessionId: sessionName, text: 'provisional', _ts: 10 },
+        ],
+      } as ServerMessage);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('provisional');
+    });
+
+    await act(async () => {
+      handler?.({
+        type: 'timeline.history',
+        sessionName,
+        requestId: 'history-transport-replace',
+        epoch: 1,
+        events: [
+          {
+            eventId: `${sessionName}-1`,
+            sessionId: sessionName,
+            ts: 20,
+            epoch: 1,
+            seq: 1,
+            source: 'daemon',
+            confidence: 'high',
+            type: 'assistant.text',
+            payload: { text: 'authoritative', streaming: false },
+          },
+        ],
+      } as ServerMessage);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('authoritative');
+    });
+  });
 });

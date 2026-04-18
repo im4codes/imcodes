@@ -1,4 +1,5 @@
 import { DAEMON_MSG } from '@shared/daemon-events.js';
+import { TRANSPORT_MSG } from '@shared/transport-events.js';
 /**
  * React hook for timeline event state management.
  * Loads from daemon file store on connect, caches in IndexedDB,
@@ -32,6 +33,7 @@ const ECHO_WINDOW_MS = 500;
 // so the same message can arrive twice (once from command-handler, once from JSONL).
 // 5s is enough to catch the JSONL delay without hiding legitimate repeated messages.
 const USER_MSG_DEDUP_WINDOW_MS = 5_000;
+const PROVISIONAL_TRANSPORT_HISTORY_PREFIX = 'transport-history:';
 
 /** Normalize text for echo comparison: strip prompt prefixes, collapse whitespace. */
 function normalizeForEcho(text: string): string {
@@ -97,6 +99,58 @@ function pruneTimelineCache(): void {
 
 function scopeCacheKey(serverId: string | null | undefined, sessionId: string): string {
   return serverId ? `${serverId}:${sessionId}` : sessionId;
+}
+
+function isProvisionalTransportHistoryEvent(event: TimelineEvent): boolean {
+  return event.eventId.startsWith(PROVISIONAL_TRANSPORT_HISTORY_PREFIX);
+}
+
+function convertTransportHistoryRecordToTimelineEvent(
+  sessionId: string,
+  record: Record<string, unknown>,
+  index: number,
+): TimelineEvent | null {
+  const rawType = typeof record.type === 'string' ? record.type : '';
+  const ts = typeof record._ts === 'number' ? record._ts : Date.now();
+  const base = {
+    eventId: `${PROVISIONAL_TRANSPORT_HISTORY_PREFIX}${sessionId}:${rawType}:${ts}:${index}`,
+    sessionId,
+    ts,
+    seq: index + 1,
+    epoch: 0,
+    source: 'daemon' as const,
+    confidence: 'high' as const,
+  };
+
+  if (rawType === 'user.message' && typeof record.text === 'string') {
+    return {
+      ...base,
+      type: 'user.message',
+      payload: { text: record.text },
+    };
+  }
+
+  if (rawType === 'assistant.text' && typeof record.text === 'string') {
+    return {
+      ...base,
+      type: 'assistant.text',
+      payload: { text: record.text, streaming: false },
+    };
+  }
+
+  if (rawType === 'tool.result') {
+    const payload: Record<string, unknown> = {};
+    if (record.output !== undefined) payload.output = record.output;
+    if (record.error !== undefined) payload.error = record.error;
+    if (record.detail !== undefined) payload.detail = record.detail;
+    return {
+      ...base,
+      type: 'tool.result',
+      payload,
+    };
+  }
+
+  return null;
 }
 
 function scopeEventsForDb(cacheKey: string, events: TimelineEvent[]): TimelineEvent[] {
@@ -366,6 +420,16 @@ export function useTimeline(
     });
   }, []);
 
+  const replaceEvents = useCallback((incoming: TimelineEvent[], maxEvents = MAX_MEMORY_EVENTS) => {
+    setEvents(() => {
+      const result = incoming.length > maxEvents
+        ? incoming.slice(incoming.length - maxEvents)
+        : incoming;
+      if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, result);
+      return result;
+    });
+  }, []);
+
   // IDB helper: scope events by cacheKey so cross-server sessions don't collide
   const idbPutEvents = useCallback((evts: TimelineEvent[]) => {
     const key = cacheKeyRef.current;
@@ -438,6 +502,19 @@ export function useTimeline(
       }
 
       // ── History response (full load from daemon file store) ──
+      if (msg.type === TRANSPORT_MSG.CHAT_HISTORY) {
+        if (msg.sessionId !== sessionId) return;
+        if (eventsRef.current.length > 0) return;
+        const provisionalEvents = msg.events
+          .map((event, index) => convertTransportHistoryRecordToTimelineEvent(sessionId, event, index))
+          .filter((event): event is TimelineEvent => event != null);
+        if (provisionalEvents.length === 0) return;
+        replaceEvents(provisionalEvents);
+        setLoading(false);
+        return;
+      }
+
+      // ── History response (full load from daemon file store) ──
       if (msg.type === 'timeline.history') {
         if (msg.sessionName !== sessionId) return;
 
@@ -471,7 +548,17 @@ export function useTimeline(
           historyRetryRef.current = 0; // reset on success
           const maxSeq = msg.events.reduce((max, e) => Math.max(max, e.seq), 0);
           seqRef.current = Math.max(seqRef.current, maxSeq);
-          mergeEvents(msg.events);
+          const current = getSharedTimelineBase(cacheKeyRef.current, eventsRef.current, MAX_MEMORY_EVENTS);
+          const withoutProvisionalTransportHistory = current.filter((event) => !isProvisionalTransportHistoryEvent(event));
+          const hadProvisionalTransportHistory = withoutProvisionalTransportHistory.length !== current.length;
+          if (hadProvisionalTransportHistory) {
+            const next = withoutProvisionalTransportHistory.length === 0
+              ? msg.events
+              : mergeTimelineEvents(withoutProvisionalTransportHistory, msg.events, MAX_MEMORY_EVENTS);
+            replaceEvents(next);
+          } else {
+            mergeEvents(msg.events);
+          }
           idbPutEvents(msg.events);
         } else if (historyRetryRef.current < 2 && ws?.connected && eventsRef.current.length === 0) {
           // Empty response with no cached events — retry once after a short delay
@@ -542,7 +629,7 @@ export function useTimeline(
 
     const unsub = ws.onMessage(handler);
     return unsub;
-  }, [ws, sessionId, appendEvent, mergeEvents]);
+  }, [ws, sessionId, appendEvent, mergeEvents, replaceEvents]);
 
   return { events, loading, refreshing, loadingOlder, hasOlderHistory, addOptimisticUserMessage, loadOlderEvents };
 }

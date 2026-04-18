@@ -134,6 +134,10 @@ function isRecoverableTmuxServerError(error: unknown): boolean {
   );
 }
 
+function isDuplicateInitSessionError(error: unknown): boolean {
+  return getTmuxErrorText(error).includes('duplicate session: imcodes_init');
+}
+
 async function ensureTmuxServer(): Promise<void> {
   if (tmuxServerChecked) return;
   if (tmuxServerCheckInFlight) {
@@ -148,7 +152,11 @@ async function ensureTmuxServer(): Promise<void> {
     const stderr = getTmuxErrorText(e);
     if (isRecoverableTmuxServerError(e)) {
       // tmux server is dead — start it
-      await execFile('tmux', ['new-session', '-d', '-s', 'imcodes_init']);
+      try {
+        await execFile('tmux', ['new-session', '-d', '-s', 'imcodes_init']);
+      } catch (initError) {
+        if (!isDuplicateInitSessionError(initError)) throw initError;
+      }
       // Kill the temp session, server stays alive
       await execFile('tmux', ['kill-session', '-t', 'imcodes_init']).catch(() => {});
       tmuxServerChecked = true;

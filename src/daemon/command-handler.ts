@@ -4119,7 +4119,7 @@ async function handleChatSubscribeReplay(cmd: Record<string, unknown>, serverLin
     const events = await replayTransportHistory(sessionId);
     if (events.length === 0) return;
     // Send history as a batch so the browser can render them before live events
-    serverLink.send({ type: 'chat.history', sessionId, events });
+    serverLink.send({ type: TRANSPORT_MSG.CHAT_HISTORY, sessionId, events });
     logger.debug({ sessionId, count: events.length }, 'Replayed transport chat history');
   } catch (err) {
     logger.debug({ sessionId, err }, 'Transport history replay failed');

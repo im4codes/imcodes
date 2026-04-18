@@ -56,6 +56,7 @@ describe("TRANSPORT_MSG constant", () => {
     const expectedKeys = [
       "CHAT_SUBSCRIBE",
       "CHAT_UNSUBSCRIBE",
+      "CHAT_HISTORY",
       "APPROVAL_RESPONSE",
       "PROVIDER_STATUS",
       "LIST_SESSIONS",
@@ -67,7 +68,7 @@ describe("TRANSPORT_MSG constant", () => {
   });
 
   it("has exactly the expected number of keys", () => {
-    expect(Object.keys(TRANSPORT_MSG)).toHaveLength(7);
+    expect(Object.keys(TRANSPORT_MSG)).toHaveLength(8);
   });
 
   it("has no duplicate values", () => {
@@ -79,6 +80,7 @@ describe("TRANSPORT_MSG constant", () => {
   it("values are correctly mapped", () => {
     expect(TRANSPORT_MSG.CHAT_SUBSCRIBE).toBe("chat.subscribe");
     expect(TRANSPORT_MSG.CHAT_UNSUBSCRIBE).toBe("chat.unsubscribe");
+    expect(TRANSPORT_MSG.CHAT_HISTORY).toBe("chat.history");
     expect(TRANSPORT_MSG.APPROVAL_RESPONSE).toBe("chat.approval_response");
     expect(TRANSPORT_MSG.PROVIDER_STATUS).toBe("provider.status");
     expect(TRANSPORT_MSG.LIST_SESSIONS).toBe("provider.list_sessions");
@@ -103,6 +105,10 @@ describe("TRANSPORT_RELAY_TYPES set", () => {
     expect(TRANSPORT_RELAY_TYPES.has(TRANSPORT_MSG.APPROVAL_RESPONSE)).toBe(true);
   });
 
+  it("contains CHAT_HISTORY from TRANSPORT_MSG", () => {
+    expect(TRANSPORT_RELAY_TYPES.has(TRANSPORT_MSG.CHAT_HISTORY)).toBe(true);
+  });
+
   it("does not contain CHAT_SUBSCRIBE or CHAT_UNSUBSCRIBE (browser-only control msgs)", () => {
     expect(TRANSPORT_RELAY_TYPES.has(TRANSPORT_MSG.CHAT_SUBSCRIBE)).toBe(false);
     expect(TRANSPORT_RELAY_TYPES.has(TRANSPORT_MSG.CHAT_UNSUBSCRIBE)).toBe(
@@ -110,8 +116,8 @@ describe("TRANSPORT_RELAY_TYPES set", () => {
     );
   });
 
-  it("contains exactly 8 entries (6 events + approval response + PROVIDER_STATUS)", () => {
-    expect(TRANSPORT_RELAY_TYPES.size).toBe(8);
+  it("contains exactly 9 entries (6 events + chat history + approval response + PROVIDER_STATUS)", () => {
+    expect(TRANSPORT_RELAY_TYPES.size).toBe(9);
   });
 });
 

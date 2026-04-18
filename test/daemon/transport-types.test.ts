@@ -93,14 +93,15 @@ describe("shared/transport-events", () => {
     expect(Object.keys(TRANSPORT_EVENT)).toHaveLength(6);
   });
 
-  it("TRANSPORT_MSG has correct values for all 6 message types", () => {
+  it("TRANSPORT_MSG has correct values for all 7 message types", () => {
     expect(TRANSPORT_MSG.CHAT_SUBSCRIBE).toBe("chat.subscribe");
     expect(TRANSPORT_MSG.CHAT_UNSUBSCRIBE).toBe("chat.unsubscribe");
+    expect(TRANSPORT_MSG.CHAT_HISTORY).toBe("chat.history");
     expect(TRANSPORT_MSG.PROVIDER_STATUS).toBe("provider.status");
     expect(TRANSPORT_MSG.LIST_SESSIONS).toBe("provider.list_sessions");
     expect(TRANSPORT_MSG.SESSIONS_RESPONSE).toBe("provider.sessions_response");
     expect(TRANSPORT_MSG.APPROVAL_RESPONSE).toBe("chat.approval_response");
-    expect(Object.keys(TRANSPORT_MSG)).toHaveLength(7);
+    expect(Object.keys(TRANSPORT_MSG)).toHaveLength(8);
   });
 
   it("TRANSPORT_AGENT_STATUSES contains all 7 statuses", () => {
@@ -129,18 +130,19 @@ describe("shared/transport-events", () => {
     expect(TRANSPORT_ACTIVE_STATUSES.size).toBe(3);
   });
 
-  it("TRANSPORT_RELAY_TYPES contains all event types plus PROVIDER_STATUS", () => {
+  it("TRANSPORT_RELAY_TYPES contains all event types plus transport session relay messages", () => {
     // All 6 TRANSPORT_EVENT values
     for (const key of Object.keys(
       TRANSPORT_EVENT,
     ) as (keyof typeof TRANSPORT_EVENT)[]) {
       expect(TRANSPORT_RELAY_TYPES.has(TRANSPORT_EVENT[key])).toBe(true);
     }
+    expect(TRANSPORT_RELAY_TYPES.has(TRANSPORT_MSG.CHAT_HISTORY)).toBe(true);
     expect(TRANSPORT_RELAY_TYPES.has(TRANSPORT_MSG.APPROVAL_RESPONSE)).toBe(true);
     // Plus PROVIDER_STATUS from TRANSPORT_MSG
     expect(TRANSPORT_RELAY_TYPES.has(TRANSPORT_MSG.PROVIDER_STATUS)).toBe(true);
-    // Total: 6 events + approval_response + provider.status = 8
-    expect(TRANSPORT_RELAY_TYPES.size).toBe(8);
+    // Total: 6 events + chat.history + approval_response + provider.status = 9
+    expect(TRANSPORT_RELAY_TYPES.size).toBe(9);
   });
 });
 
