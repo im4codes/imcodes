@@ -628,8 +628,18 @@ describe('SharedContextManagementPanel', () => {
       fireEvent.click(screen.getByLabelText('sharedContext.management.processingPrimaryBackend: qwen'));
     });
 
-    const presetSelect = await screen.findByLabelText('sharedContext.management.processingPrimaryPreset');
-    fireEvent.change(presetSelect, { target: { value: 'Qwen Team' } });
+    // Preset chip — the old `<select>` was replaced with a chip button labeled
+    // `{idPrefix}:preset:{name}` so the selector is discoverable and testable
+    // without needing combo-box semantics.
+    const presetChip = await screen.findByLabelText('primary:preset:Qwen Team');
+    await act(async () => {
+      fireEvent.click(presetChip);
+    });
+
+    // Clicking the preset chip should mark it active AND mirror the preset's
+    // ANTHROPIC_MODEL onto the built-in model highlight so the saved payload
+    // carries the correct model identifier.
+    expect(presetChip.getAttribute('aria-pressed')).toBe('true');
 
     await act(async () => {
       fireEvent.click(screen.getByText('sharedContext.management.processingSave'));

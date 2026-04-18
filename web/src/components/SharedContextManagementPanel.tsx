@@ -479,6 +479,51 @@ function modelChipStyle(active: boolean) {
       };
 }
 
+/** Preset chip: visually distinct from built-in model chips so users can see at
+ *  a glance that a preset pulls in env/endpoint config, not just a model name. */
+function presetChipStyle(active: boolean) {
+  return active
+    ? {
+        ...buttonStyle,
+        padding: '4px 10px',
+        fontSize: 12,
+        fontWeight: 700,
+        background: '#7c3aed',
+        border: '1px solid #a78bfa',
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 4,
+      }
+    : {
+        ...subtleButtonStyle,
+        padding: '4px 10px',
+        fontSize: 12,
+        fontWeight: 600,
+        background: '#1e1b3a',
+        border: '1px solid #4c1d95',
+        color: '#c4b5fd',
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 4,
+      };
+}
+
+const chipSectionLabelStyle = {
+  fontSize: 11,
+  fontWeight: 700,
+  letterSpacing: '0.08em',
+  textTransform: 'uppercase',
+  color: DT.text.muted,
+  marginBottom: 4,
+  marginTop: 2,
+} as const;
+
+const chipGroupStyle = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 6,
+} as const;
+
 const defaultPolicyState: SharedProjectPolicy = {
   enrollmentId: '',
   enterpriseId: '',
@@ -680,31 +725,116 @@ function MetaCard({ label, value }: { label: string; value: ComponentChildren })
   );
 }
 
-function ModelChipSelector({
+interface ProcessingPresetEntry {
+  name: string;
+  env: Record<string, string>;
+  contextWindow?: number;
+  initMessage?: string;
+}
+
+/**
+ * Unified model + preset selector.
+ *
+ * Replaces the older two-control design (a `<select>` for presets PLUS a chip
+ * row for models) with a single flat set of chips grouped by kind. This
+ * removes the dual-control confusion where selecting a preset left the model
+ * chip stale (or vice versa), and where the `<select>` silently failed to
+ * reflect saved state when the saved preset wasn't in the loaded list yet.
+ *
+ * Interaction:
+ *   - Clicking a PRESET chip: selects that preset and, if the preset's env
+ *     carries ANTHROPIC_MODEL, mirrors that model so downstream consumers
+ *     don't need to resolve the preset separately.
+ *   - Clicking a MODEL chip: selects the model and clears any active preset
+ *     (presets carry additional env like base URL / API key — clearing keeps
+ *     the two concepts from drifting).
+ *   - Clicking the active chip again: deselects (clears both for safety).
+ *
+ * Active-state highlighting is decoupled per-chip so users can see both the
+ * active preset AND the active model when a preset-derived model matches a
+ * built-in. That's the read path of the state the save will persist.
+ */
+function ModelPresetChipSelector({
   backend,
-  value,
-  onSelect,
+  model,
+  preset,
+  presets,
+  onChange,
+  idPrefix,
 }: {
   backend: SharedContextRuntimeBackend;
-  value: string;
-  onSelect: (model: string) => void;
+  model: string;
+  preset: string;
+  presets: ReadonlyArray<ProcessingPresetEntry>;
+  onChange: (next: { model: string; preset: string }) => void;
+  idPrefix: string;
 }) {
-  const options = PROCESSING_MODEL_OPTIONS_BY_BACKEND[backend] ?? [];
-  if (options.length === 0) return null;
+  const modelOptions = PROCESSING_MODEL_OPTIONS_BY_BACKEND[backend] ?? [];
+  const supportsPresets = doesSharedContextBackendSupportPresets(backend);
+  const trimmedModel = model.trim();
+  const trimmedPreset = preset.trim();
+  if (modelOptions.length === 0 && (!supportsPresets || presets.length === 0)) return null;
   return (
-    <div style={modelChipRowStyle}>
-      {options.map((modelId) => (
-        <button
-          key={`${backend}:${modelId}`}
-          type="button"
-          aria-label={`model:${backend}:${modelId}`}
-          aria-pressed={value.trim() === modelId}
-          style={modelChipStyle(value.trim() === modelId)}
-          onClick={() => onSelect(modelId)}
-        >
-          {modelId}
-        </button>
-      ))}
+    <div style={chipGroupStyle}>
+      {supportsPresets && presets.length > 0 ? (
+        <div>
+          <div style={chipSectionLabelStyle}>{/* eslint-disable-next-line */}Presets</div>
+          <div style={modelChipRowStyle}>
+            {presets.map((p) => {
+              const active = trimmedPreset === p.name;
+              return (
+                <button
+                  key={`${idPrefix}:preset:${p.name}`}
+                  type="button"
+                  aria-label={`${idPrefix}:preset:${p.name}`}
+                  aria-pressed={active}
+                  title={p.env?.ANTHROPIC_MODEL ? `Model: ${p.env.ANTHROPIC_MODEL}` : undefined}
+                  style={presetChipStyle(active)}
+                  onClick={() => {
+                    // Idempotent: clicking the active preset just re-applies
+                    // it. Deselecting is done by picking a different chip
+                    // (model or preset) or switching backend.
+                    const presetModel = p.env?.ANTHROPIC_MODEL?.trim() ?? '';
+                    onChange({ model: presetModel || trimmedModel, preset: p.name });
+                  }}
+                >
+                  <span aria-hidden="true">⚙</span>
+                  <span>{p.name}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      ) : null}
+      {modelOptions.length > 0 ? (
+        <div>
+          {supportsPresets && presets.length > 0 ? (
+            <div style={chipSectionLabelStyle}>{/* eslint-disable-next-line */}Built-in</div>
+          ) : null}
+          <div style={modelChipRowStyle}>
+            {modelOptions.map((modelId) => {
+              const active = trimmedModel === modelId && !trimmedPreset;
+              return (
+                <button
+                  key={`${backend}:${modelId}`}
+                  type="button"
+                  aria-label={`model:${backend}:${modelId}`}
+                  aria-pressed={active}
+                  style={modelChipStyle(active)}
+                  onClick={() => {
+                    // Idempotent: re-clicking an active model chip reaffirms
+                    // it. Switching away from a preset happens by picking a
+                    // model (or another preset); we don't deselect on click.
+                    onChange({ model: modelId, preset: '' });
+                  }}
+                >
+                  {modelId}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -838,12 +968,6 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     try { ws.send({ type: 'cc.presets.list' }); } catch {}
     return unsub;
   }, [ws]);
-
-  const getPresetModel = useCallback((presetName: string): string | undefined => {
-    const preset = processingPresets.find((entry) => entry.name === presetName);
-    const model = preset?.env?.ANTHROPIC_MODEL?.trim();
-    return model || undefined;
-  }, [processingPresets]);
 
   const renderProcessedMemoryRecords = useCallback((
     view: ContextMemoryView,
@@ -1154,6 +1278,20 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     setProcessingMemoryScoringWeights(normalizeMemoryScoringWeights(view.snapshot.persisted.memoryScoringWeights ?? DEFAULT_MEMORY_SCORING_WEIGHTS));
     setProcessingPersonalSyncEnabled(view.snapshot.persisted.enablePersonalMemorySync === true);
   }, []);
+
+  /** Defensive sync: if the persisted preset disappears from the loaded preset
+   *  list (e.g. user deleted it elsewhere, or ws reload raced), clear the
+   *  local preset bit so the UI never stays stuck on a non-existent preset.
+   *  The model stays — it's independently valid. */
+  useEffect(() => {
+    const names = new Set(processingPresets.map((p) => p.name));
+    if (processingPrimaryPreset && !names.has(processingPrimaryPreset)) {
+      setProcessingPrimaryPreset('');
+    }
+    if (processingBackupPreset && !names.has(processingBackupPreset)) {
+      setProcessingBackupPreset('');
+    }
+  }, [processingPresets, processingPrimaryPreset, processingBackupPreset]);
 
   const reloadProcessingConfig = useCallback(async () => {
     if (!serverId) {
@@ -1971,28 +2109,16 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     </label>
                     <label style={fieldLabelStyle}>
                       <span>{t('sharedContext.management.processingPrimaryModel')}</span>
-                      {doesSharedContextBackendSupportPresets(processingPrimaryBackend) ? (
-                        <select
-                          aria-label={t('sharedContext.management.processingPrimaryPreset')}
-                          value={processingPrimaryPreset}
-                          onChange={(e) => {
-                            const nextPreset = (e.currentTarget as HTMLSelectElement).value;
-                            setProcessingPrimaryPreset(nextPreset);
-                            const presetModel = getPresetModel(nextPreset);
-                            if (presetModel) setProcessingPrimaryModel(presetModel);
-                          }}
-                          style={inputStyle}
-                        >
-                          <option value="">{t('sharedContext.management.processingPresetNone')}</option>
-                          {processingPresets.map((preset) => (
-                            <option key={`primary-preset:${preset.name}`} value={preset.name}>{preset.name}</option>
-                          ))}
-                        </select>
-                      ) : null}
-                      <ModelChipSelector
+                      <ModelPresetChipSelector
                         backend={processingPrimaryBackend}
-                        value={processingPrimaryModel}
-                        onSelect={setProcessingPrimaryModel}
+                        model={processingPrimaryModel}
+                        preset={processingPrimaryPreset}
+                        presets={processingPresets}
+                        idPrefix="primary"
+                        onChange={({ model, preset }) => {
+                          setProcessingPrimaryModel(model);
+                          setProcessingPrimaryPreset(preset);
+                        }}
                       />
                     </label>
                   </div>
@@ -2017,28 +2143,16 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     </label>
                     <label style={fieldLabelStyle}>
                       <span>{t('sharedContext.management.processingBackupModel')}</span>
-                      {doesSharedContextBackendSupportPresets(processingBackupBackend) ? (
-                        <select
-                          aria-label={t('sharedContext.management.processingBackupPreset')}
-                          value={processingBackupPreset}
-                          onChange={(e) => {
-                            const nextPreset = (e.currentTarget as HTMLSelectElement).value;
-                            setProcessingBackupPreset(nextPreset);
-                            const presetModel = getPresetModel(nextPreset);
-                            if (presetModel) setProcessingBackupModel(presetModel);
-                          }}
-                          style={inputStyle}
-                        >
-                          <option value="">{t('sharedContext.management.processingPresetNone')}</option>
-                          {processingPresets.map((preset) => (
-                            <option key={`backup-preset:${preset.name}`} value={preset.name}>{preset.name}</option>
-                          ))}
-                        </select>
-                      ) : null}
-                      <ModelChipSelector
+                      <ModelPresetChipSelector
                         backend={processingBackupBackend}
-                        value={processingBackupModel}
-                        onSelect={setProcessingBackupModel}
+                        model={processingBackupModel}
+                        preset={processingBackupPreset}
+                        presets={processingPresets}
+                        idPrefix="backup"
+                        onChange={({ model, preset }) => {
+                          setProcessingBackupModel(model);
+                          setProcessingBackupPreset(preset);
+                        }}
                       />
                     </label>
                   </div>
