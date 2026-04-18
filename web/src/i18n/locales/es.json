@@ -193,6 +193,9 @@
       "timeout": "Tiempo límite (s)",
       "selectBackend": "Selecciona backend",
       "selectModel": "Selecciona modelo",
+      "customInstructionsLabel": "Instrucciones personalizadas",
+      "customInstructionsPlaceholder": "Ejemplo: exige pruebas y verificación antes de marcar la tarea como completa.",
+      "customInstructionsHelp": "Opcional. Estas instrucciones se añaden a los prompts de supervisión y continue de Auto solo para esta sesión.",
       "auditMode": {
         "audit": "Auditoría",
         "review": "Revisión",
@@ -208,6 +211,8 @@
       "summaryUnset": "sin configurar",
       "summaryDisabled": "Supervisión desactivada",
       "summaryTimeout": "Tiempo límite: {{value}}",
+      "summaryCustomInstructions": "Instrucciones personalizadas: {{value}}",
+      "summaryCustomInstructionsSet": "configuradas",
       "summaryAudit": "Auditoría: {{auditMode}} · ciclos {{loops}}",
       "summaryMeta": "Prompt {{promptVersion}}, reparación {{repairVersion}}, reintentos de parseo {{parseRetries}}, task-run {{taskRunVersion}}",
       "disabledHint": "La supervisión solo está disponible para sesiones transport.",

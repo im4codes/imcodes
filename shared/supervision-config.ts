@@ -101,6 +101,7 @@ export type SessionSupervisionSnapshotIssue =
   | 'invalid_model'
   | 'invalid_timeout'
   | 'invalid_prompt_version'
+  | 'invalid_custom_instructions'
   | 'invalid_max_parse_retries'
   | 'missing_audit_mode'
   | 'invalid_audit_mode'
@@ -125,6 +126,7 @@ export interface SupervisorDefaultConfig {
 
 export interface SessionSupervisionSnapshot extends SupervisorDefaultConfig {
   mode: SupervisionMode;
+  customInstructions?: string;
   maxParseRetries: number;
   auditMode: SupervisionAuditMode;
   maxAuditLoops: number;
@@ -228,6 +230,7 @@ export function getSessionSupervisionSnapshotIssues(
     issues.push('invalid_timeout');
   }
   if (!trimString(record.promptVersion)) issues.push('invalid_prompt_version');
+  if (record.customInstructions != null && typeof record.customInstructions !== 'string') issues.push('invalid_custom_instructions');
   if (typeof record.maxParseRetries !== 'number' || !Number.isFinite(record.maxParseRetries) || Math.floor(record.maxParseRetries) < 1) {
     issues.push('invalid_max_parse_retries');
   }
@@ -255,12 +258,14 @@ export function normalizeSessionSupervisionSnapshot(
 
   const supervisorDefaults = normalizeSupervisorDefaultConfig(merged, fallback);
   const mode = normalizeSupervisionMode(merged.mode, SUPERVISION_MODE.OFF);
+  const customInstructions = trimString(merged.customInstructions);
   const maxParseRetries = normalizePositiveInteger(merged.maxParseRetries, SUPERVISION_DEFAULT_MAX_PARSE_RETRIES, 1);
   const auditMode = isSupportedSupervisionAuditMode(merged.auditMode) ? merged.auditMode : SUPERVISION_DEFAULT_AUDIT_MODE;
   const maxAuditLoops = normalizePositiveInteger(merged.maxAuditLoops, SUPERVISION_DEFAULT_MAX_AUDIT_LOOPS, 1);
   return {
     ...supervisorDefaults,
     mode,
+    ...(customInstructions ? { customInstructions } : {}),
     maxParseRetries,
     auditMode,
     maxAuditLoops,

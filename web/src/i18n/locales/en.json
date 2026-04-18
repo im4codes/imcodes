@@ -193,6 +193,9 @@
       "timeout": "Timeout (s)",
       "selectBackend": "Select backend",
       "selectModel": "Select model",
+      "customInstructionsLabel": "Custom instructions",
+      "customInstructionsPlaceholder": "Example: Require tests and verification before marking the task complete.",
+      "customInstructionsHelp": "Optional. These instructions are appended to Auto's supervision and continue prompts for this session only.",
       "auditMode": {
         "audit": "Audit",
         "review": "Review",
@@ -208,6 +211,8 @@
       "summaryUnset": "unset",
       "summaryDisabled": "Supervision off",
       "summaryTimeout": "Timeout: {{value}}",
+      "summaryCustomInstructions": "Custom instructions: {{value}}",
+      "summaryCustomInstructionsSet": "set",
       "summaryAudit": "Audit: {{auditMode}} · loops {{loops}}",
       "summaryMeta": "Prompt {{promptVersion}}, repair {{repairVersion}}, parse retries {{parseRetries}}, task-run {{taskRunVersion}}",
       "disabledHint": "Supervision is only available for transport sessions.",

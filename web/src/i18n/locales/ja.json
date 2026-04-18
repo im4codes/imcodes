@@ -193,6 +193,9 @@
       "timeout": "タイムアウト（秒）",
       "selectBackend": "バックエンドを選択",
       "selectModel": "モデルを選択",
+      "customInstructionsLabel": "カスタム指示",
+      "customInstructionsPlaceholder": "例: 完了判定の前に必ずテストと検証結果を要求する。",
+      "customInstructionsHelp": "任意。このセッションに限り、Auto の supervision 判定と continue プロンプトに追加されます。",
       "auditMode": {
         "audit": "監査",
         "review": "レビュー",
@@ -208,6 +211,8 @@
       "summaryUnset": "未設定",
       "summaryDisabled": "監督オフ",
       "summaryTimeout": "タイムアウト: {{value}}",
+      "summaryCustomInstructions": "カスタム指示: {{value}}",
+      "summaryCustomInstructionsSet": "設定済み",
       "summaryAudit": "監査: {{auditMode}} · ループ {{loops}}",
       "summaryMeta": "プロンプト {{promptVersion}}、修復 {{repairVersion}}、解析再試行 {{parseRetries}}、task-run {{taskRunVersion}}",
       "disabledHint": "監督は transport セッションでのみ利用できます。",

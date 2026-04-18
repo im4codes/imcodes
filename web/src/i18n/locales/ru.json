@@ -193,6 +193,9 @@
       "timeout": "Тайм-аут (с)",
       "selectBackend": "Выберите бэкенд",
       "selectModel": "Выберите модель",
+      "customInstructionsLabel": "Пользовательские инструкции",
+      "customInstructionsPlaceholder": "Например: требовать тесты и проверку перед отметкой задачи как завершённой.",
+      "customInstructionsHelp": "Необязательно. Эти инструкции добавляются в supervision и continue prompts Auto только для этой сессии.",
       "auditMode": {
         "audit": "Аудит",
         "review": "Ревью",
@@ -208,6 +211,8 @@
       "summaryUnset": "не задано",
       "summaryDisabled": "Контроль выключен",
       "summaryTimeout": "Тайм-аут: {{value}}",
+      "summaryCustomInstructions": "Пользовательские инструкции: {{value}}",
+      "summaryCustomInstructionsSet": "заданы",
       "summaryAudit": "Аудит: {{auditMode}} · циклов {{loops}}",
       "summaryMeta": "Промпт {{promptVersion}}, исправление {{repairVersion}}, повторы парсинга {{parseRetries}}, task-run {{taskRunVersion}}",
       "disabledHint": "Контроль доступен только для transport-сессий.",

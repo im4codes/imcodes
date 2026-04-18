@@ -196,6 +196,7 @@ describe('SessionSettingsDialog supervision', () => {
             model: CODEX_MODEL_IDS[0],
             timeoutMs: 9000,
             promptVersion: 'supervision_decision_v1',
+            customInstructions: 'Always prefer adding tests before claiming completion.',
             maxParseRetries: 1,
             auditMode: 'review>plan',
             maxAuditLoops: 3,
@@ -210,8 +211,44 @@ describe('SessionSettingsDialog supervision', () => {
     expect(screen.getByText('summaryMode:supervised_audit')).toBeDefined();
     expect(screen.getByText(`summaryBackendModel:codex_sdk:${CODEX_MODEL_IDS[0]}`)).toBeDefined();
     expect(screen.getByText('summaryTimeout:9 s')).toBeDefined();
+    expect(screen.getByText('summaryCustomInstructions:summaryCustomInstructionsSet')).toBeDefined();
     expect(screen.getByText('summaryAudit:review_plan:3')).toBeDefined();
     expect(screen.getByText('summaryMeta:supervision_decision_v1')).toBeDefined();
+  });
+
+  it('persists custom supervision instructions in the session snapshot', async () => {
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        transportConfig={null}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    fireEvent.change(screen.getAllByRole('combobox')[1]!, { target: { value: 'supervised' } });
+    fireEvent.change(screen.getAllByRole('combobox')[2]!, { target: { value: 'codex-sdk' } });
+    fireEvent.change(screen.getAllByRole('combobox')[3]!, { target: { value: CODEX_MODEL_IDS[0] } });
+    fireEvent.input(screen.getByPlaceholderText('customInstructionsPlaceholder'), {
+      target: { value: 'Always require tests and clean verification before complete.' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => {
+      expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', expect.objectContaining({
+        transportConfig: expect.objectContaining({
+          supervision: expect.objectContaining({
+            mode: 'supervised',
+            customInstructions: 'Always require tests and clean verification before complete.',
+          }),
+        }),
+      }));
+    });
   });
 
   it('shows supervision intro copy for supported transport sessions', () => {

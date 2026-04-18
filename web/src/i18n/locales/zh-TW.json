@@ -193,6 +193,9 @@
       "timeout": "逾時（秒）",
       "selectBackend": "選擇後端",
       "selectModel": "選擇模型",
+      "customInstructionsLabel": "自訂提示詞",
+      "customInstructionsPlaceholder": "例如：在判定完成前必須要求測試與驗證結果。",
+      "customInstructionsHelp": "選填。只對目前會話生效，會追加到 Auto 的監督判定與 continue 提示詞中。",
       "auditMode": {
         "audit": "稽核",
         "review": "覆核",
@@ -208,6 +211,8 @@
       "summaryUnset": "未設定",
       "summaryDisabled": "監督已關閉",
       "summaryTimeout": "逾時：{{value}}",
+      "summaryCustomInstructions": "自訂提示詞：{{value}}",
+      "summaryCustomInstructionsSet": "已設定",
       "summaryAudit": "稽核：{{auditMode}} · 循環 {{loops}} 次",
       "summaryMeta": "提示 {{promptVersion}}，修復 {{repairVersion}}，解析重試 {{parseRetries}}，任務執行 {{taskRunVersion}}",
       "disabledHint": "只有 transport 工作階段支援監督。",

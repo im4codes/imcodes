@@ -928,6 +928,7 @@ class SupervisionAutomation {
       current.userText,
       current.lastAssistantText,
       reason,
+      current.snapshot.customInstructions,
     );
     current.continueLoops += 1;
     current.sawAssistantOutput = false;

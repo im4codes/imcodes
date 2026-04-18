@@ -193,6 +193,9 @@
       "timeout": "제한 시간(초)",
       "selectBackend": "백엔드 선택",
       "selectModel": "모델 선택",
+      "customInstructionsLabel": "사용자 지정 지침",
+      "customInstructionsPlaceholder": "예: 완료 판정 전에 반드시 테스트와 검증 결과를 요구합니다.",
+      "customInstructionsHelp": "선택 사항입니다. 이 세션에 한해 Auto의 supervision 판정과 continue 프롬프트에 추가됩니다.",
       "auditMode": {
         "audit": "감사",
         "review": "검토",
@@ -208,6 +211,8 @@
       "summaryUnset": "설정 안 됨",
       "summaryDisabled": "감독 꺼짐",
       "summaryTimeout": "제한 시간: {{value}}",
+      "summaryCustomInstructions": "사용자 지정 지침: {{value}}",
+      "summaryCustomInstructionsSet": "설정됨",
       "summaryAudit": "감사: {{auditMode}} · 루프 {{loops}}회",
       "summaryMeta": "프롬프트 {{promptVersion}}, 복구 {{repairVersion}}, 파싱 재시도 {{parseRetries}}, task-run {{taskRunVersion}}",
       "disabledHint": "감독은 transport 세션에서만 사용할 수 있습니다.",

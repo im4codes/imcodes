@@ -62,6 +62,7 @@ describe('supervision config helpers', () => {
       model: DEFAULT_PRIMARY_CONTEXT_MODEL,
       timeoutMs: 8_000,
       promptVersion: SUPERVISION_CONTRACT_IDS.DECISION_REPAIR,
+      customInstructions: '  Prefer tests before complete.  ',
       maxParseRetries: 2,
       auditMode: 'audit>plan',
       maxAuditLoops: 3,
@@ -73,6 +74,7 @@ describe('supervision config helpers', () => {
     expect(snapshot.model).toBe(DEFAULT_PRIMARY_CONTEXT_MODEL);
     expect(snapshot.timeoutMs).toBe(8_000);
     expect(snapshot.promptVersion).toBe(SUPERVISION_CONTRACT_IDS.DECISION_REPAIR);
+    expect(snapshot.customInstructions).toBe('Prefer tests before complete.');
     expect(snapshot.maxParseRetries).toBe(2);
     expect(snapshot.auditMode).toBe('audit>plan');
     expect(snapshot.maxAuditLoops).toBe(3);
@@ -88,6 +90,7 @@ describe('supervision config helpers', () => {
         model: '',
         timeoutMs: -1,
         promptVersion: '',
+        customInstructions: { invalid: true },
         maxParseRetries: 0,
         auditMode: 'not-an-audit-mode' as never,
         maxAuditLoops: 0,

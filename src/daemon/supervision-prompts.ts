@@ -5,6 +5,15 @@ import {
 } from '../../shared/supervision-config.js';
 import type { SupervisionBrokerRequest } from './supervision-broker.js';
 
+function buildCustomInstructionsSection(customInstructions: string | undefined): string {
+  const trimmed = customInstructions?.trim();
+  if (!trimmed) return '';
+  return [
+    'Session-specific supervision instructions from the user:',
+    trimmed,
+  ].join('\n');
+}
+
 export function buildSupervisionDecisionPrompt(
   request: SupervisionBrokerRequest,
   contractId: string = SUPERVISION_CONTRACT_IDS.DECISION,
@@ -22,6 +31,7 @@ export function buildSupervisionDecisionPrompt(
     '- If the assistant says tests, validation, fixes, commit/push, or other implementation work still needs to be done, choose continue.',
     '- If the assistant proposes a concrete next engineering step such as adding tests, fixing issues, verifying results, committing, or pushing, treat that as not complete yet.',
     '- Do not choose complete when the assistant itself indicates remaining work, TODOs, missing validation, or a follow-up implementation step.',
+    buildCustomInstructionsSection(request.snapshot?.customInstructions),
     request.description ? `Context: ${request.description}` : '',
     'Task request:',
     request.taskRequest,
@@ -41,6 +51,7 @@ export function buildSupervisionDecisionRepairPrompt(
     'Return exactly one valid JSON object and nothing else.',
     '{"decision":"complete|continue|ask_human","reason":"...","confidence":0.0}',
     'If the assistant response mentions remaining implementation work like tests, fixes, verification, commit/push, or another concrete next engineering step, return continue instead of complete.',
+    buildCustomInstructionsSection(request.snapshot?.customInstructions),
     'Previous invalid output:',
     previousOutput,
     'Task request:',
@@ -54,6 +65,7 @@ export function buildSupervisionContinuePrompt(
   taskRequest: string,
   assistantResponse: string | undefined,
   reason: string,
+  customInstructions?: string,
   contractId: string = SUPERVISION_CONTRACT_IDS.CONTINUE,
 ): string {
   return [
@@ -63,6 +75,7 @@ export function buildSupervisionContinuePrompt(
     'Do not restart from scratch or restate completed work.',
     'Focus only on the remaining steps needed to finish the task.',
     'If you are truly blocked or need clarification, say that explicitly.',
+    buildCustomInstructionsSection(customInstructions),
     '',
     'Original task request:',
     taskRequest,

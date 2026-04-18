@@ -52,6 +52,7 @@ type SupervisionDraft = {
   model?: string;
   timeoutMs?: number;
   promptVersion?: string;
+  customInstructions?: string;
   maxParseRetries?: number;
   auditMode?: SupervisionAuditMode;
   maxAuditLoops?: number;
@@ -215,6 +216,7 @@ export function SessionSettingsDialog({
   const supervisionTimeout = supervision.timeoutMs ?? DEFAULT_SUPERVISION_TIMEOUT_MS;
   const supervisionTimeoutSeconds = timeoutMsToUiSeconds(supervisionTimeout);
   const supervisionPromptVersion = supervision.promptVersion ?? SUPERVISION_PROMPT_VERSION;
+  const supervisionCustomInstructions = typeof supervision.customInstructions === 'string' ? supervision.customInstructions : '';
   const supervisionParseRetries = supervision.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES;
   const supervisionAuditMode = supervision.auditMode;
   const supervisionAuditLoops = supervision.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS;
@@ -229,6 +231,7 @@ export function SessionSettingsDialog({
       model: supervisionModel.trim() || undefined,
       timeoutMs: supervisionTimeout,
       promptVersion: supervisionPromptVersion,
+      customInstructions: supervisionCustomInstructions.trim() || undefined,
       maxParseRetries: supervisionParseRetries,
       ...(isAuditMode
         ? {
@@ -258,6 +261,7 @@ export function SessionSettingsDialog({
     supervisionAuditLoops,
     supervisionAuditMode,
     supervisionBackend,
+    supervisionCustomInstructions,
     supervisionModel,
     supervisionParseRetries,
     supervisionPromptVersion,
@@ -290,6 +294,7 @@ export function SessionSettingsDialog({
           model: prev.model,
           timeoutMs: prev.timeoutMs ?? DEFAULT_SUPERVISION_TIMEOUT_MS,
           promptVersion: prev.promptVersion ?? SUPERVISION_PROMPT_VERSION,
+          customInstructions: prev.customInstructions,
           maxParseRetries: prev.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
           auditMode: prev.auditMode,
           maxAuditLoops: prev.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS,
@@ -303,6 +308,7 @@ export function SessionSettingsDialog({
           model: prev.model,
           timeoutMs: prev.timeoutMs ?? DEFAULT_SUPERVISION_TIMEOUT_MS,
           promptVersion: prev.promptVersion ?? SUPERVISION_PROMPT_VERSION,
+          customInstructions: prev.customInstructions,
           maxParseRetries: prev.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
           auditMode: prev.auditMode,
           maxAuditLoops: prev.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS,
@@ -315,6 +321,7 @@ export function SessionSettingsDialog({
         model: prev.model,
         timeoutMs: prev.timeoutMs ?? DEFAULT_SUPERVISION_TIMEOUT_MS,
         promptVersion: prev.promptVersion ?? SUPERVISION_PROMPT_VERSION,
+        customInstructions: prev.customInstructions,
         maxParseRetries: prev.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
         taskRunPromptVersion: prev.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION,
       };
@@ -340,6 +347,7 @@ export function SessionSettingsDialog({
         model: supervisionModel.trim() || undefined,
         timeoutMs: supervisionTimeout,
         promptVersion: supervisionPromptVersion,
+        customInstructions: supervisionCustomInstructions.trim() || undefined,
         maxParseRetries: supervisionParseRetries,
         ...(isAuditMode
           ? {
@@ -496,6 +504,22 @@ export function SessionSettingsDialog({
             </div>
           </div>
 
+          <div>
+            <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.customInstructionsLabel')}</div>
+            <textarea
+              class="input"
+              value={supervisionCustomInstructions}
+              onInput={(e) => setSupervision((prev) => ({ ...prev, customInstructions: (e.target as HTMLTextAreaElement).value }))}
+              rows={4}
+              style={{ width: '100%', resize: 'vertical' }}
+              disabled={saving}
+              placeholder={t('session.supervision.customInstructionsPlaceholder')}
+            />
+            <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
+              {t('session.supervision.customInstructionsHelp')}
+            </div>
+          </div>
+
           {isAuditMode && (
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 12 }}>
               <div>
@@ -545,6 +569,13 @@ export function SessionSettingsDialog({
             </div>
             <div style={{ fontSize: 12, color: '#94a3b8' }}>
               {t('session.supervision.summaryTimeout', { value: `${supervisionTimeoutSeconds} s` })}
+            </div>
+            <div style={{ fontSize: 12, color: '#94a3b8' }}>
+              {t('session.supervision.summaryCustomInstructions', {
+                value: supervisionCustomInstructions.trim()
+                  ? t('session.supervision.summaryCustomInstructionsSet')
+                  : t('session.supervision.summaryUnset'),
+              })}
             </div>
             {isAuditMode && (
               <div style={{ fontSize: 12, color: '#94a3b8' }}>

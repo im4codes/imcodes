@@ -193,6 +193,9 @@
       "timeout": "超时（秒）",
       "selectBackend": "选择后端",
       "selectModel": "选择模型",
+      "customInstructionsLabel": "自定义提示词",
+      "customInstructionsPlaceholder": "例如：在判定完成前必须要求测试和验证结果。",
+      "customInstructionsHelp": "可选。只对当前会话生效，会追加到 Auto 的监督判定和 continue 提示词中。",
       "auditMode": {
         "audit": "审计",
         "review": "复核",
@@ -208,6 +211,8 @@
       "summaryUnset": "未设置",
       "summaryDisabled": "监督已关闭",
       "summaryTimeout": "超时：{{value}}",
+      "summaryCustomInstructions": "自定义提示词：{{value}}",
+      "summaryCustomInstructionsSet": "已设置",
       "summaryAudit": "审计：{{auditMode}} · 循环 {{loops}} 次",
       "summaryMeta": "提示词 {{promptVersion}}，修复 {{repairVersion}}，解析重试 {{parseRetries}}，任务运行 {{taskRunVersion}}",
       "disabledHint": "仅 transport 会话支持监督。",

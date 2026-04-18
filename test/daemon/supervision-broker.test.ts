@@ -190,6 +190,37 @@ describe('SupervisionBroker', () => {
     expect(prompt).toContain('Do not choose complete when the assistant itself indicates remaining work');
   });
 
+  it('injects custom session instructions into decision and repair prompts', async () => {
+    const provider = new FakeProvider([
+      'not valid json',
+      '{"decision":"continue","reason":"keep going","confidence":0.5}',
+    ]);
+    const broker = new SupervisionBroker({
+      resolveProvider: async () => provider,
+    });
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk',
+      model: 'gpt-5.3-codex-spark',
+      timeoutMs: 2_000,
+      promptVersion: 'supervision_decision_v1',
+      customInstructions: 'Prefer adding tests and running verification before complete.',
+      maxParseRetries: 1,
+      auditMode: 'audit',
+      maxAuditLoops: 2,
+      taskRunPromptVersion: 'task_run_status_v1',
+    });
+
+    await broker.decide({
+      snapshot,
+      taskRequest: 'Implement the task',
+      assistantResponse: 'Latest assistant response',
+    });
+
+    expect(String(provider.send.mock.calls[0]?.[1] ?? '')).toContain('Prefer adding tests and running verification before complete.');
+    expect(String(provider.send.mock.calls[1]?.[1] ?? '')).toContain('Prefer adding tests and running verification before complete.');
+  });
+
   it('retries once when the first supervisor reply is not valid JSON', async () => {
     const provider = new FakeProvider([
       'not valid json',
