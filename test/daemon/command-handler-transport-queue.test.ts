@@ -289,6 +289,44 @@ describe('handleWebCommand transport queue behavior', () => {
     );
   });
 
+  it('passes requestedModel when starting a copilot-sdk main session', async () => {
+    handleWebCommand({
+      type: 'session.start',
+      project: 'transport',
+      dir: '/proj',
+      agentType: 'copilot-sdk',
+      requestedModel: 'gpt-5.4-mini',
+      thinking: 'high',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_transport_brain',
+      agentType: 'copilot-sdk',
+      projectDir: '/proj',
+      requestedModel: 'gpt-5.4-mini',
+      effort: 'high',
+    }));
+  });
+
+  it('passes requestedModel when starting a cursor-headless main session', async () => {
+    handleWebCommand({
+      type: 'session.start',
+      project: 'transport',
+      dir: '/proj',
+      agentType: 'cursor-headless',
+      requestedModel: 'gpt-5.2',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_transport_brain',
+      agentType: 'cursor-headless',
+      projectDir: '/proj',
+      requestedModel: 'gpt-5.2',
+    }));
+  });
+
   it('dispatches /clear as a fresh openclaw relaunch that preserves the provider key', async () => {
     getSessionMock.mockReturnValue({
       name: 'deck_transport_brain',
@@ -919,6 +957,70 @@ describe('handleWebCommand transport queue behavior', () => {
       sessionId: 'deck_transport_brain',
       requestId: 'approval-1',
       approved: true,
+    }));
+  });
+
+  it('switches model for copilot-sdk transport sessions via /model', async () => {
+    const setAgentId = vi.fn();
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'copilot-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+      requestedModel: 'gpt-5.4',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'provider-route-1',
+      setAgentId,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/model gpt-5.4-mini',
+      commandId: 'cmd-model-copilot',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(setAgentId).toHaveBeenCalledWith('gpt-5.4-mini');
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      requestedModel: 'gpt-5.4-mini',
+      activeModel: 'gpt-5.4-mini',
+      modelDisplay: 'gpt-5.4-mini',
+    }));
+  });
+
+  it('switches model for cursor-headless transport sessions via /model', async () => {
+    const setAgentId = vi.fn();
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'cursor-headless',
+      runtimeType: 'transport',
+      state: 'running',
+      requestedModel: 'gpt-5.2',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'provider-route-1',
+      setAgentId,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/model claude-sonnet-4.6',
+      commandId: 'cmd-model-cursor',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(setAgentId).toHaveBeenCalledWith('claude-sonnet-4.6');
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      requestedModel: 'claude-sonnet-4.6',
+      activeModel: 'claude-sonnet-4.6',
+      modelDisplay: 'claude-sonnet-4.6',
     }));
   });
 });

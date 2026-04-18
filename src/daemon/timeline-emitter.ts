@@ -10,6 +10,7 @@ import { tmpdir } from 'os';
 import type { TimelineEvent, TimelineEventType, TimelineSource, TimelineConfidence } from './timeline-event.js';
 import { timelineStore } from './timeline-store.js';
 import { preferTimelineEvent } from '../shared/timeline/merge.js';
+import { isMemoryNoiseTurn } from '../../shared/memory-noise-patterns.js';
 
 /** Pattern matching temp file instruction: "Read and execute all instructions in @<path>" */
 const TEMP_FILE_RE = /^Read and execute all instructions in @(.+\.imcodes-prompt-[0-9a-f]+\.md)$/;
@@ -86,6 +87,14 @@ export class TimelineEmitter {
         if (prev && prev.text === resolvedText && now - prev.ts < 5_000) return null;
         this.recentUserMsg.set(key, { text: resolvedText, ts: now });
       }
+    }
+
+    if (type === 'assistant.text' && typeof payload.text === 'string' && isMemoryNoiseTurn(payload.text)) {
+      payload = {
+        ...payload,
+        memoryExcluded: true,
+        assistantKind: typeof payload.assistantKind === 'string' ? payload.assistantKind : 'error',
+      };
     }
 
     const seq = (this.seqMap.get(sessionId) ?? 0) + 1;

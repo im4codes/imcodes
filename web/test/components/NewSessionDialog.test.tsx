@@ -307,4 +307,39 @@ describe('NewSessionDialog', () => {
       thinking: 'high',
     }));
   });
+
+  it('passes requestedModel when starting copilot-sdk', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
+    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    fireEvent.input(agentTypeSelect, { target: { value: 'copilot-sdk' } });
+    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'gpt-5.4-mini' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'copilot-sdk',
+      requestedModel: 'gpt-5.4-mini',
+      thinking: 'high',
+    }));
+  });
+
+  it('passes requestedModel when starting cursor-headless', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
+    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    fireEvent.input(agentTypeSelect, { target: { value: 'cursor-headless' } });
+    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'gpt-5.2' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'cursor-headless',
+      requestedModel: 'gpt-5.2',
+    }));
+  });
 });

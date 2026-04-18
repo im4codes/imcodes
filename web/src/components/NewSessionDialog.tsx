@@ -19,6 +19,8 @@ import {
 } from "@shared/effort-levels.js";
 
 const DEFAULT_SHELL_KEY = "default_shell";
+const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ["gpt-5.2"] as const;
+const COPILOT_SDK_MODEL_SUGGESTIONS = ["gpt-5.4", "gpt-5.4-mini"] as const;
 
 interface Props {
   ws: WsClient | null;
@@ -55,6 +57,7 @@ export function NewSessionDialog({
   const [project, setProject] = useState("");
   const [dir, setDir] = useState("~/");
   const [agentType, setAgentType] = useState<AgentType>("claude-code-sdk");
+  const [requestedModel, setRequestedModel] = useState("");
   const [error, setError] = useState("");
   const [starting, setStarting] = useState(false);
   const [showDirBrowser, setShowDirBrowser] = useState(false);
@@ -252,6 +255,12 @@ export function NewSessionDialog({
         extra.ccPreset = ccPreset;
       if (ccInitPrompt.trim() && agentType === "claude-code")
         extra.ccInitPrompt = ccInitPrompt.trim();
+      if (
+        (agentType === "copilot-sdk" || agentType === "cursor-headless") &&
+        requestedModel.trim()
+      ) {
+        extra.requestedModel = requestedModel.trim();
+      }
       ws.sendSessionCommand("start", {
         project: project.trim(),
         dir: dir.trim(),
@@ -286,6 +295,14 @@ export function NewSessionDialog({
               ? OPENCLAW_THINKING_LEVELS
               : [];
   const supportsCcPreset = agentType === "claude-code" || agentType === "qwen";
+  const supportsModelSelection =
+    agentType === "copilot-sdk" || agentType === "cursor-headless";
+  const modelSuggestions =
+    agentType === "copilot-sdk"
+      ? COPILOT_SDK_MODEL_SUGGESTIONS
+      : agentType === "cursor-headless"
+        ? CURSOR_HEADLESS_MODEL_SUGGESTIONS
+        : [];
 
   useEffect(() => {
     setThinking("high");
@@ -462,6 +479,35 @@ export function NewSessionDialog({
                 </option>
               ))}
             </select>
+          </div>
+        )}
+
+        {supportsModelSelection && (
+          <div class="form-group">
+            <label>{t("session.supervision.model")}</label>
+            <input
+              type="text"
+              list={`new-session-model-options-${agentType}`}
+              placeholder={t("session.supervision.selectModel")}
+              value={requestedModel}
+              disabled={starting}
+              onInput={(e) =>
+                setRequestedModel((e.target as HTMLInputElement).value)
+              }
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellcheck={false}
+              data-lpignore="true"
+              data-1p-ignore
+            />
+            {modelSuggestions.length > 0 && (
+              <datalist id={`new-session-model-options-${agentType}`}>
+                {modelSuggestions.map((model) => (
+                  <option key={model} value={model} />
+                ))}
+              </datalist>
+            )}
           </div>
         )}
 

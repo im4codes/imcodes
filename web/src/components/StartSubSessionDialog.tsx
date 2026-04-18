@@ -10,6 +10,9 @@ import { getUserPref, saveUserPref } from '../api.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '@shared/effort-levels.js';
 import { getSessionAgentGroups, getSessionAgentLabel, SESSION_AGENT_GROUP_LABEL_KEYS } from './session-agent-options.js';
 
+const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
+const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
+
 interface Props {
   ws: WsClient | null;
   defaultCwd?: string;
@@ -34,6 +37,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   const [detectingShells, setDetectingShells] = useState(false);
   const [showDirBrowser, setShowDirBrowser] = useState(false);
   const [thinking, setThinking] = useState<TransportEffortLevel>('high');
+  const [requestedModel, setRequestedModel] = useState('');
 
   // OpenClaw-specific state
   const [ocMode, setOcMode] = useState<OpenClawMode>('new');
@@ -128,6 +132,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     if (desc) extra.description = desc;
     if (ccPreset && (type === 'claude-code' || type === 'qwen')) extra.ccPreset = ccPreset;
     if (ccInitPrompt.trim() && type === 'claude-code') extra.ccInitPrompt = ccInitPrompt.trim();
+    if ((type === 'copilot-sdk' || type === 'cursor-headless') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
     if (type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'qwen') extra.thinking = thinking;
     onStart(type, selectedShell, cwd || undefined, label || undefined, Object.keys(extra).length > 0 ? extra : undefined);
   };
@@ -144,6 +149,12 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
             ? OPENCLAW_THINKING_LEVELS
             : [];
   const supportsCcPreset = type === 'claude-code' || type === 'qwen';
+  const supportsModelSelection = type === 'copilot-sdk' || type === 'cursor-headless';
+  const modelSuggestions = type === 'copilot-sdk'
+    ? COPILOT_SDK_MODEL_SUGGESTIONS
+    : type === 'cursor-headless'
+      ? CURSOR_HEADLESS_MODEL_SUGGESTIONS
+      : [];
 
   return (
     <div class="dialog-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
@@ -422,6 +433,28 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                   <option key={level} value={level}>{level}</option>
                 ))}
               </select>
+            </div>
+          )}
+
+          {supportsModelSelection && (
+            <div>
+              <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('session.supervision.model')}</div>
+              <input
+                class="input"
+                type="text"
+                list={`sub-session-model-options-${type}`}
+                placeholder={t('session.supervision.selectModel')}
+                value={requestedModel}
+                onInput={(e) => setRequestedModel((e.target as HTMLInputElement).value)}
+                style={{ width: '100%' }}
+              />
+              {modelSuggestions.length > 0 && (
+                <datalist id={`sub-session-model-options-${type}`}>
+                  {modelSuggestions.map((model) => (
+                    <option key={model} value={model} />
+                  ))}
+                </datalist>
+              )}
             </div>
           )}
 
