@@ -43,6 +43,7 @@ import { resolveTransportContextBootstrap } from './runtime-context-bootstrap.js
 import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
 import { closeSingleSession, collectProjectCloseTargets, type CloseFailure, type CloseTreeResult } from './session-close.js';
+import { cleanupKnownTestTerminalSessions } from './startup-test-session-cleanup.js';
 
 /** Start JSONL watcher for a CC session — uses specific file if ccSessionId known, else directory scan. */
 function startCCWatcher(sessionName: string, projectDir: string, ccSessionId?: string): void {
@@ -285,6 +286,7 @@ export async function teardownProject(projectName: string): Promise<void> {
 /** Clean up orphan FIFOs from previous daemon runs and reconcile session store on startup. */
 export async function initOnStartup(): Promise<void> {
   await cleanupOrphanFifos();
+  await cleanupKnownTestTerminalSessions();
 }
 
 /** Extract a UUID from tmux pane start command (supports --session-id and --resume). */
