@@ -11,6 +11,7 @@ import type {
   ContextMemoryStatsView,
 } from '../../shared/context-types.js';
 import { computeRelevanceScore, type ProjectionClass } from '../../shared/memory-scoring.js';
+import { normalizeSummaryForFingerprint } from '../../shared/memory-fingerprint.js';
 import { getContextModelConfig } from './context-model-config.js';
 import {
   listContextEvents,
@@ -135,6 +136,30 @@ export function isTrivialRecallQuery(text: string | undefined | null): boolean {
   return false;
 }
 
+/** Collapse content-equivalent scored items so three identical "Key decisions"
+ *  summaries stored at different turns don't all surface as separate cards.
+ *  Preserves the original rank order — the first occurrence of each
+ *  fingerprint wins, so the highest-scoring duplicate is the one retained.
+ *  Scoped by projectionClass to keep recent_summary and durable_memory_candidate
+ *  entries independent even when they happen to share text. */
+export function dedupByNormalizedSummary<T extends { item: MemorySearchResultItem }>(scored: T[]): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const entry of scored) {
+    const summary = entry.item.summary ?? '';
+    if (!summary) {
+      out.push(entry);
+      continue;
+    }
+    const projectionClass = entry.item.projectionClass ?? 'recent_summary';
+    const key = `${projectionClass}\u0000${normalizeSummaryForFingerprint(summary)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(entry);
+  }
+  return out;
+}
+
 export async function searchLocalMemorySemantic(query: MemorySearchQuery): Promise<MemorySearchResult> {
   // Skip recall entirely for trivial queries (single-word "continue", "好", etc.)
   // These pollute context with irrelevant top-match-by-default results.
@@ -196,8 +221,14 @@ export async function searchLocalMemorySemantic(query: MemorySearchQuery): Promi
 
     // Sort by semantic similarity
     scored.sort((a, b) => b.score - a.score);
+    // Content-level dedup: stored duplicates from before writeProcessedProjection
+    // started reusing rows can still surface at recall time with identical
+    // summaries and near-identical similarity scores. Keep only the highest-
+    // scoring item per normalized summary (within the same projection class)
+    // so the user never sees three copies of the same "Key decisions" card.
+    const dedupedByContent = dedupByNormalizedSummary(scored);
     const limit = query.limit ?? 5;
-    const topItems = scored.slice(0, limit).map((s) => s.item);
+    const topItems = dedupedByContent.slice(0, limit).map((s) => s.item);
 
     return {
       items: topItems,

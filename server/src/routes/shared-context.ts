@@ -11,6 +11,7 @@ import { computeRelevanceScore, applyRecallCapRule, type ProjectionClass } from 
 import { normalizeSharedContextRuntimeConfig } from '../../../shared/shared-context-runtime-config.js';
 import { isTemplatePrompt, isTemplateOriginSummary, isImperativeCommand } from '../../../shared/template-prompt-patterns.js';
 import { isMemoryNoiseSummary } from '../../../shared/memory-noise-patterns.js';
+import { normalizeSummaryForFingerprint } from '../../../shared/memory-fingerprint.js';
 import { searchSemanticMemoryView } from '../util/semantic-memory-view.js';
 import { deleteEnterpriseMemoryProjection, deletePersonalMemoryProjection } from '../util/memory-delete.js';
 
@@ -1113,13 +1114,34 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
       source: 'enterprise',
     });
   }
+  // Content-level dedup: projections stored before the writer's store-time
+  // dedup landed (or from historical daemons) can produce multiple rows with
+  // the same (class, normalized-summary) but different IDs. ID-based dedup
+  // above cannot merge them, so they'd surface as three identical
+  // Related-history cards at the same score. Collapse by normalized summary
+  // here — keep the highest-scoring representative, then prefer personal
+  // over enterprise on ties (personal is closer to the current user's work).
+  results.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    if (a.source !== b.source) return a.source === 'personal' ? -1 : 1;
+    return b.updatedAt - a.updatedAt;
+  });
+  const seenFingerprints = new Set<string>();
+  const dedupedResults: typeof results = [];
+  for (const entry of results) {
+    const fp = `${entry.class}\u0000${normalizeSummaryForFingerprint(entry.summary)}`;
+    if (seenFingerprints.has(fp)) continue;
+    seenFingerprints.add(fp);
+    dedupedResults.push(entry);
+  }
+
   // Cap rule: configurable floor (default 0.4), top 3, extend to 5 iff all >= 0.6.
   // See shared/memory-scoring.ts. The client-supplied `limit` is an upper
   // bound on the extend cap — a client asking for <=3 shrinks defaultCap;
   // a client asking for >=5 keeps the default extend cap.
   const cappedDefault = Math.min(limit, 3);
   const cappedExtend = Math.min(Math.max(limit, cappedDefault), 5);
-  const topResults = applyRecallCapRule(results, {
+  const topResults = applyRecallCapRule(dedupedResults, {
     minFloor: runtimeConfig.memoryRecallMinScore,
     defaultCap: cappedDefault,
     extendCap: cappedExtend,

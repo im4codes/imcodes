@@ -1,6 +1,7 @@
 import type { ContextNamespace } from '../../shared/context-types.js';
 import type { MemorySearchResultItem } from './memory-search.js';
 import { searchLocalMemory } from './memory-search.js';
+import { normalizeSummaryForFingerprint } from '../../shared/memory-fingerprint.js';
 
 export const STARTUP_MEMORY_DURABLE_LIMIT = 7;
 export const STARTUP_MEMORY_RECENT_LIMIT = 8;
@@ -39,13 +40,37 @@ export function selectStartupMemoryItems(
     limit: Math.max(recentLimit, totalLimit),
   }).items.filter((item): item is MemorySearchResultItem => item.type === 'processed');
 
-  const selectedDurable = durable.slice(0, Math.min(durableLimit, totalLimit));
+  // ID-based dedup was failing against duplicates produced by the old
+  // writeProcessedProjection path that generated fresh UUIDs on every turn
+  // for identical summary text. Pair it with a content fingerprint so
+  // startup memory never dumps three copies of the same durable summary
+  // into the session opener.
+  const fingerprintOf = (item: MemorySearchResultItem): string => {
+    const projectionClass = item.projectionClass ?? 'recent_summary';
+    return `${projectionClass}\u0000${normalizeSummaryForFingerprint(item.summary ?? '')}`;
+  };
+
+  const seenIds = new Set<string>();
+  const seenFingerprints = new Set<string>();
+  const dedupedDurable: MemorySearchResultItem[] = [];
+  for (const item of durable) {
+    if (seenIds.has(item.id)) continue;
+    const fp = fingerprintOf(item);
+    if (seenFingerprints.has(fp)) continue;
+    seenIds.add(item.id);
+    seenFingerprints.add(fp);
+    dedupedDurable.push(item);
+  }
+
+  const selectedDurable = dedupedDurable.slice(0, Math.min(durableLimit, totalLimit));
   const remaining = Math.max(0, totalLimit - selectedDurable.length);
   const selectedRecent: MemorySearchResultItem[] = [];
-  const seenIds = new Set(selectedDurable.map((item) => item.id));
   for (const item of recent) {
     if (seenIds.has(item.id)) continue;
+    const fp = fingerprintOf(item);
+    if (seenFingerprints.has(fp)) continue;
     seenIds.add(item.id);
+    seenFingerprints.add(fp);
     selectedRecent.push(item);
     if (selectedRecent.length >= remaining) break;
   }

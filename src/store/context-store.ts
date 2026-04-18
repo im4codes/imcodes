@@ -22,6 +22,7 @@ import type {
 import { classifyTimestampFreshness } from '../../shared/context-freshness.js';
 import { serializeContextNamespace, serializeContextTarget } from '../context/context-keys.js';
 import { isMemoryNoiseSummary } from '../../shared/memory-noise-patterns.js';
+import { normalizeSummaryForFingerprint } from '../../shared/memory-fingerprint.js';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
@@ -433,6 +434,66 @@ export function deleteTentativeProjections(namespace: ContextNamespace, projecti
 export function writeProcessedProjection(input: Omit<ProcessedContextProjection, 'id' | 'createdAt' | 'updatedAt'> & Partial<Pick<ProcessedContextProjection, 'id' | 'createdAt' | 'updatedAt'>>): ProcessedContextProjection {
   const database = ensureDb();
   const now = Date.now();
+  const namespaceKey = serializeContextNamespace(input.namespace);
+  const normalizedSummary = normalizeSummaryForFingerprint(input.summary);
+
+  // Content-level dedup: before handing out a fresh UUID, look for an existing
+  // row with the same (namespace, class, normalized-summary). The daemon's
+  // materialization path was creating a new UUID on every turn even when the
+  // compressor produced a byte-for-byte identical summary, which then got
+  // replicated to the server as N distinct rows and surfaced as N copies of
+  // the same Related-history card. Reusing the existing row collapses the
+  // duplicates at the source instead of patching the symptom downstream.
+  //
+  // Matching is done in JS (not SQL) because SQLite's LOWER/TRIM handles only
+  // leading/trailing whitespace and ASCII case — the fingerprint also collapses
+  // internal whitespace runs and is locale-agnostic. We bound the scan to a
+  // recent window so the cost stays O(1) even for heavily-used projects.
+  //
+  // Only engaged when the caller did NOT pass an explicit id — replication
+  // from a remote writer preserves the remote id so ON CONFLICT(id) on the
+  // server stays authoritative and cross-device history merges correctly.
+  const DEDUP_SCAN_LIMIT = 50;
+  if (!input.id) {
+    const candidates = database.prepare(`
+      SELECT id, summary, created_at
+      FROM context_processed_local
+      WHERE namespace_key = ? AND class = ?
+      ORDER BY updated_at DESC
+      LIMIT ?
+    `).all(namespaceKey, input.class, DEDUP_SCAN_LIMIT) as Array<{ id: string; summary: string; created_at: number }>;
+    const existing = candidates.find((row) =>
+      normalizeSummaryForFingerprint(row.summary) === normalizedSummary,
+    );
+    if (existing) {
+      // Touch updated_at + refresh the content/source ids so the most recent
+      // turn's context (if it changed) stays visible. Preserve created_at so
+      // the row's age-in-store is honest (important for startup-memory
+      // selection which weighs recency).
+      database.prepare(`
+        UPDATE context_processed_local
+        SET source_event_ids_json = ?, content_json = ?, summary = ?, updated_at = ?
+        WHERE id = ?
+      `).run(
+        JSON.stringify(input.sourceEventIds),
+        JSON.stringify(input.content),
+        input.summary,
+        now,
+        existing.id,
+      );
+      return {
+        id: existing.id,
+        namespace: input.namespace,
+        class: input.class,
+        sourceEventIds: input.sourceEventIds,
+        summary: input.summary,
+        content: input.content,
+        createdAt: existing.created_at,
+        updatedAt: now,
+      };
+    }
+  }
+
   const projection: ProcessedContextProjection = {
     id: input.id ?? randomUUID(),
     namespace: input.namespace,
@@ -449,7 +510,7 @@ export function writeProcessedProjection(input: Omit<ProcessedContextProjection,
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     projection.id,
-    serializeContextNamespace(projection.namespace),
+    namespaceKey,
     projection.class,
     JSON.stringify(projection.sourceEventIds),
     projection.summary,
