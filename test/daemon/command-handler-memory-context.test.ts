@@ -463,4 +463,29 @@ describe('handleWebCommand memory context timeline', () => {
       }),
     );
   });
+
+  it('skips recall for imperative command prompts (commit&push, redeploy, etc.)', async () => {
+    // User-reported regression: short ops directives passed the <10-char
+    // filter and triggered irrelevant semantic recalls over the current
+    // task's own logs.
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_process_brain',
+      text: 'commit&push',
+      commandId: 'cmd-memory-imperative',
+    }, serverLink as any);
+
+    await flushAsync();
+
+    expect(searchLocalMemorySemanticMock).not.toHaveBeenCalled();
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_process_brain',
+      'memory.context',
+      expect.objectContaining({
+        relatedToEventId: 'evt-user-1',
+        status: 'skipped_control_message',
+        items: [],
+      }),
+    );
+  });
 });

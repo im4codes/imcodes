@@ -270,3 +270,73 @@ const SLASH_COMMAND_NAMES: ReadonlySet<string> = new Set([
 export function listKnownSlashCommands(): readonly string[] {
   return Array.from(SLASH_COMMAND_NAMES);
 }
+
+/**
+ * Short imperative-command heuristic for the per-turn recall skip list.
+ *
+ * The 10-character minimum length alone lets through meaningless short ops
+ * imperatives like "commit&push", "redeploy", "continue", "go ahead", etc.
+ * Those are task-control messages, not semantic queries — running memory
+ * recall on them wastes the candidate pool on the current task's own logs
+ * and produces misleading "related past work" hits.
+ *
+ * A message qualifies as imperative-command when ALL of:
+ *   - single line (ignoring trailing whitespace)
+ *   - at most IMPERATIVE_MAX_TOKENS whitespace/punctuation-separated tokens
+ *   - contains at least one token from IMPERATIVE_VERBS, case-insensitive,
+ *     with the token matched whole (word boundaries)
+ *   - contains no non-ASCII letters (CJK/accented → treat as natural prose)
+ *
+ * This is deliberately narrow: a sentence like "I just committed and pushed,
+ * anything else broken?" has 8 tokens and CJK? actually English — but 8
+ * tokens > IMPERATIVE_MAX_TOKENS so it stays eligible for recall. That's
+ * the intended behavior — only terse command-style input should skip.
+ */
+const IMPERATIVE_VERBS: ReadonlySet<string> = new Set([
+  'commit', 'push', 'pull', 'merge', 'rebase', 'cherry-pick', 'revert',
+  'deploy', 'redeploy', 'rollback', 'restart', 'reload', 'reboot', 'retry',
+  'run', 'build', 'rebuild', 'compile', 'test', 'lint', 'format', 'typecheck',
+  'install', 'uninstall', 'upgrade', 'downgrade', 'update',
+  'fix', 'apply', 'archive', 'propose', 'implement', 'continue', 'proceed',
+  'go', 'stop', 'pause', 'resume', 'cancel', 'abort', 'skip', 'next', 'done',
+  'ok', 'okay', 'yes', 'no', 'yep', 'nope', 'sure', 'confirm', 'approve', 'reject',
+  'ship', 'release', 'publish', 'tag', 'bump',
+  'save', 'write', 'commit&push',
+]);
+
+const IMPERATIVE_MAX_TOKENS = 5;
+
+export function isImperativeCommand(text: string | null | undefined): boolean {
+  if (!text || typeof text !== 'string') return false;
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return false;
+
+  // Must be a single line.
+  if (/\r?\n/.test(trimmed)) return false;
+
+  // Non-ASCII letters (CJK, accented Latin, Cyrillic, etc.) indicate natural
+  // prose in another language. Bail early so e.g. "请继续提交" isn't skipped
+  // here (it'd be a real user request).
+  // Allow symbols (&, /, -, _) but reject any character in the "letter" range
+  // outside ASCII a-z/A-Z.
+  if (/[^\x00-\x7F]/.test(trimmed)) return false;
+
+  // Tokenize on whitespace. Treat compound tokens like "commit&push" as one
+  // token — the ampersand/slash/hyphen is part of the verb identity.
+  const tokens = trimmed.split(/\s+/).filter((t) => t.length > 0);
+  if (tokens.length === 0 || tokens.length > IMPERATIVE_MAX_TOKENS) return false;
+
+  // At least one token must match a known imperative verb. We compare the
+  // lowercased token stripped of trailing punctuation (commit&push!) but keep
+  // internal symbols intact (commit&push stays as one token).
+  for (const raw of tokens) {
+    const cleaned = raw.toLowerCase().replace(/^[^a-z0-9&/_-]+|[^a-z0-9&/_-]+$/g, '');
+    if (cleaned.length === 0) continue;
+    if (IMPERATIVE_VERBS.has(cleaned)) return true;
+    // Also match compound "verb&verb" or "verb+verb" where BOTH halves are
+    // known verbs — catches typing variants like "commit+push" or "build/test".
+    const parts = cleaned.split(/[&+/]/).filter((p) => p.length > 0);
+    if (parts.length >= 2 && parts.every((p) => IMPERATIVE_VERBS.has(p))) return true;
+  }
+  return false;
+}

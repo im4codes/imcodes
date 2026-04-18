@@ -89,6 +89,12 @@ export interface SessionRecord extends SessionContextBootstrapState {
   /** True for sessions created by the user (not auto-synced from provider).
    *  User-created sessions must not be deleted/stopped by sync or health checks. */
   userCreated?: boolean;
+  /** True once the transport runtime has already injected its "startup memory"
+   *  (related-past-work preamble) into the provider context for this session.
+   *  Persisted so daemon restart / session restart do NOT re-inject history
+   *  into an existing conversation. Reset on /clear (fresh conversation) or
+   *  genuine new-session creation. */
+  startupMemoryInjected?: boolean;
 }
 
 export interface SessionStore {

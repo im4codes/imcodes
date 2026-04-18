@@ -9,7 +9,7 @@ import { classifyTimestampFreshness } from '../../../shared/context-freshness.js
 import type { ContextMemoryRecordView, ContextMemoryStatsView } from '../../../shared/context-types.js';
 import { computeRelevanceScore, applyRecallCapRule, type ProjectionClass } from '../../../shared/memory-scoring.js';
 import { normalizeSharedContextRuntimeConfig } from '../../../shared/shared-context-runtime-config.js';
-import { isTemplatePrompt, isTemplateOriginSummary } from '../../../shared/template-prompt-patterns.js';
+import { isTemplatePrompt, isTemplateOriginSummary, isImperativeCommand } from '../../../shared/template-prompt-patterns.js';
 import { isMemoryNoiseSummary } from '../../../shared/memory-noise-patterns.js';
 import { searchSemanticMemoryView } from '../util/semantic-memory-view.js';
 import { deleteEnterpriseMemoryProjection, deletePersonalMemoryProjection } from '../util/memory-delete.js';
@@ -956,6 +956,12 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
   // See shared/template-prompt-patterns.ts.
   if (isTemplatePrompt(query)) {
     return c.json({ results: [], vectorSearch: false, skipped: 'template_prompt' });
+  }
+  // Imperative-command skip: short ops directives ("commit&push", "redeploy",
+  // "continue") are task-control verbs, not semantic queries. Running recall
+  // on them wastes candidates on the current task's own logs.
+  if (isImperativeCommand(query)) {
+    return c.json({ results: [], vectorSearch: false, skipped: 'imperative_command' });
   }
   const limit = typeof rawLimit === 'number' && rawLimit > 0 ? Math.min(rawLimit, 20) : 5;
   const candidateLimit = Math.max(limit * 4, 20);

@@ -943,6 +943,13 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
       pendingMessageEntries: runtime.pendingEntries,
     }, { source: 'daemon', confidence: 'high' });
   };
+  runtime.onStartupMemoryInjected = () => {
+    const existing = getSession(sessionName);
+    if (!existing) return;
+    if (existing.startupMemoryInjected === true) return;
+    upsertSession({ ...existing, startupMemoryInjected: true, updatedAt: Date.now() });
+    logger.info({ sessionName }, 'Persisted startupMemoryInjected flag');
+  };
 }
 
 function mergeSessionContextBootstrap(next: SessionRecord, info: SessionInfoUpdate): boolean {
@@ -1190,6 +1197,10 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         agentId: effectiveRequestedModel,
         resumeId,
         effort: s.effort,
+        // Restore path: only re-inject startup memory if the prior run hadn't
+        // yet delivered it (e.g. daemon crashed mid-first-turn). Otherwise the
+        // conversation already has its history preamble and we must not repeat it.
+        startupMemoryAlreadyInjected: s.startupMemoryInjected === true,
       });
       if (s.description) runtime.setDescription(s.description);
       if (systemPrompt) runtime.setSystemPrompt(systemPrompt);
@@ -1376,6 +1387,12 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     }
   }
 
+  // When launching against an existing session record (e.g. session.restart
+  // without /clear) we must honor the previously-persisted inject flag — the
+  // conversation already has its history preamble. `opts.fresh` is the
+  // authoritative "force fresh" signal from /clear or explicit user action.
+  const preserveStartupMemoryInject = !opts.fresh && existing?.startupMemoryInjected === true;
+
   // Create session on provider
       await runtime.initialize({
     sessionKey: effectiveSessionKey,
@@ -1397,6 +1414,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     skipCreate: effectiveSkipCreate,
     resumeId: transportResumeId,
         effort: opts.effort,
+    startupMemoryAlreadyInjected: preserveStartupMemoryInject,
       });
   // Atomic: store runtime + register provider route + persist — rollback all on failure
   const providerSid = runtime.providerSessionId;
@@ -1454,6 +1472,10 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
         label,
         parentSession,
         userCreated: opts.userCreated,
+        // Preserve the flag across session.restart / runtime rebuild so we
+        // don't re-inject startup memory into a conversation that already
+        // received it. /clear wipes it because `opts.fresh === true`.
+        ...(preserveStartupMemoryInject ? { startupMemoryInjected: true } : {}),
       };
       upsertSession(record);
       emitSessionPersist(record, name);

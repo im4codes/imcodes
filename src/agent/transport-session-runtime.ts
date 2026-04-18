@@ -24,7 +24,7 @@ import type { MemoryContextTimelinePayload } from '../shared/timeline/types.js';
 import { buildMemoryContextTimelinePayload, buildMemoryContextStatusPayload } from '../daemon/memory-context-timeline.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
 import { searchLocalMemorySemantic, type MemorySearchResultItem } from '../context/memory-search.js';
-import { isTemplatePrompt, isTemplateOriginSummary } from '../../shared/template-prompt-patterns.js';
+import { isTemplatePrompt, isTemplateOriginSummary, isImperativeCommand } from '../../shared/template-prompt-patterns.js';
 import { applyRecallCapRule } from '../../shared/memory-scoring.js';
 import {
   filterRecentlyInjected,
@@ -100,6 +100,10 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _onDrain?: (messages: PendingTransportMessage[], mergedMessage: string, count: number) => void;
   private _onSessionInfoChange?: (info: SessionInfoUpdate) => void;
   private _onApprovalRequest?: (request: ApprovalRequest) => void;
+  /** Fired exactly once per runtime lifetime, after startup memory is accepted
+   *  by the provider on the first dispatch. Session-manager persists the flag
+   *  to SessionRecord so future restores skip injection. */
+  private _onStartupMemoryInjected?: () => void;
 
   constructor(
     private readonly provider: TransportProvider,
@@ -153,6 +157,8 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   /** Register a callback for when pending messages are drained into a new turn. */
   set onDrain(cb: (messages: PendingTransportMessage[], mergedMessage: string, count: number) => void) { this._onDrain = cb; }
+  /** Register a callback fired exactly once when startup memory reaches the provider. */
+  set onStartupMemoryInjected(cb: () => void) { this._onStartupMemoryInjected = cb; }
   /** Register a callback for provider session metadata updates. */
   set onSessionInfoChange(cb: (info: SessionInfoUpdate) => void) { this._onSessionInfoChange = cb; }
   set onApprovalRequest(cb: (request: ApprovalRequest) => void) { this._onApprovalRequest = cb; }
@@ -190,6 +196,18 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   async initialize(config: SessionConfig): Promise<void> {
+    // When resuming/restoring an existing conversation, mark startup memory
+    // injected BEFORE applyContextBootstrap runs so the bootstrap's
+    // `if (!this._startupMemoryInjected) this._startupMemory = …` guard
+    // leaves `_startupMemory` as null. This is the mechanism that prevents
+    // re-injecting "related past work" into a session that already has it.
+    const alreadyInjected = config.startupMemoryAlreadyInjected === true;
+    if (alreadyInjected) {
+      this._startupMemoryInjected = true;
+      this._startupMemoryTimelineEmitted = true;
+      this._startupMemory = null;
+    }
+
     this._providerSessionId = await this.provider.createSession(config);
     this._description = config.description;
     this._systemPrompt = config.systemPrompt;
@@ -206,9 +224,15 @@ export class TransportSessionRuntime implements SessionRuntime {
       authoredContextFilePath: config.contextAuthoredContextFilePath,
     });
     await this.refreshContextBootstrap();
-    this._startupMemoryTimelineEmitted = false;
-    this._startupMemoryInjected = false;
-    this.emitStartupMemoryContext(this._startupMemory);
+
+    if (!alreadyInjected) {
+      // Fresh conversation — reset the gate so the next turn will build and
+      // inject startup memory. Also emit the timeline card so the UI shows
+      // what past work is being pulled in.
+      this._startupMemoryTimelineEmitted = false;
+      this._startupMemoryInjected = false;
+      this.emitStartupMemoryContext(this._startupMemory);
+    }
   }
 
   /**
@@ -372,6 +396,12 @@ export class TransportSessionRuntime implements SessionRuntime {
         if (!this._startupMemoryInjected && dispatchResult.payload?.startupMemory) {
           this._startupMemoryInjected = true;
           this._startupMemory = null;
+          // Notify session-manager so the flag is persisted to SessionRecord.
+          // Invoked synchronously — the callback just schedules an upsert and
+          // returns, so there's no ordering risk with the rest of this turn.
+          try { this._onStartupMemoryInjected?.(); } catch (err) {
+            logger.warn({ err, sessionKey: this.sessionKey }, 'onStartupMemoryInjected callback failed');
+          }
         }
       })
       .catch((err) => {
@@ -491,6 +521,20 @@ export class TransportSessionRuntime implements SessionRuntime {
       return {
         artifact: null,
         statusPayload: buildMemoryContextStatusPayload(query, 'skipped_template_prompt', 'message', {
+          runtimeFamily: 'transport',
+          authoritySource,
+          sourceKind: 'local_processed',
+        }),
+      };
+    }
+    if (isImperativeCommand(trimmed)) {
+      logger.debug({ sessionKey: this.sessionKey, text: trimmed }, 'transport message recall skipped: imperative command');
+      return {
+        artifact: null,
+        // Reuse the 'skipped_control_message' reason — imperative commands are
+        // a form of control input (task-level verb, not a semantic query) and
+        // we don't need to surface a separate status banner for them.
+        statusPayload: buildMemoryContextStatusPayload(query, 'skipped_control_message', 'message', {
           runtimeFamily: 'transport',
           authoritySource,
           sourceKind: 'local_processed',

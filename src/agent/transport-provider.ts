@@ -154,6 +154,11 @@ export interface SessionConfig {
   effort?: TransportEffortLevel;
   /** Skip the sessions.create RPC — session already exists on provider (auto-sync bind). */
   skipCreate?: boolean;
+  /** When true, the runtime must NOT re-inject startup memory on the next turn
+   *  (session is being restored or restarted without /clear; the provider
+   *  already received startup memory in a prior run). The runtime still emits
+   *  the timeline status card so the UI knows it was deliberately skipped. */
+  startupMemoryAlreadyInjected?: boolean;
 }
 
 /** Structured error emitted by a provider. */

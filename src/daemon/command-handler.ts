@@ -46,7 +46,7 @@ import { buildWindowsCleanupScript, buildWindowsCleanupVbs, buildWindowsUpgradeB
 import { UPGRADE_LOCK_FILE, encodeVbsAsUtf16, encodeCmdAsUtf8Bom } from '../util/windows-launch-artifacts.js';
 import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
 import { sanitizeProjectName } from '../../shared/sanitize-project-name.js';
-import { isTemplatePrompt, isTemplateOriginSummary } from '../../shared/template-prompt-patterns.js';
+import { isTemplatePrompt, isTemplateOriginSummary, isImperativeCommand } from '../../shared/template-prompt-patterns.js';
 import { applyRecallCapRule } from '../../shared/memory-scoring.js';
 import {
   filterRecentlyInjected,
@@ -4588,6 +4588,14 @@ async function prependLocalMemory(
     return {
       text: prompt,
       timelinePayload: buildMemoryContextStatusPayload(query, 'skipped_template_prompt'),
+    };
+  }
+  // Imperative-command skip: short terse task-control verbs ("commit&push",
+  // "redeploy", "continue") are ops directives, not semantic queries.
+  if (isImperativeCommand(prompt)) {
+    return {
+      text: prompt,
+      timelinePayload: buildMemoryContextStatusPayload(query, 'skipped_control_message'),
     };
   }
   try {

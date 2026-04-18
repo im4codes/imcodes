@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   isTemplatePrompt,
   isTemplateOriginSummary,
+  isImperativeCommand,
   listKnownSlashCommands,
 } from '../../shared/template-prompt-patterns.js';
 
@@ -416,5 +417,74 @@ describe('listKnownSlashCommands', () => {
     expect(list.length).toBeGreaterThan(0);
     expect(list).toContain('/loop');
     expect(list).toContain('/schedule');
+  });
+});
+
+describe('isImperativeCommand', () => {
+  // The real user bug: "commit&push" got through the <10-char + template
+  // filter and triggered a full semantic recall, polluting results with the
+  // current task's own logs.
+  it('flags "commit&push" as an imperative command', () => {
+    expect(isImperativeCommand('commit&push')).toBe(true);
+  });
+
+  it('flags compound slash/ampersand/plus verb pairs', () => {
+    expect(isImperativeCommand('commit+push')).toBe(true);
+    expect(isImperativeCommand('build/test')).toBe(true);
+    expect(isImperativeCommand('lint&format')).toBe(true);
+  });
+
+  it('flags single-verb imperatives', () => {
+    expect(isImperativeCommand('commit')).toBe(true);
+    expect(isImperativeCommand('deploy')).toBe(true);
+    expect(isImperativeCommand('redeploy')).toBe(true);
+    expect(isImperativeCommand('continue')).toBe(true);
+    expect(isImperativeCommand('proceed')).toBe(true);
+    expect(isImperativeCommand('restart')).toBe(true);
+  });
+
+  it('flags short multi-token imperatives up to MAX_TOKENS', () => {
+    expect(isImperativeCommand('ok continue')).toBe(true);
+    expect(isImperativeCommand('please commit and push')).toBe(true); // 4 tokens, contains "commit"
+  });
+
+  it('trims trailing punctuation from tokens', () => {
+    expect(isImperativeCommand('commit!')).toBe(true);
+    expect(isImperativeCommand('ok.')).toBe(true);
+    expect(isImperativeCommand('yes, proceed.')).toBe(true);
+  });
+
+  it('does NOT flag natural-language questions that happen to contain verbs', () => {
+    expect(
+      isImperativeCommand('I just committed and pushed, anything else broken in the release pipeline?'),
+    ).toBe(false); // >5 tokens
+    expect(
+      isImperativeCommand('Should I commit this or wait for review?'),
+    ).toBe(false);
+  });
+
+  it('does NOT flag messages with non-ASCII letters (CJK / accented prose)', () => {
+    // User writes in Chinese even when asking about commits — that's a real
+    // semantic query and should go through recall normally.
+    expect(isImperativeCommand('commit 一下')).toBe(false);
+    expect(isImperativeCommand('请帮我 commit')).toBe(false);
+    expect(isImperativeCommand('¿deploy a producción?')).toBe(false);
+  });
+
+  it('does NOT flag multi-line text', () => {
+    expect(isImperativeCommand('commit\npush\ndeploy')).toBe(false);
+  });
+
+  it('does NOT flag unrelated short ASCII phrases', () => {
+    expect(isImperativeCommand('hello world')).toBe(false);
+    expect(isImperativeCommand('what is this')).toBe(false);
+    expect(isImperativeCommand('foo bar baz')).toBe(false);
+  });
+
+  it('handles empty / null / undefined without throwing', () => {
+    expect(isImperativeCommand('')).toBe(false);
+    expect(isImperativeCommand('   ')).toBe(false);
+    expect(isImperativeCommand(null)).toBe(false);
+    expect(isImperativeCommand(undefined)).toBe(false);
   });
 });

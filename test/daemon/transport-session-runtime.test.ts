@@ -365,6 +365,99 @@ describe('TransportSessionRuntime', () => {
     expect(refreshBootstrap).toHaveBeenCalledTimes(2);
   });
 
+  it('skips startup memory injection when startupMemoryAlreadyInjected is true (session.restart / restore)', async () => {
+    // Regression: restarting an existing session (or daemon restart that
+    // restores persisted sessions) must NOT replay "related past work" into
+    // the provider context. The conversation already has that preamble; a
+    // second injection would pollute history with duplicate context.
+    const startupItem = makeSearchItem({
+      projectId: 'repo-1',
+      summary: 'Should not be re-injected on restart',
+    });
+    const startupMemory = {
+      reason: 'startup' as const,
+      runtimeFamily: 'transport' as const,
+      authoritySource: 'processed_local' as const,
+      sourceKind: 'local_processed' as const,
+      injectionSurface: 'system-text' as const,
+      injectedText: '# Recent project memory\n\n- Should not be re-injected on restart',
+      items: [startupItem],
+    };
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
+      startupMemory,
+    }));
+
+    // Simulate the restore path where the prior run already injected startup
+    // memory and we persisted startupMemoryInjected=true to SessionRecord.
+    await r.initialize({ ...defaultConfig, startupMemoryAlreadyInjected: true });
+
+    // No memory.context timeline card — the UI must not re-show the startup
+    // banner for a resumed conversation.
+    expect(timelineEmitterEmitMock).not.toHaveBeenCalledWith(
+      'deck_test_brain',
+      'memory.context',
+      expect.objectContaining({ reason: 'startup' }),
+      expect.any(Object),
+    );
+
+    timelineEmitterEmitMock.mockClear();
+    r.send('Follow-up message after restart');
+    await flushDispatch();
+
+    // The provider payload on the first post-restart turn must NOT contain
+    // any `startupMemory` field — the runtime keeps `_startupMemory = null`.
+    expect(localMock.provider.send).toHaveBeenCalledTimes(1);
+    const call = localMock.provider.send.mock.calls[0];
+    expect(call[1]).not.toHaveProperty('startupMemory');
+  });
+
+  it('fires onStartupMemoryInjected exactly once when startup memory first reaches the provider', async () => {
+    const startupItem = makeSearchItem({
+      projectId: 'repo-1',
+      summary: 'Persist that we injected startup memory',
+    });
+    const startupMemory = {
+      reason: 'startup' as const,
+      runtimeFamily: 'transport' as const,
+      authoritySource: 'processed_local' as const,
+      sourceKind: 'local_processed' as const,
+      injectionSurface: 'system-text' as const,
+      injectedText: '# Recent project memory\n\n- Persist that we injected startup memory',
+      items: [startupItem],
+    };
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
+      startupMemory,
+    }));
+
+    const onInjected = vi.fn();
+    r.onStartupMemoryInjected = onInjected;
+
+    await r.initialize(defaultConfig);
+    await flushDispatch();
+
+    // Callback fires only after the first turn that actually carried it.
+    expect(onInjected).not.toHaveBeenCalled();
+
+    r.send('first turn');
+    await flushDispatch();
+    expect(onInjected).toHaveBeenCalledTimes(1);
+
+    // Subsequent turns don't refire the callback.
+    r.send('second turn');
+    await flushDispatch();
+    expect(onInjected).toHaveBeenCalledTimes(1);
+  });
+
   it('carries startup memory into the first transport payload', async () => {
     const startupItem = makeSearchItem({
       projectId: 'repo-1',
