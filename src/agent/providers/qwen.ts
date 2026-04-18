@@ -37,6 +37,7 @@ interface QwenSessionState {
   started: boolean;
   description?: string;
   model?: string;
+  env?: Record<string, string>;
   effort: TransportEffortLevel;
   settings?: string | Record<string, unknown>;
   settingsDir?: string;
@@ -223,6 +224,7 @@ export class QwenProvider implements TransportProvider {
       started: !!(config.bindExistingKey || config.skipCreate || existing?.started),
       description: config.description ?? existing?.description,
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
+      env: config.env ?? existing?.env,
       effort: config.effort ?? existing?.effort ?? DEFAULT_TRANSPORT_EFFORT,
       settings: config.settings ?? existing?.settings,
       settingsDir: existing?.settingsDir,
@@ -325,6 +327,7 @@ export class QwenProvider implements TransportProvider {
       started: true,
       description: undefined,
       model: undefined,
+      env: undefined,
       effort: DEFAULT_TRANSPORT_EFFORT,
       settings: undefined,
       settingsDir: undefined,
@@ -382,6 +385,7 @@ export class QwenProvider implements TransportProvider {
       env: {
         ...process.env,
         ...((this.config.env as Record<string, string> | undefined) ?? {}),
+        ...(state.env ?? {}),
         QWEN_CODE_SYSTEM_SETTINGS_PATH: await this.ensureSettingsPath(state),
       },
       stdio: ['ignore', 'pipe', 'pipe'],

@@ -1117,11 +1117,6 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         ? (s.qwenAvailableModels?.length ? s.qwenAvailableModels : (qwenRuntime?.availableModels ?? []))
         : [];
       const requestedTransportModel = s.requestedModel ?? s.qwenModel;
-      const effectiveQwenModel = s.providerId === 'qwen'
-        ? (requestedTransportModel && (availableQwenModels.length === 0 || availableQwenModels.includes(requestedTransportModel))
-          ? requestedTransportModel
-          : availableQwenModels[0])
-        : requestedTransportModel;
       const runtime = new TransportSessionRuntime(provider, s.name);
       wireTransportCallbacks(runtime, s.name);
       wireTransportSessionInfo(runtime, s.name, s.agentType);
@@ -1142,7 +1137,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
       let extraEnv: Record<string, string> | undefined;
       let systemPrompt: string | undefined;
       let transportSettings: string | Record<string, unknown> | undefined;
-      let effectiveRequestedModel = effectiveQwenModel;
+      let effectiveRequestedModel = requestedTransportModel;
       const resolveRuntimeContextBootstrap = () => resolveTransportContextBootstrap({
         projectDir: s.projectDir,
         transportConfig: getSession(s.name)?.transportConfig ?? s.transportConfig ?? {},
@@ -1165,6 +1160,10 @@ export async function restoreTransportSessions(providerId: string): Promise<void
           const nextModels = new Set([...(availableQwenModels ?? []), presetConfig.model]);
           availableQwenModels = [...nextModels];
         }
+      }
+      if (s.providerId === 'qwen'
+        && (!effectiveRequestedModel || (availableQwenModels.length > 0 && !availableQwenModels.includes(effectiveRequestedModel)))) {
+        effectiveRequestedModel = availableQwenModels[0] ?? effectiveRequestedModel;
       }
       await runtime.initialize({
         sessionKey: effectiveSessionKey,

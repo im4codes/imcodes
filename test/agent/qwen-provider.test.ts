@@ -185,6 +185,32 @@ describe('QwenProvider', () => {
     });
   });
 
+  it('passes session-specific preset env through to the spawned qwen process', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-preset-env',
+      cwd: '/tmp/project',
+      env: {
+        ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+        ANTHROPIC_API_KEY: 'test-token',
+        ANTHROPIC_MODEL: 'MiniMax-M2.7',
+      },
+      settings: {
+        security: { auth: { selectedType: 'anthropic' } },
+        model: { name: 'MiniMax-M2.7' },
+      },
+    });
+
+    await provider.send('sess-preset-env', 'hello');
+    const spawned = lastSpawn();
+    expect(spawned.env).toMatchObject({
+      ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+      ANTHROPIC_API_KEY: 'test-token',
+      ANTHROPIC_MODEL: 'MiniMax-M2.7',
+    });
+  });
+
   it('uses --session-id on first send, streams cumulative deltas, then resumes with --resume', async () => {
     const provider = new QwenProvider();
     await provider.connect({});
