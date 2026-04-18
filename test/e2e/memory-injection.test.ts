@@ -8,7 +8,8 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 
 const SKIP = process.env.SKIP_TMUX_TESTS === '1';
-const SESSION = 'e2e_memory_injection_test';
+const RUN_ID = Math.random().toString(36).slice(2, 8);
+const SESSION = `e2e_memory_injection_test_${RUN_ID}`;
 const FIXTURES = new URL('../fixtures', import.meta.url).pathname;
 
 describe.skipIf(SKIP)('Memory injection into agent prompts', () => {

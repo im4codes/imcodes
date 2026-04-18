@@ -8,7 +8,8 @@ import { newSession, killSession, sessionExists, capturePane } from '../../src/a
 import { tmpdir } from 'os';
 
 const SKIP = process.env.SKIP_TMUX_TESTS === '1' || !!process.env.CLAUDECODE;
-const SESSION = 'e2e_tmux_launch_test';
+const RUN_ID = Math.random().toString(36).slice(2, 8);
+const SESSION = `e2e_tmux_launch_test_${RUN_ID}`;
 
 describe.skipIf(SKIP)('tmux session launch', () => {
   afterEach(async () => {

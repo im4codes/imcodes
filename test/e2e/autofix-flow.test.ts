@@ -8,8 +8,9 @@ import { newSession, killSession, sessionExists, capturePane } from '../../src/a
 import { tmpdir } from 'os';
 
 const SKIP = process.env.SKIP_TMUX_TESTS === '1';
-const CODER_SESSION = 'e2e_autofix_coder';
-const AUDITOR_SESSION = 'e2e_autofix_auditor';
+const RUN_ID = Math.random().toString(36).slice(2, 8);
+const CODER_SESSION = `e2e_autofix_coder_${RUN_ID}`;
+const AUDITOR_SESSION = `e2e_autofix_auditor_${RUN_ID}`;
 const FIXTURES = new URL('../fixtures', import.meta.url).pathname;
 
 /** Minimal mock tracker that satisfies the IssueTracker interface */
