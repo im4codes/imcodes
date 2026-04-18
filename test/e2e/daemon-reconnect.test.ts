@@ -39,7 +39,7 @@ const FIXTURES = new URL('../fixtures', import.meta.url).pathname;
 
 // Unique prefix per run to avoid collisions with other tests
 const RUN_ID = Math.random().toString(36).slice(2, 8);
-const PREFIX = `deck_restorecheck${RUN_ID}`;
+const PREFIX = `deck_storecheck${RUN_ID}`;
 
 function sessionName(role: string): string {
   return `${PREFIX}_${role}`;
@@ -48,7 +48,7 @@ function sessionName(role: string): string {
 function makeRecord(role: string, overrides: Partial<import('../../src/store/session-store.js').SessionRecord> = {}): import('../../src/store/session-store.js').SessionRecord {
   return {
     name: sessionName(role),
-    projectName: `restorecheck${RUN_ID}`,
+    projectName: `storecheck${RUN_ID}`,
     role: role as 'brain' | `w${number}`,
     agentType: 'shell',
     projectDir: tmpdir(),
