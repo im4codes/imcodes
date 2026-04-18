@@ -40,12 +40,19 @@ export function isTemplatePrompt(text: string | null | undefined): boolean {
   const trimmed = text.trim();
   if (trimmed.length === 0) return false;
 
-  // OpenSpec change references — any `@openspec/changes/<slug>` or bare
-  // `openspec/changes/<slug>` path is a strong marker. The workflow skills
-  // (propose/apply/archive/explore) all emit these references.
-  if (/(^|[\s@/`"'])openspec\/changes\/[a-z0-9][\w./-]*/i.test(trimmed)) {
-    return true;
-  }
+  // NOTE: We deliberately do NOT flag `openspec/changes/<slug>` or
+  // `@openspec/changes/<slug>` path references as template prompts on their
+  // own. Users reference these paths naturally while debugging/discussing
+  // their own specs — those prompts need memory recall just like any other.
+  //
+  // Genuine skill invocations always emit one of the signals below:
+  //   - `<command-name>` / `<command-args>` / `<command-message>` XML tags
+  //     (the harness injects these for every dispatched slash command)
+  //   - A multilingual workflow imperative phrase ("Drive the implementation
+  //     of", "按完整 OpenSpec 工作流", etc.)
+  //   - A leading slash-command token (`/loop`, `/schedule`, etc.)
+  //   - A plugin-namespaced skill prefix (`opsx:apply`, `claude-mem:do`, etc.)
+  // These are the only reliable signals; a bare path mention is not one.
 
   // Harness-injected command invocation tags (Claude Code slash commands
   // render as `<command-name>foo</command-name>` in the transcript).
@@ -98,8 +105,9 @@ export function isTemplateOriginSummary(summary: string | null | undefined): boo
   const trimmed = summary.trim();
   if (trimmed.length === 0) return false;
 
-  // The OpenSpec change path is the most common and highest-signal leak.
-  if (/openspec\/changes\//i.test(trimmed)) return true;
+  // Mirror isTemplatePrompt's relaxation: bare or @-prefixed openspec path
+  // mentions in a summary are NOT enough to classify it as template-origin.
+  // Only workflow phrases, command tags, or namespaced skill prefixes do.
 
   // Reuse the multilingual workflow anchors so legacy summaries written
   // before ingestion-side filtering existed are also filtered at recall.

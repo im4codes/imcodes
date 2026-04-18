@@ -226,7 +226,10 @@ describe('memory recall endpoint — I.5', () => {
     const { db, executeLog } = makeMockDb({
       personalRows: [
         { id: 'ok-1', project_id: 'proj-a', projection_class: 'recent_summary', summary: '## Problem → Resolution: fixed retry', updated_at: now, score: 0.9 },
-        { id: 'bad-1', project_id: 'proj-a', projection_class: 'recent_summary', summary: 'User orchestrated openspec/changes/feature-x via subagents.', updated_at: now, score: 0.85 },
+        // Use a workflow phrase (not a bare path) since bare openspec/changes
+        // mentions are now allowed in summaries — they're legitimate debugging
+        // references, not template-origin leakage.
+        { id: 'bad-1', project_id: 'proj-a', projection_class: 'recent_summary', summary: 'Archived the completed change after orchestration.', updated_at: now, score: 0.85 },
       ],
       enterpriseRows: [
         { id: 'bad-2', project_id: 'proj-b', projection_class: 'recent_summary', summary: 'Drive the implementation of change Y.', updated_at: now, score: 0.8, enterprise_id: 'ent-1' },

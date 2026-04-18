@@ -88,12 +88,25 @@ async function readCodexRateLimitsViaAppServer(): Promise<RateLimitSnapshot | un
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
-      child.kill();
+      try { child.kill(); } catch { /* ignore */ }
       resolve(value);
     };
 
     const timeout = setTimeout(() => finish(undefined), APP_SERVER_TIMEOUT_MS);
 
+    // Safely write to child stdin — swallow EPIPE/ECONNRESET when the
+    // codex subprocess exits before we finish sending the init sequence.
+    const safeWriteStdin = (payload: string) => {
+      try {
+        child.stdin.write(payload);
+      } catch {
+        finish(undefined);
+      }
+    };
+
+    // Explicitly handle stdin errors so write-after-close doesn't become
+    // an uncaught 'error' event bubbling up to the daemon.
+    child.stdin.on('error', () => finish(undefined));
     child.on('error', () => finish(undefined));
     child.stdout.on('data', (chunk) => {
       stdoutBuffer += chunk.toString('utf8');
@@ -107,8 +120,8 @@ async function readCodexRateLimitsViaAppServer(): Promise<RateLimitSnapshot | un
           const msg = JSON.parse(line) as Record<string, any>;
           if (msg.id === 1 && msg.result && !initialized) {
             initialized = true;
-            child.stdin.write(JSON.stringify({ method: 'initialized' }) + '\n');
-            child.stdin.write(JSON.stringify({ method: 'account/rateLimits/read', id: requestId }) + '\n');
+            safeWriteStdin(JSON.stringify({ method: 'initialized' }) + '\n');
+            safeWriteStdin(JSON.stringify({ method: 'account/rateLimits/read', id: requestId }) + '\n');
             continue;
           }
           if (msg.id === requestId && msg.result?.rateLimits) {
@@ -125,7 +138,7 @@ async function readCodexRateLimitsViaAppServer(): Promise<RateLimitSnapshot | un
       if (!settled) finish(undefined);
     });
 
-    child.stdin.write(JSON.stringify({
+    safeWriteStdin(JSON.stringify({
       method: 'initialize',
       id: 1,
       params: {

@@ -6,19 +6,40 @@ import {
 } from '../../shared/template-prompt-patterns.js';
 
 describe('isTemplatePrompt', () => {
-  // ── OpenSpec references ──────────────────────────────────────────────
-  it('flags @openspec/changes/<slug> references', () => {
-    expect(isTemplatePrompt('Drive @openspec/changes/my-feature to completion')).toBe(true);
+  // ── OpenSpec path references in prose ────────────────────────────────
+  // Bare AND @-prefixed openspec/changes/... references are NOT enough to
+  // flag a prompt as template. Users reference their own specs naturally
+  // while debugging. Only workflow phrases + command tags + slash commands
+  // + namespaced skills trigger the filter. Tests below guard against
+  // regressions into over-aggressive path matching.
+
+  it('does NOT flag bare openspec/changes/<slug> mentions', () => {
+    expect(isTemplatePrompt('openspec/changes/shared-agent-context has a bug in the spec')).toBe(false);
   });
 
-  it('flags bare openspec/changes/<slug> paths', () => {
-    expect(isTemplatePrompt('See openspec/changes/shared-agent-context/proposal.md')).toBe(true);
-  });
-
-  it('flags openspec/changes references embedded in longer text', () => {
+  it('does NOT flag @openspec/changes/<slug> mentions (user debugging style)', () => {
+    // Real user pattern: reference a spec with @, then ask a real question.
     expect(
-      isTemplatePrompt(`Please drive the implementation of openspec/changes/x.
-Many sub-tasks ahead.`),
+      isTemplatePrompt('@openspec/changes/chatview-unified-file-change-diff 我也会这样发消息, 这样也会过滤吗!?'),
+    ).toBe(false);
+  });
+
+  it('does NOT flag inline mentions of openspec paths in debugging prose', () => {
+    expect(
+      isTemplatePrompt(
+        'openspec/changes/cursor-copilot-transport-providers — copilot and cursor SDKs still show "Terminal stream unavailable". Can you investigate?',
+      ),
+    ).toBe(false);
+  });
+
+  it('does NOT flag inline "see openspec/changes/..." references in prose', () => {
+    expect(isTemplatePrompt('See openspec/changes/shared-agent-context/proposal.md for details, any issues with rollout?')).toBe(false);
+  });
+
+  it('still flags openspec references when combined with a workflow verb', () => {
+    // The workflow-phrase marker catches this, not any path regex
+    expect(
+      isTemplatePrompt('Drive the implementation of @openspec/changes/x aggressively.'),
     ).toBe(true);
   });
 
@@ -343,10 +364,18 @@ Many sub-tasks ahead.`),
 });
 
 describe('isTemplateOriginSummary', () => {
-  it('flags summaries that reference openspec/changes/', () => {
+  it('does NOT flag summaries that mention openspec paths in prose', () => {
+    // Real debugging summaries may legitimately reference spec paths while
+    // discussing unrelated code/bugs — they should still be recallable.
+    // Both bare and @-prefixed mentions are treated as debugging references.
     expect(
-      isTemplateOriginSummary('User orchestrated openspec/changes/feature-x via subagents.'),
-    ).toBe(true);
+      isTemplateOriginSummary(
+        '## Project\n- User problem: copilot SDK fails with "Terminal stream unavailable"\n- Resolution: referenced openspec/changes/cursor-copilot-transport-providers during debugging; fixed by restarting pane.',
+      ),
+    ).toBe(false);
+    expect(
+      isTemplateOriginSummary('User debugging @openspec/changes/feature-x behavior with a question.'),
+    ).toBe(false);
   });
 
   it('flags summaries with "Drive the implementation of"', () => {

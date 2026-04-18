@@ -445,7 +445,8 @@ describe('handleWebCommand memory context timeline', () => {
     handleWebCommand({
       type: 'session.send',
       session: 'deck_process_brain',
-      text: 'Implement @openspec/changes/shared-agent-context and continue the template workflow',
+      // Workflow phrase triggers the skip; bare @openspec/changes refs alone would not.
+      text: 'Drive the implementation of @openspec/changes/shared-agent-context aggressively.',
       commandId: 'cmd-memory-template',
     }, serverLink as any);
 

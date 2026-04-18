@@ -642,7 +642,10 @@ describe('TransportSessionRuntime', () => {
     await r.initialize(defaultConfig);
     timelineEmitterEmitMock.mockClear();
 
-    r.send('Implement @openspec/changes/shared-agent-context and continue the template workflow', 'client-turn-template');
+    // Use a real template-prompt marker (workflow phrase). Bare
+    // @openspec/changes/... references by themselves are now allowed —
+    // they're common in user debugging prompts and must still trigger recall.
+    r.send('Drive the implementation of @openspec/changes/shared-agent-context aggressively.', 'client-turn-template');
     await flushDispatch();
 
     expect(searchLocalMemorySemanticMock).not.toHaveBeenCalled();

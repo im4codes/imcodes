@@ -132,10 +132,21 @@ export class ServerLink {
 
   send(msg: unknown): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      throw new Error('ServerLink: not connected');
+      // Best-effort: silently drop messages when the link isn't up. Throwing
+      // here would become an unhandled rejection in any fire-and-forget
+      // caller (handleP2pConfigSave, repo-handler, command-handler, etc.)
+      // since the daemon must never die from transient disconnects.
+      // Callers that need delivery confirmation should check isConnected()
+      // or await a response event before acting on `send()`.
+      return;
     }
     this.seq++;
     this.ws.send(JSON.stringify({ ...((msg as object) ?? {}), seq: this.seq }));
+  }
+
+  /** Reports whether the underlying WebSocket is currently OPEN. */
+  isConnected(): boolean {
+    return !!this.ws && this.ws.readyState === WebSocket.OPEN;
   }
 
   /** Send a binary WebSocket frame (raw PTY data). Best-effort: no throw on disconnect. */
