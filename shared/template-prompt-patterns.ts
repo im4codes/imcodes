@@ -281,30 +281,44 @@ export function listKnownSlashCommands(): readonly string[] {
  * and produces misleading "related past work" hits.
  *
  * A message qualifies as imperative-command when ALL of:
- *   - single line (ignoring trailing whitespace)
- *   - at most IMPERATIVE_MAX_TOKENS whitespace/punctuation-separated tokens
- *   - contains at least one token from IMPERATIVE_VERBS, case-insensitive,
- *     with the token matched whole (word boundaries)
- *   - contains no non-ASCII letters (CJK/accented → treat as natural prose)
+ *   - single line, ASCII-only, ≤ IMPERATIVE_MAX_TOKENS tokens
+ *   - EVERY non-connector token is either a known IMPERATIVE_VERBS entry
+ *     or a `verb&verb` / `verb+verb` / `verb/verb` compound of known verbs
+ *   - at least one such verb token is present
  *
- * This is deliberately narrow: a sentence like "I just committed and pushed,
- * anything else broken?" has 8 tokens and CJK? actually English — but 8
- * tokens > IMPERATIVE_MAX_TOKENS so it stays eligible for recall. That's
- * the intended behavior — only terse command-style input should skip.
+ * The "every token must match" rule is critical. The older "any token is a
+ * verb" rule misfired on prose like "retry behavior" or "fix garbled
+ * download filename" — both legitimate semantic queries that got their
+ * recall killed just because one of their words happened to be a verb.
+ *
+ * IMPERATIVE_VERBS is kept narrow on purpose: it only contains unambiguous
+ * ops control words. Words that are ALSO common nouns or prose verbs
+ * (test, run, update, fix, review, apply, build, release, save, write, …)
+ * are deliberately EXCLUDED so queries like "memory test" or "release
+ * notes" still get recall. The remaining verbs are things users only type
+ * as commands: commit, push, merge, deploy, redeploy, rollback, restart,
+ * proceed, continue, cancel, abort, yes/no/ok, commit&push, …
  */
 const IMPERATIVE_VERBS: ReadonlySet<string> = new Set([
+  // Git / source-control ops
   'commit', 'push', 'pull', 'merge', 'rebase', 'cherry-pick', 'revert',
-  'deploy', 'redeploy', 'rollback', 'restart', 'reload', 'reboot', 'retry',
-  'run', 'build', 'rebuild', 'compile', 'test', 'lint', 'format', 'typecheck',
-  'install', 'uninstall', 'upgrade', 'downgrade', 'update',
-  'fix', 'apply', 'archive', 'propose', 'implement', 'continue', 'proceed',
-  'go', 'stop', 'pause', 'resume', 'cancel', 'abort', 'skip', 'next', 'done',
+  // Deploy / lifecycle ops (ambiguous "release" / "publish" excluded)
+  'deploy', 'redeploy', 'rollback', 'restart', 'reload', 'reboot',
+  // Control verbs (not noun-like)
+  'proceed', 'continue', 'stop', 'pause', 'resume', 'cancel', 'abort', 'skip', 'next',
+  'go', 'done',
+  // Ack / reject shorts
   'ok', 'okay', 'yes', 'no', 'yep', 'nope', 'sure', 'confirm', 'approve', 'reject',
-  'ship', 'release', 'publish', 'tag', 'bump',
-  'save', 'write', 'commit&push',
+  // Explicit compound token (kept for completeness — decomposition also handles it)
+  'commit&push',
 ]);
 
-const IMPERATIVE_MAX_TOKENS = 5;
+/** Glue words that are allowed between verbs without disqualifying the match. */
+const IMPERATIVE_CONNECTORS: ReadonlySet<string> = new Set([
+  'and', 'then', 'or', 'also', 'please', 'now',
+]);
+
+const IMPERATIVE_MAX_TOKENS = 4;
 
 export function isImperativeCommand(text: string | null | undefined): boolean {
   if (!text || typeof text !== 'string') return false;
@@ -316,27 +330,38 @@ export function isImperativeCommand(text: string | null | undefined): boolean {
 
   // Non-ASCII letters (CJK, accented Latin, Cyrillic, etc.) indicate natural
   // prose in another language. Bail early so e.g. "请继续提交" isn't skipped
-  // here (it'd be a real user request).
-  // Allow symbols (&, /, -, _) but reject any character in the "letter" range
-  // outside ASCII a-z/A-Z.
+  // here — it'd be a real user request.
   if (/[^\x00-\x7F]/.test(trimmed)) return false;
 
-  // Tokenize on whitespace. Treat compound tokens like "commit&push" as one
-  // token — the ampersand/slash/hyphen is part of the verb identity.
+  // Tokenize on whitespace. Compound punctuation inside a token (&, +, /)
+  // stays attached so "commit&push" is ONE token with multiple verbs.
   const tokens = trimmed.split(/\s+/).filter((t) => t.length > 0);
   if (tokens.length === 0 || tokens.length > IMPERATIVE_MAX_TOKENS) return false;
 
-  // At least one token must match a known imperative verb. We compare the
-  // lowercased token stripped of trailing punctuation (commit&push!) but keep
-  // internal symbols intact (commit&push stays as one token).
+  let sawVerb = false;
   for (const raw of tokens) {
-    const cleaned = raw.toLowerCase().replace(/^[^a-z0-9&/_-]+|[^a-z0-9&/_-]+$/g, '');
+    // Strip surrounding punctuation ("commit!", "ok.", "yes,") but KEEP
+    // internal & / + - so compound verb tokens survive.
+    const cleaned = raw.toLowerCase().replace(/^[^a-z0-9&/+_-]+|[^a-z0-9&/+_-]+$/g, '');
     if (cleaned.length === 0) continue;
-    if (IMPERATIVE_VERBS.has(cleaned)) return true;
-    // Also match compound "verb&verb" or "verb+verb" where BOTH halves are
-    // known verbs — catches typing variants like "commit+push" or "build/test".
+
+    if (IMPERATIVE_CONNECTORS.has(cleaned)) continue;
+
+    if (IMPERATIVE_VERBS.has(cleaned)) {
+      sawVerb = true;
+      continue;
+    }
+
+    // Compound: `commit&push`, `build/test`, `commit+push` — every part must
+    // be a known verb for the compound to qualify.
     const parts = cleaned.split(/[&+/]/).filter((p) => p.length > 0);
-    if (parts.length >= 2 && parts.every((p) => IMPERATIVE_VERBS.has(p))) return true;
+    if (parts.length >= 2 && parts.every((p) => IMPERATIVE_VERBS.has(p))) {
+      sawVerb = true;
+      continue;
+    }
+
+    // Any other token → this is natural-language prose, not an imperative.
+    return false;
   }
-  return false;
+  return sawVerb;
 }

@@ -430,22 +430,27 @@ describe('isImperativeCommand', () => {
 
   it('flags compound slash/ampersand/plus verb pairs', () => {
     expect(isImperativeCommand('commit+push')).toBe(true);
-    expect(isImperativeCommand('build/test')).toBe(true);
-    expect(isImperativeCommand('lint&format')).toBe(true);
+    expect(isImperativeCommand('commit&push&deploy')).toBe(true);
+    expect(isImperativeCommand('push/restart')).toBe(true);
   });
 
-  it('flags single-verb imperatives', () => {
+  it('flags single-verb imperatives that are unambiguous ops verbs', () => {
     expect(isImperativeCommand('commit')).toBe(true);
     expect(isImperativeCommand('deploy')).toBe(true);
     expect(isImperativeCommand('redeploy')).toBe(true);
     expect(isImperativeCommand('continue')).toBe(true);
     expect(isImperativeCommand('proceed')).toBe(true);
     expect(isImperativeCommand('restart')).toBe(true);
+    expect(isImperativeCommand('ok')).toBe(true);
+    expect(isImperativeCommand('yes')).toBe(true);
   });
 
-  it('flags short multi-token imperatives up to MAX_TOKENS', () => {
+  it('flags short multi-token imperatives up to MAX_TOKENS when every non-connector token is a verb', () => {
     expect(isImperativeCommand('ok continue')).toBe(true);
-    expect(isImperativeCommand('please commit and push')).toBe(true); // 4 tokens, contains "commit"
+    expect(isImperativeCommand('yes proceed')).toBe(true);
+    expect(isImperativeCommand('please commit')).toBe(true);
+    expect(isImperativeCommand('commit and push')).toBe(true);
+    expect(isImperativeCommand('commit then push')).toBe(true);
   });
 
   it('trims trailing punctuation from tokens', () => {
@@ -454,10 +459,39 @@ describe('isImperativeCommand', () => {
     expect(isImperativeCommand('yes, proceed.')).toBe(true);
   });
 
-  it('does NOT flag natural-language questions that happen to contain verbs', () => {
+  // ── The critical regression: natural-language queries that CONTAIN a
+  //    verb token must NOT be classified as imperative commands. These were
+  //    getting skipped because the old "any token is a verb" rule matched
+  //    the lone verb even in prose.
+  it('does NOT flag natural-language queries with a verb + noun', () => {
+    expect(isImperativeCommand('retry behavior')).toBe(false);
+    expect(isImperativeCommand('memory test')).toBe(false);
+    expect(isImperativeCommand('commit hash')).toBe(false);
+    expect(isImperativeCommand('push notification')).toBe(false);
+    expect(isImperativeCommand('deploy script')).toBe(false);
+    expect(isImperativeCommand('restart loop')).toBe(false);
+  });
+
+  it('does NOT flag the generic placeholder query "test"', () => {
+    // `test` is too ambiguous (noun vs verb) to treat as a control command.
+    // The server test suite uses it as a generic probe query — we must not
+    // skip recall on it.
+    expect(isImperativeCommand('test')).toBe(false);
+    expect(isImperativeCommand('test harness')).toBe(false);
+    expect(isImperativeCommand('run the tests')).toBe(false);
+  });
+
+  it('does NOT flag natural prose whose first word happens to be a verb', () => {
+    expect(isImperativeCommand('fix garbled download filename')).toBe(false);
+    expect(isImperativeCommand('update the docs')).toBe(false);
+    expect(isImperativeCommand('review pending PRs')).toBe(false);
+    expect(isImperativeCommand('build failures on Windows')).toBe(false);
+  });
+
+  it('does NOT flag longer prose messages', () => {
     expect(
       isImperativeCommand('I just committed and pushed, anything else broken in the release pipeline?'),
-    ).toBe(false); // >5 tokens
+    ).toBe(false); // > MAX_TOKENS
     expect(
       isImperativeCommand('Should I commit this or wait for review?'),
     ).toBe(false);
@@ -479,6 +513,8 @@ describe('isImperativeCommand', () => {
     expect(isImperativeCommand('hello world')).toBe(false);
     expect(isImperativeCommand('what is this')).toBe(false);
     expect(isImperativeCommand('foo bar baz')).toBe(false);
+    expect(isImperativeCommand('websocket bug')).toBe(false);
+    expect(isImperativeCommand('nonexistent topic')).toBe(false);
   });
 
   it('handles empty / null / undefined without throwing', () => {
