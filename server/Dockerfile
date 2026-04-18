@@ -45,14 +45,26 @@ RUN mkdir -p /app/updates \
 RUN cd server && npm run build
 
 # ── Stage 1.5: Stable embedding-model cache ──────────────────────────────────
+# The 73MB @huggingface/transformers model layer used to invalidate on every
+# unrelated server dep bump because this stage COPY'd server/package.json +
+# package-lock.json wholesale. Keep the preload inputs minimal so the cache
+# only busts when something that actually affects the model download changes:
+#   • HF_TRANSFORMERS_VERSION (pinned here in lock-step with server/package.json)
+#   • server/scripts/preload-embedding-model.mjs
+#   • shared/embedding-config.ts (model name / dtype)
 FROM public.ecr.aws/docker/library/node:24-bookworm-slim AS embedding-model
 
 WORKDIR /app
 
 ENV IMCODES_EMBEDDING_CACHE_DIR=/app/embedding-cache
 
-COPY server/package.json server/package-lock.json* ./
-RUN npm ci --omit=dev --ignore-scripts
+# Pinned explicitly (NOT via ^4.1.0) so `npm install` can't silently resolve
+# to a later patch and invalidate this layer. Bump this in tandem with the
+# version in server/package.json whenever transformers upgrades.
+ARG HF_TRANSFORMERS_VERSION=4.1.0
+RUN npm init -y >/dev/null \
+ && npm install --omit=dev --ignore-scripts --no-audit --no-fund \
+      "@huggingface/transformers@${HF_TRANSFORMERS_VERSION}"
 
 COPY server/scripts/preload-embedding-model.mjs ./scripts/preload-embedding-model.mjs
 COPY shared/embedding-config.ts ./shared/embedding-config.ts
