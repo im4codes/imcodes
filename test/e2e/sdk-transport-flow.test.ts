@@ -231,6 +231,15 @@ vi.mock('../../src/context/embedding.js', () => ({
     if (!magA || !magB) return 0;
     return dot / (magA * magB);
   }),
+  // Persistent BLOB store helpers. Destructured eagerly at the top of
+  // searchLocalMemorySemantic's try block, so missing these causes vitest's
+  // strict mock to throw through the whole recall and drop back to plain
+  // text search — which for this test's namespace-scoped query matches
+  // nothing and hides the intended memory card. The encoded/decoded shape
+  // is a pass-through because the recall path only persists after the
+  // slow-path embedding is computed; the tests don't inspect BLOB bytes.
+  encodeEmbedding: (vec: unknown) => Buffer.from(JSON.stringify(vec), 'utf8'),
+  decodeEmbedding: (_buf: Buffer | null) => null,
 }));
 
 vi.mock('../../src/agent/agent-version.js', () => ({
