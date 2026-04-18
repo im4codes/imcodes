@@ -500,6 +500,47 @@ describe('sub-session runtime type inference', () => {
     expect(captured[0].runtimeType).toBe('transport');
   });
 
+
+  it('auto-generates short sdk labels when no label is provided', async () => {
+    const { ws } = createMockWs();
+    vi.mocked(createSubSession).mockResolvedValueOnce({
+      id: 'ccsdk-created-api',
+      sessionName: 'deck_sub_ccsdk-created-api',
+      subSession: {
+        id: 'ccsdk-created-api',
+        serverId: 'srv1',
+        type: 'claude-code-sdk',
+        runtimeType: 'transport',
+        providerId: 'claude-code-sdk',
+        providerSessionId: null,
+        cwd: '/tmp/project',
+        label: 'CC1',
+        closedAt: null,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        ccSessionId: null,
+        geminiSessionId: null,
+        parentSession: null,
+        description: null,
+        ccPresetId: null,
+        requestedModel: null,
+        activeModel: null,
+        modelDisplay: null,
+        effort: null,
+        transportConfig: null,
+      },
+    } as any);
+
+    render(<CreateHarness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    await createSubSessionHook?.('claude-code-sdk', undefined, '/tmp/project');
+    expect(createSubSession).toHaveBeenCalledWith('srv1', expect.objectContaining({
+      type: 'claude-code-sdk',
+      label: 'CC1',
+    }));
+  });
+
   it('keeps newly created copilot-sdk sub-sessions in transport mode before daemon sync arrives', async () => {
     const { ws } = createMockWs();
     vi.mocked(createSubSession).mockResolvedValueOnce({

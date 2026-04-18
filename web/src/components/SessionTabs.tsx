@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import type { SessionInfo } from '../types.js';
 import { useSyncedPreference } from '../hooks/useSyncedPreference.js';
 import { formatLabel } from '../format-label.js';
+import { getAgentBadgeConfig } from '../agent-display.js';
 
 interface Props {
   sessions: SessionInfo[];
@@ -28,14 +29,6 @@ interface Props {
 }
 
 interface CtxMenu { x: number; y: number; session: SessionInfo }
-
-const AGENT_BADGE: Record<string, { label: string; color: string }> = {
-  'claude-code': { label: 'cc', color: '#7c3aed' },
-  'codex':       { label: 'cx', color: '#d97706' },
-  'opencode':    { label: 'oc', color: '#059669' },
-  'openclaw':    { label: 'oc', color: '#f97316' },
-  'qwen':        { label: 'qw', color: '#0f766e' },
-};
 
 /** Legacy localStorage keys — read once on first load for migration. */
 const LEGACY_LS_ORDER = 'rcc_tab_order';
@@ -137,9 +130,9 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
   };
 
   const agentBadge = (agentType: string) => {
-    const b = AGENT_BADGE[agentType];
-    if (!b) return null;
-    return <span class="agent-badge" style={{ background: b.color }}>{b.label}</span>;
+    const badge = getAgentBadgeConfig(agentType);
+    if (!badge) return null;
+    return <span class="agent-badge" style={{ background: badge.color }}>{badge.label}</span>;
   };
 
   const openCtx = (e: MouseEvent, session: SessionInfo) => {

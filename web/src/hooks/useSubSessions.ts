@@ -21,6 +21,7 @@ import {
   normalizeTransportPendingEntries,
 } from '../transport-queue.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
+import { getAutoSessionLabelPrefix } from '../agent-display.js';
 
 export interface SubSession extends SubSessionData {
   sessionName: string;
@@ -390,7 +391,7 @@ export function useSubSessions(
       let effectiveLabel = label;
       if (!effectiveLabel) {
         const siblings = subSessions.filter((s) => s.parentSession === activeSession);
-        const prefix = type === 'claude-code' ? 'CC' : type === 'codex' ? 'Cx' : type === 'gemini' ? 'Gm' : type === 'qwen' ? 'Qw' : type === 'openclaw' ? 'OC' : type;
+        const prefix = getAutoSessionLabelPrefix(type);
         let n = siblings.filter((s) => s.type === type).length + 1;
         effectiveLabel = `${prefix}${n}`;
         while (siblings.some((s) => s.label === effectiveLabel)) { n++; effectiveLabel = `${prefix}${n}`; }

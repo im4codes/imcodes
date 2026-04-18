@@ -20,32 +20,9 @@ import type { SessionInfo } from '../types.js';
 import { isTransportRuntime } from '../runtime-type.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
 import { formatLabel } from '../format-label.js';
+import { getAgentBadgeConfig } from '../agent-display.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
 import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
-
-// ── Agent badge config (matches SessionTabs.tsx AGENT_BADGE) ─────────────────
-const AGENT_BADGE: Record<string, { label: string; color: string }> = {
-  'claude-code': { label: 'cc', color: '#7c3aed' },
-  'codex':       { label: 'cx', color: '#d97706' },
-  'opencode':    { label: 'oc', color: '#059669' },
-  'openclaw':    { label: 'oc', color: '#f97316' },
-  'qwen':        { label: 'qw', color: '#0f766e' },
-  'gemini':      { label: 'gm', color: '#1d4ed8' },
-  'shell':       { label: 'sh', color: '#475569' },
-  'script':      { label: 'sc', color: '#64748b' },
-};
-
-// ── Sub-session type icons ────────────────────────────────────────────────────
-const SUB_TYPE_BADGE: Record<string, { label: string; color: string }> = {
-  'claude-code': { label: 'cc', color: '#7c3aed' },
-  'codex':       { label: 'cx', color: '#d97706' },
-  'opencode':    { label: 'oc', color: '#059669' },
-  'openclaw':    { label: 'oc', color: '#f97316' },
-  'qwen':        { label: 'qw', color: '#0f766e' },
-  'gemini':      { label: 'gm', color: '#1d4ed8' },
-  'shell':       { label: 'sh', color: '#475569' },
-  'script':      { label: 'sc', color: '#64748b' },
-};
 
 interface Props {
   sessions: SessionInfo[];
@@ -117,9 +94,7 @@ function SessionNode({
 }: NodeProps) {
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
-  const badge = isSub
-    ? (SUB_TYPE_BADGE[agentType] ?? null)
-    : (AGENT_BADGE[agentType] ?? null);
+  const badge = getAgentBadgeConfig(agentType);
 
   const classes = [
     'session-tree-node',
