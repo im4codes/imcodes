@@ -49,6 +49,8 @@
     "tool_detail_output": "출력",
     "tool_detail_meta": "메타",
     "tool_detail_raw": "원본",
+    "pinned_last_sent_label": "마지막 전송",
+    "pinned_last_sent_aria": "마지막으로 보낸 메시지로 이동",
     "memory_context_title": "관련 기록",
     "memory_context_startup_title": "히스토리 컨텍스트 · 주입됨",
     "memory_context_summary": "{{count}}개 회수",

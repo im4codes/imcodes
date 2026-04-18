@@ -49,6 +49,8 @@
     "tool_detail_output": "output",
     "tool_detail_meta": "meta",
     "tool_detail_raw": "raw",
+    "pinned_last_sent_label": "Last sent",
+    "pinned_last_sent_aria": "Jump to your last sent message",
     "memory_context_title": "Related history",
     "memory_context_startup_title": "Historical context · injected",
     "memory_context_summary": "{{count}} recalled",

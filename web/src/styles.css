@@ -669,6 +669,15 @@ body {
 .chat-view-wrap { flex: 1; position: relative; overflow: hidden; display: flex; flex-direction: column; }
 .chat-split { flex-direction: row !important; }
 .chat-main { flex: 1; min-width: 0; position: relative; display: flex; flex-direction: column; overflow: hidden; }
+/* Pinned "Last sent" banner — appears only when the original user bubble has
+   scrolled off the top of the chat viewport. Sits above the scroll area so it
+   doesn't bob with the user's scroll position, only its visibility changes. */
+.chat-pinned-last-sent { display: flex; flex-direction: column; gap: 2px; margin: 6px 10px 0; padding: 6px 10px; background: linear-gradient(180deg, rgba(30, 58, 95, 0.85), rgba(30, 58, 95, 0.7)); border: 1px solid rgba(59, 130, 246, 0.35); border-left: 3px solid #3b82f6; border-radius: 6px; cursor: pointer; user-select: none; color: #dbeafe; font-size: 12px; line-height: 1.4; transition: background 0.15s; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25); }
+.chat-pinned-last-sent:hover { background: linear-gradient(180deg, rgba(30, 58, 95, 1), rgba(30, 58, 95, 0.9)); }
+.chat-pinned-last-sent:focus-visible { outline: 2px solid #3b82f6; outline-offset: 1px; }
+.chat-pinned-last-sent-label { font-size: 10px; font-weight: 600; color: #93c5fd; letter-spacing: 0.05em; text-transform: uppercase; }
+.chat-pinned-last-sent-text { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; line-clamp: 2; overflow: hidden; text-overflow: ellipsis; word-break: break-word; white-space: pre-wrap; }
+.chat-pinned-last-sent.chat-pinned-expanded .chat-pinned-last-sent-text { display: block; -webkit-line-clamp: unset; line-clamp: unset; max-height: 40vh; overflow-y: auto; }
 .chat-view { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 8px 12px; display: flex; flex-direction: column; gap: 2px; scrollbar-width: thin; scrollbar-color: #6366f1 #1e293b; }
 .chat-view-preview { justify-content: flex-end; }
 .chat-view::-webkit-scrollbar { width: 5px; }

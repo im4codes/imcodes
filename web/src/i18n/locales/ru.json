@@ -49,6 +49,8 @@
     "tool_detail_output": "вывод",
     "tool_detail_meta": "мета",
     "tool_detail_raw": "raw",
+    "pinned_last_sent_label": "Последнее отправленное",
+    "pinned_last_sent_aria": "Перейти к последнему отправленному сообщению",
     "memory_context_title": "Связанная история",
     "memory_context_startup_title": "Исторический контекст · внедрён",
     "memory_context_summary": "{{count}} найдено",

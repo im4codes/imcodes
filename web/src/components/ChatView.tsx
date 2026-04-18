@@ -487,6 +487,19 @@ function readPanelOpen(id: string | null | undefined): boolean {
   try { return localStorage.getItem(panelOpenKey(id)) === '1'; } catch { return false; }
 }
 
+/** Find a chat event element by its eventId without relying on CSS.escape —
+ *  our eventIds contain `:` and `-` chars that are illegal in CSS selectors,
+ *  and `CSS.escape` isn't polyfilled in jsdom so `querySelector` blows up in
+ *  tests. A direct DOM walk with `dataset.eventId` comparison is trivially
+ *  fast for the few dozen elements involved. */
+function findEventElement(root: ParentNode, eventId: string): HTMLElement | null {
+  const candidates = root.querySelectorAll('[data-event-id]');
+  for (const el of Array.from(candidates)) {
+    if ((el as HTMLElement).dataset.eventId === eventId) return el as HTMLElement;
+  }
+  return null;
+}
+
 export function ChatView({ events, loading, refreshing: _refreshing, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir, serverId, onQuote, agentType: _agentType, onResendFailed }: Props) {
   const { t } = useTranslation();
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -506,6 +519,31 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
   const [showScrollBtn, setShowScrollBtn] = useState(false);
   const lastScrollTopRef = useRef(0);
   const suppressLoadOlderUntilRef = useRef(0);
+
+  // ── Pinned last-sent user message (appears only when scrolled off top) ──
+  // When the user scrolls back through a long chat we want them to see what
+  // they last said without hunting for it. But while the real bubble is still
+  // on screen we don't want a redundant banner — so the pin flips on only
+  // when an IntersectionObserver says the bubble has left the viewport by
+  // the TOP edge (i.e. pushed upward by new content), and flips off as soon
+  // as the bubble comes back into view.
+  const [pinnedAboveViewport, setPinnedAboveViewport] = useState(false);
+  const [pinnedExpanded, setPinnedExpanded] = useState(false);
+  const lastSentUserMessage = useMemo(() => {
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i];
+      if (e.type !== 'user.message') continue;
+      const p = e.payload as Record<string, unknown>;
+      if (p.pending === true || p.failed === true) continue;
+      const text = typeof p.text === 'string' ? p.text : '';
+      if (!text.trim()) continue;
+      return { eventId: e.eventId, text };
+    }
+    return null;
+  }, [events]);
+  // Reset the expand state whenever the pinned target changes so a new
+  // message never inherits the expanded state of an older one.
+  useEffect(() => { setPinnedExpanded(false); }, [lastSentUserMessage?.eventId]);
 
   const suppressLoadOlder = useCallback((durationMs = 1200) => {
     suppressLoadOlderUntilRef.current = Date.now() + durationMs;
@@ -678,6 +716,60 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
   // Keep separate from fn-registration so parent re-renders don't re-trigger.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { scrollToBottom(); }, []);
+
+  // Track whether the last sent user bubble is above/below/inside the
+  // viewport. Only "above" flips the pin on — that's when new assistant
+  // output has pushed the user's last prompt off the top and they'd
+  // otherwise have to scroll up to re-read it. Below / intersecting cases
+  // both leave the pin hidden.
+  useEffect(() => {
+    if (!lastSentUserMessage) {
+      setPinnedAboveViewport(false);
+      return;
+    }
+    const root = scrollRef.current;
+    if (!root) return;
+    // jsdom (unit tests) and a small long tail of old WebKit versions don't
+    // ship IntersectionObserver. Bail before touching it — no pin is better
+    // than a blow-up rendering any chat view at all.
+    if (typeof IntersectionObserver === 'undefined') {
+      setPinnedAboveViewport(false);
+      return;
+    }
+    const target = findEventElement(root, lastSentUserMessage.eventId);
+    if (!target) {
+      // Target not mounted yet (virtualization, pagination) — treat as above
+      // viewport ONLY if the user isn't sitting at the bottom of the scroll
+      // (i.e. they're reading older history). Otherwise keep the pin hidden
+      // so a bubble that never actually rendered doesn't cause a ghost pin.
+      const atBottom = Math.abs(root.scrollHeight - root.clientHeight - root.scrollTop) < 40;
+      setPinnedAboveViewport(!atBottom);
+      return;
+    }
+
+    const observer = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.target !== target) continue;
+        if (entry.isIntersecting) {
+          setPinnedAboveViewport(false);
+          continue;
+        }
+        // Above viewport: the bubble's bottom edge is above the root's top.
+        // Below viewport is the opposite — we leave the pin off in that case
+        // because the user just scrolled up and the real bubble is still
+        // within easy scroll reach, not "lost".
+        const rootBounds = entry.rootBounds;
+        const rect = entry.boundingClientRect;
+        if (rootBounds && rect.bottom <= rootBounds.top) {
+          setPinnedAboveViewport(true);
+        } else {
+          setPinnedAboveViewport(false);
+        }
+      }
+    }, { root, threshold: [0, 1] });
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [lastSentUserMessage?.eventId]);
 
   // Auto-scroll only on visible new events — agent.status / assistant.thinking / usage.update
   // events are filtered from the chat view but still part of `events`, so using the raw last ts
@@ -937,6 +1029,30 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
       )}
       {/* refreshing indicator removed — gap-fill is invisible to the user */}
       <div class="chat-main">
+        {pinnedAboveViewport && lastSentUserMessage && (
+          <div
+            class={`chat-pinned-last-sent${pinnedExpanded ? ' chat-pinned-expanded' : ''}`}
+            role="button"
+            tabIndex={0}
+            aria-label={t('chat.pinned_last_sent_aria', 'Jump to your last sent message')}
+            onClick={() => {
+              // Tap once → toggle 2-line clamp; tap again (while expanded)
+              // behaves like a jump-to-message. Holds the expand state so a
+              // long message can be read without hunting for it.
+              if (!pinnedExpanded) { setPinnedExpanded(true); return; }
+              const root = scrollRef.current;
+              const target = root?.querySelector(
+                `[data-event-id="${CSS.escape(lastSentUserMessage.eventId)}"]`,
+              ) as HTMLElement | null;
+              if (target && root) {
+                target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+              }
+            }}
+          >
+            <span class="chat-pinned-last-sent-label">{t('chat.pinned_last_sent_label', 'Last sent')}</span>
+            <span class="chat-pinned-last-sent-text">{lastSentUserMessage.text}</span>
+          </div>
+        )}
         <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} onScroll={preview ? undefined : handleScroll}
           onContextMenu={!preview && !isTouchDevice ? handleContextMenu : undefined}
           onClick={(highlightEl || ctxMenu) ? () => {
@@ -1359,7 +1475,10 @@ const ChatEvent = memo(function ChatEvent({
       const failureReason = typeof event.payload.failureReason === 'string' ? event.payload.failureReason : undefined;
       const stateClass = isPending ? ' chat-pending' : isFailed ? ' chat-failed' : '';
       return (
-        <div class={`chat-event chat-user${stateClass}`}>
+        // data-event-id lets the pinned-last-message banner target this bubble
+        // with an IntersectionObserver so the banner only shows when the real
+        // bubble has scrolled off the top of the viewport.
+        <div class={`chat-event chat-user${stateClass}`} data-event-id={event.eventId}>
           {attachments && serverId && attachments.map((att) => (
             <AttachmentDownloadButton key={att.id} att={att} serverId={serverId} onPathClick={onPathClick} />
           ))}

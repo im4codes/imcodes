@@ -49,6 +49,8 @@
     "tool_detail_output": "輸出",
     "tool_detail_meta": "中繼資訊",
     "tool_detail_raw": "原始資料",
+    "pinned_last_sent_label": "最近發送",
+    "pinned_last_sent_aria": "跳轉到你最近發送的訊息",
     "memory_context_title": "相關歷史",
     "memory_context_startup_title": "歷史上下文 · 已注入",
     "memory_context_summary": "召回 {{count}} 條",

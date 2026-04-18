@@ -49,6 +49,8 @@
     "tool_detail_output": "输出",
     "tool_detail_meta": "元信息",
     "tool_detail_raw": "原始数据",
+    "pinned_last_sent_label": "最近发送",
+    "pinned_last_sent_aria": "跳转到你最近发送的消息",
     "memory_context_title": "相关历史",
     "memory_context_startup_title": "历史上下文 · 已注入",
     "memory_context_summary": "召回 {{count}} 条",
