@@ -227,11 +227,15 @@ export class TransportSessionRuntime implements SessionRuntime {
 
     if (!alreadyInjected) {
       // Fresh conversation — reset the gate so the next turn will build and
-      // inject startup memory. Also emit the timeline card so the UI shows
-      // what past work is being pulled in.
+      // inject startup memory. The timeline card is emitted later in
+      // `_dispatchTurn` at the same boundary where the provider actually
+      // accepts the startup payload (and `startupMemoryInjected` is
+      // persisted). Emitting it here would leak a new card on every
+      // restart-before-first-message, because the flag never gets persisted
+      // until a turn lands — those duplicate cards then stack forever in
+      // the timeline replay.
       this._startupMemoryTimelineEmitted = false;
       this._startupMemoryInjected = false;
-      this.emitStartupMemoryContext(this._startupMemory);
     }
   }
 
@@ -395,6 +399,12 @@ export class TransportSessionRuntime implements SessionRuntime {
         }
         if (!this._startupMemoryInjected && dispatchResult.payload?.startupMemory) {
           this._startupMemoryInjected = true;
+          // Emit the "Historical context · injected" timeline card at the
+          // same commit boundary as the persisted flag. Doing this here
+          // (instead of eagerly in `initialize`) guarantees restart-before-
+          // first-message never leaks an unbacked card — the card appears
+          // exactly once, for the turn that actually carried the preamble.
+          this.emitStartupMemoryContext(this._startupMemory);
           this._startupMemory = null;
           // Notify session-manager so the flag is persisted to SessionRecord.
           // Invoked synchronously — the callback just schedules an upsert and

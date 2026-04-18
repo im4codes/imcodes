@@ -1212,6 +1212,17 @@ describe('sdk transport flow e2e', () => {
       },
     });
 
+    // The "Historical context · injected" card is now emitted at the same
+    // commit boundary as the persisted `startupMemoryInjected` flag — i.e.
+    // when the first turn actually carries the preamble to the provider.
+    // Launch alone is no longer enough, so send a message to trigger it.
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({
+      type: 'session.send',
+      session: SESSION_CX,
+      text: 'Surface the seeded startup memory through the first turn',
+      commandId: 'cmd-cxsdk-startup',
+    }, serverLink);
     await flushAsync();
     await waitForCondition(() => mocks.emitted.some((event) => event.session === SESSION_CX && event.type === 'memory.context' && event.payload.reason === 'startup'));
 

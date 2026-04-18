@@ -291,6 +291,21 @@ export async function teardownProject(projectName: string): Promise<void> {
 export async function initOnStartup(): Promise<void> {
   await cleanupOrphanFifos();
   await cleanupKnownTestTerminalSessions();
+  // Fire-and-forget: preload the transformers.js feature-extraction pipeline
+  // so the first "Related history" semantic search doesn't pay the cold-load
+  // cost (hundreds of ms to a few seconds). `isEmbeddingAvailable` swallows
+  // errors internally, so a failure here just leaves the first real query to
+  // attempt the load and fall back to plain SQL search.
+  void (async () => {
+    try {
+      const { isEmbeddingAvailable } = await import('../context/embedding.js');
+      const startedAt = Date.now();
+      const ready = await isEmbeddingAvailable();
+      logger.info({ ready, elapsedMs: Date.now() - startedAt }, 'Embedding pipeline warmup');
+    } catch (err) {
+      logger.debug({ err }, 'Embedding pipeline warmup failed (non-fatal)');
+    }
+  })();
 }
 
 /** Extract a UUID from tmux pane start command (supports --session-id and --resume). */
@@ -1328,6 +1343,12 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     opts.transportConfig ?? existing?.transportConfig;
   let transportResumeId: string | undefined;
   let transportEnv: Record<string, string> | undefined = opts.extraEnv;
+  // Declared HERE (before the bootstrap resolver closes over it) because
+  // `resolveTransportContextBootstrap` reads it to decide whether to skip
+  // startup-memory DB queries entirely for restarts. Previously declared
+  // below, causing a TDZ `Cannot access before initialization` at launch —
+  // see commit f13c511 which moved the read site without moving the decl.
+  const preserveStartupMemoryInject = !opts.fresh && existing?.startupMemoryInjected === true;
   const resolveRuntimeContextBootstrap = () => resolveTransportContextBootstrap({
     projectDir,
     transportConfig: getSession(name)?.transportConfig ?? effectiveTransportConfig ?? {},
@@ -1408,11 +1429,12 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     }
   }
 
-  // When launching against an existing session record (e.g. session.restart
-  // without /clear) we must honor the previously-persisted inject flag — the
+  // `preserveStartupMemoryInject` is declared earlier so the bootstrap
+  // resolver closure can read it without hitting a TDZ. When launching
+  // against an existing session record (e.g. session.restart without
+  // /clear) we honor the previously-persisted inject flag — the
   // conversation already has its history preamble. `opts.fresh` is the
   // authoritative "force fresh" signal from /clear or explicit user action.
-  const preserveStartupMemoryInject = !opts.fresh && existing?.startupMemoryInjected === true;
 
   // Create session on provider
       await runtime.initialize({

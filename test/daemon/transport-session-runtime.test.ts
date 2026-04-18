@@ -484,12 +484,13 @@ describe('TransportSessionRuntime', () => {
     await r.initialize(defaultConfig);
     await flushDispatch();
 
-    expect(timelineEmitterEmitMock).toHaveBeenCalledWith('deck_test_brain', 'memory.context', expect.objectContaining({
+    // The "Historical context · injected" card MUST NOT fire at initialize
+    // time — that would leak a fresh card on every restart-before-first-
+    // message. The card is bound to the same commit boundary as the
+    // persisted `startupMemoryInjected` flag; see the send assertion below.
+    expect(timelineEmitterEmitMock).not.toHaveBeenCalledWith('deck_test_brain', 'memory.context', expect.objectContaining({
       reason: 'startup',
-      injectedText: expect.stringContaining('transport recall parity visible'),
     }), expect.any(Object));
-
-    timelineEmitterEmitMock.mockClear();
 
     r.send('Need a transport recall test');
     await flushDispatch();
@@ -503,9 +504,70 @@ describe('TransportSessionRuntime', () => {
         injectionSurface: 'normalized-payload',
       }),
     }));
+    // Exactly ONE startup card — fired when the provider payload actually
+    // carried the preamble, same boundary as the persisted flag.
+    const startupCardsAfterSend = timelineEmitterEmitMock.mock.calls.filter(
+      (call) => call[1] === 'memory.context' && (call[2] as Record<string, unknown>)?.reason === 'startup',
+    );
+    expect(startupCardsAfterSend).toHaveLength(1);
+    expect(startupCardsAfterSend[0][2]).toEqual(expect.objectContaining({
+      reason: 'startup',
+      injectedText: expect.stringContaining('transport recall parity visible'),
+    }));
+
+    timelineEmitterEmitMock.mockClear();
+    r.send('second turn');
+    await flushDispatch();
     expect(timelineEmitterEmitMock).not.toHaveBeenCalledWith('deck_test_brain', 'memory.context', expect.objectContaining({
       reason: 'startup',
     }), expect.any(Object));
+  });
+
+  it('does not stack duplicate startup cards across restart-before-first-message cycles', async () => {
+    // Regression for the timeline showing multiple "Historical context ·
+    // injected" cards on a session that had been restarted repeatedly
+    // before the first user turn ever landed. Each initialize used to emit
+    // one card, but `startupMemoryInjected` only persists AFTER the first
+    // successful dispatch — so the flag never caught up and cards stacked.
+    const startupItem = makeSearchItem({
+      projectId: 'repo-1',
+      summary: 'Do not emit card until provider accepts preamble',
+    });
+    const startupMemory = {
+      reason: 'startup' as const,
+      runtimeFamily: 'transport' as const,
+      authoritySource: 'processed_local' as const,
+      sourceKind: 'local_processed' as const,
+      injectionSurface: 'system-text' as const,
+      injectedText: '# Recent project memory\n\n- Do not emit card until provider accepts preamble',
+      items: [startupItem],
+    };
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
+      startupMemory,
+    }));
+
+    // Simulate three restarts before the first real message — flag never
+    // persists, so `alreadyInjected` stays false across all three.
+    await r.initialize(defaultConfig);
+    await r.initialize(defaultConfig);
+    await r.initialize(defaultConfig);
+    await flushDispatch();
+    expect(timelineEmitterEmitMock).not.toHaveBeenCalledWith('deck_test_brain', 'memory.context', expect.objectContaining({
+      reason: 'startup',
+    }), expect.any(Object));
+
+    // First real turn — now exactly one card fires.
+    r.send('first real turn after restarts');
+    await flushDispatch();
+    const startupCards = timelineEmitterEmitMock.mock.calls.filter(
+      (call) => call[1] === 'memory.context' && (call[2] as Record<string, unknown>)?.reason === 'startup',
+    );
+    expect(startupCards).toHaveLength(1);
   });
 
   it('send() adds transport recall to the payload and emits linked memory.context evidence', async () => {
