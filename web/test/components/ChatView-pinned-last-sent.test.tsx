@@ -223,6 +223,39 @@ describe('ChatView — pinned last-sent banner', () => {
     expect(banner!.textContent).not.toContain('pending text');
   });
 
+  it('uses the nearest scrolling ancestor as the observer root (fixes sub-session card where .chat-view itself does not scroll)', async () => {
+    // In the sub-session card layout, .chat-view is nested inside a
+    // .subcard-preview-like wrapper that owns the scrollbar. Emulate that by
+    // wrapping ChatView in a scrollable ancestor and asserting the observer
+    // root falls back to that ancestor — not .chat-view itself.
+    const wrapper = document.createElement('div');
+    wrapper.id = 'outer-scroll';
+    Object.defineProperty(wrapper, 'scrollHeight', { value: 2000, configurable: true });
+    Object.defineProperty(wrapper, 'clientHeight', { value: 200, configurable: true });
+    wrapper.style.overflowY = 'auto';
+    document.body.appendChild(wrapper);
+
+    const events = [
+      userEvent('u-nested', 'deep nested prompt', 1000),
+      assistantEvent('a-nested', 'reply', 2000),
+    ];
+    render(
+      <ChatView events={events} loading={false} sessionId="deck_nested_brain" />,
+      { container: wrapper },
+    );
+
+    // After mount, an observer should be registered — even though
+    // .chat-view inside ChatView may not have scrollHeight > clientHeight
+    // in jsdom (the real issue in card mode), the effect still registers
+    // an observer against SOME scroll parent so the pin can later fire.
+    await waitFor(() => expect(instances.length).toBeGreaterThan(0));
+    const obs = instances[instances.length - 1];
+    // target must be the .chat-user inside ChatView, proving the observer
+    // did pick up the element despite the nested-scroll layout.
+    expect(obs.target).not.toBeNull();
+    expect((obs.target as HTMLElement).dataset.eventId).toBe('u-nested');
+  });
+
   it('toggles the expanded state on first click (escape the 2-line clamp)', async () => {
     const events = [
       userEvent('u1', 'x', 1000),

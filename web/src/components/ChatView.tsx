@@ -500,6 +500,31 @@ function findEventElement(root: ParentNode, eventId: string): HTMLElement | null
   return null;
 }
 
+/** Walk up the DOM from `start` and return the nearest ancestor that actually
+ *  scrolls (overflow-y is `auto` or `scroll` AND the element has extra scroll
+ *  height beyond its clientHeight). Used by the pinned-last-sent banner to
+ *  find the real scroll viewport — in the sub-session card, `.chat-view` is
+ *  nested inside `.subcard-preview` which holds the scrollbar, and observing
+ *  `.chat-view` there would never fire "out of viewport". Returns the
+ *  starting element if no scrolling ancestor exists (fallback to the
+ *  component's own bounds). */
+function findScrollParent(start: HTMLElement): HTMLElement {
+  let node: HTMLElement | null = start;
+  while (node) {
+    const style = window.getComputedStyle(node);
+    const overflowY = style.overflowY;
+    const isScrollable = overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay';
+    // Ignore ancestors that declare scrollability but don't actually have
+    // scroll height (e.g. an overflow:auto container that always fits its
+    // content). Otherwise we'd incorrectly pick a sibling that never scrolls.
+    if (isScrollable && node.scrollHeight > node.clientHeight + 1) {
+      return node;
+    }
+    node = node.parentElement;
+  }
+  return start;
+}
+
 export function ChatView({ events, loading, refreshing: _refreshing, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir, serverId, onQuote, agentType: _agentType, onResendFailed }: Props) {
   const { t } = useTranslation();
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -727,8 +752,8 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
       setPinnedAboveViewport(false);
       return;
     }
-    const root = scrollRef.current;
-    if (!root) return;
+    const scrollEl = scrollRef.current;
+    if (!scrollEl) return;
     // jsdom (unit tests) and a small long tail of old WebKit versions don't
     // ship IntersectionObserver. Bail before touching it — no pin is better
     // than a blow-up rendering any chat view at all.
@@ -736,17 +761,24 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
       setPinnedAboveViewport(false);
       return;
     }
-    const target = findEventElement(root, lastSentUserMessage.eventId);
+    const target = findEventElement(scrollEl, lastSentUserMessage.eventId);
     if (!target) {
       // Target not mounted yet (virtualization, pagination) — treat as above
       // viewport ONLY if the user isn't sitting at the bottom of the scroll
       // (i.e. they're reading older history). Otherwise keep the pin hidden
       // so a bubble that never actually rendered doesn't cause a ghost pin.
-      const atBottom = Math.abs(root.scrollHeight - root.clientHeight - root.scrollTop) < 40;
+      const atBottom = Math.abs(scrollEl.scrollHeight - scrollEl.clientHeight - scrollEl.scrollTop) < 40;
       setPinnedAboveViewport(!atBottom);
       return;
     }
 
+    // In sub-session cards the .chat-view doesn't actually scroll — its
+    // parent .subcard-preview holds the scrollbar and .chat-view just grows
+    // with content. Observing .chat-view as root would therefore never fire
+    // an above-viewport event. Detect the real scrolling ancestor and use
+    // that instead. For main pane + sub-session window this naturally
+    // resolves back to .chat-view itself.
+    const root = findScrollParent(scrollEl);
     const observer = new IntersectionObserver((entries) => {
       for (const entry of entries) {
         if (entry.target !== target) continue;
@@ -1041,12 +1073,9 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
               // long message can be read without hunting for it.
               if (!pinnedExpanded) { setPinnedExpanded(true); return; }
               const root = scrollRef.current;
-              const target = root?.querySelector(
-                `[data-event-id="${CSS.escape(lastSentUserMessage.eventId)}"]`,
-              ) as HTMLElement | null;
-              if (target && root) {
-                target.scrollIntoView({ behavior: 'smooth', block: 'center' });
-              }
+              if (!root) return;
+              const target = findEventElement(root, lastSentUserMessage.eventId);
+              if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center' });
             }}
           >
             <span class="chat-pinned-last-sent-label">{t('chat.pinned_last_sent_label', 'Last sent')}</span>
