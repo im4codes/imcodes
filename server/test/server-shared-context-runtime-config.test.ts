@@ -56,8 +56,10 @@ describe('server shared-context runtime config routes', () => {
     getServerSharedContextRuntimeConfigMock.mockResolvedValue({
       primaryContextBackend: 'claude-code-sdk',
       primaryContextModel: 'sonnet',
+      primaryContextPreset: undefined,
       backupContextBackend: undefined,
       backupContextModel: undefined,
+      backupContextPreset: undefined,
       memoryRecallMinScore: 0.4,
       memoryScoringWeights: {
         similarity: 0.4,
@@ -123,10 +125,12 @@ describe('server shared-context runtime config routes', () => {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        primaryContextBackend: 'codex-sdk',
-        primaryContextModel: 'gpt-5.4',
-        backupContextBackend: 'claude-code-sdk',
-        backupContextModel: 'haiku',
+        primaryContextBackend: 'qwen',
+        primaryContextModel: 'qwen-team-model',
+        primaryContextPreset: 'Qwen Team',
+        backupContextBackend: 'qwen',
+        backupContextModel: 'qwen-backup-model',
+        backupContextPreset: 'Qwen Backup',
         memoryRecallMinScore: 0.37,
         memoryScoringWeights: {
           similarity: 0.5,
@@ -143,10 +147,12 @@ describe('server shared-context runtime config routes', () => {
       'srv-1',
       'user-1',
       {
-        primaryContextBackend: 'codex-sdk',
-        primaryContextModel: 'gpt-5.4',
-        backupContextBackend: 'claude-code-sdk',
-        backupContextModel: 'haiku',
+        primaryContextBackend: 'qwen',
+        primaryContextModel: 'qwen-team-model',
+        primaryContextPreset: 'Qwen Team',
+        backupContextBackend: 'qwen',
+        backupContextModel: 'qwen-backup-model',
+        backupContextPreset: 'Qwen Backup',
         memoryRecallMinScore: 0.37,
         memoryScoringWeights: {
           similarity: 0.5,
@@ -166,10 +172,12 @@ describe('server shared-context runtime config routes', () => {
     expect(sendToDaemonMock).toHaveBeenCalledWith(JSON.stringify({
       type: SHARED_CONTEXT_RUNTIME_CONFIG_MSG.APPLY,
       config: {
-        primaryContextBackend: 'codex-sdk',
-        primaryContextModel: 'gpt-5.4',
-        backupContextBackend: 'claude-code-sdk',
-        backupContextModel: 'haiku',
+        primaryContextBackend: 'qwen',
+        primaryContextModel: 'qwen-team-model',
+        primaryContextPreset: 'Qwen Team',
+        backupContextBackend: 'qwen',
+        backupContextModel: 'qwen-backup-model',
+        backupContextPreset: 'Qwen Backup',
         memoryRecallMinScore: 0.37,
         memoryScoringWeights: {
           similarity: 0.5,
@@ -193,8 +201,10 @@ describe('server shared-context runtime config routes', () => {
       config: {
         primaryContextBackend: 'claude-code-sdk',
         primaryContextModel: 'sonnet',
+        primaryContextPreset: undefined,
         backupContextBackend: undefined,
         backupContextModel: undefined,
+        backupContextPreset: undefined,
         memoryRecallMinScore: 0.4,
         memoryScoringWeights: {
           similarity: 0.4,

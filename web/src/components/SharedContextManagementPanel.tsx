@@ -8,6 +8,7 @@ import {
   DEFAULT_MEMORY_RECALL_MIN_SCORE,
   DEFAULT_MEMORY_SCORING_WEIGHTS,
   DEFAULT_PRIMARY_CONTEXT_BACKEND,
+  doesSharedContextBackendSupportPresets,
   getDefaultSharedContextModelForBackend,
   isKnownSharedContextModelForBackend,
   MEMORY_RECALL_MIN_SCORE_MAX,
@@ -274,20 +275,6 @@ const fieldLabelStyle = {
   letterSpacing: '0.03em',
 } as const;
 
-const fieldInputStyle = {
-  ...inputStyle,
-  width: '100%',
-} as const;
-
-const processingModelInputStyle = {
-  ...fieldInputStyle,
-  height: 40,
-  minHeight: 40,
-  padding: '8px 10px',
-  lineHeight: '22px',
-  boxSizing: 'border-box',
-} as const;
-
 const statGridStyle = {
   display: 'grid',
   gridTemplateColumns: SC_IS_MOBILE ? 'repeat(2, 1fr)' : 'repeat(auto-fit, minmax(160px, 1fr))',
@@ -480,13 +467,6 @@ const defaultPolicyState: SharedProjectPolicy = {
   allowLocalFallback: false,
   requireFullProviderSupport: false,
 };
-
-const PROCESSING_MODEL_OPTIONS = Array.from(new Set([
-  DEFAULT_PRIMARY_CONTEXT_MODEL,
-  ...CLAUDE_CODE_MODEL_IDS,
-  ...CODEX_MODEL_IDS,
-  ...QWEN_MODEL_IDS,
-]));
 
 const PROCESSING_MODEL_OPTIONS_BY_BACKEND: Record<SharedContextRuntimeBackend, readonly string[]> = {
   'claude-code-sdk': CLAUDE_CODE_MODEL_IDS,
@@ -692,6 +672,7 @@ function ModelChipSelector({
           key={`${backend}:${modelId}`}
           type="button"
           aria-label={`model:${backend}:${modelId}`}
+          aria-pressed={value.trim() === modelId}
           style={modelChipStyle(value.trim() === modelId)}
           onClick={() => onSelect(modelId)}
         >
@@ -798,12 +779,15 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [processingSnapshot, setProcessingSnapshot] = useState<SharedContextRuntimeConfigSnapshot | null>(null);
   const [processingPrimaryBackend, setProcessingPrimaryBackend] = useState<SharedContextRuntimeBackend>(DEFAULT_PRIMARY_CONTEXT_BACKEND);
   const [processingPrimaryModel, setProcessingPrimaryModel] = useState(DEFAULT_PRIMARY_CONTEXT_MODEL);
+  const [processingPrimaryPreset, setProcessingPrimaryPreset] = useState('');
   const [processingBackupBackend, setProcessingBackupBackend] = useState<SharedContextRuntimeBackend>(DEFAULT_PRIMARY_CONTEXT_BACKEND);
   const [processingBackupModel, setProcessingBackupModel] = useState('');
+  const [processingBackupPreset, setProcessingBackupPreset] = useState('');
   const [processingMemoryRecallMinScore, setProcessingMemoryRecallMinScore] = useState(DEFAULT_MEMORY_RECALL_MIN_SCORE);
   const [processingMemoryScoringWeights, setProcessingMemoryScoringWeights] = useState<MemoryScoringWeights>({ ...DEFAULT_MEMORY_SCORING_WEIGHTS });
   const [memoryAdvancedVisible, setMemoryAdvancedVisible] = useState(false);
   const [processingPersonalSyncEnabled, setProcessingPersonalSyncEnabled] = useState(false);
+  const [processingPresets, setProcessingPresets] = useState<Array<{ name: string; env: Record<string, string>; contextWindow?: number; initMessage?: string }>>([]);
   const [memoryLoading, setMemoryLoading] = useState(false);
   const [memoryProjectId, setMemoryProjectId] = useState('');
   const [memoryQuery, setMemoryQuery] = useState('');
@@ -816,6 +800,23 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [memoryPersonalSubTab, setMemoryPersonalSubTab] = useState<MemoryPersonalSubTab>('processed');
   const [memoryEnterpriseSubTab, setMemoryEnterpriseSubTab] = useState<MemoryEnterpriseSubTab>('shared-memory');
   const [showArchived, setShowArchived] = useState(false);
+
+  useEffect(() => {
+    if (!ws) return;
+    const unsub = ws.onMessage((msg) => {
+      if (msg.type === 'cc.presets.list_response') {
+        setProcessingPresets((msg as { presets?: Array<{ name: string; env: Record<string, string>; contextWindow?: number; initMessage?: string }> }).presets ?? []);
+      }
+    });
+    try { ws.send({ type: 'cc.presets.list' }); } catch {}
+    return unsub;
+  }, [ws]);
+
+  const getPresetModel = useCallback((presetName: string): string | undefined => {
+    const preset = processingPresets.find((entry) => entry.name === presetName);
+    const model = preset?.env?.ANTHROPIC_MODEL?.trim();
+    return model || undefined;
+  }, [processingPresets]);
 
   const renderProcessedMemoryRecords = useCallback((
     view: ContextMemoryView,
@@ -1098,8 +1099,10 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     setProcessingSnapshot(view.snapshot);
     setProcessingPrimaryBackend(view.snapshot.persisted.primaryContextBackend);
     setProcessingPrimaryModel(view.snapshot.persisted.primaryContextModel);
+    setProcessingPrimaryPreset(view.snapshot.persisted.primaryContextPreset ?? '');
     setProcessingBackupBackend(view.snapshot.persisted.backupContextBackend ?? view.snapshot.persisted.primaryContextBackend);
     setProcessingBackupModel(view.snapshot.persisted.backupContextModel ?? '');
+    setProcessingBackupPreset(view.snapshot.persisted.backupContextPreset ?? '');
     setProcessingMemoryRecallMinScore(view.snapshot.persisted.memoryRecallMinScore ?? DEFAULT_MEMORY_RECALL_MIN_SCORE);
     setProcessingMemoryScoringWeights(normalizeMemoryScoringWeights(view.snapshot.persisted.memoryScoringWeights ?? DEFAULT_MEMORY_SCORING_WEIGHTS));
     setProcessingPersonalSyncEnabled(view.snapshot.persisted.enablePersonalMemorySync === true);
@@ -1110,8 +1113,10 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       setProcessingSnapshot(null);
       setProcessingPrimaryBackend(DEFAULT_PRIMARY_CONTEXT_BACKEND);
       setProcessingPrimaryModel(DEFAULT_PRIMARY_CONTEXT_MODEL);
+      setProcessingPrimaryPreset('');
       setProcessingBackupBackend(DEFAULT_PRIMARY_CONTEXT_BACKEND);
       setProcessingBackupModel('');
+      setProcessingBackupPreset('');
       setProcessingMemoryRecallMinScore(DEFAULT_MEMORY_RECALL_MIN_SCORE);
       setProcessingMemoryScoringWeights({ ...DEFAULT_MEMORY_SCORING_WEIGHTS });
       setProcessingPersonalSyncEnabled(false);
@@ -1216,9 +1221,49 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     });
   }, [ws, loadMemoryViews]);
 
+  const getProcessingPresetValue = useCallback((
+    backend: SharedContextRuntimeBackend,
+    model: string,
+    preset: string,
+  ) => (
+    model.trim() && doesSharedContextBackendSupportPresets(backend)
+      ? (preset || undefined)
+      : undefined
+  ), []);
+
+  const buildProcessingConfigPayload = useCallback(() => ({
+    primaryContextBackend: processingPrimaryBackend,
+    primaryContextModel: processingPrimaryModel.trim(),
+    primaryContextPreset: getProcessingPresetValue(
+      processingPrimaryBackend,
+      processingPrimaryModel,
+      processingPrimaryPreset,
+    ),
+    backupContextBackend: processingBackupModel.trim() ? processingBackupBackend : undefined,
+    backupContextModel: processingBackupModel.trim() || undefined,
+    backupContextPreset: processingBackupModel.trim()
+      ? getProcessingPresetValue(processingBackupBackend, processingBackupModel, processingBackupPreset)
+      : undefined,
+    memoryRecallMinScore: processingMemoryRecallMinScore,
+    memoryScoringWeights: normalizeMemoryScoringWeights(processingMemoryScoringWeights),
+    enablePersonalMemorySync: processingPersonalSyncEnabled,
+  }), [
+    getProcessingPresetValue,
+    processingBackupBackend,
+    processingBackupModel,
+    processingBackupPreset,
+    processingMemoryRecallMinScore,
+    processingMemoryScoringWeights,
+    processingPersonalSyncEnabled,
+    processingPrimaryBackend,
+    processingPrimaryModel,
+    processingPrimaryPreset,
+  ]);
+
   const handleProcessingPrimaryBackendChange = useCallback((nextBackend: SharedContextRuntimeBackend) => {
     setProcessingPrimaryBackend((prevBackend) => {
       setProcessingPrimaryModel((prevModel) => resolveProcessingModelForBackend(nextBackend, prevModel, prevBackend));
+      if (!doesSharedContextBackendSupportPresets(nextBackend)) setProcessingPrimaryPreset('');
       return nextBackend;
     });
   }, []);
@@ -1226,6 +1271,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const handleProcessingBackupBackendChange = useCallback((nextBackend: SharedContextRuntimeBackend) => {
     setProcessingBackupBackend((prevBackend) => {
       setProcessingBackupModel((prevModel) => resolveProcessingModelForBackend(nextBackend, prevModel, prevBackend));
+      if (!doesSharedContextBackendSupportPresets(nextBackend)) setProcessingBackupPreset('');
       return nextBackend;
     });
   }, []);
@@ -1814,6 +1860,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                             key={`primary:${backend}`}
                             type="button"
                             aria-label={`${t('sharedContext.management.processingPrimaryBackend')}: ${backend}`}
+                            aria-pressed={processingPrimaryBackend === backend}
                             style={processingChipStyle(processingPrimaryBackend === backend)}
                             onClick={() => handleProcessingPrimaryBackendChange(backend)}
                           >
@@ -1824,14 +1871,24 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     </label>
                     <label style={fieldLabelStyle}>
                       <span>{t('sharedContext.management.processingPrimaryModel')}</span>
-                      <input
-                        aria-label={t('sharedContext.management.processingPrimaryModel')}
-                        list={`shared-context-model-options-${processingPrimaryBackend}`}
-                        value={processingPrimaryModel}
-                        onInput={(e) => setProcessingPrimaryModel((e.currentTarget as HTMLInputElement).value)}
-                        placeholder={DEFAULT_PRIMARY_CONTEXT_MODEL}
-                        style={processingModelInputStyle}
-                      />
+                      {doesSharedContextBackendSupportPresets(processingPrimaryBackend) ? (
+                        <select
+                          aria-label={t('sharedContext.management.processingPrimaryPreset')}
+                          value={processingPrimaryPreset}
+                          onChange={(e) => {
+                            const nextPreset = (e.currentTarget as HTMLSelectElement).value;
+                            setProcessingPrimaryPreset(nextPreset);
+                            const presetModel = getPresetModel(nextPreset);
+                            if (presetModel) setProcessingPrimaryModel(presetModel);
+                          }}
+                          style={inputStyle}
+                        >
+                          <option value="">{t('sharedContext.management.processingPresetNone')}</option>
+                          {processingPresets.map((preset) => (
+                            <option key={`primary-preset:${preset.name}`} value={preset.name}>{preset.name}</option>
+                          ))}
+                        </select>
+                      ) : null}
                       <ModelChipSelector
                         backend={processingPrimaryBackend}
                         value={processingPrimaryModel}
@@ -1849,6 +1906,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                             key={`backup:${backend}`}
                             type="button"
                             aria-label={`${t('sharedContext.management.processingBackupBackend')}: ${backend}`}
+                            aria-pressed={processingBackupBackend === backend}
                             style={processingChipStyle(processingBackupBackend === backend)}
                             onClick={() => handleProcessingBackupBackendChange(backend)}
                           >
@@ -1859,14 +1917,24 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     </label>
                     <label style={fieldLabelStyle}>
                       <span>{t('sharedContext.management.processingBackupModel')}</span>
-                      <input
-                        aria-label={t('sharedContext.management.processingBackupModel')}
-                        list={`shared-context-model-options-${processingBackupBackend}`}
-                        value={processingBackupModel}
-                        onInput={(e) => setProcessingBackupModel((e.currentTarget as HTMLInputElement).value)}
-                        placeholder={t('sharedContext.management.processingBackupPlaceholder')}
-                        style={processingModelInputStyle}
-                      />
+                      {doesSharedContextBackendSupportPresets(processingBackupBackend) ? (
+                        <select
+                          aria-label={t('sharedContext.management.processingBackupPreset')}
+                          value={processingBackupPreset}
+                          onChange={(e) => {
+                            const nextPreset = (e.currentTarget as HTMLSelectElement).value;
+                            setProcessingBackupPreset(nextPreset);
+                            const presetModel = getPresetModel(nextPreset);
+                            if (presetModel) setProcessingBackupModel(presetModel);
+                          }}
+                          style={inputStyle}
+                        >
+                          <option value="">{t('sharedContext.management.processingPresetNone')}</option>
+                          {processingPresets.map((preset) => (
+                            <option key={`backup-preset:${preset.name}`} value={preset.name}>{preset.name}</option>
+                          ))}
+                        </select>
+                      ) : null}
                       <ModelChipSelector
                         backend={processingBackupBackend}
                         value={processingBackupModel}
@@ -1875,13 +1943,6 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     </label>
                   </div>
                 </div>
-                {SHARED_CONTEXT_RUNTIME_BACKENDS.map((backend) => (
-                  <datalist id={`shared-context-model-options-${backend}`} key={backend}>
-                    {(PROCESSING_MODEL_OPTIONS_BY_BACKEND[backend] ?? PROCESSING_MODEL_OPTIONS).map((modelId) => (
-                      <option key={`${backend}:${modelId}`} value={modelId} />
-                    ))}
-                  </datalist>
-                ))}
                 <div style={rowStyle}>
                   <button
                     style={buttonStyle}
@@ -1889,15 +1950,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     onClick={() => void handleAction(t('sharedContext.notice.processingConfigSaved'), async () => {
                       setProcessingSaving(true);
                       try {
-                        const view = await updateSharedContextRuntimeConfig(serverId, {
-                          primaryContextBackend: processingPrimaryBackend,
-                          primaryContextModel: processingPrimaryModel.trim(),
-                          backupContextBackend: processingBackupModel.trim() ? processingBackupBackend : undefined,
-                          backupContextModel: processingBackupModel.trim() || undefined,
-                          memoryRecallMinScore: processingMemoryRecallMinScore,
-                          memoryScoringWeights: normalizeMemoryScoringWeights(processingMemoryScoringWeights),
-                          enablePersonalMemorySync: processingPersonalSyncEnabled,
-                        });
+                        const view = await updateSharedContextRuntimeConfig(serverId, buildProcessingConfigPayload());
                         applyProcessingSnapshot(view);
                       } finally {
                         setProcessingSaving(false);
@@ -2043,15 +2096,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     onClick={() => void handleAction(t('sharedContext.notice.processingConfigSaved'), async () => {
                       setProcessingSaving(true);
                       try {
-                        const view = await updateSharedContextRuntimeConfig(serverId, {
-                          primaryContextBackend: processingPrimaryBackend,
-                          primaryContextModel: processingPrimaryModel.trim(),
-                          backupContextBackend: processingBackupModel.trim() ? processingBackupBackend : undefined,
-                          backupContextModel: processingBackupModel.trim() || undefined,
-                          memoryRecallMinScore: processingMemoryRecallMinScore,
-                          memoryScoringWeights: normalizeMemoryScoringWeights(processingMemoryScoringWeights),
-                          enablePersonalMemorySync: processingPersonalSyncEnabled,
-                        });
+                        const view = await updateSharedContextRuntimeConfig(serverId, buildProcessingConfigPayload());
                         applyProcessingSnapshot(view);
                       } finally {
                         setProcessingSaving(false);
@@ -2185,15 +2230,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                       if (!serverId) return;
                       setProcessingSaving(true);
                       try {
-                        const view = await updateSharedContextRuntimeConfig(serverId, {
-                          primaryContextBackend: processingPrimaryBackend,
-                          primaryContextModel: processingPrimaryModel.trim(),
-                          backupContextBackend: processingBackupModel.trim() ? processingBackupBackend : undefined,
-                          backupContextModel: processingBackupModel.trim() || undefined,
-                          memoryRecallMinScore: processingMemoryRecallMinScore,
-                          memoryScoringWeights: normalizeMemoryScoringWeights(processingMemoryScoringWeights),
-                          enablePersonalMemorySync: processingPersonalSyncEnabled,
-                        });
+                        const view = await updateSharedContextRuntimeConfig(serverId, buildProcessingConfigPayload());
                         applyProcessingSnapshot(view);
                       } finally {
                         setProcessingSaving(false);

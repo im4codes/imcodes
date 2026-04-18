@@ -48,8 +48,10 @@ export function defaultSharedContextRuntimeConfig(): ContextModelConfig {
   return {
     primaryContextBackend: DEFAULT_PRIMARY_CONTEXT_BACKEND,
     primaryContextModel: DEFAULT_CONTEXT_MODEL_BY_BACKEND[DEFAULT_PRIMARY_CONTEXT_BACKEND],
+    primaryContextPreset: undefined,
     backupContextBackend: undefined,
     backupContextModel: undefined,
+    backupContextPreset: undefined,
     memoryRecallMinScore: DEFAULT_MEMORY_RECALL_MIN_SCORE,
     memoryScoringWeights: { ...DEFAULT_MEMORY_SCORING_WEIGHTS },
     enablePersonalMemorySync: false,
@@ -84,7 +86,15 @@ export function getDefaultSharedContextModelForBackend(backend: SharedContextRun
   return DEFAULT_CONTEXT_MODEL_BY_BACKEND[backend];
 }
 
-export function isKnownSharedContextModelForBackend(backend: SharedContextRuntimeBackend, model: string | null | undefined): boolean {
+export function doesSharedContextBackendSupportPresets(backend: SharedContextRuntimeBackend | null | undefined): boolean {
+  return backend === 'qwen';
+}
+
+export function isKnownSharedContextModelForBackend(
+  backend: SharedContextRuntimeBackend,
+  model: string | null | undefined,
+  preset?: string | null | undefined,
+): boolean {
   const trimmed = model?.trim();
   if (!trimmed) return false;
   switch (backend) {
@@ -93,7 +103,9 @@ export function isKnownSharedContextModelForBackend(backend: SharedContextRuntim
     case 'codex-sdk':
       return CODEX_MODEL_IDS.includes(trimmed as typeof CODEX_MODEL_IDS[number]);
     case 'qwen':
-      return QWEN_MODEL_IDS.includes(trimmed as typeof QWEN_MODEL_IDS[number]);
+      return preset?.trim()
+        ? true
+        : QWEN_MODEL_IDS.includes(trimmed as typeof QWEN_MODEL_IDS[number]);
     case 'openclaw':
       return true;
   }
@@ -104,23 +116,34 @@ function trimModelValue(value: string | undefined): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
+function normalizeSharedContextPresetValue(
+  backend: SharedContextRuntimeBackend | undefined,
+  preset: string | undefined,
+): string | undefined {
+  const trimmed = trimModelValue(preset);
+  if (!trimmed || !backend || !doesSharedContextBackendSupportPresets(backend)) return undefined;
+  return trimmed;
+}
+
 export function normalizeSharedContextRuntimeConfig(
   input: Partial<ContextModelConfig> | null | undefined,
 ): ContextModelConfig {
   const normalizedPrimaryBackend = normalizeSharedContextRuntimeBackend(input?.primaryContextBackend)
     ?? inferSharedContextRuntimeBackend(input?.primaryContextModel)
     ?? DEFAULT_PRIMARY_CONTEXT_BACKEND;
+  const primaryContextPreset = normalizeSharedContextPresetValue(normalizedPrimaryBackend, input?.primaryContextPreset);
   const rawPrimaryContextModel = trimModelValue(input?.primaryContextModel);
-  const primaryContextModel = rawPrimaryContextModel && isKnownSharedContextModelForBackend(normalizedPrimaryBackend, rawPrimaryContextModel)
+  const primaryContextModel = rawPrimaryContextModel && isKnownSharedContextModelForBackend(normalizedPrimaryBackend, rawPrimaryContextModel, primaryContextPreset)
     ? rawPrimaryContextModel
     : getDefaultSharedContextModelForBackend(normalizedPrimaryBackend);
   const normalizedBackupBackendCandidate = normalizeSharedContextRuntimeBackend(input?.backupContextBackend)
     ?? inferSharedContextRuntimeBackend(input?.backupContextModel);
   const rawBackupContextModel = trimModelValue(input?.backupContextModel);
   const backupContextBackend = normalizedBackupBackendCandidate;
+  const backupContextPreset = normalizeSharedContextPresetValue(backupContextBackend, input?.backupContextPreset);
   const backupContextModel = backupContextBackend
     ? (rawBackupContextModel
-      ? (isKnownSharedContextModelForBackend(backupContextBackend, rawBackupContextModel)
+      ? (isKnownSharedContextModelForBackend(backupContextBackend, rawBackupContextModel, backupContextPreset)
         ? rawBackupContextModel
         : getDefaultSharedContextModelForBackend(backupContextBackend))
       : getDefaultSharedContextModelForBackend(backupContextBackend))
@@ -132,9 +155,11 @@ export function normalizeSharedContextRuntimeConfig(
   return {
     primaryContextBackend: normalizedPrimaryBackend,
     primaryContextModel,
+    primaryContextPreset,
     primaryContextSdk: trimModelValue(input?.primaryContextSdk),
     backupContextBackend,
     backupContextModel,
+    backupContextPreset,
     backupContextSdk: trimModelValue(input?.backupContextSdk),
     materializationMinIntervalMs,
     memoryRecallMinScore,

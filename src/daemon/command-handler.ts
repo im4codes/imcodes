@@ -71,7 +71,11 @@ import {
 } from '../../shared/effort-levels.js';
 import { getSavedP2pConfig, upsertSavedP2pConfig } from '../store/p2p-config-store.js';
 import { getProcessedProjectionStats, queryPendingContextEvents, queryProcessedProjections, recordMemoryHits } from '../store/context-store.js';
-import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
+import {
+  isKnownTestProjectName,
+  isKnownTestSessionLike,
+  isKnownTestSessionName,
+} from '../../shared/test-session-guard.js';
 import {
   normalizeSharedContextRuntimeConfig,
   normalizeSharedContextRuntimeBackend,
@@ -1085,7 +1089,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
   const sessionName = `deck_${project}_brain`;
   // Preserve original name as label when sanitization changes it (e.g. Chinese characters)
   const label = project !== rawProject.trim().toLowerCase() ? rawProject.trim() : undefined;
-  if (isKnownTestSessionLike({ name: sessionName, projectName: rawProject, projectDir: dir })) {
+  if (isKnownTestSessionName(sessionName) || isKnownTestProjectName(rawProject)) {
     const message = `Refusing to start known test session pattern: ${sessionName}`;
     logger.warn({ rawProject, project, dir, agentType }, 'session.start rejected by test-session guard');
     try { serverLink.send({ type: 'session.error', project, message }); } catch { /* ignore */ }
@@ -2427,11 +2431,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
     ? requestedEffort
     : getDefaultThinkingLevel(type);
   const sessionName = subSessionName(id);
-  if (isKnownTestSessionLike({
-    name: sessionName,
-    cwd,
-    parentSession,
-  })) {
+  if (isKnownTestSessionName(parentSession)) {
     logger.warn({ id, type, cwd, parentSession }, 'subsession.start rejected by test-session guard');
     return;
   }
@@ -4162,10 +4162,12 @@ async function handleSharedContextRuntimeConfigApply(cmd: Record<string, unknown
       typeof config?.primaryContextBackend === 'string' ? config.primaryContextBackend : undefined,
     ),
     primaryContextModel: typeof config?.primaryContextModel === 'string' ? config.primaryContextModel : undefined,
+    primaryContextPreset: typeof config?.primaryContextPreset === 'string' ? config.primaryContextPreset : undefined,
     backupContextBackend: normalizeSharedContextRuntimeBackend(
       typeof config?.backupContextBackend === 'string' ? config.backupContextBackend : undefined,
     ),
     backupContextModel: typeof config?.backupContextModel === 'string' ? config.backupContextModel : undefined,
+    backupContextPreset: typeof config?.backupContextPreset === 'string' ? config.backupContextPreset : undefined,
     memoryRecallMinScore: typeof config?.memoryRecallMinScore === 'number' ? config.memoryRecallMinScore : undefined,
     memoryScoringWeights: config?.memoryScoringWeights && typeof config.memoryScoringWeights === 'object'
       ? {

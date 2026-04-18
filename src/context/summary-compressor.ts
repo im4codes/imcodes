@@ -15,6 +15,11 @@ import type { TransportProvider, ProviderError } from '../agent/transport-provid
 import type { AgentMessage } from '../../shared/agent-message.js';
 import { randomUUID } from 'node:crypto';
 import logger from '../util/logger.js';
+import {
+  resolveProcessingProviderSessionConfig,
+  type ProcessingBackendSelection as CompressionBackendSelection,
+  type ProcessingProviderSessionConfig as CompressionProviderSessionConfig,
+} from './processing-provider-config.js';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -142,11 +147,11 @@ async function sleep(ms: number): Promise<void> {
  * Retries with exponential backoff + jitter on transient errors.
  * Permanent errors (auth, model not found) fail fast.
  */
-async function sendWithRetry(backend: string, prompt: string): Promise<string> {
+async function sendWithRetry(prompt: string, selection: CompressionBackendSelection): Promise<string> {
   let lastErr: unknown;
   for (let attempt = 0; attempt <= MAX_RETRIES_PER_BACKEND; attempt++) {
     try {
-      return await sendToProvider(backend, prompt);
+      return await sendToProvider(selection, prompt);
     } catch (err) {
       lastErr = err;
       if (!isRetryableError(err) || attempt === MAX_RETRIES_PER_BACKEND) {
@@ -156,7 +161,7 @@ async function sendWithRetry(backend: string, prompt: string): Promise<string> {
       await shutdownCompressionProvider();
       const delay = Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, attempt), RETRY_MAX_DELAY_MS)
         + Math.random() * 500;
-      logger.warn({ err, backend, attempt: attempt + 1, delay }, 'SDK compression retry after transient error');
+      logger.warn({ err, backend: selection.backend, attempt: attempt + 1, delay }, 'SDK compression retry after transient error');
       await sleep(delay);
     }
   }
@@ -187,15 +192,18 @@ export const __testing__ = {
 
 let activeProvider: TransportProvider | null = null;
 let activeSessionId: string | null = null;
-let activeBackend: string | null = null;
+let activeBackendKey: string | null = null;
 
 /**
  * Get or create a private provider + session for compression.
  * The provider is lazily initialized and reused across compressions.
  * If backend changes, old one is torn down and a new one created.
  */
-async function getCompressionProvider(backend: string): Promise<{ provider: TransportProvider; sessionId: string }> {
-  if (activeProvider && activeSessionId && activeBackend === backend) {
+async function getCompressionProvider(
+  backend: string,
+  sessionConfig: CompressionProviderSessionConfig,
+): Promise<{ provider: TransportProvider; sessionId: string }> {
+  if (activeProvider && activeSessionId && activeBackendKey === sessionConfig.cacheKey) {
     return { provider: activeProvider, sessionId: activeSessionId };
   }
 
@@ -214,11 +222,14 @@ async function getCompressionProvider(backend: string): Promise<{ provider: Tran
     fresh: true,
     description: 'Memory compression — do NOT respond to questions, only output structured summaries.',
     systemPrompt: COMPRESSOR_SYSTEM_PROMPT,
+    ...(sessionConfig.env ? { env: sessionConfig.env } : {}),
+    ...(sessionConfig.settings ? { settings: sessionConfig.settings } : {}),
+    ...(sessionConfig.agentId ? { agentId: sessionConfig.agentId } : {}),
   });
 
   activeProvider = provider;
   activeSessionId = sessionId;
-  activeBackend = backend;
+  activeBackendKey = sessionConfig.cacheKey;
 
   return { provider, sessionId };
 }
@@ -232,7 +243,7 @@ export async function shutdownCompressionProvider(): Promise<void> {
     } catch { /* ignore cleanup errors */ }
     activeProvider = null;
     activeSessionId = null;
-    activeBackend = null;
+    activeBackendKey = null;
   }
 }
 
@@ -298,7 +309,11 @@ export async function compressWithSdk(input: CompressionInput): Promise<Compress
   // Try primary (gated by circuit breaker)
   if (canCall(modelConfig.primaryContextBackend, now)) {
     try {
-      const result = await sendWithRetry(modelConfig.primaryContextBackend, prompt);
+      const result = await sendWithRetry(prompt, {
+        backend: modelConfig.primaryContextBackend,
+        model: modelConfig.primaryContextModel,
+        preset: modelConfig.primaryContextPreset,
+      });
       recordSuccess(modelConfig.primaryContextBackend);
       return {
         summary: result, model: modelConfig.primaryContextModel,
@@ -319,7 +334,11 @@ export async function compressWithSdk(input: CompressionInput): Promise<Compress
   if (modelConfig.backupContextBackend && modelConfig.backupContextModel) {
     if (canCall(modelConfig.backupContextBackend, now)) {
       try {
-        const result = await sendWithRetry(modelConfig.backupContextBackend, prompt);
+        const result = await sendWithRetry(prompt, {
+          backend: modelConfig.backupContextBackend,
+          model: modelConfig.backupContextModel,
+          preset: modelConfig.backupContextPreset,
+        });
         recordSuccess(modelConfig.backupContextBackend);
         return {
           summary: result, model: modelConfig.backupContextModel,
@@ -348,16 +367,23 @@ export async function compressWithSdk(input: CompressionInput): Promise<Compress
 
 const COMPRESSION_TIMEOUT_MS = 60_000;
 
-async function sendToProvider(backend: string, prompt: string): Promise<string> {
+export async function resolveCompressionProviderSessionConfig(
+  selection: CompressionBackendSelection,
+): Promise<CompressionProviderSessionConfig> {
+  return resolveProcessingProviderSessionConfig(selection);
+}
+
+async function sendToProvider(selection: CompressionBackendSelection, prompt: string): Promise<string> {
   // claude-code-sdk: use SDK query() directly — the transport provider's spawn
   // hook adds CLI flags that cause exit code 1 in one-shot compression mode.
   // SDK query() handles subprocess lifecycle and subscription auth correctly.
-  if (backend === 'claude-code-sdk') {
+  if (selection.backend === 'claude-code-sdk') {
     return sendViaSdkQuery(prompt);
   }
 
   // Other backends: use the transport provider's send/onComplete flow.
-  const { provider, sessionId } = await getCompressionProvider(backend);
+  const sessionConfig = await resolveCompressionProviderSessionConfig(selection);
+  const { provider, sessionId } = await getCompressionProvider(selection.backend, sessionConfig);
 
   return new Promise<string>((resolve, reject) => {
     const timer = setTimeout(() => {

@@ -60,12 +60,42 @@ describe('shared-context-runtime-config', () => {
     expect(result.backupContextSdk).toBe('openai-sdk');
   });
 
+  it('passes through primaryContextPreset and backupContextPreset when provided', () => {
+    const result = normalizeSharedContextRuntimeConfig({
+      primaryContextBackend: 'qwen',
+      primaryContextModel: 'custom-qwen-model',
+      primaryContextPreset: 'Qwen Team',
+      backupContextBackend: 'qwen',
+      backupContextModel: 'custom-qwen-backup-model',
+      backupContextPreset: 'Qwen Backup',
+    });
+    expect(result.primaryContextModel).toBe('custom-qwen-model');
+    expect(result.backupContextModel).toBe('custom-qwen-backup-model');
+    expect(result.primaryContextPreset).toBe('Qwen Team');
+    expect(result.backupContextPreset).toBe('Qwen Backup');
+  });
+
+  it('drops preset selections for backends that do not support presets', () => {
+    const result = normalizeSharedContextRuntimeConfig({
+      primaryContextBackend: 'codex-sdk',
+      primaryContextModel: 'gpt-5.4',
+      primaryContextPreset: 'Should Not Persist',
+      backupContextBackend: 'claude-code-sdk',
+      backupContextModel: 'haiku',
+      backupContextPreset: 'Also Ignored',
+    });
+    expect(result.primaryContextPreset).toBeUndefined();
+    expect(result.backupContextPreset).toBeUndefined();
+  });
+
   it('omits sdk fields when not provided', () => {
     const result = normalizeSharedContextRuntimeConfig({
       primaryContextBackend: 'qwen',
     });
     expect(result.primaryContextSdk).toBeUndefined();
     expect(result.backupContextSdk).toBeUndefined();
+    expect(result.primaryContextPreset).toBeUndefined();
+    expect(result.backupContextPreset).toBeUndefined();
   });
 
   it('passes through materializationMinIntervalMs when positive', () => {

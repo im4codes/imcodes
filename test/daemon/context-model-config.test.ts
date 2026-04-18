@@ -17,8 +17,10 @@ describe('context-model-config', () => {
     expect(getContextModelConfig()).toEqual({
       primaryContextBackend: 'codex-sdk',
       primaryContextModel: 'gpt-5.4',
+      primaryContextPreset: undefined,
       backupContextBackend: 'claude-code-sdk',
       backupContextModel: 'haiku',
+      backupContextPreset: undefined,
       memoryRecallMinScore: 0.4,
       memoryScoringWeights: {
         similarity: 0.4,
@@ -49,8 +51,10 @@ describe('context-model-config', () => {
     expect(getContextModelConfig()).toEqual({
       primaryContextBackend: 'claude-code-sdk',
       primaryContextModel: 'sonnet',
+      primaryContextPreset: undefined,
       backupContextBackend: 'qwen',
       backupContextModel: 'qwen3-coder-plus',
+      backupContextPreset: undefined,
       memoryRecallMinScore: 0.4,
       memoryScoringWeights: {
         similarity: 0.4,
@@ -97,5 +101,18 @@ describe('context-model-config', () => {
       frequency: 0.1,
       project: 0.2,
     });
+  });
+
+  it('keeps the synced qwen presets for primary and backup processing paths', () => {
+    setContextModelRuntimeConfig({
+      primaryContextBackend: 'qwen',
+      primaryContextModel: 'qwen3-coder-plus',
+      primaryContextPreset: 'Qwen Team',
+      backupContextBackend: 'qwen',
+      backupContextModel: 'qwen3-coder-plus',
+      backupContextPreset: 'Qwen Backup',
+    });
+    expect(getContextModelConfig().primaryContextPreset).toBe('Qwen Team');
+    expect(getContextModelConfig().backupContextPreset).toBe('Qwen Backup');
   });
 });

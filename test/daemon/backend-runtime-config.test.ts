@@ -7,10 +7,12 @@ describe('fetchBackendSharedContextRuntimeConfig', () => {
       ok: true,
       json: async () => ({
         config: {
-          primaryContextBackend: 'codex-sdk',
-          primaryContextModel: 'gpt-5.4',
-          backupContextBackend: 'claude-code-sdk',
-          backupContextModel: 'haiku',
+          primaryContextBackend: 'qwen',
+          primaryContextModel: 'qwen-team-model',
+          primaryContextPreset: 'Qwen Team',
+          backupContextBackend: 'qwen',
+          backupContextModel: 'qwen-backup-model',
+          backupContextPreset: 'Qwen Backup',
           memoryRecallMinScore: 0.41,
           memoryScoringWeights: {
             similarity: 0.5,
@@ -29,10 +31,12 @@ describe('fetchBackendSharedContextRuntimeConfig', () => {
       serverId: 'srv-1',
       token: 'secret',
     })).resolves.toEqual({
-      primaryContextBackend: 'codex-sdk',
-      primaryContextModel: 'gpt-5.4',
-      backupContextBackend: 'claude-code-sdk',
-      backupContextModel: 'haiku',
+      primaryContextBackend: 'qwen',
+      primaryContextModel: 'qwen-team-model',
+      primaryContextPreset: 'Qwen Team',
+      backupContextBackend: 'qwen',
+      backupContextModel: 'qwen-backup-model',
+      backupContextPreset: 'Qwen Backup',
       memoryRecallMinScore: 0.41,
       memoryScoringWeights: {
         similarity: 0.5,

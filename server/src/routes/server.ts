@@ -71,8 +71,10 @@ const namespaceResolutionSchema = z.object({
 const runtimeConfigSchema = z.object({
   primaryContextBackend: z.enum(['claude-code-sdk', 'codex-sdk', 'qwen', 'openclaw']).optional().nullable(),
   primaryContextModel: z.string().trim().min(1),
+  primaryContextPreset: z.string().trim().optional().nullable(),
   backupContextBackend: z.enum(['claude-code-sdk', 'codex-sdk', 'qwen', 'openclaw']).optional().nullable(),
   backupContextModel: z.string().trim().optional().nullable(),
+  backupContextPreset: z.string().trim().optional().nullable(),
   memoryRecallMinScore: z.number().finite().min(0).max(1).optional().nullable(),
   memoryScoringWeights: z.object({
     similarity: z.number().finite().min(0).max(1).optional().nullable(),
@@ -262,8 +264,10 @@ serverRoutes.put('/:id/shared-context/runtime-config', requireAuth(), async (c) 
   const normalized = normalizeSharedContextRuntimeConfig({
     primaryContextBackend: parsed.data.primaryContextBackend ?? undefined,
     primaryContextModel: parsed.data.primaryContextModel,
+    primaryContextPreset: parsed.data.primaryContextPreset ?? undefined,
     backupContextBackend: parsed.data.backupContextBackend ?? undefined,
     backupContextModel: parsed.data.backupContextModel ?? undefined,
+    backupContextPreset: parsed.data.backupContextPreset ?? undefined,
     memoryRecallMinScore: parsed.data.memoryRecallMinScore ?? undefined,
     memoryScoringWeights: parsed.data.memoryScoringWeights
       ? {

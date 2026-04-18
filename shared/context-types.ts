@@ -237,9 +237,11 @@ export type SharedContextRuntimeBackend = 'claude-code-sdk' | 'codex-sdk' | 'qwe
 export interface ContextModelConfig {
   primaryContextBackend: SharedContextRuntimeBackend;
   primaryContextModel: string;
+  primaryContextPreset?: string;
   primaryContextSdk?: string;
   backupContextBackend?: SharedContextRuntimeBackend;
   backupContextModel?: string;
+  backupContextPreset?: string;
   backupContextSdk?: string;
   /** Minimum interval between materialization runs per target (ms). Default 10000. */
   materializationMinIntervalMs?: number;
