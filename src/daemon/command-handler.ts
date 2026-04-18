@@ -282,6 +282,45 @@ async function relaunchFreshTransportConversation(record: SessionRecord): Promis
   });
 }
 
+/**
+ * Resume an existing transport session after the runtime lost its provider
+ * session id (observed when a cancel or mid-init error left the runtime stuck
+ * with `providerSessionId === null`). Unlike `relaunchFreshTransportConversation`
+ * this does NOT pass `fresh: true` — conversation continuity is preserved via
+ * the persisted resume id (`ccSessionId` / `codexSessionId` / `providerResumeId`
+ * / `providerSessionId`), which `launchTransportSession` threads back through
+ * to the provider's resume path.
+ *
+ * On success, `launchTransportSession` will drain the transport resend queue
+ * for the same session name (see `session-manager.ts`), so any message that
+ * the caller enqueued right before invoking this helper is auto-delivered.
+ */
+async function resumeTransportRuntimeAfterLoss(record: SessionRecord): Promise<void> {
+  await stopTransportRuntimeSession(record.name).catch(() => {});
+  await launchTransportSession({
+    name: record.name,
+    projectName: record.projectName,
+    role: record.role,
+    agentType: record.agentType as 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'openclaw' | 'qwen',
+    projectDir: record.projectDir,
+    label: record.label,
+    description: record.description,
+    requestedModel: record.requestedModel,
+    effort: record.effort,
+    transportConfig: record.transportConfig,
+    ccPreset: (record.agentType === 'claude-code-sdk' || record.agentType === 'qwen') ? record.ccPreset : undefined,
+    // Thread resume ids back so the provider reuses the same conversation.
+    ...(record.agentType === 'claude-code-sdk' && record.ccSessionId ? { ccSessionId: record.ccSessionId } : {}),
+    ...(record.agentType === 'codex-sdk' && record.codexSessionId ? { codexSessionId: record.codexSessionId } : {}),
+    ...((record.agentType === 'cursor-headless' || record.agentType === 'copilot-sdk') && record.providerResumeId
+      ? { providerResumeId: record.providerResumeId } : {}),
+    ...(record.agentType === 'openclaw' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
+    ...(record.agentType === 'qwen' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
+    ...(record.parentSession ? { parentSession: record.parentSession } : {}),
+    ...(record.userCreated ? { userCreated: true } : {}),
+  });
+}
+
 function getSupportedEffortLevels(agentType: string | undefined): readonly TransportEffortLevel[] {
   return agentType === 'claude-code-sdk'
     ? CLAUDE_SDK_EFFORT_LEVELS
@@ -1668,14 +1707,66 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     return;
   }
   if (transportRuntime && !transportRuntime.providerSessionId) {
-    await stopTransportRuntimeSession(sessionName).catch(() => {});
-    const errMsg = `Provider ${record?.providerId ?? 'unknown'} restarting. Please resend in a moment.`;
-    logger.warn({ sessionName, providerId: record?.providerId }, 'session.send: transport runtime missing provider session id');
-    emitTransportUserMessage(text);
-    timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
-    timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
-    timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
-    try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg }); } catch {}
+    // Runtime object is registered but its provider session id is null —
+    // typically after a cancel or mid-init error left it stuck. Tear it down,
+    // queue the user's message for resend, and kick off a resume (NOT fresh
+    // — we want the same conversation). `launchTransportSession` drains the
+    // resend queue on success, so the message auto-delivers without user
+    // intervention.
+    const providerLabel = record?.providerId ?? 'unknown';
+    logger.info(
+      { sessionName, providerId: record?.providerId, commandId: effectiveId },
+      'session.send: transport runtime missing provider session id — queuing and auto-resuming',
+    );
+    emitTransportUserMessage(
+      text,
+      { clientMessageId: effectiveId },
+      transportUserEventId(effectiveId),
+    );
+    enqueueResend(sessionName, { text, commandId: effectiveId, queuedAt: Date.now() });
+    const queued = getResendEntries(sessionName);
+    const infoMsg = `⏳ Provider ${providerLabel} is restarting — will auto-resend ${queued.length} queued message${queued.length === 1 ? '' : 's'} once the runtime is back.`;
+    timelineEmitter.emit(
+      sessionName,
+      'assistant.text',
+      { text: infoMsg, streaming: false, memoryExcluded: true },
+      { source: 'daemon', confidence: 'high' },
+    );
+    timelineEmitter.emit(
+      sessionName,
+      'session.state',
+      {
+        state: 'queued',
+        pendingCount: queued.length,
+        pendingMessages: queued.map((e) => e.text),
+        pendingMessageEntries: queued.map((e) => ({ clientMessageId: e.commandId, text: e.text })),
+      },
+      { source: 'daemon', confidence: 'high' },
+    );
+    const status = isLegacy ? 'accepted_legacy' : 'accepted';
+    timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
+    try {
+      serverLink.send({ type: 'command.ack', commandId: effectiveId, status, session: sessionName });
+    } catch { /* not connected */ }
+    // Best-effort resume. Failure is logged but doesn't change the ack —
+    // the next user send will re-enter this branch and try again, or a
+    // manual /restart path can recover.
+    if (record) {
+      void runExclusiveSessionRelaunch(sessionName, async () => {
+        try {
+          await resumeTransportRuntimeAfterLoss(record);
+        } catch (err) {
+          logger.error({ err, sessionName }, 'auto-resume after provider-session-id loss failed');
+          const resumeErr = err instanceof Error ? err.message : String(err);
+          timelineEmitter.emit(
+            sessionName,
+            'assistant.text',
+            { text: `⚠️ Auto-resume failed: ${resumeErr}. Restart the session manually to recover.`, streaming: false, memoryExcluded: true },
+            { source: 'daemon', confidence: 'high' },
+          );
+        }
+      });
+    }
     return;
   }
   if (transportRuntime) {

@@ -653,6 +653,10 @@ describe('handleWebCommand transport queue behavior', () => {
       pendingMessages: [],
     });
 
+    // Reset the resend queue so entries from earlier tests don't leak in.
+    const { clearAllResend, getResendEntries } = await import('../../src/daemon/transport-resend-queue.js');
+    clearAllResend();
+
     handleWebCommand({
       type: 'session.send',
       session: 'deck_transport_brain',
@@ -661,26 +665,54 @@ describe('handleWebCommand transport queue behavior', () => {
     }, serverLink as any);
     await flushAsync();
 
+    // New behavior: the runtime-without-providerSessionId branch auto-resumes
+    // instead of erroring. The user message is preserved, enqueued for
+    // redelivery, and the command ack is `accepted` (not `error`) so the UI
+    // doesn't stay stuck in a "failed send" state.
     expect(stopTransportRuntimeSessionMock).toHaveBeenCalledWith('deck_transport_brain');
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'user.message',
-      { text: 'hello after restart', allowDuplicate: true, commandId: 'cmd-stale-runtime' },
-      undefined,
+      expect.objectContaining({
+        text: 'hello after restart',
+        allowDuplicate: true,
+        clientMessageId: 'cmd-stale-runtime',
+      }),
+      expect.objectContaining({ eventId: 'transport-user:cmd-stale-runtime' }),
     );
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'assistant.text',
-      { text: '⚠️ Provider unknown restarting. Please resend in a moment.', streaming: false, memoryExcluded: true },
+      expect.objectContaining({
+        text: expect.stringContaining('will auto-resend'),
+        streaming: false,
+        memoryExcluded: true,
+      }),
+      expect.objectContaining({ source: 'daemon' }),
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'session.state',
+      expect.objectContaining({
+        state: 'queued',
+        pendingCount: 1,
+        pendingMessageEntries: [
+          { clientMessageId: 'cmd-stale-runtime', text: 'hello after restart' },
+        ],
+      }),
       expect.objectContaining({ source: 'daemon' }),
     );
     expect(serverLink.send).toHaveBeenCalledWith({
       type: 'command.ack',
       commandId: 'cmd-stale-runtime',
-      status: 'error',
+      status: 'accepted',
       session: 'deck_transport_brain',
-      error: 'Provider unknown restarting. Please resend in a moment.',
     });
+    // The entry sits in the resend queue until the resumed runtime drains it.
+    expect(getResendEntries('deck_transport_brain')).toEqual([
+      expect.objectContaining({ text: 'hello after restart', commandId: 'cmd-stale-runtime' }),
+    ]);
+    clearAllResend();
   });
 
   it('waits for an in-flight settings restart before sending the first transport message', async () => {
