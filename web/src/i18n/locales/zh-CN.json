@@ -1162,6 +1162,9 @@
       "memoryLastRecalled": "上次召回：{{time}}",
       "memoryArchive": "归档",
       "memoryRestore": "恢复",
+      "memoryDelete": "删除",
+      "memoryDeleteConfirm": "确定永久删除这条记忆吗？此操作不可撤销。",
+      "memoryDeleteFailed": "删除记忆失败",
       "memoryArchived": "已归档",
       "memoryShowArchived": "显示已归档"
     },

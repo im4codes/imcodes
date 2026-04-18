@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ContextNamespace, ContextTargetRef } from '../../shared/context-types.js';
 import {
   archiveMemory,
+  deleteMemory,
   clearDirtyTarget,
   enqueueContextJob,
   getLocalProcessedFreshness,
@@ -366,6 +367,47 @@ describe('context-store', () => {
 
       expect(archiveMemory(projection.id)).toBe(true);
       expect(archiveMemory(projection.id)).toBe(false);
+    });
+
+
+    it('deleteMemory removes a processed projection permanently', () => {
+      const now = Date.now();
+      const projection = writeProcessedProjection({
+        namespace,
+        class: 'recent_summary',
+        sourceEventIds: ['evt-1'],
+        summary: 'Delete me',
+        content: {},
+        createdAt: now - 100,
+        updatedAt: now,
+      });
+
+      expect(deleteMemory(projection.id)).toBe(true);
+      expect(queryProcessedProjections({ projectId: namespace.projectId, includeArchived: true })).toHaveLength(0);
+      expect(deleteMemory(projection.id)).toBe(false);
+    });
+
+    it('deleteMemory removes pending replication ids for the deleted projection', () => {
+      const projection = writeProcessedProjection({
+        namespace,
+        class: 'recent_summary',
+        sourceEventIds: ['evt-1'],
+        summary: 'Delete and unschedule replication',
+        content: {},
+      });
+      setReplicationState(namespace, {
+        pendingProjectionIds: [projection.id, 'keep-me'],
+        lastReplicatedAt: 123,
+        lastError: 'none',
+      });
+
+      expect(deleteMemory(projection.id)).toBe(true);
+      expect(getReplicationState(namespace)).toEqual({
+        namespace,
+        pendingProjectionIds: ['keep-me'],
+        lastReplicatedAt: 123,
+        lastError: 'none',
+      });
     });
 
     it('queryProcessedProjections excludes archived by default', () => {

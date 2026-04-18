@@ -12,6 +12,7 @@ import { normalizeSharedContextRuntimeConfig } from '../../../shared/shared-cont
 import { isTemplatePrompt, isTemplateOriginSummary } from '../../../shared/template-prompt-patterns.js';
 import { isMemoryNoiseSummary } from '../../../shared/memory-noise-patterns.js';
 import { searchSemanticMemoryView } from '../util/semantic-memory-view.js';
+import { deleteEnterpriseMemoryProjection, deletePersonalMemoryProjection } from '../util/memory-delete.js';
 
 type EnterpriseRole = 'owner' | 'admin' | 'member';
 type BindingMode = 'required' | 'advisory';
@@ -205,6 +206,16 @@ function buildSharedMemoryResponse(
     })),
   };
 }
+
+sharedContextRoutes.delete('/personal-memory/:memoryId', async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const memoryId = c.req.param('memoryId');
+  if (!memoryId) return c.json({ error: 'missing_memory_id' }, 400);
+  const deleted = await deletePersonalMemoryProjection(c.env.DB, userId, memoryId);
+  if (!deleted) return c.json({ error: 'not_found' }, 404);
+  await logAudit({ userId, action: 'shared_context.personal_memory_deleted', details: { memoryId } }, c.env.DB);
+  return c.json({ ok: true, id: memoryId });
+});
 
 sharedContextRoutes.get('/personal-memory', async (c) => {
   const userId = c.get('userId' as never) as string;
@@ -698,6 +709,18 @@ sharedContextRoutes.get('/enterprises/:enterpriseId/projects/visibility', async 
     remoteProcessedPresent: !!remoteProjection,
     ...visibility,
   });
+});
+
+sharedContextRoutes.delete('/enterprises/:enterpriseId/memory/:memoryId', async (c) => {
+  const enterpriseId = c.req.param('enterpriseId');
+  const memoryId = c.req.param('memoryId');
+  if (!memoryId) return c.json({ error: 'missing_memory_id' }, 400);
+  const auth = await requireEnterpriseRole(c, enterpriseId, 'admin');
+  if (auth instanceof Response) return auth;
+  const deleted = await deleteEnterpriseMemoryProjection(c.env.DB, enterpriseId, memoryId);
+  if (!deleted) return c.json({ error: 'not_found' }, 404);
+  await logAudit({ userId: auth.userId, action: 'shared_context.enterprise_memory_deleted', details: { enterpriseId, memoryId } }, c.env.DB);
+  return c.json({ ok: true, id: memoryId });
 });
 
 sharedContextRoutes.get('/enterprises/:enterpriseId/memory', async (c) => {

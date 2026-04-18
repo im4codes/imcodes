@@ -1161,6 +1161,9 @@
       "memoryLastRecalled": "最終呼出: {{time}}",
       "memoryArchive": "アーカイブ",
       "memoryRestore": "復元",
+      "memoryDelete": "削除",
+      "memoryDeleteConfirm": "この記憶を完全に削除しますか？この操作は元に戻せません。",
+      "memoryDeleteFailed": "記憶を削除できませんでした",
       "memoryArchived": "アーカイブ済み",
       "memoryShowArchived": "アーカイブを表示"
     },

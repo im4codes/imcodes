@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { DEFAULT_PRIMARY_CONTEXT_MODEL } from '@shared/context-model-defaults.js';
 import type { ContextMemoryView, SharedContextRuntimeBackend } from '@shared/context-types.js';
 import { QWEN_MODEL_IDS } from '@shared/qwen-models.js';
+import { MEMORY_WS } from '@shared/memory-ws.js';
 import {
   DEFAULT_MEMORY_RECALL_MIN_SCORE,
   DEFAULT_MEMORY_SCORING_WEIGHTS,
@@ -32,6 +33,8 @@ import {
   createSharedDocumentVersion,
   createSharedWorkspace,
   createTeam,
+  deleteEnterpriseSharedMemory,
+  deletePersonalCloudMemory,
   createTeamInvite,
   enrollSharedProject,
   getSharedProjectPolicy,
@@ -545,6 +548,13 @@ const archiveRestoreButtonStyle = {
   flexShrink: 0,
 } as const;
 
+
+const deleteButtonStyle = {
+  ...archiveRestoreButtonStyle,
+  color: DT.text.error,
+  border: `1px solid rgba(239,68,68,0.3)`,
+} as const;
+
 type KindOption = SharedDocument['kind'];
 type ManagementTab = 'enterprise' | 'members' | 'projects' | 'knowledge' | 'processing' | 'memory';
 type MemoryTopTab = 'personal' | 'enterprise-memory';
@@ -800,6 +810,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [memoryPersonalSubTab, setMemoryPersonalSubTab] = useState<MemoryPersonalSubTab>('processed');
   const [memoryEnterpriseSubTab, setMemoryEnterpriseSubTab] = useState<MemoryEnterpriseSubTab>('shared-memory');
   const [showArchived, setShowArchived] = useState(false);
+  const [deletingMemoryIds, setDeletingMemoryIds] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     if (!ws) return;
@@ -820,11 +831,19 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
 
   const renderProcessedMemoryRecords = useCallback((
     view: ContextMemoryView,
-    opts?: { allowArchiveRestore?: boolean; onArchive?: (id: string) => void; onRestore?: (id: string) => void },
+    opts?: {
+      allowArchiveRestore?: boolean;
+      allowDelete?: boolean;
+      onArchive?: (id: string) => void;
+      onRestore?: (id: string) => void;
+      onDelete?: (id: string) => void;
+    },
   ) => {
     const allowActions = opts?.allowArchiveRestore ?? false;
+    const allowDelete = opts?.allowDelete ?? false;
     const onArchive = opts?.onArchive;
     const onRestore = opts?.onRestore;
+    const onDelete = opts?.onDelete;
     const visibleRecords = showArchived ? view.records : view.records.filter((r) => r.status !== 'archived');
     const recentRecords = visibleRecords.filter((record) => record.projectionClass === 'recent_summary');
     const durableRecords = visibleRecords.filter((record) => record.projectionClass === 'durable_memory_candidate');
@@ -884,25 +903,37 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                           ? t('sharedContext.management.memoryLastRecalled', { time: formatRelativeTime(record.lastUsedAt) })
                           : t('sharedContext.management.memoryNeverRecalled')}
                       </span>
-                      {allowActions ? (
-                        <span style={{ marginLeft: 'auto' }}>
-                          {isArchived ? (
+                      {allowActions || allowDelete ? (
+                        <span style={{ marginLeft: 'auto', display: 'inline-flex', gap: 6, flexWrap: 'wrap' }}>
+                          {allowActions ? (
+                            isArchived ? (
+                              <button
+                                type="button"
+                                style={archiveRestoreButtonStyle}
+                                onClick={() => onRestore?.(record.id)}
+                              >
+                                {t('sharedContext.management.memoryRestore')}
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                style={archiveRestoreButtonStyle}
+                                onClick={() => onArchive?.(record.id)}
+                              >
+                                {t('sharedContext.management.memoryArchive')}
+                              </button>
+                            )
+                          ) : null}
+                          {allowDelete ? (
                             <button
                               type="button"
-                              style={archiveRestoreButtonStyle}
-                              onClick={() => onRestore?.(record.id)}
+                              style={deleteButtonStyle}
+                              onClick={() => onDelete?.(record.id)}
+                              disabled={deletingMemoryIds.has(record.id)}
                             >
-                              {t('sharedContext.management.memoryRestore')}
+                              {t('sharedContext.management.memoryDelete')}
                             </button>
-                          ) : (
-                            <button
-                              type="button"
-                              style={archiveRestoreButtonStyle}
-                              onClick={() => onArchive?.(record.id)}
-                            >
-                              {t('sharedContext.management.memoryArchive')}
-                            </button>
-                          )}
+                          ) : null}
                         </span>
                       ) : null}
                     </div>
@@ -930,7 +961,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         ))}
       </div>
     );
-  }, [expandedMemoryRecordIds, t, showArchived]);
+  }, [deletingMemoryIds, expandedMemoryRecordIds, t, showArchived]);
 
   const selectedDocument = useMemo(
     () => documents.find((entry) => entry.id === selectedDocumentId) ?? null,
@@ -1142,7 +1173,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   useEffect(() => {
     if (!ws) return;
     return ws.onMessage((msg) => {
-      if (msg.type !== 'shared_context.personal_memory.response') return;
+      if (msg.type !== MEMORY_WS.PERSONAL_RESPONSE) return;
       if (msg.requestId !== personalMemoryRequestIdRef.current) return;
       setLocalPersonalMemory(normalizeMemoryView({
         stats: msg.stats,
@@ -1166,7 +1197,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         const requestId = crypto.randomUUID();
         personalMemoryRequestIdRef.current = requestId;
         ws.send({
-          type: 'shared_context.personal_memory.query',
+          type: MEMORY_WS.PERSONAL_QUERY,
           requestId,
           ...queryInput,
           includeArchived: showArchived,
@@ -1202,9 +1233,9 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const handleMemoryArchive = useCallback((id: string) => {
     if (!ws) return;
     const requestId = crypto.randomUUID();
-    ws.send({ type: 'memory.archive', requestId, id });
+    ws.send({ type: MEMORY_WS.ARCHIVE, requestId, id });
     const unsub = ws.onMessage((msg) => {
-      if (msg.type !== 'memory.archive_response' || msg.requestId !== requestId) return;
+      if (msg.type !== MEMORY_WS.ARCHIVE_RESPONSE || msg.requestId !== requestId) return;
       unsub();
       if (msg.success) void loadMemoryViews();
     });
@@ -1213,13 +1244,66 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const handleMemoryRestore = useCallback((id: string) => {
     if (!ws) return;
     const requestId = crypto.randomUUID();
-    ws.send({ type: 'memory.restore', requestId, id });
+    ws.send({ type: MEMORY_WS.RESTORE, requestId, id });
     const unsub = ws.onMessage((msg) => {
-      if (msg.type !== 'memory.restore_response' || msg.requestId !== requestId) return;
+      if (msg.type !== MEMORY_WS.RESTORE_RESPONSE || msg.requestId !== requestId) return;
       unsub();
       if (msg.success) void loadMemoryViews();
     });
   }, [ws, loadMemoryViews]);
+
+
+  const confirmMemoryDelete = useCallback((recordId: string) => {
+    const confirmed = globalThis.confirm?.(t('sharedContext.management.memoryDeleteConfirm')) ?? true;
+    if (!confirmed) return false;
+    setDeletingMemoryIds((current) => new Set(current).add(recordId));
+    return true;
+  }, [t]);
+
+  const finishMemoryDelete = useCallback((recordId: string) => {
+    setDeletingMemoryIds((current) => {
+      const next = new Set(current);
+      next.delete(recordId);
+      return next;
+    });
+  }, []);
+
+  const handleLocalMemoryDelete = useCallback((id: string) => {
+    if (!ws || !confirmMemoryDelete(id)) return;
+    const requestId = crypto.randomUUID();
+    ws.send({ type: MEMORY_WS.DELETE, requestId, id });
+    const unsub = ws.onMessage((msg) => {
+      if (msg.type !== MEMORY_WS.DELETE_RESPONSE || msg.requestId !== requestId) return;
+      unsub();
+      finishMemoryDelete(id);
+      if (msg.success) void loadMemoryViews();
+      else setError(msg.error || t('sharedContext.management.memoryDeleteFailed'));
+    });
+  }, [confirmMemoryDelete, finishMemoryDelete, loadMemoryViews, t, ws]);
+
+  const handleCloudMemoryDelete = useCallback(async (id: string) => {
+    if (!confirmMemoryDelete(id)) return;
+    try {
+      await deletePersonalCloudMemory(id);
+      await loadMemoryViews();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      finishMemoryDelete(id);
+    }
+  }, [confirmMemoryDelete, finishMemoryDelete, loadMemoryViews]);
+
+  const handleEnterpriseMemoryDelete = useCallback(async (id: string) => {
+    if (!enterpriseId || !confirmMemoryDelete(id)) return;
+    try {
+      await deleteEnterpriseSharedMemory(enterpriseId, id);
+      await loadMemoryViews();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      finishMemoryDelete(id);
+    }
+  }, [confirmMemoryDelete, enterpriseId, finishMemoryDelete, loadMemoryViews]);
 
   const getProcessingPresetValue = useCallback((
     backend: SharedContextRuntimeBackend,
@@ -2362,7 +2446,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                   <span style={{ ...helperTextStyle, fontSize: 12 }}>{t('sharedContext.management.memoryShowArchived')}</span>
                 </div>
                 {localPersonalMemory.records.length > 0
-                  ? renderProcessedMemoryRecords(localPersonalMemory, { allowArchiveRestore: true, onArchive: handleMemoryArchive, onRestore: handleMemoryRestore })
+                  ? renderProcessedMemoryRecords(localPersonalMemory, { allowArchiveRestore: true, allowDelete: true, onArchive: handleMemoryArchive, onRestore: handleMemoryRestore, onDelete: handleLocalMemoryDelete })
                   : <div style={helperTextStyle}>{t('sharedContext.management.memoryProcessedEmptyPending')}</div>}
               </div>
             ) : null}
@@ -2428,7 +2512,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     detail={`${t('sharedContext.management.memoryStatProjects')}: ${cloudPersonalMemory.stats.projectCount}`}
                   />
                 </div>
-                {renderProcessedMemoryRecords(cloudPersonalMemory)}
+                {renderProcessedMemoryRecords(cloudPersonalMemory, { allowDelete: true, onDelete: handleCloudMemoryDelete })}
               </div>
             ) : null}
 
@@ -2449,7 +2533,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     detail={`${t('sharedContext.management.memoryStatProjects')}: ${sharedMemory.stats.projectCount}`}
                   />
                 </div>
-                {renderProcessedMemoryRecords(sharedMemory)}
+                {renderProcessedMemoryRecords(sharedMemory, { allowDelete: team?.myRole === 'owner' || team?.myRole === 'admin', onDelete: handleEnterpriseMemoryDelete })}
               </div>
             ) : null}
 

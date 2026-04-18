@@ -156,16 +156,13 @@ function toNullableString(value: unknown): string | null {
 }
 
 
-function purgeMemoryNoiseProjections(database: DatabaseSyncInstance): number {
-  const rows = database.prepare('SELECT id, summary FROM context_processed_local').all() as Array<{ id: string; summary: string }>;
-  const badIds = rows.filter((row) => isMemoryNoiseSummary(row.summary)).map((row) => row.id);
-  if (badIds.length === 0) return 0;
-  const placeholders = badIds.map(() => '?').join(', ');
-  database.prepare(`DELETE FROM context_processed_local WHERE id IN (${placeholders})`).run(...badIds);
+function removeProjectionIdsFromReplicationState(database: DatabaseSyncInstance, projectionIds: string[]): void {
+  if (projectionIds.length === 0) return;
+  const projectionIdSet = new Set(projectionIds);
   const replicationRows = database.prepare('SELECT namespace_key, pending_projection_ids_json, last_replicated_at, last_error FROM context_replication_state').all() as Array<Record<string, unknown>>;
   for (const row of replicationRows) {
     const pending = parseJson<string[]>(row.pending_projection_ids_json, []);
-    const filtered = pending.filter((id) => !badIds.includes(id));
+    const filtered = pending.filter((id) => !projectionIdSet.has(id));
     if (filtered.length === pending.length) continue;
     database.prepare(`
       UPDATE context_replication_state
@@ -178,6 +175,15 @@ function purgeMemoryNoiseProjections(database: DatabaseSyncInstance): number {
       String(row.namespace_key),
     );
   }
+}
+
+function purgeMemoryNoiseProjections(database: DatabaseSyncInstance): number {
+  const rows = database.prepare('SELECT id, summary FROM context_processed_local').all() as Array<{ id: string; summary: string }>;
+  const badIds = rows.filter((row) => isMemoryNoiseSummary(row.summary)).map((row) => row.id);
+  if (badIds.length === 0) return 0;
+  const placeholders = badIds.map(() => '?').join(', ');
+  database.prepare(`DELETE FROM context_processed_local WHERE id IN (${placeholders})`).run(...badIds);
+  removeProjectionIdsFromReplicationState(database, badIds);
   return badIds.length;
 }
 
@@ -816,4 +822,19 @@ export function archiveMemory(id: string): boolean {
   `).run(id);
 
   return ((result as { changes: number }).changes ?? 0) > 0;
+}
+
+
+/**
+ * Permanently delete a local processed projection.
+ * Also removes the projection id from pending replication state so deleted items are not re-uploaded.
+ */
+export function deleteMemory(id: string): boolean {
+  const database = ensureDb();
+  const result = database.prepare('DELETE FROM context_processed_local WHERE id = ?').run(id);
+  const deleted = ((result as { changes: number }).changes ?? 0) > 0;
+  if (deleted) {
+    removeProjectionIdsFromReplicationState(database, [id]);
+  }
+  return deleted;
 }

@@ -31,6 +31,7 @@ import {
   SHARED_CONTEXT_RUNTIME_CONFIG_MSG,
 } from '../../../shared/shared-context-runtime-config.js';
 import { searchSemanticMemoryView } from '../util/semantic-memory-view.js';
+import { deletePersonalMemoryProjection } from '../util/memory-delete.js';
 import { isMemoryNoiseSummary } from '../../../shared/memory-noise-patterns.js';
 
 export const serverRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
@@ -507,6 +508,18 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
     replicatedAt: now,
     projectionCount: acceptedCount,
   });
+});
+
+serverRoutes.delete('/:id/shared-context/personal-memory/:memoryId', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id') ?? '';
+  const memoryId = c.req.param('memoryId');
+  if (!memoryId) return c.json({ error: 'missing_memory_id' }, 400);
+  const server = await getServerById(c.env.DB, serverId);
+  if (!server || server.user_id !== userId) return c.json({ error: 'not_found' }, 404);
+  const deleted = await deletePersonalMemoryProjection(c.env.DB, userId, memoryId);
+  if (!deleted) return c.json({ error: 'not_found' }, 404);
+  return c.json({ ok: true, id: memoryId });
 });
 
 serverRoutes.get('/:id/shared-context/personal-memory', requireAuth(), async (c) => {

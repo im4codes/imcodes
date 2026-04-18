@@ -57,6 +57,7 @@ import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from '.
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import { MEMORY_WS } from '../../shared/memory-ws.js';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG } from '../../shared/p2p-config-events.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import {
@@ -909,14 +910,17 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case 'file.search':
       void handleFileSearch(cmd, serverLink);
       break;
-    case 'memory.search':
+    case MEMORY_WS.SEARCH:
       void handleMemorySearch(cmd, serverLink);
       break;
-    case 'memory.archive':
+    case MEMORY_WS.ARCHIVE:
       void handleMemoryArchive(cmd, serverLink);
       break;
-    case 'memory.restore':
+    case MEMORY_WS.RESTORE:
       void handleMemoryRestore(cmd, serverLink);
+      break;
+    case MEMORY_WS.DELETE:
+      void handleMemoryDelete(cmd, serverLink);
       break;
     case 'fs.ls':
       void handleFsList(cmd, serverLink);
@@ -951,7 +955,7 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case SHARED_CONTEXT_RUNTIME_CONFIG_MSG.APPLY:
       void handleSharedContextRuntimeConfigApply(cmd);
       break;
-    case 'shared_context.personal_memory.query':
+    case MEMORY_WS.PERSONAL_QUERY:
       void handlePersonalMemoryQuery(cmd, serverLink);
       break;
     case 'file.upload':
@@ -1076,6 +1080,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
   const dir = expandTilde((cmd.dir as string) || '~');
   const ccPresetName = cmd.ccPreset as string | undefined;
   const ccInitPrompt = cmd.ccInitPrompt as string | undefined;
+  const requestedModel = (cmd.requestedModel as string | undefined) ?? (cmd.model as string | undefined);
   const requestedEffort: unknown = cmd.thinking ?? cmd.effort;
   const effort = isTransportEffortLevel(requestedEffort)
     ? requestedEffort
@@ -1139,6 +1144,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         ccSessionId: randomUUID(),
         extraEnv,
         ccPreset: ccPresetName,
+        ...(requestedModel ? { requestedModel } : {}),
         label,
         effort,
       });
@@ -1151,6 +1157,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         agentType: 'codex-sdk',
         projectDir: dir,
         fresh: true,
+        ...(requestedModel ? { requestedModel } : {}),
         label,
         effort,
       });
@@ -1163,6 +1170,21 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         agentType: agentType as 'copilot-sdk' | 'cursor-headless',
         projectDir: dir,
         fresh: true,
+        ...(requestedModel ? { requestedModel } : {}),
+        label,
+        effort,
+      });
+    } else if (agentType === 'qwen') {
+      logger.info({ project }, 'SDK fresh session.start launching new Qwen main session');
+      await launchTransportSession({
+        name: `deck_${project}_brain`,
+        projectName: project,
+        role: 'brain',
+        agentType: 'qwen',
+        projectDir: dir,
+        fresh: true,
+        ...(ccPresetName ? { ccPreset: ccPresetName } : {}),
+        ...(requestedModel ? { requestedModel } : {}),
         label,
         effort,
       });
@@ -1777,6 +1799,27 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           planLabel: sdkDisplay.planLabel,
           quotaLabel: sdkDisplay.quotaLabel,
           quotaUsageLabel: sdkDisplay.quotaUsageLabel,
+          updatedAt: Date.now(),
+        };
+        upsertSession(nextRecord);
+        persistSessionRecord(nextRecord, sessionName);
+        await handleGetSessions(serverLink);
+        syncSubSessionIfNeeded(sessionName, serverLink);
+        emitTransportUserMessage(text);
+        timelineEmitter.emit(sessionName, 'usage.update', { model: nextModel, contextWindow: resolveContextWindow(undefined, nextModel) }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'assistant.text', { text: `Switched model to ${nextModel}`, streaming: false }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
+        try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted', session: sessionName }); } catch {}
+        return;
+      }
+      if ((record?.agentType === 'copilot-sdk' || record?.agentType === 'cursor-headless') && modelMatch) {
+        const nextModel = modelMatch[1];
+        transportRuntime.setAgentId(nextModel);
+        const nextRecord = {
+          ...record,
+          requestedModel: nextModel,
+          activeModel: nextModel,
+          modelDisplay: nextModel,
           updatedAt: Date.now(),
         };
         upsertSession(nextRecord);
@@ -4282,7 +4325,7 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
     limit,
   });
   serverLink.send({
-    type: 'shared_context.personal_memory.response',
+    type: MEMORY_WS.PERSONAL_RESPONSE,
     requestId,
     stats,
     records,
@@ -4316,24 +4359,37 @@ async function handleMemoryArchive(cmd: Record<string, unknown>, serverLink: Ser
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
   const id = typeof cmd.id === 'string' ? cmd.id : '';
   if (!id) {
-    serverLink.send({ type: 'memory.archive_response', requestId, success: false, error: 'Missing id' });
+    serverLink.send({ type: MEMORY_WS.ARCHIVE_RESPONSE, requestId, success: false, error: 'Missing id' });
     return;
   }
   const { archiveMemory } = await import('../store/context-store.js');
   const success = archiveMemory(id);
-  serverLink.send({ type: 'memory.archive_response', requestId, success });
+  serverLink.send({ type: MEMORY_WS.ARCHIVE_RESPONSE, requestId, success });
 }
 
 async function handleMemoryRestore(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
   const id = typeof cmd.id === 'string' ? cmd.id : '';
   if (!id) {
-    serverLink.send({ type: 'memory.restore_response', requestId, success: false, error: 'Missing id' });
+    serverLink.send({ type: MEMORY_WS.RESTORE_RESPONSE, requestId, success: false, error: 'Missing id' });
     return;
   }
   const { restoreArchivedMemory } = await import('../store/context-store.js');
   const success = restoreArchivedMemory(id);
-  serverLink.send({ type: 'memory.restore_response', requestId, success });
+  serverLink.send({ type: MEMORY_WS.RESTORE_RESPONSE, requestId, success });
+}
+
+
+async function handleMemoryDelete(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
+  const id = typeof cmd.id === 'string' ? cmd.id : '';
+  if (!id) {
+    serverLink.send({ type: MEMORY_WS.DELETE_RESPONSE, requestId, success: false, error: 'Missing id' });
+    return;
+  }
+  const { deleteMemory } = await import('../store/context-store.js');
+  const success = deleteMemory(id);
+  serverLink.send({ type: MEMORY_WS.DELETE_RESPONSE, requestId, success });
 }
 
 // ── Process agent memory injection (text prepend) ────────────────────────

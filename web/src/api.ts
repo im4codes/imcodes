@@ -1473,3 +1473,16 @@ export async function getEnterpriseSharedMemory(
     method: 'GET',
   });
 }
+
+
+export async function deletePersonalCloudMemory(memoryId: string): Promise<{ ok: boolean }> {
+  return apiFetch(`/api/shared-context/personal-memory/${encodeURIComponent(memoryId)}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function deleteEnterpriseSharedMemory(enterpriseId: string, memoryId: string): Promise<{ ok: boolean }> {
+  return apiFetch(`/api/shared-context/enterprises/${encodeURIComponent(enterpriseId)}/memory/${encodeURIComponent(memoryId)}`, {
+    method: 'DELETE',
+  });
+}

@@ -1162,6 +1162,9 @@
       "memoryLastRecalled": "上次召回：{{time}}",
       "memoryArchive": "封存",
       "memoryRestore": "還原",
+      "memoryDelete": "刪除",
+      "memoryDeleteConfirm": "確定永久刪除這條記憶嗎？此操作無法復原。",
+      "memoryDeleteFailed": "刪除記憶失敗",
       "memoryArchived": "已封存",
       "memoryShowArchived": "顯示已封存"
     },

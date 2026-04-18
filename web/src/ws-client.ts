@@ -9,6 +9,7 @@ import { REPO_MSG } from '@shared/repo-types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
+import { MEMORY_WS } from '@shared/memory-ws.js';
 import type {
   FsLsResponse,
   FsReadResponse,
@@ -89,14 +90,15 @@ export type ServerMessage =
   | { type: 'provider.status'; providerId: string; connected: boolean }
   | { type: 'provider.sessions_response'; providerId: string; sessions: Array<{ key: string; displayName?: string; agentId?: string; updatedAt?: number; percentUsed?: number }>; error?: string }
   | {
-    type: 'shared_context.personal_memory.response';
+    type: typeof MEMORY_WS.PERSONAL_RESPONSE;
     requestId: string;
     stats: import('../../shared/context-types.js').ContextMemoryStatsView;
     records: Array<import('../../shared/context-types.js').ContextMemoryRecordView>;
     pendingRecords?: Array<import('../../shared/context-types.js').ContextPendingEventView>;
   }
-  | { type: 'memory.archive_response'; requestId?: string; success: boolean; error?: string }
-  | { type: 'memory.restore_response'; requestId?: string; success: boolean; error?: string };
+  | { type: typeof MEMORY_WS.ARCHIVE_RESPONSE; requestId?: string; success: boolean; error?: string }
+  | { type: typeof MEMORY_WS.RESTORE_RESPONSE; requestId?: string; success: boolean; error?: string }
+  | { type: typeof MEMORY_WS.DELETE_RESPONSE; requestId?: string; success: boolean; error?: string };
 
 export type {
   TimelineEvent,

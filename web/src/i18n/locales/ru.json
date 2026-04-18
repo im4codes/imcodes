@@ -1161,6 +1161,9 @@
       "memoryLastRecalled": "Последний вызов: {{time}}",
       "memoryArchive": "Архивировать",
       "memoryRestore": "Восстановить",
+      "memoryDelete": "Удалить",
+      "memoryDeleteConfirm": "Удалить эту память навсегда? Это действие нельзя отменить.",
+      "memoryDeleteFailed": "Не удалось удалить память",
       "memoryArchived": "В архиве",
       "memoryShowArchived": "Показать архивные"
     },

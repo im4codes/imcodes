@@ -1162,6 +1162,9 @@
       "memoryLastRecalled": "Last recalled: {{time}}",
       "memoryArchive": "Archive",
       "memoryRestore": "Restore",
+      "memoryDelete": "Delete",
+      "memoryDeleteConfirm": "Delete this memory permanently? This cannot be undone.",
+      "memoryDeleteFailed": "Failed to delete memory",
       "memoryArchived": "Archived",
       "memoryShowArchived": "Show archived"
     },

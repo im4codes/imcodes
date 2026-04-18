@@ -1161,6 +1161,9 @@
       "memoryLastRecalled": "Última recuperación: {{time}}",
       "memoryArchive": "Archivar",
       "memoryRestore": "Restaurar",
+      "memoryDelete": "Eliminar",
+      "memoryDeleteConfirm": "¿Eliminar esta memoria de forma permanente? Esta acción no se puede deshacer.",
+      "memoryDeleteFailed": "No se pudo eliminar la memoria",
       "memoryArchived": "Archivado",
       "memoryShowArchived": "Mostrar archivados"
     },

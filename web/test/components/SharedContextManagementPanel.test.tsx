@@ -4,6 +4,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { useState } from 'preact/hooks';
 import { act } from 'preact/test-utils';
+import { MEMORY_WS } from '@shared/memory-ws.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('react-i18next', () => ({
@@ -35,6 +36,8 @@ const fetchSharedContextRuntimeConfigMock = vi.fn();
 const updateSharedContextRuntimeConfigMock = vi.fn();
 const getPersonalCloudMemoryMock = vi.fn();
 const getEnterpriseSharedMemoryMock = vi.fn();
+const deletePersonalCloudMemoryMock = vi.fn();
+const deleteEnterpriseSharedMemoryMock = vi.fn();
 
 vi.mock('../../src/api.js', () => ({
   ApiError: class ApiError extends Error {
@@ -67,6 +70,8 @@ vi.mock('../../src/api.js', () => ({
   updateSharedContextRuntimeConfig: (...args: unknown[]) => updateSharedContextRuntimeConfigMock(...args),
   getPersonalCloudMemory: (...args: unknown[]) => getPersonalCloudMemoryMock(...args),
   getEnterpriseSharedMemory: (...args: unknown[]) => getEnterpriseSharedMemoryMock(...args),
+  deletePersonalCloudMemory: (...args: unknown[]) => deletePersonalCloudMemoryMock(...args),
+  deleteEnterpriseSharedMemory: (...args: unknown[]) => deleteEnterpriseSharedMemoryMock(...args),
 }));
 
 import { SharedContextManagementPanel } from '../../src/components/SharedContextManagementPanel.js';
@@ -216,6 +221,9 @@ describe('SharedContextManagementPanel', () => {
       ],
       pendingRecords: [],
     });
+    deletePersonalCloudMemoryMock.mockResolvedValue({ ok: true });
+    deleteEnterpriseSharedMemoryMock.mockResolvedValue({ ok: true });
+    vi.stubGlobal('confirm', vi.fn(() => true));
     getEnterpriseSharedMemoryMock.mockResolvedValue({
       stats: {
         totalRecords: 4,
@@ -245,6 +253,7 @@ describe('SharedContextManagementPanel', () => {
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
+    vi.unstubAllGlobals();
   });
 
   it('loads enterprise data and renders members, workspaces, projects, and documents', async () => {
@@ -612,6 +621,8 @@ describe('SharedContextManagementPanel', () => {
     await act(async () => {
       fireEvent.click(screen.getByText('sharedContext.management.tabs.processing'));
     });
+    await waitFor(() => expect(fetchSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1'));
+    await flush();
 
     await act(async () => {
       fireEvent.click(screen.getByLabelText('sharedContext.management.processingPrimaryBackend: qwen'));
@@ -668,12 +679,12 @@ describe('SharedContextManagementPanel', () => {
     await waitFor(() => expect(getPersonalCloudMemoryMock).toHaveBeenCalledWith(expect.any(Object)));
     await waitFor(() => expect(getEnterpriseSharedMemoryMock).toHaveBeenCalledWith('team-1', expect.any(Object)));
 
-    const queryCommand = sent.find((message) => message.type === 'shared_context.personal_memory.query');
+    const queryCommand = sent.find((message) => message.type === MEMORY_WS.PERSONAL_QUERY);
     expect(queryCommand).toBeDefined();
 
     await act(async () => {
       messageHandler?.({
-        type: 'shared_context.personal_memory.response',
+        type: MEMORY_WS.PERSONAL_RESPONSE,
         requestId: queryCommand?.requestId,
         stats: {
           totalRecords: 3,
@@ -760,4 +771,88 @@ describe('SharedContextManagementPanel', () => {
       enablePersonalMemorySync: true,
     })));
   });
+
+  it('deletes local, cloud, and enterprise memory records', async () => {
+    const sent: Array<Record<string, unknown>> = [];
+    let messageHandler: ((message: unknown) => void) | null = null;
+    const ws = {
+      send(message: Record<string, unknown>) {
+        sent.push(message);
+      },
+      onMessage(handler: (message: unknown) => void) {
+        messageHandler = handler;
+        return () => {
+          if (messageHandler === handler) messageHandler = null;
+        };
+      },
+    };
+
+    render(<SharedContextManagementPanel serverId="srv-1" ws={ws as never} />);
+    await flush();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.memory'));
+    });
+
+    const localQuery = sent.find((message) => message.type === MEMORY_WS.PERSONAL_QUERY);
+    expect(localQuery).toBeDefined();
+
+    await act(async () => {
+      messageHandler?.({
+        type: MEMORY_WS.PERSONAL_RESPONSE,
+        requestId: localQuery?.requestId,
+        stats: {
+          totalRecords: 1,
+          matchedRecords: 1,
+          recentSummaryCount: 1,
+          durableCandidateCount: 0,
+          projectCount: 1,
+          stagedEventCount: 0,
+          dirtyTargetCount: 0,
+          pendingJobCount: 0,
+        },
+        records: [
+          {
+            id: 'local-personal-1',
+            scope: 'personal',
+            projectId: 'github.com/acme/repo',
+            summary: 'Local personal summary',
+            projectionClass: 'recent_summary',
+            sourceEventCount: 1,
+            updatedAt: 1700000000000,
+          },
+        ],
+        pendingRecords: [],
+      });
+    });
+
+    const localDeleteButtons = await screen.findAllByText('sharedContext.management.memoryDelete');
+    await act(async () => {
+      fireEvent.click(localDeleteButtons[0]);
+    });
+    const deleteCommand = sent.find((message) => message.type === MEMORY_WS.DELETE);
+    expect(deleteCommand).toMatchObject({ id: 'local-personal-1' });
+    await act(async () => {
+      messageHandler?.({ type: MEMORY_WS.DELETE_RESPONSE, requestId: deleteCommand?.requestId, success: true });
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.memoryTabCloud'));
+    });
+    const cloudDeleteButtons = await screen.findAllByText('sharedContext.management.memoryDelete');
+    await act(async () => {
+      fireEvent.click(cloudDeleteButtons[0]);
+    });
+    await waitFor(() => expect(deletePersonalCloudMemoryMock).toHaveBeenCalledWith('cloud-personal-1'));
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.memoryTabEnterprise'));
+    });
+    const enterpriseDeleteButtons = await screen.findAllByText('sharedContext.management.memoryDelete');
+    await act(async () => {
+      fireEvent.click(enterpriseDeleteButtons[0]);
+    });
+    await waitFor(() => expect(deleteEnterpriseSharedMemoryMock).toHaveBeenCalledWith('team-1', 'shared-1'));
+  });
+
 });
