@@ -51,6 +51,11 @@ interface Props {
   onPendingPrefillApplied?: () => void;
   /** Whether this sub-session is participating in an active P2P discussion. */
   inP2p?: boolean;
+  /** Opens the shared file browser (desktop panel or mobile overlay).
+   *  Passed through to SessionControls so the 📁 button matches the main session. */
+  onOpenFileBrowser?: () => void;
+  /** Git-changes count for the 📁 badge. */
+  gitChangesCount?: number;
 }
 
 type ViewMode = 'terminal' | 'chat';
@@ -92,7 +97,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, onSettings, onTransportConfigSaved, zIndex, onFocus, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, inP2p,
+  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, onSettings, onTransportConfigSaved, zIndex, onFocus, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, inP2p, onOpenFileBrowser, gitChangesCount,
 }: Props) {
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
@@ -521,6 +526,8 @@ export function SubSessionWindow({
         onRemoveQuote={removeQuote}
         pendingPrefillText={pendingPrefillText}
         onPendingPrefillApplied={onPendingPrefillApplied}
+        onOpenFileBrowser={onOpenFileBrowser}
+        gitChangesCount={gitChangesCount}
       />
     </div>
   );

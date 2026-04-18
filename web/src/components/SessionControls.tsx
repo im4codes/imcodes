@@ -113,6 +113,11 @@ interface Props {
   onOverlayOpenChange?: (open: boolean) => void;
   /** Optional local optimistic update when transport config changes through quick controls. */
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
+  /** Open the shared file browser panel/overlay (reuses the top-bar file browser).
+   *  When provided, renders a 📁 button next to 📎 in the input row. */
+  onOpenFileBrowser?: () => void;
+  /** Badge count for the 📁 button — mirrors the top-bar git-changes badge. */
+  gitChangesCount?: number;
 }
 
 type MenuAction = 'restart' | 'new' | 'stop';
@@ -375,7 +380,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking: _activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking: _activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onOpenFileBrowser, gitChangesCount }: Props) {
   const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -2804,6 +2809,18 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             </button>
           )}
         </div>
+        {onOpenFileBrowser && (
+          <button
+            class="btn btn-voice"
+            onClick={() => onOpenFileBrowser()}
+            disabled={inputDisabled}
+            title={t('picker.files')}
+            style={{ position: 'relative' }}
+          >
+            {'\u{1F4C1}'}
+            {(gitChangesCount ?? 0) > 0 && <span class="file-badge">{gitChangesCount}</span>}
+          </button>
+        )}
         {serverId && (
           <>
             <input

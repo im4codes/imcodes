@@ -232,6 +232,14 @@ export function App() {
   const [localWebPreviewPort, setLocalWebPreviewPort] = useState('');
   const [localWebPreviewPath, setLocalWebPreviewPath] = useState('/');
   const [gitChangesCount, setGitChangesCount] = useState(0);
+  /** Shared toggle for the 📁 file browser — used by the top bar button AND
+   *  by the per-session 📁 button in SessionControls. Desktop opens the
+   *  FloatingPanel, mobile opens the full-screen overlay. */
+  const toggleFileBrowser = useCallback(() => {
+    const mobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+    if (mobile) setShowMobileFileBrowser((o) => !o);
+    else setShowDesktopFileBrowser((o) => !o);
+  }, []);
   // File browser geometry now managed by FloatingPanel (id="filebrowser")
   const [serverCtxMenu, setServerCtxMenu] = useState<{ server: ServerInfo; x: number; y: number } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ServerInfo | null>(null);
@@ -2859,6 +2867,8 @@ export function App() {
                 onAfterAction={focusTerminal}
                 mobileFileBrowserOpen={s.name === activeSession ? showMobileFileBrowser : false}
                 onMobileFileBrowserClose={() => setShowMobileFileBrowser(false)}
+                onOpenFileBrowser={toggleFileBrowser}
+                gitChangesCount={s.name === activeSession ? gitChangesCount : 0}
                 pendingPrefillText={pendingPrefills[s.name] ?? null}
                 onPendingPrefillApplied={() => setPendingPrefills((prev) => {
                   if (!(s.name in prev)) return prev;
@@ -3444,6 +3454,8 @@ export function App() {
               subSessions={subSessionsSlim}
               serverId={selectedServerId ?? undefined}
               inP2p={p2pSessionLabels.has(sub.sessionName)}
+              onOpenFileBrowser={toggleFileBrowser}
+              gitChangesCount={gitChangesCount}
               pendingPrefillText={pendingPrefills[sub.sessionName] ?? null}
               onPendingPrefillApplied={() => setPendingPrefills((prev) => {
                 if (!(sub.sessionName in prev)) return prev;

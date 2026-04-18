@@ -3,9 +3,9 @@
 [English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
 
-**El IM para agentes. Una capa de memoria que atraviesa todos los proveedores de IA. Auditoría y planificación multi-agente.**
+**El IM para agentes. Memoria compartida, ejecución supervisada y auditoría cruzada entre proveedores de IA.**
 
-IM.codes ofrece a los coding agents una capa de memoria compartida entre proveedores. Convierte el trabajo completado en contexto reutilizable y vuelve a inyectar el historial adecuado en sesiones futuras. Funciona con [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com) y [Qwen](https://github.com/QwenLM/qwen-agent), además de terminal, archivos, vistas Git, localhost preview, notificaciones, flujos multiagente y streaming nativo para agentes transport. Función de discusión P2P integrada: varios modelos revisan y auditan los planes y las implementaciones de los demás, reduciendo de forma eficaz las omisiones, puntos ciegos y sesgos de un solo modelo.
+IM.codes ofrece a los coding agents una capa de memoria compartida entre proveedores. Convierte el trabajo completado en contexto reutilizable y vuelve a inyectar el historial adecuado en sesiones futuras. Funciona con [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com) y [Qwen](https://github.com/QwenLM/qwen-agent), además de terminal, archivos, vistas Git, localhost preview, notificaciones, flujos multiagente y streaming nativo para agentes transport. Auto supervision integrado puede juzgar los turnos completados, seguir trabajando de forma autónoma y, si quieres, ejecutar un bucle de auditoría y retrabajo antes de devolverte el control. La discusión P2P integrada permite que varios modelos revisen y auditen los planes y las implementaciones de los demás, reduciendo de forma eficaz las omisiones, puntos ciegos y sesgos de un solo modelo.
 
 > **Nota:** Este archivo es una traducción. **El README en inglés (`../README.md`) es la versión canónica.** Si hay alguna diferencia, prevalece la versión en inglés.
 
@@ -80,6 +80,17 @@ IM.codes convierte continuamente el trabajo ya resuelto de los agentes en memori
 - **Recuperación multilingüe.** La búsqueda semántica local y el recall del servidor con pgvector usan embeddings multilingües para encontrar soluciones relacionadas entre inglés, chino, japonés, coreano, español, ruso y repos mixtos.
 - **Inyección automática donde importa.** El historial relevante se inyecta tanto por mensaje como al iniciar la sesión, con tarjetas en la timeline que muestran qué se recuperó, por qué, la puntuación de relevancia, el número de recalls y el último uso.
 - **Visible y controlable por el usuario.** La UI de Shared Context separa raw events, processed summaries, cloud memory y enterprise memory, con controles de consulta, vista previa, archive/restore y configuración de procesamiento.
+
+## Ejecución Supervisada y Auto Audit
+
+IM.codes puede supervisar sesiones transport compatibles turno a turno en lugar de depender de un auto-continue ciego.
+
+- **Modos Auto por sesión.** Configura `off`, `supervised` o `supervised_audit` por sesión, en vez de forzar una sola política en todo el sistema.
+- **Comprobaciones de finalización en el límite idle.** Cuando un turno termina, IM.codes puede clasificarlo como `complete`, `continue` o `ask_human` y enviar el siguiente continue prompt dentro de la misma sesión.
+- **Automatización fail-closed.** Auto supervision permanece visible en la timeline y en el footer, usa decisiones estructuradas y te devuelve el control si hay timeout, salida inválida o mala configuración.
+- **Bucle opcional audit → rework.** En `supervised_audit`, un turno completado puede entrar automáticamente en un pipeline de auditoría y reenviar un brief de retrabajo a la misma sesión antes de devolverte el control.
+- **Valores globales + overrides por sesión.** Define una vez el backend/modelo/timeout por defecto del supervisor y, cuando haga falta, sobrescribe backend/modelo/timeout, modo de auditoría e instrucciones personalizadas en cada sesión.
+- **Pensado para flujos reales de IM.codes.** Auto supervision entiende flujos de OpenSpec, revisiones P2P y coordinación entre agentes con `imcodes send` como pasos válidos del agente, no como una razón inmediata para parar y pedir a un humano.
 
 ## Funciones
 
