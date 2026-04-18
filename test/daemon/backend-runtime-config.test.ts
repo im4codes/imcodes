@@ -12,6 +12,12 @@ describe('fetchBackendSharedContextRuntimeConfig', () => {
           backupContextBackend: 'claude-code-sdk',
           backupContextModel: 'haiku',
           memoryRecallMinScore: 0.41,
+          memoryScoringWeights: {
+            similarity: 0.5,
+            recency: 0.2,
+            frequency: 0.1,
+            project: 0.2,
+          },
           enablePersonalMemorySync: true,
         },
       }),
@@ -28,6 +34,12 @@ describe('fetchBackendSharedContextRuntimeConfig', () => {
       backupContextBackend: 'claude-code-sdk',
       backupContextModel: 'haiku',
       memoryRecallMinScore: 0.41,
+      memoryScoringWeights: {
+        similarity: 0.5,
+        recency: 0.2,
+        frequency: 0.1,
+        project: 0.2,
+      },
       enablePersonalMemorySync: true,
     });
   });

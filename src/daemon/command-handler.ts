@@ -4167,6 +4167,14 @@ async function handleSharedContextRuntimeConfigApply(cmd: Record<string, unknown
     ),
     backupContextModel: typeof config?.backupContextModel === 'string' ? config.backupContextModel : undefined,
     memoryRecallMinScore: typeof config?.memoryRecallMinScore === 'number' ? config.memoryRecallMinScore : undefined,
+    memoryScoringWeights: config?.memoryScoringWeights && typeof config.memoryScoringWeights === 'object'
+      ? {
+          similarity: typeof (config.memoryScoringWeights as Record<string, unknown>).similarity === 'number' ? (config.memoryScoringWeights as Record<string, unknown>).similarity as number : undefined,
+          recency: typeof (config.memoryScoringWeights as Record<string, unknown>).recency === 'number' ? (config.memoryScoringWeights as Record<string, unknown>).recency as number : undefined,
+          frequency: typeof (config.memoryScoringWeights as Record<string, unknown>).frequency === 'number' ? (config.memoryScoringWeights as Record<string, unknown>).frequency as number : undefined,
+          project: typeof (config.memoryScoringWeights as Record<string, unknown>).project === 'number' ? (config.memoryScoringWeights as Record<string, unknown>).project as number : undefined,
+        }
+      : undefined,
     enablePersonalMemorySync: config?.enablePersonalMemorySync === true,
   });
   if (!normalized.primaryContextBackend || !normalized.primaryContextModel) {

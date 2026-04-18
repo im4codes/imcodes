@@ -1055,7 +1055,7 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
         projectionClass: row.projection_class,
         memoryProjectId: row.project_id,
         currentProjectId,
-      }),
+      }, runtimeConfig.memoryScoringWeights),
       source: 'personal',
     });
   }
@@ -1078,11 +1078,11 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
         currentProjectId,
         memoryEnterpriseId: row.enterprise_id ?? undefined,
         currentEnterpriseId,
-      }),
+      }, runtimeConfig.memoryScoringWeights),
       source: 'enterprise',
     });
   }
-  // Cap rule: floor 0.5, top 3, extend to 5 iff all >= 0.6.
+  // Cap rule: configurable floor (default 0.4), top 3, extend to 5 iff all >= 0.6.
   // See shared/memory-scoring.ts. The client-supplied `limit` is an upper
   // bound on the extend cap — a client asking for <=3 shrinks defaultCap;
   // a client asking for >=5 keeps the default extend cap.

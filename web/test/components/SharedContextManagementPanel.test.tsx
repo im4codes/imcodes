@@ -120,6 +120,12 @@ describe('SharedContextManagementPanel', () => {
           backupContextBackend: undefined,
           backupContextModel: undefined,
           memoryRecallMinScore: 0.4,
+          memoryScoringWeights: {
+            similarity: 0.4,
+            recency: 0.25,
+            frequency: 0.15,
+            project: 0.2,
+          },
           enablePersonalMemorySync: false,
         },
         effective: {
@@ -128,6 +134,12 @@ describe('SharedContextManagementPanel', () => {
           backupContextBackend: undefined,
           backupContextModel: undefined,
           memoryRecallMinScore: 0.4,
+          memoryScoringWeights: {
+            similarity: 0.4,
+            recency: 0.25,
+            frequency: 0.15,
+            project: 0.2,
+          },
           enablePersonalMemorySync: false,
         },
         envPrimaryOverrideActive: false,
@@ -144,6 +156,12 @@ describe('SharedContextManagementPanel', () => {
           backupContextBackend: 'claude-code-sdk',
           backupContextModel: 'haiku',
           memoryRecallMinScore: 0.37,
+          memoryScoringWeights: {
+            similarity: 0.5,
+            recency: 0.2,
+            frequency: 0.1,
+            project: 0.2,
+          },
           enablePersonalMemorySync: true,
         },
         effective: {
@@ -152,6 +170,12 @@ describe('SharedContextManagementPanel', () => {
           backupContextBackend: 'claude-code-sdk',
           backupContextModel: 'haiku',
           memoryRecallMinScore: 0.37,
+          memoryScoringWeights: {
+            similarity: 0.5,
+            recency: 0.2,
+            frequency: 0.1,
+            project: 0.2,
+          },
           enablePersonalMemorySync: true,
         },
         envPrimaryOverrideActive: false,
@@ -392,6 +416,12 @@ describe('SharedContextManagementPanel', () => {
       backupContextBackend: 'qwen',
       backupContextModel: 'qwen3-coder-plus',
       memoryRecallMinScore: 0.4,
+      memoryScoringWeights: {
+        similarity: 0.4,
+        recency: 0.25,
+        frequency: 0.15,
+        project: 0.2,
+      },
       enablePersonalMemorySync: false,
     }));
     expect((screen.getByLabelText('sharedContext.management.processingPrimaryModel') as HTMLInputElement).value).toBe('gpt-5.4');
@@ -421,6 +451,51 @@ describe('SharedContextManagementPanel', () => {
       backupContextBackend: undefined,
       backupContextModel: undefined,
       memoryRecallMinScore: 0.36,
+      memoryScoringWeights: {
+        similarity: 0.4,
+        recency: 0.25,
+        frequency: 0.15,
+        project: 0.2,
+      },
+      enablePersonalMemorySync: false,
+    }));
+  });
+
+  it('shows advanced scoring controls only after toggling and saves custom weights', async () => {
+    render(<SharedContextManagementPanel serverId="srv-1" />);
+    await flush();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.memory'));
+    });
+
+    expect(screen.queryByLabelText('sharedContext.management.memoryWeightSimilarity')).toBeNull();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.memoryAdvancedScoringShow'));
+    });
+
+    const similarity = await screen.findByLabelText('sharedContext.management.memoryWeightSimilarity') as HTMLInputElement;
+    const recency = screen.getByLabelText('sharedContext.management.memoryWeightRecency') as HTMLInputElement;
+    fireEvent.input(similarity, { target: { value: '0.5', valueAsNumber: 0.5 } });
+    fireEvent.input(recency, { target: { value: '0.2', valueAsNumber: 0.2 } });
+
+    await act(async () => {
+      fireEvent.click(screen.getAllByText('sharedContext.management.processingSave')[1]);
+    });
+
+    await waitFor(() => expect(updateSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1', {
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'sonnet',
+      backupContextBackend: undefined,
+      backupContextModel: undefined,
+      memoryRecallMinScore: 0.4,
+      memoryScoringWeights: {
+        similarity: 0.4762,
+        recency: 0.1905,
+        frequency: 0.1429,
+        project: 0.1905,
+      },
       enablePersonalMemorySync: false,
     }));
   });

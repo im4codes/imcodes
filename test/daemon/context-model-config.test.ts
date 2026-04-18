@@ -20,6 +20,12 @@ describe('context-model-config', () => {
       backupContextBackend: 'claude-code-sdk',
       backupContextModel: 'haiku',
       memoryRecallMinScore: 0.4,
+      memoryScoringWeights: {
+        similarity: 0.4,
+        recency: 0.25,
+        frequency: 0.15,
+        project: 0.2,
+      },
       enablePersonalMemorySync: false,
     });
   });
@@ -46,6 +52,12 @@ describe('context-model-config', () => {
       backupContextBackend: 'qwen',
       backupContextModel: 'qwen3-coder-plus',
       memoryRecallMinScore: 0.4,
+      memoryScoringWeights: {
+        similarity: 0.4,
+        recency: 0.25,
+        frequency: 0.15,
+        project: 0.2,
+      },
       enablePersonalMemorySync: false,
     });
   });
@@ -66,5 +78,24 @@ describe('context-model-config', () => {
       memoryRecallMinScore: 0.33,
     });
     expect(getContextModelConfig().memoryRecallMinScore).toBe(0.33);
+  });
+
+  it('keeps the synced advanced memory scoring weights', () => {
+    setContextModelRuntimeConfig({
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'sonnet',
+      memoryScoringWeights: {
+        similarity: 0.5,
+        recency: 0.2,
+        frequency: 0.1,
+        project: 0.2,
+      },
+    });
+    expect(getContextModelConfig().memoryScoringWeights).toEqual({
+      similarity: 0.5,
+      recency: 0.2,
+      frequency: 0.1,
+      project: 0.2,
+    });
   });
 });

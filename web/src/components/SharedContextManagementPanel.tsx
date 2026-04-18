@@ -6,12 +6,17 @@ import type { ContextMemoryView, SharedContextRuntimeBackend } from '@shared/con
 import { QWEN_MODEL_IDS } from '@shared/qwen-models.js';
 import {
   DEFAULT_MEMORY_RECALL_MIN_SCORE,
+  DEFAULT_MEMORY_SCORING_WEIGHTS,
   DEFAULT_PRIMARY_CONTEXT_BACKEND,
   getDefaultSharedContextModelForBackend,
   isKnownSharedContextModelForBackend,
   MEMORY_RECALL_MIN_SCORE_MAX,
   MEMORY_RECALL_MIN_SCORE_MIN,
   MEMORY_RECALL_MIN_SCORE_STEP,
+  MEMORY_SCORING_WEIGHT_INPUT_STEP,
+  MEMORY_SCORING_WEIGHT_MAX,
+  MEMORY_SCORING_WEIGHT_MIN,
+  normalizeMemoryScoringWeights,
   normalizeMemoryRecallMinScore,
   SHARED_CONTEXT_RUNTIME_BACKENDS,
   type SharedContextRuntimeConfigSnapshot,
@@ -55,6 +60,7 @@ import {
 import { ChatMarkdown } from './ChatMarkdown.js';
 import type { WsClient } from '../ws-client.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../../../src/shared/models/options.js';
+import type { MemoryScoringWeights } from '@shared/memory-scoring.js';
 
 // ── Mobile detection ────────────────────────────────────────────────────────
 const SC_IS_MOBILE = typeof navigator !== 'undefined' && /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
@@ -795,6 +801,8 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [processingBackupBackend, setProcessingBackupBackend] = useState<SharedContextRuntimeBackend>(DEFAULT_PRIMARY_CONTEXT_BACKEND);
   const [processingBackupModel, setProcessingBackupModel] = useState('');
   const [processingMemoryRecallMinScore, setProcessingMemoryRecallMinScore] = useState(DEFAULT_MEMORY_RECALL_MIN_SCORE);
+  const [processingMemoryScoringWeights, setProcessingMemoryScoringWeights] = useState<MemoryScoringWeights>({ ...DEFAULT_MEMORY_SCORING_WEIGHTS });
+  const [memoryAdvancedVisible, setMemoryAdvancedVisible] = useState(false);
   const [processingPersonalSyncEnabled, setProcessingPersonalSyncEnabled] = useState(false);
   const [memoryLoading, setMemoryLoading] = useState(false);
   const [memoryProjectId, setMemoryProjectId] = useState('');
@@ -1093,6 +1101,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     setProcessingBackupBackend(view.snapshot.persisted.backupContextBackend ?? view.snapshot.persisted.primaryContextBackend);
     setProcessingBackupModel(view.snapshot.persisted.backupContextModel ?? '');
     setProcessingMemoryRecallMinScore(view.snapshot.persisted.memoryRecallMinScore ?? DEFAULT_MEMORY_RECALL_MIN_SCORE);
+    setProcessingMemoryScoringWeights(normalizeMemoryScoringWeights(view.snapshot.persisted.memoryScoringWeights ?? DEFAULT_MEMORY_SCORING_WEIGHTS));
     setProcessingPersonalSyncEnabled(view.snapshot.persisted.enablePersonalMemorySync === true);
   }, []);
 
@@ -1104,6 +1113,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       setProcessingBackupBackend(DEFAULT_PRIMARY_CONTEXT_BACKEND);
       setProcessingBackupModel('');
       setProcessingMemoryRecallMinScore(DEFAULT_MEMORY_RECALL_MIN_SCORE);
+      setProcessingMemoryScoringWeights({ ...DEFAULT_MEMORY_SCORING_WEIGHTS });
       setProcessingPersonalSyncEnabled(false);
       return;
     }
@@ -1885,6 +1895,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                           backupContextBackend: processingBackupModel.trim() ? processingBackupBackend : undefined,
                           backupContextModel: processingBackupModel.trim() || undefined,
                           memoryRecallMinScore: processingMemoryRecallMinScore,
+                          memoryScoringWeights: normalizeMemoryScoringWeights(processingMemoryScoringWeights),
                           enablePersonalMemorySync: processingPersonalSyncEnabled,
                         });
                         applyProcessingSnapshot(view);
@@ -1978,6 +1989,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                         backupContextBackend: processingBackupModel.trim() ? processingBackupBackend : undefined,
                         backupContextModel: processingBackupModel.trim() || undefined,
                         memoryRecallMinScore: processingMemoryRecallMinScore,
+                        memoryScoringWeights: normalizeMemoryScoringWeights(processingMemoryScoringWeights),
                         enablePersonalMemorySync: next,
                       });
                       applyProcessingSnapshot(view);
@@ -2037,6 +2049,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                           backupContextBackend: processingBackupModel.trim() ? processingBackupBackend : undefined,
                           backupContextModel: processingBackupModel.trim() || undefined,
                           memoryRecallMinScore: processingMemoryRecallMinScore,
+                          memoryScoringWeights: normalizeMemoryScoringWeights(processingMemoryScoringWeights),
                           enablePersonalMemorySync: processingPersonalSyncEnabled,
                         });
                         applyProcessingSnapshot(view);
@@ -2063,6 +2076,142 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
             ) : (
               <div style={helperTextStyle}>{t('sharedContext.management.processingServerRequired')}</div>
             )}
+          </div>
+
+          <div style={sectionStyle}>
+            <SectionHeading
+              title={t('sharedContext.management.memoryAdvancedScoringTitle')}
+              description={t('sharedContext.management.memoryAdvancedScoringDescription')}
+            />
+            <button
+              type="button"
+              style={subtleButtonStyle}
+              onClick={() => setMemoryAdvancedVisible((prev) => !prev)}
+            >
+              {memoryAdvancedVisible
+                ? t('sharedContext.management.memoryAdvancedScoringHide')
+                : t('sharedContext.management.memoryAdvancedScoringShow')}
+            </button>
+            {memoryAdvancedVisible ? (
+              <>
+                <div style={helperTextStyle}>{t('sharedContext.management.memoryAdvancedScoringHelp')}</div>
+                <div style={helperTextStyle}>
+                  {t('sharedContext.management.memoryAdvancedScoringSum', {
+                    value: (
+                      processingMemoryScoringWeights.similarity
+                      + processingMemoryScoringWeights.recency
+                      + processingMemoryScoringWeights.frequency
+                      + processingMemoryScoringWeights.project
+                    ).toFixed(2),
+                  })}
+                </div>
+                <label style={fieldLabelStyle}>
+                  <span>{t('sharedContext.management.memoryWeightSimilarity')}</span>
+                  <input
+                    aria-label={t('sharedContext.management.memoryWeightSimilarity')}
+                    type="number"
+                    min={MEMORY_SCORING_WEIGHT_MIN}
+                    max={MEMORY_SCORING_WEIGHT_MAX}
+                    step={MEMORY_SCORING_WEIGHT_INPUT_STEP}
+                    value={processingMemoryScoringWeights.similarity}
+                    onInput={(e) => setProcessingMemoryScoringWeights((prev) => {
+                      const value = (e.currentTarget as HTMLInputElement).valueAsNumber;
+                      return Number.isFinite(value)
+                        ? { ...prev, similarity: Math.min(MEMORY_SCORING_WEIGHT_MAX, Math.max(MEMORY_SCORING_WEIGHT_MIN, value)) }
+                        : prev;
+                    })}
+                    style={inputStyle}
+                  />
+                </label>
+                <label style={fieldLabelStyle}>
+                  <span>{t('sharedContext.management.memoryWeightRecency')}</span>
+                  <input
+                    aria-label={t('sharedContext.management.memoryWeightRecency')}
+                    type="number"
+                    min={MEMORY_SCORING_WEIGHT_MIN}
+                    max={MEMORY_SCORING_WEIGHT_MAX}
+                    step={MEMORY_SCORING_WEIGHT_INPUT_STEP}
+                    value={processingMemoryScoringWeights.recency}
+                    onInput={(e) => setProcessingMemoryScoringWeights((prev) => {
+                      const value = (e.currentTarget as HTMLInputElement).valueAsNumber;
+                      return Number.isFinite(value)
+                        ? { ...prev, recency: Math.min(MEMORY_SCORING_WEIGHT_MAX, Math.max(MEMORY_SCORING_WEIGHT_MIN, value)) }
+                        : prev;
+                    })}
+                    style={inputStyle}
+                  />
+                </label>
+                <label style={fieldLabelStyle}>
+                  <span>{t('sharedContext.management.memoryWeightFrequency')}</span>
+                  <input
+                    aria-label={t('sharedContext.management.memoryWeightFrequency')}
+                    type="number"
+                    min={MEMORY_SCORING_WEIGHT_MIN}
+                    max={MEMORY_SCORING_WEIGHT_MAX}
+                    step={MEMORY_SCORING_WEIGHT_INPUT_STEP}
+                    value={processingMemoryScoringWeights.frequency}
+                    onInput={(e) => setProcessingMemoryScoringWeights((prev) => {
+                      const value = (e.currentTarget as HTMLInputElement).valueAsNumber;
+                      return Number.isFinite(value)
+                        ? { ...prev, frequency: Math.min(MEMORY_SCORING_WEIGHT_MAX, Math.max(MEMORY_SCORING_WEIGHT_MIN, value)) }
+                        : prev;
+                    })}
+                    style={inputStyle}
+                  />
+                </label>
+                <label style={fieldLabelStyle}>
+                  <span>{t('sharedContext.management.memoryWeightProject')}</span>
+                  <input
+                    aria-label={t('sharedContext.management.memoryWeightProject')}
+                    type="number"
+                    min={MEMORY_SCORING_WEIGHT_MIN}
+                    max={MEMORY_SCORING_WEIGHT_MAX}
+                    step={MEMORY_SCORING_WEIGHT_INPUT_STEP}
+                    value={processingMemoryScoringWeights.project}
+                    onInput={(e) => setProcessingMemoryScoringWeights((prev) => {
+                      const value = (e.currentTarget as HTMLInputElement).valueAsNumber;
+                      return Number.isFinite(value)
+                        ? { ...prev, project: Math.min(MEMORY_SCORING_WEIGHT_MAX, Math.max(MEMORY_SCORING_WEIGHT_MIN, value)) }
+                        : prev;
+                    })}
+                    style={inputStyle}
+                  />
+                </label>
+                <div style={rowStyle}>
+                  <button
+                    style={buttonStyle}
+                    disabled={processingSaving || !serverId}
+                    onClick={() => void handleAction(t('sharedContext.notice.processingConfigSaved'), async () => {
+                      if (!serverId) return;
+                      setProcessingSaving(true);
+                      try {
+                        const view = await updateSharedContextRuntimeConfig(serverId, {
+                          primaryContextBackend: processingPrimaryBackend,
+                          primaryContextModel: processingPrimaryModel.trim(),
+                          backupContextBackend: processingBackupModel.trim() ? processingBackupBackend : undefined,
+                          backupContextModel: processingBackupModel.trim() || undefined,
+                          memoryRecallMinScore: processingMemoryRecallMinScore,
+                          memoryScoringWeights: normalizeMemoryScoringWeights(processingMemoryScoringWeights),
+                          enablePersonalMemorySync: processingPersonalSyncEnabled,
+                        });
+                        applyProcessingSnapshot(view);
+                      } finally {
+                        setProcessingSaving(false);
+                      }
+                    })}
+                  >
+                    {processingSaving ? t('sharedContext.management.processingSaving') : t('sharedContext.management.processingSave')}
+                  </button>
+                  <button
+                    type="button"
+                    style={subtleButtonStyle}
+                    onClick={() => setProcessingMemoryScoringWeights(normalizeMemoryScoringWeights(processingSnapshot?.persisted.memoryScoringWeights ?? DEFAULT_MEMORY_SCORING_WEIGHTS))}
+                  >
+                    {t('sharedContext.management.memoryAdvancedScoringReset')}
+                  </button>
+                </div>
+              </>
+            ) : null}
           </div>
 
           <div style={sectionStyle}>

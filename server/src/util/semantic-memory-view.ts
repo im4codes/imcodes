@@ -1,5 +1,5 @@
 import type { ContextMemoryView } from '../../../shared/context-types.js';
-import { computeRelevanceScore, type ProjectionClass } from '../../../shared/memory-scoring.js';
+import { computeRelevanceScore, type MemoryScoringWeights, type ProjectionClass } from '../../../shared/memory-scoring.js';
 import type { Database } from '../db/client.js';
 import { embeddingToSql, generateEmbedding } from './embedding.js';
 
@@ -17,6 +17,7 @@ interface SemanticMemoryViewInput {
   projectionClass?: ProjectionClassFilter;
   limit?: number;
   enterpriseId?: string;
+  scoringWeights?: Partial<MemoryScoringWeights>;
 }
 
 interface ScopedMemoryRow {
@@ -148,7 +149,7 @@ export async function searchSemanticMemoryView(input: SemanticMemoryViewInput): 
         currentProjectId,
         memoryEnterpriseId: row.enterprise_id ?? undefined,
         currentEnterpriseId: input.scope === 'enterprise' ? input.enterpriseId : undefined,
-      }),
+      }, input.scoringWeights),
     }))
     .sort((a, b) => b.score - a.score)
     .slice(0, limit)

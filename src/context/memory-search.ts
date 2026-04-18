@@ -11,6 +11,7 @@ import type {
   ContextMemoryStatsView,
 } from '../../shared/context-types.js';
 import { computeRelevanceScore, type ProjectionClass } from '../../shared/memory-scoring.js';
+import { getContextModelConfig } from './context-model-config.js';
 import {
   listContextEvents,
   listDirtyTargets,
@@ -164,6 +165,7 @@ export async function searchLocalMemorySemantic(query: MemorySearchQuery): Promi
     const scored: Array<{ item: MemorySearchResultItem; score: number }> = [];
     const currentProjectId = query.namespace?.projectId ?? query.repo ?? '__unknown_current_project__';
     const currentEnterpriseId = query.currentEnterpriseId ?? query.namespace?.enterpriseId;
+    const scoringWeights = getContextModelConfig().memoryScoringWeights;
     for (const item of candidates.items) {
       const text = `${item.summary} ${item.content ?? ''}`.slice(0, 500);
       const itemEmb = await generateEmbedding(text);
@@ -179,7 +181,7 @@ export async function searchLocalMemorySemantic(query: MemorySearchQuery): Promi
           currentProjectId,
           memoryEnterpriseId: item.enterpriseId,
           currentEnterpriseId,
-        });
+        }, scoringWeights);
         scored.push({
           item: {
             ...item,

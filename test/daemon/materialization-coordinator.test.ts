@@ -170,9 +170,19 @@ describe('MaterializationCoordinator', () => {
     expect(coordinator.modelConfig).toEqual({
       primaryContextBackend: 'codex-sdk',
       primaryContextModel: 'gpt-5.2',
+      primaryContextSdk: undefined,
       backupContextBackend: 'qwen',
       backupContextModel: 'qwen3-coder-plus',
+      backupContextSdk: undefined,
       enablePersonalMemorySync: false,
+      materializationMinIntervalMs: undefined,
+      memoryRecallMinScore: 0.4,
+      memoryScoringWeights: {
+        similarity: 0.4,
+        recency: 0.25,
+        frequency: 0.15,
+        project: 0.2,
+      },
     });
   });
 

@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
+  DEFAULT_MEMORY_SCORING_WEIGHTS,
   DEFAULT_MEMORY_RECALL_MIN_SCORE,
   getDefaultSharedContextModelForBackend,
+  normalizeMemoryScoringWeights,
   normalizeMemoryRecallMinScore,
   normalizeSharedContextRuntimeConfig,
 } from '../shared/shared-context-runtime-config.js';
@@ -16,6 +18,7 @@ describe('shared-context-runtime-config', () => {
     expect(result.backupContextBackend).toBeUndefined();
     expect(result.backupContextModel).toBeUndefined();
     expect(result.memoryRecallMinScore).toBe(DEFAULT_MEMORY_RECALL_MIN_SCORE);
+    expect(result.memoryScoringWeights).toEqual(DEFAULT_MEMORY_SCORING_WEIGHTS);
     expect(result.enablePersonalMemorySync).toBe(false);
   });
 
@@ -101,6 +104,30 @@ describe('shared-context-runtime-config', () => {
     expect(result.memoryRecallMinScore).toBe(0.37);
   });
 
+  it('normalizes memory scoring weights so they sum to 1.0', () => {
+    const result = normalizeSharedContextRuntimeConfig({
+      primaryContextBackend: 'claude-code-sdk',
+      memoryScoringWeights: {
+        similarity: 2,
+        recency: 1,
+        frequency: 1,
+        project: 0,
+      },
+    });
+    expect(result.memoryScoringWeights).toEqual({
+      similarity: 0.5,
+      recency: 0.25,
+      frequency: 0.25,
+      project: 0,
+    });
+    expect(
+      result.memoryScoringWeights.similarity
+      + result.memoryScoringWeights.recency
+      + result.memoryScoringWeights.frequency
+      + result.memoryScoringWeights.project,
+    ).toBeCloseTo(1, 4);
+  });
+
   it('defaults memory recall threshold when undefined and clamps invalid values', () => {
     expect(normalizeSharedContextRuntimeConfig({
       primaryContextBackend: 'claude-code-sdk',
@@ -109,6 +136,7 @@ describe('shared-context-runtime-config', () => {
     expect(normalizeMemoryRecallMinScore(-1)).toBe(0);
     expect(normalizeMemoryRecallMinScore(2)).toBe(1);
     expect(normalizeMemoryRecallMinScore(Number.NaN)).toBe(DEFAULT_MEMORY_RECALL_MIN_SCORE);
+    expect(normalizeMemoryScoringWeights({ similarity: -1, recency: -1, frequency: -1, project: -1 })).toEqual(DEFAULT_MEMORY_SCORING_WEIGHTS);
   });
 
   it('defaults enablePersonalMemorySync to false when undefined', () => {

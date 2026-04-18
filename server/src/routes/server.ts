@@ -74,6 +74,12 @@ const runtimeConfigSchema = z.object({
   backupContextBackend: z.enum(['claude-code-sdk', 'codex-sdk', 'qwen', 'openclaw']).optional().nullable(),
   backupContextModel: z.string().trim().optional().nullable(),
   memoryRecallMinScore: z.number().finite().min(0).max(1).optional().nullable(),
+  memoryScoringWeights: z.object({
+    similarity: z.number().finite().min(0).max(1).optional().nullable(),
+    recency: z.number().finite().min(0).max(1).optional().nullable(),
+    frequency: z.number().finite().min(0).max(1).optional().nullable(),
+    project: z.number().finite().min(0).max(1).optional().nullable(),
+  }).optional().nullable(),
   enablePersonalMemorySync: z.boolean().optional().nullable(),
 });
 
@@ -259,6 +265,14 @@ serverRoutes.put('/:id/shared-context/runtime-config', requireAuth(), async (c) 
     backupContextBackend: parsed.data.backupContextBackend ?? undefined,
     backupContextModel: parsed.data.backupContextModel ?? undefined,
     memoryRecallMinScore: parsed.data.memoryRecallMinScore ?? undefined,
+    memoryScoringWeights: parsed.data.memoryScoringWeights
+      ? {
+          similarity: parsed.data.memoryScoringWeights.similarity ?? undefined,
+          recency: parsed.data.memoryScoringWeights.recency ?? undefined,
+          frequency: parsed.data.memoryScoringWeights.frequency ?? undefined,
+          project: parsed.data.memoryScoringWeights.project ?? undefined,
+        }
+      : undefined,
     enablePersonalMemorySync: parsed.data.enablePersonalMemorySync ?? undefined,
   });
   const updated = await updateServerSharedContextRuntimeConfig(c.env.DB, serverId, userId, {
@@ -489,6 +503,7 @@ serverRoutes.get('/:id/shared-context/personal-memory', requireAuth(), async (c)
   const serverId = c.req.param('id') ?? '';
   const server = await getServerById(c.env.DB, serverId);
   if (!server || server.user_id !== userId) return c.json({ error: 'not_found' }, 404);
+  const runtimeConfig = normalizeSharedContextRuntimeConfig(await getServerSharedContextRuntimeConfig(c.env.DB, serverId));
   const projectId = c.req.query('projectId')?.trim();
   const projectionClass = c.req.query('projectionClass') === 'recent_summary' || c.req.query('projectionClass') === 'durable_memory_candidate'
     ? c.req.query('projectionClass') as 'recent_summary' | 'durable_memory_candidate'
@@ -505,6 +520,7 @@ serverRoutes.get('/:id/shared-context/personal-memory', requireAuth(), async (c)
       projectId: projectId || undefined,
       projectionClass,
       limit,
+      scoringWeights: runtimeConfig.memoryScoringWeights,
     });
     if (semanticView) return c.json(semanticView);
   }

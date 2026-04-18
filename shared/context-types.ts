@@ -1,3 +1,5 @@
+import type { MemoryScoringWeights } from './memory-scoring.js';
+
 export type CanonicalRepositoryIdentityKind = 'git-origin' | 'local-fallback';
 
 export interface CanonicalRepositoryId {
@@ -243,6 +245,8 @@ export interface ContextModelConfig {
   materializationMinIntervalMs?: number;
   /** Minimum composite recall score required for related-history injection. Range [0, 1]. */
   memoryRecallMinScore?: number;
+  /** Advanced scoring weights for memory relevance ranking. Normalized to sum to 1.0. */
+  memoryScoringWeights?: Partial<MemoryScoringWeights>;
   enablePersonalMemorySync?: boolean;
 }
 

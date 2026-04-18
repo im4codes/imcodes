@@ -2,7 +2,13 @@ import type { ContextModelConfig, SharedContextRuntimeBackend } from './context-
 import { DEFAULT_PRIMARY_CONTEXT_MODEL } from './context-model-defaults.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../src/shared/models/options.js';
 import { QWEN_MODEL_IDS } from './qwen-models.js';
-import { RECALL_MIN_FLOOR } from './memory-scoring.js';
+import {
+  DEFAULT_MEMORY_SCORING_WEIGHTS,
+  MEMORY_SCORING_WEIGHT_STEP,
+  normalizeMemoryScoringWeights,
+  RECALL_MIN_FLOOR,
+} from './memory-scoring.js';
+export { DEFAULT_MEMORY_SCORING_WEIGHTS, normalizeMemoryScoringWeights } from './memory-scoring.js';
 
 export const SHARED_CONTEXT_RUNTIME_BACKENDS = ['claude-code-sdk', 'codex-sdk', 'qwen', 'openclaw'] as const satisfies readonly SharedContextRuntimeBackend[];
 export const DEFAULT_PRIMARY_CONTEXT_BACKEND: SharedContextRuntimeBackend = 'claude-code-sdk';
@@ -25,6 +31,9 @@ export const DEFAULT_MEMORY_RECALL_MIN_SCORE = RECALL_MIN_FLOOR;
 export const MEMORY_RECALL_MIN_SCORE_MIN = 0;
 export const MEMORY_RECALL_MIN_SCORE_MAX = 1;
 export const MEMORY_RECALL_MIN_SCORE_STEP = 0.01;
+export const MEMORY_SCORING_WEIGHT_MIN = 0;
+export const MEMORY_SCORING_WEIGHT_MAX = 1;
+export const MEMORY_SCORING_WEIGHT_INPUT_STEP = MEMORY_SCORING_WEIGHT_STEP;
 
 export interface SharedContextRuntimeConfigSnapshot {
   persisted: ContextModelConfig;
@@ -42,6 +51,7 @@ export function defaultSharedContextRuntimeConfig(): ContextModelConfig {
     backupContextBackend: undefined,
     backupContextModel: undefined,
     memoryRecallMinScore: DEFAULT_MEMORY_RECALL_MIN_SCORE,
+    memoryScoringWeights: { ...DEFAULT_MEMORY_SCORING_WEIGHTS },
     enablePersonalMemorySync: false,
   };
 }
@@ -118,6 +128,7 @@ export function normalizeSharedContextRuntimeConfig(
   const rawMinInterval = input?.materializationMinIntervalMs;
   const materializationMinIntervalMs = typeof rawMinInterval === 'number' && rawMinInterval > 0 ? rawMinInterval : undefined;
   const memoryRecallMinScore = normalizeMemoryRecallMinScore(input?.memoryRecallMinScore);
+  const memoryScoringWeights = normalizeMemoryScoringWeights(input?.memoryScoringWeights);
   return {
     primaryContextBackend: normalizedPrimaryBackend,
     primaryContextModel,
@@ -127,6 +138,7 @@ export function normalizeSharedContextRuntimeConfig(
     backupContextSdk: trimModelValue(input?.backupContextSdk),
     materializationMinIntervalMs,
     memoryRecallMinScore,
+    memoryScoringWeights,
     enablePersonalMemorySync: input?.enablePersonalMemorySync === true,
   };
 }

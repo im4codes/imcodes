@@ -59,6 +59,12 @@ describe('server shared-context runtime config routes', () => {
       backupContextBackend: undefined,
       backupContextModel: undefined,
       memoryRecallMinScore: 0.4,
+      memoryScoringWeights: {
+        similarity: 0.4,
+        recency: 0.25,
+        frequency: 0.15,
+        project: 0.2,
+      },
     });
     updateServerSharedContextRuntimeConfigMock.mockResolvedValue(true);
     getUserPrefMock.mockResolvedValue('false');
@@ -87,12 +93,24 @@ describe('server shared-context runtime config routes', () => {
           primaryContextBackend: 'claude-code-sdk',
           primaryContextModel: 'sonnet',
           memoryRecallMinScore: 0.4,
+          memoryScoringWeights: {
+            similarity: 0.4,
+            recency: 0.25,
+            frequency: 0.15,
+            project: 0.2,
+          },
           enablePersonalMemorySync: false,
         },
         effective: {
           primaryContextBackend: 'claude-code-sdk',
           primaryContextModel: 'sonnet',
           memoryRecallMinScore: 0.4,
+          memoryScoringWeights: {
+            similarity: 0.4,
+            recency: 0.25,
+            frequency: 0.15,
+            project: 0.2,
+          },
           enablePersonalMemorySync: false,
         },
       },
@@ -110,6 +128,12 @@ describe('server shared-context runtime config routes', () => {
         backupContextBackend: 'claude-code-sdk',
         backupContextModel: 'haiku',
         memoryRecallMinScore: 0.37,
+        memoryScoringWeights: {
+          similarity: 0.5,
+          recency: 0.2,
+          frequency: 0.1,
+          project: 0.2,
+        },
         enablePersonalMemorySync: true,
       }),
     });
@@ -124,6 +148,12 @@ describe('server shared-context runtime config routes', () => {
         backupContextBackend: 'claude-code-sdk',
         backupContextModel: 'haiku',
         memoryRecallMinScore: 0.37,
+        memoryScoringWeights: {
+          similarity: 0.5,
+          recency: 0.2,
+          frequency: 0.1,
+          project: 0.2,
+        },
         enablePersonalMemorySync: undefined,
       },
     );
@@ -141,6 +171,12 @@ describe('server shared-context runtime config routes', () => {
         backupContextBackend: 'claude-code-sdk',
         backupContextModel: 'haiku',
         memoryRecallMinScore: 0.37,
+        memoryScoringWeights: {
+          similarity: 0.5,
+          recency: 0.2,
+          frequency: 0.1,
+          project: 0.2,
+        },
         enablePersonalMemorySync: true,
       },
     }));
@@ -160,6 +196,12 @@ describe('server shared-context runtime config routes', () => {
         backupContextBackend: undefined,
         backupContextModel: undefined,
         memoryRecallMinScore: 0.4,
+        memoryScoringWeights: {
+          similarity: 0.4,
+          recency: 0.25,
+          frequency: 0.15,
+          project: 0.2,
+        },
         enablePersonalMemorySync: false,
       },
     });

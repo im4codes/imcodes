@@ -220,6 +220,17 @@ export async function getServerSharedContextRuntimeConfig(
   const memoryRecallMinScore = typeof raw.memoryRecallMinScore === 'number' && Number.isFinite(raw.memoryRecallMinScore)
     ? raw.memoryRecallMinScore
     : undefined;
+  const rawMemoryScoringWeights = raw.memoryScoringWeights && typeof raw.memoryScoringWeights === 'object'
+    ? raw.memoryScoringWeights as Record<string, unknown>
+    : undefined;
+  const memoryScoringWeights = rawMemoryScoringWeights
+    ? {
+        similarity: typeof rawMemoryScoringWeights.similarity === 'number' ? rawMemoryScoringWeights.similarity : undefined,
+        recency: typeof rawMemoryScoringWeights.recency === 'number' ? rawMemoryScoringWeights.recency : undefined,
+        frequency: typeof rawMemoryScoringWeights.frequency === 'number' ? rawMemoryScoringWeights.frequency : undefined,
+        project: typeof rawMemoryScoringWeights.project === 'number' ? rawMemoryScoringWeights.project : undefined,
+      }
+    : undefined;
   const enablePersonalMemorySync = raw.enablePersonalMemorySync === true;
   if (!primaryContextModel) return null;
   return {
@@ -228,6 +239,7 @@ export async function getServerSharedContextRuntimeConfig(
     backupContextBackend: backupContextBackend || undefined,
     backupContextModel: backupContextModel || undefined,
     memoryRecallMinScore,
+    memoryScoringWeights,
     enablePersonalMemorySync,
   };
 }

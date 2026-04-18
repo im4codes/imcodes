@@ -9,6 +9,21 @@ export const W_SIMILARITY = 0.4;
 export const W_RECENCY = 0.25;
 export const W_FREQUENCY = 0.15;
 export const W_PROJECT = 0.2;
+export const MEMORY_SCORING_WEIGHT_STEP = 0.01;
+
+export interface MemoryScoringWeights {
+  similarity: number;
+  recency: number;
+  frequency: number;
+  project: number;
+}
+
+export const DEFAULT_MEMORY_SCORING_WEIGHTS: MemoryScoringWeights = {
+  similarity: W_SIMILARITY,
+  recency: W_RECENCY,
+  frequency: W_FREQUENCY,
+  project: W_PROJECT,
+};
 
 // Half-lives in days
 export const HALF_LIFE_RECENT_SUMMARY = 14;
@@ -33,6 +48,29 @@ export interface MemoryScoringInput {
   memoryEnterpriseId?: string;
   /** Enterprise ID of the current context (if any) */
   currentEnterpriseId?: string;
+}
+
+export function normalizeMemoryScoringWeights(
+  input: Partial<MemoryScoringWeights> | null | undefined,
+): MemoryScoringWeights {
+  const similarity = typeof input?.similarity === 'number' && Number.isFinite(input.similarity) ? Math.max(0, input.similarity) : DEFAULT_MEMORY_SCORING_WEIGHTS.similarity;
+  const recency = typeof input?.recency === 'number' && Number.isFinite(input.recency) ? Math.max(0, input.recency) : DEFAULT_MEMORY_SCORING_WEIGHTS.recency;
+  const frequency = typeof input?.frequency === 'number' && Number.isFinite(input.frequency) ? Math.max(0, input.frequency) : DEFAULT_MEMORY_SCORING_WEIGHTS.frequency;
+  const project = typeof input?.project === 'number' && Number.isFinite(input.project) ? Math.max(0, input.project) : DEFAULT_MEMORY_SCORING_WEIGHTS.project;
+  const total = similarity + recency + frequency + project;
+  if (total <= 0) return { ...DEFAULT_MEMORY_SCORING_WEIGHTS };
+  const normalized = {
+    similarity: similarity / total,
+    recency: recency / total,
+    frequency: frequency / total,
+    project: project / total,
+  };
+  return {
+    similarity: Math.round(normalized.similarity * 10000) / 10000,
+    recency: Math.round(normalized.recency * 10000) / 10000,
+    frequency: Math.round(normalized.frequency * 10000) / 10000,
+    project: Math.round(normalized.project * 10000) / 10000,
+  };
 }
 
 /**
@@ -68,11 +106,18 @@ export function computeProjectBoost(input: Pick<MemoryScoringInput, 'memoryProje
 /**
  * Compute the full composite relevance score.
  */
-export function computeRelevanceScore(input: MemoryScoringInput): number {
+export function computeRelevanceScore(
+  input: MemoryScoringInput,
+  weightsInput?: Partial<MemoryScoringWeights> | null,
+): number {
+  const weights = normalizeMemoryScoringWeights(weightsInput);
   const recency = computeRecencyBoost(input.lastUsedAt, input.projectionClass);
   const frequency = computeFrequencyBoost(input.hitCount);
   const project = computeProjectBoost(input);
-  return W_SIMILARITY * input.similarity + W_RECENCY * recency + W_FREQUENCY * frequency + W_PROJECT * project;
+  return weights.similarity * input.similarity
+    + weights.recency * recency
+    + weights.frequency * frequency
+    + weights.project * project;
 }
 
 // ── Recall cap rule ────────────────────────────────────────────────────────
