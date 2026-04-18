@@ -39,8 +39,7 @@ jobs:
           cache: 'npm'
       - run: npm ci
       - name: Install server deps
-        run: npm ci
-        working-directory: server
+        run: ./scripts/ci-npm-ci.sh server
       - name: Daemon
         run: npx tsc --noEmit
       - name: Server
@@ -161,8 +160,7 @@ jobs:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
           cache: 'npm'
       - run: npm ci
-      - run: npm ci
-        working-directory: web
+      - run: ./scripts/ci-npm-ci.sh web
       - run: cd web && npx vitest run --config vitest.unit.config.ts
 
   web-tests-components:
@@ -175,8 +173,7 @@ jobs:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
           cache: 'npm'
       - run: npm ci
-      - run: npm ci
-        working-directory: web
+      - run: ./scripts/ci-npm-ci.sh web
       - run: cd web && npx vitest run --config vitest.components.config.ts
 
   # FileBrowser component test skipped in CI (OOM — renders full 1300-line component in jsdom).
@@ -195,8 +192,7 @@ jobs:
           cache: 'npm'
           cache-dependency-path: package-lock.json
       - run: npm ci
-      - run: npm ci
-        working-directory: server
+      - run: ./scripts/ci-npm-ci.sh server
       - run: npm run test:server
       - name: Run server-native tests (auth-flow, proxy-addr — require server/node_modules)
         run: npm test
@@ -298,11 +294,9 @@ jobs:
         run: tmux new-session -d -s init && tmux kill-session -t init
       - run: npm ci
       - name: Install web deps (needed for tsx component tests)
-        run: npm ci
-        working-directory: web
+        run: ./scripts/ci-npm-ci.sh web
       - name: Install server deps (needed for server route tests)
-        run: npm ci
-        working-directory: server
+        run: ./scripts/ci-npm-ci.sh server
       - run: npm run build
       - run: npm run test:coverage
       - name: Upload to Codecov
@@ -343,11 +337,9 @@ jobs:
       - run: npm install -g npm@11.11.1
       - run: npm ci
       - name: Install web deps
-        run: npm ci
-        working-directory: web
+        run: ./scripts/ci-npm-ci.sh web
       - name: Install server deps
-        run: npm ci
-        working-directory: server
+        run: ./scripts/ci-npm-ci.sh server
       - run: npm run build
       - name: Set version
         run: npm version ${{ needs.docker.outputs.npm_version }} --no-git-tag-version
