@@ -648,6 +648,53 @@ describe('handleWebCommand transport queue behavior', () => {
     clearAllResend();
   });
 
+  it('tracks supervision task intents while offline so Auto still follows the resent turn', async () => {
+    const { clearAllResend } = await import('../../src/daemon/transport-resend-queue.js');
+    clearAllResend();
+
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      state: 'idle',
+      transportConfig: {
+        supervision: {
+          mode: 'supervised',
+          backend: 'codex-sdk',
+          model: 'gpt-5.4',
+          timeoutMs: 12_000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+        },
+      },
+    });
+    getTransportRuntimeMock.mockReturnValue(undefined);
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'offline supervised task',
+      commandId: 'cmd-offline-supervised',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(queueTaskIntentMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'cmd-offline-supervised',
+      'offline supervised task',
+      expect.objectContaining({
+        mode: 'supervised',
+        backend: 'codex-sdk',
+        model: 'gpt-5.4',
+      }),
+    );
+
+    clearAllResend();
+  });
+
   it('treats transport runtimes without a provider session id as unavailable', async () => {
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: null,
@@ -717,6 +764,60 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(getResendEntries('deck_transport_brain')).toEqual([
       expect.objectContaining({ text: 'hello after restart', commandId: 'cmd-stale-runtime' }),
     ]);
+    clearAllResend();
+  });
+
+  it('tracks supervision task intents when the runtime is queued for auto-resume', async () => {
+    const { clearAllResend } = await import('../../src/daemon/transport-resend-queue.js');
+    clearAllResend();
+
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      state: 'idle',
+      transportConfig: {
+        supervision: {
+          mode: 'supervised',
+          backend: 'codex-sdk',
+          model: 'gpt-5.4',
+          timeoutMs: 12_000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+        },
+      },
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: null,
+      send: vi.fn(() => {
+        throw new Error('TransportSessionRuntime not initialized — call initialize() first');
+      }),
+      pendingCount: 0,
+      pendingMessages: [],
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'resume supervised task',
+      commandId: 'cmd-resume-supervised',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(queueTaskIntentMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'cmd-resume-supervised',
+      'resume supervised task',
+      expect.objectContaining({
+        mode: 'supervised',
+        backend: 'codex-sdk',
+        model: 'gpt-5.4',
+      }),
+    );
+
     clearAllResend();
   });
 

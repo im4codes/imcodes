@@ -174,6 +174,15 @@
     "supervision": {
       "title": "工作階段監督",
       "help": "啟用監督前，先選擇後端與模型。",
+      "intro": {
+        "title": "Auto 是做什麼的",
+        "howToUseTitle": "怎麼用",
+        "howToUseBody": "先選擇 Off、Supervised 或 Supervised + audit，再設定監督模型的後端與模型並儲存。這個工作階段啟用 Auto 後，系統會在閒置時自動判斷是否完成。Audit 模式還會加上稽核流程與返工次數上限。",
+        "purposeTitle": "用途是什麼",
+        "purposeBody": "Auto 用來讓一個監督模型判斷目前任務是否已完成、是否應該自動繼續，或是否需要人工介入。Audit 模式會在執行結束後再做一輪實作審查。",
+        "howItWorksTitle": "原理是什麼",
+        "howItWorksBody": "當工作階段進入 idle 狀態時，IM.codes 會把最近的任務上下文交給已設定的監督模型，解析結構化決策結果，然後決定停止、自動繼續，或回退到人工處理。如果開啟 Audit 模式，完成後的結果還會進入自動稽核與返工循環。"
+      },
       "mode": {
         "off": "關閉",
         "supervised": "監督",

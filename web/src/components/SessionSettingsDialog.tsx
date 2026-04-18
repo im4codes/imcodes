@@ -98,6 +98,47 @@ function getAuditModeOptions(): SupervisionAuditMode[] {
   return getAutomationAuditModeOptions().filter((mode): mode is SupervisionAuditMode => allowed.has(mode));
 }
 
+function SupervisionIntroCard({ t }: { t: (key: string, params?: Record<string, unknown>) => string }) {
+  const sections = [
+    {
+      title: t('session.supervision.intro.howToUseTitle'),
+      body: t('session.supervision.intro.howToUseBody'),
+    },
+    {
+      title: t('session.supervision.intro.purposeTitle'),
+      body: t('session.supervision.intro.purposeBody'),
+    },
+    {
+      title: t('session.supervision.intro.howItWorksTitle'),
+      body: t('session.supervision.intro.howItWorksBody'),
+    },
+  ];
+
+  return (
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 10,
+        padding: 12,
+        borderRadius: 10,
+        background: 'rgba(15, 23, 42, 0.45)',
+        border: '1px solid rgba(96, 165, 250, 0.2)',
+      }}
+    >
+      <div style={{ fontSize: 12, color: '#e2e8f0', fontWeight: 600 }}>
+        {t('session.supervision.intro.title')}
+      </div>
+      {sections.map((section) => (
+        <div key={section.title} style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+          <div style={{ fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>{section.title}</div>
+          <div style={{ fontSize: 12, lineHeight: 1.5, color: '#94a3b8' }}>{section.body}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export function SessionSettingsDialog({
   serverId,
   sessionName,
@@ -353,6 +394,8 @@ export function SessionSettingsDialog({
 
   const supervisionPanel = isSupportedTransport ? (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <SupervisionIntroCard t={t} />
+
       <div style={{ fontSize: 12, color: '#94a3b8' }}>
         {t('session.supervision.help')}
       </div>

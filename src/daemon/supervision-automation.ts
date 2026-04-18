@@ -50,6 +50,7 @@ interface ActiveTaskRunState {
   continueLoops: number;
   evaluating: boolean;
   sawAssistantOutput: boolean;
+  awaitingAssistantAfterIdle: boolean;
   lastAssistantText?: string;
   terminalState?: TaskRunTerminalState;
   auditRunId?: string;
@@ -410,6 +411,7 @@ class SupervisionAutomation {
   private pendingTaskIntents = new Map<string, PendingTaskIntent>();
   private recentTaskCandidates = new Map<string, RecentTaskCandidate>();
   private latestAssistantTexts = new Map<string, LatestAssistantText>();
+  private awaitingImplicitAssistantAfterIdle = new Set<string>();
   private pollers = new Map<string, ReturnType<typeof setInterval>>();
   private initialized = false;
   private serverLink: ServerLink | null = null;
@@ -477,6 +479,7 @@ class SupervisionAutomation {
     this.pendingTaskIntents.delete(sessionName);
     this.recentTaskCandidates.delete(sessionName);
     this.latestAssistantTexts.delete(sessionName);
+    this.awaitingImplicitAssistantAfterIdle.delete(sessionName);
     this.clearStatus(sessionName);
   }
 
@@ -518,6 +521,7 @@ class SupervisionAutomation {
     if (latestAssistant.sequence <= candidate.sequence) return;
     const implicitRun = this.registerTaskIntent(sessionName, candidate.commandId, candidate.text, snapshot);
     if (!implicitRun) return;
+    this.awaitingImplicitAssistantAfterIdle.delete(sessionName);
     implicitRun.lastAssistantText = latestAssistant.text;
     implicitRun.sawAssistantOutput = true;
     implicitRun.evaluating = true;
@@ -576,6 +580,7 @@ class SupervisionAutomation {
       continueLoops: 0,
       evaluating: false,
       sawAssistantOutput: false,
+      awaitingAssistantAfterIdle: false,
       reworkDispatches: 0,
       startedAt: Date.now(),
     };
@@ -597,6 +602,7 @@ class SupervisionAutomation {
       const automation = event.payload.automation === true;
       const text = trimString(event.payload.text);
       if (!automation && text && !text.startsWith('/')) {
+        this.awaitingImplicitAssistantAfterIdle.delete(event.sessionId);
         this.recentTaskCandidates.set(event.sessionId, {
           commandId: clientMessageId ?? `implicit:${Date.now()}`,
           text,
@@ -611,13 +617,35 @@ class SupervisionAutomation {
 
     if (event.type === 'assistant.text' && isFinalAssistantPayload(event.payload)) {
       if (event.payload.automation === true) return;
-      const text = trimString(event.payload.text) ?? '';
-      if (!text) return;
+      const text = typeof event.payload.text === 'string' ? event.payload.text : '';
       this.latestAssistantTexts.set(event.sessionId, { text, sequence });
       const run = this.activeRuns.get(event.sessionId);
-      if (!run) return;
+      if (!run) {
+        if (this.awaitingImplicitAssistantAfterIdle.has(event.sessionId)) {
+          const record = getSession(event.sessionId);
+          const snapshot = record?.agentType
+            ? extractSessionSupervisionSnapshot(record.transportConfig ?? null)
+            : null;
+          if (snapshot && snapshot.mode !== SUPERVISION_MODE.OFF) {
+            this.maybeTriggerImplicitRun(event.sessionId, snapshot);
+          }
+        }
+        return;
+      }
       run.lastAssistantText = text;
       run.sawAssistantOutput = true;
+      if (run.phase === 'execution' && run.awaitingAssistantAfterIdle && !run.evaluating) {
+        run.awaitingAssistantAfterIdle = false;
+        run.evaluating = true;
+        this.emitStatus(run.sessionName, 'supervision_waiting', SUPERVISION_WAITING_LABEL);
+        this.emitAutomationNote(run.sessionName, 'Auto: checking whether the task is complete...', 'supervision-status');
+        void this.evaluateExecutionTurn(run).catch((error) => {
+          logger.warn({ session: run.sessionName, err: error }, 'Supervision execution evaluation failed after delayed assistant output');
+          this.clearStatus(run.sessionName);
+          this.emitWarning(run.sessionName, 'Automation could not determine whether the task is complete. Manual continuation is required.');
+          this.finishRun(run.sessionName, 'needs_input');
+        });
+      }
       return;
     }
 
@@ -634,6 +662,7 @@ class SupervisionAutomation {
         if (candidate && snapshot && snapshot.mode !== SUPERVISION_MODE.OFF && latestAssistant && latestAssistant.sequence > candidate.sequence) {
           const implicitRun = this.registerTaskIntent(event.sessionId, candidate.commandId, candidate.text, snapshot);
           if (implicitRun) {
+            this.awaitingImplicitAssistantAfterIdle.delete(event.sessionId);
             implicitRun.lastAssistantText = latestAssistant.text;
             implicitRun.sawAssistantOutput = true;
             implicitRun.evaluating = true;
@@ -644,10 +673,9 @@ class SupervisionAutomation {
             });
           }
         } else if (candidate && snapshot && snapshot.mode !== SUPERVISION_MODE.OFF) {
-          // Supervision IS on but the preconditions for an implicit run failed
-          // (missing/stale assistant response). Those failures won't self-heal,
-          // so drop the candidate to avoid re-firing on later idle events.
-          this.recentTaskCandidates.delete(event.sessionId);
+          this.awaitingImplicitAssistantAfterIdle.add(event.sessionId);
+        } else {
+          this.awaitingImplicitAssistantAfterIdle.delete(event.sessionId);
         }
         // Intentionally: do NOT delete the candidate when supervision is OFF
         // at idle. The user may enable Auto afterwards, and
@@ -659,12 +687,11 @@ class SupervisionAutomation {
       }
       if (!run) return;
       if (state === 'idle' && run.phase === 'execution' && !run.evaluating) {
-        if (!run.sawAssistantOutput || !run.lastAssistantText?.trim()) {
-          this.emitTerminalStatus(run.sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
-          this.emitWarning(run.sessionName, 'Automation did not capture a completed assistant response for the current task. Manual continuation is required.');
-          this.finishRun(run.sessionName, 'needs_input', { preserveStatus: true });
+        if (!run.sawAssistantOutput) {
+          run.awaitingAssistantAfterIdle = true;
           return;
         }
+        run.awaitingAssistantAfterIdle = false;
         this.emitStatus(run.sessionName, 'supervision_waiting', SUPERVISION_WAITING_LABEL);
         this.emitAutomationNote(run.sessionName, 'Auto: checking whether the task is complete...', 'supervision-status');
         run.evaluating = true;
@@ -867,6 +894,7 @@ class SupervisionAutomation {
     current.auditRunId = undefined;
     current.evaluating = false;
     current.sawAssistantOutput = false;
+    current.awaitingAssistantAfterIdle = false;
     current.terminalState = undefined;
     current.lastAssistantText = undefined;
 
@@ -903,6 +931,7 @@ class SupervisionAutomation {
     );
     current.continueLoops += 1;
     current.sawAssistantOutput = false;
+    current.awaitingAssistantAfterIdle = false;
     current.lastAssistantText = undefined;
     current.terminalState = undefined;
 

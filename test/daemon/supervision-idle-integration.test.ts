@@ -358,4 +358,63 @@ describe('supervision → idle → broker integration', () => {
     expect(status).toBeTruthy();
     expect(note).toBeTruthy();
   });
+
+  it('still evaluates when idle arrives before the final assistant text for an active supervised run', async () => {
+    const transportSend = vi.fn(() => 'sent');
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: SESSION,
+      send: transportSend,
+      pendingCount: 0,
+      pendingMessages: [],
+      pendingEntries: [],
+    });
+    seedSupervisedSession('supervised');
+
+    const serverLink = { send: vi.fn(), sendBinary: vi.fn(), sendTimelineEvent: vi.fn(), daemonVersion: '0.1.0' };
+    handleWebCommand({
+      type: 'session.send',
+      session: SESSION,
+      text: 'finish the refactor',
+      commandId: 'cmd-race-active',
+    }, serverLink as any);
+    await flushAsync();
+
+    timelineEmitter.emit(SESSION, 'session.state', { state: 'running' });
+    timelineEmitter.emit(SESSION, 'session.state', { state: 'idle' });
+    expect(supervisionDecideMock).not.toHaveBeenCalled();
+
+    timelineEmitter.emit(SESSION, 'assistant.text', {
+      text: 'Refactor finished.',
+      streaming: false,
+    });
+
+    await waitFor(() => supervisionDecideMock.mock.calls.length > 0, 1_000);
+    expect(supervisionDecideMock).toHaveBeenCalledWith(expect.objectContaining({
+      taskRequest: 'finish the refactor',
+      assistantResponse: 'Refactor finished.',
+    }));
+  });
+
+  it('still evaluates when idle arrives before the final assistant text for an implicit supervised run', async () => {
+    seedSupervisedSession('supervised');
+
+    timelineEmitter.emit(SESSION, 'user.message', {
+      text: 'fix the queue bug',
+      clientMessageId: 'cmd-race-implicit',
+    });
+    timelineEmitter.emit(SESSION, 'session.state', { state: 'running' });
+    timelineEmitter.emit(SESSION, 'session.state', { state: 'idle' });
+    expect(supervisionDecideMock).not.toHaveBeenCalled();
+
+    timelineEmitter.emit(SESSION, 'assistant.text', {
+      text: 'Queue bug fixed.',
+      streaming: false,
+    });
+
+    await waitFor(() => supervisionDecideMock.mock.calls.length > 0, 1_000);
+    expect(supervisionDecideMock).toHaveBeenCalledWith(expect.objectContaining({
+      taskRequest: 'fix the queue bug',
+      assistantResponse: 'Queue bug fixed.',
+    }));
+  });
 });

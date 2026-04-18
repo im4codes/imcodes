@@ -1647,6 +1647,12 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   // Transport sessions — route directly to the provider runtime, bypassing tmux.
   const transportRuntime = getTransportRuntime(sessionName);
   const record = (await import('../store/session-store.js')).getSession(sessionName);
+  const supervisionSnapshot = isSupportedSupervisionTargetSessionType(record?.agentType)
+    ? extractSessionSupervisionSnapshot(record?.transportConfig ?? null)
+    : null;
+  const shouldTrackSupervisionTaskRun = supervisionSnapshot != null
+    && supervisionSnapshot.mode !== SUPERVISION_MODE.OFF
+    && isEligibleSupervisionTaskText(text);
   const attachments: TransportAttachment[] = [];
   const transportUserEventId = (clientMessageId: string) => `transport-user:${clientMessageId}`;
   const emitTransportUserMessage = (payloadText: string, extra?: Record<string, unknown>, eventId?: string) => {
@@ -1684,6 +1690,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       'session.send: transport session has no runtime — queuing for resend after reconnect',
     );
     enqueueResend(sessionName, { text, commandId: effectiveId, queuedAt: Date.now() });
+    if (shouldTrackSupervisionTaskRun) {
+      supervisionAutomation.queueTaskIntent(sessionName, effectiveId, text, supervisionSnapshot);
+    }
     const queued = getResendEntries(sessionName);
     const infoMsg = `⏳ Provider ${providerLabel} not connected yet — will resend ${queued.length} queued message${queued.length === 1 ? '' : 's'} once reconnected.`;
     timelineEmitter.emit(
@@ -1727,6 +1736,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       'session.send: transport runtime missing provider session id — queuing and auto-resuming',
     );
     enqueueResend(sessionName, { text, commandId: effectiveId, queuedAt: Date.now() });
+    if (shouldTrackSupervisionTaskRun) {
+      supervisionAutomation.queueTaskIntent(sessionName, effectiveId, text, supervisionSnapshot);
+    }
     const queued = getResendEntries(sessionName);
     const infoMsg = `⏳ Provider ${providerLabel} is restarting — will auto-resend ${queued.length} queued message${queued.length === 1 ? '' : 's'} once the runtime is back.`;
     timelineEmitter.emit(
@@ -2010,16 +2022,10 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted', session: sessionName }); } catch {}
         return;
       }
-      const supervisionSnapshot = isSupportedSupervisionTargetSessionType(record?.agentType)
-        ? extractSessionSupervisionSnapshot(record?.transportConfig ?? null)
-        : null;
       if (record?.agentType === 'qwen' && record.qwenAuthType === 'qwen-oauth') {
         recordQwenOAuthRequest();
         refreshQwenQuotaUsageLabels(serverLink);
       }
-      const shouldTrackSupervisionTaskRun = supervisionSnapshot != null
-        && supervisionSnapshot.mode !== SUPERVISION_MODE.OFF
-        && isEligibleSupervisionTaskText(text);
 
       // send() is synchronous: dispatches immediately if idle, queues if busy.
       // Status changes come from transport runtime's onStatusChange callback.

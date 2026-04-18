@@ -214,6 +214,26 @@ describe('SessionSettingsDialog supervision', () => {
     expect(screen.getByText('summaryMeta:supervision_decision_v1')).toBeDefined();
   });
 
+  it('shows supervision intro copy for supported transport sessions', () => {
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        transportConfig={null}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('howToUseTitle')).toBeDefined();
+    expect(screen.getByText('purposeTitle')).toBeDefined();
+    expect(screen.getByText('howItWorksTitle')).toBeDefined();
+  });
+
   it('shows unsupported copy for process sessions', () => {
     render(
       <SessionSettingsDialog

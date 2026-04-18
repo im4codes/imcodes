@@ -174,6 +174,15 @@
     "supervision": {
       "title": "会话监督",
       "help": "启用监督前，先选择后端和模型。",
+      "intro": {
+        "title": "Auto 是做什么的",
+        "howToUseTitle": "怎么用",
+        "howToUseBody": "先选择 Off、Supervised 或 Supervised + audit，再配置监督模型的后端和模型并保存。本会话启用 Auto 后，系统会在空闲时自动判断是否完成。Audit 模式会额外启用审计流程和返工次数上限。",
+        "purposeTitle": "用途是什么",
+        "purposeBody": "Auto 用来让一个监督模型判断当前任务是否已经完成、是否应该继续自动执行，或者是否需要人工介入。Audit 模式会在执行结束后再做一轮实现审查。",
+        "howItWorksTitle": "原理是什么",
+        "howItWorksBody": "当会话进入 idle 状态时，IM.codes 会把最近的任务上下文交给已配置的监督模型，解析结构化决策结果，然后决定停止、自动继续，或回退到人工处理。如果开启 Audit 模式，完成后的结果还会进入自动审计与返工闭环。"
+      },
       "mode": {
         "off": "关闭",
         "supervised": "监督",

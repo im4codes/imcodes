@@ -174,6 +174,15 @@
     "supervision": {
       "title": "Session supervision",
       "help": "Choose a backend and model before enabling supervision.",
+      "intro": {
+        "title": "What Auto does",
+        "howToUseTitle": "How to use it",
+        "howToUseBody": "Choose Off, Supervised, or Supervised + audit. Then select a supervisor backend and model, save the settings, and leave Auto enabled for this session. Audit mode adds an audit pipeline and a rework-loop limit.",
+        "purposeTitle": "What it is for",
+        "purposeBody": "Auto lets a supervisor model decide whether the current task is complete, should continue automatically, or needs a human. Audit mode adds a second pass that reviews the implementation before handing control back.",
+        "howItWorksTitle": "How it works",
+        "howItWorksBody": "When the session reaches idle, IM.codes sends the latest task context to the configured supervisor, parses a structured decision, and then either stops, sends a continue prompt, or falls back to manual handling. If audit mode is enabled, the completed turn can also enter an automated audit and rework loop."
+      },
       "mode": {
         "off": "Off",
         "supervised": "Supervised",

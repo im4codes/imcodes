@@ -160,6 +160,36 @@ describe('SupervisionBroker', () => {
     expect(String(provider.send.mock.calls[0]?.[1])).toContain('[Contract: custom_supervision_contract_v2]');
   });
 
+  it('includes stricter completion guardrails in the supervision decision prompt', async () => {
+    const provider = new FakeProvider([
+      '{"decision":"complete","reason":"ok","confidence":0.5}',
+    ]);
+    const broker = new SupervisionBroker({
+      resolveProvider: async () => provider,
+    });
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk',
+      model: 'gpt-5.3-codex-spark',
+      timeoutMs: 2_000,
+      promptVersion: 'supervision_decision_v1',
+      maxParseRetries: 1,
+      auditMode: 'audit',
+      maxAuditLoops: 2,
+      taskRunPromptVersion: 'task_run_status_v1',
+    });
+
+    await broker.decide({
+      snapshot,
+      taskRequest: 'Implement the task',
+      assistantResponse: 'Latest assistant response',
+    });
+
+    const prompt = String(provider.send.mock.calls[0]?.[1] ?? '');
+    expect(prompt).toContain('If the assistant says tests, validation, fixes, commit/push, or other implementation work still needs to be done, choose continue.');
+    expect(prompt).toContain('Do not choose complete when the assistant itself indicates remaining work');
+  });
+
   it('retries once when the first supervisor reply is not valid JSON', async () => {
     const provider = new FakeProvider([
       'not valid json',
@@ -256,6 +286,68 @@ describe('SupervisionBroker', () => {
     expect(result.reason).toMatch(/invalid supervisor decision|supervision/i);
     expect(result.unavailableReason).toBe(SUPERVISION_UNAVAILABLE_REASONS.INVALID_OUTPUT);
     expect(provider.send).toHaveBeenCalledTimes(2);
+  });
+
+  it('downgrades a complete verdict to continue when the assistant response clearly says more tests should be added', async () => {
+    const provider = new FakeProvider([
+      '{"decision":"complete","reason":"looks good","confidence":0.92}',
+    ]);
+    const broker = new SupervisionBroker({
+      resolveProvider: async () => provider,
+    });
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk',
+      model: 'gpt-5.3-codex-spark',
+      timeoutMs: 2_000,
+      promptVersion: 'supervision_decision_v1',
+      maxParseRetries: 1,
+      auditMode: 'audit',
+      maxAuditLoops: 2,
+      taskRunPromptVersion: 'task_run_status_v1',
+    });
+
+    const result = await broker.decide({
+      snapshot,
+      taskRequest: 'Fix the bug and make the change production-ready',
+      assistantResponse: 'The bug is fixed. If you want, next I can add an end-to-end repro test and push the branch.',
+    });
+
+    expect(result).toMatchObject({
+      decision: 'continue',
+    });
+    expect(result.reason).toMatch(/follow-up engineering step|remaining work/i);
+  });
+
+  it('does not downgrade a complete verdict for an unrelated explanation offer', async () => {
+    const provider = new FakeProvider([
+      '{"decision":"complete","reason":"looks good","confidence":0.92}',
+    ]);
+    const broker = new SupervisionBroker({
+      resolveProvider: async () => provider,
+    });
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk',
+      model: 'gpt-5.3-codex-spark',
+      timeoutMs: 2_000,
+      promptVersion: 'supervision_decision_v1',
+      maxParseRetries: 1,
+      auditMode: 'audit',
+      maxAuditLoops: 2,
+      taskRunPromptVersion: 'task_run_status_v1',
+    });
+
+    const result = await broker.decide({
+      snapshot,
+      taskRequest: 'Fix the bug',
+      assistantResponse: 'The bug is fixed. If you want, I can also explain the diff.',
+    });
+
+    expect(result).toMatchObject({
+      decision: 'complete',
+      reason: 'looks good',
+    });
   });
 
   it('honors a larger maxParseRetries budget from the session snapshot', async () => {

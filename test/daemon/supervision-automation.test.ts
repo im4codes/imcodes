@@ -342,7 +342,7 @@ describe('SupervisionAutomation', () => {
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
   });
 
-  it('fails closed when the session goes idle without a completed assistant response', async () => {
+  it('waits for a late final assistant response instead of dropping the run on idle', async () => {
     const snapshot = await seedSession('supervised');
 
     supervisionAutomation.init();
@@ -356,7 +356,32 @@ describe('SupervisionAutomation', () => {
 
     expect(mockSupervisionDecide).not.toHaveBeenCalled();
     expect(mockTransportRuntime.send).not.toHaveBeenCalled();
-    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      commandId: 'cmd-no-output',
+      awaitingAssistantAfterIdle: true,
+    });
+  });
+
+  it('evaluates an empty final assistant response instead of skipping the Auto check', async () => {
+    const snapshot = await seedSession('supervised');
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-empty-output', 'implement the feature', snapshot);
+    beginRun('cmd-empty-output', 'implement the feature');
+
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: '',
+      streaming: false,
+    });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', {
+      state: 'idle',
+    });
+    await sleep(25);
+
+    expect(mockSupervisionDecide).toHaveBeenCalledWith(expect.objectContaining({
+      taskRequest: 'implement the feature',
+      assistantResponse: '',
+    }));
   });
 
   it('feeds REWORK back into the same transport session after audit', async () => {

@@ -1965,6 +1965,36 @@ afterEach(() => {
     expect(patchSessionMock).not.toHaveBeenCalled();
   });
 
+  it('always shows Session Settings in the Auto dropdown when settings are available', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({
+          name: 'codex-sdk-session',
+          state: 'idle',
+          transportConfig: {
+            supervision: {
+              mode: 'supervised',
+              backend: 'codex-sdk',
+              model: 'gpt-5.4',
+              timeoutMs: 12000,
+              promptVersion: 'supervision_decision_v1',
+              maxParseRetries: 1,
+            },
+          },
+        })}
+        onSettings={vi.fn()}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /^Auto$/ }));
+    const autoMenu = document.querySelector('.menu-dropdown-auto');
+    expect(autoMenu).toBeTruthy();
+    expect(within(autoMenu as HTMLElement).getByRole('button', { name: /settings/i })).toBeDefined();
+  });
+
   it('renders approval controls for active transport chat events', async () => {
     const ws = makeWs();
     render(

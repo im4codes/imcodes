@@ -3,6 +3,7 @@ import type { TransportProvider, ProviderError } from '../agent/transport-provid
 import { ensureProviderConnected } from '../agent/provider-registry.js';
 import type { SharedContextRuntimeBackend } from '../../shared/context-types.js';
 import {
+  parseTaskRunTerminalStateFromText,
   SUPERVISION_DEFAULT_TIMEOUT_MS,
   SUPERVISION_MODE,
   SUPERVISION_UNAVAILABLE_REASONS,
@@ -38,6 +39,20 @@ export interface SupervisionBrokerDeps {
 
 const DECISIONS = new Set<SupervisionDecisionKind>(['complete', 'continue', 'ask_human']);
 const MIN_SUPERVISION_EXECUTION_BUDGET_MS = 5;
+const CONTINUE_SIGNAL_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
+  {
+    pattern: /\b(?:todo|not done|unfinished|incomplete|remaining work|still needs? work|missing tests?|needs? tests?|should add tests?|add(?:ing)? more tests?|more tests needed|still need(?:s)? to|follow-?up work|next step(?:s)?|keep working|continue working)\b/i,
+    reason: 'assistant response explicitly indicates remaining work',
+  },
+  {
+    pattern: /\b(?:if you want|next step|i can(?: next| also| still)?|we can next|can follow up)\b[\s\S]{0,80}\b(?:add|write|run|fix|improve|update|verify|audit|commit|push|test|tests)\b/i,
+    reason: 'assistant response proposes a concrete follow-up engineering step',
+  },
+  {
+    pattern: /(还没完成|未完成|还需要|待处理|待补|缺少测试|需要补测试|补测试|加测试|继续完善|继续修|下一步|接下来|如果你愿意)[\s\S]{0,40}(测试|修复|完善|验证|提交|推送|commit|push)/i,
+    reason: 'assistant response proposes concrete follow-up work in Chinese',
+  },
+];
 
 function extractRawOrFencedJson(text: string): string | null {
   const trimmed = text.trim();
@@ -73,6 +88,46 @@ export function askHuman(reason: string, unavailableReason?: SupervisionUnavaila
   return unavailableReason
     ? { decision: 'ask_human', reason, confidence: 0, unavailableReason }
     : { decision: 'ask_human', reason, confidence: 0 };
+}
+
+function getAssistantIncompleteSignal(text: string | undefined): { reason: string } | null {
+  const trimmed = text?.trim();
+  if (!trimmed) return null;
+
+  const taskRunState = parseTaskRunTerminalStateFromText(trimmed);
+  if (taskRunState === 'needs_input') {
+    return { reason: 'assistant terminal marker requested human continuation' };
+  }
+  if (taskRunState === 'blocked') {
+    return { reason: 'assistant terminal marker reported a blocked state' };
+  }
+
+  for (const entry of CONTINUE_SIGNAL_PATTERNS) {
+    if (entry.pattern.test(trimmed)) return { reason: entry.reason };
+  }
+  return null;
+}
+
+function applyDecisionGuardrails(
+  decision: SupervisionDecision,
+  request: SupervisionBrokerRequest,
+): SupervisionDecision {
+  const incompleteSignal = getAssistantIncompleteSignal(request.assistantResponse);
+  if (!incompleteSignal) return decision;
+
+  if (decision.decision === 'complete') {
+    return {
+      decision: 'continue',
+      reason: `${incompleteSignal.reason}; original supervisor reason: ${decision.reason}`,
+      confidence: Math.min(decision.confidence, 0.35),
+    };
+  }
+  if (decision.decision === 'continue') return decision;
+
+  return {
+    ...decision,
+    reason: `${incompleteSignal.reason}; original supervisor reason: ${decision.reason}`,
+  };
 }
 
 export class SupervisionBroker {
@@ -150,7 +205,7 @@ export class SupervisionBroker {
         timeoutMs,
       );
       let parsed = parseSupervisionDecision(output);
-      if (parsed) return parsed;
+      if (parsed) return applyDecisionGuardrails(parsed, request);
 
       const maxRetries = Math.max(0, request.snapshot?.maxParseRetries ?? 1);
       for (let retry = 0; retry < maxRetries; retry += 1) {
@@ -161,7 +216,7 @@ export class SupervisionBroker {
           timeoutMs,
         );
         parsed = parseSupervisionDecision(output);
-        if (parsed) return parsed;
+        if (parsed) return applyDecisionGuardrails(parsed, request);
       }
       return askHuman('invalid supervisor decision', SUPERVISION_UNAVAILABLE_REASONS.INVALID_OUTPUT);
     } finally {

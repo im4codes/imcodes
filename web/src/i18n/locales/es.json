@@ -174,6 +174,15 @@
     "supervision": {
       "title": "Supervisión de sesión",
       "help": "Elige un backend y un modelo antes de activar la supervisión.",
+      "intro": {
+        "title": "Qué hace Auto",
+        "howToUseTitle": "Cómo usarlo",
+        "howToUseBody": "Elige Off, Supervised o Supervised + audit. Después selecciona el backend y el modelo del supervisor, guarda la configuración y deja Auto activado para esta sesión. El modo audit añade una cadena de auditoría y un límite de ciclos de retrabajo.",
+        "purposeTitle": "Para qué sirve",
+        "purposeBody": "Auto permite que un modelo supervisor decida si la tarea actual ya terminó, debe continuar automáticamente o necesita intervención humana. El modo audit añade una segunda revisión de la implementación antes de devolver el control.",
+        "howItWorksTitle": "Cómo funciona",
+        "howItWorksBody": "Cuando la sesión entra en idle, IM.codes envía el contexto reciente de la tarea al supervisor configurado, interpreta una decisión estructurada y luego detiene, continúa automáticamente o vuelve al manejo manual. Si audit está activado, la respuesta completada también puede entrar en un ciclo automático de auditoría y retrabajo."
+      },
       "mode": {
         "off": "Desactivado",
         "supervised": "Supervisado",

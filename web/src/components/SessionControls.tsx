@@ -2011,7 +2011,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 >
                   {quickSupervisionMode === SUPERVISION_MODE.SUPERVISED_AUDIT ? '● ' : '○ '}{t('session.supervision.mode.supervised_audit')}
                 </button>
-                {(hasInvalidSupervisionConfig || (!supervisionSnapshot && !!onSettings)) && (
+                {!!onSettings && (
                   <>
                     <div class="menu-divider" />
                     <button
