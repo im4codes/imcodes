@@ -1806,9 +1806,7 @@ export function App() {
   useEffect(() => {
     const ws = wsRef.current;
     if (!ws?.connected || sessions.length === 0) return;
-    const names = sessions
-      .filter((s) => !isTransportRuntime(s))
-      .map((s) => s.name);
+    const names = sessions.map((s) => s.name);
     for (const name of names) {
       ws.subscribeTerminal(name, false);
       const mode = viewModesRef.current[name] ?? defaultViewMode;
@@ -1830,9 +1828,7 @@ export function App() {
   useEffect(() => {
     const ws = wsRef.current;
     if (!ws?.connected || subSessions.length === 0) return;
-    const names = subSessions
-      .filter((s) => !isTransportRuntime(s))
-      .map((s) => s.sessionName);
+    const names = subSessions.map((s) => s.sessionName);
     for (const name of names) {
       try { ws.subscribeTerminal(name, false); } catch { /* ignore */ }
     }
@@ -1883,8 +1879,6 @@ export function App() {
       const ws = wsRef.current;
       const session = activeSessionRef.current;
       if (!ws?.connected || !session) return;
-      const active = sessionsRef.current.find((entry) => entry.name === session);
-      if (active && isTransportRuntime(active)) return;
       const raw = shouldSubscribeTerminalRaw(true, (viewModesRef.current[session] ?? defaultViewMode) as ViewMode);
       ws.subscribeTerminal(session, raw);
       const mode = viewModesRef.current[session] ?? defaultViewMode;
