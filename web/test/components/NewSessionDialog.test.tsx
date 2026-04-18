@@ -82,6 +82,7 @@ describe('NewSessionDialog', () => {
     const select = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
     expect(select.value).toBe('claude-code-sdk');
     expect(screen.getByText('agent_flavor_sdk')).toBeDefined();
+    expect(screen.getByText('qwen_provider_hint')).toBeDefined();
   });
 
   it('cancel button calls onClose', () => {
@@ -218,6 +219,16 @@ describe('NewSessionDialog', () => {
     await waitFor(() => expect(screen.getByText('agent_flavor_cli')).toBeDefined());
   });
 
+  it('shows the qwen provider-specific hint when qwen is selected', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    const select = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    fireEvent.input(select, { target: { value: 'qwen' } });
+
+    await waitFor(() => expect(screen.getByText('qwen_provider_selected_hint')).toBeDefined());
+  });
+
   it('includes thinking level when starting codex-sdk', async () => {
     const ws = makeWs();
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
@@ -251,7 +262,7 @@ describe('NewSessionDialog', () => {
 
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
-    expect(screen.queryByText('API Provider')).toBeNull();
+    expect(screen.queryByText('api_provider')).toBeNull();
   });
 
   it('shows CC preset controls and submits preset for qwen', async () => {
@@ -271,7 +282,8 @@ describe('NewSessionDialog', () => {
     const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
     agentTypeSelect.value = 'qwen';
     fireEvent.input(agentTypeSelect, { target: { value: agentTypeSelect.value } });
-    await waitFor(() => expect(screen.getByText('API Provider')).toBeDefined());
+    await waitFor(() => expect(screen.getByText('api_provider')).toBeDefined());
+    expect(screen.getByText('qwen_provider_selected_hint')).toBeDefined();
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
     fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
 

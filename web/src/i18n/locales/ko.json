@@ -327,7 +327,13 @@
     "browse": "찾아보기",
     "agent_type": "에이전트 유형",
     "agent_flavor_cli": "CLI: 원래 UI를 선호하는 사용자를 위한 네이티브 인터페이스입니다. 채팅 모드는 스트리밍을 지원하지 않습니다.",
-    "agent_flavor_sdk": "SDK: 스트리밍을 지원하고 더 단순한 UI를 사용합니다."
+    "agent_flavor_sdk": "SDK: 스트리밍을 지원하고 더 단순한 UI를 사용합니다.",
+    "qwen_provider_hint": "서드파티 Coding Plan이 필요하면 Qwen Code를 선택하세요.",
+    "qwen_provider_selected_hint": "Qwen Code는 아래 API Provider 프리셋을 통해 Anthropic 호환 서드파티 Coding Plan 제공자를 사용할 수 있습니다.",
+    "api_provider": "API Provider",
+    "api_provider_add_edit": "+ 추가 / 편집",
+    "api_provider_default": "기본값 (Anthropic)",
+    "api_provider_default_help": "기본값 (Anthropic) — \"+ 추가 / 편집\"을 눌러 설정"
   },
   "api_key": {
     "copy": "복사",

@@ -9,6 +9,7 @@ import { FileBrowser } from './file-browser-lazy.js';
 import { getUserPref, saveUserPref } from '../api.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '@shared/effort-levels.js';
 import { getSessionAgentGroups, getSessionAgentLabel, SESSION_AGENT_GROUP_LABEL_KEYS } from './session-agent-options.js';
+import { QwenCodingPlanHint } from './QwenCodingPlanHint.js';
 
 const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
 const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
@@ -186,6 +187,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                 </div>
               ))}
             </div>
+            <QwenCodingPlanHint selected={type === 'qwen'} />
           </div>
 
           {/* Script command (only for script type) */}
@@ -322,18 +324,18 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
             <>
               <div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-                  <span style={{ fontSize: 12, color: '#94a3b8' }}>API Provider</span>
+                  <span style={{ fontSize: 12, color: '#94a3b8' }}>{t('new_session.api_provider')}</span>
                   <button type="button" style={{ background: 'none', border: 'none', color: '#3b82f6', cursor: 'pointer', fontSize: 11, padding: 0 }} onClick={() => setShowPresetEditor(!showPresetEditor)}>
-                    {showPresetEditor ? '▾ Close' : '+ Add / Edit'}
+                    {showPresetEditor ? `▾ ${t('common.close')}` : t('new_session.api_provider_add_edit')}
                   </button>
                 </div>
                 {ccPresets.length > 0 ? (
                   <select class="input" value={ccPreset} onInput={(e) => setCcPreset((e.target as HTMLSelectElement).value)} style={{ width: '100%' }}>
-                    <option value="">Default (Anthropic)</option>
+                    <option value="">{t('new_session.api_provider_default')}</option>
                     {ccPresets.map((p) => <option key={p.name} value={p.name}>{p.name}{p.env['ANTHROPIC_MODEL'] ? ` (${p.env['ANTHROPIC_MODEL']})` : ''}</option>)}
                   </select>
                 ) : !showPresetEditor && (
-                  <div style={{ fontSize: 11, color: '#475569' }}>Default (Anthropic)</div>
+                  <div style={{ fontSize: 11, color: '#475569' }}>{t('new_session.api_provider_default')}</div>
                 )}
               </div>
 

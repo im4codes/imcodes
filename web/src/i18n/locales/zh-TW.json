@@ -328,7 +328,13 @@
     "browse": "瀏覽",
     "agent_type": "Agent 類型",
     "agent_flavor_cli": "CLI：適合喜歡原生介面的使用者。聊天模式不支援串流輸出。",
-    "agent_flavor_sdk": "SDK：支援串流輸出，介面更精簡。"
+    "agent_flavor_sdk": "SDK：支援串流輸出，介面更精簡。",
+    "qwen_provider_hint": "需要接入第三方 Coding Plan？請選擇 Qwen Code。",
+    "qwen_provider_selected_hint": "Qwen Code 可以透過下方 API Provider 預設接入相容 Anthropic 的第三方 Coding Plan 服務。",
+    "api_provider": "API Provider",
+    "api_provider_add_edit": "+ 新增 / 編輯",
+    "api_provider_default": "預設（Anthropic）",
+    "api_provider_default_help": "預設（Anthropic）— 點擊「+ 新增 / 編輯」進行設定"
   },
   "api_key": {
     "copy": "複製",

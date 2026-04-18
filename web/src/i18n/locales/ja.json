@@ -327,7 +327,13 @@
     "browse": "参照",
     "agent_type": "エージェント種別",
     "agent_flavor_cli": "CLI: 元のUIを好む人向けのネイティブ画面です。チャットモードはストリーミング非対応です。",
-    "agent_flavor_sdk": "SDK: ストリーミング対応で、よりシンプルなUIです。"
+    "agent_flavor_sdk": "SDK: ストリーミング対応で、よりシンプルなUIです。",
+    "qwen_provider_hint": "サードパーティの Coding Plan を使うなら、Qwen Code を選択してください。",
+    "qwen_provider_selected_hint": "Qwen Code は、下の API Provider プリセット経由で Anthropic 互換のサードパーティ Coding Plan プロバイダーを利用できます。",
+    "api_provider": "API Provider",
+    "api_provider_add_edit": "+ 追加 / 編集",
+    "api_provider_default": "既定（Anthropic）",
+    "api_provider_default_help": "既定（Anthropic）— 「+ 追加 / 編集」をクリックして設定"
   },
   "api_key": {
     "copy": "コピー",

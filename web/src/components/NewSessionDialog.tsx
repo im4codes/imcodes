@@ -21,6 +21,7 @@ import {
   useTransportModels,
   supportsDynamicTransportModels,
 } from "../hooks/useTransportModels.js";
+import { QwenCodingPlanHint } from "./QwenCodingPlanHint.js";
 
 const DEFAULT_SHELL_KEY = "default_shell";
 // Fallback suggestions used only when the daemon probe returns an empty list
@@ -462,6 +463,7 @@ export function NewSessionDialog({
                 : t("new_session.agent_flavor_sdk")}
             </div>
           )}
+          <QwenCodingPlanHint selected={agentType === "qwen"} />
         </div>
 
         {thinkingLevels.length > 0 && (
@@ -534,7 +536,7 @@ export function NewSessionDialog({
                   alignItems: "center",
                 }}
               >
-                <span>API Provider</span>
+                <span>{t("new_session.api_provider")}</span>
                 <button
                   type="button"
                   style={{
@@ -547,7 +549,9 @@ export function NewSessionDialog({
                   }}
                   onClick={() => setShowPresetEditor(!showPresetEditor)}
                 >
-                  {showPresetEditor ? "▾ Close" : "+ Add / Edit"}
+                  {showPresetEditor
+                    ? `▾ ${t("common.close")}`
+                    : t("new_session.api_provider_add_edit")}
                 </button>
               </label>
               {ccPresets.length > 0 && (
@@ -567,7 +571,9 @@ export function NewSessionDialog({
                     fontFamily: "inherit",
                   }}
                 >
-                  <option value="">Default (Anthropic)</option>
+                  <option value="">
+                    {t("new_session.api_provider_default")}
+                  </option>
                   {ccPresets.map((p) => (
                     <option key={p.name} value={p.name}>
                       {p.name}
@@ -582,7 +588,7 @@ export function NewSessionDialog({
                 <div
                   style={{ fontSize: 12, color: "#475569", padding: "4px 0" }}
                 >
-                  Default (Anthropic) — click "+ Add / Edit" to configure
+                  {t("new_session.api_provider_default_help")}
                 </div>
               )}
             </div>

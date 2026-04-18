@@ -327,7 +327,13 @@
     "browse": "Examinar",
     "agent_type": "Tipo de agente",
     "agent_flavor_cli": "CLI: interfaz nativa para quienes prefieren la UI original. El modo chat no admite streaming.",
-    "agent_flavor_sdk": "SDK: admite streaming y usa una interfaz más simple."
+    "agent_flavor_sdk": "SDK: admite streaming y usa una interfaz más simple.",
+    "qwen_provider_hint": "Si necesitas un Coding Plan de terceros, elige Qwen Code.",
+    "qwen_provider_selected_hint": "Qwen Code puede usar proveedores externos de Coding Plan compatibles con Anthropic mediante los presets de API Provider de abajo.",
+    "api_provider": "Proveedor de API",
+    "api_provider_add_edit": "+ Agregar / Editar",
+    "api_provider_default": "Predeterminado (Anthropic)",
+    "api_provider_default_help": "Predeterminado (Anthropic) — haz clic en \"+ Agregar / Editar\" para configurarlo"
   },
   "api_key": {
     "copy": "Copiar",

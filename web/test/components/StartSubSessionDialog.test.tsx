@@ -77,6 +77,7 @@ describe('StartSubSessionDialog', () => {
     expect(groups[0].textContent).toMatch(/cursor_headless/i);
     expect(groups[1].textContent).toMatch(/claude_code_cli/i);
     expect(groups[1].textContent).toMatch(/codex_cli/i);
+    expect(screen.getByText('qwen_provider_hint')).toBeDefined();
   });
 
   it('defaults level to high for supported transports', () => {
@@ -144,7 +145,25 @@ describe('StartSubSessionDialog', () => {
       />,
     );
 
-    expect(screen.queryByText('API Provider')).toBeNull();
+    expect(screen.queryByText('api_provider')).toBeNull();
+  });
+
+  it('shows the qwen provider-specific hint for qwen sub-sessions', async () => {
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
+
+    await waitFor(() => expect(screen.getByText('qwen_provider_selected_hint')).toBeDefined());
   });
 
   it('shows CC preset controls and passes preset for qwen sub-sessions', async () => {
@@ -173,7 +192,8 @@ describe('StartSubSessionDialog', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
-    await waitFor(() => expect(screen.getByText('API Provider')).toBeDefined());
+    await waitFor(() => expect(screen.getByText('api_provider')).toBeDefined());
+    expect(screen.getByText('qwen_provider_selected_hint')).toBeDefined();
     const presetSelect = (screen.getAllByRole('combobox') as HTMLSelectElement[])
       .find((select) => Array.from(select.options).some((option) => option.value === 'MiniMax'));
     expect(presetSelect).toBeDefined();

@@ -328,7 +328,13 @@
     "browse": "浏览",
     "agent_type": "Agent 类型",
     "agent_flavor_cli": "CLI：适合喜欢原生界面的用户。聊天模式不支持流式输出。",
-    "agent_flavor_sdk": "SDK：支持流式输出，界面更简洁。"
+    "agent_flavor_sdk": "SDK：支持流式输出，界面更简洁。",
+    "qwen_provider_hint": "需要接入第三方 Coding Plan？请选择 Qwen Code。",
+    "qwen_provider_selected_hint": "Qwen Code 可以通过下方 API Provider 预设接入兼容 Anthropic 的第三方 Coding Plan 服务。",
+    "api_provider": "API Provider",
+    "api_provider_add_edit": "+ 新增 / 编辑",
+    "api_provider_default": "默认（Anthropic）",
+    "api_provider_default_help": "默认（Anthropic）— 点击“+ 新增 / 编辑”进行配置"
   },
   "api_key": {
     "copy": "复制",
