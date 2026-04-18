@@ -58,6 +58,7 @@ describe('server shared-context runtime config routes', () => {
       primaryContextModel: 'sonnet',
       backupContextBackend: undefined,
       backupContextModel: undefined,
+      memoryRecallMinScore: 0.44,
     });
     updateServerSharedContextRuntimeConfigMock.mockResolvedValue(true);
     getUserPrefMock.mockResolvedValue('false');
@@ -85,11 +86,13 @@ describe('server shared-context runtime config routes', () => {
         persisted: {
           primaryContextBackend: 'claude-code-sdk',
           primaryContextModel: 'sonnet',
+          memoryRecallMinScore: 0.44,
           enablePersonalMemorySync: false,
         },
         effective: {
           primaryContextBackend: 'claude-code-sdk',
           primaryContextModel: 'sonnet',
+          memoryRecallMinScore: 0.44,
           enablePersonalMemorySync: false,
         },
       },
@@ -106,6 +109,7 @@ describe('server shared-context runtime config routes', () => {
         primaryContextModel: 'gpt-5.4',
         backupContextBackend: 'claude-code-sdk',
         backupContextModel: 'haiku',
+        memoryRecallMinScore: 0.37,
         enablePersonalMemorySync: true,
       }),
     });
@@ -119,6 +123,7 @@ describe('server shared-context runtime config routes', () => {
         primaryContextModel: 'gpt-5.4',
         backupContextBackend: 'claude-code-sdk',
         backupContextModel: 'haiku',
+        memoryRecallMinScore: 0.37,
         enablePersonalMemorySync: undefined,
       },
     );
@@ -135,6 +140,7 @@ describe('server shared-context runtime config routes', () => {
         primaryContextModel: 'gpt-5.4',
         backupContextBackend: 'claude-code-sdk',
         backupContextModel: 'haiku',
+        memoryRecallMinScore: 0.37,
         enablePersonalMemorySync: true,
       },
     }));
@@ -153,6 +159,7 @@ describe('server shared-context runtime config routes', () => {
         primaryContextModel: 'sonnet',
         backupContextBackend: undefined,
         backupContextModel: undefined,
+        memoryRecallMinScore: 0.44,
         enablePersonalMemorySync: false,
       },
     });

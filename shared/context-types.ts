@@ -241,6 +241,8 @@ export interface ContextModelConfig {
   backupContextSdk?: string;
   /** Minimum interval between materialization runs per target (ms). Default 10000. */
   materializationMinIntervalMs?: number;
+  /** Minimum composite recall score required for related-history injection. Range [0, 1]. */
+  memoryRecallMinScore?: number;
   enablePersonalMemorySync?: boolean;
 }
 

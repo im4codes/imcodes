@@ -2,6 +2,7 @@ import type { ContextModelConfig, SharedContextRuntimeBackend } from './context-
 import { DEFAULT_PRIMARY_CONTEXT_MODEL } from './context-model-defaults.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../src/shared/models/options.js';
 import { QWEN_MODEL_IDS } from './qwen-models.js';
+import { RECALL_MIN_FLOOR } from './memory-scoring.js';
 
 export const SHARED_CONTEXT_RUNTIME_BACKENDS = ['claude-code-sdk', 'codex-sdk', 'qwen', 'openclaw'] as const satisfies readonly SharedContextRuntimeBackend[];
 export const DEFAULT_PRIMARY_CONTEXT_BACKEND: SharedContextRuntimeBackend = 'claude-code-sdk';
@@ -20,6 +21,11 @@ export const SHARED_CONTEXT_RUNTIME_CONFIG_ERROR = {
   INVALID_CONFIG: 'invalid_shared_context_runtime_config',
 } as const;
 
+export const DEFAULT_MEMORY_RECALL_MIN_SCORE = RECALL_MIN_FLOOR;
+export const MEMORY_RECALL_MIN_SCORE_MIN = 0;
+export const MEMORY_RECALL_MIN_SCORE_MAX = 1;
+export const MEMORY_RECALL_MIN_SCORE_STEP = 0.01;
+
 export interface SharedContextRuntimeConfigSnapshot {
   persisted: ContextModelConfig;
   effective: ContextModelConfig;
@@ -35,8 +41,16 @@ export function defaultSharedContextRuntimeConfig(): ContextModelConfig {
     primaryContextModel: DEFAULT_CONTEXT_MODEL_BY_BACKEND[DEFAULT_PRIMARY_CONTEXT_BACKEND],
     backupContextBackend: undefined,
     backupContextModel: undefined,
+    memoryRecallMinScore: DEFAULT_MEMORY_RECALL_MIN_SCORE,
     enablePersonalMemorySync: false,
   };
+}
+
+export function normalizeMemoryRecallMinScore(value: number | null | undefined): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_MEMORY_RECALL_MIN_SCORE;
+  if (value <= MEMORY_RECALL_MIN_SCORE_MIN) return MEMORY_RECALL_MIN_SCORE_MIN;
+  if (value >= MEMORY_RECALL_MIN_SCORE_MAX) return MEMORY_RECALL_MIN_SCORE_MAX;
+  return Math.round(value * 100) / 100;
 }
 
 export function normalizeSharedContextRuntimeBackend(value: string | null | undefined): SharedContextRuntimeBackend | undefined {
@@ -103,6 +117,7 @@ export function normalizeSharedContextRuntimeConfig(
     : undefined;
   const rawMinInterval = input?.materializationMinIntervalMs;
   const materializationMinIntervalMs = typeof rawMinInterval === 'number' && rawMinInterval > 0 ? rawMinInterval : undefined;
+  const memoryRecallMinScore = normalizeMemoryRecallMinScore(input?.memoryRecallMinScore);
   return {
     primaryContextBackend: normalizedPrimaryBackend,
     primaryContextModel,
@@ -111,6 +126,7 @@ export function normalizeSharedContextRuntimeConfig(
     backupContextModel,
     backupContextSdk: trimModelValue(input?.backupContextSdk),
     materializationMinIntervalMs,
+    memoryRecallMinScore,
     enablePersonalMemorySync: input?.enablePersonalMemorySync === true,
   };
 }

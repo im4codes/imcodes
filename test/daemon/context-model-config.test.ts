@@ -19,6 +19,7 @@ describe('context-model-config', () => {
       primaryContextModel: 'gpt-5.4',
       backupContextBackend: 'claude-code-sdk',
       backupContextModel: 'haiku',
+      memoryRecallMinScore: 0.44,
       enablePersonalMemorySync: false,
     });
   });
@@ -44,6 +45,7 @@ describe('context-model-config', () => {
       primaryContextModel: 'sonnet',
       backupContextBackend: 'qwen',
       backupContextModel: 'qwen3-coder-plus',
+      memoryRecallMinScore: 0.44,
       enablePersonalMemorySync: false,
     });
   });
@@ -55,5 +57,14 @@ describe('context-model-config', () => {
       enablePersonalMemorySync: true,
     });
     expect(getContextModelConfig().enablePersonalMemorySync).toBe(true);
+  });
+
+  it('keeps the synced memory recall threshold', () => {
+    setContextModelRuntimeConfig({
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'sonnet',
+      memoryRecallMinScore: 0.33,
+    });
+    expect(getContextModelConfig().memoryRecallMinScore).toBe(0.33);
   });
 });

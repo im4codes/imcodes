@@ -5,9 +5,14 @@ import { DEFAULT_PRIMARY_CONTEXT_MODEL } from '@shared/context-model-defaults.js
 import type { ContextMemoryView, SharedContextRuntimeBackend } from '@shared/context-types.js';
 import { QWEN_MODEL_IDS } from '@shared/qwen-models.js';
 import {
+  DEFAULT_MEMORY_RECALL_MIN_SCORE,
   DEFAULT_PRIMARY_CONTEXT_BACKEND,
   getDefaultSharedContextModelForBackend,
   isKnownSharedContextModelForBackend,
+  MEMORY_RECALL_MIN_SCORE_MAX,
+  MEMORY_RECALL_MIN_SCORE_MIN,
+  MEMORY_RECALL_MIN_SCORE_STEP,
+  normalizeMemoryRecallMinScore,
   SHARED_CONTEXT_RUNTIME_BACKENDS,
   type SharedContextRuntimeConfigSnapshot,
 } from '@shared/shared-context-runtime-config.js';
@@ -789,6 +794,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [processingPrimaryModel, setProcessingPrimaryModel] = useState(DEFAULT_PRIMARY_CONTEXT_MODEL);
   const [processingBackupBackend, setProcessingBackupBackend] = useState<SharedContextRuntimeBackend>(DEFAULT_PRIMARY_CONTEXT_BACKEND);
   const [processingBackupModel, setProcessingBackupModel] = useState('');
+  const [processingMemoryRecallMinScore, setProcessingMemoryRecallMinScore] = useState(DEFAULT_MEMORY_RECALL_MIN_SCORE);
   const [processingPersonalSyncEnabled, setProcessingPersonalSyncEnabled] = useState(false);
   const [memoryLoading, setMemoryLoading] = useState(false);
   const [memoryProjectId, setMemoryProjectId] = useState('');
@@ -1086,6 +1092,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     setProcessingPrimaryModel(view.snapshot.persisted.primaryContextModel);
     setProcessingBackupBackend(view.snapshot.persisted.backupContextBackend ?? view.snapshot.persisted.primaryContextBackend);
     setProcessingBackupModel(view.snapshot.persisted.backupContextModel ?? '');
+    setProcessingMemoryRecallMinScore(view.snapshot.persisted.memoryRecallMinScore ?? DEFAULT_MEMORY_RECALL_MIN_SCORE);
     setProcessingPersonalSyncEnabled(view.snapshot.persisted.enablePersonalMemorySync === true);
   }, []);
 
@@ -1096,6 +1103,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       setProcessingPrimaryModel(DEFAULT_PRIMARY_CONTEXT_MODEL);
       setProcessingBackupBackend(DEFAULT_PRIMARY_CONTEXT_BACKEND);
       setProcessingBackupModel('');
+      setProcessingMemoryRecallMinScore(DEFAULT_MEMORY_RECALL_MIN_SCORE);
       setProcessingPersonalSyncEnabled(false);
       return;
     }
@@ -1876,6 +1884,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                           primaryContextModel: processingPrimaryModel.trim(),
                           backupContextBackend: processingBackupModel.trim() ? processingBackupBackend : undefined,
                           backupContextModel: processingBackupModel.trim() || undefined,
+                          memoryRecallMinScore: processingMemoryRecallMinScore,
                           enablePersonalMemorySync: processingPersonalSyncEnabled,
                         });
                         applyProcessingSnapshot(view);
@@ -1968,6 +1977,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                         primaryContextModel: processingPrimaryModel.trim(),
                         backupContextBackend: processingBackupModel.trim() ? processingBackupBackend : undefined,
                         backupContextModel: processingBackupModel.trim() || undefined,
+                        memoryRecallMinScore: processingMemoryRecallMinScore,
                         enablePersonalMemorySync: next,
                       });
                       applyProcessingSnapshot(view);
@@ -1985,6 +1995,71 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 </div>
                 <IOSToggle checked={processingPersonalSyncEnabled} disabled={processingSaving} />
               </div>
+            ) : (
+              <div style={helperTextStyle}>{t('sharedContext.management.processingServerRequired')}</div>
+            )}
+          </div>
+
+          <div style={sectionStyle}>
+            <SectionHeading
+              title={t('sharedContext.management.memoryRecallThresholdTitle')}
+              description={t('sharedContext.management.memoryRecallThresholdDescription')}
+              action={serverId ? <span style={pillStyle}>{formatServerScopeValue(serverId)}</span> : undefined}
+            />
+            {serverId ? (
+              <>
+                <label style={fieldLabelStyle}>
+                  <span>{t('sharedContext.management.memoryRecallThresholdLabel')}</span>
+                  <input
+                    aria-label={t('sharedContext.management.memoryRecallThresholdLabel')}
+                    type="number"
+                    min={MEMORY_RECALL_MIN_SCORE_MIN}
+                    max={MEMORY_RECALL_MIN_SCORE_MAX}
+                    step={MEMORY_RECALL_MIN_SCORE_STEP}
+                    value={processingMemoryRecallMinScore}
+                    onInput={(e) => setProcessingMemoryRecallMinScore(normalizeMemoryRecallMinScore((e.currentTarget as HTMLInputElement).valueAsNumber))}
+                    style={inputStyle}
+                  />
+                </label>
+                <div style={helperTextStyle}>
+                  {t('sharedContext.management.memoryRecallThresholdHelp', { defaultValue: DEFAULT_MEMORY_RECALL_MIN_SCORE.toFixed(2) })}
+                </div>
+                <div style={rowStyle}>
+                  <button
+                    style={buttonStyle}
+                    disabled={processingSaving}
+                    onClick={() => void handleAction(t('sharedContext.notice.processingConfigSaved'), async () => {
+                      setProcessingSaving(true);
+                      try {
+                        const view = await updateSharedContextRuntimeConfig(serverId, {
+                          primaryContextBackend: processingPrimaryBackend,
+                          primaryContextModel: processingPrimaryModel.trim(),
+                          backupContextBackend: processingBackupModel.trim() ? processingBackupBackend : undefined,
+                          backupContextModel: processingBackupModel.trim() || undefined,
+                          memoryRecallMinScore: processingMemoryRecallMinScore,
+                          enablePersonalMemorySync: processingPersonalSyncEnabled,
+                        });
+                        applyProcessingSnapshot(view);
+                      } finally {
+                        setProcessingSaving(false);
+                      }
+                    })}
+                  >
+                    {processingSaving ? t('sharedContext.management.processingSaving') : t('sharedContext.management.processingSave')}
+                  </button>
+                  <button
+                    style={subtleButtonStyle}
+                    disabled={processingLoading}
+                    onClick={() => setProcessingMemoryRecallMinScore(processingSnapshot?.persisted.memoryRecallMinScore ?? DEFAULT_MEMORY_RECALL_MIN_SCORE)}
+                  >
+                    {t('sharedContext.management.memoryRecallThresholdReset')}
+                  </button>
+                </div>
+                <LabeledValue
+                  label={t('sharedContext.management.memoryRecallThresholdSaved')}
+                  value={(processingSnapshot?.persisted.memoryRecallMinScore ?? DEFAULT_MEMORY_RECALL_MIN_SCORE).toFixed(2)}
+                />
+              </>
             ) : (
               <div style={helperTextStyle}>{t('sharedContext.management.processingServerRequired')}</div>
             )}

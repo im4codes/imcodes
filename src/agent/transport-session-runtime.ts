@@ -31,6 +31,7 @@ import {
   recordRecentInjection,
   clearRecentInjectionHistory,
 } from '../context/recent-injection-history.js';
+import { getContextModelConfig } from '../context/context-model-config.js';
 import { resolveRuntimeAuthoredContext } from '../context/shared-context-runtime.js';
 import { buildTransportStartupMemory, type TransportContextBootstrap } from './runtime-context-bootstrap.js';
 import { recordMemoryHits } from '../store/context-store.js';
@@ -518,7 +519,9 @@ export class TransportSessionRuntime implements SessionRuntime {
       const dedupedCount = Math.max(0, processed.length - deduped.length);
       // 3) Cap rule: floor 0.5, top 3, extend to 5 iff all >= 0.6.
       const scored = deduped.map((item) => ({ item, score: item.relevanceScore ?? 0 }));
-      const finalScored = applyRecallCapRule(scored);
+      const finalScored = applyRecallCapRule(scored, {
+        minFloor: getContextModelConfig().memoryRecallMinScore,
+      });
       const items = finalScored.map((s) => toTransportMemoryRecallItem(s.item));
       if (items.length === 0) {
         logger.debug({ sessionKey: this.sessionKey, query }, 'transport message recall skipped: no processed matches');

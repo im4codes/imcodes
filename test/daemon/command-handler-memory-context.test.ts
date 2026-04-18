@@ -149,6 +149,7 @@ vi.mock('../../src/context/memory-search.js', () => ({
 }));
 
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
+import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 import { resetAllRecentInjectionHistories } from '../../src/context/recent-injection-history.js';
 
 const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -164,6 +165,7 @@ describe('handleWebCommand memory context timeline', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetAllRecentInjectionHistories();
+    setContextModelRuntimeConfig(null);
     getSessionMock.mockReturnValue({
       name: 'deck_process_brain',
       projectName: 'codedeck',
@@ -245,6 +247,53 @@ describe('handleWebCommand memory context timeline', () => {
     );
     expect(recordMemoryHitsMock).toHaveBeenCalledWith(['mem-1']);
     expect(recordMemoryHitsMock.mock.invocationCallOrder[0]).toBeGreaterThan(sendKeysDelayedEnterMock.mock.invocationCallOrder[0]);
+  });
+
+  it('applies the configured recall threshold when deciding whether to inject related history', async () => {
+    setContextModelRuntimeConfig({
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'sonnet',
+      memoryRecallMinScore: 0.44,
+    });
+    searchLocalMemorySemanticMock.mockResolvedValue({
+      items: [
+        {
+          id: 'mem-threshold',
+          type: 'processed',
+          projectId: 'codedeck',
+          scope: 'personal',
+          summary: 'Mid-threshold multilingual semantic match',
+          createdAt: 1,
+          relevanceScore: 0.4446,
+        },
+      ],
+      stats: {
+        totalRecords: 1,
+        matchedRecords: 1,
+        recentSummaryCount: 1,
+        durableCandidateCount: 0,
+        projectCount: 1,
+        stagedEventCount: 0,
+        dirtyTargetCount: 0,
+        pendingJobCount: 0,
+      },
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_process_brain',
+      text: '我感觉现在发的消息都没有相关历史recall了, 就像这句话 你自己测试下 不可能没有!',
+      commandId: 'cmd-memory-threshold',
+    }, serverLink as any);
+
+    await flushAsync();
+
+    expect(sendKeysDelayedEnterMock).toHaveBeenCalledWith(
+      'deck_process_brain',
+      expect.stringContaining('[Related past work]'),
+      undefined,
+    );
+    expect(recordMemoryHitsMock).toHaveBeenCalledWith(['mem-threshold']);
   });
 
   it('does not increment recall hits when the process send fails before the linked memory card is emitted', async () => {

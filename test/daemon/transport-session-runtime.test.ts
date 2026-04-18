@@ -4,6 +4,7 @@ import { RUNTIME_TYPES } from '../../src/agent/session-runtime.js';
 import type { TransportProvider, ProviderError, SessionConfig } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { MemorySearchResult, MemorySearchResultItem } from '../../src/context/memory-search.js';
+import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
 const searchLocalMemoryMock = vi.hoisted(() => vi.fn());
@@ -99,6 +100,7 @@ describe('TransportSessionRuntime', () => {
     timelineEmitterEmitMock.mockReset();
     searchLocalMemoryMock.mockReset();
     searchLocalMemorySemanticMock.mockReset();
+    setContextModelRuntimeConfig(null);
     mock = makeMockProvider();
     runtime = new TransportSessionRuntime(mock.provider, 'deck_test_brain');
     await runtime.initialize(defaultConfig);
@@ -517,6 +519,37 @@ describe('TransportSessionRuntime', () => {
       }),
       expect.anything(),
     );
+  });
+
+  it('applies the configured recall threshold for transport message recall', async () => {
+    setContextModelRuntimeConfig({
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'sonnet',
+      memoryRecallMinScore: 0.44,
+    });
+    const memoryItem = makeSearchItem({
+      summary: 'Mid-threshold multilingual semantic match',
+      relevanceScore: 0.4446,
+    });
+    searchLocalMemorySemanticMock.mockResolvedValue(makeSearchResult([memoryItem]));
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
+    }));
+    await r.initialize(defaultConfig);
+
+    r.send('我感觉现在发的消息都没有相关历史recall了, 就像这句话 你自己测试下 不可能没有!', 'client-turn-threshold');
+    await flushDispatch();
+
+    expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      memoryRecall: expect.objectContaining({
+        reason: 'message',
+        query: expect.stringContaining('我感觉现在发的消息都没有相关历史recall了'),
+      }),
+    }));
   });
 
   it('emits explicit skipped-recall statuses for control and short transport messages', async () => {

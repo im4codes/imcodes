@@ -119,6 +119,7 @@ describe('SharedContextManagementPanel', () => {
           primaryContextModel: 'sonnet',
           backupContextBackend: undefined,
           backupContextModel: undefined,
+          memoryRecallMinScore: 0.44,
           enablePersonalMemorySync: false,
         },
         effective: {
@@ -126,6 +127,7 @@ describe('SharedContextManagementPanel', () => {
           primaryContextModel: 'sonnet',
           backupContextBackend: undefined,
           backupContextModel: undefined,
+          memoryRecallMinScore: 0.44,
           enablePersonalMemorySync: false,
         },
         envPrimaryOverrideActive: false,
@@ -141,6 +143,7 @@ describe('SharedContextManagementPanel', () => {
           primaryContextModel: 'gpt-5.4',
           backupContextBackend: 'claude-code-sdk',
           backupContextModel: 'haiku',
+          memoryRecallMinScore: 0.37,
           enablePersonalMemorySync: true,
         },
         effective: {
@@ -148,6 +151,7 @@ describe('SharedContextManagementPanel', () => {
           primaryContextModel: 'gpt-5.4',
           backupContextBackend: 'claude-code-sdk',
           backupContextModel: 'haiku',
+          memoryRecallMinScore: 0.37,
           enablePersonalMemorySync: true,
         },
         envPrimaryOverrideActive: false,
@@ -387,10 +391,38 @@ describe('SharedContextManagementPanel', () => {
       primaryContextModel: 'gpt-5.4',
       backupContextBackend: 'qwen',
       backupContextModel: 'qwen3-coder-plus',
+      memoryRecallMinScore: 0.44,
       enablePersonalMemorySync: false,
     }));
     expect((screen.getByLabelText('sharedContext.management.processingPrimaryModel') as HTMLInputElement).value).toBe('gpt-5.4');
     expect(await screen.findByText('sharedContext.management.processingSavedPrimaryBackend')).toBeDefined();
+  });
+
+  it('loads and saves the message recall threshold from memory settings', async () => {
+    render(<SharedContextManagementPanel serverId="srv-1" />);
+    await flush();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.memory'));
+    });
+
+    const thresholdInput = await screen.findByLabelText('sharedContext.management.memoryRecallThresholdLabel') as HTMLInputElement;
+    expect(thresholdInput.value).toBe('0.44');
+
+    fireEvent.input(thresholdInput, { target: { value: '0.36', valueAsNumber: 0.36 } });
+
+    await act(async () => {
+      fireEvent.click(screen.getAllByText('sharedContext.management.processingSave')[0]);
+    });
+
+    await waitFor(() => expect(updateSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1', {
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'sonnet',
+      backupContextBackend: undefined,
+      backupContextModel: undefined,
+      memoryRecallMinScore: 0.36,
+      enablePersonalMemorySync: false,
+    }));
   });
 
   it('renders a shortened server label in the header but keeps the full server scope in processing details', async () => {

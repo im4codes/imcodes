@@ -76,11 +76,18 @@ function makeEnv(db: Database): Env {
 function makeMockDb(opts: {
   personalRows?: MockRow[];
   enterpriseRows?: (MockRow & { enterprise_id: string })[];
+  runtimeConfig?: Record<string, unknown> | null;
 } = {}) {
   const executeLog: Array<{ sql: string; params: unknown[] }> = [];
 
   const db: Database = {
-    queryOne: async () => null,
+    queryOne: async <T = unknown>(sql: string) => {
+      const normalized = sql.toLowerCase().replace(/\s+/g, ' ').trim();
+      if (normalized.includes('select shared_context_runtime_config from servers where id =')) {
+        return { shared_context_runtime_config: opts.runtimeConfig ?? null } as T;
+      }
+      return null;
+    },
     query: async <T = unknown>(sql: string, _params: unknown[] = []) => {
       const normalized = sql.toLowerCase().replace(/\s+/g, ' ').trim();
       // Personal memory query
@@ -382,7 +389,7 @@ describe('memory recall endpoint — I.5', () => {
     expect(ids).toContain('extra-1');
   });
 
-  it('drops rows that fail the 0.5 composite floor even for a normal query', async () => {
+  it('drops rows that fail the configured composite floor even for a normal query', async () => {
     // Ancient timestamps + no project match → composite scores collapse
     // below floor regardless of raw similarity.
     const { db } = makeMockDb({
@@ -397,6 +404,35 @@ describe('memory recall endpoint — I.5', () => {
     const res = await postRecall(app, { query: 'test' });
     const json = await res.json() as { results: unknown[] };
     expect(json.results).toEqual([]);
+  });
+
+  it('uses the saved memory recall threshold from server runtime config', async () => {
+    const now = Date.now();
+    const { db } = makeMockDb({
+      runtimeConfig: {
+        primaryContextBackend: 'claude-code-sdk',
+        primaryContextModel: 'sonnet',
+        memoryRecallMinScore: 0.44,
+      },
+      personalRows: [
+        {
+          id: 'p-threshold',
+          project_id: 'proj-1',
+          projection_class: 'recent_summary',
+          summary: 'Mid-threshold multilingual semantic match',
+          updated_at: now,
+          score: 0.4446,
+          hit_count: 0,
+          last_used_at: now,
+        },
+      ],
+    });
+    const app = await buildTestApp(db);
+
+    const res = await postRecall(app, { query: '相关历史 recall threshold test' });
+    expect(res.status).toBe(200);
+    const json = await res.json() as { results: Array<{ id: string }> };
+    expect(json.results.map((row) => row.id)).toEqual(['p-threshold']);
   });
 
   it('fires hit_count UPDATE for recalled projection ids', async () => {

@@ -76,6 +76,7 @@ import {
   normalizeSharedContextRuntimeBackend,
   SHARED_CONTEXT_RUNTIME_CONFIG_MSG,
 } from '../../shared/shared-context-runtime-config.js';
+import { getContextModelConfig } from '../context/context-model-config.js';
 import {
   SUPERVISION_MODE,
   extractSessionSupervisionSnapshot,
@@ -4149,6 +4150,7 @@ async function handleSharedContextRuntimeConfigApply(cmd: Record<string, unknown
       typeof config?.backupContextBackend === 'string' ? config.backupContextBackend : undefined,
     ),
     backupContextModel: typeof config?.backupContextModel === 'string' ? config.backupContextModel : undefined,
+    memoryRecallMinScore: typeof config?.memoryRecallMinScore === 'number' ? config.memoryRecallMinScore : undefined,
     enablePersonalMemorySync: config?.enablePersonalMemorySync === true,
   });
   if (!normalized.primaryContextBackend || !normalized.primaryContextModel) {
@@ -4366,7 +4368,9 @@ async function prependLocalMemory(
     // 3) Cap rule: floor 0.5, top 3, extend to 5 iff all >= 0.6.
     //    See shared/memory-scoring.ts.
     const scored = deduped.map((item) => ({ item, score: item.relevanceScore ?? 0 }));
-    const finalScored = applyRecallCapRule(scored);
+    const finalScored = applyRecallCapRule(scored, {
+      minFloor: getContextModelConfig().memoryRecallMinScore,
+    });
     const finalItems = finalScored.map((s) => s.item);
     if (finalItems.length === 0) {
       return {

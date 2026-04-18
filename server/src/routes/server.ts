@@ -73,6 +73,7 @@ const runtimeConfigSchema = z.object({
   primaryContextModel: z.string().trim().min(1),
   backupContextBackend: z.enum(['claude-code-sdk', 'codex-sdk', 'qwen', 'openclaw']).optional().nullable(),
   backupContextModel: z.string().trim().optional().nullable(),
+  memoryRecallMinScore: z.number().finite().min(0).max(1).optional().nullable(),
   enablePersonalMemorySync: z.boolean().optional().nullable(),
 });
 
@@ -257,6 +258,7 @@ serverRoutes.put('/:id/shared-context/runtime-config', requireAuth(), async (c) 
     primaryContextModel: parsed.data.primaryContextModel,
     backupContextBackend: parsed.data.backupContextBackend ?? undefined,
     backupContextModel: parsed.data.backupContextModel ?? undefined,
+    memoryRecallMinScore: parsed.data.memoryRecallMinScore ?? undefined,
     enablePersonalMemorySync: parsed.data.enablePersonalMemorySync ?? undefined,
   });
   const updated = await updateServerSharedContextRuntimeConfig(c.env.DB, serverId, userId, {

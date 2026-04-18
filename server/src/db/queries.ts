@@ -217,6 +217,9 @@ export async function getServerSharedContextRuntimeConfig(
   const primaryContextModel = typeof raw.primaryContextModel === 'string' ? raw.primaryContextModel.trim() : '';
   const backupContextBackend = typeof raw.backupContextBackend === 'string' ? raw.backupContextBackend.trim() : undefined;
   const backupContextModel = typeof raw.backupContextModel === 'string' ? raw.backupContextModel.trim() : '';
+  const memoryRecallMinScore = typeof raw.memoryRecallMinScore === 'number' && Number.isFinite(raw.memoryRecallMinScore)
+    ? raw.memoryRecallMinScore
+    : undefined;
   const enablePersonalMemorySync = raw.enablePersonalMemorySync === true;
   if (!primaryContextModel) return null;
   return {
@@ -224,6 +227,7 @@ export async function getServerSharedContextRuntimeConfig(
     primaryContextModel,
     backupContextBackend: backupContextBackend || undefined,
     backupContextModel: backupContextModel || undefined,
+    memoryRecallMinScore,
     enablePersonalMemorySync,
   };
 }

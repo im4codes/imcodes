@@ -8,6 +8,7 @@ import { parseCanonicalRepositoryKey } from '../../../src/agent/repository-ident
 import { classifyTimestampFreshness } from '../../../shared/context-freshness.js';
 import type { ContextMemoryRecordView, ContextMemoryStatsView } from '../../../shared/context-types.js';
 import { computeRelevanceScore, applyRecallCapRule, type ProjectionClass } from '../../../shared/memory-scoring.js';
+import { normalizeSharedContextRuntimeConfig } from '../../../shared/shared-context-runtime-config.js';
 import { isTemplatePrompt, isTemplateOriginSummary } from '../../../shared/template-prompt-patterns.js';
 import { searchSemanticMemoryView } from '../util/semantic-memory-view.js';
 
@@ -905,6 +906,15 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
   const serverId = c.req.param('id')!;
   const role = await resolveServerRole(c.env.DB, serverId, userId);
   if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+  const runtimeConfigRow = await c.env.DB.queryOne<{ shared_context_runtime_config: Record<string, unknown> | string | null }>(
+    'SELECT shared_context_runtime_config FROM servers WHERE id = $1',
+    [serverId],
+  );
+  const runtimeConfig = normalizeSharedContextRuntimeConfig(
+    typeof runtimeConfigRow?.shared_context_runtime_config === 'string'
+      ? JSON.parse(runtimeConfigRow.shared_context_runtime_config)
+      : runtimeConfigRow?.shared_context_runtime_config,
+  );
 
   let body: { query: string; projectId?: string; limit?: number };
   try {
@@ -1079,6 +1089,7 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
   const cappedDefault = Math.min(limit, 3);
   const cappedExtend = Math.min(Math.max(limit, cappedDefault), 5);
   const topResults = applyRecallCapRule(results, {
+    minFloor: runtimeConfig.memoryRecallMinScore,
     defaultCap: cappedDefault,
     extendCap: cappedExtend,
   });
