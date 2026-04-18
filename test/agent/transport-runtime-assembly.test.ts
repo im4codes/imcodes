@@ -176,7 +176,7 @@ describe('buildProviderContextPayload', () => {
     expect(payload.authority.fallbackAllowed).toBe(false);
   });
 
-  it('suppresses local recall artifacts when authority resolves to processed_remote', () => {
+  it('keeps per-message local recall as auxiliary context even when authority resolves to processed_remote', () => {
     const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
       userMessage: 'Run tests',
       namespace: { scope: 'project_shared', projectId: 'repo-1', enterpriseId: 'ent-1' },
@@ -186,16 +186,20 @@ describe('buildProviderContextPayload', () => {
         reason: 'startup',
         injectedText: '# Recent project memory (reference only)\n<recent-project-memory advisory=\"true\">\n- Prior fix\n</recent-project-memory>',
       }),
-      memoryRecall: makeRecall(),
+      memoryRecall: makeRecall({ authoritySource: 'processed_remote' }),
     });
 
     expect(payload.authority.authoritySource).toBe('processed_remote');
     expect(payload.startupMemory).toBeUndefined();
-    expect(payload.memoryRecall).toBeUndefined();
+    expect(payload.memoryRecall).toEqual(expect.objectContaining({
+      sourceKind: 'local_processed',
+      authoritySource: 'processed_remote',
+      injectionSurface: 'normalized-payload',
+    }));
     expect(payload.systemText ?? '').not.toContain('Recent project memory');
-    expect(payload.messagePreamble).toBeUndefined();
+    expect(payload.messagePreamble).toContain('[Related past work]');
     expect(payload.diagnostics).toContain('memory:start:suppressed-authority');
-    expect(payload.diagnostics).toContain('memory:message:suppressed-authority');
+    expect(payload.diagnostics).toContain('memory:message:local-auxiliary');
   });
 
   it('allows shared local processed fallback only when explicit policy permits it', () => {

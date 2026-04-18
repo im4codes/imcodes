@@ -467,13 +467,14 @@ describe('TransportSessionRuntime', () => {
     );
   });
 
-  it('does not inject local recall when authority resolves to processed_remote for shared scope', async () => {
+  it('still injects per-message local recall when authority resolves to processed_remote for shared scope', async () => {
     const memoryItem = makeSearchItem({
       projectId: 'repo-1',
       scope: 'project_shared',
       enterpriseId: 'ent-1',
       workspaceId: 'ws-1',
       summary: 'Should not be injected while remote authority is active',
+      relevanceScore: 0.92,
     });
     searchLocalMemorySemanticMock.mockResolvedValue(makeSearchResult([memoryItem]));
     const localMock = makeMockProvider();
@@ -491,15 +492,29 @@ describe('TransportSessionRuntime', () => {
     r.send('Please recall recent transport memory around recall runtime', 'client-turn-remote');
     await flushDispatch();
 
-    expect(searchLocalMemorySemanticMock).not.toHaveBeenCalled();
-    expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.not.objectContaining({
-      memoryRecall: expect.anything(),
-      startupMemory: expect.anything(),
+    expect(searchLocalMemorySemanticMock).toHaveBeenCalledWith(expect.objectContaining({
+      query: expect.stringContaining('Please recall recent transport memory'),
+      namespace: { scope: 'project_shared', projectId: 'repo-1', enterpriseId: 'ent-1', workspaceId: 'ws-1' },
+      currentEnterpriseId: 'ent-1',
+      repo: 'repo-1',
+      limit: 10,
     }));
-    expect(timelineEmitterEmitMock).not.toHaveBeenCalledWith(
+    expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      memoryRecall: expect.objectContaining({
+        reason: 'message',
+        authoritySource: 'processed_remote',
+        sourceKind: 'local_processed',
+      }),
+    }));
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
       'deck_test_brain',
       'memory.context',
-      expect.objectContaining({ reason: 'message' }),
+      expect.objectContaining({
+        reason: 'message',
+        relatedToEventId: 'transport-user:client-turn-remote',
+        authoritySource: 'processed_remote',
+        sourceKind: 'local_processed',
+      }),
       expect.anything(),
     );
   });

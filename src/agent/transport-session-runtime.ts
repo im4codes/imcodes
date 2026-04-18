@@ -14,6 +14,7 @@ import {
 } from './transport-runtime-assembly.js';
 import type {
   ContextFreshness,
+  ContextAuthorityDecision,
   ContextNamespace,
   SharedScopePolicyOverride,
   TransportMemoryRecallArtifact,
@@ -331,9 +332,7 @@ export class TransportSessionRuntime implements SessionRuntime {
             ? buildTransportStartupMemory(this._contextNamespace)
             : null
         );
-        const memoryRecallResult = authority.authoritySource === 'processed_local'
-          ? await this.buildTransportMessageRecallResult(message)
-          : { artifact: null };
+        const memoryRecallResult = await this.buildTransportMessageRecallResult(message, authority.authoritySource);
         const memoryRecall = memoryRecallResult.artifact;
         const dispatchResult = await dispatchSharedContextSend(this.provider, this._providerSessionId!, {
           userMessage: message,
@@ -453,6 +452,7 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   private async buildTransportMessageRecallResult(
     message: string,
+    authoritySource: ContextAuthorityDecision['authoritySource'],
   ): Promise<{
     artifact: TransportMemoryRecallArtifact | null;
     statusPayload?: Omit<MemoryContextTimelinePayload, 'relatedToEventId'>;
@@ -469,7 +469,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         artifact: null,
         statusPayload: buildMemoryContextStatusPayload(query, 'skipped_control_message', 'message', {
           runtimeFamily: 'transport',
-          authoritySource: 'processed_local',
+          authoritySource,
           sourceKind: 'local_processed',
         }),
       };
@@ -480,7 +480,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         artifact: null,
         statusPayload: buildMemoryContextStatusPayload(query, 'skipped_short_prompt', 'message', {
           runtimeFamily: 'transport',
-          authoritySource: 'processed_local',
+          authoritySource,
           sourceKind: 'local_processed',
         }),
       };
@@ -491,7 +491,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         artifact: null,
         statusPayload: buildMemoryContextStatusPayload(query, 'skipped_template_prompt', 'message', {
           runtimeFamily: 'transport',
-          authoritySource: 'processed_local',
+          authoritySource,
           sourceKind: 'local_processed',
         }),
       };
@@ -527,14 +527,14 @@ export class TransportSessionRuntime implements SessionRuntime {
           statusPayload: deduped.length === 0 && processed.length > 0
             ? buildMemoryContextStatusPayload(query, 'deduped_recently', 'message', {
                 runtimeFamily: 'transport',
-                authoritySource: 'processed_local',
+                authoritySource,
                 sourceKind: 'local_processed',
                 matchedCount: processed.length,
                 dedupedCount,
               })
             : buildMemoryContextStatusPayload(query, 'no_matches', 'message', {
                 runtimeFamily: 'transport',
-                authoritySource: 'processed_local',
+                authoritySource,
                 sourceKind: 'local_processed',
                 matchedCount: processed.length,
               }),
@@ -549,7 +549,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       const payload = buildMemoryContextTimelinePayload(query, items, 'message', {
         runtimeFamily: 'transport',
         injectionSurface,
-        authoritySource: 'processed_local',
+        authoritySource,
         sourceKind: 'local_processed',
       });
       if (!payload?.injectedText) return { artifact: null };
@@ -557,7 +557,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         artifact: {
           reason: 'message',
           runtimeFamily: 'transport',
-          authoritySource: 'processed_local',
+          authoritySource,
           sourceKind: 'local_processed',
           injectionSurface,
           query,
@@ -571,7 +571,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         artifact: null,
         statusPayload: buildMemoryContextStatusPayload(query, 'failed', 'message', {
           runtimeFamily: 'transport',
-          authoritySource: 'processed_local',
+          authoritySource,
           sourceKind: 'local_processed',
         }),
       };
