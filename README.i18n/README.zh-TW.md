@@ -3,9 +3,9 @@
 [English](../README.md) | [簡體中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
 
-**給 AI agent 的 IM。一套記憶層，貫通 agent 與 AI 提供方。**
+**給 AI agent 的 IM。一套記憶層，貫通所有 AI 提供方。跨模型審計與規劃。**
 
-IM.codes 為 coding agent 提供一套跨 provider 共享的記憶層。它會把已完成的工作沉澱成可重用上下文，再把合適的歷史注入後續 session，貫通 [Claude Code](https://github.com/anthropics/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)、GitHub Copilot、Cursor、OpenCode、[OpenClaw](https://openclaw.com)、[Qwen](https://github.com/QwenLM/qwen-agent) 等，同時提供終端存取、檔案瀏覽、Git 視圖、localhost 預覽、通知、多 agent 工作流，以及 transport 型 agent 的原生串流輸出。
+IM.codes 為 coding agent 提供一套跨 provider 共享的記憶層。它會把已完成的工作沉澱成可重用上下文，再把合適的歷史注入後續 session，貫通 [Claude Code](https://github.com/anthropics/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)、GitHub Copilot、Cursor、OpenCode、[OpenClaw](https://openclaw.com)、[Qwen](https://github.com/QwenLM/qwen-agent) 等,同時提供終端存取、檔案瀏覽、Git 視圖、localhost 預覽、通知、多 agent 工作流,以及 transport 型 agent 的原生串流輸出。內建 P2P 討論功能,讓多個模型互相審閱對方的方案和實作——能有效減少單模型的遺漏、盲點和偏差。
 
 > **說明：** 本文件是中文翻译版。**英文 README（`../README.md`）是規範版本。** 若内容存在差异，以英文版为准。
 

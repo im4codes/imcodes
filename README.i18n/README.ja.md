@@ -2,9 +2,9 @@
 
 [English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
-**エージェントのための IM。エージェントと AI プロバイダーをまたぐ一つのメモリレイヤー。**
+**エージェントのための IM。すべての AI プロバイダーをまたぐ一つのメモリレイヤー。エージェント横断の監査とプランニング。**
 
-IM.codes は coding agent のための、プロバイダーをまたぐ共有メモリレイヤーです。完了した作業を再利用可能なコンテキストとして蓄積し、適切な履歴を後続 session に再注入します。対応先は Claude Code、Codex、Gemini CLI、GitHub Copilot、Cursor、OpenCode、OpenClaw、Qwen などで、ターミナル、ファイル閲覧、Git 変更、localhost プレビュー、通知、マルチエージェント連携、transport 系 agent のネイティブストリーミングも備えています。
+IM.codes は coding agent のための、プロバイダーをまたぐ共有メモリレイヤーです。完了した作業を再利用可能なコンテキストとして蓄積し、適切な履歴を後続 session に再注入します。対応先は Claude Code、Codex、Gemini CLI、GitHub Copilot、Cursor、OpenCode、OpenClaw、Qwen などで、ターミナル、ファイル閲覧、Git 変更、localhost プレビュー、通知、マルチエージェント連携、transport 系 agent のネイティブストリーミングも備えています。P2P ディスカッションを内蔵——複数のモデルが互いの計画と実装をレビュー・監査し合い、単一モデルの見落とし・盲点・バイアスを効果的に減らします。
 
 > これは翻訳版です。**正式な内容は英語版 README（`../README.md`）です。** 差異がある場合は英語版を優先してください。
 
