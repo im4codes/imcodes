@@ -13,6 +13,8 @@ const SESSION_NAME_PATTERNS: RegExp[] = [
   /^deck_modeawaree2e[a-z0-9-]+_(brain|w\d+)$/i,
   /^deck_qwene2e_[a-z0-9]+_brain$/i,
   /^deck_reconntest[a-z0-9-]+_w\d+$/i,
+  /^deck_restorecheck[a-z0-9-]+_(brain|w\d+)$/i,
+  /^deck_shutdown[a-z0-9-]+_(brain|w\d+|probe)$/i,
   /^deck_sub_(?:cxsdk_e2e|cxsdk_effort|ccsdk_minimax_sub)$/i,
 ];
 
@@ -21,6 +23,8 @@ const PROJECT_NAME_PATTERNS: RegExp[] = [
   /^modeawaree2e[a-z0-9-]+$/i,
   /^qwene2e$/i,
   /^reconntest[a-z0-9-]+$/i,
+  /^restorecheck[a-z0-9-]+$/i,
+  /^shutdown[a-z0-9-]+$/i,
   /^e2e[-_]/i,
 ];
 
