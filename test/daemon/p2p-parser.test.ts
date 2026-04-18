@@ -692,14 +692,20 @@ describe('structured P2P routing via WS fields', () => {
         p2pAtTargets: [{ session: 'deck_proj_w1', mode: 'review' }],
       }, mockServerLink as any);
 
-      await new Promise((r) => setTimeout(r, 100));
+      // Poll until startP2pRun is called — reading 25 small files and hopping
+      // through handleSend's async path takes longer than the fixed 100 ms
+      // wait used elsewhere in this suite. Poll with a generous budget so the
+      // test is deterministic under slow CI rather than racing the timeout.
+      await vi.waitFor(
+        () => expect(startP2pRun).toHaveBeenCalledOnce(),
+        { timeout: 10_000, interval: 50 },
+      );
 
-      expect(startP2pRun).toHaveBeenCalledOnce();
       const [{ fileContents }] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
       expect(fileContents).toHaveLength(20);
       expect(fileContents.map((f: { path: string }) => f.path)).toEqual(filePaths.slice(0, 20));
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 });

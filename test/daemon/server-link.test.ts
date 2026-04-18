@@ -41,8 +41,19 @@ describe('ServerLink', () => {
     );
   });
 
-  it('send() throws when not connected', () => {
-    expect(() => link.send({ type: 'test' })).toThrow();
+  it('send() silently drops messages when not connected (fire-and-forget safe)', () => {
+    // The daemon must never die from transient disconnects — ServerLink.send()
+    // is best-effort and must not throw. Callers that need delivery
+    // confirmation should check isConnected() first.
+    expect(() => link.send({ type: 'test' })).not.toThrow();
+    expect(mockWsInstance.send).not.toHaveBeenCalled();
+    expect(link.isConnected()).toBe(false);
+  });
+
+  it('isConnected() reflects WebSocket readyState', () => {
+    expect(link.isConnected()).toBe(false);
+    link.connect();
+    expect(link.isConnected()).toBe(true);
   });
 
   it('send() serializes message to JSON', () => {

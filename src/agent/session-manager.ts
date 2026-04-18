@@ -44,6 +44,7 @@ import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
 import { closeSingleSession, collectProjectCloseTargets, type CloseFailure, type CloseTreeResult } from './session-close.js';
 import { cleanupKnownTestTerminalSessions } from './startup-test-session-cleanup.js';
+import { clearResend, drainResend, getResendCount } from '../daemon/transport-resend-queue.js';
 
 /** Start JSONL watcher for a CC session — uses specific file if ccSessionId known, else directory scan. */
 function startCCWatcher(sessionName: string, projectDir: string, ccSessionId?: string): void {
@@ -239,6 +240,9 @@ export async function stopProject(
           }
         }
         removeSession(record.name);
+        // Session is gone — drop any queued resend work so it can't replay into
+        // a same-named session that gets created later.
+        clearResend(record.name);
         emitSessionPersist(null, record.name);
         if (record.projectDir && !invalidatedDirs.has(record.projectDir)) {
           invalidatedDirs.add(record.projectDir);
@@ -1224,6 +1228,21 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         }),
       });
       logger.info({ session: s.name, providerId: s.providerId, providerSid: s.providerSessionId, freshAfterCancel }, 'Restored transport session runtime');
+
+      // Drain messages that arrived while the provider was offline. We invoke
+      // runtime.send() directly — the previously-emitted user.message event is
+      // already in the timeline, so we deliberately do NOT re-emit it here.
+      // Failures are logged and entries dropped to avoid retry loops.
+      const pendingCount = getResendCount(s.name);
+      if (pendingCount > 0) {
+        logger.info({ session: s.name, pendingCount }, 'Draining transport resend queue after reconnect');
+        void drainResend(s.name, (entry) => {
+          const attachments = entry.attachments ?? [];
+          return attachments.length > 0
+            ? runtime.send(entry.text, entry.commandId, attachments)
+            : runtime.send(entry.text, entry.commandId);
+        }).catch((err) => logger.warn({ err, session: s.name }, 'transport resend drain failed'));
+      }
     } catch (err) {
       logger.warn({ err, session: s.name }, 'Failed to restore transport session runtime');
     }
@@ -1447,6 +1466,19 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     transportRuntimes.delete(name);
     if (providerSid) unregisterProviderRoute(providerSid);
     throw err;
+  }
+
+  // Drain any messages queued while the runtime was being (re)built — e.g. if a
+  // relaunch stopped the old runtime and the user typed during the gap.
+  const pendingResendCount = getResendCount(name);
+  if (pendingResendCount > 0) {
+    logger.info({ session: name, pendingCount: pendingResendCount }, 'Draining transport resend queue after launch');
+    void drainResend(name, (entry) => {
+      const attachments = entry.attachments ?? [];
+      return attachments.length > 0
+        ? runtime.send(entry.text, entry.commandId, attachments)
+        : runtime.send(entry.text, entry.commandId);
+    }).catch((err) => logger.warn({ err, session: name }, 'transport resend drain (launch) failed'));
   }
 }
 

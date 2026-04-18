@@ -538,6 +538,101 @@ describe('handleWebCommand transport queue behavior', () => {
     );
   });
 
+  it('queues sends for resend when the transport runtime has not connected yet', async () => {
+    // Reset module state between tests — the queue lives in module scope.
+    const { clearAllResend, getResendEntries } = await import('../../src/daemon/transport-resend-queue.js');
+    clearAllResend();
+
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      state: 'idle',
+    });
+    // No runtime yet — provider is still reconnecting.
+    getTransportRuntimeMock.mockReturnValue(undefined);
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'first msg while offline',
+      commandId: 'cmd-offline-1',
+    }, serverLink as any);
+    await flushAsync();
+
+    // 1. Command is accepted, NOT errored — we queued it, we didn't drop it.
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'command.ack',
+      { commandId: 'cmd-offline-1', status: 'accepted' },
+    );
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: 'command.ack',
+      commandId: 'cmd-offline-1',
+      status: 'accepted',
+      session: 'deck_transport_brain',
+    });
+
+    // 2. The user message is persisted to the timeline so the UI can show it.
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'user.message',
+      { text: 'first msg while offline', allowDuplicate: true, clientMessageId: 'cmd-offline-1' },
+      expect.objectContaining({ eventId: 'transport-user:cmd-offline-1' }),
+    );
+
+    // 3. A memory-excluded info message explains the queued state.
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'assistant.text',
+      expect.objectContaining({
+        text: expect.stringContaining('will resend 1 queued message'),
+        streaming: false,
+        memoryExcluded: true,
+      }),
+      expect.objectContaining({ source: 'daemon' }),
+    );
+
+    // 4. session.state reports the queued entry so the UI can surface pending count.
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'session.state',
+      expect.objectContaining({
+        state: 'queued',
+        pendingCount: 1,
+        pendingMessageEntries: [
+          { clientMessageId: 'cmd-offline-1', text: 'first msg while offline' },
+        ],
+      }),
+      expect.objectContaining({ source: 'daemon' }),
+    );
+
+    // 5. The entry is actually sitting in the resend queue for later drain.
+    expect(getResendEntries('deck_transport_brain')).toEqual([
+      expect.objectContaining({ text: 'first msg while offline', commandId: 'cmd-offline-1' }),
+    ]);
+
+    // A second offline send accumulates.
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'second msg while offline',
+      commandId: 'cmd-offline-2',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(getResendEntries('deck_transport_brain').map((e) => e.commandId)).toEqual([
+      'cmd-offline-1',
+      'cmd-offline-2',
+    ]);
+
+    // Cleanup so later tests start from empty state.
+    clearAllResend();
+  });
+
   it('treats transport runtimes without a provider session id as unavailable', async () => {
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: null,

@@ -1,4 +1,4 @@
-import { useState, useEffect } from "preact/hooks";
+import { useState, useEffect, useMemo } from "preact/hooks";
 import { useTranslation } from "react-i18next";
 import type { WsClient } from "../ws-client.js";
 import { FileBrowser } from "./file-browser-lazy.js";
@@ -17,10 +17,16 @@ import {
   QWEN_EFFORT_LEVELS,
   type TransportEffortLevel,
 } from "@shared/effort-levels.js";
+import {
+  useTransportModels,
+  supportsDynamicTransportModels,
+} from "../hooks/useTransportModels.js";
 
 const DEFAULT_SHELL_KEY = "default_shell";
-const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ["gpt-5.2"] as const;
-const COPILOT_SDK_MODEL_SUGGESTIONS = ["gpt-5.4", "gpt-5.4-mini"] as const;
+// Fallback suggestions used only when the daemon probe returns an empty list
+// (offline/unauthenticated). The live list comes from the dynamic models hook.
+const CURSOR_HEADLESS_MODEL_FALLBACK = ["auto", "composer-2-fast", "gpt-5.2"] as const;
+const COPILOT_SDK_MODEL_FALLBACK = ["gpt-5", "claude-sonnet-4.5"] as const;
 
 interface Props {
   ws: WsClient | null;
@@ -297,12 +303,18 @@ export function NewSessionDialog({
   const supportsCcPreset = agentType === "claude-code" || agentType === "qwen";
   const supportsModelSelection =
     agentType === "copilot-sdk" || agentType === "cursor-headless";
-  const modelSuggestions =
-    agentType === "copilot-sdk"
-      ? COPILOT_SDK_MODEL_SUGGESTIONS
-      : agentType === "cursor-headless"
-        ? CURSOR_HEADLESS_MODEL_SUGGESTIONS
-        : [];
+  const dynamicModelsAgentType = supportsDynamicTransportModels(agentType)
+    ? agentType
+    : null;
+  const transportModels = useTransportModels(ws, dynamicModelsAgentType);
+  const modelSuggestions = useMemo(() => {
+    if (transportModels.models.length > 0) {
+      return transportModels.models.map((m) => m.id);
+    }
+    if (agentType === "copilot-sdk") return [...COPILOT_SDK_MODEL_FALLBACK];
+    if (agentType === "cursor-headless") return [...CURSOR_HEADLESS_MODEL_FALLBACK];
+    return [] as string[];
+  }, [transportModels.models, agentType]);
 
   useEffect(() => {
     setThinking("high");

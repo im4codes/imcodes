@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import path from 'node:path';
 import type {
   TransportProvider,
   ProviderCapabilities,
@@ -871,8 +873,29 @@ export class CopilotSdkProvider implements TransportProvider {
   }
 
   private resolveBinaryPath(config: ProviderConfig): string | undefined {
-    if (isNonEmptyString(config.binaryPath)) return config.binaryPath.trim();
-    return resolveBinaryWithWindowsFallbacks(COPILOT_BIN, []);
+    // The Copilot SDK requires `cliPath` to be an absolute path to an existing
+    // file (it runs `existsSync` before spawning). Passing just the name
+    // `"copilot"` makes the SDK fail with "Copilot CLI not found at copilot."
+    //
+    // We only override the SDK's bundled CLI when:
+    //   1. The caller explicitly passed an absolute binaryPath that exists, OR
+    //   2. On Windows, the PATH-resolved binary is an absolute existing file.
+    // Otherwise we return `undefined` so the SDK falls back to its bundled
+    // `@github/copilot/index.js` (installed as a dependency of the SDK).
+    if (isNonEmptyString(config.binaryPath)) {
+      const candidate = config.binaryPath.trim();
+      if (path.isAbsolute(candidate) && existsSync(candidate)) return candidate;
+      logger.warn(
+        { provider: this.id, candidate },
+        'Ignoring Copilot binaryPath override (not an absolute file path) — falling back to bundled CLI',
+      );
+      return undefined;
+    }
+    if (process.platform === 'win32') {
+      const resolved = resolveBinaryWithWindowsFallbacks(COPILOT_BIN, []);
+      if (resolved && path.isAbsolute(resolved) && existsSync(resolved)) return resolved;
+    }
+    return undefined;
   }
 
   private resolveDefaultModel(): string | undefined {

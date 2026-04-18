@@ -13,6 +13,7 @@ import { timelineEmitter } from './timeline-emitter.js';
 import { timelineStore } from './timeline-store.js';
 import type { MemoryContextTimelinePayload } from '../shared/timeline/types.js';
 import { emitSessionInlineError } from './session-error.js';
+import { enqueueResend, getResendEntries, getResendCount, clearResend } from './transport-resend-queue.js';
 import {
   startSubSession,
   stopSubSession,
@@ -999,6 +1000,9 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
         }
       })();
       break;
+    case 'transport.list_models':
+      void handleTransportListModels(cmd, serverLink);
+      break;
     case REPO_MSG.DETECT:
     case REPO_MSG.LIST_ISSUES:
     case REPO_MSG.LIST_PRS:
@@ -1615,15 +1619,44 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     );
   };
   if (!transportRuntime && record?.runtimeType === 'transport') {
-    // No runtime — provider not connected. Show error in chat.
-    const errMsg = `Provider ${record.providerId ?? 'unknown'} not connected. Reconnecting...`;
-    logger.warn({ sessionName, providerId: record.providerId }, 'session.send: transport session has no runtime');
-    emitTransportUserMessage(text);
-    timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
-    timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
-    const errStatus = 'error';
-    timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: errStatus, error: errMsg });
-    try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: errStatus, session: sessionName, error: errMsg }); } catch { /* not connected */ }
+    // No runtime — provider is still (re)connecting. Queue the message for
+    // automatic redelivery once `restoreTransportSessions()` rebuilds the
+    // runtime instead of dropping it on the floor.
+    const providerLabel = record.providerId ?? 'unknown';
+    logger.info(
+      { sessionName, providerId: record.providerId, commandId: effectiveId },
+      'session.send: transport session has no runtime — queuing for resend after reconnect',
+    );
+    emitTransportUserMessage(
+      text,
+      { clientMessageId: effectiveId },
+      transportUserEventId(effectiveId),
+    );
+    enqueueResend(sessionName, { text, commandId: effectiveId, queuedAt: Date.now() });
+    const queued = getResendEntries(sessionName);
+    const infoMsg = `⏳ Provider ${providerLabel} not connected yet — will resend ${queued.length} queued message${queued.length === 1 ? '' : 's'} once reconnected.`;
+    timelineEmitter.emit(
+      sessionName,
+      'assistant.text',
+      { text: infoMsg, streaming: false, memoryExcluded: true },
+      { source: 'daemon', confidence: 'high' },
+    );
+    timelineEmitter.emit(
+      sessionName,
+      'session.state',
+      {
+        state: 'queued',
+        pendingCount: queued.length,
+        pendingMessages: queued.map((e) => e.text),
+        pendingMessageEntries: queued.map((e) => ({ clientMessageId: e.commandId, text: e.text })),
+      },
+      { source: 'daemon', confidence: 'high' },
+    );
+    const status = isLegacy ? 'accepted_legacy' : 'accepted';
+    timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
+    try {
+      serverLink.send({ type: 'command.ack', commandId: effectiveId, status, session: sessionName });
+    } catch { /* not connected */ }
     return;
   }
   if (transportRuntime && !transportRuntime.providerSessionId) {
@@ -1640,6 +1673,8 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   if (transportRuntime) {
     if (text.trim() === '/stop') {
       emitTransportUserMessage(text);
+      // Explicit stop discards any queued resend work — the user asked for a halt.
+      clearResend(sessionName);
       try {
         supervisionAutomation.cancelSession(sessionName);
         await transportRuntime.cancel();
@@ -1663,6 +1698,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     }
     if (text.trim() === '/clear' && supportsTransportClear(record?.agentType)) {
       emitTransportUserMessage(text);
+      // Fresh conversation must not replay stale queued messages from the prior
+      // offline window — drop anything we had buffered for resend.
+      clearResend(sessionName);
       try {
         await runExclusiveSessionRelaunch(sessionName, async () => {
           await relaunchFreshTransportConversation(record);
@@ -4214,6 +4252,61 @@ async function handleListProviderSessions(cmd: Record<string, unknown>, serverLi
   } catch (err) {
     logger.warn({ err, providerId }, 'Failed to list provider sessions');
     serverLink.send({ type: 'provider.sync_sessions', providerId, sessions: [] });
+  }
+}
+
+async function handleTransportListModels(
+  cmd: Record<string, unknown>,
+  serverLink: ServerLink,
+): Promise<void> {
+  const agentType = typeof cmd.agentType === 'string' ? cmd.agentType : '';
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
+  const force = cmd.force === true;
+  const reply = (payload: {
+    models: Array<{ id: string; name?: string; supportsReasoningEffort?: boolean }>;
+    defaultModel?: string;
+    isAuthenticated?: boolean;
+    error?: string;
+  }): void => {
+    try {
+      serverLink.send({
+        type: 'transport.models_response',
+        agentType,
+        ...(requestId ? { requestId } : {}),
+        ...payload,
+      });
+    } catch { /* not connected */ }
+  };
+  try {
+    if (agentType === 'cursor-headless') {
+      const { getCursorRuntimeConfig } = await import('../agent/cursor-runtime-config.js');
+      const cfg = await getCursorRuntimeConfig(force);
+      reply({
+        models: cfg.availableModels.map((id) => ({ id })),
+        ...(cfg.defaultModel ? { defaultModel: cfg.defaultModel } : {}),
+        isAuthenticated: cfg.isAuthenticated,
+      });
+      return;
+    }
+    if (agentType === 'copilot-sdk') {
+      const { getCopilotRuntimeConfig } = await import('../agent/copilot-runtime-config.js');
+      const cfg = await getCopilotRuntimeConfig(force);
+      reply({
+        models: cfg.models.map((m) => ({
+          id: m.id,
+          ...(m.name ? { name: m.name } : {}),
+          ...(m.supportsReasoningEffort ? { supportsReasoningEffort: true } : {}),
+        })),
+        isAuthenticated: cfg.isAuthenticated,
+        ...(cfg.probeError ? { error: cfg.probeError } : {}),
+      });
+      return;
+    }
+    reply({ models: [], error: `Unsupported agentType: ${agentType || '(missing)'}` });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.warn({ err, agentType }, 'transport.list_models failed');
+    reply({ models: [], error: message });
   }
 }
 

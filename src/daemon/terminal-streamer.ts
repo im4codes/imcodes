@@ -34,6 +34,12 @@ const REBIND_DELAYS_MS = [1000, 2000, 4000, 8000, 16000, 30000];
 const MAX_REBIND_ATTEMPTS = 5;
 
 function shouldSuppressPaneIdInlineError(sessionName: string): boolean {
+  return isTransportSessionName(sessionName);
+}
+
+/** Transport sessions don't have tmux panes; all tmux-backed streamer
+ *  operations (snapshot, pipe, rebind) are no-ops for them. */
+function isTransportSessionName(sessionName: string): boolean {
   const session = getSession(sessionName);
   return session?.runtimeType === 'transport'
     || (typeof session?.agentType === 'string' && isTransportAgent(session.agentType));
@@ -86,6 +92,14 @@ export class TerminalStreamer {
 
   subscribe(subscriber: StreamSubscriber): () => void {
     const { sessionName } = subscriber;
+
+    // Transport sessions don't have a tmux pane — every tmux op fails noisily.
+    // Return a no-op unsubscribe without registering the subscriber so that
+    // `bootstrapSubscriber` (snapshot + pipe-pane start) never runs for them.
+    if (isTransportSessionName(sessionName)) {
+      logger.debug({ sessionName }, 'Terminal streamer subscribe skipped for transport session');
+      return () => { /* no-op */ };
+    }
 
     if (!this.subscribers.has(sessionName)) {
       this.subscribers.set(sessionName, new Map());
@@ -201,6 +215,8 @@ export class TerminalStreamer {
 
   /** Request an on-demand snapshot for all subscribers of a session. */
   requestSnapshot(sessionName: string): void {
+    // Transport sessions have no tmux pane — snapshot requests are no-ops.
+    if (isTransportSessionName(sessionName)) return;
     const subs = this.subscribers.get(sessionName);
     if (!subs || subs.size === 0) return;
 
@@ -263,6 +279,9 @@ export class TerminalStreamer {
   /** Called by session-manager when a session restarts with a new pane. */
   async rebindSession(sessionName: string): Promise<void> {
     if (!this.subscribers.has(sessionName)) return;
+    // Transport sessions don't have a pane to rebind — skip rather than
+    // trigger the "paneId not available" error on every relaunch.
+    if (isTransportSessionName(sessionName)) return;
     await this.stopPipe(sessionName);
     await this.startPipe(sessionName, 0);
     // Re-snapshot all subscribers

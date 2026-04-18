@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, mkdir, writeFile, rm, stat, utimes } from 'fs/promises';
+import { mkdtemp, mkdir, readdir, writeFile, rm, stat, utimes } from 'fs/promises';
 import { tmpdir, homedir } from 'os';
 import { join } from 'path';
+import { randomUUID } from 'crypto';
 
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({
   timelineEmitter: { emit: vi.fn(), on: vi.fn() },
@@ -33,21 +34,52 @@ async function waitUntil(fn: () => boolean, timeoutMs = 4000): Promise<void> {
   throw new Error('waitUntil timeout');
 }
 
+// Purge any stale slug directories in ~/.gemini/tmp whose chats contain files
+// matching the given uuid prefix. Leaked files from a crashed prior run can
+// otherwise poison findSessionFile(), because the hardcoded 8-char uuid prefix
+// becomes a collision key across runs.
+async function purgeGeminiTmpForPrefix(prefix: string): Promise<void> {
+  const root = join(homedir(), '.gemini', 'tmp');
+  let slugs: string[];
+  try {
+    slugs = await readdir(root);
+  } catch {
+    return;
+  }
+  for (const slug of slugs) {
+    if (!slug.startsWith('slug-')) continue;
+    const chatsDir = join(root, slug, 'chats');
+    let entries: string[];
+    try {
+      entries = await readdir(chatsDir);
+    } catch {
+      continue;
+    }
+    if (entries.some((entry) => entry.endsWith(`-${prefix}.json`) || entry.endsWith(`-${prefix}`))) {
+      await rm(join(root, slug), { recursive: true, force: true });
+    }
+  }
+}
+
 describe('gemini retrackLatestSessionFile', () => {
   let rootDir: string;
   let chatsDir: string;
   let oldFile: string;
   let newFile: string;
-  const sessionUuid = 'abcd1234-1111-2222-3333-444444444444';
+  // Fresh uuid per suite run so crashed prior runs can't poison findSessionFile
+  // via leaked `~/.gemini/tmp/slug-*/chats/session-*-<prefix>.json` files.
+  const sessionUuid = randomUUID();
+  const uuidPrefix = sessionUuid.slice(0, 8);
   const sessionName = `session-gemini-retrack-${Date.now()}`;
 
   beforeEach(async () => {
     vi.mocked(timelineEmitter.emit).mockClear();
+    await purgeGeminiTmpForPrefix(uuidPrefix);
     rootDir = await mkdtemp(join(tmpdir(), 'gemini-retrack-proj-'));
-    chatsDir = join(homedir(), '.gemini', 'tmp', `slug-${Date.now()}`, 'chats');
+    chatsDir = join(homedir(), '.gemini', 'tmp', `slug-${Date.now()}-${uuidPrefix}`, 'chats');
     await mkdir(chatsDir, { recursive: true });
-    oldFile = join(chatsDir, 'session-old-abcd1234.json');
-    newFile = join(chatsDir, 'session-new-abcd1234.json');
+    oldFile = join(chatsDir, `session-old-${uuidPrefix}.json`);
+    newFile = join(chatsDir, `session-new-${uuidPrefix}.json`);
     await writeFile(oldFile, JSON.stringify({
       sessionId: sessionUuid,
       lastUpdated: '2026-04-05T00:00:00Z',
@@ -66,6 +98,9 @@ describe('gemini retrackLatestSessionFile', () => {
     stopWatching(sessionName);
     await rm(rootDir, { recursive: true, force: true });
     await rm(chatsDir.substring(0, chatsDir.indexOf('/chats')), { recursive: true, force: true });
+    // Belt-and-suspenders: if the test crashed before reaching the rm above
+    // on a previous run, the next run still starts clean.
+    await purgeGeminiTmpForPrefix(uuidPrefix);
   });
 
   it('switches to the latest matching session file and replays missed content', async () => {
