@@ -25,6 +25,8 @@ describe('supervision prompts', () => {
       assistantResponse: 'I can continue from here.',
     });
 
+    expect(prompt).toContain('Use this background mainly to interpret the user\'s requested workflow and custom instructions.');
+    expect(prompt).toContain('that is usually work the agent can continue doing autonomously');
     expect(prompt).toContain('openspec status --change "<name>" --json');
     expect(prompt).toContain('@@all(discuss) <message>');
     expect(prompt).toContain('imcodes send --list');
@@ -38,6 +40,7 @@ describe('supervision prompts', () => {
       'Prefer OpenSpec when a change is already referenced.',
     );
 
+    expect(prompt).toContain('Do not treat the mere need to use one of these IM.codes workflows as a reason to ask_human');
     expect(prompt).toContain('openspec new change "<name>"');
     expect(prompt).toContain('@@<label-or-session>(audit) <message>');
     expect(prompt).toContain('imcodes send --type codex "<message>"');

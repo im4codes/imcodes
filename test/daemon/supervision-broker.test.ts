@@ -188,6 +188,8 @@ describe('SupervisionBroker', () => {
     const prompt = String(provider.send.mock.calls[0]?.[1] ?? '');
     expect(prompt).toContain('If the assistant says tests, validation, fixes, commit/push, or other implementation work still needs to be done, choose continue.');
     expect(prompt).toContain('Do not choose complete when the assistant itself indicates remaining work');
+    expect(prompt).toContain('Use this background mainly to interpret the user\'s requested workflow and custom instructions.');
+    expect(prompt).toContain('Do not treat the mere need to use one of these IM.codes workflows as a reason to ask_human');
     expect(prompt).toContain('openspec status --change "<name>" --json');
     expect(prompt).toContain('@@all(discuss) <message>');
     expect(prompt).toContain('imcodes send --list');
