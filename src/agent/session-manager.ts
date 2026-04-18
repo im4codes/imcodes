@@ -1240,18 +1240,37 @@ export async function restoreTransportSessions(providerId: string): Promise<void
       });
       logger.info({ session: s.name, providerId: s.providerId, providerSid: s.providerSessionId, freshAfterCancel }, 'Restored transport session runtime');
 
-      // Drain messages that arrived while the provider was offline. We invoke
-      // runtime.send() directly — the previously-emitted user.message event is
-      // already in the timeline, so we deliberately do NOT re-emit it here.
+      // Drain messages that arrived while the provider was offline. The
+      // enqueue path deliberately did NOT emit a user.message event (the
+      // agent hadn't seen the message yet), so emit it HERE — exactly when
+      // runtime.send() returns 'sent' and the entry really is dispatched to
+      // the agent. If the runtime queues it internally (returns 'queued'),
+      // leave the optimistic pending bubble in place; it will be reconciled
+      // once the turn actually fires.
       // Failures are logged and entries dropped to avoid retry loops.
       const pendingCount = getResendCount(s.name);
       if (pendingCount > 0) {
         logger.info({ session: s.name, pendingCount }, 'Draining transport resend queue after reconnect');
         void drainResend(s.name, (entry) => {
           const attachments = entry.attachments ?? [];
-          return attachments.length > 0
+          const result = attachments.length > 0
             ? runtime.send(entry.text, entry.commandId, attachments)
             : runtime.send(entry.text, entry.commandId);
+          if (result === 'sent') {
+            timelineEmitter.emit(
+              s.name,
+              'user.message',
+              {
+                text: entry.text,
+                allowDuplicate: true,
+                commandId: entry.commandId,
+                clientMessageId: entry.commandId,
+                ...(attachments.length > 0 ? { attachments } : {}),
+              },
+              { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.commandId}` },
+            );
+          }
+          return result;
         }).catch((err) => logger.warn({ err, session: s.name }, 'transport resend drain failed'));
       }
     } catch (err) {
@@ -1492,14 +1511,32 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
 
   // Drain any messages queued while the runtime was being (re)built — e.g. if a
   // relaunch stopped the old runtime and the user typed during the gap.
+  // Emits user.message on 'sent' for the same reason the reconnect drain
+  // does: the enqueue path skipped the emit so the timeline doesn't lie,
+  // and now the turn is actually firing.
   const pendingResendCount = getResendCount(name);
   if (pendingResendCount > 0) {
     logger.info({ session: name, pendingCount: pendingResendCount }, 'Draining transport resend queue after launch');
     void drainResend(name, (entry) => {
       const attachments = entry.attachments ?? [];
-      return attachments.length > 0
+      const result = attachments.length > 0
         ? runtime.send(entry.text, entry.commandId, attachments)
         : runtime.send(entry.text, entry.commandId);
+      if (result === 'sent') {
+        timelineEmitter.emit(
+          name,
+          'user.message',
+          {
+            text: entry.text,
+            allowDuplicate: true,
+            commandId: entry.commandId,
+            clientMessageId: entry.commandId,
+            ...(attachments.length > 0 ? { attachments } : {}),
+          },
+          { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.commandId}` },
+        );
+      }
+      return result;
     }).catch((err) => logger.warn({ err, session: name }, 'transport resend drain (launch) failed'));
   }
 }

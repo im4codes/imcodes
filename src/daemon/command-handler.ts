@@ -1669,15 +1669,19 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     // No runtime — provider is still (re)connecting. Queue the message for
     // automatic redelivery once `restoreTransportSessions()` rebuilds the
     // runtime instead of dropping it on the floor.
+    //
+    // Deliberately NOT emitting a user.message timeline event here — the
+    // agent has not seen this message yet, only the daemon has. Surfacing
+    // it as a committed timeline entry mid-outage would be a lie. The web
+    // client's optimistic pending bubble stays in its "sending" state, and
+    // the session.state 'queued' event below carries pendingMessageEntries
+    // so the UI can surface the queue count. The real user.message event
+    // is emitted by restoreTransportSessions when the drain actually
+    // dispatches the entry via runtime.send().
     const providerLabel = record.providerId ?? 'unknown';
     logger.info(
       { sessionName, providerId: record.providerId, commandId: effectiveId },
       'session.send: transport session has no runtime — queuing for resend after reconnect',
-    );
-    emitTransportUserMessage(
-      text,
-      { clientMessageId: effectiveId },
-      transportUserEventId(effectiveId),
     );
     enqueueResend(sessionName, { text, commandId: effectiveId, queuedAt: Date.now() });
     const queued = getResendEntries(sessionName);
@@ -1713,15 +1717,14 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     // — we want the same conversation). `launchTransportSession` drains the
     // resend queue on success, so the message auto-delivers without user
     // intervention.
+    // Same "don't lie to the timeline" rule as the no-runtime branch above:
+    // the agent hasn't seen this message yet. Skip the user.message emit
+    // here and let the drain path emit it when the runtime actually
+    // dispatches the entry.
     const providerLabel = record?.providerId ?? 'unknown';
     logger.info(
       { sessionName, providerId: record?.providerId, commandId: effectiveId },
       'session.send: transport runtime missing provider session id — queuing and auto-resuming',
-    );
-    emitTransportUserMessage(
-      text,
-      { clientMessageId: effectiveId },
-      transportUserEventId(effectiveId),
     );
     enqueueResend(sessionName, { text, commandId: effectiveId, queuedAt: Date.now() });
     const queued = getResendEntries(sessionName);

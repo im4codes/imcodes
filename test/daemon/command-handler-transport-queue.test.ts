@@ -586,12 +586,17 @@ describe('handleWebCommand transport queue behavior', () => {
       session: 'deck_transport_brain',
     });
 
-    // 2. The user message is persisted to the timeline so the UI can show it.
-    expect(emitMock).toHaveBeenCalledWith(
+    // 2. NO user.message timeline event — the agent hasn't seen this message
+    //    yet, it's sitting in the daemon's resend queue. Emitting a
+    //    user.message here would lie to the timeline: committed rows mean
+    //    "the agent saw this". The optimistic pending bubble on the web
+    //    client stays in its "sending" state, and the real user.message
+    //    event fires on drain when runtime.send() actually dispatches.
+    expect(emitMock).not.toHaveBeenCalledWith(
       'deck_transport_brain',
       'user.message',
-      { text: 'first msg while offline', allowDuplicate: true, commandId: 'cmd-offline-1', clientMessageId: 'cmd-offline-1' },
-      expect.objectContaining({ eventId: 'transport-user:cmd-offline-1' }),
+      expect.anything(),
+      expect.anything(),
     );
 
     // 3. A memory-excluded info message explains the queued state.
@@ -670,15 +675,15 @@ describe('handleWebCommand transport queue behavior', () => {
     // redelivery, and the command ack is `accepted` (not `error`) so the UI
     // doesn't stay stuck in a "failed send" state.
     expect(stopTransportRuntimeSessionMock).toHaveBeenCalledWith('deck_transport_brain');
-    expect(emitMock).toHaveBeenCalledWith(
+    // No user.message emission on the stale-runtime queue path either —
+    // the message is only in daemon memory, not yet re-dispatched. The
+    // drain helper (launchTransportSession / restoreTransportSessions)
+    // emits user.message when runtime.send() returns 'sent'.
+    expect(emitMock).not.toHaveBeenCalledWith(
       'deck_transport_brain',
       'user.message',
-      expect.objectContaining({
-        text: 'hello after restart',
-        allowDuplicate: true,
-        clientMessageId: 'cmd-stale-runtime',
-      }),
-      expect.objectContaining({ eventId: 'transport-user:cmd-stale-runtime' }),
+      expect.anything(),
+      expect.anything(),
     );
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
