@@ -73,6 +73,9 @@ describe('cc presets', () => {
         ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
         ANTHROPIC_API_KEY: 'test-token',
         ANTHROPIC_MODEL: 'MiniMax-M2.7',
+        // qwen CLI reads OPENAI_BASE_URL / OPENAI_API_KEY for --auth-type anthropic
+        OPENAI_BASE_URL: 'https://api.minimax.io/anthropic',
+        OPENAI_API_KEY: 'test-token',
       },
       model: 'MiniMax-M2.7',
       settings: {

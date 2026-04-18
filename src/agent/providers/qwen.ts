@@ -32,6 +32,37 @@ import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-p
 const execFileAsync = promisify(execFile);
 const QWEN_BIN = 'qwen';
 
+/**
+ * Auth types accepted by the qwen CLI's `--auth-type` flag.
+ * Verified via `qwen --help` (qwen 0.14.5). Passing this flag forces the CLI
+ * to use the named tier for the current run, bypassing the user-level
+ * `~/.qwen/settings.json` that otherwise wins over our system-level settings.
+ *
+ * This is separate from `shared/qwen-auth.ts`'s display-tier constants
+ * (`qwen-oauth` / `coding-plan` / `api-key` — used for UI badges).
+ */
+const QWEN_CLI_AUTH_TYPES = new Set([
+  'openai',
+  'anthropic',
+  'qwen-oauth',
+  'gemini',
+  'vertex-ai',
+]);
+
+/** Extract `security.auth.selectedType` from a settings object if it names a
+ *  qwen CLI auth type. Returns undefined when settings are absent, malformed,
+ *  or hold a value that qwen doesn't recognize (so we don't crash the spawn). */
+function resolveCliAuthType(settings: string | Record<string, unknown> | undefined): string | undefined {
+  if (!settings || typeof settings === 'string') return undefined;
+  const security = settings.security;
+  if (!security || typeof security !== 'object') return undefined;
+  const auth = (security as Record<string, unknown>).auth;
+  if (!auth || typeof auth !== 'object') return undefined;
+  const selected = (auth as Record<string, unknown>).selectedType;
+  if (typeof selected !== 'string') return undefined;
+  return QWEN_CLI_AUTH_TYPES.has(selected) ? selected : undefined;
+}
+
 interface QwenSessionState {
   cwd: string;
   started: boolean;
@@ -371,6 +402,16 @@ export class QwenProvider implements TransportProvider {
     }
     if (state.model) {
       args.push('--model', state.model);
+    }
+    // When a preset is active, state.settings carries `security.auth.selectedType`.
+    // Pass it explicitly via --auth-type so the qwen CLI uses that tier for this
+    // run — otherwise user-level ~/.qwen/settings.json (which may still say
+    // qwen-oauth) overrides our system-level settings file and we fall back to
+    // the discontinued OAuth tier. See shared/qwen-auth.ts for the display-tier
+    // counterpart; these CLI values are distinct.
+    const cliAuthType = resolveCliAuthType(state.settings);
+    if (cliAuthType) {
+      args.push('--auth-type', cliAuthType);
     }
     if (state.started) {
       args.push('--resume', state.qwenConversationId);

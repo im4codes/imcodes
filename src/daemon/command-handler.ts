@@ -1850,9 +1850,15 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       if (record?.agentType === 'qwen' && modelMatch) {
         const nextModel = modelMatch[1];
           const runtimeConfig = await getQwenRuntimeConfig(true).catch(() => null);
-          const allowedModels = runtimeConfig?.availableModels?.length
-            ? runtimeConfig.availableModels
-            : (record.qwenAvailableModels?.length ? record.qwenAvailableModels : QWEN_MODEL_IDS);
+          // Priority: session qwenAvailableModels (may include preset models) >
+          // runtimeConfig.availableModels (from Qwen CLI, may not know about preset
+          // models) > hardcoded QWEN_MODEL_IDS fallback. Session record is
+          // authoritative because it was populated with preset models at launch.
+          const sessionModels = record.qwenAvailableModels ?? [];
+          const runtimeModels = runtimeConfig?.availableModels ?? [];
+          const allowedModels = sessionModels.length
+            ? sessionModels
+            : (runtimeModels.length ? runtimeModels : QWEN_MODEL_IDS);
           if (!allowedModels.includes(nextModel)) {
             const qwenAuthType = runtimeConfig?.authType ?? record.qwenAuthType;
             const authHint = qwenAuthType === 'qwen-oauth'
@@ -1870,6 +1876,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           }
           transportRuntime.setAgentId(nextModel);
           const qwenAuthType = runtimeConfig?.authType ?? record.qwenAuthType;
+          // Merge runtime models INTO session's existing list (union) so preset
+          // models survive future switches. Never overwrite with only runtime models.
+          const mergedAvailableModels = [...new Set([...sessionModels, ...runtimeModels])];
           const nextRecord = {
             ...record,
             requestedModel: nextModel,
@@ -1878,7 +1887,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
             qwenModel: nextModel,
             ...(qwenAuthType ? { qwenAuthType } : {}),
             ...(runtimeConfig?.authLimit ? { qwenAuthLimit: runtimeConfig.authLimit } : {}),
-            ...(runtimeConfig?.availableModels?.length ? { qwenAvailableModels: runtimeConfig.availableModels } : {}),
+            ...(mergedAvailableModels.length ? { qwenAvailableModels: mergedAvailableModels } : {}),
             ...getQwenDisplayMetadata({
               model: nextModel,
               authType: qwenAuthType,

@@ -132,8 +132,18 @@ export async function getQwenPresetTransportConfig(presetName: string): Promise<
     || undefined;
 
   const env: Record<string, string> = {};
-  if (baseUrl) env['ANTHROPIC_BASE_URL'] = baseUrl;
-  if (apiKey) env['ANTHROPIC_API_KEY'] = apiKey;
+  if (baseUrl) {
+    env['ANTHROPIC_BASE_URL'] = baseUrl;
+    // qwen CLI reads OPENAI_BASE_URL for --auth-type anthropic (OpenAI-compatible).
+    // Also set ANTHROPIC_BASE_URL for completeness.
+    env['OPENAI_BASE_URL'] = baseUrl;
+  }
+  if (apiKey) {
+    env['ANTHROPIC_API_KEY'] = apiKey;
+    // qwen CLI reads OPENAI_API_KEY for --auth-type anthropic (OpenAI-compatible).
+    // Also set ANTHROPIC_API_KEY for completeness.
+    env['OPENAI_API_KEY'] = apiKey;
+  }
   if (model) env['ANTHROPIC_MODEL'] = model;
 
   const settings: Record<string, unknown> | undefined = (baseUrl && apiKey && model)
