@@ -12,6 +12,7 @@ const upsertSessionMock = vi.hoisted(() => vi.fn());
 const listSessionsMock = vi.hoisted(() => vi.fn(() => []));
 const timelineEmitMock = vi.hoisted(() => vi.fn(() => ({})));
 const sendKeysMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const sendProcessSessionMessageForAutomationMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const capturePane = vi.hoisted(() => vi.fn().mockResolvedValue([]));
 const getTransportRuntimeMock = vi.hoisted(() => vi.fn());
 const refreshSessionWatcherMock = vi.hoisted(() => vi.fn().mockResolvedValue(false));
@@ -24,6 +25,10 @@ vi.mock('../../src/store/session-store.js', () => ({
 
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({
   timelineEmitter: { emit: timelineEmitMock, on: vi.fn() },
+}));
+
+vi.mock('../../src/daemon/command-handler.js', () => ({
+  sendProcessSessionMessageForAutomation: sendProcessSessionMessageForAutomationMock,
 }));
 
 vi.mock('../../src/util/logger.js', () => ({
@@ -280,7 +285,7 @@ describe('Hook server /send endpoint', () => {
   // ── Successful delivery ──────────────────────────────────────────────────
 
   describe('Successful delivery', () => {
-    it('delivers message to idle process session via sendKeys', async () => {
+    it('REGRESSION GUARD: CLI /send to process sessions must route through session.send recall pipeline and this test must not be deleted', async () => {
       const brain = makeSession({ name: 'deck_proj_brain', role: 'brain', agentType: 'claude-code' });
       const w1 = makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'codex' });
 
@@ -298,7 +303,8 @@ describe('Hook server /send endpoint', () => {
       expect(res.body.ok).toBe(true);
       expect(res.body.delivered).toBe(true);
       expect(res.body.target).toBe('deck_proj_w1');
-      expect(sendKeysMock).toHaveBeenCalledWith('deck_proj_w1', 'hello');
+      expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith('deck_proj_w1', 'hello');
+      expect(sendKeysMock).not.toHaveBeenCalled();
     });
 
     it('delivers message to transport session via runtime.send()', async () => {

@@ -7,6 +7,7 @@ const {
   sendKeysDelayedEnterMock,
   searchLocalMemorySemanticMock,
   recordMemoryHitsMock,
+  detectRepoMock,
 } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
   getTransportRuntimeMock: vi.fn(),
@@ -14,6 +15,7 @@ const {
   sendKeysDelayedEnterMock: vi.fn().mockResolvedValue(undefined),
   searchLocalMemorySemanticMock: vi.fn(),
   recordMemoryHitsMock: vi.fn(),
+  detectRepoMock: vi.fn(),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -148,6 +150,16 @@ vi.mock('../../src/context/memory-search.js', () => ({
   searchLocalMemorySemantic: searchLocalMemorySemanticMock,
 }));
 
+vi.mock('../../src/repo/detector.js', () => ({
+  detectRepo: detectRepoMock,
+  parseRemoteUrl: vi.fn((url: string) => {
+    if (url === 'git@github.com:imcodes/codedeck.git') {
+      return { host: 'github.com', owner: 'imcodes', repo: 'codedeck' };
+    }
+    return null;
+  }),
+}));
+
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 import { resetAllRecentInjectionHistories } from '../../src/context/recent-injection-history.js';
@@ -210,6 +222,9 @@ describe('handleWebCommand memory context timeline', () => {
         pendingJobCount: 0,
       },
     });
+    detectRepoMock.mockResolvedValue({
+      info: { remoteUrl: 'git@github.com:imcodes/codedeck.git' },
+    });
   });
 
   it('emits a linked memory.context event for injected related history', async () => {
@@ -247,6 +262,39 @@ describe('handleWebCommand memory context timeline', () => {
     );
     expect(recordMemoryHitsMock).toHaveBeenCalledWith(['mem-1']);
     expect(recordMemoryHitsMock.mock.invocationCallOrder[0]).toBeGreaterThan(sendKeysDelayedEnterMock.mock.invocationCallOrder[0]);
+  });
+
+  it('REGRESSION GUARD: process recall queries must use canonical repo identity instead of projectName and this test must not be deleted', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_process_brain',
+      projectName: 'friendly-name',
+      projectDir: '/worktrees/codedeck',
+      role: 'brain',
+      agentType: 'claude-code',
+      runtimeType: 'process',
+      state: 'running',
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_process_brain',
+      text: 'Fix reconnect issues in websocket client',
+      commandId: 'cmd-memory-canonical',
+    }, serverLink as any);
+
+    await flushAsync();
+    await flushAsync();
+
+    expect(detectRepoMock).toHaveBeenCalledWith('/worktrees/codedeck');
+    expect(searchLocalMemorySemanticMock).toHaveBeenCalledWith(expect.objectContaining({
+      query: 'Fix reconnect issues in websocket client',
+      namespace: { scope: 'personal', projectId: 'github.com/imcodes/codedeck' },
+      repo: 'github.com/imcodes/codedeck',
+      limit: 10,
+    }));
+    expect(searchLocalMemorySemanticMock).not.toHaveBeenCalledWith(expect.objectContaining({
+      repo: 'friendly-name',
+    }));
   });
 
   it('applies the configured recall threshold when deciding whether to inject related history', async () => {

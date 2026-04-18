@@ -83,6 +83,8 @@ import {
   SHARED_CONTEXT_RUNTIME_CONFIG_MSG,
 } from '../../shared/shared-context-runtime-config.js';
 import { getContextModelConfig } from '../context/context-model-config.js';
+import { detectRepo } from '../repo/detector.js';
+import { GitOriginRepositoryIdentityService } from '../agent/repository-identity-service.js';
 import {
   SUPERVISION_MODE,
   extractSessionSupervisionSnapshot,
@@ -90,6 +92,7 @@ import {
 } from '../../shared/supervision-config.js';
 
 const MAX_P2P_FILE_PULL_COUNT = 20;
+const processRecallRepositoryIdentityService = new GitOriginRepositoryIdentityService();
 
 function isEligibleSupervisionTaskText(text: string): boolean {
   const trimmed = text.trim();
@@ -1980,24 +1983,43 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     }
   }
 
-  // Serialized write via per-session mutex
+  try {
+    await sendProcessSessionMessage(sessionName, finalText, attachments, {
+      originalText: text,
+      commandId: effectiveId,
+      isLegacy,
+      serverLink,
+    });
+  } catch (err) {
+    logger.error({ sessionName, err }, 'session.send failed');
+  }
+}
+
+async function sendProcessSessionMessage(
+  sessionName: string,
+  finalText: string,
+  attachments: TransportAttachment[],
+  options?: {
+    originalText?: string;
+    commandId?: string;
+    isLegacy?: boolean;
+    serverLink?: Pick<ServerLink, 'send'>;
+  },
+): Promise<void> {
   const release = await getMutex(sessionName).acquire();
   try {
     const agentType = getSession(sessionName)?.agentType ?? 'unknown';
 
-    // Sandboxed agents (Gemini, Codex) can only access files under their project dir.
-    // Copy referenced files from ~/.imcodes/ to project .imc/ and rewrite paths.
     let sendText = finalText;
     if (agentType === 'gemini' || agentType === 'codex') {
       sendText = await rewritePathsForSandbox(sessionName, finalText);
     }
 
-    // Inject relevant memories from local processed context for process agents
     const memoryContext = await prependLocalMemory(sendText, sessionName);
     sendText = memoryContext.text;
 
     await sendShellAwareCommand(sessionName, sendText, agentType);
-    const payload: Record<string, unknown> = { text };
+    const payload: Record<string, unknown> = { text: options?.originalText ?? finalText };
     if (attachments.length > 0) payload.attachments = attachments;
     const userEvent = timelineEmitter.emit(sessionName, 'user.message', payload);
     if (memoryContext.timelinePayload && userEvent) {
@@ -2009,21 +2031,72 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         try { recordMemoryHits(memoryContext.hitIds); } catch { /* non-fatal */ }
       }
     }
-    // Emit accepted ack (accepted_legacy for fallback IDs so callers can distinguish)
-    const status = isLegacy ? 'accepted_legacy' : 'accepted';
-    timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
-    try {
-      serverLink.send({ type: 'command.ack', commandId: effectiveId, status, session: sessionName });
-    } catch { /* not connected */ }
+    if (options?.commandId) {
+      const status = options.isLegacy ? 'accepted_legacy' : 'accepted';
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId: options.commandId, status });
+      try {
+        options.serverLink?.send({ type: 'command.ack', commandId: options.commandId, status, session: sessionName });
+      } catch { /* not connected */ }
+    }
     if (agentType === 'opencode') {
       const { scheduleCatchup } = await import('./opencode-watcher.js');
       scheduleCatchup(sessionName);
     }
   } catch (err) {
-    logger.error({ sessionName, err }, 'session.send failed');
+    if (options?.commandId) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId: options.commandId, status: 'error', error: errMsg });
+      try {
+        options.serverLink?.send({ type: 'command.ack', commandId: options.commandId, status: 'error', session: sessionName, error: errMsg });
+      } catch { /* not connected */ }
+    }
+    throw err;
   } finally {
     release();
   }
+}
+
+export async function sendProcessSessionMessageForAutomation(sessionName: string, text: string): Promise<void> {
+  await sendProcessSessionMessage(sessionName, text, [], { originalText: text });
+}
+
+async function resolveProcessRecallQueryContext(
+  sessionName: string,
+): Promise<{
+  namespace?: SessionRecord['contextNamespace'];
+  repo?: string;
+  currentEnterpriseId?: string;
+}> {
+  const record = getSession(sessionName);
+  if (record?.contextNamespace?.projectId) {
+    return {
+      namespace: record.contextNamespace,
+      repo: record.contextNamespace.projectId,
+      currentEnterpriseId: record.contextNamespace.enterpriseId,
+    };
+  }
+
+  const projectDir = record?.projectDir?.trim();
+  let originUrl: string | null | undefined;
+  if (projectDir) {
+    try {
+      const repo = await detectRepo(projectDir);
+      originUrl = repo.info?.remoteUrl ?? null;
+    } catch {
+      originUrl = null;
+    }
+  }
+
+  const canonical = processRecallRepositoryIdentityService.resolve({
+    cwd: projectDir,
+    originUrl,
+  });
+  const projectId = canonical.key || record?.projectName;
+  if (!projectId) return {};
+  return {
+    namespace: { scope: 'personal', projectId },
+    repo: projectId,
+  };
 }
 
 async function handleEditQueuedTransportMessage(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
@@ -4426,15 +4499,14 @@ async function prependLocalMemory(
   }
   try {
     const { searchLocalMemorySemantic } = await import('../context/memory-search.js');
-    const record = getSession(sessionName);
+    const recallContext = await resolveProcessRecallQueryContext(sessionName);
     // Broaden the candidate pool — the cap rule trims to 3 (or up to 5 for
     // all-strong results). We need enough candidates to survive filtering.
     const searchResult = await searchLocalMemorySemantic({
       query,
-      namespace: record?.projectName
-        ? { scope: 'personal', projectId: record.projectName }
-        : undefined,
-      repo: record?.projectName ?? undefined,
+      namespace: recallContext.namespace,
+      currentEnterpriseId: recallContext.currentEnterpriseId,
+      repo: recallContext.repo,
       limit: 10,
     });
     // 1) Template-origin legacy summaries never surface through recall.
