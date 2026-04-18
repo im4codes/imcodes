@@ -20,6 +20,7 @@ import {
   mergeTransportPendingMessagesForRunningState,
   normalizeTransportPendingEntries,
 } from '../transport-queue.js';
+import { getSessionRuntimeType } from '@shared/agent-types.js';
 
 export interface SubSession extends SubSessionData {
   sessionName: string;
@@ -68,6 +69,7 @@ export function useSubSessions(
           loadedGenRef.current = gen;
           setSubSessions(list.map((s) => ({
             ...s,
+            runtimeType: s.runtimeType ?? getSessionRuntimeType(s.type),
             sessionName: toSessionName(s.id),
             state: 'unknown' as const,
           })));
@@ -173,7 +175,7 @@ export function useSubSessions(
               serverId: '',
               type: m.sessionType || 'shell',
               sessionName: m.sessionName || `deck_sub_${m.id}`,
-              runtimeType: m.runtimeType ?? (m.sessionType === 'qwen' || m.sessionType === 'openclaw' ? 'transport' : null),
+              runtimeType: m.runtimeType ?? getSessionRuntimeType(m.sessionType || 'shell'),
               providerId: m.providerId ?? null,
               providerSessionId: m.providerSessionId ?? null,
               cwd: m.cwd || null,
@@ -423,8 +425,8 @@ export function useSubSessions(
       const sub: SubSession = {
         ...res.subSession,
         sessionName: res.sessionName,
-        runtimeType: res.subSession.runtimeType ?? (type === 'openclaw' || type === 'qwen' ? 'transport' : 'process'),
-        providerId: res.subSession.providerId ?? (type === 'openclaw' || type === 'qwen' ? type : null),
+        runtimeType: res.subSession.runtimeType ?? getSessionRuntimeType(type),
+        providerId: res.subSession.providerId ?? (getSessionRuntimeType(type) === 'transport' ? type : null),
         state: 'starting',
         requestedModel: res.subSession.requestedModel ?? requestedModel ?? null,
         activeModel: res.subSession.activeModel ?? requestedModel ?? null,

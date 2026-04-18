@@ -8,6 +8,8 @@ import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/pr
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, _opts?: Record<string, unknown>) => {
+      if (key === 'session.agentGroup.transport_sdk') return 'SDK';
+      if (key === 'session.agentGroup.cli_process') return 'CLI';
       // Return last segment of key as simple translation
       const parts = key.split('.');
       return parts[parts.length - 1];
@@ -53,15 +55,25 @@ describe('NewSessionDialog', () => {
     expect(select).toBeDefined();
   });
 
-  it('agent type selector orders sdk agents before cli agents', () => {
+  it('agent type selector separates transport/sdk and cli/process groups', () => {
     render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
     const select = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    const optgroups = Array.from(select.querySelectorAll('optgroup'));
+    expect(optgroups.map((group) => group.label)).toEqual(['SDK', 'CLI']);
     const options = Array.from(select.options).map((o) => o.value);
-    expect(options.slice(0, 4)).toEqual([
+    expect(options.slice(0, 6)).toEqual([
       'claude-code-sdk',
-      'claude-code',
       'codex-sdk',
+      'copilot-sdk',
+      'cursor-headless',
+      'qwen',
+      'openclaw',
+    ]);
+    expect(options.slice(6)).toEqual([
+      'claude-code',
       'codex',
+      'opencode',
+      'gemini',
     ]);
   });
 

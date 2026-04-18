@@ -8,6 +8,8 @@ import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/pr
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string) => {
+      if (key === 'session.agentGroup.transport_sdk') return 'SDK';
+      if (key === 'session.agentGroup.cli_process') return 'CLI';
       const parts = key.split('.');
       return parts[parts.length - 1];
     },
@@ -48,7 +50,7 @@ describe('StartSubSessionDialog', () => {
     expect(screen.getByRole('button', { name: /codex_sdk/i })).toBeDefined();
   });
 
-  it('defaults to claude-code-sdk and keeps sdk options on the left', () => {
+  it('defaults to claude-code-sdk and renders transport/process groups separately', () => {
     const { container } = render(
       <StartSubSessionDialog
         ws={makeWs() as any}
@@ -64,9 +66,17 @@ describe('StartSubSessionDialog', () => {
     const activeBtn = container.querySelector('.subsession-type-btn.active') as HTMLButtonElement | null;
     expect(activeBtn?.textContent).toMatch(/claude_code_sdk/i);
 
-    const typeButtons = Array.from(container.querySelectorAll('.subsession-type-btn')).map((el) => el.textContent ?? '');
-    expect(typeButtons.indexOf('⚡ claude_code_sdk')).toBeLessThan(typeButtons.indexOf('⚡ Claude Code'));
-    expect(typeButtons.indexOf('📦 codex_sdk')).toBeLessThan(typeButtons.indexOf('📦 Codex'));
+    const groupTitles = Array.from(container.querySelectorAll('.subsession-type-group-title')).map((el) => el.textContent?.trim());
+    expect(groupTitles).toEqual(['SDK', 'CLI']);
+
+    const groups = Array.from(container.querySelectorAll('.subsession-type-group'));
+    expect(groups).toHaveLength(2);
+    expect(groups[0].textContent).toMatch(/claude_code_sdk/i);
+    expect(groups[0].textContent).toMatch(/codex_sdk/i);
+    expect(groups[0].textContent).toMatch(/copilot_sdk/i);
+    expect(groups[0].textContent).toMatch(/cursor_headless/i);
+    expect(groups[1].textContent).toMatch(/claude_code_cli/i);
+    expect(groups[1].textContent).toMatch(/codex_cli/i);
   });
 
   it('defaults level to high for supported transports', () => {

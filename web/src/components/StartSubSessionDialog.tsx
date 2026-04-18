@@ -8,6 +8,7 @@ import type { RemoteSession } from '../hooks/useProviderStatus.js';
 import { FileBrowser } from './file-browser-lazy.js';
 import { getUserPref, saveUserPref } from '../api.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '@shared/effort-levels.js';
+import { getSessionAgentGroups, getSessionAgentLabel, SESSION_AGENT_GROUP_LABEL_KEYS } from './session-agent-options.js';
 
 interface Props {
   ws: WsClient | null;
@@ -18,22 +19,6 @@ interface Props {
   onStart: (type: string, shellBin?: string, cwd?: string, label?: string, extra?: Record<string, unknown>) => void;
   onClose: () => void;
 }
-
-const BASE_AGENT_TYPES = [
-  { id: 'claude-code-sdk', label: 'Claude Code SDK', icon: '⚡' },
-  { id: 'claude-code', label: 'Claude Code', icon: '⚡' },
-  { id: 'codex-sdk', label: 'Codex SDK', icon: '📦' },
-  { id: 'codex', label: 'Codex', icon: '📦' },
-  { id: 'copilot-sdk', label: 'GitHub Copilot SDK', icon: '🐙' },
-  { id: 'cursor-headless', label: 'Cursor Headless', icon: '⌘' },
-  { id: 'opencode', label: 'OpenCode', icon: '🔆' },
-  { id: 'gemini', label: 'Gemini CLI', icon: '♊' },
-  { id: 'qwen', label: 'Qwen Code', icon: '千' },
-  { id: 'shell', label: 'Shell', icon: '🐚' },
-  { id: 'script', label: 'Script', icon: '🔄' },
-];
-
-const OPENCLAW_AGENT = { id: 'openclaw', label: 'OpenClaw', icon: '🦞' };
 
 type OpenClawMode = 'new' | 'bind';
 
@@ -75,8 +60,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   // Remote sessions come from the provider status hook (pushed on connect, cached in DB)
   const ocRemoteSessions = getRemoteSessions('openclaw');
 
-  // OpenClaw is always shown (greyed when not connected)
-  const agentTypes = [...BASE_AGENT_TYPES, OPENCLAW_AGENT];
+  const agentGroups = getSessionAgentGroups('sub-session');
 
   // Load saved shell preference from server
   useEffect(() => {
@@ -173,27 +157,22 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
           {/* Type selection */}
           <div>
             <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>Type</div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-              {agentTypes.map((at) => (
-                <button
-                  key={at.id}
-                  class={`subsession-type-btn${type === at.id ? ' active' : ''}`}
-                  onClick={() => setType(at.id)}
-                >
-                  <span>{at.icon}</span> {at.id === 'openclaw'
-                    ? t('session.agentType.openclaw')
-                    : at.id === 'qwen'
-                      ? t('session.agentType.qwen')
-                      : at.id === 'claude-code-sdk'
-                        ? t('session.agentType.claude_code_sdk')
-                        : at.id === 'codex-sdk'
-                          ? t('session.agentType.codex_sdk')
-                          : at.id === 'copilot-sdk'
-                            ? t('session.agentType.copilot_sdk')
-                            : at.id === 'cursor-headless'
-                              ? t('session.agentType.cursor_headless')
-                              : at.label}
-                </button>
+            <div class="subsession-type-groups">
+              {agentGroups.map((group) => (
+                <div key={group.id} class="subsession-type-group">
+                  <div class="subsession-type-group-title">{t(SESSION_AGENT_GROUP_LABEL_KEYS[group.id])}</div>
+                  <div class="subsession-type-grid">
+                    {group.items.map((choice) => (
+                      <button
+                        key={choice.id}
+                        class={`subsession-type-btn${type === choice.id ? ' active' : ''}`}
+                        onClick={() => setType(choice.id)}
+                      >
+                        <span>{choice.icon}</span> {getSessionAgentLabel(t, choice)}
+                      </button>
+                    ))}
+                  </div>
+                </div>
               ))}
             </div>
           </div>

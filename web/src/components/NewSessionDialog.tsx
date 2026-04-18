@@ -5,6 +5,11 @@ import { FileBrowser } from "./file-browser-lazy.js";
 import { getUserPref, saveUserPref } from "../api.js";
 import { sanitizeProjectName } from "@shared/sanitize-project-name.js";
 import {
+  getSessionAgentGroups,
+  getSessionAgentLabel,
+  SESSION_AGENT_GROUP_LABEL_KEYS,
+} from "./session-agent-options.js";
+import {
   CLAUDE_SDK_EFFORT_LEVELS,
   CODEX_SDK_EFFORT_LEVELS,
   COPILOT_SDK_EFFORT_LEVELS,
@@ -56,6 +61,7 @@ export function NewSessionDialog({
   const [thinking, setThinking] = useState<TransportEffortLevel>("high");
   const [shells, setShells] = useState<string[]>([]);
   const [shellBin, setShellBin] = useState<string>("");
+  const agentGroups = getSessionAgentGroups("new-session");
 
   // CC env presets
   const [ccPresets, setCcPresets] = useState<
@@ -403,26 +409,15 @@ export function NewSessionDialog({
               fontFamily: "inherit",
             }}
           >
-            <option value="claude-code-sdk">
-              {t("session.agentType.claude_code_sdk")}
-            </option>
-            <option value="claude-code">
-              {t("session.agentType.claude_code_cli")}
-            </option>
-            <option value="codex-sdk">
-              {t("session.agentType.codex_sdk")}
-            </option>
-            <option value="codex">{t("session.agentType.codex_cli")}</option>
-            <option value="copilot-sdk">
-              {t("session.agentType.copilot_sdk")}
-            </option>
-            <option value="cursor-headless">
-              {t("session.agentType.cursor_headless")}
-            </option>
-            <option value="opencode">OpenCode</option>
-            <option value="gemini">Gemini CLI</option>
-            <option value="qwen">{t("session.agentType.qwen")}</option>
-            <option value="openclaw">{t("session.agentType.openclaw")}</option>
+            {agentGroups.map((group) => (
+              <optgroup key={group.id} label={t(SESSION_AGENT_GROUP_LABEL_KEYS[group.id])}>
+                {group.items.map((choice) => (
+                  <option key={choice.id} value={choice.id}>
+                    {getSessionAgentLabel(t, choice)}
+                  </option>
+                ))}
+              </optgroup>
+            ))}
           </select>
           {agentFlavor && (
             <div

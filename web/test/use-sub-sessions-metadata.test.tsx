@@ -11,7 +11,7 @@ import {
   SUPERVISION_TRANSPORT_CONFIG_KEY,
 } from '@shared/supervision-config.js';
 import { useSubSessions, type SubSession } from '../src/hooks/useSubSessions.js';
-import { listSubSessions, patchSubSession } from '../src/api.js';
+import { createSubSession, listSubSessions, patchSubSession } from '../src/api.js';
 
 vi.mock('../src/api.js', () => ({
   listSubSessions: vi.fn().mockResolvedValue([]),
@@ -26,6 +26,7 @@ function createMockWs() {
   return {
     ws: {
       subSessionRebuildAll: vi.fn(),
+      subSessionStart: vi.fn(),
       onMessage: vi.fn((fn: MsgHandler) => {
         handlers.push(fn);
         return () => { const i = handlers.indexOf(fn); if (i >= 0) handlers.splice(i, 1); };
@@ -45,6 +46,7 @@ function Harness({ ws, connected }: { ws: any; connected: boolean }) {
 
 let closeSubSessionHook: ((id: string) => Promise<void>) | null = null;
 let renameSubSessionHook: ((id: string, label: string) => Promise<void>) | null = null;
+let createSubSessionHook: ((type: string, shellBin?: string, cwd?: string, label?: string, extra?: Record<string, unknown>) => Promise<SubSession | null>) | null = null;
 
 function CloseHarness({ ws, connected }: { ws: any; connected: boolean }) {
   const { subSessions, close } = useSubSessions('srv1', ws, connected, null);
@@ -57,6 +59,13 @@ function RenameHarness({ ws, connected }: { ws: any; connected: boolean }) {
   const { subSessions, rename } = useSubSessions('srv1', ws, connected, null);
   captured = subSessions;
   renameSubSessionHook = rename;
+  return null;
+}
+
+function CreateHarness({ ws, connected }: { ws: any; connected: boolean }) {
+  const { subSessions, create } = useSubSessions('srv1', ws, connected, null);
+  captured = subSessions;
+  createSubSessionHook = create;
   return null;
 }
 
@@ -463,6 +472,71 @@ describe('sub-session metadata integration', () => {
 
     act(() => send({ type: 'subsession.removed', id: 'rm1', sessionName: 'deck_sub_rm1' }));
     expect(captured).toHaveLength(0);
+  });
+});
+
+describe('sub-session runtime type inference', () => {
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+    captured = [];
+    createSubSessionHook = null;
+  });
+
+  it('marks copilot-sdk subsession.created payloads as transport when runtimeType is omitted', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'cp-created',
+      sessionName: 'deck_sub_cp-created',
+      sessionType: 'copilot-sdk',
+      state: 'running',
+    }));
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].runtimeType).toBe('transport');
+  });
+
+  it('keeps newly created copilot-sdk sub-sessions in transport mode before daemon sync arrives', async () => {
+    const { ws } = createMockWs();
+    vi.mocked(createSubSession).mockResolvedValueOnce({
+      id: 'cp-created-api',
+      sessionName: 'deck_sub_cp-created-api',
+      subSession: {
+        id: 'cp-created-api',
+        serverId: 'srv1',
+        type: 'copilot-sdk',
+        runtimeType: null,
+        providerId: null,
+        providerSessionId: null,
+        cwd: '/tmp/project',
+        label: 'Copilot Worker',
+        closedAt: null,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        ccSessionId: null,
+        geminiSessionId: null,
+        parentSession: null,
+        description: null,
+        ccPresetId: null,
+        requestedModel: null,
+        activeModel: null,
+        modelDisplay: null,
+        effort: null,
+        transportConfig: null,
+      },
+    } as any);
+
+    render(<CreateHarness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    const created = await createSubSessionHook?.('copilot-sdk', undefined, '/tmp/project', 'Copilot Worker');
+    expect(created?.runtimeType).toBe('transport');
+    expect(created?.providerId).toBe('copilot-sdk');
+    expect(captured.at(-1)?.runtimeType).toBe('transport');
   });
 });
 

@@ -6,6 +6,7 @@
 
 import { COOKIE_SESSION, COOKIE_CSRF, HEADER_CSRF } from '@shared/cookie-names.js';
 import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM } from '@shared/preview-types.js';
+import { getSessionRuntimeType } from '@shared/agent-types.js';
 import type { ContextMemoryView, ContextModelConfig } from '@shared/context-types.js';
 import type { SharedContextRuntimeConfigSnapshot } from '@shared/shared-context-runtime-config.js';
 import {
@@ -602,7 +603,7 @@ export async function listSubSessions(serverId: string): Promise<SubSessionData[
   }> }>(`/api/server/${serverId}/sub-sessions`);
   return res.subSessions.map((s) => ({
     id: s.id, serverId: s.server_id, type: s.type,
-    runtimeType: s.runtime_type ?? (s.type === 'qwen' || s.type === 'openclaw' ? 'transport' : null),
+    runtimeType: s.runtime_type ?? getSessionRuntimeType(s.type),
     providerId: s.provider_id, providerSessionId: s.provider_session_id,
     shellBin: s.shell_bin, cwd: s.cwd, label: s.label,
     closedAt: s.closed_at, createdAt: s.created_at, updatedAt: s.updated_at,
