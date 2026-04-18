@@ -20,6 +20,30 @@ function resolveEmbeddingCacheDir(): string {
 let pipelineInstance: any = null;
 let loadingPromise: Promise<any> | null = null;
 
+// ── Float32 ⇄ Buffer helpers ────────────────────────────────────────────────
+// Used by the persistent embedding store in context-store.ts to stash the
+// L2-normalized query-time output as a BLOB. Every vector is EMBEDDING_DIM
+// floats (= 384 × 4 bytes = 1.5 KB).
+
+/** Encode a Float32Array to a little-endian Buffer suitable for SQLite BLOB. */
+export function encodeEmbedding(vec: Float32Array): Buffer {
+  // Copy because Float32Array's underlying ArrayBuffer may include unrelated
+  // bytes when the view was created via .slice() on a larger buffer.
+  const buf = Buffer.alloc(vec.length * 4);
+  for (let i = 0; i < vec.length; i++) buf.writeFloatLE(vec[i], i * 4);
+  return buf;
+}
+
+/** Decode a SQLite BLOB back into a Float32Array. Returns null if size mismatches. */
+export function decodeEmbedding(buf: Buffer | Uint8Array | null | undefined): Float32Array | null {
+  if (!buf) return null;
+  const bytes = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+  if (bytes.length !== EMBEDDING_DIM * 4) return null;
+  const out = new Float32Array(EMBEDDING_DIM);
+  for (let i = 0; i < EMBEDDING_DIM; i++) out[i] = bytes.readFloatLE(i * 4);
+  return out;
+}
+
 async function getPipeline(): Promise<any> {
   if (pipelineInstance) return pipelineInstance;
   if (loadingPromise) return loadingPromise;

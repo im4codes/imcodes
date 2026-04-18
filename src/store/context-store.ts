@@ -107,7 +107,15 @@ function ensureDb(): DatabaseSyncInstance {
       updated_at INTEGER NOT NULL,
       hit_count INTEGER NOT NULL DEFAULT 0,
       last_used_at INTEGER,
-      status TEXT NOT NULL DEFAULT 'active'
+      status TEXT NOT NULL DEFAULT 'active',
+      -- Normalized feature-extraction embedding of the summary, encoded as
+      -- little-endian Float32 bytes. NULL when the model was unavailable at
+      -- write time; recall lazy-fills these on first read.
+      embedding BLOB,
+      -- Source text used to compute the embedding — comparing against this
+      -- tells us whether the stored blob is still current when the summary
+      -- gets edited.
+      embedding_source TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_context_processed_local_namespace
       ON context_processed_local(namespace_key, class, updated_at DESC);
@@ -123,6 +131,8 @@ function ensureDb(): DatabaseSyncInstance {
   try { db.exec('ALTER TABLE context_processed_local ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0'); } catch { /* already exists */ }
   try { db.exec('ALTER TABLE context_processed_local ADD COLUMN last_used_at INTEGER'); } catch { /* already exists */ }
   try { db.exec('ALTER TABLE context_processed_local ADD COLUMN status TEXT NOT NULL DEFAULT \'active\''); } catch { /* already exists */ }
+  try { db.exec('ALTER TABLE context_processed_local ADD COLUMN embedding BLOB'); } catch { /* already exists */ }
+  try { db.exec('ALTER TABLE context_processed_local ADD COLUMN embedding_source TEXT'); } catch { /* already exists */ }
   if (stagedReconciledForPath !== dbPath) {
     reconcileMaterializedStagedEvents(db);
     purgeMemoryNoiseProjections(db);
@@ -519,6 +529,86 @@ export function writeProcessedProjection(input: Omit<ProcessedContextProjection,
     projection.updatedAt,
   );
   return projection;
+}
+
+// ── Persistent per-projection embeddings ──────────────────────────────────────
+//
+// The daemon-side recall path used to recompute a Float32Array for every
+// candidate's summary on every query (~7 ms × 40 candidates = ~300 ms of pure
+// model inference per recall). The server side already stores embeddings
+// in pgvector; the daemon needs the same treatment against local SQLite.
+//
+// These helpers take opaque BLOBs — the embedding.ts module owns encoding
+// via encodeEmbedding / decodeEmbedding so the store layer does not depend
+// on the model implementation.
+
+export interface ProjectionEmbeddingRow {
+  id: string;
+  summary: string;
+  embedding: Buffer | null;
+  /** Summary text used when `embedding` was computed, for staleness checks. */
+  embeddingSource: string | null;
+}
+
+/** Read the stored embedding BLOB and its source text for a single projection.
+ *  Returns `undefined` when the row does not exist. */
+export function getProjectionEmbedding(projectionId: string): ProjectionEmbeddingRow | undefined {
+  const database = ensureDb();
+  const row = database.prepare(
+    'SELECT id, summary, embedding, embedding_source FROM context_processed_local WHERE id = ?',
+  ).get(projectionId) as
+    | { id: string; summary: string; embedding: Buffer | Uint8Array | null; embedding_source: string | null }
+    | undefined;
+  if (!row) return undefined;
+  const embedding = row.embedding == null
+    ? null
+    : Buffer.isBuffer(row.embedding)
+      ? row.embedding
+      : Buffer.from(row.embedding);
+  return { id: row.id, summary: row.summary, embedding, embeddingSource: row.embedding_source };
+}
+
+/** Persist a freshly-computed embedding for an existing projection row.
+ *  `source` is the exact text that was embedded — a later write that changes
+ *  the summary text invalidates this row on read via the staleness check. */
+export function saveProjectionEmbedding(
+  projectionId: string,
+  embedding: Buffer,
+  source: string,
+): void {
+  const database = ensureDb();
+  database.prepare(
+    'UPDATE context_processed_local SET embedding = ?, embedding_source = ? WHERE id = ?',
+  ).run(embedding, source, projectionId);
+}
+
+/** Read stored embeddings for many projections in one query.
+ *  Returns a map keyed by projection id; rows with no stored embedding have
+ *  `embedding: null` so the caller can lazy-fill them. */
+export function getProjectionEmbeddings(projectionIds: string[]): Map<string, ProjectionEmbeddingRow> {
+  if (projectionIds.length === 0) return new Map();
+  const database = ensureDb();
+  const placeholders = projectionIds.map(() => '?').join(',');
+  const rows = database.prepare(
+    `SELECT id, summary, embedding, embedding_source
+       FROM context_processed_local
+      WHERE id IN (${placeholders})`,
+  ).all(...projectionIds) as Array<{
+    id: string;
+    summary: string;
+    embedding: Buffer | Uint8Array | null;
+    embedding_source: string | null;
+  }>;
+  const out = new Map<string, ProjectionEmbeddingRow>();
+  for (const row of rows) {
+    const embedding = row.embedding == null
+      ? null
+      : Buffer.isBuffer(row.embedding)
+        ? row.embedding
+        : Buffer.from(row.embedding);
+    out.set(row.id, { id: row.id, summary: row.summary, embedding, embeddingSource: row.embedding_source });
+  }
+  return out;
 }
 
 export function listProcessedProjections(namespace: ContextNamespace, projectionClass?: ProcessedContextClass): ProcessedContextProjection[] {

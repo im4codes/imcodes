@@ -17,6 +17,8 @@ import {
   listContextEvents,
   listDirtyTargets,
   queryProcessedProjections,
+  getProjectionEmbeddings,
+  saveProjectionEmbedding,
 } from '../store/context-store.js';
 
 // ── Query types ──────────────────────────────────────────────────────────────
@@ -182,9 +184,27 @@ export async function searchLocalMemorySemantic(query: MemorySearchQuery): Promi
   if (candidates.items.length === 0 || !query.query) return searchLocalMemory(query);
 
   try {
-    const { generateEmbedding, cosineSimilarity } = await import('./embedding.js');
+    const { generateEmbedding, cosineSimilarity, encodeEmbedding, decodeEmbedding } = await import('./embedding.js');
     const queryEmb = await generateEmbedding(query.query);
     if (!queryEmb) return searchLocalMemory(query); // model unavailable, fallback
+
+    // Persistent embedding store: avoid recomputing the same Float32Array for
+    // every candidate on every recall. The server already does this via
+    // pgvector; the daemon mirrors that for local SQLite by stashing the
+    // BLOB in context_processed_local.embedding.
+    //
+    // Batch-read stored embeddings for all "processed" candidates in one
+    // query, then only invoke the model on rows that are missing or stale
+    // (summary text changed since the stored vector was computed).
+    const processedIds = candidates.items
+      .filter((item) => item.type === 'processed')
+      .map((item) => item.id);
+    const storedEmbeddings = processedIds.length > 0
+      ? getProjectionEmbeddings(processedIds)
+      : new Map<string, ReturnType<typeof getProjectionEmbeddings> extends Map<string, infer V> ? V : never>();
+
+    const itemEmbedText = (item: MemorySearchResultItem): string =>
+      `${item.summary} ${item.content ?? ''}`.slice(0, 500);
 
     // Score each candidate by cosine similarity
     const scored: Array<{ item: MemorySearchResultItem; score: number }> = [];
@@ -192,8 +212,29 @@ export async function searchLocalMemorySemantic(query: MemorySearchQuery): Promi
     const currentEnterpriseId = query.currentEnterpriseId ?? query.namespace?.enterpriseId;
     const scoringWeights = getContextModelConfig().memoryScoringWeights;
     for (const item of candidates.items) {
-      const text = `${item.summary} ${item.content ?? ''}`.slice(0, 500);
-      const itemEmb = await generateEmbedding(text);
+      const text = itemEmbedText(item);
+      let itemEmb: Float32Array | null = null;
+
+      // 1) Fast path: decode the stored BLOB if the source text still matches.
+      if (item.type === 'processed') {
+        const stored = storedEmbeddings.get(item.id);
+        if (stored?.embedding && stored.embeddingSource === text) {
+          itemEmb = decodeEmbedding(stored.embedding);
+        }
+      }
+
+      // 2) Slow path: recompute and persist so the next recall is fast.
+      if (!itemEmb) {
+        itemEmb = await generateEmbedding(text);
+        if (itemEmb && item.type === 'processed') {
+          // Persist is best-effort — a transient SQLite write failure must
+          // not break the in-progress recall.
+          try {
+            saveProjectionEmbedding(item.id, encodeEmbedding(itemEmb), text);
+          } catch { /* ignore */ }
+        }
+      }
+
       if (itemEmb) {
         const similarity = cosineSimilarity(queryEmb, itemEmb);
         const projectionClass = (item.projectionClass ?? 'recent_summary') as ProjectionClass;
