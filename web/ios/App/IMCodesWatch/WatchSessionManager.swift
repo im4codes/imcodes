@@ -136,6 +136,49 @@ final class WatchSessionManager: NSObject, ObservableObject {
         activeRoute = nil
     }
 
+    // MARK: - Optimistic send UX
+    //
+    // The watch chat polls history every 6s when the detail view is open. That
+    // still leaves a visible gap between tapping Send and the reply appearing
+    // on the tiny screen. `appendOptimisticSend` injects a pending user bubble
+    // immediately; `markOptimisticSendFailed` flips it to the red failure state
+    // when the REST call errors. `WatchConversationItem.merge` replaces the
+    // optimistic bubble when the real echo arrives (matched by commandId, with
+    // a text+timestamp fallback for older daemons).
+
+    func appendOptimisticSend(for route: WatchRoute, text: String, commandId: String) {
+        seedHistoryStateIfNeeded(for: route)
+        let item = WatchConversationItem.optimisticSend(
+            sessionId: route.sessionName,
+            text: text,
+            commandId: commandId
+        )
+        updateHistoryState(for: route) { state in
+            state.items = WatchConversationItem.merge(existing: state.items, incoming: [item])
+        }
+    }
+
+    func markOptimisticSendFailed(for route: WatchRoute, commandId: String, reason: String?) {
+        updateHistoryState(for: route) { state in
+            state.items = state.items.map { item in
+                guard item.commandId == commandId, item.isPending else { return item }
+                var updated = item
+                updated.isPending = false
+                updated.isFailed = true
+                updated.failureReason = reason
+                return updated
+            }
+        }
+    }
+
+    func removeOptimisticSend(for route: WatchRoute, commandId: String) {
+        updateHistoryState(for: route) { state in
+            state.items = state.items.filter { item in
+                !(item.commandId == commandId && (item.isPending || item.isFailed))
+            }
+        }
+    }
+
     func handleNotificationPayload(_ userInfo: [AnyHashable: Any]) {
         guard let serverId = userInfo["serverId"] as? String, !serverId.isEmpty else {
             lastErrorMessage = "Notification missing server route."

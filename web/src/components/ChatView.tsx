@@ -1602,18 +1602,23 @@ function FileChangePreviewBlock({
 }) {
   const { t } = useTranslation();
   const visibleLines = lines.length > 0 ? lines : [{ text: emptyText }];
+  const preClass = className.includes('added') ? 'chat-file-change-diff-pre-added' : 'chat-file-change-diff-pre-removed';
   return (
     <div class="chat-file-change-diff-block">
+      {/* Kept for screen readers — hidden visually via CSS since each row now
+          prefixes its own +/- sign. */}
       <div class={className} title={markerTitle} aria-label={markerTitle}>{marker}</div>
-      <div class={`chat-file-change-diff-pre ${className.includes('added') ? 'chat-file-change-diff-pre-added' : 'chat-file-change-diff-pre-removed'}`}>
+      <div class={`chat-file-change-diff-pre ${preClass}`}>
         {visibleLines.map((line, index) => (
           <div class="chat-file-change-diff-row" key={`${marker}:${line.lineNumber ?? 'na'}:${index}`}>
+            <span class="chat-file-change-diff-sign" aria-hidden="true">{marker}</span>
             <span class="chat-file-change-diff-ln">{line.lineNumber ?? ''}</span>
             <span class="chat-file-change-diff-code">{line.text}</span>
           </div>
         ))}
         {truncated && (
           <div class="chat-file-change-diff-row">
+            <span class="chat-file-change-diff-sign" aria-hidden="true">…</span>
             <span class="chat-file-change-diff-ln"></span>
             <span class="chat-file-change-diff-code">{t('chat.file_change_truncated')}</span>
           </div>

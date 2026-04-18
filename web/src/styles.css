@@ -742,14 +742,22 @@ body {
 .chat-file-change-patches { display: flex; flex-direction: column; gap: 8px; }
 .chat-file-change-patch { display: flex; flex-direction: column; gap: 6px; }
 .chat-file-change-diff { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; background: #111827; border: 1px solid #1f2937; border-radius: 6px; }
-.chat-file-change-diff-block { display: flex; flex-direction: column; gap: 4px; }
-.chat-file-change-diff-label { display: inline-flex; align-items: center; justify-content: center; width: 14px; font-size: 12px; font-weight: 700; line-height: 1; color: #94a3b8; }
+.chat-file-change-diff-block { display: flex; flex-direction: column; gap: 0; }
+/* Block header label (+ or -) is kept in DOM for accessibility but hidden —
+   the per-row sign inside each .chat-file-change-diff-row already makes the
+   direction obvious, so a separate legend adds noise. */
+.chat-file-change-diff-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 .chat-file-change-diff-label-removed { color: #fca5a5; }
 .chat-file-change-diff-label-added { color: #86efac; }
-.chat-file-change-diff-pre { margin: 0; padding: 8px; border-radius: 4px; color: #dbeafe; font-size: 11px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; overflow-x: auto; background: #0b1220; max-height: 260px; overflow-y: auto; }
-.chat-file-change-diff-pre-removed { background: rgba(127, 29, 29, 0.22); color: #fee2e2; }
-.chat-file-change-diff-pre-added { background: rgba(20, 83, 45, 0.22); color: #dcfce7; }
-.chat-file-change-diff-row { display: grid; grid-template-columns: 42px minmax(0, 1fr); gap: 8px; align-items: start; }
+.chat-file-change-diff-pre { margin: 0; padding: 0; border-radius: 4px; color: #dbeafe; font-size: 11px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; overflow-x: auto; background: #0b1220; max-height: 260px; overflow-y: auto; }
+.chat-file-change-diff-pre-removed { background: rgba(185, 28, 28, 0.28); color: #fecaca; }
+.chat-file-change-diff-pre-added { background: rgba(34, 197, 94, 0.28); color: #dcfce7; }
+/* Per-row: [ sign | line# | code ]. Background extends the full row so the
+   green/red tint reads as a continuous band (mirrors git/gh diff layout). */
+.chat-file-change-diff-row { display: grid; grid-template-columns: 20px 44px minmax(0, 1fr); gap: 8px; align-items: start; padding: 1px 8px; }
+.chat-file-change-diff-sign { text-align: center; font-weight: 700; user-select: none; font-variant-numeric: tabular-nums; line-height: inherit; }
+.chat-file-change-diff-pre-added .chat-file-change-diff-sign { color: #4ade80; }
+.chat-file-change-diff-pre-removed .chat-file-change-diff-sign { color: #f87171; }
 .chat-file-change-diff-ln { color: #94a3b8; text-align: right; user-select: none; font-variant-numeric: tabular-nums; opacity: 0.9; }
 .chat-file-change-diff-code { white-space: pre-wrap; word-break: break-word; min-width: 0; }
 .chat-file-change-diff-coarse { gap: 4px; }

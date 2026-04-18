@@ -159,6 +159,22 @@ const inputStyle = {
   outline: 'none',
 } as const;
 
+// Compact style for numeric inputs like a recall threshold or scoring weight.
+// The generic `inputStyle` uses `flex: 1 1 180px` which stretches to fill the
+// whole section card — a single "0.4" was rendering in an input 600+px wide,
+// which looks broken on both desktop and mobile. `maxWidth` keeps the field
+// proportional to the content while `alignSelf` prevents the flex parent from
+// re-expanding it.
+const numberInputStyle = {
+  ...inputStyle,
+  flex: '0 0 auto',
+  width: SC_IS_MOBILE ? 120 : 110,
+  maxWidth: '100%',
+  alignSelf: 'flex-start' as const,
+  textAlign: 'right' as const,
+  fontVariantNumeric: 'tabular-nums' as const,
+} as const;
+
 const buttonStyle = {
   background: '#2563eb',
   color: '#ffffff',
@@ -2167,7 +2183,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     step={MEMORY_RECALL_MIN_SCORE_STEP}
                     value={processingMemoryRecallMinScore}
                     onInput={(e) => setProcessingMemoryRecallMinScore(normalizeMemoryRecallMinScore((e.currentTarget as HTMLInputElement).valueAsNumber))}
-                    style={inputStyle}
+                    style={numberInputStyle}
                   />
                 </label>
                 <div style={helperTextStyle}>
@@ -2249,7 +2265,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                         ? { ...prev, similarity: Math.min(MEMORY_SCORING_WEIGHT_MAX, Math.max(MEMORY_SCORING_WEIGHT_MIN, value)) }
                         : prev;
                     })}
-                    style={inputStyle}
+                    style={numberInputStyle}
                   />
                 </label>
                 <label style={fieldLabelStyle}>
@@ -2267,7 +2283,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                         ? { ...prev, recency: Math.min(MEMORY_SCORING_WEIGHT_MAX, Math.max(MEMORY_SCORING_WEIGHT_MIN, value)) }
                         : prev;
                     })}
-                    style={inputStyle}
+                    style={numberInputStyle}
                   />
                 </label>
                 <label style={fieldLabelStyle}>
@@ -2285,7 +2301,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                         ? { ...prev, frequency: Math.min(MEMORY_SCORING_WEIGHT_MAX, Math.max(MEMORY_SCORING_WEIGHT_MIN, value)) }
                         : prev;
                     })}
-                    style={inputStyle}
+                    style={numberInputStyle}
                   />
                 </label>
                 <label style={fieldLabelStyle}>
@@ -2303,7 +2319,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                         ? { ...prev, project: Math.min(MEMORY_SCORING_WEIGHT_MAX, Math.max(MEMORY_SCORING_WEIGHT_MIN, value)) }
                         : prev;
                     })}
-                    style={inputStyle}
+                    style={numberInputStyle}
                   />
                 </label>
                 <div style={rowStyle}>
