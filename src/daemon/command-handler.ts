@@ -71,6 +71,7 @@ import {
 } from '../../shared/effort-levels.js';
 import { getSavedP2pConfig, upsertSavedP2pConfig } from '../store/p2p-config-store.js';
 import { getProcessedProjectionStats, queryPendingContextEvents, queryProcessedProjections, recordMemoryHits } from '../store/context-store.js';
+import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 import {
   normalizeSharedContextRuntimeConfig,
   normalizeSharedContextRuntimeBackend,
@@ -1081,8 +1082,15 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
     return;
   }
   const project = sanitizeProjectName(rawProject);
+  const sessionName = `deck_${project}_brain`;
   // Preserve original name as label when sanitization changes it (e.g. Chinese characters)
   const label = project !== rawProject.trim().toLowerCase() ? rawProject.trim() : undefined;
+  if (isKnownTestSessionLike({ name: sessionName, projectName: rawProject, projectDir: dir })) {
+    const message = `Refusing to start known test session pattern: ${sessionName}`;
+    logger.warn({ rawProject, project, dir, agentType }, 'session.start rejected by test-session guard');
+    try { serverLink.send({ type: 'session.error', project, message }); } catch { /* ignore */ }
+    return;
+  }
 
   try {
     // Resolve CC env preset if specified
@@ -2418,10 +2426,18 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
   const effort = isTransportEffortLevel(requestedEffort)
     ? requestedEffort
     : getDefaultThinkingLevel(type);
+  const sessionName = subSessionName(id);
+  if (isKnownTestSessionLike({
+    name: sessionName,
+    cwd,
+    parentSession,
+  })) {
+    logger.warn({ id, type, cwd, parentSession }, 'subsession.start rejected by test-session guard');
+    return;
+  }
 
   // Transport-backed providers: launch without tmux.
   if (isTransportAgent(type)) {
-    const sessionName = subSessionName(id);
     const ocMode = cmd.ocMode as string | undefined;
     const bindExistingKey = type === 'openclaw'
       ? (ocMode === 'bind' ? (cmd.ocSessionId as string) || undefined : undefined)

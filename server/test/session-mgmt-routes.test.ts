@@ -125,6 +125,23 @@ describe('session-mgmt persistence routes', () => {
     expect(mockUpsertDbSession).not.toHaveBeenCalled();
   });
 
+  it('POST /session/start rejects known test sessions before relaying to daemon', async () => {
+    const app = await buildApp();
+    const res = await app.request('/api/server/srv-1/session/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        project: 'bootmainabc123',
+        dir: '/tmp/bootmain-e2e',
+        agentType: 'claude-code-sdk',
+      }),
+    });
+
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'test_session_blocked' });
+    expect(sendToDaemonMock).not.toHaveBeenCalled();
+  });
+
   it('PATCH /sessions/:name updates requestedModel/activeModel/effort/transportConfig', async () => {
     const app = await buildApp();
     const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain', {

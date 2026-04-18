@@ -13,6 +13,7 @@ import { WsBridge } from '../ws/bridge.js';
 import logger from '../util/logger.js';
 import { isSessionAgentType } from '../../../shared/agent-types.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
+import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
 
 export const subSessionRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -59,6 +60,12 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
 
   if (!body.type) return c.json({ error: 'missing_fields' }, 400);
   if (!isSessionAgentType(body.type)) return c.json({ error: 'invalid_type' }, 400);
+  if (isKnownTestSessionLike({
+    cwd: body.cwd ?? null,
+    parentSession: body.parent_session ?? null,
+  })) {
+    return c.json({ error: 'test_session_blocked' }, 400);
+  }
 
   // Generate 8-char id
   const id = Array.from(crypto.getRandomValues(new Uint8Array(6)))
