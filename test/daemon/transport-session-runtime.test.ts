@@ -525,7 +525,7 @@ describe('TransportSessionRuntime', () => {
     setContextModelRuntimeConfig({
       primaryContextBackend: 'claude-code-sdk',
       primaryContextModel: 'sonnet',
-      memoryRecallMinScore: 0.44,
+      memoryRecallMinScore: 0.4,
     });
     const memoryItem = makeSearchItem({
       summary: 'Mid-threshold multilingual semantic match',

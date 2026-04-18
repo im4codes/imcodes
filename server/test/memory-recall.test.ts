@@ -412,7 +412,7 @@ describe('memory recall endpoint — I.5', () => {
       runtimeConfig: {
         primaryContextBackend: 'claude-code-sdk',
         primaryContextModel: 'sonnet',
-        memoryRecallMinScore: 0.44,
+        memoryRecallMinScore: 0.4,
       },
       personalRows: [
         {

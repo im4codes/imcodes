@@ -19,7 +19,7 @@ describe('context-model-config', () => {
       primaryContextModel: 'gpt-5.4',
       backupContextBackend: 'claude-code-sdk',
       backupContextModel: 'haiku',
-      memoryRecallMinScore: 0.44,
+      memoryRecallMinScore: 0.4,
       enablePersonalMemorySync: false,
     });
   });
@@ -45,7 +45,7 @@ describe('context-model-config', () => {
       primaryContextModel: 'sonnet',
       backupContextBackend: 'qwen',
       backupContextModel: 'qwen3-coder-plus',
-      memoryRecallMinScore: 0.44,
+      memoryRecallMinScore: 0.4,
       enablePersonalMemorySync: false,
     });
   });

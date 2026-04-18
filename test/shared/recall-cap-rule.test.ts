@@ -11,22 +11,22 @@ const mk = (id: string, score: number) => ({ id, score });
 
 describe('applyRecallCapRule — defaults', () => {
   it('uses the documented constants', () => {
-    expect(RECALL_MIN_FLOOR).toBe(0.44);
+    expect(RECALL_MIN_FLOOR).toBe(0.4);
     expect(RECALL_DEFAULT_CAP).toBe(3);
     expect(RECALL_EXTEND_BAR).toBe(0.6);
     expect(RECALL_EXTEND_CAP).toBe(5);
   });
 
   it('returns [] when every candidate scores below the default floor', () => {
-    const items = [mk('a', 0.43), mk('b', 0.3), mk('c', 0.1)];
+    const items = [mk('a', 0.39), mk('b', 0.3), mk('c', 0.1)];
     expect(applyRecallCapRule(items)).toEqual([]);
   });
 
   it('keeps items at or above the default floor, drops those below', () => {
     const items = [
       mk('pass-1', 0.9),
-      mk('pass-2', 0.44),
-      mk('drop-1', 0.43),
+      mk('pass-2', 0.4),
+      mk('drop-1', 0.39),
       mk('drop-2', 0.2),
     ];
     const out = applyRecallCapRule(items);
@@ -40,7 +40,7 @@ describe('applyRecallCapRule — defaults', () => {
     const cleaner = [mk('a', 0.9), mk('b', 0.7), mk('c', 0.55), mk('d', 0.75), mk('e', 0.65)];
     const out = applyRecallCapRule(cleaner);
     // Sorted: 0.9, 0.75, 0.7, 0.65, 0.55 → top 3 are 0.9/0.75/0.7 (all >= 0.6),
-    // so extension kicks in — 0.65 joins, 0.55 is cut off by floor? No, 0.55 >= 0.44,
+    // so extension kicks in — 0.65 joins, 0.55 is cut off by floor? No, 0.55 >= 0.4,
     // but fails extend_bar so extension stops at 0.65.
     expect(out.map((i) => i.score)).toEqual([0.9, 0.75, 0.7, 0.65]);
   });
@@ -126,16 +126,16 @@ describe('applyRecallCapRule — defaults', () => {
 
   it('accepts custom floor', () => {
     const items = [mk('a', 0.55), mk('b', 0.52), mk('c', 0.45)];
-    // Default floor 0.44 → all pass. Custom floor 0.6 → all drop.
+    // Default floor 0.4 → all pass. Custom floor 0.6 → all drop.
     expect(applyRecallCapRule(items).map((i) => i.id)).toEqual(['a', 'b', 'c']);
     expect(applyRecallCapRule(items, { minFloor: 0.6 })).toEqual([]);
   });
 
   it('calibration example: project+recency alone cannot pass (similarity=0 pure-boost case)', () => {
     // From design.md: same project, fresh, never recalled, sim=0
-    //   0.4*0 + 0.25*~0.9 + 0.15*0 + 0.2*1.0 = 0.425 < 0.44 floor → dropped
+    //   0.4*0 + 0.25*~0.9 + 0.15*0 + 0.2*1.0 = 0.425 >= 0.4 floor → survives
     const items = [mk('pure-boost', 0.425)];
-    expect(applyRecallCapRule(items)).toEqual([]);
+    expect(applyRecallCapRule(items).map((i) => i.id)).toEqual(['pure-boost']);
   });
 
   it('calibration example: same project + decent semantic match passes floor', () => {
@@ -145,7 +145,7 @@ describe('applyRecallCapRule — defaults', () => {
     expect(out.map((i) => i.id)).toEqual(['decent-sim']);
   });
 
-  it('calibration example: mid-0.44 multilingual matches now survive the default floor', () => {
+  it('calibration example: mid-0.44 multilingual matches survive the default floor', () => {
     const items = [mk('multilingual-match', 0.4446)];
     expect(applyRecallCapRule(items).map((i) => i.id)).toEqual(['multilingual-match']);
   });

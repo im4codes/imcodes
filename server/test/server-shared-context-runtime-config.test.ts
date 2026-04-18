@@ -58,7 +58,7 @@ describe('server shared-context runtime config routes', () => {
       primaryContextModel: 'sonnet',
       backupContextBackend: undefined,
       backupContextModel: undefined,
-      memoryRecallMinScore: 0.44,
+      memoryRecallMinScore: 0.4,
     });
     updateServerSharedContextRuntimeConfigMock.mockResolvedValue(true);
     getUserPrefMock.mockResolvedValue('false');
@@ -86,13 +86,13 @@ describe('server shared-context runtime config routes', () => {
         persisted: {
           primaryContextBackend: 'claude-code-sdk',
           primaryContextModel: 'sonnet',
-          memoryRecallMinScore: 0.44,
+          memoryRecallMinScore: 0.4,
           enablePersonalMemorySync: false,
         },
         effective: {
           primaryContextBackend: 'claude-code-sdk',
           primaryContextModel: 'sonnet',
-          memoryRecallMinScore: 0.44,
+          memoryRecallMinScore: 0.4,
           enablePersonalMemorySync: false,
         },
       },
@@ -159,7 +159,7 @@ describe('server shared-context runtime config routes', () => {
         primaryContextModel: 'sonnet',
         backupContextBackend: undefined,
         backupContextModel: undefined,
-        memoryRecallMinScore: 0.44,
+        memoryRecallMinScore: 0.4,
         enablePersonalMemorySync: false,
       },
     });

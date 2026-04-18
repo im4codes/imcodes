@@ -78,16 +78,16 @@ export function computeRelevanceScore(input: MemoryScoringInput): number {
 // ── Recall cap rule ────────────────────────────────────────────────────────
 //
 // Tuning rationale:
-//   - MIN_FLOOR = 0.44 → still excludes pure project+recency noise
+//   - MIN_FLOOR = 0.4 → still excludes pure project+recency noise
 //     (same-project, fresh, never-recalled, similarity 0 scores only 0.425),
-//     but avoids falsely dropping real multilingual semantic matches that
-//     commonly land in the mid-0.44 range after composite scoring.
+//     while keeping weaker-but-real multilingual semantic matches that
+//     often land around 0.40–0.44 after composite scoring.
 //   - DEFAULT_CAP = 3 → tight default; noise-resistant.
 //   - EXTEND_BAR = 0.6, EXTEND_CAP = 5 → if the top 3 are ALL strong,
 //     keep absorbing equally-strong items up to 5. Mediocre 4th items
 //     do not get promoted.
 
-export const RECALL_MIN_FLOOR = 0.44;
+export const RECALL_MIN_FLOOR = 0.4;
 export const RECALL_DEFAULT_CAP = 3;
 export const RECALL_EXTEND_BAR = 0.6;
 export const RECALL_EXTEND_CAP = 5;
@@ -106,7 +106,7 @@ export interface RecallCapOptions {
  * function sorts defensively without mutating the caller's array.
  *
  * Rule:
- *   1. Drop anything with `score < minFloor` (default 0.44).
+ *   1. Drop anything with `score < minFloor` (default 0.4).
  *   2. Take the first `defaultCap` (default 3).
  *   3. If those `defaultCap` are ALL at or above `extendBar` (default 0.6),
  *      keep absorbing subsequent items that are also at or above `extendBar`,

@@ -119,7 +119,7 @@ describe('SharedContextManagementPanel', () => {
           primaryContextModel: 'sonnet',
           backupContextBackend: undefined,
           backupContextModel: undefined,
-          memoryRecallMinScore: 0.44,
+          memoryRecallMinScore: 0.4,
           enablePersonalMemorySync: false,
         },
         effective: {
@@ -127,7 +127,7 @@ describe('SharedContextManagementPanel', () => {
           primaryContextModel: 'sonnet',
           backupContextBackend: undefined,
           backupContextModel: undefined,
-          memoryRecallMinScore: 0.44,
+          memoryRecallMinScore: 0.4,
           enablePersonalMemorySync: false,
         },
         envPrimaryOverrideActive: false,
@@ -391,7 +391,7 @@ describe('SharedContextManagementPanel', () => {
       primaryContextModel: 'gpt-5.4',
       backupContextBackend: 'qwen',
       backupContextModel: 'qwen3-coder-plus',
-      memoryRecallMinScore: 0.44,
+      memoryRecallMinScore: 0.4,
       enablePersonalMemorySync: false,
     }));
     expect((screen.getByLabelText('sharedContext.management.processingPrimaryModel') as HTMLInputElement).value).toBe('gpt-5.4');
@@ -407,7 +407,7 @@ describe('SharedContextManagementPanel', () => {
     });
 
     const thresholdInput = await screen.findByLabelText('sharedContext.management.memoryRecallThresholdLabel') as HTMLInputElement;
-    expect(thresholdInput.value).toBe('0.44');
+    expect(thresholdInput.value).toBe('0.4');
 
     fireEvent.input(thresholdInput, { target: { value: '0.36', valueAsNumber: 0.36 } });
 
