@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   filterRecentlyInjected,
   recordRecentInjection,
@@ -7,6 +7,19 @@ import {
   getRecentInjectionHistory,
   RECENT_INJECTION_HISTORY_SIZE,
 } from '../../src/context/recent-injection-history.js';
+import { getSession, upsertSession, removeSession } from '../../src/store/session-store.js';
+
+function seedSession(name: string, extra: Record<string, unknown> = {}): void {
+  upsertSession({
+    name,
+    projectName: 'proj',
+    role: 'brain',
+    agentType: 'claude-code-sdk',
+    runtimeType: 'transport',
+    state: 'running',
+    ...extra,
+  } as any);
+}
 
 describe('recent-injection-history', () => {
   beforeEach(() => {
@@ -85,5 +98,68 @@ describe('recent-injection-history', () => {
     recordRecentInjection(undefined, ['mem-1']);
     expect(filterRecentlyInjected(undefined, ['mem-1', 'mem-2'])).toEqual(['mem-1', 'mem-2']);
     expect(filterRecentlyInjected('', ['mem-1'])).toEqual(['mem-1']);
+  });
+
+  describe('persistence across daemon restart', () => {
+    // Simulating "daemon restart" here = reset the in-memory Map (what the
+    // real process start does) without touching the SessionRecord. The
+    // rehydration then has to rebuild the dedup state from the stored field.
+    const SESSION = 'deck_persist_brain';
+
+    beforeEach(() => {
+      // Drop any SessionRecord a previous test may have left behind so the
+      // hydration path starts from whatever the test itself seeds.
+      try { removeSession(SESSION); } catch { /* store may not have it */ }
+    });
+
+    it('persists recorded injection events onto the SessionRecord', () => {
+      seedSession(SESSION);
+      recordRecentInjection(SESSION, ['mem-a', 'mem-b']);
+      const record = getSession(SESSION);
+      expect(record?.recentInjectionHistory).toEqual([['mem-a', 'mem-b']]);
+    });
+
+    it('rehydrates history from SessionRecord after the in-memory Map is wiped', () => {
+      seedSession(SESSION);
+      recordRecentInjection(SESSION, ['mem-a']);
+      recordRecentInjection(SESSION, ['mem-b']);
+
+      // Simulate daemon restart — in-memory Map gone, SessionRecord survived.
+      resetAllRecentInjectionHistories();
+
+      // After restart, the dedup still knows about mem-a and mem-b.
+      expect(filterRecentlyInjected(SESSION, ['mem-a', 'mem-b', 'mem-c'])).toEqual(['mem-c']);
+    });
+
+    it('clearRecentInjectionHistory wipes the persisted field too', () => {
+      seedSession(SESSION);
+      recordRecentInjection(SESSION, ['mem-a']);
+      expect(getSession(SESSION)?.recentInjectionHistory).toEqual([['mem-a']]);
+
+      clearRecentInjectionHistory(SESSION);
+      expect(getSession(SESSION)?.recentInjectionHistory).toEqual([]);
+
+      // After a "restart" the clear must not un-clear from the stale record.
+      resetAllRecentInjectionHistories();
+      expect(filterRecentlyInjected(SESSION, ['mem-a', 'mem-b'])).toEqual(['mem-a', 'mem-b']);
+    });
+
+    it('tolerates missing SessionRecord — history still works in memory only', () => {
+      // No seedSession call — simulating a transient/anonymous recall
+      // target. The in-memory ring buffer must still work for the
+      // lifetime of this daemon, even if there's nothing to persist to.
+      recordRecentInjection('deck_ephemeral_brain', ['mem-x']);
+      expect(filterRecentlyInjected('deck_ephemeral_brain', ['mem-x', 'mem-y'])).toEqual(['mem-y']);
+    });
+
+    it('ignores malformed persisted history gracefully', () => {
+      // A prior crash could leave garbage in the record — the hydrator
+      // must treat it as empty, not throw.
+      seedSession(SESSION, { recentInjectionHistory: [null, 123, [null, 'mem-z']] });
+      // Drop any in-memory state so the hydrator runs.
+      resetAllRecentInjectionHistories();
+      // Only the well-formed 'mem-z' survives the hydrator's filter.
+      expect(filterRecentlyInjected(SESSION, ['mem-z', 'mem-other'])).toEqual(['mem-other']);
+    });
   });
 });

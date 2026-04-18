@@ -257,7 +257,11 @@ describe('ChatView', () => {
     );
 
     expect(container.querySelector('.chat-linked-event-group')).toBeNull();
-    fireEvent.click(getByText('chat.memory_context_title'));
+    // Startup-reason memory-context cards now use a distinct title so users
+    // can tell a pre-loaded history preamble from a per-prompt recall at a
+    // glance. The collapsed header therefore shows
+    // chat.memory_context_startup_title, not the plain recall title.
+    fireEvent.click(getByText('chat.memory_context_startup_title'));
 
     await waitFor(() => {
       expect(container.textContent).toContain('chat.memory_context_startup_reason');

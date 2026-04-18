@@ -1796,11 +1796,21 @@ const MemoryContextEvent = memo(function MemoryContextEvent({ event }: { event: 
   const statusSummary = getMemoryContextStatusSummary(t, payload, items.length);
   const statusDetail = getMemoryContextStatusDetail(t, payload);
   const isStatusOnly = items.length === 0 && !!payload.status;
+  // The startup-memory dump and the per-message recall both render as
+  // memory-context cards, but they're conceptually different things:
+  //   - startup: a one-shot "pre-loaded project history" preamble
+  //   - message: memories related to the current prompt
+  // Using a different title for startup makes the distinction legible
+  // at a glance and stops users from reading a restored-session card as a
+  // fresh recall (see the daemon-restart dedup fix that pairs with this).
+  const titleKey = reason === 'startup'
+    ? 'chat.memory_context_startup_title'
+    : 'chat.memory_context_title';
 
   if (isStatusOnly) {
     return (
       <div class="chat-event chat-memory-context chat-memory-context-status" data-related-to={String(payload.relatedToEventId ?? '')}>
-        <div class="chat-memory-context-status-title">{t('chat.memory_context_title')}</div>
+        <div class="chat-memory-context-status-title">{t(titleKey)}</div>
         <div class="chat-memory-context-status-summary">{statusSummary}</div>
         {query && (
           <div class="chat-memory-context-query">{t('chat.memory_context_query', { query })}</div>
@@ -1815,7 +1825,7 @@ const MemoryContextEvent = memo(function MemoryContextEvent({ event }: { event: 
   return (
     <div class="chat-event chat-memory-context" data-related-to={String(payload.relatedToEventId ?? '')}>
       <button class="chat-memory-context-toggle" onClick={() => setExpanded((value) => !value)}>
-        <span class="chat-memory-context-title">{t('chat.memory_context_title')}</span>
+        <span class="chat-memory-context-title">{t(titleKey)}</span>
         <span class="chat-memory-context-summary">{statusSummary}</span>
         <span class="chat-memory-context-caret">{expanded ? '▲' : '▼'}</span>
       </button>

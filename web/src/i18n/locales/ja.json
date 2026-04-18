@@ -50,6 +50,7 @@
     "tool_detail_meta": "メタ",
     "tool_detail_raw": "生データ",
     "memory_context_title": "関連履歴",
+    "memory_context_startup_title": "履歴コンテキスト・注入済み",
     "memory_context_summary": "{{count}} 件を想起",
     "memory_context_query": "クエリ: {{query}}",
     "memory_context_score": "スコア {{score}}",

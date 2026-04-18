@@ -95,6 +95,16 @@ export interface SessionRecord extends SessionContextBootstrapState {
    *  into an existing conversation. Reset on /clear (fresh conversation) or
    *  genuine new-session creation. */
   startupMemoryInjected?: boolean;
+  /** Ring buffer of per-turn memory-ID sets that have been injected into
+   *  this session's recall prompts (most recent first, bounded by
+   *  RECENT_INJECTION_HISTORY_SIZE). Persisted so daemon restart does not
+   *  re-dedup from zero and re-inject the same memories into an agent that
+   *  already has them in its own conversation history.
+   *
+   *  Semantics match the in-memory Map in recent-injection-history.ts:
+   *  1 turn = 1 inner array (regardless of how many IDs it carries).
+   *  Wiped on `/clear` / fresh-restart alongside the runtime state. */
+  recentInjectionHistory?: string[][];
 }
 
 export interface SessionStore {

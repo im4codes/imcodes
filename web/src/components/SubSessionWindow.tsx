@@ -101,7 +101,12 @@ export function SubSessionWindow({
 
   // Always pass sessionName + ws so useTimeline keeps its cache warm.
   // active flag is only for rendering — timeline state should persist across minimize/restore.
-  const { events, refreshing } = useTimeline(sub.sessionName, ws, serverId);
+  const {
+    events,
+    refreshing,
+    addOptimisticUserMessage,
+    removeOptimisticMessage,
+  } = useTimeline(sub.sessionName, ws, serverId);
   const quickData = useQuickData();
 
   // Earliest ts of the current continuous thinking sequence (shared logic).
@@ -118,6 +123,41 @@ export function SubSessionWindow({
   const [quotes, setQuotes] = useState<string[]>([]);
   const addQuote = useCallback((text: string) => setQuotes((prev) => [...prev, text]), []);
   const removeQuote = useCallback((i: number) => setQuotes((prev) => prev.filter((_, j) => j !== i)), []);
+
+  // ── Retry failed send ─────────────────────────────────────────────────────
+  // Mirrors the main-session SessionPane handler so optimistic-UX behavior is
+  // uniform: locate the failed bubble in the timeline cache, clear it, dispatch
+  // a fresh session.send with a new commandId, and re-inject an optimistic
+  // "sending" bubble immediately.
+  const eventsRef = useRef(events);
+  eventsRef.current = events;
+  const handleResendFailed = useCallback((commandId: string, text: string) => {
+    if (!ws || !connected) return;
+    const failedEvent = eventsRef.current.find(
+      (e) => e.type === 'user.message'
+        && e.payload.failed === true
+        && e.payload.commandId === commandId,
+    );
+    const resendExtra = failedEvent && typeof failedEvent.payload._resendExtra === 'object'
+      ? (failedEvent.payload._resendExtra as Record<string, unknown>)
+      : undefined;
+    const attachmentsFromFailure = failedEvent && Array.isArray(failedEvent.payload.attachments)
+      ? (failedEvent.payload.attachments as Array<Record<string, unknown>>)
+      : undefined;
+    removeOptimisticMessage(commandId);
+    const newCommandId = globalThis.crypto?.randomUUID?.()
+      ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    ws.sendSessionCommand('send', {
+      sessionName: sub.sessionName,
+      text,
+      ...(resendExtra ?? {}),
+      commandId: newCommandId,
+    });
+    addOptimisticUserMessage(text, newCommandId, {
+      ...(attachmentsFromFailure ? { attachments: attachmentsFromFailure } : {}),
+      ...(resendExtra ? { resendExtra } : {}),
+    });
+  }, [addOptimisticUserMessage, connected, removeOptimisticMessage, sub.sessionName, ws]);
 
   const thinkingNow = useNowTicker(!!activeThinkingTs && active);
   const isShell = sub.type === 'shell' || sub.type === 'script';
@@ -420,6 +460,7 @@ export function SubSessionWindow({
             serverId={serverId}
             onQuote={addQuote}
             agentType={sessionInfo?.agentType ?? sub.type}
+            onResendFailed={handleResendFailed}
           />
         )}
       </div>
@@ -451,7 +492,18 @@ export function SubSessionWindow({
         inputRef={inputRef}
         quickData={quickData}
         hideShortcuts={false}
-        onSend={scrollToBottom}
+        onSend={(_name, text, meta) => {
+          // Inject the optimistic "sending" bubble so the user sees the
+          // message with a spinner immediately, instead of waiting for the
+          // daemon's echoed user.message (transport) or the JSONL scrape lag
+          // (process). Uses the same contract as SessionPane — bubble keyed
+          // by commandId, reconciled when the authoritative echo arrives.
+          addOptimisticUserMessage(text, meta?.commandId, {
+            ...(meta?.attachments ? { attachments: meta.attachments } : {}),
+            ...(meta?.extra ? { resendExtra: meta.extra } : {}),
+          });
+          scrollToBottom();
+        }}
         onSubRestart={onRestart}
         onSubNew={onRestart}
         onSubStop={onClose}

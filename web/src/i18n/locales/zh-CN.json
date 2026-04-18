@@ -50,6 +50,7 @@
     "tool_detail_meta": "元信息",
     "tool_detail_raw": "原始数据",
     "memory_context_title": "相关历史",
+    "memory_context_startup_title": "历史上下文 · 已注入",
     "memory_context_summary": "召回 {{count}} 条",
     "memory_context_query": "查询：{{query}}",
     "memory_context_score": "分数 {{score}}",

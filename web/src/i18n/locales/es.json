@@ -50,6 +50,7 @@
     "tool_detail_meta": "meta",
     "tool_detail_raw": "raw",
     "memory_context_title": "Historial relacionado",
+    "memory_context_startup_title": "Contexto histórico · inyectado",
     "memory_context_summary": "{{count}} recuperados",
     "memory_context_query": "Consulta: {{query}}",
     "memory_context_score": "Puntuación {{score}}",
