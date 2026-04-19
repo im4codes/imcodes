@@ -113,11 +113,6 @@ interface Props {
   onOverlayOpenChange?: (open: boolean) => void;
   /** Optional local optimistic update when transport config changes through quick controls. */
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
-  /** Open the shared file browser panel/overlay (reuses the top-bar file browser).
-   *  When provided, renders a 📁 button next to 📎 in the input row. */
-  onOpenFileBrowser?: () => void;
-  /** Badge count for the 📁 button — mirrors the top-bar git-changes badge. */
-  gitChangesCount?: number;
 }
 
 type MenuAction = 'restart' | 'new' | 'stop';
@@ -372,7 +367,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking: _activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onOpenFileBrowser, gitChangesCount }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking: _activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved }: Props) {
   const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -1953,24 +1948,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             </button>
           ))}
         </div>}
-
-        {/* File browser — belongs in the per-session header (this shortcuts
-            row), not next to 📎 in the input row. The button opens the same
-            shared file browser the top-bar 📁 opens, so pair with mode
-            dropdowns like OpenSpec / Auto / Model for consistency. */}
-        {onOpenFileBrowser && (
-          <button
-            class="shortcut-btn shortcut-btn-icon"
-            onClick={() => onOpenFileBrowser()}
-            disabled={disabled}
-            title={t('picker.files')}
-            aria-label={t('picker.files')}
-            style={{ position: 'relative' }}
-          >
-            <span aria-hidden="true">{'\u{1F4C1}'}</span>
-            {(gitChangesCount ?? 0) > 0 && <span class="file-badge">{gitChangesCount}</span>}
-          </button>
-        )}
 
         {canQuickControlSupervision && (
           <div class="shortcuts-model" ref={autoRef}>

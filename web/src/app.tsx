@@ -2872,8 +2872,6 @@ export function App() {
                 onAfterAction={focusTerminal}
                 mobileFileBrowserOpen={s.name === activeSession ? showMobileFileBrowser : false}
                 onMobileFileBrowserClose={() => setShowMobileFileBrowser(false)}
-                onOpenFileBrowser={toggleFileBrowser}
-                gitChangesCount={s.name === activeSession ? gitChangesCount : 0}
                 pendingPrefillText={pendingPrefills[s.name] ?? null}
                 onPendingPrefillApplied={() => setPendingPrefills((prev) => {
                   if (!(s.name in prev)) return prev;

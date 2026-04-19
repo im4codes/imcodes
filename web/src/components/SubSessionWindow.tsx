@@ -432,6 +432,24 @@ export function SubSessionWindow({
         {sub.ccPresetId && <span style={{ fontSize: 11, color: '#f59e0b' }} title={`Custom API: ${sub.ccPresetId}`}>◉</span>}
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 10 }}>
           {!isShell && !isTransport && <button class="subsession-mode-btn" onClick={() => { const next = viewMode === 'chat' ? 'terminal' : 'chat'; setViewMode(next); if (next === 'chat') requestAnimationFrame(() => chatScrollRef.current?.()); }} title={viewMode === 'chat' ? 'Switch to terminal' : 'Switch to chat'}>{viewMode === 'chat' ? '⌨' : '💬'}</button>}
+          {/* File browser — placed to the LEFT of the pin button in the
+              sub-session window header. The main session already exposes
+              📁 in the mobile-server-bar / desktop top bar, so it is NOT
+              rendered inside SessionControls. Sub-sessions render in
+              floating windows with their own header, and need their own
+              entry point here. */}
+          {onOpenFileBrowser && (
+            <button
+              class="subsession-minimize-btn"
+              onClick={() => onOpenFileBrowser()}
+              title={t('picker.files')}
+              aria-label={t('picker.files')}
+              style={{ position: 'relative' }}
+            >
+              <span aria-hidden="true">{'\u{1F4C1}'}</span>
+              {(gitChangesCount ?? 0) > 0 && <span class="file-badge">{gitChangesCount}</span>}
+            </button>
+          )}
           {isPinnable && <button class="subsession-minimize-btn" onClick={() => onPin?.(viewMode)} title={t('sidebar.pin_to_sidebar')}>📌</button>}
           <button class="subsession-minimize-btn" onClick={onMinimize} title="Minimize">▾</button>
           <button class="subsession-close-btn" onClick={onMinimize} title="Hide">×</button>
@@ -526,8 +544,6 @@ export function SubSessionWindow({
         onRemoveQuote={removeQuote}
         pendingPrefillText={pendingPrefillText}
         onPendingPrefillApplied={onPendingPrefillApplied}
-        onOpenFileBrowser={onOpenFileBrowser}
-        gitChangesCount={gitChangesCount}
       />
     </div>
   );

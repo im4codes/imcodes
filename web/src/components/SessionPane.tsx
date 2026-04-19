@@ -67,11 +67,6 @@ export interface SessionPaneProps {
   mobileFileBrowserOpen?: boolean;
   /** Mobile: called when the file browser overlay requests close. */
   onMobileFileBrowserClose?: () => void;
-  /** Opens the shared file browser (desktop floating panel or mobile overlay).
-   *  Reuses the same state as the top-bar 📁 button so the same panel shows. */
-  onOpenFileBrowser?: () => void;
-  /** Git-changes count for the 📁 badge — same value as the top-bar badge. */
-  gitChangesCount?: number;
   /** Text to prefill into the input when a navigation action carries a quote. */
   pendingPrefillText?: string | null;
   /** Called after pendingPrefillText has been consumed by the input. */
@@ -103,8 +98,6 @@ export function SessionPane({
   onAfterAction,
   mobileFileBrowserOpen,
   onMobileFileBrowserClose,
-  onOpenFileBrowser,
-  gitChangesCount,
   pendingPrefillText,
   onPendingPrefillApplied,
 }: SessionPaneProps) {
@@ -355,8 +348,6 @@ export function SessionPane({
           activeThinking={!!activeThinkingTs}
           mobileFileBrowserOpen={mobileFileBrowserOpen}
           onMobileFileBrowserClose={onMobileFileBrowserClose}
-          onOpenFileBrowser={onOpenFileBrowser}
-          gitChangesCount={gitChangesCount}
           sessions={sessions}
           subSessions={subSessions}
           serverId={serverId}
