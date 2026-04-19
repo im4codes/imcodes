@@ -12,16 +12,35 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { execFile } from 'node:util';
+import { execFile, execFileSync } from 'node:child_process';
+import { promisify } from 'node:util';
 import { spawn } from 'node:child_process';
 
-const execFileAsync = execFile as (file: string, args: string[], options?: Record<string, unknown>) => Promise<[string, string, number]>;
+const execFileAsync = promisify(execFile) as unknown as (file: string, args: string[], options?: Record<string, unknown>) => Promise<{ stdout: string; stderr: string }>;
+void execFileAsync; // reserved for future assertions; silences unused import
 
 const flushAsync = async () => {
   for (let i = 0; i < 5; i++) await new Promise((r) => process.nextTick(r));
 };
+void flushAsync; // reserved helper; keeps the import in case the test grows
 
-describe('qwen preset real CLI integration', () => {
+// Only run when a real `qwen` binary is on PATH. CI runners don't ship the
+// CLI, and the test spawns it to assert MiniMax-M2.7 is referenced in the
+// init output — which requires the binary to actually start. Without this
+// guard, CI hangs on ENOENT or bails with an empty stdout that doesn't
+// contain the model name, producing a false-negative failure on every push.
+// Developers with `qwen` installed locally will still execute the test.
+const qwenAvailable = (() => {
+  try {
+    execFileSync('qwen', ['--version'], { stdio: 'ignore', timeout: 5_000 });
+    return true;
+  } catch {
+    return false;
+  }
+})();
+const describeIfQwen = qwenAvailable ? describe : describe.skip;
+
+describeIfQwen('qwen preset real CLI integration', () => {
   const state = vi.hoisted(() => ({
     home: '',
   }));
@@ -100,6 +119,14 @@ describe('qwen preset real CLI integration', () => {
         cwd: tmpdir(),
         env: {
           ...process.env,
+          // qwen CLI with --auth-type anthropic requires ANTHROPIC_API_KEY
+          // in the env (or settings.security.auth.apiKey). The OPENAI_*
+          // pair is the OpenAI-compatible fallback but not sufficient on
+          // its own for the anthropic tier. getQwenPresetTransportConfig
+          // sets both pairs; the production provider spawn path inherits
+          // them from state.env — this test must mirror that exactly.
+          ANTHROPIC_API_KEY: config.env.ANTHROPIC_API_KEY!,
+          ANTHROPIC_BASE_URL: config.env.ANTHROPIC_BASE_URL!,
           OPENAI_API_KEY: config.env.OPENAI_API_KEY!,
           OPENAI_BASE_URL: config.env.OPENAI_BASE_URL!,
           QWEN_CODE_SYSTEM_SETTINGS_PATH: settingsPath,
