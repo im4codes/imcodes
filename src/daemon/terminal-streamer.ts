@@ -315,22 +315,19 @@ export class TerminalStreamer {
       // dead pane and tries to restart in a 3-strikes loop.
       if (isTransportSessionName(sessionName)) return;
       const session = getSession(sessionName);
-      // Race guard: a freshly-created transport session may briefly land here
-      // before its agentType / runtimeType fields are visible in the in-memory
-      // store. Without this check, the user sees an immediate red error
-      // ("Terminal stream unavailable: pane id not available") on the chat
-      // bubble for a Copilot/Cursor session that's only milliseconds old.
-      // Treat "session record missing entirely" as "not ready, skip silently".
-      if (!session) {
-        logger.debug({ sessionName }, 'startPipe: no session record — skipping (likely transport race or stale subscriber)');
-        return;
-      }
-      paneId = session.paneId;
+      paneId = session?.paneId;
       if (!paneId) {
-        // Session created before paneId persistence — fetch dynamically from tmux
+        // Fetch paneId from tmux. For transport sessions that were just created
+        // and not yet registered in the session store, getPaneId will return
+        // undefined and we'll emit the "not available" error (transported sessions
+        // that genuinely have no pane are filtered above by
+        // isTransportSessionName — this path only fires for unregistered process
+        // sessions or sessions created before paneId persistence).
+        // For genuine tmux sessions (e.g. E2E test sessions), getPaneId succeeds
+        // even when the daemon's session store has no record for them yet.
         const fetched = getPaneId(sessionName);
         paneId = fetched != null ? await fetched.catch(() => undefined) : undefined;
-        if (paneId) {
+        if (paneId && session) {
           upsertSession({ ...session, paneId });
         }
       }
