@@ -436,7 +436,7 @@ describe('QuickInputPanel history scope', () => {
     expect(commandPills).toContain('/clear');
     expect(commandPills).toContain('/model');
     expect(commandPills).toContain('/thinking');
-    expect(commandPills).not.toContain('/compact');
+    expect(commandPills).toContain('/compact');
   });
 
   it('uses explicit default commands for cursor-headless instead of the claude fallback', () => {
@@ -464,7 +464,7 @@ describe('QuickInputPanel history scope', () => {
     const commandPills = Array.from(document.querySelectorAll('.qp-section-header + .qp-pills .qp-pill-default')).map((el) => el.textContent?.trim());
     expect(commandPills).toContain('/clear');
     expect(commandPills).toContain('/model');
-    expect(commandPills).not.toContain('/compact');
+    expect(commandPills).toContain('/compact');
     expect(commandPills).not.toContain('/thinking');
   });
 });

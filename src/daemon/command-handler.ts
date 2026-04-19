@@ -1916,6 +1916,13 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         // Only memory-eligible turns feed the compressor. Tool calls, deltas,
         // session state pings, and approval requests are noise here — they
         // bloat the prompt without informing the summary.
+        // Synthesize a minimal ContextTargetRef — the compressor only reads
+        // `eventType` and `content` from each event when serializing the prompt,
+        // so the namespace fields are filler. Reuse the session's persisted
+        // namespace when available so logs are coherent across the codebase.
+        const compactNamespace: import('../../shared/context-types.js').ContextNamespace =
+          record?.contextNamespace
+          ?? { scope: 'personal', projectId: record?.projectName ?? sessionName };
         const localEvents: import('../../shared/context-types.js').LocalContextEvent[] = rawEvents
           .filter((e) => {
             const t = typeof e.type === 'string' ? e.type : '';
@@ -1923,7 +1930,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           })
           .map((e, idx) => ({
             id: `compact-src:${sessionName}:${idx}`,
-            target: { kind: 'session' as const, sessionName },
+            target: { namespace: compactNamespace, kind: 'session' as const, sessionName },
             eventType: String(e.type),
             content: typeof e.text === 'string' ? e.text : '',
             createdAt: typeof e._ts === 'number' ? e._ts : Date.now(),
