@@ -664,7 +664,13 @@ body {
 /* Mobile responsive */
 @media (max-width: 640px) {
   .sidebar { display: none; }
-  .main { padding-top: env(safe-area-inset-top); }
+  /* NOTE: do NOT add `padding-top: env(safe-area-inset-top)` on `.main`
+     here. `.layout` already sets `margin-top: env(safe-area-inset-top)`
+     AND `height: calc(100dvh - env(safe-area-inset-top))` at the root
+     level — stacking another inset on `.main` causes a double-gap that
+     shows up as ~80-100px of black space under the iOS status bar on
+     iPhone X+ devices. Regression landed in commit 6f9a5e0 and reverted
+     here. */
   .mobile-server-bar { display: flex; align-items: center; justify-content: space-between; padding: 4px 10px; background: #1e293b; border-bottom: 1px solid #334155; flex-shrink: 0; position: relative; z-index: 50; }
   .mobile-sidebar-toggle { display: block; background: none; border: none; color: #94a3b8; font-size: 18px; cursor: pointer; padding: 4px 8px 4px 0; line-height: 1; flex-shrink: 0; }
   .mobile-sidebar-toggle:active { color: #e2e8f0; }
