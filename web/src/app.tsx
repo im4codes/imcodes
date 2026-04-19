@@ -1758,14 +1758,12 @@ export function App() {
       // like the daemon ate the command silently. Handle here so the
       // user can see what happened and open the config panel.
       if (msg.type === 'command.ack'
-        && (msg as unknown as Record<string, unknown>).status === 'error'
-        && typeof (msg as unknown as Record<string, unknown>).error === 'string') {
-        // `msg` is typed as the `ServerMessage` discriminated union; the
-        // non-error `command.ack` variant in that union doesn't declare an
-        // `error` field, so a direct cast to `{ error: string }` fails
-        // strict conversion (TS2352). Go through `unknown` — we've just
-        // typeof-guarded the field so the access is sound at runtime.
-        const errorCode = (msg as unknown as Record<string, unknown>).error as string;
+        && (msg as { status?: unknown }).status === 'error'
+        && typeof (msg as { error?: unknown }).error === 'string') {
+        // Cast through `unknown` because `msg.type === 'command.ack'` already
+        // narrows msg to a shape that doesn't declare `error`; the runtime
+        // `typeof error === 'string'` check above guarantees the field exists.
+        const errorCode = (msg as unknown as { error: string }).error;
         const knownP2pErrors = new Set<string>([
           'no_configured_targets',
           'no_sessions',

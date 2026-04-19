@@ -6,6 +6,7 @@ import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
 import type { SessionContextBootstrapState } from '../../shared/session-context-bootstrap.js';
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
+import { getSessionRuntimeType } from '../../shared/agent-types.js';
 
 const STORE_DIR = join(homedir(), '.imcodes');
 const STORE_PATH = join(STORE_DIR, 'sessions.json');
@@ -147,11 +148,49 @@ export async function loadStore(): Promise<SessionStore> {
     store = { sessions: {} };
   }
   if (pruneNonPersistableSessions()) scheduleWrite();
+  if (reconcilePersistedSessions()) scheduleWrite();
   // Probe actual state of each session via terminal detection.
   // Without this, stale "running" states from before daemon restart persist
   // and cause UI animations to trigger for idle agents.
   void probeSessionStates();
   return store;
+}
+
+/**
+ * Reconcile persisted records on daemon startup:
+ *
+ *  1) Backfill `runtimeType` for records persisted before that field existed.
+ *     CRITICAL: without this, transport SDK sessions (`claude-code-sdk`,
+ *     `codex-sdk`, etc.) read back with `runtimeType === undefined`. The
+ *     lifecycle health poller and `restartSession` then treat them as
+ *     tmux-backed and cycle them into `state: 'error'` on every daemon
+ *     restart (because there is no tmux pane to attach).
+ *
+ *  2) Auto-recover `state: 'error'` to `stopped`. The error state is reached
+ *     only when the restart budget (3 restarts / 5 min) is exhausted. By the
+ *     time a fresh daemon process has loaded, the rate window has elapsed and
+ *     the proximate cause (often "tmux pane killed when previous daemon
+ *     OOM'd") no longer applies. Letting sessions retry once more avoids
+ *     requiring manual web-UI intervention after every daemon crash.
+ *
+ * Returns true when any record was mutated and the store needs flushing.
+ */
+function reconcilePersistedSessions(): boolean {
+  let mutated = false;
+  for (const session of Object.values(store.sessions)) {
+    if (!session.runtimeType && typeof session.agentType === 'string') {
+      session.runtimeType = getSessionRuntimeType(session.agentType);
+      mutated = true;
+    }
+    if (session.state === 'error') {
+      session.state = 'stopped';
+      session.restarts = 0;
+      session.restartTimestamps = [];
+      session.updatedAt = Date.now();
+      mutated = true;
+    }
+  }
+  return mutated;
 }
 
 /** After loadStore, detect actual state of each session from terminal and emit corrections. */

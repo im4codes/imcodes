@@ -35,6 +35,7 @@ import { LiveContextIngestion } from '../context/live-context-ingestion.js';
 import { resolveTransportContextBootstrap } from '../agent/runtime-context-bootstrap.js';
 import { pruneLocalMemory } from '../context/memory-pruning.js';
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
+import { isTransportAgent } from '../agent/detect.js';
 
 /** Get the last assistant.text from a session's timeline (for push notification context). */
 function getLastAssistantText(sessionName: string): string | undefined {
@@ -841,8 +842,11 @@ function startHealthPoller(): void {
     const sessions = listSessions();
     for (const s of sessions) {
       if (s.state === 'stopped' || s.state === 'error') continue;
-      // Transport sessions have no tmux pane — skip tmux health checks
-      if (s.runtimeType === 'transport') continue;
+      // Transport sessions have no tmux pane — skip tmux health checks.
+      // Belt-and-suspenders: also check agentType so records persisted before
+      // the runtimeType field existed (or written by an older daemon) don't
+      // fall through and trigger a tmux restart loop on transport sessions.
+      if (s.runtimeType === 'transport' || isTransportAgent(s.agentType)) continue;
       // Sub-sessions: auto-restart dead panes, mark stopped if tmux session gone entirely
       if (s.name.startsWith('deck_sub_')) {
         try {

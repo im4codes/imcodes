@@ -388,6 +388,13 @@ async function sendToProvider(selection: CompressionBackendSelection, prompt: st
   return new Promise<string>((resolve, reject) => {
     const timer = setTimeout(() => {
       offComplete(); offError();
+      // Tear down the underlying provider session so a stuck CLI subprocess
+      // (e.g., a qwen child waiting on a misconfigured model endpoint) is
+      // killed via SIGTERM. Without this, hung subprocesses keep buffering
+      // stream-json output into the daemon's stdout pipes until the V8 heap
+      // exhausts and the daemon OOM-crashes, taking every active session
+      // with it. Best-effort: don't await — the rejection must fire promptly.
+      void shutdownCompressionProvider().catch(() => { /* best-effort */ });
       reject(new Error(`Compression timed out after ${COMPRESSION_TIMEOUT_MS}ms`));
     }, COMPRESSION_TIMEOUT_MS);
 

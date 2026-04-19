@@ -308,6 +308,12 @@ export class TerminalStreamer {
     // ConPTY doesn't need paneId — it uses session name directly from the in-memory map
     let paneId: string | undefined;
     if (BACKEND !== 'conpty') {
+      // Transport sessions (claude-code-sdk, codex-sdk, qwen, …) don't have a
+      // tmux pane to pipe. If a stale subscribe path lands here for a transport
+      // session, bail out cleanly instead of producing a misleading
+      // "paneId not available" error that the session-manager mistakes for a
+      // dead pane and tries to restart in a 3-strikes loop.
+      if (isTransportSessionName(sessionName)) return;
       const session = getSession(sessionName);
       paneId = session?.paneId;
       if (!paneId) {
