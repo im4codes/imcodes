@@ -1504,6 +1504,8 @@ afterEach(() => {
       />,
     );
 
+    // Compact pill is shown by default — click to expand
+    fireEvent.click(screen.getByRole('button', { name: /2 queued/i }));
     expect(document.querySelector('.controls-queued-hint')).toBeTruthy();
     expect(screen.getByText('queued first')).toBeDefined();
     expect(screen.getByText('queued second')).toBeDefined();
@@ -1527,6 +1529,8 @@ afterEach(() => {
       />,
     );
 
+    // Compact pill is shown by default — click to expand
+    fireEvent.click(screen.getByRole('button', { name: /2 queued/i }));
     expect(screen.getByText('queued first')).toBeDefined();
     expect(screen.getByText('queued second')).toBeDefined();
   });
@@ -1669,6 +1673,8 @@ afterEach(() => {
         quickData={makeQuickData() as any}
       />,
     );
+    // Compact pill is shown by default — click to expand
+    fireEvent.click(screen.getByRole('button', { name: /2 queued/i }));
     expect(screen.getByText('transport_send_queued')).toBeDefined();
     expect(screen.getByText('queued send')).toBeDefined();
     expect(screen.getByText('second queued send')).toBeDefined();
@@ -1694,6 +1700,8 @@ afterEach(() => {
       />,
     );
 
+    // Compact pill is shown by default — click to expand first
+    fireEvent.click(screen.getByRole('button', { name: /2 queued/i }));
     fireEvent.click(screen.getByRole('button', { name: 'hide' }));
 
     // Collapsed state is now a compact pill — only a count, no latest-only
@@ -1703,11 +1711,9 @@ afterEach(() => {
     expect(screen.queryByText('queued send')).toBeNull();
     expect(screen.queryByText('second queued send')).toBeNull();
     expect(screen.queryByText('2 queued · showing latest only')).toBeNull();
-    expect(localStorage.getItem('imcodes-queued-hint-expanded')).toBe('0');
   });
 
   it('remembers collapsed queued transport messages globally', () => {
-    localStorage.setItem('imcodes-queued-hint-expanded', '0');
     const runningSession = makeSession({
       name: 'qwen-session',
       agentType: 'qwen',
@@ -1727,11 +1733,15 @@ afterEach(() => {
       />,
     );
 
-    // Loads from localStorage and renders the compact collapsed pill.
+    // Compact pill is shown by default — click to expand
     expect(screen.getByRole('button', { name: '2 queued' })).toBeDefined();
     expect(screen.queryByText('queued send')).toBeNull();
     expect(screen.queryByText('second queued send')).toBeNull();
     expect(screen.queryByText('2 queued · showing latest only')).toBeNull();
+    // Click pill to expand and verify messages appear
+    fireEvent.click(screen.getByRole('button', { name: /2 queued/i }));
+    expect(screen.getByText('queued send')).toBeDefined();
+    expect(screen.getByText('second queued send')).toBeDefined();
   });
 
   it('edits a queued transport message through the queue controls', () => {
@@ -1754,6 +1764,8 @@ afterEach(() => {
       />,
     );
 
+    // Compact pill is shown by default — click to expand first
+    fireEvent.click(screen.getByRole('button', { name: /1 queued/i }));
     fireEvent.click(screen.getByRole('button', { name: /edit/i }));
     const input = screen.getByRole('textbox') as HTMLDivElement;
     expect(input.textContent).toBe('queued send');
@@ -1793,6 +1805,8 @@ afterEach(() => {
       />,
     );
 
+    // Compact pill is shown by default — click to expand first
+    fireEvent.click(screen.getByRole('button', { name: /1 queued/i }));
     fireEvent.click(screen.getByRole('button', { name: /delete/i }));
 
     expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({

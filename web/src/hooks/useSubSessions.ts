@@ -20,7 +20,7 @@ import {
   mergeTransportPendingMessagesForRunningState,
   normalizeTransportPendingEntries,
 } from '../transport-queue.js';
-import { getSessionRuntimeType } from '@shared/agent-types.js';
+import { getSessionRuntimeType, isTransportSessionAgentType } from '@shared/agent-types.js';
 import { getAutoSessionLabelPrefix } from '../agent-display.js';
 
 export interface SubSession extends SubSessionData {
@@ -436,12 +436,19 @@ export function useSubSessions(
       };
       setSubSessions((prev) => [...prev, sub]);
       // Ask daemon to start it — transport providers may need extra fields
-      if ((type === 'openclaw' || type === 'qwen') && extra) {
+      // (requestedModel / transportConfig / thinking / ocMode / etc.). The daemon's
+      // `subsession.start` handler reads these off the wire message, so ALL
+      // transport agent types must include `extra` — not just qwen/openclaw.
+      // Dropping extras for copilot-sdk / cursor-headless here was causing their
+      // chat subscription to appear "stuck" (no model configured → provider
+      // never produced a response).
+      if (isTransportSessionAgentType(type) && extra) {
         ws?.send({
           type: 'subsession.start',
           id: sub.id,
           sessionType: type,
           cwd,
+          ccSessionId,
           parentSession: activeSession,
           ...extra,
         });

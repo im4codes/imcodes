@@ -406,6 +406,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModel);
   const [qwenModel, setQwenModel] = useState<QwenModelChoice | null>(loadQwenModel);
   const [editingQueuedMessageId, setEditingQueuedMessageId] = useState<string | null>(null);
+  const [queuedHintExpanded, setQueuedHintExpanded] = useState(false);
+  const toggleQueuedHintExpanded = useCallback(() => setQueuedHintExpanded((v) => !v), []);
   const [optimisticQueuedEntries, setOptimisticQueuedEntries] = useState<Array<{ clientMessageId: string; text: string }> | null>(null);
   const [mobileComposerMultiline, setMobileComposerMultiline] = useState(false);
   const [mobileComposerExpanded, setMobileComposerExpanded] = useState(false);
@@ -627,10 +629,17 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             : []
   ), [activeSession?.agentType]);
   const supportsThinking = thinkingLevels.length > 0;
+  // Default the pill to a sensible value whenever the agent supports thinking
+  // but the session doesn't yet have an `effort` persisted. Prefer 'high' if
+  // the agent's level set includes it (true for every current transport type),
+  // otherwise pick the last level which is conventionally the strongest.
+  const defaultThinkingForAgent: TransportEffortLevel | undefined = supportsThinking
+    ? (thinkingLevels.includes('high' as TransportEffortLevel)
+        ? 'high'
+        : thinkingLevels[thinkingLevels.length - 1])
+    : undefined;
   const currentThinking = (activeSession?.effort as TransportEffortLevel | undefined)
-    ?? (activeSession?.agentType === 'qwen' || activeSession?.agentType === 'openclaw'
-      ? 'high'
-      : undefined);
+    ?? defaultThinkingForAgent;
   const qwenTier = getQwenAuthTier(activeSession?.qwenAuthType);
   const qwenTierLabel = qwenTier === QWEN_AUTH_TIERS.FREE
     ? t('session.qwen_tier_free')

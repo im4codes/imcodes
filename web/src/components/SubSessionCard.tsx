@@ -22,7 +22,11 @@ import { isTransportRuntime, resolveSubSessionRuntimeType } from '../runtime-typ
 
 const TYPE_ICON: Record<string, string> = {
   'claude-code': '⚡',
+  'claude-code-sdk': '⚡',
   'codex': '📦',
+  'codex-sdk': '📦',
+  'copilot-sdk': '🧭',
+  'cursor-headless': '➤',
   'opencode': '🔆',
   'openclaw': '☁️',
   'qwen': '千',
