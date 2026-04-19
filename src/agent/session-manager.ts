@@ -1194,6 +1194,10 @@ export async function restoreTransportSessions(providerId: string): Promise<void
           availableQwenModels = [presetConfig.model];
         }
         transportSettings = presetConfig.settings;
+        // Override the qwen CLI's built-in "I am Qwen Code" identity with the
+        // preset's runtime-facts prompt — without this, the model introduces
+        // itself as Qwen / 通义千问 even when the turn is served by MiniMax.
+        if (presetConfig.systemPrompt) systemPrompt = presetConfig.systemPrompt;
       }
       if (s.providerId === 'qwen'
         && (!effectiveRequestedModel || (availableQwenModels.length > 0 && !availableQwenModels.includes(effectiveRequestedModel)))) {
@@ -1394,6 +1398,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
         availableQwenModels = [presetConfig.model];
       }
       if (presetConfig.settings) transportSettings = presetConfig.settings;
+      if (presetConfig.systemPrompt) transportSystemPrompt = presetConfig.systemPrompt;
       qwenAuthType = QWEN_AUTH_TYPES.API_KEY;
       qwenAuthLimit = undefined;
     }
