@@ -2593,13 +2593,21 @@ function handleSubscribe(cmd: Record<string, unknown>, serverLink: ServerLink): 
   const session = cmd.session as string | undefined;
   if (!session) return;
   const record = getSession(session);
-  if (record?.runtimeType === 'transport') {
+  // Check BOTH runtimeType and agentType to dodge a race where a freshly-
+  // created transport session (copilot-sdk / cursor-headless / qwen / etc.)
+  // is persisted with agentType but `runtimeType` hasn't propagated yet.
+  // Without the agentType fallback, the subscribe falls through to
+  // terminalStreamer → startPipe → "Terminal stream unavailable: pane id
+  // not available" error in the web UI within seconds of session creation.
+  const isTransport = record?.runtimeType === 'transport'
+    || (typeof record?.agentType === 'string' && isTransportAgent(record.agentType));
+  if (isTransport) {
     const existing = activeSubscriptions.get(session);
     if (existing) {
       existing.unsubscribe();
       activeSubscriptions.delete(session);
     }
-    logger.debug({ session }, 'Terminal subscribe skipped for transport session');
+    logger.debug({ session, agentType: record?.agentType }, 'Terminal subscribe skipped for transport session');
     return;
   }
 

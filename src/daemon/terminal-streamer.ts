@@ -315,12 +315,22 @@ export class TerminalStreamer {
       // dead pane and tries to restart in a 3-strikes loop.
       if (isTransportSessionName(sessionName)) return;
       const session = getSession(sessionName);
-      paneId = session?.paneId;
+      // Race guard: a freshly-created transport session may briefly land here
+      // before its agentType / runtimeType fields are visible in the in-memory
+      // store. Without this check, the user sees an immediate red error
+      // ("Terminal stream unavailable: pane id not available") on the chat
+      // bubble for a Copilot/Cursor session that's only milliseconds old.
+      // Treat "session record missing entirely" as "not ready, skip silently".
+      if (!session) {
+        logger.debug({ sessionName }, 'startPipe: no session record — skipping (likely transport race or stale subscriber)');
+        return;
+      }
+      paneId = session.paneId;
       if (!paneId) {
         // Session created before paneId persistence — fetch dynamically from tmux
         const fetched = getPaneId(sessionName);
         paneId = fetched != null ? await fetched.catch(() => undefined) : undefined;
-        if (paneId && session != null) {
+        if (paneId) {
           upsertSession({ ...session, paneId });
         }
       }
