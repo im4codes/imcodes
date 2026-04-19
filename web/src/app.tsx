@@ -1840,6 +1840,9 @@ export function App() {
 
   // Subscribe to structured transport chat/timeline updates for ALL transport sessions.
   // SDK-backed sessions must remain globally subscribed regardless of which panel is active.
+  // Key includes runtimeType so effect re-runs when WebSocket merge corrects null→'transport'
+  // for copilot/cursor sessions loaded from a pre-migration DB (runtime_type was NULL).
+  const transportSessionKey = sessions.map((s) => `${s.name}:${s.runtimeType}`).sort().join(',');
   useEffect(() => {
     const ws = wsRef.current;
     if (!ws?.connected || sessions.length === 0) return;
@@ -1852,7 +1855,7 @@ export function App() {
         try { ws.unsubscribeTransportSession(name); } catch { /* ignore */ }
       }
     };
-  }, [connected, sessionNamesKey, sessions]);
+  }, [connected, transportSessionKey, sessions]);
 
   // Subscribe terminal for ALL sub-sessions in passive mode.
   // Active sub-session windows upgrade themselves to raw:true while visible.
@@ -1873,6 +1876,8 @@ export function App() {
   }, [connected, subSessionNamesKey]);
 
   // Subscribe to structured transport updates for ALL transport sub-sessions too.
+  // Key includes runtimeType so effect re-runs when WebSocket merge corrects null→'transport'.
+  const transportSubSessionKey = subSessions.map((s) => `${s.sessionName}:${s.runtimeType}`).sort().join(',');
   useEffect(() => {
     const ws = wsRef.current;
     if (!ws?.connected || subSessions.length === 0) return;
@@ -1909,7 +1914,7 @@ export function App() {
   // Keep the active session in raw mode only while it is actively rendering terminal output.
   useEffect(() => {
     const ws = wsRef.current;
-    if (!ws?.connected || !activeSession || activeRuntimeType === 'transport') return;
+    if (!ws?.connected || !activeSession) return;
     const raw = shouldSubscribeTerminalRaw(true, viewMode);
     ws.subscribeTerminal(activeSession, raw);
     if (!raw) {
