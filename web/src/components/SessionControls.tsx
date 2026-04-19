@@ -1954,6 +1954,24 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           ))}
         </div>}
 
+        {/* File browser — belongs in the per-session header (this shortcuts
+            row), not next to 📎 in the input row. The button opens the same
+            shared file browser the top-bar 📁 opens, so pair with mode
+            dropdowns like OpenSpec / Auto / Model for consistency. */}
+        {onOpenFileBrowser && (
+          <button
+            class="shortcut-btn shortcut-btn-icon"
+            onClick={() => onOpenFileBrowser()}
+            disabled={disabled}
+            title={t('picker.files')}
+            aria-label={t('picker.files')}
+            style={{ position: 'relative' }}
+          >
+            <span aria-hidden="true">{'\u{1F4C1}'}</span>
+            {(gitChangesCount ?? 0) > 0 && <span class="file-badge">{gitChangesCount}</span>}
+          </button>
+        )}
+
         {canQuickControlSupervision && (
           <div class="shortcuts-model" ref={autoRef}>
             <button
@@ -2784,18 +2802,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             </button>
           )}
         </div>
-        {onOpenFileBrowser && (
-          <button
-            class="btn btn-voice"
-            onClick={() => onOpenFileBrowser()}
-            disabled={inputDisabled}
-            title={t('picker.files')}
-            style={{ position: 'relative' }}
-          >
-            {'\u{1F4C1}'}
-            {(gitChangesCount ?? 0) > 0 && <span class="file-badge">{gitChangesCount}</span>}
-          </button>
-        )}
         {serverId && (
           <>
             <input
