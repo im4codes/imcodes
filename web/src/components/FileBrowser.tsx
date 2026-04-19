@@ -20,6 +20,13 @@ import { FileEditor, FileEditorContent } from './file-editor-lazy.js';
 const FilePreviewPane = lazy(() => import('./FilePreviewPane.js'));
 const OfficePreview = lazy(() => import('./OfficePreview.js'));
 import { downloadAttachment } from '../api.js';
+import {
+  getSharedChangesKey,
+  subscribeSharedChanges,
+  requestSharedChanges,
+  __resetSharedChangesForTests,
+  type ChangeFile,
+} from '../git-status-store.js';
 
 const PREF_KEY = 'fb_prefer_editor';
 const WINDOWS_DRIVES_ROOT = '__imcodes_windows_drives__';
@@ -194,108 +201,11 @@ function updateNode(nodes: FsNode[], targetId: string, patch: Partial<FsNode>): 
   });
 }
 
-type ChangeFile = { path: string; code: string; additions?: number; deletions?: number };
-type SharedChangesListener = (files: ChangeFile[]) => void;
 type PendingPreviewRequest = { path: string; cycleId: number };
 
-interface SharedChangesEntry {
-  repoPath: string;
-  files: ChangeFile[];
-  updatedAt: number;
-  inFlightRequestId: string | null;
-  queued: boolean;
-  listeners: Set<SharedChangesListener>;
-  ws: WsClient | null;
-}
-
-const SHARED_CHANGES_TTL_MS = 5_000;
-const sharedChangesByKey = new Map<string, SharedChangesEntry>();
-const sharedChangesRequestKey = new Map<string, string>();
-const wsIds = new WeakMap<WsClient, number>();
-let nextWsId = 1;
-
-export function __resetFileBrowserSharedChangesForTests(): void {
-  sharedChangesByKey.clear();
-  sharedChangesRequestKey.clear();
-  nextWsId = 1;
-}
-
-function getWsId(ws: WsClient): number {
-  let id = wsIds.get(ws);
-  if (!id) {
-    id = nextWsId++;
-    wsIds.set(ws, id);
-  }
-  return id;
-}
-
-function getSharedChangesKey(ws: WsClient, repoPath: string): string {
-  return `${getWsId(ws)}::${repoPath}`;
-}
-
-function getSharedChangesEntry(key: string): SharedChangesEntry {
-  let entry = sharedChangesByKey.get(key);
-  if (!entry) {
-    entry = { repoPath: '', files: [], updatedAt: 0, inFlightRequestId: null, queued: false, listeners: new Set(), ws: null };
-    sharedChangesByKey.set(key, entry);
-  }
-  return entry;
-}
-
-function subscribeSharedChanges(key: string, listener: SharedChangesListener): () => void {
-  const entry = getSharedChangesEntry(key);
-  entry.listeners.add(listener);
-  if (entry.updatedAt > 0) listener(entry.files);
-  return () => {
-    const current = sharedChangesByKey.get(key);
-    if (!current) return;
-    current.listeners.delete(listener);
-    if (current.listeners.size === 0 && !current.inFlightRequestId) {
-      sharedChangesByKey.delete(key);
-    }
-  };
-}
-
-function publishSharedChanges(key: string, files: ChangeFile[]): void {
-  const entry = getSharedChangesEntry(key);
-  entry.files = files;
-  entry.updatedAt = Date.now();
-  for (const listener of entry.listeners) listener(files);
-}
-
-function requestSharedChanges(key: string, ws: WsClient, repoPath: string, force = false): void {
-  const entry = getSharedChangesEntry(key);
-  entry.ws = ws;
-  entry.repoPath = repoPath;
-  const fresh = entry.updatedAt > 0 && (Date.now() - entry.updatedAt) < SHARED_CHANGES_TTL_MS;
-  if (!force && fresh) {
-    publishSharedChanges(key, entry.files);
-    return;
-  }
-  if (entry.inFlightRequestId) {
-    entry.queued = true;
-    return;
-  }
-  const requestId = ws.fsGitStatus(repoPath, { includeStats: true });
-  entry.inFlightRequestId = requestId;
-  sharedChangesRequestKey.set(requestId, key);
-}
-
-function settleSharedChangesRequest(requestId: string, files: ChangeFile[] | null): boolean {
-  const key = sharedChangesRequestKey.get(requestId);
-  if (!key) return false;
-  sharedChangesRequestKey.delete(requestId);
-  const entry = sharedChangesByKey.get(key);
-  if (!entry) return true;
-  entry.inFlightRequestId = null;
-  if (files) publishSharedChanges(key, files);
-  if (entry.queued && entry.ws) {
-    entry.queued = false;
-    requestSharedChanges(key, entry.ws, entry.repoPath, true);
-  }
-  return true;
-}
-
+/** Backward-compat re-export so the existing FileBrowser test suite keeps
+ *  working after the shared-changes cache moved to `git-status-store.ts`. */
+export const __resetFileBrowserSharedChangesForTests = __resetSharedChangesForTests;
 
 export function FileBrowser({
   ws,
@@ -604,10 +514,10 @@ export function FileBrowser({
       }
 
       if (msg.type === 'fs.git_status_response') {
-        const sharedFiles = msg.status === 'ok' ? ((msg.files as ChangeFile[] | undefined) ?? []) : [];
-        if (settleSharedChangesRequest(msg.requestId, sharedFiles)) {
-          return;
-        }
+        // Shared-cache path (changesRootPath, badges, etc.) is routed
+        // into `git-status-store` by its per-ws bridge, so we only handle
+        // the per-tree-node path here: requests we fired while expanding
+        // a directory to annotate individual file rows with git state.
         const dirPath = pendingGitStatusRef.current.get(msg.requestId);
         if (!dirPath) return;
         pendingGitStatusRef.current.delete(msg.requestId);
@@ -876,19 +786,18 @@ export function FileBrowser({
 
   const refreshChanges = useCallback(() => {
     if (!changesRootPath) return;
-    const cacheKey = getSharedChangesKey(ws, changesRootPath);
     const now = Date.now();
     const elapsed = now - lastChangesRefreshRef.current;
     if (elapsed >= CHANGES_RATE_LIMIT_MS) {
       lastChangesRefreshRef.current = now;
-      requestSharedChanges(cacheKey, ws, changesRootPath);
+      requestSharedChanges(ws, changesRootPath);
     } else {
       // Schedule for when rate limit clears
       if (pendingChangesTimerRef.current) clearTimeout(pendingChangesTimerRef.current);
       pendingChangesTimerRef.current = setTimeout(() => {
         if (!mountedRef.current) return;
         lastChangesRefreshRef.current = Date.now();
-        requestSharedChanges(cacheKey, ws, changesRootPath, true);
+        requestSharedChanges(ws, changesRootPath, true);
       }, CHANGES_RATE_LIMIT_MS - elapsed);
     }
   }, [changesRootPath, ws]);
@@ -1196,7 +1105,7 @@ export function FileBrowser({
         <span class="fb-changes-title">{t('file_browser.changes_title', { count: changesFiles.length })}</span>
         {changesRootPath && (
           <button class="fb-changes-refresh" onClick={() => {
-            requestSharedChanges(getSharedChangesKey(ws, changesRootPath!), ws, changesRootPath!, true);
+            requestSharedChanges(ws, changesRootPath!, true);
           }} title="Refresh">↻</button>
         )}
       </div>

@@ -88,6 +88,14 @@ vi.mock('../../src/components/QuickInputPanel.js', () => ({
   }),
 }));
 
+vi.mock('../../src/git-status-store.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/git-status-store.js')>();
+  return {
+    ...actual,
+    useSharedGitChanges: () => [],
+  };
+});
+
 import { SubSessionWindow } from '../../src/components/SubSessionWindow.js';
 import type { SubSession } from '../../src/hooks/useSubSessions.js';
 

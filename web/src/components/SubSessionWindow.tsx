@@ -9,11 +9,14 @@ import { recordCost } from '../cost-tracker.js';
 import { formatLabel } from '../format-label.js';
 import { TerminalView } from './TerminalView.js';
 import { ChatView } from './ChatView.js';
+import { FileBrowser } from './FileBrowser.js';
 import { SessionControls } from './SessionControls.js';
 import { UsageFooter } from './UsageFooter.js';
+import { FloatingPanel } from './FloatingPanel.js';
 import { useTimeline } from '../hooks/useTimeline.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
 import { useQuickData } from './QuickInputPanel.js';
+import { useSharedGitChanges } from '../git-status-store.js';
 import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff, SessionInfo } from '../types.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
@@ -51,11 +54,6 @@ interface Props {
   onPendingPrefillApplied?: () => void;
   /** Whether this sub-session is participating in an active P2P discussion. */
   inP2p?: boolean;
-  /** Opens the shared file browser (desktop panel or mobile overlay).
-   *  Passed through to SessionControls so the 📁 button matches the main session. */
-  onOpenFileBrowser?: () => void;
-  /** Git-changes count for the 📁 badge. */
-  gitChangesCount?: number;
 }
 
 type ViewMode = 'terminal' | 'chat';
@@ -97,12 +95,20 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, onSettings, onTransportConfigSaved, zIndex, onFocus, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, inP2p, onOpenFileBrowser, gitChangesCount,
+  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, onSettings, onTransportConfigSaved, zIndex, onFocus, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, inP2p,
 }: Props) {
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   const swipeBackRef = useSwipeBack(isMobile ? onMinimize : null);
+
+  // ── Shared git-changes cache for the 📁 badge ─────────────────────────────
+  // Uses the same git-status-store as the main session and FileBrowser.
+  // When cwd matches another consumer (main session, other sub-sessions),
+  // a single `fs.git_status` request feeds all of them. No separate polling
+  // loop needed — `useSharedGitChanges` polls every 30s automatically.
+  const sharedGitFiles = useSharedGitChanges(ws, sub.cwd ?? null);
+  const gitChangesCount = sharedGitFiles.length;
 
   // Always pass sessionName + ws so useTimeline keeps its cache warm.
   // active flag is only for rendering — timeline state should persist across minimize/restore.
@@ -124,6 +130,12 @@ export function SubSessionWindow({
     () => getTailSessionState(events) ?? sub.state ?? null,
     [events, sub.state],
   );
+
+  // Dedicated per-sub-session file browser state. Each sub-session has its own
+  // cwd, so opening 📁 here should browse THIS sub-session's working directory
+  // (not the parent main session's). The overlay/panel is rendered locally so
+  // it layers above this sub-session window instead of being hidden behind it.
+  const [showFileBrowser, setShowFileBrowser] = useState(false);
 
   const [quotes, setQuotes] = useState<string[]>([]);
   const addQuote = useCallback((text: string) => setQuotes((prev) => [...prev, text]), []);
@@ -433,23 +445,21 @@ export function SubSessionWindow({
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 10 }}>
           {!isShell && !isTransport && <button class="subsession-mode-btn" onClick={() => { const next = viewMode === 'chat' ? 'terminal' : 'chat'; setViewMode(next); if (next === 'chat') requestAnimationFrame(() => chatScrollRef.current?.()); }} title={viewMode === 'chat' ? 'Switch to terminal' : 'Switch to chat'}>{viewMode === 'chat' ? '⌨' : '💬'}</button>}
           {/* File browser — placed to the LEFT of the pin button in the
-              sub-session window header. The main session already exposes
-              📁 in the mobile-server-bar / desktop top bar, so it is NOT
-              rendered inside SessionControls. Sub-sessions render in
-              floating windows with their own header, and need their own
-              entry point here. */}
-          {onOpenFileBrowser && (
-            <button
-              class="subsession-minimize-btn"
-              onClick={() => onOpenFileBrowser()}
-              title={t('picker.files')}
-              aria-label={t('picker.files')}
-              style={{ position: 'relative' }}
-            >
-              <span aria-hidden="true">{'\u{1F4C1}'}</span>
-              {(gitChangesCount ?? 0) > 0 && <span class="file-badge">{gitChangesCount}</span>}
-            </button>
-          )}
+              sub-session window header. Each sub-session owns its own
+              FileBrowser instance rooted at sub.cwd, so selected paths land
+              in THIS sub-session's input (not the parent main session's).
+              The overlay/panel is rendered at zIndex > this window's zIndex
+              so it isn't hidden behind the window itself. */}
+          <button
+            class="subsession-minimize-btn"
+            onClick={() => setShowFileBrowser((o) => !o)}
+            title={t('picker.files')}
+            aria-label={t('picker.files')}
+            style={{ position: 'relative' }}
+          >
+            <span aria-hidden="true">{'\u{1F4C1}'}</span>
+            {(gitChangesCount ?? 0) > 0 && <span class="file-badge">{gitChangesCount}</span>}
+          </button>
           {isPinnable && <button class="subsession-minimize-btn" onClick={() => onPin?.(viewMode)} title={t('sidebar.pin_to_sidebar')}>📌</button>}
           <button class="subsession-minimize-btn" onClick={onMinimize} title="Minimize">▾</button>
           <button class="subsession-close-btn" onClick={onMinimize} title="Hide">×</button>
@@ -556,6 +566,76 @@ export function SubSessionWindow({
         pendingPrefillText={pendingPrefillText}
         onPendingPrefillApplied={onPendingPrefillApplied}
       />
+
+      {/* Per-sub-session file browser. Mobile: full-screen overlay.
+          Desktop: floating panel. Rooted at this sub-session's cwd so
+          selected paths land in the sub-session's own input. zIndex is
+          pinned to this window's zIndex + 1 so it layers above the window. */}
+      {showFileBrowser && ws && (
+        isMobile ? (
+          <div class="mobile-fb-overlay" style={{ zIndex: zIndex + 1 }}>
+            <div class="mobile-fb-header">
+              <span style={{ fontSize: 13, fontWeight: 600 }}>📁 {t('picker.files')}</span>
+              <button class="fb-close" onClick={() => setShowFileBrowser(false)}>✕</button>
+            </div>
+            <FileBrowser
+              ws={ws}
+              serverId={serverId}
+              mode="file-multi"
+              layout="panel"
+              initialPath={sub.cwd ?? '~'}
+              changesRootPath={sub.cwd ?? undefined}
+              hideFooter={false}
+              onConfirm={(paths) => {
+                const cwd = sub.cwd ?? null;
+                const rel = cwd
+                  ? paths.map((p) => '@' + (p.startsWith(cwd + '/') ? p.slice(cwd.length + 1) : p) + ' ')
+                  : paths.map((p) => '@' + p + ' ');
+                const inputEl = inputRef.current;
+                if (inputEl) {
+                  inputEl.textContent = (inputEl.textContent || '') + rel.join('');
+                  inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+                  inputEl.focus();
+                }
+                setShowFileBrowser(false);
+              }}
+              onClose={() => setShowFileBrowser(false)}
+            />
+          </div>
+        ) : (
+          <FloatingPanel
+            id={`subsession-filebrowser-${sub.id}`}
+            title={`📁 ${t('picker.files')}`}
+            onClose={() => setShowFileBrowser(false)}
+            zIndex={zIndex + 1}
+            defaultW={420}
+            defaultH={500}
+          >
+            <FileBrowser
+              ws={ws}
+              serverId={serverId}
+              mode="file-multi"
+              layout="panel"
+              initialPath={sub.cwd ?? '~'}
+              changesRootPath={sub.cwd ?? undefined}
+              hideFooter={false}
+              onConfirm={(paths) => {
+                const cwd = sub.cwd ?? null;
+                const rel = cwd
+                  ? paths.map((p) => '@' + (p.startsWith(cwd + '/') ? p.slice(cwd.length + 1) : p) + ' ')
+                  : paths.map((p) => '@' + p + ' ');
+                const inputEl = inputRef.current;
+                if (inputEl) {
+                  inputEl.textContent = (inputEl.textContent || '') + rel.join('');
+                  inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+                  inputEl.focus();
+                }
+              }}
+              onClose={() => setShowFileBrowser(false)}
+            />
+          </FloatingPanel>
+        )
+      )}
     </div>
   );
 }

@@ -19,6 +19,7 @@ import { useQuickData } from './components/QuickInputPanel.js';
 import { NewSessionDialog } from './components/NewSessionDialog.js';
 import { SubSessionBar } from './components/SubSessionBar.js';
 import { SubSessionWindow } from './components/SubSessionWindow.js';
+import { useSharedGitChanges, requestSharedChanges } from './git-status-store.js';
 import { StartSubSessionDialog } from './components/StartSubSessionDialog.js';
 import { SessionSettingsDialog } from './components/SessionSettingsDialog.js';
 import { StartDiscussionDialog, type DiscussionPrefs, type SubSessionOption } from './components/StartDiscussionDialog.js';
@@ -231,16 +232,10 @@ export function App() {
   const [showDesktopLocalWebPreview, setShowDesktopLocalWebPreview] = useState(false);
   const [localWebPreviewPort, setLocalWebPreviewPort] = useState('');
   const [localWebPreviewPath, setLocalWebPreviewPath] = useState('/');
-  const [gitChangesCount, setGitChangesCount] = useState(0);
-  /** Shared toggle for the 📁 file browser — used by the top bar button AND
-   *  by the per-session 📁 button in SessionControls. Desktop opens the
-   *  FloatingPanel, mobile opens the full-screen overlay. */
-  const toggleFileBrowser = useCallback(() => {
-    const mobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
-    if (mobile) setShowMobileFileBrowser((o) => !o);
-    else setShowDesktopFileBrowser((o) => !o);
-  }, []);
   // File browser geometry now managed by FloatingPanel (id="filebrowser")
+  // NOTE: top-bar 📁 buttons call setShowMobile/DesktopFileBrowser directly.
+  // Sub-sessions now own their own FileBrowser inside SubSessionWindow
+  // (rooted at sub.cwd, layered above the window) — no shared toggle needed.
   const [serverCtxMenu, setServerCtxMenu] = useState<{ server: ServerInfo; x: number; y: number } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ServerInfo | null>(null);
 
@@ -2436,42 +2431,27 @@ export function App() {
   }, [activeSession, activeSessionInfo?.projectDir, pinnedPanels.length, pinPanel, selectedServerId]);
 
   // ── Git changes count for file browser badge ───────────────────────────
-  // Refreshes on: initial load, every 30s, and after tool calls (file writes).
-  const refreshGitStatusRef = useRef<(() => void) | null>(null);
+  // Uses useSharedGitChanges — shares the cache with FileBrowser, SubSessionWindow,
+  // and any other consumer pointing at the same repo path. A single `fs.git_status`
+  // request feeds all of them; no duplicate requests when paths match.
+  const sharedGitFiles = useSharedGitChanges(wsRef.current, activeSessionInfo?.projectDir ?? null);
+  const gitChangesCount = sharedGitFiles.length;
+
+  // Nudge the shared cache when the agent finishes a tool call or goes idle,
+  // so the badge reflects new/modified files without waiting for the 30s poll.
+  // The 5s TTL in the store dedupes bursty events across sessions.
   useEffect(() => {
     const ws = wsRef.current;
     const dir = activeSessionInfo?.projectDir;
-    if (!ws || !connected || !dir) { setGitChangesCount(0); refreshGitStatusRef.current = null; return; }
-
-    let lastReqId: string | null = null;
-    let lastRefreshTs = 0;
-    const refresh = () => {
-      const now = Date.now();
-      if (now - lastRefreshTs < 10_000) return; // throttle: max once per 10s
-      lastRefreshTs = now;
-      lastReqId = ws.fsGitStatus(dir);
-    };
-    refreshGitStatusRef.current = refresh;
-
+    if (!ws || !connected || !dir) return;
     const unsub = ws.onMessage((msg) => {
-      // Handle git status response
-      if (msg.type === 'fs.git_status_response' && 'requestId' in msg && msg.requestId === lastReqId) {
-        const files = (msg as unknown as { files?: unknown[] }).files;
-        setGitChangesCount(Array.isArray(files) ? files.length : 0);
-      }
-      // Refresh on tool completion + session idle (throttled to max 1 per 10s)
-      if (msg.type === 'timeline.event') {
-        const evt = (msg as unknown as { event?: { type?: string; payload?: { state?: string } } }).event;
-        if (evt?.type === 'tool.result' || (evt?.type === 'session.state' && evt.payload?.state === 'idle')) {
-          refresh();
-        }
+      if (msg.type !== 'timeline.event') return;
+      const evt = (msg as unknown as { event?: { type?: string; payload?: { state?: string } } }).event;
+      if (evt?.type === 'tool.result' || (evt?.type === 'session.state' && evt.payload?.state === 'idle')) {
+        requestSharedChanges(ws, dir);
       }
     });
-
-    refresh(); // initial
-    const timer = setInterval(refresh, 30_000); // fallback poll
-
-    return () => { unsub(); clearInterval(timer); refreshGitStatusRef.current = null; };
+    return () => { unsub(); };
   }, [activeSessionInfo?.projectDir, connected]);
 
   // ── Auto-detect repo for active session (with retry) ───────────────────
@@ -3500,8 +3480,6 @@ export function App() {
               subSessions={subSessionsSlim}
               serverId={selectedServerId ?? undefined}
               inP2p={p2pSessionLabels.has(sub.sessionName)}
-              onOpenFileBrowser={toggleFileBrowser}
-              gitChangesCount={gitChangesCount}
               pendingPrefillText={pendingPrefills[sub.sessionName] ?? null}
               onPendingPrefillApplied={() => setPendingPrefills((prev) => {
                 if (!(sub.sessionName in prev)) return prev;
