@@ -39,6 +39,7 @@ import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import { isClaudeCodeFamily, isCodexFamily } from '../../shared/agent-types.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 import { resolveTransportContextBootstrap } from './runtime-context-bootstrap.js';
+import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 
 import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
@@ -1183,12 +1184,16 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         const { getQwenPresetTransportConfig } = await import('../daemon/cc-presets.js');
         const presetConfig = await getQwenPresetTransportConfig(s.ccPreset);
         extraEnv = { ...(extraEnv ?? {}), ...presetConfig.env };
-        if (!effectiveRequestedModel && presetConfig.model) effectiveRequestedModel = presetConfig.model;
-        transportSettings = presetConfig.settings;
+        // Preset is authoritative: its model overrides any stored value (e.g. a
+        // pre-preset session persisted `qwenModel: 'coder-model'` that is no
+        // longer valid under --auth-type anthropic). Restricting the available
+        // list to the preset model prevents the downstream fallback from
+        // reverting to the OAuth `coder-model` placeholder.
         if (presetConfig.model) {
-          const nextModels = new Set([...(availableQwenModels ?? []), presetConfig.model]);
-          availableQwenModels = [...nextModels];
+          effectiveRequestedModel = presetConfig.model;
+          availableQwenModels = [presetConfig.model];
         }
+        transportSettings = presetConfig.settings;
       }
       if (s.providerId === 'qwen'
         && (!effectiveRequestedModel || (availableQwenModels.length > 0 && !availableQwenModels.includes(effectiveRequestedModel)))) {
@@ -1244,14 +1249,28 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         // Preserve transportConfig exactly via ...s spread — never force `{}` which
         // would wipe user-set supervision settings on every daemon restart.
         ...(effectiveRequestedModel && s.providerId === 'qwen' ? { qwenModel: effectiveRequestedModel } : {}),
-        ...(qwenRuntime?.authType ? { qwenAuthType: qwenRuntime.authType } : {}),
-        ...(qwenRuntime?.authLimit ? { qwenAuthLimit: qwenRuntime.authLimit } : {}),
+        // When a qwen preset is active we're running `qwen --auth-type anthropic`
+        // against a user-provided API key (BYO tier). The user-level
+        // `~/.qwen/settings.json` tier labels ("Free", "No longer available")
+        // are misleading in that context, so override them for preset sessions.
+        qwenAuthType: (s.providerId === 'qwen' && s.ccPreset)
+          ? QWEN_AUTH_TYPES.API_KEY
+          : (qwenRuntime?.authType ?? s.qwenAuthType),
+        qwenAuthLimit: (s.providerId === 'qwen' && s.ccPreset)
+          ? undefined
+          : (qwenRuntime?.authLimit ?? s.qwenAuthLimit),
         ...(availableQwenModels.length > 0 ? { qwenAvailableModels: availableQwenModels } : {}),
         ...getQwenDisplayMetadata({
           model: effectiveRequestedModel,
-          authType: qwenRuntime?.authType ?? s.qwenAuthType,
-          authLimit: qwenRuntime?.authLimit ?? s.qwenAuthLimit,
-          quotaUsageLabel: (qwenRuntime?.authType ?? s.qwenAuthType) === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,
+          authType: (s.providerId === 'qwen' && s.ccPreset)
+            ? QWEN_AUTH_TYPES.API_KEY
+            : (qwenRuntime?.authType ?? s.qwenAuthType),
+          authLimit: (s.providerId === 'qwen' && s.ccPreset)
+            ? undefined
+            : (qwenRuntime?.authLimit ?? s.qwenAuthLimit),
+          quotaUsageLabel: (s.providerId === 'qwen' && s.ccPreset)
+            ? undefined
+            : ((qwenRuntime?.authType ?? s.qwenAuthType) === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined),
         }),
       });
       logger.info({ session: s.name, providerId: s.providerId, providerSid: s.providerSessionId, freshAfterCancel }, 'Restored transport session runtime');
@@ -1365,12 +1384,18 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
       const { getQwenPresetTransportConfig } = await import('../daemon/cc-presets.js');
       const presetConfig = await getQwenPresetTransportConfig(opts.ccPreset);
       transportEnv = { ...(transportEnv ?? {}), ...presetConfig.env };
-      if (!requestedTransportModel && presetConfig.model) requestedTransportModel = presetConfig.model;
-      if (presetConfig.settings) transportSettings = presetConfig.settings;
+      // Preset is authoritative — its model overrides any stored/requested
+      // model, and we restrict the available list so the fallback below can't
+      // revert to the OAuth placeholder (`coder-model`). We're spawning qwen
+      // with `--auth-type anthropic` against a BYO API key, so the OAuth tier
+      // labels ("Free", "No longer available") don't apply — clear them.
       if (presetConfig.model) {
-        const nextModels = new Set([...(availableQwenModels ?? []), presetConfig.model]);
-        availableQwenModels = [...nextModels];
+        requestedTransportModel = presetConfig.model;
+        availableQwenModels = [presetConfig.model];
       }
+      if (presetConfig.settings) transportSettings = presetConfig.settings;
+      qwenAuthType = QWEN_AUTH_TYPES.API_KEY;
+      qwenAuthLimit = undefined;
     }
     if (!requestedTransportModel || (availableQwenModels.length > 0 && !availableQwenModels.includes(requestedTransportModel))) {
       requestedTransportModel = availableQwenModels[0] ?? requestedTransportModel;

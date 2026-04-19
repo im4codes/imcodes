@@ -9,6 +9,7 @@ import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
 import { getCopilotRuntimeConfig } from '../agent/copilot-runtime-config.js';
 import { getCursorRuntimeConfig } from '../agent/cursor-runtime-config.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
+import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
 
 export interface SessionListItem extends SessionContextBootstrapState {
@@ -143,6 +144,22 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
   const copilotRuntime = needsCopilotHydration ? await getCopilotRuntimeConfig().catch(() => null) : null;
   const cursorRuntime = needsCursorHydration ? await getCursorRuntimeConfig().catch(() => null) : null;
 
+  // Collect preset-pinned models for all qwen sessions that have a ccPreset.
+  // Doing this once (before the map) avoids per-session dynamic imports inside
+  // a synchronous .map() callback. The preset model takes priority over
+  // qwenRuntime available models for display so preset sessions (e.g. MiniMax)
+  // show the correct model even when qwenRuntime hasn't loaded yet.
+  const presetModelBySession = new Map<string, string | undefined>();
+  if (needsQwenHydration) {
+    const { getPreset } = await import('./cc-presets.js');
+    for (const s of sessions) {
+      if (s.agentType === 'qwen' && s.ccPreset) {
+        const preset = await getPreset(s.ccPreset);
+        presetModelBySession.set(s.name, preset?.env?.['ANTHROPIC_MODEL']?.trim() || undefined);
+      }
+    }
+  }
+
   return sessions.map((s) => {
     if (s.agentType === 'claude-code-sdk') {
       const hydrated: Partial<SessionRecord> = {
@@ -199,23 +216,45 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
     }
     if (s.agentType !== 'qwen') return baseItem(s);
 
-    const qwenAuthType = s.qwenAuthType ?? qwenRuntime?.authType;
-    const qwenAuthLimit = s.qwenAuthLimit ?? qwenRuntime?.authLimit;
-    const qwenAvailableModels = s.qwenAvailableModels?.length
-      ? s.qwenAvailableModels
-      : (qwenRuntime?.availableModels?.length ? qwenRuntime.availableModels : undefined);
-    const qwenModel = s.qwenModel ?? qwenAvailableModels?.[0];
+    // Preset-backed qwen sessions run `qwen --auth-type anthropic` against a
+    // user-provided API key. The user-level `~/.qwen/settings.json` tier
+    // ("Free / qwen-oauth") and the "Limit: No longer available" string from
+    // `qwen auth status` don't apply in that context — override them so the
+    // footer shows "BYO" + the preset's pinned model instead of "coder-model
+    // No longer available". Non-preset qwen sessions keep the OAuth-derived
+    // tier labels so users see the real state of their CLI auth.
+    const presetActive = !!s.ccPreset;
+    const presetModel = presetModelBySession.get(s.name);
+
+    const qwenAuthType = presetActive
+      ? QWEN_AUTH_TYPES.API_KEY
+      : (s.qwenAuthType ?? qwenRuntime?.authType);
+    const qwenAuthLimit = presetActive
+      ? undefined
+      : (s.qwenAuthLimit ?? qwenRuntime?.authLimit);
+    const qwenAvailableModels = presetActive && presetModel
+      ? [presetModel]
+      : (s.qwenAvailableModels?.length
+          ? s.qwenAvailableModels
+          : (qwenRuntime?.availableModels?.length ? qwenRuntime.availableModels : undefined));
+    const qwenModel = presetModel ?? s.qwenModel ?? qwenAvailableModels?.[0];
+    // modelDisplay: prefer preset's pinned model, then session's existing
+    // modelDisplay, then the effective qwenModel. This ensures the preset
+    // model (MiniMax-M2.7) displays correctly even when qwenRuntime's
+    // availableModels hasn't loaded yet or the session was restored from
+    // persisted state without the preset context.
+    const displayModel = presetModel ?? s.modelDisplay ?? qwenModel;
     const displayMetadata = getQwenDisplayMetadata({
-      model: qwenModel,
+      model: displayModel,
       authType: qwenAuthType,
       authLimit: qwenAuthLimit,
-      quotaUsageLabel: qwenAuthType === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,
+      quotaUsageLabel: !presetActive && qwenAuthType === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,
     });
 
     const hydrated: Partial<SessionRecord> = {
       ...(qwenModel ? { qwenModel } : {}),
-      ...(qwenAuthType ? { qwenAuthType } : {}),
-      ...(qwenAuthLimit ? { qwenAuthLimit } : {}),
+      qwenAuthType,
+      qwenAuthLimit,
       ...(qwenAvailableModels?.length ? { qwenAvailableModels } : {}),
       ...displayMetadata,
     };

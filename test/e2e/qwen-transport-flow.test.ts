@@ -187,6 +187,10 @@ vi.mock('../../src/daemon/cc-presets.js', () => ({
       },
     },
   }) : { env: {} }),
+  getPreset: vi.fn(async (presetName: string) => presetName === 'MiniMax' ? ({
+    name: 'MiniMax',
+    env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+  }) : null),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({

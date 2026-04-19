@@ -126,6 +126,55 @@ describe('buildSessionList', () => {
     ]));
   });
 
+  it('preset-backed qwen sessions surface preset model + BYO tier, dropping OAuth labels', async () => {
+    const store = await import('../../src/store/session-store.js');
+    // Persisted record looks like an OAuth qwen session (e.g. created before
+    // the preset was added, or inherited from a stale restart) but now has a
+    // ccPreset set. The list surface should treat the preset as authoritative.
+    store.upsertSession({
+      name: 'deck_qwen_preset_brain',
+      projectName: 'demo',
+      role: 'brain',
+      agentType: 'qwen',
+      runtimeType: 'transport',
+      providerId: 'qwen',
+      providerSessionId: 'sid-preset',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      ccPreset: 'minimax',
+      qwenModel: 'coder-model',
+      qwenAuthType: 'qwen-oauth',
+      qwenAuthLimit: 'No longer available',
+      qwenAvailableModels: ['coder-model'],
+      modelDisplay: 'coder-model',
+    });
+
+    // Stub dynamic `./cc-presets.js` import — returns a preset pinned to
+    // MiniMax-M2.7 via ANTHROPIC_MODEL.
+    vi.doMock('../../src/daemon/cc-presets.js', () => ({
+      getPreset: vi.fn(async (name: string) => name === 'minimax'
+        ? { name: 'minimax', env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' } }
+        : undefined),
+    }));
+
+    const { buildSessionList } = await import('../../src/daemon/session-list.js');
+    const sessions = await buildSessionList();
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]).toMatchObject({
+      qwenAuthType: 'api-key',
+      qwenAvailableModels: ['MiniMax-M2.7'],
+      qwenModel: 'MiniMax-M2.7',
+      modelDisplay: 'MiniMax-M2.7',
+      planLabel: 'BYO',
+    });
+    expect(sessions[0].qwenAuthLimit).toBeUndefined();
+    expect(sessions[0].quotaLabel).toBeUndefined();
+    expect(sessions[0].quotaUsageLabel).toBeUndefined();
+  });
+
   it('preserves the session transportConfig snapshot in the list surface', async () => {
     const store = await import('../../src/store/session-store.js');
     store.upsertSession({
