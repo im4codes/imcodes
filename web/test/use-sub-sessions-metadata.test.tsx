@@ -21,8 +21,10 @@ vi.mock('../src/api.js', () => ({
 
 type MsgHandler = (msg: any) => void;
 
+const sentMessages: any[] = [];
 function createMockWs() {
   const handlers: MsgHandler[] = [];
+  const send = (msg: any) => { sentMessages.push(msg); handlers.forEach((h) => h(msg)); };
   return {
     ws: {
       subSessionRebuildAll: vi.fn(),
@@ -31,8 +33,9 @@ function createMockWs() {
         handlers.push(fn);
         return () => { const i = handlers.indexOf(fn); if (i >= 0) handlers.splice(i, 1); };
       }),
+      send,
     } as any,
-    send(msg: any) { handlers.forEach((h) => h(msg)); },
+    send,
   };
 }
 
@@ -70,7 +73,7 @@ function CreateHarness({ ws, connected }: { ws: any; connected: boolean }) {
 }
 
 describe('sub-session metadata via subsession.created', () => {
-  afterEach(() => { cleanup(); vi.clearAllMocks(); captured = []; });
+  afterEach(() => { cleanup(); vi.clearAllMocks(); captured = []; sentMessages.length = 0; });
 
   it('stores Qwen metadata fields from subsession.created', async () => {
     const { ws, send } = createMockWs();
@@ -578,6 +581,51 @@ describe('sub-session runtime type inference', () => {
     expect(created?.runtimeType).toBe('transport');
     expect(created?.providerId).toBe('copilot-sdk');
     expect(captured.at(-1)?.runtimeType).toBe('transport');
+  });
+
+  it('REGRESSION: copilot-sdk sends subsession.start (not subSessionStart) so the daemon receives transport fields', async () => {
+    const { ws } = createMockWs();
+    vi.mocked(createSubSession).mockResolvedValueOnce({
+      id: 'cp-start-test', sessionName: 'deck_sub_cp-start-test', subSession: {
+        id: 'cp-start-test', serverId: 'srv1', type: 'copilot-sdk', runtimeType: null,
+        providerId: null, providerSessionId: null, cwd: '/tmp/project', label: 'CP',
+        closedAt: null, createdAt: Date.now(), updatedAt: Date.now(),
+        ccSessionId: null, geminiSessionId: null, parentSession: null,
+        description: null, ccPresetId: null, requestedModel: null,
+        activeModel: null, modelDisplay: null, effort: null, transportConfig: null,
+      },
+    } as any);
+
+    render(<CreateHarness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    await createSubSessionHook?.('copilot-sdk', undefined, '/tmp/project', 'CP');
+    // Previously broken: only qwen/openclaw used ws.send; copilot-sdk fell through
+    // to subSessionStart which omits transport fields (requestedModel/thinking/
+    // transportConfig), causing chat subscription to appear stuck.
+    expect(sentMessages.some((m) => m.type === 'subsession.start' && m.sessionType === 'copilot-sdk')).toBe(true);
+    expect(ws.subSessionStart).not.toHaveBeenCalled();
+  });
+
+  it('REGRESSION: cursor-headless sends subsession.start (not subSessionStart)', async () => {
+    const { ws } = createMockWs();
+    vi.mocked(createSubSession).mockResolvedValueOnce({
+      id: 'cu-start-test', sessionName: 'deck_sub_cu-start-test', subSession: {
+        id: 'cu-start-test', serverId: 'srv1', type: 'cursor-headless', runtimeType: null,
+        providerId: null, providerSessionId: null, cwd: '/tmp/project', label: 'CU',
+        closedAt: null, createdAt: Date.now(), updatedAt: Date.now(),
+        ccSessionId: null, geminiSessionId: null, parentSession: null,
+        description: null, ccPresetId: null, requestedModel: null,
+        activeModel: null, modelDisplay: null, effort: null, transportConfig: null,
+      },
+    } as any);
+
+    render(<CreateHarness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    await createSubSessionHook?.('cursor-headless', undefined, '/tmp/project', 'CU');
+    expect(sentMessages.some((m) => m.type === 'subsession.start' && m.sessionType === 'cursor-headless')).toBe(true);
+    expect(ws.subSessionStart).not.toHaveBeenCalled();
   });
 });
 

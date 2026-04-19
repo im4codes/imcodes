@@ -436,13 +436,15 @@ export function useSubSessions(
       };
       setSubSessions((prev) => [...prev, sub]);
       // Ask daemon to start it — transport providers may need extra fields
-      // (requestedModel / transportConfig / thinking / ocMode / etc.). The daemon's
-      // `subsession.start` handler reads these off the wire message, so ALL
-      // transport agent types must include `extra` — not just qwen/openclaw.
-      // Dropping extras for copilot-sdk / cursor-headless here was causing their
-      // chat subscription to appear "stuck" (no model configured → provider
-      // never produced a response).
-      if (isTransportSessionAgentType(type) && extra) {
+      // ALL transport agent types (qwen/openclaw/copilot-sdk/cursor-headless/
+      // claude-code-sdk/codex-sdk) need the full subsession.start message so the
+      // daemon receives transport fields (requestedModel, thinking/effort,
+      // transportConfig, ccSessionId, etc.). Previously only qwen/openclaw used ws.send;
+      // copilot-sdk/cursor-headless fell through to subSessionStart which omits those
+      // fields, causing chat subscriptions to appear "stuck" (no model → no response).
+      // Use `isTransportSessionAgentType(type)` as the primary guard (not && extra)
+      // so that copilot/cursor work even when extra is falsy.
+      if (isTransportSessionAgentType(type)) {
         ws?.send({
           type: 'subsession.start',
           id: sub.id,
@@ -450,10 +452,10 @@ export function useSubSessions(
           cwd,
           ccSessionId,
           parentSession: activeSession,
-          ...extra,
+          ...(extra ?? {}),
         });
-      } else if (extra?.ccPreset || extra?.ccInitPrompt || extra?.thinking) {
-        // CC with preset — send as raw message to include extra fields
+      } else if (extra?.ccPreset || extra?.ccInitPrompt) {
+        // Plain claude-code with preset — no transport provider but has CC extras
         ws?.send({
           type: 'subsession.start',
           id: sub.id,
