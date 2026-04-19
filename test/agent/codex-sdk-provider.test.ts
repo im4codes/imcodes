@@ -385,7 +385,7 @@ describe('CodexSdkProvider', () => {
     expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(2);
   });
 
-  it('emits WebSearch tool events for webSearch items', async () => {
+  it('emits WebSearch tool events for webSearch items (legacy top-level query)', async () => {
     const provider = new CodexSdkProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-websearch', cwd: '/tmp/project' });
@@ -406,32 +406,74 @@ describe('CodexSdkProvider', () => {
     child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
     await flush();
 
-    expect(tools).toEqual([
-      {
-        name: 'WebSearch',
-        status: 'running',
-        input: { query: 'nyc weather' },
-        detail: {
-          kind: 'webSearch',
-          summary: 'nyc weather',
-          input: { query: 'nyc weather', action: undefined },
-          meta: { actionType: undefined },
-          raw: { id: 'ws-1', type: 'webSearch', query: 'nyc weather' },
-        },
-      },
-      {
-        name: 'WebSearch',
-        status: 'complete',
-        input: { query: 'nyc weather', action: { type: 'search', query: 'nyc weather' } },
-        detail: {
-          kind: 'webSearch',
-          summary: 'nyc weather',
-          input: { query: 'nyc weather', action: { type: 'search', query: 'nyc weather' } },
-          meta: { actionType: 'search' },
-          raw: { id: 'ws-1', type: 'webSearch', query: 'nyc weather', action: { type: 'search', query: 'nyc weather' } },
-        },
-      },
-    ]);
+    expect(tools[0].name).toBe('WebSearch');
+    expect((tools[0].input as { query: string }).query).toBe('nyc weather');
+    expect(tools[1].name).toBe('WebSearch');
+    expect((tools[1].input as { query: string }).query).toBe('nyc weather');
+    const detail = tools[1].detail as { kind: string; summary: string; meta: { actionType?: string } };
+    expect(detail.kind).toBe('webSearch');
+    expect(detail.summary).toBe('nyc weather');
+    expect(detail.meta.actionType).toBe('search');
+  });
+
+  it('extracts WebSearch query from action.query when item.query is absent (current Codex CLI shape)', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-websearch-action', cwd: '/tmp/project' });
+
+    const tools: Array<{ name: string; status: string; input: unknown; detail?: unknown }> = [];
+    provider.onToolCall((_, tool) => tools.push({ name: tool.name, status: tool.status, input: tool.input, detail: tool.detail }));
+
+    await provider.send('route-websearch-action', 'search');
+    const child = childProcessMock.children[0];
+    // Modern Codex CLI: top-level `query` absent, query lives under `action.query`.
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-2', type: 'webSearch', action: { type: 'search', query: 'minimax glm pricing' } } },
+    });
+    child.emits({
+      method: 'item/completed',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-2', type: 'webSearch', action: { type: 'search', query: 'minimax glm pricing' } } },
+    });
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+    await flush();
+
+    expect((tools[0].input as { query: string }).query).toBe('minimax glm pricing');
+    expect((tools[1].input as { query: string }).query).toBe('minimax glm pricing');
+    const detail = tools[1].detail as { summary: string; meta: { actionType?: string } };
+    expect(detail.summary).toBe('minimax glm pricing');
+    expect(detail.meta.actionType).toBe('search');
+  });
+
+  it('falls back to action url/pattern/type for non-search WebSearch actions', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-websearch-other', cwd: '/tmp/project' });
+
+    const tools: Array<{ name: string; status: string; input: unknown; detail?: unknown }> = [];
+    provider.onToolCall((_, tool) => tools.push({ name: tool.name, status: tool.status, input: tool.input, detail: tool.detail }));
+
+    await provider.send('route-websearch-other', 'search');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/completed',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-3', type: 'webSearch', action: { type: 'open_page', url: 'https://example.com/article' } } },
+    });
+    child.emits({
+      method: 'item/completed',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-4', type: 'webSearch', action: { type: 'find_in_page', pattern: 'pricing' } } },
+    });
+    child.emits({
+      method: 'item/completed',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-5', type: 'webSearch', action: { type: 'other' } } },
+    });
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+    await flush();
+
+    const summaries = tools.map((t) => (t.detail as { summary?: string }).summary);
+    expect(summaries[0]).toBe('https://example.com/article');
+    expect(summaries[1]).toBe('pricing');
+    expect(summaries[2]).toBe('(other)');
   });
 
   it('applies thinking level to subsequent Codex SDK turns', async () => {

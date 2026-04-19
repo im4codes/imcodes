@@ -132,26 +132,54 @@ function toolFromItem(item: Record<string, any>, lifecycle: 'started' | 'complet
           raw: item,
         },
       };
-    case 'webSearch':
+    case 'webSearch': {
+      // The Codex CLI emits `WebSearchAction` as a tagged enum:
+      //   { type: 'search',        query: '...' }
+      //   { type: 'find_in_page',  pattern: '...', url?: '...' }
+      //   { type: 'open_page',     url:   '...' }
+      //   { type: 'other' }                       // unknown / catch-all
+      //
+      // Older CLI versions also surfaced a top-level `item.query`. The
+      // current binary does NOT — for the `search` variant the query is
+      // nested under `item.action.query`, and for the catch-all `other`
+      // there's no query at all. Without this fallback the chat UI shows
+      // every WebSearch as `{"query":"","action":{"type":"other"}}`.
+      const action = item.action as Record<string, unknown> | undefined;
+      const actionType = typeof action?.type === 'string' ? action.type : undefined;
+      const actionQuery = typeof action?.query === 'string' ? action.query : undefined;
+      const actionPattern = typeof action?.pattern === 'string' ? action.pattern : undefined;
+      const actionUrl = typeof action?.url === 'string' ? action.url : undefined;
+      const topLevelQuery = typeof item.query === 'string' ? item.query : undefined;
+      const summary = topLevelQuery
+        ?? actionQuery
+        ?? actionPattern
+        ?? actionUrl
+        ?? (actionType ? `(${actionType})` : undefined);
+      const effectiveQuery = topLevelQuery ?? actionQuery ?? '';
       return {
         id: item.id,
         name: 'WebSearch',
         status: lifecycle === 'started' ? 'running' : 'complete',
         input: {
-          query: item.query,
-          ...(item.action ? { action: item.action } : {}),
+          query: effectiveQuery,
+          ...(actionPattern ? { pattern: actionPattern } : {}),
+          ...(actionUrl ? { url: actionUrl } : {}),
+          ...(action ? { action } : {}),
         },
         detail: {
           kind: 'webSearch',
-          summary: item.query,
+          summary,
           input: {
-            query: item.query,
-            action: item.action,
+            query: effectiveQuery,
+            ...(actionPattern ? { pattern: actionPattern } : {}),
+            ...(actionUrl ? { url: actionUrl } : {}),
+            action,
           },
-          meta: { actionType: item.action?.type },
+          meta: { actionType },
           raw: item,
         },
       };
+    }
     default:
       return null;
   }
