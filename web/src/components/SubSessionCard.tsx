@@ -360,6 +360,17 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
                   // sub-session card — parity with SessionPane and
                   // SubSessionWindow. Shell/script cards have no helper
                   // (no chat timeline) so the call is a no-op there.
+                  //
+                  // Exception: P2P command sends do not belong in the
+                  // sub-session's own chat — they start a discussion run
+                  // whose conversation lives in the discussion file.
+                  const extras = meta?.extra as Record<string, unknown> | undefined;
+                  const isP2pSend = !!extras && (
+                    Array.isArray(extras.p2pAtTargets) && extras.p2pAtTargets.length > 0
+                    || (typeof extras.p2pMode === 'string' && extras.p2pMode.length > 0)
+                    || (extras.p2pSessionConfig != null && typeof extras.p2pSessionConfig === 'object')
+                  );
+                  if (isP2pSend) return;
                   addOptimisticUserMessage?.(text, meta?.commandId, {
                     ...(meta?.attachments ? { attachments: meta.attachments } : {}),
                     ...(meta?.extra ? { resendExtra: meta.extra } : {}),

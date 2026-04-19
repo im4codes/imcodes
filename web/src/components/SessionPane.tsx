@@ -331,6 +331,23 @@ export function SessionPane({
             // watcher or terminal scraper, which can lag several seconds — the
             // optimistic bubble is the whole point of this path. Either way,
             // attaching commandId lets the "red !" retry path work uniformly.
+            //
+            // EXCEPT for P2P commands: `@@all(discuss) xxx` / `@@label(audit) xxx`
+            // is a command to start a P2P run — not a chat message to the
+            // main session's agent. Injecting an optimistic bubble leaves a
+            // stray user message in the main session's timeline (the real
+            // conversation lives in .imc/discussions/<run>.md). Detect via
+            // the payload extras the composer attaches for structured P2P
+            // dispatch (p2pAtTargets / p2pMode / p2pSessionConfig). Skip
+            // bubble injection entirely; the daemon emits `p2p.run_started`
+            // which the discussions UI surfaces as its own run card.
+            const extras = meta?.extra as Record<string, unknown> | undefined;
+            const isP2pSend = !!extras && (
+              Array.isArray(extras.p2pAtTargets) && extras.p2pAtTargets.length > 0
+              || (typeof extras.p2pMode === 'string' && extras.p2pMode.length > 0)
+              || (extras.p2pSessionConfig != null && typeof extras.p2pSessionConfig === 'object')
+            );
+            if (isP2pSend) return;
             addOptimisticUserMessage(text, meta?.commandId, {
               ...(meta?.attachments ? { attachments: meta.attachments } : {}),
               ...(meta?.extra ? { resendExtra: meta.extra } : {}),

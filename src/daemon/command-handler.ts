@@ -1644,38 +1644,20 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         advancedRunTimeoutMs: p2pAdvancedRunTimeoutMinutes != null ? p2pAdvancedRunTimeoutMinutes * 60_000 : undefined,
         contextReducer: p2pContextReducer,
       });
-      // Close the loop on the web's optimistic pending bubble.
+      // NOTE: do NOT emit a `user.message` on the initiator timeline here.
+      // A P2P send is a COMMAND to start a discussion, not a chat message to
+      // the main session's agent — it belongs in .imc/discussions/<run>.md,
+      // not in the main session's chat stream. The web side is expected to
+      // skip the optimistic pending bubble entirely when the send payload
+      // carries p2pAtTargets/p2pMode (see SessionPane.onSend guard); with
+      // no pending bubble to reconcile, no echo is needed.
       //
-      // The P2P path takes the `session.send` command on the wire like any
-      // normal text send, which causes SessionControls → SessionPane to
-      // inject a `pending: true` user.message into the timeline keyed by
-      // commandId. `useTimeline`'s reconciliation (web/src/hooks/useTimeline
-      // .ts L575-594) clears that pending state ONLY when a subsequent
-      // `user.message` arrives carrying the same `commandId` (or
-      // `clientMessageId`) — `command.ack` alone merely cancels the 30s
-      // failure timer, it does NOT remove the spinner.
-      //
-      // Non-P2P transport sends emit this echo via emitTransportUserMessage
-      // (L1657-1672 below). Before this fix the P2P branch emitted only
-      // `command.ack accepted` + `p2p.run_started`, so the optimistic
-      // bubble stayed in its `pending` state forever and the user
-      // perceived "can't send P2P" — retry re-issued the same command,
-      // same accepted-ack, same stuck spinner. Regression introduced by
-      // commit 2986702 ("Add optimistic send UX — spinner while sending,
-      // red ! on failure with retry") which changed the web contract but
-      // didn't teach the P2P dispatch path about it.
-      timelineEmitter.emit(
-        sessionName,
-        'user.message',
-        {
-          text: tokens.cleanText,
-          commandId: effectiveId,
-          clientMessageId: effectiveId,
-          allowDuplicate: true,
-          p2pRunId: run.id,
-        },
-        { source: 'daemon', confidence: 'high', eventId: `p2p-user:${effectiveId}` },
-      );
+      // A previous commit (96218b5) mistakenly added a user.message echo
+      // here "to clear the stuck spinner" — that fixed the spinner but
+      // made every P2P send leave a stray committed user bubble in the
+      // main session's chat, which the user correctly flagged as wrong
+      // ("应该拦截掉发起 p2p 讨论"). The correct fix is at the web
+      // composer: never inject the optimistic bubble for P2P sends.
       const status = isLegacy ? 'accepted_legacy' : 'accepted';
       timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
       try {

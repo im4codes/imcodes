@@ -521,6 +521,17 @@ export function SubSessionWindow({
           // daemon's echoed user.message (transport) or the JSONL scrape lag
           // (process). Uses the same contract as SessionPane — bubble keyed
           // by commandId, reconciled when the authoritative echo arrives.
+          //
+          // Exception: P2P command sends (`@@all(...) ...`, structured
+          // p2pMode / p2pAtTargets). Those belong to a discussion file, not
+          // the sub-session's own chat. Matches the SessionPane guard.
+          const extras = meta?.extra as Record<string, unknown> | undefined;
+          const isP2pSend = !!extras && (
+            Array.isArray(extras.p2pAtTargets) && extras.p2pAtTargets.length > 0
+            || (typeof extras.p2pMode === 'string' && extras.p2pMode.length > 0)
+            || (extras.p2pSessionConfig != null && typeof extras.p2pSessionConfig === 'object')
+          );
+          if (isP2pSend) return;
           addOptimisticUserMessage(text, meta?.commandId, {
             ...(meta?.attachments ? { attachments: meta.attachments } : {}),
             ...(meta?.extra ? { resendExtra: meta.extra } : {}),
