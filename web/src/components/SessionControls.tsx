@@ -601,11 +601,23 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const isCopilot = activeSession?.agentType === 'copilot-sdk';
   const isCursorHeadless = activeSession?.agentType === 'cursor-headless';
   const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless;
-  const genericTransportModelSuggestions = isCopilot
-    ? COPILOT_SDK_MODEL_SUGGESTIONS
-    : isCursorHeadless
-      ? CURSOR_HEADLESS_MODEL_SUGGESTIONS
-      : [];
+  // Prefer the full daemon-probed model list (Copilot SDK `listModels()` /
+  // `cursor-agent --list-models`) so users see every supported model, not
+  // just the hardcoded suggestions. Fall back to the suggestions when the
+  // probe hasn't completed yet (first paint after fresh daemon start).
+  const genericTransportModelSuggestions: readonly string[] = useMemo(() => {
+    if (isCopilot) {
+      const probed = activeSession?.copilotAvailableModels;
+      if (probed && probed.length > 0) return probed;
+      return COPILOT_SDK_MODEL_SUGGESTIONS;
+    }
+    if (isCursorHeadless) {
+      const probed = activeSession?.cursorAvailableModels;
+      if (probed && probed.length > 0) return probed;
+      return CURSOR_HEADLESS_MODEL_SUGGESTIONS;
+    }
+    return [];
+  }, [isCopilot, isCursorHeadless, activeSession?.copilotAvailableModels, activeSession?.cursorAvailableModels]);
   const genericTransportModel = activeSession?.activeModel
     ?? activeSession?.requestedModel
     ?? detectedModel

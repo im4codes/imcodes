@@ -51,6 +51,13 @@ export interface SessionRecord extends SessionContextBootstrapState {
   qwenAuthLimit?: string;
   /** Qwen models available for the current auth source. */
   qwenAvailableModels?: string[];
+  /** Copilot models reported by `client.listModels()` (full SDK list, not the
+   *  hardcoded fallback). Hydrated by `buildSessionList` for `copilot-sdk`
+   *  agent sessions so the web model picker can show every supported model. */
+  copilotAvailableModels?: string[];
+  /** Cursor models reported by `cursor-agent --list-models`. Hydrated by
+   *  `buildSessionList` for `cursor-headless` agent sessions. */
+  cursorAvailableModels?: string[];
   /** Generic display model override for UI footer/header. */
   modelDisplay?: string;
   /** User-requested transport model persisted for restart/rebuild/cross-device restore. */

@@ -6,6 +6,8 @@ import { getQwenDisplayMetadata } from '../agent/provider-display.js';
 import { getQwenOAuthQuotaUsageLabel } from '../agent/provider-quota.js';
 import { getClaudeSdkRuntimeConfig } from '../agent/sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
+import { getCopilotRuntimeConfig } from '../agent/copilot-runtime-config.js';
+import { getCursorRuntimeConfig } from '../agent/cursor-runtime-config.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
 
@@ -26,6 +28,8 @@ export interface SessionListItem extends SessionContextBootstrapState {
   qwenAuthType?: string;
   qwenAuthLimit?: string;
   qwenAvailableModels?: string[];
+  copilotAvailableModels?: string[];
+  cursorAvailableModels?: string[];
   modelDisplay?: string;
   planLabel?: string;
   permissionLabel?: string;
@@ -73,6 +77,8 @@ function baseItem(s: SessionRecord): SessionListItem {
     qwenAuthType: s.qwenAuthType,
     qwenAuthLimit: s.qwenAuthLimit,
     qwenAvailableModels: s.qwenAvailableModels,
+    copilotAvailableModels: s.copilotAvailableModels,
+    cursorAvailableModels: s.cursorAvailableModels,
     modelDisplay: s.modelDisplay ?? s.activeModel,
     planLabel: s.planLabel,
     permissionLabel: s.permissionLabel,
@@ -129,9 +135,13 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
   const needsQwenHydration = sessions.some((s) => s.agentType === 'qwen');
   const needsClaudeSdkHydration = sessions.some((s) => s.agentType === 'claude-code-sdk');
   const needsCodexHydration = sessions.some((s) => (s.agentType === 'codex' || s.agentType === 'codex-sdk'));
+  const needsCopilotHydration = sessions.some((s) => s.agentType === 'copilot-sdk');
+  const needsCursorHydration = sessions.some((s) => s.agentType === 'cursor-headless');
   const qwenRuntime = needsQwenHydration ? await getQwenRuntimeConfig().catch(() => null) : null;
   const claudeSdkRuntime = needsClaudeSdkHydration ? await getClaudeSdkRuntimeConfig().catch(() => ({}) as import('../agent/sdk-runtime-config.js').SdkRuntimeConfig) : null;
   const codexRuntime = needsCodexHydration ? await getCodexRuntimeConfig().catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig) : null;
+  const copilotRuntime = needsCopilotHydration ? await getCopilotRuntimeConfig().catch(() => null) : null;
+  const cursorRuntime = needsCursorHydration ? await getCursorRuntimeConfig().catch(() => null) : null;
 
   return sessions.map((s) => {
     if (s.agentType === 'claude-code-sdk') {
@@ -159,6 +169,30 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
         || hydrated.quotaUsageLabel != s.quotaUsageLabel
         || !providerQuotaMetaEquals(hydrated.quotaMeta, s.quotaMeta)
       ) {
+        upsertSession({ ...s, ...hydrated, updatedAt: Date.now() });
+      }
+      return { ...baseItem(s), ...hydrated };
+    }
+    if (s.agentType === 'copilot-sdk') {
+      const available = copilotRuntime?.availableModels?.length
+        ? copilotRuntime.availableModels
+        : s.copilotAvailableModels;
+      const hydrated: Partial<SessionRecord> = {
+        ...(available?.length ? { copilotAvailableModels: available } : {}),
+      };
+      if (!arraysEqual(hydrated.copilotAvailableModels, s.copilotAvailableModels)) {
+        upsertSession({ ...s, ...hydrated, updatedAt: Date.now() });
+      }
+      return { ...baseItem(s), ...hydrated };
+    }
+    if (s.agentType === 'cursor-headless') {
+      const available = cursorRuntime?.availableModels?.length
+        ? cursorRuntime.availableModels
+        : s.cursorAvailableModels;
+      const hydrated: Partial<SessionRecord> = {
+        ...(available?.length ? { cursorAvailableModels: available } : {}),
+      };
+      if (!arraysEqual(hydrated.cursorAvailableModels, s.cursorAvailableModels)) {
         upsertSession({ ...s, ...hydrated, updatedAt: Date.now() });
       }
       return { ...baseItem(s), ...hydrated };
