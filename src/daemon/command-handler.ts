@@ -563,9 +563,29 @@ function expandAllTargets(initiatorName: string, mode: string, excludeSameType =
 
     if (sessionConfig) {
       const entry = sessionConfig[s.name];
-      if (!entry || !entry.enabled) continue;        // strict: missing = excluded
-      if (entry.mode === 'skip') continue;
-      targets.push({ session: s.name, mode: mode === P2P_CONFIG_MODE ? entry.mode : mode });
+      // Semantics: a saved P2P config is an EXCLUSION list plus a mode
+      // override table. Entries with `enabled: false` or `mode: 'skip'`
+      // are explicit opt-outs. MISSING entries default to INCLUDED,
+      // using `mode` (the dropdown / combo override) as their mode.
+      //
+      // Previous semantics ("missing = excluded") was too strict:
+      // whenever the user's saved config grew stale (sub-session names
+      // change on restart, new sessions join the project, etc.) every
+      // active session got filtered out → daemon emitted
+      // `P2P: config filtered all eligible structured-routing targets`
+      // → `command.ack error` with `no_configured_targets`. Combined
+      // with the web intercepting the optimistic bubble for P2P sends
+      // (so `markOptimisticFailed` becomes a no-op), the user
+      // experiences a silent failure where "P2P just doesn't start"
+      // with no visible error.
+      //
+      // Entries for CONFIGURED sessions still win — if a user opted a
+      // session out, it stays out. This change only rescues the stale-
+      // config case by treating never-configured sessions as "no
+      // preference expressed → include by default".
+      if (entry && (entry.enabled === false || entry.mode === 'skip')) continue;
+      const effectiveMode = (entry && mode === P2P_CONFIG_MODE) ? entry.mode : mode;
+      targets.push({ session: s.name, mode: effectiveMode });
     } else {
       targets.push({ session: s.name, mode });
     }

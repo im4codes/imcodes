@@ -1749,6 +1749,46 @@ export function App() {
         // Auto-dismiss after 10 seconds
         setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 10_000);
       }
+      // P2P command errors surface as `command.ack status:error` with a
+      // specific `error` code. `useTimeline` handles them per-session by
+      // flipping an optimistic bubble to failed-"!", but the web composer
+      // now INTERCEPTS optimistic bubbles for P2P sends (they belong to
+      // the discussion file, not the chat) — so without this top-level
+      // toast there is literally no UI feedback and P2P failures look
+      // like the daemon ate the command silently. Handle here so the
+      // user can see what happened and open the config panel.
+      if (msg.type === 'command.ack'
+        && (msg as { status?: unknown }).status === 'error'
+        && typeof (msg as { error?: unknown }).error === 'string') {
+        const errorCode = (msg as { error: string }).error;
+        const knownP2pErrors = new Set<string>([
+          'no_configured_targets',
+          'no_sessions',
+          'no_valid_targets',
+        ]);
+        if (knownP2pErrors.has(errorCode)) {
+          const titleMap: Record<string, string> = {
+            no_configured_targets: 'P2P: no configured participants',
+            no_sessions: 'P2P: no eligible sessions',
+            no_valid_targets: 'P2P: targets not found',
+          };
+          const bodyMap: Record<string, string> = {
+            no_configured_targets: 'All eligible sessions are opt-out or absent from your saved P2P config. Open the P2P panel and enable the sessions you want to include.',
+            no_sessions: 'No other active sessions in this project/domain to dispatch to.',
+            no_valid_targets: 'The @@ targets you referenced do not match any active sessions.',
+          };
+          const id = Date.now() + Math.random();
+          setToasts((prev) => [...prev, {
+            id,
+            sessionName: '',
+            project: '',
+            kind: 'notification',
+            title: titleMap[errorCode] ?? 'P2P send failed',
+            message: bodyMap[errorCode] ?? errorCode,
+          }]);
+          setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 8000);
+        }
+      }
       if (msg.type === DAEMON_MSG.RECONNECTED) {
         setDaemonOnline(true);
         // Daemon process (re)started — all its subscriptions are gone.
