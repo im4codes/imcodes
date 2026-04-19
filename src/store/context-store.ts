@@ -690,14 +690,30 @@ export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}
   }
 
   if (filters.scope) {
-    // Full prefix match — scope is the leading field so the LIKE query hits the index.
-    const nsPrefix = [
-      filters.scope,
-      filters.enterpriseId ?? '',
-      filters.workspaceId ?? '',
-      filters.userId ?? '',
-      filters.projectId ?? '',
-    ].join('::');
+    // Build a LIKE prefix from ONLY the contiguous leading namespace fields.
+    // namespace_key format is `scope::enterprise::workspace::user::project`, so
+    // blindly joining all filter fields produces a wrong prefix when the
+    // filter skips a middle field. E.g. `{scope:'personal', projectId:'repo'}`
+    // was producing LIKE `personal::::::::repo%` (8 colons, empty user) which
+    // never matches a stored row with userId='user-1' keyed as
+    // `personal::::::user-1::repo` (6 colons, populated user). We stop at the
+    // first missing leading field and let the JS-side filter at the bottom
+    // enforce the remaining conditions. This preserves index usage for the
+    // common fully-populated case while fixing the gap case.
+    const leadingParts: string[] = [filters.scope];
+    if (filters.enterpriseId) {
+      leadingParts.push(filters.enterpriseId);
+      if (filters.workspaceId) {
+        leadingParts.push(filters.workspaceId);
+        if (filters.userId) {
+          leadingParts.push(filters.userId);
+          if (filters.projectId) {
+            leadingParts.push(filters.projectId);
+          }
+        }
+      }
+    }
+    const nsPrefix = leadingParts.join('::');
     conditions.push('namespace_key LIKE ?');
     params.push(nsPrefix + '%');
   }

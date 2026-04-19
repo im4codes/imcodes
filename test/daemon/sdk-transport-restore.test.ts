@@ -319,19 +319,23 @@ describe('sdk transport session restore', () => {
     const runtime = getTransportRuntime('deck_sdk_startup_brain');
     expect(runtime).toBeDefined();
     runtime!.send('first turn that surfaces seeded startup memory');
-    // Wait for dispatch → provider.send → turn/completed round-trip.
-    for (let i = 0; i < 30; i++) {
-      await new Promise((r) => setTimeout(r, 10));
-      if (mocks.codexRuns.length > 0) break;
-    }
-    // One more flush for the post-completion _onStartupMemoryInjected callback.
-    await flush();
 
-    const startupCall = timelineEmitterEmitMock.mock.calls.find(([session, type, payload]) =>
+    // Poll for the startup card directly — waiting on `codexRuns.length > 0`
+    // is not enough because the card fires after `turn/completed` returns and
+    // the post-dispatch `emitStartupMemoryContext` runs. CI runners are
+    // slower than dev boxes, so wait on the actual terminal signal with a
+    // generous budget instead of a fixed microtask/setTimeout cap.
+    const findStartupCall = () => timelineEmitterEmitMock.mock.calls.find(([session, type, payload]) =>
       session === 'deck_sdk_startup_brain'
       && type === 'memory.context'
       && (payload as Record<string, unknown>).reason === 'startup',
     );
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline && !findStartupCall()) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+
+    const startupCall = findStartupCall();
     expect(startupCall).toBeDefined();
     expect(startupCall?.[2]).toEqual(expect.objectContaining({
       reason: 'startup',
