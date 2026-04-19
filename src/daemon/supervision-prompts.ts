@@ -75,6 +75,25 @@ export function buildSupervisionContinuePrompt(
   customInstructions?: string,
   contractId: string = SUPERVISION_CONTRACT_IDS.CONTINUE,
 ): string {
+  // Continue prompt goes to the TARGET session's chat (user-visible), not to
+  // the supervisor judge. It must stay a lightweight nudge — the IM.codes
+  // capability background is NOT injected here, because:
+  //   1. The target session already has `customInstructions` in its own
+  //      system prompt / session config, and its chat history retains the
+  //      original user request and last assistant turn.
+  //   2. The capability docs are authored to help the SUPERVISOR classify
+  //      workflows (OpenSpec / P2P / imcodes send) as autonomous work, not
+  //      to re-teach the target agent what tools it already has.
+  // Previously this function appended buildImcodesWorkflowBackgroundSection()
+  // here; that dumped ~80 lines of operator-facing docs into every continue
+  // turn, leaking into user-visible chat and polluting downstream P2P runs
+  // that harvested the latest message as `userText`.
+  //
+  // The taskRequest + assistantResponse restatements are kept because some
+  // transport providers rehydrate conversation state per-turn from the
+  // payload rather than from server-side history; dropping them risks the
+  // agent losing task framing mid-run. They're cheap (a few KB) compared to
+  // the background block we removed.
   return [
     `[Contract: ${contractId}]`,
     'Continue working on the same task.',
@@ -82,7 +101,6 @@ export function buildSupervisionContinuePrompt(
     'Do not restart from scratch or restate completed work.',
     'Focus only on the remaining steps needed to finish the task.',
     'If you are truly blocked or need clarification, say that explicitly.',
-    buildImcodesWorkflowBackgroundSection(),
     buildCustomInstructionsSection(customInstructions),
     '',
     'Original task request:',
