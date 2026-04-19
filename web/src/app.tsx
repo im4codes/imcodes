@@ -1885,7 +1885,7 @@ export function App() {
         try { ws.unsubscribeTransportSession(name); } catch { /* ignore */ }
       }
     };
-  }, [connected, subSessionNamesKey, subSessions]);
+  }, [connected, transportSubSessionKey, subSessions]);
 
   // When switching to a session in terminal mode, trigger fit.
   // All sessions are subscribed to PTY streaming, so xterm buffer is already current —
