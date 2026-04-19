@@ -256,6 +256,24 @@ function supportsTransportClear(agentType: string | undefined): agentType is 'cl
     || agentType === 'qwen';
 }
 
+/**
+ * Transport agents that benefit from server-side `/compact` interception.
+ * None of the underlying SDKs expose a programmatic compact API (claude-code-sdk
+ * only emits compact_boundary events, never accepts a manual trigger), so we
+ * synthesize compaction by:
+ *   1. Loading the session's transport-history events,
+ *   2. Calling `compressWithSdk` (the same memory-compression pipeline used for
+ *      shared context), which routes to the user's configured context backend,
+ *   3. Restarting a fresh transport conversation (same as `/clear`),
+ *   4. Surfacing the summary in chat as a memory-excluded assistant.text.
+ *
+ * Result: zero token bloat in the agent's context, but the user keeps the
+ * compressed history visible in the timeline for reference.
+ */
+function supportsTransportCompact(agentType: string | undefined): agentType is 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'openclaw' | 'qwen' {
+  return supportsTransportClear(agentType);
+}
+
 function supportsProcessClear(agentType: string | undefined): agentType is 'claude-code' | 'codex' | 'opencode' {
   return agentType === 'claude-code' || agentType === 'codex' || agentType === 'opencode';
 }
@@ -1626,6 +1644,38 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         advancedRunTimeoutMs: p2pAdvancedRunTimeoutMinutes != null ? p2pAdvancedRunTimeoutMinutes * 60_000 : undefined,
         contextReducer: p2pContextReducer,
       });
+      // Close the loop on the web's optimistic pending bubble.
+      //
+      // The P2P path takes the `session.send` command on the wire like any
+      // normal text send, which causes SessionControls → SessionPane to
+      // inject a `pending: true` user.message into the timeline keyed by
+      // commandId. `useTimeline`'s reconciliation (web/src/hooks/useTimeline
+      // .ts L575-594) clears that pending state ONLY when a subsequent
+      // `user.message` arrives carrying the same `commandId` (or
+      // `clientMessageId`) — `command.ack` alone merely cancels the 30s
+      // failure timer, it does NOT remove the spinner.
+      //
+      // Non-P2P transport sends emit this echo via emitTransportUserMessage
+      // (L1657-1672 below). Before this fix the P2P branch emitted only
+      // `command.ack accepted` + `p2p.run_started`, so the optimistic
+      // bubble stayed in its `pending` state forever and the user
+      // perceived "can't send P2P" — retry re-issued the same command,
+      // same accepted-ack, same stuck spinner. Regression introduced by
+      // commit 2986702 ("Add optimistic send UX — spinner while sending,
+      // red ! on failure with retry") which changed the web contract but
+      // didn't teach the P2P dispatch path about it.
+      timelineEmitter.emit(
+        sessionName,
+        'user.message',
+        {
+          text: tokens.cleanText,
+          commandId: effectiveId,
+          clientMessageId: effectiveId,
+          allowDuplicate: true,
+          p2pRunId: run.id,
+        },
+        { source: 'daemon', confidence: 'high', eventId: `p2p-user:${effectiveId}` },
+      );
       const status = isLegacy ? 'accepted_legacy' : 'accepted';
       timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
       try {
@@ -1838,6 +1888,91 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         const errMsg = describeTransportSendError(err);
         logger.error({ sessionName, err }, 'session.clear (transport) failed');
         timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Clear failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
+        try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg }); } catch { /* */ }
+      }
+      return;
+    }
+    if (text.trim() === '/compact' && supportsTransportCompact(record?.agentType)) {
+      emitTransportUserMessage(text);
+      // Stream a placeholder "running" assistant turn so the chat shows progress
+      // while compression runs. This is a long-ish round-trip (LLM call) so silent
+      // dead air is a worse UX than a visible spinner with status text.
+      const compactingEventId = `compact:${sessionName}:${effectiveId}`;
+      const emitCompactStatus = (statusText: string, streaming: boolean): void => {
+        timelineEmitter.emit(sessionName, 'assistant.text', {
+          text: statusText,
+          streaming,
+          memoryExcluded: true,
+        }, { source: 'daemon', confidence: 'high', eventId: compactingEventId });
+      };
+      emitCompactStatus('🗜 Compacting conversation…', true);
+      // Fresh conversation must not replay stale queued messages from the prior
+      // offline window — drop anything we had buffered for resend.
+      clearResend(sessionName);
+      try {
+        const { replayTransportHistory } = await import('./transport-history.js');
+        const rawEvents = await replayTransportHistory(sessionName);
+        // Only memory-eligible turns feed the compressor. Tool calls, deltas,
+        // session state pings, and approval requests are noise here — they
+        // bloat the prompt without informing the summary.
+        const localEvents: import('../../shared/context-types.js').LocalContextEvent[] = rawEvents
+          .filter((e) => {
+            const t = typeof e.type === 'string' ? e.type : '';
+            return t === 'user.message' || t === 'assistant.text';
+          })
+          .map((e, idx) => ({
+            id: `compact-src:${sessionName}:${idx}`,
+            target: { kind: 'session' as const, sessionName },
+            eventType: String(e.type),
+            content: typeof e.text === 'string' ? e.text : '',
+            createdAt: typeof e._ts === 'number' ? e._ts : Date.now(),
+          }))
+          .filter((e) => e.content && e.content.trim().length > 0);
+
+        if (localEvents.length === 0) {
+          emitCompactStatus('⚠️ Nothing to compact yet — start a turn first.', false);
+          const ackStatus = isLegacy ? 'accepted_legacy' : 'accepted';
+          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: ackStatus });
+          try {
+            serverLink.send({ type: 'command.ack', commandId: effectiveId, status: ackStatus, session: sessionName });
+          } catch { /* */ }
+          return;
+        }
+
+        const { compressWithSdk } = await import('../context/summary-compressor.js');
+        const modelConfig = getContextModelConfig();
+        const result = await compressWithSdk({
+          events: localEvents,
+          modelConfig,
+          targetTokens: 600,
+        });
+
+        // Restart the transport runtime fresh — the compressed summary replaces
+        // the verbose history. Same exclusive-relaunch dance as /clear.
+        await runExclusiveSessionRelaunch(sessionName, async () => {
+          await relaunchFreshTransportConversation(record);
+        });
+        clearRecentInjectionHistory(sessionName);
+        await handleGetSessions(serverLink);
+        await syncSubSessionIfNeeded(sessionName, serverLink);
+
+        const backendNote = result.backend
+          ? ` · ${result.backend}${result.usedBackup ? ' (backup)' : ''}`
+          : '';
+        emitCompactStatus(
+          `🗜 Compacted ${localEvents.length} turn${localEvents.length === 1 ? '' : 's'}${backendNote}\n\n${result.summary}`,
+          false,
+        );
+        const compactStatus = isLegacy ? 'accepted_legacy' : 'accepted';
+        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: compactStatus });
+        try {
+          serverLink.send({ type: 'command.ack', commandId: effectiveId, status: compactStatus, session: sessionName });
+        } catch { /* */ }
+      } catch (err) {
+        const errMsg = describeTransportSendError(err);
+        logger.error({ sessionName, err }, 'session.compact (transport) failed');
+        emitCompactStatus(`⚠️ Compact failed: ${errMsg}`, false);
         timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
         try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg }); } catch { /* */ }
       }

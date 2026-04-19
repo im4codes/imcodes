@@ -453,6 +453,58 @@ describe('structured P2P routing via WS fields', () => {
     expect(sendKeysDelayedEnter).not.toHaveBeenCalled();
   });
 
+  it('emits an initiator user.message echo tagged with the commandId so the web optimistic bubble reconciles', async () => {
+    // Regression guard for "P2P send stuck on spinner" bug:
+    //   Web injects a `pending: true` bubble keyed by commandId on every
+    //   send. `useTimeline`'s reconciliation (web/src/hooks/useTimeline.ts
+    //   L575-594) clears that state ONLY when a later `user.message`
+    //   arrives with the same `commandId` (or `clientMessageId`).
+    //   The non-P2P transport path emits that echo via
+    //   emitTransportUserMessage (command-handler.ts L1657-1672). The P2P
+    //   branch used to skip it — emitted only `command.ack accepted` +
+    //   `p2p.run_started` — so P2P sends looked like "can't send", retry
+    //   included. We now mirror the transport echo pattern on the P2P
+    //   success path.
+    const { timelineEmitter } = await import('../../src/daemon/timeline-emitter.js');
+    const emitMock = (timelineEmitter as unknown as { emit: ReturnType<typeof vi.fn> }).emit;
+    emitMock.mockClear();
+
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_proj_brain',
+      text: 'kick off a discussion',
+      commandId: 'cmd-p2p-echo',
+      p2pAtTargets: [{ session: 'deck_proj_w1', mode: 'review' }],
+    }, mockServerLink as any);
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    const userEchoCall = emitMock.mock.calls.find(
+      (call) => call[0] === 'deck_proj_brain'
+        && call[1] === 'user.message'
+        && (call[2] as Record<string, unknown>)?.commandId === 'cmd-p2p-echo',
+    );
+    expect(userEchoCall, 'missing initiator user.message echo — optimistic bubble will stay stuck on spinner').toBeDefined();
+    const payload = userEchoCall![2] as Record<string, unknown>;
+    expect(payload).toEqual(expect.objectContaining({
+      text: 'kick off a discussion',
+      commandId: 'cmd-p2p-echo',
+      clientMessageId: 'cmd-p2p-echo',
+      allowDuplicate: true,
+    }));
+    // p2pRunId lets the UI attribute the bubble to the P2P run if needed.
+    expect(typeof payload.p2pRunId).toBe('string');
+
+    // And the ack still fires so the 30s failure timer clears.
+    const ackCall = emitMock.mock.calls.find(
+      (call) => call[0] === 'deck_proj_brain'
+        && call[1] === 'command.ack'
+        && (call[2] as Record<string, unknown>)?.commandId === 'cmd-p2p-echo',
+    );
+    expect(ackCall).toBeDefined();
+    expect((ackCall![2] as Record<string, unknown>).status).toBe('accepted');
+  });
+
 
   it('auto-appends the selected i18n language instruction for p2p runs', async () => {
     handleWebCommand({
