@@ -107,20 +107,6 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     setThinking('high');
   }, [type]);
 
-  // Qwen OAuth free tier was discontinued (2026-04-15), so a fresh Qwen
-  // sub-session without a preset spawns against the dead `coder-model` and
-  // fails on the first turn. If the user has any API Provider presets
-  // configured, auto-default to the first one when they switch to Qwen so the
-  // session actually works out of the box. They can still pick "default" or a
-  // different preset from the dropdown. For non-qwen types we leave the
-  // selector untouched so Claude Code keeps its explicit-opt-in behaviour.
-  useEffect(() => {
-    if (type !== 'qwen') return;
-    if (ccPreset) return;
-    if (ccPresets.length === 0) return;
-    setCcPreset(ccPresets[0].name);
-  }, [type, ccPresets, ccPreset]);
-
   const handleStart = () => {
     const desc = description.trim() || undefined;
     if (type === 'script') {
