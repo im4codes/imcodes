@@ -390,6 +390,23 @@ export async function startup(): Promise<DaemonContext> {
     logger.error({ err }, 'AckOutbox init failed — daemon continues (acks will be best-effort)');
   }
 
+  // Warm up the transformers.js embedding model in the background so the
+  // first user send after daemon start doesn't pay the ~16s cold-load latency
+  // inside prependLocalMemory(). Fire-and-forget — the recall path falls
+  // through safely if this is still in flight when the first message arrives.
+  void (async () => {
+    try {
+      const { generateEmbedding } = await import('../context/embedding.js');
+      const t0 = Date.now();
+      await generateEmbedding('warmup');
+      logger.info({ ms: Date.now() - t0 }, 'Embedding model warmed up');
+    } catch (err) {
+      // Non-fatal: semantic recall falls back to substring match if the
+      // model never loads.
+      logger.warn({ err }, 'Embedding model warmup failed — semantic recall will be lazy');
+    }
+  })();
+
   const liveContextIngestion = new LiveContextIngestion({
     sessionLookup: getSession,
     resolveBootstrap: (session) => resolveTransportContextBootstrap({
