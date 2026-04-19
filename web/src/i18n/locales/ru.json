@@ -23,6 +23,11 @@
     "hide": "Скрыть"
   },
   "chat": {
+    "sendFailedReason": {
+      "daemonOffline": "Соединение потеряно",
+      "ackTimeout": "Нет ответа от агента",
+      "daemonError": "Ошибка агента"
+    },
     "loading": "Загрузка чата...",
     "syncing": "↻ Синхронизация...",
     "no_events": "Событий пока нет",

@@ -23,6 +23,11 @@
     "hide": "Ocultar"
   },
   "chat": {
+    "sendFailedReason": {
+      "daemonOffline": "Conexión perdida",
+      "ackTimeout": "Sin respuesta del agente",
+      "daemonError": "Error del agente"
+    },
     "loading": "Cargando chat...",
     "syncing": "↻ Sincronizando...",
     "no_events": "Sin eventos aún",

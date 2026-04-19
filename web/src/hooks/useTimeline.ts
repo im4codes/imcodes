@@ -1,5 +1,25 @@
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
+import i18next from 'i18next';
+import {
+  MSG_COMMAND_FAILED,
+  MSG_DAEMON_ONLINE,
+  MSG_DAEMON_OFFLINE,
+  type AckFailureReason,
+} from '@shared/ack-protocol.js';
+
+/** Map an AckFailureReason to a localized message suitable for failureReason payload. */
+function localizedAckFailureReason(reason: AckFailureReason): string {
+  // Keys live under `chat.sendFailedReason.*` in every locale JSON.
+  switch (reason) {
+    case 'daemon_offline':
+      return i18next.t('chat.sendFailedReason.daemonOffline', 'Connection lost');
+    case 'ack_timeout':
+      return i18next.t('chat.sendFailedReason.ackTimeout', 'No response');
+    case 'daemon_error':
+      return i18next.t('chat.sendFailedReason.daemonError', 'Server error');
+  }
+}
 /**
  * React hook for timeline event state management.
  * Loads from daemon file store on connect, caches in IndexedDB,
@@ -784,6 +804,36 @@ export function useTimeline(
         } else if (status) {
           clearOptimisticTimer(commandId);
         }
+      }
+
+      // ── command.failed: server-surfaced fast failure (daemon_offline / ack_timeout).
+      //    The server already owns retry coordination (buffer during grace, replay
+      //    on reconnect), so the web does NOT maintain its own retry queue — we
+      //    just flip the optimistic bubble to failed state so the user can retry
+      //    manually when they choose. ──
+      if (msg.type === MSG_COMMAND_FAILED) {
+        const failedSession = typeof (msg as { session?: unknown }).session === 'string'
+          ? (msg as { session: string }).session
+          : undefined;
+        if (failedSession && failedSession !== sessionId) return;
+        const commandId = typeof (msg as { commandId?: unknown }).commandId === 'string'
+          ? (msg as { commandId: string }).commandId
+          : '';
+        const reason = (msg as { reason?: unknown }).reason;
+        if (!commandId) return;
+        const reasonStr: AckFailureReason = (reason === 'ack_timeout' || reason === 'daemon_error')
+          ? reason
+          : 'daemon_offline';
+        markOptimisticFailed(commandId, localizedAckFailureReason(reasonStr));
+      }
+
+      // ── daemon.online / daemon.offline: purely advisory status signals.
+      //    DAEMON_MSG.RECONNECTED / .DISCONNECTED already drive terminal
+      //    subscription state; these new signals exist for future UI polish
+      //    (e.g. status badge reflecting the grace window) without mutating
+      //    any optimistic bubble state here. ──
+      if (msg.type === MSG_DAEMON_ONLINE || msg.type === MSG_DAEMON_OFFLINE) {
+        return;
       }
     };
 

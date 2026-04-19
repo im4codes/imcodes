@@ -24,6 +24,8 @@ import {
   type SubSessionRecord,
 } from './subsession-manager.js';
 import logger from '../util/logger.js';
+import { getDefaultAckOutbox } from './ack-outbox.js';
+import { MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
 import { homedir } from 'os';
 import { readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, stat as fsStat, writeFile as fsWriteFile } from 'node:fs/promises';
 import * as nodePath from 'node:path';
@@ -2338,9 +2340,31 @@ async function sendProcessSessionMessage(
     if (options?.commandId) {
       const status = options.isLegacy ? 'accepted_legacy' : 'accepted';
       timelineEmitter.emit(sessionName, 'command.ack', { commandId: options.commandId, status });
+      const outbox = getDefaultAckOutbox();
+      // Enqueue BEFORE the network send so a thrown send() doesn't lose the ack.
+      // In-memory update is synchronous; disk persistence is fire-and-forget to
+      // avoid holding the per-session mutex on file I/O.
+      outbox.enqueue({
+        commandId: options.commandId,
+        sessionName,
+        status,
+        ts: Date.now(),
+      }).catch((err) => {
+        logger.error({ commandId: options.commandId, err }, 'ackOutbox.enqueue failed');
+      });
       try {
-        options.serverLink?.send({ type: 'command.ack', commandId: options.commandId, status, session: sessionName });
-      } catch { /* not connected */ }
+        options.serverLink?.send({ type: MSG_COMMAND_ACK, commandId: options.commandId, status, session: sessionName });
+        // Delivery accepted by the transport; server LRU dedup handles any later
+        // outbox replay. Tombstone locally so we don't retransmit on reconnect.
+        outbox.markAcked(options.commandId).catch((err) => {
+          logger.warn({ commandId: options.commandId, err }, 'ackOutbox.markAcked failed');
+        });
+      } catch (err) {
+        // Do NOT silently swallow — the entry stays in the outbox (fire-and-forget
+        // disk write is already in flight) and will be flushed on the next
+        // successful server-link auth.
+        logger.warn({ commandId: options.commandId, err }, 'command.ack send failed, queued for retry');
+      }
     }
     if (agentType === 'opencode') {
       const { scheduleCatchup } = await import('./opencode-watcher.js');
@@ -2350,9 +2374,24 @@ async function sendProcessSessionMessage(
     if (options?.commandId) {
       const errMsg = err instanceof Error ? err.message : String(err);
       timelineEmitter.emit(sessionName, 'command.ack', { commandId: options.commandId, status: 'error', error: errMsg });
+      const outbox = getDefaultAckOutbox();
+      outbox.enqueue({
+        commandId: options.commandId,
+        sessionName,
+        status: 'error',
+        error: errMsg,
+        ts: Date.now(),
+      }).catch((enqueueErr) => {
+        logger.error({ commandId: options.commandId, err: enqueueErr }, 'ackOutbox.enqueue (error ack) failed');
+      });
       try {
-        options.serverLink?.send({ type: 'command.ack', commandId: options.commandId, status: 'error', session: sessionName, error: errMsg });
-      } catch { /* not connected */ }
+        options.serverLink?.send({ type: MSG_COMMAND_ACK, commandId: options.commandId, status: 'error', session: sessionName, error: errMsg });
+        outbox.markAcked(options.commandId).catch((mErr) => {
+          logger.warn({ commandId: options.commandId, err: mErr }, 'ackOutbox.markAcked (error ack) failed');
+        });
+      } catch (sendErr) {
+        logger.warn({ commandId: options.commandId, err: sendErr }, 'command.ack (error) send failed, queued for retry');
+      }
     }
     throw err;
   } finally {

@@ -23,6 +23,11 @@
     "hide": "隠す"
   },
   "chat": {
+    "sendFailedReason": {
+      "daemonOffline": "接続が切れました",
+      "ackTimeout": "エージェントから応答がありません",
+      "daemonError": "エージェントエラー"
+    },
     "loading": "チャットを読み込み中...",
     "syncing": "↻ 同期中...",
     "no_events": "イベントはまだありません",

@@ -12,6 +12,7 @@ import { buildSessionList } from './session-list.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { supervisionAutomation } from './supervision-automation.js';
 import { timelineStore } from './timeline-store.js';
+import { getDefaultAckOutbox } from './ack-outbox.js';
 import { startHookServer, drainQueue } from './hook-server.js';
 import { initTempFileStore } from '../store/temp-file-store.js';
 import { setupCCHooks } from '../agent/signal.js';
@@ -378,6 +379,15 @@ export async function startup(): Promise<DaemonContext> {
     // restoreFromStore must NEVER crash the daemon — log and continue.
     // Sessions may not be restored, but daemon stays alive for WS/heartbeat.
     logger.error({ err }, 'restoreFromStore failed — daemon continues without session restore');
+  }
+
+  // Initialize the command.ack outbox before serverLink connects so any
+  // pending acks from a previous process life get flushed on first open.
+  try {
+    await getDefaultAckOutbox().init();
+    logger.info('AckOutbox ready');
+  } catch (err) {
+    logger.error({ err }, 'AckOutbox init failed — daemon continues (acks will be best-effort)');
   }
 
   const liveContextIngestion = new LiveContextIngestion({

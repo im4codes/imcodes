@@ -23,6 +23,11 @@
     "hide": "숨기기"
   },
   "chat": {
+    "sendFailedReason": {
+      "daemonOffline": "연결이 끊어졌습니다",
+      "ackTimeout": "에이전트 응답 없음",
+      "daemonError": "에이전트 오류"
+    },
     "loading": "채팅 로딩 중...",
     "syncing": "↻ 동기화 중...",
     "no_events": "아직 이벤트 없음",

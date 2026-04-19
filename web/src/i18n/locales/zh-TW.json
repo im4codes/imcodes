@@ -23,6 +23,11 @@
     "hide": "隱藏"
   },
   "chat": {
+    "sendFailedReason": {
+      "daemonOffline": "連線中斷",
+      "ackTimeout": "代理無回應",
+      "daemonError": "代理錯誤"
+    },
     "loading": "載入對話中...",
     "syncing": "↻ 同步中...",
     "no_events": "尚無事件",

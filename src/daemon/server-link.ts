@@ -4,6 +4,7 @@ import logger from '../util/logger.js';
 import { DAEMON_VERSION } from '../util/version.js';
 import { setTransportRelaySend } from './transport-relay.js';
 import { setProviderRegistryServerLink } from '../agent/provider-registry.js';
+import { getDefaultAckOutbox } from './ack-outbox.js';
 
 /** Collect lightweight system stats for daemon.stats messages. */
 function collectSystemStats(): { cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number } {
@@ -88,6 +89,17 @@ export class ServerLink {
       setProviderRegistryServerLink(this);
       this.startHeartbeat();
       this.startWatchdog();
+
+      // Flush any acks that couldn't be sent before/during previous disconnects.
+      // The outbox handles ordering, attempt caps, TTL, and isConnected() gating.
+      const outbox = getDefaultAckOutbox();
+      const sender = Object.assign(
+        (msg: Parameters<typeof this.send>[0]) => this.send(msg),
+        { isConnected: () => this.isConnected() },
+      );
+      outbox.flushOnReconnect(sender as never).catch((err) => {
+        logger.warn({ err }, 'AckOutbox flush on reconnect failed');
+      });
     });
 
     ws.addEventListener('error', (event) => {

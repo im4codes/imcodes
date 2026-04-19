@@ -10,6 +10,12 @@ import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import { MEMORY_WS } from '@shared/memory-ws.js';
+import {
+  MSG_COMMAND_FAILED,
+  MSG_DAEMON_ONLINE,
+  MSG_DAEMON_OFFLINE,
+  type AckFailureReason,
+} from '@shared/ack-protocol.js';
 import type {
   FsLsResponse,
   FsReadResponse,
@@ -44,6 +50,9 @@ export type ServerMessage =
   | { type: 'timeline.replay'; sessionName: string; requestId?: string; events: TimelineEvent[]; truncated: boolean; epoch: number }
   | { type: 'timeline.history'; sessionName: string; requestId?: string; events: TimelineEvent[]; epoch: number }
   | { type: 'command.ack'; commandId: string; status: string; session: string }
+  | { type: typeof MSG_COMMAND_FAILED; commandId: string; session: string; reason: AckFailureReason; retryable: boolean }
+  | { type: typeof MSG_DAEMON_ONLINE }
+  | { type: typeof MSG_DAEMON_OFFLINE }
   | { type: 'error'; message: string }
   | { type: 'pong' }
   | { type: 'subsession.shells'; shells: string[] }
