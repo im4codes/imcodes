@@ -273,7 +273,7 @@ describe('sdk transport session restore', () => {
     expect(onSessionEvent).toHaveBeenCalledWith('started', 'deck_sdk_new_brain', 'idle');
   });
 
-  it('emits startup memory.context when the first transport turn carries the seeded memory', async () => {
+  it('emits startup memory.context when the first transport turn carries the seeded memory', { timeout: 30_000 }, async () => {
     // NOTE: the "Historical context · injected" card is emitted at the same
     // commit boundary as the persisted `startupMemoryInjected` flag — i.e.
     // in _dispatchTurn when the provider actually accepts the preamble, not
@@ -323,16 +323,19 @@ describe('sdk transport session restore', () => {
     // Poll for the startup card directly — waiting on `codexRuns.length > 0`
     // is not enough because the card fires after `turn/completed` returns and
     // the post-dispatch `emitStartupMemoryContext` runs. CI runners are
-    // slower than dev boxes, so wait on the actual terminal signal with a
-    // generous budget instead of a fixed microtask/setTimeout cap.
+    // slower than dev boxes — especially macOS which can take 5-8s for the
+    // full dispatch round-trip — so wait on the actual terminal signal with
+    // a generous budget (matched by the test-level `timeout: 30_000` above)
+    // instead of a fixed microtask/setTimeout cap. 10ms interval gives ~2000
+    // poll attempts in 20s without burning CPU.
     const findStartupCall = () => timelineEmitterEmitMock.mock.calls.find(([session, type, payload]) =>
       session === 'deck_sdk_startup_brain'
       && type === 'memory.context'
       && (payload as Record<string, unknown>).reason === 'startup',
     );
-    const deadline = Date.now() + 5_000;
+    const deadline = Date.now() + 20_000;
     while (Date.now() < deadline && !findStartupCall()) {
-      await new Promise((r) => setTimeout(r, 25));
+      await new Promise((r) => setTimeout(r, 10));
     }
 
     const startupCall = findStartupCall();
