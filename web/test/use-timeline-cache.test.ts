@@ -652,4 +652,73 @@ describe('useTimeline global cache bounds', () => {
       expect(screen.getByTestId('probe').textContent).toBe('authoritative');
     });
   });
+
+  it('passes afterTs on browser-reconnect history request so the server gap-fills only missed events', async () => {
+    // Regression: when the browser WS reconnected after a mobile background
+    // the client fired a blank full-history request, which dumped at most
+    // MAX_MEMORY_EVENTS (300) of recent events. Gaps longer than that window
+    // silently dropped events. Now we compute the max ts of events already
+    // rendered and pass it as afterTs so the server replays only the delta.
+    const sessionName = `deck_reconnect_after_ts_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const sendTimelineHistoryRequest = vi.fn(() => 'history-reconnect');
+
+    // Seed the shared cache so the hook mounts with known events — the
+    // most recent has ts=5000, which should become afterTs on reconnect.
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-ingest-1`,
+      sessionId: sessionName,
+      ts: 3000,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'older' },
+    }, serverId);
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-ingest-2`,
+      sessionId: sessionName,
+      ts: 5000,
+      epoch: 1,
+      seq: 2,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'newest' },
+    }, serverId);
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest,
+    } as unknown as WsClient;
+
+    function Probe() {
+      useTimeline(sessionName, ws, serverId);
+      return h('div', { 'data-testid': 'probe' }, 'mounted');
+    }
+
+    render(h(Probe));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('mounted');
+    });
+
+    // Initial mount triggers a blank full-history request.
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300);
+    sendTimelineHistoryRequest.mockClear();
+
+    // Simulate browser WS reconnect. useTimeline should now gap-fill using
+    // afterTs = max ts of currently-rendered events (5000).
+    await act(async () => {
+      handler?.({ type: 'session.event', event: 'connected', session: '', state: 'connected' } as ServerMessage);
+    });
+
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300, 5000);
+  });
 });

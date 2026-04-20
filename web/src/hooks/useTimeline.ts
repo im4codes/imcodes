@@ -775,9 +775,27 @@ export function useTimeline(
       // ── Browser WS reconnected: fill gaps using afterTs for reliability ──
       // Always use timestamp-based history (not seq-based replay) to avoid
       // epoch mismatch and seq desync issues on mobile (app killed/backgrounded).
+      //
+      // The afterTs cursor is the max ts of any event currently rendered for
+      // this session — server replays only events with ts > afterTs. Without
+      // this cursor the server dumped a MAX_MEMORY_EVENTS-sized recent window,
+      // which (a) re-downloaded events we already had and (b) silently lost
+      // anything older than that window if the disconnect gap exceeded the
+      // window. Now we catch up exactly the missed range. If we have no local
+      // events (first connect / fresh tab) we omit afterTs and get the
+      // standard recent window.
       if (msg.type === 'session.event' && (msg as { event: string }).event === 'connected') {
         if (ws && sessionId) {
-          historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
+          const current = eventsRef.current;
+          let afterTs: number | undefined;
+          for (const ev of current) {
+            // Pending optimistic bubbles carry `ts = Date.now()` from the
+            // client clock — exclude them so a skewed client clock can't
+            // accidentally filter out legitimately-missed server events.
+            if (ev.type === 'user.message' && (ev as { payload?: { pending?: boolean } }).payload?.pending) continue;
+            if (typeof ev.ts === 'number' && (afterTs === undefined || ev.ts > afterTs)) afterTs = ev.ts;
+          }
+          historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS, afterTs);
         }
       }
 

@@ -225,6 +225,61 @@ describe('WsClient', () => {
     expect(() => client.send({ type: 'ping' })).toThrow('WebSocket not connected');
   });
 
+  describe('dead-socket detection (pong timeout)', () => {
+    it('force-reconnects a new socket when no pong arrives within the watchdog window', async () => {
+      // Regression: mobile OS commonly half-closes the TCP on background
+      // eviction without propagating close() to the WebView — the old client
+      // believed it was "connected" indefinitely while no events arrived.
+      // Now we ping every HEARTBEAT_MS (10s) and force-reconnect if no pong
+      // arrives within 2× that window.
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      const firstWs = lastWs!;
+
+      // Initial ping fires on open; assert we sent one.
+      const initialPings = firstWs.send.mock.calls.filter(
+        (c) => JSON.parse(c[0] as string).type === 'ping',
+      );
+      expect(initialPings.length).toBeGreaterThanOrEqual(1);
+
+      // Walk past the 20s watchdog without ever sending a pong.
+      await vi.advanceTimersByTimeAsync(20_000);
+      // reconnectNow(true) fires synchronously, but openSocket() awaits a
+      // ticket fetch Promise — flush several microtask turns so the new
+      // MockWebSocket is constructed before we assert.
+      for (let i = 0; i < 5; i++) await vi.advanceTimersByTimeAsync(0);
+      expect(firstWs.readyState).toBe(MockWebSocket.CLOSED);
+      expect(lastWs).not.toBe(firstWs);
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('does NOT reconnect while pongs keep arriving', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      const firstWs = lastWs!;
+
+      // Simulate a healthy server that pongs every ping.
+      for (let i = 0; i < 5; i++) {
+        await vi.advanceTimersByTimeAsync(10_000); // one heartbeat interval
+        firstWs.emit('message', { data: JSON.stringify({ type: 'pong' }) });
+      }
+
+      // Still on the same socket — the watchdog was cleared by each pong.
+      expect(lastWs).toBe(firstWs);
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
+  });
+
   describe('terminal subscription modes', () => {
     it('subscribeTerminal sends an explicit raw flag', async () => {
       const client = await connectClient();

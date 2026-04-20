@@ -130,6 +130,11 @@ export type {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30000;
 const HEARTBEAT_MS = 10000; // lowered from 25s for faster dead-connection detection
+/** If no pong arrives within this window after a ping, assume the socket is a
+ *  half-open zombie (iOS/Android commonly leave the TCP open after aggressive
+ *  background eviction) and force a fresh reconnect. 2× heartbeat gives one
+ *  interval of slack for genuinely slow networks before we tear it down. */
+const PONG_TIMEOUT_MS = HEARTBEAT_MS * 2;
 
 export class WsClient {
   private ws: WebSocket | null = null;
@@ -144,6 +149,7 @@ export class WsClient {
   private _destroyed = false;
   private _pingLatency: number | null = null;
   private _pingSentAt: number | null = null;
+  private _pongTimer: ReturnType<typeof setTimeout> | null = null;
   private _onLatency: ((ms: number) => void) | null = null;
 
   /** Per-session callbacks for raw PTY binary frames. Supports multiple subscribers per session. */
@@ -584,6 +590,11 @@ export class WsClient {
             this._pingSentAt = null;
             this._onLatency?.(this._pingLatency);
           }
+          // Clear the dead-socket watchdog — we just proved the socket is alive.
+          if (this._pongTimer) {
+            clearTimeout(this._pongTimer);
+            this._pongTimer = null;
+          }
           return;
         }
         if (msg.type === 'terminal.stream_reset') {
@@ -722,26 +733,47 @@ export class WsClient {
   }
 
   private startHeartbeat(): void {
-    // Send first ping immediately to get initial latency
-    try {
-      this._pingSentAt = Date.now();
-      this.send({ type: 'ping' });
-    } catch { /* ignore */ }
-    this.heartbeatTimer = setInterval(() => {
+    // Each ping arms a watchdog. If no pong arrives before the watchdog fires
+    // we assume the socket is a zombie (mobile OS commonly half-closes the
+    // TCP on background eviction without propagating close() to the WebView)
+    // and force a fresh reconnect. Without this, the client believes it's
+    // still "connected" indefinitely while no new events ever arrive — which
+    // is exactly the "回前台后消息不同步" symptom users reported.
+    const armPing = () => {
       try {
         this._pingSentAt = Date.now();
         this.send({ type: 'ping' });
       } catch {
-        // ignore
+        // If send itself threw, the socket is already broken — let close
+        // handler + scheduleReconnect take over.
+        return;
       }
-    }, HEARTBEAT_MS);
+      // Only arm a fresh watchdog if none is pending. A still-pending
+      // watchdog means the previous ping hasn't been ponged yet; resetting
+      // it here would just keep delaying detection forever on a dead
+      // socket. The pong handler is the only thing that clears it.
+      if (!this._pongTimer) {
+        this._pongTimer = setTimeout(() => {
+          this._pongTimer = null;
+          if (this._destroyed) return;
+          // Socket is half-open. Force a fresh connection so subscriptions
+          // and optimistic bubbles get re-synced via the reconnect path.
+          this.reconnectNow(true);
+        }, PONG_TIMEOUT_MS);
+      }
+    };
+    armPing(); // send first ping immediately for initial latency
+    this.heartbeatTimer = setInterval(armPing, HEARTBEAT_MS);
   }
 
   private clearTimers(): void {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    if (this._pongTimer) clearTimeout(this._pongTimer);
     this.reconnectTimer = null;
     this.heartbeatTimer = null;
+    this._pongTimer = null;
+    this._pingSentAt = null;
   }
 
   private dispatch(msg: ServerMessage): void {
