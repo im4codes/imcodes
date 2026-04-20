@@ -100,6 +100,16 @@ export class TerminalStreamer {
   private subscribers = new Map<string, Map<StreamSubscriber, SubscriberState>>();
   private pipes = new Map<string, PipeState>();
   private retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Per-session "startPipe in flight" lock. `startPipe` is async; between
+   *  its `await startPipePaneStream(...)` and its later `this.pipes.set(...)`
+   *  assignment there is a window where `this.pipes.has(sessionName)` is
+   *  still false. Without this lock two concurrent calls (e.g. two web
+   *  subscribes arriving within the same tick after a network flap) both
+   *  see "no pipe yet", both spawn their own `cat /tmp/.../stream.fifo`,
+   *  and the second one's `pipes.set()` overwrites the first — the first
+   *  `cat` is then orphaned. Observed a ~5% orphan rate (10 of 215 pipe
+   *  starts) on a leaking production daemon before this guard. */
+  private pipeStartLocks = new Set<string>();
 
   // Idle detection
   private lastRawAt = new Map<string, number>();
@@ -336,6 +346,24 @@ export class TerminalStreamer {
       // "paneId not available" error that the session-manager mistakes for a
       // dead pane and tries to restart in a 3-strikes loop.
       if (isTransportSessionName(sessionName)) return;
+    }
+
+    // Concurrent-start guard. If a previous `startPipe` for this session
+    // has already persisted a pipeState OR is currently awaiting
+    // `startPipePaneStream` (lock held), bail — don't race to overwrite.
+    // The only caller that legitimately needs a fresh pipe while one is
+    // "alive" in the map is `rebindSession`, and that path explicitly
+    // calls `stopPipe` first; and `scheduleRebind` only fires after
+    // `handlePipeClose` has already removed the dead entry from the map.
+    // So reaching this guard with a non-empty state is always a race we
+    // should drop.
+    if (this.pipes.has(sessionName) || this.pipeStartLocks.has(sessionName)) {
+      logger.debug({ sessionName }, 'startPipe: concurrent start skipped');
+      return;
+    }
+    this.pipeStartLocks.add(sessionName);
+    try {
+    if (BACKEND !== 'conpty') {
       const session = getSession(sessionName);
       paneId = session?.paneId;
       if (!paneId) {
@@ -393,6 +421,9 @@ export class TerminalStreamer {
       } else {
         this.errorAllSubscribers(sessionName, err instanceof Error ? err : new Error(String(err)));
       }
+    }
+    } finally {
+      this.pipeStartLocks.delete(sessionName);
     }
   }
 

@@ -276,6 +276,52 @@ describe('TerminalStreamer — snapshot behavior', () => {
     expect(mockStopPipe).toHaveBeenCalledWith(session);
   });
 
+  it('concurrent subscribes for the same session spawn only one pipe (no orphan cat)', async () => {
+    // Regression: `startPipe` was a non-locking async; two subscribes
+    // arriving in the same tick both saw `this.pipes.has() === false`,
+    // both awaited `startPipePaneStream`, both spawned a `cat` via tmux,
+    // and the second's `pipes.set(...)` orphaned the first — its cat
+    // kept running with no tracking entry, feeding bytes into a Node
+    // stream that `handlePipeClose` could never find. On one production
+    // daemon this surfaced as ~5% orphan rate (10 of 215 pipe starts).
+    const session = 'race-session';
+
+    let startInvocations = 0;
+    // Make startPipePaneStream "slow" — returns a promise that only
+    // resolves on our signal. This reproduces the race: two subscribes
+    // both find `pipes.has === false`, both enter startPipe, both await.
+    let resolveFirst: (() => void) | null = null;
+    const firstResolved = new Promise<void>((r) => { resolveFirst = r; });
+    mockStartPipe.mockImplementation(async () => {
+      startInvocations++;
+      // Only the first call awaits the gate; any additional concurrent
+      // call must NOT even reach here (the guard in startPipe should
+      // drop it).
+      await firstResolved;
+      const stream = { on: vi.fn(), destroy: vi.fn() };
+      return { stream, cleanup: vi.fn().mockResolvedValue(undefined) };
+    });
+
+    streamer.subscribe({ sessionName: session, send: () => {} });
+    streamer.subscribe({ sessionName: session, send: () => {} });
+
+    // Let the microtasks flush so both subscribes enter startPipe.
+    await vi.advanceTimersByTimeAsync(0);
+    await Promise.resolve();
+
+    // Both subscribes have queued; only ONE of them should have reached
+    // the `startPipePaneStream` call. The other was dropped by the
+    // `pipes.has() || pipeStartLocks.has()` guard.
+    expect(startInvocations).toBe(1);
+
+    // Release the gate so the in-flight start completes cleanly.
+    resolveFirst?.();
+    await flush();
+
+    // Still exactly one invocation — no deferred spawn after release.
+    expect(startInvocations).toBe(1);
+  });
+
   it('suppresses pane-id inline errors when the session record is not yet in the store', async () => {
     // Simulates the launch race for transport sub-sessions (copilot-sdk /
     // cursor-headless): the web UI subscribes before `launchTransportSession`
