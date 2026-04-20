@@ -474,6 +474,51 @@ describe('CodexSdkProvider', () => {
     expect(summaries[0]).toBe('https://example.com/article');
     expect(summaries[1]).toBe('pricing');
     expect(summaries[2]).toBe('(other)');
+
+    // Regression (chat-row rendering): `input` must surface a non-empty
+    // `query` with the same label as `summary`, and must NOT carry the raw
+    // `action` object. Previously `input = { query: '', action: { type: ... } }`
+    // — the web UI's `summarizeToolInput` treats an empty `query` as
+    // not-useful, walks past it, sees two keys, and falls back to
+    // `JSON.stringify(input)`. That produced `{"query":"","action":{"type":"other"}}`
+    // stamped into the chat row instead of a readable label.
+    const inputs = tools.map((t) => t.input as Record<string, unknown>);
+    expect(inputs[0]).toEqual({ query: 'https://example.com/article' });
+    expect(inputs[1]).toEqual({ query: 'pricing' });
+    expect(inputs[2]).toEqual({ query: '(other)' });
+    for (const inp of inputs) {
+      expect(inp.action).toBeUndefined();
+      expect(inp.query).not.toBe('');
+    }
+  });
+
+  it('WebSearch started lifecycle with no action surfaces a readable label (not empty query)', async () => {
+    // Covers the screen artifact from the 2026-04-20 production report:
+    // codex emits `item/started` before the search has a query. Without
+    // this fallback the UI rendered `WebSearch {"query":"","action":...}`.
+    // The started-state label must be a non-empty string so
+    // `summarizeToolInput` short-circuits on `query` instead of
+    // JSON-stringifying the whole input object.
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-websearch-start', cwd: '/tmp/project' });
+
+    const tools: Array<{ input: unknown; status: string }> = [];
+    provider.onToolCall((_, tool) => tools.push({ input: tool.input, status: tool.status }));
+
+    await provider.send('route-websearch-start', 'search');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-start', type: 'webSearch', action: { type: 'other' } } },
+    });
+    await flush();
+
+    expect(tools).toHaveLength(1);
+    expect(tools[0].status).toBe('running');
+    const input = tools[0].input as Record<string, unknown>;
+    expect(input.query).toBe('(other)');
+    expect(input.action).toBeUndefined();
   });
 
   it('applies thinking level to subsequent Codex SDK turns', async () => {

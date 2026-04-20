@@ -143,35 +143,49 @@ function toolFromItem(item: Record<string, any>, lifecycle: 'started' | 'complet
       // Older CLI versions also surfaced a top-level `item.query`. The
       // current binary does NOT — for the `search` variant the query is
       // nested under `item.action.query`, and for the catch-all `other`
-      // there's no query at all. Without this fallback the chat UI shows
-      // every WebSearch as `{"query":"","action":{"type":"other"}}`.
+      // there's no query at all.
+      //
+      // Rendering contract: `input` is the flat summary payload the web UI
+      // shows next to the tool name; `detail.raw` keeps the original item
+      // for the expand panel. Do NOT inline the raw `action` object into
+      // `input` — `summarizeToolInput` walks `TOOL_INPUT_SUMMARY_KEYS`
+      // (`query` first); when `query` is an empty string it's treated as
+      // not-useful, the walker falls through to all keys, and with two
+      // entries (`query` + `action`) the renderer fallbacks to
+      // `JSON.stringify(input)` — that's where the
+      // `{"query":"","action":{"type":"other"}}` screen artifact came from.
       const action = item.action as Record<string, unknown> | undefined;
       const actionType = typeof action?.type === 'string' ? action.type : undefined;
       const actionQuery = typeof action?.query === 'string' ? action.query : undefined;
       const actionPattern = typeof action?.pattern === 'string' ? action.pattern : undefined;
       const actionUrl = typeof action?.url === 'string' ? action.url : undefined;
       const topLevelQuery = typeof item.query === 'string' ? item.query : undefined;
-      const summary = topLevelQuery
+      // Pick the single best human-readable label for the flat `input.query`
+      // slot. Priority: explicit query → pattern → url → bracketed action
+      // type (`(other)` / `(open_page)`) for the no-info fallback. The UI
+      // treats the result as an opaque string, so any of these values flow
+      // through `summarizeToolInput` without triggering the empty-string
+      // fallback branch.
+      const bestLabel = topLevelQuery
         ?? actionQuery
         ?? actionPattern
         ?? actionUrl
-        ?? (actionType ? `(${actionType})` : undefined);
-      const effectiveQuery = topLevelQuery ?? actionQuery ?? '';
+        ?? (actionType ? `(${actionType})` : '(web_search)');
       return {
         id: item.id,
         name: 'WebSearch',
         status: lifecycle === 'started' ? 'running' : 'complete',
         input: {
-          query: effectiveQuery,
-          ...(actionPattern ? { pattern: actionPattern } : {}),
-          ...(actionUrl ? { url: actionUrl } : {}),
-          ...(action ? { action } : {}),
+          // Single-key payload: `summarizeToolInput` picks `query` first
+          // and short-circuits, so the chat row reads `WebSearch <label>`
+          // regardless of which enum variant Codex produced.
+          query: bestLabel,
         },
         detail: {
           kind: 'webSearch',
-          summary,
+          summary: bestLabel,
           input: {
-            query: effectiveQuery,
+            query: bestLabel,
             ...(actionPattern ? { pattern: actionPattern } : {}),
             ...(actionUrl ? { url: actionUrl } : {}),
             action,
