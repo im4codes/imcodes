@@ -2,6 +2,7 @@ import { access } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import readline, { type Interface as ReadlineInterface } from 'node:readline';
+import { killProcessTree } from '../../util/kill-process-tree.js';
 import type {
   TransportProvider,
   ProviderCapabilities,
@@ -235,7 +236,13 @@ export class CodexSdkProvider implements TransportProvider {
     this.rejectPending(new Error('Codex app-server disconnected'));
     this.rl?.close();
     this.rl = null;
-    if (this.child && !this.child.killed) this.child.kill('SIGTERM');
+    // `child.kill('SIGTERM')` only terminates the node wrapper; the native
+    // codex binary it spawned lives on and leaks ~60MB per abandoned pair.
+    // Walk the descendant tree and tree-kill instead. Fire-and-forget is
+    // fine — the caller does not await teardown reaping.
+    if (this.child && !this.child.killed) {
+      void killProcessTree(this.child);
+    }
     this.child = null;
     this.threadToSession.clear();
     this.sessions.clear();
@@ -652,6 +659,32 @@ export class CodexSdkProvider implements TransportProvider {
       this.pendingRequests.set(id, { resolve, reject });
       this.child!.stdin.write(`${payload}\n`);
     });
+  }
+
+  /**
+   * Expose the `account/rateLimits/read` RPC over the already-connected
+   * app-server so callers (e.g. the daemon's rate-limit probe) can reuse
+   * this singleton instead of spawning a one-shot codex child. Returns
+   * `undefined` if the provider isn't connected or the RPC doesn't include
+   * a `rateLimits` payload — the caller then falls back to a fresh spawn.
+   *
+   * Keeping this method on the provider (rather than exposing `request`
+   * publicly) keeps the RPC surface area explicit: future reuse targets
+   * (usage summary, plan type, etc.) should each get their own public
+   * wrapper.
+   */
+  async readRateLimits(): Promise<Record<string, unknown> | undefined> {
+    if (!this.child || !this.child.stdin.writable) return undefined;
+    try {
+      const result = await this.request('account/rateLimits/read', {});
+      if (result && typeof result === 'object' && 'rateLimits' in (result as Record<string, unknown>)) {
+        const payload = (result as Record<string, unknown>).rateLimits;
+        return payload && typeof payload === 'object' ? payload as Record<string, unknown> : undefined;
+      }
+      return undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   private notify(method: string, params: Record<string, any>): void {

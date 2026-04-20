@@ -188,16 +188,33 @@ export const __testing__ = {
   recordFailure,
 };
 
-// ── Dedicated compression provider (private, NOT in global registry) ─────────
+// ── Compression provider (shared with the global registry singleton) ─────────
+//
+// History: this module used to construct its own private CodexSdkProvider /
+// QwenProvider / ClaudeCodeSdkProvider instances, so each backend switch
+// spawned (and hopefully reaped) a brand-new SDK child process. In production
+// that pattern compounded with kill-signal bugs to leak ~107MB per orphaned
+// codex app-server pair (>2GB after a few hours).
+//
+// The provider instances already cached by `src/agent/provider-registry.ts`
+// are long-lived singletons that safely support multiple concurrent sessions
+// (threads) within a single app-server. Compression now borrows one of those
+// singletons and creates a transient sub-session for its own work instead.
+// Result: a single shared codex / claude / qwen process regardless of how
+// many times compression, supervision, and user sessions all fire together.
+//
+// `activeSessionId` still tracks compression's current sub-session so we can
+// cleanly end it when the backend changes. We do NOT disconnect the shared
+// provider on backend change — that would also kill user/supervision traffic.
 
 let activeProvider: TransportProvider | null = null;
 let activeSessionId: string | null = null;
 let activeBackendKey: string | null = null;
 
 /**
- * Get or create a private provider + session for compression.
- * The provider is lazily initialized and reused across compressions.
- * If backend changes, old one is torn down and a new one created.
+ * Get or reuse a compression sub-session on the shared registry provider.
+ * The SDK provider is reused indefinitely — only the sub-session is
+ * recreated when the backend/model (cacheKey) changes.
  */
 async function getCompressionProvider(
   backend: string,
@@ -207,16 +224,17 @@ async function getCompressionProvider(
     return { provider: activeProvider, sessionId: activeSessionId };
   }
 
-  // Tear down previous
-  await shutdownCompressionProvider();
+  // End the previous sub-session, but keep the shared SDK process running.
+  await endActiveCompressionSession();
 
-  // Create a PRIVATE provider instance — not in the global registry.
-  const provider = await createPrivateProvider(backend);
+  // Borrow (or lazily connect) the registry singleton. This is the same
+  // provider instance supervision + user transport sessions use — so no
+  // parallel codex/claude/qwen child processes are spawned.
+  const { ensureProviderConnected } = await import('../agent/provider-registry.js');
+  const provider = await ensureProviderConnected(backend, {});
 
-  await provider.connect({});
-
-  // Create a dedicated session. Use UUID format for sessionKey since some
-  // providers (e.g. qwen) require UUID-formatted session IDs.
+  // Create a dedicated sub-session. UUID sessionKey keeps it distinct from
+  // any user-facing session; the SDK treats it as an independent thread.
   const sessionId = await provider.createSession({
     sessionKey: randomUUID(),
     fresh: true,
@@ -234,44 +252,26 @@ async function getCompressionProvider(
   return { provider, sessionId };
 }
 
-/** Tear down the compression provider (e.g. on daemon shutdown or backend change). */
-export async function shutdownCompressionProvider(): Promise<void> {
-  if (activeProvider) {
+/** End the compression sub-session without touching the shared provider. */
+async function endActiveCompressionSession(): Promise<void> {
+  if (activeProvider && activeSessionId) {
     try {
-      if (activeSessionId) await activeProvider.endSession(activeSessionId);
-      await activeProvider.disconnect();
-    } catch { /* ignore cleanup errors */ }
-    activeProvider = null;
-    activeSessionId = null;
-    activeBackendKey = null;
+      await activeProvider.endSession(activeSessionId);
+    } catch { /* ignore — best-effort */ }
   }
+  activeProvider = null;
+  activeSessionId = null;
+  activeBackendKey = null;
 }
 
 /**
- * Create a standalone provider instance that is NOT registered in the global
- * provider registry. Its sessions won't appear in the user's session list.
+ * Shut down the compression sub-session. Kept as an exported alias for
+ * back-compat with existing callers (daemon shutdown, backend-change
+ * unwinds, tests). We intentionally do NOT call `provider.disconnect()` on
+ * the shared singleton — that would kill user + supervision traffic too.
  */
-async function createPrivateProvider(backend: string): Promise<TransportProvider> {
-  switch (backend) {
-    case 'claude-code-sdk': {
-      const { ClaudeCodeSdkProvider } = await import('../agent/providers/claude-code-sdk.js');
-      return new ClaudeCodeSdkProvider();
-    }
-    case 'codex-sdk': {
-      const { CodexSdkProvider } = await import('../agent/providers/codex-sdk.js');
-      return new CodexSdkProvider();
-    }
-    case 'qwen': {
-      const { QwenProvider } = await import('../agent/providers/qwen.js');
-      return new QwenProvider();
-    }
-    case 'openclaw': {
-      const { OpenClawProvider } = await import('../agent/providers/openclaw.js');
-      return new OpenClawProvider();
-    }
-    default:
-      throw new Error(`Unsupported compression backend: ${backend}`);
-  }
+export async function shutdownCompressionProvider(): Promise<void> {
+  await endActiveCompressionSession();
 }
 
 const COMPRESSOR_SYSTEM_PROMPT = `You are a memory compression engine. Your output will be stored as a durable memory entry for a coding agent. Do NOT respond to any questions — only output the structured summary. Do NOT include any preamble, greeting, or prefix.`;

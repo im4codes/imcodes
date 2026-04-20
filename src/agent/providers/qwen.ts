@@ -2,6 +2,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
+import { killProcessTree } from '../../util/kill-process-tree.js';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import readline from 'node:readline';
@@ -238,7 +239,9 @@ export class QwenProvider implements TransportProvider {
   async disconnect(): Promise<void> {
     for (const [sessionId, state] of this.sessions) {
       if (state.child && !state.child.killed) {
-        state.child.kill('SIGTERM');
+        // Tree-kill: qwen CLI forks children (web_search etc.) that survive
+        // a wrapper-only SIGTERM. See killProcessTree for walk+SIGKILL logic.
+        void killProcessTree(state.child);
       }
       await this.cleanupSessionSettings(state);
       this.sessions.delete(sessionId);
@@ -278,7 +281,9 @@ export class QwenProvider implements TransportProvider {
   async endSession(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (state?.child && !state.child.killed) {
-      state.child.kill('SIGTERM');
+      // Tree-kill so any child forked by the qwen CLI (web_search etc.) is
+      // also terminated — see provider disconnect comment.
+      void killProcessTree(state.child);
     }
     if (state) await this.cleanupSessionSettings(state);
     this.sessions.delete(sessionId);
@@ -738,15 +743,11 @@ export class QwenProvider implements TransportProvider {
     if (!state?.child || state.child.killed) return;
     state.cancelled = true;
     const child = state.child;
-    child.kill('SIGTERM');
-    // SIGKILL escalation — Qwen CLI may have child processes (web_search, etc.) that ignore SIGTERM
-    const killTimer = setTimeout(() => {
-      if (!child.killed) {
-        logger.warn({ provider: this.id, sessionId }, 'Qwen process did not exit after SIGTERM — sending SIGKILL');
-        child.kill('SIGKILL');
-      }
-    }, 2000);
-    child.once('close', () => clearTimeout(killTimer));
+    // Tree-kill: previously we only SIGTERM+SIGKILL'd the wrapper, which
+    // left Qwen CLI's grandchildren (web_search, bash helpers) alive.
+    // killProcessTree walks the descendant tree via `ps` and sends SIGTERM
+    // → SIGKILL to each pid explicitly (2s grace).
+    void killProcessTree(child, { gracefulMs: 2_000 });
     // Reset conversation so next send uses --session-id with a fresh ID
     // instead of --resume on the conversation stuck in a tool-call loop.
     state.started = false;
