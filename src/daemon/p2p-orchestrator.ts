@@ -1772,6 +1772,35 @@ async function dispatchHop(
         }
 
         if (!fileGrew && pastGrace && idleConfirmed) {
+          // Final race guard before re-sending the prompt:
+          //
+          // The poll tick above stat'd the file up to IDLE_POLL_MS (3s) ago.
+          // A legitimate response that lands in that 3s window would be
+          // invisible to `fileGrew` here, so without this second stat() we'd
+          // re-dispatch the same prompt on top of a just-started response,
+          // producing either a duplicate answer or an agent that gets
+          // confused about which prompt it's answering.
+          //
+          // Re-stat right at the retry decision — if the file has grown we
+          // treat it as "already executed" and fall through to the normal
+          // completion detection path (continue polling for settle + idle).
+          try {
+            const freshSize = (await stat(watchPath)).size;
+            if (freshSize > sizeBefore) {
+              lastSize = freshSize;
+              lastGrowthAt = Date.now();
+              fileGrew = true;
+              idleEventReceived = false;
+              if (run.status === 'dispatched') transition(run, 'running', serverLink);
+              updateHopStatus(run, hop, 'running');
+              logger.info(
+                { runId: run.id, session, attempt, grown: freshSize - sizeBefore },
+                'P2P: agent wrote to file between last poll and retry decision — skipping reminder',
+              );
+              continue;
+            }
+          } catch {}
+
           if (attempt < MAX_RETRIES) {
             logger.warn({ runId: run.id, session, attempt }, 'P2P: agent went idle without writing to file, retrying');
             idleWaiter.cancel();
@@ -1788,7 +1817,30 @@ async function dispatchHop(
 
     idleWaiter.cancel();
 
-    if (!fileGrew && attempt < MAX_RETRIES && Date.now() < hardDeadline) continue;
+    if (!fileGrew && attempt < MAX_RETRIES && Date.now() < hardDeadline) {
+      // Same race guard as the in-loop retry branch above: the poll tick
+      // may have missed growth in the final IDLE_POLL_MS window. Re-stat
+      // before re-dispatching — if the agent has responded, treat it as
+      // already executed and fall into the next iteration's wait loop
+      // instead of firing a duplicate prompt.
+      try {
+        const freshSize = (await stat(watchPath)).size;
+        if (freshSize > sizeBefore) {
+          logger.info(
+            { runId: run.id, session, attempt, grown: freshSize - sizeBefore },
+            'P2P: agent wrote to file between deadline and retry decision — skipping reminder',
+          );
+          // Fall through to timeout path: we observed growth but no completion
+          // signal before the deadline. Treat as failed-to-complete (hop timed
+          // out) rather than firing another prompt on top of an in-flight
+          // response. The written content is preserved on disk either way.
+        } else {
+          continue;
+        }
+      } catch {
+        continue;
+      }
+    }
 
     logger.warn({ runId: run.id, session }, 'P2P: hop timed out');
     await finishHop('timed_out', 'timed_out');
