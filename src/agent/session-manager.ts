@@ -1319,7 +1319,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
 }
 
 export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
-  const { name, projectName, role, agentType, projectDir, skipStore, label, description, bindExistingKey, skipCreate, parentSession } = opts;
+  const { name, projectName, role, agentType, projectDir, skipStore, label, description, bindExistingKey, skipCreate } = opts;
   const existing = getSession(name);
   const inheritedClaudeResumeId = opts.ccSessionId ?? (!opts.fresh ? existing?.ccSessionId : undefined);
   const shouldResumeClaudeCliConversation = agentType === 'claude-code-sdk'
@@ -1364,6 +1364,23 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   // strip supervision on restart/relaunch.
   const effectiveTransportConfig: Record<string, unknown> | undefined =
     opts.transportConfig ?? existing?.transportConfig;
+  // Sticky fields — fall back to the stored record when the caller didn't pass
+  // them (e.g. daemon restart → rebuildSubSessions, provider auto-reconnect).
+  // Without this, reconstructing the SessionRecord below clobbers the preset
+  // and causes Qwen to revert from the preset model (MiniMax-M2 / GLM / Kimi …)
+  // back to the OAuth `coder-model` placeholder. `opts.fresh` (from /clear or
+  // explicit reset) still wins — same rule applied to transportConfig above.
+  const effectiveCcPreset: string | undefined =
+    opts.ccPreset ?? (!opts.fresh ? existing?.ccPreset : undefined);
+  const effectiveUserCreated: boolean | undefined =
+    opts.userCreated ?? (!opts.fresh ? existing?.userCreated : undefined);
+  const effectiveParentSession: string | undefined =
+    opts.parentSession ?? (!opts.fresh ? existing?.parentSession : undefined);
+  // recentInjectionHistory is maintained out-of-band by recent-injection-history.ts.
+  // If we don't carry it forward, upsertSession below wipes the dedup ring buffer
+  // and previously-injected memories get re-injected into the same conversation.
+  const preservedRecentInjectionHistory: string[][] | undefined =
+    !opts.fresh ? existing?.recentInjectionHistory : undefined;
   let transportResumeId: string | undefined;
   let transportEnv: Record<string, string> | undefined = opts.extraEnv;
   let presetContextWindow: number | undefined = !opts.fresh ? existing?.presetContextWindow : undefined;
@@ -1385,9 +1402,9 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     qwenAuthType = qwenRuntime?.authType;
     qwenAuthLimit = qwenRuntime?.authLimit;
     availableQwenModels = qwenRuntime?.availableModels ?? [];
-    if (opts.ccPreset) {
+    if (effectiveCcPreset) {
       const { getQwenPresetTransportConfig } = await import('../daemon/cc-presets.js');
-      const presetConfig = await getQwenPresetTransportConfig(opts.ccPreset);
+      const presetConfig = await getQwenPresetTransportConfig(effectiveCcPreset);
       transportEnv = { ...(transportEnv ?? {}), ...presetConfig.env };
       // Preset is authoritative — its model overrides any stored/requested
       // model, and we restrict the available list so the fallback below can't
@@ -1430,10 +1447,10 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     if (shouldResumeClaudeCliConversation) {
       effectiveSkipCreate = true;
     }
-    if (opts.ccPreset) {
+    if (effectiveCcPreset) {
       const { resolvePresetEnv, getPresetTransportOverrides } = await import('../daemon/cc-presets.js');
-      transportEnv = { ...(transportEnv ?? {}), ...(await resolvePresetEnv(opts.ccPreset, transportResumeId)) };
-      const presetOverrides = await getPresetTransportOverrides(opts.ccPreset);
+      transportEnv = { ...(transportEnv ?? {}), ...(await resolvePresetEnv(effectiveCcPreset, transportResumeId)) };
+      const presetOverrides = await getPresetTransportOverrides(effectiveCcPreset);
       if (!requestedTransportModel && presetOverrides.model) requestedTransportModel = presetOverrides.model;
       presetContextWindow = presetOverrides.contextWindow;
       transportSystemPrompt = presetOverrides.systemPrompt;
@@ -1544,15 +1561,21 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
         ...(sdkDisplay ?? {}),
         ...(opts.effort ? { effort: opts.effort } : {}),
         description,
-        ...(opts.ccPreset ? { ccPreset: opts.ccPreset } : {}),
+        ...(effectiveCcPreset ? { ccPreset: effectiveCcPreset } : {}),
         ...(presetContextWindow ? { presetContextWindow } : {}),
         label,
-        parentSession,
-        userCreated: opts.userCreated,
+        parentSession: effectiveParentSession,
+        userCreated: effectiveUserCreated,
         // Preserve the flag across session.restart / runtime rebuild so we
         // don't re-inject startup memory into a conversation that already
         // received it. /clear wipes it because `opts.fresh === true`.
         ...(preserveStartupMemoryInject ? { startupMemoryInjected: true } : {}),
+        // Carry the dedup ring buffer over so previously-injected memories
+        // are not re-injected into the same conversation after a rebuild.
+        // recent-injection-history.ts owns writes; we just avoid clobbering.
+        ...(preservedRecentInjectionHistory && preservedRecentInjectionHistory.length > 0
+          ? { recentInjectionHistory: preservedRecentInjectionHistory }
+          : {}),
       };
       upsertSession(record);
       emitSessionPersist(record, name);
