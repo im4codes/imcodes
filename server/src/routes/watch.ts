@@ -5,6 +5,7 @@ import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { WsBridge } from '../ws/bridge.js';
 import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
 import { getPodIdentity } from '../util/pod-identity.js';
+import logger from '../util/logger.js';
 
 export const watchRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -301,6 +302,11 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
   const rawAfterTs = c.req.query('afterTs');
   const afterTs = rawAfterTs !== undefined ? Number(rawAfterTs) : undefined;
 
+  // Instrument the bridge relay latency (server ↔ daemon round-trip incl.
+  // the daemon's disk read). Paired with the daemon-side `timeline.history
+  // served` log — subtracting that from bridgeMs gives the network/WS
+  // overhead isolated.
+  const tStart = Date.now();
   try {
     const response = await WsBridge.get(serverId).requestTimelineHistory({
       sessionName,
@@ -308,6 +314,7 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
       ...(beforeTs !== undefined && Number.isFinite(beforeTs) ? { beforeTs } : {}),
       ...(afterTs !== undefined && Number.isFinite(afterTs) ? { afterTs } : {}),
     });
+    const bridgeMs = Date.now() - tStart;
     c.header(IMCODES_POD_HEADER, getPodIdentity());
 
     const rawEvents = Array.isArray(response.events) ? response.events : [];
@@ -326,6 +333,13 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
       : null;
     const hasMore = earliestTs !== null && events.length >= limit;
 
+    const totalMs = Date.now() - tStart;
+    logger.info({
+      serverId, sessionName, limit, afterTs, beforeTs,
+      eventsReturned: events.length,
+      bridgeMs, totalMs,
+    }, 'timeline.history/full served');
+
     return c.json({
       sessionName,
       epoch: typeof response.epoch === 'number' ? response.epoch : null,
@@ -334,7 +348,9 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
       nextCursor: hasMore ? earliestTs : null,
     });
   } catch (err) {
+    const bridgeMs = Date.now() - tStart;
     const message = err instanceof Error ? err.message : String(err);
+    logger.warn({ serverId, sessionName, bridgeMs, err: message }, 'timeline.history/full failed');
     if (message === 'daemon_offline') return c.json({ error: 'daemon_offline' }, 503);
     if (message === 'timeout') return c.json({ error: 'timeline_timeout' }, 504);
     return c.json({ error: 'relay_failed' }, 502);

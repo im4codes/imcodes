@@ -2869,11 +2869,20 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
     return;
   }
 
+  // Instrumentation: measure disk-read + parse + synthesize + serialize so
+  // we can watch p95/p99 of user-visible history-pull latency over time.
+  // (Was previously unmeasured — see daemon.log grep for empty results.)
+  const tStart = Date.now();
+  let readMs = 0;
+  let synthesizeMs = 0;
+
   // Read generously from disk — session.state events are excluded from the limit budget
   // so we need to read more to ensure enough substantive events.
   // Do NOT filter by epoch — history should include events across daemon restarts.
   const readLimit = Math.min(limit * 6, 10000);
+  const tRead0 = Date.now();
   const events = timelineStore.read(sessionName, { limit: readLimit, afterTs, beforeTs });
+  readMs = Date.now() - tRead0;
 
   // Content-aware limit: session.state events don't count toward the budget.
   // This prevents idle↔running oscillation storms from crowding out user.message events.
@@ -2897,6 +2906,7 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
 
   const record = await recoverOpenCodeSessionRecord(getSession(sessionName));
   if (record?.agentType === 'opencode' && record.projectDir && record.opencodeSessionId) {
+    const tSyn0 = Date.now();
     try {
       const { exportOpenCodeSession, buildTimelineEventsFromOpenCodeExport } = await import('./opencode-history.js');
       const exportData = await exportOpenCodeSession(record.projectDir, record.opencodeSessionId);
@@ -2914,6 +2924,7 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
     } catch (err) {
       logger.debug({ err, sessionName, opencodeSessionId: record.opencodeSessionId }, 'Failed to synthesize OpenCode timeline history');
     }
+    synthesizeMs = Date.now() - tSyn0;
   }
 
   try {
@@ -2925,6 +2936,23 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
       epoch: timelineEmitter.epoch,
     });
   } catch { /* not connected */ }
+
+  // One line per pull. Fields: server-side disk/parse time, opencode
+  // synthesis time (0 for normal sessions), total handler time, counts.
+  // Hot-enough path that info-level is appropriate — expect ~1 pull per
+  // user session-open event, bounded by web-side cooldown.
+  const totalMs = Date.now() - tStart;
+  logger.info({
+    sessionName,
+    requestId,
+    limit,
+    afterTs,
+    eventsReturned: trimmed.length,
+    eventsRead: events.length,
+    readMs,
+    synthesizeMs,
+    totalMs,
+  }, 'timeline.history served');
 }
 
 // ── Sub-session handlers ──────────────────────────────────────────────────
