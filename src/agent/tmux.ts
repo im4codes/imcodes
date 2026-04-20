@@ -138,16 +138,11 @@ function isDuplicateInitSessionError(error: unknown): boolean {
   return getTmuxErrorText(error).includes('duplicate session: imcodes_init');
 }
 
-async function ensureTmuxServer(): Promise<void> {
-  if (tmuxServerChecked) return;
-  if (tmuxServerCheckInFlight) {
-    await tmuxServerCheckInFlight;
-    return;
-  }
-  tmuxServerCheckInFlight = (async () => {
+async function tryEnsureTmuxServerOnce(): Promise<void> {
   try {
     await execFile('tmux', ['list-sessions']);
     tmuxServerChecked = true;
+    return;
   } catch (e: any) {
     const stderr = getTmuxErrorText(e);
     if (isRecoverableTmuxServerError(e)) {
@@ -160,13 +155,54 @@ async function ensureTmuxServer(): Promise<void> {
       // Kill the temp session, server stays alive
       await execFile('tmux', ['kill-session', '-t', 'imcodes_init']).catch(() => {});
       tmuxServerChecked = true;
-    } else if (stderr.includes('no sessions')) {
+      return;
+    }
+    if (stderr.includes('no sessions')) {
       // Server running but no sessions — fine
       tmuxServerChecked = true;
-    } else {
-      throw e;
+      return;
     }
+    throw e;
   }
+}
+
+/**
+ * Ensure tmux server is running. Auto-starts if dead, with exponential
+ * backoff retries to handle early-boot races where the socket path or
+ * user-level services aren't fully up yet.
+ *
+ * Historical context: the daemon used to crash-loop at boot when tmux
+ * server wasn't ready. The `list-sessions` call threw "error connecting
+ * to /tmp/tmux-1000/default", propagated up to `program.parseAsync().catch`,
+ * and systemd kept restarting. See /home/k/.imcodes/daemon.log (pre-fix).
+ */
+async function ensureTmuxServer(): Promise<void> {
+  if (tmuxServerChecked) return;
+  if (tmuxServerCheckInFlight) {
+    await tmuxServerCheckInFlight;
+    return;
+  }
+  const maxAttempts = 5;
+  const delaysMs = [0, 500, 1000, 2000, 4000]; // cumulative: 0, .5s, 1.5s, 3.5s, 7.5s
+  tmuxServerCheckInFlight = (async () => {
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (delaysMs[attempt]) {
+        await new Promise((r) => setTimeout(r, delaysMs[attempt]));
+      }
+      try {
+        await tryEnsureTmuxServerOnce();
+        return;
+      } catch (e) {
+        lastErr = e;
+        // Only retry for recoverable/transient errors. Non-recoverable
+        // (e.g. tmux binary missing) fail fast.
+        if (!isRecoverableTmuxServerError(e) && !isDuplicateInitSessionError(e)) {
+          throw e;
+        }
+      }
+    }
+    throw lastErr;
   })();
   try {
     await tmuxServerCheckInFlight;

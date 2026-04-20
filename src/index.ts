@@ -149,10 +149,18 @@ program
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (msg.includes('already running')) {
+          // Duplicate instance: this is the ONLY startup error that should exit.
           console.error(msg);
           process.exit(1);
         }
-        throw err; // re-throw other startup errors
+        // All other startup errors: log + keep the daemon alive.
+        // Exiting here would cause systemd to rapid-restart in a crash loop
+        // (see pre-fix daemon.log — 479 fatal errors, all transient tmux issues).
+        // Subsystems that failed to initialize will retry lazily when used.
+        // Uncaught errors hitting the global handlers at the top of this file
+        // are the backstop for any post-startup crashes.
+        logger.error({ err }, 'startup() failed — daemon stays alive with degraded state');
+        forwardDaemonError('uncaughtException', err);
       }
       // Called by launchd/systemd plist/unit — run inline.
       // Global error handlers are registered at the top of this file.

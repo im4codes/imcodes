@@ -290,8 +290,20 @@ export async function teardownProject(projectName: string): Promise<void> {
 
 /** Clean up orphan FIFOs from previous daemon runs and reconcile session store on startup. */
 export async function initOnStartup(): Promise<void> {
-  await cleanupOrphanFifos();
-  await cleanupKnownTestTerminalSessions();
+  // Each step is isolated: a failure here (e.g. tmux not ready at boot) must
+  // never crash the daemon. The daemon stays alive with degraded startup state
+  // and retries operations lazily when used. See daemon-NEVER-die policy in
+  // src/index.ts.
+  try {
+    await cleanupOrphanFifos();
+  } catch (err) {
+    logger.warn({ err }, 'cleanupOrphanFifos failed — daemon continues');
+  }
+  try {
+    await cleanupKnownTestTerminalSessions();
+  } catch (err) {
+    logger.warn({ err }, 'cleanupKnownTestTerminalSessions failed — daemon continues');
+  }
   // Fire-and-forget: preload the transformers.js feature-extraction pipeline
   // so the first "Related history" semantic search doesn't pay the cold-load
   // cost (hundreds of ms to a few seconds). `isEmbeddingAvailable` swallows
