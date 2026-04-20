@@ -89,6 +89,13 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
       expect(screen.getByTestId('probe').textContent).toContain('local');
     });
 
+    // Consume the mount-time backfill (200ms) before simulating the reconnect
+    // so we can cleanly assert the reconnect-only behavior below.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+    });
+    fetchSpy.mockClear();
+
     // Simulate browser WS reconnect.
     await act(async () => {
       handler?.({ type: 'session.event', event: 'connected', session: '', state: 'connected' } as ServerMessage);
@@ -103,10 +110,14 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     });
 
     expect(fetchSpy).toHaveBeenCalledTimes(1);
+    // The cursor is recomputed at fire time from currently-rendered events.
+    // The mount-time backfill already merged `recovered` (ts=7500) before we
+    // cleared the spy, so the reconnect-time cursor reflects that — it
+    // correctly won't re-download the same event.
     expect(fetchSpy).toHaveBeenCalledWith(
       serverId,
       sessionName,
-      expect.objectContaining({ afterTs: 5000 }),
+      expect.objectContaining({ afterTs: 7500 }),
     );
 
     await waitFor(() => {
@@ -191,6 +202,13 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
       expect(screen.getByTestId('probe').textContent).toBe('mounted');
     });
 
+    // Drain the mount-time backfill so the post-reconnect assertion below
+    // counts only the reconnect-path fire.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+    });
+    fetchSpy.mockClear();
+
     await act(async () => {
       handler?.({ type: 'session.event', event: 'connected', session: '', state: 'connected' } as ServerMessage);
     });
@@ -202,5 +220,89 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     // Hook is still responsive after null response.
     expect(screen.getByTestId('probe').textContent).toBe('mounted');
+  });
+
+  it('fires HTTP backfill on session mount (memory-cache path) even without a WS reconnect', async () => {
+    // Regression: before this change the HTTP backfill only ran on the
+    // WS `session.event connected` message. That left a gap for
+    // "user opens a session window while the WS is already connected" —
+    // e.g. switching between sessions, reopening a minimized pane,
+    // navigating back to a tab after background throttling. The
+    // memory-cached events rendered instantly but any daemon-side writes
+    // made while this window wasn't visible were missed until the next
+    // full reconnect. Now every session mount fires a background
+    // backfill ~200ms after render.
+    const sessionName = `deck_http_backfill_mount_${Date.now()}`;
+    const serverId = `srv-mount-${Date.now()}`;
+
+    const recovered: TimelineEvent = {
+      eventId: `${sessionName}-recovered-mount`,
+      sessionId: sessionName,
+      ts: 9000,
+      epoch: 1,
+      seq: 4,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'mount-backfill' },
+    };
+    fetchSpy.mockResolvedValue({ events: [recovered], epoch: 1, hasMore: false, nextCursor: null });
+
+    // Seed a cached event so the mount effect takes path 1 (memory-cache
+    // hit). The mount still needs to fire HTTP backfill alongside the
+    // synchronous render.
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-seed`,
+      sessionId: sessionName,
+      ts: 6000,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'cached' },
+    }, serverId);
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineHistoryRequest: vi.fn(() => 'history-mount'),
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, ws, serverId);
+      return h(
+        'div',
+        { 'data-testid': 'probe' },
+        events.map((e) => String(e.payload.text ?? '')).join('|'),
+      );
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toContain('cached');
+    });
+
+    // No backfill yet — the 200ms delay is still running.
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    // Drive past the mount-time 200ms delay without firing any WS
+    // reconnect event. The hook should still have scheduled a backfill.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+    });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledWith(
+      serverId,
+      sessionName,
+      expect.objectContaining({ afterTs: 6000 }),
+    );
+
+    // Recovered event merged into the rendered view.
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toContain('mount-backfill');
+    });
   });
 });

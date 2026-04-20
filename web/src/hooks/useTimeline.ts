@@ -319,6 +319,11 @@ export function useTimeline(
         setRefreshing(true);
         historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
       }
+      // Background HTTP backfill — catches events missed while this window
+      // was minimized/backgrounded since the memory cache can be stale.
+      // Kept short (~200ms) because the UI is already visible; this is
+      // strictly additive catch-up, merged by eventId.
+      fireHttpBackfillRef.current(200);
       return () => { cancelled = true; };
     }
 
@@ -330,6 +335,10 @@ export function useTimeline(
         setRefreshing(true);
         historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
       }
+      // Same reasoning as path 1 — back-fill in the background so the
+      // re-opened window is guaranteed to reflect authoritative daemon
+      // state, not whatever the WS subscription happened to catch.
+      fireHttpBackfillRef.current(200);
       return () => { cancelled = true; };
     }
 
@@ -357,6 +366,10 @@ export function useTimeline(
           setRefreshing(true);
           historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
         }
+        // Background HTTP backfill — IDB is authoritative only up to the
+        // last time a WS event landed; if the user closed the tab mid-chat
+        // and reopened later there may be a gap between IDB and daemon.
+        fireHttpBackfillRef.current(200);
       } else {
         epochRef.current = 0;
         seqRef.current = 0;
@@ -367,6 +380,11 @@ export function useTimeline(
         } else {
           setLoading(false);
         }
+        // Cold load — no IDB cache, no memory cache. HTTP backfill is
+        // still worthwhile: the WS history request may race against the
+        // bridge's subscribe ownership-check window, and HTTP reads go
+        // through a separate unicast request-response path.
+        fireHttpBackfillRef.current(200);
       }
     };
     load().catch(() => {});
@@ -559,6 +577,68 @@ export function useTimeline(
     if (!key) return;
     persistTimelineEvents(key, evts);
   }, []);
+
+  /**
+   * Defense-in-depth: fire an HTTP "/timeline/history/full" read for this
+   * session after a short delay. Results are merged via `eventId`, so the
+   * overlap with the WS stream is harmless (pure dedup). Runs in the
+   * background — the UI has already rendered from memory cache / IDB / WS
+   * history before this fires.
+   *
+   * Call sites:
+   *   - Session mount / switch (covers "user just opened a window" case —
+   *     web UI may have missed events while the tab was backgrounded, or
+   *     while another client-side renderer held the only subscribe and this
+   *     window was minimized).
+   *   - WS reconnect (covers the ~10–100ms subscribe-race window on the
+   *     bridge where live events can be silently dropped by the
+   *     subscription router).
+   *
+   * Safe to call when:
+   *   - `serverId` is unknown → skipped (self-hosted deploys require it).
+   *   - The user switches session mid-flight → the cacheKey-guard in the
+   *     timeout callback discards results for the old session.
+   *   - Backfill returns zero events → no-op.
+   */
+  const fireHttpBackfill = useCallback((delayMs: number) => {
+    if (!serverId || !sessionId) return;
+    const backfillSessionId = sessionId;
+    const backfillCacheKey = cacheKey;
+    setTimeout(() => {
+      if (cacheKeyRef.current !== backfillCacheKey) return;
+      // Recompute the cursor at fire time, not call time — the UI may have
+      // received fresh WS events during the delay window and we don't want
+      // to redownload them.
+      let afterTs: number | undefined;
+      for (const ev of eventsRef.current) {
+        // Pending optimistic bubbles carry `ts = Date.now()` from the client
+        // clock — exclude them so a skewed client clock can't accidentally
+        // filter out legitimately-missed server events.
+        if (ev.type === 'user.message' && (ev as { payload?: { pending?: boolean } }).payload?.pending) continue;
+        if (typeof ev.ts === 'number' && (afterTs === undefined || ev.ts > afterTs)) afterTs = ev.ts;
+      }
+      void fetchTimelineHistoryHttp(serverId, backfillSessionId, {
+        afterTs,
+        limit: MAX_MEMORY_EVENTS,
+      }).then((result) => {
+        if (!result || result.events.length === 0) return;
+        if (cacheKeyRef.current !== backfillCacheKey) return;
+        const recovered = result.events.filter(
+          (ev): ev is TimelineEvent => !!ev && typeof ev === 'object' && typeof (ev as TimelineEvent).eventId === 'string',
+        );
+        if (recovered.length === 0) return;
+        mergeEvents(recovered);
+        idbPutEvents(recovered);
+      }).catch(() => { /* opportunistic — WS path is primary */ });
+    }, delayMs);
+  }, [serverId, sessionId, cacheKey, mergeEvents, idbPutEvents]);
+
+  // Stable indirection — lets the session-mount effect below call the latest
+  // `fireHttpBackfill` without having to list it (and transitively its five
+  // dependencies) in its own dep array, which would otherwise cause the
+  // mount effect to re-run on every render.
+  const fireHttpBackfillRef = useRef(fireHttpBackfill);
+  fireHttpBackfillRef.current = fireHttpBackfill;
 
   // Listen for WS messages
   useEffect(() => {
@@ -798,42 +878,13 @@ export function useTimeline(
           }
           historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS, afterTs);
 
-          // Defense-in-depth: fire a parallel HTTP backfill ~600ms after the
-          // WS reconnect. The WS `timeline.history_request` path is
-          // theoretically sufficient, but on the server side the bridge's
-          // `terminal.subscribe` handler does an async DB ownership check
-          // before registering the browser as a subscriber. Any live
-          // `timeline.event` emitted during that ~10–100ms resolve window
-          // is routed through `sendToSessionSubscribers`, finds the browser
-          // not-yet-subscribed, and gets silently dropped.
-          //
-          // HTTP /timeline/history/full reads the daemon store directly via
-          // a unicast request-response path that bypasses subscription
-          // routing entirely. By the ~600ms mark the subscribe race has
-          // long resolved and the daemon has persisted any in-flight events
-          // to the store, so a cursor-based read catches whatever WS
-          // dropped. `mergeTimelineEvents` dedups by eventId, so the
-          // overlap with the WS response is harmless.
-          if (serverId) {
-            const backfillAfterTs = afterTs;
-            const backfillSessionId = sessionId;
-            setTimeout(() => {
-              if (cacheKeyRef.current !== cacheKey) return; // unmounted / switched session
-              void fetchTimelineHistoryHttp(serverId, backfillSessionId, {
-                afterTs: backfillAfterTs,
-                limit: MAX_MEMORY_EVENTS,
-              }).then((result) => {
-                if (!result || result.events.length === 0) return;
-                if (cacheKeyRef.current !== cacheKey) return;
-                const recovered = result.events.filter(
-                  (ev): ev is TimelineEvent => !!ev && typeof ev === 'object' && typeof (ev as TimelineEvent).eventId === 'string',
-                );
-                if (recovered.length === 0) return;
-                mergeEvents(recovered);
-                idbPutEvents(recovered);
-              }).catch(() => { /* opportunistic — WS path is primary */ });
-            }, 600);
-          }
+          // Fire HTTP backfill with a ~600ms delay to let the bridge's async
+          // `terminal.subscribe` ownership-check race resolve; any live
+          // `timeline.event` emitted during that window is routed through
+          // `sendToSessionSubscribers`, finds the browser not-yet-subscribed,
+          // and gets silently dropped. The HTTP path reads daemon store
+          // directly (unicast request-response, no subscription routing).
+          fireHttpBackfillRef.current(600);
         }
       }
 
