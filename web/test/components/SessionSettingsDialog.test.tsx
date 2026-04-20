@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/preact';
+import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/preact';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../../../src/shared/models/options.js';
 
 const patchSessionMock = vi.fn();
@@ -211,6 +211,96 @@ describe('SessionSettingsDialog supervision', () => {
     expect(screen.getByText('summaryCustomInstructions:summaryCustomInstructionsSet')).toBeDefined();
     expect(screen.getByText('summaryAudit:review_plan:3')).toBeDefined();
     expect(screen.getByText('summaryMeta:supervision_decision_v1')).toBeDefined();
+  });
+
+  it('persists qwen preset selection via the preset picker when ws fetches presets', async () => {
+    // Stub ws that records sent messages and lets the test dispatch a preset list.
+    // Pattern (Set of handlers + `act`-wrapped dispatch) mirrors the existing
+    // SharedContextManagementPanel test, which the supervision picker reuses.
+    const sent: Array<Record<string, unknown>> = [];
+    const handlers = new Set<(message: unknown) => void>();
+    const wsStub = {
+      send(message: Record<string, unknown>) { sent.push(message); },
+      onMessage(handler: (message: unknown) => void) {
+        handlers.add(handler);
+        return () => { handlers.delete(handler); };
+      },
+    };
+
+    fetchSupervisorDefaultsMock.mockResolvedValue({
+      backend: 'qwen',
+      model: 'qwen3-coder-plus',
+      timeoutMs: 12_000,
+      promptVersion: 'supervision_decision_v1',
+    });
+
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="qwen"
+        transportConfig={null}
+        ws={wsStub as unknown as import('../../src/ws-client.js').WsClient}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(fetchSupervisorDefaultsMock).toHaveBeenCalled();
+      expect(sent.some((m) => m.type === 'cc.presets.list')).toBe(true);
+    });
+
+    // Dispatch the preset list inside `act` so preact flushes the state update
+    // before subsequent assertions. Without this wrapping `setCcPresets` is
+    // batched past the next query, and the picker is never found.
+    await act(async () => {
+      for (const h of handlers) {
+        h({
+          type: 'cc.presets.list_response',
+          presets: [
+            { name: 'MiniMax', env: { ANTHROPIC_MODEL: 'MiniMax-M2.5' } },
+            { name: 'Kimi', env: { ANTHROPIC_MODEL: 'kimi-k2.5' } },
+          ],
+        });
+      }
+    });
+
+    // Defaults backend is already `qwen` via fetchSupervisorDefaults → the
+    // Global-defaults preset picker should render now that ccPresets is non-empty.
+    await waitFor(() => expect(screen.getAllByTestId('supervision-preset-picker').length).toBeGreaterThan(0));
+
+    // Enable supervised mode on this qwen session and pick a preset-pinned model.
+    fireEvent.change(screen.getAllByRole('combobox')[3]!, { target: { value: 'supervised' } });
+    fireEvent.change(screen.getAllByRole('combobox')[4]!, { target: { value: 'qwen' } });
+    fireEvent.change(screen.getAllByRole('combobox')[5]!, { target: { value: 'MiniMax-M2.5' } });
+
+    // Both regions now render a preset picker (Global defaults + This session).
+    await waitFor(() => expect(screen.getAllByTestId('supervision-preset-picker').length).toBe(2));
+
+    // Click the session-region MiniMax chip. Buttons render in the same order
+    // the pickers render (defaults first, session second) so [1] is session.
+    const minimaxButtons = screen.getAllByRole('button', { name: 'MiniMax' });
+    expect(minimaxButtons.length).toBe(2);
+    fireEvent.click(minimaxButtons[1]!);
+
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => {
+      expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', expect.objectContaining({
+        transportConfig: expect.objectContaining({
+          supervision: expect.objectContaining({
+            mode: 'supervised',
+            backend: 'qwen',
+            model: 'MiniMax-M2.5',
+            preset: 'MiniMax',
+          }),
+        }),
+      }));
+    });
   });
 
   it('persists customInstructionsOverride=true when user checks the override checkbox, and drops the global cache for that session', async () => {

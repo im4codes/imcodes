@@ -3580,6 +3580,7 @@ export function App() {
           type={settingsTarget.type}
           parentSession={settingsTarget.parentSession}
           transportConfig={settingsTarget.transportConfig}
+          ws={wsRef.current}
           onClose={() => setSettingsTarget(null)}
           onSaved={(fields) => {
             if (settingsTarget.subId) {

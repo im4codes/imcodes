@@ -4,6 +4,7 @@ import { QWEN_MODEL_IDS } from './qwen-models.js';
 import {
   DEFAULT_CONTEXT_MODEL_BY_BACKEND,
   SHARED_CONTEXT_RUNTIME_BACKENDS,
+  doesSharedContextBackendSupportPresets,
   getDefaultSharedContextModelForBackend,
   inferSharedContextRuntimeBackend,
   isKnownSharedContextModelForBackend,
@@ -104,6 +105,7 @@ export type SessionSupervisionSnapshotIssue =
   | 'invalid_custom_instructions'
   | 'invalid_custom_instructions_override'
   | 'invalid_global_custom_instructions'
+  | 'invalid_preset'
   | 'invalid_max_parse_retries'
   | 'missing_audit_mode'
   | 'invalid_audit_mode'
@@ -133,6 +135,13 @@ export interface SupervisorDefaultConfig {
    * the web client keeps in sync.
    */
   customInstructions?: string;
+  /**
+   * Optional preset name for backends that expose them via
+   * `doesSharedContextBackendSupportPresets()` (currently only `qwen`). When
+   * set, the daemon broker routes the supervisor session through the preset's
+   * env bundle by delegating to `resolveProcessingProviderSessionConfig`.
+   */
+  preset?: string;
 }
 
 export interface SessionSupervisionSnapshot extends SupervisorDefaultConfig {
@@ -214,8 +223,13 @@ export function normalizeSupervisorDefaultConfig(
   const normalizedBackend = normalizeSharedContextRuntimeBackend(merged.backend)
     ?? inferSharedContextRuntimeBackend(merged.model)
     ?? SUPERVISION_SUPPORTED_BACKENDS[0];
+  // Presets are only meaningful for backends that declare preset support
+  // (currently qwen). We retain the trimmed value only in that case so
+  // switching to a non-preset backend silently drops the stored preset.
+  const rawPreset = trimString(merged.preset);
+  const preset = rawPreset && doesSharedContextBackendSupportPresets(normalizedBackend) ? rawPreset : undefined;
   const rawModel = trimString(merged.model);
-  const model = rawModel && isKnownSharedContextModelForBackend(normalizedBackend, rawModel)
+  const model = rawModel && isKnownSharedContextModelForBackend(normalizedBackend, rawModel, preset)
     ? rawModel
     : getDefaultSharedContextModelForBackend(normalizedBackend);
   const customInstructions = trimString(merged.customInstructions);
@@ -225,6 +239,7 @@ export function normalizeSupervisorDefaultConfig(
     timeoutMs: normalizePositiveInteger(merged.timeoutMs, SUPERVISION_DEFAULT_TIMEOUT_MS, 1),
     promptVersion: trimString(merged.promptVersion) ?? SUPERVISION_DEFAULT_PROMPT_VERSION,
     ...(customInstructions ? { customInstructions } : {}),
+    ...(preset ? { preset } : {}),
   };
 }
 
@@ -250,9 +265,23 @@ export function getSessionSupervisionSnapshotIssues(
   else if (!isSupportedSupervisionBackend(backend)) issues.push('invalid_backend');
 
   const model = trimString(record.model);
+  // Preset is validated here as a non-empty string (when present) — the
+  // backend-gating happens in the normalizer. We do NOT reject presets for
+  // non-preset backends at validation time because the normalizer strips them.
+  const preset = trimString(record.preset);
+  if (record.preset != null && typeof record.preset !== 'string') {
+    issues.push('invalid_preset');
+  }
   if (!model) {
     issues.push('missing_model');
-  } else if (backend && isSupportedSupervisionBackend(backend) && backend !== 'openclaw' && !isKnownSharedContextModelForBackend(backend, model)) {
+  } else if (
+    backend
+    && isSupportedSupervisionBackend(backend)
+    && backend !== 'openclaw'
+    // Pass `preset` so qwen + preset combos (e.g. `MiniMax-M2.5`) don't get
+    // flagged as invalid_model. See design.md §3.
+    && !isKnownSharedContextModelForBackend(backend, model, preset)
+  ) {
     issues.push('invalid_model');
   }
 

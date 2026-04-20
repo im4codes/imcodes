@@ -4,9 +4,10 @@
 import { useEffect, useMemo, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { fetchSupervisorDefaults, patchSession, patchSubSession, saveSupervisorDefaults } from '../api.js';
+import type { WsClient } from '../ws-client.js';
 import { SESSION_AGENT_TYPES, TRANSPORT_SESSION_AGENT_TYPES, type SessionAgentType } from '@shared/agent-types.js';
 import type { SharedContextRuntimeBackend } from '@shared/context-types.js';
-import { isKnownSharedContextModelForBackend } from '@shared/shared-context-runtime-config.js';
+import { doesSharedContextBackendSupportPresets, isKnownSharedContextModelForBackend } from '@shared/shared-context-runtime-config.js';
 import {
   buildTransportConfigWithSupervision,
   DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS,
@@ -43,6 +44,13 @@ interface Props {
   type: string;
   parentSession?: string | null;
   transportConfig?: Record<string, unknown> | null;
+  /**
+   * Optional WebSocket client. When supplied, the supervision dialog subscribes
+   * to `cc.presets.list_response` and renders a preset picker for qwen
+   * supervisor backends. When absent (tests, legacy callers), the dialog
+   * silently omits the picker — the rest of the UI keeps working unchanged.
+   */
+  ws?: WsClient | null;
   onClose: () => void;
   onSaved: (fields: { label?: string; description?: string; cwd?: string; type?: string; transportConfig?: Record<string, unknown> | null }) => void;
 }
@@ -51,6 +59,13 @@ type SupervisionDraft = {
   mode: SupervisionMode;
   backend?: SharedContextRuntimeBackend;
   model?: string;
+  /**
+   * Optional preset name — only meaningful when
+   * `doesSharedContextBackendSupportPresets(backend)` returns true
+   * (currently only `qwen`). The daemon broker routes the supervisor session
+   * through the preset's env bundle when set.
+   */
+  preset?: string;
   timeoutMs?: number;
   promptVersion?: string;
   customInstructions?: string;
@@ -67,12 +82,13 @@ type SupervisionDraft = {
 };
 
 // Runtime draft used for both the global-defaults region and the session's
-// own backend/model/timeout overrides. `customInstructions` is included here
-// so the global-defaults region can edit it; the session region edits its own
-// textarea value separately and uses the override flag to decide merging.
+// own backend/model/timeout overrides. `customInstructions` and `preset` are
+// included here so the global-defaults region can edit them; the session
+// region edits its own textarea value separately and uses the override flag
+// to decide merging.
 type SupervisionRuntimeDraft = Pick<
   SupervisionDraft,
-  'backend' | 'model' | 'timeoutMs' | 'promptVersion' | 'customInstructions'
+  'backend' | 'model' | 'preset' | 'timeoutMs' | 'promptVersion' | 'customInstructions'
 >;
 
 function timeoutMsToUiSeconds(timeoutMs: number | undefined): number {
@@ -238,6 +254,86 @@ function SupervisionIntroCard({ t }: { t: (key: string, params?: Record<string, 
   );
 }
 
+/**
+ * Qwen preset picker — renders a chip row (including a "none" clear chip) for
+ * backends that support presets. Kept lightweight and decoupled from the
+ * broader shared-context panel's unified selector since supervision has no
+ * preset-pinned model dimension today (the broker resolves the pinned model
+ * via `resolveProcessingProviderSessionConfig`).
+ */
+function SupervisionPresetPicker({
+  t,
+  saving,
+  presets,
+  value,
+  onChange,
+  noneLabel,
+  labelKey,
+  helpKey,
+}: {
+  t: (key: string, params?: Record<string, unknown>) => string;
+  saving: boolean;
+  presets: Array<{ name: string; env?: Record<string, string> }>;
+  value: string;
+  onChange: (next: string | undefined) => void;
+  noneLabel: string;
+  labelKey: string;
+  helpKey: string;
+}) {
+  const baseChipStyle = {
+    padding: '4px 10px',
+    fontSize: 11,
+    borderRadius: 999,
+    border: '1px solid rgba(148, 163, 184, 0.35)',
+    background: 'rgba(15, 23, 42, 0.6)',
+    color: '#cbd5e1',
+    cursor: saving ? 'not-allowed' : 'pointer',
+    opacity: saving ? 0.6 : 1,
+  } as const;
+  const activeChipStyle = {
+    ...baseChipStyle,
+    background: 'rgba(124, 58, 237, 0.35)',
+    border: '1px solid rgba(167, 139, 250, 0.55)',
+    color: '#f3e8ff',
+    fontWeight: 600,
+  } as const;
+  const noneActiveStyle = {
+    ...baseChipStyle,
+    background: '#374151',
+    border: '1px solid rgba(148, 163, 184, 0.55)',
+    color: '#f3f4f6',
+    fontWeight: 600,
+  } as const;
+  const trimmed = value.trim();
+  return (
+    <div>
+      <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t(labelKey)}</div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }} data-testid="supervision-preset-picker">
+        <button
+          type="button"
+          disabled={saving}
+          style={trimmed === '' ? noneActiveStyle : baseChipStyle}
+          onClick={() => onChange(undefined)}
+        >
+          {noneLabel}
+        </button>
+        {presets.map((p) => (
+          <button
+            key={p.name}
+            type="button"
+            disabled={saving}
+            style={trimmed === p.name ? activeChipStyle : baseChipStyle}
+            onClick={() => onChange(p.name)}
+          >
+            {p.name}
+          </button>
+        ))}
+      </div>
+      <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>{t(helpKey)}</div>
+    </div>
+  );
+}
+
 function SupervisionRuntimeFields({
   t,
   saving,
@@ -334,6 +430,7 @@ export function SessionSettingsDialog({
   type,
   transportConfig,
   parentSession,
+  ws,
   onClose,
   onSaved,
 }: Props) {
@@ -357,6 +454,10 @@ export function SessionSettingsDialog({
   const [supervision, setSupervision] = useState<SupervisionDraft>(initialSupervision);
   const [supervisorDefaults, setSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
   const [initialSupervisorDefaults, setInitialSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
+  // Qwen presets (env bundles) fetched from the daemon via the same
+  // `cc.presets.list` WS channel the Shared Context panel uses. Stays empty
+  // when `ws` is not provided — the picker hides itself in that case.
+  const [ccPresets, setCcPresets] = useState<Array<{ name: string; env?: Record<string, string> }>>([]);
 
   useEffect(() => {
     setLabel(initLabel);
@@ -369,6 +470,21 @@ export function SessionSettingsDialog({
   const hasSupervision = supervision.mode !== 'off';
   const isSupportedTransport = TRANSPORT_SESSION_AGENT_TYPES.includes(agentType as typeof TRANSPORT_SESSION_AGENT_TYPES[number]);
   const isAuditMode = supervision.mode === 'supervised_audit';
+
+  // Subscribe to `cc.presets.list_response` for as long as the dialog is
+  // mounted with a valid `ws`. We fire the list request once on mount and
+  // again whenever `ws` changes — the daemon response is idempotent.
+  useEffect(() => {
+    if (!ws) return;
+    const unsub = ws.onMessage((msg) => {
+      const m = msg as { type?: string; presets?: Array<{ name: string; env?: Record<string, string> }> };
+      if (m.type === 'cc.presets.list_response') {
+        setCcPresets(m.presets ?? []);
+      }
+    });
+    try { ws.send({ type: 'cc.presets.list' }); } catch { /* ws may not support send in tests */ }
+    return unsub;
+  }, [ws]);
 
   useEffect(() => {
     if (!isSupportedTransport) return;
@@ -386,6 +502,10 @@ export function SessionSettingsDialog({
             ...prev,
             backend: resolvedDefaults.backend,
             model: resolvedDefaults.model,
+            // Seed preset from defaults when the backend supports it. If the
+            // backend doesn't support presets the normalizer already stripped
+            // it, so copying is safe either way.
+            preset: resolvedDefaults.preset,
             timeoutMs: resolvedDefaults.timeoutMs,
             promptVersion: resolvedDefaults.promptVersion,
             maxParseRetries: prev.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
@@ -419,6 +539,14 @@ export function SessionSettingsDialog({
   const supervisorDefaultsPromptVersion = supervisorDefaults.promptVersion ?? SUPERVISION_PROMPT_VERSION;
   const supervisorDefaultsModelOptions = supervisorDefaultsBackend ? getSupervisionModelOptions(supervisorDefaultsBackend) : [];
   const supervisorDefaultsCustomInstructions = typeof supervisorDefaults.customInstructions === 'string' ? supervisorDefaults.customInstructions : '';
+  const supervisionPreset = typeof supervision.preset === 'string' ? supervision.preset : '';
+  const supervisorDefaultsPreset = typeof supervisorDefaults.preset === 'string' ? supervisorDefaults.preset : '';
+  // Gate preset picker visibility: needs a ws channel to fetch presets, a
+  // backend that actually uses them (qwen today), and at least one preset.
+  const sessionSupportsPreset = !!supervisionBackend && doesSharedContextBackendSupportPresets(supervisionBackend);
+  const defaultsSupportsPreset = !!supervisorDefaultsBackend && doesSharedContextBackendSupportPresets(supervisorDefaultsBackend);
+  const showSessionPresetPicker = !!ws && sessionSupportsPreset && ccPresets.length > 0;
+  const showDefaultsPresetPicker = !!ws && defaultsSupportsPreset && ccPresets.length > 0;
   // Merged preview shown only when override is unchecked AND both sides have
   // non-empty trimmed content. Any other case is redundant (the effective
   // value equals one or the other side, visible in the textarea already).
@@ -438,6 +566,10 @@ export function SessionSettingsDialog({
     mode: supervision.mode,
     backend: supervisionBackend || undefined,
     model: supervisionModel.trim() || undefined,
+    // Preset only survives when the current backend supports it; the shared
+    // normalizer will also strip it server-side, but stripping here keeps the
+    // diff clean when the user flips between qwen and non-preset backends.
+    ...(sessionSupportsPreset && supervisionPreset.trim() ? { preset: supervisionPreset.trim() } : {}),
     timeoutMs: supervisionTimeout,
     promptVersion: supervisionPromptVersion,
     customInstructions: supervisionCustomInstructions.trim() || undefined,
@@ -460,6 +592,7 @@ export function SessionSettingsDialog({
       : {}),
   }), [
     isAuditMode,
+    sessionSupportsPreset,
     supervision.mode,
     supervisionAuditLoops,
     supervisionAuditMode,
@@ -468,6 +601,7 @@ export function SessionSettingsDialog({
     supervisionCustomInstructionsOverride,
     supervisionModel,
     supervisionParseRetries,
+    supervisionPreset,
     supervisionPromptVersion,
     supervisionTimeout,
     supervisorDefaultsCustomInstructions,
@@ -563,12 +697,19 @@ export function SessionSettingsDialog({
     nextBackendValue: string,
   ): SupervisionRuntimeDraft => {
     if (!isSupportedSupervisionBackend(nextBackendValue)) {
-      return { ...previous, backend: undefined, model: undefined };
+      // Clearing the backend also clears preset — otherwise a stale preset
+      // would round-trip to the server and the normalizer would strip it
+      // anyway, leaving the dialog's diff out of sync with storage.
+      return { ...previous, backend: undefined, model: undefined, preset: undefined };
     }
+    const nextSupportsPreset = doesSharedContextBackendSupportPresets(nextBackendValue);
     return {
       ...previous,
       backend: nextBackendValue,
       model: resolveSupervisionModelForBackend(nextBackendValue, previous.model ?? '', previous.backend),
+      // Switch to a non-preset backend → drop preset. Switch between preset
+      // backends (future case) → keep the previous preset for continuity.
+      preset: nextSupportsPreset ? previous.preset : undefined,
     };
   };
 
@@ -585,6 +726,12 @@ export function SessionSettingsDialog({
           // Optional free-text global supervision instructions. Empty string
           // is normalized to undefined by the shared helper.
           customInstructions: supervisorDefaultsCustomInstructions.trim() || undefined,
+          // Only forward preset when the current defaults backend supports it.
+          // The shared normalizer would strip it anyway for non-preset backends,
+          // but scrubbing here keeps the wire payload tidy.
+          ...(defaultsSupportsPreset && supervisorDefaultsPreset.trim()
+            ? { preset: supervisorDefaultsPreset.trim() }
+            : {}),
         });
       }
 
@@ -637,10 +784,10 @@ export function SessionSettingsDialog({
     if (!isSupportedTransport) return true;
     if (!supervisorDefaultsBackend) return false;
     if (!supervisorDefaultsModel.trim()) return false;
-    if (supervisorDefaultsBackend !== 'openclaw' && !isKnownSharedContextModelForBackend(supervisorDefaultsBackend, supervisorDefaultsModel.trim())) return false;
+    if (supervisorDefaultsBackend !== 'openclaw' && !isKnownSharedContextModelForBackend(supervisorDefaultsBackend, supervisorDefaultsModel.trim(), supervisorDefaultsPreset.trim() || undefined)) return false;
     if (supervisorDefaultsTimeout <= 0) return false;
     return true;
-  }, [isSupportedTransport, supervisorDefaultsBackend, supervisorDefaultsModel, supervisorDefaultsTimeout]);
+  }, [isSupportedTransport, supervisorDefaultsBackend, supervisorDefaultsModel, supervisorDefaultsPreset, supervisorDefaultsTimeout]);
 
   const supervisionPanel = isSupportedTransport ? (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
@@ -670,6 +817,19 @@ export function SessionSettingsDialog({
           onModelChange={(model) => setSupervisorDefaults((prev) => ({ ...prev, model }))}
           onTimeoutChange={(seconds) => setSupervisorDefaults((prev) => ({ ...prev, timeoutMs: timeoutUiSecondsToMs(seconds) }))}
         />
+
+        {showDefaultsPresetPicker && (
+          <SupervisionPresetPicker
+            t={t}
+            saving={saving}
+            presets={ccPresets}
+            value={supervisorDefaultsPreset}
+            onChange={(next) => setSupervisorDefaults((prev) => ({ ...prev, preset: next }))}
+            noneLabel={t('session.supervision.presetNone')}
+            labelKey="session.supervision.presetLabel"
+            helpKey="session.supervision.presetHelp"
+          />
+        )}
 
         <div>
           <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>
@@ -701,7 +861,7 @@ export function SessionSettingsDialog({
           </div>
         )}
 
-        {supervisorDefaultsBackend && supervisorDefaultsModel.trim() && supervisorDefaultsBackend !== 'openclaw' && !isKnownSharedContextModelForBackend(supervisorDefaultsBackend, supervisorDefaultsModel.trim()) && (
+        {supervisorDefaultsBackend && supervisorDefaultsModel.trim() && supervisorDefaultsBackend !== 'openclaw' && !isKnownSharedContextModelForBackend(supervisorDefaultsBackend, supervisorDefaultsModel.trim(), supervisorDefaultsPreset.trim() || undefined) && (
           <div style={{ color: '#f87171', fontSize: 12 }}>
             {t('session.supervision.validation.modelInvalid', { backend: labelForBackend(t, supervisorDefaultsBackend) })}
           </div>
@@ -746,6 +906,19 @@ export function SessionSettingsDialog({
               onModelChange={(model) => setSupervision((prev) => ({ ...prev, model }))}
               onTimeoutChange={(seconds) => setSupervision((prev) => ({ ...prev, timeoutMs: timeoutUiSecondsToMs(seconds) }))}
             />
+
+            {showSessionPresetPicker && (
+              <SupervisionPresetPicker
+                t={t}
+                saving={saving}
+                presets={ccPresets}
+                value={supervisionPreset}
+                onChange={(next) => setSupervision((prev) => ({ ...prev, preset: next }))}
+                noneLabel={t('session.supervision.presetNone')}
+                labelKey="session.supervision.presetLabel"
+                helpKey="session.supervision.presetHelp"
+              />
+            )}
 
             <div>
               <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.customInstructionsLabel')}</div>
@@ -898,7 +1071,7 @@ export function SessionSettingsDialog({
         </div>
       )}
 
-      {hasSupervision && supervisionBackend && supervisionModel.trim() && supervisionBackend !== 'openclaw' && !isKnownSharedContextModelForBackend(supervisionBackend, supervisionModel.trim()) && (
+      {hasSupervision && supervisionBackend && supervisionModel.trim() && supervisionBackend !== 'openclaw' && !isKnownSharedContextModelForBackend(supervisionBackend, supervisionModel.trim(), supervisionPreset.trim() || undefined) && (
         <div style={{ color: '#f87171', fontSize: 12 }}>
           {t('session.supervision.validation.modelInvalid', { backend: labelForBackend(t, supervisionBackend) })}
         </div>
@@ -921,14 +1094,14 @@ export function SessionSettingsDialog({
     if (!hasSupervision) return true;
     if (!supervisionBackend) return false;
     if (!supervisionModel.trim()) return false;
-    if (supervisionBackend !== 'openclaw' && !isKnownSharedContextModelForBackend(supervisionBackend, supervisionModel.trim())) return false;
+    if (supervisionBackend !== 'openclaw' && !isKnownSharedContextModelForBackend(supervisionBackend, supervisionModel.trim(), supervisionPreset.trim() || undefined)) return false;
     if (supervisionTimeout <= 0) return false;
     if (isAuditMode) {
       if (!supervisionAuditMode || !isSupportedSupervisionAuditMode(supervisionAuditMode)) return false;
       if (supervisionAuditLoops <= 0) return false;
     }
     return true;
-  }, [hasSupervision, isAuditMode, isSupportedTransport, supervisionAuditLoops, supervisionAuditMode, supervisionBackend, supervisionModel, supervisionTimeout]);
+  }, [hasSupervision, isAuditMode, isSupportedTransport, supervisionAuditLoops, supervisionAuditMode, supervisionBackend, supervisionModel, supervisionPreset, supervisionTimeout]);
 
   return (
     <div class="dialog-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>

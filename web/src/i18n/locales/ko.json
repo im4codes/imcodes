@@ -214,6 +214,9 @@
       "customInstructionsOverrideLabel": "전역 지침 재정의",
       "customInstructionsOverrideHelp": "체크하면 이 세션은 위의 세션 지침만 사용합니다. 체크하지 않으면 전역 지침이 빈 줄을 두고 앞에 추가됩니다.",
       "customInstructionsMergedPreviewHeading": "감독자에게 전송되는 병합 지침:",
+      "presetLabel": "프리셋 (env 번들)",
+      "presetHelp": "감독 트래픽을 프리셋 엔드포인트(자체 base URL, API 키, 고정 모델)로 라우팅합니다. 프리셋은 Shared Context 패널에서 관리합니다.",
+      "presetNone": "(없음)",
       "auditMode": {
         "audit": "감사",
         "review": "검토",

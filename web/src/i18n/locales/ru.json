@@ -214,6 +214,9 @@
       "customInstructionsOverrideLabel": "Переопределить глобальные инструкции",
       "customInstructionsOverrideHelp": "Если отмечено, используются только инструкции этой сессии выше. Если нет — глобальные добавляются в начало через пустую строку.",
       "customInstructionsMergedPreviewHeading": "Объединённые инструкции, отправленные супервизору:",
+      "presetLabel": "Пресет (env-пакет)",
+      "presetHelp": "Направляет supervisor через пресет-эндпоинт с собственным base URL, API-ключом и зафиксированной моделью. Пресеты настраиваются в панели Shared Context.",
+      "presetNone": "(нет)",
       "auditMode": {
         "audit": "Аудит",
         "review": "Ревью",

@@ -14,6 +14,7 @@ import {
   buildSupervisionDecisionPrompt,
   buildSupervisionDecisionRepairPrompt,
 } from './supervision-prompts.js';
+import { resolveProcessingProviderSessionConfig } from '../context/processing-provider-config.js';
 
 export type SupervisionDecisionKind = 'complete' | 'continue' | 'ask_human';
 
@@ -168,7 +169,7 @@ export class SupervisionBroker {
 
     try {
       const provider = await this.resolveProvider(snapshot.backend);
-      return await this.evaluateWithProvider(provider, request, remainingBudget, snapshot.model, request.cwd);
+      return await this.evaluateWithProvider(provider, request, remainingBudget, snapshot, request.cwd);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const unavailableReason = (error && typeof error === 'object' && 'supervisionUnavailableReason' in error
@@ -185,19 +186,34 @@ export class SupervisionBroker {
     provider: TransportProvider,
     request: SupervisionBrokerRequest,
     timeoutMs: number,
-    model: string,
+    snapshot: SessionSupervisionSnapshot,
     cwd?: string,
   ): Promise<SupervisionDecision> {
     const sessionKey = `deck_supervision_${randomUUID()}`;
+
+    // Delegate backend/model/preset → env/agentId/settings resolution to the
+    // shared processing-provider config. For qwen with a preset this applies
+    // ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY / pinned ANTHROPIC_MODEL; for
+    // everything else it short-circuits to `{ agentId: model }`. See
+    // openspec change `supervision-qwen-preset-support` design §1.
+    const resolved = await resolveProcessingProviderSessionConfig({
+      backend: snapshot.backend,
+      model: snapshot.model,
+      preset: snapshot.preset,
+    });
+    const effectiveAgentId = resolved.agentId ?? snapshot.model;
+
     const providerSessionId = await provider.createSession({
       sessionKey,
       fresh: true,
       cwd,
-      agentId: model,
+      ...(effectiveAgentId ? { agentId: effectiveAgentId } : {}),
+      ...(resolved.env ? { env: resolved.env } : {}),
+      ...(resolved.settings ? { settings: resolved.settings } : {}),
     });
 
     try {
-      if (provider.setSessionAgentId) provider.setSessionAgentId(providerSessionId, model);
+      if (provider.setSessionAgentId && effectiveAgentId) provider.setSessionAgentId(providerSessionId, effectiveAgentId);
       let output = await this.runDecisionAttempt(
         provider,
         providerSessionId,

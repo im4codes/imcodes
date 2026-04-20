@@ -214,6 +214,9 @@
       "customInstructionsOverrideLabel": "Anular las instrucciones globales",
       "customInstructionsOverrideHelp": "Si se marca, esta sesión solo usa las instrucciones de arriba. Si no, las globales se añaden antes separadas por una línea en blanco.",
       "customInstructionsMergedPreviewHeading": "Instrucciones fusionadas enviadas al supervisor:",
+      "presetLabel": "Preset (paquete de entorno)",
+      "presetHelp": "Enruta al supervisor a través de un endpoint preconfigurado con su propia base URL, clave API y modelo fijo. Los presets se administran desde el panel de Contexto compartido.",
+      "presetNone": "(ninguno)",
       "auditMode": {
         "audit": "Auditoría",
         "review": "Revisión",

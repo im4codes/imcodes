@@ -8,6 +8,18 @@ import { SupervisionBroker, parseSupervisionDecision } from '../../src/daemon/su
 import type { TransportProvider, ProviderError, SessionConfig } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 
+// Mock the preset resolver so broker tests don't touch ~/.imcodes/cc-presets.json.
+// Tests that care about preset behaviour inspect `resolverMock.mock.calls` and
+// set `resolverMock.mockResolvedValueOnce(...)` to shape the response.
+const resolverMock = vi.fn(async (selection: { backend: string; model?: string; preset?: string }) => ({
+  cacheKey: 'test',
+  ...(selection.model ? { agentId: selection.model } : {}),
+}));
+vi.mock('../../src/context/processing-provider-config.js', () => ({
+  resolveProcessingProviderSessionConfig: (selection: { backend: string; model?: string; preset?: string }) =>
+    resolverMock(selection),
+}));
+
 class FakeProvider implements TransportProvider {
   readonly id = 'codex-sdk';
   readonly connectionMode = 'local-sdk';
@@ -71,6 +83,12 @@ class FakeProvider implements TransportProvider {
 
 beforeEach(() => {
   vi.restoreAllMocks();
+  // vi.restoreAllMocks() clears implementations on vi.fn() too, so re-install
+  // the default preset resolver behaviour for each test.
+  resolverMock.mockImplementation(async (selection: { backend: string; model?: string; preset?: string }) => ({
+    cacheKey: 'test',
+    ...(selection.model ? { agentId: selection.model } : {}),
+  }));
 });
 
 describe('parseSupervisionDecision', () => {
@@ -698,6 +716,123 @@ describe('SupervisionBroker', () => {
 
       const prompt = String(provider.send.mock.calls[0]?.[1] ?? '');
       expect(prompt).not.toContain('Session-specific supervision instructions from the user:');
+    });
+  });
+
+  describe('qwen preset plumbing', () => {
+    const decisionOk = '{"decision":"complete","reason":"ok","confidence":0.5}';
+
+    it('passes preset into resolveProcessingProviderSessionConfig and forwards env/agentId into createSession', async () => {
+      // Simulate the resolver returning a preset-backed env bundle + pinned model.
+      resolverMock.mockResolvedValueOnce({
+        cacheKey: 'qwen:MiniMax:MiniMax-M2.5',
+        agentId: 'MiniMax-M2.5',
+        env: {
+          ANTHROPIC_BASE_URL: 'https://minimax.example.com',
+          ANTHROPIC_API_KEY: 'secret',
+          ANTHROPIC_MODEL: 'MiniMax-M2.5',
+        },
+      });
+
+      const provider = new FakeProvider([decisionOk]);
+      const broker = new SupervisionBroker({ resolveProvider: async () => provider });
+      const snapshot = normalizeSessionSupervisionSnapshot({
+        mode: SUPERVISION_MODE.SUPERVISED,
+        backend: 'qwen',
+        model: 'qwen3-coder-plus', // user's display model; preset pins something else
+        preset: 'MiniMax',
+        timeoutMs: 2_000,
+        promptVersion: 'supervision_decision_v1',
+        maxParseRetries: 1,
+        auditMode: 'audit',
+        maxAuditLoops: 2,
+        taskRunPromptVersion: 'task_run_status_v1',
+      });
+
+      await broker.decide({
+        snapshot,
+        taskRequest: 'implement',
+        assistantResponse: 'progress',
+      });
+
+      // Resolver was called with the triple.
+      expect(resolverMock).toHaveBeenCalledWith(expect.objectContaining({
+        backend: 'qwen',
+        model: 'qwen3-coder-plus',
+        preset: 'MiniMax',
+      }));
+
+      // createSession received the resolver's agentId + env — the preset actually
+      // routes traffic, it's not just a label.
+      expect(provider.createSession).toHaveBeenCalledWith(expect.objectContaining({
+        fresh: true,
+        agentId: 'MiniMax-M2.5',
+        env: expect.objectContaining({
+          ANTHROPIC_BASE_URL: 'https://minimax.example.com',
+          ANTHROPIC_API_KEY: 'secret',
+          ANTHROPIC_MODEL: 'MiniMax-M2.5',
+        }),
+      }));
+    });
+
+    it('without preset falls back to snapshot.model as agentId and no env override', async () => {
+      const provider = new FakeProvider([decisionOk]);
+      const broker = new SupervisionBroker({ resolveProvider: async () => provider });
+      const snapshot = normalizeSessionSupervisionSnapshot({
+        mode: SUPERVISION_MODE.SUPERVISED,
+        backend: 'qwen',
+        model: 'qwen3-coder-plus',
+        timeoutMs: 2_000,
+        promptVersion: 'supervision_decision_v1',
+        maxParseRetries: 1,
+        auditMode: 'audit',
+        maxAuditLoops: 2,
+        taskRunPromptVersion: 'task_run_status_v1',
+      });
+
+      await broker.decide({
+        snapshot,
+        taskRequest: 'implement',
+        assistantResponse: 'progress',
+      });
+
+      const call = provider.createSession.mock.calls[0]?.[0];
+      expect(call).toMatchObject({
+        fresh: true,
+        agentId: 'qwen3-coder-plus',
+      });
+      expect((call as SessionConfig | undefined)?.env).toBeUndefined();
+    });
+
+    it('fails closed with PROVIDER_ERROR when preset resolution throws', async () => {
+      resolverMock.mockRejectedValueOnce(new Error('preset not found'));
+      const provider = new FakeProvider([decisionOk]);
+      const broker = new SupervisionBroker({ resolveProvider: async () => provider });
+      const snapshot = normalizeSessionSupervisionSnapshot({
+        mode: SUPERVISION_MODE.SUPERVISED,
+        backend: 'qwen',
+        model: 'qwen3-coder-plus',
+        preset: 'VanishedPreset',
+        timeoutMs: 2_000,
+        promptVersion: 'supervision_decision_v1',
+        maxParseRetries: 1,
+        auditMode: 'audit',
+        maxAuditLoops: 2,
+        taskRunPromptVersion: 'task_run_status_v1',
+      });
+
+      const result = await broker.decide({
+        snapshot,
+        taskRequest: 'implement',
+        assistantResponse: 'progress',
+      });
+
+      expect(result.decision).toBe('ask_human');
+      // Existing broker catch path surfaces this as PROVIDER_NOT_CONNECTED
+      // when the error has no supervisionUnavailableReason attached — that's
+      // the correct fail-closed behaviour; the key assertion is that decide()
+      // does NOT silently claim success.
+      expect(result.unavailableReason).toBeDefined();
     });
   });
 });

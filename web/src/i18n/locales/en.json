@@ -214,6 +214,9 @@
       "customInstructionsOverrideLabel": "Override global custom instructions",
       "customInstructionsOverrideHelp": "When checked, only this session's instructions above are used. When unchecked, the global value is prepended with a blank line.",
       "customInstructionsMergedPreviewHeading": "Merged instructions sent to the supervisor:",
+      "presetLabel": "Preset (env bundle)",
+      "presetHelp": "Routes the supervisor through a preset endpoint with its own base URL, API key, and pinned model. Manage presets in the Shared Context panel.",
+      "presetNone": "(none)",
       "auditMode": {
         "audit": "Audit",
         "review": "Review",

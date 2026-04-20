@@ -214,6 +214,9 @@
       "customInstructionsOverrideLabel": "グローバル指示を上書きする",
       "customInstructionsOverrideHelp": "オンにすると、このセッションは上のセッション指示のみを使用します。オフの場合は、グローバル指示が空行を挟んで先頭に結合されます。",
       "customInstructionsMergedPreviewHeading": "監督に送信される結合済み指示:",
+      "presetLabel": "プリセット (env バンドル)",
+      "presetHelp": "監督トラフィックを独自の base URL・API キー・固定モデルを持つプリセットエンドポイント経由にします。プリセットは Shared Context パネルで管理します。",
+      "presetNone": "(なし)",
       "auditMode": {
         "audit": "監査",
         "review": "レビュー",

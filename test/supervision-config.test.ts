@@ -257,6 +257,50 @@ describe('supervision config helpers', () => {
       expect(snapshot.customInstructions).toBe('session');
     });
 
+    it('qwen preset round-trips through SupervisorDefaultConfig', () => {
+      const config = normalizeSupervisorDefaultConfig({
+        backend: 'qwen',
+        model: 'qwen3-coder-plus',
+        preset: 'MiniMax',
+      });
+      expect(config.preset).toBe('MiniMax');
+    });
+
+    it('preset is stripped when backend does not support presets', () => {
+      const config = normalizeSupervisorDefaultConfig({
+        backend: 'codex-sdk',
+        model: CODEX_MODEL_IDS[0],
+        // @ts-expect-error intentionally passing preset to a non-preset backend
+        preset: 'ShouldBeDropped',
+      });
+      expect(config.preset).toBeUndefined();
+    });
+
+    it('preset-pinned qwen model passes snapshot validation', () => {
+      const issues = getSessionSupervisionSnapshotIssues({
+        mode: SUPERVISION_MODE.SUPERVISED,
+        backend: 'qwen',
+        model: 'MiniMax-M2.5',
+        preset: 'MiniMax',
+        timeoutMs: 12_000,
+        promptVersion: SUPERVISION_DEFAULT_PROMPT_VERSION,
+        maxParseRetries: 1,
+      });
+      expect(issues).not.toContain('invalid_model');
+    });
+
+    it('unknown qwen model without preset still fails validation', () => {
+      const issues = getSessionSupervisionSnapshotIssues({
+        mode: SUPERVISION_MODE.SUPERVISED,
+        backend: 'qwen',
+        model: 'some-unreleased-model',
+        timeoutMs: 12_000,
+        promptVersion: SUPERVISION_DEFAULT_PROMPT_VERSION,
+        maxParseRetries: 1,
+      });
+      expect(issues).toContain('invalid_model');
+    });
+
     it('resolveEffectiveCustomInstructions reads from the snapshot fields', () => {
       const concat = resolveEffectiveCustomInstructions({
         customInstructions: 'S',

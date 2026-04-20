@@ -214,6 +214,9 @@
       "customInstructionsOverrideLabel": "覆蓋全域自訂提示詞",
       "customInstructionsOverrideHelp": "勾選後，本會話僅使用上方自己的提示詞。不勾選時，全域提示詞會拼在前面，以空行分隔。",
       "customInstructionsMergedPreviewHeading": "傳送給監督者的合併提示詞：",
+      "presetLabel": "預設（env 套餐）",
+      "presetHelp": "讓監督流量走某個預設的 endpoint（獨立的 base URL、API key 與固定模型）。預設在共享上下文面板裡管理。",
+      "presetNone": "（無）",
       "auditMode": {
         "audit": "稽核",
         "review": "覆核",
