@@ -92,6 +92,8 @@ export interface SessionRecord extends SessionContextBootstrapState {
   description?: string;
   /** CC env preset name — persisted so respawn can re-inject the same env vars. */
   ccPreset?: string;
+  /** Context window override carried by a provider preset (e.g. MiniMax 200K). */
+  presetContextWindow?: number;
   /** Human-readable label for UI display (e.g. "OC:main", "discord:#general"). */
   label?: string;
   /** True for sessions created by the user (not auto-synced from provider).

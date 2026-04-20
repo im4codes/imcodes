@@ -172,6 +172,7 @@ vi.mock('../../src/daemon/cc-presets.js', () => ({
       OPENAI_API_KEY: 'test-token',
     },
     model: 'MiniMax-M2.7',
+    contextWindow: 200000,
     settings: {
       security: { auth: { selectedType: 'anthropic' } },
       model: { name: 'MiniMax-M2.7' },
@@ -190,7 +191,9 @@ vi.mock('../../src/daemon/cc-presets.js', () => ({
   getPreset: vi.fn(async (presetName: string) => presetName === 'MiniMax' ? ({
     name: 'MiniMax',
     env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+    contextWindow: 200000,
   }) : null),
+  getCachedPresetContextWindow: vi.fn((presetName: string) => presetName === 'MiniMax' ? 200000 : undefined),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -369,6 +372,31 @@ describe('qwen transport flow e2e', () => {
     expect(record?.requestedModel).toBe('MiniMax-M2.7');
     expect(record?.modelDisplay).toBe('MiniMax-M2.7');
     expect(record?.qwenModel).toBe('MiniMax-M2.7');
+    expect(record?.presetContextWindow).toBe(200000);
+  });
+
+  it('uses preset context window for qwen preset usage updates', async () => {
+    await launchSession({
+      name: SESSION,
+      projectName: 'qwene2e',
+      role: 'brain',
+      agentType: 'qwen',
+      projectDir: '/tmp/qwen-e2e',
+      ccPreset: 'MiniMax',
+    });
+
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({
+      type: 'session.send',
+      session: SESSION,
+      text: 'hello',
+      commandId: 'cmd-qwen-preset-ctx',
+    }, serverLink);
+    await flushAsync();
+
+    const usage = mocks.emitted.find((e) => e.session === SESSION && e.type === 'usage.update');
+    expect(usage?.payload.model).toBe('MiniMax-M2.7');
+    expect(usage?.payload.contextWindow).toBe(200000);
   });
 
   it('finalizes a streaming transport error onto the same eventId instead of appending a second message', async () => {

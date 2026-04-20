@@ -95,6 +95,7 @@ export async function resolvePresetEnv(presetName: string, ccSessionId?: string)
 export async function getPresetTransportOverrides(presetName: string): Promise<{
   model?: string;
   systemPrompt?: string;
+  contextWindow?: number;
 }> {
   const preset = await getPreset(presetName);
   if (!preset) return {};
@@ -113,6 +114,7 @@ export async function getPresetTransportOverrides(presetName: string): Promise<{
   return {
     ...(configuredModel ? { model: configuredModel } : {}),
     ...(runtimeFacts ? { systemPrompt: runtimeFacts } : {}),
+    ...(preset.contextWindow ? { contextWindow: preset.contextWindow } : {}),
   };
 }
 
@@ -121,6 +123,7 @@ export async function getQwenPresetTransportConfig(presetName: string): Promise<
   settings?: Record<string, unknown>;
   model?: string;
   systemPrompt?: string;
+  contextWindow?: number;
 }> {
   const preset = await getPreset(presetName);
   if (!preset) return { env: {} };
@@ -199,6 +202,7 @@ export async function getQwenPresetTransportConfig(presetName: string): Promise<
     ...(settings ? { settings } : {}),
     ...(model ? { model } : {}),
     ...(runtimeFacts ? { systemPrompt: runtimeFacts } : {}),
+    ...(preset.contextWindow ? { contextWindow: preset.contextWindow } : {}),
   };
 }
 
@@ -217,4 +221,10 @@ export function invalidateCache(): void {
 /** Look up cached contextWindow for a CC session UUID. Returns undefined if not found. */
 export function getSessionContextWindow(ccSessionId: string): number | undefined {
   return sessionContextWindows.get(ccSessionId);
+}
+
+export function getCachedPresetContextWindow(presetName: string | null | undefined): number | undefined {
+  const normalized = presetName?.trim().toLowerCase();
+  if (!normalized || !cachedPresets) return undefined;
+  return cachedPresets.find((preset) => normalizePresetName(preset.name) === normalized)?.contextWindow;
 }

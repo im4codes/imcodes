@@ -53,8 +53,12 @@ vi.mock('../../src/daemon/cc-presets.js', () => ({
       ? {
           model: 'MiniMax-M2.7',
           systemPrompt: 'Authoritative runtime model: MiniMax-M2.7.',
+          contextWindow: 200000,
         }
       : {}
+  )),
+  getCachedPresetContextWindow: vi.fn((name: string) => (
+    name.trim().toLowerCase() === 'minimax' ? 200000 : undefined
   )),
   getPresetInitMessage: vi.fn(() => 'preset-init'),
   invalidateCache: vi.fn(),

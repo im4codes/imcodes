@@ -1366,6 +1366,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     opts.transportConfig ?? existing?.transportConfig;
   let transportResumeId: string | undefined;
   let transportEnv: Record<string, string> | undefined = opts.extraEnv;
+  let presetContextWindow: number | undefined = !opts.fresh ? existing?.presetContextWindow : undefined;
   // Declared HERE (before the bootstrap resolver closes over it) because
   // `resolveTransportContextBootstrap` reads it to decide whether to skip
   // startup-memory DB queries entirely for restarts. Previously declared
@@ -1397,6 +1398,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
         requestedTransportModel = presetConfig.model;
         availableQwenModels = [presetConfig.model];
       }
+      presetContextWindow = presetConfig.contextWindow;
       if (presetConfig.settings) transportSettings = presetConfig.settings;
       if (presetConfig.systemPrompt) transportSystemPrompt = presetConfig.systemPrompt;
       qwenAuthType = QWEN_AUTH_TYPES.API_KEY;
@@ -1433,6 +1435,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
       transportEnv = { ...(transportEnv ?? {}), ...(await resolvePresetEnv(opts.ccPreset, transportResumeId)) };
       const presetOverrides = await getPresetTransportOverrides(opts.ccPreset);
       if (!requestedTransportModel && presetOverrides.model) requestedTransportModel = presetOverrides.model;
+      presetContextWindow = presetOverrides.contextWindow;
       transportSystemPrompt = presetOverrides.systemPrompt;
     }
     if (requestedTransportModel) {
@@ -1542,6 +1545,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
         ...(opts.effort ? { effort: opts.effort } : {}),
         description,
         ...(opts.ccPreset ? { ccPreset: opts.ccPreset } : {}),
+        ...(presetContextWindow ? { presetContextWindow } : {}),
         label,
         parentSession,
         userCreated: opts.userCreated,

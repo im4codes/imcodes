@@ -13,6 +13,8 @@ import { timelineEmitter } from './timeline-emitter.js';
 import { appendTransportEvent } from './transport-history.js';
 import logger from '../util/logger.js';
 import { resolveContextWindow } from '../util/model-context.js';
+import { getSession } from '../store/session-store.js';
+import { getCachedPresetContextWindow } from './cc-presets.js';
 import { TIMELINE_EVENT_FILE_CHANGE } from '../../shared/file-change.js';
 import { normalizeCodexSdkFileChange, normalizeQwenFileChange } from './file-change-normalizer.js';
 
@@ -64,6 +66,7 @@ function clearPendingStreamUpdate(eventId: string): void {
 }
 
 function normalizeUsageUpdatePayload(
+  sessionName: string,
   usage: {
     input_tokens?: number;
     output_tokens?: number;
@@ -73,6 +76,9 @@ function normalizeUsageUpdatePayload(
   model: string | undefined,
 ): Record<string, unknown> | null {
   if (!usage && !model) return null;
+  const session = getSession(sessionName);
+  const presetCtx = session?.presetContextWindow
+    ?? (session?.ccPreset ? getCachedPresetContextWindow(session.ccPreset) : undefined);
   const inputTokens = typeof usage?.input_tokens === 'number'
     ? usage.input_tokens + (usage.cache_creation_input_tokens ?? 0)
     : undefined;
@@ -80,7 +86,7 @@ function normalizeUsageUpdatePayload(
     ...(typeof inputTokens === 'number' ? { inputTokens } : {}),
     ...(typeof usage?.cache_read_input_tokens === 'number' ? { cacheTokens: usage.cache_read_input_tokens } : {}),
     ...(model ? { model } : {}),
-    contextWindow: resolveContextWindow(undefined, model),
+    contextWindow: resolveContextWindow(presetCtx, model),
   };
   return payload;
 }
@@ -186,7 +192,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       cache_creation_input_tokens?: number;
     } | undefined;
     const model = typeof message.metadata?.model === 'string' ? message.metadata.model : undefined;
-    const usagePayload = normalizeUsageUpdatePayload(usage, model);
+    const usagePayload = normalizeUsageUpdatePayload(sessionName, usage, model);
     if (usagePayload) {
       timelineEmitter.emit(sessionName, 'usage.update', usagePayload, { source: 'daemon', confidence: 'high' });
     }
