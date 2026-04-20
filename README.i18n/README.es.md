@@ -83,7 +83,7 @@ IM.codes convierte continuamente el trabajo ya resuelto de los agentes en memori
 
 ## Ejecución Supervisada y Auto Audit
 
-IM.codes puede supervisar sesiones transport compatibles turno a turno en lugar de depender de un auto-continue ciego.
+IM.codes puede conducir sesiones de agent compatibles turno a turno — un supervisor con tus propias instrucciones evalúa cada turno completado en el límite idle y decide auto-continuar, devolver el control o disparar un bucle de auditoría, en lugar de que tengas que escribir "continue" cada ronda.
 
 - **Modos Auto por sesión.** Configura `off`, `supervised` o `supervised_audit` por sesión, en vez de forzar una sola política en todo el sistema.
 - **Comprobaciones de finalización en el límite idle.** Cuando un turno termina, IM.codes puede clasificarlo como `complete`, `continue` o `ask_human` y enviar el siguiente continue prompt dentro de la misma sesión.

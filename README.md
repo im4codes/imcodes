@@ -88,7 +88,7 @@ IM.codes continuously turns completed agent work into reusable memory and feeds 
 
 ## Supervised Execution & Auto Audit
 
-IM.codes can supervise supported transport-backed agent sessions turn by turn instead of relying on blind auto-continue.
+IM.codes can drive supported agent sessions turn by turn — a supervisor with your own instructions evaluates each completed turn at the idle boundary and decides to auto-continue, hand back, or trigger an audit loop, instead of you typing "continue" every round.
 
 - **Per-session Auto modes.** Configure `off`, `supervised`, or `supervised_audit` per session instead of forcing one policy everywhere.
 - **Completion checks at the idle boundary.** When a turn finishes, IM.codes can classify it as `complete`, `continue`, or `ask_human`, then dispatch the next continue prompt inside the same session.
