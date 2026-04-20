@@ -67,11 +67,33 @@ function resetBackfillCooldowns(): void {
   lastHttpBackfillOkAt.clear();
 }
 
+/**
+ * Custom DOM event fired when an ALREADY-MOUNTED timeline hook should force
+ * an immediate HTTP backfill, bypassing its mount-time cooldown. Triggers:
+ *
+ *   1. Visibility returning from hidden (any duration). Typical case: user
+ *      opens the app from a push notification and lands on a session that
+ *      was already active — no re-mount happens so the mount path's
+ *      backfill never fires.
+ *   2. `deck:navigate` navigation from a push notification payload: the
+ *      target session may already be active, in which case `setActiveSession`
+ *      no-ops and the hook doesn't re-run its mount effect.
+ *   3. Mobile native `App.appStateChange` resume (fires `visibilitychange`
+ *      via our Capacitor bridge in ws-client.ts).
+ *
+ * The event is listener-only; hooks subscribe in an effect. We emit it
+ * from this module's own visibility handler AND from external callers
+ * (push-notifications.ts) so there's a single chokepoint hooks listen to.
+ */
+export const ACTIVE_TIMELINE_REFRESH_EVENT = 'deck:active-timeline-refresh';
+
 // On every visibility transition we record when the document went hidden;
-// on the return-to-visible side, if the hidden gap is >= the cooldown
-// window the cache is pessimistically wiped so the next mount for any
-// session re-hits the HTTP path. Shorter blurs (alt-tab to Slack for 5s)
-// leave the cache intact so the cooldown's rate-limit is still useful.
+// on the return-to-visible side we always emit a refresh request, and for
+// long-hide gaps we ALSO wipe cooldowns so the next mount of any other
+// session re-hits HTTP. Previously only the >=60s path did anything, which
+// meant short-hide wake-ups (push-notification tap, lock-screen glance,
+// alt-tab during typing) never surfaced newer messages until the user
+// navigated away and back.
 //
 // Guard against non-browser environments (vitest node / SSR):
 // `document`/`window` may be undefined at import time.
@@ -82,9 +104,16 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
       hiddenAt = Date.now();
       return;
     }
-    // visible
-    if (hiddenAt !== null && Date.now() - hiddenAt >= MOUNT_BACKFILL_COOLDOWN_MS) {
+    // visible: notify the mounted timeline hook for the active session.
+    // Cooldown reset is restricted to long hides because it affects ALL
+    // cached sessions, not just the visible one.
+    const wasHidden = hiddenAt !== null;
+    const hiddenMs = wasHidden ? Date.now() - (hiddenAt ?? 0) : 0;
+    if (wasHidden && hiddenMs >= MOUNT_BACKFILL_COOLDOWN_MS) {
       resetBackfillCooldowns();
+    }
+    if (wasHidden) {
+      try { window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT)); } catch { /* older browsers */ }
     }
     hiddenAt = null;
   };
@@ -93,7 +122,10 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
   // fresh app open — the cache entries from before bfcache freezes are
   // stale relative to whatever landed in the meantime.
   window.addEventListener('pageshow', (ev) => {
-    if ((ev as PageTransitionEvent).persisted) resetBackfillCooldowns();
+    if ((ev as PageTransitionEvent).persisted) {
+      resetBackfillCooldowns();
+      try { window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT)); } catch { /* ignore */ }
+    }
   });
 }
 
@@ -720,6 +752,19 @@ export function useTimeline(
   // mount effect to re-run on every render.
   const fireHttpBackfillRef = useRef(fireHttpBackfill);
   fireHttpBackfillRef.current = fireHttpBackfill;
+
+  // Force-refresh the active session when the app comes back to the
+  // foreground. This covers the push-notification → already-mounted-session
+  // gap: the mount effect never re-runs so its cooldown-gated backfill
+  // never fires. Using cooldownMs=0 so every resume pulls fresh state.
+  useEffect(() => {
+    if (!sessionId || !serverId) return;
+    const handler = (): void => {
+      fireHttpBackfillRef.current(0, { cooldownMs: 0 });
+    };
+    window.addEventListener(ACTIVE_TIMELINE_REFRESH_EVENT, handler);
+    return () => window.removeEventListener(ACTIVE_TIMELINE_REFRESH_EVENT, handler);
+  }, [sessionId, serverId]);
 
   // Listen for WS messages
   useEffect(() => {

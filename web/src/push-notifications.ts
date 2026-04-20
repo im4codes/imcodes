@@ -12,6 +12,7 @@ let lastBadgeResetAt = 0;
 // Expose badge-reset to native layer (AppDelegate calls via evaluateJavaScript on app foreground).
 // Uses apiFetch which prepends baseUrl and includes Bearer token — relative URLs fail in Capacitor.
 import { apiFetch } from './api.js';
+import { ACTIVE_TIMELINE_REFRESH_EVENT } from './hooks/useTimeline.js';
 (window as any).__imcodesResetBadge = () => {
   void resetPushBadge(true);
 };
@@ -67,6 +68,13 @@ export async function initPushNotifications(
         detail: { serverId: data.serverId, session: data.session },
       }));
     }
+    // Force a fresh HTTP backfill of the now-active session regardless of
+    // whether navigation actually switched sessions. If the target session
+    // was already mounted, `setActiveSession` no-ops and the mount-time
+    // backfill never fires — the user would see stale messages until the
+    // next WS event. Dispatching ACTIVE_TIMELINE_REFRESH_EVENT pulls the
+    // latest timeline via the history API immediately.
+    try { window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT)); } catch { /* ignore */ }
   });
 }
 

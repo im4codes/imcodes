@@ -85,7 +85,7 @@ import {
   mergeTransportPendingMessagesForRunningState,
   normalizeTransportPendingEntries,
 } from './transport-queue.js';
-import { ingestTimelineEventForCache } from './hooks/useTimeline.js';
+import { ingestTimelineEventForCache, ACTIVE_TIMELINE_REFRESH_EVENT } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
 import { updateMainSessionLabel } from './session-label-api.js';
@@ -1827,7 +1827,15 @@ export function App() {
     if (isNative()) {
       void import('@capacitor/app').then(({ App }) =>
         App.addListener('appStateChange', ({ isActive }) => {
-          if (isActive) ws.reconnectNow(true);
+          if (isActive) {
+            ws.reconnectNow(true);
+            // Native resume: WebView `visibilitychange` is unreliable on some
+            // iOS versions, so explicitly signal the active timeline to
+            // force-pull history. Safe to fire even when visibilitychange
+            // also fires — useTimeline's listener is idempotent (cooldownMs=0
+            // but rate-limited by the 200ms setTimeout in fireHttpBackfill).
+            try { window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT)); } catch { /* ignore */ }
+          }
         }).then((listener) => {
           removeAppStateListener = () => { void listener.remove(); };
         }).catch(() => {})
