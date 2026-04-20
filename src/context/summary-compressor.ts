@@ -290,9 +290,48 @@ export async function localOnlyCompressor(input: CompressionInput): Promise<Comp
   };
 }
 
+// ── Serialization gate ──────────────────────────────────────────────────────
+//
+// Compression MUST run one-at-a-time across the whole daemon. The shared
+// Codex sub-session (see `getCompressionProvider`) only accepts one `send`
+// in flight; concurrent callers used to race it, trigger
+// "Codex SDK session is already busy" errors, enter the retry loop, and
+// with ~40 materialization targets firing on the 10s cadence this became
+// a self-reinforcing storm — observed on a production daemon as
+// 85 %-CPU sustained on the main thread with user message dispatch going
+// noticeably laggy. Every stream-delta callback from ANY concurrent
+// compression piles into the same main-thread event loop, so "it's async"
+// doesn't actually protect the loop from multiplicative callback load.
+//
+// The gate is a single Promise chain: each caller awaits the previous
+// one before entering the inner compression path. Releases in `finally`
+// so even a thrown / timed-out compression can't stall the queue.
+//
+// Callers (`materialization-coordinator.materializeTarget`) remain
+// fire-and-forget from their perspective — they just observe natural
+// backpressure when the queue is busy.
+let compressionChain: Promise<void> = Promise.resolve();
+
+function enqueueExclusive<T>(job: () => Promise<T>): Promise<T> {
+  const prev = compressionChain;
+  let release!: () => void;
+  compressionChain = new Promise<void>((r) => { release = r; });
+  return prev.catch(() => {}).then(async () => {
+    try {
+      return await job();
+    } finally {
+      release();
+    }
+  });
+}
+
 // ── Main entry point ─────────────────────────────────────────────────────────
 
 export async function compressWithSdk(input: CompressionInput): Promise<CompressionResult> {
+  return enqueueExclusive(() => compressWithSdkInner(input));
+}
+
+async function compressWithSdkInner(input: CompressionInput): Promise<CompressionResult> {
   const { events, previousSummary, modelConfig } = input;
   const targetTokens = input.targetTokens ?? 500;
 
@@ -365,7 +404,13 @@ export async function compressWithSdk(input: CompressionInput): Promise<Compress
 
 // ── Provider send with completion wait ───────────────────────────────────────
 
-const COMPRESSION_TIMEOUT_MS = 60_000;
+// Tighter than the 60 s we had during single-request debugging. With the
+// serialization gate above the queue is now the budget, not the timeout —
+// a single slow call blocked everything behind it for up to a full minute.
+// 20 s still lets a model with warm context finish a structured summary;
+// genuinely slow/broken calls release the lane 3× faster and the
+// circuit breaker trips sooner, falling back to the local summarizer.
+const COMPRESSION_TIMEOUT_MS = 20_000;
 
 export async function resolveCompressionProviderSessionConfig(
   selection: CompressionBackendSelection,
