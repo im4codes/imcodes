@@ -30,6 +30,7 @@ import { useEffect, useRef, useState, useCallback } from 'preact/hooks';
 import type { WsClient, TimelineEvent, ServerMessage } from '../ws-client.js';
 import { TimelineDB } from '../timeline-db.js';
 import { mergeTimelineEvents, preferTimelineEvent } from '../../../src/shared/timeline/merge.js';
+import { fetchTimelineHistoryHttp } from '../api.js';
 
 // Singleton DB shared across all useTimeline instances — opened once at module load.
 // This avoids per-hook open() latency and ensures the DB is ready before any hook queries it.
@@ -796,6 +797,43 @@ export function useTimeline(
             if (typeof ev.ts === 'number' && (afterTs === undefined || ev.ts > afterTs)) afterTs = ev.ts;
           }
           historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS, afterTs);
+
+          // Defense-in-depth: fire a parallel HTTP backfill ~600ms after the
+          // WS reconnect. The WS `timeline.history_request` path is
+          // theoretically sufficient, but on the server side the bridge's
+          // `terminal.subscribe` handler does an async DB ownership check
+          // before registering the browser as a subscriber. Any live
+          // `timeline.event` emitted during that ~10–100ms resolve window
+          // is routed through `sendToSessionSubscribers`, finds the browser
+          // not-yet-subscribed, and gets silently dropped.
+          //
+          // HTTP /timeline/history/full reads the daemon store directly via
+          // a unicast request-response path that bypasses subscription
+          // routing entirely. By the ~600ms mark the subscribe race has
+          // long resolved and the daemon has persisted any in-flight events
+          // to the store, so a cursor-based read catches whatever WS
+          // dropped. `mergeTimelineEvents` dedups by eventId, so the
+          // overlap with the WS response is harmless.
+          if (serverId) {
+            const backfillAfterTs = afterTs;
+            const backfillSessionId = sessionId;
+            setTimeout(() => {
+              if (cacheKeyRef.current !== cacheKey) return; // unmounted / switched session
+              void fetchTimelineHistoryHttp(serverId, backfillSessionId, {
+                afterTs: backfillAfterTs,
+                limit: MAX_MEMORY_EVENTS,
+              }).then((result) => {
+                if (!result || result.events.length === 0) return;
+                if (cacheKeyRef.current !== cacheKey) return;
+                const recovered = result.events.filter(
+                  (ev): ev is TimelineEvent => !!ev && typeof ev === 'object' && typeof (ev as TimelineEvent).eventId === 'string',
+                );
+                if (recovered.length === 0) return;
+                mergeEvents(recovered);
+                idbPutEvents(recovered);
+              }).catch(() => { /* opportunistic — WS path is primary */ });
+            }, 600);
+          }
         }
       }
 
