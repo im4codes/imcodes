@@ -404,6 +404,37 @@ describe('SupervisionBroker', () => {
     expect(result.reason).toMatch(/follow-up work in Chinese|original supervisor reason/i);
   });
 
+  it('downgrades a complete verdict to continue for the exact Chinese commit-followup phrasing from the reported screenshot', async () => {
+    const provider = new FakeProvider([
+      '{"decision":"complete","reason":"looks good","confidence":0.92}',
+    ]);
+    const broker = new SupervisionBroker({
+      resolveProvider: async () => provider,
+    });
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk',
+      model: 'gpt-5.3-codex-spark',
+      timeoutMs: 2_000,
+      promptVersion: 'supervision_decision_v1',
+      maxParseRetries: 1,
+      auditMode: 'audit',
+      maxAuditLoops: 2,
+      taskRunPromptVersion: 'task_run_status_v1',
+    });
+
+    const result = await broker.decide({
+      snapshot,
+      taskRequest: '把 .gitignore 这个改动提交掉',
+      assistantResponse: '这还没提交。如果你要，我可以顺手给你再提一个小 commit。',
+    });
+
+    expect(result).toMatchObject({
+      decision: 'continue',
+    });
+    expect(result.reason).toMatch(/follow-up work in Chinese|remaining work|original supervisor reason/i);
+  });
+
   it('does not downgrade a complete verdict for an unrelated explanation offer', async () => {
     const provider = new FakeProvider([
       '{"decision":"complete","reason":"looks good","confidence":0.92}',

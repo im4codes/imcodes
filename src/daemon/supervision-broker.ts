@@ -42,15 +42,19 @@ const DECISIONS = new Set<SupervisionDecisionKind>(['complete', 'continue', 'ask
 const MIN_SUPERVISION_EXECUTION_BUDGET_MS = 5;
 const CONTINUE_SIGNAL_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
   {
-    pattern: /\b(?:todo|not done|unfinished|incomplete|remaining work|still needs? work|missing tests?|needs? tests?|should add tests?|add(?:ing)? more tests?|more tests needed|still need(?:s)? to|follow-?up work|next step(?:s)?|keep working|continue working)\b/i,
+    pattern: /\b(?:todo|not done|unfinished|incomplete|remaining work|still needs? work|missing tests?|needs? tests?|should add tests?|add(?:ing)? more tests?|more tests needed|still need(?:s)? to|follow-?up work|next step(?:s)?|keep working|continue working|not committed|uncommitted|not pushed)\b/i,
     reason: 'assistant response explicitly indicates remaining work',
   },
   {
-    pattern: /\b(?:if you want|next step|i can(?: next| also| still)?|we can next|can follow up)\b[\s\S]{0,80}\b(?:add|write|run|fix|improve|update|verify|audit|commit|push|test|tests)\b/i,
+    pattern: /\b(?:if you want|next step|i can(?: next| also| still)?|we can next|can follow up)\b[\s\S]{0,80}\b(?:add|write|run|fix|improve|update|verify|audit|commit|push|submit|test|tests)\b/i,
     reason: 'assistant response proposes a concrete follow-up engineering step',
   },
   {
-    pattern: /(还没完成|未完成|还需要|待处理|待补|缺少测试|需要补测试|补测试|加测试|继续完善|继续修|下一步|接下来|如果你愿意)[\s\S]{0,40}(测试|修复|完善|验证|提交|推送|commit|push)/i,
+    pattern: /(还没完成|未完成|还需要|待处理|待补|缺少测试|需要补测试|补测试|加测试|继续完善|继续修|下一步|接下来|如果你愿意|如果你要|还没提交|未提交|没有提交|还没推送|未推送|没有推送|还没commit|未commit|没commit|还没push|未push|没push)[\s\S]{0,60}(测试|修复|完善|验证|提交|推送|commit|push)/i,
+    reason: 'assistant response proposes concrete follow-up work in Chinese',
+  },
+  {
+    pattern: /(这还没提交|还没提交|未提交|没有提交|还没推送|未推送|没有推送|如果你要|我可以顺手|再提一个(?:小)?\s*commit|再帮你(?:提个)?\s*commit|再帮你提交|再帮你推送)/i,
     reason: 'assistant response proposes concrete follow-up work in Chinese',
   },
 ];
