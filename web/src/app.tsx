@@ -1893,7 +1893,16 @@ export function App() {
         try { ws.unsubscribeTransportSession(name); } catch { /* ignore */ }
       }
     };
-  }, [connected, transportSessionKey, sessions]);
+  // NOTE: `sessions` (the raw array) is intentionally omitted from the dep
+  // array. Including it caused a subscribe/unsubscribe flap loop — every
+  // setState produces a new array reference even when contents are identical,
+  // which re-ran this effect dozens of times per frame and saturated the
+  // server's per-browser rate limit (120 msgs / 10s), collaterally dropping
+  // `session.send` messages and leaving the chat bubble spinning for 30s.
+  // `transportSessionKey` already captures every semantic change
+  // (session names + runtimeType), so the string key is sufficient.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connected, transportSessionKey]);
 
   // Subscribe terminal for ALL sub-sessions in passive mode.
   // Active sub-session windows upgrade themselves to raw:true while visible.
@@ -1928,7 +1937,11 @@ export function App() {
         try { ws.unsubscribeTransportSession(name); } catch { /* ignore */ }
       }
     };
-  }, [connected, transportSubSessionKey, subSessions]);
+  // Same rationale as the transport-session effect above — string key only,
+  // no raw array ref. See that effect's comment for the subscribe/unsubscribe
+  // flap loop this prevents.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connected, transportSubSessionKey]);
 
   // When switching to a session in terminal mode, trigger fit.
   // All sessions are subscribed to PTY streaming, so xterm buffer is already current —
