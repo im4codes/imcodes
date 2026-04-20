@@ -1100,6 +1100,16 @@ function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName:
 /** providerSessionId → IM.codes sessionName routing map */
 const providerRouting = new Map<string, string>();
 
+/**
+ * providerSessionIds that belong to **out-of-band callers** (e.g.
+ * `supervision-broker`, `summary-compressor`) which drive the provider
+ * directly and attach their own `onComplete`/`onError` listeners filtered
+ * by sid. Their deltas must be silently dropped by `transport-relay`
+ * rather than warn-logged per-delta, because there's no IM.codes
+ * user-facing session to relay them to. Caller owns mark/unmark lifecycle.
+ */
+const ephemeralProviderSids = new Set<string>();
+
 /** Register a provider session ID → IM.codes session name route. */
 export function registerProviderRoute(providerSessionId: string, sessionName: string): void {
   providerRouting.set(providerSessionId, sessionName);
@@ -1108,6 +1118,27 @@ export function registerProviderRoute(providerSessionId: string, sessionName: st
 /** Unregister a provider session ID route. */
 export function unregisterProviderRoute(providerSessionId: string): void {
   providerRouting.delete(providerSessionId);
+}
+
+/**
+ * Mark a providerSessionId as belonging to an ephemeral out-of-band caller
+ * (supervision decision, summary compression, etc.). `transport-relay`
+ * will drop this sid's deltas silently instead of warning. The caller is
+ * responsible for calling `unmarkEphemeralProviderSid` when the session
+ * ends (typically in a finally block alongside `provider.endSession`).
+ */
+export function markEphemeralProviderSid(providerSessionId: string): void {
+  ephemeralProviderSids.add(providerSessionId);
+}
+
+/** Release an ephemeral providerSessionId marking. Idempotent. */
+export function unmarkEphemeralProviderSid(providerSessionId: string): void {
+  ephemeralProviderSids.delete(providerSessionId);
+}
+
+/** Is this providerSessionId a known ephemeral/out-of-band sid? */
+export function isEphemeralProviderSid(providerSessionId: string): boolean {
+  return ephemeralProviderSids.has(providerSessionId);
 }
 
 /** Resolve a provider session ID to an IM.codes session name. */

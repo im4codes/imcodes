@@ -15,6 +15,7 @@ import {
   buildSupervisionDecisionRepairPrompt,
 } from './supervision-prompts.js';
 import { resolveProcessingProviderSessionConfig } from '../context/processing-provider-config.js';
+import { markEphemeralProviderSid, unmarkEphemeralProviderSid } from '../agent/session-manager.js';
 
 export type SupervisionDecisionKind = 'complete' | 'continue' | 'ask_human';
 
@@ -215,6 +216,10 @@ export class SupervisionBroker {
       ...(resolved.env ? { env: resolved.env } : {}),
       ...(resolved.settings ? { settings: resolved.settings } : {}),
     });
+    // Supervision runs its own per-call onComplete/onError filtered by sid;
+    // mark the sid so transport-relay's global onDelta drops its events
+    // silently instead of per-delta "unresolved route" warnings.
+    markEphemeralProviderSid(providerSessionId);
 
     try {
       if (provider.setSessionAgentId && effectiveAgentId) provider.setSessionAgentId(providerSessionId, effectiveAgentId);
@@ -240,6 +245,7 @@ export class SupervisionBroker {
       }
       return askHuman('invalid supervisor decision', SUPERVISION_UNAVAILABLE_REASONS.INVALID_OUTPUT);
     } finally {
+      unmarkEphemeralProviderSid(providerSessionId);
       await provider.endSession(providerSessionId).catch(() => {});
     }
   }

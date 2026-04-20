@@ -8,7 +8,7 @@
 import type { TransportProvider, ProviderError, ProviderStatusUpdate } from '../agent/transport-provider.js';
 import type { MessageDelta, AgentMessage, ToolCallEvent } from '../../shared/agent-message.js';
 import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
-import { resolveSessionName } from '../agent/session-manager.js';
+import { resolveSessionName, isEphemeralProviderSid } from '../agent/session-manager.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { appendTransportEvent } from './transport-history.js';
 import logger from '../util/logger.js';
@@ -146,7 +146,15 @@ export function setTransportRelaySend(fn: (msg: Record<string, unknown>) => void
 export function wireProviderToRelay(provider: TransportProvider): void {
   provider.onDelta((providerSid: string, delta: MessageDelta) => {
     const sessionName = resolveSessionName(providerSid);
-    if (!sessionName) { logger.warn({ providerSid }, 'transport-relay: unresolved route for delta — dropped'); return; }
+    if (!sessionName) {
+      // Out-of-band callers (supervision-broker, summary-compressor) drive
+      // the provider directly with their own per-call listeners; their
+      // deltas aren't meant for the relay. Drop silently — logging per
+      // delta produced hundreds of warns/min on a busy daemon.
+      if (isEphemeralProviderSid(providerSid)) return;
+      logger.warn({ providerSid }, 'transport-relay: unresolved route for delta — dropped');
+      return;
+    }
 
     // Provider may send cumulative deltas (full text so far) or incremental.
     // Use delta.delta as the display text directly — the provider's internal

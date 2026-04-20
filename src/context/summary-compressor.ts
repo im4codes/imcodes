@@ -20,6 +20,7 @@ import {
   type ProcessingBackendSelection as CompressionBackendSelection,
   type ProcessingProviderSessionConfig as CompressionProviderSessionConfig,
 } from './processing-provider-config.js';
+import { markEphemeralProviderSid, unmarkEphemeralProviderSid } from '../agent/session-manager.js';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -244,6 +245,11 @@ async function getCompressionProvider(
     ...(sessionConfig.settings ? { settings: sessionConfig.settings } : {}),
     ...(sessionConfig.agentId ? { agentId: sessionConfig.agentId } : {}),
   });
+  // Out-of-band session: compression uses its own per-call listeners and
+  // never registers with the providerRouting map. Mark the sid so
+  // transport-relay drops its deltas silently (previously each delta
+  // produced a level=40 "unresolved route" warn — hundreds per minute).
+  markEphemeralProviderSid(sessionId);
 
   activeProvider = provider;
   activeSessionId = sessionId;
@@ -255,6 +261,7 @@ async function getCompressionProvider(
 /** End the compression sub-session without touching the shared provider. */
 async function endActiveCompressionSession(): Promise<void> {
   if (activeProvider && activeSessionId) {
+    unmarkEphemeralProviderSid(activeSessionId);
     try {
       await activeProvider.endSession(activeSessionId);
     } catch { /* ignore — best-effort */ }
