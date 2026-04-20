@@ -213,6 +213,86 @@ describe('SessionSettingsDialog supervision', () => {
     expect(screen.getByText('summaryMeta:supervision_decision_v1')).toBeDefined();
   });
 
+  it('persists customInstructionsOverride=true when user checks the override checkbox, and drops the global cache for that session', async () => {
+    // Simulate a user who already has global custom instructions saved.
+    fetchSupervisorDefaultsMock.mockResolvedValue({
+      backend: 'codex-sdk',
+      model: CODEX_MODEL_IDS[0],
+      timeoutMs: 12_000,
+      promptVersion: 'supervision_decision_v1',
+      customInstructions: 'GLOBAL: always prefer tests',
+    });
+
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        transportConfig={null}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    // Wait for the async fetchSupervisorDefaults to resolve and the global
+    // textarea to pre-populate. Both the "merged preview" gate and the
+    // `globalCustomInstructions` cache-mirror field depend on this.
+    await waitFor(() => {
+      expect(fetchSupervisorDefaultsMock).toHaveBeenCalled();
+    });
+
+    // Turn on supervised mode and the session body must become editable.
+    fireEvent.change(screen.getAllByRole('combobox')[3]!, { target: { value: 'supervised' } });
+    fireEvent.change(screen.getAllByRole('combobox')[4]!, { target: { value: 'codex-sdk' } });
+    fireEvent.change(screen.getAllByRole('combobox')[5]!, { target: { value: CODEX_MODEL_IDS[0] } });
+
+    // Session-level custom instructions — different text so we can confirm
+    // the session layer vs global layer are kept distinct in the payload.
+    fireEvent.input(screen.getByPlaceholderText('customInstructionsPlaceholder'), {
+      target: { value: 'SESSION: block commits on failing tests' },
+    });
+
+    // The override checkbox must be present and initially unchecked.
+    const overrideCheckbox = screen.getByLabelText(/customInstructionsOverrideLabel/i) as HTMLInputElement;
+    expect(overrideCheckbox.checked).toBe(false);
+
+    // With override=false AND both layers non-empty, the merged preview is
+    // shown — this proves the UI reads both layers.
+    expect(screen.getByTestId('supervision-merged-preview')).toBeDefined();
+
+    // Check override → session replaces global for this session.
+    fireEvent.click(overrideCheckbox);
+    expect(overrideCheckbox.checked).toBe(true);
+
+    // Preview must hide when override is active (no ambiguity to preview).
+    expect(screen.queryByTestId('supervision-merged-preview')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => {
+      expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', expect.objectContaining({
+        transportConfig: expect.objectContaining({
+          supervision: expect.objectContaining({
+            mode: 'supervised',
+            customInstructions: 'SESSION: block commits on failing tests',
+            customInstructionsOverride: true,
+            // Cache mirror of the current global value is still written to the
+            // snapshot so the daemon can re-read it next time override flips
+            // back to false without needing another defaults fetch.
+            globalCustomInstructions: 'GLOBAL: always prefer tests',
+          }),
+        }),
+      }));
+    });
+
+    // User did not edit the global region → defaults endpoint must not be
+    // hit. This proves the save-split handles override-only changes cleanly.
+    expect(saveSupervisorDefaultsMock).not.toHaveBeenCalled();
+  });
+
   it('persists custom supervision instructions in the session snapshot', async () => {
     render(
       <SessionSettingsDialog
