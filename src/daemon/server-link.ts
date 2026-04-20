@@ -116,6 +116,18 @@ export class ServerLink {
       outbox.flushOnReconnect(sender as never).catch((err) => {
         logger.warn({ err }, 'AckOutbox flush on reconnect failed');
       });
+
+      // Refresh the supervisor global-defaults cache on every (re)connect so
+      // user edits to "Global custom instructions" land in the daemon within
+      // one WS round-trip, not next restart. See `supervisor-defaults-cache.ts`.
+      void (async () => {
+        try {
+          const { refreshSupervisorDefaultsCache } = await import('./supervisor-defaults-cache.js');
+          await refreshSupervisorDefaultsCache();
+        } catch (err) {
+          logger.debug({ err }, 'supervisor-defaults-cache: reconnect refresh failed');
+        }
+      })();
     });
 
     ws.addEventListener('error', (event) => {

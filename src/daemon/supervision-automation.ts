@@ -7,6 +7,7 @@ import { startP2pRun, cancelP2pRun, getP2pRun } from './p2p-orchestrator.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { supervisionBroker } from './supervision-broker.js';
+import { getCachedGlobalCustomInstructions } from './supervisor-defaults-cache.js';
 import logger from '../util/logger.js';
 import {
   SUPERVISION_CONTRACT_IDS,
@@ -28,6 +29,27 @@ import {
   buildReworkBriefPrompt,
 } from './supervision-prompts.js';
 import { TIMELINE_EVENT_FILE_CHANGE, type FileChangePatch } from '../../shared/file-change.js';
+
+/**
+ * Merge the daemon-cached global custom instructions into a session snapshot
+ * when the snapshot's own `globalCustomInstructions` mirror is empty. The
+ * web client only updates the mirror for the currently-edited session on
+ * save, so snapshots for other sessions can be stale — this function is
+ * the runtime fallback that makes the user's saved defaults actually reach
+ * every session's supervisor. See `supervisor-defaults-cache.ts`.
+ *
+ * Returns a new snapshot (does not mutate) when augmentation happens; returns
+ * the original reference otherwise so the fast path stays allocation-free.
+ */
+function enrichSnapshotWithGlobalDefaults(
+  snapshot: SessionSupervisionSnapshot,
+): SessionSupervisionSnapshot {
+  const existing = snapshot.globalCustomInstructions?.trim();
+  if (existing) return snapshot;
+  const cached = getCachedGlobalCustomInstructions();
+  if (!cached) return snapshot;
+  return { ...snapshot, globalCustomInstructions: cached };
+}
 
 type TaskRunPhase = 'execution' | 'auditing';
 
@@ -712,7 +734,7 @@ class SupervisionAutomation {
     let decision;
     try {
       decision = await supervisionBroker.decide({
-        snapshot: current.snapshot,
+        snapshot: enrichSnapshotWithGlobalDefaults(current.snapshot),
         taskRequest: current.userText,
         assistantResponse: current.lastAssistantText,
         cwd: record?.projectDir,
@@ -918,13 +940,14 @@ class SupervisionAutomation {
     }
 
     // Resolve the effective custom instructions (global + session + override)
-    // at dispatch time from the current session snapshot. The snapshot's
-    // `globalCustomInstructions` cache is kept in sync by the web client.
+    // at dispatch time. The session-scoped snapshot mirror can be stale when
+    // the user updated defaults from a different session's dialog — the
+    // daemon-side cache layer (`supervisor-defaults-cache.ts`) covers that gap.
     const continuePrompt = buildSupervisionContinuePrompt(
       current.userText,
       current.lastAssistantText,
       reason,
-      resolveEffectiveCustomInstructions(current.snapshot),
+      resolveEffectiveCustomInstructions(enrichSnapshotWithGlobalDefaults(current.snapshot)),
     );
     current.continueLoops += 1;
     current.sawAssistantOutput = false;

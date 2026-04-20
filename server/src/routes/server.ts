@@ -33,6 +33,7 @@ import {
 import { searchSemanticMemoryView } from '../util/semantic-memory-view.js';
 import { deletePersonalMemoryProjection } from '../util/memory-delete.js';
 import { isMemoryNoiseSummary } from '../../../shared/memory-noise-patterns.js';
+import { SUPERVISION_USER_DEFAULT_PREF_KEY } from '../../../shared/supervision-config.js';
 
 export const serverRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -317,6 +318,43 @@ serverRoutes.get('/:id/shared-context/runtime-config/daemon', async (c) => {
       enablePersonalMemorySync: personalSyncEnabled,
     },
   });
+});
+
+/**
+ * GET /:id/supervision/user-defaults/daemon
+ *
+ * Daemon-scoped (Bearer server token) read of the user's global supervision
+ * defaults pref. Exists because the web client only mirrors
+ * `globalCustomInstructions` into the CURRENTLY-edited session's transportConfig
+ * on save. Any OTHER session's cached snapshot retains an older (or empty)
+ * global value — which is what made the user-visible complaint "typed
+ * `Always commit and push if asked!` in Global custom instructions, but
+ * supervisor ignores it" real: the session under supervision was not the
+ * session where the defaults were saved, so its snapshot's
+ * `globalCustomInstructions` was stale.
+ *
+ * The daemon polls this at startup + on each WS reconnect and uses the
+ * result as a fallback layer for `resolveEffectiveCustomInstructions()`.
+ */
+serverRoutes.get('/:id/supervision/user-defaults/daemon', async (c) => {
+  const auth = c.req.header('Authorization');
+  if (!auth?.startsWith('Bearer ')) return c.json({ error: 'unauthorized' }, 401);
+  const tokenHash = sha256Hex(auth.slice(7));
+  const serverId = c.req.param('id');
+  const server = await c.env.DB.queryOne<{ id: string; user_id: string }>(
+    'SELECT id, user_id FROM servers WHERE id = $1 AND token_hash = $2',
+    [serverId, tokenHash],
+  );
+  if (!server) return c.json({ error: 'unauthorized' }, 401);
+  const raw = await getUserPref(c.env.DB, server.user_id, SUPERVISION_USER_DEFAULT_PREF_KEY);
+  let parsed: Record<string, unknown> | null = null;
+  if (raw) {
+    try {
+      const value = JSON.parse(raw);
+      if (value && typeof value === 'object' && !Array.isArray(value)) parsed = value as Record<string, unknown>;
+    } catch { /* malformed pref → treat as empty */ }
+  }
+  return c.json({ defaults: parsed });
 });
 
 /**

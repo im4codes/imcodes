@@ -365,6 +365,19 @@ export async function startup(): Promise<DaemonContext> {
     } catch (err) {
       logger.warn({ err, serverId }, 'shared-context runtime config bootstrap failed');
     }
+    // Prime the supervisor global-defaults cache so the very first
+    // supervision dispatch after startup uses the current custom
+    // instructions even if no session's cached snapshot carries them.
+    // Fire-and-forget: failure just means the daemon falls through to
+    // the snapshot mirror. The WS-reconnect hook below keeps it fresh.
+    void (async () => {
+      try {
+        const { refreshSupervisorDefaultsCache } = await import('./supervisor-defaults-cache.js');
+        await refreshSupervisorDefaultsCache();
+      } catch (err) {
+        logger.debug({ err }, 'supervisor-defaults-cache: startup prime failed');
+      }
+    })();
   }
 
   // Sync sessions from D1 before restoring tmux sessions
