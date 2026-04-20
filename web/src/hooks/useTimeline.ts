@@ -45,6 +45,58 @@ const eventsCache = new Map<string, TimelineEvent[]>();
 const eventsCacheAccess = new Map<string, number>();
 const cacheListeners = new Map<string, Set<(events: TimelineEvent[]) => void>>();
 
+// Cross-hook-instance, cross-mount memo of the last time the HTTP backfill
+// for a given `cacheKey` (server+session scope) completed. Consulted by the
+// mount-time backfill path so that rapidly switching between the same two
+// windows (open A → open B → open A again) doesn't re-hit the daemon store
+// for every visit. Only updated on a SUCCESSFUL fetch — null/error responses
+// leave the timestamp unchanged so the next mount retries promptly. The WS
+// reconnect path deliberately bypasses this cooldown because a reconnect
+// indicates a real connection gap where missed events are probable.
+const lastHttpBackfillOkAt = new Map<string, number>();
+const MOUNT_BACKFILL_COOLDOWN_MS = 60_000;
+
+/**
+ * Wipe all mount-backfill cooldown stamps. Called when the app has been
+ * backgrounded long enough that missed events become likely (mobile app
+ * resumed from background, laptop lid opened, browser tab restored after
+ * a long hide). Callers supply their own gate — the function itself is
+ * unconditional.
+ */
+function resetBackfillCooldowns(): void {
+  lastHttpBackfillOkAt.clear();
+}
+
+// On every visibility transition we record when the document went hidden;
+// on the return-to-visible side, if the hidden gap is >= the cooldown
+// window the cache is pessimistically wiped so the next mount for any
+// session re-hits the HTTP path. Shorter blurs (alt-tab to Slack for 5s)
+// leave the cache intact so the cooldown's rate-limit is still useful.
+//
+// Guard against non-browser environments (vitest node / SSR):
+// `document`/`window` may be undefined at import time.
+if (typeof document !== 'undefined' && typeof window !== 'undefined') {
+  let hiddenAt: number | null = document.visibilityState === 'hidden' ? Date.now() : null;
+  const onVisibility = (): void => {
+    if (document.visibilityState === 'hidden') {
+      hiddenAt = Date.now();
+      return;
+    }
+    // visible
+    if (hiddenAt !== null && Date.now() - hiddenAt >= MOUNT_BACKFILL_COOLDOWN_MS) {
+      resetBackfillCooldowns();
+    }
+    hiddenAt = null;
+  };
+  document.addEventListener('visibilitychange', onVisibility);
+  // Treat `pageshow` with a truthy `persisted` flag (bfcache restore) like a
+  // fresh app open — the cache entries from before bfcache freezes are
+  // stale relative to whatever landed in the meantime.
+  window.addEventListener('pageshow', (ev) => {
+    if ((ev as PageTransitionEvent).persisted) resetBackfillCooldowns();
+  });
+}
+
 const MAX_MEMORY_EVENTS = 300;
 const MAX_HISTORY_EVENTS = 2000;
 const MAX_CACHED_SESSIONS = 12;
@@ -213,6 +265,16 @@ export function __resetTimelineCacheForTests(): void {
   eventsCache.clear();
   eventsCacheAccess.clear();
   cacheListeners.clear();
+  lastHttpBackfillOkAt.clear();
+}
+
+/**
+ * Test-only entry point for the same wipe the app does on long-hide /
+ * pageshow restore. Exposed so tests can verify the cooldown actually
+ * gets cleared without having to mock `document.visibilityState`.
+ */
+export function __resetBackfillCooldownsForTests(): void {
+  resetBackfillCooldowns();
 }
 
 export function __getTimelineCacheKeysForTests(): string[] {
@@ -323,7 +385,7 @@ export function useTimeline(
       // was minimized/backgrounded since the memory cache can be stale.
       // Kept short (~200ms) because the UI is already visible; this is
       // strictly additive catch-up, merged by eventId.
-      fireHttpBackfillRef.current(200);
+      fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS });
       return () => { cancelled = true; };
     }
 
@@ -338,7 +400,7 @@ export function useTimeline(
       // Same reasoning as path 1 — back-fill in the background so the
       // re-opened window is guaranteed to reflect authoritative daemon
       // state, not whatever the WS subscription happened to catch.
-      fireHttpBackfillRef.current(200);
+      fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS });
       return () => { cancelled = true; };
     }
 
@@ -369,7 +431,7 @@ export function useTimeline(
         // Background HTTP backfill — IDB is authoritative only up to the
         // last time a WS event landed; if the user closed the tab mid-chat
         // and reopened later there may be a gap between IDB and daemon.
-        fireHttpBackfillRef.current(200);
+        fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS });
       } else {
         epochRef.current = 0;
         seqRef.current = 0;
@@ -384,7 +446,7 @@ export function useTimeline(
         // still worthwhile: the WS history request may race against the
         // bridge's subscribe ownership-check window, and HTTP reads go
         // through a separate unicast request-response path.
-        fireHttpBackfillRef.current(200);
+        fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS });
       }
     };
     load().catch(() => {});
@@ -586,26 +648,41 @@ export function useTimeline(
    * history before this fires.
    *
    * Call sites:
-   *   - Session mount / switch (covers "user just opened a window" case —
-   *     web UI may have missed events while the tab was backgrounded, or
-   *     while another client-side renderer held the only subscribe and this
-   *     window was minimized).
-   *   - WS reconnect (covers the ~10–100ms subscribe-race window on the
-   *     bridge where live events can be silently dropped by the
-   *     subscription router).
+   *   - Session mount / switch (`cooldownMs = 60_000`): "user just opened a
+   *     window". If the previous backfill for this same session succeeded
+   *     less than a minute ago — e.g. user is flicking A → B → A — don't
+   *     rehit the daemon store; the freshly cached result is authoritative
+   *     enough.
+   *   - WS reconnect (`cooldownMs = 0`): covers the ~10–100ms subscribe-race
+   *     window on the bridge where live events can be silently dropped.
+   *     Reconnects imply a real connection gap, so they deliberately bypass
+   *     the cooldown — missing events after a disconnect is exactly what
+   *     this read exists to recover.
    *
    * Safe to call when:
    *   - `serverId` is unknown → skipped (self-hosted deploys require it).
    *   - The user switches session mid-flight → the cacheKey-guard in the
    *     timeout callback discards results for the old session.
-   *   - Backfill returns zero events → no-op.
+   *   - Backfill returns zero events → cooldown stamp still recorded (the
+   *     fetch confirmed "no gap").
+   *   - Backfill returns null / rejects → cooldown stamp is NOT recorded so
+   *     the next attempt tries again promptly.
    */
-  const fireHttpBackfill = useCallback((delayMs: number) => {
+  const fireHttpBackfill = useCallback((delayMs: number, opts?: { cooldownMs?: number }) => {
     if (!serverId || !sessionId) return;
+    const cooldownMs = opts?.cooldownMs ?? 0;
     const backfillSessionId = sessionId;
     const backfillCacheKey = cacheKey;
     setTimeout(() => {
       if (cacheKeyRef.current !== backfillCacheKey) return;
+      // Cooldown is enforced AT FIRE TIME (after the delay) rather than at
+      // call time so two back-to-back switches landing inside the delay
+      // window still observe the correct gap relative to the previous
+      // confirmed fetch.
+      if (backfillCacheKey && cooldownMs > 0) {
+        const lastOk = lastHttpBackfillOkAt.get(backfillCacheKey);
+        if (lastOk !== undefined && Date.now() - lastOk < cooldownMs) return;
+      }
       // Recompute the cursor at fire time, not call time — the UI may have
       // received fresh WS events during the delay window and we don't want
       // to redownload them.
@@ -621,7 +698,11 @@ export function useTimeline(
         afterTs,
         limit: MAX_MEMORY_EVENTS,
       }).then((result) => {
-        if (!result || result.events.length === 0) return;
+        if (!result) return; // null = transient failure, don't stamp cooldown
+        // Any non-null response (including zero-events "no gap") counts as
+        // confirmed-up-to-now and arms the cooldown.
+        if (backfillCacheKey) lastHttpBackfillOkAt.set(backfillCacheKey, Date.now());
+        if (result.events.length === 0) return;
         if (cacheKeyRef.current !== backfillCacheKey) return;
         const recovered = result.events.filter(
           (ev): ev is TimelineEvent => !!ev && typeof ev === 'object' && typeof (ev as TimelineEvent).eventId === 'string',
@@ -629,7 +710,7 @@ export function useTimeline(
         if (recovered.length === 0) return;
         mergeEvents(recovered);
         idbPutEvents(recovered);
-      }).catch(() => { /* opportunistic — WS path is primary */ });
+      }).catch(() => { /* opportunistic — WS path is primary; don't stamp cooldown */ });
     }, delayMs);
   }, [serverId, sessionId, cacheKey, mergeEvents, idbPutEvents]);
 
