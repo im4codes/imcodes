@@ -34,11 +34,33 @@ const REBIND_DELAYS_MS = [1000, 2000, 4000, 8000, 16000, 30000];
 const MAX_REBIND_ATTEMPTS = 5;
 
 function shouldSuppressPaneIdInlineError(sessionName: string): boolean {
-  return isTransportSessionName(sessionName);
+  const session = getSession(sessionName);
+  // Transport sessions never have a tmux pane — suppress the inline error.
+  if (session?.runtimeType === 'transport') return true;
+  if (typeof session?.agentType === 'string' && isTransportAgent(session.agentType)) return true;
+  // Session not yet in the store. Reached here only after startPipe already
+  // tried `getPaneId(sessionName)` and got undefined — meaning no tmux pane
+  // AND no session record. Two races produce this shape:
+  //   (a) Transport launch race: subscribe arrives before
+  //       launchTransportSession persists the session record.
+  //   (b) Stale subscribe for a session that has been deleted.
+  // In both cases, permanently stamping "Terminal stream unavailable: pane
+  // id not available. Restart the session to fix." into a newly-created
+  // (or vanished) transport session's timeline is misleading. The E2E
+  // "mode-aware-terminal-subscribe" path is unaffected: that test's tmux
+  // session has a real pane, so `getPaneId` succeeds and execution never
+  // reaches the inline-error branch that consults this helper.
+  if (!session) return true;
+  return false;
 }
 
 /** Transport sessions don't have tmux panes; all tmux-backed streamer
- *  operations (snapshot, pipe, rebind) are no-ops for them. */
+ *  operations (snapshot, pipe, rebind) are no-ops for them.
+ *  NOTE: returns false for sessions not yet in the store so that genuine
+ *  tmux sessions created outside the daemon's session store (e.g. E2E
+ *  tests calling `newSession` directly) can still subscribe via the pane
+ *  path. Pre-creation race suppression for transport sessions lives in
+ *  {@link shouldSuppressPaneIdInlineError}. */
 function isTransportSessionName(sessionName: string): boolean {
   const session = getSession(sessionName);
   return session?.runtimeType === 'transport'

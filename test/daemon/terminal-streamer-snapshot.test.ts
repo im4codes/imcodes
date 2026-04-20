@@ -220,4 +220,33 @@ describe('TerminalStreamer — snapshot behavior', () => {
       expect.any(Object),
     );
   });
+
+  it('suppresses pane-id inline errors when the session record is not yet in the store', async () => {
+    // Simulates the launch race for transport sub-sessions (copilot-sdk /
+    // cursor-headless): the web UI subscribes before `launchTransportSession`
+    // has finished persisting the session record. Without this guard, users
+    // see a permanent "Terminal stream unavailable: pane id not available.
+    // Restart the session to fix." error stamped into the timeline of a
+    // session that's only a handful of milliseconds old.
+    const session = 'deck_sub_copilot_race';
+    mockGetSession.mockReturnValue(undefined);
+    mockGetPaneId.mockResolvedValue(undefined);
+
+    streamer.subscribe({
+      sessionName: session,
+      send: () => {},
+      onError: () => {},
+    });
+
+    await flush();
+
+    expect(emitSpy).not.toHaveBeenCalledWith(
+      session,
+      'assistant.text',
+      expect.objectContaining({
+        text: '⚠️ Error: Terminal stream unavailable: pane id not available. Restart the session to fix.',
+      }),
+      expect.any(Object),
+    );
+  });
 });

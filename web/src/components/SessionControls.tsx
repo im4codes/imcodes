@@ -33,6 +33,7 @@ import { getQwenAuthTier, QWEN_AUTH_TIERS } from '@shared/qwen-auth.js';
 import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/qwen-models.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, normalizeClaudeCodeModelId } from '../../../src/shared/models/options.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '@shared/effort-levels.js';
+import { useTransportModels, supportsDynamicTransportModels } from '../hooks/useTransportModels.js';
 import {
   buildTransportConfigWithSupervision,
   extractSessionSupervisionSnapshot,
@@ -601,11 +602,24 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const isCopilot = activeSession?.agentType === 'copilot-sdk';
   const isCursorHeadless = activeSession?.agentType === 'cursor-headless';
   const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless;
-  // Prefer the full daemon-probed model list (Copilot SDK `listModels()` /
-  // `cursor-agent --list-models`) so users see every supported model, not
-  // just the hardcoded suggestions. Fall back to the suggestions when the
-  // probe hasn't completed yet (first paint after fresh daemon start).
+  // Source-of-truth priority for the model picker:
+  //   1. `useTransportModels` — live daemon probe via `transport.list_models`
+  //      WS round-trip. Works uniformly for main sessions AND sub-sessions
+  //      (sub-session SessionInfo records aren't hydrated with
+  //      copilot/cursorAvailableModels, so we can't rely on activeSession).
+  //   2. `activeSession?.{copilot,cursor}AvailableModels` — the cached
+  //      hydration set by `buildSessionList()` for main sessions (first
+  //      paint before the WS probe reply arrives).
+  //   3. Hardcoded suggestion constants — offline/no-probe fallback so the
+  //      picker never renders empty.
+  const dynamicModelsAgentType = supportsDynamicTransportModels(activeSession?.agentType)
+    ? activeSession!.agentType
+    : null;
+  const dynamicTransportModels = useTransportModels(ws, dynamicModelsAgentType);
   const genericTransportModelSuggestions: readonly string[] = useMemo(() => {
+    if (dynamicTransportModels.models.length > 0) {
+      return dynamicTransportModels.models.map((m) => m.id);
+    }
     if (isCopilot) {
       const probed = activeSession?.copilotAvailableModels;
       if (probed && probed.length > 0) return probed;
@@ -617,7 +631,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       return CURSOR_HEADLESS_MODEL_SUGGESTIONS;
     }
     return [];
-  }, [isCopilot, isCursorHeadless, activeSession?.copilotAvailableModels, activeSession?.cursorAvailableModels]);
+  }, [
+    dynamicTransportModels.models,
+    isCopilot,
+    isCursorHeadless,
+    activeSession?.copilotAvailableModels,
+    activeSession?.cursorAvailableModels,
+  ]);
   const genericTransportModel = activeSession?.activeModel
     ?? activeSession?.requestedModel
     ?? detectedModel
