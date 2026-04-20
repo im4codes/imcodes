@@ -191,7 +191,9 @@
         "purposeTitle": "用途是什麼",
         "purposeBody": "Auto 用來讓一個監督模型判斷目前任務是否已完成、是否應該自動繼續，或是否需要人工介入。Audit 模式會在執行結束後再做一輪實作審查。",
         "howItWorksTitle": "原理是什麼",
-        "howItWorksBody": "當工作階段進入 idle 狀態時，IM.codes 會把最近的任務上下文交給已設定的監督模型，解析結構化決策結果，然後決定停止、自動繼續，或回退到人工處理。如果開啟 Audit 模式，完成後的結果還會進入自動稽核與返工循環。"
+        "howItWorksBody": "當工作階段進入 idle 狀態時，IM.codes 會把最近的任務上下文交給已設定的監督模型，解析結構化決策結果，然後決定停止、自動繼續，或回退到人工處理。如果開啟 Audit 模式，完成後的結果還會進入自動稽核與返工循環。",
+        "expandHint": "展開說明",
+        "collapseHint": "收合"
       },
       "mode": {
         "off": "關閉",
@@ -206,6 +208,12 @@
       "customInstructionsLabel": "自訂提示詞",
       "customInstructionsPlaceholder": "例如：在判定完成前必須要求測試與驗證結果。",
       "customInstructionsHelp": "選填。只對目前會話生效，會追加到 Auto 的監督判定與 continue 提示詞中。",
+      "globalCustomInstructionsLabel": "全域自訂提示詞",
+      "globalCustomInstructionsPlaceholder": "例如：任何時候都優先寫測試，不允許註解掉失敗的程式碼。",
+      "globalCustomInstructionsHelp": "選填。對所有啟用 Auto 的會話生效，除非下方的「覆蓋全域」被勾選。",
+      "customInstructionsOverrideLabel": "覆蓋全域自訂提示詞",
+      "customInstructionsOverrideHelp": "勾選後，本會話僅使用上方自己的提示詞。不勾選時，全域提示詞會拼在前面，以空行分隔。",
+      "customInstructionsMergedPreviewHeading": "傳送給監督者的合併提示詞：",
       "auditMode": {
         "audit": "稽核",
         "review": "覆核",

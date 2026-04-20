@@ -15,14 +15,17 @@ import {
   TASK_RUN_STATUS_MARKERS,
   embedSessionSupervisionSnapshot,
   extractSessionSupervisionSnapshot,
+  getSessionSupervisionSnapshotIssues,
   hasInvalidSessionSupervisionSnapshot,
   getSupportedSupervisionAuditModes,
   isSupportedSupervisionAuditMode,
+  mergeSupervisionCustomInstructions,
   mergeTransportConfigPreservingSupervision,
   normalizeSessionSupervisionSnapshot,
   normalizeSupervisorDefaultConfig,
   parseAuditVerdictFromText,
   parseTaskRunTerminalStateFromText,
+  resolveEffectiveCustomInstructions,
 } from '../shared/supervision-config.js';
 
 describe('supervision config helpers', () => {
@@ -169,6 +172,108 @@ describe('supervision config helpers', () => {
       const incoming = { someOtherKey: 'value' };
       expect(mergeTransportConfigPreservingSupervision(incoming, null)).toEqual(incoming);
       expect(mergeTransportConfigPreservingSupervision(incoming, {})).toEqual(incoming);
+    });
+  });
+
+  describe('global custom instructions (supervision-global-custom-instructions)', () => {
+    describe('mergeSupervisionCustomInstructions', () => {
+      it('returns empty string when both sides are empty and override is false', () => {
+        expect(mergeSupervisionCustomInstructions('', '', false)).toBe('');
+        expect(mergeSupervisionCustomInstructions(undefined, undefined, undefined)).toBe('');
+      });
+
+      it('returns global when session is empty and override is false', () => {
+        expect(mergeSupervisionCustomInstructions('global text', '', false)).toBe('global text');
+        expect(mergeSupervisionCustomInstructions('global text', '   ', undefined)).toBe('global text');
+      });
+
+      it('returns session when global is empty and override is false', () => {
+        expect(mergeSupervisionCustomInstructions('', 'session text', false)).toBe('session text');
+      });
+
+      it('concatenates with double newline when both non-empty and override is false', () => {
+        expect(mergeSupervisionCustomInstructions('A', 'B', false)).toBe('A\n\nB');
+        expect(mergeSupervisionCustomInstructions('  line one  ', '  line two  ', undefined))
+          .toBe('line one\n\nline two');
+      });
+
+      it('returns only the session value when override is true, ignoring global', () => {
+        expect(mergeSupervisionCustomInstructions('G', 'S', true)).toBe('S');
+        expect(mergeSupervisionCustomInstructions('G', '', true)).toBe('');
+      });
+    });
+
+    it('round-trips optional global customInstructions on SupervisorDefaultConfig', () => {
+      const withString = normalizeSupervisorDefaultConfig({ customInstructions: '  always test  ' });
+      expect(withString.customInstructions).toBe('always test');
+
+      const empty = normalizeSupervisorDefaultConfig({ customInstructions: '   ' });
+      expect(empty.customInstructions).toBeUndefined();
+
+      const missing = normalizeSupervisorDefaultConfig({});
+      expect(missing.customInstructions).toBeUndefined();
+    });
+
+    it('normalizes session snapshot override flag (default false, preserves true)', () => {
+      const defaulted = normalizeSessionSupervisionSnapshot({
+        mode: SUPERVISION_MODE.SUPERVISED,
+        backend: 'codex-sdk',
+        model: CODEX_MODEL_IDS[0],
+      });
+      expect(defaulted.customInstructionsOverride).toBeUndefined(); // omitted when false
+
+      const override = normalizeSessionSupervisionSnapshot({
+        mode: SUPERVISION_MODE.SUPERVISED,
+        backend: 'codex-sdk',
+        model: CODEX_MODEL_IDS[0],
+        customInstructionsOverride: true,
+      });
+      expect(override.customInstructionsOverride).toBe(true);
+    });
+
+    it('surfaces invalid_custom_instructions_override when the flag is non-boolean', () => {
+      const issues = getSessionSupervisionSnapshotIssues({
+        mode: SUPERVISION_MODE.SUPERVISED,
+        backend: 'codex-sdk',
+        model: CODEX_MODEL_IDS[0],
+        timeoutMs: 12_000,
+        promptVersion: SUPERVISION_DEFAULT_PROMPT_VERSION,
+        maxParseRetries: 1,
+        // @ts-expect-error intentionally wrong type
+        customInstructionsOverride: 'yes',
+      });
+      expect(issues).toContain('invalid_custom_instructions_override');
+    });
+
+    it('round-trips globalCustomInstructions cache on the session snapshot', () => {
+      const snapshot = normalizeSessionSupervisionSnapshot({
+        mode: SUPERVISION_MODE.SUPERVISED,
+        backend: 'codex-sdk',
+        model: CODEX_MODEL_IDS[0],
+        customInstructions: 'session',
+        globalCustomInstructions: '  global  ',
+      });
+      expect(snapshot.globalCustomInstructions).toBe('global');
+      expect(snapshot.customInstructions).toBe('session');
+    });
+
+    it('resolveEffectiveCustomInstructions reads from the snapshot fields', () => {
+      const concat = resolveEffectiveCustomInstructions({
+        customInstructions: 'S',
+        globalCustomInstructions: 'G',
+        customInstructionsOverride: false,
+      });
+      expect(concat).toBe('G\n\nS');
+
+      const overridden = resolveEffectiveCustomInstructions({
+        customInstructions: 'S',
+        globalCustomInstructions: 'G',
+        customInstructionsOverride: true,
+      });
+      expect(overridden).toBe('S');
+
+      expect(resolveEffectiveCustomInstructions(null)).toBe('');
+      expect(resolveEffectiveCustomInstructions({})).toBe('');
     });
   });
 });

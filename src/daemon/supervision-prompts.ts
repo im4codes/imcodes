@@ -2,6 +2,7 @@ import {
   AUDIT_VERDICT_MARKERS,
   SUPERVISION_CONTRACT_IDS,
   TASK_RUN_STATUS_MARKERS,
+  resolveEffectiveCustomInstructions,
 } from '../../shared/supervision-config.js';
 import { SUPERVISION_IMCODES_BACKGROUND_DOCS } from './imcodes-workflow-docs.js';
 import type { SupervisionBrokerRequest } from './supervision-broker.js';
@@ -37,7 +38,7 @@ export function buildSupervisionDecisionPrompt(
     '- If the assistant proposes a concrete next engineering step such as adding tests, fixing issues, verifying results, committing, or pushing, treat that as not complete yet.',
     '- Do not choose complete when the assistant itself indicates remaining work, TODOs, missing validation, or a follow-up implementation step.',
     buildImcodesWorkflowBackgroundSection(),
-    buildCustomInstructionsSection(request.snapshot?.customInstructions),
+    buildCustomInstructionsSection(resolveEffectiveCustomInstructions(request.snapshot)),
     request.description ? `Context: ${request.description}` : '',
     'Task request:',
     request.taskRequest,
@@ -58,7 +59,7 @@ export function buildSupervisionDecisionRepairPrompt(
     '{"decision":"complete|continue|ask_human","reason":"...","confidence":0.0}',
     'If the assistant response mentions remaining implementation work like tests, fixes, verification, commit/push, or another concrete next engineering step, return continue instead of complete.',
     buildImcodesWorkflowBackgroundSection(),
-    buildCustomInstructionsSection(request.snapshot?.customInstructions),
+    buildCustomInstructionsSection(resolveEffectiveCustomInstructions(request.snapshot)),
     'Previous invalid output:',
     previousOutput,
     'Task request:',

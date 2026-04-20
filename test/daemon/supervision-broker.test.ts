@@ -608,4 +608,96 @@ describe('SupervisionBroker', () => {
       unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
     });
   });
+
+  describe('custom instructions merge (end-to-end through broker)', () => {
+    const decisionOk = '{"decision":"complete","reason":"ok","confidence":0.5}';
+
+    const base = {
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk' as const,
+      model: 'gpt-5.3-codex-spark',
+      timeoutMs: 2_000,
+      promptVersion: 'supervision_decision_v1',
+      maxParseRetries: 1,
+      auditMode: 'audit' as const,
+      maxAuditLoops: 2,
+      taskRunPromptVersion: 'task_run_status_v1',
+    };
+
+    it('injects the concatenated global + session text into the supervisor prompt when override is false', async () => {
+      const provider = new FakeProvider([decisionOk]);
+      const broker = new SupervisionBroker({ resolveProvider: async () => provider });
+      const snapshot = normalizeSessionSupervisionSnapshot({
+        ...base,
+        customInstructions: 'SESSION-EXTRA-XYZ',
+        globalCustomInstructions: 'GLOBAL-PERSONA-ABC',
+      });
+
+      await broker.decide({
+        snapshot,
+        taskRequest: 'implement',
+        assistantResponse: 'progress so far',
+      });
+
+      const prompt = String(provider.send.mock.calls[0]?.[1] ?? '');
+      // Both layers present with global first, double-newline, then session.
+      expect(prompt).toContain('GLOBAL-PERSONA-ABC\n\nSESSION-EXTRA-XYZ');
+      // The human-readable header is also present.
+      expect(prompt).toContain('Session-specific supervision instructions from the user:');
+    });
+
+    it('uses only session text when the override flag is set', async () => {
+      const provider = new FakeProvider([decisionOk]);
+      const broker = new SupervisionBroker({ resolveProvider: async () => provider });
+      const snapshot = normalizeSessionSupervisionSnapshot({
+        ...base,
+        customInstructions: 'SESSION-ONLY',
+        globalCustomInstructions: 'GLOBAL-SHOULD-NOT-APPEAR',
+        customInstructionsOverride: true,
+      });
+
+      await broker.decide({
+        snapshot,
+        taskRequest: 'implement',
+        assistantResponse: 'progress',
+      });
+
+      const prompt = String(provider.send.mock.calls[0]?.[1] ?? '');
+      expect(prompt).toContain('SESSION-ONLY');
+      expect(prompt).not.toContain('GLOBAL-SHOULD-NOT-APPEAR');
+    });
+
+    it('falls back to global only when session is empty', async () => {
+      const provider = new FakeProvider([decisionOk]);
+      const broker = new SupervisionBroker({ resolveProvider: async () => provider });
+      const snapshot = normalizeSessionSupervisionSnapshot({
+        ...base,
+        globalCustomInstructions: 'ONLY-GLOBAL',
+      });
+
+      await broker.decide({
+        snapshot,
+        taskRequest: 'implement',
+        assistantResponse: 'progress',
+      });
+
+      const prompt = String(provider.send.mock.calls[0]?.[1] ?? '');
+      expect(prompt).toContain('ONLY-GLOBAL');
+    });
+
+    it('emits no custom-instructions block when both layers are empty', async () => {
+      const provider = new FakeProvider([decisionOk]);
+      const broker = new SupervisionBroker({ resolveProvider: async () => provider });
+      const snapshot = normalizeSessionSupervisionSnapshot({ ...base });
+
+      await broker.decide({
+        snapshot,
+        taskRequest: 'implement',
+        assistantResponse: 'progress',
+      });
+
+      const prompt = String(provider.send.mock.calls[0]?.[1] ?? '');
+      expect(prompt).not.toContain('Session-specific supervision instructions from the user:');
+    });
+  });
 });

@@ -102,6 +102,8 @@ export type SessionSupervisionSnapshotIssue =
   | 'invalid_timeout'
   | 'invalid_prompt_version'
   | 'invalid_custom_instructions'
+  | 'invalid_custom_instructions_override'
+  | 'invalid_global_custom_instructions'
   | 'invalid_max_parse_retries'
   | 'missing_audit_mode'
   | 'invalid_audit_mode'
@@ -122,11 +124,37 @@ export interface SupervisorDefaultConfig {
   model: string;
   timeoutMs: number;
   promptVersion: string;
+  /**
+   * Optional global supervision custom instructions. Free text appended to the
+   * supervisor prompt for every Auto-enabled session that does not set
+   * `customInstructionsOverride` on its session snapshot. Persisted in the
+   * user-default prefs; the daemon sees it via the per-session
+   * `SessionSupervisionSnapshot.globalCustomInstructions` cache field, which
+   * the web client keeps in sync.
+   */
+  customInstructions?: string;
 }
 
 export interface SessionSupervisionSnapshot extends SupervisorDefaultConfig {
   mode: SupervisionMode;
+  /** Session-scoped supervision custom instructions. See merge rule in design §2. */
   customInstructions?: string;
+  /**
+   * When `true`, the session's own `customInstructions` replaces the global
+   * value for this session (including when empty). When `false` or missing,
+   * the daemon merges global + session as `global + "\n\n" + session`.
+   */
+  customInstructionsOverride?: boolean;
+  /**
+   * Cache mirror of the user-default global `customInstructions` value at the
+   * time of the most recent session-snapshot write. The daemon treats this as
+   * the authoritative "global layer" for merge resolution at dispatch time and
+   * does not itself read user-default prefs. The web client keeps this in
+   * sync: every snapshot save includes the currently known global value, and
+   * global-only saves fan out cache-update patches to every currently-enabled
+   * transport session.
+   */
+  globalCustomInstructions?: string;
   maxParseRetries: number;
   auditMode: SupervisionAuditMode;
   maxAuditLoops: number;
@@ -190,11 +218,13 @@ export function normalizeSupervisorDefaultConfig(
   const model = rawModel && isKnownSharedContextModelForBackend(normalizedBackend, rawModel)
     ? rawModel
     : getDefaultSharedContextModelForBackend(normalizedBackend);
+  const customInstructions = trimString(merged.customInstructions);
   return {
     backend: normalizedBackend,
     model,
     timeoutMs: normalizePositiveInteger(merged.timeoutMs, SUPERVISION_DEFAULT_TIMEOUT_MS, 1),
     promptVersion: trimString(merged.promptVersion) ?? SUPERVISION_DEFAULT_PROMPT_VERSION,
+    ...(customInstructions ? { customInstructions } : {}),
   };
 }
 
@@ -231,6 +261,12 @@ export function getSessionSupervisionSnapshotIssues(
   }
   if (!trimString(record.promptVersion)) issues.push('invalid_prompt_version');
   if (record.customInstructions != null && typeof record.customInstructions !== 'string') issues.push('invalid_custom_instructions');
+  if (record.customInstructionsOverride != null && typeof record.customInstructionsOverride !== 'boolean') {
+    issues.push('invalid_custom_instructions_override');
+  }
+  if (record.globalCustomInstructions != null && typeof record.globalCustomInstructions !== 'string') {
+    issues.push('invalid_global_custom_instructions');
+  }
   if (typeof record.maxParseRetries !== 'number' || !Number.isFinite(record.maxParseRetries) || Math.floor(record.maxParseRetries) < 1) {
     issues.push('invalid_max_parse_retries');
   }
@@ -259,6 +295,10 @@ export function normalizeSessionSupervisionSnapshot(
   const supervisorDefaults = normalizeSupervisorDefaultConfig(merged, fallback);
   const mode = normalizeSupervisionMode(merged.mode, SUPERVISION_MODE.OFF);
   const customInstructions = trimString(merged.customInstructions);
+  const customInstructionsOverride = typeof merged.customInstructionsOverride === 'boolean'
+    ? merged.customInstructionsOverride
+    : false;
+  const globalCustomInstructions = trimString(merged.globalCustomInstructions);
   const maxParseRetries = normalizePositiveInteger(merged.maxParseRetries, SUPERVISION_DEFAULT_MAX_PARSE_RETRIES, 1);
   const auditMode = isSupportedSupervisionAuditMode(merged.auditMode) ? merged.auditMode : SUPERVISION_DEFAULT_AUDIT_MODE;
   const maxAuditLoops = normalizePositiveInteger(merged.maxAuditLoops, SUPERVISION_DEFAULT_MAX_AUDIT_LOOPS, 1);
@@ -266,6 +306,10 @@ export function normalizeSessionSupervisionSnapshot(
     ...supervisorDefaults,
     mode,
     ...(customInstructions ? { customInstructions } : {}),
+    // Only emit the override flag when true, to keep payloads minimal for the
+    // default (unchecked = concat) case. Normalizer defaults missing to false.
+    ...(customInstructionsOverride ? { customInstructionsOverride: true } : {}),
+    ...(globalCustomInstructions ? { globalCustomInstructions } : {}),
     maxParseRetries,
     auditMode,
     maxAuditLoops,
@@ -455,3 +499,43 @@ export function isSupportedSupervisionSessionType(value: string | null | undefin
 
 export const DEFAULT_SUPERVISION_BACKEND: SharedContextRuntimeBackend = SUPERVISION_SUPPORTED_BACKENDS[0];
 export const DEFAULT_SUPERVISION_MODEL_BY_BACKEND: Record<SharedContextRuntimeBackend, string> = DEFAULT_CONTEXT_MODEL_BY_BACKEND;
+
+/**
+ * Merge rule for supervision custom instructions. See design.md §2 of
+ * openspec/changes/supervision-global-custom-instructions.
+ *
+ * - override === true           → session only (even if empty), global ignored
+ * - session empty (override false) → global
+ * - global empty (override false)  → session
+ * - both non-empty (override false) → `global + "\n\n" + session`
+ *
+ * Inputs are trimmed before comparison. Returns the empty string when the
+ * resulting block should be omitted entirely.
+ */
+export function mergeSupervisionCustomInstructions(
+  global: string | null | undefined,
+  session: string | null | undefined,
+  override: boolean | null | undefined,
+): string {
+  const g = typeof global === 'string' ? global.trim() : '';
+  const s = typeof session === 'string' ? session.trim() : '';
+  if (override === true) return s;
+  if (!s) return g;
+  if (!g) return s;
+  return `${g}\n\n${s}`;
+}
+
+/**
+ * Convenience wrapper around `mergeSupervisionCustomInstructions` that pulls
+ * all three inputs directly from a session supervision snapshot.
+ */
+export function resolveEffectiveCustomInstructions(
+  snapshot: Partial<SessionSupervisionSnapshot> | null | undefined,
+): string {
+  if (!snapshot) return '';
+  return mergeSupervisionCustomInstructions(
+    snapshot.globalCustomInstructions,
+    snapshot.customInstructions,
+    snapshot.customInstructionsOverride,
+  );
+}

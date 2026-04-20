@@ -191,7 +191,9 @@
         "purposeTitle": "用途是什么",
         "purposeBody": "Auto 用来让一个监督模型判断当前任务是否已经完成、是否应该继续自动执行，或者是否需要人工介入。Audit 模式会在执行结束后再做一轮实现审查。",
         "howItWorksTitle": "原理是什么",
-        "howItWorksBody": "当会话进入 idle 状态时，IM.codes 会把最近的任务上下文交给已配置的监督模型，解析结构化决策结果，然后决定停止、自动继续，或回退到人工处理。如果开启 Audit 模式，完成后的结果还会进入自动审计与返工闭环。"
+        "howItWorksBody": "当会话进入 idle 状态时，IM.codes 会把最近的任务上下文交给已配置的监督模型，解析结构化决策结果，然后决定停止、自动继续，或回退到人工处理。如果开启 Audit 模式，完成后的结果还会进入自动审计与返工闭环。",
+        "expandHint": "展开说明",
+        "collapseHint": "收起"
       },
       "mode": {
         "off": "关闭",
@@ -206,6 +208,12 @@
       "customInstructionsLabel": "自定义提示词",
       "customInstructionsPlaceholder": "例如：在判定完成前必须要求测试和验证结果。",
       "customInstructionsHelp": "可选。只对当前会话生效，会追加到 Auto 的监督判定和 continue 提示词中。",
+      "globalCustomInstructionsLabel": "全局自定义提示词",
+      "globalCustomInstructionsPlaceholder": "例如：任何时候都优先写测试，不允许注释掉失败的代码。",
+      "globalCustomInstructionsHelp": "可选。对所有启用了 Auto 的会话生效，除非下方的「覆盖全局」被勾选。",
+      "customInstructionsOverrideLabel": "覆盖全局自定义提示词",
+      "customInstructionsOverrideHelp": "勾选后，本会话仅使用上方自己的提示词。不勾选时，全局提示词会被拼在前面，用一个空行分隔。",
+      "customInstructionsMergedPreviewHeading": "发送给监督者的合并提示词：",
       "auditMode": {
         "audit": "审计",
         "review": "复核",

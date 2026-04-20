@@ -191,7 +191,9 @@
         "purposeTitle": "용도",
         "purposeBody": "Auto는 현재 작업이 끝났는지, 자동으로 계속해야 하는지, 사람이 개입해야 하는지를 감독 모델이 판단하도록 하는 기능입니다. Audit 모드는 구현이 끝난 뒤 추가 검토까지 수행합니다.",
         "howItWorksTitle": "동작 원리",
-        "howItWorksBody": "세션이 idle 상태가 되면 IM.codes가 최근 작업 문맥을 설정된 감독 모델에 보내고 구조화된 결정을 파싱합니다. 그 결과에 따라 중지, 자동 계속, 또는 수동 처리로 전환합니다. Audit 모드가 켜져 있으면 완료된 응답은 자동 감사와 재작업 루프에도 들어갑니다."
+        "howItWorksBody": "세션이 idle 상태가 되면 IM.codes가 최근 작업 문맥을 설정된 감독 모델에 보내고 구조화된 결정을 파싱합니다. 그 결과에 따라 중지, 자동 계속, 또는 수동 처리로 전환합니다. Audit 모드가 켜져 있으면 완료된 응답은 자동 감사와 재작업 루프에도 들어갑니다.",
+        "expandHint": "자세히 보기",
+        "collapseHint": "접기"
       },
       "mode": {
         "off": "끔",
@@ -206,6 +208,12 @@
       "customInstructionsLabel": "사용자 지정 지침",
       "customInstructionsPlaceholder": "예: 완료 판정 전에 반드시 테스트와 검증 결과를 요구합니다.",
       "customInstructionsHelp": "선택 사항입니다. 이 세션에 한해 Auto의 supervision 판정과 continue 프롬프트에 추가됩니다.",
+      "globalCustomInstructionsLabel": "전역 사용자 지정 지침",
+      "globalCustomInstructionsPlaceholder": "예: 실패하는 코드를 주석 처리하기보다 항상 테스트 작성을 우선합니다.",
+      "globalCustomInstructionsHelp": "선택 사항입니다. Auto가 활성화된 모든 세션에 적용되며, 아래 세션에서 재정의하면 예외입니다.",
+      "customInstructionsOverrideLabel": "전역 지침 재정의",
+      "customInstructionsOverrideHelp": "체크하면 이 세션은 위의 세션 지침만 사용합니다. 체크하지 않으면 전역 지침이 빈 줄을 두고 앞에 추가됩니다.",
+      "customInstructionsMergedPreviewHeading": "감독자에게 전송되는 병합 지침:",
       "auditMode": {
         "audit": "감사",
         "review": "검토",

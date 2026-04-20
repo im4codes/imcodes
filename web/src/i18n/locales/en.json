@@ -191,7 +191,9 @@
         "purposeTitle": "What it is for",
         "purposeBody": "Auto lets a supervisor model decide whether the current task is complete, should continue automatically, or needs a human. Audit mode adds a second pass that reviews the implementation before handing control back.",
         "howItWorksTitle": "How it works",
-        "howItWorksBody": "When the session reaches idle, IM.codes sends the latest task context to the configured supervisor, parses a structured decision, and then either stops, sends a continue prompt, or falls back to manual handling. If audit mode is enabled, the completed turn can also enter an automated audit and rework loop."
+        "howItWorksBody": "When the session reaches idle, IM.codes sends the latest task context to the configured supervisor, parses a structured decision, and then either stops, sends a continue prompt, or falls back to manual handling. If audit mode is enabled, the completed turn can also enter an automated audit and rework loop.",
+        "expandHint": "Show details",
+        "collapseHint": "Hide"
       },
       "mode": {
         "off": "Off",
@@ -206,6 +208,12 @@
       "customInstructionsLabel": "Custom instructions",
       "customInstructionsPlaceholder": "Example: Require tests and verification before marking the task complete.",
       "customInstructionsHelp": "Optional. These instructions are appended to Auto's supervision and continue prompts for this session only.",
+      "globalCustomInstructionsLabel": "Global custom instructions",
+      "globalCustomInstructionsPlaceholder": "Example: Always prefer tests over commenting-out failing code.",
+      "globalCustomInstructionsHelp": "Optional. Applies to every Auto-enabled session unless that session overrides it below.",
+      "customInstructionsOverrideLabel": "Override global custom instructions",
+      "customInstructionsOverrideHelp": "When checked, only this session's instructions above are used. When unchecked, the global value is prepended with a blank line.",
+      "customInstructionsMergedPreviewHeading": "Merged instructions sent to the supervisor:",
       "auditMode": {
         "audit": "Audit",
         "review": "Review",

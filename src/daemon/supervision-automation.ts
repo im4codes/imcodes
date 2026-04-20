@@ -14,6 +14,7 @@ import {
   SUPERVISION_UNAVAILABLE_REASONS,
   extractSessionSupervisionSnapshot,
   parseAuditVerdictDetailsFromText,
+  resolveEffectiveCustomInstructions,
   type SessionSupervisionSnapshot,
   type SupervisionUnavailableReason,
   type TaskRunTerminalState,
@@ -924,11 +925,14 @@ class SupervisionAutomation {
       return;
     }
 
+    // Resolve the effective custom instructions (global + session + override)
+    // at dispatch time from the current session snapshot. The snapshot's
+    // `globalCustomInstructions` cache is kept in sync by the web client.
     const continuePrompt = buildSupervisionContinuePrompt(
       current.userText,
       current.lastAssistantText,
       reason,
-      current.snapshot.customInstructions,
+      resolveEffectiveCustomInstructions(current.snapshot),
     );
     current.continueLoops += 1;
     current.sawAssistantOutput = false;

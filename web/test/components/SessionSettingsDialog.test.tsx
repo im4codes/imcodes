@@ -248,7 +248,13 @@ describe('SessionSettingsDialog supervision', () => {
     });
   });
 
-  it('shows supervision intro copy for supported transport sessions', () => {
+  it('shows supervision intro copy for supported transport sessions when expanded', () => {
+    // The intro card is collapsed by default to save dialog real estate.
+    // Expanding it via the toggle reveals the three detail sections.
+    // Previous render may have persisted a collapsed preference in localStorage —
+    // clear it so this test starts in a deterministic (default collapsed) state.
+    try { window.localStorage.removeItem('imcodes:supervision-intro-collapsed'); } catch { /* noop */ }
+
     render(
       <SessionSettingsDialog
         serverId="srv-1"
@@ -263,11 +269,57 @@ describe('SessionSettingsDialog supervision', () => {
       />,
     );
 
+    // Collapsed by default: detail bodies are hidden until expanded.
+    expect(screen.queryByText('howToUseTitle')).toBeNull();
+
+    // The two region titles (global defaults / session config) stay visible.
+    expect(screen.getByText('globalDefaultsTitle')).toBeDefined();
+    expect(screen.getByText('sessionConfigTitle')).toBeDefined();
+
+    // Clicking the toggle expands the intro card and exposes the three sections.
+    fireEvent.click(screen.getByTestId('supervision-intro-toggle'));
     expect(screen.getByText('howToUseTitle')).toBeDefined();
     expect(screen.getByText('purposeTitle')).toBeDefined();
     expect(screen.getByText('howItWorksTitle')).toBeDefined();
-    expect(screen.getByText('globalDefaultsTitle')).toBeDefined();
-    expect(screen.getByText('sessionConfigTitle')).toBeDefined();
+  });
+
+  it('persists intro collapse state in localStorage', () => {
+    try { window.localStorage.removeItem('imcodes:supervision-intro-collapsed'); } catch { /* noop */ }
+
+    const { unmount } = render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        transportConfig={null}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    // Expand the card; the pref should flip to "0" (not collapsed).
+    fireEvent.click(screen.getByTestId('supervision-intro-toggle'));
+    expect(window.localStorage.getItem('imcodes:supervision-intro-collapsed')).toBe('0');
+    unmount();
+
+    // Remount: state is read from localStorage so the detail body is visible immediately.
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        transportConfig={null}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+    expect(screen.getByText('howToUseTitle')).toBeDefined();
   });
 
   it('shows unsupported copy for process sessions', () => {

@@ -191,7 +191,9 @@
         "purposeTitle": "Para qué sirve",
         "purposeBody": "Auto permite que un modelo supervisor decida si la tarea actual ya terminó, debe continuar automáticamente o necesita intervención humana. El modo audit añade una segunda revisión de la implementación antes de devolver el control.",
         "howItWorksTitle": "Cómo funciona",
-        "howItWorksBody": "Cuando la sesión entra en idle, IM.codes envía el contexto reciente de la tarea al supervisor configurado, interpreta una decisión estructurada y luego detiene, continúa automáticamente o vuelve al manejo manual. Si audit está activado, la respuesta completada también puede entrar en un ciclo automático de auditoría y retrabajo."
+        "howItWorksBody": "Cuando la sesión entra en idle, IM.codes envía el contexto reciente de la tarea al supervisor configurado, interpreta una decisión estructurada y luego detiene, continúa automáticamente o vuelve al manejo manual. Si audit está activado, la respuesta completada también puede entrar en un ciclo automático de auditoría y retrabajo.",
+        "expandHint": "Mostrar detalles",
+        "collapseHint": "Ocultar"
       },
       "mode": {
         "off": "Desactivado",
@@ -206,6 +208,12 @@
       "customInstructionsLabel": "Instrucciones personalizadas",
       "customInstructionsPlaceholder": "Ejemplo: exige pruebas y verificación antes de marcar la tarea como completa.",
       "customInstructionsHelp": "Opcional. Estas instrucciones se añaden a los prompts de supervisión y continue de Auto solo para esta sesión.",
+      "globalCustomInstructionsLabel": "Instrucciones personalizadas globales",
+      "globalCustomInstructionsPlaceholder": "Ejemplo: prefiere siempre escribir pruebas en lugar de comentar código que falla.",
+      "globalCustomInstructionsHelp": "Opcional. Se aplica a todas las sesiones con Auto habilitado a menos que la sesión lo anule a continuación.",
+      "customInstructionsOverrideLabel": "Anular las instrucciones globales",
+      "customInstructionsOverrideHelp": "Si se marca, esta sesión solo usa las instrucciones de arriba. Si no, las globales se añaden antes separadas por una línea en blanco.",
+      "customInstructionsMergedPreviewHeading": "Instrucciones fusionadas enviadas al supervisor:",
       "auditMode": {
         "audit": "Auditoría",
         "review": "Revisión",

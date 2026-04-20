@@ -18,6 +18,7 @@ import {
   hasInvalidSessionSupervisionSnapshot,
   isSupportedSupervisionAuditMode,
   isSupportedSupervisionBackend,
+  mergeSupervisionCustomInstructions,
   normalizeSupervisorDefaultConfig,
   readSupervisionSnapshotFromTransportConfig,
   resolveSupervisionModelForBackend,
@@ -53,13 +54,26 @@ type SupervisionDraft = {
   timeoutMs?: number;
   promptVersion?: string;
   customInstructions?: string;
+  /**
+   * Session-level switch. When `true`, only the session `customInstructions`
+   * is sent to the supervisor; the global value is ignored for this session.
+   * When `false` (or missing), the daemon merges global + session.
+   */
+  customInstructionsOverride?: boolean;
   maxParseRetries?: number;
   auditMode?: SupervisionAuditMode;
   maxAuditLoops?: number;
   taskRunPromptVersion?: string;
 };
 
-type SupervisionRuntimeDraft = Pick<SupervisionDraft, 'backend' | 'model' | 'timeoutMs' | 'promptVersion'>;
+// Runtime draft used for both the global-defaults region and the session's
+// own backend/model/timeout overrides. `customInstructions` is included here
+// so the global-defaults region can edit it; the session region edits its own
+// textarea value separately and uses the override flag to decide merging.
+type SupervisionRuntimeDraft = Pick<
+  SupervisionDraft,
+  'backend' | 'model' | 'timeoutMs' | 'promptVersion' | 'customInstructions'
+>;
 
 function timeoutMsToUiSeconds(timeoutMs: number | undefined): number {
   const safeMs = typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0
@@ -101,7 +115,45 @@ function getAuditModeOptions(): SupervisionAuditMode[] {
   return getAutomationAuditModeOptions().filter((mode): mode is SupervisionAuditMode => allowed.has(mode));
 }
 
+// localStorage key tracking whether the per-user has hidden the intro block.
+// The intro card summarizes how Auto supervision works across three short
+// paragraphs; users who already understand it asked to hide it by default,
+// and we persist the choice across sessions so the dialog reopens small.
+const SUPERVISION_INTRO_COLLAPSED_KEY = 'imcodes:supervision-intro-collapsed';
+
+function readIntroCollapsedPref(): boolean {
+  if (typeof window === 'undefined') return true;
+  try {
+    const raw = window.localStorage.getItem(SUPERVISION_INTRO_COLLAPSED_KEY);
+    // Default to collapsed on first open — the intro block is long and most
+    // users will only need it once. They can expand it any time.
+    return raw === null ? true : raw === '1';
+  } catch {
+    return true;
+  }
+}
+
+function writeIntroCollapsedPref(collapsed: boolean): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(SUPERVISION_INTRO_COLLAPSED_KEY, collapsed ? '1' : '0');
+  } catch {
+    // storage unavailable (private mode / quota) — fall through; UI still works,
+    // state just won't persist across reloads.
+  }
+}
+
 function SupervisionIntroCard({ t }: { t: (key: string, params?: Record<string, unknown>) => string }) {
+  const [collapsed, setCollapsed] = useState<boolean>(() => readIntroCollapsedPref());
+
+  const toggleCollapsed = () => {
+    setCollapsed((prev) => {
+      const next = !prev;
+      writeIntroCollapsedPref(next);
+      return next;
+    });
+  };
+
   const sections = [
     {
       title: t('session.supervision.intro.howToUseTitle'),
@@ -122,22 +174,66 @@ function SupervisionIntroCard({ t }: { t: (key: string, params?: Record<string, 
       style={{
         display: 'flex',
         flexDirection: 'column',
-        gap: 10,
+        gap: collapsed ? 0 : 10,
         padding: 12,
         borderRadius: 10,
         background: 'rgba(15, 23, 42, 0.45)',
         border: '1px solid rgba(96, 165, 250, 0.2)',
       }}
     >
-      <div style={{ fontSize: 12, color: '#e2e8f0', fontWeight: 600 }}>
-        {t('session.supervision.intro.title')}
-      </div>
-      {sections.map((section) => (
-        <div key={section.title} style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
-          <div style={{ fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>{section.title}</div>
-          <div style={{ fontSize: 12, lineHeight: 1.5, color: '#94a3b8' }}>{section.body}</div>
+      <button
+        type="button"
+        onClick={toggleCollapsed}
+        aria-expanded={!collapsed}
+        aria-controls="supervision-intro-body"
+        data-testid="supervision-intro-toggle"
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
+          background: 'transparent',
+          border: 'none',
+          padding: 0,
+          margin: 0,
+          cursor: 'pointer',
+          color: '#e2e8f0',
+          fontSize: 12,
+          fontWeight: 600,
+          textAlign: 'left',
+          width: '100%',
+        }}
+      >
+        <span
+          aria-hidden="true"
+          style={{
+            display: 'inline-block',
+            transition: 'transform 150ms ease',
+            transform: collapsed ? 'rotate(-90deg)' : 'rotate(0deg)',
+            width: 10,
+            textAlign: 'center',
+            color: '#94a3b8',
+          }}
+        >
+          ▾
+        </span>
+        <span style={{ flex: 1 }}>{t('session.supervision.intro.title')}</span>
+        <span style={{ fontSize: 11, color: '#64748b', fontWeight: 400 }}>
+          {t(collapsed ? 'session.supervision.intro.expandHint' : 'session.supervision.intro.collapseHint')}
+        </span>
+      </button>
+      {!collapsed && (
+        <div
+          id="supervision-intro-body"
+          style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 2 }}
+        >
+          {sections.map((section) => (
+            <div key={section.title} style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+              <div style={{ fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>{section.title}</div>
+              <div style={{ fontSize: 12, lineHeight: 1.5, color: '#94a3b8' }}>{section.body}</div>
+            </div>
+          ))}
         </div>
-      ))}
+      )}
     </div>
   );
 }
@@ -310,6 +406,7 @@ export function SessionSettingsDialog({
   const supervisionTimeoutSeconds = timeoutMsToUiSeconds(supervisionTimeout);
   const supervisionPromptVersion = supervision.promptVersion ?? SUPERVISION_PROMPT_VERSION;
   const supervisionCustomInstructions = typeof supervision.customInstructions === 'string' ? supervision.customInstructions : '';
+  const supervisionCustomInstructionsOverride = supervision.customInstructionsOverride === true;
   const supervisionParseRetries = supervision.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES;
   const supervisionAuditMode = supervision.auditMode;
   const supervisionAuditLoops = supervision.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS;
@@ -321,6 +418,21 @@ export function SessionSettingsDialog({
   const supervisorDefaultsTimeoutSeconds = timeoutMsToUiSeconds(supervisorDefaultsTimeout);
   const supervisorDefaultsPromptVersion = supervisorDefaults.promptVersion ?? SUPERVISION_PROMPT_VERSION;
   const supervisorDefaultsModelOptions = supervisorDefaultsBackend ? getSupervisionModelOptions(supervisorDefaultsBackend) : [];
+  const supervisorDefaultsCustomInstructions = typeof supervisorDefaults.customInstructions === 'string' ? supervisorDefaults.customInstructions : '';
+  // Merged preview shown only when override is unchecked AND both sides have
+  // non-empty trimmed content. Any other case is redundant (the effective
+  // value equals one or the other side, visible in the textarea already).
+  const supervisionMergedPreview = useMemo(
+    () => mergeSupervisionCustomInstructions(
+      supervisorDefaultsCustomInstructions,
+      supervisionCustomInstructions,
+      supervisionCustomInstructionsOverride,
+    ),
+    [supervisionCustomInstructions, supervisionCustomInstructionsOverride, supervisorDefaultsCustomInstructions],
+  );
+  const shouldShowMergedPreview = !supervisionCustomInstructionsOverride
+    && supervisorDefaultsCustomInstructions.trim().length > 0
+    && supervisionCustomInstructions.trim().length > 0;
 
   const nextTransportConfig = useMemo(() => buildTransportConfigWithSupervision(transportConfig, {
     mode: supervision.mode,
@@ -329,6 +441,15 @@ export function SessionSettingsDialog({
     timeoutMs: supervisionTimeout,
     promptVersion: supervisionPromptVersion,
     customInstructions: supervisionCustomInstructions.trim() || undefined,
+    // Only write the flag when true to keep default payloads minimal.
+    ...(supervisionCustomInstructionsOverride ? { customInstructionsOverride: true } : {}),
+    // Snapshot cache mirror of the global custom instructions. The daemon
+    // merges this with the session value at dispatch time; the field is
+    // intentionally re-populated on every save so it stays in sync when the
+    // user edits the global textarea in the same dialog.
+    ...(supervisorDefaultsCustomInstructions.trim()
+      ? { globalCustomInstructions: supervisorDefaultsCustomInstructions.trim() }
+      : {}),
     maxParseRetries: supervisionParseRetries,
     ...(isAuditMode
       ? {
@@ -344,10 +465,12 @@ export function SessionSettingsDialog({
     supervisionAuditMode,
     supervisionBackend,
     supervisionCustomInstructions,
+    supervisionCustomInstructionsOverride,
     supervisionModel,
     supervisionParseRetries,
     supervisionPromptVersion,
     supervisionTimeout,
+    supervisorDefaultsCustomInstructions,
     taskRunPromptVersion,
     transportConfig,
   ]);
@@ -459,6 +582,9 @@ export function SessionSettingsDialog({
           model: supervisorDefaultsModel.trim(),
           timeoutMs: supervisorDefaultsTimeout,
           promptVersion: supervisorDefaultsPromptVersion,
+          // Optional free-text global supervision instructions. Empty string
+          // is normalized to undefined by the shared helper.
+          customInstructions: supervisorDefaultsCustomInstructions.trim() || undefined,
         });
       }
 
@@ -545,6 +671,24 @@ export function SessionSettingsDialog({
           onTimeoutChange={(seconds) => setSupervisorDefaults((prev) => ({ ...prev, timeoutMs: timeoutUiSecondsToMs(seconds) }))}
         />
 
+        <div>
+          <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>
+            {t('session.supervision.globalCustomInstructionsLabel')}
+          </div>
+          <textarea
+            class="input"
+            value={supervisorDefaultsCustomInstructions}
+            onInput={(e) => setSupervisorDefaults((prev) => ({ ...prev, customInstructions: (e.target as HTMLTextAreaElement).value }))}
+            rows={3}
+            style={{ width: '100%', resize: 'vertical' }}
+            disabled={saving}
+            placeholder={t('session.supervision.globalCustomInstructionsPlaceholder')}
+          />
+          <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
+            {t('session.supervision.globalCustomInstructionsHelp')}
+          </div>
+        </div>
+
         {!supervisorDefaultsBackend && (
           <div style={{ color: '#fbbf24', fontSize: 12 }}>
             {t('session.supervision.validation.backendRequired')}
@@ -617,6 +761,41 @@ export function SessionSettingsDialog({
               <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
                 {t('session.supervision.customInstructionsHelp')}
               </div>
+
+              <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginTop: 8, cursor: saving ? 'not-allowed' : 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={supervisionCustomInstructionsOverride}
+                  disabled={saving}
+                  onChange={(e) => {
+                    const checked = (e.target as HTMLInputElement).checked;
+                    setSupervision((prev) => ({ ...prev, customInstructionsOverride: checked }));
+                  }}
+                  style={{ marginTop: 2 }}
+                />
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  <span style={{ fontSize: 12, color: '#e2e8f0' }}>
+                    {t('session.supervision.customInstructionsOverrideLabel')}
+                  </span>
+                  <span style={{ fontSize: 11, color: '#64748b' }}>
+                    {t('session.supervision.customInstructionsOverrideHelp')}
+                  </span>
+                </div>
+              </label>
+
+              {shouldShowMergedPreview && (
+                <div
+                  data-testid="supervision-merged-preview"
+                  style={{ marginTop: 8, padding: 10, borderRadius: 8, background: 'rgba(15, 23, 42, 0.6)', border: '1px dashed rgba(148, 163, 184, 0.24)' }}
+                >
+                  <div style={{ fontSize: 11, color: '#cbd5e1', fontWeight: 600, marginBottom: 4 }}>
+                    {t('session.supervision.customInstructionsMergedPreviewHeading')}
+                  </div>
+                  <pre style={{ margin: 0, fontSize: 11, color: '#94a3b8', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                    {supervisionMergedPreview}
+                  </pre>
+                </div>
+              )}
             </div>
 
             {isAuditMode && (

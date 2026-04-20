@@ -191,7 +191,9 @@
         "purposeTitle": "用途",
         "purposeBody": "Auto は、現在のタスクが完了したか、自動で続行すべきか、人の判断が必要かを監督モデルに判定させるための機能です。Audit モードでは、実装完了後に追加のレビューも行います。",
         "howItWorksTitle": "仕組み",
-        "howItWorksBody": "セッションが idle になると、IM.codes は直近のタスク文脈を設定済みの監督モデルに送り、構造化された判定を解析します。その結果に応じて停止、自動続行、または手動対応へフォールバックします。Audit モードが有効な場合は、完了した応答が自動監査と手戻りループにも入ります。"
+        "howItWorksBody": "セッションが idle になると、IM.codes は直近のタスク文脈を設定済みの監督モデルに送り、構造化された判定を解析します。その結果に応じて停止、自動続行、または手動対応へフォールバックします。Audit モードが有効な場合は、完了した応答が自動監査と手戻りループにも入ります。",
+        "expandHint": "詳細を表示",
+        "collapseHint": "折りたたむ"
       },
       "mode": {
         "off": "オフ",
@@ -206,6 +208,12 @@
       "customInstructionsLabel": "カスタム指示",
       "customInstructionsPlaceholder": "例: 完了判定の前に必ずテストと検証結果を要求する。",
       "customInstructionsHelp": "任意。このセッションに限り、Auto の supervision 判定と continue プロンプトに追加されます。",
+      "globalCustomInstructionsLabel": "グローバル カスタム指示",
+      "globalCustomInstructionsPlaceholder": "例: 失敗するコードをコメントアウトするより、常にテストを優先すること。",
+      "globalCustomInstructionsHelp": "任意。Auto が有効な全セッションに適用されます（下の上書きチェックがオンの場合を除く）。",
+      "customInstructionsOverrideLabel": "グローバル指示を上書きする",
+      "customInstructionsOverrideHelp": "オンにすると、このセッションは上のセッション指示のみを使用します。オフの場合は、グローバル指示が空行を挟んで先頭に結合されます。",
+      "customInstructionsMergedPreviewHeading": "監督に送信される結合済み指示:",
       "auditMode": {
         "audit": "監査",
         "review": "レビュー",
