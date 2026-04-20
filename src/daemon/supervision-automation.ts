@@ -667,8 +667,11 @@ class SupervisionAutomation {
             implicitRun.lastAssistantText = latestAssistant.text;
             implicitRun.sawAssistantOutput = true;
             implicitRun.evaluating = true;
+            this.emitStatus(implicitRun.sessionName, 'supervision_waiting', SUPERVISION_WAITING_LABEL);
+            this.emitAutomationNote(implicitRun.sessionName, 'Auto: checking whether the task is complete...', 'supervision-status');
             void this.evaluateExecutionTurn(implicitRun).catch((error) => {
               logger.warn({ session: implicitRun.sessionName, err: error }, 'Supervision implicit execution evaluation failed');
+              this.clearStatus(implicitRun.sessionName);
               this.emitWarning(implicitRun.sessionName, 'Automation could not determine whether the task is complete. Manual continuation is required.');
               this.finishRun(implicitRun.sessionName, 'needs_input');
             });

@@ -257,6 +257,47 @@ describe('supervision → idle → broker integration', () => {
     }));
   });
 
+  it('emits a visible checking note and supervision status for the implicit idle-trigger path', async () => {
+    seedSupervisedSession('supervised');
+
+    const seen: Array<{ type: string; payload: Record<string, unknown> }> = [];
+    const unsubscribe = timelineEmitter.on((event) => {
+      seen.push({ type: event.type, payload: event.payload });
+    });
+
+    timelineEmitter.emit(SESSION, 'user.message', {
+      text: 'tighten the retry handling',
+      clientMessageId: 'cmd-implicit-visible',
+    });
+    timelineEmitter.emit(SESSION, 'assistant.text', {
+      text: 'Retry handling tightened.',
+      streaming: false,
+    });
+    timelineEmitter.emit(SESSION, 'session.state', { state: 'running' });
+    timelineEmitter.emit(SESSION, 'session.state', { state: 'idle' });
+
+    await waitFor(() => supervisionDecideMock.mock.calls.length > 0, 1_000);
+    unsubscribe();
+
+    expect(seen).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'agent.status',
+        payload: expect.objectContaining({
+          status: 'supervision_waiting',
+          label: 'Supervised: analyzing completion...',
+        }),
+      }),
+      expect.objectContaining({
+        type: 'assistant.text',
+        payload: expect.objectContaining({
+          automation: true,
+          automationKind: 'supervision-status',
+          text: 'Auto: checking whether the task is complete...',
+        }),
+      }),
+    ]));
+  });
+
   it('evaluates immediately when supervision is enabled while the session is already idle with a prior turn', async () => {
     // This is THE regression the user reported: "idle 后依旧不触发任何动作和效果".
     // Sequence:
