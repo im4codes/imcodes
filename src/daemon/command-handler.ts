@@ -103,6 +103,63 @@ function isEligibleSupervisionTaskText(text: string): boolean {
 }
 
 /**
+ * Reliable `command.ack` emission — enqueue into the on-disk outbox BEFORE the
+ * network send so that a transient serverLink outage doesn't silently drop the
+ * ack. The outbox flushes on the next successful reconnect + auth; the server's
+ * seenCommandAcks LRU dedups replays so the browser sees the ack exactly once.
+ *
+ * Replaces the original `try { serverLink.send({ type: 'command.ack', ... }) }
+ * catch {}` pattern that existed in ~15 sites across handleSessionSend's
+ * transport/P2P/queue paths. Keeping it all funnelled through one helper makes
+ * it impossible to forget the outbox hook on a new code path.
+ *
+ * Does NOT emit the corresponding `timelineEmitter.emit(..., 'command.ack', ...)`
+ * — call sites still do that explicitly so they can choose whether the ack is
+ * timeline-visible (process path) or not (some P2P internal paths).
+ */
+function emitCommandAckReliable(
+  serverLink: Pick<ServerLink, 'send'> | undefined,
+  params: {
+    commandId: string;
+    sessionName: string;
+    status: string;
+    error?: string;
+  },
+): void {
+  const outbox = getDefaultAckOutbox();
+  outbox
+    .enqueue({
+      commandId: params.commandId,
+      sessionName: params.sessionName,
+      status: params.status,
+      ...(params.error ? { error: params.error } : {}),
+      ts: Date.now(),
+    })
+    .catch((err) =>
+      logger.error({ commandId: params.commandId, err }, 'ackOutbox.enqueue failed'),
+    );
+  try {
+    serverLink?.send({
+      type: MSG_COMMAND_ACK,
+      commandId: params.commandId,
+      status: params.status,
+      session: params.sessionName,
+      ...(params.error ? { error: params.error } : {}),
+    });
+    outbox
+      .markAcked(params.commandId)
+      .catch((err) =>
+        logger.warn({ commandId: params.commandId, err }, 'ackOutbox.markAcked failed'),
+      );
+  } catch (err) {
+    logger.warn(
+      { commandId: params.commandId, err },
+      'command.ack send failed, queued for retry via outbox',
+    );
+  }
+}
+
+/**
  * Build a unified subsession.sync payload from the session store record.
  * Ensures all fields (including Qwen metadata) are always sent — no more
  * scattered inline objects with different field subsets.
@@ -1682,8 +1739,8 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       // composer: never inject the optimistic bubble for P2P sends.
       const status = isLegacy ? 'accepted_legacy' : 'accepted';
       timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
+      emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status });
       try {
-        serverLink.send({ type: 'command.ack', commandId: effectiveId, status, session: sessionName });
         serverLink.send({ type: 'p2p.run_started', runId: run.id, session: sessionName });
       } catch { /* not connected */ }
     } catch (err) {
@@ -1691,9 +1748,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       const errMsg = err instanceof Error ? err.message : String(err);
       // Emit error ack so the message exits pending state in the UI
       timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
-      try {
-        serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg });
-      } catch { /* not connected */ }
+      emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
     }
     return;
   }
@@ -1768,9 +1823,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     );
     const status = isLegacy ? 'accepted_legacy' : 'accepted';
     timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
-    try {
-      serverLink.send({ type: 'command.ack', commandId: effectiveId, status, session: sessionName });
-    } catch { /* not connected */ }
+    emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status });
     return;
   }
   if (transportRuntime && !transportRuntime.providerSessionId) {
@@ -1814,9 +1867,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     );
     const status = isLegacy ? 'accepted_legacy' : 'accepted';
     timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
-    try {
-      serverLink.send({ type: 'command.ack', commandId: effectiveId, status, session: sessionName });
-    } catch { /* not connected */ }
+    emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status });
     // Best-effort resume. Failure is logged but doesn't change the ack —
     // the next user send will re-enter this branch and try again, or a
     // manual /restart path can recover.
@@ -2218,15 +2269,13 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       }
       const status = isLegacy ? 'accepted_legacy' : 'accepted';
       timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
-      try {
-        serverLink.send({ type: 'command.ack', commandId: effectiveId, status, session: sessionName });
-      } catch { /* not connected */ }
+      emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status });
     } catch (err) {
       const errMsg = describeTransportSendError(err);
       logger.error({ sessionName, err }, 'session.send (transport) failed');
       timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Send failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
       timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
-      try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg }); } catch { /* */ }
+      emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
     } finally {
       release();
     }
