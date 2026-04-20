@@ -27,6 +27,7 @@ import {
   MSG_DAEMON_OFFLINE,
   ACK_FAILURE_DAEMON_OFFLINE,
   ACK_FAILURE_ACK_TIMEOUT,
+  ACK_FAILURE_DAEMON_ERROR,
   RECONNECT_GRACE_MS,
   ACK_TIMEOUT_MS,
   ACK_DEDUP_TTL_MS,
@@ -645,6 +646,26 @@ export class WsBridge {
         if (!this.browserRateLimiter.check(browserId, BROWSER_RATE_LIMIT, BROWSER_RATE_WINDOW)) {
           logger.warn({ serverId: this.serverId, type: msg.type }, 'Browser rate limit exceeded — dropped');
           safeSend(ws, JSON.stringify({ type: 'error', code: 'rate_limited', message: 'Too many requests', originalType: msg.type, requestId: msg.requestId }));
+          // If the dropped message is a session.send, also emit command.failed
+          // so the web UI's optimistic bubble flips to failed immediately
+          // instead of waiting 30s for the client-side timeout. Without this,
+          // a mobile browser that flaps subscribe/unsubscribe can easily
+          // exceed the per-browser rate limit — the user then sees their
+          // send bubble spin for 30 full seconds with no signal why.
+          if (msg.type === 'session.send' && typeof msg.commandId === 'string') {
+            const rlSessionName = typeof msg.sessionName === 'string'
+              ? msg.sessionName
+              : (typeof msg.session === 'string' ? msg.session : '');
+            if (rlSessionName) {
+              safeSend(ws, JSON.stringify({
+                type: MSG_COMMAND_FAILED,
+                commandId: msg.commandId,
+                session: rlSessionName,
+                reason: ACK_FAILURE_DAEMON_ERROR,
+                retryable: true,
+              }));
+            }
+          }
           return;
         }
       }
