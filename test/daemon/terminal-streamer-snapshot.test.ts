@@ -12,6 +12,9 @@ vi.mock('../../src/agent/tmux.js', () => ({
   stopPipePaneStream: vi.fn().mockResolvedValue(undefined),
 }));
 
+import { stopPipePaneStream } from '../../src/agent/tmux.js';
+const mockStopPipe = stopPipePaneStream as ReturnType<typeof vi.fn>;
+
 // Mock session-store so getSession returns a valid paneId (needed by startPipe)
 vi.mock('../../src/store/session-store.js', () => ({
   getSession: vi.fn().mockReturnValue({ paneId: '%1' }),
@@ -219,6 +222,58 @@ describe('TerminalStreamer — snapshot behavior', () => {
       }),
       expect.any(Object),
     );
+  });
+
+  it('unexpected pipe close reaps the FIFO reader subprocess (no orphan `cat stream.fifo`)', async () => {
+    // Regression test: previously `handlePipeClose` deleted the pipeState
+    // tracking entry but never called `pipeState.cleanup()` or
+    // `stopPipePaneStream()`. The backing `cat /tmp/.../stream.fifo` child
+    // process stayed alive forever, draining bytes into a dangling Node
+    // stream whose buffer grew unbounded — ~425MB/min growth until OOM. On
+    // one leaking production daemon we observed 10 orphan cat processes.
+    const session = 'orphan-fifo-session';
+
+    // Build a stream that we can trigger 'close' on.
+    const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+    const stream = {
+      on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+        if (!listeners.has(event)) listeners.set(event, []);
+        listeners.get(event)!.push(cb);
+      }),
+      destroy: vi.fn(),
+    };
+    const cleanup = vi.fn().mockResolvedValue(undefined);
+    mockStartPipe.mockResolvedValue({ stream, cleanup });
+    mockStopPipe.mockClear();
+    // mockClear() wipes mockResolvedValue too — re-prime so handlePipeClose's
+    // `await stopPipePaneStream(sessionName).catch(...)` sees a real Promise.
+    mockStopPipe.mockResolvedValue(undefined);
+
+    streamer.subscribe({
+      sessionName: session,
+      send: () => {},
+      onError: () => {},
+    });
+
+    // Wait for startPipe to register the stream listeners.
+    await flush();
+
+    // Simulate an unexpected FIFO close (e.g. tmux session died). This is
+    // the code path that previously leaked the child.
+    const closeCbs = listeners.get('close');
+    expect(closeCbs, 'startPipe must register a close listener').toBeTruthy();
+    closeCbs!.forEach((cb) => cb());
+
+    await flush();
+
+    // The stream's destroy() must be invoked so the Node readable side
+    // stops buffering.
+    expect(stream.destroy).toHaveBeenCalled();
+    // The pipeState's cleanup closure must run so provider-side resources
+    // get released.
+    expect(cleanup).toHaveBeenCalled();
+    // stopPipePaneStream must be called so tmux kills the `cat` reader.
+    expect(mockStopPipe).toHaveBeenCalledWith(session);
   });
 
   it('suppresses pane-id inline errors when the session record is not yet in the store', async () => {

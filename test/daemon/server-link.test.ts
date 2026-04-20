@@ -79,4 +79,22 @@ describe('ServerLink', () => {
     link.disconnect();
     expect(mockWsInstance.close).toHaveBeenCalled();
   });
+
+  it('reconnect via connect() closes the previous WebSocket to prevent TCP/socket leak', () => {
+    // Regression test: previously `connect()` overwrote `this.ws` without
+    // closing the old instance. On error/close → scheduleReconnect → connect
+    // loops, this accumulated ESTAB TCP connections + Node WebSocket internal
+    // buffers (7 concurrent WS observed on a leaking production daemon before
+    // OOM). Every reconnect MUST close the prior ws even though the stale
+    // guards in the event handlers already prevent handler-level confusion.
+    link.connect();
+    expect(MockWebSocket).toHaveBeenCalledTimes(1);
+    expect(mockWsInstance.close).not.toHaveBeenCalled();
+
+    // Simulate a reconnect: call connect() again while a socket exists.
+    link.connect();
+    expect(MockWebSocket).toHaveBeenCalledTimes(2);
+    // The previous WS instance must have been explicitly closed.
+    expect(mockWsInstance.close).toHaveBeenCalledTimes(1);
+  });
 });

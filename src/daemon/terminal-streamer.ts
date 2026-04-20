@@ -415,7 +415,23 @@ export class TerminalStreamer {
   }
 
   private handlePipeClose(sessionName: string): void {
+    // Tear down the previous pipeState so the underlying
+    // `cat /tmp/.../stream.fifo` subprocess gets reaped and the Node stream
+    // stops accumulating buffered data in its internal read queue. Without
+    // this, unexpected pipe close (stream `error` / `close`) leaves a
+    // dangling FIFO reader that keeps draining data into the daemon with no
+    // subscriber consuming it — the readable buffer grows unbounded until
+    // OOM. Empirically we saw 10 orphan `cat` processes accumulate and RSS
+    // climb ~425MB/min before the daemon crashed.
+    const pipeState = this.pipes.get(sessionName);
     this.pipes.delete(sessionName);
+    if (pipeState) {
+      try { pipeState.stream.destroy(); } catch { /* ignore */ }
+      void pipeState.cleanup().catch((err) => {
+        logger.warn({ sessionName, err }, 'Pipe cleanup error in handlePipeClose');
+      });
+      void stopPipePaneStream(sessionName).catch(() => { /* best-effort */ });
+    }
 
     // If still have active subscribers, attempt rebind
     const subs = this.subscribers.get(sessionName);

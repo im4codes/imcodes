@@ -64,6 +64,22 @@ export class ServerLink {
     this.stopWatchdog();
     if (this.pongTimer) { clearTimeout(this.pongTimer); this.pongTimer = undefined; }
 
+    // Close previous socket before creating a new one. Without this, the
+    // regular `error` / `close` → `scheduleReconnect()` → `connect()` path
+    // orphans the old WebSocket: the stale-check guards (`this.ws !== ws`)
+    // in the open/message/close handlers let the old WS's events drop safely,
+    // but no one actually calls `close()` on it. The OS keeps the TCP socket
+    // ESTAB for minutes until network timeout, and the Node WebSocket
+    // instance keeps its internal buffers, TLS state, and event emitter
+    // closures alive the whole time. Under reconnect flapping we observed
+    // 7 parallel ESTAB connections on a single daemon which correlated with
+    // the OOM cascade. `forceReconnect()` already does this; regular
+    // scheduled reconnects must too.
+    if (this.ws) {
+      try { this.ws.close(); } catch { /* ignore */ }
+      this.ws = null;
+    }
+
     const wsUrl = this.workerUrl.replace(/^http/, 'ws') + `/api/server/${this.serverId}/ws`;
     logger.info({ url: wsUrl }, 'ServerLink: connecting');
     this.reconnecting = false;
