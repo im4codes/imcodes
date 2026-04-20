@@ -140,6 +140,27 @@ describe('transport-history', () => {
     expect(events[0]['text']).toBe('safe');
   });
 
+  it('returns exactly MAX_REPLAY_LINES entries even when each line is large (reverse-chunk scans back as far as needed)', async () => {
+    // Adversarial shape: fewer lines, but each line is 6 KB. 200 tail
+    // lines therefore need ~1.2 MB of file window — greater than any
+    // fixed-byte "read last 1 MiB" strategy would cover. A simple
+    // fixed-window tail-read would silently return fewer than 200 here;
+    // the reverse-chunk scan keeps walking back until it has 201
+    // newlines (or hits MAX_TAIL_BYTES).
+    const session = `${TS}-fat-lines`;
+    const FAT = 'y'.repeat(6000);
+    for (let i = 0; i < 250; i++) {
+      await appendTransportEvent(session, { idx: i, text: FAT });
+    }
+
+    const events = await replayTransportHistory(session);
+
+    // Must return exactly the cap, and must be the tail slice [50..249].
+    expect(events).toHaveLength(200);
+    expect(events[0]['idx']).toBe(50);
+    expect(events[events.length - 1]['idx']).toBe(249);
+  });
+
   it('replay stays bounded on multi-megabyte JSONL files (tail-read only)', async () => {
     // Regression: before tail-reading, replay loaded the full file into a
     // JS string then sliced — a single 170MB session on 211 caused ~340MB

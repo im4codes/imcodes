@@ -6,7 +6,7 @@
  * Completion = file grew + agent idle.
  */
 
-import { appendFile, readdir, stat, writeFile, readFile, unlink, copyFile } from 'node:fs/promises';
+import { appendFile, readdir, stat, writeFile, readFile, unlink, copyFile, open } from 'node:fs/promises';
 import { join, basename, dirname } from 'node:path';
 import { ensureImcDir } from '../util/imc-dir.js';
 import { randomUUID } from 'node:crypto';
@@ -1021,11 +1021,30 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
   if (run._cancelled || isTerminal(run.status)) return;
 
   // ── Done ──
-  let fullContent = '';
+  // Read only the trailing 2 KiB (enough to over-cover the 2000-char
+  // summary window once UTF-8 decoded) instead of slurping the whole
+  // discussion file — multi-round discussions across several hops can
+  // produce megabytes of markdown, and this used to allocate a V8
+  // string sized to the full file just to slice off the last 2000
+  // chars, exactly the same shape bug we fixed in transport-history.
   try {
-    fullContent = await readFile(run.contextFilePath, 'utf8');
-    run.resultSummary = fullContent.slice(-2000); // last 2000 chars as summary
-  } catch { /* ignore */ }
+    const P2P_TAIL_BYTES = 2 * 1024;
+    let fh;
+    try {
+      fh = await open(run.contextFilePath, 'r');
+      const { size } = await fh.stat();
+      if (size > 0) {
+        const length = Math.min(P2P_TAIL_BYTES, size);
+        const buf = Buffer.alloc(length);
+        await fh.read(buf, 0, length, size - length);
+        // Drop the leading partial UTF-8 sequence if any; 2000 chars
+        // downstream further trims to exactly the wanted window.
+        run.resultSummary = buf.toString('utf8').slice(-2000);
+      }
+    } finally {
+      if (fh) { try { await fh.close(); } catch { /* best-effort */ } }
+    }
+  } catch { /* ignore — discussion file may not exist if cancelled early */ }
 
   run.completedAt = new Date().toISOString();
   transition(run, 'completed', serverLink);
