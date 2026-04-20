@@ -312,6 +312,32 @@ describe('SupervisionAutomation', () => {
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
   });
 
+  it('does not evaluate before idle when Auto is enabled after the assistant reply but before the idle boundary', async () => {
+    const snapshot = await seedSession('supervised');
+
+    supervisionAutomation.init();
+    beginRun('cmd-pre-idle', 'implement the feature');
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: 'implemented the feature',
+      streaming: false,
+    });
+
+    supervisionAutomation.applySnapshotUpdate('deck_supervision_brain', snapshot);
+    await sleep(25);
+
+    expect(mockSupervisionDecide).not.toHaveBeenCalled();
+
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', {
+      state: 'idle',
+    });
+    await sleep(25);
+
+    expect(mockSupervisionDecide).toHaveBeenCalledWith(expect.objectContaining({
+      taskRequest: 'implement the feature',
+      assistantResponse: 'implemented the feature',
+    }));
+  });
+
   it('cancels active automation immediately when supervision is turned off live', async () => {
     const snapshot = await seedSession('supervised');
     supervisionAutomation.init();
@@ -342,7 +368,7 @@ describe('SupervisionAutomation', () => {
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
   });
 
-  it('waits for a late final assistant response instead of dropping the run on idle', async () => {
+  it('fails closed when a supervised run reaches idle without a completed assistant response', async () => {
     const snapshot = await seedSession('supervised');
 
     supervisionAutomation.init();
@@ -356,10 +382,25 @@ describe('SupervisionAutomation', () => {
 
     expect(mockSupervisionDecide).not.toHaveBeenCalled();
     expect(mockTransportRuntime.send).not.toHaveBeenCalled();
-    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
-      commandId: 'cmd-no-output',
-      awaitingAssistantAfterIdle: true,
-    });
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    const events = timelineEmitter.replay('deck_supervision_brain', 0).events;
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'assistant.text',
+        payload: expect.objectContaining({
+          automation: true,
+          automationKind: 'supervision-warning',
+          text: '⚠️ Automation stopped because no completed assistant response was available for that turn. Manual continuation is required.',
+        }),
+      }),
+      expect.objectContaining({
+        type: 'agent.status',
+        payload: expect.objectContaining({
+          status: 'supervision_needs_input',
+          label: 'Supervised: returned control to you.',
+        }),
+      }),
+    ]));
   });
 
   it('evaluates an empty final assistant response instead of skipping the Auto check', async () => {
@@ -452,6 +493,34 @@ describe('SupervisionAutomation', () => {
 
     expect(mockSupervisionDecide).not.toHaveBeenCalled();
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+  });
+
+  it('ignores automation-tagged assistant rows when deciding whether an implicit run has a matching completion', async () => {
+    const snapshot = await seedSession('supervised');
+    supervisionAutomation.init();
+
+    timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+      text: 'implement the latest task',
+      clientMessageId: 'cmd-transport-control',
+      allowDuplicate: true,
+    });
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: 'Switched model to gpt-5.4',
+      streaming: false,
+      automation: true,
+      memoryExcluded: true,
+    });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', {
+      state: 'idle',
+    });
+    await sleep(25);
+
+    expect(mockSupervisionDecide).not.toHaveBeenCalled();
+
+    supervisionAutomation.applySnapshotUpdate('deck_supervision_brain', snapshot);
+    await sleep(25);
+
+    expect(mockSupervisionDecide).not.toHaveBeenCalled();
   });
 
   it('routes OpenSpec task runs through the implementation-only OpenSpec audit baseline', async () => {

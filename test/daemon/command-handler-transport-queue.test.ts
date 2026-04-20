@@ -957,6 +957,44 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(queueTaskIntentMock).not.toHaveBeenCalled();
   });
 
+  it('marks transport control-plane success messages as automation so supervision does not capture them as task completions', async () => {
+    const setAgentId = vi.fn();
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'cursor-headless',
+      runtimeType: 'transport',
+      state: 'running',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      setAgentId,
+      pendingCount: 0,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/model gpt-5.4',
+      commandId: 'cmd-model-switch',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(setAgentId).toHaveBeenCalledWith('gpt-5.4');
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'assistant.text',
+      expect.objectContaining({
+        text: 'Switched model to gpt-5.4',
+        streaming: false,
+        automation: true,
+        memoryExcluded: true,
+      }),
+      expect.any(Object),
+    );
+  });
+
   it('updates live supervision state when the browser patches transportConfig', async () => {
     getSessionMock.mockReturnValue({
       name: 'deck_transport_brain',

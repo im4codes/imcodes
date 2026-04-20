@@ -51,7 +51,6 @@ interface ActiveTaskRunState {
   continueLoops: number;
   evaluating: boolean;
   sawAssistantOutput: boolean;
-  awaitingAssistantAfterIdle: boolean;
   lastAssistantText?: string;
   terminalState?: TaskRunTerminalState;
   auditRunId?: string;
@@ -412,8 +411,8 @@ class SupervisionAutomation {
   private pendingTaskIntents = new Map<string, PendingTaskIntent>();
   private recentTaskCandidates = new Map<string, RecentTaskCandidate>();
   private latestAssistantTexts = new Map<string, LatestAssistantText>();
-  private awaitingImplicitAssistantAfterIdle = new Set<string>();
   private pollers = new Map<string, ReturnType<typeof setInterval>>();
+  private lastObservedSessionStates = new Map<string, string>();
   private initialized = false;
   private serverLink: ServerLink | null = null;
   private eventSequence = 0;
@@ -480,7 +479,7 @@ class SupervisionAutomation {
     this.pendingTaskIntents.delete(sessionName);
     this.recentTaskCandidates.delete(sessionName);
     this.latestAssistantTexts.delete(sessionName);
-    this.awaitingImplicitAssistantAfterIdle.delete(sessionName);
+    this.lastObservedSessionStates.delete(sessionName);
     this.clearStatus(sessionName);
   }
 
@@ -507,33 +506,67 @@ class SupervisionAutomation {
     // We reuse the same implicit-idle preconditions as `handleTimelineEvent`
     // (recent task candidate + newer assistant response) so the guardrails
     // against stale turns stay identical.
-    if (!active) {
-      this.maybeTriggerImplicitRun(sessionName, snapshot);
+    if (!active && this.isSessionIdle(sessionName)) {
+      if (!this.tryStartImplicitRun(sessionName, snapshot)) {
+        this.failClosedImplicitCandidate(sessionName, snapshot);
+      }
     }
   }
 
-  private maybeTriggerImplicitRun(
+  private isSessionIdle(sessionName: string): boolean {
+    const observed = this.lastObservedSessionStates.get(sessionName);
+    if (observed) return observed === 'idle';
+    return getSession(sessionName)?.state === 'idle';
+  }
+
+  private isEligibleAssistantCompletionPayload(payload: Record<string, unknown>): boolean {
+    return isFinalAssistantPayload(payload)
+      && payload.automation !== true
+      && payload.memoryExcluded !== true;
+  }
+
+  private emitCheckingState(sessionName: string): void {
+    this.emitStatus(sessionName, 'supervision_waiting', SUPERVISION_WAITING_LABEL);
+    this.emitAutomationNote(sessionName, 'Auto: checking whether the task is complete...', 'supervision-status');
+  }
+
+  private failClosedMissingCompletion(sessionName: string): void {
+    this.emitTerminalStatus(sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
+    this.emitWarning(sessionName, 'Automation stopped because no completed assistant response was available for that turn. Manual continuation is required.');
+  }
+
+  private tryStartImplicitRun(
     sessionName: string,
     snapshot: SessionSupervisionSnapshot,
-  ): void {
+  ): boolean {
     const candidate = this.recentTaskCandidates.get(sessionName);
     const latestAssistant = this.latestAssistantTexts.get(sessionName);
-    if (!candidate || !latestAssistant) return;
-    if (latestAssistant.sequence <= candidate.sequence) return;
+    if (!candidate || !latestAssistant) return false;
+    if (latestAssistant.sequence <= candidate.sequence) return false;
     const implicitRun = this.registerTaskIntent(sessionName, candidate.commandId, candidate.text, snapshot);
-    if (!implicitRun) return;
-    this.awaitingImplicitAssistantAfterIdle.delete(sessionName);
+    if (!implicitRun) return false;
     implicitRun.lastAssistantText = latestAssistant.text;
     implicitRun.sawAssistantOutput = true;
     implicitRun.evaluating = true;
-    this.emitStatus(sessionName, 'supervision_waiting', SUPERVISION_WAITING_LABEL);
-    this.emitAutomationNote(sessionName, 'Auto: checking whether the task is complete...', 'supervision-status');
+    this.emitCheckingState(sessionName);
     void this.evaluateExecutionTurn(implicitRun).catch((error) => {
       logger.warn({ session: sessionName, err: error }, 'Supervision implicit execution evaluation failed on snapshot update');
       this.clearStatus(sessionName);
       this.emitWarning(sessionName, 'Automation could not determine whether the task is complete. Manual continuation is required.');
       this.finishRun(sessionName, 'needs_input');
     });
+    return true;
+  }
+
+  private failClosedImplicitCandidate(
+    sessionName: string,
+    snapshot: SessionSupervisionSnapshot | null | undefined,
+  ): void {
+    if (!snapshot || snapshot.mode === SUPERVISION_MODE.OFF) return;
+    const candidate = this.recentTaskCandidates.get(sessionName);
+    if (!candidate) return;
+    this.recentTaskCandidates.delete(sessionName);
+    this.failClosedMissingCompletion(sessionName);
   }
 
   queueTaskIntent(
@@ -581,7 +614,6 @@ class SupervisionAutomation {
       continueLoops: 0,
       evaluating: false,
       sawAssistantOutput: false,
-      awaitingAssistantAfterIdle: false,
       reworkDispatches: 0,
       startedAt: Date.now(),
     };
@@ -603,7 +635,6 @@ class SupervisionAutomation {
       const automation = event.payload.automation === true;
       const text = trimString(event.payload.text);
       if (!automation && text && !text.startsWith('/')) {
-        this.awaitingImplicitAssistantAfterIdle.delete(event.sessionId);
         this.recentTaskCandidates.set(event.sessionId, {
           commandId: clientMessageId ?? `implicit:${Date.now()}`,
           text,
@@ -616,70 +647,30 @@ class SupervisionAutomation {
       }
     }
 
-    if (event.type === 'assistant.text' && isFinalAssistantPayload(event.payload)) {
-      if (event.payload.automation === true) return;
+    if (event.type === 'assistant.text' && this.isEligibleAssistantCompletionPayload(event.payload)) {
       const text = typeof event.payload.text === 'string' ? event.payload.text : '';
       this.latestAssistantTexts.set(event.sessionId, { text, sequence });
       const run = this.activeRuns.get(event.sessionId);
-      if (!run) {
-        if (this.awaitingImplicitAssistantAfterIdle.has(event.sessionId)) {
-          const record = getSession(event.sessionId);
-          const snapshot = record?.agentType
-            ? extractSessionSupervisionSnapshot(record.transportConfig ?? null)
-            : null;
-          if (snapshot && snapshot.mode !== SUPERVISION_MODE.OFF) {
-            this.maybeTriggerImplicitRun(event.sessionId, snapshot);
-          }
-        }
-        return;
-      }
+      if (!run) return;
       run.lastAssistantText = text;
       run.sawAssistantOutput = true;
-      if (run.phase === 'execution' && run.awaitingAssistantAfterIdle && !run.evaluating) {
-        run.awaitingAssistantAfterIdle = false;
-        run.evaluating = true;
-        this.emitStatus(run.sessionName, 'supervision_waiting', SUPERVISION_WAITING_LABEL);
-        this.emitAutomationNote(run.sessionName, 'Auto: checking whether the task is complete...', 'supervision-status');
-        void this.evaluateExecutionTurn(run).catch((error) => {
-          logger.warn({ session: run.sessionName, err: error }, 'Supervision execution evaluation failed after delayed assistant output');
-          this.clearStatus(run.sessionName);
-          this.emitWarning(run.sessionName, 'Automation could not determine whether the task is complete. Manual continuation is required.');
-          this.finishRun(run.sessionName, 'needs_input');
-        });
-      }
       return;
     }
 
     if (event.type === 'session.state') {
       const run = this.activeRuns.get(event.sessionId);
       const state = trimString(event.payload.state);
+      if (state) this.lastObservedSessionStates.set(event.sessionId, state);
       if (state === 'idle' && !run) {
         const candidate = this.recentTaskCandidates.get(event.sessionId);
         const record = getSession(event.sessionId);
         const snapshot = record?.agentType
           ? extractSessionSupervisionSnapshot(record.transportConfig ?? null)
           : null;
-        const latestAssistant = this.latestAssistantTexts.get(event.sessionId);
-        if (candidate && snapshot && snapshot.mode !== SUPERVISION_MODE.OFF && latestAssistant && latestAssistant.sequence > candidate.sequence) {
-          const implicitRun = this.registerTaskIntent(event.sessionId, candidate.commandId, candidate.text, snapshot);
-          if (implicitRun) {
-            this.awaitingImplicitAssistantAfterIdle.delete(event.sessionId);
-            implicitRun.lastAssistantText = latestAssistant.text;
-            implicitRun.sawAssistantOutput = true;
-            implicitRun.evaluating = true;
-            this.emitStatus(implicitRun.sessionName, 'supervision_waiting', SUPERVISION_WAITING_LABEL);
-            this.emitAutomationNote(implicitRun.sessionName, 'Auto: checking whether the task is complete...', 'supervision-status');
-            void this.evaluateExecutionTurn(implicitRun).catch((error) => {
-              logger.warn({ session: implicitRun.sessionName, err: error }, 'Supervision implicit execution evaluation failed');
-              this.clearStatus(implicitRun.sessionName);
-              this.emitWarning(implicitRun.sessionName, 'Automation could not determine whether the task is complete. Manual continuation is required.');
-              this.finishRun(implicitRun.sessionName, 'needs_input');
-            });
+        if (candidate && snapshot && snapshot.mode !== SUPERVISION_MODE.OFF) {
+          if (!this.tryStartImplicitRun(event.sessionId, snapshot)) {
+            this.failClosedImplicitCandidate(event.sessionId, snapshot);
           }
-        } else if (candidate && snapshot && snapshot.mode !== SUPERVISION_MODE.OFF) {
-          this.awaitingImplicitAssistantAfterIdle.add(event.sessionId);
-        } else {
-          this.awaitingImplicitAssistantAfterIdle.delete(event.sessionId);
         }
         // Intentionally: do NOT delete the candidate when supervision is OFF
         // at idle. The user may enable Auto afterwards, and
@@ -692,12 +683,11 @@ class SupervisionAutomation {
       if (!run) return;
       if (state === 'idle' && run.phase === 'execution' && !run.evaluating) {
         if (!run.sawAssistantOutput) {
-          run.awaitingAssistantAfterIdle = true;
+          this.failClosedMissingCompletion(run.sessionName);
+          this.finishRun(run.sessionName, 'needs_input', { preserveStatus: true });
           return;
         }
-        run.awaitingAssistantAfterIdle = false;
-        this.emitStatus(run.sessionName, 'supervision_waiting', SUPERVISION_WAITING_LABEL);
-        this.emitAutomationNote(run.sessionName, 'Auto: checking whether the task is complete...', 'supervision-status');
+        this.emitCheckingState(run.sessionName);
         run.evaluating = true;
         void this.evaluateExecutionTurn(run).catch((error) => {
           logger.warn({ session: run.sessionName, err: error }, 'Supervision execution evaluation failed');
@@ -898,7 +888,6 @@ class SupervisionAutomation {
     current.auditRunId = undefined;
     current.evaluating = false;
     current.sawAssistantOutput = false;
-    current.awaitingAssistantAfterIdle = false;
     current.terminalState = undefined;
     current.lastAssistantText = undefined;
 
@@ -939,7 +928,6 @@ class SupervisionAutomation {
     );
     current.continueLoops += 1;
     current.sawAssistantOutput = false;
-    current.awaitingAssistantAfterIdle = false;
     current.lastAssistantText = undefined;
     current.terminalState = undefined;
 

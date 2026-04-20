@@ -400,7 +400,7 @@ describe('supervision → idle → broker integration', () => {
     expect(note).toBeTruthy();
   });
 
-  it('still evaluates when idle arrives before the final assistant text for an active supervised run', async () => {
+  it('fails closed when idle arrives before the final assistant text for an active supervised run', async () => {
     const transportSend = vi.fn(() => 'sent');
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: SESSION,
@@ -410,6 +410,10 @@ describe('supervision → idle → broker integration', () => {
       pendingEntries: [],
     });
     seedSupervisedSession('supervised');
+    const seen: Array<{ type: string; payload: Record<string, unknown> }> = [];
+    const unsubscribe = timelineEmitter.on((event) => {
+      seen.push({ type: event.type, payload: event.payload });
+    });
 
     const serverLink = { send: vi.fn(), sendBinary: vi.fn(), sendTimelineEvent: vi.fn(), daemonVersion: '0.1.0' };
     handleWebCommand({
@@ -422,22 +426,35 @@ describe('supervision → idle → broker integration', () => {
 
     timelineEmitter.emit(SESSION, 'session.state', { state: 'running' });
     timelineEmitter.emit(SESSION, 'session.state', { state: 'idle' });
+    await flushAsync();
+    unsubscribe();
+
     expect(supervisionDecideMock).not.toHaveBeenCalled();
-
-    timelineEmitter.emit(SESSION, 'assistant.text', {
-      text: 'Refactor finished.',
-      streaming: false,
-    });
-
-    await waitFor(() => supervisionDecideMock.mock.calls.length > 0, 1_000);
-    expect(supervisionDecideMock).toHaveBeenCalledWith(expect.objectContaining({
-      taskRequest: 'finish the refactor',
-      assistantResponse: 'Refactor finished.',
-    }));
+    expect(seen).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'assistant.text',
+        payload: expect.objectContaining({
+          automation: true,
+          automationKind: 'supervision-warning',
+          text: '⚠️ Automation stopped because no completed assistant response was available for that turn. Manual continuation is required.',
+        }),
+      }),
+      expect.objectContaining({
+        type: 'agent.status',
+        payload: expect.objectContaining({
+          status: 'supervision_needs_input',
+          label: 'Supervised: returned control to you.',
+        }),
+      }),
+    ]));
   });
 
-  it('still evaluates when idle arrives before the final assistant text for an implicit supervised run', async () => {
+  it('fails closed when idle arrives before the final assistant text for an implicit supervised run', async () => {
     seedSupervisedSession('supervised');
+    const seen: Array<{ type: string; payload: Record<string, unknown> }> = [];
+    const unsubscribe = timelineEmitter.on((event) => {
+      seen.push({ type: event.type, payload: event.payload });
+    });
 
     timelineEmitter.emit(SESSION, 'user.message', {
       text: 'fix the queue bug',
@@ -445,17 +462,82 @@ describe('supervision → idle → broker integration', () => {
     });
     timelineEmitter.emit(SESSION, 'session.state', { state: 'running' });
     timelineEmitter.emit(SESSION, 'session.state', { state: 'idle' });
-    expect(supervisionDecideMock).not.toHaveBeenCalled();
+    await flushAsync();
+    unsubscribe();
 
+    expect(supervisionDecideMock).not.toHaveBeenCalled();
+    expect(seen).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'assistant.text',
+        payload: expect.objectContaining({
+          automation: true,
+          automationKind: 'supervision-warning',
+          text: '⚠️ Automation stopped because no completed assistant response was available for that turn. Manual continuation is required.',
+        }),
+      }),
+      expect.objectContaining({
+        type: 'agent.status',
+        payload: expect.objectContaining({
+          status: 'supervision_needs_input',
+          label: 'Supervised: returned control to you.',
+        }),
+      }),
+    ]));
+  });
+
+  it('does not evaluate on snapshot update before idle when a turn is still running', async () => {
+    seedSupervisedSession('supervised');
+
+    timelineEmitter.emit(SESSION, 'user.message', {
+      text: 'refactor the parser',
+      clientMessageId: 'cmd-enable-pre-idle',
+    });
     timelineEmitter.emit(SESSION, 'assistant.text', {
-      text: 'Queue bug fixed.',
+      text: 'Refactored the parser.',
       streaming: false,
     });
+    timelineEmitter.emit(SESSION, 'session.state', { state: 'running' });
 
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk',
+      model: 'gpt-5.3-codex-spark',
+      timeoutMs: 2_000,
+      promptVersion: 'supervision_decision_v1',
+      maxParseRetries: 1,
+      auditMode: 'audit',
+      maxAuditLoops: 2,
+      taskRunPromptVersion: 'supervision_continue_v1',
+    });
+    supervisionAutomation.applySnapshotUpdate(SESSION, snapshot);
+    await flushAsync();
+
+    expect(supervisionDecideMock).not.toHaveBeenCalled();
+
+    timelineEmitter.emit(SESSION, 'session.state', { state: 'idle' });
     await waitFor(() => supervisionDecideMock.mock.calls.length > 0, 1_000);
     expect(supervisionDecideMock).toHaveBeenCalledWith(expect.objectContaining({
-      taskRequest: 'fix the queue bug',
-      assistantResponse: 'Queue bug fixed.',
+      taskRequest: 'refactor the parser',
+      assistantResponse: 'Refactored the parser.',
     }));
+  });
+
+  it('ignores automation-tagged control-plane assistant rows for implicit idle pickup', async () => {
+    seedSupervisedSession('supervised');
+
+    timelineEmitter.emit(SESSION, 'user.message', {
+      text: 'implement the feature',
+      clientMessageId: 'cmd-control-plane',
+    });
+    timelineEmitter.emit(SESSION, 'assistant.text', {
+      text: 'Switched model to gpt-5.4',
+      streaming: false,
+      automation: true,
+      memoryExcluded: true,
+    });
+    timelineEmitter.emit(SESSION, 'session.state', { state: 'idle' });
+    await flushAsync();
+
+    expect(supervisionDecideMock).not.toHaveBeenCalled();
   });
 });
