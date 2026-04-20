@@ -348,6 +348,7 @@ export function SessionPane({
               || (extras.p2pSessionConfig != null && typeof extras.p2pSessionConfig === 'object')
             );
             if (isP2pSend) return;
+            if (effectiveRuntimeType === 'transport') return;
             addOptimisticUserMessage(text, meta?.commandId, {
               ...(meta?.attachments ? { attachments: meta.attachments } : {}),
               ...(meta?.extra ? { resendExtra: meta.extra } : {}),

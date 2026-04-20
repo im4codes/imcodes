@@ -108,13 +108,10 @@ describe('SessionPane', () => {
     expect(screen.getByText(/5h 11% 2h03m 4\/6 14:40/)).toBeDefined();
   });
 
-  it('adds optimistic user messages for transport sessions too', () => {
-    // Previously transport sessions were skipped because the daemon echo was
-    // "close enough". That still introduces a WebSocket round-trip of latency
-    // between the user hitting send and anything appearing on screen, which
-    // feels broken on slow links. The new contract: every send produces an
-    // immediate optimistic bubble and the daemon echo reconciles it via
-    // commandId (see use-timeline-optimistic.test.ts).
+  it('does not add optimistic user messages for transport sessions', () => {
+    // Transport sends can be queued daemon-side. Showing an optimistic user
+    // bubble before the runtime actually accepts the turn advances the timeline
+    // incorrectly, so transport sessions now wait for the authoritative echo.
     render(
       <SessionPane
         serverId="s1"
@@ -138,7 +135,7 @@ describe('SessionPane', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: 'send' }));
-    expect(addOptimisticUserMessageMock).toHaveBeenCalledWith('queued text', 'test-cmd-1', {});
+    expect(addOptimisticUserMessageMock).not.toHaveBeenCalled();
   });
 
   it('forces copilot-sdk sessions into chat mode when runtimeType is omitted', () => {
@@ -169,9 +166,7 @@ describe('SessionPane', () => {
     const lastTerminalProps = terminalViewSpy.mock.calls.at(-1)?.[0];
     expect(lastTerminalProps?.active).toBe(false);
     fireEvent.click(screen.getByRole('button', { name: 'send' }));
-    // Transport sessions (copilot-sdk) now also receive the optimistic bubble
-    // — the daemon echo reconciles via commandId, not runtime-type gating.
-    expect(addOptimisticUserMessageMock).toHaveBeenCalledWith('queued text', 'test-cmd-1', {});
+    expect(addOptimisticUserMessageMock).not.toHaveBeenCalled();
   });
 
   it('keeps optimistic user messages for process sessions', () => {

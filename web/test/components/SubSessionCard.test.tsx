@@ -389,14 +389,13 @@ describe('SubSessionCard', () => {
     expect(props.hideShortcuts).toBeUndefined();
   });
 
-  it('routes SessionControls.onSend through addOptimisticUserMessage so the card shows the pending bubble immediately', () => {
-    // Regression: the sub-session card used to omit the onSend callback
-    // entirely, so messages typed in the compact card composer never got an
-    // optimistic bubble — the user saw nothing until the daemon echoed back.
-    // Parity with SessionPane + SubSessionWindow is required.
+  it('does not add optimistic bubbles for transport sub-session card sends', () => {
+    // Transport sends can remain queued daemon-side. The compact card must
+    // not inject a committed-looking optimistic bubble before the daemon emits
+    // the authoritative user.message for the actual drain.
     render(
       <SubSessionCard
-        sub={makeSubSession()}
+        sub={makeSubSession({ runtimeType: 'transport' as any, type: 'claude-code-sdk' } as any)}
         ws={null}
         connected={true}
         isOpen={false}
@@ -416,14 +415,6 @@ describe('SubSessionCard', () => {
       extra: { mode: 'quick' },
     });
 
-    expect(addOptimisticUserMessageSpy).toHaveBeenCalledTimes(1);
-    expect(addOptimisticUserMessageSpy).toHaveBeenCalledWith(
-      'card-typed message',
-      'cmd-card-1',
-      expect.objectContaining({
-        attachments: [{ kind: 'file', name: 'notes.md' }],
-        resendExtra: { mode: 'quick' },
-      }),
-    );
+    expect(addOptimisticUserMessageSpy).not.toHaveBeenCalled();
   });
 });

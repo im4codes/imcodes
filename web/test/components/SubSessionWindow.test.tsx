@@ -747,12 +747,10 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     expect(view.container.querySelector('.idle-flash-layer--frame')).toBeNull();
   });
 
-  it('injects an optimistic user message when SessionControls.onSend fires (parity with main-session pane)', async () => {
-    // Regression: the sub-session window used to only call scrollToBottom on
-    // send; the "message goes to the timeline with a spinner immediately"
-    // UX worked for the main session but not for sub-sessions. This test
-    // verifies the onSend callback now routes through addOptimisticUserMessage
-    // with the same (text, commandId, { attachments, resendExtra }) contract.
+  it('does not add optimistic bubbles for transport sub-session window sends', async () => {
+    // Transport sends may remain queued until the runtime is ready. The window
+    // must wait for the authoritative daemon echo instead of advancing the
+    // timeline immediately with an optimistic bubble.
     const sub = makeSubSession({ type: 'claude-code-sdk', runtimeType: 'transport' as any } as any);
 
     render(
@@ -783,15 +781,7 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
       extra: { foo: 'bar' },
     });
 
-    expect(addOptimisticUserMessageSpy).toHaveBeenCalledTimes(1);
-    expect(addOptimisticUserMessageSpy).toHaveBeenCalledWith(
-      'hello from sub',
-      'cmd-sub-42',
-      expect.objectContaining({
-        attachments: [{ kind: 'file', name: 'a.txt' }],
-        resendExtra: { foo: 'bar' },
-      }),
-    );
+    expect(addOptimisticUserMessageSpy).not.toHaveBeenCalled();
   });
 
   it('wires onResendFailed into ChatView so retry works from sub-session bubbles', async () => {

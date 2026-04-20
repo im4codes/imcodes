@@ -170,10 +170,12 @@ export function SubSessionWindow({
       ...(resendExtra ?? {}),
       commandId: newCommandId,
     });
-    addOptimisticUserMessage(text, newCommandId, {
-      ...(attachmentsFromFailure ? { attachments: attachmentsFromFailure } : {}),
-      ...(resendExtra ? { resendExtra } : {}),
-    });
+    if (effectiveRuntimeType !== 'transport') {
+      addOptimisticUserMessage(text, newCommandId, {
+        ...(attachmentsFromFailure ? { attachments: attachmentsFromFailure } : {}),
+        ...(resendExtra ? { resendExtra } : {}),
+      });
+    }
   }, [addOptimisticUserMessage, connected, removeOptimisticMessage, sub.sessionName, ws]);
 
   const thinkingNow = useNowTicker(!!activeThinkingTs && active);
@@ -541,7 +543,7 @@ export function SubSessionWindow({
             || (typeof extras.p2pMode === 'string' && extras.p2pMode.length > 0)
             || (extras.p2pSessionConfig != null && typeof extras.p2pSessionConfig === 'object')
           );
-          if (isP2pSend) return;
+          if (isP2pSend || effectiveRuntimeType === 'transport') return;
           addOptimisticUserMessage(text, meta?.commandId, {
             ...(meta?.attachments ? { attachments: meta.attachments } : {}),
             ...(meta?.extra ? { resendExtra: meta.extra } : {}),
