@@ -381,6 +381,47 @@ describe('ChatView', () => {
     expect(container.querySelectorAll('.chat-assistant-automation')).toHaveLength(1);
   });
 
+  it('keeps only the latest Auto note when supervision reuses the same event id', async () => {
+    const events = [
+      {
+        eventId: 'supervision-note:deck_main_brain',
+        type: 'assistant.text',
+        ts: 1001,
+        payload: {
+          text: 'Auto: checking whether the task is complete...',
+          streaming: false,
+          automation: true,
+          automationKind: 'supervision-status',
+        },
+      },
+      {
+        eventId: 'supervision-note:deck_main_brain',
+        type: 'assistant.text',
+        ts: 1002,
+        payload: {
+          text: 'Auto: task looks complete.',
+          streaming: false,
+          automation: true,
+          automationKind: 'supervision-complete',
+        },
+      },
+    ] as any;
+
+    const { container } = render(
+      <ChatView
+        events={events}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    expect(chatMarkdownRenderSpy).toHaveBeenCalledTimes(1);
+    expect(chatMarkdownRenderSpy.mock.calls[0]?.[0]).toBe('Auto: task looks complete.');
+    expect(container.textContent).toContain('Auto: task looks complete.');
+    expect(container.textContent).not.toContain('Auto: checking whether the task is complete...');
+    expect(container.querySelectorAll('.chat-assistant-automation')).toHaveLength(1);
+  });
+
   it('renders transport-origin memory.context cards the same as process recall cards', async () => {
     const { container, getByText } = render(
       <ChatView

@@ -634,6 +634,8 @@
     "uploading": "업로드 중...",
     "upload_failed": "업로드 실패",
     "file_too_large": "파일이 너무 큽니다 (최대 {{max}}MB)",
+    "long_text_attached": "긴 붙여넣기 텍스트가 {{name}} 첨부파일로 추가되었습니다",
+    "long_text_requires_attachment": "이 붙여넣기 내용은 입력창에 직접 넣기엔 너무 깁니다. 파일로 업로드하세요.",
     "download_file": "다운로드",
     "downloading": "다운로드 중...",
     "preview_unavailable": "미리보기 불가",

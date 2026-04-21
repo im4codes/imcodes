@@ -255,7 +255,7 @@ git clone https://github.com/im4codes/imcodes.git && cd imcodes
 docker compose up -d
 ```
 
-생성되는 `docker-compose.yml` 은 PostgreSQL 이미지로 `pgvector/pgvector:pg16` 을 사용합니다.
+생성되는 `docker-compose.yml` 은 PostgreSQL 이미지로 `pgvector/pgvector:pg18` 을 사용합니다.
 
 ## Windows (실험적)
 

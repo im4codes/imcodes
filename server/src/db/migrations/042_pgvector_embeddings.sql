@@ -1,5 +1,5 @@
 -- Enable pgvector extension (requires pgvector/pgvector Docker image).
--- BREAKING CHANGE: PostgreSQL image must be pgvector/pgvector:pg16 (not postgres:16-alpine).
+-- Default compose/template image is pgvector/pgvector:pg18 (not postgres:16-alpine).
 CREATE EXTENSION IF NOT EXISTS vector;
 
 -- Migration 038 created shared_context_embeddings with either vector(1536) or JSONB fallback.

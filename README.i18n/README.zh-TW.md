@@ -299,7 +299,7 @@ git clone https://github.com/im4codes/imcodes.git && cd imcodes
 docker compose up -d
 ```
 
-產生的 `docker-compose.yml` 已經預設使用 `pgvector/pgvector:pg16` 作為 PostgreSQL 映像。
+產生的 `docker-compose.yml` 已經預設使用 `pgvector/pgvector:pg18` 作為 PostgreSQL 映像。
 
 然后访问 `https://your-domain`，使用 `admin` 和打印出来的密码登录。之后使用 `imcodes bind` 绑定你的开发机。
 

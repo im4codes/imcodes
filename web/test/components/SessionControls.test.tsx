@@ -56,6 +56,12 @@ vi.mock('react-i18next', () => ({
       if (key === 'session.send_placeholder_desktop_upload') {
         return `${String(opts?.placeholder ?? '')} Supports fast multi-file paste upload`;
       }
+      if (key === 'upload.long_text_attached') {
+        return `Large pasted text attached as ${String(opts?.name ?? '')}`;
+      }
+      if (key === 'upload.long_text_requires_attachment') {
+        return 'Paste is too large for inline input here. Upload it as a file instead.';
+      }
       if (key === 'session.stop_plain') return 'Stop';
       if (key === 'session.supervision.quickLabel') return 'Auto';
       if (key === 'session.supervision.quickTitle') return 'Auto mode';
@@ -139,6 +145,7 @@ vi.mock('../../src/components/AtPicker.js', () => ({
 }));
 
 const uploadFileMock = vi.fn();
+const execCommandMock = vi.fn(() => true);
 const getUserPrefMock = vi.fn().mockResolvedValue(null);
 const saveUserPrefMock = vi.fn().mockResolvedValue(undefined);
 const fetchSupervisorDefaultsMock = vi.fn().mockResolvedValue(null);
@@ -170,6 +177,15 @@ import { P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 
 const flushAsync = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+function readBlobText(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error('Failed to read blob text'));
+    reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '');
+    reader.readAsText(blob);
+  });
+}
 
 const TEST_OPENSPEC_ADVANCED_ROUNDS = [
   {
@@ -275,6 +291,17 @@ afterEach(() => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    execCommandMock.mockImplementation((_command: string, _ui?: boolean, value?: string) => {
+      const active = document.activeElement as HTMLDivElement | null;
+      if (active && typeof active.textContent === 'string') {
+        active.textContent = `${active.textContent}${String(value ?? '')}`;
+      }
+      return true;
+    });
+    Object.defineProperty(document, 'execCommand', {
+      configurable: true,
+      value: execCommandMock,
+    });
     sessionStorage.clear();
     localStorage.clear();
     fetchSupervisorDefaultsMock.mockResolvedValue(null);
@@ -2405,6 +2432,91 @@ afterEach(() => {
       />,
     );
     expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project…');
+  });
+
+  it('keeps normal plain-text paste inline for short clipboard content', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession()}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.focus();
+    fireEvent.paste(input, {
+      clipboardData: {
+        getData: (type: string) => type === 'text/plain' ? 'short inline paste' : '',
+      },
+    });
+
+    expect(execCommandMock).toHaveBeenCalledWith('insertText', false, 'short inline paste');
+    expect(input.textContent).toBe('short inline paste');
+    expect(uploadFileMock).not.toHaveBeenCalled();
+  });
+
+  it('converts oversized plain-text paste into an attachment upload', async () => {
+    uploadFileMock.mockResolvedValue({ attachment: { daemonPath: '/tmp/pasted-text.txt' } });
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.focus();
+    const longText = 'x'.repeat(13000);
+    fireEvent.paste(input, {
+      clipboardData: {
+        getData: (type: string) => type === 'text/plain' ? longText : '',
+      },
+    });
+
+    await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(1));
+    const uploadedFile = uploadFileMock.mock.calls[0]?.[1] as File;
+    expect(uploadedFile).toBeInstanceOf(File);
+    expect(uploadedFile.name).toMatch(/^pasted-text-.*\.txt$/);
+    expect(await readBlobText(uploadedFile)).toBe(longText);
+    expect(execCommandMock).not.toHaveBeenCalled();
+    expect(input.textContent).toBe('');
+    await waitFor(() => {
+      expect(document.querySelector('.attachment-badge-name')?.textContent).toMatch(/^pasted-text-.*\.txt$/);
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+    expectSendPayload(ws, {
+      sessionName: 'my-session',
+      text: '@/tmp/pasted-text.txt',
+    });
+  });
+
+  it('blocks oversized plain-text paste when upload context is unavailable', async () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession()}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.focus();
+    fireEvent.paste(input, {
+      clipboardData: {
+        getData: (type: string) => type === 'text/plain' ? 'y'.repeat(13000) : '',
+      },
+    });
+
+    expect(uploadFileMock).not.toHaveBeenCalled();
+    expect(execCommandMock).not.toHaveBeenCalled();
+    expect(input.textContent).toBe('');
+    expect(await screen.findByText('Paste is too large for inline input here. Upload it as a file instead.')).toBeDefined();
   });
 
   // TODO: fix — file upload mock doesn't trigger state update in jsdom

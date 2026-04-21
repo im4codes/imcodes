@@ -264,6 +264,37 @@ describe('SupervisionAutomation', () => {
     ]));
   });
 
+  it('reuses a single visible Auto note id across supervision status transitions', async () => {
+    const snapshot = await seedSession('supervised');
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-note-id', 'implement the feature', snapshot);
+    beginRun('cmd-note-id', 'implement the feature');
+
+    completeTurn('implemented the feature');
+    await sleep(25);
+
+    const noteEvents = timelineEmitter
+      .replay('deck_supervision_brain', 0)
+      .events
+      .filter((event) => event.type === 'assistant.text' && event.payload.automation === true);
+
+    expect(noteEvents).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        eventId: 'supervision-note:deck_supervision_brain',
+        payload: expect.objectContaining({
+          text: 'Auto: checking whether the task is complete...',
+        }),
+      }),
+      expect.objectContaining({
+        eventId: 'supervision-note:deck_supervision_brain',
+        payload: expect.objectContaining({
+          text: 'Auto: task looks complete.',
+        }),
+      }),
+    ]));
+  });
+
   it('updates an in-flight run to the latest supervision snapshot when Auto settings change live', async () => {
     const supervised = await seedSession('supervised');
     const upgraded = normalizeSessionSupervisionSnapshot({

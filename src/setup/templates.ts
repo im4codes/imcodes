@@ -4,7 +4,7 @@ export function dockerComposeTemplate(opts?: { ghcrPrefix?: string }): string {
   const ghcr = opts?.ghcrPrefix ?? 'ghcr.io';
   return `services:
   postgres:
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:pg18
     restart: unless-stopped
     environment:
       POSTGRES_DB: imcodes

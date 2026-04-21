@@ -255,7 +255,7 @@ git clone https://github.com/im4codes/imcodes.git && cd imcodes
 docker compose up -d
 ```
 
-生成される `docker-compose.yml` は PostgreSQL に `pgvector/pgvector:pg16` を使用します。
+生成される `docker-compose.yml` は PostgreSQL に `pgvector/pgvector:pg18` を使用します。
 
 ## Windows（実験的）
 

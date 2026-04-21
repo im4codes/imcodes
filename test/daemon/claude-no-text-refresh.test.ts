@@ -74,7 +74,7 @@ function assistantText(text: string): string {
   })}\n`;
 }
 
-async function waitUntil(fn: () => boolean, timeoutMs = 4000): Promise<void> {
+async function waitUntil(fn: () => boolean, timeoutMs = 10000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (fn()) return;

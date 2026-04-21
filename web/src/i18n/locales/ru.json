@@ -634,6 +634,8 @@
     "uploading": "Загрузка...",
     "upload_failed": "Ошибка загрузки",
     "file_too_large": "Файл слишком большой (макс. {{max}}МБ)",
+    "long_text_attached": "Большой вставленный текст прикреплен как {{name}}",
+    "long_text_requires_attachment": "Эта вставка слишком большая для поля ввода. Загрузите ее как файл.",
     "download_file": "Скачать",
     "downloading": "Скачивание...",
     "preview_unavailable": "Предпросмотр недоступен",

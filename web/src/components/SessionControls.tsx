@@ -118,6 +118,13 @@ interface Props {
 
 type MenuAction = 'restart' | 'new' | 'stop';
 type ModelChoice = 'opus[1M]' | 'sonnet' | 'haiku';
+
+const INLINE_PASTE_TEXT_CHAR_LIMIT = 1200;
+
+function buildPastedTextFileName(now = new Date()): string {
+  const compact = now.toISOString().replace(/[:.]/g, '-');
+  return `pasted-text-${compact}.txt`;
+}
 type CodexModelChoice = 'gpt-5.4' | 'gpt-5.4-mini' | 'gpt-5.2';
 type QwenModelChoice = string;
 type P2pMode = string; // 'solo' | single modes | combo pipelines like 'brainstorm>discuss>plan' | typeof P2P_CONFIG_MODE
@@ -1743,30 +1750,17 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (document.body.scrollTop !== 0) document.body.scrollTop = 0;
   };
 
-  // Paste: upload files from clipboard, or insert plain text
-  const handlePaste = (e: Event) => {
-    const ce = e as ClipboardEvent;
-    const files = ce.clipboardData?.files;
-    if (files && files.length > 0) {
-      e.preventDefault();
-      void handleFileUpload(files);
-      return;
-    }
-    e.preventDefault();
-    const text = ce.clipboardData?.getData('text/plain') ?? '';
-    document.execCommand('insertText', false, text);
-    setHasText(!!(divRef.current?.textContent?.trim()));
-  };
-
-  const handleFileUpload = useCallback(async (files: FileList | null) => {
-    if (!files || files.length === 0 || !serverId) return;
+  const uploadAttachmentFiles = useCallback(async (files: readonly File[]): Promise<boolean> => {
+    if (files.length === 0 || !serverId) return false;
     setUploading(true);
     setUploadProgress(0);
     setUploadError(null);
-    for (const file of Array.from(files)) {
+    let uploadedAny = false;
+    for (const file of files) {
       try {
         const result = await uploadFile(serverId, file, (pct) => setUploadProgress(pct));
         if (result.attachment?.daemonPath) {
+          uploadedAny = true;
           setAttachments((prev) => [...prev, { path: result.attachment!.daemonPath, name: file.name }]);
         }
       } catch (err) {
@@ -1783,7 +1777,45 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       }
     }
     setUploading(false);
+    return uploadedAny;
   }, [serverId, t]);
+
+  const handleFileUpload = useCallback(async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    await uploadAttachmentFiles(Array.from(files));
+  }, [uploadAttachmentFiles]);
+
+  // Paste: upload files from clipboard, or insert plain text
+  const handlePaste = (e: Event) => {
+    const ce = e as ClipboardEvent;
+    const files = ce.clipboardData?.files;
+    if (files && files.length > 0) {
+      e.preventDefault();
+      void handleFileUpload(files);
+      return;
+    }
+    e.preventDefault();
+    const text = ce.clipboardData?.getData('text/plain') ?? '';
+    if (!text) return;
+    if (text.length > INLINE_PASTE_TEXT_CHAR_LIMIT) {
+      if (!serverId) {
+        showSendWarning(t('upload.long_text_requires_attachment'));
+        return;
+      }
+      const fileName = buildPastedTextFileName();
+      const textFile = new File([text], fileName, { type: 'text/plain' });
+      void (async () => {
+        const uploaded = await uploadAttachmentFiles([textFile]);
+        if (uploaded) {
+          showSendWarning(t('upload.long_text_attached', { name: fileName }));
+          divRef.current?.focus();
+        }
+      })();
+      return;
+    }
+    document.execCommand('insertText', false, text);
+    setHasText(!!(divRef.current?.textContent?.trim()));
+  };
 
   const handleShortcut = (data: string) => {
     if (!ws || !activeSession) return;

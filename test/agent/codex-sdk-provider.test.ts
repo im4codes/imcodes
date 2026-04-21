@@ -521,6 +521,40 @@ describe('CodexSdkProvider', () => {
     expect(input.action).toBeUndefined();
   });
 
+  it('ignores empty-string WebSearch query fields and still falls back to action type', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-websearch-empty-query', cwd: '/tmp/project' });
+
+    const tools: Array<{ input: unknown; detail?: unknown }> = [];
+    provider.onToolCall((_, tool) => tools.push({ input: tool.input, detail: tool.detail }));
+
+    await provider.send('route-websearch-empty-query', 'search');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          id: 'ws-empty',
+          type: 'webSearch',
+          query: '',
+          action: { type: 'other', query: '' },
+        },
+      },
+    });
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+    await flush();
+
+    expect(tools).toHaveLength(1);
+    expect(tools[0].input).toEqual({ query: '(other)' });
+    const detail = tools[0].detail as { summary?: string; input?: Record<string, unknown>; meta?: { actionType?: string } };
+    expect(detail.summary).toBe('(other)');
+    expect(detail.input).toEqual({ query: '(other)', action: { type: 'other', query: '' } });
+    expect(detail.meta?.actionType).toBe('other');
+  });
+
   it('applies thinking level to subsequent Codex SDK turns', async () => {
     const provider = new CodexSdkProvider();
     await provider.connect({ binaryPath: 'codex' });

@@ -10,12 +10,12 @@ IM.codes gives coding agents one shared memory layer across providers. It turns 
 
 ### Breaking Changes
 
-- **PostgreSQL image changed to `pgvector/pgvector:pg16`** (was `postgres:16-alpine`). Required for multilingual vector search in shared agent memory. Existing self-hosted deployments must update their `docker-compose.yml`:
+- **PostgreSQL default image changed to `pgvector/pgvector:pg18`** (instead of `postgres:16-alpine`). New self-hosted deployments generated from the current templates use this image for multilingual vector search in shared agent memory:
   ```yaml
   postgres:
-    image: pgvector/pgvector:pg16   # was: postgres:16-alpine
+    image: pgvector/pgvector:pg18   # was: postgres:16-alpine
   ```
-  This is a drop-in replacement — data volumes are fully compatible. The pgvector extension is enabled automatically by the server migration on first startup.
+  The pgvector extension is enabled automatically by the server migration on first startup.
 
 ## Screenshots
 
@@ -309,7 +309,7 @@ git clone https://github.com/im4codes/imcodes.git && cd imcodes
 docker compose up -d
 ```
 
-The generated `docker-compose.yml` already uses `pgvector/pgvector:pg16` for PostgreSQL.
+The generated `docker-compose.yml` already uses `pgvector/pgvector:pg18` for PostgreSQL.
 
 Login at `https://your-domain` with `admin` and the printed password. Bind your dev machine with `imcodes bind`.
 
