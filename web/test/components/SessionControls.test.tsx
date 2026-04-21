@@ -2505,6 +2505,55 @@ afterEach(() => {
     });
   });
 
+  it('restores uploaded attachment badges when switching back to the same main session', async () => {
+    uploadFileMock.mockResolvedValue({ attachment: { daemonPath: '/tmp/persisted-attachment.txt' } });
+    const ws = makeWs();
+    const { rerender } = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'session-a' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    fireEvent.paste(input, {
+      clipboardData: {
+        getData: (type: string) => type === 'text/plain' ? 'x'.repeat(1300) : '',
+      },
+    });
+
+    await waitFor(() => {
+      expect(document.querySelector('.attachment-badge-name')?.textContent).toMatch(/^pasted-text-.*\.txt$/);
+    });
+    const badgeName = document.querySelector('.attachment-badge-name')?.textContent ?? '';
+
+    rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'session-b' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    expect(document.querySelector('.attachment-badge-name')).toBeNull();
+
+    rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'session-a' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(document.querySelector('.attachment-badge-name')?.textContent).toBe(badgeName);
+    });
+  });
+
   it('blocks oversized plain-text paste when upload context is unavailable', async () => {
     render(
       <SessionControls
