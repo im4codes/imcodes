@@ -178,6 +178,15 @@ import { TRANSPORT_MSG } from '@shared/transport-events.js';
 
 const flushAsync = () => new Promise((resolve) => setTimeout(resolve, 0));
 
+function readBlobText(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error('Failed to read blob text'));
+    reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '');
+    reader.readAsText(blob);
+  });
+}
+
 const TEST_OPENSPEC_ADVANCED_ROUNDS = [
   {
     id: 'initial_audit',
@@ -2473,7 +2482,7 @@ afterEach(() => {
     const uploadedFile = uploadFileMock.mock.calls[0]?.[1] as File;
     expect(uploadedFile).toBeInstanceOf(File);
     expect(uploadedFile.name).toMatch(/^pasted-text-.*\.txt$/);
-    expect(await uploadedFile.text()).toBe(longText);
+    expect(await readBlobText(uploadedFile)).toBe(longText);
     expect(execCommandMock).not.toHaveBeenCalled();
     expect(input.textContent).toBe('');
     await waitFor(() => {

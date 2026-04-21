@@ -464,7 +464,7 @@ class SupervisionAutomation {
       sessionName,
       'assistant.text',
       { text, streaming: false, automation: true, automationKind: kind, memoryExcluded: true },
-      { source: 'daemon', confidence: 'high', eventId: `supervision-note:${sessionName}:${kind}` },
+      { source: 'daemon', confidence: 'high', eventId: `supervision-note:${sessionName}` },
     );
   }
 

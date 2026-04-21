@@ -384,7 +384,7 @@ describe('ChatView', () => {
   it('keeps only the latest Auto note when supervision reuses the same event id', async () => {
     const events = [
       {
-        eventId: 'supervision-note:deck_main_brain:supervision-status',
+        eventId: 'supervision-note:deck_main_brain',
         type: 'assistant.text',
         ts: 1001,
         payload: {
@@ -395,14 +395,14 @@ describe('ChatView', () => {
         },
       },
       {
-        eventId: 'supervision-note:deck_main_brain:supervision-status',
+        eventId: 'supervision-note:deck_main_brain',
         type: 'assistant.text',
         ts: 1002,
         payload: {
           text: 'Auto: task looks complete.',
           streaming: false,
           automation: true,
-          automationKind: 'supervision-status',
+          automationKind: 'supervision-complete',
         },
       },
     ] as any;
