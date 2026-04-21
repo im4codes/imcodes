@@ -82,7 +82,10 @@ export function getAccountHistory(data: QuickData): string[] {
 
 let _debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
-function scheduleSave(data: QuickData): void {
+function scheduleSave(data: QuickData, canPersist: boolean): void {
+  // Never replace server state with a local empty snapshot before we've
+  // successfully hydrated quick-data at least once in this tab.
+  if (!canPersist) return;
   if (_debounceTimer) clearTimeout(_debounceTimer);
   _debounceTimer = setTimeout(() => {
     apiFetch('/api/quick-data', { method: 'PUT', body: JSON.stringify({ data }) }).catch((err) => {
@@ -108,6 +111,7 @@ export interface UseQuickDataResult {
 export function useQuickData(): UseQuickDataResult {
   const [data, setData] = useState<QuickData>(EMPTY_QUICK_DATA);
   const [loaded, setLoaded] = useState(false);
+  const [hasHydratedFromServer, setHasHydratedFromServer] = useState(false);
 
   useEffect(() => {
     const fetchData = () => {
@@ -115,6 +119,7 @@ export function useQuickData(): UseQuickDataResult {
         const d = res.data;
         if (!d.sessionHistory) d.sessionHistory = {};
         setData(d);
+        setHasHydratedFromServer(true);
         setLoaded(true);
       }).catch(() => { setLoaded(true); });
     };
@@ -128,7 +133,7 @@ export function useQuickData(): UseQuickDataResult {
   const recordHistory = (text: string, sessionName?: string) => {
     setData((prev) => {
       const next = recordHistoryEntry(prev, text, sessionName);
-      scheduleSave(next);
+      scheduleSave(next, hasHydratedFromServer);
       return next;
     });
   };
@@ -139,7 +144,7 @@ export function useQuickData(): UseQuickDataResult {
     setData((prev) => {
       if (prev.commands.includes(trimmed)) return prev;
       const next = { ...prev, commands: [...prev.commands, trimmed] };
-      scheduleSave(next);
+      scheduleSave(next, hasHydratedFromServer);
       return next;
     });
   };
@@ -150,7 +155,7 @@ export function useQuickData(): UseQuickDataResult {
     setData((prev) => {
       if (prev.phrases.includes(trimmed)) return prev;
       const next = { ...prev, phrases: [...prev.phrases, trimmed] };
-      scheduleSave(next);
+      scheduleSave(next, hasHydratedFromServer);
       return next;
     });
   };
@@ -158,21 +163,21 @@ export function useQuickData(): UseQuickDataResult {
   const removeCommand = (cmd: string) => {
     setData((prev) => {
       const next = { ...prev, commands: prev.commands.filter((c) => c !== cmd) };
-      scheduleSave(next);
+      scheduleSave(next, hasHydratedFromServer);
       return next;
     });
   };
   const removePhrase = (phrase: string) => {
     setData((prev) => {
       const next = { ...prev, phrases: prev.phrases.filter((p) => p !== phrase) };
-      scheduleSave(next);
+      scheduleSave(next, hasHydratedFromServer);
       return next;
     });
   };
   const removeHistory = (text: string) => {
     setData((prev) => {
       const next = { ...prev, history: prev.history.filter((h) => h !== text) };
-      scheduleSave(next);
+      scheduleSave(next, hasHydratedFromServer);
       return next;
     });
   };
@@ -180,21 +185,21 @@ export function useQuickData(): UseQuickDataResult {
     setData((prev) => {
       const sh = prev.sessionHistory[sessionName] ?? [];
       const next = { ...prev, sessionHistory: { ...prev.sessionHistory, [sessionName]: sh.filter((h) => h !== text) } };
-      scheduleSave(next);
+      scheduleSave(next, hasHydratedFromServer);
       return next;
     });
   };
   const clearHistory = () => {
     setData((prev) => {
       const next = { ...prev, history: [] };
-      scheduleSave(next);
+      scheduleSave(next, hasHydratedFromServer);
       return next;
     });
   };
   const clearSessionHistory = (sessionName: string) => {
     setData((prev) => {
       const next = { ...prev, sessionHistory: { ...prev.sessionHistory, [sessionName]: [] } };
-      scheduleSave(next);
+      scheduleSave(next, hasHydratedFromServer);
       return next;
     });
   };

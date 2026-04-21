@@ -3,8 +3,10 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, fireEvent, cleanup } from '@testing-library/preact';
+import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/preact';
 import { useState } from 'preact/hooks';
+
+const apiFetchMock = vi.fn();
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -35,14 +37,18 @@ vi.mock('react-i18next', () => ({
 }));
 
 vi.mock('../../src/components/FileBrowser.js', () => ({ FileBrowser: () => null }));
+vi.mock('../../src/api.js', () => ({
+  apiFetch: (...args: unknown[]) => apiFetchMock(...args),
+}));
 
-import { QuickInputPanel, type QuickData } from '../../src/components/QuickInputPanel.js';
+import { QuickInputPanel, useQuickData, type QuickData } from '../../src/components/QuickInputPanel.js';
 
 describe('QuickInputPanel history scope', () => {
   const defaultWidth = window.innerWidth;
   const defaultHeight = window.innerHeight;
 
   beforeEach(() => {
+    apiFetchMock.mockReset();
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: defaultWidth });
     Object.defineProperty(window, 'innerHeight', { configurable: true, value: defaultHeight });
   });
@@ -466,5 +472,69 @@ describe('QuickInputPanel history scope', () => {
     expect(commandPills).toContain('/model');
     expect(commandPills).toContain('/compact');
     expect(commandPills).not.toContain('/thinking');
+  });
+});
+
+describe('useQuickData persistence guard', () => {
+  beforeEach(() => {
+    apiFetchMock.mockReset();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.runOnlyPendingTimers();
+    vi.useRealTimers();
+    cleanup();
+  });
+
+  function Harness() {
+    const quick = useQuickData();
+    return (
+      <div>
+        <div data-testid="loaded">{String(quick.loaded)}</div>
+        <div data-testid="commands">{quick.data.commands.join(',')}</div>
+        <button onClick={() => quick.addCommand('/custom')}>add-command</button>
+      </div>
+    );
+  }
+
+  it('does not PUT quick-data after the initial GET fails', async () => {
+    apiFetchMock.mockRejectedValueOnce(new Error('network down'));
+
+    render(<Harness />);
+
+    await waitFor(() => expect(screen.getByTestId('loaded').textContent).toBe('true'));
+    fireEvent.click(screen.getByText('add-command'));
+    vi.advanceTimersByTime(2000);
+    await Promise.resolve();
+
+    expect(screen.getByTestId('commands').textContent).toBe('/custom');
+    expect(apiFetchMock).toHaveBeenCalledTimes(1);
+    expect(apiFetchMock).toHaveBeenCalledWith('/api/quick-data');
+  });
+
+  it('still PUTs quick-data after a successful initial hydration', async () => {
+    apiFetchMock.mockResolvedValueOnce({ data: { history: [], sessionHistory: {}, commands: [], phrases: [] } });
+    apiFetchMock.mockResolvedValueOnce({ ok: true });
+
+    render(<Harness />);
+
+    await waitFor(() => expect(screen.getByTestId('loaded').textContent).toBe('true'));
+    fireEvent.click(screen.getByText('add-command'));
+    vi.advanceTimersByTime(2000);
+    await waitFor(() => expect(apiFetchMock).toHaveBeenCalledTimes(2));
+
+    expect(apiFetchMock).toHaveBeenNthCalledWith(1, '/api/quick-data');
+    expect(apiFetchMock).toHaveBeenNthCalledWith(2, '/api/quick-data', {
+      method: 'PUT',
+      body: JSON.stringify({
+        data: {
+          history: [],
+          sessionHistory: {},
+          commands: ['/custom'],
+          phrases: [],
+        },
+      }),
+    });
   });
 });
