@@ -224,11 +224,11 @@ export function App() {
   const [mobileHideTabBar, setMobileHideTabBar] = useState(() => localStorage.getItem('mobile_hide_tab_bar') === '1');
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => loadSidebarCollapsed());
   const handleToggleSidebar = useCallback(() => {
-    setSidebarCollapsed((prev) => {
-      saveSidebarCollapsed(!prev);
-      return !prev;
-    });
+    setSidebarCollapsed((prev) => !prev);
   }, []);
+  useEffect(() => {
+    saveSidebarCollapsed(sidebarCollapsed);
+  }, [sidebarCollapsed]);
   const [showDesktopFileBrowser, setShowDesktopFileBrowser] = useState(false);
   const [showDesktopLocalWebPreview, setShowDesktopLocalWebPreview] = useState(false);
   const [localWebPreviewPort, setLocalWebPreviewPort] = useState('');

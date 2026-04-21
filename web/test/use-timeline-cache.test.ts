@@ -8,6 +8,7 @@ import type { ServerMessage, TimelineEvent, WsClient } from '../src/ws-client.js
 import { TimelineDB } from '../src/timeline-db.js';
 import { mergeTimelineEvents } from '../../src/shared/timeline/merge.js';
 import {
+  __clearPersistedTimelineSnapshotsForTests,
   __getTimelineCacheKeysForTests,
   __getSharedTimelineBaseForTests,
   __resetTimelineCacheForTests,
@@ -33,6 +34,7 @@ function makeEvents(sessionId: string, count: number): TimelineEvent[] {
 describe('useTimeline global cache bounds', () => {
   beforeEach(() => {
     __resetTimelineCacheForTests();
+    __clearPersistedTimelineSnapshotsForTests();
     cleanup();
   });
 
@@ -300,6 +302,69 @@ describe('useTimeline global cache bounds', () => {
 
     await waitFor(() => {
       expect(screen.getByTestId('probe-2').textContent).toBe('1');
+    });
+  });
+
+  it('renders immediately from the persisted local snapshot before IndexedDB resolves', async () => {
+    const sessionName = `deck_local_snapshot_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-snap-1`,
+      sessionId: sessionName,
+      ts: 1,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'snapshot history' },
+    }, serverId);
+
+    __resetTimelineCacheForTests();
+    vi.spyOn(TimelineDB.prototype, 'open').mockImplementation(() => new Promise(() => {}));
+
+    function Probe() {
+      const { events, loading } = useTimeline(sessionName, null, serverId);
+      return h('div', { 'data-testid': 'probe', 'data-loading': String(loading) }, events.map((event) => String(event.payload.text ?? '')).join('|'));
+    }
+
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('snapshot history');
+      expect(screen.getByTestId('probe').getAttribute('data-loading')).toBe('false');
+    });
+  });
+
+  it('requests timeline history when the socket connects after the first mount', async () => {
+    const sessionName = `deck_late_connect_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    let connected = false;
+    const sendTimelineHistoryRequest = vi.fn(() => 'history-late-connect');
+
+    const ws: WsClient = {
+      get connected() {
+        return connected;
+      },
+      onMessage: () => () => {},
+      sendTimelineHistoryRequest,
+    } as unknown as WsClient;
+
+    function Probe({ tick }: { tick: number }) {
+      const { loading } = useTimeline(sessionName, ws, serverId);
+      return h('div', { 'data-testid': 'probe', 'data-tick': String(tick) }, String(loading));
+    }
+
+    const view = render(h(Probe, { tick: 0 }));
+
+    expect(sendTimelineHistoryRequest).not.toHaveBeenCalled();
+
+    connected = true;
+    view.rerender(h(Probe, { tick: 1 }));
+
+    await waitFor(() => {
+      expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName);
     });
   });
 
