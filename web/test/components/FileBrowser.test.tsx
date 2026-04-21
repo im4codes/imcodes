@@ -266,6 +266,22 @@ describe('FileBrowser', () => {
     expect(fsListDir).toHaveBeenCalledWith('/home/user', false, false);
   });
 
+  it('keeps the initial list request lightweight even when downloads are enabled', () => {
+    const { ws, fsListDir } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        serverId="srv-1"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect(fsListDir).toHaveBeenCalledWith('/home/user', true, false);
+  });
+
   it('uses entry.path from a Windows drive root listing', async () => {
     const { ws, respond } = makeWsFactory();
     render(
