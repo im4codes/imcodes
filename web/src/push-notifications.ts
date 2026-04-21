@@ -74,7 +74,21 @@ export async function initPushNotifications(
     // backfill never fires — the user would see stale messages until the
     // next WS event. Dispatching ACTIVE_TIMELINE_REFRESH_EVENT pulls the
     // latest timeline via the history API immediately.
-    try { window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT)); } catch { /* ignore */ }
+    //
+    // Dispatch twice to cover two race windows:
+    //   1. Synchronous — already-mounted SessionPane listeners catch it.
+    //   2. After two requestAnimationFrame ticks — gives React time to
+    //      re-render from the deck:navigate → setActiveSession update
+    //      above so a SessionPane that mounts for a just-activated
+    //      session (cold tab, notification for a previously-unvisited
+    //      session) can still attach its listener and catch the refresh.
+    //      useTimeline's handler is idempotent — the 200ms debounce inside
+    //      fireHttpBackfill coalesces back-to-back dispatches.
+    const fireRefresh = (): void => {
+      try { window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT)); } catch { /* ignore */ }
+    };
+    fireRefresh();
+    requestAnimationFrame(() => requestAnimationFrame(fireRefresh));
   });
 }
 

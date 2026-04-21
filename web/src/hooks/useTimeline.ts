@@ -474,11 +474,18 @@ export function useTimeline(
         } else {
           setLoading(false);
         }
-        // Cold load — no IDB cache, no memory cache. HTTP backfill is
-        // still worthwhile: the WS history request may race against the
-        // bridge's subscribe ownership-check window, and HTTP reads go
-        // through a separate unicast request-response path.
-        fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS });
+        // Cold load — no IDB cache, no memory cache. Skip the
+        // MOUNT_BACKFILL_COOLDOWN_MS gate: with zero cached events the UI
+        // is showing "No events yet", so a cooldown from a prior session's
+        // mount on this page (unrelated cacheKey can't trigger it, but a
+        // prior cold-mount of *this* session in the same page session can)
+        // would leave the user staring at an empty timeline until the next
+        // WS event. That's exactly the symptom users report after opening
+        // a chat via push notification — the mount effect runs inside
+        // React's render tick but ACTIVE_TIMELINE_REFRESH_EVENT dispatched
+        // by the notification handler can race with listener attachment.
+        // Passing cooldownMs=0 here guarantees the fetch actually fires.
+        fireHttpBackfillRef.current(200, { cooldownMs: 0 });
       }
     };
     load().catch(() => {});
@@ -754,17 +761,22 @@ export function useTimeline(
   fireHttpBackfillRef.current = fireHttpBackfill;
 
   // Force-refresh the active session when the app comes back to the
-  // foreground. This covers the push-notification → already-mounted-session
-  // gap: the mount effect never re-runs so its cooldown-gated backfill
-  // never fires. Using cooldownMs=0 so every resume pulls fresh state.
+  // foreground or a push-notification is tapped. Listener is intentionally
+  // registered with NO deps so it stays attached across session switches:
+  // if we gated on [sessionId, serverId], React would tear down + re-add
+  // the listener on every navigate, and an ACTIVE_TIMELINE_REFRESH_EVENT
+  // dispatched synchronously in the same tick as setActiveSession() (see
+  // push-notifications.ts) would land in the gap and be silently dropped,
+  // leaving the user staring at "No events yet" after a notification tap.
+  // `fireHttpBackfillRef.current` reads the latest sessionId/serverId on
+  // each call, and `fireHttpBackfill` itself no-ops when either is unset.
   useEffect(() => {
-    if (!sessionId || !serverId) return;
     const handler = (): void => {
       fireHttpBackfillRef.current(0, { cooldownMs: 0 });
     };
     window.addEventListener(ACTIVE_TIMELINE_REFRESH_EVENT, handler);
     return () => window.removeEventListener(ACTIVE_TIMELINE_REFRESH_EVENT, handler);
-  }, [sessionId, serverId]);
+  }, []);
 
   // Listen for WS messages
   useEffect(() => {
