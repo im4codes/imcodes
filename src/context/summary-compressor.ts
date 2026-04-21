@@ -524,6 +524,9 @@ function buildCompressionPrompt(
 ## Key Decisions
 [Important technical decisions and why — include constraints and preferences]
 
+## User-Pinned Notes
+[If the user explicitly asked you to remember, memorize, take note of, or never forget any specific piece of information (in any language — e.g. English "remember/keep in mind/note this", Chinese "记住/记得/记下/牢记", Japanese "覚えて/覚えておいて", Korean "기억해줘", Spanish "recuerda", Russian "запомни", etc. — recognise the INTENT, not any fixed keyword list), copy the exact content here VERBATIM. Never paraphrase, summarise, translate, truncate, or reword pinned content. Preserve the user's original words exactly, including code, paths, numbers, names, and formatting. If there are no such requests in this batch, omit this section entirely.]
+
 ## Active State
 [Files modified, test results, current branch — only if relevant]`;
 
@@ -538,6 +541,8 @@ ${serializedEvents}
 
 Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new actions and outcomes. Move completed items from pending to resolved. Update active state. Remove information only if clearly obsolete.
 
+CRITICAL — VERBATIM PRESERVATION RULE: If the previous summary contains a "User-Pinned Notes" section, every line in it MUST be carried forward UNCHANGED (word-for-word, character-for-character) into the updated summary. Also scan NEW EVENTS for any user message expressing an intent to be remembered (in any language — see the "User-Pinned Notes" description below). Append such content verbatim to that section. Never drop, paraphrase, translate, or compress pinned content, even if it looks redundant.
+
 ${template}
 
 Target ~${targetTokens} tokens. Be CONCRETE — include file paths, error messages, and specific values. Write only the summary.`;
@@ -551,6 +556,8 @@ ${serializedEvents}
 Use this exact structure:
 
 ${template}
+
+CRITICAL — VERBATIM PRESERVATION RULE: If any user message in the events above expresses an intent to be remembered (in any language — see the "User-Pinned Notes" description above), copy that exact content word-for-word into the "User-Pinned Notes" section. Never paraphrase, translate, summarise, or reorder pinned content.
 
 Target ~${targetTokens} tokens. Be CONCRETE — include file paths, error messages, and specific values. Write only the summary.`;
 }
