@@ -96,6 +96,11 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
       ...(!sub.providerSessionId && agentType === 'claude-code-sdk' ? { ccSessionId: randomUUID(), fresh: true } : {}),
       ...(!sub.providerSessionId && agentType === 'codex-sdk' ? { fresh: true } : {}),
       ...(sub.effort ? { effort: sub.effort } : {}),
+      // Carry the preset through the transport launch so Qwen doesn't revert
+      // to the OAuth `coder-model` when the sub-session record says the run
+      // is routed through a MiniMax/GLM/Kimi preset. The non-transport branch
+      // below already resolves preset env via sub.ccPreset.
+      ...(sub.ccPreset ? { ccPreset: sub.ccPreset } : {}),
       userCreated: true,
       parentSession: sub.parentSession ?? undefined,
     });
@@ -325,6 +330,10 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         requestedModel: sub.requestedModel ?? undefined,
         effort: sub.effort ?? undefined,
         transportConfig: sub.transportConfig ?? undefined,
+        // Without this the daemon-restart rebuild path rewrites SessionRecord
+        // without ccPreset — Qwen then spawns with no --model / no preset
+        // settings and reverts to the OAuth `coder-model` placeholder.
+        ...(sub.ccPreset ? { ccPreset: sub.ccPreset } : {}),
       }).catch((e) => logger.warn({ err: e, sessionName }, 'Failed to rebuild transport sub-session'));
       }
       continue;
@@ -392,6 +401,17 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         restartTimestamps: stored?.restartTimestamps ?? [],
         createdAt: stored?.createdAt ?? Date.now(),
         updatedAt: Date.now(),
+        // Sticky fields — the upsert above is a *replace*, so anything we
+        // don't copy forward gets wiped. Without carrying these over, daemon
+        // restart resets preset/description/userCreated/memory-dedup state
+        // and the next respawn spawns the raw CLI without preset env.
+        ...(sub.ccPreset ?? stored?.ccPreset ? { ccPreset: sub.ccPreset ?? stored?.ccPreset ?? undefined } : {}),
+        ...(sub.description ?? stored?.description ? { description: sub.description ?? stored?.description ?? undefined } : {}),
+        ...(stored?.userCreated ? { userCreated: stored.userCreated } : {}),
+        ...(stored?.startupMemoryInjected ? { startupMemoryInjected: true } : {}),
+        ...(stored?.recentInjectionHistory && stored.recentInjectionHistory.length > 0
+          ? { recentInjectionHistory: stored.recentInjectionHistory }
+          : {}),
       });
     }
   }

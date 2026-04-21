@@ -170,9 +170,21 @@ describe('MaterializationCoordinator', () => {
     expect(coordinator.modelConfig).toEqual({
       primaryContextBackend: 'codex-sdk',
       primaryContextModel: 'gpt-5.2',
+      primaryContextPreset: undefined,
+      primaryContextSdk: undefined,
       backupContextBackend: 'qwen',
       backupContextModel: 'qwen3-coder-plus',
+      backupContextPreset: undefined,
+      backupContextSdk: undefined,
       enablePersonalMemorySync: false,
+      materializationMinIntervalMs: undefined,
+      memoryRecallMinScore: 0.4,
+      memoryScoringWeights: {
+        similarity: 0.4,
+        recency: 0.25,
+        frequency: 0.15,
+        project: 0.2,
+      },
     });
   });
 
@@ -197,6 +209,41 @@ describe('MaterializationCoordinator', () => {
     expect(coordinator.canMaterializeTarget(target, 10_200)).toBe(true);
   });
 
+  it('records template-prompt content at ingestion (filtering is a recall-side concern, not ingestion)', async () => {
+    // Built-in / templated prompts (OpenSpec workflow invocations, slash
+    // commands, harness command tags) are still written to memory — the
+    // template filter applies only on the recall path, not at record time.
+    // See shared/template-prompt-patterns.ts and Phase L.
+    const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
+      thresholds: { eventCount: 1, idleMs: 1000, scheduleMs: 10_000 },
+    });
+
+    const openspec = coordinator.ingestEvent({
+      target,
+      eventType: 'assistant.text',
+      content: 'Drove the implementation of @openspec/changes/my-feature by orchestrating subagents.',
+      createdAt: 100,
+    });
+    expect(openspec.filtered).toBeUndefined();
+    expect(openspec.queuedJob).toEqual(expect.objectContaining({ trigger: 'threshold' }));
+  });
+
+
+  it('drops pure API connection failure summaries instead of persisting them as memory', async () => {
+    const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
+      thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
+    });
+
+    coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'continue the run', createdAt: 100 });
+    coordinator.ingestEvent({ target, eventType: 'assistant.text', content: '[API Error: Connection error. (cause: fetch failed)]', createdAt: 120 });
+
+    const result = await coordinator.materializeTarget(target, 'manual', 500);
+
+    expect(result.filteredOut).toBe(true);
+    expect(result.summaryProjection).toBeUndefined();
+    expect(getReplicationState(namespace)?.pendingProjectionIds ?? []).toEqual([]);
+  });
+
   it('pairs final assistant.text output with the user request in structured summaries', async () => {
     const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
@@ -209,5 +256,51 @@ describe('MaterializationCoordinator', () => {
 
     expect(result.summaryProjection.summary).toContain('**User:** fix the flaky build');
     expect(result.summaryProjection.summary).toContain('**Assistant:** updated the import and reran the build');
+  });
+
+  it('creates durable memory automatically from structured summary key decisions even without explicit durable events', async () => {
+    const coordinator = new MaterializationCoordinator({
+      compressor: async () => ({
+        summary: [
+          '## User Problem',
+          'Need startup memory to preserve key decisions',
+          '',
+          '## Resolution',
+          'Added automatic durable extraction from structured summaries.',
+          '',
+          '## Key Decisions',
+          '- Key decisions: Preserve startup architecture notes',
+          '- Constraints: Do not require manual memory tagging',
+          '- Preferences: Prefer durable-first startup context',
+          '',
+          '## Active State',
+          'Tests pending.',
+        ].join('\n'),
+        model: 'test-model',
+        backend: 'none',
+        usedBackup: false,
+        fromSdk: true,
+      }),
+      thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
+    });
+
+    coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'keep startup notes stable', createdAt: 100 });
+    coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'implemented durable extraction', createdAt: 120 });
+
+    const result = await coordinator.materializeTarget(target, 'manual', 500);
+
+    expect(result.durableProjection?.class).toBe('durable_memory_candidate');
+    expect(result.durableProjection?.summary).toContain('Preserve startup architecture notes');
+    expect(result.durableProjection?.summary).toContain('Do not require manual memory tagging');
+    expect(result.durableProjection?.summary).toContain('Prefer durable-first startup context');
+    expect(result.durableProjection?.sourceEventIds).toEqual(result.summaryProjection.sourceEventIds);
+    expect(result.durableProjection?.content).toEqual(expect.objectContaining({
+      source: 'summary',
+      durableSignals: {
+        decisions: ['Preserve startup architecture notes'],
+        constraints: ['Do not require manual memory tagging'],
+        preferences: ['Prefer durable-first startup context'],
+      },
+    }));
   });
 });

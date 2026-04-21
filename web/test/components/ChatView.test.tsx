@@ -257,12 +257,92 @@ describe('ChatView', () => {
     );
 
     expect(container.querySelector('.chat-linked-event-group')).toBeNull();
-    fireEvent.click(getByText('chat.memory_context_title'));
+    // Startup-reason memory-context cards now use a distinct title so users
+    // can tell a pre-loaded history preamble from a per-prompt recall at a
+    // glance. The collapsed header therefore shows
+    // chat.memory_context_startup_title, not the plain recall title.
+    fireEvent.click(getByText('chat.memory_context_startup_title'));
 
     await waitFor(() => {
       expect(container.textContent).toContain('chat.memory_context_startup_reason');
       expect(container.textContent).toContain('Fix websocket reconnect loop');
     });
+  });
+
+  it('renders status-only memory context hints collapsed by default — only the one-line reason is visible', async () => {
+    const { container, getByText } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-user',
+            type: 'user.message',
+            ts: 1000,
+            payload: { text: 'Continue' },
+          },
+          {
+            eventId: 'evt-memory-status',
+            type: 'memory.context',
+            ts: 1001,
+            payload: {
+              relatedToEventId: 'evt-user',
+              query: 'Continue',
+              status: 'deduped_recently',
+              matchedCount: 2,
+              dedupedCount: 2,
+              items: [],
+            },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    const statusCard = container.querySelector('.chat-memory-context-status');
+    expect(statusCard).not.toBeNull();
+    // Headline reason is visible without user interaction.
+    expect(container.textContent).toContain('chat.memory_context_status_deduped_recently');
+    // Detail is hidden until the user expands the card.
+    expect(container.textContent).not.toContain('chat.memory_context_status_deduped_recently_detail');
+    // The query line is redundant with the preceding user.message bubble —
+    // it must not re-appear in the status card regardless of expand state.
+    expect(container.textContent).not.toContain('chat.memory_context_query');
+
+    // Expanding the card reveals the detail line.
+    fireEvent.click(getByText('chat.memory_context_status_deduped_recently'));
+    await waitFor(() => {
+      expect(container.textContent).toContain('chat.memory_context_status_deduped_recently_detail');
+    });
+    // Query stays hidden even after expanding — it was always redundant.
+    expect(container.textContent).not.toContain('chat.memory_context_query');
+  });
+
+  it('renders status-only cards with no detail as a flat one-liner (no toggle)', () => {
+    // Not every status has a detail translation — for those the card must
+    // degrade to a flat row with no caret / no click handler.
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-memory-no-detail',
+            type: 'memory.context',
+            ts: 1001,
+            payload: {
+              query: 'x',
+              status: 'no_matches',
+              matchedCount: 0,
+              items: [],
+            },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+    const card = container.querySelector('.chat-memory-context-status');
+    expect(card).not.toBeNull();
+    expect(container.querySelector('.chat-memory-context-status-toggle')).toBeNull();
+    expect(container.querySelector('.chat-memory-context-status-row')).not.toBeNull();
   });
 
   it('renders Auto progress notes as a separate assistant block instead of merging them into the model reply', async () => {

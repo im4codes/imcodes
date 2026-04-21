@@ -4,6 +4,7 @@ import {
   computeFrequencyBoost,
   computeProjectBoost,
   computeRelevanceScore,
+  normalizeMemoryScoringWeights,
   W_SIMILARITY,
   W_RECENCY,
   W_FREQUENCY,
@@ -238,6 +239,40 @@ describe('memory-scoring', () => {
       // Best case should be very close to 1.0
       // 0.4*1 + 0.25*1 + 0.15*1 + 0.2*1 = 1.0
       expect(bestScore).toBeCloseTo(1.0, 2);
+    });
+
+    it('supports custom weights for advanced scoring configuration', () => {
+      vi.useFakeTimers();
+      const now = Date.now();
+      const input: MemoryScoringInput = {
+        similarity: 0.4,
+        lastUsedAt: now,
+        hitCount: 7,
+        projectionClass: 'recent_summary',
+        memoryProjectId: 'proj-1',
+        currentProjectId: 'proj-2',
+      };
+      const score = computeRelevanceScore(input, {
+        similarity: 0.1,
+        recency: 0.6,
+        frequency: 0.2,
+        project: 0.1,
+      });
+      expect(score).toBeGreaterThan(computeRelevanceScore(input));
+    });
+
+    it('falls back per-field and renormalizes when some advanced weights are invalid', () => {
+      expect(normalizeMemoryScoringWeights({
+        similarity: Number.NaN,
+        recency: -1,
+        frequency: Number.NaN,
+        project: -1,
+      })).toEqual({
+        similarity: 0.7273,
+        recency: 0,
+        frequency: 0.2727,
+        project: 0,
+      });
     });
   });
 });

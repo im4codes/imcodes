@@ -9,6 +9,21 @@ export const W_SIMILARITY = 0.4;
 export const W_RECENCY = 0.25;
 export const W_FREQUENCY = 0.15;
 export const W_PROJECT = 0.2;
+export const MEMORY_SCORING_WEIGHT_STEP = 0.01;
+
+export interface MemoryScoringWeights {
+  similarity: number;
+  recency: number;
+  frequency: number;
+  project: number;
+}
+
+export const DEFAULT_MEMORY_SCORING_WEIGHTS: MemoryScoringWeights = {
+  similarity: W_SIMILARITY,
+  recency: W_RECENCY,
+  frequency: W_FREQUENCY,
+  project: W_PROJECT,
+};
 
 // Half-lives in days
 export const HALF_LIFE_RECENT_SUMMARY = 14;
@@ -33,6 +48,29 @@ export interface MemoryScoringInput {
   memoryEnterpriseId?: string;
   /** Enterprise ID of the current context (if any) */
   currentEnterpriseId?: string;
+}
+
+export function normalizeMemoryScoringWeights(
+  input: Partial<MemoryScoringWeights> | null | undefined,
+): MemoryScoringWeights {
+  const similarity = typeof input?.similarity === 'number' && Number.isFinite(input.similarity) ? Math.max(0, input.similarity) : DEFAULT_MEMORY_SCORING_WEIGHTS.similarity;
+  const recency = typeof input?.recency === 'number' && Number.isFinite(input.recency) ? Math.max(0, input.recency) : DEFAULT_MEMORY_SCORING_WEIGHTS.recency;
+  const frequency = typeof input?.frequency === 'number' && Number.isFinite(input.frequency) ? Math.max(0, input.frequency) : DEFAULT_MEMORY_SCORING_WEIGHTS.frequency;
+  const project = typeof input?.project === 'number' && Number.isFinite(input.project) ? Math.max(0, input.project) : DEFAULT_MEMORY_SCORING_WEIGHTS.project;
+  const total = similarity + recency + frequency + project;
+  if (total <= 0) return { ...DEFAULT_MEMORY_SCORING_WEIGHTS };
+  const normalized = {
+    similarity: similarity / total,
+    recency: recency / total,
+    frequency: frequency / total,
+    project: project / total,
+  };
+  return {
+    similarity: Math.round(normalized.similarity * 10000) / 10000,
+    recency: Math.round(normalized.recency * 10000) / 10000,
+    frequency: Math.round(normalized.frequency * 10000) / 10000,
+    project: Math.round(normalized.project * 10000) / 10000,
+  };
 }
 
 /**
@@ -68,9 +106,83 @@ export function computeProjectBoost(input: Pick<MemoryScoringInput, 'memoryProje
 /**
  * Compute the full composite relevance score.
  */
-export function computeRelevanceScore(input: MemoryScoringInput): number {
+export function computeRelevanceScore(
+  input: MemoryScoringInput,
+  weightsInput?: Partial<MemoryScoringWeights> | null,
+): number {
+  const weights = normalizeMemoryScoringWeights(weightsInput);
   const recency = computeRecencyBoost(input.lastUsedAt, input.projectionClass);
   const frequency = computeFrequencyBoost(input.hitCount);
   const project = computeProjectBoost(input);
-  return W_SIMILARITY * input.similarity + W_RECENCY * recency + W_FREQUENCY * frequency + W_PROJECT * project;
+  return weights.similarity * input.similarity
+    + weights.recency * recency
+    + weights.frequency * frequency
+    + weights.project * project;
+}
+
+// ── Recall cap rule ────────────────────────────────────────────────────────
+//
+// Tuning rationale:
+//   - MIN_FLOOR = 0.4 → still excludes pure project+recency noise
+//     (same-project, fresh, never-recalled, similarity 0 scores only 0.425),
+//     while keeping weaker-but-real multilingual semantic matches that
+//     often land around 0.40–0.44 after composite scoring.
+//   - DEFAULT_CAP = 3 → tight default; noise-resistant.
+//   - EXTEND_BAR = 0.6, EXTEND_CAP = 5 → if the top 3 are ALL strong,
+//     keep absorbing equally-strong items up to 5. Mediocre 4th items
+//     do not get promoted.
+
+export const RECALL_MIN_FLOOR = 0.4;
+export const RECALL_DEFAULT_CAP = 3;
+export const RECALL_EXTEND_BAR = 0.6;
+export const RECALL_EXTEND_CAP = 5;
+
+export interface RecallCapOptions {
+  minFloor?: number;
+  defaultCap?: number;
+  extendBar?: number;
+  extendCap?: number;
+}
+
+/**
+ * Apply the recall cap rule to a list of scored candidates.
+ *
+ * Input SHOULD already be sorted by `score` descending; if not, this
+ * function sorts defensively without mutating the caller's array.
+ *
+ * Rule:
+ *   1. Drop anything with `score < minFloor` (default 0.4).
+ *   2. Take the first `defaultCap` (default 3).
+ *   3. If those `defaultCap` are ALL at or above `extendBar` (default 0.6),
+ *      keep absorbing subsequent items that are also at or above `extendBar`,
+ *      up to `extendCap` items total (default 5).
+ */
+export function applyRecallCapRule<T extends { score: number }>(
+  scored: readonly T[],
+  options: RecallCapOptions = {},
+): T[] {
+  const minFloor = options.minFloor ?? RECALL_MIN_FLOOR;
+  const defaultCap = options.defaultCap ?? RECALL_DEFAULT_CAP;
+  const extendBar = options.extendBar ?? RECALL_EXTEND_BAR;
+  const extendCap = options.extendCap ?? RECALL_EXTEND_CAP;
+
+  // Defensive sort copy — callers that already sort pay only O(n) scan.
+  const sorted = [...scored].sort((a, b) => b.score - a.score);
+
+  const floored = sorted.filter((item) => item.score >= minFloor);
+  if (floored.length === 0) return [];
+
+  const base = floored.slice(0, defaultCap);
+  if (base.length < defaultCap) return base;
+
+  const allStrong = base.every((item) => item.score >= extendBar);
+  if (!allStrong) return base;
+
+  const extended: T[] = [...base];
+  for (let i = defaultCap; i < floored.length && extended.length < extendCap; i++) {
+    const candidate = floored[i];
+    if (candidate.score < extendBar) break;
+    extended.push(candidate);
+  }
+  return extended;
 }

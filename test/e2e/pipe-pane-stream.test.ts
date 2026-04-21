@@ -19,10 +19,11 @@ import {
 import { RawStreamParser, resetParser } from '../../src/daemon/terminal-parser.js';
 
 const SKIP = process.env.SKIP_TMUX_TESTS === '1';
+const RUN_ID = Math.random().toString(36).slice(2, 8);
 
 // Session names must match /^deck_[a-z0-9_]+_(brain|w\d+)$/
-const SESSION_A = 'deck_e2epptest_brain';
-const SESSION_B = 'deck_e2epptest_w1';
+const SESSION_A = `deck_e2epptest${RUN_ID}_brain`;
+const SESSION_B = `deck_e2epptest${RUN_ID}_w1`;
 
 /** Collect all stream chunks for `ms` milliseconds then return as a Buffer. */
 async function collectStream(stream: NodeJS.ReadableStream, ms: number): Promise<Buffer> {
@@ -43,6 +44,47 @@ async function retry<T>(fn: () => Promise<T>, attempts = 3, delayMs = 500): Prom
     }
   }
   throw new Error('unreachable');
+}
+
+async function waitForSnapshotText(sessionName: string, expected: string[], attempts = 8, delayMs = 250): Promise<string> {
+  let lastSnapshot = '';
+  for (let i = 0; i < attempts; i++) {
+    lastSnapshot = await capturePaneVisible(sessionName);
+    if (expected.every((value) => lastSnapshot.includes(value))) return lastSnapshot;
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
+  return lastSnapshot;
+}
+
+async function waitForStreamText(stream: NodeJS.ReadableStream, expected: string, timeoutMs = 5000): Promise<string> {
+  return await new Promise<string>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`Timed out waiting for stream text: ${expected}`));
+    }, timeoutMs);
+
+    const onData = (chunk: unknown) => {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string));
+      const output = Buffer.concat(chunks).toString();
+      if (output.includes(expected)) {
+        cleanup();
+        resolve(output);
+      }
+    };
+    const onError = (error: unknown) => {
+      cleanup();
+      reject(error instanceof Error ? error : new Error(String(error)));
+    };
+    const cleanup = () => {
+      clearTimeout(timer);
+      stream.off('data', onData);
+      stream.off('error', onError);
+    };
+
+    stream.on('data', onData);
+    stream.on('error', onError);
+  });
 }
 
 describe.skipIf(SKIP)('pipe-pane stream e2e (task 8.5)', () => {
@@ -134,7 +176,10 @@ describe.skipIf(SKIP)('pipe-pane stream e2e (task 8.5)', () => {
     await sendKeys(SESSION_A, 'echo SNAPSHOT_LINE_TWO');
     await new Promise((r) => setTimeout(r, 600));
 
-    const snapshot = await capturePaneVisible(SESSION_A);
+    const snapshot = await waitForSnapshotText(SESSION_A, [
+      'SNAPSHOT_LINE_ONE',
+      'SNAPSHOT_LINE_TWO',
+    ]);
     expect(snapshot).toContain('SNAPSHOT_LINE_ONE');
     expect(snapshot).toContain('SNAPSHOT_LINE_TWO');
   }, 10_000);
@@ -190,19 +235,17 @@ describe.skipIf(SKIP)('pipe-pane stream e2e (task 8.5)', () => {
     const { stream: s1, cleanup: c1 } = await startPipePaneStream(SESSION_A, paneId);
     await new Promise((r) => setTimeout(r, 200));
     await c1(); // stop first pipe
+    await new Promise((r) => setTimeout(r, 250));
 
     // Restart: must succeed without error
     const { stream: s2, cleanup: c2 } = await startPipePaneStream(SESSION_A, paneId);
-    const chunks: Buffer[] = [];
-    s2.on('data', (c: unknown) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c as string)));
 
     await new Promise((r) => setTimeout(r, 200));
+    const outputPromise = waitForStreamText(s2, 'AFTER_REBIND', 8000);
     await sendKeys(SESSION_A, 'echo AFTER_REBIND');
-    await new Promise((r) => setTimeout(r, 800));
-
-    const out = Buffer.concat(chunks).toString();
+    const out = await outputPromise;
     expect(out).toContain('AFTER_REBIND');
 
     await c2();
-  }, 15_000);
+  }, 30_000);
 });

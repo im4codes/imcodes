@@ -8,6 +8,14 @@ import type { TimelineEvent } from '../../src/shared/timeline/types.js';
 import { REPO_MSG } from '@shared/repo-types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
+import { TRANSPORT_MSG } from '@shared/transport-events.js';
+import { MEMORY_WS } from '@shared/memory-ws.js';
+import {
+  MSG_COMMAND_FAILED,
+  MSG_DAEMON_ONLINE,
+  MSG_DAEMON_OFFLINE,
+  type AckFailureReason,
+} from '@shared/ack-protocol.js';
 import type {
   FsLsResponse,
   FsReadResponse,
@@ -28,17 +36,23 @@ export type ServerMessage =
   | { type: 'session.idle'; session: string; project: string; agentType: string; label?: string; parentLabel?: string }
   | { type: 'session.notification'; session: string; project: string; title: string; message: string; agentType?: string; label?: string; parentLabel?: string }
   | { type: 'session.tool'; session: string; tool: string | null }
+  | { type: typeof TRANSPORT_MSG.CHAT_HISTORY; sessionId: string; events: Array<Record<string, unknown>> }
+  | { type: typeof TRANSPORT_MSG.CHAT_APPROVAL; sessionId: string; requestId: string; description: string; tool?: string }
+  | { type: typeof TRANSPORT_MSG.APPROVAL_RESPONSE; sessionId: string; requestId: string; approved: boolean }
   | { type: typeof DAEMON_MSG.RECONNECTED }
   | { type: typeof DAEMON_MSG.DISCONNECTED }
   | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'p2p_active'; activeRunIds?: string[] }
   | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'transport_busy'; activeSessionNames?: string[] }
   | { type: 'daemon.error'; kind: 'uncaughtException' | 'unhandledRejection' | 'warning'; message: string; stack?: string; ts: number }
-  | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; project: string; role: string; agentType: string; agentVersion?: string; state: string; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; qwenModel?: string; requestedModel?: string; activeModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; permissionLabel?: string; quotaLabel?: string; quotaUsageLabel?: string; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace']; contextNamespaceDiagnostics?: string[]; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextRetryExhausted?: boolean; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride; transportConfig?: Record<string, unknown> | null; transportPendingMessages?: string[]; transportPendingMessageEntries?: Array<{ clientMessageId: string; text: string }> }> }
+  | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; project: string; role: string; agentType: string; agentVersion?: string; state: string; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; qwenModel?: string; requestedModel?: string; activeModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; copilotAvailableModels?: string[]; cursorAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; permissionLabel?: string; quotaLabel?: string; quotaUsageLabel?: string; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace']; contextNamespaceDiagnostics?: string[]; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextRetryExhausted?: boolean; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride; transportConfig?: Record<string, unknown> | null; transportPendingMessages?: string[]; transportPendingMessageEntries?: Array<{ clientMessageId: string; text: string }> }> }
   | { type: 'outbound'; platform: string; channelId: string; content: string }
   | { type: 'timeline.event'; event: TimelineEvent }
   | { type: 'timeline.replay'; sessionName: string; requestId?: string; events: TimelineEvent[]; truncated: boolean; epoch: number }
   | { type: 'timeline.history'; sessionName: string; requestId?: string; events: TimelineEvent[]; epoch: number }
   | { type: 'command.ack'; commandId: string; status: string; session: string }
+  | { type: typeof MSG_COMMAND_FAILED; commandId: string; session: string; reason: AckFailureReason; retryable: boolean }
+  | { type: typeof MSG_DAEMON_ONLINE }
+  | { type: typeof MSG_DAEMON_OFFLINE }
   | { type: 'error'; message: string }
   | { type: 'pong' }
   | { type: 'subsession.shells'; shells: string[] }
@@ -81,17 +95,21 @@ export type ServerMessage =
   | { type: 'repo.issue_detail_response'; requestId?: string; projectDir: string; detail: any }
   | { type: 'repo.error'; requestId: string; projectDir?: string; error: string }
   | { type: 'repo.detected'; projectDir: string; context: any }
+  | { type: typeof TRANSPORT_MSG.CHAT_HISTORY; sessionId: string; events: Array<Record<string, unknown>> }
+  | { type: typeof TRANSPORT_MSG.CHAT_APPROVAL; sessionId: string; requestId: string; description: string; tool?: string }
+  | { type: typeof TRANSPORT_MSG.APPROVAL_RESPONSE; sessionId: string; requestId: string; approved: boolean }
   | { type: 'provider.status'; providerId: string; connected: boolean }
   | { type: 'provider.sessions_response'; providerId: string; sessions: Array<{ key: string; displayName?: string; agentId?: string; updatedAt?: number; percentUsed?: number }>; error?: string }
   | {
-    type: 'shared_context.personal_memory.response';
+    type: typeof MEMORY_WS.PERSONAL_RESPONSE;
     requestId: string;
     stats: import('../../shared/context-types.js').ContextMemoryStatsView;
     records: Array<import('../../shared/context-types.js').ContextMemoryRecordView>;
     pendingRecords?: Array<import('../../shared/context-types.js').ContextPendingEventView>;
   }
-  | { type: 'memory.archive_response'; requestId?: string; success: boolean; error?: string }
-  | { type: 'memory.restore_response'; requestId?: string; success: boolean; error?: string };
+  | { type: typeof MEMORY_WS.ARCHIVE_RESPONSE; requestId?: string; success: boolean; error?: string }
+  | { type: typeof MEMORY_WS.RESTORE_RESPONSE; requestId?: string; success: boolean; error?: string }
+  | { type: typeof MEMORY_WS.DELETE_RESPONSE; requestId?: string; success: boolean; error?: string };
 
 export type {
   TimelineEvent,
@@ -112,6 +130,11 @@ export type {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30000;
 const HEARTBEAT_MS = 10000; // lowered from 25s for faster dead-connection detection
+/** If no pong arrives within this window after a ping, assume the socket is a
+ *  half-open zombie (iOS/Android commonly leave the TCP open after aggressive
+ *  background eviction) and force a fresh reconnect. 2× heartbeat gives one
+ *  interval of slack for genuinely slow networks before we tear it down. */
+const PONG_TIMEOUT_MS = HEARTBEAT_MS * 2;
 
 export class WsClient {
   private ws: WebSocket | null = null;
@@ -126,6 +149,7 @@ export class WsClient {
   private _destroyed = false;
   private _pingLatency: number | null = null;
   private _pingSentAt: number | null = null;
+  private _pongTimer: ReturnType<typeof setTimeout> | null = null;
   private _onLatency: ((ms: number) => void) | null = null;
 
   /** Per-session callbacks for raw PTY binary frames. Supports multiple subscribers per session. */
@@ -133,6 +157,9 @@ export class WsClient {
 
   /** Desired terminal subscription mode per session. Replayed on browser reconnect. */
   private terminalSubscriptions = new Map<string, boolean>();
+
+  /** Desired transport-chat subscriptions per session. Replayed on browser reconnect. */
+  private transportSubscriptions = new Set<string>();
 
   /** Per-session stream reset recovery state. */
   private resetState = new Map<string, {
@@ -224,6 +251,30 @@ export class WsClient {
     this.terminalSubscriptions.delete(sessionName);
     if (!this._connected) return;
     this.send({ type: 'terminal.unsubscribe', session: sessionName });
+  }
+
+  /** Subscribe to transport chat events for a session (history replay + live approval/tool updates). */
+  subscribeTransportSession(sessionId: string): void {
+    if (!sessionId) return;
+    if (this.transportSubscriptions.has(sessionId)) return;
+    this.transportSubscriptions.add(sessionId);
+    if (!this._connected) return;
+    this.send({ type: TRANSPORT_MSG.CHAT_SUBSCRIBE, sessionId });
+  }
+
+  /** Unsubscribe from transport chat events for a session. */
+  unsubscribeTransportSession(sessionId: string): void {
+    if (!sessionId) return;
+    if (!this.transportSubscriptions.has(sessionId)) return;
+    this.transportSubscriptions.delete(sessionId);
+    if (!this._connected) return;
+    this.send({ type: TRANSPORT_MSG.CHAT_UNSUBSCRIBE, sessionId });
+  }
+
+  /** Respond to a transport approval request. */
+  respondTransportApproval(sessionId: string, requestId: string, approved: boolean): void {
+    if (!sessionId || !requestId) return;
+    this.send({ type: TRANSPORT_MSG.APPROVAL_RESPONSE, sessionId, requestId, approved });
   }
 
   sendSessionCommand(command: 'start' | 'stop' | 'send' | 'restart', payload: object = {}): void {
@@ -496,11 +547,13 @@ export class WsClient {
 
     const url = `${wsUrl}/api/server/${this.serverId}/ws?ticket=${encodeURIComponent(ticket)}`;
 
-    this.ws = new WebSocket(url);
-    this.ws.binaryType = 'arraybuffer';
+    const socket = new WebSocket(url);
+    this.ws = socket;
+    socket.binaryType = 'arraybuffer';
     this._connecting = false;
 
-    this.ws.addEventListener('open', () => {
+    socket.addEventListener('open', () => {
+      if (this.ws !== socket) return;
       this._connected = true;
       this.reconnectAttempt = 0;
       this.startHeartbeat();
@@ -511,10 +564,18 @@ export class WsClient {
           break;
         }
       }
+      for (const sessionId of this.transportSubscriptions) {
+        try {
+          this.send({ type: TRANSPORT_MSG.CHAT_SUBSCRIBE, sessionId });
+        } catch {
+          break;
+        }
+      }
       this.dispatch({ type: 'session.event', event: 'connected', session: '', state: 'connected' });
     });
 
-    this.ws.addEventListener('message', (ev) => {
+    socket.addEventListener('message', (ev) => {
+      if (this.ws !== socket) return;
       // Binary frame: raw PTY data
       if (ev.data instanceof ArrayBuffer) {
         this.handleRawFrame(ev.data);
@@ -529,6 +590,11 @@ export class WsClient {
             this._pingSentAt = null;
             this._onLatency?.(this._pingLatency);
           }
+          // Clear the dead-socket watchdog — we just proved the socket is alive.
+          if (this._pongTimer) {
+            clearTimeout(this._pongTimer);
+            this._pongTimer = null;
+          }
           return;
         }
         if (msg.type === 'terminal.stream_reset') {
@@ -542,7 +608,8 @@ export class WsClient {
       }
     });
 
-    this.ws.addEventListener('close', () => {
+    socket.addEventListener('close', () => {
+      if (this.ws !== socket) return;
       const wasConnected = this._connected;
       this._connected = false;
       this._connecting = false;
@@ -554,8 +621,9 @@ export class WsClient {
       if (!this._destroyed) this.scheduleReconnect();
     });
 
-    this.ws.addEventListener('error', () => {
-      this.ws?.close();
+    socket.addEventListener('error', () => {
+      if (this.ws !== socket) return;
+      socket.close();
     });
   }
 
@@ -645,35 +713,67 @@ export class WsClient {
   }
 
   /** Force immediate reconnect (e.g. app returning from background). */
-  reconnectNow(): void {
+  reconnectNow(force = false): void {
     if (this._destroyed) return;
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) return; // already connected
+    if (!force && this.ws && this.ws.readyState === WebSocket.OPEN) return; // already connected
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
     this.reconnectAttempt = 0;
+
+    if (force && this.ws) {
+      const staleSocket = this.ws;
+      this.ws = null;
+      this._connected = false;
+      this._connecting = false;
+      this.clearTimers();
+      try { staleSocket.close(4001, 'client refresh'); } catch { /* ignore */ }
+    }
+
     void this.openSocket();
   }
 
   private startHeartbeat(): void {
-    // Send first ping immediately to get initial latency
-    try {
-      this._pingSentAt = Date.now();
-      this.send({ type: 'ping' });
-    } catch { /* ignore */ }
-    this.heartbeatTimer = setInterval(() => {
+    // Each ping arms a watchdog. If no pong arrives before the watchdog fires
+    // we assume the socket is a zombie (mobile OS commonly half-closes the
+    // TCP on background eviction without propagating close() to the WebView)
+    // and force a fresh reconnect. Without this, the client believes it's
+    // still "connected" indefinitely while no new events ever arrive — which
+    // is exactly the "回前台后消息不同步" symptom users reported.
+    const armPing = () => {
       try {
         this._pingSentAt = Date.now();
         this.send({ type: 'ping' });
       } catch {
-        // ignore
+        // If send itself threw, the socket is already broken — let close
+        // handler + scheduleReconnect take over.
+        return;
       }
-    }, HEARTBEAT_MS);
+      // Only arm a fresh watchdog if none is pending. A still-pending
+      // watchdog means the previous ping hasn't been ponged yet; resetting
+      // it here would just keep delaying detection forever on a dead
+      // socket. The pong handler is the only thing that clears it.
+      if (!this._pongTimer) {
+        this._pongTimer = setTimeout(() => {
+          this._pongTimer = null;
+          if (this._destroyed) return;
+          // Socket is half-open. Force a fresh connection so subscriptions
+          // and optimistic bubbles get re-synced via the reconnect path.
+          this.reconnectNow(true);
+        }, PONG_TIMEOUT_MS);
+      }
+    };
+    armPing(); // send first ping immediately for initial latency
+    this.heartbeatTimer = setInterval(armPing, HEARTBEAT_MS);
   }
 
   private clearTimers(): void {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    if (this._pongTimer) clearTimeout(this._pongTimer);
     this.reconnectTimer = null;
     this.heartbeatTimer = null;
+    this._pongTimer = null;
+    this._pingSentAt = null;
   }
 
   private dispatch(msg: ServerMessage): void {

@@ -22,6 +22,7 @@
 
 import { mergeTransportConfigPreservingSupervision } from '@shared/supervision-config.js';
 import type { SessionInfo } from './types.js';
+import { resolveRuntimeType } from './runtime-type.js';
 import {
   extractTransportPendingMessages,
   normalizeTransportPendingEntries,
@@ -98,7 +99,10 @@ export function mergeSessionListEntry(
     agentVersion: incoming.agentVersion,
     state: incoming.state as SessionInfo['state'],
     projectDir: incoming.projectDir ?? existing?.projectDir,
-    runtimeType: incoming.runtimeType as SessionInfo['runtimeType'],
+    runtimeType: resolveRuntimeType({
+      runtimeType: (incoming.runtimeType as SessionInfo['runtimeType']) ?? existing?.runtimeType,
+      agentType: incoming.agentType,
+    }),
     label: incoming.label ?? existing?.label,
     description: incoming.description ?? existing?.description,
     qwenModel: incoming.qwenModel ?? existing?.qwenModel,

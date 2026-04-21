@@ -3,6 +3,8 @@ export const SESSION_AGENT_TYPES = [
   'claude-code',
   'codex-sdk',
   'codex',
+  'copilot-sdk',
+  'cursor-headless',
   'opencode',
   'gemini',
   'qwen',
@@ -15,7 +17,14 @@ export type SessionAgentType = typeof SESSION_AGENT_TYPES[number];
 
 export const CLAUDE_CODE_FAMILY = ['claude-code-sdk', 'claude-code'] as const;
 export const CODEX_FAMILY = ['codex-sdk', 'codex'] as const;
-export const TRANSPORT_SESSION_AGENT_TYPES = ['claude-code-sdk', 'codex-sdk', 'qwen', 'openclaw'] as const;
+export const TRANSPORT_SESSION_AGENT_TYPES = [
+  'claude-code-sdk',
+  'codex-sdk',
+  'copilot-sdk',
+  'cursor-headless',
+  'qwen',
+  'openclaw',
+] as const;
 export const PROCESS_SESSION_AGENT_TYPES = ['claude-code', 'codex', 'opencode', 'gemini', 'shell', 'script'] as const;
 
 export function isSessionAgentType(value: string): value is SessionAgentType {

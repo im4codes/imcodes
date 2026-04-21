@@ -116,6 +116,18 @@ function makeMockDb() {
         }
         return null;
       }
+      if (normalized.includes("select id from shared_context_projections where id = $1 and scope = 'personal' and user_id = $2")) {
+        if (params[0] === 'personal-projection-1' && params[1] === 'user-1') {
+          return { id: 'personal-projection-1' } as T;
+        }
+        return null;
+      }
+      if (normalized.includes("select id from shared_context_projections where id = $1 and enterprise_id = $2 and scope in ('project_shared', 'workspace_shared', 'org_shared')")) {
+        if (params[0] === 'shared-projection-1' && params[1] === 'ent-1') {
+          return { id: 'shared-projection-1' } as T;
+        }
+        return null;
+      }
       if (normalized.includes('select role from team_members where team_id = $1 and user_id = $2')) {
         if (params[0] === 'ent-1' && params[1] === 'user-1') {
           return { role: 'owner' } as T;
@@ -251,8 +263,15 @@ function makeMockDb() {
         aliasRows.push({ id: params[0] });
         return { changes: 1 };
       }
+      if (normalized.includes('delete from shared_context_embeddings')) {
+        return { changes: 1 };
+      }
+      if (normalized.includes('delete from shared_context_projections where id = $1')) {
+        return { changes: 1 };
+      }
       return { changes: 0 };
     },
+    transaction: async <T>(fn: (tx: Database) => Promise<T>) => fn(db),
     exec: async () => {},
     close: async () => {},
   } as unknown as Database;
@@ -335,6 +354,65 @@ describe('shared-context processed remote route', () => {
       }),
     ]);
     expect(aliasRows).toHaveLength(0);
+  });
+
+
+  it('skips noisy API error projections during remote replication', async () => {
+    const { db, projectionRows, recordRows } = makeMockDb();
+    const app = new Hono<{ Bindings: Env }>();
+    app.route('/api/server', serverRoutes);
+
+    const response = await app.request('/api/server/srv-1/shared-context/processed', {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer daemon-token',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        namespace: {
+          scope: 'project_shared',
+          projectId: 'github.com/acme/repo',
+          enterpriseId: 'ent-1',
+        },
+        projections: [
+          {
+            id: 'bad-proj',
+            namespace: {
+              scope: 'project_shared',
+              projectId: 'github.com/acme/repo',
+              enterpriseId: 'ent-1',
+            },
+            class: 'recent_summary',
+            sourceEventIds: ['evt-bad'],
+            summary: '**Assistant:** [API Error: Connection error. (cause: fetch failed)]',
+            content: {},
+            createdAt: 100,
+            updatedAt: 101,
+          },
+          {
+            id: 'good-proj',
+            namespace: {
+              scope: 'project_shared',
+              projectId: 'github.com/acme/repo',
+              enterpriseId: 'ent-1',
+            },
+            class: 'recent_summary',
+            sourceEventIds: ['evt-good'],
+            summary: 'useful summary',
+            content: {},
+            createdAt: 110,
+            updatedAt: 111,
+          },
+        ],
+      }),
+    }, makeEnv(db));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(expect.objectContaining({ ok: true, projectionCount: 1 }));
+    expect(projectionRows).toEqual([
+      expect.objectContaining({ id: 'good-proj' }),
+    ]);
+    expect(recordRows).toEqual([]);
   });
 
   it('sanitizes personal projections to the daemon owner and rejects mismatched namespace users', async () => {
@@ -753,6 +831,37 @@ describe('shared-context processed remote route', () => {
       ],
     });
   });
+
+  it('deletes server-scoped personal memory for the owning user', async () => {
+    const { db, executeSql } = makeMockDb();
+    const app = new Hono<{ Bindings: Env }>();
+    app.route('/api/server', serverRoutes);
+
+    const response = await app.request('/api/server/srv-1/shared-context/personal-memory/personal-projection-1', {
+      method: 'DELETE',
+    }, makeEnv(db));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, id: 'personal-projection-1' });
+    expect(executeSql.some((sql) => sql.toLowerCase().includes('delete from shared_context_embeddings'))).toBe(true);
+    expect(executeSql.some((sql) => sql.toLowerCase().includes('delete from shared_context_projections where id = $1'))).toBe(true);
+  });
+
+  it('deletes enterprise shared memory for admins', async () => {
+    const { db, executeSql } = makeMockDb();
+    const app = new Hono<{ Bindings: Env }>();
+    app.route('/api/shared-context', sharedContextRoutes);
+
+    const response = await app.request('/api/shared-context/enterprises/ent-1/memory/shared-projection-1', {
+      method: 'DELETE',
+    }, makeEnv(db));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, id: 'shared-projection-1' });
+    expect(executeSql.some((sql) => sql.toLowerCase().includes('delete from shared_context_embeddings'))).toBe(true);
+    expect(executeSql.some((sql) => sql.toLowerCase().includes('delete from shared_context_projections where id = $1'))).toBe(true);
+  });
+
 
   it('marks daemon-authenticated shared namespace as stale when the latest remote projection is older than the freshness cutoff', async () => {
     const now = Date.now();

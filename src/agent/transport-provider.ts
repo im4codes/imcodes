@@ -14,6 +14,7 @@ import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/age
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import type { SessionContextBootstrapState } from '../../shared/session-context-bootstrap.js';
 import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
+import type { TransportAttachment } from '../../shared/transport-attachments.js';
 import type {
   ProviderContextPayload,
   ProviderSupportClass,
@@ -153,6 +154,11 @@ export interface SessionConfig {
   effort?: TransportEffortLevel;
   /** Skip the sessions.create RPC — session already exists on provider (auto-sync bind). */
   skipCreate?: boolean;
+  /** When true, the runtime must NOT re-inject startup memory on the next turn
+   *  (session is being restored or restarted without /clear; the provider
+   *  already received startup memory in a prior run). The runtime still emits
+   *  the timeline status card so the UI knows it was deliberately skipped. */
+  startupMemoryAlreadyInjected?: boolean;
 }
 
 /** Structured error emitted by a provider. */
@@ -269,7 +275,7 @@ export interface TransportProvider {
    * @param message    - The user's text message.
    * @param attachments - Optional file/image attachments (only when capabilities.attachments is true).
    */
-  send(sessionId: string, payload: string | ProviderContextPayload, attachments?: unknown[], extraSystemPrompt?: string): Promise<void>;
+  send(sessionId: string, payload: string | ProviderContextPayload, attachments?: TransportAttachment[], extraSystemPrompt?: string): Promise<void>;
 
   /**
    * Best-effort cancellation of the current in-flight turn for a session.
@@ -373,7 +379,7 @@ export interface TransportProvider {
 
 export function normalizeProviderPayload(
   payload: string | ProviderContextPayload,
-  attachments?: unknown[],
+  attachments?: TransportAttachment[],
   extraSystemPrompt?: string,
 ): ProviderContextPayload {
   if (typeof payload !== 'string') {

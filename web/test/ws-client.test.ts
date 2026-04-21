@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { WsClient } from '../src/ws-client.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
+import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import type { MessageHandler } from '../src/ws-client.js';
 
 // Mock WebSocket implementation
@@ -188,9 +189,95 @@ describe('WsClient', () => {
     vi.useRealTimers();
   });
 
+
+  it('force reconnect refreshes a stale-open socket and replays subscriptions', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const firstWs = lastWs!;
+
+    client.subscribeTerminal('chat-session', false);
+    client.subscribeTransportSession('transport-session');
+    firstWs.send.mockClear();
+
+    client.reconnectNow(true);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const secondWs = lastWs!;
+    expect(secondWs).not.toBe(firstWs);
+    secondWs.emit('open');
+
+    expect(secondWs.send).toHaveBeenCalledWith(expect.stringContaining('"type":"terminal.subscribe"'));
+    expect(secondWs.send).toHaveBeenCalledWith(expect.stringContaining('"type":"chat.subscribe"'));
+
+    // Late close from the stale socket must not tear down the fresh connection.
+    firstWs.emit('close');
+    expect(client.connected).toBe(true);
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
   it('send() throws when not connected', () => {
     const client = new WsClient('http://localhost:8787', 'srv-1');
     expect(() => client.send({ type: 'ping' })).toThrow('WebSocket not connected');
+  });
+
+  describe('dead-socket detection (pong timeout)', () => {
+    it('force-reconnects a new socket when no pong arrives within the watchdog window', async () => {
+      // Regression: mobile OS commonly half-closes the TCP on background
+      // eviction without propagating close() to the WebView — the old client
+      // believed it was "connected" indefinitely while no events arrived.
+      // Now we ping every HEARTBEAT_MS (10s) and force-reconnect if no pong
+      // arrives within 2× that window.
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      const firstWs = lastWs!;
+
+      // Initial ping fires on open; assert we sent one.
+      const initialPings = firstWs.send.mock.calls.filter(
+        (c) => JSON.parse(c[0] as string).type === 'ping',
+      );
+      expect(initialPings.length).toBeGreaterThanOrEqual(1);
+
+      // Walk past the 20s watchdog without ever sending a pong.
+      await vi.advanceTimersByTimeAsync(20_000);
+      // reconnectNow(true) fires synchronously, but openSocket() awaits a
+      // ticket fetch Promise — flush several microtask turns so the new
+      // MockWebSocket is constructed before we assert.
+      for (let i = 0; i < 5; i++) await vi.advanceTimersByTimeAsync(0);
+      expect(firstWs.readyState).toBe(MockWebSocket.CLOSED);
+      expect(lastWs).not.toBe(firstWs);
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('does NOT reconnect while pongs keep arriving', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      const firstWs = lastWs!;
+
+      // Simulate a healthy server that pongs every ping.
+      for (let i = 0; i < 5; i++) {
+        await vi.advanceTimersByTimeAsync(10_000); // one heartbeat interval
+        firstWs.emit('message', { data: JSON.stringify({ type: 'pong' }) });
+      }
+
+      // Still on the same socket — the watchdog was cleared by each pong.
+      expect(lastWs).toBe(firstWs);
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
   });
 
   describe('terminal subscription modes', () => {
@@ -278,6 +365,49 @@ describe('WsClient', () => {
         client.disconnect();
         vi.useRealTimers();
       }
+    });
+  });
+
+  describe('transport chat subscriptions', () => {
+    it('subscribeTransportSession sends chat.subscribe and replays on reconnect', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      const firstWs = lastWs!;
+
+      client.subscribeTransportSession('transport-session');
+      expect(JSON.parse(firstWs.send.mock.calls.at(-1)[0] as string)).toEqual({
+        type: 'chat.subscribe',
+        sessionId: 'transport-session',
+      });
+
+      firstWs.send.mockClear();
+      firstWs.emit('close');
+      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(0);
+      const secondWs = lastWs!;
+      secondWs.emit('open');
+
+      expect(secondWs.send).toHaveBeenCalledWith(expect.stringContaining('"chat.subscribe"'));
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('respondTransportApproval sends chat.approval_response', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+
+      client.respondTransportApproval('transport-session', 'req-1', true);
+
+      expect(JSON.parse(lastWs!.send.mock.calls[0][0] as string)).toEqual({
+        type: TRANSPORT_MSG.APPROVAL_RESPONSE,
+        sessionId: 'transport-session',
+        requestId: 'req-1',
+        approved: true,
+      });
+      client.disconnect();
     });
   });
 

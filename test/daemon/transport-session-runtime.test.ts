@@ -4,6 +4,7 @@ import { RUNTIME_TYPES } from '../../src/agent/session-runtime.js';
 import type { TransportProvider, ProviderError, SessionConfig } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { MemorySearchResult, MemorySearchResultItem } from '../../src/context/memory-search.js';
+import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
 const searchLocalMemoryMock = vi.hoisted(() => vi.fn());
@@ -26,6 +27,7 @@ function makeMockProvider() {
   let deltaCb: ((sid: string, d: MessageDelta) => void) | null = null;
   let completeCb: ((sid: string, m: AgentMessage) => void) | null = null;
   let errorCb: ((sid: string, e: ProviderError) => void) | null = null;
+  let approvalCb: ((sid: string, req: { id: string; description: string; tool?: string }) => void) | null = null;
 
   const fireDelta = (sid: string) =>
     deltaCb?.(sid, { messageId: 'msg', type: 'text', delta: 'x', role: 'assistant' });
@@ -33,6 +35,8 @@ function makeMockProvider() {
     completeCb?.(sid, { id: 'msg-1', sessionId: sid, kind: 'text', role: 'assistant', content: 'done', timestamp: Date.now(), status: 'complete' });
   const fireError = (sid: string, err?: ProviderError) =>
     errorCb?.(sid, err ?? { code: 'PROVIDER_ERROR', message: 'err', recoverable: false });
+  const fireApproval = (sid: string, req: { id: string; description: string; tool?: string }) =>
+    approvalCb?.(sid, req);
 
   return {
     provider: {
@@ -43,8 +47,10 @@ function makeMockProvider() {
       onDelta: (cb: (sid: string, d: MessageDelta) => void) => { deltaCb = cb; return () => { deltaCb = null; }; },
       onComplete: (cb: (sid: string, m: AgentMessage) => void) => { completeCb = cb; return () => { completeCb = null; }; },
       onError: (cb: (sid: string, e: ProviderError) => void) => { errorCb = cb; return () => { errorCb = null; }; },
+      onApprovalRequest: (cb: (sid: string, req: { id: string; description: string; tool?: string }) => void) => { approvalCb = cb; },
+      respondApproval: vi.fn().mockResolvedValue(undefined),
     } as unknown as TransportProvider,
-    fireDelta, fireComplete, fireError,
+    fireDelta, fireComplete, fireError, fireApproval,
   };
 }
 
@@ -94,6 +100,7 @@ describe('TransportSessionRuntime', () => {
     timelineEmitterEmitMock.mockReset();
     searchLocalMemoryMock.mockReset();
     searchLocalMemorySemanticMock.mockReset();
+    setContextModelRuntimeConfig(null);
     mock = makeMockProvider();
     runtime = new TransportSessionRuntime(mock.provider, 'deck_test_brain');
     await runtime.initialize(defaultConfig);
@@ -267,6 +274,34 @@ describe('TransportSessionRuntime', () => {
     });
   });
 
+  it('forwards approval requests through runtime callbacks', async () => {
+    const approvalMock = makeMockProvider();
+    const runtimeWithApproval = new TransportSessionRuntime(approvalMock.provider, 'deck_test_brain');
+    const approvalEvents: Array<Record<string, unknown>> = [];
+    runtimeWithApproval.onApprovalRequest = (request) => approvalEvents.push(request as Record<string, unknown>);
+    await runtimeWithApproval.initialize(defaultConfig);
+
+    approvalMock.fireApproval('sess-1', {
+      id: 'approval-1',
+      description: 'Allow file write',
+      tool: 'shell',
+    });
+
+    expect(approvalEvents).toEqual([
+      { id: 'approval-1', description: 'Allow file write', tool: 'shell' },
+    ]);
+  });
+
+  it('forwards approval responses to the provider', async () => {
+    const approvalMock = makeMockProvider();
+    const runtimeWithApproval = new TransportSessionRuntime(approvalMock.provider, 'deck_test_brain');
+    await runtimeWithApproval.initialize(defaultConfig);
+
+    await runtimeWithApproval.respondApproval('approval-2', true);
+
+    expect((approvalMock.provider as any).respondApproval).toHaveBeenCalledWith('sess-1', 'approval-2', true);
+  });
+
   it('refreshes shared-context bootstrap on each dispatch turn instead of freezing launch-time namespace state', async () => {
     const localMock = makeMockProvider();
     const r = new TransportSessionRuntime(localMock.provider, 'x');
@@ -330,6 +365,99 @@ describe('TransportSessionRuntime', () => {
     expect(refreshBootstrap).toHaveBeenCalledTimes(2);
   });
 
+  it('skips startup memory injection when startupMemoryAlreadyInjected is true (session.restart / restore)', async () => {
+    // Regression: restarting an existing session (or daemon restart that
+    // restores persisted sessions) must NOT replay "related past work" into
+    // the provider context. The conversation already has that preamble; a
+    // second injection would pollute history with duplicate context.
+    const startupItem = makeSearchItem({
+      projectId: 'repo-1',
+      summary: 'Should not be re-injected on restart',
+    });
+    const startupMemory = {
+      reason: 'startup' as const,
+      runtimeFamily: 'transport' as const,
+      authoritySource: 'processed_local' as const,
+      sourceKind: 'local_processed' as const,
+      injectionSurface: 'system-text' as const,
+      injectedText: '# Recent project memory\n\n- Should not be re-injected on restart',
+      items: [startupItem],
+    };
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
+      startupMemory,
+    }));
+
+    // Simulate the restore path where the prior run already injected startup
+    // memory and we persisted startupMemoryInjected=true to SessionRecord.
+    await r.initialize({ ...defaultConfig, startupMemoryAlreadyInjected: true });
+
+    // No memory.context timeline card — the UI must not re-show the startup
+    // banner for a resumed conversation.
+    expect(timelineEmitterEmitMock).not.toHaveBeenCalledWith(
+      'deck_test_brain',
+      'memory.context',
+      expect.objectContaining({ reason: 'startup' }),
+      expect.any(Object),
+    );
+
+    timelineEmitterEmitMock.mockClear();
+    r.send('Follow-up message after restart');
+    await flushDispatch();
+
+    // The provider payload on the first post-restart turn must NOT contain
+    // any `startupMemory` field — the runtime keeps `_startupMemory = null`.
+    expect(localMock.provider.send).toHaveBeenCalledTimes(1);
+    const call = localMock.provider.send.mock.calls[0];
+    expect(call[1]).not.toHaveProperty('startupMemory');
+  });
+
+  it('fires onStartupMemoryInjected exactly once when startup memory first reaches the provider', async () => {
+    const startupItem = makeSearchItem({
+      projectId: 'repo-1',
+      summary: 'Persist that we injected startup memory',
+    });
+    const startupMemory = {
+      reason: 'startup' as const,
+      runtimeFamily: 'transport' as const,
+      authoritySource: 'processed_local' as const,
+      sourceKind: 'local_processed' as const,
+      injectionSurface: 'system-text' as const,
+      injectedText: '# Recent project memory\n\n- Persist that we injected startup memory',
+      items: [startupItem],
+    };
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
+      startupMemory,
+    }));
+
+    const onInjected = vi.fn();
+    r.onStartupMemoryInjected = onInjected;
+
+    await r.initialize(defaultConfig);
+    await flushDispatch();
+
+    // Callback fires only after the first turn that actually carried it.
+    expect(onInjected).not.toHaveBeenCalled();
+
+    r.send('first turn');
+    await flushDispatch();
+    expect(onInjected).toHaveBeenCalledTimes(1);
+
+    // Subsequent turns don't refire the callback.
+    r.send('second turn');
+    await flushDispatch();
+    expect(onInjected).toHaveBeenCalledTimes(1);
+  });
+
   it('carries startup memory into the first transport payload', async () => {
     const startupItem = makeSearchItem({
       projectId: 'repo-1',
@@ -356,6 +484,14 @@ describe('TransportSessionRuntime', () => {
     await r.initialize(defaultConfig);
     await flushDispatch();
 
+    // The "Historical context · injected" card MUST NOT fire at initialize
+    // time — that would leak a fresh card on every restart-before-first-
+    // message. The card is bound to the same commit boundary as the
+    // persisted `startupMemoryInjected` flag; see the send assertion below.
+    expect(timelineEmitterEmitMock).not.toHaveBeenCalledWith('deck_test_brain', 'memory.context', expect.objectContaining({
+      reason: 'startup',
+    }), expect.any(Object));
+
     r.send('Need a transport recall test');
     await flushDispatch();
 
@@ -368,6 +504,70 @@ describe('TransportSessionRuntime', () => {
         injectionSurface: 'normalized-payload',
       }),
     }));
+    // Exactly ONE startup card — fired when the provider payload actually
+    // carried the preamble, same boundary as the persisted flag.
+    const startupCardsAfterSend = timelineEmitterEmitMock.mock.calls.filter(
+      (call) => call[1] === 'memory.context' && (call[2] as Record<string, unknown>)?.reason === 'startup',
+    );
+    expect(startupCardsAfterSend).toHaveLength(1);
+    expect(startupCardsAfterSend[0][2]).toEqual(expect.objectContaining({
+      reason: 'startup',
+      injectedText: expect.stringContaining('transport recall parity visible'),
+    }));
+
+    timelineEmitterEmitMock.mockClear();
+    r.send('second turn');
+    await flushDispatch();
+    expect(timelineEmitterEmitMock).not.toHaveBeenCalledWith('deck_test_brain', 'memory.context', expect.objectContaining({
+      reason: 'startup',
+    }), expect.any(Object));
+  });
+
+  it('does not stack duplicate startup cards across restart-before-first-message cycles', async () => {
+    // Regression for the timeline showing multiple "Historical context ·
+    // injected" cards on a session that had been restarted repeatedly
+    // before the first user turn ever landed. Each initialize used to emit
+    // one card, but `startupMemoryInjected` only persists AFTER the first
+    // successful dispatch — so the flag never caught up and cards stacked.
+    const startupItem = makeSearchItem({
+      projectId: 'repo-1',
+      summary: 'Do not emit card until provider accepts preamble',
+    });
+    const startupMemory = {
+      reason: 'startup' as const,
+      runtimeFamily: 'transport' as const,
+      authoritySource: 'processed_local' as const,
+      sourceKind: 'local_processed' as const,
+      injectionSurface: 'system-text' as const,
+      injectedText: '# Recent project memory\n\n- Do not emit card until provider accepts preamble',
+      items: [startupItem],
+    };
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
+      startupMemory,
+    }));
+
+    // Simulate three restarts before the first real message — flag never
+    // persists, so `alreadyInjected` stays false across all three.
+    await r.initialize(defaultConfig);
+    await r.initialize(defaultConfig);
+    await r.initialize(defaultConfig);
+    await flushDispatch();
+    expect(timelineEmitterEmitMock).not.toHaveBeenCalledWith('deck_test_brain', 'memory.context', expect.objectContaining({
+      reason: 'startup',
+    }), expect.any(Object));
+
+    // First real turn — now exactly one card fires.
+    r.send('first real turn after restarts');
+    await flushDispatch();
+    const startupCards = timelineEmitterEmitMock.mock.calls.filter(
+      (call) => call[1] === 'memory.context' && (call[2] as Record<string, unknown>)?.reason === 'startup',
+    );
+    expect(startupCards).toHaveLength(1);
   });
 
   it('send() adds transport recall to the payload and emits linked memory.context evidence', async () => {
@@ -395,7 +595,8 @@ describe('TransportSessionRuntime', () => {
       query: expect.stringContaining('Please recall recent transport memory'),
       namespace: { scope: 'personal', projectId: 'repo-1' },
       repo: 'repo-1',
-      limit: 5,
+      currentEnterpriseId: undefined,
+      limit: 10,
     }));
     expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
       memoryRecall: expect.objectContaining({
@@ -423,13 +624,14 @@ describe('TransportSessionRuntime', () => {
     );
   });
 
-  it('does not inject local recall when authority resolves to processed_remote for shared scope', async () => {
+  it('still injects per-message local recall when authority resolves to processed_remote for shared scope', async () => {
     const memoryItem = makeSearchItem({
       projectId: 'repo-1',
       scope: 'project_shared',
       enterpriseId: 'ent-1',
       workspaceId: 'ws-1',
       summary: 'Should not be injected while remote authority is active',
+      relevanceScore: 0.92,
     });
     searchLocalMemorySemanticMock.mockResolvedValue(makeSearchResult([memoryItem]));
     const localMock = makeMockProvider();
@@ -447,25 +649,71 @@ describe('TransportSessionRuntime', () => {
     r.send('Please recall recent transport memory around recall runtime', 'client-turn-remote');
     await flushDispatch();
 
-    expect(searchLocalMemorySemanticMock).not.toHaveBeenCalled();
-    expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.not.objectContaining({
-      memoryRecall: expect.anything(),
-      startupMemory: expect.anything(),
+    expect(searchLocalMemorySemanticMock).toHaveBeenCalledWith(expect.objectContaining({
+      query: expect.stringContaining('Please recall recent transport memory'),
+      namespace: { scope: 'project_shared', projectId: 'repo-1', enterpriseId: 'ent-1', workspaceId: 'ws-1' },
+      currentEnterpriseId: 'ent-1',
+      repo: 'repo-1',
+      limit: 10,
     }));
-    expect(timelineEmitterEmitMock).not.toHaveBeenCalledWith(
+    expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      memoryRecall: expect.objectContaining({
+        reason: 'message',
+        authoritySource: 'processed_remote',
+        sourceKind: 'local_processed',
+      }),
+    }));
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
       'deck_test_brain',
       'memory.context',
-      expect.objectContaining({ reason: 'message' }),
+      expect.objectContaining({
+        reason: 'message',
+        relatedToEventId: 'transport-user:client-turn-remote',
+        authoritySource: 'processed_remote',
+        sourceKind: 'local_processed',
+      }),
       expect.anything(),
     );
   });
 
-  it('skips transport recall for control and short messages without emitting memory.context', async () => {
+  it('applies the configured recall threshold for transport message recall', async () => {
+    setContextModelRuntimeConfig({
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'sonnet',
+      memoryRecallMinScore: 0.4,
+    });
+    const memoryItem = makeSearchItem({
+      summary: 'Mid-threshold multilingual semantic match',
+      relevanceScore: 0.4446,
+    });
+    searchLocalMemorySemanticMock.mockResolvedValue(makeSearchResult([memoryItem]));
     const localMock = makeMockProvider();
     const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
     r.setContextBootstrapResolver(async () => ({
       namespace: { scope: 'personal', projectId: 'repo-1' },
       diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
+    }));
+    await r.initialize(defaultConfig);
+
+    r.send('我感觉现在发的消息都没有相关历史recall了, 就像这句话 你自己测试下 不可能没有!', 'client-turn-threshold');
+    await flushDispatch();
+
+    expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      memoryRecall: expect.objectContaining({
+        reason: 'message',
+        query: expect.stringContaining('我感觉现在发的消息都没有相关历史recall了'),
+      }),
+    }));
+  });
+
+  it('emits explicit skipped-recall statuses for control and short transport messages', async () => {
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
     }));
     await r.initialize(defaultConfig);
     timelineEmitterEmitMock.mockClear();
@@ -483,10 +731,26 @@ describe('TransportSessionRuntime', () => {
     expect(localMock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.not.objectContaining({
       memoryRecall: expect.anything(),
     }));
-    expect(timelineEmitterEmitMock).not.toHaveBeenCalledWith(
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
       'deck_test_brain',
       'memory.context',
-      expect.objectContaining({ reason: 'message' }),
+      expect.objectContaining({
+        reason: 'message',
+        relatedToEventId: 'transport-user:client-turn-control',
+        status: 'skipped_control_message',
+        items: [],
+      }),
+      expect.anything(),
+    );
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+      'deck_test_brain',
+      'memory.context',
+      expect.objectContaining({
+        reason: 'message',
+        relatedToEventId: 'transport-user:client-turn-short',
+        status: 'skipped_short_prompt',
+        items: [],
+      }),
       expect.anything(),
     );
   });
@@ -498,6 +762,7 @@ describe('TransportSessionRuntime', () => {
     r.setContextBootstrapResolver(async () => ({
       namespace: { scope: 'personal', projectId: 'repo-1' },
       diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
     }));
     await r.initialize(defaultConfig);
     timelineEmitterEmitMock.mockClear();
@@ -508,10 +773,49 @@ describe('TransportSessionRuntime', () => {
     expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.not.objectContaining({
       memoryRecall: expect.anything(),
     }));
-    expect(timelineEmitterEmitMock).not.toHaveBeenCalledWith(
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
       'deck_test_brain',
       'memory.context',
-      expect.objectContaining({ reason: 'message' }),
+      expect.objectContaining({
+        reason: 'message',
+        relatedToEventId: 'transport-user:client-turn-2',
+        status: 'failed',
+        items: [],
+      }),
+      expect.anything(),
+    );
+  });
+
+  it('emits a template-prompt skip status before transport recall lookup', async () => {
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
+    }));
+    await r.initialize(defaultConfig);
+    timelineEmitterEmitMock.mockClear();
+
+    // Use a real template-prompt marker (workflow phrase). Bare
+    // @openspec/changes/... references by themselves are now allowed —
+    // they're common in user debugging prompts and must still trigger recall.
+    r.send('Drive the implementation of @openspec/changes/shared-agent-context aggressively.', 'client-turn-template');
+    await flushDispatch();
+
+    expect(searchLocalMemorySemanticMock).not.toHaveBeenCalled();
+    expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.not.objectContaining({
+      memoryRecall: expect.anything(),
+    }));
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+      'deck_test_brain',
+      'memory.context',
+      expect.objectContaining({
+        reason: 'message',
+        relatedToEventId: 'transport-user:client-turn-template',
+        status: 'skipped_template_prompt',
+        items: [],
+      }),
       expect.anything(),
     );
   });

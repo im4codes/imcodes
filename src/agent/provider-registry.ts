@@ -96,6 +96,14 @@ async function createProvider(id: string): Promise<TransportProvider> {
       const { CodexSdkProvider } = await import('./providers/codex-sdk.js');
       return new CodexSdkProvider();
     }
+    case 'cursor-headless': {
+      const { CursorHeadlessProvider } = await import('./providers/cursor-headless.js');
+      return new CursorHeadlessProvider();
+    }
+    case 'copilot-sdk': {
+      const { CopilotSdkProvider } = await import('./providers/copilot-sdk.js');
+      return new CopilotSdkProvider();
+    }
     default:
       throw new Error(`Unknown provider: ${id}`);
   }

@@ -8,6 +8,8 @@ import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/pr
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string) => {
+      if (key === 'session.agentGroup.transport_sdk') return 'SDK';
+      if (key === 'session.agentGroup.cli_process') return 'CLI';
       const parts = key.split('.');
       return parts[parts.length - 1];
     },
@@ -48,7 +50,7 @@ describe('StartSubSessionDialog', () => {
     expect(screen.getByRole('button', { name: /codex_sdk/i })).toBeDefined();
   });
 
-  it('defaults to claude-code-sdk and keeps sdk options on the left', () => {
+  it('defaults to claude-code-sdk and renders transport/process groups separately', () => {
     const { container } = render(
       <StartSubSessionDialog
         ws={makeWs() as any}
@@ -64,9 +66,18 @@ describe('StartSubSessionDialog', () => {
     const activeBtn = container.querySelector('.subsession-type-btn.active') as HTMLButtonElement | null;
     expect(activeBtn?.textContent).toMatch(/claude_code_sdk/i);
 
-    const typeButtons = Array.from(container.querySelectorAll('.subsession-type-btn')).map((el) => el.textContent ?? '');
-    expect(typeButtons.indexOf('⚡ claude_code_sdk')).toBeLessThan(typeButtons.indexOf('⚡ Claude Code'));
-    expect(typeButtons.indexOf('📦 codex_sdk')).toBeLessThan(typeButtons.indexOf('📦 Codex'));
+    const groupTitles = Array.from(container.querySelectorAll('.subsession-type-group-title')).map((el) => el.textContent?.trim());
+    expect(groupTitles).toEqual(['SDK', 'CLI']);
+
+    const groups = Array.from(container.querySelectorAll('.subsession-type-group'));
+    expect(groups).toHaveLength(2);
+    expect(groups[0].textContent).toMatch(/claude_code_sdk/i);
+    expect(groups[0].textContent).toMatch(/codex_sdk/i);
+    expect(groups[0].textContent).toMatch(/copilot_sdk/i);
+    expect(groups[0].textContent).toMatch(/cursor_headless/i);
+    expect(groups[1].textContent).toMatch(/claude_code_cli/i);
+    expect(groups[1].textContent).toMatch(/codex_cli/i);
+    expect(screen.getByText('qwen_provider_hint')).toBeDefined();
   });
 
   it('defaults level to high for supported transports', () => {
@@ -134,7 +145,25 @@ describe('StartSubSessionDialog', () => {
       />,
     );
 
-    expect(screen.queryByText('API Provider')).toBeNull();
+    expect(screen.queryByText('api_provider')).toBeNull();
+  });
+
+  it('shows the qwen provider-specific hint for qwen sub-sessions', async () => {
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
+
+    await waitFor(() => expect(screen.getByText('qwen_provider_selected_hint')).toBeDefined());
   });
 
   it('shows CC preset controls and passes preset for qwen sub-sessions', async () => {
@@ -163,7 +192,8 @@ describe('StartSubSessionDialog', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
-    await waitFor(() => expect(screen.getByText('API Provider')).toBeDefined());
+    await waitFor(() => expect(screen.getByText('api_provider')).toBeDefined());
+    expect(screen.getByText('qwen_provider_selected_hint')).toBeDefined();
     const presetSelect = (screen.getAllByRole('combobox') as HTMLSelectElement[])
       .find((select) => Array.from(select.options).some((option) => option.value === 'MiniMax'));
     expect(presetSelect).toBeDefined();
@@ -197,5 +227,52 @@ describe('StartSubSessionDialog', () => {
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
     expect(onStart).toHaveBeenCalledWith('qwen', undefined, '/tmp', undefined, { thinking: 'high' });
+  });
+
+  it('passes requestedModel for copilot-sdk sub-sessions', () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /copilot_sdk/i }));
+    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'gpt-5.4-mini' } });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledWith('copilot-sdk', undefined, '/tmp', undefined, {
+      requestedModel: 'gpt-5.4-mini',
+      thinking: 'high',
+    });
+  });
+
+  it('passes requestedModel for cursor-headless sub-sessions', () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /cursor_headless/i }));
+    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'gpt-5.2' } });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledWith('cursor-headless', undefined, '/tmp', undefined, {
+      requestedModel: 'gpt-5.2',
+    });
   });
 });

@@ -4,6 +4,7 @@ import logger from '../util/logger.js';
 import { DAEMON_VERSION } from '../util/version.js';
 import { setTransportRelaySend } from './transport-relay.js';
 import { setProviderRegistryServerLink } from '../agent/provider-registry.js';
+import { getDefaultAckOutbox } from './ack-outbox.js';
 
 /** Collect lightweight system stats for daemon.stats messages. */
 function collectSystemStats(): { cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number } {
@@ -63,6 +64,22 @@ export class ServerLink {
     this.stopWatchdog();
     if (this.pongTimer) { clearTimeout(this.pongTimer); this.pongTimer = undefined; }
 
+    // Close previous socket before creating a new one. Without this, the
+    // regular `error` / `close` → `scheduleReconnect()` → `connect()` path
+    // orphans the old WebSocket: the stale-check guards (`this.ws !== ws`)
+    // in the open/message/close handlers let the old WS's events drop safely,
+    // but no one actually calls `close()` on it. The OS keeps the TCP socket
+    // ESTAB for minutes until network timeout, and the Node WebSocket
+    // instance keeps its internal buffers, TLS state, and event emitter
+    // closures alive the whole time. Under reconnect flapping we observed
+    // 7 parallel ESTAB connections on a single daemon which correlated with
+    // the OOM cascade. `forceReconnect()` already does this; regular
+    // scheduled reconnects must too.
+    if (this.ws) {
+      try { this.ws.close(); } catch { /* ignore */ }
+      this.ws = null;
+    }
+
     const wsUrl = this.workerUrl.replace(/^http/, 'ws') + `/api/server/${this.serverId}/ws`;
     logger.info({ url: wsUrl }, 'ServerLink: connecting');
     this.reconnecting = false;
@@ -88,6 +105,29 @@ export class ServerLink {
       setProviderRegistryServerLink(this);
       this.startHeartbeat();
       this.startWatchdog();
+
+      // Flush any acks that couldn't be sent before/during previous disconnects.
+      // The outbox handles ordering, attempt caps, TTL, and isConnected() gating.
+      const outbox = getDefaultAckOutbox();
+      const sender = Object.assign(
+        (msg: Parameters<typeof this.send>[0]) => this.send(msg),
+        { isConnected: () => this.isConnected() },
+      );
+      outbox.flushOnReconnect(sender as never).catch((err) => {
+        logger.warn({ err }, 'AckOutbox flush on reconnect failed');
+      });
+
+      // Refresh the supervisor global-defaults cache on every (re)connect so
+      // user edits to "Global custom instructions" land in the daemon within
+      // one WS round-trip, not next restart. See `supervisor-defaults-cache.ts`.
+      void (async () => {
+        try {
+          const { refreshSupervisorDefaultsCache } = await import('./supervisor-defaults-cache.js');
+          await refreshSupervisorDefaultsCache();
+        } catch (err) {
+          logger.debug({ err }, 'supervisor-defaults-cache: reconnect refresh failed');
+        }
+      })();
     });
 
     ws.addEventListener('error', (event) => {
@@ -132,10 +172,21 @@ export class ServerLink {
 
   send(msg: unknown): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      throw new Error('ServerLink: not connected');
+      // Best-effort: silently drop messages when the link isn't up. Throwing
+      // here would become an unhandled rejection in any fire-and-forget
+      // caller (handleP2pConfigSave, repo-handler, command-handler, etc.)
+      // since the daemon must never die from transient disconnects.
+      // Callers that need delivery confirmation should check isConnected()
+      // or await a response event before acting on `send()`.
+      return;
     }
     this.seq++;
     this.ws.send(JSON.stringify({ ...((msg as object) ?? {}), seq: this.seq }));
+  }
+
+  /** Reports whether the underlying WebSocket is currently OPEN. */
+  isConnected(): boolean {
+    return !!this.ws && this.ws.readyState === WebSocket.OPEN;
   }
 
   /** Send a binary WebSocket frame (raw PTY data). Best-effort: no throw on disconnect. */

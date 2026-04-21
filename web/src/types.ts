@@ -46,6 +46,8 @@ export interface SessionInfo {
   qwenAuthType?: string;
   qwenAuthLimit?: string;
   qwenAvailableModels?: string[];
+  copilotAvailableModels?: string[];
+  cursorAvailableModels?: string[];
   modelDisplay?: string;
   planLabel?: string;
   permissionLabel?: string;

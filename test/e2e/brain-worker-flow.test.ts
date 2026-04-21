@@ -8,8 +8,9 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { newSession, killSession, sendKeys, capturePane, sessionExists } from '../../src/agent/tmux.js';
 
 const SKIP = process.env.SKIP_TMUX_TESTS === '1';
-const BRAIN_SESSION = 'e2e_brain_flow_brain';
-const WORKER_SESSION = 'e2e_brain_flow_w1';
+const RUN_ID = Math.random().toString(36).slice(2, 8);
+const BRAIN_SESSION = `e2e_brain_flow_brain_${RUN_ID}`;
+const WORKER_SESSION = `e2e_brain_flow_w1_${RUN_ID}`;
 const FIXTURES = new URL('../fixtures', import.meta.url).pathname;
 
 describe.skipIf(SKIP)('Brain → Worker dispatch flow', () => {

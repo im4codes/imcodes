@@ -8,16 +8,33 @@ import { h } from 'preact';
 const addOptimisticUserMessageMock = vi.fn();
 let timelineEventsMock: any[] = [];
 let activeToolCallMock = false;
+const terminalViewSpy = vi.fn(() => null);
+const chatViewSpy = vi.fn(() => null);
 
-vi.mock('../../src/components/TerminalView.js', () => ({ TerminalView: () => null }));
-vi.mock('../../src/components/ChatView.js', () => ({ ChatView: () => null }));
+vi.mock('../../src/components/TerminalView.js', () => ({ TerminalView: (props: any) => terminalViewSpy(props) }));
+vi.mock('../../src/components/ChatView.js', () => ({ ChatView: (props: any) => chatViewSpy(props) }));
 vi.mock('../../src/components/SessionControls.js', () => ({
-  SessionControls: (props: { onSend?: (sessionName: string, text: string) => void; activeSession?: { name: string } | null }) => (
-    <button type="button" onClick={() => props.onSend?.(props.activeSession?.name ?? 'session', 'queued text')}>
+  SessionControls: (props: {
+    onSend?: (
+      sessionName: string,
+      text: string,
+      meta?: { commandId: string; attachments?: Array<Record<string, unknown>>; extra?: Record<string, unknown> },
+    ) => void;
+    activeSession?: { name: string } | null;
+  }) => (
+    <button
+      type="button"
+      onClick={() => props.onSend?.(
+        props.activeSession?.name ?? 'session',
+        'queued text',
+        { commandId: 'test-cmd-1' },
+      )}
+    >
       send
     </button>
   ),
 }));
+const removeOptimisticMessageMock = vi.fn();
 vi.mock('../../src/hooks/useTimeline.js', () => ({
   useTimeline: () => ({
     events: timelineEventsMock,
@@ -26,6 +43,7 @@ vi.mock('../../src/hooks/useTimeline.js', () => ({
     loadingOlder: false,
     hasOlderHistory: false,
     addOptimisticUserMessage: addOptimisticUserMessageMock,
+    removeOptimisticMessage: removeOptimisticMessageMock,
     loadOlderEvents: vi.fn(),
   }),
 }));
@@ -53,6 +71,8 @@ describe('SessionPane', () => {
     addOptimisticUserMessageMock.mockReset();
     timelineEventsMock = [];
     activeToolCallMock = false;
+    terminalViewSpy.mockClear();
+    chatViewSpy.mockClear();
   });
 
   afterEach(() => {
@@ -89,6 +109,9 @@ describe('SessionPane', () => {
   });
 
   it('does not add optimistic user messages for transport sessions', () => {
+    // Transport sends can be queued daemon-side. Showing an optimistic user
+    // bubble before the runtime actually accepts the turn advances the timeline
+    // incorrectly, so transport sessions now wait for the authoritative echo.
     render(
       <SessionPane
         serverId="s1"
@@ -111,6 +134,37 @@ describe('SessionPane', () => {
       />,
     );
 
+    fireEvent.click(screen.getByRole('button', { name: 'send' }));
+    expect(addOptimisticUserMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('forces copilot-sdk sessions into chat mode when runtimeType is omitted', () => {
+    render(
+      <SessionPane
+        serverId="s1"
+        session={{
+          name: 'deck_test_brain',
+          project: 'test',
+          role: 'brain',
+          agentType: 'copilot-sdk',
+          state: 'running',
+          runtimeType: undefined,
+          projectDir: '/tmp/test',
+        } as any}
+        sessions={[]}
+        subSessions={[]}
+        ws={null}
+        connected={false}
+        isActive={true}
+        viewMode="terminal"
+        quickData={{} as any}
+      />,
+    );
+
+    expect(chatViewSpy).toHaveBeenCalled();
+    expect(terminalViewSpy).toHaveBeenCalled();
+    const lastTerminalProps = terminalViewSpy.mock.calls.at(-1)?.[0];
+    expect(lastTerminalProps?.active).toBe(false);
     fireEvent.click(screen.getByRole('button', { name: 'send' }));
     expect(addOptimisticUserMessageMock).not.toHaveBeenCalled();
   });
@@ -139,7 +193,7 @@ describe('SessionPane', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: 'send' }));
-    expect(addOptimisticUserMessageMock).toHaveBeenCalledWith('queued text');
+    expect(addOptimisticUserMessageMock).toHaveBeenCalledWith('queued text', 'test-cmd-1', {});
   });
 
   it('prefers timeline tail running state over stale outer idle state for footer status', () => {

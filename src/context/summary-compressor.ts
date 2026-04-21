@@ -15,6 +15,12 @@ import type { TransportProvider, ProviderError } from '../agent/transport-provid
 import type { AgentMessage } from '../../shared/agent-message.js';
 import { randomUUID } from 'node:crypto';
 import logger from '../util/logger.js';
+import {
+  resolveProcessingProviderSessionConfig,
+  type ProcessingBackendSelection as CompressionBackendSelection,
+  type ProcessingProviderSessionConfig as CompressionProviderSessionConfig,
+} from './processing-provider-config.js';
+import { markEphemeralProviderSid, unmarkEphemeralProviderSid } from '../agent/session-manager.js';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -142,11 +148,11 @@ async function sleep(ms: number): Promise<void> {
  * Retries with exponential backoff + jitter on transient errors.
  * Permanent errors (auth, model not found) fail fast.
  */
-async function sendWithRetry(backend: string, prompt: string): Promise<string> {
+async function sendWithRetry(prompt: string, selection: CompressionBackendSelection): Promise<string> {
   let lastErr: unknown;
   for (let attempt = 0; attempt <= MAX_RETRIES_PER_BACKEND; attempt++) {
     try {
-      return await sendToProvider(backend, prompt);
+      return await sendToProvider(selection, prompt);
     } catch (err) {
       lastErr = err;
       if (!isRetryableError(err) || attempt === MAX_RETRIES_PER_BACKEND) {
@@ -156,7 +162,7 @@ async function sendWithRetry(backend: string, prompt: string): Promise<string> {
       await shutdownCompressionProvider();
       const delay = Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, attempt), RETRY_MAX_DELAY_MS)
         + Math.random() * 500;
-      logger.warn({ err, backend, attempt: attempt + 1, delay }, 'SDK compression retry after transient error');
+      logger.warn({ err, backend: selection.backend, attempt: attempt + 1, delay }, 'SDK compression retry after transient error');
       await sleep(delay);
     }
   }
@@ -183,84 +189,96 @@ export const __testing__ = {
   recordFailure,
 };
 
-// ── Dedicated compression provider (private, NOT in global registry) ─────────
+// ── Compression provider (shared with the global registry singleton) ─────────
+//
+// History: this module used to construct its own private CodexSdkProvider /
+// QwenProvider / ClaudeCodeSdkProvider instances, so each backend switch
+// spawned (and hopefully reaped) a brand-new SDK child process. In production
+// that pattern compounded with kill-signal bugs to leak ~107MB per orphaned
+// codex app-server pair (>2GB after a few hours).
+//
+// The provider instances already cached by `src/agent/provider-registry.ts`
+// are long-lived singletons that safely support multiple concurrent sessions
+// (threads) within a single app-server. Compression now borrows one of those
+// singletons and creates a transient sub-session for its own work instead.
+// Result: a single shared codex / claude / qwen process regardless of how
+// many times compression, supervision, and user sessions all fire together.
+//
+// `activeSessionId` still tracks compression's current sub-session so we can
+// cleanly end it when the backend changes. We do NOT disconnect the shared
+// provider on backend change — that would also kill user/supervision traffic.
 
 let activeProvider: TransportProvider | null = null;
 let activeSessionId: string | null = null;
-let activeBackend: string | null = null;
+let activeBackendKey: string | null = null;
 
 /**
- * Get or create a private provider + session for compression.
- * The provider is lazily initialized and reused across compressions.
- * If backend changes, old one is torn down and a new one created.
+ * Get or reuse a compression sub-session on the shared registry provider.
+ * The SDK provider is reused indefinitely — only the sub-session is
+ * recreated when the backend/model (cacheKey) changes.
  */
-async function getCompressionProvider(backend: string): Promise<{ provider: TransportProvider; sessionId: string }> {
-  if (activeProvider && activeSessionId && activeBackend === backend) {
+async function getCompressionProvider(
+  backend: string,
+  sessionConfig: CompressionProviderSessionConfig,
+): Promise<{ provider: TransportProvider; sessionId: string }> {
+  if (activeProvider && activeSessionId && activeBackendKey === sessionConfig.cacheKey) {
     return { provider: activeProvider, sessionId: activeSessionId };
   }
 
-  // Tear down previous
-  await shutdownCompressionProvider();
+  // End the previous sub-session, but keep the shared SDK process running.
+  await endActiveCompressionSession();
 
-  // Create a PRIVATE provider instance — not in the global registry.
-  const provider = await createPrivateProvider(backend);
+  // Borrow (or lazily connect) the registry singleton. This is the same
+  // provider instance supervision + user transport sessions use — so no
+  // parallel codex/claude/qwen child processes are spawned.
+  const { ensureProviderConnected } = await import('../agent/provider-registry.js');
+  const provider = await ensureProviderConnected(backend, {});
 
-  await provider.connect({});
-
-  // Create a dedicated session. Use UUID format for sessionKey since some
-  // providers (e.g. qwen) require UUID-formatted session IDs.
+  // Create a dedicated sub-session. UUID sessionKey keeps it distinct from
+  // any user-facing session; the SDK treats it as an independent thread.
   const sessionId = await provider.createSession({
     sessionKey: randomUUID(),
     fresh: true,
     description: 'Memory compression — do NOT respond to questions, only output structured summaries.',
     systemPrompt: COMPRESSOR_SYSTEM_PROMPT,
+    ...(sessionConfig.env ? { env: sessionConfig.env } : {}),
+    ...(sessionConfig.settings ? { settings: sessionConfig.settings } : {}),
+    ...(sessionConfig.agentId ? { agentId: sessionConfig.agentId } : {}),
   });
+  // Out-of-band session: compression uses its own per-call listeners and
+  // never registers with the providerRouting map. Mark the sid so
+  // transport-relay drops its deltas silently (previously each delta
+  // produced a level=40 "unresolved route" warn — hundreds per minute).
+  markEphemeralProviderSid(sessionId);
 
   activeProvider = provider;
   activeSessionId = sessionId;
-  activeBackend = backend;
+  activeBackendKey = sessionConfig.cacheKey;
 
   return { provider, sessionId };
 }
 
-/** Tear down the compression provider (e.g. on daemon shutdown or backend change). */
-export async function shutdownCompressionProvider(): Promise<void> {
-  if (activeProvider) {
+/** End the compression sub-session without touching the shared provider. */
+async function endActiveCompressionSession(): Promise<void> {
+  if (activeProvider && activeSessionId) {
+    unmarkEphemeralProviderSid(activeSessionId);
     try {
-      if (activeSessionId) await activeProvider.endSession(activeSessionId);
-      await activeProvider.disconnect();
-    } catch { /* ignore cleanup errors */ }
-    activeProvider = null;
-    activeSessionId = null;
-    activeBackend = null;
+      await activeProvider.endSession(activeSessionId);
+    } catch { /* ignore — best-effort */ }
   }
+  activeProvider = null;
+  activeSessionId = null;
+  activeBackendKey = null;
 }
 
 /**
- * Create a standalone provider instance that is NOT registered in the global
- * provider registry. Its sessions won't appear in the user's session list.
+ * Shut down the compression sub-session. Kept as an exported alias for
+ * back-compat with existing callers (daemon shutdown, backend-change
+ * unwinds, tests). We intentionally do NOT call `provider.disconnect()` on
+ * the shared singleton — that would kill user + supervision traffic too.
  */
-async function createPrivateProvider(backend: string): Promise<TransportProvider> {
-  switch (backend) {
-    case 'claude-code-sdk': {
-      const { ClaudeCodeSdkProvider } = await import('../agent/providers/claude-code-sdk.js');
-      return new ClaudeCodeSdkProvider();
-    }
-    case 'codex-sdk': {
-      const { CodexSdkProvider } = await import('../agent/providers/codex-sdk.js');
-      return new CodexSdkProvider();
-    }
-    case 'qwen': {
-      const { QwenProvider } = await import('../agent/providers/qwen.js');
-      return new QwenProvider();
-    }
-    case 'openclaw': {
-      const { OpenClawProvider } = await import('../agent/providers/openclaw.js');
-      return new OpenClawProvider();
-    }
-    default:
-      throw new Error(`Unsupported compression backend: ${backend}`);
-  }
+export async function shutdownCompressionProvider(): Promise<void> {
+  await endActiveCompressionSession();
 }
 
 const COMPRESSOR_SYSTEM_PROMPT = `You are a memory compression engine. Your output will be stored as a durable memory entry for a coding agent. Do NOT respond to any questions — only output the structured summary. Do NOT include any preamble, greeting, or prefix.`;
@@ -279,9 +297,48 @@ export async function localOnlyCompressor(input: CompressionInput): Promise<Comp
   };
 }
 
+// ── Serialization gate ──────────────────────────────────────────────────────
+//
+// Compression MUST run one-at-a-time across the whole daemon. The shared
+// Codex sub-session (see `getCompressionProvider`) only accepts one `send`
+// in flight; concurrent callers used to race it, trigger
+// "Codex SDK session is already busy" errors, enter the retry loop, and
+// with ~40 materialization targets firing on the 10s cadence this became
+// a self-reinforcing storm — observed on a production daemon as
+// 85 %-CPU sustained on the main thread with user message dispatch going
+// noticeably laggy. Every stream-delta callback from ANY concurrent
+// compression piles into the same main-thread event loop, so "it's async"
+// doesn't actually protect the loop from multiplicative callback load.
+//
+// The gate is a single Promise chain: each caller awaits the previous
+// one before entering the inner compression path. Releases in `finally`
+// so even a thrown / timed-out compression can't stall the queue.
+//
+// Callers (`materialization-coordinator.materializeTarget`) remain
+// fire-and-forget from their perspective — they just observe natural
+// backpressure when the queue is busy.
+let compressionChain: Promise<void> = Promise.resolve();
+
+function enqueueExclusive<T>(job: () => Promise<T>): Promise<T> {
+  const prev = compressionChain;
+  let release!: () => void;
+  compressionChain = new Promise<void>((r) => { release = r; });
+  return prev.catch(() => {}).then(async () => {
+    try {
+      return await job();
+    } finally {
+      release();
+    }
+  });
+}
+
 // ── Main entry point ─────────────────────────────────────────────────────────
 
 export async function compressWithSdk(input: CompressionInput): Promise<CompressionResult> {
+  return enqueueExclusive(() => compressWithSdkInner(input));
+}
+
+async function compressWithSdkInner(input: CompressionInput): Promise<CompressionResult> {
   const { events, previousSummary, modelConfig } = input;
   const targetTokens = input.targetTokens ?? 500;
 
@@ -298,7 +355,11 @@ export async function compressWithSdk(input: CompressionInput): Promise<Compress
   // Try primary (gated by circuit breaker)
   if (canCall(modelConfig.primaryContextBackend, now)) {
     try {
-      const result = await sendWithRetry(modelConfig.primaryContextBackend, prompt);
+      const result = await sendWithRetry(prompt, {
+        backend: modelConfig.primaryContextBackend,
+        model: modelConfig.primaryContextModel,
+        preset: modelConfig.primaryContextPreset,
+      });
       recordSuccess(modelConfig.primaryContextBackend);
       return {
         summary: result, model: modelConfig.primaryContextModel,
@@ -319,7 +380,11 @@ export async function compressWithSdk(input: CompressionInput): Promise<Compress
   if (modelConfig.backupContextBackend && modelConfig.backupContextModel) {
     if (canCall(modelConfig.backupContextBackend, now)) {
       try {
-        const result = await sendWithRetry(modelConfig.backupContextBackend, prompt);
+        const result = await sendWithRetry(prompt, {
+          backend: modelConfig.backupContextBackend,
+          model: modelConfig.backupContextModel,
+          preset: modelConfig.backupContextPreset,
+        });
         recordSuccess(modelConfig.backupContextBackend);
         return {
           summary: result, model: modelConfig.backupContextModel,
@@ -346,22 +411,42 @@ export async function compressWithSdk(input: CompressionInput): Promise<Compress
 
 // ── Provider send with completion wait ───────────────────────────────────────
 
-const COMPRESSION_TIMEOUT_MS = 60_000;
+// Tighter than the 60 s we had during single-request debugging. With the
+// serialization gate above the queue is now the budget, not the timeout —
+// a single slow call blocked everything behind it for up to a full minute.
+// 20 s still lets a model with warm context finish a structured summary;
+// genuinely slow/broken calls release the lane 3× faster and the
+// circuit breaker trips sooner, falling back to the local summarizer.
+const COMPRESSION_TIMEOUT_MS = 20_000;
 
-async function sendToProvider(backend: string, prompt: string): Promise<string> {
+export async function resolveCompressionProviderSessionConfig(
+  selection: CompressionBackendSelection,
+): Promise<CompressionProviderSessionConfig> {
+  return resolveProcessingProviderSessionConfig(selection);
+}
+
+async function sendToProvider(selection: CompressionBackendSelection, prompt: string): Promise<string> {
   // claude-code-sdk: use SDK query() directly — the transport provider's spawn
   // hook adds CLI flags that cause exit code 1 in one-shot compression mode.
   // SDK query() handles subprocess lifecycle and subscription auth correctly.
-  if (backend === 'claude-code-sdk') {
+  if (selection.backend === 'claude-code-sdk') {
     return sendViaSdkQuery(prompt);
   }
 
   // Other backends: use the transport provider's send/onComplete flow.
-  const { provider, sessionId } = await getCompressionProvider(backend);
+  const sessionConfig = await resolveCompressionProviderSessionConfig(selection);
+  const { provider, sessionId } = await getCompressionProvider(selection.backend, sessionConfig);
 
   return new Promise<string>((resolve, reject) => {
     const timer = setTimeout(() => {
       offComplete(); offError();
+      // Tear down the underlying provider session so a stuck CLI subprocess
+      // (e.g., a qwen child waiting on a misconfigured model endpoint) is
+      // killed via SIGTERM. Without this, hung subprocesses keep buffering
+      // stream-json output into the daemon's stdout pipes until the V8 heap
+      // exhausts and the daemon OOM-crashes, taking every active session
+      // with it. Best-effort: don't await — the rejection must fire promptly.
+      void shutdownCompressionProvider().catch(() => { /* best-effort */ });
       reject(new Error(`Compression timed out after ${COMPRESSION_TIMEOUT_MS}ms`));
     }, COMPRESSION_TIMEOUT_MS);
 

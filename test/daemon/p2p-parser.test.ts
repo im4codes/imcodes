@@ -453,6 +453,55 @@ describe('structured P2P routing via WS fields', () => {
     expect(sendKeysDelayedEnter).not.toHaveBeenCalled();
   });
 
+  it('does NOT emit an initiator user.message on P2P success — command is intercepted, not chatted', async () => {
+    // P2P sends are COMMANDS to launch a discussion run, not messages to
+    // the main session's agent. The conversation happens in the P2P
+    // discussion file (.imc/discussions/<run>.md) — nothing about the
+    // user's prompt belongs in the initiator's chat timeline.
+    //
+    // The web composer mirrors this: SessionPane / SubSessionWindow /
+    // SubSessionCard skip `addOptimisticUserMessage` when the send
+    // payload carries `p2pAtTargets` / `p2pMode` / `p2pSessionConfig`.
+    // With no pending bubble to reconcile, the daemon must NOT emit a
+    // `user.message` here — doing so would leave a stray committed
+    // user bubble in the main session's chat (regression from an
+    // earlier round; see commit history).
+    //
+    // The `command.ack status: 'accepted'` + `p2p.run_started` pair is
+    // still emitted so the web clears any failure timer and the
+    // discussions UI surfaces the new run.
+    const { timelineEmitter } = await import('../../src/daemon/timeline-emitter.js');
+    const emitMock = (timelineEmitter as unknown as { emit: ReturnType<typeof vi.fn> }).emit;
+    emitMock.mockClear();
+
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_proj_brain',
+      text: 'kick off a discussion',
+      commandId: 'cmd-p2p-no-echo',
+      p2pAtTargets: [{ session: 'deck_proj_w1', mode: 'review' }],
+    }, mockServerLink as any);
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    // No `user.message` should be emitted on the initiator session.
+    const userEchoCall = emitMock.mock.calls.find(
+      (call) => call[0] === 'deck_proj_brain'
+        && call[1] === 'user.message',
+    );
+    expect(userEchoCall, 'unexpected user.message — P2P command leaking into main session chat').toBeUndefined();
+
+    // But the ack IS still emitted (clears any failure timer the web set
+    // speculatively on send).
+    const ackCall = emitMock.mock.calls.find(
+      (call) => call[0] === 'deck_proj_brain'
+        && call[1] === 'command.ack'
+        && (call[2] as Record<string, unknown>)?.commandId === 'cmd-p2p-no-echo',
+    );
+    expect(ackCall).toBeDefined();
+    expect((ackCall![2] as Record<string, unknown>).status).toBe('accepted');
+  });
+
 
   it('auto-appends the selected i18n language instruction for p2p runs', async () => {
     handleWebCommand({
@@ -692,14 +741,20 @@ describe('structured P2P routing via WS fields', () => {
         p2pAtTargets: [{ session: 'deck_proj_w1', mode: 'review' }],
       }, mockServerLink as any);
 
-      await new Promise((r) => setTimeout(r, 100));
+      // Poll until startP2pRun is called — reading 25 small files and hopping
+      // through handleSend's async path takes longer than the fixed 100 ms
+      // wait used elsewhere in this suite. Poll with a generous budget so the
+      // test is deterministic under slow CI rather than racing the timeout.
+      await vi.waitFor(
+        () => expect(startP2pRun).toHaveBeenCalledOnce(),
+        { timeout: 10_000, interval: 50 },
+      );
 
-      expect(startP2pRun).toHaveBeenCalledOnce();
       const [{ fileContents }] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
       expect(fileContents).toHaveLength(20);
       expect(fileContents.map((f: { path: string }) => f.path)).toEqual(filePaths.slice(0, 20));
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 });

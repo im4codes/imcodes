@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, fireEvent, cleanup, within, waitFor } from '@testing-library/preact';
+import { render, screen, fireEvent, cleanup, within, waitFor, act } from '@testing-library/preact';
 import { useState } from 'preact/hooks';
 
 const DEFAULT_INNER_WIDTH = 1280;
@@ -47,6 +47,9 @@ vi.mock('react-i18next', () => ({
       if (key === 'session.transport_send_queued_collapsed') {
         return `${opts?.count ?? 0} queued · showing latest only`;
       }
+      if (key === 'session.transport_send_queued_count') {
+        return `${opts?.count ?? 0} queued`;
+      }
       if (key === 'session.send_placeholder') {
         return `Send to ${String(opts?.name ?? 'session')}…`;
       }
@@ -56,6 +59,10 @@ vi.mock('react-i18next', () => ({
       if (key === 'session.stop_plain') return 'Stop';
       if (key === 'session.supervision.quickLabel') return 'Auto';
       if (key === 'session.supervision.quickTitle') return 'Auto mode';
+      if (key === 'session.approval.pending') return 'Approval required';
+      if (key === 'session.approval.allow') return 'Allow';
+      if (key === 'session.approval.deny') return 'Deny';
+      if (key === 'session.approval.tool') return `${String(opts?.tool ?? 'tool')} wants approval`;
       if (key === 'common.hide') return 'hide';
       if (key === 'common.show') return 'show';
       const parts = key.split('.');
@@ -160,6 +167,7 @@ import { SessionControls } from '../../src/components/SessionControls.js';
 import type { SessionInfo } from '../../src/types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
+import { TRANSPORT_MSG } from '@shared/transport-events.js';
 
 const flushAsync = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -184,6 +192,9 @@ const makeWs = () => {
     send: vi.fn(),
     sendSessionCommand: vi.fn(),
     sendInput: vi.fn(),
+    subscribeTransportSession: vi.fn(),
+    unsubscribeTransportSession: vi.fn(),
+    respondTransportApproval: vi.fn(),
     connected: true,
     subSessionSetModel: vi.fn(),
     fsListDir: vi.fn(() => 'openspec-request'),
@@ -1493,6 +1504,8 @@ afterEach(() => {
       />,
     );
 
+    // Compact pill is shown by default — click to expand
+    fireEvent.click(screen.getByRole('button', { name: /2 queued/i }));
     expect(document.querySelector('.controls-queued-hint')).toBeTruthy();
     expect(screen.getByText('queued first')).toBeDefined();
     expect(screen.getByText('queued second')).toBeDefined();
@@ -1516,6 +1529,8 @@ afterEach(() => {
       />,
     );
 
+    // Compact pill is shown by default — click to expand
+    fireEvent.click(screen.getByRole('button', { name: /2 queued/i }));
     expect(screen.getByText('queued first')).toBeDefined();
     expect(screen.getByText('queued second')).toBeDefined();
   });
@@ -1658,6 +1673,8 @@ afterEach(() => {
         quickData={makeQuickData() as any}
       />,
     );
+    // Compact pill is shown by default — click to expand
+    fireEvent.click(screen.getByRole('button', { name: /2 queued/i }));
     expect(screen.getByText('transport_send_queued')).toBeDefined();
     expect(screen.getByText('queued send')).toBeDefined();
     expect(screen.getByText('second queued send')).toBeDefined();
@@ -1683,17 +1700,20 @@ afterEach(() => {
       />,
     );
 
+    // Compact pill is shown by default — click to expand first
+    fireEvent.click(screen.getByRole('button', { name: /2 queued/i }));
     fireEvent.click(screen.getByRole('button', { name: 'hide' }));
 
-    expect(screen.getByText('2 queued · showing latest only')).toBeDefined();
+    // Collapsed state is now a compact pill — only a count, no latest-only
+    // summary or message preview (took too much vertical space on mobile).
+    // The pill itself is the button that expands the full list back.
+    expect(screen.getByRole('button', { name: '2 queued' })).toBeDefined();
     expect(screen.queryByText('queued send')).toBeNull();
-    expect(screen.getByText('second queued send')).toBeDefined();
-    expect(screen.getByRole('button', { name: 'show' })).toBeDefined();
-    expect(localStorage.getItem('imcodes-queued-hint-expanded')).toBe('0');
+    expect(screen.queryByText('second queued send')).toBeNull();
+    expect(screen.queryByText('2 queued · showing latest only')).toBeNull();
   });
 
   it('remembers collapsed queued transport messages globally', () => {
-    localStorage.setItem('imcodes-queued-hint-expanded', '0');
     const runningSession = makeSession({
       name: 'qwen-session',
       agentType: 'qwen',
@@ -1713,10 +1733,15 @@ afterEach(() => {
       />,
     );
 
-    expect(screen.getByText('2 queued · showing latest only')).toBeDefined();
+    // Compact pill is shown by default — click to expand
+    expect(screen.getByRole('button', { name: '2 queued' })).toBeDefined();
     expect(screen.queryByText('queued send')).toBeNull();
+    expect(screen.queryByText('second queued send')).toBeNull();
+    expect(screen.queryByText('2 queued · showing latest only')).toBeNull();
+    // Click pill to expand and verify messages appear
+    fireEvent.click(screen.getByRole('button', { name: /2 queued/i }));
+    expect(screen.getByText('queued send')).toBeDefined();
     expect(screen.getByText('second queued send')).toBeDefined();
-    expect(screen.getByRole('button', { name: 'show' })).toBeDefined();
   });
 
   it('edits a queued transport message through the queue controls', () => {
@@ -1739,6 +1764,8 @@ afterEach(() => {
       />,
     );
 
+    // Compact pill is shown by default — click to expand first
+    fireEvent.click(screen.getByRole('button', { name: /1 queued/i }));
     fireEvent.click(screen.getByRole('button', { name: /edit/i }));
     const input = screen.getByRole('textbox') as HTMLDivElement;
     expect(input.textContent).toBe('queued send');
@@ -1778,6 +1805,8 @@ afterEach(() => {
       />,
     );
 
+    // Compact pill is shown by default — click to expand first
+    fireEvent.click(screen.getByRole('button', { name: /1 queued/i }));
     fireEvent.click(screen.getByRole('button', { name: /delete/i }));
 
     expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
@@ -1955,6 +1984,97 @@ afterEach(() => {
       expect(onSettings).toHaveBeenCalled();
     });
     expect(patchSessionMock).not.toHaveBeenCalled();
+  });
+
+  it('always shows Session Settings in the Auto dropdown when settings are available', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({
+          name: 'codex-sdk-session',
+          state: 'idle',
+          transportConfig: {
+            supervision: {
+              mode: 'supervised',
+              backend: 'codex-sdk',
+              model: 'gpt-5.4',
+              timeoutMs: 12000,
+              promptVersion: 'supervision_decision_v1',
+              maxParseRetries: 1,
+            },
+          },
+        })}
+        onSettings={vi.fn()}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /^Auto$/ }));
+    const autoMenu = document.querySelector('.menu-dropdown-auto');
+    expect(autoMenu).toBeTruthy();
+    expect(within(autoMenu as HTMLElement).getByRole('button', { name: /settings/i })).toBeDefined();
+  });
+
+  it('renders approval controls for active transport chat events', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({
+          name: 'codex-sdk-session',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(ws.onMessage).toHaveBeenCalled();
+    });
+    await flushAsync();
+
+    await act(async () => {
+      for (const call of ws.onMessage.mock.calls) {
+        const handler = call[0] as ((msg: unknown) => void) | undefined;
+        handler?.({
+          type: TRANSPORT_MSG.CHAT_APPROVAL,
+          sessionId: 'codex-sdk-session',
+          requestId: 'approval-1',
+          description: 'Allow file write',
+          tool: 'shell',
+        });
+      }
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('Approval required')).toBeDefined();
+      expect(screen.getByText('shell wants approval')).toBeDefined();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /^Allow$/ }));
+    expect(ws.respondTransportApproval).toHaveBeenCalledWith('codex-sdk-session', 'approval-1', true);
+  });
+
+  it('treats copilot-sdk sessions as transport even when runtimeType is omitted', async () => {
+    const ws = makeWs();
+
+    render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        activeSession={makeSession({
+          name: 'copilot-session',
+          agentType: 'copilot-sdk',
+          state: 'running',
+          runtimeType: undefined,
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: /^Stop$/ })).toBeDefined();
   });
 
   it('pressing Shift+Enter does not submit', () => {
@@ -2565,6 +2685,54 @@ afterEach(() => {
     expectSendPayload(ws, {
       sessionName: 'codex-sdk-session',
       text: '/thinking high',
+    });
+  });
+
+  it('shows a model selector for copilot-sdk and sends /model', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'copilot-sdk-session',
+          agentType: 'copilot-sdk',
+          runtimeType: 'transport',
+          activeModel: 'gpt-5.4',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /^gpt-5.4$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /gpt-5.4-mini/i }));
+
+    expectSendPayload(ws, {
+      sessionName: 'copilot-sdk-session',
+      text: '/model gpt-5.4-mini',
+    });
+  });
+
+  it('shows a model selector for cursor-headless and sends /model', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'cursor-headless-session',
+          agentType: 'cursor-headless',
+          runtimeType: 'transport',
+          activeModel: 'gpt-5.2',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /^gpt-5.2$/i }));
+    fireEvent.click(screen.getAllByRole('button', { name: /gpt-5.2/i })[1]!);
+
+    expectSendPayload(ws, {
+      sessionName: 'cursor-headless-session',
+      text: '/model gpt-5.2',
     });
   });
 });

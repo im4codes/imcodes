@@ -43,6 +43,8 @@ interface Props {
   agentType?: string | null;
   /** Server ID for file transfer download API. */
   serverId?: string;
+  /** Retry a failed optimistic send — called with the original commandId and text. */
+  onResendFailed?: (commandId: string, text: string) => void;
 }
 
 /** A merged view item — either a single event, merged assistant text, or collapsed tool group. */
@@ -100,6 +102,52 @@ function formatMemoryContextScore(score: number | undefined): string | null {
 function formatMemoryContextTimestamp(ts: number | undefined): string | null {
   if (typeof ts !== 'number' || !Number.isFinite(ts)) return null;
   return new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+function getMemoryContextStatusSummary(
+  t: (key: string, options?: Record<string, unknown>) => string,
+  payload: MemoryContextTimelinePayload,
+  itemCount: number,
+): string {
+  switch (payload.status) {
+    case 'no_matches':
+      return t('chat.memory_context_status_no_matches');
+    case 'deduped_recently':
+      return t('chat.memory_context_status_deduped_recently', { count: payload.matchedCount ?? 0 });
+    case 'skipped_template_prompt':
+      return t('chat.memory_context_status_skipped_template_prompt');
+    case 'skipped_short_prompt':
+      return t('chat.memory_context_status_skipped_short_prompt');
+    case 'skipped_control_message':
+      return t('chat.memory_context_status_skipped_control_message');
+    case 'failed':
+      return t('chat.memory_context_status_failed');
+    default:
+      return t('chat.memory_context_summary', { count: itemCount });
+  }
+}
+
+function getMemoryContextStatusDetail(
+  t: (key: string, options?: Record<string, unknown>) => string,
+  payload: MemoryContextTimelinePayload,
+): string | null {
+  switch (payload.status) {
+    case 'deduped_recently':
+      return t('chat.memory_context_status_deduped_recently_detail', {
+        count: payload.matchedCount ?? 0,
+        deduped: payload.dedupedCount ?? payload.matchedCount ?? 0,
+      });
+    case 'skipped_template_prompt':
+      return t('chat.memory_context_status_skipped_template_prompt_detail');
+    case 'skipped_short_prompt':
+      return t('chat.memory_context_status_skipped_short_prompt_detail');
+    case 'skipped_control_message':
+      return t('chat.memory_context_status_skipped_control_message_detail');
+    case 'failed':
+      return t('chat.memory_context_status_failed_detail');
+    default:
+      return null;
+  }
 }
 
 const TOOL_INPUT_SUMMARY_KEYS = [
@@ -439,7 +487,45 @@ function readPanelOpen(id: string | null | undefined): boolean {
   try { return localStorage.getItem(panelOpenKey(id)) === '1'; } catch { return false; }
 }
 
-export function ChatView({ events, loading, refreshing: _refreshing, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir, serverId, onQuote, agentType: _agentType }: Props) {
+/** Find a chat event element by its eventId without relying on CSS.escape —
+ *  our eventIds contain `:` and `-` chars that are illegal in CSS selectors,
+ *  and `CSS.escape` isn't polyfilled in jsdom so `querySelector` blows up in
+ *  tests. A direct DOM walk with `dataset.eventId` comparison is trivially
+ *  fast for the few dozen elements involved. */
+function findEventElement(root: ParentNode, eventId: string): HTMLElement | null {
+  const candidates = root.querySelectorAll('[data-event-id]');
+  for (const el of Array.from(candidates)) {
+    if ((el as HTMLElement).dataset.eventId === eventId) return el as HTMLElement;
+  }
+  return null;
+}
+
+/** Walk up the DOM from `start` and return the nearest ancestor that actually
+ *  scrolls (overflow-y is `auto` or `scroll` AND the element has extra scroll
+ *  height beyond its clientHeight). Used by the pinned-last-sent banner to
+ *  find the real scroll viewport — in the sub-session card, `.chat-view` is
+ *  nested inside `.subcard-preview` which holds the scrollbar, and observing
+ *  `.chat-view` there would never fire "out of viewport". Returns the
+ *  starting element if no scrolling ancestor exists (fallback to the
+ *  component's own bounds). */
+function findScrollParent(start: HTMLElement): HTMLElement {
+  let node: HTMLElement | null = start;
+  while (node) {
+    const style = window.getComputedStyle(node);
+    const overflowY = style.overflowY;
+    const isScrollable = overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay';
+    // Ignore ancestors that declare scrollability but don't actually have
+    // scroll height (e.g. an overflow:auto container that always fits its
+    // content). Otherwise we'd incorrectly pick a sibling that never scrolls.
+    if (isScrollable && node.scrollHeight > node.clientHeight + 1) {
+      return node;
+    }
+    node = node.parentElement;
+  }
+  return start;
+}
+
+export function ChatView({ events, loading, refreshing: _refreshing, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir, serverId, onQuote, agentType: _agentType, onResendFailed }: Props) {
   const { t } = useTranslation();
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -458,6 +544,31 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
   const [showScrollBtn, setShowScrollBtn] = useState(false);
   const lastScrollTopRef = useRef(0);
   const suppressLoadOlderUntilRef = useRef(0);
+
+  // ── Pinned last-sent user message (appears only when scrolled off top) ──
+  // When the user scrolls back through a long chat we want them to see what
+  // they last said without hunting for it. But while the real bubble is still
+  // on screen we don't want a redundant banner — so the pin flips on only
+  // when an IntersectionObserver says the bubble has left the viewport by
+  // the TOP edge (i.e. pushed upward by new content), and flips off as soon
+  // as the bubble comes back into view.
+  const [pinnedAboveViewport, setPinnedAboveViewport] = useState(false);
+  const [pinnedExpanded, setPinnedExpanded] = useState(false);
+  const lastSentUserMessage = useMemo(() => {
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i];
+      if (e.type !== 'user.message') continue;
+      const p = e.payload as Record<string, unknown>;
+      if (p.pending === true || p.failed === true) continue;
+      const text = typeof p.text === 'string' ? p.text : '';
+      if (!text.trim()) continue;
+      return { eventId: e.eventId, text };
+    }
+    return null;
+  }, [events]);
+  // Reset the expand state whenever the pinned target changes so a new
+  // message never inherits the expanded state of an older one.
+  useEffect(() => { setPinnedExpanded(false); }, [lastSentUserMessage?.eventId]);
 
   const suppressLoadOlder = useCallback((durationMs = 1200) => {
     suppressLoadOlderUntilRef.current = Date.now() + durationMs;
@@ -630,6 +741,67 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
   // Keep separate from fn-registration so parent re-renders don't re-trigger.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { scrollToBottom(); }, []);
+
+  // Track whether the last sent user bubble is above/below/inside the
+  // viewport. Only "above" flips the pin on — that's when new assistant
+  // output has pushed the user's last prompt off the top and they'd
+  // otherwise have to scroll up to re-read it. Below / intersecting cases
+  // both leave the pin hidden.
+  useEffect(() => {
+    if (!lastSentUserMessage) {
+      setPinnedAboveViewport(false);
+      return;
+    }
+    const scrollEl = scrollRef.current;
+    if (!scrollEl) return;
+    // jsdom (unit tests) and a small long tail of old WebKit versions don't
+    // ship IntersectionObserver. Bail before touching it — no pin is better
+    // than a blow-up rendering any chat view at all.
+    if (typeof IntersectionObserver === 'undefined') {
+      setPinnedAboveViewport(false);
+      return;
+    }
+    const target = findEventElement(scrollEl, lastSentUserMessage.eventId);
+    if (!target) {
+      // Target not mounted yet (virtualization, pagination) — treat as above
+      // viewport ONLY if the user isn't sitting at the bottom of the scroll
+      // (i.e. they're reading older history). Otherwise keep the pin hidden
+      // so a bubble that never actually rendered doesn't cause a ghost pin.
+      const atBottom = Math.abs(scrollEl.scrollHeight - scrollEl.clientHeight - scrollEl.scrollTop) < 40;
+      setPinnedAboveViewport(!atBottom);
+      return;
+    }
+
+    // In sub-session cards the .chat-view doesn't actually scroll — its
+    // parent .subcard-preview holds the scrollbar and .chat-view just grows
+    // with content. Observing .chat-view as root would therefore never fire
+    // an above-viewport event. Detect the real scrolling ancestor and use
+    // that instead. For main pane + sub-session window this naturally
+    // resolves back to .chat-view itself.
+    const root = findScrollParent(scrollEl);
+    const observer = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.target !== target) continue;
+        if (entry.isIntersecting) {
+          setPinnedAboveViewport(false);
+          continue;
+        }
+        // Above viewport: the bubble's bottom edge is above the root's top.
+        // Below viewport is the opposite — we leave the pin off in that case
+        // because the user just scrolled up and the real bubble is still
+        // within easy scroll reach, not "lost".
+        const rootBounds = entry.rootBounds;
+        const rect = entry.boundingClientRect;
+        if (rootBounds && rect.bottom <= rootBounds.top) {
+          setPinnedAboveViewport(true);
+        } else {
+          setPinnedAboveViewport(false);
+        }
+      }
+    }, { root, threshold: [0, 1] });
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [lastSentUserMessage?.eventId]);
 
   // Auto-scroll only on visible new events — agent.status / assistant.thinking / usage.update
   // events are filtered from the chat view but still part of `events`, so using the raw last ts
@@ -889,6 +1061,27 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
       )}
       {/* refreshing indicator removed — gap-fill is invisible to the user */}
       <div class="chat-main">
+        {pinnedAboveViewport && lastSentUserMessage && (
+          <div
+            class={`chat-pinned-last-sent${pinnedExpanded ? ' chat-pinned-expanded' : ''}`}
+            role="button"
+            tabIndex={0}
+            aria-label={t('chat.pinned_last_sent_aria', 'Jump to your last sent message')}
+            onClick={() => {
+              // Tap once → toggle 2-line clamp; tap again (while expanded)
+              // behaves like a jump-to-message. Holds the expand state so a
+              // long message can be read without hunting for it.
+              if (!pinnedExpanded) { setPinnedExpanded(true); return; }
+              const root = scrollRef.current;
+              if (!root) return;
+              const target = findEventElement(root, lastSentUserMessage.eventId);
+              if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }}
+          >
+            <span class="chat-pinned-last-sent-label">{t('chat.pinned_last_sent_label', 'Last sent')}</span>
+            <span class="chat-pinned-last-sent-text">{lastSentUserMessage.text}</span>
+          </div>
+        )}
         <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} onScroll={preview ? undefined : handleScroll}
           onContextMenu={!preview && !isTouchDevice ? handleContextMenu : undefined}
           onClick={(highlightEl || ctxMenu) ? () => {
@@ -942,11 +1135,11 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
             }
             const linkedEvents = item.linkedEvents ?? [];
             if (linkedEvents.length === 0) {
-              return <ChatEvent key={item.key} event={item.event!} nextTs={nextTs} onPathClick={pathClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} />;
+              return <ChatEvent key={item.key} event={item.event!} nextTs={nextTs} onPathClick={pathClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />;
             }
             return (
               <div key={item.key} class="chat-linked-event-group">
-                <ChatEvent event={item.event!} nextTs={nextTs} onPathClick={pathClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} />
+                <ChatEvent event={item.event!} nextTs={nextTs} onPathClick={pathClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />
                 {linkedEvents.map((linkedEvent) => (
                   <ChatEvent
                     key={linkedEvent.eventId}
@@ -955,6 +1148,7 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
                     onFileChangeOpen={handleFileChangeOpen}
                     onDownload={downloadHandler}
                     serverId={serverId}
+                    onResendFailed={onResendFailed}
                   />
                 ))}
               </div>
@@ -1074,6 +1268,7 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
               onConfirm={(paths) => {
                 if (paths[0]) onInsertPath?.(paths[0]);
               }}
+              onInsertPath={onInsertPath}
             />
           </div>
         </>
@@ -1127,6 +1322,10 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
               if (paths[0]) onInsertPath?.(paths[0]);
               setFileBrowserTarget(null);
             }}
+            onInsertPath={onInsertPath ? (path) => {
+              onInsertPath(path);
+              setFileBrowserTarget(null);
+            } : undefined}
             onClose={() => setFileBrowserTarget(null)}
           />
         </FloatingPanel>
@@ -1283,6 +1482,7 @@ const ChatEvent = memo(function ChatEvent({
   onFileChangeOpen,
   onDownload,
   serverId,
+  onResendFailed,
 }: {
   event: TimelineEvent;
   nextTs?: number;
@@ -1290,6 +1490,7 @@ const ChatEvent = memo(function ChatEvent({
   onFileChangeOpen?: (path: string, preferDiff?: boolean) => void;
   onDownload?: (path: string) => void;
   serverId?: string;
+  onResendFailed?: (commandId: string, text: string) => void;
 }) {
   const { t } = useTranslation();
   switch (event.type) {
@@ -1302,13 +1503,46 @@ const ChatEvent = memo(function ChatEvent({
           if (att.daemonPath) userText = userText.split(`@${att.daemonPath}`).join('').trim();
         }
       }
+      const isPending = !!event.payload.pending;
+      const isFailed = !!event.payload.failed;
+      const commandId = typeof event.payload.commandId === 'string' ? event.payload.commandId : undefined;
+      const failureReason = typeof event.payload.failureReason === 'string' ? event.payload.failureReason : undefined;
+      const stateClass = isPending ? ' chat-pending' : isFailed ? ' chat-failed' : '';
       return (
-        <div class={`chat-event chat-user${event.payload.pending ? ' chat-pending' : ''}`}>
+        // data-event-id lets the pinned-last-message banner target this bubble
+        // with an IntersectionObserver so the banner only shows when the real
+        // bubble has scrolled off the top of the viewport.
+        <div class={`chat-event chat-user${stateClass}`} data-event-id={event.eventId}>
           {attachments && serverId && attachments.map((att) => (
             <AttachmentDownloadButton key={att.id} att={att} serverId={serverId} onPathClick={onPathClick} />
           ))}
           {userText && <div class="chat-bubble-content">{splitPathsAndUrls(userText, onPathClick, undefined, onDownload)}</div>}
-          {!event.payload.pending && <ChatTime ts={event.ts} />}
+          {isPending && (
+            <span
+              class="chat-user-status chat-user-status-pending"
+              aria-label={t('chat.sendingLabel', 'Sending')}
+              title={t('chat.sendingLabel', 'Sending')}
+            />
+          )}
+          {isFailed && (
+            <div class="chat-user-status chat-user-status-failed">
+              <span
+                class="chat-user-status-icon"
+                aria-label={t('chat.sendFailedLabel', 'Send failed')}
+                title={failureReason ?? t('chat.sendFailedLabel', 'Send failed')}
+              >!</span>
+              {commandId && onResendFailed && (
+                <button
+                  type="button"
+                  class="chat-user-retry-btn"
+                  onClick={() => onResendFailed(commandId, String(event.payload.text ?? ''))}
+                >
+                  {t('chat.retrySend', 'Retry')}
+                </button>
+              )}
+            </div>
+          )}
+          {!isPending && !isFailed && <ChatTime ts={event.ts} />}
         </div>
       );
     }
@@ -1521,18 +1755,23 @@ function FileChangePreviewBlock({
 }) {
   const { t } = useTranslation();
   const visibleLines = lines.length > 0 ? lines : [{ text: emptyText }];
+  const preClass = className.includes('added') ? 'chat-file-change-diff-pre-added' : 'chat-file-change-diff-pre-removed';
   return (
     <div class="chat-file-change-diff-block">
+      {/* Kept for screen readers — hidden visually via CSS since each row now
+          prefixes its own +/- sign. */}
       <div class={className} title={markerTitle} aria-label={markerTitle}>{marker}</div>
-      <div class={`chat-file-change-diff-pre ${className.includes('added') ? 'chat-file-change-diff-pre-added' : 'chat-file-change-diff-pre-removed'}`}>
+      <div class={`chat-file-change-diff-pre ${preClass}`}>
         {visibleLines.map((line, index) => (
           <div class="chat-file-change-diff-row" key={`${marker}:${line.lineNumber ?? 'na'}:${index}`}>
+            <span class="chat-file-change-diff-sign" aria-hidden="true">{marker}</span>
             <span class="chat-file-change-diff-ln">{line.lineNumber ?? ''}</span>
             <span class="chat-file-change-diff-code">{line.text}</span>
           </div>
         ))}
         {truncated && (
           <div class="chat-file-change-diff-row">
+            <span class="chat-file-change-diff-sign" aria-hidden="true">…</span>
             <span class="chat-file-change-diff-ln"></span>
             <span class="chat-file-change-diff-code">{t('chat.file_change_truncated')}</span>
           </div>
@@ -1707,12 +1946,57 @@ const MemoryContextEvent = memo(function MemoryContextEvent({ event }: { event: 
   const items = Array.isArray(payload.items) ? payload.items as MemoryContextTimelineItem[] : [];
   const query = typeof payload.query === 'string' ? payload.query : '';
   const reason = payload.reason ?? 'message';
+  const statusSummary = getMemoryContextStatusSummary(t, payload, items.length);
+  const statusDetail = getMemoryContextStatusDetail(t, payload);
+  const isStatusOnly = items.length === 0 && !!payload.status;
+  // The startup-memory dump and the per-message recall both render as
+  // memory-context cards, but they're conceptually different things:
+  //   - startup: a one-shot "pre-loaded project history" preamble
+  //   - message: memories related to the current prompt
+  // Using a different title for startup makes the distinction legible
+  // at a glance and stops users from reading a restored-session card as a
+  // fresh recall (see the daemon-restart dedup fix that pairs with this).
+  const titleKey = reason === 'startup'
+    ? 'chat.memory_context_startup_title'
+    : 'chat.memory_context_title';
+
+  if (isStatusOnly) {
+    // Skipped/empty recall cards were showing title + summary + query + detail
+    // stacked at once. The query is just the prompt the user already sees one
+    // bubble above — redundant noise. Collapse to a single-line summary with
+    // a caret to expand when the user actually wants the detail.
+    const hasDetail = !!statusDetail;
+    return (
+      <div class="chat-event chat-memory-context chat-memory-context-status" data-related-to={String(payload.relatedToEventId ?? '')}>
+        {hasDetail ? (
+          <button
+            type="button"
+            class="chat-memory-context-toggle chat-memory-context-status-toggle"
+            onClick={() => setExpanded((value) => !value)}
+            aria-expanded={expanded}
+          >
+            <span class="chat-memory-context-status-title">{t(titleKey)}</span>
+            <span class="chat-memory-context-status-summary">{statusSummary}</span>
+            <span class="chat-memory-context-caret">{expanded ? '▲' : '▼'}</span>
+          </button>
+        ) : (
+          <div class="chat-memory-context-status-row">
+            <span class="chat-memory-context-status-title">{t(titleKey)}</span>
+            <span class="chat-memory-context-status-summary">{statusSummary}</span>
+          </div>
+        )}
+        {expanded && hasDetail && (
+          <div class="chat-memory-context-status-detail">{statusDetail}</div>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div class="chat-event chat-memory-context" data-related-to={String(payload.relatedToEventId ?? '')}>
       <button class="chat-memory-context-toggle" onClick={() => setExpanded((value) => !value)}>
-        <span class="chat-memory-context-title">{t('chat.memory_context_title')}</span>
-        <span class="chat-memory-context-summary">{t('chat.memory_context_summary', { count: items.length })}</span>
+        <span class="chat-memory-context-title">{t(titleKey)}</span>
+        <span class="chat-memory-context-summary">{statusSummary}</span>
         <span class="chat-memory-context-caret">{expanded ? '▲' : '▼'}</span>
       </button>
       {expanded && (

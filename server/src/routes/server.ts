@@ -31,6 +31,9 @@ import {
   SHARED_CONTEXT_RUNTIME_CONFIG_MSG,
 } from '../../../shared/shared-context-runtime-config.js';
 import { searchSemanticMemoryView } from '../util/semantic-memory-view.js';
+import { deletePersonalMemoryProjection } from '../util/memory-delete.js';
+import { isMemoryNoiseSummary } from '../../../shared/memory-noise-patterns.js';
+import { SUPERVISION_USER_DEFAULT_PREF_KEY } from '../../../shared/supervision-config.js';
 
 export const serverRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -71,8 +74,17 @@ const namespaceResolutionSchema = z.object({
 const runtimeConfigSchema = z.object({
   primaryContextBackend: z.enum(['claude-code-sdk', 'codex-sdk', 'qwen', 'openclaw']).optional().nullable(),
   primaryContextModel: z.string().trim().min(1),
+  primaryContextPreset: z.string().trim().optional().nullable(),
   backupContextBackend: z.enum(['claude-code-sdk', 'codex-sdk', 'qwen', 'openclaw']).optional().nullable(),
   backupContextModel: z.string().trim().optional().nullable(),
+  backupContextPreset: z.string().trim().optional().nullable(),
+  memoryRecallMinScore: z.number().finite().min(0).max(1).optional().nullable(),
+  memoryScoringWeights: z.object({
+    similarity: z.number().finite().min(0).max(1).optional().nullable(),
+    recency: z.number().finite().min(0).max(1).optional().nullable(),
+    frequency: z.number().finite().min(0).max(1).optional().nullable(),
+    project: z.number().finite().min(0).max(1).optional().nullable(),
+  }).optional().nullable(),
   enablePersonalMemorySync: z.boolean().optional().nullable(),
 });
 
@@ -118,18 +130,19 @@ function buildRemoteMemoryResponse(
   limit = 20,
 ): { stats: ContextMemoryStatsView; records: ContextMemoryRecordView[] } {
   const normalizedQuery = query?.trim() ?? '';
-  const filtered = rows.filter((row) => matchesMemoryQuery(
+  const cleanRows = rows.filter((row) => !isMemoryNoiseSummary(row.summary));
+  const filtered = cleanRows.filter((row) => matchesMemoryQuery(
     row.summary,
     typeof row.content_json === 'string' ? JSON.parse(row.content_json) : row.content_json,
     normalizedQuery,
   ));
-  const projectIds = new Set(rows.map((row) => row.project_id));
+  const projectIds = new Set(cleanRows.map((row) => row.project_id));
   return {
     stats: {
-      totalRecords: rows.length,
+      totalRecords: cleanRows.length,
       matchedRecords: filtered.length,
-      recentSummaryCount: rows.filter((row) => row.projection_class === 'recent_summary').length,
-      durableCandidateCount: rows.filter((row) => row.projection_class === 'durable_memory_candidate').length,
+      recentSummaryCount: cleanRows.filter((row) => row.projection_class === 'recent_summary').length,
+      durableCandidateCount: cleanRows.filter((row) => row.projection_class === 'durable_memory_candidate').length,
       projectCount: projectIds.size,
       stagedEventCount: 0,
       dirtyTargetCount: 0,
@@ -255,8 +268,19 @@ serverRoutes.put('/:id/shared-context/runtime-config', requireAuth(), async (c) 
   const normalized = normalizeSharedContextRuntimeConfig({
     primaryContextBackend: parsed.data.primaryContextBackend ?? undefined,
     primaryContextModel: parsed.data.primaryContextModel,
+    primaryContextPreset: parsed.data.primaryContextPreset ?? undefined,
     backupContextBackend: parsed.data.backupContextBackend ?? undefined,
     backupContextModel: parsed.data.backupContextModel ?? undefined,
+    backupContextPreset: parsed.data.backupContextPreset ?? undefined,
+    memoryRecallMinScore: parsed.data.memoryRecallMinScore ?? undefined,
+    memoryScoringWeights: parsed.data.memoryScoringWeights
+      ? {
+          similarity: parsed.data.memoryScoringWeights.similarity ?? undefined,
+          recency: parsed.data.memoryScoringWeights.recency ?? undefined,
+          frequency: parsed.data.memoryScoringWeights.frequency ?? undefined,
+          project: parsed.data.memoryScoringWeights.project ?? undefined,
+        }
+      : undefined,
     enablePersonalMemorySync: parsed.data.enablePersonalMemorySync ?? undefined,
   });
   const updated = await updateServerSharedContextRuntimeConfig(c.env.DB, serverId, userId, {
@@ -294,6 +318,43 @@ serverRoutes.get('/:id/shared-context/runtime-config/daemon', async (c) => {
       enablePersonalMemorySync: personalSyncEnabled,
     },
   });
+});
+
+/**
+ * GET /:id/supervision/user-defaults/daemon
+ *
+ * Daemon-scoped (Bearer server token) read of the user's global supervision
+ * defaults pref. Exists because the web client only mirrors
+ * `globalCustomInstructions` into the CURRENTLY-edited session's transportConfig
+ * on save. Any OTHER session's cached snapshot retains an older (or empty)
+ * global value — which is what made the user-visible complaint "typed
+ * `Always commit and push if asked!` in Global custom instructions, but
+ * supervisor ignores it" real: the session under supervision was not the
+ * session where the defaults were saved, so its snapshot's
+ * `globalCustomInstructions` was stale.
+ *
+ * The daemon polls this at startup + on each WS reconnect and uses the
+ * result as a fallback layer for `resolveEffectiveCustomInstructions()`.
+ */
+serverRoutes.get('/:id/supervision/user-defaults/daemon', async (c) => {
+  const auth = c.req.header('Authorization');
+  if (!auth?.startsWith('Bearer ')) return c.json({ error: 'unauthorized' }, 401);
+  const tokenHash = sha256Hex(auth.slice(7));
+  const serverId = c.req.param('id');
+  const server = await c.env.DB.queryOne<{ id: string; user_id: string }>(
+    'SELECT id, user_id FROM servers WHERE id = $1 AND token_hash = $2',
+    [serverId, tokenHash],
+  );
+  if (!server) return c.json({ error: 'unauthorized' }, 401);
+  const raw = await getUserPref(c.env.DB, server.user_id, SUPERVISION_USER_DEFAULT_PREF_KEY);
+  let parsed: Record<string, unknown> | null = null;
+  if (raw) {
+    try {
+      const value = JSON.parse(raw);
+      if (value && typeof value === 'object' && !Array.isArray(value)) parsed = value as Record<string, unknown>;
+    } catch { /* malformed pref → treat as empty */ }
+  }
+  return c.json({ defaults: parsed });
 });
 
 /**
@@ -383,7 +444,10 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
 
   const now = Date.now();
+  let acceptedCount = 0;
+  const acceptedProjections: typeof parsed.data.projections = [];
   for (const projection of parsed.data.projections) {
+    if (isMemoryNoiseSummary(projection.summary)) continue;
     const isPersonal = projection.namespace.scope === 'personal';
     if (isPersonal && projection.namespace.userId && projection.namespace.userId !== serverRow.user_id) {
       return c.json({ error: 'namespace_user_mismatch', projectionId: projection.id }, 403);
@@ -430,6 +494,8 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
         now,
       ],
     );
+    acceptedCount += 1;
+    acceptedProjections.push(projection);
 
     if (projection.class === 'durable_memory_candidate') {
       await c.env.DB.execute(
@@ -468,7 +534,7 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
 
   // Fire-and-forget: generate and store embeddings for replicated projections
   import('../util/embedding.js').then(({ storeProjectionEmbedding }) => {
-    for (const projection of parsed.data.projections) {
+    for (const projection of acceptedProjections) {
       if (projection.summary) {
         storeProjectionEmbedding(c.env.DB, projection.id, projection.summary).catch(() => {});
       }
@@ -478,8 +544,20 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
   return c.json({
     ok: true,
     replicatedAt: now,
-    projectionCount: parsed.data.projections.length,
+    projectionCount: acceptedCount,
   });
+});
+
+serverRoutes.delete('/:id/shared-context/personal-memory/:memoryId', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id') ?? '';
+  const memoryId = c.req.param('memoryId');
+  if (!memoryId) return c.json({ error: 'missing_memory_id' }, 400);
+  const server = await getServerById(c.env.DB, serverId);
+  if (!server || server.user_id !== userId) return c.json({ error: 'not_found' }, 404);
+  const deleted = await deletePersonalMemoryProjection(c.env.DB, userId, memoryId);
+  if (!deleted) return c.json({ error: 'not_found' }, 404);
+  return c.json({ ok: true, id: memoryId });
 });
 
 serverRoutes.get('/:id/shared-context/personal-memory', requireAuth(), async (c) => {
@@ -487,6 +565,7 @@ serverRoutes.get('/:id/shared-context/personal-memory', requireAuth(), async (c)
   const serverId = c.req.param('id') ?? '';
   const server = await getServerById(c.env.DB, serverId);
   if (!server || server.user_id !== userId) return c.json({ error: 'not_found' }, 404);
+  const runtimeConfig = normalizeSharedContextRuntimeConfig(await getServerSharedContextRuntimeConfig(c.env.DB, serverId));
   const projectId = c.req.query('projectId')?.trim();
   const projectionClass = c.req.query('projectionClass') === 'recent_summary' || c.req.query('projectionClass') === 'durable_memory_candidate'
     ? c.req.query('projectionClass') as 'recent_summary' | 'durable_memory_candidate'
@@ -503,6 +582,7 @@ serverRoutes.get('/:id/shared-context/personal-memory', requireAuth(), async (c)
       projectId: projectId || undefined,
       projectionClass,
       limit,
+      scoringWeights: runtimeConfig.memoryScoringWeights,
     });
     if (semanticView) return c.json(semanticView);
   }

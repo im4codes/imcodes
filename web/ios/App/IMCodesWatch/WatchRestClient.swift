@@ -164,14 +164,16 @@ actor WatchRestClient {
         serverId: String,
         sessionName: String,
         text: String,
-        apiKey: String
+        apiKey: String,
+        commandId: String = UUID().uuidString
     ) async throws -> SendResult {
         let request = try Self.makeRequest(
             baseUrl: baseUrl,
             serverId: serverId,
             sessionName: sessionName,
             text: text,
-            apiKey: apiKey
+            apiKey: apiKey,
+            commandId: commandId
         )
 
         do {

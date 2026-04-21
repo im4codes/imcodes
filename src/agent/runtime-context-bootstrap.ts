@@ -17,6 +17,8 @@ import { buildStartupProjectMemoryText } from '../../shared/memory-recall-format
 export interface TransportContextBootstrapInput {
   projectDir?: string;
   transportConfig?: Record<string, unknown> | null;
+  /** When true, skip the expensive startup-memory build step entirely. */
+  startupMemoryAlreadyInjected?: boolean;
 }
 
 export interface TransportContextBootstrap {
@@ -36,11 +38,9 @@ export async function resolveTransportContextBootstrap(
 ): Promise<TransportContextBootstrap> {
   const explicitNamespace = parseExplicitContextNamespace(input.transportConfig);
   if (explicitNamespace) {
-    return {
-      namespace: explicitNamespace,
+    return buildBootstrapResult(explicitNamespace, {
       diagnostics: ['namespace:explicit'],
-      localProcessedFreshness: getLocalProcessedFreshness(explicitNamespace),
-    };
+    }, input.startupMemoryAlreadyInjected);
   }
 
   const projectDir = input.projectDir?.trim();
@@ -64,36 +64,30 @@ export async function resolveTransportContextBootstrap(
         const resolved = await fetchBackendSharedContextNamespace(credentials, canonical.key);
         if (resolved?.namespace) {
           const namespace = resolved.namespace;
-          return {
-            namespace,
+          return buildBootstrapResult(namespace, {
             diagnostics: ['namespace:server-control-plane', ...resolved.diagnostics],
             remoteProcessedFreshness: resolved.remoteProcessedFreshness,
-            localProcessedFreshness: getLocalProcessedFreshness(namespace),
             retryExhausted: resolved.retryExhausted,
             sharedPolicyOverride: resolved.sharedPolicyOverride,
-          };
+          }, input.startupMemoryAlreadyInjected);
         }
         const personalNamespace: ContextNamespace = {
           scope: 'personal',
           projectId: canonical.key,
         };
-        return {
-          namespace: personalNamespace,
+        return buildBootstrapResult(personalNamespace, {
           diagnostics: ['namespace:server-personal-fallback', ...(resolved?.diagnostics ?? [])],
           remoteProcessedFreshness: resolved?.remoteProcessedFreshness,
-          localProcessedFreshness: getLocalProcessedFreshness(personalNamespace),
           retryExhausted: resolved?.retryExhausted,
-        };
+        }, input.startupMemoryAlreadyInjected);
       } catch {
         const personalNamespace: ContextNamespace = {
           scope: 'personal',
           projectId: canonical.key,
         };
-        return {
-          namespace: personalNamespace,
+        return buildBootstrapResult(personalNamespace, {
           diagnostics: ['namespace:server-resolution-failed', 'namespace:git-origin'],
-          localProcessedFreshness: getLocalProcessedFreshness(personalNamespace),
-        };
+        }, input.startupMemoryAlreadyInjected);
       }
     }
   }
@@ -102,10 +96,21 @@ export async function resolveTransportContextBootstrap(
     scope: 'personal',
     projectId: canonical.key,
   };
-  return {
-    namespace: fallbackNamespace,
+  return buildBootstrapResult(fallbackNamespace, {
     diagnostics: [`namespace:${canonical.kind}`],
-    localProcessedFreshness: getLocalProcessedFreshness(fallbackNamespace),
+  }, input.startupMemoryAlreadyInjected);
+}
+
+function buildBootstrapResult(
+  namespace: ContextNamespace,
+  extras: Omit<TransportContextBootstrap, 'namespace' | 'localProcessedFreshness' | 'startupMemory'>,
+  skipStartupMemory = false,
+): TransportContextBootstrap {
+  return {
+    namespace,
+    ...extras,
+    localProcessedFreshness: getLocalProcessedFreshness(namespace),
+    startupMemory: skipStartupMemory ? undefined : buildTransportStartupMemory(namespace),
   };
 }
 

@@ -114,8 +114,11 @@ struct SessionDetailView: View {
         }
         .task {
             await sessionManager.loadHistoryIfNeeded(for: route)
+            // Chat view active → poll more aggressively so a sent message
+            // reconciles with the real echo fast instead of sitting in the
+            // optimistic "sending" state for 12+ seconds.
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(12))
+                try? await Task.sleep(for: .seconds(6))
                 guard !Task.isCancelled else { break }
                 await sessionManager.loadHistoryIfNeeded(for: route)
             }
@@ -153,13 +156,42 @@ struct SessionDetailView: View {
                 ForEach(historyState.items) { item in
                     HStack {
                         if item.isUser { Spacer(minLength: 20) }
-                        Text(item.text)
-                            .font(.system(size: 12))
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 6)
-                            .foregroundStyle(item.isUser ? Color.white : Color.primary)
-                            .background(item.isUser ? Color.green : Color.gray.opacity(0.22))
-                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        VStack(alignment: item.isUser ? .trailing : .leading, spacing: 2) {
+                            Text(item.text)
+                                .font(.system(size: 12))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 6)
+                                .foregroundStyle(bubbleForeground(for: item))
+                                .background(bubbleBackground(for: item))
+                                .opacity(item.isPending ? 0.65 : 1.0)
+                                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                        .strokeBorder(item.isFailed ? Color.red.opacity(0.85) : Color.clear, lineWidth: 1)
+                                )
+                            if item.isPending {
+                                HStack(spacing: 3) {
+                                    ProgressView()
+                                        .progressViewStyle(.circular)
+                                        .scaleEffect(0.45)
+                                        .frame(width: 10, height: 10)
+                                    Text("Sending")
+                                        .font(.system(size: 8))
+                                        .foregroundStyle(.secondary)
+                                }
+                            } else if item.isFailed {
+                                HStack(spacing: 3) {
+                                    Text("!")
+                                        .font(.system(size: 9, weight: .bold))
+                                        .foregroundStyle(.white)
+                                        .frame(width: 10, height: 10)
+                                        .background(Circle().fill(Color.red))
+                                    Text(item.failureReason ?? "Failed — tap Send to retry")
+                                        .font(.system(size: 8))
+                                        .foregroundStyle(.red)
+                                }
+                            }
+                        }
                         if !item.isUser { Spacer(minLength: 20) }
                     }
                 }
@@ -234,6 +266,22 @@ struct SessionDetailView: View {
         sessionManager.historyState(for: route)
     }
 
+    // Pending/failed states tint the bubble so the user can see the status of
+    // each send at a glance on a tiny screen. Assistant messages always use the
+    // muted gray background.
+    private func bubbleBackground(for item: WatchConversationItem) -> Color {
+        if !item.isUser { return Color.gray.opacity(0.22) }
+        if item.isFailed { return Color.red.opacity(0.28) }
+        if item.isPending { return Color.green.opacity(0.45) }
+        return Color.green
+    }
+
+    private func bubbleForeground(for item: WatchConversationItem) -> Color {
+        if !item.isUser { return Color.primary }
+        if item.isFailed { return Color.white }
+        return Color.white
+    }
+
     private var stateColor: Color {
         guard let session else { return .gray }
         switch session.state {
@@ -259,6 +307,13 @@ struct SessionDetailView: View {
         isSending = true
         defer { isSending = false }
 
+        // Inject an optimistic user bubble immediately so the watch screen
+        // shows the message before the HTTP round-trip completes. The real
+        // echo from the next 6s history poll replaces it by commandId.
+        let commandId = UUID().uuidString
+        let sendRoute = route
+        sessionManager.appendOptimisticSend(for: sendRoute, text: text, commandId: commandId)
+
         do {
             let client = WatchRestClient()
             let result = try await client.sendReply(
@@ -266,23 +321,30 @@ struct SessionDetailView: View {
                 serverId: route.serverId,
                 sessionName: session.sessionName,
                 text: text,
-                apiKey: apiKey
+                apiKey: apiKey,
+                commandId: commandId
             )
             switch result {
             case .accepted:
                 draft = ""
                 WKInterfaceDevice.current().play(.success)
                 statusMessage = "Sent"
+                // Speed up reconciliation: pull fresh history right away
+                // instead of waiting for the 6s tick.
+                Task { await sessionManager.loadHistoryIfNeeded(for: sendRoute) }
             case .authExpired:
                 WKInterfaceDevice.current().play(.failure)
                 statusMessage = "Auth expired"
+                sessionManager.markOptimisticSendFailed(for: sendRoute, commandId: commandId, reason: "Auth expired")
             case .agentUnavailable:
                 WKInterfaceDevice.current().play(.failure)
                 statusMessage = "Agent offline"
+                sessionManager.markOptimisticSendFailed(for: sendRoute, commandId: commandId, reason: "Agent offline")
             }
         } catch {
             WKInterfaceDevice.current().play(.failure)
             statusMessage = "Network error"
+            sessionManager.markOptimisticSendFailed(for: sendRoute, commandId: commandId, reason: "Network error")
         }
     }
 }

@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ── Hoisted mocks ─────────────────────────────────────────────────────────────
 
-const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider } = vi.hoisted(() => {
+const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider } = vi.hoisted(() => {
   const mockConnect = vi.fn().mockResolvedValue(undefined);
   const mockDisconnect = vi.fn().mockResolvedValue(undefined);
   const MockOpenClawProvider = vi.fn().mockImplementation(() => ({
@@ -89,7 +89,50 @@ const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, Moc
     createSession: vi.fn().mockResolvedValue('session-1'),
     endSession: vi.fn().mockResolvedValue(undefined),
   }));
-  return { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider };
+  const MockCursorHeadlessProvider = vi.fn().mockImplementation(() => ({
+    id: 'cursor-headless',
+    connectionMode: 'local-sdk',
+    sessionOwnership: 'shared',
+    capabilities: {
+      streaming: true,
+      toolCalling: true,
+      approval: false,
+      sessionRestore: true,
+      multiTurn: true,
+      attachments: false,
+    },
+    connect: mockConnect,
+    disconnect: mockDisconnect,
+    send: vi.fn().mockResolvedValue(undefined),
+    onDelta: vi.fn(),
+    onComplete: vi.fn(),
+    onError: vi.fn(),
+    createSession: vi.fn().mockResolvedValue('route-1'),
+    endSession: vi.fn().mockResolvedValue(undefined),
+  }));
+  const MockCopilotSdkProvider = vi.fn().mockImplementation(() => ({
+    id: 'copilot-sdk',
+    connectionMode: 'local-sdk',
+    sessionOwnership: 'shared',
+    capabilities: {
+      streaming: true,
+      toolCalling: true,
+      approval: true,
+      sessionRestore: true,
+      multiTurn: true,
+      attachments: true,
+      reasoningEffort: true,
+    },
+    connect: mockConnect,
+    disconnect: mockDisconnect,
+    send: vi.fn().mockResolvedValue(undefined),
+    onDelta: vi.fn(),
+    onComplete: vi.fn(),
+    onError: vi.fn(),
+    createSession: vi.fn().mockResolvedValue('route-2'),
+    endSession: vi.fn().mockResolvedValue(undefined),
+  }));
+  return { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider };
 });
 
 vi.mock('../../src/agent/providers/openclaw.js', () => ({
@@ -106,6 +149,14 @@ vi.mock('../../src/agent/providers/claude-code-sdk.js', () => ({
 
 vi.mock('../../src/agent/providers/codex-sdk.js', () => ({
   CodexSdkProvider: MockCodexSdkProvider,
+}));
+
+vi.mock('../../src/agent/providers/cursor-headless.js', () => ({
+  CursorHeadlessProvider: MockCursorHeadlessProvider,
+}));
+
+vi.mock('../../src/agent/providers/copilot-sdk.js', () => ({
+  CopilotSdkProvider: MockCopilotSdkProvider,
 }));
 
 vi.mock('../../src/util/logger.js', () => ({
@@ -172,6 +223,20 @@ describe('getProvider', () => {
     expect(provider!.id).toBe('codex-sdk');
   });
 
+  it('returns cursor-headless after connectProvider()', async () => {
+    await connectProvider('cursor-headless', CONFIG);
+    const provider = getProvider('cursor-headless');
+    expect(provider).toBeDefined();
+    expect(provider!.id).toBe('cursor-headless');
+  });
+
+  it('returns copilot-sdk after connectProvider()', async () => {
+    await connectProvider('copilot-sdk', CONFIG);
+    const provider = getProvider('copilot-sdk');
+    expect(provider).toBeDefined();
+    expect(provider!.id).toBe('copilot-sdk');
+  });
+
   it('returns undefined for an unknown id', () => {
     expect(getProvider('minimax')).toBeUndefined();
   });
@@ -200,6 +265,18 @@ describe('connectProvider', () => {
   it('instantiates CodexSdkProvider and calls connect()', async () => {
     await connectProvider('codex-sdk', CONFIG);
     expect(MockCodexSdkProvider).toHaveBeenCalledOnce();
+    expect(mockConnect).toHaveBeenCalledWith(CONFIG);
+  });
+
+  it('instantiates CursorHeadlessProvider and calls connect()', async () => {
+    await connectProvider('cursor-headless', CONFIG);
+    expect(MockCursorHeadlessProvider).toHaveBeenCalledOnce();
+    expect(mockConnect).toHaveBeenCalledWith(CONFIG);
+  });
+
+  it('instantiates CopilotSdkProvider and calls connect()', async () => {
+    await connectProvider('copilot-sdk', CONFIG);
+    expect(MockCopilotSdkProvider).toHaveBeenCalledOnce();
     expect(mockConnect).toHaveBeenCalledWith(CONFIG);
   });
 

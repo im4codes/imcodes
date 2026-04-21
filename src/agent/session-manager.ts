@@ -39,10 +39,13 @@ import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import { isClaudeCodeFamily, isCodexFamily } from '../../shared/agent-types.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 import { resolveTransportContextBootstrap } from './runtime-context-bootstrap.js';
+import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 
 import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
 import { closeSingleSession, collectProjectCloseTargets, type CloseFailure, type CloseTreeResult } from './session-close.js';
+import { cleanupKnownTestTerminalSessions } from './startup-test-session-cleanup.js';
+import { clearResend, drainResend, getResendCount } from '../daemon/transport-resend-queue.js';
 
 /** Start JSONL watcher for a CC session — uses specific file if ccSessionId known, else directory scan. */
 function startCCWatcher(sessionName: string, projectDir: string, ccSessionId?: string): void {
@@ -238,6 +241,9 @@ export async function stopProject(
           }
         }
         removeSession(record.name);
+        // Session is gone — drop any queued resend work so it can't replay into
+        // a same-named session that gets created later.
+        clearResend(record.name);
         emitSessionPersist(null, record.name);
         if (record.projectDir && !invalidatedDirs.has(record.projectDir)) {
           invalidatedDirs.add(record.projectDir);
@@ -284,7 +290,35 @@ export async function teardownProject(projectName: string): Promise<void> {
 
 /** Clean up orphan FIFOs from previous daemon runs and reconcile session store on startup. */
 export async function initOnStartup(): Promise<void> {
-  await cleanupOrphanFifos();
+  // Each step is isolated: a failure here (e.g. tmux not ready at boot) must
+  // never crash the daemon. The daemon stays alive with degraded startup state
+  // and retries operations lazily when used. See daemon-NEVER-die policy in
+  // src/index.ts.
+  try {
+    await cleanupOrphanFifos();
+  } catch (err) {
+    logger.warn({ err }, 'cleanupOrphanFifos failed — daemon continues');
+  }
+  try {
+    await cleanupKnownTestTerminalSessions();
+  } catch (err) {
+    logger.warn({ err }, 'cleanupKnownTestTerminalSessions failed — daemon continues');
+  }
+  // Fire-and-forget: preload the transformers.js feature-extraction pipeline
+  // so the first "Related history" semantic search doesn't pay the cold-load
+  // cost (hundreds of ms to a few seconds). `isEmbeddingAvailable` swallows
+  // errors internally, so a failure here just leaves the first real query to
+  // attempt the load and fall back to plain SQL search.
+  void (async () => {
+    try {
+      const { isEmbeddingAvailable } = await import('../context/embedding.js');
+      const startedAt = Date.now();
+      const ready = await isEmbeddingAvailable();
+      logger.info({ ready, elapsedMs: Date.now() - startedAt }, 'Embedding pipeline warmup');
+    } catch (err) {
+      logger.debug({ err }, 'Embedding pipeline warmup failed (non-fatal)');
+    }
+  })();
 }
 
 /** Extract a UUID from tmux pane start command (supports --session-id and --resume). */
@@ -762,6 +796,8 @@ export interface LaunchOpts {
   geminiSessionId?: string;
   /** OpenCode session ID for `opencode -s <ID>`. */
   opencodeSessionId?: string;
+  /** Provider-side durable resume identifier for shared local-sdk providers. */
+  providerResumeId?: string;
   /** Qwen model ID for `qwen --model <ID>`. */
   qwenModel?: string;
   /** Unified requested transport model for launch/restore. */
@@ -857,6 +893,8 @@ export async function relaunchSessionWithSettings(
     // codexSessionId and therefore use a fresh local route key on relaunch.
     && targetAgentType !== 'claude-code-sdk'
     && targetAgentType !== 'codex-sdk'
+    && targetAgentType !== 'copilot-sdk'
+    && targetAgentType !== 'cursor-headless'
     && typeof record.providerSessionId === 'string'
     && record.providerSessionId.length > 0;
 
@@ -933,6 +971,13 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
       pendingMessageEntries: runtime.pendingEntries,
     }, { source: 'daemon', confidence: 'high' });
   };
+  runtime.onStartupMemoryInjected = () => {
+    const existing = getSession(sessionName);
+    if (!existing) return;
+    if (existing.startupMemoryInjected === true) return;
+    upsertSession({ ...existing, startupMemoryInjected: true, updatedAt: Date.now() });
+    logger.info({ sessionName }, 'Persisted startupMemoryInjected flag');
+  };
 }
 
 function mergeSessionContextBootstrap(next: SessionRecord, info: SessionInfoUpdate): boolean {
@@ -996,6 +1041,10 @@ function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName:
         next.codexSessionId = info.resumeId;
         changed = true;
       }
+      if ((agentType === 'cursor-headless' || agentType === 'copilot-sdk') && next.providerResumeId !== info.resumeId) {
+        next.providerResumeId = info.resumeId;
+        changed = true;
+      }
       if (agentType === 'qwen' && next.providerSessionId !== info.resumeId) {
         if (next.providerSessionId) unregisterProviderRoute(next.providerSessionId);
         next.providerSessionId = info.resumeId;
@@ -1051,6 +1100,16 @@ function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName:
 /** providerSessionId → IM.codes sessionName routing map */
 const providerRouting = new Map<string, string>();
 
+/**
+ * providerSessionIds that belong to **out-of-band callers** (e.g.
+ * `supervision-broker`, `summary-compressor`) which drive the provider
+ * directly and attach their own `onComplete`/`onError` listeners filtered
+ * by sid. Their deltas must be silently dropped by `transport-relay`
+ * rather than warn-logged per-delta, because there's no IM.codes
+ * user-facing session to relay them to. Caller owns mark/unmark lifecycle.
+ */
+const ephemeralProviderSids = new Set<string>();
+
 /** Register a provider session ID → IM.codes session name route. */
 export function registerProviderRoute(providerSessionId: string, sessionName: string): void {
   providerRouting.set(providerSessionId, sessionName);
@@ -1059,6 +1118,27 @@ export function registerProviderRoute(providerSessionId: string, sessionName: st
 /** Unregister a provider session ID route. */
 export function unregisterProviderRoute(providerSessionId: string): void {
   providerRouting.delete(providerSessionId);
+}
+
+/**
+ * Mark a providerSessionId as belonging to an ephemeral out-of-band caller
+ * (supervision decision, summary compression, etc.). `transport-relay`
+ * will drop this sid's deltas silently instead of warning. The caller is
+ * responsible for calling `unmarkEphemeralProviderSid` when the session
+ * ends (typically in a finally block alongside `provider.endSession`).
+ */
+export function markEphemeralProviderSid(providerSessionId: string): void {
+  ephemeralProviderSids.add(providerSessionId);
+}
+
+/** Release an ephemeral providerSessionId marking. Idempotent. */
+export function unmarkEphemeralProviderSid(providerSessionId: string): void {
+  ephemeralProviderSids.delete(providerSessionId);
+}
+
+/** Is this providerSessionId a known ephemeral/out-of-band sid? */
+export function isEphemeralProviderSid(providerSessionId: string): boolean {
+  return ephemeralProviderSids.has(providerSessionId);
 }
 
 /** Resolve a provider session ID to an IM.codes session name. */
@@ -1109,30 +1189,31 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         ? (s.qwenAvailableModels?.length ? s.qwenAvailableModels : (qwenRuntime?.availableModels ?? []))
         : [];
       const requestedTransportModel = s.requestedModel ?? s.qwenModel;
-      const effectiveQwenModel = s.providerId === 'qwen'
-        ? (requestedTransportModel && (availableQwenModels.length === 0 || availableQwenModels.includes(requestedTransportModel))
-          ? requestedTransportModel
-          : availableQwenModels[0])
-        : requestedTransportModel;
       const runtime = new TransportSessionRuntime(provider, s.name);
       wireTransportCallbacks(runtime, s.name);
       wireTransportSessionInfo(runtime, s.name, s.agentType);
       // After cancel, qwenFreshOnResume is set — don't resume the stuck conversation.
       const freshAfterCancel = !!(s.qwenFreshOnResume && s.providerId === 'qwen');
-      const needsEphemeralRouteKey = s.providerId === 'claude-code-sdk' || s.providerId === 'codex-sdk';
+      const needsEphemeralRouteKey = s.providerId === 'claude-code-sdk'
+        || s.providerId === 'codex-sdk'
+        || s.providerId === 'cursor-headless'
+        || s.providerId === 'copilot-sdk';
       const effectiveSessionKey = freshAfterCancel || needsEphemeralRouteKey ? randomUUID() : s.providerSessionId;
       const resumeId = s.providerId === 'claude-code-sdk'
         ? s.ccSessionId
         : s.providerId === 'codex-sdk'
           ? s.codexSessionId
-          : undefined;
+          : (s.providerId === 'cursor-headless' || s.providerId === 'copilot-sdk')
+            ? s.providerResumeId
+            : undefined;
       let extraEnv: Record<string, string> | undefined;
       let systemPrompt: string | undefined;
       let transportSettings: string | Record<string, unknown> | undefined;
-      let effectiveRequestedModel = effectiveQwenModel;
+      let effectiveRequestedModel = requestedTransportModel;
       const resolveRuntimeContextBootstrap = () => resolveTransportContextBootstrap({
         projectDir: s.projectDir,
         transportConfig: getSession(s.name)?.transportConfig ?? s.transportConfig ?? {},
+        startupMemoryAlreadyInjected: s.startupMemoryInjected === true,
       });
       const contextBootstrap = await resolveRuntimeContextBootstrap();
       runtime.setContextBootstrapResolver(resolveRuntimeContextBootstrap);
@@ -1146,17 +1227,29 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         const { getQwenPresetTransportConfig } = await import('../daemon/cc-presets.js');
         const presetConfig = await getQwenPresetTransportConfig(s.ccPreset);
         extraEnv = { ...(extraEnv ?? {}), ...presetConfig.env };
-        if (!effectiveRequestedModel && presetConfig.model) effectiveRequestedModel = presetConfig.model;
-        transportSettings = presetConfig.settings;
+        // Preset is authoritative: its model overrides any stored value (e.g. a
+        // pre-preset session persisted `qwenModel: 'coder-model'` that is no
+        // longer valid under --auth-type anthropic). Restricting the available
+        // list to the preset model prevents the downstream fallback from
+        // reverting to the OAuth `coder-model` placeholder.
         if (presetConfig.model) {
-          const nextModels = new Set([...(availableQwenModels ?? []), presetConfig.model]);
-          availableQwenModels = [...nextModels];
+          effectiveRequestedModel = presetConfig.model;
+          availableQwenModels = [presetConfig.model];
         }
+        transportSettings = presetConfig.settings;
+        // Override the qwen CLI's built-in "I am Qwen Code" identity with the
+        // preset's runtime-facts prompt — without this, the model introduces
+        // itself as Qwen / 通义千问 even when the turn is served by MiniMax.
+        if (presetConfig.systemPrompt) systemPrompt = presetConfig.systemPrompt;
+      }
+      if (s.providerId === 'qwen'
+        && (!effectiveRequestedModel || (availableQwenModels.length > 0 && !availableQwenModels.includes(effectiveRequestedModel)))) {
+        effectiveRequestedModel = availableQwenModels[0] ?? effectiveRequestedModel;
       }
       await runtime.initialize({
         sessionKey: effectiveSessionKey,
-        bindExistingKey: freshAfterCancel ? undefined : s.providerSessionId,
-        skipCreate: !freshAfterCancel,
+        bindExistingKey: freshAfterCancel ? undefined : (needsEphemeralRouteKey ? s.providerSessionId : s.providerSessionId),
+        skipCreate: !freshAfterCancel && !!s.providerSessionId,
         ...(extraEnv ? { env: extraEnv } : {}),
         cwd: s.projectDir,
         label: s.label ?? s.name,
@@ -1172,6 +1265,10 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         agentId: effectiveRequestedModel,
         resumeId,
         effort: s.effort,
+        // Restore path: only re-inject startup memory if the prior run hadn't
+        // yet delivered it (e.g. daemon crashed mid-first-turn). Otherwise the
+        // conversation already has its history preamble and we must not repeat it.
+        startupMemoryAlreadyInjected: s.startupMemoryInjected === true,
       });
       if (s.description) runtime.setDescription(s.description);
       if (systemPrompt) runtime.setSystemPrompt(systemPrompt);
@@ -1199,17 +1296,65 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         // Preserve transportConfig exactly via ...s spread — never force `{}` which
         // would wipe user-set supervision settings on every daemon restart.
         ...(effectiveRequestedModel && s.providerId === 'qwen' ? { qwenModel: effectiveRequestedModel } : {}),
-        ...(qwenRuntime?.authType ? { qwenAuthType: qwenRuntime.authType } : {}),
-        ...(qwenRuntime?.authLimit ? { qwenAuthLimit: qwenRuntime.authLimit } : {}),
+        // When a qwen preset is active we're running `qwen --auth-type anthropic`
+        // against a user-provided API key (BYO tier). The user-level
+        // `~/.qwen/settings.json` tier labels ("Free", "No longer available")
+        // are misleading in that context, so override them for preset sessions.
+        qwenAuthType: (s.providerId === 'qwen' && s.ccPreset)
+          ? QWEN_AUTH_TYPES.API_KEY
+          : (qwenRuntime?.authType ?? s.qwenAuthType),
+        qwenAuthLimit: (s.providerId === 'qwen' && s.ccPreset)
+          ? undefined
+          : (qwenRuntime?.authLimit ?? s.qwenAuthLimit),
         ...(availableQwenModels.length > 0 ? { qwenAvailableModels: availableQwenModels } : {}),
         ...getQwenDisplayMetadata({
           model: effectiveRequestedModel,
-          authType: qwenRuntime?.authType ?? s.qwenAuthType,
-          authLimit: qwenRuntime?.authLimit ?? s.qwenAuthLimit,
-          quotaUsageLabel: (qwenRuntime?.authType ?? s.qwenAuthType) === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,
+          authType: (s.providerId === 'qwen' && s.ccPreset)
+            ? QWEN_AUTH_TYPES.API_KEY
+            : (qwenRuntime?.authType ?? s.qwenAuthType),
+          authLimit: (s.providerId === 'qwen' && s.ccPreset)
+            ? undefined
+            : (qwenRuntime?.authLimit ?? s.qwenAuthLimit),
+          quotaUsageLabel: (s.providerId === 'qwen' && s.ccPreset)
+            ? undefined
+            : ((qwenRuntime?.authType ?? s.qwenAuthType) === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined),
         }),
       });
       logger.info({ session: s.name, providerId: s.providerId, providerSid: s.providerSessionId, freshAfterCancel }, 'Restored transport session runtime');
+
+      // Drain messages that arrived while the provider was offline. The
+      // enqueue path deliberately did NOT emit a user.message event (the
+      // agent hadn't seen the message yet), so emit it HERE — exactly when
+      // runtime.send() returns 'sent' and the entry really is dispatched to
+      // the agent. If the runtime queues it internally (returns 'queued'),
+      // leave the optimistic pending bubble in place; it will be reconciled
+      // once the turn actually fires.
+      // Failures are logged and entries dropped to avoid retry loops.
+      const pendingCount = getResendCount(s.name);
+      if (pendingCount > 0) {
+        logger.info({ session: s.name, pendingCount }, 'Draining transport resend queue after reconnect');
+        void drainResend(s.name, (entry) => {
+          const attachments = entry.attachments ?? [];
+          const result = attachments.length > 0
+            ? runtime.send(entry.text, entry.commandId, attachments)
+            : runtime.send(entry.text, entry.commandId);
+          if (result === 'sent') {
+            timelineEmitter.emit(
+              s.name,
+              'user.message',
+              {
+                text: entry.text,
+                allowDuplicate: true,
+                commandId: entry.commandId,
+                clientMessageId: entry.commandId,
+                ...(attachments.length > 0 ? { attachments } : {}),
+              },
+              { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.commandId}` },
+            );
+          }
+          return result;
+        }).catch((err) => logger.warn({ err, session: s.name }, 'transport resend drain failed'));
+      }
     } catch (err) {
       logger.warn({ err, session: s.name }, 'Failed to restore transport session runtime');
     }
@@ -1217,7 +1362,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
 }
 
 export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
-  const { name, projectName, role, agentType, projectDir, skipStore, label, description, bindExistingKey, skipCreate, parentSession } = opts;
+  const { name, projectName, role, agentType, projectDir, skipStore, label, description, bindExistingKey, skipCreate } = opts;
   const existing = getSession(name);
   const inheritedClaudeResumeId = opts.ccSessionId ?? (!opts.fresh ? existing?.ccSessionId : undefined);
   const shouldResumeClaudeCliConversation = agentType === 'claude-code-sdk'
@@ -1255,17 +1400,43 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   let transportSystemPrompt: string | undefined;
   let transportSettings: string | Record<string, unknown> | undefined;
   const storedRequestedModel = !opts.fresh ? existing?.requestedModel : undefined;
+  const storedProviderResumeId = !opts.fresh ? existing?.providerResumeId : undefined;
   let requestedTransportModel = opts.requestedModel ?? storedRequestedModel ?? (agentType === 'qwen' ? (opts.qwenModel ?? existing?.qwenModel) : undefined);
   // Preserve existing transportConfig (including supervision) when opts doesn't override.
   // Only fall through to `undefined` if nothing is set — never force `{}`, which would
   // strip supervision on restart/relaunch.
   const effectiveTransportConfig: Record<string, unknown> | undefined =
     opts.transportConfig ?? existing?.transportConfig;
+  // Sticky fields — fall back to the stored record when the caller didn't pass
+  // them (e.g. daemon restart → rebuildSubSessions, provider auto-reconnect).
+  // Without this, reconstructing the SessionRecord below clobbers the preset
+  // and causes Qwen to revert from the preset model (MiniMax-M2 / GLM / Kimi …)
+  // back to the OAuth `coder-model` placeholder. `opts.fresh` (from /clear or
+  // explicit reset) still wins — same rule applied to transportConfig above.
+  const effectiveCcPreset: string | undefined =
+    opts.ccPreset ?? (!opts.fresh ? existing?.ccPreset : undefined);
+  const effectiveUserCreated: boolean | undefined =
+    opts.userCreated ?? (!opts.fresh ? existing?.userCreated : undefined);
+  const effectiveParentSession: string | undefined =
+    opts.parentSession ?? (!opts.fresh ? existing?.parentSession : undefined);
+  // recentInjectionHistory is maintained out-of-band by recent-injection-history.ts.
+  // If we don't carry it forward, upsertSession below wipes the dedup ring buffer
+  // and previously-injected memories get re-injected into the same conversation.
+  const preservedRecentInjectionHistory: string[][] | undefined =
+    !opts.fresh ? existing?.recentInjectionHistory : undefined;
   let transportResumeId: string | undefined;
   let transportEnv: Record<string, string> | undefined = opts.extraEnv;
+  let presetContextWindow: number | undefined = !opts.fresh ? existing?.presetContextWindow : undefined;
+  // Declared HERE (before the bootstrap resolver closes over it) because
+  // `resolveTransportContextBootstrap` reads it to decide whether to skip
+  // startup-memory DB queries entirely for restarts. Previously declared
+  // below, causing a TDZ `Cannot access before initialization` at launch —
+  // see commit f13c511 which moved the read site without moving the decl.
+  const preserveStartupMemoryInject = !opts.fresh && existing?.startupMemoryInjected === true;
   const resolveRuntimeContextBootstrap = () => resolveTransportContextBootstrap({
     projectDir,
     transportConfig: getSession(name)?.transportConfig ?? effectiveTransportConfig ?? {},
+    startupMemoryAlreadyInjected: preserveStartupMemoryInject,
   });
   const contextBootstrap = await resolveRuntimeContextBootstrap();
   runtime.setContextBootstrapResolver(resolveRuntimeContextBootstrap);
@@ -1274,16 +1445,24 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     qwenAuthType = qwenRuntime?.authType;
     qwenAuthLimit = qwenRuntime?.authLimit;
     availableQwenModels = qwenRuntime?.availableModels ?? [];
-    if (opts.ccPreset) {
+    if (effectiveCcPreset) {
       const { getQwenPresetTransportConfig } = await import('../daemon/cc-presets.js');
-      const presetConfig = await getQwenPresetTransportConfig(opts.ccPreset);
+      const presetConfig = await getQwenPresetTransportConfig(effectiveCcPreset);
       transportEnv = { ...(transportEnv ?? {}), ...presetConfig.env };
-      if (!requestedTransportModel && presetConfig.model) requestedTransportModel = presetConfig.model;
-      if (presetConfig.settings) transportSettings = presetConfig.settings;
+      // Preset is authoritative — its model overrides any stored/requested
+      // model, and we restrict the available list so the fallback below can't
+      // revert to the OAuth placeholder (`coder-model`). We're spawning qwen
+      // with `--auth-type anthropic` against a BYO API key, so the OAuth tier
+      // labels ("Free", "No longer available") don't apply — clear them.
       if (presetConfig.model) {
-        const nextModels = new Set([...(availableQwenModels ?? []), presetConfig.model]);
-        availableQwenModels = [...nextModels];
+        requestedTransportModel = presetConfig.model;
+        availableQwenModels = [presetConfig.model];
       }
+      presetContextWindow = presetConfig.contextWindow;
+      if (presetConfig.settings) transportSettings = presetConfig.settings;
+      if (presetConfig.systemPrompt) transportSystemPrompt = presetConfig.systemPrompt;
+      qwenAuthType = QWEN_AUTH_TYPES.API_KEY;
+      qwenAuthLimit = undefined;
     }
     if (!requestedTransportModel || (availableQwenModels.length > 0 && !availableQwenModels.includes(requestedTransportModel))) {
       requestedTransportModel = availableQwenModels[0] ?? requestedTransportModel;
@@ -1311,11 +1490,12 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     if (shouldResumeClaudeCliConversation) {
       effectiveSkipCreate = true;
     }
-    if (opts.ccPreset) {
+    if (effectiveCcPreset) {
       const { resolvePresetEnv, getPresetTransportOverrides } = await import('../daemon/cc-presets.js');
-      transportEnv = { ...(transportEnv ?? {}), ...(await resolvePresetEnv(opts.ccPreset, transportResumeId)) };
-      const presetOverrides = await getPresetTransportOverrides(opts.ccPreset);
+      transportEnv = { ...(transportEnv ?? {}), ...(await resolvePresetEnv(effectiveCcPreset, transportResumeId)) };
+      const presetOverrides = await getPresetTransportOverrides(effectiveCcPreset);
       if (!requestedTransportModel && presetOverrides.model) requestedTransportModel = presetOverrides.model;
+      presetContextWindow = presetOverrides.contextWindow;
       transportSystemPrompt = presetOverrides.systemPrompt;
     }
     if (requestedTransportModel) {
@@ -1333,7 +1513,21 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
       effectiveSkipCreate = true;
     }
     sdkDisplay = await getCodexRuntimeConfig().catch(() => ({}));
+  } else if (agentType === 'cursor-headless' || agentType === 'copilot-sdk') {
+    effectiveSessionKey = randomUUID();
+    effectiveBindExistingKey = undefined;
+    transportResumeId = opts.providerResumeId ?? storedProviderResumeId;
+    if (transportResumeId) {
+      effectiveSkipCreate = true;
+    }
   }
+
+  // `preserveStartupMemoryInject` is declared earlier so the bootstrap
+  // resolver closure can read it without hitting a TDZ. When launching
+  // against an existing session record (e.g. session.restart without
+  // /clear) we honor the previously-persisted inject flag — the
+  // conversation already has its history preamble. `opts.fresh` is the
+  // authoritative "force fresh" signal from /clear or explicit user action.
 
   // Create session on provider
       await runtime.initialize({
@@ -1356,6 +1550,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     skipCreate: effectiveSkipCreate,
     resumeId: transportResumeId,
         effort: opts.effort,
+    startupMemoryAlreadyInjected: preserveStartupMemoryInject,
       });
   // Atomic: store runtime + register provider route + persist — rollback all on failure
   const providerSid = runtime.providerSessionId;
@@ -1378,6 +1573,9 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
         runtimeType: RUNTIME_TYPES.TRANSPORT,
         providerId: provider.id,
         providerSessionId: runtime.providerSessionId ?? undefined,
+        ...((agentType === 'copilot-sdk' || agentType === 'cursor-headless') && transportResumeId
+          ? { providerResumeId: transportResumeId }
+          : {}),
         ...(agentType === 'claude-code-sdk' && transportResumeId ? { ccSessionId: transportResumeId } : {}),
         ...(agentType === 'codex-sdk' && transportResumeId ? { codexSessionId: transportResumeId } : {}),
         contextNamespace: contextBootstrap.namespace,
@@ -1406,10 +1604,21 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
         ...(sdkDisplay ?? {}),
         ...(opts.effort ? { effort: opts.effort } : {}),
         description,
-        ...(opts.ccPreset ? { ccPreset: opts.ccPreset } : {}),
+        ...(effectiveCcPreset ? { ccPreset: effectiveCcPreset } : {}),
+        ...(presetContextWindow ? { presetContextWindow } : {}),
         label,
-        parentSession,
-        userCreated: opts.userCreated,
+        parentSession: effectiveParentSession,
+        userCreated: effectiveUserCreated,
+        // Preserve the flag across session.restart / runtime rebuild so we
+        // don't re-inject startup memory into a conversation that already
+        // received it. /clear wipes it because `opts.fresh === true`.
+        ...(preserveStartupMemoryInject ? { startupMemoryInjected: true } : {}),
+        // Carry the dedup ring buffer over so previously-injected memories
+        // are not re-injected into the same conversation after a rebuild.
+        // recent-injection-history.ts owns writes; we just avoid clobbering.
+        ...(preservedRecentInjectionHistory && preservedRecentInjectionHistory.length > 0
+          ? { recentInjectionHistory: preservedRecentInjectionHistory }
+          : {}),
       };
       upsertSession(record);
       emitSessionPersist(record, name);
@@ -1422,6 +1631,37 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     transportRuntimes.delete(name);
     if (providerSid) unregisterProviderRoute(providerSid);
     throw err;
+  }
+
+  // Drain any messages queued while the runtime was being (re)built — e.g. if a
+  // relaunch stopped the old runtime and the user typed during the gap.
+  // Emits user.message on 'sent' for the same reason the reconnect drain
+  // does: the enqueue path skipped the emit so the timeline doesn't lie,
+  // and now the turn is actually firing.
+  const pendingResendCount = getResendCount(name);
+  if (pendingResendCount > 0) {
+    logger.info({ session: name, pendingCount: pendingResendCount }, 'Draining transport resend queue after launch');
+    void drainResend(name, (entry) => {
+      const attachments = entry.attachments ?? [];
+      const result = attachments.length > 0
+        ? runtime.send(entry.text, entry.commandId, attachments)
+        : runtime.send(entry.text, entry.commandId);
+      if (result === 'sent') {
+        timelineEmitter.emit(
+          name,
+          'user.message',
+          {
+            text: entry.text,
+            allowDuplicate: true,
+            commandId: entry.commandId,
+            clientMessageId: entry.commandId,
+            ...(attachments.length > 0 ? { attachments } : {}),
+          },
+          { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.commandId}` },
+        );
+      }
+      return result;
+    }).catch((err) => logger.warn({ err, session: name }, 'transport resend drain (launch) failed'));
   }
 }
 

@@ -12,6 +12,7 @@ import { buildSessionList } from './session-list.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { supervisionAutomation } from './supervision-automation.js';
 import { timelineStore } from './timeline-store.js';
+import { getDefaultAckOutbox } from './ack-outbox.js';
 import { startHookServer, drainQueue } from './hook-server.js';
 import { initTempFileStore } from '../store/temp-file-store.js';
 import { setupCCHooks } from '../agent/signal.js';
@@ -35,6 +36,7 @@ import { LiveContextIngestion } from '../context/live-context-ingestion.js';
 import { resolveTransportContextBootstrap } from '../agent/runtime-context-bootstrap.js';
 import { pruneLocalMemory } from '../context/memory-pruning.js';
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
+import { isTransportAgent } from '../agent/detect.js';
 
 /** Get the last assistant.text from a session's timeline (for push notification context). */
 function getLastAssistantText(sessionName: string): string | undefined {
@@ -363,6 +365,19 @@ export async function startup(): Promise<DaemonContext> {
     } catch (err) {
       logger.warn({ err, serverId }, 'shared-context runtime config bootstrap failed');
     }
+    // Prime the supervisor global-defaults cache so the very first
+    // supervision dispatch after startup uses the current custom
+    // instructions even if no session's cached snapshot carries them.
+    // Fire-and-forget: failure just means the daemon falls through to
+    // the snapshot mirror. The WS-reconnect hook below keeps it fresh.
+    void (async () => {
+      try {
+        const { refreshSupervisorDefaultsCache } = await import('./supervisor-defaults-cache.js');
+        await refreshSupervisorDefaultsCache();
+      } catch (err) {
+        logger.debug({ err }, 'supervisor-defaults-cache: startup prime failed');
+      }
+    })();
   }
 
   // Sync sessions from D1 before restoring tmux sessions
@@ -378,6 +393,32 @@ export async function startup(): Promise<DaemonContext> {
     // Sessions may not be restored, but daemon stays alive for WS/heartbeat.
     logger.error({ err }, 'restoreFromStore failed — daemon continues without session restore');
   }
+
+  // Initialize the command.ack outbox before serverLink connects so any
+  // pending acks from a previous process life get flushed on first open.
+  try {
+    await getDefaultAckOutbox().init();
+    logger.info('AckOutbox ready');
+  } catch (err) {
+    logger.error({ err }, 'AckOutbox init failed — daemon continues (acks will be best-effort)');
+  }
+
+  // Warm up the transformers.js embedding model in the background so the
+  // first user send after daemon start doesn't pay the ~16s cold-load latency
+  // inside prependLocalMemory(). Fire-and-forget — the recall path falls
+  // through safely if this is still in flight when the first message arrives.
+  void (async () => {
+    try {
+      const { generateEmbedding } = await import('../context/embedding.js');
+      const t0 = Date.now();
+      await generateEmbedding('warmup');
+      logger.info({ ms: Date.now() - t0 }, 'Embedding model warmed up');
+    } catch (err) {
+      // Non-fatal: semantic recall falls back to substring match if the
+      // model never loads.
+      logger.warn({ err }, 'Embedding model warmup failed — semantic recall will be lazy');
+    }
+  })();
 
   const liveContextIngestion = new LiveContextIngestion({
     sessionLookup: getSession,
@@ -425,15 +466,25 @@ export async function startup(): Promise<DaemonContext> {
         if (P2P_TERMINAL_RUN_STATUSES.has(run.status)) continue;
         try { serverLink.send({ type: 'p2p.run_save', run: serializeP2pRun(run) }); } catch { /* ignore */ }
       }
-      // Re-sync all active sub-sessions so server DB and frontend stay in sync
+      // Re-sync all sub-sessions (including idle ones) so server DB and
+      // frontend stay in sync. The previous `state === 'running'` filter
+      // left idle sub-sessions with `state: 'unknown'` in the web sidebar
+      // after WS reconnect, which rendered as a stuck gray dot that only
+      // flipped to the correct color when the next live state transition
+      // happened — sometimes never, for genuinely-quiet sessions.
+      // Only skip terminal states that should have been cleaned up already.
       for (const session of listSessions()) {
         if (!session.name.startsWith('deck_sub_')) continue;
-        if (session.state !== 'running') continue;
+        if (session.state === 'stopped') continue;
         const id = session.name.slice('deck_sub_'.length);
         try {
           serverLink.send({
             type: 'subsession.sync',
             id,
+            // Including state here fixes "sidebar sub-session dot stuck
+            // gray after reconnect" — see buildSubSessionSync for the
+            // equivalent fix on the regular sync path.
+            state: session.state ?? null,
             sessionType: session.agentType,
             cwd: session.projectDir || null,
             label: session.label ?? null,
@@ -733,7 +784,7 @@ async function autoReconnectProviders(): Promise<void> {
     const { connectProvider, ensureProviderConnected } = await import('../agent/provider-registry.js');
     const { restoreTransportSessions } = await import('../agent/session-manager.js');
 
-    for (const providerId of ['qwen', 'claude-code-sdk', 'codex-sdk'] as const) {
+    for (const providerId of ['qwen', 'claude-code-sdk', 'codex-sdk', 'cursor-headless', 'copilot-sdk'] as const) {
       if (!listSessions().some((s) => s.runtimeType === 'transport' && s.providerId === providerId)) continue;
       try {
         await ensureProviderConnected(providerId, {});
@@ -841,8 +892,11 @@ function startHealthPoller(): void {
     const sessions = listSessions();
     for (const s of sessions) {
       if (s.state === 'stopped' || s.state === 'error') continue;
-      // Transport sessions have no tmux pane — skip tmux health checks
-      if (s.runtimeType === 'transport') continue;
+      // Transport sessions have no tmux pane — skip tmux health checks.
+      // Belt-and-suspenders: also check agentType so records persisted before
+      // the runtimeType field existed (or written by an older daemon) don't
+      // fall through and trigger a tmux restart loop on transport sessions.
+      if (s.runtimeType === 'transport' || isTransportAgent(s.agentType)) continue;
       // Sub-sessions: auto-restart dead panes, mark stopped if tmux session gone entirely
       if (s.name.startsWith('deck_sub_')) {
         try {

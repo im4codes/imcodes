@@ -7,6 +7,7 @@ import { startP2pRun, cancelP2pRun, getP2pRun } from './p2p-orchestrator.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { supervisionBroker } from './supervision-broker.js';
+import { getCachedGlobalCustomInstructions } from './supervisor-defaults-cache.js';
 import logger from '../util/logger.js';
 import {
   SUPERVISION_CONTRACT_IDS,
@@ -14,6 +15,7 @@ import {
   SUPERVISION_UNAVAILABLE_REASONS,
   extractSessionSupervisionSnapshot,
   parseAuditVerdictDetailsFromText,
+  resolveSupervisionCustomInstructionsDetail,
   type SessionSupervisionSnapshot,
   type SupervisionUnavailableReason,
   type TaskRunTerminalState,
@@ -28,9 +30,41 @@ import {
 } from './supervision-prompts.js';
 import { TIMELINE_EVENT_FILE_CHANGE, type FileChangePatch } from '../../shared/file-change.js';
 
+/**
+ * Merge the daemon-cached global custom instructions into a session snapshot
+ * when the snapshot's own `globalCustomInstructions` mirror is empty. The
+ * web client only updates the mirror for the currently-edited session on
+ * save, so snapshots for other sessions can be stale — this function is
+ * the runtime fallback that makes the user's saved defaults actually reach
+ * every session's supervisor. See `supervisor-defaults-cache.ts`.
+ *
+ * Returns a new snapshot (does not mutate) when augmentation happens; returns
+ * the original reference otherwise so the fast path stays allocation-free.
+ */
+function enrichSnapshotWithGlobalDefaults(
+  snapshot: SessionSupervisionSnapshot,
+): SessionSupervisionSnapshot {
+  const existing = snapshot.globalCustomInstructions?.trim();
+  if (existing) return snapshot;
+  const cached = getCachedGlobalCustomInstructions();
+  if (!cached) return snapshot;
+  return { ...snapshot, globalCustomInstructions: cached };
+}
+
 type TaskRunPhase = 'execution' | 'auditing';
 
-const MAX_AUTO_CONTINUE_STEPS = 8;
+/**
+ * Hard cap on auto-dispatched continue turns per task-run.
+ *
+ * Was 8 historically — but even when the supervisor returned specific-looking
+ * `continue` verdicts, running 8 cycles before handing back to the user
+ * amplified any residual ambiguity into a frustrating back-and-forth. Per
+ * user direction (issue: "不断拉扯"), we now allow AT MOST 2 auto-continue
+ * dispatches before escalating to `ask_human`. If two concrete nextActions
+ * didn't close the gap, the pattern is stuck in a loop the supervisor can't
+ * resolve autonomously — surface it to the human.
+ */
+const MAX_AUTO_CONTINUE_STEPS = 2;
 const SUPERVISION_WAITING_LABEL = 'Supervised: analyzing completion...';
 const SUPERVISION_AUDIT_WAITING_LABEL = 'Supervised: running automated audit...';
 const SUPERVISION_COMPLETE_LABEL = 'Supervised: task looks complete.';
@@ -411,6 +445,7 @@ class SupervisionAutomation {
   private recentTaskCandidates = new Map<string, RecentTaskCandidate>();
   private latestAssistantTexts = new Map<string, LatestAssistantText>();
   private pollers = new Map<string, ReturnType<typeof setInterval>>();
+  private lastObservedSessionStates = new Map<string, string>();
   private initialized = false;
   private serverLink: ServerLink | null = null;
   private eventSequence = 0;
@@ -477,6 +512,7 @@ class SupervisionAutomation {
     this.pendingTaskIntents.delete(sessionName);
     this.recentTaskCandidates.delete(sessionName);
     this.latestAssistantTexts.delete(sessionName);
+    this.lastObservedSessionStates.delete(sessionName);
     this.clearStatus(sessionName);
   }
 
@@ -493,6 +529,77 @@ class SupervisionAutomation {
     if (pending) {
       this.pendingTaskIntents.set(sessionName, { ...pending, snapshot });
     }
+    // Regression fix: if supervision was freshly enabled on an already-idle
+    // session (user flipped Auto ON after the assistant had already finished a
+    // turn), we must evaluate the most recent turn NOW. Waiting for the next
+    // idle boundary would mean "nothing ever happens" until the user sends
+    // another message — which is exactly the symptom reported as
+    // "idle 后依旧不触发任何动作和效果".
+    //
+    // We reuse the same implicit-idle preconditions as `handleTimelineEvent`
+    // (recent task candidate + newer assistant response) so the guardrails
+    // against stale turns stay identical.
+    if (!active && this.isSessionIdle(sessionName)) {
+      if (!this.tryStartImplicitRun(sessionName, snapshot)) {
+        this.failClosedImplicitCandidate(sessionName, snapshot);
+      }
+    }
+  }
+
+  private isSessionIdle(sessionName: string): boolean {
+    const observed = this.lastObservedSessionStates.get(sessionName);
+    if (observed) return observed === 'idle';
+    return getSession(sessionName)?.state === 'idle';
+  }
+
+  private isEligibleAssistantCompletionPayload(payload: Record<string, unknown>): boolean {
+    return isFinalAssistantPayload(payload)
+      && payload.automation !== true
+      && payload.memoryExcluded !== true;
+  }
+
+  private emitCheckingState(sessionName: string): void {
+    this.emitStatus(sessionName, 'supervision_waiting', SUPERVISION_WAITING_LABEL);
+    this.emitAutomationNote(sessionName, 'Auto: checking whether the task is complete...', 'supervision-status');
+  }
+
+  private failClosedMissingCompletion(sessionName: string): void {
+    this.emitTerminalStatus(sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
+    this.emitWarning(sessionName, 'Automation stopped because no completed assistant response was available for that turn. Manual continuation is required.');
+  }
+
+  private tryStartImplicitRun(
+    sessionName: string,
+    snapshot: SessionSupervisionSnapshot,
+  ): boolean {
+    const candidate = this.recentTaskCandidates.get(sessionName);
+    const latestAssistant = this.latestAssistantTexts.get(sessionName);
+    if (!candidate || !latestAssistant) return false;
+    if (latestAssistant.sequence <= candidate.sequence) return false;
+    const implicitRun = this.registerTaskIntent(sessionName, candidate.commandId, candidate.text, snapshot);
+    if (!implicitRun) return false;
+    implicitRun.lastAssistantText = latestAssistant.text;
+    implicitRun.sawAssistantOutput = true;
+    implicitRun.evaluating = true;
+    this.emitCheckingState(sessionName);
+    void this.evaluateExecutionTurn(implicitRun).catch((error) => {
+      logger.warn({ session: sessionName, err: error }, 'Supervision implicit execution evaluation failed on snapshot update');
+      this.clearStatus(sessionName);
+      this.emitWarning(sessionName, 'Automation could not determine whether the task is complete. Manual continuation is required.');
+      this.finishRun(sessionName, 'needs_input');
+    });
+    return true;
+  }
+
+  private failClosedImplicitCandidate(
+    sessionName: string,
+    snapshot: SessionSupervisionSnapshot | null | undefined,
+  ): void {
+    if (!snapshot || snapshot.mode === SUPERVISION_MODE.OFF) return;
+    const candidate = this.recentTaskCandidates.get(sessionName);
+    if (!candidate) return;
+    this.recentTaskCandidates.delete(sessionName);
+    this.failClosedMissingCompletion(sessionName);
   }
 
   queueTaskIntent(
@@ -573,10 +680,8 @@ class SupervisionAutomation {
       }
     }
 
-    if (event.type === 'assistant.text' && isFinalAssistantPayload(event.payload)) {
-      if (event.payload.automation === true) return;
-      const text = trimString(event.payload.text) ?? '';
-      if (!text) return;
+    if (event.type === 'assistant.text' && this.isEligibleAssistantCompletionPayload(event.payload)) {
+      const text = typeof event.payload.text === 'string' ? event.payload.text : '';
       this.latestAssistantTexts.set(event.sessionId, { text, sequence });
       const run = this.activeRuns.get(event.sessionId);
       if (!run) return;
@@ -588,40 +693,34 @@ class SupervisionAutomation {
     if (event.type === 'session.state') {
       const run = this.activeRuns.get(event.sessionId);
       const state = trimString(event.payload.state);
+      if (state) this.lastObservedSessionStates.set(event.sessionId, state);
       if (state === 'idle' && !run) {
         const candidate = this.recentTaskCandidates.get(event.sessionId);
         const record = getSession(event.sessionId);
         const snapshot = record?.agentType
           ? extractSessionSupervisionSnapshot(record.transportConfig ?? null)
           : null;
-        const latestAssistant = this.latestAssistantTexts.get(event.sessionId);
-        if (candidate && snapshot && snapshot.mode !== SUPERVISION_MODE.OFF && latestAssistant && latestAssistant.sequence > candidate.sequence) {
-          const implicitRun = this.registerTaskIntent(event.sessionId, candidate.commandId, candidate.text, snapshot);
-          if (implicitRun) {
-            implicitRun.lastAssistantText = latestAssistant.text;
-            implicitRun.sawAssistantOutput = true;
-            implicitRun.evaluating = true;
-            void this.evaluateExecutionTurn(implicitRun).catch((error) => {
-              logger.warn({ session: implicitRun.sessionName, err: error }, 'Supervision implicit execution evaluation failed');
-              this.emitWarning(implicitRun.sessionName, 'Automation could not determine whether the task is complete. Manual continuation is required.');
-              this.finishRun(implicitRun.sessionName, 'needs_input');
-            });
+        if (candidate && snapshot && snapshot.mode !== SUPERVISION_MODE.OFF) {
+          if (!this.tryStartImplicitRun(event.sessionId, snapshot)) {
+            this.failClosedImplicitCandidate(event.sessionId, snapshot);
           }
-        } else if (candidate) {
-          this.recentTaskCandidates.delete(event.sessionId);
         }
+        // Intentionally: do NOT delete the candidate when supervision is OFF
+        // at idle. The user may enable Auto afterwards, and
+        // `applySnapshotUpdate` uses this candidate to kick off an implicit
+        // run against the most recent completed turn. Clearing here was the
+        // reason "idle 后依旧不触发任何动作和效果" when Auto was turned on
+        // against an already-idle session.
         return;
       }
       if (!run) return;
       if (state === 'idle' && run.phase === 'execution' && !run.evaluating) {
-        if (!run.sawAssistantOutput || !run.lastAssistantText?.trim()) {
-          this.emitTerminalStatus(run.sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
-          this.emitWarning(run.sessionName, 'Automation did not capture a completed assistant response for the current task. Manual continuation is required.');
+        if (!run.sawAssistantOutput) {
+          this.failClosedMissingCompletion(run.sessionName);
           this.finishRun(run.sessionName, 'needs_input', { preserveStatus: true });
           return;
         }
-        this.emitStatus(run.sessionName, 'supervision_waiting', SUPERVISION_WAITING_LABEL);
-        this.emitAutomationNote(run.sessionName, 'Auto: checking whether the task is complete...', 'supervision-status');
+        this.emitCheckingState(run.sessionName);
         run.evaluating = true;
         void this.evaluateExecutionTurn(run).catch((error) => {
           logger.warn({ session: run.sessionName, err: error }, 'Supervision execution evaluation failed');
@@ -646,7 +745,7 @@ class SupervisionAutomation {
     let decision;
     try {
       decision = await supervisionBroker.decide({
-        snapshot: current.snapshot,
+        snapshot: enrichSnapshotWithGlobalDefaults(current.snapshot),
         taskRequest: current.userText,
         assistantResponse: current.lastAssistantText,
         cwd: record?.projectDir,
@@ -674,11 +773,19 @@ class SupervisionAutomation {
       }
       case 'continue': {
         if (latest.continueLoops >= MAX_AUTO_CONTINUE_STEPS) {
-          this.emitWarning(run.sessionName, 'Automation reached the maximum auto-continue limit. Manual continuation is required.');
+          this.emitWarning(run.sessionName, `Automation reached the auto-continue limit (${MAX_AUTO_CONTINUE_STEPS}); handing control back to the human.`);
           this.finishRun(run.sessionName, 'needs_input');
           return;
         }
-        await this.dispatchContinue(latest, decision.reason);
+        // Forward the full decision so the continue prompt can lead with
+        // the supervisor's concrete nextAction. Without this, the target
+        // agent only sees the reason and has to infer what to do next —
+        // which historically caused the "rewrite same answer" loop.
+        await this.dispatchContinue(latest, {
+          reason: decision.reason,
+          nextAction: decision.nextAction,
+          gap: decision.gap,
+        });
         return;
       }
       case 'ask_human':
@@ -842,7 +949,13 @@ class SupervisionAutomation {
     }
   }
 
-  private async dispatchContinue(run: ActiveTaskRunState, reason: string): Promise<void> {
+  private async dispatchContinue(
+    run: ActiveTaskRunState,
+    /** Pass the full decision so the target agent receives a concrete
+     *  imperative nextAction instead of just a vague reason string — this
+     *  is what breaks the supervision loop. */
+    decision: { reason: string; nextAction?: string; gap?: string },
+  ): Promise<void> {
     const current = this.activeRuns.get(run.sessionName);
     if (!current || current.generation !== run.generation || current.phase !== 'execution') return;
     const transportRuntime = getTransportRuntime(run.sessionName);
@@ -851,10 +964,21 @@ class SupervisionAutomation {
       return;
     }
 
+    // Resolve the effective custom instructions (global + session + override)
+    // at dispatch time. The session-scoped snapshot mirror can be stale when
+    // the user updated defaults from a different session's dialog — the
+    // daemon-side cache layer (`supervisor-defaults-cache.ts`) covers that gap.
+    // Pass the classified detail (text + source tag) so the continue prompt's
+    // heading reflects whether the instruction came from the user's global
+    // defaults, a session-specific override, or a merge of both — previously
+    // globals were mislabeled as "Session-specific".
     const continuePrompt = buildSupervisionContinuePrompt(
       current.userText,
       current.lastAssistantText,
-      reason,
+      // Pass the full structured instructions; the builder leads with
+      // nextAction so the agent has something concrete to execute.
+      { reason: decision.reason, nextAction: decision.nextAction, gap: decision.gap },
+      resolveSupervisionCustomInstructionsDetail(enrichSnapshotWithGlobalDefaults(current.snapshot)),
     );
     current.continueLoops += 1;
     current.sawAssistantOutput = false;

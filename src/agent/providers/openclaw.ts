@@ -27,6 +27,7 @@ import {
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
+import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 import logger from '../../util/logger.js';
 import { normalizeOpenClawDisplayName } from '../openclaw-display.js';
 import { OPENCLAW_THINKING_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
@@ -162,7 +163,7 @@ export class OpenClawProvider implements TransportProvider {
     logger.info({ provider: this.id }, 'Disconnected from OpenClaw gateway');
   }
 
-  async send(sessionId: string, payloadOrMessage: string | ProviderContextPayload, _attachments?: unknown[], extraSystemPrompt?: string): Promise<void> {
+  async send(sessionId: string, payloadOrMessage: string | ProviderContextPayload, _attachments?: TransportAttachment[], extraSystemPrompt?: string): Promise<void> {
     const payload = normalizeProviderPayload(payloadOrMessage, _attachments, extraSystemPrompt);
     const ocKey = unsanitizeKey(sessionId);
     const thinking = this.sessionThinking.get(sessionId) ?? 'off';

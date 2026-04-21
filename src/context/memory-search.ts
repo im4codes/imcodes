@@ -11,10 +11,14 @@ import type {
   ContextMemoryStatsView,
 } from '../../shared/context-types.js';
 import { computeRelevanceScore, type ProjectionClass } from '../../shared/memory-scoring.js';
+import { normalizeSummaryForFingerprint } from '../../shared/memory-fingerprint.js';
+import { getContextModelConfig } from './context-model-config.js';
 import {
   listContextEvents,
   listDirtyTargets,
   queryProcessedProjections,
+  getProjectionEmbeddings,
+  saveProjectionEmbedding,
 } from '../store/context-store.js';
 
 // ── Query types ──────────────────────────────────────────────────────────────
@@ -66,6 +70,7 @@ export interface MemorySearchResultItem {
   lastUsedAt?: number;
   status?: ProcessedContextProjectionStatus;
   sourceEventCount?: number;
+  sourceEventIds?: string[];
   processingModel?: string;
   relevanceScore?: number;
 }
@@ -133,6 +138,30 @@ export function isTrivialRecallQuery(text: string | undefined | null): boolean {
   return false;
 }
 
+/** Collapse content-equivalent scored items so three identical "Key decisions"
+ *  summaries stored at different turns don't all surface as separate cards.
+ *  Preserves the original rank order — the first occurrence of each
+ *  fingerprint wins, so the highest-scoring duplicate is the one retained.
+ *  Scoped by projectionClass to keep recent_summary and durable_memory_candidate
+ *  entries independent even when they happen to share text. */
+export function dedupByNormalizedSummary<T extends { item: MemorySearchResultItem }>(scored: T[]): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const entry of scored) {
+    const summary = entry.item.summary ?? '';
+    if (!summary) {
+      out.push(entry);
+      continue;
+    }
+    const projectionClass = entry.item.projectionClass ?? 'recent_summary';
+    const key = `${projectionClass}\u0000${normalizeSummaryForFingerprint(summary)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(entry);
+  }
+  return out;
+}
+
 export async function searchLocalMemorySemantic(query: MemorySearchQuery): Promise<MemorySearchResult> {
   // Skip recall entirely for trivial queries (single-word "continue", "好", etc.)
   // These pollute context with irrelevant top-match-by-default results.
@@ -155,17 +184,57 @@ export async function searchLocalMemorySemantic(query: MemorySearchQuery): Promi
   if (candidates.items.length === 0 || !query.query) return searchLocalMemory(query);
 
   try {
-    const { generateEmbedding, cosineSimilarity } = await import('./embedding.js');
+    const { generateEmbedding, cosineSimilarity, encodeEmbedding, decodeEmbedding } = await import('./embedding.js');
     const queryEmb = await generateEmbedding(query.query);
     if (!queryEmb) return searchLocalMemory(query); // model unavailable, fallback
+
+    // Persistent embedding store: avoid recomputing the same Float32Array for
+    // every candidate on every recall. The server already does this via
+    // pgvector; the daemon mirrors that for local SQLite by stashing the
+    // BLOB in context_processed_local.embedding.
+    //
+    // Batch-read stored embeddings for all "processed" candidates in one
+    // query, then only invoke the model on rows that are missing or stale
+    // (summary text changed since the stored vector was computed).
+    const processedIds = candidates.items
+      .filter((item) => item.type === 'processed')
+      .map((item) => item.id);
+    const storedEmbeddings = processedIds.length > 0
+      ? getProjectionEmbeddings(processedIds)
+      : new Map<string, ReturnType<typeof getProjectionEmbeddings> extends Map<string, infer V> ? V : never>();
+
+    const itemEmbedText = (item: MemorySearchResultItem): string =>
+      `${item.summary} ${item.content ?? ''}`.slice(0, 500);
 
     // Score each candidate by cosine similarity
     const scored: Array<{ item: MemorySearchResultItem; score: number }> = [];
     const currentProjectId = query.namespace?.projectId ?? query.repo ?? '__unknown_current_project__';
     const currentEnterpriseId = query.currentEnterpriseId ?? query.namespace?.enterpriseId;
+    const scoringWeights = getContextModelConfig().memoryScoringWeights;
     for (const item of candidates.items) {
-      const text = `${item.summary} ${item.content ?? ''}`.slice(0, 500);
-      const itemEmb = await generateEmbedding(text);
+      const text = itemEmbedText(item);
+      let itemEmb: Float32Array | null = null;
+
+      // 1) Fast path: decode the stored BLOB if the source text still matches.
+      if (item.type === 'processed') {
+        const stored = storedEmbeddings.get(item.id);
+        if (stored?.embedding && stored.embeddingSource === text) {
+          itemEmb = decodeEmbedding(stored.embedding);
+        }
+      }
+
+      // 2) Slow path: recompute and persist so the next recall is fast.
+      if (!itemEmb) {
+        itemEmb = await generateEmbedding(text);
+        if (itemEmb && item.type === 'processed') {
+          // Persist is best-effort — a transient SQLite write failure must
+          // not break the in-progress recall.
+          try {
+            saveProjectionEmbedding(item.id, encodeEmbedding(itemEmb), text);
+          } catch { /* ignore */ }
+        }
+      }
+
       if (itemEmb) {
         const similarity = cosineSimilarity(queryEmb, itemEmb);
         const projectionClass = (item.projectionClass ?? 'recent_summary') as ProjectionClass;
@@ -178,7 +247,7 @@ export async function searchLocalMemorySemantic(query: MemorySearchQuery): Promi
           currentProjectId,
           memoryEnterpriseId: item.enterpriseId,
           currentEnterpriseId,
-        });
+        }, scoringWeights);
         scored.push({
           item: {
             ...item,
@@ -193,8 +262,14 @@ export async function searchLocalMemorySemantic(query: MemorySearchQuery): Promi
 
     // Sort by semantic similarity
     scored.sort((a, b) => b.score - a.score);
+    // Content-level dedup: stored duplicates from before writeProcessedProjection
+    // started reusing rows can still surface at recall time with identical
+    // summaries and near-identical similarity scores. Keep only the highest-
+    // scoring item per normalized summary (within the same projection class)
+    // so the user never sees three copies of the same "Key decisions" card.
+    const dedupedByContent = dedupByNormalizedSummary(scored);
     const limit = query.limit ?? 5;
-    const topItems = scored.slice(0, limit).map((s) => s.item);
+    const topItems = dedupedByContent.slice(0, limit).map((s) => s.item);
 
     return {
       items: topItems,
@@ -354,6 +429,7 @@ function projectionToItem(projection: ProcessedContextProjection): MemorySearchR
     lastUsedAt: projection.lastUsedAt,
     status: projection.status,
     sourceEventCount: typeof content?.eventCount === 'number' ? content.eventCount : undefined,
+    sourceEventIds: projection.sourceEventIds,
     processingModel: typeof content?.primaryContextModel === 'string' ? content.primaryContextModel : undefined,
   };
 }

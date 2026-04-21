@@ -13,9 +13,10 @@ import {
 import { tmpdir } from 'os';
 
 const SKIP = process.env.SKIP_TMUX_TESTS === '1';
-const BRAIN_SESSION = 'e2e_multi_brain';
-const WORKER1_SESSION = 'e2e_multi_w1';
-const WORKER2_SESSION = 'e2e_multi_w2';
+const RUN_ID = Math.random().toString(36).slice(2, 8);
+const BRAIN_SESSION = `e2e_multi_brain_${RUN_ID}`;
+const WORKER1_SESSION = `e2e_multi_w1_${RUN_ID}`;
+const WORKER2_SESSION = `e2e_multi_w2_${RUN_ID}`;
 const FIXTURES = new URL('../fixtures', import.meta.url).pathname;
 
 describe.skipIf(SKIP)('Multi-session parallel dispatch', () => {

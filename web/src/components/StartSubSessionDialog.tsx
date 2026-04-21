@@ -7,7 +7,12 @@ import type { WsClient } from '../ws-client.js';
 import type { RemoteSession } from '../hooks/useProviderStatus.js';
 import { FileBrowser } from './file-browser-lazy.js';
 import { getUserPref, saveUserPref } from '../api.js';
-import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '@shared/effort-levels.js';
+import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '@shared/effort-levels.js';
+import { getSessionAgentGroups, getSessionAgentLabel, SESSION_AGENT_GROUP_LABEL_KEYS } from './session-agent-options.js';
+import { QwenCodingPlanHint } from './QwenCodingPlanHint.js';
+
+const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
+const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
 
 interface Props {
   ws: WsClient | null;
@@ -18,20 +23,6 @@ interface Props {
   onStart: (type: string, shellBin?: string, cwd?: string, label?: string, extra?: Record<string, unknown>) => void;
   onClose: () => void;
 }
-
-const BASE_AGENT_TYPES = [
-  { id: 'claude-code-sdk', label: 'Claude Code SDK', icon: '⚡' },
-  { id: 'claude-code', label: 'Claude Code', icon: '⚡' },
-  { id: 'codex-sdk', label: 'Codex SDK', icon: '📦' },
-  { id: 'codex', label: 'Codex', icon: '📦' },
-  { id: 'opencode', label: 'OpenCode', icon: '🔆' },
-  { id: 'gemini', label: 'Gemini CLI', icon: '♊' },
-  { id: 'qwen', label: 'Qwen Code', icon: '千' },
-  { id: 'shell', label: 'Shell', icon: '🐚' },
-  { id: 'script', label: 'Script', icon: '🔄' },
-];
-
-const OPENCLAW_AGENT = { id: 'openclaw', label: 'OpenClaw', icon: '🦞' };
 
 type OpenClawMode = 'new' | 'bind';
 
@@ -47,6 +38,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   const [detectingShells, setDetectingShells] = useState(false);
   const [showDirBrowser, setShowDirBrowser] = useState(false);
   const [thinking, setThinking] = useState<TransportEffortLevel>('high');
+  const [requestedModel, setRequestedModel] = useState('');
 
   // OpenClaw-specific state
   const [ocMode, setOcMode] = useState<OpenClawMode>('new');
@@ -73,8 +65,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   // Remote sessions come from the provider status hook (pushed on connect, cached in DB)
   const ocRemoteSessions = getRemoteSessions('openclaw');
 
-  // OpenClaw is always shown (greyed when not connected)
-  const agentTypes = [...BASE_AGENT_TYPES, OPENCLAW_AGENT];
+  const agentGroups = getSessionAgentGroups('sub-session');
 
   // Load saved shell preference from server
   useEffect(() => {
@@ -142,7 +133,8 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     if (desc) extra.description = desc;
     if (ccPreset && (type === 'claude-code' || type === 'qwen')) extra.ccPreset = ccPreset;
     if (ccInitPrompt.trim() && type === 'claude-code') extra.ccInitPrompt = ccInitPrompt.trim();
-    if (type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'qwen') extra.thinking = thinking;
+    if ((type === 'copilot-sdk' || type === 'cursor-headless') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
+    if (type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'qwen') extra.thinking = thinking;
     onStart(type, selectedShell, cwd || undefined, label || undefined, Object.keys(extra).length > 0 ? extra : undefined);
   };
 
@@ -150,12 +142,20 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     ? CLAUDE_SDK_EFFORT_LEVELS
     : type === 'codex-sdk'
       ? CODEX_SDK_EFFORT_LEVELS
-      : type === 'qwen'
-        ? QWEN_EFFORT_LEVELS
-      : type === 'openclaw'
-        ? OPENCLAW_THINKING_LEVELS
-        : [];
+      : type === 'copilot-sdk'
+        ? COPILOT_SDK_EFFORT_LEVELS
+        : type === 'qwen'
+          ? QWEN_EFFORT_LEVELS
+          : type === 'openclaw'
+            ? OPENCLAW_THINKING_LEVELS
+            : [];
   const supportsCcPreset = type === 'claude-code' || type === 'qwen';
+  const supportsModelSelection = type === 'copilot-sdk' || type === 'cursor-headless';
+  const modelSuggestions = type === 'copilot-sdk'
+    ? COPILOT_SDK_MODEL_SUGGESTIONS
+    : type === 'cursor-headless'
+      ? CURSOR_HEADLESS_MODEL_SUGGESTIONS
+      : [];
 
   return (
     <div class="dialog-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
@@ -169,25 +169,25 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
           {/* Type selection */}
           <div>
             <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>Type</div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-              {agentTypes.map((at) => (
-                <button
-                  key={at.id}
-                  class={`subsession-type-btn${type === at.id ? ' active' : ''}`}
-                  onClick={() => setType(at.id)}
-                >
-                  <span>{at.icon}</span> {at.id === 'openclaw'
-                    ? t('session.agentType.openclaw')
-                    : at.id === 'qwen'
-                      ? t('session.agentType.qwen')
-                      : at.id === 'claude-code-sdk'
-                        ? t('session.agentType.claude_code_sdk')
-                        : at.id === 'codex-sdk'
-                          ? t('session.agentType.codex_sdk')
-                          : at.label}
-                </button>
+            <div class="subsession-type-groups">
+              {agentGroups.map((group) => (
+                <div key={group.id} class="subsession-type-group">
+                  <div class="subsession-type-group-title">{t(SESSION_AGENT_GROUP_LABEL_KEYS[group.id])}</div>
+                  <div class="subsession-type-grid">
+                    {group.items.map((choice) => (
+                      <button
+                        key={choice.id}
+                        class={`subsession-type-btn${type === choice.id ? ' active' : ''}`}
+                        onClick={() => setType(choice.id)}
+                      >
+                        <span>{choice.icon}</span> {getSessionAgentLabel(t, choice)}
+                      </button>
+                    ))}
+                  </div>
+                </div>
               ))}
             </div>
+            <QwenCodingPlanHint selected={type === 'qwen'} />
           </div>
 
           {/* Script command (only for script type) */}
@@ -324,18 +324,18 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
             <>
               <div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-                  <span style={{ fontSize: 12, color: '#94a3b8' }}>API Provider</span>
+                  <span style={{ fontSize: 12, color: '#94a3b8' }}>{t('new_session.api_provider')}</span>
                   <button type="button" style={{ background: 'none', border: 'none', color: '#3b82f6', cursor: 'pointer', fontSize: 11, padding: 0 }} onClick={() => setShowPresetEditor(!showPresetEditor)}>
-                    {showPresetEditor ? '▾ Close' : '+ Add / Edit'}
+                    {showPresetEditor ? `▾ ${t('common.close')}` : t('new_session.api_provider_add_edit')}
                   </button>
                 </div>
                 {ccPresets.length > 0 ? (
                   <select class="input" value={ccPreset} onInput={(e) => setCcPreset((e.target as HTMLSelectElement).value)} style={{ width: '100%' }}>
-                    <option value="">Default (Anthropic)</option>
+                    <option value="">{t('new_session.api_provider_default')}</option>
                     {ccPresets.map((p) => <option key={p.name} value={p.name}>{p.name}{p.env['ANTHROPIC_MODEL'] ? ` (${p.env['ANTHROPIC_MODEL']})` : ''}</option>)}
                   </select>
                 ) : !showPresetEditor && (
-                  <div style={{ fontSize: 11, color: '#475569' }}>Default (Anthropic)</div>
+                  <div style={{ fontSize: 11, color: '#475569' }}>{t('new_session.api_provider_default')}</div>
                 )}
               </div>
 
@@ -435,6 +435,28 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                   <option key={level} value={level}>{level}</option>
                 ))}
               </select>
+            </div>
+          )}
+
+          {supportsModelSelection && (
+            <div>
+              <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('session.supervision.model')}</div>
+              <input
+                class="input"
+                type="text"
+                list={`sub-session-model-options-${type}`}
+                placeholder={t('session.supervision.selectModel')}
+                value={requestedModel}
+                onInput={(e) => setRequestedModel((e.target as HTMLInputElement).value)}
+                style={{ width: '100%' }}
+              />
+              {modelSuggestions.length > 0 && (
+                <datalist id={`sub-session-model-options-${type}`}>
+                  {modelSuggestions.map((model) => (
+                    <option key={model} value={model} />
+                  ))}
+                </datalist>
+              )}
             </div>
           )}
 

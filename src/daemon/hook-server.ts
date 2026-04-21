@@ -199,9 +199,11 @@ async function dispatchMessage(target: SessionRecord, message: string): Promise<
     return;
   }
 
-  // Process session: send via tmux
-  const { sendKeys } = await import('../agent/tmux.js');
-  await sendKeys(target.name, message);
+  // Process session: route through the same session.send pipeline as the web UI
+  // so CLI/hook sends keep recall, path rewriting, timeline emission, and other
+  // daemon-side behaviors in sync.
+  const { sendProcessSessionMessageForAutomation } = await import('./command-handler.js');
+  await sendProcessSessionMessageForAutomation(target.name, message);
 }
 
 // ─── Circuit Breakers ────────────────────────────────────────────────────────

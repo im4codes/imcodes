@@ -4,10 +4,22 @@ import { useTranslation } from 'react-i18next';
 import { DEFAULT_PRIMARY_CONTEXT_MODEL } from '@shared/context-model-defaults.js';
 import type { ContextMemoryView, SharedContextRuntimeBackend } from '@shared/context-types.js';
 import { QWEN_MODEL_IDS } from '@shared/qwen-models.js';
+import { MEMORY_WS } from '@shared/memory-ws.js';
 import {
+  DEFAULT_MEMORY_RECALL_MIN_SCORE,
+  DEFAULT_MEMORY_SCORING_WEIGHTS,
   DEFAULT_PRIMARY_CONTEXT_BACKEND,
+  doesSharedContextBackendSupportPresets,
   getDefaultSharedContextModelForBackend,
   isKnownSharedContextModelForBackend,
+  MEMORY_RECALL_MIN_SCORE_MAX,
+  MEMORY_RECALL_MIN_SCORE_MIN,
+  MEMORY_RECALL_MIN_SCORE_STEP,
+  MEMORY_SCORING_WEIGHT_INPUT_STEP,
+  MEMORY_SCORING_WEIGHT_MAX,
+  MEMORY_SCORING_WEIGHT_MIN,
+  normalizeMemoryScoringWeights,
+  normalizeMemoryRecallMinScore,
   SHARED_CONTEXT_RUNTIME_BACKENDS,
   type SharedContextRuntimeConfigSnapshot,
 } from '@shared/shared-context-runtime-config.js';
@@ -21,6 +33,8 @@ import {
   createSharedDocumentVersion,
   createSharedWorkspace,
   createTeam,
+  deleteEnterpriseSharedMemory,
+  deletePersonalCloudMemory,
   createTeamInvite,
   enrollSharedProject,
   getSharedProjectPolicy,
@@ -50,6 +64,7 @@ import {
 import { ChatMarkdown } from './ChatMarkdown.js';
 import type { WsClient } from '../ws-client.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../../../src/shared/models/options.js';
+import type { MemoryScoringWeights } from '@shared/memory-scoring.js';
 
 // ── Mobile detection ────────────────────────────────────────────────────────
 const SC_IS_MOBILE = typeof navigator !== 'undefined' && /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
@@ -142,6 +157,22 @@ const inputStyle = {
   fontSize: SC_IS_MOBILE ? 14 : 13,
   transition: 'border-color 0.15s, box-shadow 0.15s',
   outline: 'none',
+} as const;
+
+// Compact style for numeric inputs like a recall threshold or scoring weight.
+// The generic `inputStyle` uses `flex: 1 1 180px` which stretches to fill the
+// whole section card — a single "0.4" was rendering in an input 600+px wide,
+// which looks broken on both desktop and mobile. `maxWidth` keeps the field
+// proportional to the content while `alignSelf` prevents the flex parent from
+// re-expanding it.
+const numberInputStyle = {
+  ...inputStyle,
+  flex: '0 0 auto',
+  width: SC_IS_MOBILE ? 120 : 110,
+  maxWidth: '100%',
+  alignSelf: 'flex-start' as const,
+  textAlign: 'right' as const,
+  fontVariantNumeric: 'tabular-nums' as const,
 } as const;
 
 const buttonStyle = {
@@ -261,20 +292,6 @@ const fieldLabelStyle = {
   fontWeight: 500,
   textTransform: 'uppercase',
   letterSpacing: '0.03em',
-} as const;
-
-const fieldInputStyle = {
-  ...inputStyle,
-  width: '100%',
-} as const;
-
-const processingModelInputStyle = {
-  ...fieldInputStyle,
-  height: 40,
-  minHeight: 40,
-  padding: '8px 10px',
-  lineHeight: '22px',
-  boxSizing: 'border-box',
 } as const;
 
 const statGridStyle = {
@@ -422,12 +439,6 @@ const backendChipRowStyle = {
   flexWrap: 'wrap',
 } as const;
 
-const modelChipRowStyle = {
-  display: 'flex',
-  gap: 6,
-  flexWrap: 'wrap',
-} as const;
-
 function processingChipStyle(active: boolean) {
   return active
     ? {
@@ -448,17 +459,99 @@ function modelChipStyle(active: boolean) {
   return active
     ? {
         ...buttonStyle,
-        padding: '4px 8px',
-        fontSize: 12,
+        padding: '3px 8px',
+        fontSize: 11,
         fontWeight: 700,
         background: '#0f766e',
+        lineHeight: 1.35,
       }
     : {
         ...subtleButtonStyle,
-        padding: '4px 8px',
-        fontSize: 12,
+        padding: '3px 8px',
+        fontSize: 11,
         fontWeight: 600,
         background: '#1e293b',
+        lineHeight: 1.35,
+      };
+}
+
+/** Preset chip: visually distinct from built-in model chips so users can see at
+ *  a glance that a preset pulls in env/endpoint config, not just a model name. */
+function presetChipStyle(active: boolean) {
+  return active
+    ? {
+        ...buttonStyle,
+        padding: '3px 8px',
+        fontSize: 11,
+        fontWeight: 700,
+        background: '#7c3aed',
+        border: '1px solid #a78bfa',
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 3,
+        lineHeight: 1.35,
+      }
+    : {
+        ...subtleButtonStyle,
+        padding: '3px 8px',
+        fontSize: 11,
+        fontWeight: 600,
+        background: '#1e1b3a',
+        border: '1px solid #4c1d95',
+        color: '#c4b5fd',
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 3,
+        lineHeight: 1.35,
+      };
+}
+
+/** Shared row for preset + built-in chips. Wraps on narrow widths but never
+ *  grows vertically beyond what the content needs — no decorative container. */
+const compactChipRowStyle = {
+  display: 'flex',
+  gap: 4,
+  flexWrap: 'wrap',
+  alignItems: 'center',
+} as const;
+
+/** Tiny inline "Preset:" / "Model:" label that sits on the same row as the
+ *  chips. Smaller than the uppercase field label to keep the dimension
+ *  separation visually obvious without adding another stacked heading. */
+const inlineDimensionLabelStyle = {
+  fontSize: 10,
+  fontWeight: 700,
+  letterSpacing: '0.1em',
+  textTransform: 'uppercase',
+  color: DT.text.muted,
+  marginRight: 6,
+  minWidth: 44,
+  flex: '0 0 auto',
+} as const;
+
+/** "(none)" / neutral chip used to clear the preset selection explicitly —
+ *  visually distinct from both preset chips (purple) and model chips (teal)
+ *  so users can see at a glance that it's the "no bundle" state. */
+function neutralChipStyle(active: boolean) {
+  return active
+    ? {
+        ...buttonStyle,
+        padding: '3px 8px',
+        fontSize: 11,
+        fontWeight: 700,
+        background: '#374151',
+        border: '1px solid #6b7280',
+        lineHeight: 1.35,
+      }
+    : {
+        ...subtleButtonStyle,
+        padding: '3px 8px',
+        fontSize: 11,
+        fontWeight: 600,
+        background: '#1f2937',
+        border: '1px solid #374151',
+        color: '#9ca3af',
+        lineHeight: 1.35,
       };
 }
 
@@ -469,13 +562,6 @@ const defaultPolicyState: SharedProjectPolicy = {
   allowLocalFallback: false,
   requireFullProviderSupport: false,
 };
-
-const PROCESSING_MODEL_OPTIONS = Array.from(new Set([
-  DEFAULT_PRIMARY_CONTEXT_MODEL,
-  ...CLAUDE_CODE_MODEL_IDS,
-  ...CODEX_MODEL_IDS,
-  ...QWEN_MODEL_IDS,
-]));
 
 const PROCESSING_MODEL_OPTIONS_BY_BACKEND: Record<SharedContextRuntimeBackend, readonly string[]> = {
   'claude-code-sdk': CLAUDE_CODE_MODEL_IDS,
@@ -552,6 +638,13 @@ const archiveRestoreButtonStyle = {
   transition: 'color 0.15s, border-color 0.15s',
   whiteSpace: 'nowrap',
   flexShrink: 0,
+} as const;
+
+
+const deleteButtonStyle = {
+  ...archiveRestoreButtonStyle,
+  color: DT.text.error,
+  border: `1px solid rgba(239,68,68,0.3)`,
 } as const;
 
 type KindOption = SharedDocument['kind'];
@@ -663,33 +756,168 @@ function MetaCard({ label, value }: { label: string; value: ComponentChildren })
   );
 }
 
-function ModelChipSelector({
+interface ProcessingPresetEntry {
+  name: string;
+  env: Record<string, string>;
+  contextWindow?: number;
+  initMessage?: string;
+}
+
+/**
+ * Unified model + preset selector.
+ *
+ * Replaces the older two-control design (a `<select>` for presets PLUS a chip
+ * row for models) with a single flat set of chips grouped by kind. This
+ * removes the dual-control confusion where selecting a preset left the model
+ * chip stale (or vice versa), and where the `<select>` silently failed to
+ * reflect saved state when the saved preset wasn't in the loaded list yet.
+ *
+ * Interaction:
+ *   - Clicking a PRESET chip: selects that preset and, if the preset's env
+ *     carries ANTHROPIC_MODEL, mirrors that model so downstream consumers
+ *     don't need to resolve the preset separately.
+ *   - Clicking a MODEL chip: selects the model and clears any active preset
+ *     (presets carry additional env like base URL / API key — clearing keeps
+ *     the two concepts from drifting).
+ *   - Clicking the active chip again: deselects (clears both for safety).
+ *
+ * Active-state highlighting is decoupled per-chip so users can see both the
+ * active preset AND the active model when a preset-derived model matches a
+ * built-in. That's the read path of the state the save will persist.
+ */
+function ModelPresetChipSelector({
   backend,
-  value,
-  onSelect,
+  model,
+  preset,
+  presets,
+  onChange,
+  idPrefix,
 }: {
   backend: SharedContextRuntimeBackend;
-  value: string;
-  onSelect: (model: string) => void;
+  model: string;
+  preset: string;
+  presets: ReadonlyArray<ProcessingPresetEntry>;
+  onChange: (next: { model: string; preset: string }) => void;
+  idPrefix: string;
 }) {
-  const options = PROCESSING_MODEL_OPTIONS_BY_BACKEND[backend] ?? [];
-  if (options.length === 0) return null;
+  const modelOptions = PROCESSING_MODEL_OPTIONS_BY_BACKEND[backend] ?? [];
+  const supportsPresets = doesSharedContextBackendSupportPresets(backend);
+  const trimmedModel = model.trim();
+  const trimmedPreset = preset.trim();
+  if (modelOptions.length === 0 && (!supportsPresets || presets.length === 0)) return null;
+
+  // Preset vs model are two DIFFERENT dimensions, not peers.
+  //
+  //   - A preset is an env bundle (ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY +
+  //     ANTHROPIC_MODEL). Picking a preset routes traffic to the endpoint
+  //     that preset points at, and pins the model that endpoint serves.
+  //   - A model is the identifier the endpoint resolves. Built-in qwen
+  //     models run on the default qwen endpoint (OAuth / coding plan).
+  //
+  // Rendering them as one flat chip list invited users to read the preset
+  // as a "model" alongside the others. Split them into two labeled rows so
+  // the semantic distinction is visible in a glance, still compact:
+  //
+  //   Preset:  [ (none) ] [⚙ minimax] [⚙ team-b]
+  //   Model:   [coder-model] [qwen3-coder-plus] …   (when no preset)
+  //            [MiniMax-M2.5]                         (when preset pins one)
+  const activePreset = supportsPresets
+    ? presets.find((p) => p.name === trimmedPreset)
+    : undefined;
+  const presetPinnedModel = activePreset?.env?.ANTHROPIC_MODEL?.trim() || '';
+  // When a preset is active, model selection collapses to what the preset
+  // endpoint exposes — show ONLY the pinned model as a single read-ish chip.
+  // User can still switch away by clicking a built-in chip, which clears
+  // the preset (the `onChange({ model, preset: '' })` path handles that).
   return (
-    <div style={modelChipRowStyle}>
-      {options.map((modelId) => (
-        <button
-          key={`${backend}:${modelId}`}
-          type="button"
-          aria-label={`model:${backend}:${modelId}`}
-          style={modelChipStyle(value.trim() === modelId)}
-          onClick={() => onSelect(modelId)}
-        >
-          {modelId}
-        </button>
-      ))}
+    <div style={chipGroupStyle}>
+      {supportsPresets && presets.length > 0 ? (
+        <div style={compactChipRowStyle}>
+          <span style={inlineDimensionLabelStyle}>Preset</span>
+          <button
+            key={`${idPrefix}:preset:__none__`}
+            type="button"
+            aria-label={`${idPrefix}:preset:none`}
+            aria-pressed={!trimmedPreset}
+            title="No preset — use the default provider endpoint"
+            style={neutralChipStyle(!trimmedPreset)}
+            onClick={() => onChange({ model: trimmedModel, preset: '' })}
+          >
+            (none)
+          </button>
+          {presets.map((p) => {
+            const active = trimmedPreset === p.name;
+            const pinned = p.env?.ANTHROPIC_MODEL?.trim();
+            return (
+              <button
+                key={`${idPrefix}:preset:${p.name}`}
+                type="button"
+                aria-label={`${idPrefix}:preset:${p.name}`}
+                aria-pressed={active}
+                title={pinned ? `Preset bundle → model: ${pinned}` : `Preset bundle: ${p.name}`}
+                style={presetChipStyle(active)}
+                onClick={() => {
+                  // Picking a preset pins its embedded model. User has to
+                  // explicitly pick a built-in model chip below (or "(none)"
+                  // + another chip) to override, which clears the preset
+                  // so the two dimensions can't drift.
+                  onChange({ model: pinned || trimmedModel, preset: p.name });
+                }}
+              >
+                <span aria-hidden="true">⚙</span>
+                <span>{p.name}</span>
+              </button>
+            );
+          })}
+        </div>
+      ) : null}
+      <div style={compactChipRowStyle}>
+        <span style={inlineDimensionLabelStyle}>Model</span>
+        {activePreset ? (
+          // Preset active — this row is read-only: the endpoint dictates
+          // the model. Rendered with the teal "active" style so the user
+          // sees WHICH model the preset pins without a misleading
+          // "click to pick" affordance.
+          <button
+            key={`${backend}:preset-pinned`}
+            type="button"
+            aria-label={`model:${backend}:${presetPinnedModel || '(preset)'}`}
+            aria-pressed={true}
+            disabled
+            title="Model is set by the active preset. Clear the preset to pick another."
+            style={{ ...modelChipStyle(true), cursor: 'default', opacity: 0.95 }}
+          >
+            {presetPinnedModel || '(defined by preset)'}
+          </button>
+        ) : (
+          modelOptions.map((modelId) => {
+            const active = trimmedModel === modelId;
+            return (
+              <button
+                key={`${backend}:${modelId}`}
+                type="button"
+                aria-label={`model:${backend}:${modelId}`}
+                aria-pressed={active}
+                style={modelChipStyle(active)}
+                onClick={() => onChange({ model: modelId, preset: '' })}
+              >
+                {modelId}
+              </button>
+            );
+          })
+        )}
+      </div>
     </div>
   );
 }
+
+/** Vertical stack for the two-row (Preset / Model) selector. Tighter than
+ *  `fieldLabelStyle`'s flex-column so the rows sit close together. */
+const chipGroupStyle = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 4,
+} as const;
 
 function formatMemberIdentity(member: TeamDetail['members'][number]): string {
   const displayName = member.display_name?.trim();
@@ -787,9 +1015,15 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [processingSnapshot, setProcessingSnapshot] = useState<SharedContextRuntimeConfigSnapshot | null>(null);
   const [processingPrimaryBackend, setProcessingPrimaryBackend] = useState<SharedContextRuntimeBackend>(DEFAULT_PRIMARY_CONTEXT_BACKEND);
   const [processingPrimaryModel, setProcessingPrimaryModel] = useState(DEFAULT_PRIMARY_CONTEXT_MODEL);
+  const [processingPrimaryPreset, setProcessingPrimaryPreset] = useState('');
   const [processingBackupBackend, setProcessingBackupBackend] = useState<SharedContextRuntimeBackend>(DEFAULT_PRIMARY_CONTEXT_BACKEND);
   const [processingBackupModel, setProcessingBackupModel] = useState('');
+  const [processingBackupPreset, setProcessingBackupPreset] = useState('');
+  const [processingMemoryRecallMinScore, setProcessingMemoryRecallMinScore] = useState(DEFAULT_MEMORY_RECALL_MIN_SCORE);
+  const [processingMemoryScoringWeights, setProcessingMemoryScoringWeights] = useState<MemoryScoringWeights>({ ...DEFAULT_MEMORY_SCORING_WEIGHTS });
+  const [memoryAdvancedVisible, setMemoryAdvancedVisible] = useState(false);
   const [processingPersonalSyncEnabled, setProcessingPersonalSyncEnabled] = useState(false);
+  const [processingPresets, setProcessingPresets] = useState<Array<{ name: string; env: Record<string, string>; contextWindow?: number; initMessage?: string }>>([]);
   const [memoryLoading, setMemoryLoading] = useState(false);
   const [memoryProjectId, setMemoryProjectId] = useState('');
   const [memoryQuery, setMemoryQuery] = useState('');
@@ -802,14 +1036,34 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [memoryPersonalSubTab, setMemoryPersonalSubTab] = useState<MemoryPersonalSubTab>('processed');
   const [memoryEnterpriseSubTab, setMemoryEnterpriseSubTab] = useState<MemoryEnterpriseSubTab>('shared-memory');
   const [showArchived, setShowArchived] = useState(false);
+  const [deletingMemoryIds, setDeletingMemoryIds] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (!ws) return;
+    const unsub = ws.onMessage((msg) => {
+      if (msg.type === 'cc.presets.list_response') {
+        setProcessingPresets((msg as { presets?: Array<{ name: string; env: Record<string, string>; contextWindow?: number; initMessage?: string }> }).presets ?? []);
+      }
+    });
+    try { ws.send({ type: 'cc.presets.list' }); } catch {}
+    return unsub;
+  }, [ws]);
 
   const renderProcessedMemoryRecords = useCallback((
     view: ContextMemoryView,
-    opts?: { allowArchiveRestore?: boolean; onArchive?: (id: string) => void; onRestore?: (id: string) => void },
+    opts?: {
+      allowArchiveRestore?: boolean;
+      allowDelete?: boolean;
+      onArchive?: (id: string) => void;
+      onRestore?: (id: string) => void;
+      onDelete?: (id: string) => void;
+    },
   ) => {
     const allowActions = opts?.allowArchiveRestore ?? false;
+    const allowDelete = opts?.allowDelete ?? false;
     const onArchive = opts?.onArchive;
     const onRestore = opts?.onRestore;
+    const onDelete = opts?.onDelete;
     const visibleRecords = showArchived ? view.records : view.records.filter((r) => r.status !== 'archived');
     const recentRecords = visibleRecords.filter((record) => record.projectionClass === 'recent_summary');
     const durableRecords = visibleRecords.filter((record) => record.projectionClass === 'durable_memory_candidate');
@@ -869,25 +1123,37 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                           ? t('sharedContext.management.memoryLastRecalled', { time: formatRelativeTime(record.lastUsedAt) })
                           : t('sharedContext.management.memoryNeverRecalled')}
                       </span>
-                      {allowActions ? (
-                        <span style={{ marginLeft: 'auto' }}>
-                          {isArchived ? (
+                      {allowActions || allowDelete ? (
+                        <span style={{ marginLeft: 'auto', display: 'inline-flex', gap: 6, flexWrap: 'wrap' }}>
+                          {allowActions ? (
+                            isArchived ? (
+                              <button
+                                type="button"
+                                style={archiveRestoreButtonStyle}
+                                onClick={() => onRestore?.(record.id)}
+                              >
+                                {t('sharedContext.management.memoryRestore')}
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                style={archiveRestoreButtonStyle}
+                                onClick={() => onArchive?.(record.id)}
+                              >
+                                {t('sharedContext.management.memoryArchive')}
+                              </button>
+                            )
+                          ) : null}
+                          {allowDelete ? (
                             <button
                               type="button"
-                              style={archiveRestoreButtonStyle}
-                              onClick={() => onRestore?.(record.id)}
+                              style={deleteButtonStyle}
+                              onClick={() => onDelete?.(record.id)}
+                              disabled={deletingMemoryIds.has(record.id)}
                             >
-                              {t('sharedContext.management.memoryRestore')}
+                              {t('sharedContext.management.memoryDelete')}
                             </button>
-                          ) : (
-                            <button
-                              type="button"
-                              style={archiveRestoreButtonStyle}
-                              onClick={() => onArchive?.(record.id)}
-                            >
-                              {t('sharedContext.management.memoryArchive')}
-                            </button>
-                          )}
+                          ) : null}
                         </span>
                       ) : null}
                     </div>
@@ -915,7 +1181,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         ))}
       </div>
     );
-  }, [expandedMemoryRecordIds, t, showArchived]);
+  }, [deletingMemoryIds, expandedMemoryRecordIds, t, showArchived]);
 
   const selectedDocument = useMemo(
     () => documents.find((entry) => entry.id === selectedDocumentId) ?? null,
@@ -1084,18 +1350,40 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     setProcessingSnapshot(view.snapshot);
     setProcessingPrimaryBackend(view.snapshot.persisted.primaryContextBackend);
     setProcessingPrimaryModel(view.snapshot.persisted.primaryContextModel);
+    setProcessingPrimaryPreset(view.snapshot.persisted.primaryContextPreset ?? '');
     setProcessingBackupBackend(view.snapshot.persisted.backupContextBackend ?? view.snapshot.persisted.primaryContextBackend);
     setProcessingBackupModel(view.snapshot.persisted.backupContextModel ?? '');
+    setProcessingBackupPreset(view.snapshot.persisted.backupContextPreset ?? '');
+    setProcessingMemoryRecallMinScore(view.snapshot.persisted.memoryRecallMinScore ?? DEFAULT_MEMORY_RECALL_MIN_SCORE);
+    setProcessingMemoryScoringWeights(normalizeMemoryScoringWeights(view.snapshot.persisted.memoryScoringWeights ?? DEFAULT_MEMORY_SCORING_WEIGHTS));
     setProcessingPersonalSyncEnabled(view.snapshot.persisted.enablePersonalMemorySync === true);
   }, []);
+
+  /** Defensive sync: if the persisted preset disappears from the loaded preset
+   *  list (e.g. user deleted it elsewhere, or ws reload raced), clear the
+   *  local preset bit so the UI never stays stuck on a non-existent preset.
+   *  The model stays — it's independently valid. */
+  useEffect(() => {
+    const names = new Set(processingPresets.map((p) => p.name));
+    if (processingPrimaryPreset && !names.has(processingPrimaryPreset)) {
+      setProcessingPrimaryPreset('');
+    }
+    if (processingBackupPreset && !names.has(processingBackupPreset)) {
+      setProcessingBackupPreset('');
+    }
+  }, [processingPresets, processingPrimaryPreset, processingBackupPreset]);
 
   const reloadProcessingConfig = useCallback(async () => {
     if (!serverId) {
       setProcessingSnapshot(null);
       setProcessingPrimaryBackend(DEFAULT_PRIMARY_CONTEXT_BACKEND);
       setProcessingPrimaryModel(DEFAULT_PRIMARY_CONTEXT_MODEL);
+      setProcessingPrimaryPreset('');
       setProcessingBackupBackend(DEFAULT_PRIMARY_CONTEXT_BACKEND);
       setProcessingBackupModel('');
+      setProcessingBackupPreset('');
+      setProcessingMemoryRecallMinScore(DEFAULT_MEMORY_RECALL_MIN_SCORE);
+      setProcessingMemoryScoringWeights({ ...DEFAULT_MEMORY_SCORING_WEIGHTS });
       setProcessingPersonalSyncEnabled(false);
       return;
     }
@@ -1119,7 +1407,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   useEffect(() => {
     if (!ws) return;
     return ws.onMessage((msg) => {
-      if (msg.type !== 'shared_context.personal_memory.response') return;
+      if (msg.type !== MEMORY_WS.PERSONAL_RESPONSE) return;
       if (msg.requestId !== personalMemoryRequestIdRef.current) return;
       setLocalPersonalMemory(normalizeMemoryView({
         stats: msg.stats,
@@ -1143,7 +1431,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         const requestId = crypto.randomUUID();
         personalMemoryRequestIdRef.current = requestId;
         ws.send({
-          type: 'shared_context.personal_memory.query',
+          type: MEMORY_WS.PERSONAL_QUERY,
           requestId,
           ...queryInput,
           includeArchived: showArchived,
@@ -1179,9 +1467,9 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const handleMemoryArchive = useCallback((id: string) => {
     if (!ws) return;
     const requestId = crypto.randomUUID();
-    ws.send({ type: 'memory.archive', requestId, id });
+    ws.send({ type: MEMORY_WS.ARCHIVE, requestId, id });
     const unsub = ws.onMessage((msg) => {
-      if (msg.type !== 'memory.archive_response' || msg.requestId !== requestId) return;
+      if (msg.type !== MEMORY_WS.ARCHIVE_RESPONSE || msg.requestId !== requestId) return;
       unsub();
       if (msg.success) void loadMemoryViews();
     });
@@ -1190,17 +1478,110 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const handleMemoryRestore = useCallback((id: string) => {
     if (!ws) return;
     const requestId = crypto.randomUUID();
-    ws.send({ type: 'memory.restore', requestId, id });
+    ws.send({ type: MEMORY_WS.RESTORE, requestId, id });
     const unsub = ws.onMessage((msg) => {
-      if (msg.type !== 'memory.restore_response' || msg.requestId !== requestId) return;
+      if (msg.type !== MEMORY_WS.RESTORE_RESPONSE || msg.requestId !== requestId) return;
       unsub();
       if (msg.success) void loadMemoryViews();
     });
   }, [ws, loadMemoryViews]);
 
+
+  const confirmMemoryDelete = useCallback((recordId: string) => {
+    const confirmed = globalThis.confirm?.(t('sharedContext.management.memoryDeleteConfirm')) ?? true;
+    if (!confirmed) return false;
+    setDeletingMemoryIds((current) => new Set(current).add(recordId));
+    return true;
+  }, [t]);
+
+  const finishMemoryDelete = useCallback((recordId: string) => {
+    setDeletingMemoryIds((current) => {
+      const next = new Set(current);
+      next.delete(recordId);
+      return next;
+    });
+  }, []);
+
+  const handleLocalMemoryDelete = useCallback((id: string) => {
+    if (!ws || !confirmMemoryDelete(id)) return;
+    const requestId = crypto.randomUUID();
+    ws.send({ type: MEMORY_WS.DELETE, requestId, id });
+    const unsub = ws.onMessage((msg) => {
+      if (msg.type !== MEMORY_WS.DELETE_RESPONSE || msg.requestId !== requestId) return;
+      unsub();
+      finishMemoryDelete(id);
+      if (msg.success) void loadMemoryViews();
+      else setError(msg.error || t('sharedContext.management.memoryDeleteFailed'));
+    });
+  }, [confirmMemoryDelete, finishMemoryDelete, loadMemoryViews, t, ws]);
+
+  const handleCloudMemoryDelete = useCallback(async (id: string) => {
+    if (!confirmMemoryDelete(id)) return;
+    try {
+      await deletePersonalCloudMemory(id);
+      await loadMemoryViews();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      finishMemoryDelete(id);
+    }
+  }, [confirmMemoryDelete, finishMemoryDelete, loadMemoryViews]);
+
+  const handleEnterpriseMemoryDelete = useCallback(async (id: string) => {
+    if (!enterpriseId || !confirmMemoryDelete(id)) return;
+    try {
+      await deleteEnterpriseSharedMemory(enterpriseId, id);
+      await loadMemoryViews();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      finishMemoryDelete(id);
+    }
+  }, [confirmMemoryDelete, enterpriseId, finishMemoryDelete, loadMemoryViews]);
+
+  const getProcessingPresetValue = useCallback((
+    backend: SharedContextRuntimeBackend,
+    model: string,
+    preset: string,
+  ) => (
+    model.trim() && doesSharedContextBackendSupportPresets(backend)
+      ? (preset || undefined)
+      : undefined
+  ), []);
+
+  const buildProcessingConfigPayload = useCallback(() => ({
+    primaryContextBackend: processingPrimaryBackend,
+    primaryContextModel: processingPrimaryModel.trim(),
+    primaryContextPreset: getProcessingPresetValue(
+      processingPrimaryBackend,
+      processingPrimaryModel,
+      processingPrimaryPreset,
+    ),
+    backupContextBackend: processingBackupModel.trim() ? processingBackupBackend : undefined,
+    backupContextModel: processingBackupModel.trim() || undefined,
+    backupContextPreset: processingBackupModel.trim()
+      ? getProcessingPresetValue(processingBackupBackend, processingBackupModel, processingBackupPreset)
+      : undefined,
+    memoryRecallMinScore: processingMemoryRecallMinScore,
+    memoryScoringWeights: normalizeMemoryScoringWeights(processingMemoryScoringWeights),
+    enablePersonalMemorySync: processingPersonalSyncEnabled,
+  }), [
+    getProcessingPresetValue,
+    processingBackupBackend,
+    processingBackupModel,
+    processingBackupPreset,
+    processingMemoryRecallMinScore,
+    processingMemoryScoringWeights,
+    processingPersonalSyncEnabled,
+    processingPrimaryBackend,
+    processingPrimaryModel,
+    processingPrimaryPreset,
+  ]);
+
   const handleProcessingPrimaryBackendChange = useCallback((nextBackend: SharedContextRuntimeBackend) => {
     setProcessingPrimaryBackend((prevBackend) => {
       setProcessingPrimaryModel((prevModel) => resolveProcessingModelForBackend(nextBackend, prevModel, prevBackend));
+      if (!doesSharedContextBackendSupportPresets(nextBackend)) setProcessingPrimaryPreset('');
       return nextBackend;
     });
   }, []);
@@ -1208,6 +1589,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const handleProcessingBackupBackendChange = useCallback((nextBackend: SharedContextRuntimeBackend) => {
     setProcessingBackupBackend((prevBackend) => {
       setProcessingBackupModel((prevModel) => resolveProcessingModelForBackend(nextBackend, prevModel, prevBackend));
+      if (!doesSharedContextBackendSupportPresets(nextBackend)) setProcessingBackupPreset('');
       return nextBackend;
     });
   }, []);
@@ -1796,6 +2178,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                             key={`primary:${backend}`}
                             type="button"
                             aria-label={`${t('sharedContext.management.processingPrimaryBackend')}: ${backend}`}
+                            aria-pressed={processingPrimaryBackend === backend}
                             style={processingChipStyle(processingPrimaryBackend === backend)}
                             onClick={() => handleProcessingPrimaryBackendChange(backend)}
                           >
@@ -1806,18 +2189,16 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     </label>
                     <label style={fieldLabelStyle}>
                       <span>{t('sharedContext.management.processingPrimaryModel')}</span>
-                      <input
-                        aria-label={t('sharedContext.management.processingPrimaryModel')}
-                        list={`shared-context-model-options-${processingPrimaryBackend}`}
-                        value={processingPrimaryModel}
-                        onInput={(e) => setProcessingPrimaryModel((e.currentTarget as HTMLInputElement).value)}
-                        placeholder={DEFAULT_PRIMARY_CONTEXT_MODEL}
-                        style={processingModelInputStyle}
-                      />
-                      <ModelChipSelector
+                      <ModelPresetChipSelector
                         backend={processingPrimaryBackend}
-                        value={processingPrimaryModel}
-                        onSelect={setProcessingPrimaryModel}
+                        model={processingPrimaryModel}
+                        preset={processingPrimaryPreset}
+                        presets={processingPresets}
+                        idPrefix="primary"
+                        onChange={({ model, preset }) => {
+                          setProcessingPrimaryModel(model);
+                          setProcessingPrimaryPreset(preset);
+                        }}
                       />
                     </label>
                   </div>
@@ -1831,6 +2212,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                             key={`backup:${backend}`}
                             type="button"
                             aria-label={`${t('sharedContext.management.processingBackupBackend')}: ${backend}`}
+                            aria-pressed={processingBackupBackend === backend}
                             style={processingChipStyle(processingBackupBackend === backend)}
                             onClick={() => handleProcessingBackupBackendChange(backend)}
                           >
@@ -1841,29 +2223,20 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     </label>
                     <label style={fieldLabelStyle}>
                       <span>{t('sharedContext.management.processingBackupModel')}</span>
-                      <input
-                        aria-label={t('sharedContext.management.processingBackupModel')}
-                        list={`shared-context-model-options-${processingBackupBackend}`}
-                        value={processingBackupModel}
-                        onInput={(e) => setProcessingBackupModel((e.currentTarget as HTMLInputElement).value)}
-                        placeholder={t('sharedContext.management.processingBackupPlaceholder')}
-                        style={processingModelInputStyle}
-                      />
-                      <ModelChipSelector
+                      <ModelPresetChipSelector
                         backend={processingBackupBackend}
-                        value={processingBackupModel}
-                        onSelect={setProcessingBackupModel}
+                        model={processingBackupModel}
+                        preset={processingBackupPreset}
+                        presets={processingPresets}
+                        idPrefix="backup"
+                        onChange={({ model, preset }) => {
+                          setProcessingBackupModel(model);
+                          setProcessingBackupPreset(preset);
+                        }}
                       />
                     </label>
                   </div>
                 </div>
-                {SHARED_CONTEXT_RUNTIME_BACKENDS.map((backend) => (
-                  <datalist id={`shared-context-model-options-${backend}`} key={backend}>
-                    {(PROCESSING_MODEL_OPTIONS_BY_BACKEND[backend] ?? PROCESSING_MODEL_OPTIONS).map((modelId) => (
-                      <option key={`${backend}:${modelId}`} value={modelId} />
-                    ))}
-                  </datalist>
-                ))}
                 <div style={rowStyle}>
                   <button
                     style={buttonStyle}
@@ -1871,13 +2244,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     onClick={() => void handleAction(t('sharedContext.notice.processingConfigSaved'), async () => {
                       setProcessingSaving(true);
                       try {
-                        const view = await updateSharedContextRuntimeConfig(serverId, {
-                          primaryContextBackend: processingPrimaryBackend,
-                          primaryContextModel: processingPrimaryModel.trim(),
-                          backupContextBackend: processingBackupModel.trim() ? processingBackupBackend : undefined,
-                          backupContextModel: processingBackupModel.trim() || undefined,
-                          enablePersonalMemorySync: processingPersonalSyncEnabled,
-                        });
+                        const view = await updateSharedContextRuntimeConfig(serverId, buildProcessingConfigPayload());
                         applyProcessingSnapshot(view);
                       } finally {
                         setProcessingSaving(false);
@@ -1968,6 +2335,8 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                         primaryContextModel: processingPrimaryModel.trim(),
                         backupContextBackend: processingBackupModel.trim() ? processingBackupBackend : undefined,
                         backupContextModel: processingBackupModel.trim() || undefined,
+                        memoryRecallMinScore: processingMemoryRecallMinScore,
+                        memoryScoringWeights: normalizeMemoryScoringWeights(processingMemoryScoringWeights),
                         enablePersonalMemorySync: next,
                       });
                       applyProcessingSnapshot(view);
@@ -1988,6 +2357,192 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
             ) : (
               <div style={helperTextStyle}>{t('sharedContext.management.processingServerRequired')}</div>
             )}
+          </div>
+
+          <div style={sectionStyle}>
+            <SectionHeading
+              title={t('sharedContext.management.memoryRecallThresholdTitle')}
+              description={t('sharedContext.management.memoryRecallThresholdDescription')}
+              action={serverId ? <span style={pillStyle}>{formatServerScopeValue(serverId)}</span> : undefined}
+            />
+            {serverId ? (
+              <>
+                <label style={fieldLabelStyle}>
+                  <span>{t('sharedContext.management.memoryRecallThresholdLabel')}</span>
+                  <input
+                    aria-label={t('sharedContext.management.memoryRecallThresholdLabel')}
+                    type="number"
+                    min={MEMORY_RECALL_MIN_SCORE_MIN}
+                    max={MEMORY_RECALL_MIN_SCORE_MAX}
+                    step={MEMORY_RECALL_MIN_SCORE_STEP}
+                    value={processingMemoryRecallMinScore}
+                    onInput={(e) => setProcessingMemoryRecallMinScore(normalizeMemoryRecallMinScore((e.currentTarget as HTMLInputElement).valueAsNumber))}
+                    style={numberInputStyle}
+                  />
+                </label>
+                <div style={helperTextStyle}>
+                  {t('sharedContext.management.memoryRecallThresholdHelp', { defaultValue: DEFAULT_MEMORY_RECALL_MIN_SCORE.toFixed(2) })}
+                </div>
+                <div style={rowStyle}>
+                  <button
+                    style={buttonStyle}
+                    disabled={processingSaving}
+                    onClick={() => void handleAction(t('sharedContext.notice.processingConfigSaved'), async () => {
+                      setProcessingSaving(true);
+                      try {
+                        const view = await updateSharedContextRuntimeConfig(serverId, buildProcessingConfigPayload());
+                        applyProcessingSnapshot(view);
+                      } finally {
+                        setProcessingSaving(false);
+                      }
+                    })}
+                  >
+                    {processingSaving ? t('sharedContext.management.processingSaving') : t('sharedContext.management.processingSave')}
+                  </button>
+                  <button
+                    style={subtleButtonStyle}
+                    disabled={processingLoading}
+                    onClick={() => setProcessingMemoryRecallMinScore(processingSnapshot?.persisted.memoryRecallMinScore ?? DEFAULT_MEMORY_RECALL_MIN_SCORE)}
+                  >
+                    {t('sharedContext.management.memoryRecallThresholdReset')}
+                  </button>
+                </div>
+                <LabeledValue
+                  label={t('sharedContext.management.memoryRecallThresholdSaved')}
+                  value={(processingSnapshot?.persisted.memoryRecallMinScore ?? DEFAULT_MEMORY_RECALL_MIN_SCORE).toFixed(2)}
+                />
+              </>
+            ) : (
+              <div style={helperTextStyle}>{t('sharedContext.management.processingServerRequired')}</div>
+            )}
+          </div>
+
+          <div style={sectionStyle}>
+            <SectionHeading
+              title={t('sharedContext.management.memoryAdvancedScoringTitle')}
+              description={t('sharedContext.management.memoryAdvancedScoringDescription')}
+            />
+            <button
+              type="button"
+              style={subtleButtonStyle}
+              onClick={() => setMemoryAdvancedVisible((prev) => !prev)}
+            >
+              {memoryAdvancedVisible
+                ? t('sharedContext.management.memoryAdvancedScoringHide')
+                : t('sharedContext.management.memoryAdvancedScoringShow')}
+            </button>
+            {memoryAdvancedVisible ? (
+              <>
+                <div style={helperTextStyle}>{t('sharedContext.management.memoryAdvancedScoringHelp')}</div>
+                <div style={helperTextStyle}>
+                  {t('sharedContext.management.memoryAdvancedScoringSum', {
+                    value: (
+                      processingMemoryScoringWeights.similarity
+                      + processingMemoryScoringWeights.recency
+                      + processingMemoryScoringWeights.frequency
+                      + processingMemoryScoringWeights.project
+                    ).toFixed(2),
+                  })}
+                </div>
+                <label style={fieldLabelStyle}>
+                  <span>{t('sharedContext.management.memoryWeightSimilarity')}</span>
+                  <input
+                    aria-label={t('sharedContext.management.memoryWeightSimilarity')}
+                    type="number"
+                    min={MEMORY_SCORING_WEIGHT_MIN}
+                    max={MEMORY_SCORING_WEIGHT_MAX}
+                    step={MEMORY_SCORING_WEIGHT_INPUT_STEP}
+                    value={processingMemoryScoringWeights.similarity}
+                    onInput={(e) => setProcessingMemoryScoringWeights((prev) => {
+                      const value = (e.currentTarget as HTMLInputElement).valueAsNumber;
+                      return Number.isFinite(value)
+                        ? { ...prev, similarity: Math.min(MEMORY_SCORING_WEIGHT_MAX, Math.max(MEMORY_SCORING_WEIGHT_MIN, value)) }
+                        : prev;
+                    })}
+                    style={numberInputStyle}
+                  />
+                </label>
+                <label style={fieldLabelStyle}>
+                  <span>{t('sharedContext.management.memoryWeightRecency')}</span>
+                  <input
+                    aria-label={t('sharedContext.management.memoryWeightRecency')}
+                    type="number"
+                    min={MEMORY_SCORING_WEIGHT_MIN}
+                    max={MEMORY_SCORING_WEIGHT_MAX}
+                    step={MEMORY_SCORING_WEIGHT_INPUT_STEP}
+                    value={processingMemoryScoringWeights.recency}
+                    onInput={(e) => setProcessingMemoryScoringWeights((prev) => {
+                      const value = (e.currentTarget as HTMLInputElement).valueAsNumber;
+                      return Number.isFinite(value)
+                        ? { ...prev, recency: Math.min(MEMORY_SCORING_WEIGHT_MAX, Math.max(MEMORY_SCORING_WEIGHT_MIN, value)) }
+                        : prev;
+                    })}
+                    style={numberInputStyle}
+                  />
+                </label>
+                <label style={fieldLabelStyle}>
+                  <span>{t('sharedContext.management.memoryWeightFrequency')}</span>
+                  <input
+                    aria-label={t('sharedContext.management.memoryWeightFrequency')}
+                    type="number"
+                    min={MEMORY_SCORING_WEIGHT_MIN}
+                    max={MEMORY_SCORING_WEIGHT_MAX}
+                    step={MEMORY_SCORING_WEIGHT_INPUT_STEP}
+                    value={processingMemoryScoringWeights.frequency}
+                    onInput={(e) => setProcessingMemoryScoringWeights((prev) => {
+                      const value = (e.currentTarget as HTMLInputElement).valueAsNumber;
+                      return Number.isFinite(value)
+                        ? { ...prev, frequency: Math.min(MEMORY_SCORING_WEIGHT_MAX, Math.max(MEMORY_SCORING_WEIGHT_MIN, value)) }
+                        : prev;
+                    })}
+                    style={numberInputStyle}
+                  />
+                </label>
+                <label style={fieldLabelStyle}>
+                  <span>{t('sharedContext.management.memoryWeightProject')}</span>
+                  <input
+                    aria-label={t('sharedContext.management.memoryWeightProject')}
+                    type="number"
+                    min={MEMORY_SCORING_WEIGHT_MIN}
+                    max={MEMORY_SCORING_WEIGHT_MAX}
+                    step={MEMORY_SCORING_WEIGHT_INPUT_STEP}
+                    value={processingMemoryScoringWeights.project}
+                    onInput={(e) => setProcessingMemoryScoringWeights((prev) => {
+                      const value = (e.currentTarget as HTMLInputElement).valueAsNumber;
+                      return Number.isFinite(value)
+                        ? { ...prev, project: Math.min(MEMORY_SCORING_WEIGHT_MAX, Math.max(MEMORY_SCORING_WEIGHT_MIN, value)) }
+                        : prev;
+                    })}
+                    style={numberInputStyle}
+                  />
+                </label>
+                <div style={rowStyle}>
+                  <button
+                    style={buttonStyle}
+                    disabled={processingSaving || !serverId}
+                    onClick={() => void handleAction(t('sharedContext.notice.processingConfigSaved'), async () => {
+                      if (!serverId) return;
+                      setProcessingSaving(true);
+                      try {
+                        const view = await updateSharedContextRuntimeConfig(serverId, buildProcessingConfigPayload());
+                        applyProcessingSnapshot(view);
+                      } finally {
+                        setProcessingSaving(false);
+                      }
+                    })}
+                  >
+                    {processingSaving ? t('sharedContext.management.processingSaving') : t('sharedContext.management.processingSave')}
+                  </button>
+                  <button
+                    type="button"
+                    style={subtleButtonStyle}
+                    onClick={() => setProcessingMemoryScoringWeights(normalizeMemoryScoringWeights(processingSnapshot?.persisted.memoryScoringWeights ?? DEFAULT_MEMORY_SCORING_WEIGHTS))}
+                  >
+                    {t('sharedContext.management.memoryAdvancedScoringReset')}
+                  </button>
+                </div>
+              </>
+            ) : null}
           </div>
 
           <div style={sectionStyle}>
@@ -2101,7 +2656,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                   <span style={{ ...helperTextStyle, fontSize: 12 }}>{t('sharedContext.management.memoryShowArchived')}</span>
                 </div>
                 {localPersonalMemory.records.length > 0
-                  ? renderProcessedMemoryRecords(localPersonalMemory, { allowArchiveRestore: true, onArchive: handleMemoryArchive, onRestore: handleMemoryRestore })
+                  ? renderProcessedMemoryRecords(localPersonalMemory, { allowArchiveRestore: true, allowDelete: true, onArchive: handleMemoryArchive, onRestore: handleMemoryRestore, onDelete: handleLocalMemoryDelete })
                   : <div style={helperTextStyle}>{t('sharedContext.management.memoryProcessedEmptyPending')}</div>}
               </div>
             ) : null}
@@ -2167,7 +2722,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     detail={`${t('sharedContext.management.memoryStatProjects')}: ${cloudPersonalMemory.stats.projectCount}`}
                   />
                 </div>
-                {renderProcessedMemoryRecords(cloudPersonalMemory)}
+                {renderProcessedMemoryRecords(cloudPersonalMemory, { allowDelete: true, onDelete: handleCloudMemoryDelete })}
               </div>
             ) : null}
 
@@ -2188,7 +2743,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     detail={`${t('sharedContext.management.memoryStatProjects')}: ${sharedMemory.stats.projectCount}`}
                   />
                 </div>
-                {renderProcessedMemoryRecords(sharedMemory)}
+                {renderProcessedMemoryRecords(sharedMemory, { allowDelete: team?.myRole === 'owner' || team?.myRole === 'admin', onDelete: handleEnterpriseMemoryDelete })}
               </div>
             ) : null}
 

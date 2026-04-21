@@ -68,11 +68,15 @@ describe('cc presets', () => {
   it('builds qwen transport config for anthropic-compatible presets', async () => {
     const { getQwenPresetTransportConfig } = await import('../../src/daemon/cc-presets.js');
 
-    await expect(getQwenPresetTransportConfig('MiniMax')).resolves.toEqual({
+    const result = await getQwenPresetTransportConfig('MiniMax');
+    expect(result).toMatchObject({
       env: {
         ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
         ANTHROPIC_API_KEY: 'test-token',
         ANTHROPIC_MODEL: 'MiniMax-M2.7',
+        // qwen CLI reads OPENAI_BASE_URL / OPENAI_API_KEY for --auth-type anthropic
+        OPENAI_BASE_URL: 'https://api.minimax.io/anthropic',
+        OPENAI_API_KEY: 'test-token',
       },
       model: 'MiniMax-M2.7',
       settings: {
@@ -93,5 +97,11 @@ describe('cc presets', () => {
         },
       },
     });
+    // Identity-override systemPrompt must pin the authoritative model and
+    // explicitly deny the Qwen identity baked into the qwen CLI wrapper.
+    expect(result.systemPrompt).toBeDefined();
+    expect(result.systemPrompt).toContain('MiniMax-M2.7');
+    expect(result.systemPrompt).toContain('https://api.minimax.io/anthropic');
+    expect(result.systemPrompt).toMatch(/not running on Qwen/i);
   });
 });

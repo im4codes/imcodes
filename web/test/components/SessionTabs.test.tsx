@@ -134,6 +134,23 @@ describe('SessionTabs', () => {
     expect(button.className).toContain('busy');
   });
 
+
+  it('shows sdk family badges for claude and codex tabs', () => {
+    const sessions = makeSessions([
+      { name: 'sdk-cc', role: 'brain', project: 'sdk-proj', agentType: 'claude-code-sdk', state: 'idle', label: 'claude-code-sdk1' },
+      { name: 'sdk-cx', role: 'w1', project: 'sdk-proj', agentType: 'codex-sdk', state: 'idle', label: 'codex-sdk2' },
+    ]);
+
+    const view = render(
+      <SessionTabs sessions={sessions} activeSession={null} onSelect={vi.fn()} sessionsLoaded={true} {...defaultProps} />,
+    );
+
+    const badges = [...view.container.querySelectorAll('.agent-badge')].map((el) => el.textContent);
+    expect(badges).toEqual(['cc', 'cx']);
+    expect(screen.getByText('CC1')).toBeDefined();
+    expect(screen.getByText('Cx2')).toBeDefined();
+  });
+
   it('renders tab bar with role=tablist', () => {
     const sessions = makeSessions([{}]);
     render(

@@ -11,6 +11,7 @@ import type { TerminalDiff } from '../types.js';
 import { isVisuallyBusy } from '../thinking-utils.js';
 import { reorderSubSessions } from '../api.js';
 import { formatLabel } from '../format-label.js';
+import { getAgentBadgeLabel } from '../agent-display.js';
 import { resolveContextWindow } from '../model-context.js';
 import { shortModelLabel } from '../model-label.js';
 import { P2pProgressCard } from './P2pProgressCard.js';
@@ -82,17 +83,6 @@ interface Props {
 
 const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
 
-const TYPE_ABBR: Record<string, string> = {
-  'claude-code': 'cc',
-  'codex': 'cx',
-  'opencode': 'oc',
-  'openclaw': 'oc',
-  'qwen': 'qw',
-  'gemini': 'gm',
-  'shell': 'sh',
-  'script': 'sc',
-};
-
 type Layout = 'single' | 'double';
 
 interface CardSize { w: number; h: number }
@@ -121,7 +111,7 @@ function CollapsedSubSessionButton({ sub, isOpen, idleFlashToken, usage, inP2p, 
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
-  const abbr = TYPE_ABBR[sub.type] ?? agentTag.slice(0, 2);
+  const abbr = getAgentBadgeLabel(sub.type);
   const model = usage ? shortModelLabel(usage.model) : null;
   let ctxPct = 0;
   if (usage) {

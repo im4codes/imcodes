@@ -34,8 +34,19 @@ vi.mock('../../src/components/TerminalView.js', () => ({
   },
 }));
 
+const addOptimisticUserMessageSpy = vi.fn();
+const removeOptimisticMessageSpy = vi.fn();
+
 vi.mock('../../src/hooks/useTimeline.js', () => ({
-  useTimeline: () => ({ events: timelineEvents, refreshing: false }),
+  useTimeline: () => ({
+    events: timelineEvents,
+    refreshing: false,
+    // Exposed so the card's onSend / handleResendFailed handlers exercise
+    // real wiring. Shell sub-sessions deliberately skip useTimeline and the
+    // card falls back to no-op; that path is covered by its own test.
+    addOptimisticUserMessage: addOptimisticUserMessageSpy,
+    removeOptimisticMessage: removeOptimisticMessageSpy,
+  }),
 }));
 
 const sessionControlsSpy = vi.fn((props: any) => (
@@ -376,5 +387,34 @@ describe('SubSessionCard', () => {
     const props = sessionControlsSpy.mock.calls.at(-1)?.[0];
     expect(props.compact).toBe(true);
     expect(props.hideShortcuts).toBeUndefined();
+  });
+
+  it('does not add optimistic bubbles for transport sub-session card sends', () => {
+    // Transport sends can remain queued daemon-side. The compact card must
+    // not inject a committed-looking optimistic bubble before the daemon emits
+    // the authoritative user.message for the actual drain.
+    render(
+      <SubSessionCard
+        sub={makeSubSession({ runtimeType: 'transport' as any, type: 'claude-code-sdk' } as any)}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        quickData={{ data: [], recordHistory: vi.fn() } as any}
+      />,
+    );
+
+    const props = sessionControlsSpy.mock.calls.at(-1)?.[0];
+    expect(typeof props.onSend).toBe('function');
+
+    props.onSend('deck_sub_x', 'card-typed message', {
+      commandId: 'cmd-card-1',
+      attachments: [{ kind: 'file', name: 'notes.md' }],
+      extra: { mode: 'quick' },
+    });
+
+    expect(addOptimisticUserMessageSpy).not.toHaveBeenCalled();
   });
 });

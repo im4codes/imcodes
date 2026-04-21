@@ -117,33 +117,116 @@ function requireTmux(feature: string): void {
 
 /** Ensure tmux server is running. Auto-starts if dead. */
 let tmuxServerChecked = false;
-async function ensureTmuxServer(): Promise<void> {
-  if (tmuxServerChecked) return;
+let tmuxServerCheckInFlight: Promise<void> | null = null;
+function getTmuxErrorText(error: unknown): string {
+  if (!error || typeof error !== 'object') return String(error ?? '');
+  const e = error as { stderr?: unknown; message?: unknown };
+  return String(e.stderr || e.message || '');
+}
+
+function isRecoverableTmuxServerError(error: unknown): boolean {
+  const stderr = getTmuxErrorText(error);
+  return (
+    stderr.includes('no server running')
+    || stderr.includes('No such file or directory')
+    || stderr.includes('error connecting')
+    || stderr.includes('server exited unexpectedly')
+  );
+}
+
+function isDuplicateInitSessionError(error: unknown): boolean {
+  return getTmuxErrorText(error).includes('duplicate session: imcodes_init');
+}
+
+async function tryEnsureTmuxServerOnce(): Promise<void> {
   try {
     await execFile('tmux', ['list-sessions']);
     tmuxServerChecked = true;
+    return;
   } catch (e: any) {
-    const stderr = String(e.stderr || e.message || '');
-    if (stderr.includes('no server running') || stderr.includes('No such file or directory') || stderr.includes('error connecting')) {
+    const stderr = getTmuxErrorText(e);
+    if (isRecoverableTmuxServerError(e)) {
       // tmux server is dead — start it
-      await execFile('tmux', ['new-session', '-d', '-s', 'imcodes_init']);
+      try {
+        await execFile('tmux', ['new-session', '-d', '-s', 'imcodes_init']);
+      } catch (initError) {
+        if (!isDuplicateInitSessionError(initError)) throw initError;
+      }
       // Kill the temp session, server stays alive
       await execFile('tmux', ['kill-session', '-t', 'imcodes_init']).catch(() => {});
       tmuxServerChecked = true;
-    } else if (stderr.includes('no sessions')) {
+      return;
+    }
+    if (stderr.includes('no sessions')) {
       // Server running but no sessions — fine
       tmuxServerChecked = true;
-    } else {
-      throw e;
+      return;
     }
+    throw e;
+  }
+}
+
+/**
+ * Ensure tmux server is running. Auto-starts if dead, with exponential
+ * backoff retries to handle early-boot races where the socket path or
+ * user-level services aren't fully up yet.
+ *
+ * Historical context: the daemon used to crash-loop at boot when tmux
+ * server wasn't ready. The `list-sessions` call threw "error connecting
+ * to /tmp/tmux-1000/default", propagated up to `program.parseAsync().catch`,
+ * and systemd kept restarting. See /home/k/.imcodes/daemon.log (pre-fix).
+ */
+async function ensureTmuxServer(): Promise<void> {
+  if (tmuxServerChecked) return;
+  if (tmuxServerCheckInFlight) {
+    await tmuxServerCheckInFlight;
+    return;
+  }
+  const maxAttempts = 5;
+  const delaysMs = [0, 500, 1000, 2000, 4000]; // cumulative: 0, .5s, 1.5s, 3.5s, 7.5s
+  tmuxServerCheckInFlight = (async () => {
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (delaysMs[attempt]) {
+        await new Promise((r) => setTimeout(r, delaysMs[attempt]));
+      }
+      try {
+        await tryEnsureTmuxServerOnce();
+        return;
+      } catch (e) {
+        lastErr = e;
+        // Only retry for recoverable/transient errors. Non-recoverable
+        // (e.g. tmux binary missing) fail fast.
+        if (!isRecoverableTmuxServerError(e) && !isDuplicateInitSessionError(e)) {
+          throw e;
+        }
+      }
+    }
+    throw lastErr;
+  })();
+  try {
+    await tmuxServerCheckInFlight;
+  } finally {
+    tmuxServerCheckInFlight = null;
   }
 }
 
 /** Run a tmux command with array args (no shell — safe from injection). */
 async function tmuxRun(...args: string[]): Promise<string> {
   await ensureTmuxServer();
-  const { stdout } = await execFile('tmux', args);
-  return stdout.trim();
+  try {
+    const { stdout } = await execFile('tmux', args);
+    return stdout.trim();
+  } catch (error) {
+    if (!isRecoverableTmuxServerError(error)) throw error;
+    // tmux exits when the last session dies. Under rapid create/kill loops,
+    // a cached "server exists" assumption can race with the server shutting
+    // down between commands. Re-prime once, then retry the original command.
+    tmuxServerChecked = false;
+    await ensureTmuxServer();
+    const { stdout } = await execFile('tmux', args);
+    return stdout.trim();
+  }
 }
 
 // ── Raw send primitives (backend-dispatched) ────────────────────────────────────

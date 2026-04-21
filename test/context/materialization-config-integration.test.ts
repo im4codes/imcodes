@@ -67,6 +67,20 @@ describe('MaterializationCoordinator config integration', () => {
     expect(coordinator.modelConfig.backupContextSdk).toBe('openai-sdk');
   });
 
+  it('stores primaryContextPreset and backupContextPreset in model config', async () => {
+    setContextModelRuntimeConfig({
+      primaryContextBackend: 'qwen',
+      primaryContextModel: 'qwen3-coder-plus',
+      primaryContextPreset: 'Qwen Team',
+      backupContextBackend: 'qwen',
+      backupContextModel: 'qwen3-coder-plus',
+      backupContextPreset: 'Qwen Backup',
+    });
+    const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor });
+    expect(coordinator.modelConfig.primaryContextPreset).toBe('Qwen Team');
+    expect(coordinator.modelConfig.backupContextPreset).toBe('Qwen Backup');
+  });
+
   it('records model+backend in materialized projection content', async () => {
     setContextModelRuntimeConfig({
       primaryContextBackend: 'qwen',

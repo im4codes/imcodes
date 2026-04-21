@@ -16,7 +16,8 @@ function hasClaude(): boolean {
 
 // restartSession re-launches via the claude-code driver — requires `claude` binary
 const SKIP = process.env.SKIP_TMUX_TESTS === '1' || !!process.env.CLAUDECODE || !hasClaude();
-const SESSION = 'e2e_crash_restart_test';
+const RUN_ID = Math.random().toString(36).slice(2, 8);
+const SESSION = `e2e_crash_restart_test_${RUN_ID}`;
 const FIXTURES = new URL('../fixtures', import.meta.url).pathname;
 
 describe.skipIf(SKIP)('Crash and auto-restart', () => {

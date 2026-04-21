@@ -21,6 +21,8 @@ import type {
 } from '../../shared/context-types.js';
 import { classifyTimestampFreshness } from '../../shared/context-freshness.js';
 import { serializeContextNamespace, serializeContextTarget } from '../context/context-keys.js';
+import { isMemoryNoiseSummary } from '../../shared/memory-noise-patterns.js';
+import { normalizeSummaryForFingerprint } from '../../shared/memory-fingerprint.js';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
@@ -105,7 +107,15 @@ function ensureDb(): DatabaseSyncInstance {
       updated_at INTEGER NOT NULL,
       hit_count INTEGER NOT NULL DEFAULT 0,
       last_used_at INTEGER,
-      status TEXT NOT NULL DEFAULT 'active'
+      status TEXT NOT NULL DEFAULT 'active',
+      -- Normalized feature-extraction embedding of the summary, encoded as
+      -- little-endian Float32 bytes. NULL when the model was unavailable at
+      -- write time; recall lazy-fills these on first read.
+      embedding BLOB,
+      -- Source text used to compute the embedding — comparing against this
+      -- tells us whether the stored blob is still current when the summary
+      -- gets edited.
+      embedding_source TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_context_processed_local_namespace
       ON context_processed_local(namespace_key, class, updated_at DESC);
@@ -121,8 +131,11 @@ function ensureDb(): DatabaseSyncInstance {
   try { db.exec('ALTER TABLE context_processed_local ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0'); } catch { /* already exists */ }
   try { db.exec('ALTER TABLE context_processed_local ADD COLUMN last_used_at INTEGER'); } catch { /* already exists */ }
   try { db.exec('ALTER TABLE context_processed_local ADD COLUMN status TEXT NOT NULL DEFAULT \'active\''); } catch { /* already exists */ }
+  try { db.exec('ALTER TABLE context_processed_local ADD COLUMN embedding BLOB'); } catch { /* already exists */ }
+  try { db.exec('ALTER TABLE context_processed_local ADD COLUMN embedding_source TEXT'); } catch { /* already exists */ }
   if (stagedReconciledForPath !== dbPath) {
     reconcileMaterializedStagedEvents(db);
+    purgeMemoryNoiseProjections(db);
     stagedReconciledForPath = dbPath;
   }
   return db;
@@ -143,6 +156,50 @@ function parseJson<T>(raw: unknown, fallback: T): T {
   } catch {
     return fallback;
   }
+}
+
+function toNullableNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function toNullableString(value: unknown): string | null {
+  return typeof value === 'string' ? value : null;
+}
+
+
+function removeProjectionIdsFromReplicationState(database: DatabaseSyncInstance, projectionIds: string[]): void {
+  if (projectionIds.length === 0) return;
+  const projectionIdSet = new Set(projectionIds);
+  const replicationRows = database.prepare('SELECT namespace_key, pending_projection_ids_json, last_replicated_at, last_error FROM context_replication_state').all() as Array<Record<string, unknown>>;
+  for (const row of replicationRows) {
+    const pending = parseJson<string[]>(row.pending_projection_ids_json, []);
+    const filtered = pending.filter((id) => !projectionIdSet.has(id));
+    if (filtered.length === pending.length) continue;
+    database.prepare(`
+      UPDATE context_replication_state
+      SET pending_projection_ids_json = ?, last_replicated_at = ?, last_error = ?
+      WHERE namespace_key = ?
+    `).run(
+      JSON.stringify(filtered),
+      toNullableNumber(row.last_replicated_at),
+      toNullableString(row.last_error),
+      String(row.namespace_key),
+    );
+  }
+}
+
+function purgeMemoryNoiseProjections(database: DatabaseSyncInstance): number {
+  const rows = database.prepare('SELECT id, summary FROM context_processed_local').all() as Array<{ id: string; summary: string }>;
+  const badIds = rows.filter((row) => isMemoryNoiseSummary(row.summary)).map((row) => row.id);
+  if (badIds.length === 0) return 0;
+  const placeholders = badIds.map(() => '?').join(', ');
+  database.prepare(`DELETE FROM context_processed_local WHERE id IN (${placeholders})`).run(...badIds);
+  removeProjectionIdsFromReplicationState(database, badIds);
+  return badIds.length;
+}
+
+export function removeMemoryNoiseProjections(): number {
+  return purgeMemoryNoiseProjections(ensureDb());
 }
 
 export function resetContextStoreForTests(): void {
@@ -387,6 +444,66 @@ export function deleteTentativeProjections(namespace: ContextNamespace, projecti
 export function writeProcessedProjection(input: Omit<ProcessedContextProjection, 'id' | 'createdAt' | 'updatedAt'> & Partial<Pick<ProcessedContextProjection, 'id' | 'createdAt' | 'updatedAt'>>): ProcessedContextProjection {
   const database = ensureDb();
   const now = Date.now();
+  const namespaceKey = serializeContextNamespace(input.namespace);
+  const normalizedSummary = normalizeSummaryForFingerprint(input.summary);
+
+  // Content-level dedup: before handing out a fresh UUID, look for an existing
+  // row with the same (namespace, class, normalized-summary). The daemon's
+  // materialization path was creating a new UUID on every turn even when the
+  // compressor produced a byte-for-byte identical summary, which then got
+  // replicated to the server as N distinct rows and surfaced as N copies of
+  // the same Related-history card. Reusing the existing row collapses the
+  // duplicates at the source instead of patching the symptom downstream.
+  //
+  // Matching is done in JS (not SQL) because SQLite's LOWER/TRIM handles only
+  // leading/trailing whitespace and ASCII case — the fingerprint also collapses
+  // internal whitespace runs and is locale-agnostic. We bound the scan to a
+  // recent window so the cost stays O(1) even for heavily-used projects.
+  //
+  // Only engaged when the caller did NOT pass an explicit id — replication
+  // from a remote writer preserves the remote id so ON CONFLICT(id) on the
+  // server stays authoritative and cross-device history merges correctly.
+  const DEDUP_SCAN_LIMIT = 50;
+  if (!input.id) {
+    const candidates = database.prepare(`
+      SELECT id, summary, created_at
+      FROM context_processed_local
+      WHERE namespace_key = ? AND class = ?
+      ORDER BY updated_at DESC
+      LIMIT ?
+    `).all(namespaceKey, input.class, DEDUP_SCAN_LIMIT) as Array<{ id: string; summary: string; created_at: number }>;
+    const existing = candidates.find((row) =>
+      normalizeSummaryForFingerprint(row.summary) === normalizedSummary,
+    );
+    if (existing) {
+      // Touch updated_at + refresh the content/source ids so the most recent
+      // turn's context (if it changed) stays visible. Preserve created_at so
+      // the row's age-in-store is honest (important for startup-memory
+      // selection which weighs recency).
+      database.prepare(`
+        UPDATE context_processed_local
+        SET source_event_ids_json = ?, content_json = ?, summary = ?, updated_at = ?
+        WHERE id = ?
+      `).run(
+        JSON.stringify(input.sourceEventIds),
+        JSON.stringify(input.content),
+        input.summary,
+        now,
+        existing.id,
+      );
+      return {
+        id: existing.id,
+        namespace: input.namespace,
+        class: input.class,
+        sourceEventIds: input.sourceEventIds,
+        summary: input.summary,
+        content: input.content,
+        createdAt: existing.created_at,
+        updatedAt: now,
+      };
+    }
+  }
+
   const projection: ProcessedContextProjection = {
     id: input.id ?? randomUUID(),
     namespace: input.namespace,
@@ -403,7 +520,7 @@ export function writeProcessedProjection(input: Omit<ProcessedContextProjection,
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     projection.id,
-    serializeContextNamespace(projection.namespace),
+    namespaceKey,
     projection.class,
     JSON.stringify(projection.sourceEventIds),
     projection.summary,
@@ -412,6 +529,86 @@ export function writeProcessedProjection(input: Omit<ProcessedContextProjection,
     projection.updatedAt,
   );
   return projection;
+}
+
+// ── Persistent per-projection embeddings ──────────────────────────────────────
+//
+// The daemon-side recall path used to recompute a Float32Array for every
+// candidate's summary on every query (~7 ms × 40 candidates = ~300 ms of pure
+// model inference per recall). The server side already stores embeddings
+// in pgvector; the daemon needs the same treatment against local SQLite.
+//
+// These helpers take opaque BLOBs — the embedding.ts module owns encoding
+// via encodeEmbedding / decodeEmbedding so the store layer does not depend
+// on the model implementation.
+
+export interface ProjectionEmbeddingRow {
+  id: string;
+  summary: string;
+  embedding: Buffer | null;
+  /** Summary text used when `embedding` was computed, for staleness checks. */
+  embeddingSource: string | null;
+}
+
+/** Read the stored embedding BLOB and its source text for a single projection.
+ *  Returns `undefined` when the row does not exist. */
+export function getProjectionEmbedding(projectionId: string): ProjectionEmbeddingRow | undefined {
+  const database = ensureDb();
+  const row = database.prepare(
+    'SELECT id, summary, embedding, embedding_source FROM context_processed_local WHERE id = ?',
+  ).get(projectionId) as
+    | { id: string; summary: string; embedding: Buffer | Uint8Array | null; embedding_source: string | null }
+    | undefined;
+  if (!row) return undefined;
+  const embedding = row.embedding == null
+    ? null
+    : Buffer.isBuffer(row.embedding)
+      ? row.embedding
+      : Buffer.from(row.embedding);
+  return { id: row.id, summary: row.summary, embedding, embeddingSource: row.embedding_source };
+}
+
+/** Persist a freshly-computed embedding for an existing projection row.
+ *  `source` is the exact text that was embedded — a later write that changes
+ *  the summary text invalidates this row on read via the staleness check. */
+export function saveProjectionEmbedding(
+  projectionId: string,
+  embedding: Buffer,
+  source: string,
+): void {
+  const database = ensureDb();
+  database.prepare(
+    'UPDATE context_processed_local SET embedding = ?, embedding_source = ? WHERE id = ?',
+  ).run(embedding, source, projectionId);
+}
+
+/** Read stored embeddings for many projections in one query.
+ *  Returns a map keyed by projection id; rows with no stored embedding have
+ *  `embedding: null` so the caller can lazy-fill them. */
+export function getProjectionEmbeddings(projectionIds: string[]): Map<string, ProjectionEmbeddingRow> {
+  if (projectionIds.length === 0) return new Map();
+  const database = ensureDb();
+  const placeholders = projectionIds.map(() => '?').join(',');
+  const rows = database.prepare(
+    `SELECT id, summary, embedding, embedding_source
+       FROM context_processed_local
+      WHERE id IN (${placeholders})`,
+  ).all(...projectionIds) as Array<{
+    id: string;
+    summary: string;
+    embedding: Buffer | Uint8Array | null;
+    embedding_source: string | null;
+  }>;
+  const out = new Map<string, ProjectionEmbeddingRow>();
+  for (const row of rows) {
+    const embedding = row.embedding == null
+      ? null
+      : Buffer.isBuffer(row.embedding)
+        ? row.embedding
+        : Buffer.from(row.embedding);
+    out.set(row.id, { id: row.id, summary: row.summary, embedding, embeddingSource: row.embedding_source });
+  }
+  return out;
 }
 
 export function listProcessedProjections(namespace: ContextNamespace, projectionClass?: ProcessedContextClass): ProcessedContextProjection[] {
@@ -432,7 +629,7 @@ export function listProcessedProjections(namespace: ContextNamespace, projection
     hitCount: typeof row.hit_count === 'number' ? row.hit_count : 0,
     lastUsedAt: typeof row.last_used_at === 'number' ? row.last_used_at : undefined,
     status: typeof row.status === 'string' ? row.status as 'active' | 'archived' : 'active',
-  }));
+  })).filter((projection) => !isMemoryNoiseSummary(projection.summary));
 }
 
 /** Returns a map of namespace_key → projection IDs for all local projections. */
@@ -473,11 +670,66 @@ export interface ProcessedProjectionStats {
 
 export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}): ProcessedContextProjection[] {
   const database = ensureDb();
-  const sql = filters.includeArchived
-    ? 'SELECT * FROM context_processed_local ORDER BY updated_at DESC'
-    : "SELECT * FROM context_processed_local WHERE status != 'archived' ORDER BY updated_at DESC";
-  const rows = database.prepare(sql).all() as Array<Record<string, unknown>>;
   const normalizedQuery = filters.query?.trim().toLowerCase() ?? '';
+
+  const limit = typeof filters.limit === 'number' && filters.limit > 0 ? filters.limit : 50;
+  // Request slightly more than the limit since noise-filtering + class-filter may
+  // reduce the result set below the requested count.
+  const fetchLimit = limit + 20;
+
+  // Build indexed WHERE predicates.
+  // namespace_key format: scope::enterpriseId::workspaceId::userId::projectId.
+  // The index idx_context_processed_local_namespace covers (namespace_key, class, updated_at).
+  // We can use prefix-match LIKE only when the FIRST field (scope) is provided —
+  // otherwise ":::projectId" would not match "personal::::projectId".
+  const conditions: string[] = [];
+  const params: (string | number)[] = [];
+
+  if (!filters.includeArchived) {
+    conditions.push("status != 'archived'");
+  }
+
+  if (filters.scope) {
+    // Build a LIKE prefix from ONLY the contiguous leading namespace fields.
+    // namespace_key format is `scope::enterprise::workspace::user::project`, so
+    // blindly joining all filter fields produces a wrong prefix when the
+    // filter skips a middle field. E.g. `{scope:'personal', projectId:'repo'}`
+    // was producing LIKE `personal::::::::repo%` (8 colons, empty user) which
+    // never matches a stored row with userId='user-1' keyed as
+    // `personal::::::user-1::repo` (6 colons, populated user). We stop at the
+    // first missing leading field and let the JS-side filter at the bottom
+    // enforce the remaining conditions. This preserves index usage for the
+    // common fully-populated case while fixing the gap case.
+    const leadingParts: string[] = [filters.scope];
+    if (filters.enterpriseId) {
+      leadingParts.push(filters.enterpriseId);
+      if (filters.workspaceId) {
+        leadingParts.push(filters.workspaceId);
+        if (filters.userId) {
+          leadingParts.push(filters.userId);
+          if (filters.projectId) {
+            leadingParts.push(filters.projectId);
+          }
+        }
+      }
+    }
+    const nsPrefix = leadingParts.join('::');
+    conditions.push('namespace_key LIKE ?');
+    params.push(nsPrefix + '%');
+  }
+  // If scope is absent but other namespace fields are present, we skip the namespace_key
+  // predicate — the remaining JS filters (applied below) will handle it. This is
+  // intentionally a full-table scan for the uncommon "projectId-only" query path.
+
+  if (filters.projectionClass) {
+    conditions.push('class = ?');
+    params.push(filters.projectionClass);
+  }
+
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const sql = `SELECT * FROM context_processed_local ${where} ORDER BY updated_at DESC LIMIT ${fetchLimit}`;
+  const rows = database.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+
   const filtered = rows
     .map((row) => {
       const namespace = parseNamespaceKey(String(row.namespace_key));
@@ -495,18 +747,23 @@ export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}
         status: typeof row.status === 'string' ? row.status as 'active' | 'archived' : 'active',
       } satisfies ProcessedContextProjection;
     })
-    .filter((projection) => !filters.scope || projection.namespace.scope === filters.scope)
-    .filter((projection) => (filters.enterpriseId ?? undefined) === undefined || projection.namespace.enterpriseId === filters.enterpriseId)
-    .filter((projection) => (filters.workspaceId ?? undefined) === undefined || projection.namespace.workspaceId === filters.workspaceId)
-    .filter((projection) => (filters.userId ?? undefined) === undefined || projection.namespace.userId === filters.userId)
-    .filter((projection) => !filters.projectId || projection.namespace.projectId === filters.projectId)
-    .filter((projection) => !filters.projectionClass || projection.class === filters.projectionClass)
     .filter((projection) => {
-      if (!normalizedQuery) return true;
-      const haystack = `${projection.summary}\n${JSON.stringify(projection.content)}`.toLowerCase();
-      return haystack.includes(normalizedQuery);
+      // Namespace + class JS filters — applied regardless of SQL predicate coverage.
+      if (filters.scope && projection.namespace.scope !== filters.scope) return false;
+      if (filters.enterpriseId && projection.namespace.enterpriseId !== filters.enterpriseId) return false;
+      if (filters.workspaceId && projection.namespace.workspaceId !== filters.workspaceId) return false;
+      if (filters.userId && projection.namespace.userId !== filters.userId) return false;
+      if (filters.projectId && projection.namespace.projectId !== filters.projectId) return false;
+      // Class was already in SQL (when provided); still safe to double-check.
+      if (filters.projectionClass && projection.class !== filters.projectionClass) return false;
+      if (isMemoryNoiseSummary(projection.summary)) return false;
+      if (normalizedQuery) {
+        const haystack = `${projection.summary}\n${JSON.stringify(projection.content)}`.toLowerCase();
+        if (!haystack.includes(normalizedQuery)) return false;
+      }
+      return true;
     });
-  const limit = typeof filters.limit === 'number' && filters.limit > 0 ? filters.limit : 50;
+
   return filtered.slice(0, limit);
 }
 
@@ -538,6 +795,7 @@ export function getProcessedProjectionStats(filters: ProcessedProjectionQuery = 
     if (filters.projectionClass && projectionClass !== filters.projectionClass) continue;
     const status = typeof row.status === 'string' ? row.status : 'active';
     if (!filters.includeArchived && status === 'archived') continue;
+    if (isMemoryNoiseSummary(String(row.summary))) continue;
     totalRecords += 1;
     projectIds.add(namespace.projectId);
     if (projectionClass === 'recent_summary') recentSummaryCount += 1;
@@ -774,4 +1032,19 @@ export function archiveMemory(id: string): boolean {
   `).run(id);
 
   return ((result as { changes: number }).changes ?? 0) > 0;
+}
+
+
+/**
+ * Permanently delete a local processed projection.
+ * Also removes the projection id from pending replication state so deleted items are not re-uploaded.
+ */
+export function deleteMemory(id: string): boolean {
+  const database = ensureDb();
+  const result = database.prepare('DELETE FROM context_processed_local WHERE id = ?').run(id);
+  const deleted = ((result as { changes: number }).changes ?? 0) > 0;
+  if (deleted) {
+    removeProjectionIdsFromReplicationState(database, [id]);
+  }
+  return deleted;
 }

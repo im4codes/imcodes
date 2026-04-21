@@ -215,15 +215,35 @@ export async function getServerSharedContextRuntimeConfig(
   if (!raw || typeof raw !== 'object') return null;
   const primaryContextBackend = typeof raw.primaryContextBackend === 'string' ? raw.primaryContextBackend.trim() : undefined;
   const primaryContextModel = typeof raw.primaryContextModel === 'string' ? raw.primaryContextModel.trim() : '';
+  const primaryContextPreset = typeof raw.primaryContextPreset === 'string' ? raw.primaryContextPreset.trim() : '';
   const backupContextBackend = typeof raw.backupContextBackend === 'string' ? raw.backupContextBackend.trim() : undefined;
   const backupContextModel = typeof raw.backupContextModel === 'string' ? raw.backupContextModel.trim() : '';
+  const backupContextPreset = typeof raw.backupContextPreset === 'string' ? raw.backupContextPreset.trim() : '';
+  const memoryRecallMinScore = typeof raw.memoryRecallMinScore === 'number' && Number.isFinite(raw.memoryRecallMinScore)
+    ? raw.memoryRecallMinScore
+    : undefined;
+  const rawMemoryScoringWeights = raw.memoryScoringWeights && typeof raw.memoryScoringWeights === 'object'
+    ? raw.memoryScoringWeights as Record<string, unknown>
+    : undefined;
+  const memoryScoringWeights = rawMemoryScoringWeights
+    ? {
+        similarity: typeof rawMemoryScoringWeights.similarity === 'number' ? rawMemoryScoringWeights.similarity : undefined,
+        recency: typeof rawMemoryScoringWeights.recency === 'number' ? rawMemoryScoringWeights.recency : undefined,
+        frequency: typeof rawMemoryScoringWeights.frequency === 'number' ? rawMemoryScoringWeights.frequency : undefined,
+        project: typeof rawMemoryScoringWeights.project === 'number' ? rawMemoryScoringWeights.project : undefined,
+      }
+    : undefined;
   const enablePersonalMemorySync = raw.enablePersonalMemorySync === true;
   if (!primaryContextModel) return null;
   return {
     primaryContextBackend,
     primaryContextModel,
+    primaryContextPreset: primaryContextPreset || undefined,
     backupContextBackend: backupContextBackend || undefined,
     backupContextModel: backupContextModel || undefined,
+    backupContextPreset: backupContextPreset || undefined,
+    memoryRecallMinScore,
+    memoryScoringWeights,
     enablePersonalMemorySync,
   };
 }

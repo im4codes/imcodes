@@ -19,6 +19,7 @@ import { fetchSupervisorDefaults, patchSession, patchSubSession } from '../api.j
 import { isRunningSessionState } from '../thinking-utils.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { isLegacyTransportPendingMessageId, normalizeTransportPendingEntries } from '../transport-queue.js';
+import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 import {
   buildP2pConfigSelection,
   P2P_CONFIG_MODE,
@@ -26,11 +27,13 @@ import {
   isComboMode,
 } from '@shared/p2p-modes.js';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
+import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import type { P2pSavedConfig } from '@shared/p2p-modes.js';
 import { getQwenAuthTier, QWEN_AUTH_TIERS } from '@shared/qwen-auth.js';
 import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/qwen-models.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, normalizeClaudeCodeModelId } from '../../../src/shared/models/options.js';
-import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '@shared/effort-levels.js';
+import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '@shared/effort-levels.js';
+import { useTransportModels, supportsDynamicTransportModels } from '../hooks/useTransportModels.js';
 import {
   buildTransportConfigWithSupervision,
   extractSessionSupervisionSnapshot,
@@ -64,8 +67,22 @@ interface Props {
   detectedModel?: string;
   /** Hide the shortcuts row (e.g. in chat mode). */
   hideShortcuts?: boolean;
-  /** Called after a message is sent — for local UX only (e.g. optimistic display). Does not emit timeline events. */
-  onSend?: (sessionName: string, text: string) => void;
+  /** Called after a message is sent — for local UX only (e.g. optimistic display).
+   *  Does not emit timeline events. The `commandId` lets the consumer reconcile
+   *  the optimistic bubble with the eventual command.ack / echoed user.message.
+   *  `attachments` is the original attachment list so the pending bubble can
+   *  surface the same badges the confirmed message will. `extra` is the raw
+   *  session.send extras (p2p targets, mode, locale, etc.) — kept so the retry
+   *  path can replay the original send faithfully. */
+  onSend?: (
+    sessionName: string,
+    text: string,
+    meta?: {
+      commandId: string;
+      attachments?: Array<Record<string, unknown>>;
+      extra?: Record<string, unknown>;
+    },
+  ) => void;
   /** Sub-session overrides — when set, menu actions use these instead of main session commands. */
   onSubRestart?: () => void;
   onSubNew?: () => void;
@@ -108,10 +125,10 @@ type P2pMode = string; // 'solo' | single modes | combo pipelines like 'brainsto
 const MODEL_STORAGE_KEY = 'imcodes-model';
 const CODEX_MODEL_STORAGE_KEY = 'imcodes-codex-model';
 const QWEN_MODEL_STORAGE_KEY = 'imcodes-qwen-model';
-const QUEUED_HINT_EXPANDED_STORAGE_KEY = 'imcodes-queued-hint-expanded';
-const QUEUED_HINT_EXPANDED_EVENT = 'imcodes:queued-hint-expanded';
 const P2P_COMBO_CONFIRM_SKIP_PREF_KEY = 'p2p_combo_direct_send_skip_confirm';
 const CODEX_MODELS: CodexModelChoice[] = [...CODEX_MODEL_IDS] as CodexModelChoice[];
+const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
+const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
 const P2P_BASE_MODES = ['solo', 'audit', 'review', 'plan', 'brainstorm', 'discuss', P2P_CONFIG_MODE] as const;
 const P2P_MODE_I18N: Record<string, string> = { solo: 'p2p.mode_solo', audit: 'p2p.mode_audit', review: 'p2p.mode_review', plan: 'p2p.mode_plan', brainstorm: 'p2p.mode_brainstorm', discuss: 'p2p.mode_discuss', [P2P_CONFIG_MODE]: 'p2p.mode_config' };
 const P2P_SINGLE_COLORS: Record<string, string> = { solo: '#dbe7f5', audit: '#f59e0b', review: '#3b82f6', plan: '#06b6d4', brainstorm: '#a78bfa', discuss: '#22c55e', [P2P_CONFIG_MODE]: '#94a3b8' };
@@ -240,6 +257,13 @@ type PendingP2pConfigSave = {
   timer: ReturnType<typeof setTimeout>;
 };
 
+type PendingTransportApproval = {
+  sessionId: string;
+  requestId: string;
+  description: string;
+  tool?: string;
+};
+
 function appendOptionalAdvancedP2pConfig(extra: Record<string, unknown>, config: P2pSavedConfig): void {
   const advanced = config as P2pSavedConfig & OptionalP2pAdvancedConfig;
   if (advanced.advancedPresetKey) extra.p2pAdvancedPresetKey = advanced.advancedPresetKey;
@@ -287,12 +311,6 @@ function loadQwenModel(): QwenModelChoice | null {
   return null;
 }
 
-function loadQueuedHintExpanded(): boolean {
-  try {
-    return localStorage.getItem(QUEUED_HINT_EXPANDED_STORAGE_KEY) !== '0';
-  } catch { /* ignore */ }
-  return true;
-}
 
 function normalizeP2pMode(mode: string): string | null {
   const normalized = mode.trim().toLowerCase();
@@ -383,8 +401,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [model, setModel] = useState<ModelChoice | null>(loadModel);
   const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModel);
   const [qwenModel, setQwenModel] = useState<QwenModelChoice | null>(loadQwenModel);
-  const [queuedHintExpanded, setQueuedHintExpanded] = useState(loadQueuedHintExpanded);
   const [editingQueuedMessageId, setEditingQueuedMessageId] = useState<string | null>(null);
+  const [queuedHintExpanded, setQueuedHintExpanded] = useState(false);
+  const toggleQueuedHintExpanded = useCallback(() => setQueuedHintExpanded((v) => !v), []);
   const [optimisticQueuedEntries, setOptimisticQueuedEntries] = useState<Array<{ clientMessageId: string; text: string }> | null>(null);
   const [mobileComposerMultiline, setMobileComposerMultiline] = useState(false);
   const [mobileComposerExpanded, setMobileComposerExpanded] = useState(false);
@@ -393,6 +412,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [skipComboSendConfirm, setSkipComboSendConfirm] = useState(false);
   const [pendingComboSendConfirm, setPendingComboSendConfirm] = useState<PendingComboSendConfirmation | null>(null);
   const [rememberComboSendChoice, setRememberComboSendChoice] = useState(false);
+  const [pendingTransportApproval, setPendingTransportApproval] = useState<PendingTransportApproval | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const modelRef = useRef<HTMLDivElement>(null);
   const autoRef = useRef<HTMLDivElement>(null);
@@ -408,11 +428,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const quickWrapRef = useRef<HTMLDivElement>(null);
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const showRunningSweep = !compact && isRunningSessionState(activeSession?.state);
-  const incomingQueuedTransportEntries = activeSession?.runtimeType === 'transport'
+  const effectiveRuntimeType = activeSession ? resolveSessionInfoRuntimeType(activeSession) : undefined;
+  const incomingQueuedTransportEntries = effectiveRuntimeType === 'transport'
     ? normalizeTransportPendingEntries(
-        activeSession.transportPendingMessageEntries,
-        activeSession.transportPendingMessages,
-        activeSession.name,
+        activeSession?.transportPendingMessageEntries,
+        activeSession?.transportPendingMessages,
+        activeSession?.name ?? '',
       )
     : [];
   const queuedTransportEntries = optimisticQueuedEntries ?? incomingQueuedTransportEntries;
@@ -502,6 +523,37 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setLocalTransportConfig(activeSession?.transportConfig ?? null);
   }, [activeSession?.name, activeSession?.transportConfig]);
 
+  useEffect(() => {
+    if (effectiveRuntimeType !== 'transport') {
+      setPendingTransportApproval(null);
+    }
+  }, [activeSession?.name, effectiveRuntimeType]);
+
+  const connected = !!ws?.connected;
+
+  useEffect(() => {
+    if (!ws) return;
+    return ws.onMessage((msg) => {
+      if (!activeSession || effectiveRuntimeType !== 'transport') return;
+      if (msg.type === TRANSPORT_MSG.CHAT_APPROVAL && msg.sessionId === activeSession.name) {
+        setPendingTransportApproval({
+          sessionId: msg.sessionId,
+          requestId: msg.requestId,
+          description: msg.description,
+          ...(msg.tool ? { tool: msg.tool } : {}),
+        });
+        return;
+      }
+      if (msg.type === TRANSPORT_MSG.APPROVAL_RESPONSE && msg.sessionId === activeSession.name) {
+        setPendingTransportApproval((current) => (
+          current?.sessionId === msg.sessionId && current.requestId === msg.requestId
+            ? null
+            : current
+        ));
+      }
+    });
+  }, [activeSession, effectiveRuntimeType, ws]);
+
   // Auto-sync model selector with detected model from terminal/ctx
   // Detection is the real-time truth — always override the selector
   useEffect(() => {
@@ -527,7 +579,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     }
   }, [activeSession?.agentType, activeSession?.qwenModel, qwenModel]);
 
-  const connected = !!ws?.connected;
   const hasSession = !!activeSession;
   // Input only disabled when there's no session at all (can type while disconnected)
   const inputDisabled = !hasSession;
@@ -535,7 +586,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const disabled = !connected || !hasSession;
   const isClaudeCode = activeSession?.agentType === 'claude-code' || activeSession?.agentType === 'claude-code-sdk';
   const isShellLike = activeSession?.agentType === 'shell' || activeSession?.agentType === 'script';
-  const isTransport = activeSession?.runtimeType === 'transport';
+  const isTransport = effectiveRuntimeType === 'transport';
   const currentTransportConfig = localTransportConfig ?? activeSession?.transportConfig ?? null;
   const hasInvalidSupervisionConfig = hasInvalidSessionSupervisionSnapshot(currentTransportConfig);
   const supervisionSnapshot = extractSessionSupervisionSnapshot(currentTransportConfig);
@@ -548,6 +599,49 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   );
   const isCodex = activeSession?.agentType === 'codex' || activeSession?.agentType === 'codex-sdk';
   const isQwen = activeSession?.agentType === 'qwen';
+  const isCopilot = activeSession?.agentType === 'copilot-sdk';
+  const isCursorHeadless = activeSession?.agentType === 'cursor-headless';
+  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless;
+  // Source-of-truth priority for the model picker:
+  //   1. `useTransportModels` — live daemon probe via `transport.list_models`
+  //      WS round-trip. Works uniformly for main sessions AND sub-sessions
+  //      (sub-session SessionInfo records aren't hydrated with
+  //      copilot/cursorAvailableModels, so we can't rely on activeSession).
+  //   2. `activeSession?.{copilot,cursor}AvailableModels` — the cached
+  //      hydration set by `buildSessionList()` for main sessions (first
+  //      paint before the WS probe reply arrives).
+  //   3. Hardcoded suggestion constants — offline/no-probe fallback so the
+  //      picker never renders empty.
+  const dynamicModelsAgentType = supportsDynamicTransportModels(activeSession?.agentType)
+    ? activeSession!.agentType
+    : null;
+  const dynamicTransportModels = useTransportModels(ws, dynamicModelsAgentType);
+  const genericTransportModelSuggestions: readonly string[] = useMemo(() => {
+    if (dynamicTransportModels.models.length > 0) {
+      return dynamicTransportModels.models.map((m) => m.id);
+    }
+    if (isCopilot) {
+      const probed = activeSession?.copilotAvailableModels;
+      if (probed && probed.length > 0) return probed;
+      return COPILOT_SDK_MODEL_SUGGESTIONS;
+    }
+    if (isCursorHeadless) {
+      const probed = activeSession?.cursorAvailableModels;
+      if (probed && probed.length > 0) return probed;
+      return CURSOR_HEADLESS_MODEL_SUGGESTIONS;
+    }
+    return [];
+  }, [
+    dynamicTransportModels.models,
+    isCopilot,
+    isCursorHeadless,
+    activeSession?.copilotAvailableModels,
+    activeSession?.cursorAvailableModels,
+  ]);
+  const genericTransportModel = activeSession?.activeModel
+    ?? activeSession?.requestedModel
+    ?? detectedModel
+    ?? null;
   const thinkingLevels = useMemo((): readonly TransportEffortLevel[] => (
     activeSession?.agentType === 'claude-code-sdk'
       ? CLAUDE_SDK_EFFORT_LEVELS
@@ -555,15 +649,24 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         ? CODEX_SDK_EFFORT_LEVELS
         : activeSession?.agentType === 'qwen'
           ? QWEN_EFFORT_LEVELS
-        : activeSession?.agentType === 'openclaw'
-          ? OPENCLAW_THINKING_LEVELS
-          : []
+          : activeSession?.agentType === 'copilot-sdk'
+            ? COPILOT_SDK_EFFORT_LEVELS
+          : activeSession?.agentType === 'openclaw'
+            ? OPENCLAW_THINKING_LEVELS
+            : []
   ), [activeSession?.agentType]);
   const supportsThinking = thinkingLevels.length > 0;
+  // Default the pill to a sensible value whenever the agent supports thinking
+  // but the session doesn't yet have an `effort` persisted. Prefer 'high' if
+  // the agent's level set includes it (true for every current transport type),
+  // otherwise pick the last level which is conventionally the strongest.
+  const defaultThinkingForAgent: TransportEffortLevel | undefined = supportsThinking
+    ? (thinkingLevels.includes('high' as TransportEffortLevel)
+        ? 'high'
+        : thinkingLevels[thinkingLevels.length - 1])
+    : undefined;
   const currentThinking = (activeSession?.effort as TransportEffortLevel | undefined)
-    ?? (activeSession?.agentType === 'qwen' || activeSession?.agentType === 'openclaw'
-      ? 'high'
-      : undefined);
+    ?? defaultThinkingForAgent;
   const qwenTier = getQwenAuthTier(activeSession?.qwenAuthType);
   const qwenTierLabel = qwenTier === QWEN_AUTH_TIERS.FREE
     ? t('session.qwen_tier_free')
@@ -627,19 +730,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return () => onOverlayOpenChange?.(false);
   }, [mobileFileBrowserOpen, onOverlayOpenChange, overlayOpen]);
 
-  useEffect(() => {
-    const syncQueuedHintExpanded = () => setQueuedHintExpanded(loadQueuedHintExpanded());
-    const handleStorage = (event: StorageEvent) => {
-      if (event.key && event.key !== QUEUED_HINT_EXPANDED_STORAGE_KEY) return;
-      syncQueuedHintExpanded();
-    };
-    window.addEventListener('storage', handleStorage);
-    window.addEventListener(QUEUED_HINT_EXPANDED_EVENT, syncQueuedHintExpanded);
-    return () => {
-      window.removeEventListener('storage', handleStorage);
-      window.removeEventListener(QUEUED_HINT_EXPANDED_EVENT, syncQueuedHintExpanded);
-    };
-  }, []);
 
   useEffect(() => {
     if (!editingQueuedMessageId) return;
@@ -654,7 +744,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   );
   const lastIncomingQueuedTransportEntriesKeyRef = useRef(incomingQueuedTransportEntriesKey);
   useEffect(() => {
-    if (activeSession?.runtimeType !== 'transport') {
+    if (effectiveRuntimeType !== 'transport') {
       setOptimisticQueuedEntries(null);
       lastIncomingQueuedTransportEntriesKeyRef.current = incomingQueuedTransportEntriesKey;
       return;
@@ -663,7 +753,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       setOptimisticQueuedEntries(null);
     }
     lastIncomingQueuedTransportEntriesKeyRef.current = incomingQueuedTransportEntriesKey;
-  }, [activeSession?.name, activeSession?.runtimeType, incomingQueuedTransportEntriesKey]);
+  }, [activeSession?.name, effectiveRuntimeType, incomingQueuedTransportEntriesKey]);
 
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
@@ -1346,8 +1436,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return { text: cleanText, extra };
   }, [activeSession, applySavedP2pConfigSelection, i18n?.language, p2pExcludeSameType, p2pMode, p2pSavedConfig, sessions, subSessions, ws]);
 
-  const sendSessionMessage = useCallback((text: string, extra: Record<string, unknown> = {}) => {
-    if (!ws || !activeSession) return false;
+  // Returns the commandId on success (so the caller can drive optimistic UI
+  // reconciliation via command.ack / the echoed user.message) or null when the
+  // preconditions (ws, session) aren't satisfied.
+  const sendSessionMessage = useCallback((text: string, extra: Record<string, unknown> = {}): string | null => {
+    if (!ws || !activeSession) return null;
     const commandId = globalThis.crypto?.randomUUID?.() ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     ws.sendSessionCommand('send', {
       sessionName: activeSession.name,
@@ -1355,7 +1448,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       ...extra,
       commandId,
     });
-    return true;
+    return commandId;
   }, [activeSession, ws]);
 
   const sendQueuedMessageMutation = useCallback((type: 'session.edit_queued_message' | 'session.undo_queued_message', payload: Record<string, unknown>) => {
@@ -1372,7 +1465,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const finalizeSend = useCallback((payload: PendingSendPayload, options?: { clearComposer?: boolean }) => {
     if (!activeSession) return;
-    if (editingQueuedMessageId && activeSession.runtimeType === 'transport') {
+    if (editingQueuedMessageId && effectiveRuntimeType === 'transport') {
       try {
         if (!sendQueuedMessageMutation('session.edit_queued_message', {
           clientMessageId: editingQueuedMessageId,
@@ -1410,12 +1503,27 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       return;
     }
     quickData.recordHistory(payload.text, activeSession.name);
+    let commandId: string | null = null;
     try {
-      if (!sendSessionMessage(payload.text, payload.extra)) return;
+      commandId = sendSessionMessage(payload.text, payload.extra);
+      if (!commandId) return;
     } catch {
       return;
     }
-    onSend?.(activeSession.name, payload.text);
+    // Snapshot attachments before clearComposer wipes them so the optimistic
+    // bubble surfaces the same badges the confirmed message will.
+    const attachmentSnapshot = attachments.length > 0
+      ? attachments.map((a) => ({
+          id: a.path,
+          daemonPath: a.path,
+          originalName: a.name,
+        }))
+      : undefined;
+    onSend?.(activeSession.name, payload.text, {
+      commandId,
+      ...(attachmentSnapshot ? { attachments: attachmentSnapshot } : {}),
+      ...(payload.extra && Object.keys(payload.extra).length > 0 ? { extra: payload.extra } : {}),
+    });
     if (options?.clearComposer) {
       pendingAtTargetsRef.current = [];
       pendingConfigOverrideRef.current = null;
@@ -1439,7 +1547,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (!isEditableQueuedEntry(entry)) return;
     fillInput(entry.text);
     setEditingQueuedMessageId(entry.clientMessageId);
-    setQueuedHintExpanded(true);
   }, [isEditableQueuedEntry]);
 
   const handleQueuedMessageDelete = useCallback((entry: { clientMessageId: string; text: string }) => {
@@ -1559,7 +1666,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [buildModeOnlySendPayload, requestSend]);
 
   const handleKeyDown = (e: KeyboardEvent) => {
-    if (e.key === 'Escape' && activeSession?.runtimeType === 'transport' && isRunningSessionState(activeSession.state)) {
+    if (e.key === 'Escape' && effectiveRuntimeType === 'transport' && isRunningSessionState(activeSession?.state)) {
       e.preventDefault();
       sendSessionMessage('/stop');
       return;
@@ -1770,23 +1877,19 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     onAfterAction?.();
   };
 
+  const handleGenericTransportModelSelect = (m: string) => {
+    if (!activeSession) return;
+    sendSessionMessage(`/model ${m}`);
+    setModelOpen(false);
+    onAfterAction?.();
+  };
+
   const handleThinkingSelect = (level: TransportEffortLevel) => {
     if (!activeSession) return;
     setThinkingOpen(false);
     sendSessionMessage(`/thinking ${level}`);
     onAfterAction?.();
   };
-
-  const toggleQueuedHintExpanded = useCallback(() => {
-    setQueuedHintExpanded((current) => {
-      const next = !current;
-      try {
-        localStorage.setItem(QUEUED_HINT_EXPANDED_STORAGE_KEY, next ? '1' : '0');
-        window.dispatchEvent(new CustomEvent(QUEUED_HINT_EXPANDED_EVENT));
-      } catch { /* ignore */ }
-      return next;
-    });
-  }, []);
 
   const isMobileLayout = typeof window !== 'undefined' && window.innerWidth <= 640;
   const showEmbeddedVoiceButton = isMobileLayout && VoiceInput.isAvailable() && !hasText;
@@ -1915,7 +2018,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 >
                   {quickSupervisionMode === SUPERVISION_MODE.SUPERVISED_AUDIT ? '● ' : '○ '}{t('session.supervision.mode.supervised_audit')}
                 </button>
-                {(hasInvalidSupervisionConfig || (!supervisionSnapshot && !!onSettings)) && (
+                {!!onSettings && (
                   <>
                     <div class="menu-divider" />
                     <button
@@ -2215,6 +2318,32 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             )}
           </div>
         )}
+        {supportsGenericTransportModelSelect && (
+          <div class="shortcuts-model" ref={modelRef}>
+            <button
+              class="shortcut-btn"
+              onClick={() => setModelOpen((o) => !o)}
+              disabled={disabled}
+              title={genericTransportModel ? `Model: ${genericTransportModel}` : 'Model: default — tap to select'}
+              style={{ color: genericTransportModel ? '#34d399' : '#6b7280', fontSize: 10 }}
+            >
+              {genericTransportModel ?? 'default'}
+            </button>
+            {modelOpen && (
+              <div class="menu-dropdown">
+                {genericTransportModelSuggestions.map((m) => (
+                  <button
+                    key={m}
+                    class={`menu-item ${genericTransportModel === m ? 'menu-item-active' : ''}`}
+                    onClick={() => handleGenericTransportModelSelect(m)}
+                  >
+                    {genericTransportModel === m ? '● ' : '○ '}{m}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
         {supportsThinking && (
           <div class="shortcuts-model" ref={thinkingRef}>
             <button
@@ -2324,6 +2453,68 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           )}
         </div>}
       </div>}
+
+      {pendingTransportApproval && effectiveRuntimeType === 'transport' && (
+        <div
+          class="transport-approval-banner"
+          style={{
+            margin: '0 8px 4px',
+            padding: '6px 8px',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            borderRadius: 8,
+            border: '1px solid rgba(96,165,250,0.35)',
+            background: 'rgba(30,41,59,0.82)',
+            color: '#e2e8f0',
+            fontSize: 12,
+            lineHeight: 1.25,
+          }}
+        >
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontWeight: 600, marginBottom: 2 }}>{t('session.approval.pending')}</div>
+            <div style={{ color: '#cbd5e1', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+              {pendingTransportApproval.tool
+                ? t('session.approval.tool', { tool: pendingTransportApproval.tool })
+                : pendingTransportApproval.description}
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+            <button
+              class="btn btn-secondary"
+              style={{ minWidth: 64, padding: '4px 8px', fontSize: 12 }}
+              disabled={disabled}
+              onClick={() => {
+                if (!ws || !activeSession || effectiveRuntimeType !== 'transport') return;
+                try {
+                  ws.respondTransportApproval(activeSession.name, pendingTransportApproval.requestId, true);
+                  setPendingTransportApproval(null);
+                } catch {
+                  // leave the approval visible so the user can retry
+                }
+              }}
+            >
+              {t('session.approval.allow')}
+            </button>
+            <button
+              class="btn btn-secondary"
+              style={{ minWidth: 64, padding: '4px 8px', fontSize: 12 }}
+              disabled={disabled}
+              onClick={() => {
+                if (!ws || !activeSession || effectiveRuntimeType !== 'transport') return;
+                try {
+                  ws.respondTransportApproval(activeSession.name, pendingTransportApproval.requestId, false);
+                  setPendingTransportApproval(null);
+                } catch {
+                  // leave the approval visible so the user can retry
+                }
+              }}
+            >
+              {t('session.approval.deny')}
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Upload progress bar */}
       {uploading && (
@@ -2732,16 +2923,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         </div>}
       </div>
       {queuedTransportMessages.length > 0 && (
-        <div class="controls-queued-hint" role="status" aria-live="polite">
-          <div class="controls-queued-header">
-            <div>{t('session.transport_send_queued')}</div>
-            <button type="button" class="controls-queued-toggle" onClick={toggleQueuedHintExpanded}>
-              {queuedHintExpanded ? t('common.hide') : t('common.show')}
-            </button>
-          </div>
-          <div class="controls-queued-list">
-            {queuedHintExpanded ? (
-              queuedTransportEntries.map((entry) => (
+        queuedHintExpanded ? (
+          <div class="controls-queued-hint" role="status" aria-live="polite">
+            <div class="controls-queued-header">
+              <div>{t('session.transport_send_queued')}</div>
+              <button type="button" class="controls-queued-toggle" onClick={toggleQueuedHintExpanded}>
+                {t('common.hide')}
+              </button>
+            </div>
+            <div class="controls-queued-list">
+              {queuedTransportEntries.map((entry) => (
                 <div class="controls-queued-item" key={entry.clientMessageId}>
                   <span class="controls-queued-item-text">{entry.text}</span>
                   {isEditableQueuedEntry(entry) && (
@@ -2755,19 +2946,23 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                     </span>
                   )}
                 </div>
-              ))
-            ) : (
-              <>
-                <div class="controls-queued-summary">
-                  {t('session.transport_send_queued_collapsed', { count: queuedTransportMessages.length })}
-                </div>
-                <div class="controls-queued-item" key={`${activeSession?.name ?? 'session'}:latest:${queuedTransportLatestMessage}`}>
-                  <span class="controls-queued-item-text">{queuedTransportLatestMessage}</span>
-                </div>
-              </>
-            )}
+              ))}
+            </div>
           </div>
-        </div>
+        ) : (
+          // Collapsed — render a single compact pill (count only) instead of
+          // the full hint. The full header+summary+preview was occupying too
+          // much vertical space above the composer on mobile.
+          <button
+            type="button"
+            class="controls-queued-pill"
+            onClick={toggleQueuedHintExpanded}
+            aria-live="polite"
+            title={queuedTransportLatestMessage}
+          >
+            {t('session.transport_send_queued_count', { count: queuedTransportMessages.length })}
+          </button>
+        )
       )}
       {editingQueuedEntry && (
         <div class="controls-queued-editing">

@@ -2,6 +2,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
+import { killProcessTree } from '../../util/kill-process-tree.js';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import readline from 'node:readline';
@@ -23,6 +24,7 @@ import {
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
+import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 import { DEFAULT_TRANSPORT_EFFORT, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import logger from '../../util/logger.js';
 import { inferContextWindow } from '../../util/model-context.js';
@@ -31,11 +33,43 @@ import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-p
 const execFileAsync = promisify(execFile);
 const QWEN_BIN = 'qwen';
 
+/**
+ * Auth types accepted by the qwen CLI's `--auth-type` flag.
+ * Verified via `qwen --help` (qwen 0.14.5). Passing this flag forces the CLI
+ * to use the named tier for the current run, bypassing the user-level
+ * `~/.qwen/settings.json` that otherwise wins over our system-level settings.
+ *
+ * This is separate from `shared/qwen-auth.ts`'s display-tier constants
+ * (`qwen-oauth` / `coding-plan` / `api-key` — used for UI badges).
+ */
+const QWEN_CLI_AUTH_TYPES = new Set([
+  'openai',
+  'anthropic',
+  'qwen-oauth',
+  'gemini',
+  'vertex-ai',
+]);
+
+/** Extract `security.auth.selectedType` from a settings object if it names a
+ *  qwen CLI auth type. Returns undefined when settings are absent, malformed,
+ *  or hold a value that qwen doesn't recognize (so we don't crash the spawn). */
+function resolveCliAuthType(settings: string | Record<string, unknown> | undefined): string | undefined {
+  if (!settings || typeof settings === 'string') return undefined;
+  const security = settings.security;
+  if (!security || typeof security !== 'object') return undefined;
+  const auth = (security as Record<string, unknown>).auth;
+  if (!auth || typeof auth !== 'object') return undefined;
+  const selected = (auth as Record<string, unknown>).selectedType;
+  if (typeof selected !== 'string') return undefined;
+  return QWEN_CLI_AUTH_TYPES.has(selected) ? selected : undefined;
+}
+
 interface QwenSessionState {
   cwd: string;
   started: boolean;
   description?: string;
   model?: string;
+  env?: Record<string, string>;
   effort: TransportEffortLevel;
   settings?: string | Record<string, unknown>;
   settingsDir?: string;
@@ -205,7 +239,9 @@ export class QwenProvider implements TransportProvider {
   async disconnect(): Promise<void> {
     for (const [sessionId, state] of this.sessions) {
       if (state.child && !state.child.killed) {
-        state.child.kill('SIGTERM');
+        // Tree-kill: qwen CLI forks children (web_search etc.) that survive
+        // a wrapper-only SIGTERM. See killProcessTree for walk+SIGKILL logic.
+        void killProcessTree(state.child);
       }
       await this.cleanupSessionSettings(state);
       this.sessions.delete(sessionId);
@@ -222,6 +258,7 @@ export class QwenProvider implements TransportProvider {
       started: !!(config.bindExistingKey || config.skipCreate || existing?.started),
       description: config.description ?? existing?.description,
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
+      env: config.env ?? existing?.env,
       effort: config.effort ?? existing?.effort ?? DEFAULT_TRANSPORT_EFFORT,
       settings: config.settings ?? existing?.settings,
       settingsDir: existing?.settingsDir,
@@ -244,7 +281,9 @@ export class QwenProvider implements TransportProvider {
   async endSession(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (state?.child && !state.child.killed) {
-      state.child.kill('SIGTERM');
+      // Tree-kill so any child forked by the qwen CLI (web_search etc.) is
+      // also terminated — see provider disconnect comment.
+      void killProcessTree(state.child);
     }
     if (state) await this.cleanupSessionSettings(state);
     this.sessions.delete(sessionId);
@@ -311,7 +350,7 @@ export class QwenProvider implements TransportProvider {
   async send(
     sessionId: string,
     payloadOrMessage: string | ProviderContextPayload,
-    _attachments?: unknown[],
+    _attachments?: TransportAttachment[],
     extraSystemPrompt?: string,
     allowResumeFallback = true,
   ): Promise<void> {
@@ -324,6 +363,7 @@ export class QwenProvider implements TransportProvider {
       started: true,
       description: undefined,
       model: undefined,
+      env: undefined,
       effort: DEFAULT_TRANSPORT_EFFORT,
       settings: undefined,
       settingsDir: undefined,
@@ -368,6 +408,16 @@ export class QwenProvider implements TransportProvider {
     if (state.model) {
       args.push('--model', state.model);
     }
+    // When a preset is active, state.settings carries `security.auth.selectedType`.
+    // Pass it explicitly via --auth-type so the qwen CLI uses that tier for this
+    // run — otherwise user-level ~/.qwen/settings.json (which may still say
+    // qwen-oauth) overrides our system-level settings file and we fall back to
+    // the discontinued OAuth tier. See shared/qwen-auth.ts for the display-tier
+    // counterpart; these CLI values are distinct.
+    const cliAuthType = resolveCliAuthType(state.settings);
+    if (cliAuthType) {
+      args.push('--auth-type', cliAuthType);
+    }
     if (state.started) {
       args.push('--resume', state.qwenConversationId);
     } else {
@@ -381,6 +431,7 @@ export class QwenProvider implements TransportProvider {
       env: {
         ...process.env,
         ...((this.config.env as Record<string, string> | undefined) ?? {}),
+        ...(state.env ?? {}),
         QWEN_CODE_SYSTEM_SETTINGS_PATH: await this.ensureSettingsPath(state),
       },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -692,15 +743,11 @@ export class QwenProvider implements TransportProvider {
     if (!state?.child || state.child.killed) return;
     state.cancelled = true;
     const child = state.child;
-    child.kill('SIGTERM');
-    // SIGKILL escalation — Qwen CLI may have child processes (web_search, etc.) that ignore SIGTERM
-    const killTimer = setTimeout(() => {
-      if (!child.killed) {
-        logger.warn({ provider: this.id, sessionId }, 'Qwen process did not exit after SIGTERM — sending SIGKILL');
-        child.kill('SIGKILL');
-      }
-    }, 2000);
-    child.once('close', () => clearTimeout(killTimer));
+    // Tree-kill: previously we only SIGTERM+SIGKILL'd the wrapper, which
+    // left Qwen CLI's grandchildren (web_search, bash helpers) alive.
+    // killProcessTree walks the descendant tree via `ps` and sends SIGTERM
+    // → SIGKILL to each pid explicitly (2s grace).
+    void killProcessTree(child, { gracefulMs: 2_000 });
     // Reset conversation so next send uses --session-id with a fresh ID
     // instead of --resume on the conversation stuck in a tool-call loop.
     state.started = false;

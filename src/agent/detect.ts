@@ -5,6 +5,12 @@
  * Status: 'idle' | 'streaming' | 'thinking' | 'tool_running' | 'permission' | 'unknown'
  */
 
+import {
+  PROCESS_SESSION_AGENT_TYPES,
+  TRANSPORT_SESSION_AGENT_TYPES,
+  type SessionAgentType,
+} from '../../shared/agent-types.js';
+
 export type AgentStatus =
   | 'idle'
   | 'streaming'
@@ -15,19 +21,19 @@ export type AgentStatus =
   | 'unknown';
 
 /** Process-backed agents — controlled via tmux sessions */
-export type ProcessAgent = 'claude-code' | 'codex' | 'opencode' | 'shell' | 'script' | 'gemini';
+export type ProcessAgent = typeof PROCESS_SESSION_AGENT_TYPES[number];
 
 /** Transport-backed agents — controlled via network protocols */
-export type TransportAgent = 'openclaw' | 'qwen' | 'claude-code-sdk' | 'codex-sdk';
+export type TransportAgent = typeof TRANSPORT_SESSION_AGENT_TYPES[number];
 
 /** All agent types */
-export type AgentType = ProcessAgent | TransportAgent;
+export type AgentType = SessionAgentType;
 
 /** Set of all transport agent type strings */
-export const TRANSPORT_AGENTS = new Set<TransportAgent>(['openclaw', 'qwen', 'claude-code-sdk', 'codex-sdk']);
+export const TRANSPORT_AGENTS = new Set<TransportAgent>(TRANSPORT_SESSION_AGENT_TYPES);
 
 /** Set of all process agent type strings */
-export const PROCESS_AGENTS = new Set<ProcessAgent>(['claude-code', 'codex', 'opencode', 'shell', 'script', 'gemini']);
+export const PROCESS_AGENTS = new Set<ProcessAgent>(PROCESS_SESSION_AGENT_TYPES);
 
 /** Check if an agent type is transport-backed */
 export function isTransportAgent(agentType: string): agentType is TransportAgent {

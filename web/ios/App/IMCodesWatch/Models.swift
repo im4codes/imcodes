@@ -282,6 +282,15 @@ struct WatchConversationItem: Identifiable, Equatable {
     let type: String
     let text: String
     let isWarmCache: Bool
+    /// True while the message is awaiting daemon confirmation (optimistic bubble).
+    var isPending: Bool = false
+    /// True when the send has failed (HTTP error, auth expired, etc.).
+    var isFailed: Bool = false
+    /// Present for optimistic user messages so later real echoes can reconcile
+    /// by commandId instead of text (agent may normalize the prompt).
+    var commandId: String?
+    /// Failure reason shown as a small subtitle under a failed bubble.
+    var failureReason: String?
 
     var id: String { eventId }
     var isUser: Bool { type == "user.message" }
@@ -313,9 +322,43 @@ struct WatchConversationItem: Identifiable, Equatable {
         )
     }
 
+    /// Optimistic user.message injected when the user taps Send, before the
+    /// daemon round-trip confirms delivery. The eventId is prefixed so merge()
+    /// can distinguish it from real events; commandId lets a later echo (with
+    /// payload.commandId / payload.clientMessageId) replace it in place.
+    static func optimisticSend(sessionId: String, text: String, commandId: String) -> WatchConversationItem {
+        return WatchConversationItem(
+            eventId: "optimistic:\(sessionId):\(commandId)",
+            sessionId: sessionId,
+            ts: Date().timeIntervalSince1970 * 1000,
+            type: "user.message",
+            text: text,
+            isWarmCache: false,
+            isPending: true,
+            isFailed: false,
+            commandId: commandId
+        )
+    }
+
     static func merge(existing: [WatchConversationItem], incoming: [WatchConversationItem]) -> [WatchConversationItem] {
+        // Extract any live optimistic bubbles from `existing` so real echoes
+        // arriving in `incoming` can cancel them by commandId rather than
+        // leaving a ghost "sending" row next to the confirmed message.
+        var incomingCommandIds = Set<String>()
+        for item in incoming {
+            if let cmd = item.commandId, !cmd.isEmpty {
+                incomingCommandIds.insert(cmd)
+            }
+        }
+
         var byId: [String: WatchConversationItem] = [:]
         for item in existing + incoming {
+            // A real event for this commandId arrived → drop the optimistic
+            // sibling regardless of eventId (they have different eventIds by
+            // construction: "optimistic:<id>" vs. daemon-emitted id).
+            if item.isPending, let cmd = item.commandId, incomingCommandIds.contains(cmd) {
+                continue
+            }
             if let current = byId[item.eventId] {
                 if current.isWarmCache && !item.isWarmCache {
                     byId[item.eventId] = item
@@ -326,6 +369,24 @@ struct WatchConversationItem: Identifiable, Equatable {
                 byId[item.eventId] = item
             }
         }
+
+        // Fallback: match optimistic bubbles to real echoes by (text, user
+        // type) within a 5-second window. Handles older daemons that don't
+        // emit payload.commandId yet.
+        let dedupWindow: Double = 5_000
+        var trimmedReal: [(text: String, ts: Double)] = []
+        for item in byId.values where !item.isPending && item.isUser && !item.isFailed {
+            trimmedReal.append((item.text.trimmingCharacters(in: .whitespacesAndNewlines), item.ts))
+        }
+        let staleOptimistic: [String] = byId.compactMap { key, value in
+            guard value.isPending else { return nil }
+            let trimmed = value.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let matched = trimmedReal.contains { real in
+                real.text == trimmed && abs(real.ts - value.ts) < dedupWindow
+            }
+            return matched ? key : nil
+        }
+        for key in staleOptimistic { byId.removeValue(forKey: key) }
 
         return byId.values.sorted { lhs, rhs in
             if lhs.ts == rhs.ts { return lhs.eventId < rhs.eventId }

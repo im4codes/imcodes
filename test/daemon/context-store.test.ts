@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ContextNamespace, ContextTargetRef } from '../../shared/context-types.js';
 import {
   archiveMemory,
+  deleteMemory,
   clearDirtyTarget,
   enqueueContextJob,
   getLocalProcessedFreshness,
@@ -12,6 +13,7 @@ import {
   listProcessedProjections,
   queryPendingContextEvents,
   queryProcessedProjections,
+  removeMemoryNoiseProjections,
   recordContextEvent,
   recordMemoryHits,
   resetContextStoreForTests,
@@ -202,6 +204,36 @@ describe('context-store', () => {
     expect(queryPendingContextEvents({ scope: 'personal', projectId: 'repo', limit: 10 })).toEqual([]);
   });
 
+
+  it('removes legacy API error memories from the local database', () => {
+    const clean = writeProcessedProjection({
+      namespace,
+      class: 'recent_summary',
+      sourceEventIds: ['evt-1'],
+      summary: 'Useful summary',
+      content: {},
+      createdAt: 10,
+      updatedAt: 10,
+    });
+    const noisy = writeProcessedProjection({
+      namespace,
+      class: 'recent_summary',
+      sourceEventIds: ['evt-2'],
+      summary: '**Assistant:** [API Error: Connection error. (cause: fetch failed)]',
+      content: {},
+      createdAt: 20,
+      updatedAt: 20,
+    });
+    setReplicationState(namespace, {
+      pendingProjectionIds: [clean.id, noisy.id],
+      lastReplicatedAt: 0,
+    });
+
+    expect(removeMemoryNoiseProjections()).toBeLessThanOrEqual(1);
+    expect(listProcessedProjections(namespace).map((row) => row.id)).toEqual([clean.id]);
+    expect(getReplicationState(namespace)?.pendingProjectionIds).toEqual([clean.id]);
+  });
+
   it('reconciles stale staged events that were already referenced by processed projections', () => {
     const first = recordContextEvent({ target, eventType: 'user.turn', content: 'question', createdAt: 10 });
     const second = recordContextEvent({ target, eventType: 'assistant.turn', content: 'answer', createdAt: 20 });
@@ -335,6 +367,47 @@ describe('context-store', () => {
 
       expect(archiveMemory(projection.id)).toBe(true);
       expect(archiveMemory(projection.id)).toBe(false);
+    });
+
+
+    it('deleteMemory removes a processed projection permanently', () => {
+      const now = Date.now();
+      const projection = writeProcessedProjection({
+        namespace,
+        class: 'recent_summary',
+        sourceEventIds: ['evt-1'],
+        summary: 'Delete me',
+        content: {},
+        createdAt: now - 100,
+        updatedAt: now,
+      });
+
+      expect(deleteMemory(projection.id)).toBe(true);
+      expect(queryProcessedProjections({ projectId: namespace.projectId, includeArchived: true })).toHaveLength(0);
+      expect(deleteMemory(projection.id)).toBe(false);
+    });
+
+    it('deleteMemory removes pending replication ids for the deleted projection', () => {
+      const projection = writeProcessedProjection({
+        namespace,
+        class: 'recent_summary',
+        sourceEventIds: ['evt-1'],
+        summary: 'Delete and unschedule replication',
+        content: {},
+      });
+      setReplicationState(namespace, {
+        pendingProjectionIds: [projection.id, 'keep-me'],
+        lastReplicatedAt: 123,
+        lastError: 'none',
+      });
+
+      expect(deleteMemory(projection.id)).toBe(true);
+      expect(getReplicationState(namespace)).toEqual({
+        namespace,
+        pendingProjectionIds: ['keep-me'],
+        lastReplicatedAt: 123,
+        lastError: 'none',
+      });
     });
 
     it('queryProcessedProjections excludes archived by default', () => {

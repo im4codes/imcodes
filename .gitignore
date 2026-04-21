@@ -45,6 +45,10 @@ docs/*.local.md
 .claude/
 .codex/
 .gemini/
+.qwen/
+.imcodes/
+.opencode/
+opencode.json
 
 # System
 .DS_Store

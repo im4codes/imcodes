@@ -12,6 +12,12 @@ const cosineSimilarityMock = vi.hoisted(() => vi.fn());
 vi.mock('../../src/context/embedding.js', () => ({
   generateEmbedding: generateEmbeddingMock,
   cosineSimilarity: cosineSimilarityMock,
+  // Persistent embedding store helpers. The recall path now reads stored
+  // BLOBs from SQLite and writes freshly-computed ones back — the mocks here
+  // keep those paths well-typed without exercising real on-disk persistence
+  // (the existing tests only care about the scoring path).
+  encodeEmbedding: (vec: Float32Array) => Buffer.from(new Uint8Array(vec.buffer.slice(0))),
+  decodeEmbedding: (_buf: Buffer | null) => null,
 }));
 
 describe('memory-search semantic ranking', () => {

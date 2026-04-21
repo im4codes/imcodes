@@ -6,6 +6,7 @@ import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
 import type { SessionContextBootstrapState } from '../../shared/session-context-bootstrap.js';
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
+import { getSessionRuntimeType } from '../../shared/agent-types.js';
 
 const STORE_DIR = join(homedir(), '.imcodes');
 const STORE_PATH = join(STORE_DIR, 'sessions.json');
@@ -50,6 +51,13 @@ export interface SessionRecord extends SessionContextBootstrapState {
   qwenAuthLimit?: string;
   /** Qwen models available for the current auth source. */
   qwenAvailableModels?: string[];
+  /** Copilot models reported by `client.listModels()` (full SDK list, not the
+   *  hardcoded fallback). Hydrated by `buildSessionList` for `copilot-sdk`
+   *  agent sessions so the web model picker can show every supported model. */
+  copilotAvailableModels?: string[];
+  /** Cursor models reported by `cursor-agent --list-models`. Hydrated by
+   *  `buildSessionList` for `cursor-headless` agent sessions. */
+  cursorAvailableModels?: string[];
   /** Generic display model override for UI footer/header. */
   modelDisplay?: string;
   /** User-requested transport model persisted for restart/rebuild/cross-device restore. */
@@ -78,15 +86,35 @@ export interface SessionRecord extends SessionContextBootstrapState {
   providerId?: string;
   /** Provider-side session ID/key. For OpenClaw this is the OC session key. */
   providerSessionId?: string;
+  /** Provider-side durable resume/session identifier for shared local-sdk providers. */
+  providerResumeId?: string;
   /** Session description — used for persona/system prompt injection. */
   description?: string;
   /** CC env preset name — persisted so respawn can re-inject the same env vars. */
   ccPreset?: string;
+  /** Context window override carried by a provider preset (e.g. MiniMax 200K). */
+  presetContextWindow?: number;
   /** Human-readable label for UI display (e.g. "OC:main", "discord:#general"). */
   label?: string;
   /** True for sessions created by the user (not auto-synced from provider).
    *  User-created sessions must not be deleted/stopped by sync or health checks. */
   userCreated?: boolean;
+  /** True once the transport runtime has already injected its "startup memory"
+   *  (related-past-work preamble) into the provider context for this session.
+   *  Persisted so daemon restart / session restart do NOT re-inject history
+   *  into an existing conversation. Reset on /clear (fresh conversation) or
+   *  genuine new-session creation. */
+  startupMemoryInjected?: boolean;
+  /** Ring buffer of per-turn memory-ID sets that have been injected into
+   *  this session's recall prompts (most recent first, bounded by
+   *  RECENT_INJECTION_HISTORY_SIZE). Persisted so daemon restart does not
+   *  re-dedup from zero and re-inject the same memories into an agent that
+   *  already has them in its own conversation history.
+   *
+   *  Semantics match the in-memory Map in recent-injection-history.ts:
+   *  1 turn = 1 inner array (regardless of how many IDs it carries).
+   *  Wiped on `/clear` / fresh-restart alongside the runtime state. */
+  recentInjectionHistory?: string[][];
 }
 
 export interface SessionStore {
@@ -129,11 +157,49 @@ export async function loadStore(): Promise<SessionStore> {
     store = { sessions: {} };
   }
   if (pruneNonPersistableSessions()) scheduleWrite();
+  if (reconcilePersistedSessions()) scheduleWrite();
   // Probe actual state of each session via terminal detection.
   // Without this, stale "running" states from before daemon restart persist
   // and cause UI animations to trigger for idle agents.
   void probeSessionStates();
   return store;
+}
+
+/**
+ * Reconcile persisted records on daemon startup:
+ *
+ *  1) Backfill `runtimeType` for records persisted before that field existed.
+ *     CRITICAL: without this, transport SDK sessions (`claude-code-sdk`,
+ *     `codex-sdk`, etc.) read back with `runtimeType === undefined`. The
+ *     lifecycle health poller and `restartSession` then treat them as
+ *     tmux-backed and cycle them into `state: 'error'` on every daemon
+ *     restart (because there is no tmux pane to attach).
+ *
+ *  2) Auto-recover `state: 'error'` to `stopped`. The error state is reached
+ *     only when the restart budget (3 restarts / 5 min) is exhausted. By the
+ *     time a fresh daemon process has loaded, the rate window has elapsed and
+ *     the proximate cause (often "tmux pane killed when previous daemon
+ *     OOM'd") no longer applies. Letting sessions retry once more avoids
+ *     requiring manual web-UI intervention after every daemon crash.
+ *
+ * Returns true when any record was mutated and the store needs flushing.
+ */
+function reconcilePersistedSessions(): boolean {
+  let mutated = false;
+  for (const session of Object.values(store.sessions)) {
+    if (!session.runtimeType && typeof session.agentType === 'string') {
+      session.runtimeType = getSessionRuntimeType(session.agentType);
+      mutated = true;
+    }
+    if (session.state === 'error') {
+      session.state = 'stopped';
+      session.restarts = 0;
+      session.restartTimestamps = [];
+      session.updatedAt = Date.now();
+      mutated = true;
+    }
+  }
+  return mutated;
 }
 
 /** After loadStore, detect actual state of each session from terminal and emit corrections. */

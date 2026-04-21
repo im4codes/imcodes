@@ -10,6 +10,7 @@ import { getPodIdentity } from '../util/pod-identity.js';
 import { isSessionAgentType } from '../../../shared/agent-types.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
+import { sanitizeProjectName } from '../../../shared/sanitize-project-name.js';
 
 export const sessionMgmtRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -278,11 +279,27 @@ sessionMgmtRoutes.delete('/:id/sessions/:name', async (c) => {
 
 sessionMgmtRoutes.post('/:id/session/start', async (c) => {
   const userId = c.get('userId' as never) as string;
-  const role = await resolveServerRole(c.env.DB, c.req.param('id')!, userId);
+  const serverId = c.req.param('id')!;
+  const role = await resolveServerRole(c.env.DB, serverId, userId);
   if (role !== 'owner' && role !== 'admin') {
     return c.json({ error: 'forbidden', reason: 'start requires admin or owner role' }, 403);
   }
-  return relayToDaemon(c, 'session.start');
+  let body: Record<string, unknown> = {};
+  try {
+    body = await c.req.json() as Record<string, unknown>;
+  } catch {
+    body = {};
+  }
+  const rawProject = typeof body.project === 'string' ? body.project : '';
+  const projectDir = typeof body.dir === 'string' ? body.dir : '';
+  if (rawProject) {
+    const projectName = sanitizeProjectName(rawProject);
+    const sessionName = `deck_${projectName}_brain`;
+    if (isKnownTestSessionLike({ name: sessionName, projectName: rawProject, projectDir })) {
+      return c.json({ error: 'test_session_blocked' }, 400);
+    }
+  }
+  return relayToDaemon(c, 'session.start', body);
 });
 
 sessionMgmtRoutes.post('/:id/session/stop', async (c) => {
@@ -308,16 +325,19 @@ sessionMgmtRoutes.post('/:id/session/send', async (c) => {
 async function relayToDaemon(
   c: Context<{ Bindings: Env; Variables: { userId: string; role: string } }>,
   command: string,
+  bodyOverride?: Record<string, unknown>,
 ) {
   const serverId = c.req.param('id')!;
   const server = await getServerById(c.env.DB, serverId);
   if (!server) return c.json({ error: 'not_found' }, 404);
 
-  let body: unknown = {};
-  try {
-    body = await c.req.json();
-  } catch {
-    // body is optional
+  let body: unknown = bodyOverride ?? {};
+  if (bodyOverride === undefined) {
+    try {
+      body = await c.req.json();
+    } catch {
+      // body is optional
+    }
   }
 
   const { type: _ignoredType, ...rest } = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;

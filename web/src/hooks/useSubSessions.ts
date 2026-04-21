@@ -20,6 +20,8 @@ import {
   mergeTransportPendingMessagesForRunningState,
   normalizeTransportPendingEntries,
 } from '../transport-queue.js';
+import { getSessionRuntimeType, isTransportSessionAgentType } from '@shared/agent-types.js';
+import { getAutoSessionLabelPrefix } from '../agent-display.js';
 
 export interface SubSession extends SubSessionData {
   sessionName: string;
@@ -68,6 +70,7 @@ export function useSubSessions(
           loadedGenRef.current = gen;
           setSubSessions(list.map((s) => ({
             ...s,
+            runtimeType: s.runtimeType ?? getSessionRuntimeType(s.type),
             sessionName: toSessionName(s.id),
             state: 'unknown' as const,
           })));
@@ -173,7 +176,7 @@ export function useSubSessions(
               serverId: '',
               type: m.sessionType || 'shell',
               sessionName: m.sessionName || `deck_sub_${m.id}`,
-              runtimeType: m.runtimeType ?? (m.sessionType === 'qwen' || m.sessionType === 'openclaw' ? 'transport' : null),
+              runtimeType: m.runtimeType ?? getSessionRuntimeType(m.sessionType || 'shell'),
               providerId: m.providerId ?? null,
               providerSessionId: m.providerSessionId ?? null,
               cwd: m.cwd || null,
@@ -388,7 +391,7 @@ export function useSubSessions(
       let effectiveLabel = label;
       if (!effectiveLabel) {
         const siblings = subSessions.filter((s) => s.parentSession === activeSession);
-        const prefix = type === 'claude-code' ? 'CC' : type === 'codex' ? 'Cx' : type === 'gemini' ? 'Gm' : type === 'qwen' ? 'Qw' : type === 'openclaw' ? 'OC' : type;
+        const prefix = getAutoSessionLabelPrefix(type);
         let n = siblings.filter((s) => s.type === type).length + 1;
         effectiveLabel = `${prefix}${n}`;
         while (siblings.some((s) => s.label === effectiveLabel)) { n++; effectiveLabel = `${prefix}${n}`; }
@@ -423,8 +426,8 @@ export function useSubSessions(
       const sub: SubSession = {
         ...res.subSession,
         sessionName: res.sessionName,
-        runtimeType: res.subSession.runtimeType ?? (type === 'openclaw' || type === 'qwen' ? 'transport' : 'process'),
-        providerId: res.subSession.providerId ?? (type === 'openclaw' || type === 'qwen' ? type : null),
+        runtimeType: res.subSession.runtimeType ?? getSessionRuntimeType(type),
+        providerId: res.subSession.providerId ?? (getSessionRuntimeType(type) === 'transport' ? type : null),
         state: 'starting',
         requestedModel: res.subSession.requestedModel ?? requestedModel ?? null,
         activeModel: res.subSession.activeModel ?? requestedModel ?? null,
@@ -433,17 +436,26 @@ export function useSubSessions(
       };
       setSubSessions((prev) => [...prev, sub]);
       // Ask daemon to start it — transport providers may need extra fields
-      if ((type === 'openclaw' || type === 'qwen') && extra) {
+      // ALL transport agent types (qwen/openclaw/copilot-sdk/cursor-headless/
+      // claude-code-sdk/codex-sdk) need the full subsession.start message so the
+      // daemon receives transport fields (requestedModel, thinking/effort,
+      // transportConfig, ccSessionId, etc.). Previously only qwen/openclaw used ws.send;
+      // copilot-sdk/cursor-headless fell through to subSessionStart which omits those
+      // fields, causing chat subscriptions to appear "stuck" (no model → no response).
+      // Use `isTransportSessionAgentType(type)` as the primary guard (not && extra)
+      // so that copilot/cursor work even when extra is falsy.
+      if (isTransportSessionAgentType(type)) {
         ws?.send({
           type: 'subsession.start',
           id: sub.id,
           sessionType: type,
           cwd,
+          ccSessionId,
           parentSession: activeSession,
-          ...extra,
+          ...(extra ?? {}),
         });
-      } else if (extra?.ccPreset || extra?.ccInitPrompt || extra?.thinking) {
-        // CC with preset — send as raw message to include extra fields
+      } else if (extra?.ccPreset || extra?.ccInitPrompt) {
+        // Plain claude-code with preset — no transport provider but has CC extras
         ws?.send({
           type: 'subsession.start',
           id: sub.id,

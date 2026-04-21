@@ -188,6 +188,16 @@ describe('mergeSessionListEntry — general field behavior', () => {
     expect(merged.effort).toBe('high');
   });
 
+  it('preserves and infers transport runtime type when a partial broadcast omits runtimeType', () => {
+    const merged = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      runtimeType: undefined,
+      agentType: 'copilot-sdk',
+    }, makeExisting({ agentType: 'copilot-sdk', runtimeType: 'transport' }));
+
+    expect(merged.runtimeType).toBe('transport');
+  });
+
   it('clears pending messages when daemon reports a terminal state', () => {
     const existing = makeExisting({
       state: 'running',

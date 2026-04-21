@@ -7,6 +7,7 @@ import { CRON_STATUS } from '@shared/cron-types';
 import { BUILT_IN_MODES } from '@shared/p2p-modes';
 import type { SessionInfo } from '../types.js';
 import { formatLabel } from '../format-label.js';
+import { getAgentBadgeLabel } from '../agent-display.js';
 import { FloatingPanel } from '../components/FloatingPanel.js';
 
 // ── Types ────────────────────────────────────────────────────────────────
@@ -117,12 +118,8 @@ function sessionDisplayLabel(s: SessionInfo): string {
   return s.role === 'brain' ? s.project : `W${s.name.split('_w')[1] ?? '?'}`;
 }
 
-/** Short agent type badge. */
-const AGENT_ABBR: Record<string, string> = {
-  'claude-code': 'cc', codex: 'cx', opencode: 'oc', gemini: 'gm', qwen: 'qw', shell: 'sh',
-};
 function agentBadge(agentType: string): string {
-  return AGENT_ABBR[agentType] ?? agentType.slice(0, 3);
+  return getAgentBadgeLabel(agentType);
 }
 
 /** Resolve a role to its display label from sessions list, scoped to project. */

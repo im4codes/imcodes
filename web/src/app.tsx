@@ -7,6 +7,7 @@ import {
   type FileBrowserPreviewUpdate,
 } from './components/file-browser-lazy.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
+import { RECONNECT_GRACE_MS } from '@shared/ack-protocol.js';
 import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate } from './p2p-run-mapping.js';
 import { useTranslation } from 'react-i18next';
 import { ErrorBoundary } from './components/ErrorBoundary.js';
@@ -19,6 +20,7 @@ import { useQuickData } from './components/QuickInputPanel.js';
 import { NewSessionDialog } from './components/NewSessionDialog.js';
 import { SubSessionBar } from './components/SubSessionBar.js';
 import { SubSessionWindow } from './components/SubSessionWindow.js';
+import { useSharedGitChanges, requestSharedChanges } from './git-status-store.js';
 import { StartSubSessionDialog } from './components/StartSubSessionDialog.js';
 import { SessionSettingsDialog } from './components/SessionSettingsDialog.js';
 import { StartDiscussionDialog, type DiscussionPrefs, type SubSessionOption } from './components/StartDiscussionDialog.js';
@@ -48,6 +50,7 @@ import {
 import { LocalWebPreviewPanel } from './components/LocalWebPreviewPanel.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
 import { mergeSessionListEntry, type IncomingSessionListEntry } from './session-list-merge.js';
+import { resolveSessionInfoRuntimeType } from './runtime-type.js';
 import { useSyncedPreference } from './hooks/useSyncedPreference.js';
 import { resolveInitialServerId, resolveInitialSessionName, writeHashState } from './hooks/useHashState.js';
 import { useSubSessions } from './hooks/useSubSessions.js';
@@ -63,7 +66,15 @@ import { ServerSetupPage } from './pages/ServerSetupPage.js';
 import { NativeAuthBridge } from './pages/NativeAuthBridge.js';
 import type { SessionInfo, TerminalDiff } from './types.js';
 import { REPO_MSG } from '@shared/repo-types.js';
-import { shouldSubscribeTerminalRaw, type TerminalSubscribeViewMode } from './terminal-subscribe-mode.js';
+import {
+  buildTerminalResubscribePlan,
+  listGlobalTransportSubSessionNames,
+  listGlobalTransportSubscriptionNames,
+  listPassiveTerminalSubSessionNames,
+  listPassiveTerminalSubscriptionNames,
+  shouldSubscribeTerminalRaw,
+  type TerminalSubscribeViewMode,
+} from './terminal-subscribe-mode.js';
 import { onWatchCommand } from './watch-bridge.js';
 import { watchProjectionStore } from './watch-projection.js';
 import { isIdleSessionStateTimelineEvent, isRunningTimelineEvent } from './timeline-running.js';
@@ -75,7 +86,7 @@ import {
   mergeTransportPendingMessagesForRunningState,
   normalizeTransportPendingEntries,
 } from './transport-queue.js';
-import { ingestTimelineEventForCache } from './hooks/useTimeline.js';
+import { ingestTimelineEventForCache, ACTIVE_TIMELINE_REFRESH_EVENT } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
 import { updateMainSessionLabel } from './session-label-api.js';
@@ -222,8 +233,10 @@ export function App() {
   const [showDesktopLocalWebPreview, setShowDesktopLocalWebPreview] = useState(false);
   const [localWebPreviewPort, setLocalWebPreviewPort] = useState('');
   const [localWebPreviewPath, setLocalWebPreviewPath] = useState('/');
-  const [gitChangesCount, setGitChangesCount] = useState(0);
   // File browser geometry now managed by FloatingPanel (id="filebrowser")
+  // NOTE: top-bar 📁 buttons call setShowMobile/DesktopFileBrowser directly.
+  // Sub-sessions now own their own FileBrowser inside SubSessionWindow
+  // (rooted at sub.cwd, layered above the window) — no shared toggle needed.
   const [serverCtxMenu, setServerCtxMenu] = useState<{ server: ServerInfo; x: number; y: number } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ServerInfo | null>(null);
 
@@ -373,10 +386,37 @@ export function App() {
     vv.addEventListener('resize', update);
     document.addEventListener('focusin', onFocusIn);
     document.addEventListener('focusout', onFocusOut);
+    // App-resume recovery: when the app returns from background (push-notification
+    // tap, switcher, home-button), the OS dismisses the keyboard + blurs inputs at
+    // the native layer, but the WebView doesn't always fire matching focusout /
+    // visualViewport resize events. Without this handler, `inputFocused`/
+    // `hadKeyboardOpen` stay truthy and the `.input-focused` / `.kb-open` classes
+    // stick on <html>, hiding the sub-session bar (styles.css lines 983/989)
+    // even though the keyboard is gone — which is exactly what users see after
+    // tapping a notification ("底部的 sub-session 按钮没了").
+    const onResume = () => {
+      if (document.visibilityState !== 'visible') return;
+      const active = document.activeElement as HTMLElement | null;
+      const activeIsInput = !!active && (
+        active.tagName === 'INPUT'
+        || active.tagName === 'TEXTAREA'
+        || active.getAttribute('contenteditable') === 'true'
+        || active.classList.contains('xterm-helper-textarea')
+      );
+      // If the OS dismissed focus during background, blur the stale element so
+      // update() reflects reality. If focus genuinely survived, keep it.
+      if (!activeIsInput) {
+        inputFocused = false;
+        hadKeyboardOpen = false;
+      }
+      update();
+    };
+    document.addEventListener('visibilitychange', onResume);
     return () => {
       vv.removeEventListener('resize', update);
       document.removeEventListener('focusin', onFocusIn);
       document.removeEventListener('focusout', onFocusOut);
+      document.removeEventListener('visibilitychange', onResume);
     };
   }, []);
 
@@ -687,6 +727,14 @@ export function App() {
   const [daemonOnline, setDaemonOnline] = useState(false);
   const sessionListRetryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stoppedNavTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Debounce the "Daemon Offline" badge. The server broadcasts
+  // DAEMON_MSG.DISCONNECTED the instant the daemon WS closes, then waits
+  // RECONNECT_GRACE_MS before actually declaring the daemon offline (inflight
+  // commands are replayed silently if the daemon returns in time). Without
+  // this matching delay on the client, a 200 ms pod restart or network blip
+  // flashes "Daemon Offline" even though the daemon is back before the grace
+  // window expires and the user's turn never fails.
+  const daemonOfflineGraceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [idleAlerts, setIdleAlerts] = useState<Set<string>>(new Set());
   const [idleFlashTokens, setIdleFlashTokens] = useState<Map<string, number>>(() => new Map());
@@ -1194,7 +1242,12 @@ export function App() {
     return {};
   });
   // Transport sessions have no terminal backend — force chat mode, no toggle
-  const activeRuntimeType = sessions.find((s) => s.name === activeSession)?.runtimeType;
+  const activeRuntimeType = activeSession
+    ? (() => {
+        const session = sessions.find((s) => s.name === activeSession);
+        return session ? resolveSessionInfoRuntimeType(session) : undefined;
+      })()
+    : undefined;
   const isTransportSession = activeRuntimeType === 'transport';
   const effectiveDefault: ViewMode = isTransportSession ? 'chat' : defaultViewMode;
   const viewMode: ViewMode = isTransportSession ? 'chat' : ((activeSession && viewModes[activeSession]) ? viewModes[activeSession] : effectiveDefault);
@@ -1258,7 +1311,17 @@ export function App() {
             });
           }, 5000);
         }
-        if (msg.event === 'disconnected') { setConnected(false); setConnecting(true); setDaemonOnline(false); }
+        if (msg.event === 'disconnected') {
+          setConnected(false); setConnecting(true); setDaemonOnline(false);
+          // Cancel any pending debounce — the browser-server WS dropped so
+          // the grace-window flip would be redundant (badge now shows
+          // "Connecting"/"Offline", not "Daemon Offline") and could later
+          // fire in a stale state after a reconnect cycle.
+          if (daemonOfflineGraceTimerRef.current) {
+            clearTimeout(daemonOfflineGraceTimerRef.current);
+            daemonOfflineGraceTimerRef.current = null;
+          }
+        }
         if (msg.session && !msg.session.startsWith('deck_sub_')) {
           setSessions((prev) => {
             // Stopped → remove the tab immediately
@@ -1316,7 +1379,14 @@ export function App() {
           msg.sessions,
           watchSubInputs,
         );
-        // Daemon is connected — mark this server as online now
+        // Daemon is connected — mark this server as online now. Also cancel
+        // any pending disconnect→offline timer: receiving a session_list is
+        // proof that the daemon is alive even without a DAEMON_MSG.RECONNECTED
+        // (e.g. first connect after a page reload during a grace window).
+        if (daemonOfflineGraceTimerRef.current) {
+          clearTimeout(daemonOfflineGraceTimerRef.current);
+          daemonOfflineGraceTimerRef.current = null;
+        }
         setDaemonOnline(true);
         if (sessionListRetryRef.current) { clearTimeout(sessionListRetryRef.current); sessionListRetryRef.current = null; }
         setServers((prev) => prev.map((s) =>
@@ -1707,9 +1777,23 @@ export function App() {
         setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 8000);
       }
       if (msg.type === DAEMON_MSG.DISCONNECTED) {
-        // Daemon went offline — keep existing session data visible, just update status
-        setDaemonOnline(false);
+        // Mark projection stale immediately — that's just a data-freshness
+        // hint, not the user-facing status badge. But do NOT flip the
+        // "Daemon Offline" badge yet: the server side still has a
+        // RECONNECT_GRACE_MS window during which the daemon can reconnect
+        // and inflight commands are replayed without surfacing any failure.
+        // Matching that grace period here prevents the badge from flashing
+        // on every pod restart / brief network blip while the user's turn
+        // is actually landing fine. If the daemon does stay gone, the
+        // server will broadcast MSG_DAEMON_OFFLINE (no reconnect event) and
+        // this timer fires, putting the badge into the Daemon-Offline
+        // state. RECONNECTED / session_list clear the timer below.
         watchProjectionStore.setSnapshotStatus('stale');
+        if (daemonOfflineGraceTimerRef.current) clearTimeout(daemonOfflineGraceTimerRef.current);
+        daemonOfflineGraceTimerRef.current = setTimeout(() => {
+          daemonOfflineGraceTimerRef.current = null;
+          setDaemonOnline(false);
+        }, RECONNECT_GRACE_MS);
       }
       if (msg.type === 'daemon.error') {
         // Surface uncaught daemon errors as a toast so users aren't left in the dark.
@@ -1727,23 +1811,69 @@ export function App() {
         // Auto-dismiss after 10 seconds
         setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 10_000);
       }
+      // P2P command errors surface as `command.ack status:error` with a
+      // specific `error` code. `useTimeline` handles them per-session by
+      // flipping an optimistic bubble to failed-"!", but the web composer
+      // now INTERCEPTS optimistic bubbles for P2P sends (they belong to
+      // the discussion file, not the chat) — so without this top-level
+      // toast there is literally no UI feedback and P2P failures look
+      // like the daemon ate the command silently. Handle here so the
+      // user can see what happened and open the config panel.
+      if (msg.type === 'command.ack'
+        && (msg as { status?: unknown }).status === 'error'
+        && typeof (msg as { error?: unknown }).error === 'string') {
+        // Cast through `unknown` because `msg.type === 'command.ack'` already
+        // narrows msg to a shape that doesn't declare `error`; the runtime
+        // `typeof error === 'string'` check above guarantees the field exists.
+        const errorCode = (msg as unknown as { error: string }).error;
+        const knownP2pErrors = new Set<string>([
+          'no_configured_targets',
+          'no_sessions',
+          'no_valid_targets',
+        ]);
+        if (knownP2pErrors.has(errorCode)) {
+          const titleMap: Record<string, string> = {
+            no_configured_targets: 'P2P: no configured participants',
+            no_sessions: 'P2P: no eligible sessions',
+            no_valid_targets: 'P2P: targets not found',
+          };
+          const bodyMap: Record<string, string> = {
+            no_configured_targets: 'All eligible sessions are opt-out or absent from your saved P2P config. Open the P2P panel and enable the sessions you want to include.',
+            no_sessions: 'No other active sessions in this project/domain to dispatch to.',
+            no_valid_targets: 'The @@ targets you referenced do not match any active sessions.',
+          };
+          const id = Date.now() + Math.random();
+          setToasts((prev) => [...prev, {
+            id,
+            sessionName: '',
+            project: '',
+            kind: 'notification',
+            title: titleMap[errorCode] ?? 'P2P send failed',
+            message: bodyMap[errorCode] ?? errorCode,
+          }]);
+          setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 8000);
+        }
+      }
       if (msg.type === DAEMON_MSG.RECONNECTED) {
+        // Daemon came back within (or after) the grace window — cancel any
+        // pending "flip to offline" so the badge never flashes red for a
+        // reconnect that actually succeeded.
+        if (daemonOfflineGraceTimerRef.current) {
+          clearTimeout(daemonOfflineGraceTimerRef.current);
+          daemonOfflineGraceTimerRef.current = null;
+        }
         setDaemonOnline(true);
         // Daemon process (re)started — all its subscriptions are gone.
         // Re-subscribe active targets first, then stagger the rest to avoid a herd.
         const activeName = activeSessionRef.current;
         const activeMode = activeName ? (viewModesRef.current[activeName] ?? defaultViewMode) as ViewMode : undefined;
-        const focusedSub = focusedSubIdRef.current
-          ? subSessionsRef.current.find((sub) => sub.id === focusedSubIdRef.current)
-          : null;
-        scheduleResubscribe([
-          ...(activeName ? [{ name: activeName, mode: activeMode }] : []),
-          ...(focusedSub ? [{ name: focusedSub.sessionName, mode: 'chat' as ViewMode }] : []),
-          ...sessionsRef.current
-            .filter((s) => s.name !== activeName)
-            .map((s) => ({ name: s.name, mode: 'chat' as ViewMode })),
-          ...subSessionsRef.current.map((sub) => ({ name: sub.sessionName, mode: 'chat' as ViewMode })),
-        ]);
+        scheduleResubscribe(buildTerminalResubscribePlan({
+          activeName,
+          activeMode,
+          focusedSubId: focusedSubIdRef.current,
+          sessions: sessionsRef.current,
+          subSessions: subSessionsRef.current,
+        }));
         // Refresh discussion list
         ws.discussionList();
       }
@@ -1758,14 +1888,37 @@ export function App() {
     setConnecting(true);
     ws.connect();
 
-    // Reconnect immediately when app returns from background (mobile + desktop tab)
+    // Reconnect immediately when the app returns from background. On mobile/native,
+    // force a fresh socket because the WebView can resume with a stale-open socket
+    // that never receives timeline events even though readyState still says OPEN.
+    const shouldForceResumeReconnect = isNative() || /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
     const onVisibility = () => {
-      if (document.visibilityState === 'visible') ws.reconnectNow();
+      if (document.visibilityState === 'visible') ws.reconnectNow(shouldForceResumeReconnect);
     };
     document.addEventListener('visibilitychange', onVisibility);
 
+    let removeAppStateListener: (() => void) | null = null;
+    if (isNative()) {
+      void import('@capacitor/app').then(({ App }) =>
+        App.addListener('appStateChange', ({ isActive }) => {
+          if (isActive) {
+            ws.reconnectNow(true);
+            // Native resume: WebView `visibilitychange` is unreliable on some
+            // iOS versions, so explicitly signal the active timeline to
+            // force-pull history. Safe to fire even when visibilitychange
+            // also fires — useTimeline's listener is idempotent (cooldownMs=0
+            // but rate-limited by the 200ms setTimeout in fireHttpBackfill).
+            try { window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT)); } catch { /* ignore */ }
+          }
+        }).then((listener) => {
+          removeAppStateListener = () => { void listener.remove(); };
+        }).catch(() => {})
+      ).catch(() => {});
+    }
+
     return () => {
       document.removeEventListener('visibilitychange', onVisibility);
+      removeAppStateListener?.();
       unsub();
       unsubStats();
       ws.onLatency(null);
@@ -1777,19 +1930,20 @@ export function App() {
       setLatencyMs(null);
       setDaemonStats(null);
       if (sessionListRetryRef.current) { clearTimeout(sessionListRetryRef.current); sessionListRetryRef.current = null; }
+      if (daemonOfflineGraceTimerRef.current) { clearTimeout(daemonOfflineGraceTimerRef.current); daemonOfflineGraceTimerRef.current = null; }
       for (const timer of resubscribeTimersRef.current) clearTimeout(timer);
       resubscribeTimersRef.current.clear();
     };
   }, [auth, selectedServerId]);
 
   // Subscribe to terminal for ALL sessions when connected.
-  // Passive/background subscriptions stay raw:false so chat/timeline traffic still flows
-  // without pulling raw PTY bytes into browsers that are not actively rendering terminal output.
+  // SDK/transport sessions must remain passively subscribed so shared timeline
+  // updates keep flowing even when their chat controls are not mounted.
   const sessionNamesKey = sessions.map((s) => s.name).sort().join(',');
   useEffect(() => {
     const ws = wsRef.current;
     if (!ws?.connected || sessions.length === 0) return;
-    const names = sessions.map((s) => s.name);
+    const names = listPassiveTerminalSubscriptionNames(sessions);
     for (const name of names) {
       ws.subscribeTerminal(name, false);
       const mode = viewModesRef.current[name] ?? defaultViewMode;
@@ -1805,13 +1959,41 @@ export function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connected, sessionNamesKey]);
 
+  // Subscribe to structured transport chat/timeline updates for ALL transport sessions.
+  // SDK-backed sessions must remain globally subscribed regardless of which panel is active.
+  // Key includes runtimeType so effect re-runs when WebSocket merge corrects null→'transport'
+  // for copilot/cursor sessions loaded from a pre-migration DB (runtime_type was NULL).
+  const transportSessionKey = sessions.map((s) => `${s.name}:${s.runtimeType}`).sort().join(',');
+  useEffect(() => {
+    const ws = wsRef.current;
+    if (!ws?.connected || sessions.length === 0) return;
+    const names = listGlobalTransportSubscriptionNames(sessions);
+    for (const name of names) {
+      try { ws.subscribeTransportSession(name); } catch { /* ignore */ }
+    }
+    return () => {
+      for (const name of names) {
+        try { ws.unsubscribeTransportSession(name); } catch { /* ignore */ }
+      }
+    };
+  // NOTE: `sessions` (the raw array) is intentionally omitted from the dep
+  // array. Including it caused a subscribe/unsubscribe flap loop — every
+  // setState produces a new array reference even when contents are identical,
+  // which re-ran this effect dozens of times per frame and saturated the
+  // server's per-browser rate limit (120 msgs / 10s), collaterally dropping
+  // `session.send` messages and leaving the chat bubble spinning for 30s.
+  // `transportSessionKey` already captures every semantic change
+  // (session names + runtimeType), so the string key is sufficient.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connected, transportSessionKey]);
+
   // Subscribe terminal for ALL sub-sessions in passive mode.
   // Active sub-session windows upgrade themselves to raw:true while visible.
   const subSessionNamesKey = subSessions.map((s) => s.sessionName).sort().join(',');
   useEffect(() => {
     const ws = wsRef.current;
     if (!ws?.connected || subSessions.length === 0) return;
-    const names = subSessions.map((s) => s.sessionName);
+    const names = listPassiveTerminalSubSessionNames(subSessions);
     for (const name of names) {
       try { ws.subscribeTerminal(name, false); } catch { /* ignore */ }
     }
@@ -1822,6 +2004,27 @@ export function App() {
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connected, subSessionNamesKey]);
+
+  // Subscribe to structured transport updates for ALL transport sub-sessions too.
+  // Key includes runtimeType so effect re-runs when WebSocket merge corrects null→'transport'.
+  const transportSubSessionKey = subSessions.map((s) => `${s.sessionName}:${s.runtimeType}`).sort().join(',');
+  useEffect(() => {
+    const ws = wsRef.current;
+    if (!ws?.connected || subSessions.length === 0) return;
+    const names = listGlobalTransportSubSessionNames(subSessions);
+    for (const name of names) {
+      try { ws.subscribeTransportSession(name); } catch { /* ignore */ }
+    }
+    return () => {
+      for (const name of names) {
+        try { ws.unsubscribeTransportSession(name); } catch { /* ignore */ }
+      }
+    };
+  // Same rationale as the transport-session effect above — string key only,
+  // no raw array ref. See that effect's comment for the subscribe/unsubscribe
+  // flap loop this prevents.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connected, transportSubSessionKey]);
 
   // When switching to a session in terminal mode, trigger fit.
   // All sessions are subscribed to PTY streaming, so xterm buffer is already current —
@@ -1854,7 +2057,7 @@ export function App() {
     return () => {
       try { ws.subscribeTerminal(activeSession, false); } catch { /* ignore */ }
     };
-  }, [connected, activeSession, viewMode]);
+  }, [connected, activeRuntimeType, activeSession, viewMode]);
 
   useEffect(() => {
     const handler = () => {
@@ -2324,42 +2527,27 @@ export function App() {
   }, [activeSession, activeSessionInfo?.projectDir, pinnedPanels.length, pinPanel, selectedServerId]);
 
   // ── Git changes count for file browser badge ───────────────────────────
-  // Refreshes on: initial load, every 30s, and after tool calls (file writes).
-  const refreshGitStatusRef = useRef<(() => void) | null>(null);
+  // Uses useSharedGitChanges — shares the cache with FileBrowser, SubSessionWindow,
+  // and any other consumer pointing at the same repo path. A single `fs.git_status`
+  // request feeds all of them; no duplicate requests when paths match.
+  const sharedGitFiles = useSharedGitChanges(wsRef.current, activeSessionInfo?.projectDir ?? null);
+  const gitChangesCount = sharedGitFiles.length;
+
+  // Nudge the shared cache when the agent finishes a tool call or goes idle,
+  // so the badge reflects new/modified files without waiting for the 30s poll.
+  // The 5s TTL in the store dedupes bursty events across sessions.
   useEffect(() => {
     const ws = wsRef.current;
     const dir = activeSessionInfo?.projectDir;
-    if (!ws || !connected || !dir) { setGitChangesCount(0); refreshGitStatusRef.current = null; return; }
-
-    let lastReqId: string | null = null;
-    let lastRefreshTs = 0;
-    const refresh = () => {
-      const now = Date.now();
-      if (now - lastRefreshTs < 10_000) return; // throttle: max once per 10s
-      lastRefreshTs = now;
-      lastReqId = ws.fsGitStatus(dir);
-    };
-    refreshGitStatusRef.current = refresh;
-
+    if (!ws || !connected || !dir) return;
     const unsub = ws.onMessage((msg) => {
-      // Handle git status response
-      if (msg.type === 'fs.git_status_response' && 'requestId' in msg && msg.requestId === lastReqId) {
-        const files = (msg as unknown as { files?: unknown[] }).files;
-        setGitChangesCount(Array.isArray(files) ? files.length : 0);
-      }
-      // Refresh on tool completion + session idle (throttled to max 1 per 10s)
-      if (msg.type === 'timeline.event') {
-        const evt = (msg as unknown as { event?: { type?: string; payload?: { state?: string } } }).event;
-        if (evt?.type === 'tool.result' || (evt?.type === 'session.state' && evt.payload?.state === 'idle')) {
-          refresh();
-        }
+      if (msg.type !== 'timeline.event') return;
+      const evt = (msg as unknown as { event?: { type?: string; payload?: { state?: string } } }).event;
+      if (evt?.type === 'tool.result' || (evt?.type === 'session.state' && evt.payload?.state === 'idle')) {
+        requestSharedChanges(ws, dir);
       }
     });
-
-    refresh(); // initial
-    const timer = setInterval(refresh, 30_000); // fallback poll
-
-    return () => { unsub(); clearInterval(timer); refreshGitStatusRef.current = null; };
+    return () => { unsub(); };
   }, [activeSessionInfo?.projectDir, connected]);
 
   // ── Auto-detect repo for active session (with retry) ───────────────────
@@ -3475,6 +3663,7 @@ export function App() {
           type={settingsTarget.type}
           parentSession={settingsTarget.parentSession}
           transportConfig={settingsTarget.transportConfig}
+          ws={wsRef.current}
           onClose={() => setSettingsTarget(null)}
           onSaved={(fields) => {
             if (settingsTarget.subId) {

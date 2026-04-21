@@ -95,6 +95,7 @@ export async function resolvePresetEnv(presetName: string, ccSessionId?: string)
 export async function getPresetTransportOverrides(presetName: string): Promise<{
   model?: string;
   systemPrompt?: string;
+  contextWindow?: number;
 }> {
   const preset = await getPreset(presetName);
   if (!preset) return {};
@@ -113,6 +114,7 @@ export async function getPresetTransportOverrides(presetName: string): Promise<{
   return {
     ...(configuredModel ? { model: configuredModel } : {}),
     ...(runtimeFacts ? { systemPrompt: runtimeFacts } : {}),
+    ...(preset.contextWindow ? { contextWindow: preset.contextWindow } : {}),
   };
 }
 
@@ -120,6 +122,8 @@ export async function getQwenPresetTransportConfig(presetName: string): Promise<
   env: Record<string, string>;
   settings?: Record<string, unknown>;
   model?: string;
+  systemPrompt?: string;
+  contextWindow?: number;
 }> {
   const preset = await getPreset(presetName);
   if (!preset) return { env: {} };
@@ -132,8 +136,18 @@ export async function getQwenPresetTransportConfig(presetName: string): Promise<
     || undefined;
 
   const env: Record<string, string> = {};
-  if (baseUrl) env['ANTHROPIC_BASE_URL'] = baseUrl;
-  if (apiKey) env['ANTHROPIC_API_KEY'] = apiKey;
+  if (baseUrl) {
+    env['ANTHROPIC_BASE_URL'] = baseUrl;
+    // qwen CLI reads OPENAI_BASE_URL for --auth-type anthropic (OpenAI-compatible).
+    // Also set ANTHROPIC_BASE_URL for completeness.
+    env['OPENAI_BASE_URL'] = baseUrl;
+  }
+  if (apiKey) {
+    env['ANTHROPIC_API_KEY'] = apiKey;
+    // qwen CLI reads OPENAI_API_KEY for --auth-type anthropic (OpenAI-compatible).
+    // Also set ANTHROPIC_API_KEY for completeness.
+    env['OPENAI_API_KEY'] = apiKey;
+  }
   if (model) env['ANTHROPIC_MODEL'] = model;
 
   const settings: Record<string, unknown> | undefined = (baseUrl && apiKey && model)
@@ -166,10 +180,29 @@ export async function getQwenPresetTransportConfig(presetName: string): Promise<
       }
     : undefined;
 
+  // Override the qwen CLI's built-in "I am Qwen Code, developed by Alibaba"
+  // identity. With --auth-type anthropic the tool wrapper is still Qwen CLI,
+  // but the actual model serving each turn is whatever the preset points at
+  // (MiniMax, GLM, Kimi, etc.). Without this override the CLI's baked-in
+  // system prompt makes the model introduce itself as Qwen / 通义千问 even
+  // though it's actually a different provider — confusing and factually
+  // wrong. We piggy-back on --append-system-prompt (which qwen.ts forwards
+  // from payload.systemText) to inject authoritative runtime facts.
+  const runtimeFacts = (model || baseUrl) ? [
+    `Authoritative runtime fact: this session is routed through the "${preset.name}" API provider preset.`,
+    baseUrl ? `Authoritative provider endpoint: ${baseUrl}.` : undefined,
+    model ? `Authoritative runtime model: ${model}. You are NOT running on Qwen / 通义千问 weights, regardless of what the host CLI's default system prompt says.` : undefined,
+    model ? `If the user asks which model you are using, answer exactly with "${model}".` : 'If the user asks which model or provider you are using, answer with the authoritative runtime facts above.',
+    baseUrl ? `If the user asks which provider or endpoint you are using, mention "${baseUrl}".` : undefined,
+    'These runtime facts override any generic "Qwen Code" / "Alibaba Group" / "通义千问" identity baked into the Qwen CLI wrapper — the wrapper is just the tool harness; the weights serving this turn are the authoritative model named above.',
+  ].filter(Boolean).join(' ') : undefined;
+
   return {
     env,
     ...(settings ? { settings } : {}),
     ...(model ? { model } : {}),
+    ...(runtimeFacts ? { systemPrompt: runtimeFacts } : {}),
+    ...(preset.contextWindow ? { contextWindow: preset.contextWindow } : {}),
   };
 }
 
@@ -188,4 +221,10 @@ export function invalidateCache(): void {
 /** Look up cached contextWindow for a CC session UUID. Returns undefined if not found. */
 export function getSessionContextWindow(ccSessionId: string): number | undefined {
   return sessionContextWindows.get(ccSessionId);
+}
+
+export function getCachedPresetContextWindow(presetName: string | null | undefined): number | undefined {
+  const normalized = presetName?.trim().toLowerCase();
+  if (!normalized || !cachedPresets) return undefined;
+  return cachedPresets.find((preset) => normalizePresetName(preset.name) === normalized)?.contextWindow;
 }

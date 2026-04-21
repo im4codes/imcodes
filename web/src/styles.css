@@ -179,6 +179,37 @@ body {
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.22);
   pointer-events: auto;
 }
+/* Collapsed-state pill: just a count chip, shown only when the user has
+   chosen to hide the full queue list. Keeps vertical space above the
+   composer minimal (the full hint was previously taking 3+ lines). */
+.controls-queued-pill {
+  align-self: flex-start;
+  margin: 0 8px 6px;
+  padding: 3px 10px 3px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: max-content;
+  background: rgba(15, 23, 42, 0.92);
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  border-radius: 999px;
+  color: #fbbf24;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.35;
+  cursor: pointer;
+  pointer-events: auto;
+  font-family: inherit;
+}
+.controls-queued-pill::before {
+  content: '';
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: #fbbf24;
+  flex-shrink: 0;
+}
+.controls-queued-pill:hover { color: #fde68a; border-color: rgba(251, 191, 36, 0.6); }
+.controls-queued-pill:hover::before { background: #fde68a; }
 .controls-queued-header {
   display: flex;
   align-items: center;
@@ -633,6 +664,13 @@ body {
 /* Mobile responsive */
 @media (max-width: 640px) {
   .sidebar { display: none; }
+  /* NOTE: do NOT add `padding-top: env(safe-area-inset-top)` on `.main`
+     here. `.layout` already sets `margin-top: env(safe-area-inset-top)`
+     AND `height: calc(100dvh - env(safe-area-inset-top))` at the root
+     level — stacking another inset on `.main` causes a double-gap that
+     shows up as ~80-100px of black space under the iOS status bar on
+     iPhone X+ devices. Regression landed in commit 6f9a5e0 and reverted
+     here. */
   .mobile-server-bar { display: flex; align-items: center; justify-content: space-between; padding: 4px 10px; background: #1e293b; border-bottom: 1px solid #334155; flex-shrink: 0; position: relative; z-index: 50; }
   .mobile-sidebar-toggle { display: block; background: none; border: none; color: #94a3b8; font-size: 18px; cursor: pointer; padding: 4px 8px 4px 0; line-height: 1; flex-shrink: 0; }
   .mobile-sidebar-toggle:active { color: #e2e8f0; }
@@ -669,6 +707,15 @@ body {
 .chat-view-wrap { flex: 1; position: relative; overflow: hidden; display: flex; flex-direction: column; }
 .chat-split { flex-direction: row !important; }
 .chat-main { flex: 1; min-width: 0; position: relative; display: flex; flex-direction: column; overflow: hidden; }
+/* Pinned "Last sent" banner — appears only when the original user bubble has
+   scrolled off the top of the chat viewport. Sits above the scroll area so it
+   doesn't bob with the user's scroll position, only its visibility changes. */
+.chat-pinned-last-sent { display: flex; flex-direction: column; gap: 2px; margin: 6px 10px 0; padding: 6px 10px; background: linear-gradient(180deg, rgba(30, 58, 95, 0.85), rgba(30, 58, 95, 0.7)); border: 1px solid rgba(59, 130, 246, 0.35); border-left: 3px solid #3b82f6; border-radius: 6px; cursor: pointer; user-select: none; color: #dbeafe; font-size: 12px; line-height: 1.4; transition: background 0.15s; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25); }
+.chat-pinned-last-sent:hover { background: linear-gradient(180deg, rgba(30, 58, 95, 1), rgba(30, 58, 95, 0.9)); }
+.chat-pinned-last-sent:focus-visible { outline: 2px solid #3b82f6; outline-offset: 1px; }
+.chat-pinned-last-sent-label { font-size: 10px; font-weight: 600; color: #93c5fd; letter-spacing: 0.05em; text-transform: uppercase; }
+.chat-pinned-last-sent-text { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; line-clamp: 2; overflow: hidden; text-overflow: ellipsis; word-break: break-word; white-space: pre-wrap; }
+.chat-pinned-last-sent.chat-pinned-expanded .chat-pinned-last-sent-text { display: block; -webkit-line-clamp: unset; line-clamp: unset; max-height: 40vh; overflow-y: auto; }
 .chat-view { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 8px 12px; display: flex; flex-direction: column; gap: 2px; scrollbar-width: thin; scrollbar-color: #6366f1 #1e293b; }
 .chat-view-preview { justify-content: flex-end; }
 .chat-view::-webkit-scrollbar { width: 5px; }
@@ -690,8 +737,17 @@ body {
 .chat-attachment-dl-btn:hover { color: #60a5fa; border-color: #3b82f6; }
 .chat-event { margin: 2px 0; min-width: 0; transition: background 0.15s; border-radius: 6px; }
 .chat-event.chat-highlight { background: rgba(52,211,153,0.12); box-shadow: inset 0 0 0 1.5px rgba(52,211,153,0.5); }
-.chat-user { background: #1e3a5f; border-radius: 8px; padding: 6px 12px; align-self: flex-end; max-width: 80%; width: fit-content; text-align: left; word-break: break-all; overflow-wrap: break-word; }
+.chat-user { background: #1e3a5f; border-radius: 8px; padding: 6px 12px; align-self: flex-end; max-width: 80%; width: fit-content; text-align: left; word-break: break-all; overflow-wrap: break-word; position: relative; }
 .chat-user.chat-pending { background: #1e3a5f80; color: #94a3b8; }
+.chat-user.chat-failed { background: #3a1a1a; color: #fca5a5; border: 1px solid #7f1d1d; }
+.chat-user-status { display: inline-flex; align-items: center; gap: 6px; margin-top: 4px; font-size: 11px; line-height: 1; }
+.chat-user-status-pending { width: 11px; height: 11px; border: 1.5px solid #60a5fa80; border-top-color: #60a5fa; border-radius: 50%; animation: chat-spinner-rotate 0.8s linear infinite; vertical-align: -1px; margin-top: 4px; margin-left: 2px; }
+@keyframes chat-spinner-rotate { to { transform: rotate(360deg); } }
+.chat-user-status-failed { gap: 8px; }
+.chat-user-status-icon { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; border-radius: 50%; background: #dc2626; color: #fff; font-size: 10px; font-weight: 700; font-family: ui-sans-serif, system-ui, sans-serif; line-height: 1; cursor: help; }
+.chat-user-retry-btn { background: #7f1d1d; color: #fecaca; border: 1px solid #b91c1c; border-radius: 4px; padding: 2px 10px; font-size: 11px; cursor: pointer; font-family: inherit; }
+.chat-user-retry-btn:hover { background: #991b1b; color: #fff; border-color: #dc2626; }
+.chat-user-retry-btn:active { background: #7f1d1d; }
 .chat-assistant { padding: 6px 10px; word-break: break-word; overflow-wrap: break-word; line-height: 1.5; background: #161b22; border-radius: 8px; border-left: 2px solid #1e293b; }
 .chat-assistant-automation { border-left-color: #10b981; background: #101a19; }
 .chat-rich-text { white-space: pre-wrap; }
@@ -733,14 +789,22 @@ body {
 .chat-file-change-patches { display: flex; flex-direction: column; gap: 8px; }
 .chat-file-change-patch { display: flex; flex-direction: column; gap: 6px; }
 .chat-file-change-diff { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; background: #111827; border: 1px solid #1f2937; border-radius: 6px; }
-.chat-file-change-diff-block { display: flex; flex-direction: column; gap: 4px; }
-.chat-file-change-diff-label { display: inline-flex; align-items: center; justify-content: center; width: 14px; font-size: 12px; font-weight: 700; line-height: 1; color: #94a3b8; }
+.chat-file-change-diff-block { display: flex; flex-direction: column; gap: 0; }
+/* Block header label (+ or -) is kept in DOM for accessibility but hidden —
+   the per-row sign inside each .chat-file-change-diff-row already makes the
+   direction obvious, so a separate legend adds noise. */
+.chat-file-change-diff-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 .chat-file-change-diff-label-removed { color: #fca5a5; }
 .chat-file-change-diff-label-added { color: #86efac; }
-.chat-file-change-diff-pre { margin: 0; padding: 8px; border-radius: 4px; color: #dbeafe; font-size: 11px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; overflow-x: auto; background: #0b1220; max-height: 260px; overflow-y: auto; }
-.chat-file-change-diff-pre-removed { background: rgba(127, 29, 29, 0.22); color: #fee2e2; }
-.chat-file-change-diff-pre-added { background: rgba(20, 83, 45, 0.22); color: #dcfce7; }
-.chat-file-change-diff-row { display: grid; grid-template-columns: 42px minmax(0, 1fr); gap: 8px; align-items: start; }
+.chat-file-change-diff-pre { margin: 0; padding: 0; border-radius: 4px; color: #dbeafe; font-size: 11px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; overflow-x: auto; background: #0b1220; max-height: 260px; overflow-y: auto; }
+.chat-file-change-diff-pre-removed { background: rgba(185, 28, 28, 0.28); color: #fecaca; }
+.chat-file-change-diff-pre-added { background: rgba(34, 197, 94, 0.28); color: #dcfce7; }
+/* Per-row: [ sign | line# | code ]. Background extends the full row so the
+   green/red tint reads as a continuous band (mirrors git/gh diff layout). */
+.chat-file-change-diff-row { display: grid; grid-template-columns: 20px 44px minmax(0, 1fr); gap: 8px; align-items: start; padding: 1px 8px; }
+.chat-file-change-diff-sign { text-align: center; font-weight: 700; user-select: none; font-variant-numeric: tabular-nums; line-height: inherit; }
+.chat-file-change-diff-pre-added .chat-file-change-diff-sign { color: #4ade80; }
+.chat-file-change-diff-pre-removed .chat-file-change-diff-sign { color: #f87171; }
 .chat-file-change-diff-ln { color: #94a3b8; text-align: right; user-select: none; font-variant-numeric: tabular-nums; opacity: 0.9; }
 .chat-file-change-diff-code { white-space: pre-wrap; word-break: break-word; min-width: 0; }
 .chat-file-change-diff-coarse { gap: 4px; }
@@ -761,6 +825,21 @@ body {
 .chat-memory-context-chip-muted { color: #64748b; }
 .chat-memory-context-collapse-bottom { align-self: flex-start; background: none; border: 1px solid #334155; color: #94a3b8; border-radius: 6px; padding: 6px 10px; font-size: 11px; cursor: pointer; transition: color 0.15s, border-color 0.15s, background 0.15s; }
 .chat-memory-context-collapse-bottom:hover { color: #e2e8f0; border-color: #6366f1; background: rgba(99,102,241,0.08); }
+/* Gap shrunk to 0 because the expand toggle owns its own padding; the
+   inner detail block adds its own margin-top below. */
+.chat-memory-context-status { display: flex; flex-direction: column; padding: 0; }
+.chat-memory-context-status-title { font-size: 12px; font-weight: 600; color: #c4b5fd; }
+.chat-memory-context-status-summary { font-size: 12px; color: #e2e8f0; }
+/* The single-line summary row for skipped/no-match cards. The title +
+   summary sit side-by-side so the collapsed card reads as "Title — reason"
+   instead of two stacked lines. */
+.chat-memory-context-status-row { display: flex; align-items: center; gap: 8px; padding: 8px 10px; flex-wrap: wrap; }
+/* When a detail body exists we expose the toggle form so the user can
+   expand-on-demand. Reuse chat-memory-context-toggle baseline but add a
+   status-specific alignment override so the caret sits on the right. */
+.chat-memory-context-status-toggle { justify-content: flex-start; }
+.chat-memory-context-status-toggle .chat-memory-context-caret { margin-left: auto; font-size: 11px; color: #64748b; }
+.chat-memory-context-status-detail { font-size: 11px; color: #94a3b8; white-space: pre-wrap; word-break: break-word; padding: 0 10px 10px; }
 .chat-mode { display: inline-block; background: #1e1338; color: #a78bfa; padding: 2px 8px; border-radius: 4px; font-size: 11px; }
 .chat-system { text-align: center; color: #475569; font-size: 11px; padding: 4px 0; }
 .chat-loading { text-align: center; color: #475569; padding: 24px; }
@@ -1001,15 +1080,42 @@ body {
 .resize-sw { bottom: 0; left: 0; width: 12px; height: 12px; cursor: sw-resize; }
 
 /* ── Generic dialog overlay ──────────────────────────────────────────────── */
-.dialog-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 9999; padding: 16px; }
-.dialog { background: #1e293b; border: 1px solid #334155; border-radius: 8px; width: 100%; }
-.dialog-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px 0; }
+/* Padding bakes in iOS safe-area insets so the dialog never touches the
+   status bar/notch or the home-indicator. Dialog itself is capped to the
+   remaining vertical space and split into flex-column header/body so the
+   body scrolls while the header stays pinned — required because some
+   dialogs (SessionSettingsDialog) are taller than the viewport on mobile. */
+.dialog-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 9999;
+  padding: calc(var(--sat, 0px) + 16px) 16px calc(env(safe-area-inset-bottom, 0px) + 16px);
+}
+.dialog {
+  background: #1e293b; border: 1px solid #334155; border-radius: 8px;
+  width: 100%;
+  max-height: 100%;
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.dialog-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px 0; flex-shrink: 0; }
 .dialog-header h2 { margin: 0; font-size: 15px; color: #f1f5f9; }
 .dialog-close { background: none; border: none; color: #64748b; font-size: 20px; cursor: pointer; line-height: 1; padding: 0; }
 .dialog-close:hover { color: #e2e8f0; }
-.dialog-body { padding: 16px 20px 20px; }
+.dialog-body {
+  padding: 16px 20px 20px;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  flex: 1 1 auto;
+  min-height: 0;
+}
 
 /* ── Sub-session start dialog extras ─────────────────────────────────────── */
+.subsession-type-groups { display: flex; flex-direction: column; gap: 12px; }
+.subsession-type-group { display: flex; flex-direction: column; gap: 8px; }
+.subsession-type-group-title { font-size: 11px; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase; color: #64748b; }
+.subsession-type-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .subsession-type-btn { display: flex; align-items: center; gap: 6px; padding: 8px 12px; background: #1e293b; border: 1px solid #334155; border-radius: 6px; color: #94a3b8; cursor: pointer; font-size: 13px; font-family: inherit; transition: all 0.15s; }
 .subsession-type-btn:hover { background: #253348; border-color: #475569; color: #e2e8f0; }
 .subsession-type-btn.active { background: #1e3a5f; border-color: #3b82f6; color: #93c5fd; }
@@ -1513,6 +1619,7 @@ body {
 .discussions-nav-row {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   padding: 10px 16px;
   flex-shrink: 0;
@@ -1524,8 +1631,10 @@ body {
 }
 .discussions-nav-controls {
   margin-left: auto;
-  display: inline-flex;
+  display: flex;
   align-items: center;
+  flex: 1 1 260px;
+  flex-wrap: wrap;
   justify-content: flex-end;
   gap: 10px;
   min-width: 0;
@@ -1536,6 +1645,7 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  flex: 1 1 180px;
   min-width: 0;
   color: #cbd5e1;
   font-size: 13px;
@@ -1546,13 +1656,16 @@ body {
   accent-color: #38bdf8;
 }
 .discussions-follow-toggle span {
-  white-space: nowrap;
+  white-space: normal;
+  line-height: 1.2;
 }
 .discussions-scroll-arrows {
   display: flex;
   flex-direction: row;
   align-items: center;
   gap: 8px;
+  flex: 0 0 auto;
+  margin-left: auto;
 }
 .discussions-scroll-btn-floating {
   width: 34px;
@@ -1592,17 +1705,16 @@ body {
   }
   .discussions-nav-row { align-items: flex-start; }
   .discussions-nav-controls {
-    flex-wrap: wrap;
+    flex-basis: 100%;
     row-gap: 8px;
     justify-content: flex-end;
   }
-  .discussions-follow-toggle span { white-space: normal; line-height: 1.2; }
   .discussions-scroll-btn-floating { width: 38px; height: 38px; }
 }
 
 /* AskQuestionDialog */
-.ask-dialog-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 9999; padding: 16px; }
-.ask-dialog { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 20px; width: 100%; max-width: 480px; max-height: 80vh; overflow-y: auto; display: flex; flex-direction: column; gap: 16px; }
+.ask-dialog-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 9999; padding: calc(var(--sat, 0px) + 16px) 16px calc(env(safe-area-inset-bottom, 0px) + 16px); }
+.ask-dialog { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 20px; width: 100%; max-width: 480px; max-height: 100%; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; display: flex; flex-direction: column; gap: 16px; }
 .ask-question-block { display: flex; flex-direction: column; gap: 8px; }
 .ask-header { font-size: 11px; font-weight: 600; color: #818cf8; text-transform: uppercase; letter-spacing: 0.05em; }
 .ask-question { font-size: 14px; color: #e2e8f0; line-height: 1.5; }

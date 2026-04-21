@@ -56,8 +56,17 @@ describe('server shared-context runtime config routes', () => {
     getServerSharedContextRuntimeConfigMock.mockResolvedValue({
       primaryContextBackend: 'claude-code-sdk',
       primaryContextModel: 'sonnet',
+      primaryContextPreset: undefined,
       backupContextBackend: undefined,
       backupContextModel: undefined,
+      backupContextPreset: undefined,
+      memoryRecallMinScore: 0.4,
+      memoryScoringWeights: {
+        similarity: 0.4,
+        recency: 0.25,
+        frequency: 0.15,
+        project: 0.2,
+      },
     });
     updateServerSharedContextRuntimeConfigMock.mockResolvedValue(true);
     getUserPrefMock.mockResolvedValue('false');
@@ -85,11 +94,25 @@ describe('server shared-context runtime config routes', () => {
         persisted: {
           primaryContextBackend: 'claude-code-sdk',
           primaryContextModel: 'sonnet',
+          memoryRecallMinScore: 0.4,
+          memoryScoringWeights: {
+            similarity: 0.4,
+            recency: 0.25,
+            frequency: 0.15,
+            project: 0.2,
+          },
           enablePersonalMemorySync: false,
         },
         effective: {
           primaryContextBackend: 'claude-code-sdk',
           primaryContextModel: 'sonnet',
+          memoryRecallMinScore: 0.4,
+          memoryScoringWeights: {
+            similarity: 0.4,
+            recency: 0.25,
+            frequency: 0.15,
+            project: 0.2,
+          },
           enablePersonalMemorySync: false,
         },
       },
@@ -102,10 +125,19 @@ describe('server shared-context runtime config routes', () => {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        primaryContextBackend: 'codex-sdk',
-        primaryContextModel: 'gpt-5.4',
-        backupContextBackend: 'claude-code-sdk',
-        backupContextModel: 'haiku',
+        primaryContextBackend: 'qwen',
+        primaryContextModel: 'qwen-team-model',
+        primaryContextPreset: 'Qwen Team',
+        backupContextBackend: 'qwen',
+        backupContextModel: 'qwen-backup-model',
+        backupContextPreset: 'Qwen Backup',
+        memoryRecallMinScore: 0.37,
+        memoryScoringWeights: {
+          similarity: 0.5,
+          recency: 0.2,
+          frequency: 0.1,
+          project: 0.2,
+        },
         enablePersonalMemorySync: true,
       }),
     });
@@ -115,10 +147,19 @@ describe('server shared-context runtime config routes', () => {
       'srv-1',
       'user-1',
       {
-        primaryContextBackend: 'codex-sdk',
-        primaryContextModel: 'gpt-5.4',
-        backupContextBackend: 'claude-code-sdk',
-        backupContextModel: 'haiku',
+        primaryContextBackend: 'qwen',
+        primaryContextModel: 'qwen-team-model',
+        primaryContextPreset: 'Qwen Team',
+        backupContextBackend: 'qwen',
+        backupContextModel: 'qwen-backup-model',
+        backupContextPreset: 'Qwen Backup',
+        memoryRecallMinScore: 0.37,
+        memoryScoringWeights: {
+          similarity: 0.5,
+          recency: 0.2,
+          frequency: 0.1,
+          project: 0.2,
+        },
         enablePersonalMemorySync: undefined,
       },
     );
@@ -131,10 +172,19 @@ describe('server shared-context runtime config routes', () => {
     expect(sendToDaemonMock).toHaveBeenCalledWith(JSON.stringify({
       type: SHARED_CONTEXT_RUNTIME_CONFIG_MSG.APPLY,
       config: {
-        primaryContextBackend: 'codex-sdk',
-        primaryContextModel: 'gpt-5.4',
-        backupContextBackend: 'claude-code-sdk',
-        backupContextModel: 'haiku',
+        primaryContextBackend: 'qwen',
+        primaryContextModel: 'qwen-team-model',
+        primaryContextPreset: 'Qwen Team',
+        backupContextBackend: 'qwen',
+        backupContextModel: 'qwen-backup-model',
+        backupContextPreset: 'Qwen Backup',
+        memoryRecallMinScore: 0.37,
+        memoryScoringWeights: {
+          similarity: 0.5,
+          recency: 0.2,
+          frequency: 0.1,
+          project: 0.2,
+        },
         enablePersonalMemorySync: true,
       },
     }));
@@ -151,8 +201,17 @@ describe('server shared-context runtime config routes', () => {
       config: {
         primaryContextBackend: 'claude-code-sdk',
         primaryContextModel: 'sonnet',
+        primaryContextPreset: undefined,
         backupContextBackend: undefined,
         backupContextModel: undefined,
+        backupContextPreset: undefined,
+        memoryRecallMinScore: 0.4,
+        memoryScoringWeights: {
+          similarity: 0.4,
+          recency: 0.25,
+          frequency: 0.15,
+          project: 0.2,
+        },
         enablePersonalMemorySync: false,
       },
     });

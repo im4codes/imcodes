@@ -4,7 +4,9 @@ import { RUNTIME_TYPES } from './session-runtime.js';
 import type { AgentStatus } from './detect.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { TransportProvider, ProviderError, SessionConfig, SessionInfoUpdate } from './transport-provider.js';
+import type { ApprovalRequest } from './transport-provider.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
+import type { TransportAttachment } from '../../shared/transport-attachments.js';
 import {
   SharedContextDispatchError,
   dispatchSharedContextSend,
@@ -12,14 +14,24 @@ import {
 } from './transport-runtime-assembly.js';
 import type {
   ContextFreshness,
+  ContextAuthorityDecision,
   ContextNamespace,
   SharedScopePolicyOverride,
   TransportMemoryRecallArtifact,
   TransportMemoryRecallItem,
 } from '../../shared/context-types.js';
-import { buildMemoryContextTimelinePayload } from '../daemon/memory-context-timeline.js';
+import type { MemoryContextTimelinePayload } from '../shared/timeline/types.js';
+import { buildMemoryContextTimelinePayload, buildMemoryContextStatusPayload } from '../daemon/memory-context-timeline.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
 import { searchLocalMemorySemantic, type MemorySearchResultItem } from '../context/memory-search.js';
+import { isTemplatePrompt, isTemplateOriginSummary, isImperativeCommand } from '../../shared/template-prompt-patterns.js';
+import { applyRecallCapRule } from '../../shared/memory-scoring.js';
+import {
+  filterRecentlyInjected,
+  recordRecentInjection,
+  clearRecentInjectionHistory,
+} from '../context/recent-injection-history.js';
+import { getContextModelConfig } from '../context/context-model-config.js';
 import { resolveRuntimeAuthoredContext } from '../context/shared-context-runtime.js';
 import { buildTransportStartupMemory, type TransportContextBootstrap } from './runtime-context-bootstrap.js';
 import { recordMemoryHits } from '../store/context-store.js';
@@ -28,6 +40,7 @@ import logger from '../util/logger.js';
 export interface PendingTransportMessage {
   clientMessageId: string;
   text: string;
+  attachments?: TransportAttachment[];
 }
 
 /**
@@ -67,7 +80,8 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _contextAuthoredContextLanguage: string | undefined;
   private _contextAuthoredContextFilePath: string | undefined;
   private _startupMemory: TransportMemoryRecallArtifact | null = null;
-  private _startupMemoryEmitted = false;
+  private _startupMemoryTimelineEmitted = false;
+  private _startupMemoryInjected = false;
   private _contextBootstrapResolver: (() => Promise<TransportContextBootstrap>) | undefined;
   private _unsubscribes: Array<() => void> = [];
   private _onStatusChange?: (status: AgentStatus) => void;
@@ -85,6 +99,11 @@ export class TransportSessionRuntime implements SessionRuntime {
   /** Callback fired when pending messages are drained into a new turn. */
   private _onDrain?: (messages: PendingTransportMessage[], mergedMessage: string, count: number) => void;
   private _onSessionInfoChange?: (info: SessionInfoUpdate) => void;
+  private _onApprovalRequest?: (request: ApprovalRequest) => void;
+  /** Fired exactly once per runtime lifetime, after startup memory is accepted
+   *  by the provider on the first dispatch. Session-manager persists the flag
+   *  to SessionRecord so future restores skip injection. */
+  private _onStartupMemoryInjected?: () => void;
 
   constructor(
     private readonly provider: TransportProvider,
@@ -123,6 +142,12 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._onSessionInfoChange?.(info);
       })] : []),
     );
+    if (this.provider.onApprovalRequest) {
+      this.provider.onApprovalRequest((sid: string, req: ApprovalRequest) => {
+        if (sid !== this._providerSessionId) return;
+        this._onApprovalRequest?.(req);
+      });
+    }
   }
 
   // ── Public API ──────────────────────────────────────────────────────────────
@@ -132,8 +157,11 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   /** Register a callback for when pending messages are drained into a new turn. */
   set onDrain(cb: (messages: PendingTransportMessage[], mergedMessage: string, count: number) => void) { this._onDrain = cb; }
+  /** Register a callback fired exactly once when startup memory reaches the provider. */
+  set onStartupMemoryInjected(cb: () => void) { this._onStartupMemoryInjected = cb; }
   /** Register a callback for provider session metadata updates. */
   set onSessionInfoChange(cb: (info: SessionInfoUpdate) => void) { this._onSessionInfoChange = cb; }
+  set onApprovalRequest(cb: (request: ApprovalRequest) => void) { this._onApprovalRequest = cb; }
 
   /** Set providerSessionId directly (restore from store without initialize). */
   setProviderSessionId(id: string): void { this._providerSessionId = id; }
@@ -168,6 +196,18 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   async initialize(config: SessionConfig): Promise<void> {
+    // When resuming/restoring an existing conversation, mark startup memory
+    // injected BEFORE applyContextBootstrap runs so the bootstrap's
+    // `if (!this._startupMemoryInjected) this._startupMemory = …` guard
+    // leaves `_startupMemory` as null. This is the mechanism that prevents
+    // re-injecting "related past work" into a session that already has it.
+    const alreadyInjected = config.startupMemoryAlreadyInjected === true;
+    if (alreadyInjected) {
+      this._startupMemoryInjected = true;
+      this._startupMemoryTimelineEmitted = true;
+      this._startupMemory = null;
+    }
+
     this._providerSessionId = await this.provider.createSession(config);
     this._description = config.description;
     this._systemPrompt = config.systemPrompt;
@@ -184,7 +224,19 @@ export class TransportSessionRuntime implements SessionRuntime {
       authoredContextFilePath: config.contextAuthoredContextFilePath,
     });
     await this.refreshContextBootstrap();
-    this._startupMemoryEmitted = false;
+
+    if (!alreadyInjected) {
+      // Fresh conversation — reset the gate so the next turn will build and
+      // inject startup memory. The timeline card is emitted later in
+      // `_dispatchTurn` at the same boundary where the provider actually
+      // accepts the startup payload (and `startupMemoryInjected` is
+      // persisted). Emitting it here would leak a new card on every
+      // restart-before-first-message, because the flag never gets persisted
+      // until a turn lands — those duplicate cards then stack forever in
+      // the timeline replay.
+      this._startupMemoryTimelineEmitted = false;
+      this._startupMemoryInjected = false;
+    }
   }
 
   /**
@@ -196,7 +248,7 @@ export class TransportSessionRuntime implements SessionRuntime {
    *
    * Returns 'sent' if dispatched immediately, 'queued' if enqueued.
    */
-  send(message: string, clientMessageId?: string): 'sent' | 'queued' {
+  send(message: string, clientMessageId?: string, attachments?: TransportAttachment[]): 'sent' | 'queued' {
     if (!this._providerSessionId) {
       throw new Error('TransportSessionRuntime not initialized — call initialize() first');
     }
@@ -205,11 +257,12 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._pendingMessages.push({
         clientMessageId: clientMessageId ?? randomUUID(),
         text: message,
+        ...(attachments?.length ? { attachments } : {}),
       });
       return 'queued';
     }
 
-    this._dispatchTurn(message, clientMessageId);
+    this._dispatchTurn(message, clientMessageId, attachments);
     return 'sent';
   }
 
@@ -255,6 +308,9 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._sending = false;
     this._activeTurn = null;
     this._pendingMessages = [];
+    // Per-session memory injection history is daemon-scoped to this session;
+    // a kill ends that scope. clear() is called on session.clear separately.
+    clearRecentInjectionHistory(this.sessionKey);
   }
 
   getHistory(): AgentMessage[] { return [...this._history]; }
@@ -268,7 +324,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   /** Dispatch a single turn to the provider. Assumes _sending is false. */
-  private _dispatchTurn(message: string, clientMessageId?: string): void {
+  private _dispatchTurn(message: string, clientMessageId?: string, attachments?: TransportAttachment[]): void {
     this._history.push({
       id: randomUUID(),
       sessionId: this._providerSessionId!,
@@ -301,17 +357,17 @@ export class TransportSessionRuntime implements SessionRuntime {
           sharedPolicyOverride: this._contextSharedPolicyOverride,
         }).authority;
         const startupMemory = this._startupMemory ?? (
-          !this._startupMemoryEmitted && authority.authoritySource === 'processed_local' && this._contextNamespace
+          !this._startupMemoryInjected && authority.authoritySource === 'processed_local' && this._contextNamespace
             ? buildTransportStartupMemory(this._contextNamespace)
             : null
         );
-        const memoryRecall = authority.authoritySource === 'processed_local'
-          ? await this.buildTransportMessageRecall(message)
-          : null;
+        const memoryRecallResult = await this.buildTransportMessageRecallResult(message, authority.authoritySource);
+        const memoryRecall = memoryRecallResult.artifact;
         const dispatchResult = await dispatchSharedContextSend(this.provider, this._providerSessionId!, {
           userMessage: message,
           description: this._description,
           systemPrompt: this._systemPrompt,
+          attachments,
           namespace: this._contextNamespace,
           namespaceDiagnostics: this._contextNamespaceDiagnostics,
           remoteProcessedFreshness: this._contextRemoteProcessedFreshness,
@@ -338,9 +394,24 @@ export class TransportSessionRuntime implements SessionRuntime {
             try { recordMemoryHits(hitIds); } catch { /* non-fatal */ }
           }
           this.emitMemoryContextEvent(dispatchResult.payload.memoryRecall, clientMessageId);
+        } else if (memoryRecallResult.statusPayload) {
+          this.emitMemoryContextStatusEvent(memoryRecallResult.statusPayload, clientMessageId);
         }
-        if (!this._startupMemoryEmitted && dispatchResult.payload?.startupMemory) {
-          this.emitStartupMemoryContext(dispatchResult.payload.startupMemory);
+        if (!this._startupMemoryInjected && dispatchResult.payload?.startupMemory) {
+          this._startupMemoryInjected = true;
+          // Emit the "Historical context · injected" timeline card at the
+          // same commit boundary as the persisted flag. Doing this here
+          // (instead of eagerly in `initialize`) guarantees restart-before-
+          // first-message never leaks an unbacked card — the card appears
+          // exactly once, for the turn that actually carried the preamble.
+          this.emitStartupMemoryContext(this._startupMemory);
+          this._startupMemory = null;
+          // Notify session-manager so the flag is persisted to SessionRecord.
+          // Invoked synchronously — the callback just schedules an upsert and
+          // returns, so there's no ordering risk with the rest of this turn.
+          try { this._onStartupMemoryInjected?.(); } catch (err) {
+            logger.warn({ err, sessionKey: this.sessionKey }, 'onStartupMemoryInjected callback failed');
+          }
         }
       })
       .catch((err) => {
@@ -377,8 +448,13 @@ export class TransportSessionRuntime implements SessionRuntime {
 
     const messages = this._pendingMessages.splice(0);
     const merged = messages.map((entry) => entry.text).join('\n\n');
+    const attachments = messages.flatMap((entry) => entry.attachments ?? []);
     this._onDrain?.(messages, merged, messages.length);
-    this._dispatchTurn(merged, messages.length === 1 ? messages[0]?.clientMessageId : undefined);
+    this._dispatchTurn(
+      merged,
+      messages.length === 1 ? messages[0]?.clientMessageId : undefined,
+      attachments.length > 0 ? attachments : undefined,
+    );
     return true;
   }
 
@@ -404,7 +480,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._contextSharedPolicyOverride = bootstrap.sharedPolicyOverride;
     this._contextAuthoredContextLanguage = bootstrap.authoredContextLanguage;
     this._contextAuthoredContextFilePath = bootstrap.authoredContextFilePath;
-    if (!this._startupMemoryEmitted) this._startupMemory = bootstrap.startupMemory ?? null;
+    if (!this._startupMemoryInjected) this._startupMemory = bootstrap.startupMemory ?? null;
     this._onSessionInfoChange?.({
       contextNamespace: this._contextNamespace,
       contextNamespaceDiagnostics: [...this._contextNamespaceDiagnostics],
@@ -415,36 +491,114 @@ export class TransportSessionRuntime implements SessionRuntime {
     });
   }
 
-  private async buildTransportMessageRecall(message: string): Promise<TransportMemoryRecallArtifact | null> {
+  private async buildTransportMessageRecallResult(
+    message: string,
+    authoritySource: ContextAuthorityDecision['authoritySource'],
+  ): Promise<{
+    artifact: TransportMemoryRecallArtifact | null;
+    statusPayload?: Omit<MemoryContextTimelinePayload, 'relatedToEventId'>;
+  }> {
     const trimmed = message.trim();
+    const query = trimmed.slice(0, 200);
     if (!trimmed) {
       logger.debug({ sessionKey: this.sessionKey }, 'transport message recall skipped: empty message');
-      return null;
+      return { artifact: null };
     }
     if (trimmed.startsWith('/')) {
       logger.debug({ sessionKey: this.sessionKey }, 'transport message recall skipped: control message');
-      return null;
+      return {
+        artifact: null,
+        statusPayload: buildMemoryContextStatusPayload(query, 'skipped_control_message', 'message', {
+          runtimeFamily: 'transport',
+          authoritySource,
+          sourceKind: 'local_processed',
+        }),
+      };
     }
     if (trimmed.length < 10) {
       logger.debug({ sessionKey: this.sessionKey, length: trimmed.length }, 'transport message recall skipped: short message');
-      return null;
+      return {
+        artifact: null,
+        statusPayload: buildMemoryContextStatusPayload(query, 'skipped_short_prompt', 'message', {
+          runtimeFamily: 'transport',
+          authoritySource,
+          sourceKind: 'local_processed',
+        }),
+      };
+    }
+    if (isTemplatePrompt(trimmed)) {
+      logger.debug({ sessionKey: this.sessionKey }, 'transport message recall skipped: template prompt');
+      return {
+        artifact: null,
+        statusPayload: buildMemoryContextStatusPayload(query, 'skipped_template_prompt', 'message', {
+          runtimeFamily: 'transport',
+          authoritySource,
+          sourceKind: 'local_processed',
+        }),
+      };
+    }
+    if (isImperativeCommand(trimmed)) {
+      logger.debug({ sessionKey: this.sessionKey, text: trimmed }, 'transport message recall skipped: imperative command');
+      return {
+        artifact: null,
+        // Reuse the 'skipped_control_message' reason — imperative commands are
+        // a form of control input (task-level verb, not a semantic query) and
+        // we don't need to surface a separate status banner for them.
+        statusPayload: buildMemoryContextStatusPayload(query, 'skipped_control_message', 'message', {
+          runtimeFamily: 'transport',
+          authoritySource,
+          sourceKind: 'local_processed',
+        }),
+      };
     }
     try {
-      const query = trimmed.slice(0, 200);
+      // Broaden candidate pool — the cap rule trims to 3 (up to 5 if all
+      // results are strong). See shared/memory-scoring.ts.
       const result = await searchLocalMemorySemantic({
         query,
         namespace: this._contextNamespace,
         currentEnterpriseId: this._contextNamespace?.enterpriseId,
         repo: this._contextNamespace?.projectId ?? this.resolveAuthoredContextRepository(),
-        limit: 5,
+        limit: 10,
       });
-      const items = result.items
+      // 1) Template-origin legacy summaries never surface through recall.
+      const processed = result.items
         .filter((item): item is MemorySearchResultItem => item.type === 'processed')
-        .map(toTransportMemoryRecallItem);
+        .filter((item) => !isTemplateOriginSummary(item.summary));
+      // 2) Per-session dedup: skip items injected in this session's last
+      //    10 turns. Cleared on session.clear.
+      const procIds = processed.map((item) => item.id);
+      const keepIds = new Set(filterRecentlyInjected(this.sessionKey, procIds));
+      const deduped = processed.filter((item) => keepIds.has(item.id));
+      const dedupedCount = Math.max(0, processed.length - deduped.length);
+      // 3) Cap rule: floor 0.5, top 3, extend to 5 iff all >= 0.6.
+      const scored = deduped.map((item) => ({ item, score: item.relevanceScore ?? 0 }));
+      const finalScored = applyRecallCapRule(scored, {
+        minFloor: getContextModelConfig().memoryRecallMinScore,
+      });
+      const items = finalScored.map((s) => toTransportMemoryRecallItem(s.item));
       if (items.length === 0) {
         logger.debug({ sessionKey: this.sessionKey, query }, 'transport message recall skipped: no processed matches');
-        return null;
+        return {
+          artifact: null,
+          statusPayload: deduped.length === 0 && processed.length > 0
+            ? buildMemoryContextStatusPayload(query, 'deduped_recently', 'message', {
+                runtimeFamily: 'transport',
+                authoritySource,
+                sourceKind: 'local_processed',
+                matchedCount: processed.length,
+                dedupedCount,
+              })
+            : buildMemoryContextStatusPayload(query, 'no_matches', 'message', {
+                runtimeFamily: 'transport',
+                authoritySource,
+                sourceKind: 'local_processed',
+                matchedCount: processed.length,
+              }),
+        };
       }
+      // 4) Record injection into the per-session ring buffer.
+      recordRecentInjection(this.sessionKey, items.map((it) => it.id));
       const supportClass = this.provider.capabilities.contextSupport ?? 'full-normalized-context-injection';
       const injectionSurface = supportClass === 'full-normalized-context-injection'
         ? 'normalized-payload'
@@ -452,28 +606,37 @@ export class TransportSessionRuntime implements SessionRuntime {
       const payload = buildMemoryContextTimelinePayload(query, items, 'message', {
         runtimeFamily: 'transport',
         injectionSurface,
-        authoritySource: 'processed_local',
+        authoritySource,
         sourceKind: 'local_processed',
       });
-      if (!payload) return null;
+      if (!payload?.injectedText) return { artifact: null };
       return {
-        reason: 'message',
-        runtimeFamily: 'transport',
-        authoritySource: 'processed_local',
-        sourceKind: 'local_processed',
-        injectionSurface,
-        query,
-        items,
-        injectedText: payload.injectedText,
+        artifact: {
+          reason: 'message',
+          runtimeFamily: 'transport',
+          authoritySource,
+          sourceKind: 'local_processed',
+          injectionSurface,
+          query,
+          items,
+          injectedText: payload.injectedText,
+        },
       };
     } catch (err) {
       logger.warn({ err, sessionKey: this.sessionKey }, 'transport message recall failed; continuing without recall');
-      return null;
+      return {
+        artifact: null,
+        statusPayload: buildMemoryContextStatusPayload(query, 'failed', 'message', {
+          runtimeFamily: 'transport',
+          authoritySource,
+          sourceKind: 'local_processed',
+        }),
+      };
     }
   }
 
-  private emitStartupMemoryContext(startupMemory: TransportMemoryRecallArtifact): void {
-    if (this._startupMemoryEmitted || startupMemory.items.length === 0) return;
+  private emitStartupMemoryContext(startupMemory: TransportMemoryRecallArtifact | null): void {
+    if (this._startupMemoryTimelineEmitted || !startupMemory || startupMemory.items.length === 0) return;
     const payload = buildMemoryContextTimelinePayload(undefined, startupMemory.items, 'startup', {
       runtimeFamily: 'transport',
       injectionSurface: startupMemory.injectionSurface,
@@ -483,8 +646,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     });
     if (!payload) return;
     timelineEmitter.emit(this.sessionKey, 'memory.context', payload, { source: 'daemon', confidence: 'high' });
-    this._startupMemory = null;
-    this._startupMemoryEmitted = true;
+    this._startupMemoryTimelineEmitted = true;
   }
 
   private emitMemoryContextEvent(
@@ -508,6 +670,31 @@ export class TransportSessionRuntime implements SessionRuntime {
       },
       { source: 'daemon', confidence: 'high' },
     );
+  }
+
+  private emitMemoryContextStatusEvent(
+    payload: Omit<MemoryContextTimelinePayload, 'relatedToEventId'>,
+    clientMessageId?: string,
+  ): void {
+    timelineEmitter.emit(
+      this.sessionKey,
+      'memory.context',
+      {
+        ...payload,
+        ...(clientMessageId ? { relatedToEventId: `transport-user:${clientMessageId}` } : {}),
+      },
+      { source: 'daemon', confidence: 'high' },
+    );
+  }
+
+  async respondApproval(requestId: string, approved: boolean): Promise<void> {
+    if (!this._providerSessionId) {
+      throw new Error('TransportSessionRuntime not initialized — call initialize() first');
+    }
+    if (!this.provider.respondApproval) {
+      throw new Error(`Provider ${this.provider.id} does not support approval responses`);
+    }
+    await this.provider.respondApproval(this._providerSessionId, requestId, approved);
   }
 }
 

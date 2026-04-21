@@ -2,9 +2,9 @@
 
 [English](README.md) | [简体中文](README.i18n/README.zh-CN.md) | [繁體中文](README.i18n/README.zh-TW.md) | [Español](README.i18n/README.es.md) | [Русский](README.i18n/README.ru.md) | [日本語](README.i18n/README.ja.md) | [한국어](README.i18n/README.ko.md)
 
-**The IM for agents.**
+**The IM for agents. Shared memory, supervised execution, and cross-agent audit across AI providers.**
 
-A specialized instant messenger for AI agents. Keep long-running coding-agent sessions within reach from iPhone, iPad, Apple Watch, mobile, or web, with terminal access, file browsing, git views, localhost preview, notifications, multi-agent workflows, and shared agent memory built in. Works with [Claude Code](https://github.com/anthropics/claude-code) and [Codex](https://github.com/openai/codex) via both CLI and SDK integrations, plus [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more — including native streaming output for transport-backed agents.
+IM.codes gives coding agents one shared memory layer across providers. It turns completed work into reusable context, then injects the right history back into future sessions across [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more — with terminal access, file browsing, git views, localhost preview, notifications, multi-agent workflows, and native streaming output for transport-backed agents. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. P2P discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.
 
 > **Disclaimer:** This is an actively developed personal open-source project. There are no warranties, no SLA, and no guarantees of stability, security, or backward compatibility. Use at your own risk. Breaking changes may happen at any time without notice.
 
@@ -63,7 +63,7 @@ Watch support covers quick session monitoring, unread counts, push notifications
 
 <a href="https://apps.apple.com/us/app/im-codes/id6761014424"><img src="https://developer.apple.com/assets/elements/badges/download-on-the-app-store.svg" height="40" alt="Download on the App Store" /></a>
 
-Supports iPhone, iPad, and Apple Watch. Also available as a [web app](https://app.im.codes) and via `npm install -g imcodes` (daemon CLI).
+Supports iPhone, iPad, and Apple Watch. Also available as a [web app](https://app.im.codes).
 
 ## Why
 
@@ -81,10 +81,22 @@ IM.codes continuously turns completed agent work into reusable memory and feeds 
 
 - **Problem → solution memory, not log spam.** Only final `assistant.text` outputs are materialized. Streaming deltas, tool calls, and intermediate noise are excluded.
 - **Personal memory with optional cloud sync.** Raw and processed memory always stay local; processed summaries can optionally sync to a user-scoped cloud pool shared across your devices.
-- **Enterprise shared context.** Teams can publish reusable memory into workspace/project scopes, inspect it in the UI, query it, and see stats instead of treating context as hidden prompt text.
+- **Enterprise shared context.** Teams can publish reusable memory into workspace/project scopes, inspect it in the UI, query it, and see stats instead of treating context as hidden prompt text. This part is still under active development and has not been fully production-tested yet.
 - **Multilingual recall.** Local semantic search and server-side pgvector recall use multilingual embeddings, so related fixes can be found across English, Chinese, Japanese, Korean, Spanish, Russian, and mixed-language repos.
 - **Automatic injection where it matters.** Relevant past work is injected both per-message and at session startup, with timeline cards that show what was recalled, why, the relevance score, recall count, and last-used time.
 - **User-visible inspection and control.** Shared Context UI separates raw events, processed summaries, cloud memory, and enterprise memory, with query, preview, archive/restore, and processing configuration controls.
+
+## Supervised Execution & Auto Audit
+
+IM.codes can drive supported agent sessions turn by turn — a supervisor with your own instructions evaluates each completed turn at the idle boundary and decides to auto-continue, hand back, or trigger an audit loop, instead of you typing "continue" every round.
+
+- **Per-session Auto modes.** Configure `off`, `supervised`, or `supervised_audit` per session instead of forcing one policy everywhere.
+- **Completion checks at the idle boundary.** When a turn finishes, IM.codes can classify it as `complete`, `continue`, or `ask_human`, then dispatch the next continue prompt inside the same session.
+- **Fail-closed automation.** Auto supervision stays visible in the timeline/footer, uses structured decisions, and returns control to you on timeout, invalid output, or bad config instead of silently guessing.
+- **Optional audit → rework loop.** In `supervised_audit`, a completed turn can automatically enter an audit pipeline and send a rework brief back into the same session before control returns.
+- **Global defaults seed new sessions.** Set your default supervisor backend, model, and timeout once. New `supervised` / `supervised_audit` sessions snapshot them at enable time, and each session can still override backend/model/timeout and audit mode individually.
+- **Two-layer custom supervision instructions.** Keep a global supervision persona alongside a per-session addition. By default the two are concatenated (`global`, blank line, then `session`); tick the session's **Override global** checkbox to ignore the global value for that one session. Unlike backend/model/timeout, the global value is re-read on every dispatch, so editing it takes effect on already-enabled sessions without a re-enable.
+- **Built for real IM.codes workflows.** Auto supervision understands OpenSpec work, P2P discussion/review flows, and `imcodes send`-style cross-agent coordination as valid agent actions, not immediate reasons to stop for a human.
 
 ## Features
 
@@ -103,6 +115,12 @@ Preview your local dev server from any device — phone, tablet, or remote brows
 ### Mobile, Watch & Notifications
 
 Full mobile support with biometric auth and push notifications. Shell sessions allow interactive keyboard input on mobile (SSH-like). Sub-session preview cards always show latest messages. Toast notifications navigate directly to the relevant session. Apple Watch support adds quick session monitoring, unread counts, and quick replies from the wrist.
+
+### Supervised Task Automation
+
+Auto supervision adds turn-level control for supported transport-backed agents. Instead of blindly continuing forever, IM.codes evaluates the latest completed turn and decides whether the task looks done, should keep going, or should come back to you. For higher-assurance work, `supervised_audit` can automatically trigger an audit/rework loop before the session is considered finished.
+
+Auto supervision splits configuration into two layers. Backend, model, and timeout are **snapshot-frozen** at the moment you enable Auto on a session, so editing the global defaults later never surprises an already-running session. Custom supervision instructions work differently: a **global persona** is paired with the session's own free text and — by default — both are concatenated into the prompt sent to the supervisor. Tick the session's **Override global** checkbox to have that session ignore the global persona entirely. The global persona is re-read on every turn, so when you update it every already-enabled session picks it up on the next dispatch without needing a re-enable. Auto is also aware of IM.codes-native workflows such as OpenSpec changes, P2P discussions, and `imcodes send`, so those actions count as legitimate next steps instead of accidental "ask human" triggers.
 
 ### Multi-Agent Discussions & Cross-Provider Audit
 

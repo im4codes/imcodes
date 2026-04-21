@@ -183,6 +183,160 @@ describe('QwenProvider', () => {
         ],
       },
     });
+    // --auth-type must be passed so qwen CLI doesn't fall back to user-level
+    // ~/.qwen/settings.json (which commonly pins selectedType: qwen-oauth).
+    const authTypeIndex = first.args.indexOf('--auth-type');
+    expect(authTypeIndex).toBeGreaterThan(-1);
+    expect(first.args[authTypeIndex + 1]).toBe('anthropic');
+  });
+
+  it('omits --auth-type when no preset settings are provided (preserves default qwen auth)', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-no-preset',
+      cwd: '/tmp/project',
+      effort: 'medium',
+    });
+
+    await provider.send('sess-no-preset', 'hello');
+    const spawned = lastSpawn();
+    // Users without a preset rely on `qwen auth` (coding-plan / api-key / OAuth
+    // choice stored in ~/.qwen/settings.json) — we must not force an auth tier
+    // for them, or we'd override their working configuration.
+    expect(spawned.args.includes('--auth-type')).toBe(false);
+  });
+
+  it('ignores settings.security.auth.selectedType that qwen CLI does not recognize', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-unknown-auth',
+      cwd: '/tmp/project',
+      settings: {
+        // e.g. a value from shared/qwen-auth.ts (display-tier), not a CLI value
+        security: { auth: { selectedType: 'coding-plan' } },
+      },
+    });
+
+    await provider.send('sess-unknown-auth', 'hello');
+    const spawned = lastSpawn();
+    // Unknown values must not be forwarded — CLI would reject the spawn.
+    expect(spawned.args.includes('--auth-type')).toBe(false);
+  });
+
+  it('preserves preset settings (security + modelProviders + model.name) when effort changes on subsequent sends', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-preset-effort',
+      cwd: '/tmp/project',
+      effort: 'medium',
+      agentId: 'MiniMax-M2.7',
+      settings: {
+        security: { auth: { selectedType: 'anthropic' } },
+        model: { name: 'MiniMax-M2.7' },
+        modelProviders: {
+          anthropic: [
+            {
+              id: 'MiniMax-M2.7',
+              envKey: 'ANTHROPIC_API_KEY',
+              baseUrl: 'https://api.minimax.io/anthropic',
+            },
+          ],
+        },
+      },
+    });
+
+    // First send — verify full preset config is written
+    await provider.send('sess-preset-effort', 'hello');
+    const first = lastSpawn();
+    const settingsPath = first.env?.QWEN_CODE_SYSTEM_SETTINGS_PATH;
+    expect(typeof settingsPath).toBe('string');
+    expect(JSON.parse(await readFile(String(settingsPath), 'utf8'))).toEqual({
+      security: { auth: { selectedType: 'anthropic' } },
+      model: {
+        name: 'MiniMax-M2.7',
+        generationConfig: { reasoning: { effort: 'medium' } },
+      },
+      modelProviders: {
+        anthropic: [
+          {
+            id: 'MiniMax-M2.7',
+            envKey: 'ANTHROPIC_API_KEY',
+            baseUrl: 'https://api.minimax.io/anthropic',
+          },
+        ],
+      },
+    });
+    // --auth-type must still be forwarded on the first send
+    const firstAuthIdx = first.args.indexOf('--auth-type');
+    expect(firstAuthIdx).toBeGreaterThan(-1);
+    expect(first.args[firstAuthIdx + 1]).toBe('anthropic');
+
+    // Complete first send so second send is allowed
+    first.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-1', content: [{ type: 'text', text: 'Hi' }] } })}\n`);
+    first.child.emit('close', 0, null);
+    await flushIO();
+
+    // Change effort — this is the bug path: ensureSettingsPath is called again
+    // and must NOT overwrite the temp file with only { model: { generationConfig } }
+    await provider.setSessionEffort('sess-preset-effort', 'high');
+    await provider.send('sess-preset-effort', 'again');
+    const second = lastSpawn();
+    expect(second.env?.QWEN_CODE_SYSTEM_SETTINGS_PATH).toBe(String(settingsPath));
+    // All preset fields must survive the rewrite
+    expect(JSON.parse(await readFile(String(settingsPath), 'utf8'))).toEqual({
+      security: { auth: { selectedType: 'anthropic' } },
+      model: {
+        name: 'MiniMax-M2.7',
+        generationConfig: { reasoning: { effort: 'high' } },
+      },
+      modelProviders: {
+        anthropic: [
+          {
+            id: 'MiniMax-M2.7',
+            envKey: 'ANTHROPIC_API_KEY',
+            baseUrl: 'https://api.minimax.io/anthropic',
+          },
+        ],
+      },
+    });
+    // --auth-type must still be forwarded on the second send too
+    const secondAuthIdx = second.args.indexOf('--auth-type');
+    expect(secondAuthIdx).toBeGreaterThan(-1);
+    expect(second.args[secondAuthIdx + 1]).toBe('anthropic');
+  });
+
+  it('passes session-specific preset env through to the spawned qwen process', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-preset-env',
+      cwd: '/tmp/project',
+      env: {
+        ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+        ANTHROPIC_API_KEY: 'test-token',
+        ANTHROPIC_MODEL: 'MiniMax-M2.7',
+      },
+      settings: {
+        security: { auth: { selectedType: 'anthropic' } },
+        model: { name: 'MiniMax-M2.7' },
+      },
+    });
+
+    await provider.send('sess-preset-env', 'hello');
+    const spawned = lastSpawn();
+    expect(spawned.env).toMatchObject({
+      ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+      ANTHROPIC_API_KEY: 'test-token',
+      ANTHROPIC_MODEL: 'MiniMax-M2.7',
+    });
+    // MiniMax preset ships with selectedType: anthropic — must be forwarded to
+    // qwen CLI so it doesn't fall back to OAuth via user-level settings.
+    const authTypeIndex = spawned.args.indexOf('--auth-type');
+    expect(authTypeIndex).toBeGreaterThan(-1);
+    expect(spawned.args[authTypeIndex + 1]).toBe('anthropic');
   });
 
   it('uses --session-id on first send, streams cumulative deltas, then resumes with --resume', async () => {

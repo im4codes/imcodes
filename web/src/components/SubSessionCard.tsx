@@ -18,10 +18,15 @@ import { SessionControls } from './SessionControls.js';
 import type { SessionInfo } from '../types.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
 import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
+import { isTransportRuntime, resolveSubSessionRuntimeType } from '../runtime-type.js';
 
 const TYPE_ICON: Record<string, string> = {
   'claude-code': '⚡',
+  'claude-code-sdk': '⚡',
   'codex': '📦',
+  'codex-sdk': '📦',
+  'copilot-sdk': '🧭',
+  'cursor-headless': '➤',
   'opencode': '🔆',
   'openclaw': '☁️',
   'qwen': '千',
@@ -74,7 +79,17 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const isShell = sub.type === 'shell' || sub.type === 'script';
-  const { events, refreshing } = isShell ? { events: [], refreshing: false } : useTimeline(sub.sessionName, ws, serverId);
+  // Shell/script sub-sessions are terminal-only; they have no chat timeline
+  // to attach optimistic bubbles to. For everything else we pull the
+  // optimistic helpers so the card input behaves like the main-session pane
+  // (message goes straight to the timeline with a spinner, reconciled by the
+  // daemon echo).
+  const timeline = isShell
+    ? { events: [], refreshing: false, addOptimisticUserMessage: undefined, removeOptimisticMessage: undefined }
+    : useTimeline(sub.sessionName, ws, serverId);
+  const { events, refreshing } = timeline;
+  const addOptimisticUserMessage = 'addOptimisticUserMessage' in timeline ? timeline.addOptimisticUserMessage : undefined;
+  const removeOptimisticMessage = 'removeOptimisticMessage' in timeline ? timeline.removeOptimisticMessage : undefined;
   const termScrollRef = useRef<(() => void) | null>(null);
   const chatScrollRef = useRef<(() => void) | null>(null);
   const cardInputRef = useRef<HTMLInputElement>(null);
@@ -87,6 +102,42 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   const [quickPanelOpen, setQuickPanelOpen] = useState(false);
   const [overlayOpen, setOverlayOpen] = useState(false);
 
+  // ── Retry failed send ─────────────────────────────────────────────────────
+  // Same contract as SessionPane / SubSessionWindow. Shell/script sub-sessions
+  // don't expose the optimistic helpers (no chat timeline), so the handler
+  // becomes a no-op there.
+  const eventsRef = useRef(events);
+  eventsRef.current = events;
+  const handleResendFailed = useCallback((commandId: string, text: string) => {
+    if (!ws || !connected || !addOptimisticUserMessage || !removeOptimisticMessage) return;
+    const failedEvent = eventsRef.current.find(
+      (e) => e.type === 'user.message'
+        && e.payload.failed === true
+        && e.payload.commandId === commandId,
+    );
+    const resendExtra = failedEvent && typeof failedEvent.payload._resendExtra === 'object'
+      ? (failedEvent.payload._resendExtra as Record<string, unknown>)
+      : undefined;
+    const attachmentsFromFailure = failedEvent && Array.isArray(failedEvent.payload.attachments)
+      ? (failedEvent.payload.attachments as Array<Record<string, unknown>>)
+      : undefined;
+    removeOptimisticMessage(commandId);
+    const newCommandId = globalThis.crypto?.randomUUID?.()
+      ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    ws.sendSessionCommand('send', {
+      sessionName: sub.sessionName,
+      text,
+      ...(resendExtra ?? {}),
+      commandId: newCommandId,
+    });
+    if (!isTransportRuntime(sub)) {
+      addOptimisticUserMessage(text, newCommandId, {
+        ...(attachmentsFromFailure ? { attachments: attachmentsFromFailure } : {}),
+        ...(resendExtra ? { resendExtra } : {}),
+      });
+    }
+  }, [addOptimisticUserMessage, connected, removeOptimisticMessage, sub.sessionName, ws]);
+
   // Build a SessionInfo for SessionControls compact mode
   const sessionInfo = useMemo<SessionInfo>(() => ({
     name: sub.sessionName,
@@ -96,7 +147,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     state: (sub.state as SessionInfo['state']) ?? 'unknown',
     label: sub.label ?? null,
     projectDir: sub.cwd ?? undefined,
-    runtimeType: sub.runtimeType ?? undefined,
+    runtimeType: resolveSubSessionRuntimeType(sub),
     transportConfig: sub.transportConfig ?? undefined,
     transportPendingMessages: sub.transportPendingMessages ?? undefined,
     transportPendingMessageEntries: sub.transportPendingMessageEntries ?? undefined,
@@ -263,6 +314,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
               onScrollBottomFn={(fn) => { chatScrollRef.current = fn; }}
               preview
               agentType={sub.type}
+              onResendFailed={handleResendFailed}
             />
           )}
         </div>
@@ -274,7 +326,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
       {/* Compact input — reuses SessionControls with @picker, ⚡, 📎, paste upload */}
       <div class="subcard-input-area" onClick={(e) => e.stopPropagation()}>
         <div class="subcard-input-row">
-          {sub.runtimeType === 'transport' && (
+          {isTransportRuntime(sub) && (
             <button
               class="subcard-stop-btn"
               type="button"
@@ -305,6 +357,28 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
                 onTransportConfigSaved={(transportConfig) => onTransportConfigSaved?.(sub.id, transportConfig)}
                 onQuickOpenChange={setQuickPanelOpen}
                 onOverlayOpenChange={setOverlayOpen}
+                onSend={(_name, text, meta) => {
+                  // Inject the optimistic "sending" bubble from the compact
+                  // sub-session card — parity with SessionPane and
+                  // SubSessionWindow. Shell/script cards have no helper
+                  // (no chat timeline) so the call is a no-op there.
+                  //
+                  // Exception: P2P command sends do not belong in the
+                  // sub-session's own chat — they start a discussion run
+                  // whose conversation lives in the discussion file.
+                  const extras = meta?.extra as Record<string, unknown> | undefined;
+                  const isP2pSend = !!extras && (
+                    Array.isArray(extras.p2pAtTargets) && extras.p2pAtTargets.length > 0
+                    || (typeof extras.p2pMode === 'string' && extras.p2pMode.length > 0)
+                    || (extras.p2pSessionConfig != null && typeof extras.p2pSessionConfig === 'object')
+                  );
+                  if (isP2pSend || isTransportRuntime(sub)) return;
+                  addOptimisticUserMessage?.(text, meta?.commandId, {
+                    ...(meta?.attachments ? { attachments: meta.attachments } : {}),
+                    ...(meta?.extra ? { resendExtra: meta.extra } : {}),
+                  });
+                  scrollToBottom();
+                }}
               />
             ) : (
               <input

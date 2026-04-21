@@ -8,6 +8,8 @@ import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/pr
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, _opts?: Record<string, unknown>) => {
+      if (key === 'session.agentGroup.transport_sdk') return 'SDK';
+      if (key === 'session.agentGroup.cli_process') return 'CLI';
       // Return last segment of key as simple translation
       const parts = key.split('.');
       return parts[parts.length - 1];
@@ -53,15 +55,25 @@ describe('NewSessionDialog', () => {
     expect(select).toBeDefined();
   });
 
-  it('agent type selector orders sdk agents before cli agents', () => {
+  it('agent type selector separates transport/sdk and cli/process groups', () => {
     render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
     const select = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    const optgroups = Array.from(select.querySelectorAll('optgroup'));
+    expect(optgroups.map((group) => group.label)).toEqual(['SDK', 'CLI']);
     const options = Array.from(select.options).map((o) => o.value);
-    expect(options.slice(0, 4)).toEqual([
+    expect(options.slice(0, 6)).toEqual([
       'claude-code-sdk',
-      'claude-code',
       'codex-sdk',
+      'copilot-sdk',
+      'cursor-headless',
+      'qwen',
+      'openclaw',
+    ]);
+    expect(options.slice(6)).toEqual([
+      'claude-code',
       'codex',
+      'opencode',
+      'gemini',
     ]);
   });
 
@@ -70,6 +82,7 @@ describe('NewSessionDialog', () => {
     const select = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
     expect(select.value).toBe('claude-code-sdk');
     expect(screen.getByText('agent_flavor_sdk')).toBeDefined();
+    expect(screen.getByText('qwen_provider_hint')).toBeDefined();
   });
 
   it('cancel button calls onClose', () => {
@@ -206,6 +219,16 @@ describe('NewSessionDialog', () => {
     await waitFor(() => expect(screen.getByText('agent_flavor_cli')).toBeDefined());
   });
 
+  it('shows the qwen provider-specific hint when qwen is selected', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    const select = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    fireEvent.input(select, { target: { value: 'qwen' } });
+
+    await waitFor(() => expect(screen.getByText('qwen_provider_selected_hint')).toBeDefined());
+  });
+
   it('includes thinking level when starting codex-sdk', async () => {
     const ws = makeWs();
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
@@ -239,7 +262,7 @@ describe('NewSessionDialog', () => {
 
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
-    expect(screen.queryByText('API Provider')).toBeNull();
+    expect(screen.queryByText('api_provider')).toBeNull();
   });
 
   it('shows CC preset controls and submits preset for qwen', async () => {
@@ -259,7 +282,8 @@ describe('NewSessionDialog', () => {
     const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
     agentTypeSelect.value = 'qwen';
     fireEvent.input(agentTypeSelect, { target: { value: agentTypeSelect.value } });
-    await waitFor(() => expect(screen.getByText('API Provider')).toBeDefined());
+    await waitFor(() => expect(screen.getByText('api_provider')).toBeDefined());
+    expect(screen.getByText('qwen_provider_selected_hint')).toBeDefined();
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
     fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
 
@@ -293,6 +317,41 @@ describe('NewSessionDialog', () => {
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
       agentType: 'qwen',
       thinking: 'high',
+    }));
+  });
+
+  it('passes requestedModel when starting copilot-sdk', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
+    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    fireEvent.input(agentTypeSelect, { target: { value: 'copilot-sdk' } });
+    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'gpt-5.4-mini' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'copilot-sdk',
+      requestedModel: 'gpt-5.4-mini',
+      thinking: 'high',
+    }));
+  });
+
+  it('passes requestedModel when starting cursor-headless', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
+    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    fireEvent.input(agentTypeSelect, { target: { value: 'cursor-headless' } });
+    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'gpt-5.2' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'cursor-headless',
+      requestedModel: 'gpt-5.2',
     }));
   });
 });

@@ -9,6 +9,9 @@ import * as childProcess from 'child_process';
 
 // Track all execFile calls to verify args
 const execFileCalls: Array<{ cmd: string; args: string[] }> = [];
+let failNextTmuxSubcommand: string | null = null;
+let failNextTmuxErrorText = 'server exited unexpectedly';
+let failNextTmuxCall: ((cmd: string, args: string[]) => Error | null) | null = null;
 const originalExecFile = childProcess.execFile;
 
 // Mock execFile to capture calls and return success
@@ -25,6 +28,21 @@ vi.mock('child_process', async (importOriginal) => {
       // Return mock stdout for commands that need it
       const subCmd = args[0];
       if (cmd === 'tmux') {
+        if (failNextTmuxCall) {
+          const err = failNextTmuxCall(cmd, args);
+          if (err) {
+            if (typeof cb === 'function') cb(err);
+            return;
+          }
+        }
+        if (failNextTmuxSubcommand && subCmd === failNextTmuxSubcommand) {
+          const err = Object.assign(new Error(failNextTmuxErrorText), {
+            stderr: failNextTmuxErrorText,
+          });
+          failNextTmuxSubcommand = null;
+          if (typeof cb === 'function') cb(err);
+          return;
+        }
         if (subCmd === 'list-sessions') {
           if (typeof cb === 'function') cb(null, { stdout: '' });
           return;
@@ -58,6 +76,9 @@ const tmux = await import('../../src/agent/tmux.js');
 describe('tmux shell-injection prevention', () => {
   beforeEach(() => {
     execFileCalls.length = 0;
+    failNextTmuxSubcommand = null;
+    failNextTmuxErrorText = 'server exited unexpectedly';
+    failNextTmuxCall = null;
   });
 
   it('uses execFile (not exec) for all tmux commands', async () => {
@@ -142,6 +163,75 @@ describe('tmux shell-injection prevention', () => {
     const call = execFileCalls.find((c) => c.args[0] === 'capture-pane' && c.args.includes('-e'));
     expect(call).toBeDefined();
     expect(call!.args).toEqual(['capture-pane', '-e', '-p', '-t', 'deck_test_brain']);
+  });
+
+  it('retries once when tmux server exits between commands', async () => {
+    await tmux.capturePane('deck_test_brain'); // primes ensureTmuxServer cache
+    execFileCalls.length = 0;
+    failNextTmuxSubcommand = 'new-session';
+
+    await tmux.newSession('deck_test_brain', 'bash');
+
+    const listSessionsCalls = execFileCalls.filter((c) => c.args[0] === 'list-sessions');
+    const newSessionCalls = execFileCalls.filter((c) => c.args[0] === 'new-session' && c.args[3] === 'deck_test_brain');
+    expect(listSessionsCalls.length).toBe(1);
+    expect(newSessionCalls.length).toBe(2);
+  });
+
+  it('serializes tmux server priming so concurrent calls do not race on imcodes_init', async () => {
+    vi.resetModules();
+    const freshTmux = await import('../../src/agent/tmux.js');
+    execFileCalls.length = 0;
+    failNextTmuxSubcommand = 'list-sessions';
+    failNextTmuxErrorText = 'no server running';
+
+    await Promise.all([
+      freshTmux.newSession('deck_test_brain_a', 'bash'),
+      freshTmux.newSession('deck_test_brain_b', 'bash'),
+    ]);
+
+    const initSessions = execFileCalls.filter(
+      (c) => c.args[0] === 'new-session' && c.args[3] === 'imcodes_init',
+    );
+    expect(initSessions.length).toBe(1);
+
+    const killInit = execFileCalls.filter(
+      (c) => c.args[0] === 'kill-session' && c.args[2] === 'imcodes_init',
+    );
+    expect(killInit.length).toBe(1);
+  });
+
+  it('recovers when tmux priming temp session already exists', async () => {
+    vi.resetModules();
+    const freshTmux = await import('../../src/agent/tmux.js');
+    execFileCalls.length = 0;
+    failNextTmuxSubcommand = 'list-sessions';
+    failNextTmuxErrorText = 'no server running';
+    let initAttempted = false;
+    failNextTmuxCall = (_cmd, args) => {
+      if (!initAttempted && args[0] === 'new-session' && args[3] === 'imcodes_init') {
+        initAttempted = true;
+        return Object.assign(new Error('duplicate session: imcodes_init'), {
+          stderr: 'duplicate session: imcodes_init\n',
+        });
+      }
+      return null;
+    };
+
+    await freshTmux.newSession('deck_test_brain_c', 'bash');
+
+    const initSessions = execFileCalls.filter(
+      (c) => c.args[0] === 'new-session' && c.args[3] === 'imcodes_init',
+    );
+    expect(initSessions.length).toBe(1);
+    const killInit = execFileCalls.filter(
+      (c) => c.args[0] === 'kill-session' && c.args[2] === 'imcodes_init',
+    );
+    expect(killInit.length).toBe(1);
+    const targetSession = execFileCalls.filter(
+      (c) => c.args[0] === 'new-session' && c.args[3] === 'deck_test_brain_c',
+    );
+    expect(targetSession.length).toBe(1);
   });
 });
 

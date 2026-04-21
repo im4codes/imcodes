@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
+import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 
 const {
   getSessionMock,
@@ -273,7 +274,12 @@ describe('handleWebCommand transport queue behavior', () => {
       fresh: true,
       ccSessionId: expect.any(String),
     }));
-    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'user.message', { text: '/clear', allowDuplicate: true }, undefined);
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'user.message',
+      { text: '/clear', allowDuplicate: true, commandId: 'cmd-clear-cc' },
+      undefined,
+    );
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'assistant.text', {
       text: 'Started a fresh conversation',
       streaming: false,
@@ -286,6 +292,44 @@ describe('handleWebCommand transport queue behavior', () => {
       expect.objectContaining({ state: 'queued' }),
       expect.anything(),
     );
+  });
+
+  it('passes requestedModel when starting a copilot-sdk main session', async () => {
+    handleWebCommand({
+      type: 'session.start',
+      project: 'transport',
+      dir: '/proj',
+      agentType: 'copilot-sdk',
+      requestedModel: 'gpt-5.4-mini',
+      thinking: 'high',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_transport_brain',
+      agentType: 'copilot-sdk',
+      projectDir: '/proj',
+      requestedModel: 'gpt-5.4-mini',
+      effort: 'high',
+    }));
+  });
+
+  it('passes requestedModel when starting a cursor-headless main session', async () => {
+    handleWebCommand({
+      type: 'session.start',
+      project: 'transport',
+      dir: '/proj',
+      agentType: 'cursor-headless',
+      requestedModel: 'gpt-5.2',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_transport_brain',
+      agentType: 'cursor-headless',
+      projectDir: '/proj',
+      requestedModel: 'gpt-5.2',
+    }));
   });
 
   it('dispatches /clear as a fresh openclaw relaunch that preserves the provider key', async () => {
@@ -413,7 +457,12 @@ describe('handleWebCommand transport queue behavior', () => {
     await flushAsync();
 
     expect(cancel).toHaveBeenCalledTimes(1);
-    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'user.message', { text: '/stop', allowDuplicate: true }, undefined);
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'user.message',
+      { text: '/stop', allowDuplicate: true, commandId: 'cmd-stop' },
+      undefined,
+    );
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-stop', status: 'accepted' });
     expect(emitMock).not.toHaveBeenCalledWith(
       'deck_transport_brain',
@@ -436,7 +485,7 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'user.message',
-      { text: 'sent msg', allowDuplicate: true, clientMessageId: 'cmd-sent' },
+      { text: 'sent msg', allowDuplicate: true, commandId: 'cmd-sent', clientMessageId: 'cmd-sent' },
       expect.objectContaining({ eventId: 'transport-user:cmd-sent' }),
     );
     expect(emitMock).not.toHaveBeenCalledWith(
@@ -488,7 +537,7 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'user.message',
-      { text: '你在用什么模型', allowDuplicate: true, clientMessageId: 'cmd-identity' },
+      { text: '你在用什么模型', allowDuplicate: true, commandId: 'cmd-identity', clientMessageId: 'cmd-identity' },
       expect.objectContaining({ eventId: 'transport-user:cmd-identity' }),
     );
     expect(emitMock).not.toHaveBeenCalledWith(
@@ -497,6 +546,153 @@ describe('handleWebCommand transport queue behavior', () => {
       expect.objectContaining({ text: expect.any(String), streaming: false }),
       expect.anything(),
     );
+  });
+
+  it('queues sends for resend when the transport runtime has not connected yet', async () => {
+    // Reset module state between tests — the queue lives in module scope.
+    const { clearAllResend, getResendEntries } = await import('../../src/daemon/transport-resend-queue.js');
+    clearAllResend();
+
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      state: 'idle',
+    });
+    // No runtime yet — provider is still reconnecting.
+    getTransportRuntimeMock.mockReturnValue(undefined);
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'first msg while offline',
+      commandId: 'cmd-offline-1',
+    }, serverLink as any);
+    await flushAsync();
+
+    // 1. Command is accepted, NOT errored — we queued it, we didn't drop it.
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'command.ack',
+      { commandId: 'cmd-offline-1', status: 'accepted' },
+    );
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: 'command.ack',
+      commandId: 'cmd-offline-1',
+      status: 'accepted',
+      session: 'deck_transport_brain',
+    });
+
+    // 2. NO user.message timeline event — the agent hasn't seen this message
+    //    yet, it's sitting in the daemon's resend queue. Emitting a
+    //    user.message here would lie to the timeline: committed rows mean
+    //    "the agent saw this". The optimistic pending bubble on the web
+    //    client stays in its "sending" state, and the real user.message
+    //    event fires on drain when runtime.send() actually dispatches.
+    expect(emitMock).not.toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'user.message',
+      expect.anything(),
+      expect.anything(),
+    );
+
+    // 3. A memory-excluded info message explains the queued state.
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'assistant.text',
+      expect.objectContaining({
+        text: expect.stringContaining('will resend 1 queued message'),
+        streaming: false,
+        memoryExcluded: true,
+      }),
+      expect.objectContaining({ source: 'daemon' }),
+    );
+
+    // 4. session.state reports the queued entry so the UI can surface pending count.
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'session.state',
+      expect.objectContaining({
+        state: 'queued',
+        pendingCount: 1,
+        pendingMessageEntries: [
+          { clientMessageId: 'cmd-offline-1', text: 'first msg while offline' },
+        ],
+      }),
+      expect.objectContaining({ source: 'daemon' }),
+    );
+
+    // 5. The entry is actually sitting in the resend queue for later drain.
+    expect(getResendEntries('deck_transport_brain')).toEqual([
+      expect.objectContaining({ text: 'first msg while offline', commandId: 'cmd-offline-1' }),
+    ]);
+
+    // A second offline send accumulates.
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'second msg while offline',
+      commandId: 'cmd-offline-2',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(getResendEntries('deck_transport_brain').map((e) => e.commandId)).toEqual([
+      'cmd-offline-1',
+      'cmd-offline-2',
+    ]);
+
+    // Cleanup so later tests start from empty state.
+    clearAllResend();
+  });
+
+  it('tracks supervision task intents while offline so Auto still follows the resent turn', async () => {
+    const { clearAllResend } = await import('../../src/daemon/transport-resend-queue.js');
+    clearAllResend();
+
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      state: 'idle',
+      transportConfig: {
+        supervision: {
+          mode: 'supervised',
+          backend: 'codex-sdk',
+          model: 'gpt-5.4',
+          timeoutMs: 12_000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+        },
+      },
+    });
+    getTransportRuntimeMock.mockReturnValue(undefined);
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'offline supervised task',
+      commandId: 'cmd-offline-supervised',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(queueTaskIntentMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'cmd-offline-supervised',
+      'offline supervised task',
+      expect.objectContaining({
+        mode: 'supervised',
+        backend: 'codex-sdk',
+        model: 'gpt-5.4',
+      }),
+    );
+
+    clearAllResend();
   });
 
   it('treats transport runtimes without a provider session id as unavailable', async () => {
@@ -509,6 +705,10 @@ describe('handleWebCommand transport queue behavior', () => {
       pendingMessages: [],
     });
 
+    // Reset the resend queue so entries from earlier tests don't leak in.
+    const { clearAllResend, getResendEntries } = await import('../../src/daemon/transport-resend-queue.js');
+    clearAllResend();
+
     handleWebCommand({
       type: 'session.send',
       session: 'deck_transport_brain',
@@ -517,26 +717,108 @@ describe('handleWebCommand transport queue behavior', () => {
     }, serverLink as any);
     await flushAsync();
 
+    // New behavior: the runtime-without-providerSessionId branch auto-resumes
+    // instead of erroring. The user message is preserved, enqueued for
+    // redelivery, and the command ack is `accepted` (not `error`) so the UI
+    // doesn't stay stuck in a "failed send" state.
     expect(stopTransportRuntimeSessionMock).toHaveBeenCalledWith('deck_transport_brain');
-    expect(emitMock).toHaveBeenCalledWith(
+    // No user.message emission on the stale-runtime queue path either —
+    // the message is only in daemon memory, not yet re-dispatched. The
+    // drain helper (launchTransportSession / restoreTransportSessions)
+    // emits user.message when runtime.send() returns 'sent'.
+    expect(emitMock).not.toHaveBeenCalledWith(
       'deck_transport_brain',
       'user.message',
-      { text: 'hello after restart', allowDuplicate: true },
-      undefined,
+      expect.anything(),
+      expect.anything(),
     );
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'assistant.text',
-      { text: '⚠️ Provider unknown restarting. Please resend in a moment.', streaming: false, memoryExcluded: true },
+      expect.objectContaining({
+        text: expect.stringContaining('will auto-resend'),
+        streaming: false,
+        memoryExcluded: true,
+      }),
+      expect.objectContaining({ source: 'daemon' }),
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'session.state',
+      expect.objectContaining({
+        state: 'queued',
+        pendingCount: 1,
+        pendingMessageEntries: [
+          { clientMessageId: 'cmd-stale-runtime', text: 'hello after restart' },
+        ],
+      }),
       expect.objectContaining({ source: 'daemon' }),
     );
     expect(serverLink.send).toHaveBeenCalledWith({
       type: 'command.ack',
       commandId: 'cmd-stale-runtime',
-      status: 'error',
+      status: 'accepted',
       session: 'deck_transport_brain',
-      error: 'Provider unknown restarting. Please resend in a moment.',
     });
+    // The entry sits in the resend queue until the resumed runtime drains it.
+    expect(getResendEntries('deck_transport_brain')).toEqual([
+      expect.objectContaining({ text: 'hello after restart', commandId: 'cmd-stale-runtime' }),
+    ]);
+    clearAllResend();
+  });
+
+  it('tracks supervision task intents when the runtime is queued for auto-resume', async () => {
+    const { clearAllResend } = await import('../../src/daemon/transport-resend-queue.js');
+    clearAllResend();
+
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      state: 'idle',
+      transportConfig: {
+        supervision: {
+          mode: 'supervised',
+          backend: 'codex-sdk',
+          model: 'gpt-5.4',
+          timeoutMs: 12_000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+        },
+      },
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: null,
+      send: vi.fn(() => {
+        throw new Error('TransportSessionRuntime not initialized — call initialize() first');
+      }),
+      pendingCount: 0,
+      pendingMessages: [],
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'resume supervised task',
+      commandId: 'cmd-resume-supervised',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(queueTaskIntentMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'cmd-resume-supervised',
+      'resume supervised task',
+      expect.objectContaining({
+        mode: 'supervised',
+        backend: 'codex-sdk',
+        model: 'gpt-5.4',
+      }),
+    );
+
+    clearAllResend();
   });
 
   it('waits for an in-flight settings restart before sending the first transport message', async () => {
@@ -578,7 +860,7 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'user.message',
-      { text: 'after restart', allowDuplicate: true, clientMessageId: 'cmd-after-restart' },
+      { text: 'after restart', allowDuplicate: true, commandId: 'cmd-after-restart', clientMessageId: 'cmd-after-restart' },
       expect.objectContaining({ eventId: 'transport-user:cmd-after-restart' }),
     );
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-after-restart', status: 'accepted' });
@@ -673,6 +955,44 @@ describe('handleWebCommand transport queue behavior', () => {
       expect.objectContaining({ mode: 'supervised_audit' }),
     );
     expect(queueTaskIntentMock).not.toHaveBeenCalled();
+  });
+
+  it('marks transport control-plane success messages as automation so supervision does not capture them as task completions', async () => {
+    const setAgentId = vi.fn();
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'cursor-headless',
+      runtimeType: 'transport',
+      state: 'running',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      setAgentId,
+      pendingCount: 0,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/model gpt-5.4',
+      commandId: 'cmd-model-switch',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(setAgentId).toHaveBeenCalledWith('gpt-5.4');
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'assistant.text',
+      expect.objectContaining({
+        text: 'Switched model to gpt-5.4',
+        streaming: false,
+        automation: true,
+        memoryExcluded: true,
+      }),
+      expect.any(Object),
+    );
   });
 
   it('updates live supervision state when the browser patches transportConfig', async () => {
@@ -887,5 +1207,101 @@ describe('handleWebCommand transport queue behavior', () => {
     await flushAsync();
 
     expect(resizeSessionMock).not.toHaveBeenCalled();
+  });
+
+  it('forwards transport approval responses to the live runtime and rebroadcasts them', async () => {
+    const respondApproval = vi.fn().mockResolvedValue(undefined);
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'copilot-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'provider-route-1',
+      respondApproval,
+    });
+
+    await handleWebCommand({
+      type: TRANSPORT_MSG.APPROVAL_RESPONSE,
+      sessionId: 'deck_transport_brain',
+      requestId: 'approval-1',
+      approved: true,
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(respondApproval).toHaveBeenCalledWith('approval-1', true);
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: TRANSPORT_MSG.APPROVAL_RESPONSE,
+      sessionId: 'deck_transport_brain',
+      requestId: 'approval-1',
+      approved: true,
+    }));
+  });
+
+  it('switches model for copilot-sdk transport sessions via /model', async () => {
+    const setAgentId = vi.fn();
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'copilot-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+      requestedModel: 'gpt-5.4',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'provider-route-1',
+      setAgentId,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/model gpt-5.4-mini',
+      commandId: 'cmd-model-copilot',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(setAgentId).toHaveBeenCalledWith('gpt-5.4-mini');
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      requestedModel: 'gpt-5.4-mini',
+      activeModel: 'gpt-5.4-mini',
+      modelDisplay: 'gpt-5.4-mini',
+    }));
+  });
+
+  it('switches model for cursor-headless transport sessions via /model', async () => {
+    const setAgentId = vi.fn();
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'cursor-headless',
+      runtimeType: 'transport',
+      state: 'running',
+      requestedModel: 'gpt-5.2',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'provider-route-1',
+      setAgentId,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/model claude-sonnet-4.6',
+      commandId: 'cmd-model-cursor',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(setAgentId).toHaveBeenCalledWith('claude-sonnet-4.6');
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      requestedModel: 'claude-sonnet-4.6',
+      activeModel: 'claude-sonnet-4.6',
+      modelDisplay: 'claude-sonnet-4.6',
+    }));
   });
 });

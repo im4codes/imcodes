@@ -94,6 +94,16 @@ describe('TimelineEmitter — seq counter', () => {
     expect(events[0]?.payload.text).toBe('retry');
   });
 
+
+  it('marks pure API failure assistant text as non-memory answer text at emit time', () => {
+    const event = emitter.emit('session-a', 'assistant.text', {
+      text: '[API Error: Connection error. (cause: fetch failed)]',
+      streaming: false,
+    });
+    expect(event?.payload.memoryExcluded).toBe(true);
+    expect(event?.payload.assistantKind).toBe('error');
+  });
+
   it('does not let a stale streaming update overwrite a newer final event with the same eventId', () => {
     emitter.emit('session-a', 'assistant.text', { text: 'partial', streaming: true }, { eventId: 'transport:session-a:msg-1', ts: 10 });
     emitter.emit('session-a', 'assistant.text', { text: 'final', streaming: false }, { eventId: 'transport:session-a:msg-1', ts: 20 });

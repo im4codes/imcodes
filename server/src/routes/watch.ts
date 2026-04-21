@@ -5,6 +5,7 @@ import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { WsBridge } from '../ws/bridge.js';
 import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
 import { getPodIdentity } from '../util/pod-identity.js';
+import logger from '../util/logger.js';
 
 export const watchRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -257,6 +258,99 @@ watchRoutes.get('/server/:id/timeline/history', requireAuth(), async (c) => {
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    if (message === 'daemon_offline') return c.json({ error: 'daemon_offline' }, 503);
+    if (message === 'timeout') return c.json({ error: 'timeline_timeout' }, 504);
+    return c.json({ error: 'relay_failed' }, 502);
+  }
+});
+
+/**
+ * Web-facing full-fidelity variant of the Watch timeline/history endpoint.
+ *
+ * The Watch endpoint above deliberately strips TimelineEvent down to
+ * {eventId, sessionId, ts, type, payload.text} for bandwidth/complexity
+ * on tiny Watch UIs. The web client needs the full event shape (tool.call
+ * payloads, session.state fields, user.message pending flags, etc.) so it
+ * can dedup via `mergeTimelineEvents` and render the same way as live
+ * WS timeline.event messages.
+ *
+ * Why a separate HTTP path when WS `timeline.history_request` already exists:
+ * the WS request rides on the same socket whose subscription may still be
+ * resolving an async ownership check (bridge.ts `terminal.subscribe`
+ * handler). Live `timeline.event` messages emitted during that ~50ms resolve
+ * window are silently dropped by `sendToSessionSubscribers`. A parallel
+ * HTTP backfill fired ~500ms after reconnect reads the daemon store
+ * directly and recovers those events — dedup by eventId makes it safe to
+ * merge alongside the WS path.
+ *
+ * Response schema mirrors the Watch variant except `events[]` contains the
+ * raw, unsanitized TimelineEvent records the daemon persisted.
+ */
+watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id')!;
+  const role = await resolveServerRole(c.env.DB, serverId, userId);
+  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+
+  const sessionName = c.req.query('sessionName')?.trim();
+  if (!sessionName) return c.json({ error: 'session_name_required' }, 400);
+
+  const rawLimit = Number(c.req.query('limit') ?? '50');
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.trunc(rawLimit), 500) : 50;
+  const rawBeforeTs = c.req.query('beforeTs');
+  const beforeTs = rawBeforeTs !== undefined ? Number(rawBeforeTs) : undefined;
+  const rawAfterTs = c.req.query('afterTs');
+  const afterTs = rawAfterTs !== undefined ? Number(rawAfterTs) : undefined;
+
+  // Instrument the bridge relay latency (server ↔ daemon round-trip incl.
+  // the daemon's disk read). Paired with the daemon-side `timeline.history
+  // served` log — subtracting that from bridgeMs gives the network/WS
+  // overhead isolated.
+  const tStart = Date.now();
+  try {
+    const response = await WsBridge.get(serverId).requestTimelineHistory({
+      sessionName,
+      limit,
+      ...(beforeTs !== undefined && Number.isFinite(beforeTs) ? { beforeTs } : {}),
+      ...(afterTs !== undefined && Number.isFinite(afterTs) ? { afterTs } : {}),
+    });
+    const bridgeMs = Date.now() - tStart;
+    c.header(IMCODES_POD_HEADER, getPodIdentity());
+
+    const rawEvents = Array.isArray(response.events) ? response.events : [];
+    // Only filter out obviously malformed records (missing eventId/ts/type).
+    // Preserve every other field so the web merge path gets the full shape.
+    const events = rawEvents.filter((event): event is Record<string, unknown> => {
+      if (!event || typeof event !== 'object') return false;
+      const e = event as Record<string, unknown>;
+      return typeof e.eventId === 'string'
+        && typeof e.sessionId === 'string'
+        && typeof e.ts === 'number'
+        && typeof e.type === 'string';
+    });
+    const earliestTs = events.length > 0 && typeof events[0].ts === 'number'
+      ? events[0].ts as number
+      : null;
+    const hasMore = earliestTs !== null && events.length >= limit;
+
+    const totalMs = Date.now() - tStart;
+    logger.info({
+      serverId, sessionName, limit, afterTs, beforeTs,
+      eventsReturned: events.length,
+      bridgeMs, totalMs,
+    }, 'timeline.history/full served');
+
+    return c.json({
+      sessionName,
+      epoch: typeof response.epoch === 'number' ? response.epoch : null,
+      events,
+      hasMore,
+      nextCursor: hasMore ? earliestTs : null,
+    });
+  } catch (err) {
+    const bridgeMs = Date.now() - tStart;
+    const message = err instanceof Error ? err.message : String(err);
+    logger.warn({ serverId, sessionName, bridgeMs, err: message }, 'timeline.history/full failed');
     if (message === 'daemon_offline') return c.json({ error: 'daemon_offline' }, 503);
     if (message === 'timeout') return c.json({ error: 'timeline_timeout' }, 504);
     return c.json({ error: 'relay_failed' }, 502);

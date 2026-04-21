@@ -103,6 +103,8 @@ const BADGE_MAP: Record<string, string> = {
   'claude-code-sdk': 'cc',
   'codex': 'cx',
   'codex-sdk': 'cx',
+  'copilot-sdk': 'co',
+  'cursor-headless': 'cu',
   'opencode': 'oc',
   'openclaw': 'oc',
   'qwen': 'qw',

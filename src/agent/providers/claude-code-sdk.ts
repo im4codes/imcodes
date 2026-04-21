@@ -3,6 +3,7 @@ import { access } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { query, type PermissionMode, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
+import { killProcessTree } from '../../util/kill-process-tree.js';
 import type {
   TransportProvider,
   ProviderCapabilities,
@@ -21,6 +22,7 @@ import {
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
+import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 import logger from '../../util/logger.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
@@ -232,7 +234,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     this.emitSessionInfo(sessionId, { effort });
   }
 
-  async send(sessionId: string, payloadOrMessage: string | ProviderContextPayload, _attachments?: unknown[], extraSystemPrompt?: string): Promise<void> {
+  async send(sessionId: string, payloadOrMessage: string | ProviderContextPayload, _attachments?: TransportAttachment[], extraSystemPrompt?: string): Promise<void> {
     if (!this.config) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Claude Code SDK provider not connected', false);
     }
@@ -672,11 +674,10 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
   private terminateChild(state: ClaudeSdkSessionState): void {
     const child = state.currentChild;
     if (!child || child.killed) return;
-    try { child.kill('SIGTERM'); } catch {}
-    const timer = setTimeout(() => {
-      if (state.currentChild !== child || child.killed) return;
-      try { child.kill('SIGKILL'); } catch {}
-    }, FORCE_KILL_TIMEOUT_MS);
-    timer.unref?.();
+    // Tree-kill instead of single SIGTERM: the claude-code wrapper may spawn
+    // native descendants that survive a wrapper-only kill. killProcessTree
+    // walks the descendant tree via `ps` and SIGKILLs stragglers after
+    // FORCE_KILL_TIMEOUT_MS. Fire-and-forget so callers stay synchronous.
+    void killProcessTree(child, { gracefulMs: FORCE_KILL_TIMEOUT_MS });
   }
 }

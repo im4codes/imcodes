@@ -17,8 +17,17 @@ describe('context-model-config', () => {
     expect(getContextModelConfig()).toEqual({
       primaryContextBackend: 'codex-sdk',
       primaryContextModel: 'gpt-5.4',
+      primaryContextPreset: undefined,
       backupContextBackend: 'claude-code-sdk',
       backupContextModel: 'haiku',
+      backupContextPreset: undefined,
+      memoryRecallMinScore: 0.4,
+      memoryScoringWeights: {
+        similarity: 0.4,
+        recency: 0.25,
+        frequency: 0.15,
+        project: 0.2,
+      },
       enablePersonalMemorySync: false,
     });
   });
@@ -42,8 +51,17 @@ describe('context-model-config', () => {
     expect(getContextModelConfig()).toEqual({
       primaryContextBackend: 'claude-code-sdk',
       primaryContextModel: 'sonnet',
+      primaryContextPreset: undefined,
       backupContextBackend: 'qwen',
       backupContextModel: 'qwen3-coder-plus',
+      backupContextPreset: undefined,
+      memoryRecallMinScore: 0.4,
+      memoryScoringWeights: {
+        similarity: 0.4,
+        recency: 0.25,
+        frequency: 0.15,
+        project: 0.2,
+      },
       enablePersonalMemorySync: false,
     });
   });
@@ -55,5 +73,46 @@ describe('context-model-config', () => {
       enablePersonalMemorySync: true,
     });
     expect(getContextModelConfig().enablePersonalMemorySync).toBe(true);
+  });
+
+  it('keeps the synced memory recall threshold', () => {
+    setContextModelRuntimeConfig({
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'sonnet',
+      memoryRecallMinScore: 0.33,
+    });
+    expect(getContextModelConfig().memoryRecallMinScore).toBe(0.33);
+  });
+
+  it('keeps the synced advanced memory scoring weights', () => {
+    setContextModelRuntimeConfig({
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'sonnet',
+      memoryScoringWeights: {
+        similarity: 0.5,
+        recency: 0.2,
+        frequency: 0.1,
+        project: 0.2,
+      },
+    });
+    expect(getContextModelConfig().memoryScoringWeights).toEqual({
+      similarity: 0.5,
+      recency: 0.2,
+      frequency: 0.1,
+      project: 0.2,
+    });
+  });
+
+  it('keeps the synced qwen presets for primary and backup processing paths', () => {
+    setContextModelRuntimeConfig({
+      primaryContextBackend: 'qwen',
+      primaryContextModel: 'qwen3-coder-plus',
+      primaryContextPreset: 'Qwen Team',
+      backupContextBackend: 'qwen',
+      backupContextModel: 'qwen3-coder-plus',
+      backupContextPreset: 'Qwen Backup',
+    });
+    expect(getContextModelConfig().primaryContextPreset).toBe('Qwen Team');
+    expect(getContextModelConfig().backupContextPreset).toBe('Qwen Backup');
   });
 });

@@ -6,6 +6,7 @@
 
 import { COOKIE_SESSION, COOKIE_CSRF, HEADER_CSRF } from '@shared/cookie-names.js';
 import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM } from '@shared/preview-types.js';
+import { getSessionRuntimeType } from '@shared/agent-types.js';
 import type { ContextMemoryView, ContextModelConfig } from '@shared/context-types.js';
 import type { SharedContextRuntimeConfigSnapshot } from '@shared/shared-context-runtime-config.js';
 import {
@@ -602,7 +603,7 @@ export async function listSubSessions(serverId: string): Promise<SubSessionData[
   }> }>(`/api/server/${serverId}/sub-sessions`);
   return res.subSessions.map((s) => ({
     id: s.id, serverId: s.server_id, type: s.type,
-    runtimeType: s.runtime_type ?? (s.type === 'qwen' || s.type === 'openclaw' ? 'transport' : null),
+    runtimeType: s.runtime_type ?? getSessionRuntimeType(s.type),
     providerId: s.provider_id, providerSessionId: s.provider_session_id,
     shellBin: s.shell_bin, cwd: s.cwd, label: s.label,
     closedAt: s.closed_at, createdAt: s.created_at, updatedAt: s.updated_at,
@@ -731,6 +732,56 @@ export async function reorderSubSessions(serverId: string, ids: string[]): Promi
     method: 'PATCH',
     body: JSON.stringify({ ids }),
   });
+}
+
+/**
+ * Fetch timeline history via HTTP (full-fidelity variant of the Watch
+ * endpoint). Used as a defense-in-depth backfill on WS reconnect so live
+ * `timeline.event` messages dropped during the bridge's async subscription
+ * resolve window can still be recovered. Pod-sticky via `:serverId`.
+ *
+ * Returns full TimelineEvent objects (not the Watch-sanitized simplified
+ * shape), so callers can merge them with `mergeTimelineEvents` exactly as
+ * they would a WS `timeline.history` response. Dedup by eventId makes it
+ * safe to call alongside the WS history request.
+ *
+ * Returns null (not throw) on expected transient failures — daemon offline,
+ * pod routing miss, timeout — so callers can treat HTTP backfill as purely
+ * opportunistic. Auth failures still throw via `apiFetch`.
+ */
+export async function fetchTimelineHistoryHttp(
+  serverId: string,
+  sessionName: string,
+  opts: { afterTs?: number; beforeTs?: number; limit?: number } = {},
+): Promise<{ events: unknown[]; epoch: number | null; hasMore: boolean; nextCursor: number | null } | null> {
+  const params = new URLSearchParams();
+  params.set('sessionName', sessionName);
+  if (typeof opts.afterTs === 'number' && Number.isFinite(opts.afterTs)) params.set('afterTs', String(opts.afterTs));
+  if (typeof opts.beforeTs === 'number' && Number.isFinite(opts.beforeTs)) params.set('beforeTs', String(opts.beforeTs));
+  if (typeof opts.limit === 'number' && Number.isFinite(opts.limit)) params.set('limit', String(opts.limit));
+  try {
+    const result = await apiFetch<{
+      sessionName: string;
+      epoch: number | null;
+      events: unknown[];
+      hasMore: boolean;
+      nextCursor: number | null;
+    }>(`/api/server/${encodeURIComponent(serverId)}/timeline/history/full?${params.toString()}`, {
+      method: 'GET',
+    });
+    return {
+      events: Array.isArray(result.events) ? result.events : [],
+      epoch: result.epoch ?? null,
+      hasMore: !!result.hasMore,
+      nextCursor: result.nextCursor ?? null,
+    };
+  } catch (err) {
+    // 401/403 → let it propagate (auth handler already runs in apiFetch).
+    if (err instanceof ApiError && (err.status === 401 || err.status === 403)) throw err;
+    // 503 daemon_offline / 504 timeout / network errors are transient — caller
+    // should fall back to the WS path. Returning null lets the caller decide.
+    return null;
+  }
 }
 
 export async function deleteSubSession(serverId: string, subId: string): Promise<void> {
@@ -1470,5 +1521,18 @@ export async function getEnterpriseSharedMemory(
   if (typeof input?.limit === 'number') params.set('limit', String(input.limit));
   return apiFetch(`/api/shared-context/enterprises/${encodeURIComponent(enterpriseId)}/memory?${params.toString()}`, {
     method: 'GET',
+  });
+}
+
+
+export async function deletePersonalCloudMemory(memoryId: string): Promise<{ ok: boolean }> {
+  return apiFetch(`/api/shared-context/personal-memory/${encodeURIComponent(memoryId)}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function deleteEnterpriseSharedMemory(enterpriseId: string, memoryId: string): Promise<{ ok: boolean }> {
+  return apiFetch(`/api/shared-context/enterprises/${encodeURIComponent(enterpriseId)}/memory/${encodeURIComponent(memoryId)}`, {
+    method: 'DELETE',
   });
 }

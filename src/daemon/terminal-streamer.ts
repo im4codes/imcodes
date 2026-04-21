@@ -35,6 +35,34 @@ const MAX_REBIND_ATTEMPTS = 5;
 
 function shouldSuppressPaneIdInlineError(sessionName: string): boolean {
   const session = getSession(sessionName);
+  // Transport sessions never have a tmux pane — suppress the inline error.
+  if (session?.runtimeType === 'transport') return true;
+  if (typeof session?.agentType === 'string' && isTransportAgent(session.agentType)) return true;
+  // Session not yet in the store. Reached here only after startPipe already
+  // tried `getPaneId(sessionName)` and got undefined — meaning no tmux pane
+  // AND no session record. Two races produce this shape:
+  //   (a) Transport launch race: subscribe arrives before
+  //       launchTransportSession persists the session record.
+  //   (b) Stale subscribe for a session that has been deleted.
+  // In both cases, permanently stamping "Terminal stream unavailable: pane
+  // id not available. Restart the session to fix." into a newly-created
+  // (or vanished) transport session's timeline is misleading. The E2E
+  // "mode-aware-terminal-subscribe" path is unaffected: that test's tmux
+  // session has a real pane, so `getPaneId` succeeds and execution never
+  // reaches the inline-error branch that consults this helper.
+  if (!session) return true;
+  return false;
+}
+
+/** Transport sessions don't have tmux panes; all tmux-backed streamer
+ *  operations (snapshot, pipe, rebind) are no-ops for them.
+ *  NOTE: returns false for sessions not yet in the store so that genuine
+ *  tmux sessions created outside the daemon's session store (e.g. E2E
+ *  tests calling `newSession` directly) can still subscribe via the pane
+ *  path. Pre-creation race suppression for transport sessions lives in
+ *  {@link shouldSuppressPaneIdInlineError}. */
+function isTransportSessionName(sessionName: string): boolean {
+  const session = getSession(sessionName);
   return session?.runtimeType === 'transport'
     || (typeof session?.agentType === 'string' && isTransportAgent(session.agentType));
 }
@@ -72,6 +100,16 @@ export class TerminalStreamer {
   private subscribers = new Map<string, Map<StreamSubscriber, SubscriberState>>();
   private pipes = new Map<string, PipeState>();
   private retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Per-session "startPipe in flight" lock. `startPipe` is async; between
+   *  its `await startPipePaneStream(...)` and its later `this.pipes.set(...)`
+   *  assignment there is a window where `this.pipes.has(sessionName)` is
+   *  still false. Without this lock two concurrent calls (e.g. two web
+   *  subscribes arriving within the same tick after a network flap) both
+   *  see "no pipe yet", both spawn their own `cat /tmp/.../stream.fifo`,
+   *  and the second one's `pipes.set()` overwrites the first — the first
+   *  `cat` is then orphaned. Observed a ~5% orphan rate (10 of 215 pipe
+   *  starts) on a leaking production daemon before this guard. */
+  private pipeStartLocks = new Set<string>();
 
   // Idle detection
   private lastRawAt = new Map<string, number>();
@@ -86,6 +124,14 @@ export class TerminalStreamer {
 
   subscribe(subscriber: StreamSubscriber): () => void {
     const { sessionName } = subscriber;
+
+    // Transport sessions don't have a tmux pane — every tmux op fails noisily.
+    // Return a no-op unsubscribe without registering the subscriber so that
+    // `bootstrapSubscriber` (snapshot + pipe-pane start) never runs for them.
+    if (isTransportSessionName(sessionName)) {
+      logger.debug({ sessionName }, 'Terminal streamer subscribe skipped for transport session');
+      return () => { /* no-op */ };
+    }
 
     if (!this.subscribers.has(sessionName)) {
       this.subscribers.set(sessionName, new Map());
@@ -201,6 +247,8 @@ export class TerminalStreamer {
 
   /** Request an on-demand snapshot for all subscribers of a session. */
   requestSnapshot(sessionName: string): void {
+    // Transport sessions have no tmux pane — snapshot requests are no-ops.
+    if (isTransportSessionName(sessionName)) return;
     const subs = this.subscribers.get(sessionName);
     if (!subs || subs.size === 0) return;
 
@@ -263,6 +311,9 @@ export class TerminalStreamer {
   /** Called by session-manager when a session restarts with a new pane. */
   async rebindSession(sessionName: string): Promise<void> {
     if (!this.subscribers.has(sessionName)) return;
+    // Transport sessions don't have a pane to rebind — skip rather than
+    // trigger the "paneId not available" error on every relaunch.
+    if (isTransportSessionName(sessionName)) return;
     await this.stopPipe(sessionName);
     await this.startPipe(sessionName, 0);
     // Re-snapshot all subscribers
@@ -289,13 +340,44 @@ export class TerminalStreamer {
     // ConPTY doesn't need paneId — it uses session name directly from the in-memory map
     let paneId: string | undefined;
     if (BACKEND !== 'conpty') {
+      // Transport sessions (claude-code-sdk, codex-sdk, qwen, …) don't have a
+      // tmux pane to pipe. If a stale subscribe path lands here for a transport
+      // session, bail out cleanly instead of producing a misleading
+      // "paneId not available" error that the session-manager mistakes for a
+      // dead pane and tries to restart in a 3-strikes loop.
+      if (isTransportSessionName(sessionName)) return;
+    }
+
+    // Concurrent-start guard. If a previous `startPipe` for this session
+    // has already persisted a pipeState OR is currently awaiting
+    // `startPipePaneStream` (lock held), bail — don't race to overwrite.
+    // The only caller that legitimately needs a fresh pipe while one is
+    // "alive" in the map is `rebindSession`, and that path explicitly
+    // calls `stopPipe` first; and `scheduleRebind` only fires after
+    // `handlePipeClose` has already removed the dead entry from the map.
+    // So reaching this guard with a non-empty state is always a race we
+    // should drop.
+    if (this.pipes.has(sessionName) || this.pipeStartLocks.has(sessionName)) {
+      logger.debug({ sessionName }, 'startPipe: concurrent start skipped');
+      return;
+    }
+    this.pipeStartLocks.add(sessionName);
+    try {
+    if (BACKEND !== 'conpty') {
       const session = getSession(sessionName);
       paneId = session?.paneId;
       if (!paneId) {
-        // Session created before paneId persistence — fetch dynamically from tmux
+        // Fetch paneId from tmux. For transport sessions that were just created
+        // and not yet registered in the session store, getPaneId will return
+        // undefined and we'll emit the "not available" error (transported sessions
+        // that genuinely have no pane are filtered above by
+        // isTransportSessionName — this path only fires for unregistered process
+        // sessions or sessions created before paneId persistence).
+        // For genuine tmux sessions (e.g. E2E test sessions), getPaneId succeeds
+        // even when the daemon's session store has no record for them yet.
         const fetched = getPaneId(sessionName);
         paneId = fetched != null ? await fetched.catch(() => undefined) : undefined;
-        if (paneId && session != null) {
+        if (paneId && session) {
           upsertSession({ ...session, paneId });
         }
       }
@@ -340,6 +422,9 @@ export class TerminalStreamer {
         this.errorAllSubscribers(sessionName, err instanceof Error ? err : new Error(String(err)));
       }
     }
+    } finally {
+      this.pipeStartLocks.delete(sessionName);
+    }
   }
 
   private async stopPipe(sessionName: string): Promise<void> {
@@ -361,7 +446,23 @@ export class TerminalStreamer {
   }
 
   private handlePipeClose(sessionName: string): void {
+    // Tear down the previous pipeState so the underlying
+    // `cat /tmp/.../stream.fifo` subprocess gets reaped and the Node stream
+    // stops accumulating buffered data in its internal read queue. Without
+    // this, unexpected pipe close (stream `error` / `close`) leaves a
+    // dangling FIFO reader that keeps draining data into the daemon with no
+    // subscriber consuming it — the readable buffer grows unbounded until
+    // OOM. Empirically we saw 10 orphan `cat` processes accumulate and RSS
+    // climb ~425MB/min before the daemon crashed.
+    const pipeState = this.pipes.get(sessionName);
     this.pipes.delete(sessionName);
+    if (pipeState) {
+      try { pipeState.stream.destroy(); } catch { /* ignore */ }
+      void pipeState.cleanup().catch((err) => {
+        logger.warn({ sessionName, err }, 'Pipe cleanup error in handlePipeClose');
+      });
+      void stopPipePaneStream(sessionName).catch(() => { /* best-effort */ });
+    }
 
     // If still have active subscribers, attempt rebind
     const subs = this.subscribers.get(sessionName);

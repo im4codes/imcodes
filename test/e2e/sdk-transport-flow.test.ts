@@ -53,8 +53,12 @@ vi.mock('../../src/daemon/cc-presets.js', () => ({
       ? {
           model: 'MiniMax-M2.7',
           systemPrompt: 'Authoritative runtime model: MiniMax-M2.7.',
+          contextWindow: 200000,
         }
       : {}
+  )),
+  getCachedPresetContextWindow: vi.fn((name: string) => (
+    name.trim().toLowerCase() === 'minimax' ? 200000 : undefined
   )),
   getPresetInitMessage: vi.fn(() => 'preset-init'),
   invalidateCache: vi.fn(),
@@ -214,6 +218,32 @@ vi.mock('../../src/daemon/timeline-emitter.js', () => ({
 
 vi.mock('../../src/daemon/transport-history.js', () => ({
   appendTransportEvent: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('../../src/context/embedding.js', () => ({
+  generateEmbedding: vi.fn(async (text: string) => {
+    const normalized = text.toLowerCase();
+    if (normalized.includes('recall') || normalized.includes('latency') || normalized.includes('memory.context')) {
+      return [1, 0, 0];
+    }
+    return [0, 1, 0];
+  }),
+  cosineSimilarity: vi.fn((a: number[], b: number[]) => {
+    const dot = a.reduce((sum, value, index) => sum + value * (b[index] ?? 0), 0);
+    const magA = Math.sqrt(a.reduce((sum, value) => sum + value * value, 0));
+    const magB = Math.sqrt(b.reduce((sum, value) => sum + value * value, 0));
+    if (!magA || !magB) return 0;
+    return dot / (magA * magB);
+  }),
+  // Persistent BLOB store helpers. Destructured eagerly at the top of
+  // searchLocalMemorySemantic's try block, so missing these causes vitest's
+  // strict mock to throw through the whole recall and drop back to plain
+  // text search — which for this test's namespace-scoped query matches
+  // nothing and hides the intended memory card. The encoded/decoded shape
+  // is a pass-through because the recall path only persists after the
+  // slow-path embedding is computed; the tests don't inspect BLOB bytes.
+  encodeEmbedding: (vec: unknown) => Buffer.from(JSON.stringify(vec), 'utf8'),
+  decodeEmbedding: (_buf: Buffer | null) => null,
 }));
 
 vi.mock('../../src/agent/agent-version.js', () => ({
@@ -1186,10 +1216,17 @@ describe('sdk transport flow e2e', () => {
       },
     });
 
-    const runtime = getTransportRuntime(SESSION_CX);
-    expect(runtime).toBeDefined();
-    runtime!.send('/status');
-
+    // The "Historical context · injected" card is now emitted at the same
+    // commit boundary as the persisted `startupMemoryInjected` flag — i.e.
+    // when the first turn actually carries the preamble to the provider.
+    // Launch alone is no longer enough, so send a message to trigger it.
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({
+      type: 'session.send',
+      session: SESSION_CX,
+      text: 'Surface the seeded startup memory through the first turn',
+      commandId: 'cmd-cxsdk-startup',
+    }, serverLink);
     await flushAsync();
     await waitForCondition(() => mocks.emitted.some((event) => event.session === SESSION_CX && event.type === 'memory.context' && event.payload.reason === 'startup'));
 

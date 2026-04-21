@@ -88,4 +88,38 @@ describe('useSubSessions rebuild gating', () => {
       }),
     ]);
   });
+
+  it('infers copilot-sdk as transport when persisted runtimeType is missing', async () => {
+    const ws = { subSessionRebuildAll: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    listSubSessions.mockResolvedValueOnce([{
+      id: 'cp1',
+      serverId: 'srv1',
+      type: 'copilot-sdk',
+      runtimeType: null,
+      providerId: null,
+      providerSessionId: null,
+      shellBin: null,
+      cwd: '/tmp/project',
+      label: 'copilot worker',
+      parentSession: 'deck_proj_brain',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }]);
+
+    function Harness() {
+      useSubSessions('srv1', ws, true, 'deck_proj_brain');
+      return null;
+    }
+
+    render(<Harness />);
+
+    await waitFor(() => expect(ws.subSessionRebuildAll).toHaveBeenCalledTimes(1));
+    expect(ws.subSessionRebuildAll).toHaveBeenCalledWith([
+      expect.objectContaining({
+        id: 'cp1',
+        type: 'copilot-sdk',
+        runtimeType: 'transport',
+      }),
+    ]);
+  });
 });

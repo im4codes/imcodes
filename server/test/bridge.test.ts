@@ -2027,6 +2027,67 @@ describe('WsBridge', () => {
       expect(msg.description).toBe('Write to file /etc/passwd');
     });
 
+    it('relays chat.history only to subscribed browsers', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const subscribedBrowser = new MockWs();
+      const unsubscribedBrowser = new MockWs();
+      bridge.handleBrowserConnection(subscribedBrowser as never, 'user-sub', makeDb('valid-hash'));
+      bridge.handleBrowserConnection(unsubscribedBrowser as never, 'user-unsub', makeDb('valid-hash'));
+      subscribedBrowser.emit('message', JSON.stringify({ type: 'chat.subscribe', sessionId: 'ts-history' }));
+      await flushAsync();
+      subscribedBrowser.sent.length = 0;
+      unsubscribedBrowser.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'chat.history',
+        sessionId: 'ts-history',
+        events: [{ type: 'assistant.text', text: 'hello', _ts: 10 }],
+      }));
+      await flushAsync();
+
+      expect(subscribedBrowser.sentStrings.some((raw) => {
+        const msg = JSON.parse(raw);
+        return msg.type === 'chat.history' && msg.sessionId === 'ts-history';
+      })).toBe(true);
+      expect(unsubscribedBrowser.sentStrings.some((raw) => JSON.parse(raw).type === 'chat.history')).toBe(false);
+    });
+
+    it('relays chat.approval_response only to subscribed browsers', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const subscribedBrowser = new MockWs();
+      const unsubscribedBrowser = new MockWs();
+      bridge.handleBrowserConnection(subscribedBrowser as never, 'user-sub', makeDb('valid-hash'));
+      bridge.handleBrowserConnection(unsubscribedBrowser as never, 'user-unsub', makeDb('valid-hash'));
+      subscribedBrowser.emit('message', JSON.stringify({ type: 'chat.subscribe', sessionId: 'ts-approval-response' }));
+      await flushAsync();
+      subscribedBrowser.sent.length = 0;
+      unsubscribedBrowser.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'chat.approval_response',
+        sessionId: 'ts-approval-response',
+        requestId: 'req-2',
+        approved: true,
+      }));
+      await flushAsync();
+
+      expect(subscribedBrowser.sentStrings.some((raw) => {
+        const msg = JSON.parse(raw);
+        return msg.type === 'chat.approval_response' && msg.requestId === 'req-2' && msg.approved === true;
+      })).toBe(true);
+      expect(unsubscribedBrowser.sentStrings.some((raw) => JSON.parse(raw).type === 'chat.approval_response')).toBe(false);
+    });
+
     it('isolates transport subscriptions between browsers', async () => {
       const bridge = WsBridge.get(serverId);
       const daemonWs = new MockWs();

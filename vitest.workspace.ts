@@ -41,7 +41,9 @@ export default defineWorkspace([
       exclude: ['**/node_modules/**'],
       environment: 'node',
       globals: false,
-      testTimeout: 30000, // E2E tests spawn real tmux + agent processes which take several seconds
+      fileParallelism: false,
+      hookTimeout: 30000,
+      testTimeout: 60000, // E2E tests spawn real tmux + agent processes and are unstable under file-level parallelism
     },
   },
 ]);

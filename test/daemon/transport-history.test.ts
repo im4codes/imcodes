@@ -139,4 +139,60 @@ describe('transport-history', () => {
     expect(events).toHaveLength(1);
     expect(events[0]['text']).toBe('safe');
   });
+
+  it('returns exactly MAX_REPLAY_LINES entries even when each line is large (reverse-chunk scans back as far as needed)', async () => {
+    // Adversarial shape: fewer lines, but each line is 6 KB. 200 tail
+    // lines therefore need ~1.2 MB of file window — greater than any
+    // fixed-byte "read last 1 MiB" strategy would cover. A simple
+    // fixed-window tail-read would silently return fewer than 200 here;
+    // the reverse-chunk scan keeps walking back until it has 201
+    // newlines (or hits MAX_TAIL_BYTES).
+    const session = `${TS}-fat-lines`;
+    const FAT = 'y'.repeat(6000);
+    for (let i = 0; i < 250; i++) {
+      await appendTransportEvent(session, { idx: i, text: FAT });
+    }
+
+    const events = await replayTransportHistory(session);
+
+    // Must return exactly the cap, and must be the tail slice [50..249].
+    expect(events).toHaveLength(200);
+    expect(events[0]['idx']).toBe(50);
+    expect(events[events.length - 1]['idx']).toBe(249);
+  });
+
+  it('replay stays bounded on multi-megabyte JSONL files (tail-read only)', async () => {
+    // Regression: before tail-reading, replay loaded the full file into a
+    // JS string then sliced — a single 170MB session on 211 caused ~340MB
+    // V8 heap spikes per browser subscribe, and concurrent subscribes
+    // compounded that into multi-GB transient allocations and 80MB/min
+    // sustained RSS growth. The rewritten impl opens the file, reads only
+    // the trailing ~1 MiB, and returns the last 200 parsed entries.
+    const session = `${TS}-large-jsonl`;
+
+    // Write 5000 entries, each with ~5KB of payload → ~25 MB file — well
+    // above the old "small fixture" but small enough to keep the test
+    // itself fast. Each entry encodes its index so we can verify the tail.
+    const BIG_PAYLOAD = 'x'.repeat(5000);
+    for (let i = 0; i < 5000; i++) {
+      await appendTransportEvent(session, {
+        type: 'assistant.text',
+        sessionId: session,
+        idx: i,
+        text: BIG_PAYLOAD,
+      });
+    }
+
+    const events = await replayTransportHistory(session);
+
+    // The cap is 200 — regardless of file size.
+    expect(events).toHaveLength(200);
+
+    // The returned slice MUST be the tail of the file (last 200 of 5000).
+    // If the implementation silently returned the HEAD we'd see idx=0.
+    const firstIdx = events[0]['idx'] as number;
+    const lastIdx = events[events.length - 1]['idx'] as number;
+    expect(lastIdx).toBe(4999);
+    expect(firstIdx).toBe(4800);
+  });
 });

@@ -12,6 +12,9 @@ vi.mock('../../src/agent/tmux.js', () => ({
   stopPipePaneStream: vi.fn().mockResolvedValue(undefined),
 }));
 
+import { stopPipePaneStream } from '../../src/agent/tmux.js';
+const mockStopPipe = stopPipePaneStream as ReturnType<typeof vi.fn>;
+
 // Mock session-store so getSession returns a valid paneId (needed by startPipe)
 vi.mock('../../src/store/session-store.js', () => ({
   getSession: vi.fn().mockReturnValue({ paneId: '%1' }),
@@ -201,6 +204,133 @@ describe('TerminalStreamer — snapshot behavior', () => {
   it('suppresses pane-id inline errors for transport sessions', async () => {
     const session = 'deck_sub_qwen';
     mockGetSession.mockReturnValue({ agentType: 'qwen', runtimeType: 'transport' });
+    mockGetPaneId.mockResolvedValue(undefined);
+
+    streamer.subscribe({
+      sessionName: session,
+      send: () => {},
+      onError: () => {},
+    });
+
+    await flush();
+
+    expect(emitSpy).not.toHaveBeenCalledWith(
+      session,
+      'assistant.text',
+      expect.objectContaining({
+        text: '⚠️ Error: Terminal stream unavailable: pane id not available. Restart the session to fix.',
+      }),
+      expect.any(Object),
+    );
+  });
+
+  it('unexpected pipe close reaps the FIFO reader subprocess (no orphan `cat stream.fifo`)', async () => {
+    // Regression test: previously `handlePipeClose` deleted the pipeState
+    // tracking entry but never called `pipeState.cleanup()` or
+    // `stopPipePaneStream()`. The backing `cat /tmp/.../stream.fifo` child
+    // process stayed alive forever, draining bytes into a dangling Node
+    // stream whose buffer grew unbounded — ~425MB/min growth until OOM. On
+    // one leaking production daemon we observed 10 orphan cat processes.
+    const session = 'orphan-fifo-session';
+
+    // Build a stream that we can trigger 'close' on.
+    const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+    const stream = {
+      on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+        if (!listeners.has(event)) listeners.set(event, []);
+        listeners.get(event)!.push(cb);
+      }),
+      destroy: vi.fn(),
+    };
+    const cleanup = vi.fn().mockResolvedValue(undefined);
+    mockStartPipe.mockResolvedValue({ stream, cleanup });
+    mockStopPipe.mockClear();
+    // mockClear() wipes mockResolvedValue too — re-prime so handlePipeClose's
+    // `await stopPipePaneStream(sessionName).catch(...)` sees a real Promise.
+    mockStopPipe.mockResolvedValue(undefined);
+
+    streamer.subscribe({
+      sessionName: session,
+      send: () => {},
+      onError: () => {},
+    });
+
+    // Wait for startPipe to register the stream listeners.
+    await flush();
+
+    // Simulate an unexpected FIFO close (e.g. tmux session died). This is
+    // the code path that previously leaked the child.
+    const closeCbs = listeners.get('close');
+    expect(closeCbs, 'startPipe must register a close listener').toBeTruthy();
+    closeCbs!.forEach((cb) => cb());
+
+    await flush();
+
+    // The stream's destroy() must be invoked so the Node readable side
+    // stops buffering.
+    expect(stream.destroy).toHaveBeenCalled();
+    // The pipeState's cleanup closure must run so provider-side resources
+    // get released.
+    expect(cleanup).toHaveBeenCalled();
+    // stopPipePaneStream must be called so tmux kills the `cat` reader.
+    expect(mockStopPipe).toHaveBeenCalledWith(session);
+  });
+
+  it('concurrent subscribes for the same session spawn only one pipe (no orphan cat)', async () => {
+    // Regression: `startPipe` was a non-locking async; two subscribes
+    // arriving in the same tick both saw `this.pipes.has() === false`,
+    // both awaited `startPipePaneStream`, both spawned a `cat` via tmux,
+    // and the second's `pipes.set(...)` orphaned the first — its cat
+    // kept running with no tracking entry, feeding bytes into a Node
+    // stream that `handlePipeClose` could never find. On one production
+    // daemon this surfaced as ~5% orphan rate (10 of 215 pipe starts).
+    const session = 'race-session';
+
+    let startInvocations = 0;
+    // Make startPipePaneStream "slow" — returns a promise that only
+    // resolves on our signal. This reproduces the race: two subscribes
+    // both find `pipes.has === false`, both enter startPipe, both await.
+    let resolveFirst: (() => void) | null = null;
+    const firstResolved = new Promise<void>((r) => { resolveFirst = r; });
+    mockStartPipe.mockImplementation(async () => {
+      startInvocations++;
+      // Only the first call awaits the gate; any additional concurrent
+      // call must NOT even reach here (the guard in startPipe should
+      // drop it).
+      await firstResolved;
+      const stream = { on: vi.fn(), destroy: vi.fn() };
+      return { stream, cleanup: vi.fn().mockResolvedValue(undefined) };
+    });
+
+    streamer.subscribe({ sessionName: session, send: () => {} });
+    streamer.subscribe({ sessionName: session, send: () => {} });
+
+    // Let the microtasks flush so both subscribes enter startPipe.
+    await vi.advanceTimersByTimeAsync(0);
+    await Promise.resolve();
+
+    // Both subscribes have queued; only ONE of them should have reached
+    // the `startPipePaneStream` call. The other was dropped by the
+    // `pipes.has() || pipeStartLocks.has()` guard.
+    expect(startInvocations).toBe(1);
+
+    // Release the gate so the in-flight start completes cleanly.
+    resolveFirst?.();
+    await flush();
+
+    // Still exactly one invocation — no deferred spawn after release.
+    expect(startInvocations).toBe(1);
+  });
+
+  it('suppresses pane-id inline errors when the session record is not yet in the store', async () => {
+    // Simulates the launch race for transport sub-sessions (copilot-sdk /
+    // cursor-headless): the web UI subscribes before `launchTransportSession`
+    // has finished persisting the session record. Without this guard, users
+    // see a permanent "Terminal stream unavailable: pane id not available.
+    // Restart the session to fix." error stamped into the timeline of a
+    // session that's only a handful of milliseconds old.
+    const session = 'deck_sub_copilot_race';
+    mockGetSession.mockReturnValue(undefined);
     mockGetPaneId.mockResolvedValue(undefined);
 
     streamer.subscribe({

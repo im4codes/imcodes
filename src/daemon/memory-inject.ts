@@ -12,6 +12,7 @@ import { homedir } from 'os';
 import { randomUUID } from 'node:crypto';
 import { timelineEmitter } from './timeline-emitter.js';
 import { buildMemoryContextTimelinePayload } from './memory-context-timeline.js';
+import { AGENT_SEND_DOCS } from './imcodes-workflow-docs.js';
 import type { MemorySearchResultItem } from '../context/memory-search.js';
 import { selectStartupMemoryItems } from '../context/startup-memory.js';
 import { buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
@@ -116,35 +117,6 @@ export async function injectGeminiMemoryWithTimeline(
   if (!payload) return;
   timelineEmitter.emit(sessionName, 'memory.context', payload, { source: 'daemon', confidence: 'high' });
 }
-
-// ── Inter-agent communication docs ──────────────────────────────────────────────
-
-/**
- * Documentation for `imcodes send` that gets injected into agent prompts.
- * This enables agents to communicate with sibling sessions.
- */
-const AGENT_SEND_DOCS = `
-## Inter-Agent Communication
-
-You can send messages to other agent sessions managed by the same daemon.
-
-To send a message to another agent session:
-  imcodes send "<label-or-session-name>" "<message>"
-  imcodes send "<label-or-session-name>" "<message>" --files file1.ts,file2.ts
-
-To broadcast to all sibling sessions:
-  imcodes send --all "<message>"
-
-To target by agent type:
-  imcodes send --type codex "<message>"
-
-Use \`imcodes send --list\` to see available sibling sessions.
-
-Notes:
-- Messages are delivered via the daemon's hook server. If the target is busy, the message is queued.
-- The \`--files\` flag attaches file references; format depends on the target agent type.
-- Your session identity is auto-detected from $IMCODES_SESSION.
-`.trim();
 
 /**
  * Read processed memory summaries relevant to this project from local context store.

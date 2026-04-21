@@ -1,3 +1,5 @@
+import type { MemoryScoringWeights } from './memory-scoring.js';
+
 export type CanonicalRepositoryIdentityKind = 'git-origin' | 'local-fallback';
 
 export interface CanonicalRepositoryId {
@@ -129,7 +131,7 @@ export interface ProviderContextPayload {
   assembledMessage: string;
   systemText?: string;
   messagePreamble?: string;
-  attachments?: unknown[];
+  attachments?: TransportAttachment[];
   startupMemory?: TransportMemoryRecallArtifact;
   memoryRecall?: TransportMemoryRecallArtifact;
   context: CompiledAgentContextArtifact;
@@ -235,12 +237,18 @@ export type SharedContextRuntimeBackend = 'claude-code-sdk' | 'codex-sdk' | 'qwe
 export interface ContextModelConfig {
   primaryContextBackend: SharedContextRuntimeBackend;
   primaryContextModel: string;
+  primaryContextPreset?: string;
   primaryContextSdk?: string;
   backupContextBackend?: SharedContextRuntimeBackend;
   backupContextModel?: string;
+  backupContextPreset?: string;
   backupContextSdk?: string;
   /** Minimum interval between materialization runs per target (ms). Default 10000. */
   materializationMinIntervalMs?: number;
+  /** Minimum composite recall score required for related-history injection. Range [0, 1]. */
+  memoryRecallMinScore?: number;
+  /** Advanced scoring weights for memory relevance ranking. Normalized to sum to 1.0. */
+  memoryScoringWeights?: Partial<MemoryScoringWeights>;
   enablePersonalMemorySync?: boolean;
 }
 
@@ -287,3 +295,4 @@ export interface ProcessedContextReplicationBody {
   namespace: ContextNamespace;
   projections: ProcessedContextProjection[];
 }
+import type { TransportAttachment } from './transport-attachments.js';

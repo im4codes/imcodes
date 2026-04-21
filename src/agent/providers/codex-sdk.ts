@@ -2,6 +2,7 @@ import { access } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import readline, { type Interface as ReadlineInterface } from 'node:readline';
+import { killProcessTree } from '../../util/kill-process-tree.js';
 import type {
   TransportProvider,
   ProviderCapabilities,
@@ -20,6 +21,7 @@ import {
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
+import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 import logger from '../../util/logger.js';
 import { CODEX_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
@@ -131,26 +133,68 @@ function toolFromItem(item: Record<string, any>, lifecycle: 'started' | 'complet
           raw: item,
         },
       };
-    case 'webSearch':
+    case 'webSearch': {
+      // The Codex CLI emits `WebSearchAction` as a tagged enum:
+      //   { type: 'search',        query: '...' }
+      //   { type: 'find_in_page',  pattern: '...', url?: '...' }
+      //   { type: 'open_page',     url:   '...' }
+      //   { type: 'other' }                       // unknown / catch-all
+      //
+      // Older CLI versions also surfaced a top-level `item.query`. The
+      // current binary does NOT — for the `search` variant the query is
+      // nested under `item.action.query`, and for the catch-all `other`
+      // there's no query at all.
+      //
+      // Rendering contract: `input` is the flat summary payload the web UI
+      // shows next to the tool name; `detail.raw` keeps the original item
+      // for the expand panel. Do NOT inline the raw `action` object into
+      // `input` — `summarizeToolInput` walks `TOOL_INPUT_SUMMARY_KEYS`
+      // (`query` first); when `query` is an empty string it's treated as
+      // not-useful, the walker falls through to all keys, and with two
+      // entries (`query` + `action`) the renderer fallbacks to
+      // `JSON.stringify(input)` — that's where the
+      // `{"query":"","action":{"type":"other"}}` screen artifact came from.
+      const action = item.action as Record<string, unknown> | undefined;
+      const actionType = typeof action?.type === 'string' ? action.type : undefined;
+      const actionQuery = typeof action?.query === 'string' ? action.query : undefined;
+      const actionPattern = typeof action?.pattern === 'string' ? action.pattern : undefined;
+      const actionUrl = typeof action?.url === 'string' ? action.url : undefined;
+      const topLevelQuery = typeof item.query === 'string' ? item.query : undefined;
+      // Pick the single best human-readable label for the flat `input.query`
+      // slot. Priority: explicit query → pattern → url → bracketed action
+      // type (`(other)` / `(open_page)`) for the no-info fallback. The UI
+      // treats the result as an opaque string, so any of these values flow
+      // through `summarizeToolInput` without triggering the empty-string
+      // fallback branch.
+      const bestLabel = topLevelQuery
+        ?? actionQuery
+        ?? actionPattern
+        ?? actionUrl
+        ?? (actionType ? `(${actionType})` : '(web_search)');
       return {
         id: item.id,
         name: 'WebSearch',
         status: lifecycle === 'started' ? 'running' : 'complete',
         input: {
-          query: item.query,
-          ...(item.action ? { action: item.action } : {}),
+          // Single-key payload: `summarizeToolInput` picks `query` first
+          // and short-circuits, so the chat row reads `WebSearch <label>`
+          // regardless of which enum variant Codex produced.
+          query: bestLabel,
         },
         detail: {
           kind: 'webSearch',
-          summary: item.query,
+          summary: bestLabel,
           input: {
-            query: item.query,
-            action: item.action,
+            query: bestLabel,
+            ...(actionPattern ? { pattern: actionPattern } : {}),
+            ...(actionUrl ? { url: actionUrl } : {}),
+            action,
           },
-          meta: { actionType: item.action?.type },
+          meta: { actionType },
           raw: item,
         },
       };
+    }
     default:
       return null;
   }
@@ -206,7 +250,13 @@ export class CodexSdkProvider implements TransportProvider {
     this.rejectPending(new Error('Codex app-server disconnected'));
     this.rl?.close();
     this.rl = null;
-    if (this.child && !this.child.killed) this.child.kill('SIGTERM');
+    // `child.kill('SIGTERM')` only terminates the node wrapper; the native
+    // codex binary it spawned lives on and leaks ~60MB per abandoned pair.
+    // Walk the descendant tree and tree-kill instead. Fire-and-forget is
+    // fine — the caller does not await teardown reaping.
+    if (this.child && !this.child.killed) {
+      void killProcessTree(this.child);
+    }
     this.child = null;
     this.threadToSession.clear();
     this.sessions.clear();
@@ -304,7 +354,7 @@ export class CodexSdkProvider implements TransportProvider {
     this.emitSessionInfo(sessionId, { effort });
   }
 
-  async send(sessionId: string, payloadOrMessage: string | ProviderContextPayload, attachments?: unknown[], extraSystemPrompt?: string): Promise<void> {
+  async send(sessionId: string, payloadOrMessage: string | ProviderContextPayload, attachments?: TransportAttachment[], extraSystemPrompt?: string): Promise<void> {
     if (!this.config || !this.child) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server not connected', false);
     }
@@ -623,6 +673,32 @@ export class CodexSdkProvider implements TransportProvider {
       this.pendingRequests.set(id, { resolve, reject });
       this.child!.stdin.write(`${payload}\n`);
     });
+  }
+
+  /**
+   * Expose the `account/rateLimits/read` RPC over the already-connected
+   * app-server so callers (e.g. the daemon's rate-limit probe) can reuse
+   * this singleton instead of spawning a one-shot codex child. Returns
+   * `undefined` if the provider isn't connected or the RPC doesn't include
+   * a `rateLimits` payload — the caller then falls back to a fresh spawn.
+   *
+   * Keeping this method on the provider (rather than exposing `request`
+   * publicly) keeps the RPC surface area explicit: future reuse targets
+   * (usage summary, plan type, etc.) should each get their own public
+   * wrapper.
+   */
+  async readRateLimits(): Promise<Record<string, unknown> | undefined> {
+    if (!this.child || !this.child.stdin.writable) return undefined;
+    try {
+      const result = await this.request('account/rateLimits/read', {});
+      if (result && typeof result === 'object' && 'rateLimits' in (result as Record<string, unknown>)) {
+        const payload = (result as Record<string, unknown>).rateLimits;
+        return payload && typeof payload === 'object' ? payload as Record<string, unknown> : undefined;
+      }
+      return undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   private notify(method: string, params: Record<string, any>): void {

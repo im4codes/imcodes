@@ -7,8 +7,13 @@ import { parseRemoteUrl } from '../../../src/repo/detector.js';
 import { parseCanonicalRepositoryKey } from '../../../src/agent/repository-identity-service.js';
 import { classifyTimestampFreshness } from '../../../shared/context-freshness.js';
 import type { ContextMemoryRecordView, ContextMemoryStatsView } from '../../../shared/context-types.js';
-import { computeRelevanceScore, type ProjectionClass } from '../../../shared/memory-scoring.js';
+import { computeRelevanceScore, applyRecallCapRule, type ProjectionClass } from '../../../shared/memory-scoring.js';
+import { normalizeSharedContextRuntimeConfig } from '../../../shared/shared-context-runtime-config.js';
+import { isTemplatePrompt, isTemplateOriginSummary, isImperativeCommand } from '../../../shared/template-prompt-patterns.js';
+import { isMemoryNoiseSummary } from '../../../shared/memory-noise-patterns.js';
+import { normalizeSummaryForFingerprint } from '../../../shared/memory-fingerprint.js';
 import { searchSemanticMemoryView } from '../util/semantic-memory-view.js';
+import { deleteEnterpriseMemoryProjection, deletePersonalMemoryProjection } from '../util/memory-delete.js';
 
 type EnterpriseRole = 'owner' | 'admin' | 'member';
 type BindingMode = 'required' | 'advisory';
@@ -168,18 +173,19 @@ function buildSharedMemoryResponse(
   limit = 20,
 ): { stats: ContextMemoryStatsView; records: ContextMemoryRecordView[] } {
   const normalizedQuery = query?.trim() ?? '';
-  const filtered = rows.filter((row) => matchesMemoryQuery(
+  const cleanRows = rows.filter((row) => !isMemoryNoiseSummary(row.summary));
+  const filtered = cleanRows.filter((row) => matchesMemoryQuery(
     row.summary,
     typeof row.content_json === 'string' ? JSON.parse(row.content_json) : row.content_json,
     normalizedQuery,
   ));
-  const projectIds = new Set(rows.map((row) => row.project_id));
+  const projectIds = new Set(cleanRows.map((row) => row.project_id));
   return {
     stats: {
-      totalRecords: rows.length,
+      totalRecords: cleanRows.length,
       matchedRecords: filtered.length,
-      recentSummaryCount: rows.filter((row) => row.projection_class === 'recent_summary').length,
-      durableCandidateCount: rows.filter((row) => row.projection_class === 'durable_memory_candidate').length,
+      recentSummaryCount: cleanRows.filter((row) => row.projection_class === 'recent_summary').length,
+      durableCandidateCount: cleanRows.filter((row) => row.projection_class === 'durable_memory_candidate').length,
       projectCount: projectIds.size,
       stagedEventCount: 0,
       dirtyTargetCount: 0,
@@ -201,6 +207,16 @@ function buildSharedMemoryResponse(
     })),
   };
 }
+
+sharedContextRoutes.delete('/personal-memory/:memoryId', async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const memoryId = c.req.param('memoryId');
+  if (!memoryId) return c.json({ error: 'missing_memory_id' }, 400);
+  const deleted = await deletePersonalMemoryProjection(c.env.DB, userId, memoryId);
+  if (!deleted) return c.json({ error: 'not_found' }, 404);
+  await logAudit({ userId, action: 'shared_context.personal_memory_deleted', details: { memoryId } }, c.env.DB);
+  return c.json({ ok: true, id: memoryId });
+});
 
 sharedContextRoutes.get('/personal-memory', async (c) => {
   const userId = c.get('userId' as never) as string;
@@ -696,6 +712,18 @@ sharedContextRoutes.get('/enterprises/:enterpriseId/projects/visibility', async 
   });
 });
 
+sharedContextRoutes.delete('/enterprises/:enterpriseId/memory/:memoryId', async (c) => {
+  const enterpriseId = c.req.param('enterpriseId');
+  const memoryId = c.req.param('memoryId');
+  if (!memoryId) return c.json({ error: 'missing_memory_id' }, 400);
+  const auth = await requireEnterpriseRole(c, enterpriseId, 'admin');
+  if (auth instanceof Response) return auth;
+  const deleted = await deleteEnterpriseMemoryProjection(c.env.DB, enterpriseId, memoryId);
+  if (!deleted) return c.json({ error: 'not_found' }, 404);
+  await logAudit({ userId: auth.userId, action: 'shared_context.enterprise_memory_deleted', details: { enterpriseId, memoryId } }, c.env.DB);
+  return c.json({ ok: true, id: memoryId });
+});
+
 sharedContextRoutes.get('/enterprises/:enterpriseId/memory', async (c) => {
   const enterpriseId = c.req.param('enterpriseId');
   const auth = await requireEnterpriseRole(c, enterpriseId, 'member');
@@ -904,6 +932,15 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
   const serverId = c.req.param('id')!;
   const role = await resolveServerRole(c.env.DB, serverId, userId);
   if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+  const runtimeConfigRow = await c.env.DB.queryOne<{ shared_context_runtime_config: Record<string, unknown> | string | null }>(
+    'SELECT shared_context_runtime_config FROM servers WHERE id = $1',
+    [serverId],
+  );
+  const runtimeConfig = normalizeSharedContextRuntimeConfig(
+    typeof runtimeConfigRow?.shared_context_runtime_config === 'string'
+      ? JSON.parse(runtimeConfigRow.shared_context_runtime_config)
+      : runtimeConfigRow?.shared_context_runtime_config,
+  );
 
   let body: { query: string; projectId?: string; limit?: number };
   try {
@@ -914,6 +951,18 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
   const { query, projectId, limit: rawLimit } = body;
   if (!query || typeof query !== 'string' || query.trim().length === 0) {
     return c.json({ error: 'query_required' }, 400);
+  }
+  // Template-prompt skip: OpenSpec / slash-command / skill-template queries
+  // are not natural-language requests; a recall over them returns noise.
+  // See shared/template-prompt-patterns.ts.
+  if (isTemplatePrompt(query)) {
+    return c.json({ results: [], vectorSearch: false, skipped: 'template_prompt' });
+  }
+  // Imperative-command skip: short ops directives ("commit&push", "redeploy",
+  // "continue") are task-control verbs, not semantic queries. Running recall
+  // on them wastes candidates on the current task's own logs.
+  if (isImperativeCommand(query)) {
+    return c.json({ results: [], vectorSearch: false, skipped: 'imperative_command' });
   }
   const limit = typeof rawLimit === 'number' && rawLimit > 0 ? Math.min(rawLimit, 20) : 5;
   const candidateLimit = Math.max(limit * 4, 20);
@@ -1015,13 +1064,16 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
     );
   }
 
-  // Merge, deduplicate by id, sort by composite relevance score
+  // Merge, deduplicate by id, sort by composite relevance score.
+  // Result-side template filter: legacy projections whose summary reflects
+  // a templated workflow origin must not leak back through recall.
   const seen = new Set<string>();
   const currentProjectId = projectId ?? '__unknown_current_project__';
   const results: Array<{ id: string; projectId: string; class: string; summary: string; updatedAt: number; score: number; source: 'personal' | 'enterprise' }> = [];
   for (const row of personalRows) {
     if (seen.has(row.id)) continue;
     seen.add(row.id);
+    if (isTemplateOriginSummary(row.summary) || isMemoryNoiseSummary(row.summary)) continue;
     results.push({
       id: row.id,
       projectId: row.project_id,
@@ -1035,13 +1087,14 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
         projectionClass: row.projection_class,
         memoryProjectId: row.project_id,
         currentProjectId,
-      }),
+      }, runtimeConfig.memoryScoringWeights),
       source: 'personal',
     });
   }
   for (const row of enterpriseRows) {
     if (seen.has(row.id)) continue;
     seen.add(row.id);
+    if (isTemplateOriginSummary(row.summary) || isMemoryNoiseSummary(row.summary)) continue;
     results.push({
       id: row.id,
       projectId: row.project_id,
@@ -1057,14 +1110,46 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
         currentProjectId,
         memoryEnterpriseId: row.enterprise_id ?? undefined,
         currentEnterpriseId,
-      }),
+      }, runtimeConfig.memoryScoringWeights),
       source: 'enterprise',
     });
   }
-  results.sort((a, b) => b.score - a.score);
-  const topResults = results.slice(0, limit);
+  // Content-level dedup: projections stored before the writer's store-time
+  // dedup landed (or from historical daemons) can produce multiple rows with
+  // the same (class, normalized-summary) but different IDs. ID-based dedup
+  // above cannot merge them, so they'd surface as three identical
+  // Related-history cards at the same score. Collapse by normalized summary
+  // here — keep the highest-scoring representative, then prefer personal
+  // over enterprise on ties (personal is closer to the current user's work).
+  results.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    if (a.source !== b.source) return a.source === 'personal' ? -1 : 1;
+    return b.updatedAt - a.updatedAt;
+  });
+  const seenFingerprints = new Set<string>();
+  const dedupedResults: typeof results = [];
+  for (const entry of results) {
+    const fp = `${entry.class}\u0000${normalizeSummaryForFingerprint(entry.summary)}`;
+    if (seenFingerprints.has(fp)) continue;
+    seenFingerprints.add(fp);
+    dedupedResults.push(entry);
+  }
 
-  // Record hits for recalled projections (server-side spaced repetition)
+  // Cap rule: configurable floor (default 0.4), top 3, extend to 5 iff all >= 0.6.
+  // See shared/memory-scoring.ts. The client-supplied `limit` is an upper
+  // bound on the extend cap — a client asking for <=3 shrinks defaultCap;
+  // a client asking for >=5 keeps the default extend cap.
+  const cappedDefault = Math.min(limit, 3);
+  const cappedExtend = Math.min(Math.max(limit, cappedDefault), 5);
+  const topResults = applyRecallCapRule(dedupedResults, {
+    minFloor: runtimeConfig.memoryRecallMinScore,
+    defaultCap: cappedDefault,
+    extendCap: cappedExtend,
+  });
+
+  // Record hits only for projections that actually survived the cap rule —
+  // items dropped by floor or session-side filtering never reached the
+  // user's prompt and should not receive a spaced-repetition credit.
   const hitIds = topResults.map((r) => r.id);
   if (hitIds.length > 0) {
     const now = Date.now();

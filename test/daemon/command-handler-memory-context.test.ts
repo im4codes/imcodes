@@ -7,6 +7,7 @@ const {
   sendKeysDelayedEnterMock,
   searchLocalMemorySemanticMock,
   recordMemoryHitsMock,
+  detectRepoMock,
 } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
   getTransportRuntimeMock: vi.fn(),
@@ -14,6 +15,7 @@ const {
   sendKeysDelayedEnterMock: vi.fn().mockResolvedValue(undefined),
   searchLocalMemorySemanticMock: vi.fn(),
   recordMemoryHitsMock: vi.fn(),
+  detectRepoMock: vi.fn(),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -148,7 +150,19 @@ vi.mock('../../src/context/memory-search.js', () => ({
   searchLocalMemorySemantic: searchLocalMemorySemanticMock,
 }));
 
+vi.mock('../../src/repo/detector.js', () => ({
+  detectRepo: detectRepoMock,
+  parseRemoteUrl: vi.fn((url: string) => {
+    if (url === 'git@github.com:imcodes/codedeck.git') {
+      return { host: 'github.com', owner: 'imcodes', repo: 'codedeck' };
+    }
+    return null;
+  }),
+}));
+
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
+import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
+import { resetAllRecentInjectionHistories } from '../../src/context/recent-injection-history.js';
 
 const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
@@ -162,6 +176,8 @@ describe('handleWebCommand memory context timeline', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    resetAllRecentInjectionHistories();
+    setContextModelRuntimeConfig(null);
     getSessionMock.mockReturnValue({
       name: 'deck_process_brain',
       projectName: 'codedeck',
@@ -206,6 +222,9 @@ describe('handleWebCommand memory context timeline', () => {
         pendingJobCount: 0,
       },
     });
+    detectRepoMock.mockResolvedValue({
+      info: { remoteUrl: 'git@github.com:imcodes/codedeck.git' },
+    });
   });
 
   it('emits a linked memory.context event for injected related history', async () => {
@@ -245,6 +264,86 @@ describe('handleWebCommand memory context timeline', () => {
     expect(recordMemoryHitsMock.mock.invocationCallOrder[0]).toBeGreaterThan(sendKeysDelayedEnterMock.mock.invocationCallOrder[0]);
   });
 
+  it('REGRESSION GUARD: process recall queries must use canonical repo identity instead of projectName and this test must not be deleted', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_process_brain',
+      projectName: 'friendly-name',
+      projectDir: '/worktrees/codedeck',
+      role: 'brain',
+      agentType: 'claude-code',
+      runtimeType: 'process',
+      state: 'running',
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_process_brain',
+      text: 'Fix reconnect issues in websocket client',
+      commandId: 'cmd-memory-canonical',
+    }, serverLink as any);
+
+    await flushAsync();
+    await flushAsync();
+
+    expect(detectRepoMock).toHaveBeenCalledWith('/worktrees/codedeck');
+    expect(searchLocalMemorySemanticMock).toHaveBeenCalledWith(expect.objectContaining({
+      query: 'Fix reconnect issues in websocket client',
+      namespace: { scope: 'personal', projectId: 'github.com/imcodes/codedeck' },
+      repo: 'github.com/imcodes/codedeck',
+      limit: 10,
+    }));
+    expect(searchLocalMemorySemanticMock).not.toHaveBeenCalledWith(expect.objectContaining({
+      repo: 'friendly-name',
+    }));
+  });
+
+  it('applies the configured recall threshold when deciding whether to inject related history', async () => {
+    setContextModelRuntimeConfig({
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'sonnet',
+      memoryRecallMinScore: 0.4,
+    });
+    searchLocalMemorySemanticMock.mockResolvedValue({
+      items: [
+        {
+          id: 'mem-threshold',
+          type: 'processed',
+          projectId: 'codedeck',
+          scope: 'personal',
+          summary: 'Mid-threshold multilingual semantic match',
+          createdAt: 1,
+          relevanceScore: 0.4446,
+        },
+      ],
+      stats: {
+        totalRecords: 1,
+        matchedRecords: 1,
+        recentSummaryCount: 1,
+        durableCandidateCount: 0,
+        projectCount: 1,
+        stagedEventCount: 0,
+        dirtyTargetCount: 0,
+        pendingJobCount: 0,
+      },
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_process_brain',
+      text: '我感觉现在发的消息都没有相关历史recall了, 就像这句话 你自己测试下 不可能没有!',
+      commandId: 'cmd-memory-threshold',
+    }, serverLink as any);
+
+    await flushAsync();
+
+    expect(sendKeysDelayedEnterMock).toHaveBeenCalledWith(
+      'deck_process_brain',
+      expect.stringContaining('[Related past work]'),
+      undefined,
+    );
+    expect(recordMemoryHitsMock).toHaveBeenCalledWith(['mem-threshold']);
+  });
+
   it('does not increment recall hits when the process send fails before the linked memory card is emitted', async () => {
     sendKeysDelayedEnterMock.mockRejectedValueOnce(new Error('tmux failed'));
 
@@ -262,6 +361,131 @@ describe('handleWebCommand memory context timeline', () => {
       'deck_process_brain',
       'memory.context',
       expect.anything(),
+    );
+  });
+
+  it('emits a no-matches status when no related process memory is found', async () => {
+    searchLocalMemorySemanticMock.mockResolvedValue({
+      items: [],
+      stats: {
+        totalRecords: 0,
+        matchedRecords: 0,
+        recentSummaryCount: 0,
+        durableCandidateCount: 0,
+        projectCount: 0,
+        stagedEventCount: 0,
+        dirtyTargetCount: 0,
+        pendingJobCount: 0,
+      },
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_process_brain',
+      text: 'Investigate websocket reconnect behavior',
+      commandId: 'cmd-memory-none',
+    }, serverLink as any);
+
+    await flushAsync();
+
+    expect(sendKeysDelayedEnterMock).toHaveBeenCalledWith(
+      'deck_process_brain',
+      'Investigate websocket reconnect behavior',
+      undefined,
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_process_brain',
+      'memory.context',
+      expect.objectContaining({
+        relatedToEventId: 'evt-user-1',
+        query: 'Investigate websocket reconnect behavior',
+        status: 'no_matches',
+        items: [],
+      }),
+    );
+    expect(recordMemoryHitsMock).not.toHaveBeenCalled();
+  });
+
+  it('emits a recently-injected status when matches were found but all were filtered by recency', async () => {
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_process_brain',
+      text: 'Fix reconnect issues in websocket client',
+      commandId: 'cmd-memory-first',
+    }, serverLink as any);
+    await flushAsync();
+
+    emitMock.mockClear();
+    recordMemoryHitsMock.mockClear();
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_process_brain',
+      text: 'Fix reconnect issues in websocket client',
+      commandId: 'cmd-memory-second',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_process_brain',
+      'memory.context',
+      expect.objectContaining({
+        relatedToEventId: 'evt-user-1',
+        query: 'Fix reconnect issues in websocket client',
+        status: 'deduped_recently',
+        matchedCount: 1,
+        dedupedCount: 1,
+        items: [],
+      }),
+    );
+    expect(recordMemoryHitsMock).not.toHaveBeenCalled();
+  });
+
+  it('emits a template-prompt skip status for built-in workflow prompts', async () => {
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_process_brain',
+      // Workflow phrase triggers the skip; bare @openspec/changes refs alone would not.
+      text: 'Drive the implementation of @openspec/changes/shared-agent-context aggressively.',
+      commandId: 'cmd-memory-template',
+    }, serverLink as any);
+
+    await flushAsync();
+
+    expect(searchLocalMemorySemanticMock).not.toHaveBeenCalled();
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_process_brain',
+      'memory.context',
+      expect.objectContaining({
+        relatedToEventId: 'evt-user-1',
+        status: 'skipped_template_prompt',
+        items: [],
+      }),
+    );
+  });
+
+  it('skips recall for imperative command prompts (commit&push, redeploy, etc.)', async () => {
+    // User-reported regression: short ops directives passed the <10-char
+    // filter and triggered irrelevant semantic recalls over the current
+    // task's own logs.
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_process_brain',
+      text: 'commit&push',
+      commandId: 'cmd-memory-imperative',
+    }, serverLink as any);
+
+    await flushAsync();
+
+    expect(searchLocalMemorySemanticMock).not.toHaveBeenCalled();
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_process_brain',
+      'memory.context',
+      expect.objectContaining({
+        relatedToEventId: 'evt-user-1',
+        status: 'skipped_control_message',
+        items: [],
+      }),
     );
   });
 });

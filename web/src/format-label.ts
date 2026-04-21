@@ -7,9 +7,11 @@
  *
  * Also handles colon-separated variant "platform:id:name" → "platform:name".
  */
+import { normalizeLegacyAutoSessionLabel } from './agent-display.js';
+
 export function formatLabel(label: string): string {
   // Match "platform:id#name" or "platform:id:name" — strip the numeric ID
   const match = label.match(/^([^:]+):\d+([#:].+)$/);
-  if (match) return `${match[1]}${match[2]}`;
-  return label;
+  const normalized = match ? `${match[1]}${match[2]}` : label;
+  return normalizeLegacyAutoSessionLabel(normalized);
 }

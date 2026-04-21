@@ -7,12 +7,14 @@
  */
 import type { TransportProvider, ProviderError, ProviderStatusUpdate } from '../agent/transport-provider.js';
 import type { MessageDelta, AgentMessage, ToolCallEvent } from '../../shared/agent-message.js';
-import { TRANSPORT_MSG } from '../../shared/transport-events.js';
-import { resolveSessionName } from '../agent/session-manager.js';
+import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
+import { resolveSessionName, isEphemeralProviderSid } from '../agent/session-manager.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { appendTransportEvent } from './transport-history.js';
 import logger from '../util/logger.js';
 import { resolveContextWindow } from '../util/model-context.js';
+import { getSession } from '../store/session-store.js';
+import { getCachedPresetContextWindow } from './cc-presets.js';
 import { TIMELINE_EVENT_FILE_CHANGE } from '../../shared/file-change.js';
 import { normalizeCodexSdkFileChange, normalizeQwenFileChange } from './file-change-normalizer.js';
 
@@ -64,6 +66,7 @@ function clearPendingStreamUpdate(eventId: string): void {
 }
 
 function normalizeUsageUpdatePayload(
+  sessionName: string,
   usage: {
     input_tokens?: number;
     output_tokens?: number;
@@ -73,6 +76,9 @@ function normalizeUsageUpdatePayload(
   model: string | undefined,
 ): Record<string, unknown> | null {
   if (!usage && !model) return null;
+  const session = getSession(sessionName);
+  const presetCtx = session?.presetContextWindow
+    ?? (session?.ccPreset ? getCachedPresetContextWindow(session.ccPreset) : undefined);
   const inputTokens = typeof usage?.input_tokens === 'number'
     ? usage.input_tokens + (usage.cache_creation_input_tokens ?? 0)
     : undefined;
@@ -80,7 +86,7 @@ function normalizeUsageUpdatePayload(
     ...(typeof inputTokens === 'number' ? { inputTokens } : {}),
     ...(typeof usage?.cache_read_input_tokens === 'number' ? { cacheTokens: usage.cache_read_input_tokens } : {}),
     ...(model ? { model } : {}),
-    contextWindow: resolveContextWindow(undefined, model),
+    contextWindow: resolveContextWindow(presetCtx, model),
   };
   return payload;
 }
@@ -140,7 +146,15 @@ export function setTransportRelaySend(fn: (msg: Record<string, unknown>) => void
 export function wireProviderToRelay(provider: TransportProvider): void {
   provider.onDelta((providerSid: string, delta: MessageDelta) => {
     const sessionName = resolveSessionName(providerSid);
-    if (!sessionName) { logger.warn({ providerSid }, 'transport-relay: unresolved route for delta — dropped'); return; }
+    if (!sessionName) {
+      // Out-of-band callers (supervision-broker, summary-compressor) drive
+      // the provider directly with their own per-call listeners; their
+      // deltas aren't meant for the relay. Drop silently — logging per
+      // delta produced hundreds of warns/min on a busy daemon.
+      if (isEphemeralProviderSid(providerSid)) return;
+      logger.warn({ providerSid }, 'transport-relay: unresolved route for delta — dropped');
+      return;
+    }
 
     // Provider may send cumulative deltas (full text so far) or incremental.
     // Use delta.delta as the display text directly — the provider's internal
@@ -186,7 +200,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       cache_creation_input_tokens?: number;
     } | undefined;
     const model = typeof message.metadata?.model === 'string' ? message.metadata.model : undefined;
-    const usagePayload = normalizeUsageUpdatePayload(usage, model);
+    const usagePayload = normalizeUsageUpdatePayload(sessionName, usage, model);
     if (usagePayload) {
       timelineEmitter.emit(sessionName, 'usage.update', usagePayload, { source: 'daemon', confidence: 'high' });
     }
@@ -413,6 +427,24 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       status: status.status,
       ...(status.label !== undefined ? { label: status.label } : {}),
     }, { source: 'daemon', confidence: 'high' });
+  });
+
+  provider.onApprovalRequest?.((providerSid: string, request) => {
+    const sessionName = resolveSessionName(providerSid);
+    if (!sessionName) {
+      logger.debug({ providerSid }, 'transport-relay: unresolved route for approval — dropped');
+      return;
+    }
+
+    const payload = {
+      type: TRANSPORT_EVENT.CHAT_APPROVAL,
+      sessionId: sessionName,
+      requestId: request.id,
+      description: request.description,
+      ...(request.tool ? { tool: request.tool } : {}),
+    } as const;
+    sendToServer?.(payload);
+    void appendTransportEvent(sessionName, payload);
   });
 }
 

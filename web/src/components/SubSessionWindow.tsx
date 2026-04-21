@@ -9,11 +9,14 @@ import { recordCost } from '../cost-tracker.js';
 import { formatLabel } from '../format-label.js';
 import { TerminalView } from './TerminalView.js';
 import { ChatView } from './ChatView.js';
+import { FileBrowser } from './FileBrowser.js';
 import { SessionControls } from './SessionControls.js';
 import { UsageFooter } from './UsageFooter.js';
+import { FloatingPanel } from './FloatingPanel.js';
 import { useTimeline } from '../hooks/useTimeline.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
 import { useQuickData } from './QuickInputPanel.js';
+import { useSharedGitChanges } from '../git-status-store.js';
 import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff, SessionInfo } from '../types.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
@@ -21,6 +24,7 @@ import { extractLatestUsage } from '../usage-data.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
 import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
+import { resolveSubSessionRuntimeType } from '../runtime-type.js';
 
 interface WindowGeometry { x: number; y: number; w: number; h: number }
 
@@ -98,9 +102,22 @@ export function SubSessionWindow({
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   const swipeBackRef = useSwipeBack(isMobile ? onMinimize : null);
 
+  // ── Shared git-changes cache for the 📁 badge ─────────────────────────────
+  // Uses the same git-status-store as the main session and FileBrowser.
+  // When cwd matches another consumer (main session, other sub-sessions),
+  // a single `fs.git_status` request feeds all of them. No separate polling
+  // loop needed — `useSharedGitChanges` polls every 30s automatically.
+  const sharedGitFiles = useSharedGitChanges(ws, sub.cwd ?? null);
+  const gitChangesCount = sharedGitFiles.length;
+
   // Always pass sessionName + ws so useTimeline keeps its cache warm.
   // active flag is only for rendering — timeline state should persist across minimize/restore.
-  const { events, refreshing } = useTimeline(sub.sessionName, ws, serverId);
+  const {
+    events,
+    refreshing,
+    addOptimisticUserMessage,
+    removeOptimisticMessage,
+  } = useTimeline(sub.sessionName, ws, serverId);
   const quickData = useQuickData();
 
   // Earliest ts of the current continuous thinking sequence (shared logic).
@@ -114,14 +131,58 @@ export function SubSessionWindow({
     [events, sub.state],
   );
 
+  // Dedicated per-sub-session file browser state. Each sub-session has its own
+  // cwd, so opening 📁 here should browse THIS sub-session's working directory
+  // (not the parent main session's). The overlay/panel is rendered locally so
+  // it layers above this sub-session window instead of being hidden behind it.
+  const [showFileBrowser, setShowFileBrowser] = useState(false);
+
   const [quotes, setQuotes] = useState<string[]>([]);
   const addQuote = useCallback((text: string) => setQuotes((prev) => [...prev, text]), []);
   const removeQuote = useCallback((i: number) => setQuotes((prev) => prev.filter((_, j) => j !== i)), []);
 
+  // ── Retry failed send ─────────────────────────────────────────────────────
+  // Mirrors the main-session SessionPane handler so optimistic-UX behavior is
+  // uniform: locate the failed bubble in the timeline cache, clear it, dispatch
+  // a fresh session.send with a new commandId, and re-inject an optimistic
+  // "sending" bubble immediately.
+  const eventsRef = useRef(events);
+  eventsRef.current = events;
+  const handleResendFailed = useCallback((commandId: string, text: string) => {
+    if (!ws || !connected) return;
+    const failedEvent = eventsRef.current.find(
+      (e) => e.type === 'user.message'
+        && e.payload.failed === true
+        && e.payload.commandId === commandId,
+    );
+    const resendExtra = failedEvent && typeof failedEvent.payload._resendExtra === 'object'
+      ? (failedEvent.payload._resendExtra as Record<string, unknown>)
+      : undefined;
+    const attachmentsFromFailure = failedEvent && Array.isArray(failedEvent.payload.attachments)
+      ? (failedEvent.payload.attachments as Array<Record<string, unknown>>)
+      : undefined;
+    removeOptimisticMessage(commandId);
+    const newCommandId = globalThis.crypto?.randomUUID?.()
+      ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    ws.sendSessionCommand('send', {
+      sessionName: sub.sessionName,
+      text,
+      ...(resendExtra ?? {}),
+      commandId: newCommandId,
+    });
+    if (effectiveRuntimeType !== 'transport') {
+      addOptimisticUserMessage(text, newCommandId, {
+        ...(attachmentsFromFailure ? { attachments: attachmentsFromFailure } : {}),
+        ...(resendExtra ? { resendExtra } : {}),
+      });
+    }
+  }, [addOptimisticUserMessage, connected, removeOptimisticMessage, sub.sessionName, ws]);
+
   const thinkingNow = useNowTicker(!!activeThinkingTs && active);
   const isShell = sub.type === 'shell' || sub.type === 'script';
   /** Transport-backed sessions have no tmux terminal — chat only */
-  const isTransport = sub.runtimeType === 'transport';
+  const effectiveRuntimeType = resolveSubSessionRuntimeType(sub);
+  const isTransport = effectiveRuntimeType === 'transport';
   const initial = loadLocal(sub.id);
   const [geom, setGeom] = useState<WindowGeometry>(initial.geom);
   const [viewMode, setViewMode] = useState<ViewMode>(isShell ? 'terminal' : isTransport ? 'chat' : initial.viewMode);
@@ -166,7 +227,7 @@ export function SubSessionWindow({
     quotaUsageLabel: sub.quotaUsageLabel ?? undefined,
     quotaMeta: sub.quotaMeta ?? undefined,
     effort: sub.effort ?? undefined,
-    runtimeType: sub.runtimeType ?? undefined,
+    runtimeType: effectiveRuntimeType,
     transportConfig: sub.transportConfig ?? undefined,
     transportPendingMessages: sub.transportPendingMessages ?? undefined,
     transportPendingMessageEntries: sub.transportPendingMessageEntries ?? undefined,
@@ -203,7 +264,7 @@ export function SubSessionWindow({
   // SubSessionWindow unmounts on minimize, so without this the remounted
   // TerminalView would start empty (no snapshot, only incremental data).
   useEffect(() => {
-    if (!ws || !connected) return;
+    if (!ws || !connected || isTransport) return;
     const raw = active;
     try { ws.subscribeTerminal(sub.sessionName, raw); } catch { /* ignore */ }
     if (!raw) {
@@ -212,7 +273,7 @@ export function SubSessionWindow({
     return () => {
       try { ws.subscribeTerminal(sub.sessionName, false); } catch { /* ignore */ }
     };
-  }, [ws, connected, sub.sessionName, active]);
+  }, [ws, connected, sub.sessionName, active, isTransport]);
 
   const scrollToBottom = useCallback(() => {
     setTimeout(() => {
@@ -385,6 +446,22 @@ export function SubSessionWindow({
         {sub.ccPresetId && <span style={{ fontSize: 11, color: '#f59e0b' }} title={`Custom API: ${sub.ccPresetId}`}>◉</span>}
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 10 }}>
           {!isShell && !isTransport && <button class="subsession-mode-btn" onClick={() => { const next = viewMode === 'chat' ? 'terminal' : 'chat'; setViewMode(next); if (next === 'chat') requestAnimationFrame(() => chatScrollRef.current?.()); }} title={viewMode === 'chat' ? 'Switch to terminal' : 'Switch to chat'}>{viewMode === 'chat' ? '⌨' : '💬'}</button>}
+          {/* File browser — placed to the LEFT of the pin button in the
+              sub-session window header. Each sub-session owns its own
+              FileBrowser instance rooted at sub.cwd, so selected paths land
+              in THIS sub-session's input (not the parent main session's).
+              The overlay/panel is rendered at zIndex > this window's zIndex
+              so it isn't hidden behind the window itself. */}
+          <button
+            class="subsession-minimize-btn"
+            onClick={() => setShowFileBrowser((o) => !o)}
+            title={t('picker.files')}
+            aria-label={t('picker.files')}
+            style={{ position: 'relative' }}
+          >
+            <span aria-hidden="true">{'\u{1F4C1}'}</span>
+            {(gitChangesCount ?? 0) > 0 && <span class="file-badge">{gitChangesCount}</span>}
+          </button>
           {isPinnable && <button class="subsession-minimize-btn" onClick={() => onPin?.(viewMode)} title={t('sidebar.pin_to_sidebar')}>📌</button>}
           <button class="subsession-minimize-btn" onClick={onMinimize} title="Minimize">▾</button>
           <button class="subsession-close-btn" onClick={onMinimize} title="Hide">×</button>
@@ -418,6 +495,7 @@ export function SubSessionWindow({
             serverId={serverId}
             onQuote={addQuote}
             agentType={sessionInfo?.agentType ?? sub.type}
+            onResendFailed={handleResendFailed}
           />
         )}
       </div>
@@ -449,7 +527,29 @@ export function SubSessionWindow({
         inputRef={inputRef}
         quickData={quickData}
         hideShortcuts={false}
-        onSend={scrollToBottom}
+        onSend={(_name, text, meta) => {
+          // Inject the optimistic "sending" bubble so the user sees the
+          // message with a spinner immediately, instead of waiting for the
+          // daemon's echoed user.message (transport) or the JSONL scrape lag
+          // (process). Uses the same contract as SessionPane — bubble keyed
+          // by commandId, reconciled when the authoritative echo arrives.
+          //
+          // Exception: P2P command sends (`@@all(...) ...`, structured
+          // p2pMode / p2pAtTargets). Those belong to a discussion file, not
+          // the sub-session's own chat. Matches the SessionPane guard.
+          const extras = meta?.extra as Record<string, unknown> | undefined;
+          const isP2pSend = !!extras && (
+            Array.isArray(extras.p2pAtTargets) && extras.p2pAtTargets.length > 0
+            || (typeof extras.p2pMode === 'string' && extras.p2pMode.length > 0)
+            || (extras.p2pSessionConfig != null && typeof extras.p2pSessionConfig === 'object')
+          );
+          if (isP2pSend || effectiveRuntimeType === 'transport') return;
+          addOptimisticUserMessage(text, meta?.commandId, {
+            ...(meta?.attachments ? { attachments: meta.attachments } : {}),
+            ...(meta?.extra ? { resendExtra: meta.extra } : {}),
+          });
+          scrollToBottom();
+        }}
         onSubRestart={onRestart}
         onSubNew={onRestart}
         onSubStop={onClose}
@@ -468,6 +568,76 @@ export function SubSessionWindow({
         pendingPrefillText={pendingPrefillText}
         onPendingPrefillApplied={onPendingPrefillApplied}
       />
+
+      {/* Per-sub-session file browser. Mobile: full-screen overlay.
+          Desktop: floating panel. Rooted at this sub-session's cwd so
+          selected paths land in the sub-session's own input. zIndex is
+          pinned to this window's zIndex + 1 so it layers above the window. */}
+      {showFileBrowser && ws && (
+        isMobile ? (
+          <div class="mobile-fb-overlay" style={{ zIndex: zIndex + 1 }}>
+            <div class="mobile-fb-header">
+              <span style={{ fontSize: 13, fontWeight: 600 }}>📁 {t('picker.files')}</span>
+              <button class="fb-close" onClick={() => setShowFileBrowser(false)}>✕</button>
+            </div>
+            <FileBrowser
+              ws={ws}
+              serverId={serverId}
+              mode="file-multi"
+              layout="panel"
+              initialPath={sub.cwd ?? '~'}
+              changesRootPath={sub.cwd ?? undefined}
+              hideFooter={false}
+              onConfirm={(paths) => {
+                const cwd = sub.cwd ?? null;
+                const rel = cwd
+                  ? paths.map((p) => '@' + (p.startsWith(cwd + '/') ? p.slice(cwd.length + 1) : p) + ' ')
+                  : paths.map((p) => '@' + p + ' ');
+                const inputEl = inputRef.current;
+                if (inputEl) {
+                  inputEl.textContent = (inputEl.textContent || '') + rel.join('');
+                  inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+                  inputEl.focus();
+                }
+                setShowFileBrowser(false);
+              }}
+              onClose={() => setShowFileBrowser(false)}
+            />
+          </div>
+        ) : (
+          <FloatingPanel
+            id={`subsession-filebrowser-${sub.id}`}
+            title={`📁 ${t('picker.files')}`}
+            onClose={() => setShowFileBrowser(false)}
+            zIndex={zIndex + 1}
+            defaultW={420}
+            defaultH={500}
+          >
+            <FileBrowser
+              ws={ws}
+              serverId={serverId}
+              mode="file-multi"
+              layout="panel"
+              initialPath={sub.cwd ?? '~'}
+              changesRootPath={sub.cwd ?? undefined}
+              hideFooter={false}
+              onConfirm={(paths) => {
+                const cwd = sub.cwd ?? null;
+                const rel = cwd
+                  ? paths.map((p) => '@' + (p.startsWith(cwd + '/') ? p.slice(cwd.length + 1) : p) + ' ')
+                  : paths.map((p) => '@' + p + ' ');
+                const inputEl = inputRef.current;
+                if (inputEl) {
+                  inputEl.textContent = (inputEl.textContent || '') + rel.join('');
+                  inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+                  inputEl.focus();
+                }
+              }}
+              onClose={() => setShowFileBrowser(false)}
+            />
+          </FloatingPanel>
+        )
+      )}
     </div>
   );
 }

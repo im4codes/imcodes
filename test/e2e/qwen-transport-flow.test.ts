@@ -162,6 +162,40 @@ vi.mock('../../src/agent/qwen-runtime-config.js', () => ({
   })),
 }));
 
+vi.mock('../../src/daemon/cc-presets.js', () => ({
+  getQwenPresetTransportConfig: vi.fn(async (presetName: string) => presetName === 'MiniMax' ? ({
+    env: {
+      ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+      ANTHROPIC_API_KEY: 'test-token',
+      ANTHROPIC_MODEL: 'MiniMax-M2.7',
+      OPENAI_BASE_URL: 'https://api.minimax.io/anthropic',
+      OPENAI_API_KEY: 'test-token',
+    },
+    model: 'MiniMax-M2.7',
+    contextWindow: 200000,
+    settings: {
+      security: { auth: { selectedType: 'anthropic' } },
+      model: { name: 'MiniMax-M2.7' },
+      modelProviders: {
+        anthropic: [
+          {
+            id: 'MiniMax-M2.7',
+            name: 'minimax',
+            envKey: 'ANTHROPIC_API_KEY',
+            baseUrl: 'https://api.minimax.io/anthropic',
+          },
+        ],
+      },
+    },
+  }) : { env: {} }),
+  getPreset: vi.fn(async (presetName: string) => presetName === 'MiniMax' ? ({
+    name: 'MiniMax',
+    env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+    contextWindow: 200000,
+  }) : null),
+  getCachedPresetContextWindow: vi.fn((presetName: string) => presetName === 'MiniMax' ? 200000 : undefined),
+}));
+
 vi.mock('../../src/store/session-store.js', () => ({
   listSessions: vi.fn(() => [...mocks.store.values()]),
   getSession: vi.fn((name: string) => mocks.store.get(name) ?? null),
@@ -208,8 +242,9 @@ vi.mock('../../src/agent/notify-setup.js', () => ({
 }));
 
 import { launchSession } from '../../src/agent/session-manager.js';
-import { disconnectAll } from '../../src/agent/provider-registry.js';
+import { connectProvider, disconnectAll } from '../../src/agent/provider-registry.js';
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
+import { restoreTransportSessions } from '../../src/agent/session-manager.js';
 
 describe('qwen transport flow e2e', () => {
   afterEach(async () => {
@@ -305,6 +340,65 @@ describe('qwen transport flow e2e', () => {
     expect(laterUsage?.payload.model).toBe('qwen3-coder-plus');
   });
 
+  it('applies qwen preset env, settings, and model on launch', async () => {
+    await launchSession({
+      name: SESSION,
+      projectName: 'qwene2e',
+      role: 'brain',
+      agentType: 'qwen',
+      projectDir: '/tmp/qwen-e2e',
+      ccPreset: 'MiniMax',
+    });
+
+    const provider = (await import('../../src/agent/provider-registry.js')).getProvider('qwen') as InstanceType<typeof mocks.MockQwenProvider> | undefined;
+    const created = provider?.created[0];
+    expect(created).toEqual(expect.objectContaining({
+      agentId: 'MiniMax-M2.7',
+      env: expect.objectContaining({
+        ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+        ANTHROPIC_API_KEY: 'test-token',
+        ANTHROPIC_MODEL: 'MiniMax-M2.7',
+        OPENAI_BASE_URL: 'https://api.minimax.io/anthropic',
+        OPENAI_API_KEY: 'test-token',
+      }),
+      settings: expect.objectContaining({
+        security: { auth: { selectedType: 'anthropic' } },
+        model: { name: 'MiniMax-M2.7' },
+      }),
+    }));
+
+    const record = mocks.store.get(SESSION);
+    expect(record?.ccPreset).toBe('MiniMax');
+    expect(record?.requestedModel).toBe('MiniMax-M2.7');
+    expect(record?.modelDisplay).toBe('MiniMax-M2.7');
+    expect(record?.qwenModel).toBe('MiniMax-M2.7');
+    expect(record?.presetContextWindow).toBe(200000);
+  });
+
+  it('uses preset context window for qwen preset usage updates', async () => {
+    await launchSession({
+      name: SESSION,
+      projectName: 'qwene2e',
+      role: 'brain',
+      agentType: 'qwen',
+      projectDir: '/tmp/qwen-e2e',
+      ccPreset: 'MiniMax',
+    });
+
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({
+      type: 'session.send',
+      session: SESSION,
+      text: 'hello',
+      commandId: 'cmd-qwen-preset-ctx',
+    }, serverLink);
+    await flushAsync();
+
+    const usage = mocks.emitted.find((e) => e.session === SESSION && e.type === 'usage.update');
+    expect(usage?.payload.model).toBe('MiniMax-M2.7');
+    expect(usage?.payload.contextWindow).toBe(200000);
+  });
+
   it('finalizes a streaming transport error onto the same eventId instead of appending a second message', async () => {
     await launchSession({
       name: SESSION,
@@ -370,6 +464,116 @@ describe('qwen transport flow e2e', () => {
 
     const final = mocks.emitted.find((e) => e.session === SESSION && e.type === 'assistant.text' && e.payload.streaming === false);
     expect(final?.payload.text).toBe('Qwen: hello after restart');
+  });
+
+  it('restores qwen preset sessions with preset model even when runtime catalog does not list it', async () => {
+    const restoreSession = `${SESSION}_restore`;
+    mocks.store.set(restoreSession, {
+      name: restoreSession,
+      projectName: 'qwene2e',
+      role: 'brain',
+      agentType: 'qwen',
+      projectDir: '/tmp/qwen-e2e',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'qwen',
+      providerSessionId: 'route-qwen-preset',
+      ccPreset: 'MiniMax',
+      requestedModel: 'MiniMax-M2.7',
+      activeModel: 'MiniMax-M2.7',
+      modelDisplay: 'MiniMax-M2.7',
+    });
+
+    await connectProvider('qwen', {});
+    await restoreTransportSessions('qwen');
+
+    const provider = (await import('../../src/agent/provider-registry.js')).getProvider('qwen') as InstanceType<typeof mocks.MockQwenProvider> | undefined;
+    const restored = provider?.created.at(-1);
+    expect(restored).toEqual(expect.objectContaining({
+      bindExistingKey: 'route-qwen-preset',
+      skipCreate: true,
+      agentId: 'MiniMax-M2.7',
+      env: expect.objectContaining({
+        ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+        ANTHROPIC_API_KEY: 'test-token',
+        ANTHROPIC_MODEL: 'MiniMax-M2.7',
+        OPENAI_BASE_URL: 'https://api.minimax.io/anthropic',
+        OPENAI_API_KEY: 'test-token',
+      }),
+      settings: expect.objectContaining({
+        security: { auth: { selectedType: 'anthropic' } },
+        model: { name: 'MiniMax-M2.7' },
+      }),
+    }));
+
+    const record = mocks.store.get(restoreSession);
+    expect(record?.requestedModel).toBe('MiniMax-M2.7');
+    expect(record?.activeModel).toBe('MiniMax-M2.7');
+    expect(record?.modelDisplay).toBe('MiniMax-M2.7');
+  });
+
+  it('allows /model switch to preset model when runtime catalog does not list it', async () => {
+    // The Qwen CLI's availableModels list does NOT include MiniMax-M2.7
+    // (mock returns only qwen3.5-plus etc.). A session with MiniMax preset
+    // has qwenAvailableModels populated with MiniMax-M2.7 at launch. The
+    // /model command must accept the preset model using the session record,
+    // not reject it because runtimeConfig.availableModels is stale.
+    const modelSession = `${SESSION}_model_switch`;
+    mocks.store.set(modelSession, {
+      name: modelSession,
+      projectName: 'qwene2e',
+      role: 'brain',
+      agentType: 'qwen',
+      projectDir: '/tmp/qwen-e2e',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'qwen',
+      providerSessionId: 'route-qwen-model-switch',
+      ccPreset: 'MiniMax',
+      requestedModel: 'MiniMax-M2.7',
+      activeModel: 'MiniMax-M2.7',
+      modelDisplay: 'MiniMax-M2.7',
+      qwenAvailableModels: ['MiniMax-M2.7'],
+    });
+
+    await connectProvider('qwen', {});
+    await restoreTransportSessions('qwen');
+
+    const serverLink = { send: vi.fn(), daemonVersion: 'test' } as any;
+    handleWebCommand({
+      type: 'session.send',
+      session: modelSession,
+      text: '/model MiniMax-M2.7',
+      commandId: 'cmd-model-switch',
+    }, serverLink);
+    await flushAsync();
+
+    // Must NOT emit unknown model error — session qwenAvailableModels is authoritative
+    const errorEvent = mocks.emitted.find((e) =>
+      e.session === modelSession && e.type === 'assistant.text'
+      && (e.payload.text as string)?.includes('Unknown Qwen model'),
+    );
+    expect(errorEvent).toBeUndefined();
+
+    // Model switch must be accepted
+    const ack = mocks.emitted.find((e) =>
+      e.session === modelSession && e.type === 'command.ack'
+      && (e.payload as Record<string, unknown>).commandId === 'cmd-model-switch',
+    );
+    expect(ack).toEqual(expect.objectContaining({
+      payload: expect.objectContaining({ status: 'accepted' }),
+    }));
+
+    const provider = (await import('../../src/agent/provider-registry.js')).getProvider('qwen') as InstanceType<typeof mocks.MockQwenProvider> | undefined;
+    expect(provider?.modelBySession.get('route-qwen-model-switch')).toBe('MiniMax-M2.7');
   });
 
   it('keeps queued transport messages stable across timeline and session list updates', async () => {

@@ -1,4 +1,5 @@
 import type { TransportProvider } from './transport-provider.js';
+import type { TransportAttachment } from '../../shared/transport-attachments.js';
 import { selectRuntimeAuthoredContext } from './authored-context.js';
 import { evaluateContextAuthority } from './context-authority.js';
 import { buildContextDiagnostics } from './context-diagnostics.js';
@@ -20,7 +21,7 @@ export interface TransportRuntimeAssemblyInput {
   description?: string;
   systemPrompt?: string;
   messagePreamble?: string;
-  attachments?: unknown[];
+  attachments?: TransportAttachment[];
   namespace?: ContextNamespace;
   namespaceDiagnostics?: string[];
   remoteProcessedFreshness?: 'fresh' | 'stale' | 'missing';
@@ -105,15 +106,10 @@ export function buildProviderContextPayload(
     projectId: 'transport-default',
   };
   const { supportClass, authority } = resolveTransportDispatchAuthority(provider, input);
-  const sanitizedRecall = authority.authoritySource === 'processed_local'
-    ? {
-        startupMemory: input.startupMemory,
-        memoryRecall: input.memoryRecall,
-      }
-    : {
-        startupMemory: undefined,
-        memoryRecall: undefined,
-      };
+  const sanitizedRecall = {
+    startupMemory: authority.authoritySource === 'processed_local' ? input.startupMemory : undefined,
+    memoryRecall: input.memoryRecall,
+  };
   const compiledContextInput = composeTransportMemoryInputs({
     ...input,
     startupMemory: sanitizedRecall.startupMemory,
@@ -132,7 +128,7 @@ export function buildProviderContextPayload(
     if (!diagnostics.includes(entry)) diagnostics.push(entry);
   }
   if (input.startupMemory) diagnostics.push(authority.authoritySource === 'processed_local' ? 'memory:start' : 'memory:start:suppressed-authority');
-  if (input.memoryRecall) diagnostics.push(authority.authoritySource === 'processed_local' ? 'memory:message' : 'memory:message:suppressed-authority');
+  if (input.memoryRecall) diagnostics.push(authority.authoritySource === 'processed_local' ? 'memory:message' : 'memory:message:local-auxiliary');
   const recallInjectionSurface: MemoryRecallInjectionSurface = supportClass === 'degraded-message-side-context-mapping'
     ? 'degraded-message-side'
     : 'normalized-payload';

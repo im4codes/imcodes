@@ -547,4 +547,178 @@ describe('useTimeline global cache bounds', () => {
       expect(screen.getByTestId('server-a-remount').textContent).toBe('1');
     });
   });
+
+  it('hydrates an empty transport timeline from chat.history before authoritative history arrives', async () => {
+    const sessionName = `deck_transport_history_${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest: () => 'history-transport',
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events, loading } = useTimeline(sessionName, ws, 'srv');
+      return h(
+        'div',
+        {
+          'data-testid': 'probe',
+          'data-loading': String(loading),
+        },
+        events.map((event) => `${event.type}:${String(event.payload.text ?? event.payload.output ?? '')}`).join('|'),
+      );
+    }
+
+    render(h(Probe));
+
+    await act(async () => {
+      handler?.({
+        type: 'chat.history',
+        sessionId: sessionName,
+        events: [
+          { type: 'user.message', sessionId: sessionName, text: 'hello', _ts: 10 },
+          { type: 'assistant.text', sessionId: sessionName, text: 'world', _ts: 11 },
+        ],
+      } as ServerMessage);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').getAttribute('data-loading')).toBe('false');
+      expect(screen.getByTestId('probe').textContent).toBe('user.message:hello|assistant.text:world');
+    });
+  });
+
+  it('replaces provisional transport history with authoritative timeline.history instead of duplicating it', async () => {
+    const sessionName = `deck_transport_history_replace_${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest: () => 'history-transport-replace',
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, ws, 'srv');
+      return h('div', { 'data-testid': 'probe' }, events.map((event) => String(event.payload.text ?? '')).join('|'));
+    }
+
+    render(h(Probe));
+
+    await act(async () => {
+      handler?.({
+        type: 'chat.history',
+        sessionId: sessionName,
+        events: [
+          { type: 'assistant.text', sessionId: sessionName, text: 'provisional', _ts: 10 },
+        ],
+      } as ServerMessage);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('provisional');
+    });
+
+    await act(async () => {
+      handler?.({
+        type: 'timeline.history',
+        sessionName,
+        requestId: 'history-transport-replace',
+        epoch: 1,
+        events: [
+          {
+            eventId: `${sessionName}-1`,
+            sessionId: sessionName,
+            ts: 20,
+            epoch: 1,
+            seq: 1,
+            source: 'daemon',
+            confidence: 'high',
+            type: 'assistant.text',
+            payload: { text: 'authoritative', streaming: false },
+          },
+        ],
+      } as ServerMessage);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('authoritative');
+    });
+  });
+
+  it('passes afterTs on browser-reconnect history request so the server gap-fills only missed events', async () => {
+    // Regression: when the browser WS reconnected after a mobile background
+    // the client fired a blank full-history request, which dumped at most
+    // MAX_MEMORY_EVENTS (300) of recent events. Gaps longer than that window
+    // silently dropped events. Now we compute the max ts of events already
+    // rendered and pass it as afterTs so the server replays only the delta.
+    const sessionName = `deck_reconnect_after_ts_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const sendTimelineHistoryRequest = vi.fn(() => 'history-reconnect');
+
+    // Seed the shared cache so the hook mounts with known events — the
+    // most recent has ts=5000, which should become afterTs on reconnect.
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-ingest-1`,
+      sessionId: sessionName,
+      ts: 3000,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'older' },
+    }, serverId);
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-ingest-2`,
+      sessionId: sessionName,
+      ts: 5000,
+      epoch: 1,
+      seq: 2,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'newest' },
+    }, serverId);
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest,
+    } as unknown as WsClient;
+
+    function Probe() {
+      useTimeline(sessionName, ws, serverId);
+      return h('div', { 'data-testid': 'probe' }, 'mounted');
+    }
+
+    render(h(Probe));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('mounted');
+    });
+
+    // Initial mount triggers a blank full-history request.
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300);
+    sendTimelineHistoryRequest.mockClear();
+
+    // Simulate browser WS reconnect. useTimeline should now gap-fill using
+    // afterTs = max ts of currently-rendered events (5000).
+    await act(async () => {
+      handler?.({ type: 'session.event', event: 'connected', session: '', state: 'connected' } as ServerMessage);
+    });
+
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300, 5000);
+  });
 });

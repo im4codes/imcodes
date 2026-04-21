@@ -21,6 +21,20 @@ import { DAEMON_MSG } from '../../../shared/daemon-events.js';
 import { REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
 import { TRANSPORT_RELAY_TYPES, TRANSPORT_MSG } from '../../../shared/transport-events.js';
 import {
+  MSG_COMMAND_ACK,
+  MSG_COMMAND_FAILED,
+  MSG_DAEMON_ONLINE,
+  MSG_DAEMON_OFFLINE,
+  ACK_FAILURE_DAEMON_OFFLINE,
+  ACK_FAILURE_ACK_TIMEOUT,
+  ACK_FAILURE_DAEMON_ERROR,
+  RECONNECT_GRACE_MS,
+  ACK_TIMEOUT_MS,
+  ACK_DEDUP_TTL_MS,
+  INFLIGHT_GC_TTL_MS,
+  type AckFailureReason,
+} from '../../../shared/ack-protocol.js';
+import {
   PREVIEW_BINARY_FRAME,
   PREVIEW_ERROR,
   PREVIEW_LIMITS,
@@ -218,6 +232,20 @@ function mergeRecentTextRows(rows: WatchRecentTextRow[]): WatchRecentTextRow[] {
   return merged;
 }
 
+// ── Inflight command bookkeeping (ack reliability) ───────────────────────
+
+type InflightState = 'buffered' | 'dispatched' | 'acked';
+
+interface InflightCommand {
+  commandId: string;
+  sessionName: string;
+  browser: WebSocket;
+  rawPayload: string;          // the original session.send JSON as received from browser
+  state: InflightState;
+  sentAt: number;              // when the inflight was created (dispatch or buffer)
+  timeoutTimer: ReturnType<typeof setTimeout> | null;
+}
+
 // Periodic cleanup interval handle (module-level, shared across all bridge instances)
 let cleanupSweepHandle: ReturnType<typeof setInterval> | null = null;
 
@@ -324,6 +352,18 @@ export class WsBridge {
    * session → browser → queue
    */
   private terminalQueues = new Map<string, Map<WebSocket, TerminalForwardQueue>>();
+
+  // ── Command ack reliability (see shared/ack-protocol.ts) ────────────────
+  /** commandId → inflight state; sticky-pod makes this authoritative per daemon. */
+  private inflightCommands = new Map<string, InflightCommand>();
+  /** LRU-ish dedup for replayed acks from daemon outbox flushes. */
+  private seenCommandAcks = new Map<string, number>();
+  /** Set while the daemon WS is closed but we're still inside the grace window. */
+  private graceTimer: ReturnType<typeof setTimeout> | null = null;
+  /** True iff we have broadcast `daemon.offline` for the current outage (resets on online). */
+  private daemonOfflineAnnounced = false;
+  /** Periodic GC for inflightCommands + seenCommandAcks. */
+  private ackHousekeepingTimer: ReturnType<typeof setInterval> | null = null;
 
   private constructor(private serverId: string) {
     // Start periodic cleanup sweep (shared across all bridge instances)
@@ -464,6 +504,16 @@ export class WsBridge {
           }
         }
 
+        // ── Ack reliability: cancel grace, replay inflight, announce online ──
+        if (this.graceTimer) {
+          clearTimeout(this.graceTimer);
+          this.graceTimer = null;
+        }
+        this.daemonOfflineAnnounced = false;
+        this.replayInflightToDaemon();
+        this.broadcastToBrowsers(JSON.stringify({ type: MSG_DAEMON_ONLINE }));
+        this.startAckHousekeepingIfNeeded();
+
         return;
       }
 
@@ -530,6 +580,15 @@ export class WsBridge {
         updateServerStatus(db, this.serverId, 'offline').catch((err) =>
           logger.error({ err }, 'Failed to mark server offline'),
         );
+
+        // ── Ack reliability: start grace window, don't yet announce offline ──
+        // If daemon reconnects within RECONNECT_GRACE_MS, we replay inflight
+        // commands and users never see a failure.
+        if (this.graceTimer) clearTimeout(this.graceTimer);
+        this.graceTimer = setTimeout(() => {
+          this.graceTimer = null;
+          this.onReconnectGraceExpired();
+        }, RECONNECT_GRACE_MS);
       }
       this.maybeCleanup();
     });
@@ -587,6 +646,26 @@ export class WsBridge {
         if (!this.browserRateLimiter.check(browserId, BROWSER_RATE_LIMIT, BROWSER_RATE_WINDOW)) {
           logger.warn({ serverId: this.serverId, type: msg.type }, 'Browser rate limit exceeded — dropped');
           safeSend(ws, JSON.stringify({ type: 'error', code: 'rate_limited', message: 'Too many requests', originalType: msg.type, requestId: msg.requestId }));
+          // If the dropped message is a session.send, also emit command.failed
+          // so the web UI's optimistic bubble flips to failed immediately
+          // instead of waiting 30s for the client-side timeout. Without this,
+          // a mobile browser that flaps subscribe/unsubscribe can easily
+          // exceed the per-browser rate limit — the user then sees their
+          // send bubble spin for 30 full seconds with no signal why.
+          if (msg.type === 'session.send' && typeof msg.commandId === 'string') {
+            const rlSessionName = typeof msg.sessionName === 'string'
+              ? msg.sessionName
+              : (typeof msg.session === 'string' ? msg.session : '');
+            if (rlSessionName) {
+              safeSend(ws, JSON.stringify({
+                type: MSG_COMMAND_FAILED,
+                commandId: msg.commandId,
+                session: rlSessionName,
+                reason: ACK_FAILURE_DAEMON_ERROR,
+                retryable: true,
+              }));
+            }
+          }
           return;
         }
       }
@@ -675,6 +754,27 @@ export class WsBridge {
       if (msg.type === TRANSPORT_MSG.CHAT_UNSUBSCRIBE && typeof msg.sessionId === 'string') {
         this.transportSubscriptions.get(ws)?.delete(msg.sessionId);
         return;
+      }
+
+      // ── command.ack reliability: intercept session.send ────────────────
+      //
+      // Three cases:
+      //   1. daemon fully offline (past grace)       → immediately command.failed
+      //   2. daemon transiently offline (in grace)   → buffer + replay on reconnect
+      //   3. daemon online                           → forward + arm 5s ack timeout
+      //
+      // In all cases we record an inflight entry so that the later command.ack
+      // (or timeout / disconnect) can correlate back to the right browser.
+      if (msg.type === 'session.send' && typeof msg.commandId === 'string') {
+        const sessionName = typeof msg.sessionName === 'string'
+          ? msg.sessionName
+          : (typeof msg.session === 'string' ? msg.session : '');
+        if (sessionName) {
+          this.handleOutboundSessionSend(ws, msg.commandId, sessionName, raw);
+          return;
+        }
+        // Malformed: no sessionName — fall through to regular forwarding,
+        // the daemon will ignore it. Don't drop silently here.
       }
 
       this.sendToDaemon(raw);
@@ -911,11 +1011,22 @@ export class WsBridge {
     }
 
     // ── Command & subsession: session-scoped ──────────────────────────────────
-    if (type === 'command.ack') {
+    if (type === MSG_COMMAND_ACK) {
       const sessionName = msg.session as string | undefined;
       if (!sessionName) {
         logger.warn({ serverId: this.serverId }, 'command.ack missing session — discarded');
         return;
+      }
+      const commandId = typeof msg.commandId === 'string' ? msg.commandId : null;
+      if (commandId) {
+        // Dedup replayed acks from daemon outbox flush (sticky-pod keeps this
+        // LRU authoritative within a pod lifetime).
+        if (this.seenCommandAcks.has(commandId)) {
+          logger.debug({ serverId: this.serverId, commandId }, 'command.ack dedup — dropping replay');
+          return;
+        }
+        this.seenCommandAcks.set(commandId, Date.now());
+        this.clearInflightOnAck(commandId);
       }
       this.sendToSessionSubscribers(sessionName, JSON.stringify(msg));
       return;
@@ -1522,6 +1633,188 @@ export class WsBridge {
         this.browserSockets.delete(bs);
       }
     }
+  }
+
+  // ── Ack reliability helpers ────────────────────────────────────────────
+
+  /**
+   * Entry point for `session.send` interception. Registers an inflight entry
+   * and dispatches / buffers / fast-fails based on current daemon state.
+   */
+  private handleOutboundSessionSend(
+    ws: WebSocket,
+    commandId: string,
+    sessionName: string,
+    raw: string,
+  ): void {
+    // Guard: if we already have an inflight for this commandId, the browser is
+    // retrying / double-sending. The daemon-side user.message 5s dedup will
+    // absorb duplicates, but we still skip creating a second inflight entry.
+    if (this.inflightCommands.has(commandId)) {
+      this.sendToDaemon(raw);
+      return;
+    }
+
+    if (this.isDaemonConnected()) {
+      const entry: InflightCommand = {
+        commandId,
+        sessionName,
+        browser: ws,
+        rawPayload: raw,
+        state: 'dispatched',
+        sentAt: Date.now(),
+        timeoutTimer: null,
+      };
+      entry.timeoutTimer = setTimeout(() => this.onAckTimeout(commandId), ACK_TIMEOUT_MS);
+      this.inflightCommands.set(commandId, entry);
+      this.sendToDaemon(raw);
+      this.startAckHousekeepingIfNeeded();
+      return;
+    }
+
+    if (this.graceTimer) {
+      // Transient outage — buffer for replay when the daemon reconnects.
+      const entry: InflightCommand = {
+        commandId,
+        sessionName,
+        browser: ws,
+        rawPayload: raw,
+        state: 'buffered',
+        sentAt: Date.now(),
+        timeoutTimer: null,
+      };
+      this.inflightCommands.set(commandId, entry);
+      this.startAckHousekeepingIfNeeded();
+      return;
+    }
+
+    // Fully offline (grace already expired): fail fast.
+    this.emitCommandFailed(ws, commandId, sessionName, ACK_FAILURE_DAEMON_OFFLINE);
+  }
+
+  /** Replay buffered + dispatched commands to the daemon after reconnect. */
+  private replayInflightToDaemon(): void {
+    const ordered = [...this.inflightCommands.values()].sort((a, b) => a.sentAt - b.sentAt);
+    for (const entry of ordered) {
+      if (entry.state === 'acked') continue;
+      try {
+        this.sendToDaemon(entry.rawPayload);
+        if (entry.state === 'buffered') {
+          entry.state = 'dispatched';
+        }
+        // Arm (or re-arm) ack timeout from "now" — daemon's perspective.
+        if (entry.timeoutTimer) clearTimeout(entry.timeoutTimer);
+        entry.timeoutTimer = setTimeout(() => this.onAckTimeout(entry.commandId), ACK_TIMEOUT_MS);
+      } catch (err) {
+        logger.warn({ commandId: entry.commandId, err }, 'replayInflightToDaemon failed for entry');
+      }
+    }
+  }
+
+  /** Called when RECONNECT_GRACE_MS elapses without the daemon coming back. */
+  private onReconnectGraceExpired(): void {
+    if (this.authenticated) return;  // daemon actually came back — nothing to do
+    if (!this.daemonOfflineAnnounced) {
+      this.daemonOfflineAnnounced = true;
+      this.broadcastToBrowsers(JSON.stringify({ type: MSG_DAEMON_OFFLINE }));
+    }
+    for (const entry of [...this.inflightCommands.values()]) {
+      this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, ACK_FAILURE_DAEMON_OFFLINE);
+      this.removeInflight(entry.commandId);
+    }
+  }
+
+  /** Per-command ack timeout fired. */
+  private onAckTimeout(commandId: string): void {
+    const entry = this.inflightCommands.get(commandId);
+    if (!entry) return;
+    if (entry.state === 'acked') return;
+    logger.warn({ serverId: this.serverId, commandId, sessionName: entry.sessionName }, 'command.ack timeout');
+    this.emitCommandFailed(entry.browser, commandId, entry.sessionName, ACK_FAILURE_ACK_TIMEOUT);
+    this.removeInflight(commandId);
+  }
+
+  /** Ack arrived — clear timer + mark acked. */
+  private clearInflightOnAck(commandId: string): void {
+    const entry = this.inflightCommands.get(commandId);
+    if (!entry) return;
+    entry.state = 'acked';
+    if (entry.timeoutTimer) {
+      clearTimeout(entry.timeoutTimer);
+      entry.timeoutTimer = null;
+    }
+    // Leave the entry around briefly for housekeeping GC so duplicate acks
+    // still hit dedup via `seenCommandAcks`.
+    this.removeInflight(commandId);
+  }
+
+  private removeInflight(commandId: string): void {
+    const entry = this.inflightCommands.get(commandId);
+    if (!entry) return;
+    if (entry.timeoutTimer) {
+      clearTimeout(entry.timeoutTimer);
+      entry.timeoutTimer = null;
+    }
+    this.inflightCommands.delete(commandId);
+  }
+
+  private emitCommandFailed(
+    browser: WebSocket,
+    commandId: string,
+    sessionName: string,
+    reason: AckFailureReason,
+  ): void {
+    const payload = {
+      type: MSG_COMMAND_FAILED,
+      commandId,
+      session: sessionName,
+      reason,
+      retryable: true,
+    };
+    try {
+      if (browser.readyState === WebSocket.OPEN) {
+        browser.send(JSON.stringify(payload));
+      }
+    } catch (err) {
+      logger.warn({ commandId, err }, 'failed to deliver command.failed to browser');
+    }
+  }
+
+  /** Start periodic GC timer (idempotent). */
+  private startAckHousekeepingIfNeeded(): void {
+    if (this.ackHousekeepingTimer) return;
+    this.ackHousekeepingTimer = setInterval(() => this.ackHousekeepingSweep(), 15_000);
+    this.ackHousekeepingTimer.unref?.();
+  }
+
+  private ackHousekeepingSweep(): void {
+    const now = Date.now();
+    // GC stale inflight entries (shouldn't happen unless timers misfire)
+    for (const [id, entry] of this.inflightCommands) {
+      if (now - entry.sentAt > INFLIGHT_GC_TTL_MS) {
+        logger.warn({ commandId: id, ageMs: now - entry.sentAt }, 'inflight GC: dropping stale entry');
+        this.removeInflight(id);
+      }
+    }
+    // GC dedup LRU
+    for (const [id, ts] of this.seenCommandAcks) {
+      if (now - ts > ACK_DEDUP_TTL_MS) this.seenCommandAcks.delete(id);
+    }
+    if (this.inflightCommands.size === 0 && this.seenCommandAcks.size === 0 && this.ackHousekeepingTimer) {
+      clearInterval(this.ackHousekeepingTimer);
+      this.ackHousekeepingTimer = null;
+    }
+  }
+
+  /** Test-only accessor; prefer narrow APIs in production code. */
+  _getInflightCountForTest(): number {
+    return this.inflightCommands.size;
+  }
+  _isDaemonOfflineAnnouncedForTest(): boolean {
+    return this.daemonOfflineAnnounced;
+  }
+  _hasSeenAckForTest(commandId: string): boolean {
+    return this.seenCommandAcks.has(commandId);
   }
 
   /** Force-close the daemon WebSocket. Use after token rotation to evict the stale connection. */

@@ -2,6 +2,13 @@ import type { ContextModelConfig, SharedContextRuntimeBackend } from './context-
 import { DEFAULT_PRIMARY_CONTEXT_MODEL } from './context-model-defaults.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../src/shared/models/options.js';
 import { QWEN_MODEL_IDS } from './qwen-models.js';
+import {
+  DEFAULT_MEMORY_SCORING_WEIGHTS,
+  MEMORY_SCORING_WEIGHT_STEP,
+  normalizeMemoryScoringWeights,
+  RECALL_MIN_FLOOR,
+} from './memory-scoring.js';
+export { DEFAULT_MEMORY_SCORING_WEIGHTS, normalizeMemoryScoringWeights } from './memory-scoring.js';
 
 export const SHARED_CONTEXT_RUNTIME_BACKENDS = ['claude-code-sdk', 'codex-sdk', 'qwen', 'openclaw'] as const satisfies readonly SharedContextRuntimeBackend[];
 export const DEFAULT_PRIMARY_CONTEXT_BACKEND: SharedContextRuntimeBackend = 'claude-code-sdk';
@@ -20,6 +27,14 @@ export const SHARED_CONTEXT_RUNTIME_CONFIG_ERROR = {
   INVALID_CONFIG: 'invalid_shared_context_runtime_config',
 } as const;
 
+export const DEFAULT_MEMORY_RECALL_MIN_SCORE = RECALL_MIN_FLOOR;
+export const MEMORY_RECALL_MIN_SCORE_MIN = 0;
+export const MEMORY_RECALL_MIN_SCORE_MAX = 1;
+export const MEMORY_RECALL_MIN_SCORE_STEP = 0.01;
+export const MEMORY_SCORING_WEIGHT_MIN = 0;
+export const MEMORY_SCORING_WEIGHT_MAX = 1;
+export const MEMORY_SCORING_WEIGHT_INPUT_STEP = MEMORY_SCORING_WEIGHT_STEP;
+
 export interface SharedContextRuntimeConfigSnapshot {
   persisted: ContextModelConfig;
   effective: ContextModelConfig;
@@ -33,10 +48,21 @@ export function defaultSharedContextRuntimeConfig(): ContextModelConfig {
   return {
     primaryContextBackend: DEFAULT_PRIMARY_CONTEXT_BACKEND,
     primaryContextModel: DEFAULT_CONTEXT_MODEL_BY_BACKEND[DEFAULT_PRIMARY_CONTEXT_BACKEND],
+    primaryContextPreset: undefined,
     backupContextBackend: undefined,
     backupContextModel: undefined,
+    backupContextPreset: undefined,
+    memoryRecallMinScore: DEFAULT_MEMORY_RECALL_MIN_SCORE,
+    memoryScoringWeights: { ...DEFAULT_MEMORY_SCORING_WEIGHTS },
     enablePersonalMemorySync: false,
   };
+}
+
+export function normalizeMemoryRecallMinScore(value: number | null | undefined): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_MEMORY_RECALL_MIN_SCORE;
+  if (value <= MEMORY_RECALL_MIN_SCORE_MIN) return MEMORY_RECALL_MIN_SCORE_MIN;
+  if (value >= MEMORY_RECALL_MIN_SCORE_MAX) return MEMORY_RECALL_MIN_SCORE_MAX;
+  return Math.round(value * 100) / 100;
 }
 
 export function normalizeSharedContextRuntimeBackend(value: string | null | undefined): SharedContextRuntimeBackend | undefined {
@@ -60,7 +86,15 @@ export function getDefaultSharedContextModelForBackend(backend: SharedContextRun
   return DEFAULT_CONTEXT_MODEL_BY_BACKEND[backend];
 }
 
-export function isKnownSharedContextModelForBackend(backend: SharedContextRuntimeBackend, model: string | null | undefined): boolean {
+export function doesSharedContextBackendSupportPresets(backend: SharedContextRuntimeBackend | null | undefined): boolean {
+  return backend === 'qwen';
+}
+
+export function isKnownSharedContextModelForBackend(
+  backend: SharedContextRuntimeBackend,
+  model: string | null | undefined,
+  preset?: string | null | undefined,
+): boolean {
   const trimmed = model?.trim();
   if (!trimmed) return false;
   switch (backend) {
@@ -69,7 +103,9 @@ export function isKnownSharedContextModelForBackend(backend: SharedContextRuntim
     case 'codex-sdk':
       return CODEX_MODEL_IDS.includes(trimmed as typeof CODEX_MODEL_IDS[number]);
     case 'qwen':
-      return QWEN_MODEL_IDS.includes(trimmed as typeof QWEN_MODEL_IDS[number]);
+      return preset?.trim()
+        ? true
+        : QWEN_MODEL_IDS.includes(trimmed as typeof QWEN_MODEL_IDS[number]);
     case 'openclaw':
       return true;
   }
@@ -80,37 +116,54 @@ function trimModelValue(value: string | undefined): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
+function normalizeSharedContextPresetValue(
+  backend: SharedContextRuntimeBackend | undefined,
+  preset: string | undefined,
+): string | undefined {
+  const trimmed = trimModelValue(preset);
+  if (!trimmed || !backend || !doesSharedContextBackendSupportPresets(backend)) return undefined;
+  return trimmed;
+}
+
 export function normalizeSharedContextRuntimeConfig(
   input: Partial<ContextModelConfig> | null | undefined,
 ): ContextModelConfig {
   const normalizedPrimaryBackend = normalizeSharedContextRuntimeBackend(input?.primaryContextBackend)
     ?? inferSharedContextRuntimeBackend(input?.primaryContextModel)
     ?? DEFAULT_PRIMARY_CONTEXT_BACKEND;
+  const primaryContextPreset = normalizeSharedContextPresetValue(normalizedPrimaryBackend, input?.primaryContextPreset);
   const rawPrimaryContextModel = trimModelValue(input?.primaryContextModel);
-  const primaryContextModel = rawPrimaryContextModel && isKnownSharedContextModelForBackend(normalizedPrimaryBackend, rawPrimaryContextModel)
+  const primaryContextModel = rawPrimaryContextModel && isKnownSharedContextModelForBackend(normalizedPrimaryBackend, rawPrimaryContextModel, primaryContextPreset)
     ? rawPrimaryContextModel
     : getDefaultSharedContextModelForBackend(normalizedPrimaryBackend);
   const normalizedBackupBackendCandidate = normalizeSharedContextRuntimeBackend(input?.backupContextBackend)
     ?? inferSharedContextRuntimeBackend(input?.backupContextModel);
   const rawBackupContextModel = trimModelValue(input?.backupContextModel);
   const backupContextBackend = normalizedBackupBackendCandidate;
+  const backupContextPreset = normalizeSharedContextPresetValue(backupContextBackend, input?.backupContextPreset);
   const backupContextModel = backupContextBackend
     ? (rawBackupContextModel
-      ? (isKnownSharedContextModelForBackend(backupContextBackend, rawBackupContextModel)
+      ? (isKnownSharedContextModelForBackend(backupContextBackend, rawBackupContextModel, backupContextPreset)
         ? rawBackupContextModel
         : getDefaultSharedContextModelForBackend(backupContextBackend))
       : getDefaultSharedContextModelForBackend(backupContextBackend))
     : undefined;
   const rawMinInterval = input?.materializationMinIntervalMs;
   const materializationMinIntervalMs = typeof rawMinInterval === 'number' && rawMinInterval > 0 ? rawMinInterval : undefined;
+  const memoryRecallMinScore = normalizeMemoryRecallMinScore(input?.memoryRecallMinScore);
+  const memoryScoringWeights = normalizeMemoryScoringWeights(input?.memoryScoringWeights);
   return {
     primaryContextBackend: normalizedPrimaryBackend,
     primaryContextModel,
+    primaryContextPreset,
     primaryContextSdk: trimModelValue(input?.primaryContextSdk),
     backupContextBackend,
     backupContextModel,
+    backupContextPreset,
     backupContextSdk: trimModelValue(input?.backupContextSdk),
     materializationMinIntervalMs,
+    memoryRecallMinScore,
+    memoryScoringWeights,
     enablePersonalMemorySync: input?.enablePersonalMemorySync === true,
   };
 }
