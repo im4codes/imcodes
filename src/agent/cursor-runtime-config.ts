@@ -18,6 +18,7 @@ export interface CursorRuntimeConfig {
 }
 
 let cached: { expiresAt: number; value: CursorRuntimeConfig } | null = null;
+let inFlightProbe: Promise<CursorRuntimeConfig> | null = null;
 
 /** Strip ANSI escape codes that the cursor CLI emits when stdout is a TTY.
  *  Works on a best-effort basis — we only need clean lines for parsing. */
@@ -82,31 +83,42 @@ async function execFileStdout(file: string, args: string[]): Promise<string> {
 export async function getCursorRuntimeConfig(force = false): Promise<CursorRuntimeConfig> {
   const now = Date.now();
   if (!force && cached && cached.expiresAt > now) return cached.value;
+  // Share a single in-flight probe across concurrent callers. The two
+  // `cursor-agent` exec calls take up to PROBE_TIMEOUT_MS (10s) each — without
+  // this dedupe, every cache-miss caller (session-list, command-handler,
+  // session-manager) would start its own pair of execs in parallel.
+  if (inFlightProbe) return inFlightProbe;
+  inFlightProbe = (async () => {
+    try {
+      const resolved = resolveExecutableForSpawn(CURSOR_BIN);
+      let modelsOut = '';
+      try {
+        modelsOut = await execFileStdout(resolved.executable, [...resolved.prependArgs, '--list-models']);
+      } catch (err) {
+        logger.warn({ err }, 'cursor-agent --list-models probe failed');
+      }
+      let statusOut = '';
+      try {
+        statusOut = await execFileStdout(resolved.executable, [...resolved.prependArgs, 'status']);
+      } catch (err) {
+        logger.debug({ err }, 'cursor-agent status probe failed');
+      }
 
-  const resolved = resolveExecutableForSpawn(CURSOR_BIN);
-  let modelsOut = '';
-  try {
-    modelsOut = await execFileStdout(resolved.executable, [...resolved.prependArgs, '--list-models']);
-  } catch (err) {
-    logger.warn({ err }, 'cursor-agent --list-models probe failed');
-  }
-  let statusOut = '';
-  try {
-    statusOut = await execFileStdout(resolved.executable, [...resolved.prependArgs, 'status']);
-  } catch (err) {
-    logger.debug({ err }, 'cursor-agent status probe failed');
-  }
-
-  const { availableModels, defaultModel } = parseListModelsOutput(modelsOut);
-  const auth = parseStatusOutput(statusOut);
-  const value: CursorRuntimeConfig = {
-    availableModels,
-    ...(defaultModel ? { defaultModel } : {}),
-    ...(auth.loggedInAs ? { loggedInAs: auth.loggedInAs } : {}),
-    isAuthenticated: auth.isAuthenticated,
-  };
-  cached = { expiresAt: now + CACHE_TTL_MS, value };
-  return value;
+      const { availableModels, defaultModel } = parseListModelsOutput(modelsOut);
+      const auth = parseStatusOutput(statusOut);
+      const value: CursorRuntimeConfig = {
+        availableModels,
+        ...(defaultModel ? { defaultModel } : {}),
+        ...(auth.loggedInAs ? { loggedInAs: auth.loggedInAs } : {}),
+        isAuthenticated: auth.isAuthenticated,
+      };
+      cached = { expiresAt: Date.now() + CACHE_TTL_MS, value };
+      return value;
+    } finally {
+      inFlightProbe = null;
+    }
+  })();
+  return inFlightProbe;
 }
 
 /** Exposed for tests. */
@@ -115,5 +127,6 @@ export const __cursorRuntimeConfigInternals = {
   parseStatusOutput,
   clearCache: () => {
     cached = null;
+    inFlightProbe = null;
   },
 };

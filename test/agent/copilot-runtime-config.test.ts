@@ -63,7 +63,11 @@ describe('getCopilotRuntimeConfig', () => {
     expect(config.isAuthenticated).toBe(true);
     expect(config.cliVersion).toBe('1.0.31');
     expect(config.probeError).toBeUndefined();
-    expect(stop).toHaveBeenCalledOnce();
+    // Singleton design: the CopilotClient is kept alive for the daemon's
+    // lifetime (see clientPromise in copilot-runtime-config.ts). stop() must
+    // NOT be called per probe — earlier we observed ~160MB-per-probe leaks
+    // because stop() didn't reliably reap the headless child process.
+    expect(stop).not.toHaveBeenCalled();
   });
 
   it('falls back to a curated list when listModels throws', async () => {

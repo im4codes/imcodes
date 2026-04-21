@@ -33,13 +33,41 @@ const FALLBACK_COPILOT_MODEL_IDS = [
   'claude-opus-4.5',
 ];
 
-async function probeCopilotSdk(): Promise<CopilotRuntimeConfig> {
-  let client: any = null;
-  try {
+// ── Singleton CopilotClient ──────────────────────────────────────────────────
+//
+// The `@github/copilot-sdk` CopilotClient owns a `copilot --headless` node
+// subprocess (~160MB RSS). Earlier revisions called `new CopilotClient() →
+// start() → stop()` on every probe, but `stop()` does not reliably reap the
+// headless child — the daemon observed 13+ leaked copilot procs in 2 minutes,
+// burning ~2GB. So we maintain ONE client for the daemon's lifetime and
+// simply re-invoke `getStatus`/`listModels`/`getAuthStatus` against it.
+//
+// `clientPromise` also doubles as a concurrent-call dedupe: multiple probes
+// racing through the cache-miss branch await the same init, instead of each
+// spawning its own subprocess.
+
+let clientPromise: Promise<unknown> | null = null;
+let inFlightProbe: Promise<CopilotRuntimeConfig> | null = null;
+
+async function getCopilotClient(): Promise<unknown> {
+  if (clientPromise) return clientPromise;
+  clientPromise = (async () => {
     const sdk = await import('@github/copilot-sdk');
-    // Intentionally do NOT pass cliPath — let the SDK use its bundled CLI.
-    client = new sdk.CopilotClient({ autoStart: false });
+    const client = new sdk.CopilotClient({ autoStart: false });
     await client.start();
+    return client;
+  })().catch((err) => {
+    // On start failure, tear down the promise so the next call retries —
+    // otherwise every future call would resolve to the same failed promise.
+    clientPromise = null;
+    throw err;
+  });
+  return clientPromise;
+}
+
+async function probeCopilotSdk(): Promise<CopilotRuntimeConfig> {
+  try {
+    const client = await getCopilotClient() as any;
     let cliVersion: string | undefined;
     try {
       const status = await client.getStatus();
@@ -90,21 +118,27 @@ async function probeCopilotSdk(): Promise<CopilotRuntimeConfig> {
       isAuthenticated: false,
       probeError: message,
     };
-  } finally {
-    if (client) {
-      try { await client.stop(); } catch { /* best-effort */ }
-    }
   }
 }
 
 /** Fetch the current Copilot runtime config (available models + auth state).
- *  Cached for {@link CACHE_TTL_MS} unless `force` is true. Never throws. */
+ *  Cached for {@link CACHE_TTL_MS} unless `force` is true. Never throws.
+ *  Concurrent callers share a single in-flight probe so we never spawn more
+ *  than one CopilotClient (see `clientPromise` comment). */
 export async function getCopilotRuntimeConfig(force = false): Promise<CopilotRuntimeConfig> {
   const now = Date.now();
   if (!force && cached && cached.expiresAt > now) return cached.value;
-  const value = await probeCopilotSdk();
-  cached = { expiresAt: now + CACHE_TTL_MS, value };
-  return value;
+  if (inFlightProbe) return inFlightProbe;
+  inFlightProbe = (async () => {
+    try {
+      const value = await probeCopilotSdk();
+      cached = { expiresAt: Date.now() + CACHE_TTL_MS, value };
+      return value;
+    } finally {
+      inFlightProbe = null;
+    }
+  })();
+  return inFlightProbe;
 }
 
 export const COPILOT_FALLBACK_MODEL_IDS = FALLBACK_COPILOT_MODEL_IDS;
@@ -113,5 +147,7 @@ export const COPILOT_FALLBACK_MODEL_IDS = FALLBACK_COPILOT_MODEL_IDS;
 export const __copilotRuntimeConfigInternals = {
   clearCache: () => {
     cached = null;
+    inFlightProbe = null;
+    clientPromise = null;
   },
 };
