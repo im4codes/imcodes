@@ -311,7 +311,7 @@
     "timeout": "请求超时",
     "timeout_detail": "无法读取目录。可能是由网络驱动器缓慢或不可用引起的。",
     "preview_loading": "加载中…",
-    "preview_too_large": "文件过大，无法预览（> 512 KB）",
+    "preview_too_large": "文件过大，无法预览（> 5 MB）",
     "preview_error": "预览不可用",
     "preview_binary": "二进制文件 — 无法预览",
     "mkdir_failed": "创建文件夹失败",

@@ -311,7 +311,7 @@
     "timeout": "Tiempo de espera agotado",
     "timeout_detail": "No se pudo leer el directorio. Puede ser causado por unidades de red lentas o no disponibles.",
     "preview_loading": "Cargando…",
-    "preview_too_large": "Archivo demasiado grande para previsualizar (> 512 KB)",
+    "preview_too_large": "Archivo demasiado grande para previsualizar (> 5 MB)",
     "preview_error": "Vista previa no disponible",
     "preview_binary": "Archivo binario — vista previa no disponible",
     "mkdir_failed": "No se pudo crear la carpeta",

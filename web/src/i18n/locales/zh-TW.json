@@ -311,7 +311,7 @@
     "timeout": "請求逾時",
     "timeout_detail": "無法讀取目錄。可能是由網路磁碟緩慢或不可用所導致。",
     "preview_loading": "載入中…",
-    "preview_too_large": "檔案過大，無法預覽（> 512 KB）",
+    "preview_too_large": "檔案過大，無法預覽（> 5 MB）",
     "preview_error": "預覽不可用",
     "preview_binary": "二進位檔案 — 無法預覽",
     "mkdir_failed": "建立資料夾失敗",

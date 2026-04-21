@@ -3692,6 +3692,100 @@ async function handleFileSearch(cmd: Record<string, unknown>, serverLink: Server
 }
 
 const FS_LIST_DEADLINE_MS = 10_000;
+const FS_LIST_CACHE_TTL_MS = 5_000;
+
+interface FsLsSnapshot {
+  resolvedPath: string;
+  dirSignature: string;
+  entries: Array<Record<string, unknown>>;
+}
+
+const fsListCache = new Map<string, { expiresAt: number; value: FsLsSnapshot }>();
+const fsListInflight = new Map<string, Promise<FsLsSnapshot>>();
+const fsListGenerations = new Map<string, number>();
+
+function getFsListCacheKey(realPath: string, includeFiles: boolean, includeMetadata: boolean): string {
+  return `${realPath}::${includeFiles ? 'files' : 'dirs'}::${includeMetadata ? 'meta' : 'plain'}`;
+}
+
+async function loadFsListSnapshot(real: string, includeFiles: boolean, includeMetadata: boolean): Promise<FsLsSnapshot> {
+  const dirents = await fsReaddir(real, { withFileTypes: true });
+  const filtered = dirents.filter((d) => d.isDirectory() || (includeFiles && d.isFile()));
+
+  const entries = await Promise.all(filtered.map(async (d) => {
+    const entry: Record<string, unknown> = { name: d.name, path: nodePath.join(real, d.name), isDir: d.isDirectory(), hidden: d.name.startsWith('.') };
+    if (includeMetadata && !d.isDirectory()) {
+      try {
+        const filePath = nodePath.join(real, d.name);
+        const fileStat = await fsStat(filePath);
+        entry.size = fileStat.size;
+        const ext = nodePath.extname(d.name).toLowerCase().slice(1);
+        entry.mime = MIME_MAP[ext] || undefined;
+        const handle = createProjectFileHandle(filePath, d.name, entry.mime as string | undefined, fileStat.size);
+        entry.downloadId = handle.id;
+      } catch { /* stat failed, skip metadata */ }
+    }
+    return entry;
+  }));
+
+  entries.sort((a, b) => {
+    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+    if (a.hidden !== b.hidden) return (a.hidden ? 1 : 0) - (b.hidden ? 1 : 0);
+    return (a.name as string).localeCompare(b.name as string);
+  });
+
+  return {
+    resolvedPath: real,
+    dirSignature: await safeStatSignature(real),
+    entries,
+  };
+}
+
+async function getFsListSnapshot(real: string, includeFiles: boolean, includeMetadata: boolean): Promise<FsLsSnapshot> {
+  const dirSignature = await safeStatSignature(real);
+  const cacheKey = getFsListCacheKey(real, includeFiles, includeMetadata);
+  const cached = fsListCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now() && cached.value.dirSignature === dirSignature) {
+    return cached.value;
+  }
+
+  const generation = getResourceGeneration(fsListGenerations, real);
+  const inflightKey = `${cacheKey}::${generation}`;
+  const inflight = fsListInflight.get(inflightKey);
+  if (inflight) return await inflight;
+
+  const promise = loadFsListSnapshot(real, includeFiles, includeMetadata)
+    .then(async (value) => {
+      const currentSignature = await safeStatSignature(real);
+      if (getResourceGeneration(fsListGenerations, real) === generation && currentSignature === value.dirSignature) {
+        fsListCache.set(cacheKey, { value, expiresAt: Date.now() + FS_LIST_CACHE_TTL_MS });
+      }
+      return value;
+    })
+    .finally(() => {
+      fsListInflight.delete(inflightKey);
+    });
+  fsListInflight.set(inflightKey, promise);
+  return await promise;
+}
+
+function invalidateFsListCachesForPath(targetPath: string): void {
+  const realTarget = normalizeFsPath(targetPath);
+  bumpResourceGeneration(fsListGenerations, realTarget);
+  fsListCache.delete(getFsListCacheKey(realTarget, false, false));
+  fsListCache.delete(getFsListCacheKey(realTarget, true, false));
+  fsListCache.delete(getFsListCacheKey(realTarget, false, true));
+  fsListCache.delete(getFsListCacheKey(realTarget, true, true));
+
+  const parent = nodePath.dirname(realTarget);
+  if (parent !== realTarget) {
+    bumpResourceGeneration(fsListGenerations, parent);
+    fsListCache.delete(getFsListCacheKey(parent, false, false));
+    fsListCache.delete(getFsListCacheKey(parent, true, false));
+    fsListCache.delete(getFsListCacheKey(parent, false, true));
+    fsListCache.delete(getFsListCacheKey(parent, true, true));
+  }
+}
 
 async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const rawPath = cmd.path as string | undefined;
@@ -3768,36 +3862,12 @@ async function handleFsListInner(resolved: string, rawPath: string, requestId: s
     return;
   }
 
-  const dirents = await fsReaddir(real, { withFileTypes: true });
-  const filtered = dirents.filter((d) => d.isDirectory() || (includeFiles && d.isFile()));
+  const snapshot = await getFsListSnapshot(real, includeFiles, includeMetadata);
 
-  const entries = await Promise.all(filtered.map(async (d) => {
-    const entry: Record<string, unknown> = { name: d.name, path: nodePath.join(real, d.name), isDir: d.isDirectory(), hidden: d.name.startsWith('.') };
-    if (includeMetadata && !d.isDirectory()) {
-      try {
-        const filePath = nodePath.join(real, d.name);
-        const fileStat = await fsStat(filePath);
-        entry.size = fileStat.size;
-        const ext = nodePath.extname(d.name).toLowerCase().slice(1);
-        entry.mime = MIME_MAP[ext] || undefined;
-        // Generate a short-lived download handle
-        const handle = createProjectFileHandle(filePath, d.name, entry.mime as string | undefined, fileStat.size);
-        entry.downloadId = handle.id;
-      } catch { /* stat failed, skip metadata */ }
-    }
-    return entry;
-  }));
-
-  entries.sort((a, b) => {
-    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
-    if (a.hidden !== b.hidden) return (a.hidden ? 1 : 0) - (b.hidden ? 1 : 0);
-    return (a.name as string).localeCompare(b.name as string);
-  });
-
-  try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', entries }); } catch { /* ignore */ }
+  try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: snapshot.resolvedPath, status: 'ok', entries: snapshot.entries }); } catch { /* ignore */ }
 }
 
-const FS_READ_SIZE_LIMIT = 512 * 1024; // 512 KB
+const FS_READ_SIZE_LIMIT = 5 * 1024 * 1024; // 5 MB
 
 interface FsReadSnapshot {
   path: string;
@@ -4485,6 +4555,7 @@ async function handleFsMkdir(cmd: Record<string, unknown>, serverLink: ServerLin
     const { mkdir } = await import('fs/promises');
     await mkdir(resolved, { recursive: true });
     const real = await fsRealpath(resolved);
+    invalidateFsListCachesForPath(real);
     try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, resolvedPath: real, status: 'ok' }); } catch { /* ignore */ }
   } catch (err) {
     try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: err instanceof Error ? err.message : String(err) }); } catch { /* ignore */ }
@@ -4553,6 +4624,7 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
       // Write the file
       await fsWriteFile(real, content, 'utf-8');
       const newStats = await fsStat(real);
+      invalidateFsListCachesForPath(real);
       invalidateGitCachesForPath(real);
       try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', mtime: newStats.mtimeMs }); } catch { /* ignore */ }
     } catch (err) {
@@ -4572,6 +4644,7 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
       await fsWriteFile(resolved, content, 'utf-8');
       const newStats = await fsStat(resolved);
       const real = await fsRealpath(resolved);
+      invalidateFsListCachesForPath(real);
       invalidateGitCachesForPath(real);
       try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', mtime: newStats.mtimeMs }); } catch { /* ignore */ }
     } catch (err) {
