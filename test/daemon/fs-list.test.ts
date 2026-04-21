@@ -19,9 +19,11 @@ const mockServerLink = {
 vi.mock('node:fs/promises', () => ({
   readdir: vi.fn(),
   realpath: vi.fn(),
+  stat: vi.fn(),
 }));
 const mockReaddir = vi.mocked(fsp.readdir);
 const mockRealpath = vi.mocked(fsp.realpath);
+const mockStat = vi.mocked(fsp.stat);
 
 // ── Pull the handler function out of command-handler indirectly ────────────
 // We test via handleWebCommand to keep the test at the public API level.
@@ -45,6 +47,7 @@ describe('fs.ls handler', () => {
     sent.length = 0;
     // Restore send implementation after clearAllMocks resets it
     mockServerLink.send.mockImplementation((msg: unknown) => { sent.push(msg); });
+    mockStat.mockResolvedValue({ mtimeMs: 1, size: 0 } as any);
   });
 
   afterEach(() => {
@@ -169,6 +172,25 @@ describe('fs.ls handler', () => {
     expect(resp.entries.map((e: any) => e.name)).toEqual(['src', '.git']);
     // README.md should not appear
     expect(resp.entries.every((e: any) => e.isDir)).toBe(true);
+  });
+
+  it('reuses a hot directory listing cache for repeated requests', async () => {
+    const testDir = path.join(homedir(), 'cached-dir');
+    mockRealpath.mockResolvedValue(testDir as unknown as string);
+    mockReaddir.mockResolvedValue([
+      makeDirent('src', true),
+      makeDirent('README.md', false),
+    ] as unknown as fsp.Dirent<string>[]);
+
+    handleWebCommand({ type: 'fs.ls', path: testDir, requestId: 'req-cache-1', includeFiles: true }, mockServerLink as any);
+    await flushAsync();
+    handleWebCommand({ type: 'fs.ls', path: testDir, requestId: 'req-cache-2', includeFiles: true }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockReaddir).toHaveBeenCalledTimes(1);
+    expect((sent[0] as any).status).toBe('ok');
+    expect((sent[1] as any).status).toBe('ok');
+    expect((sent[1] as any).entries.map((e: any) => e.name)).toEqual(['src', 'README.md']);
   });
 
   it('includes files when includeFiles is true', async () => {

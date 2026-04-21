@@ -244,6 +244,28 @@ describe('FileBrowser', () => {
     expect(getByText('documents')).toBeDefined();
   });
 
+  it('renders cached root entries immediately before refreshing live data', () => {
+    localStorage.setItem(
+      'rcc_fb_snapshot_v1:local:dirs:visible:/home/user',
+      JSON.stringify({
+        savedAt: Date.now(),
+        currentLabel: '/home/user',
+        rootChildren: [
+          { id: '/home/user/projects', name: 'projects', isDir: true, children: [] },
+          { id: '/home/user/documents', name: 'documents', isDir: true, children: [] },
+        ],
+      }),
+    );
+    const { ws, fsListDir } = makeWsFactory();
+    const { getByText } = render(
+      <FileBrowser ws={ws} mode="dir-only" layout="modal" initialPath="/home/user" onConfirm={vi.fn()} onClose={vi.fn()} />,
+    );
+
+    expect(getByText('projects')).toBeDefined();
+    expect(getByText('documents')).toBeDefined();
+    expect(fsListDir).toHaveBeenCalledWith('/home/user', false, false);
+  });
+
   it('uses entry.path from a Windows drive root listing', async () => {
     const { ws, respond } = makeWsFactory();
     render(
