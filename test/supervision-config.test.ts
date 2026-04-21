@@ -103,6 +103,32 @@ describe('supervision config helpers', () => {
     expect(snapshot.maxAutoContinueTotal).toBe(0);
   });
 
+  it('parses sparse persisted snapshots by filling optional tuning defaults', () => {
+    const snapshot = extractSessionSupervisionSnapshot({
+      supervision: {
+        mode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+        backend: 'codex-sdk',
+        model: CODEX_MODEL_IDS[0],
+        timeoutMs: 12_000,
+        promptVersion: SUPERVISION_CONTRACT_IDS.DECISION,
+      },
+    });
+
+    expect(snapshot).toMatchObject({
+      mode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+      backend: 'codex-sdk',
+      model: CODEX_MODEL_IDS[0],
+      timeoutMs: 12_000,
+      promptVersion: SUPERVISION_CONTRACT_IDS.DECISION,
+      maxParseRetries: 1,
+      maxAutoContinueStreak: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
+      maxAutoContinueTotal: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
+      auditMode: SUPERVISION_DEFAULT_AUDIT_MODE,
+      maxAuditLoops: 2,
+      taskRunPromptVersion: SUPERVISION_DEFAULT_TASK_RUN_PROMPT_VERSION,
+    });
+  });
+
   it('flags invalid persisted supervision snapshots instead of silently activating normalized automation', () => {
     const transportConfig = {
       keep: true,

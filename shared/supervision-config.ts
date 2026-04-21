@@ -312,23 +312,46 @@ export function getSessionSupervisionSnapshotIssues(
   if (record.globalCustomInstructions != null && typeof record.globalCustomInstructions !== 'string') {
     issues.push('invalid_global_custom_instructions');
   }
-  if (typeof record.maxParseRetries !== 'number' || !Number.isFinite(record.maxParseRetries) || Math.floor(record.maxParseRetries) < 1) {
+  if (
+    record.maxParseRetries != null
+    && (typeof record.maxParseRetries !== 'number' || !Number.isFinite(record.maxParseRetries) || Math.floor(record.maxParseRetries) < 1)
+  ) {
     issues.push('invalid_max_parse_retries');
   }
-  if (typeof record.maxAutoContinueStreak !== 'number' || !Number.isFinite(record.maxAutoContinueStreak) || Math.floor(record.maxAutoContinueStreak) < 0) {
+  if (
+    record.maxAutoContinueStreak != null
+    && (
+      typeof record.maxAutoContinueStreak !== 'number'
+      || !Number.isFinite(record.maxAutoContinueStreak)
+      || Math.floor(record.maxAutoContinueStreak) < 0
+    )
+  ) {
     issues.push('invalid_max_auto_continue_streak');
   }
-  if (typeof record.maxAutoContinueTotal !== 'number' || !Number.isFinite(record.maxAutoContinueTotal) || Math.floor(record.maxAutoContinueTotal) < 0) {
+  if (
+    record.maxAutoContinueTotal != null
+    && (
+      typeof record.maxAutoContinueTotal !== 'number'
+      || !Number.isFinite(record.maxAutoContinueTotal)
+      || Math.floor(record.maxAutoContinueTotal) < 0
+    )
+  ) {
     issues.push('invalid_max_auto_continue_total');
   }
 
   if (mode === SUPERVISION_MODE.SUPERVISED_AUDIT) {
-    if (record.auditMode == null || record.auditMode === '') issues.push('missing_audit_mode');
-    else if (!isSupportedSupervisionAuditMode(String(record.auditMode))) issues.push('invalid_audit_mode');
-    if (typeof record.maxAuditLoops !== 'number' || !Number.isFinite(record.maxAuditLoops) || Math.floor(record.maxAuditLoops) < 1) {
+    if (record.auditMode != null && record.auditMode !== '' && !isSupportedSupervisionAuditMode(String(record.auditMode))) {
+      issues.push('invalid_audit_mode');
+    }
+    if (
+      record.maxAuditLoops != null
+      && (typeof record.maxAuditLoops !== 'number' || !Number.isFinite(record.maxAuditLoops) || Math.floor(record.maxAuditLoops) < 1)
+    ) {
       issues.push('invalid_max_audit_loops');
     }
-    if (!trimString(record.taskRunPromptVersion)) issues.push('invalid_task_run_prompt_version');
+    if (record.taskRunPromptVersion != null && !trimString(record.taskRunPromptVersion)) {
+      issues.push('invalid_task_run_prompt_version');
+    }
   }
 
   return issues;
