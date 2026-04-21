@@ -332,7 +332,7 @@ function buildViewItems(events: TimelineEvent[]): ViewItem[] {
           || summarizeToolInput((next.payload.detail as any)?.input, next.payload.detail);
         const input = inputText ? ` ${inputText}` : '';
         const status = next.payload.error ? `✗ ${String(next.payload.error)}` : '✓';
-        const output = !next.payload.error && next.payload.output ? String(next.payload.output) : undefined;
+        const output = !next.payload.error ? formatToolPayloadValue(next.payload.output) : undefined;
         consolidated.push({
           ...ev,
           type: 'tool.call',
@@ -1396,7 +1396,7 @@ function ToolCallGroup({
             </button>
           )
         )}
-        {last && <ChatEvent event={last} onPathClick={onPathClick} onDownload={onDownload} serverId={serverId} />}
+        {last && <ChatEvent event={last} onPathClick={onPathClick} onDownload={onDownload} serverId={serverId} showTime />}
         {expanded && middle.length > 0 && (
           <button class="chat-tool-fold-btn" onClick={() => setExpanded(false)}>
             {t('chat.tool_group_collapse')}
@@ -1483,6 +1483,7 @@ const ChatEvent = memo(function ChatEvent({
   onDownload,
   serverId,
   onResendFailed,
+  showTime,
 }: {
   event: TimelineEvent;
   nextTs?: number;
@@ -1491,6 +1492,7 @@ const ChatEvent = memo(function ChatEvent({
   onDownload?: (path: string) => void;
   serverId?: string;
   onResendFailed?: (commandId: string, text: string) => void;
+  showTime?: boolean;
 }) {
   const { t } = useTranslation();
   switch (event.type) {
@@ -1550,6 +1552,7 @@ const ChatEvent = memo(function ChatEvent({
     case 'tool.call': {
       const callDetail = event.payload._callDetail ?? event.payload.detail;
       const resultDetail = event.payload._resultDetail;
+      const shouldShowTime = showTime || event.payload._merged === true;
       // Fall back to result detail for input — transport SDK tool.call may arrive without input
       const toolInput = summarizeToolInput(event.payload.input, callDetail)
         || summarizeToolInput((resultDetail as any)?.input, resultDetail);
@@ -1560,6 +1563,7 @@ const ChatEvent = memo(function ChatEvent({
             <span class="chat-tool-icon">{'>'}</span>
             <span class="chat-tool-name">{String(event.payload.tool ?? 'tool')}</span>
             {toolInput && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInput, onPathClick, undefined, onDownload)}</span>}
+            {shouldShowTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{new Date(event.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>}
           </div>
           {toolOutput && (
             <div class="chat-event chat-tool chat-tool-result-preview">
@@ -1595,6 +1599,7 @@ const ChatEvent = memo(function ChatEvent({
             ) : (
               <span class="chat-tool-output">done</span>
             )}
+            {showTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{new Date(event.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>}
           </div>
           {detail && (
             <details class="chat-tool-detail">

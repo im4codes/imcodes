@@ -886,4 +886,43 @@ describe('ChatView', () => {
       if (hadTouchStart) (window as Window & { ontouchstart?: unknown }).ontouchstart = originalTouchStart;
     }
   });
+
+  it('copies the last tool event without the trailing timestamp from the context menu', async () => {
+    const hadTouchStart = 'ontouchstart' in window;
+    const originalTouchStart = (window as Window & { ontouchstart?: unknown }).ontouchstart;
+    if (hadTouchStart) delete (window as Window & { ontouchstart?: unknown }).ontouchstart;
+    try {
+      const { container, getByText } = render(
+        <ChatView
+          events={[
+            {
+              eventId: 'evt-tool-copy-call',
+              type: 'tool.call',
+              ts: new Date('2026-04-17T12:34:00Z').getTime(),
+              payload: { tool: 'Read', input: { file_path: 'README.md' } },
+            },
+            {
+              eventId: 'evt-tool-copy-result',
+              type: 'tool.result',
+              ts: new Date('2026-04-17T12:35:00Z').getTime(),
+              payload: { output: { path: '/tmp/README.md' } },
+            },
+          ] as any}
+          loading={false}
+          sessionId="deck_main_brain"
+        />,
+      );
+
+      const toolEvents = container.querySelectorAll('.chat-event.chat-tool');
+      const lastToolEvent = toolEvents[toolEvents.length - 1] as HTMLElement;
+      fireEvent.contextMenu(lastToolEvent, { clientX: 40, clientY: 40 });
+      fireEvent.click(getByText('common.copy'));
+
+      await waitFor(() => {
+        expect(clipboardWriteText).toHaveBeenCalledWith('/tmp/README.md');
+      });
+    } finally {
+      if (hadTouchStart) (window as Window & { ontouchstart?: unknown }).ontouchstart = originalTouchStart;
+    }
+  });
 });

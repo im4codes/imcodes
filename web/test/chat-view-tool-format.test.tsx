@@ -151,6 +151,27 @@ describe('ChatView tool payload formatting', () => {
     expect(screen.getByText('output')).toBeDefined();
   });
 
+  it('shows a single timestamp on the final merged tool row', () => {
+    const events = [
+      makeEvent({
+        eventId: 'tool-group-call',
+        type: 'tool.call',
+        ts: 1_000,
+        payload: { tool: 'Read', input: { file_path: 'README.md' } },
+      }),
+      makeEvent({
+        eventId: 'tool-group-result',
+        type: 'tool.result',
+        ts: 2_000,
+        payload: { output: { path: '/tmp/README.md' } },
+      }),
+    ];
+
+    const { container } = render(<ChatView events={events} loading={false} />);
+
+    expect(container.querySelectorAll('.chat-tool .chat-bubble-time')).toHaveLength(1);
+  });
+
   it('renders tool-call summary from detail.input when live payload.input is missing', () => {
     const events = [
       makeEvent({
