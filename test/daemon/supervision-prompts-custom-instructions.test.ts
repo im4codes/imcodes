@@ -126,4 +126,40 @@ describe('supervision prompt custom-instructions merge', () => {
     expect(prompt).toContain('Global supervision rules set by the user (supervision enforces these on every session, including this one):');
     expect(prompt).not.toContain('Session-specific supervision rules set by the user');
   });
+
+  it('buildSupervisionContinuePrompt leads with nextAction when structured instructions are supplied', () => {
+    // This is the loop-breaker: when the supervisor supplied a concrete
+    // nextAction, the target must see it as the first imperative line.
+    // Without this the agent only saw the reason field and kept rewriting
+    // the same answer.
+    const prompt = buildSupervisionContinuePrompt(
+      'the task',
+      'last assistant turn',
+      {
+        reason: 'tests missing',
+        nextAction: 'Add a regression test for the new guardrail and run `npx vitest run`.',
+        gap: 'no test covers the new fallback branch',
+      },
+    );
+    expect(prompt).toContain('Next action required: Add a regression test for the new guardrail and run `npx vitest run`.');
+    expect(prompt).toContain("What's missing: no test covers the new fallback branch");
+    expect(prompt).toContain('Supervisor reason: tests missing');
+    // nextAction appears BEFORE the Supervisor reason line.
+    const idxNext = prompt.indexOf('Next action required:');
+    const idxReason = prompt.indexOf('Supervisor reason:');
+    expect(idxNext).toBeGreaterThanOrEqual(0);
+    expect(idxReason).toBeGreaterThanOrEqual(0);
+    expect(idxNext).toBeLessThan(idxReason);
+  });
+
+  it('buildSupervisionContinuePrompt omits nextAction / gap lines when not provided', () => {
+    const prompt = buildSupervisionContinuePrompt(
+      'the task',
+      'last assistant turn',
+      { reason: 'just continue' },
+    );
+    expect(prompt).not.toContain('Next action required:');
+    expect(prompt).not.toContain("What's missing:");
+    expect(prompt).toContain('Supervisor reason: just continue');
+  });
 });

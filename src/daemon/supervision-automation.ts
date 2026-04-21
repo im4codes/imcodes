@@ -53,7 +53,18 @@ function enrichSnapshotWithGlobalDefaults(
 
 type TaskRunPhase = 'execution' | 'auditing';
 
-const MAX_AUTO_CONTINUE_STEPS = 8;
+/**
+ * Hard cap on auto-dispatched continue turns per task-run.
+ *
+ * Was 8 historically — but even when the supervisor returned specific-looking
+ * `continue` verdicts, running 8 cycles before handing back to the user
+ * amplified any residual ambiguity into a frustrating back-and-forth. Per
+ * user direction (issue: "不断拉扯"), we now allow AT MOST 2 auto-continue
+ * dispatches before escalating to `ask_human`. If two concrete nextActions
+ * didn't close the gap, the pattern is stuck in a loop the supervisor can't
+ * resolve autonomously — surface it to the human.
+ */
+const MAX_AUTO_CONTINUE_STEPS = 2;
 const SUPERVISION_WAITING_LABEL = 'Supervised: analyzing completion...';
 const SUPERVISION_AUDIT_WAITING_LABEL = 'Supervised: running automated audit...';
 const SUPERVISION_COMPLETE_LABEL = 'Supervised: task looks complete.';
@@ -762,11 +773,19 @@ class SupervisionAutomation {
       }
       case 'continue': {
         if (latest.continueLoops >= MAX_AUTO_CONTINUE_STEPS) {
-          this.emitWarning(run.sessionName, 'Automation reached the maximum auto-continue limit. Manual continuation is required.');
+          this.emitWarning(run.sessionName, `Automation reached the auto-continue limit (${MAX_AUTO_CONTINUE_STEPS}); handing control back to the human.`);
           this.finishRun(run.sessionName, 'needs_input');
           return;
         }
-        await this.dispatchContinue(latest, decision.reason);
+        // Forward the full decision so the continue prompt can lead with
+        // the supervisor's concrete nextAction. Without this, the target
+        // agent only sees the reason and has to infer what to do next —
+        // which historically caused the "rewrite same answer" loop.
+        await this.dispatchContinue(latest, {
+          reason: decision.reason,
+          nextAction: decision.nextAction,
+          gap: decision.gap,
+        });
         return;
       }
       case 'ask_human':
@@ -930,7 +949,13 @@ class SupervisionAutomation {
     }
   }
 
-  private async dispatchContinue(run: ActiveTaskRunState, reason: string): Promise<void> {
+  private async dispatchContinue(
+    run: ActiveTaskRunState,
+    /** Pass the full decision so the target agent receives a concrete
+     *  imperative nextAction instead of just a vague reason string — this
+     *  is what breaks the supervision loop. */
+    decision: { reason: string; nextAction?: string; gap?: string },
+  ): Promise<void> {
     const current = this.activeRuns.get(run.sessionName);
     if (!current || current.generation !== run.generation || current.phase !== 'execution') return;
     const transportRuntime = getTransportRuntime(run.sessionName);
@@ -950,7 +975,9 @@ class SupervisionAutomation {
     const continuePrompt = buildSupervisionContinuePrompt(
       current.userText,
       current.lastAssistantText,
-      reason,
+      // Pass the full structured instructions; the builder leads with
+      // nextAction so the agent has something concrete to execute.
+      { reason: decision.reason, nextAction: decision.nextAction, gap: decision.gap },
       resolveSupervisionCustomInstructionsDetail(enrichSnapshotWithGlobalDefaults(current.snapshot)),
     );
     current.continueLoops += 1;

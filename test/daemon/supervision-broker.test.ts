@@ -204,8 +204,14 @@ describe('SupervisionBroker', () => {
     });
 
     const prompt = String(provider.send.mock.calls[0]?.[1] ?? '');
-    expect(prompt).toContain('If the assistant says tests, validation, fixes, commit/push, or other implementation work still needs to be done, choose continue.');
-    expect(prompt).toContain('Do not choose complete when the assistant itself indicates remaining work');
+    // New action-oriented contract: nextAction is required for continue,
+    // and vague fillers are explicitly rejected. Prefer ask_human over a
+    // fuzzy continue — the whole point of this redesign.
+    expect(prompt).toContain('REQUIRED when decision is continue — imperative instruction for the agent\'s next turn.');
+    expect(prompt).toContain('DO NOT write vague fillers like "keep going", "continue", "finish the task"');
+    expect(prompt).toContain('Prefer ask_human over a vague continue');
+    expect(prompt).toContain('When the assistant itself says remaining implementation work (tests, fixes, commit/push) is still pending, choose continue AND spell out what to do in nextAction.');
+    // IM.codes background docs still injected.
     expect(prompt).toContain('Use this background mainly to interpret the user\'s requested workflow and custom instructions.');
     expect(prompt).toContain('Do not treat the mere need to use one of these IM.codes workflows as a reason to ask_human');
     expect(prompt).toContain('openspec status --change "<name>" --json');
@@ -247,7 +253,7 @@ describe('SupervisionBroker', () => {
   it('retries once when the first supervisor reply is not valid JSON', async () => {
     const provider = new FakeProvider([
       'not valid json',
-      '{"decision":"continue","reason":"looks good","confidence":0.91}',
+      '{"decision":"continue","reason":"looks good","confidence":0.91,"gap":"missing regression tests","nextAction":"Add a regression test covering the new guardrail and run `npm test`."}',
     ]);
     const broker = new SupervisionBroker({
       resolveProvider: async () => provider,
@@ -272,14 +278,106 @@ describe('SupervisionBroker', () => {
       description: 'test session',
     });
 
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       decision: 'continue',
       reason: 'looks good',
       confidence: 0.91,
+      gap: 'missing regression tests',
+      nextAction: 'Add a regression test covering the new guardrail and run `npm test`.',
     });
     expect(provider.createSession).toHaveBeenCalledTimes(1);
     expect(provider.send).toHaveBeenCalledTimes(2);
     expect(provider.endSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('downgrades continue to ask_human when nextAction is missing (vague-continue guardrail)', async () => {
+    // This is the core loop-breaker: a supervisor returning continue without
+    // a concrete nextAction used to drive the target agent in circles.
+    // Now it escalates to ask_human instead.
+    const provider = new FakeProvider([
+      '{"decision":"continue","reason":"task still incomplete","confidence":0.8}',
+    ]);
+    const broker = new SupervisionBroker({ resolveProvider: async () => provider });
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk',
+      model: 'gpt-5.3-codex-spark',
+      timeoutMs: 2_000,
+      promptVersion: 'supervision_decision_v1',
+      maxParseRetries: 1,
+      auditMode: 'audit',
+      maxAuditLoops: 2,
+      taskRunPromptVersion: 'task_run_status_v1',
+    });
+
+    const result = await broker.decide({
+      snapshot,
+      taskRequest: 'Implement the task',
+      assistantResponse: 'Done with the main change.',
+    });
+
+    expect(result.decision).toBe('ask_human');
+    expect(result.reason).toMatch(/without an actionable nextAction/i);
+  });
+
+  it('downgrades continue to ask_human when nextAction is a vague filler like "keep going"', async () => {
+    const provider = new FakeProvider([
+      '{"decision":"continue","reason":"not done","confidence":0.6,"nextAction":"keep going"}',
+    ]);
+    const broker = new SupervisionBroker({ resolveProvider: async () => provider });
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk',
+      model: 'gpt-5.3-codex-spark',
+      timeoutMs: 2_000,
+      promptVersion: 'supervision_decision_v1',
+      maxParseRetries: 1,
+      auditMode: 'audit',
+      maxAuditLoops: 2,
+      taskRunPromptVersion: 'task_run_status_v1',
+    });
+
+    const result = await broker.decide({
+      snapshot,
+      taskRequest: 'Implement the task',
+      assistantResponse: 'Partial output',
+    });
+
+    expect(result.decision).toBe('ask_human');
+    expect(result.reason).toMatch(/without an actionable nextAction/i);
+  });
+
+  it('accepts continue with a concrete nextAction and preserves gap / extra metadata', async () => {
+    const provider = new FakeProvider([
+      '{"decision":"continue","reason":"missing tests","confidence":0.85,"gap":"no test covers the new branch","nextAction":"Write a test for the guardrail fallback path and run `npx vitest run`.","extra":{"suggestedSpec":"supervision-broker.test.ts"}}',
+    ]);
+    const broker = new SupervisionBroker({ resolveProvider: async () => provider });
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk',
+      model: 'gpt-5.3-codex-spark',
+      timeoutMs: 2_000,
+      promptVersion: 'supervision_decision_v1',
+      maxParseRetries: 1,
+      auditMode: 'audit',
+      maxAuditLoops: 2,
+      taskRunPromptVersion: 'task_run_status_v1',
+    });
+
+    const result = await broker.decide({
+      snapshot,
+      taskRequest: 'Implement the task',
+      assistantResponse: 'Implementation done; tests pending.',
+    });
+
+    expect(result).toMatchObject({
+      decision: 'continue',
+      reason: 'missing tests',
+      confidence: 0.85,
+      gap: 'no test covers the new branch',
+      nextAction: 'Write a test for the guardrail fallback path and run `npx vitest run`.',
+      extra: { suggestedSpec: 'supervision-broker.test.ts' },
+    });
   });
 
   it('creates a fresh provider session for each supervision decision', async () => {
@@ -433,6 +531,70 @@ describe('SupervisionBroker', () => {
       decision: 'continue',
     });
     expect(result.reason).toMatch(/follow-up work in Chinese|remaining work|original supervisor reason/i);
+  });
+
+  it('does NOT downgrade when the assistant factually reports git state in answer to a user question (regression: supervision loop on 未提交 state report)', async () => {
+    // User asked a git-status question, agent answered with facts (N uncommitted
+    // files). Previously the regex fired on bare "未提交" and flipped
+    // complete→continue, then the continue-prompt nudged the agent to answer
+    // the same question again, looping 5-6 times. After tightening the
+    // patterns to require INTENT (not STATE), this transcript must stay
+    // complete.
+    const provider = new FakeProvider([
+      '{"decision":"complete","reason":"assistant answered the question","confidence":0.9}',
+    ]);
+    const broker = new SupervisionBroker({ resolveProvider: async () => provider });
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk',
+      model: 'gpt-5.3-codex-spark',
+      timeoutMs: 2_000,
+      promptVersion: 'supervision_decision_v1',
+      maxParseRetries: 1,
+      auditMode: 'audit',
+      maxAuditLoops: 2,
+      taskRunPromptVersion: 'task_run_status_v1',
+    });
+
+    const result = await broker.decide({
+      snapshot,
+      taskRequest: '还有未提交的代码吗？',
+      assistantResponse: '是的，还有未提交代码。当前就是这 3 个修改文件，除此之外没有未跟踪文件。',
+    });
+
+    expect(result).toMatchObject({
+      decision: 'complete',
+      reason: 'assistant answered the question',
+    });
+  });
+
+  it('does NOT downgrade an English factual git-state answer (regression: uncommitted/not pushed are state words)', async () => {
+    const provider = new FakeProvider([
+      '{"decision":"complete","reason":"answered the status question","confidence":0.88}',
+    ]);
+    const broker = new SupervisionBroker({ resolveProvider: async () => provider });
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk',
+      model: 'gpt-5.3-codex-spark',
+      timeoutMs: 2_000,
+      promptVersion: 'supervision_decision_v1',
+      maxParseRetries: 1,
+      auditMode: 'audit',
+      maxAuditLoops: 2,
+      taskRunPromptVersion: 'task_run_status_v1',
+    });
+
+    const result = await broker.decide({
+      snapshot,
+      taskRequest: 'Are there uncommitted files in the repo right now?',
+      assistantResponse: 'Yes — three modified files are currently uncommitted and not pushed. Nothing else untracked.',
+    });
+
+    expect(result).toMatchObject({
+      decision: 'complete',
+      reason: 'answered the status question',
+    });
   });
 
   it('does not downgrade a complete verdict for an unrelated explanation offer', async () => {
