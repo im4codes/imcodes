@@ -907,7 +907,10 @@
     "saveSuccess": "已保存",
     "saveError": "保存失败",
     "fileTooLarge": "文件过大，无法保存（> 1 MB）",
-    "saveTimeout": "保存超时 — 请重新加载文件"
+    "saveTimeout": "保存超时 — 请重新加载文件",
+    "copyPath": "复制路径",
+    "copied": "已复制",
+    "insertPath": "插入路径"
   },
   "onboarding": {
     "prompt": {

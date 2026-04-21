@@ -1268,6 +1268,7 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
               onConfirm={(paths) => {
                 if (paths[0]) onInsertPath?.(paths[0]);
               }}
+              onInsertPath={onInsertPath}
             />
           </div>
         </>
@@ -1321,6 +1322,10 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
               if (paths[0]) onInsertPath?.(paths[0]);
               setFileBrowserTarget(null);
             }}
+            onInsertPath={onInsertPath ? (path) => {
+              onInsertPath(path);
+              setFileBrowserTarget(null);
+            } : undefined}
             onClose={() => setFileBrowserTarget(null)}
           />
         </FloatingPanel>

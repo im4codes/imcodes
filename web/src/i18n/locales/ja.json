@@ -906,7 +906,10 @@
     "saveSuccess": "保存しました",
     "saveError": "保存に失敗しました",
     "fileTooLarge": "ファイルが大きすぎて保存できません（> 1 MB）",
-    "saveTimeout": "保存がタイムアウトしました — ファイルを再読み込みしてください"
+    "saveTimeout": "保存がタイムアウトしました — ファイルを再読み込みしてください",
+    "copyPath": "パスをコピー",
+    "copied": "コピーしました!",
+    "insertPath": "パスを挿入"
   },
   "onboarding": {
     "prompt": {

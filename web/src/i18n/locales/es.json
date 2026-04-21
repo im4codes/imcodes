@@ -906,7 +906,10 @@
     "saveSuccess": "Guardado",
     "saveError": "Error al guardar",
     "fileTooLarge": "Archivo demasiado grande para guardar (> 1 MB)",
-    "saveTimeout": "Tiempo de espera de guardado agotado — vuelva a cargar el archivo"
+    "saveTimeout": "Tiempo de espera de guardado agotado — vuelva a cargar el archivo",
+    "copyPath": "Copiar ruta",
+    "copied": "¡Copiado!",
+    "insertPath": "Insertar ruta"
   },
   "onboarding": {
     "prompt": {

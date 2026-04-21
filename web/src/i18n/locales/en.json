@@ -907,7 +907,10 @@
     "saveSuccess": "Saved",
     "saveError": "Save failed",
     "fileTooLarge": "File too large to save (> 1 MB)",
-    "saveTimeout": "Save timed out — please reload file"
+    "saveTimeout": "Save timed out — please reload file",
+    "copyPath": "Copy path",
+    "copied": "Copied!",
+    "insertPath": "Insert path"
   },
   "onboarding": {
     "prompt": {

@@ -126,6 +126,14 @@ export interface FileBrowserProps {
   onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
   /** Default panel tab — 'files' or 'changes'. Default: 'files' */
   defaultTab?: 'files' | 'changes';
+  /**
+   * Called when the user explicitly chooses to insert the previewed file's
+   * path into the host (usually the chat composer). If provided, the preview
+   * header shows an "Insert path" button alongside Edit/Download/Copy-path.
+   * Separated from `onConfirm` because `onConfirm` is tied to the file-picker
+   * flow; inserting from an already-open preview is a different user intent.
+   */
+  onInsertPath?: (path: string) => void;
 }
 
 type FsNode = {
@@ -227,6 +235,7 @@ export function FileBrowser({
   skipAutoPreviewIfLoading = false,
   onPreviewFile,
   defaultTab = 'files',
+  onInsertPath,
 }: FileBrowserProps) {
   const { t } = useTranslation();
   const includeFiles = mode !== 'dir-only';
@@ -249,6 +258,10 @@ export function FileBrowser({
   });
   const [lightbox, setLightbox] = useState<string | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
+  // Transient "Copied!" label flips back to the default after 1.5s. Keyed by
+  // path so rapidly switching between previews never shows a stale "Copied!"
+  // badge on a file that wasn't the one the user copied.
+  const [copiedPath, setCopiedPath] = useState<string | null>(null);
 
   // Editor state (logic lives in FileEditor component)
   const [isEditing, setIsEditing] = useState(() => {
@@ -1005,6 +1018,47 @@ export function FileBrowser({
             }}
           >
             {downloadError || t('upload.download_file')}
+          </button>
+        )}
+        {/* Copy path / Insert path — available whenever we know the file path.
+            Copy targets the clipboard via navigator.clipboard.writeText; Insert
+            calls `onInsertPath` if the host wired it (ChatView does; standalone
+            preview hosts may not, in which case the button is hidden to avoid
+            a dead-end click). Inside the `hasInlinePreview` branch `preview`
+            is already narrowed to a non-idle state, so every sub-variant has
+            a `.path`. */}
+        {'path' in preview && (
+          <button
+            class="fb-diff-toggle"
+            title={preview.path}
+            onClick={() => {
+              const p = preview.path;
+              void (async () => {
+                try {
+                  await navigator.clipboard.writeText(p);
+                  setCopiedPath(p);
+                  setTimeout(() => setCopiedPath((cur) => (cur === p ? null : cur)), 1500);
+                } catch {
+                  // Clipboard API can reject in insecure contexts or without a
+                  // user gesture on some browsers — fall back silently; the
+                  // user can still long-press the filename.
+                }
+              })();
+            }}
+          >
+            {copiedPath === preview.path ? t('fileBrowser.copied') : t('fileBrowser.copyPath')}
+          </button>
+        )}
+        {onInsertPath && 'path' in preview && (
+          <button
+            class="fb-diff-toggle"
+            title={t('fileBrowser.insertPath')}
+            onClick={() => {
+              onInsertPath(preview.path);
+              dismissPreview();
+            }}
+          >
+            {t('fileBrowser.insertPath')}
           </button>
         )}
         <button class="fb-close" onClick={() => {
