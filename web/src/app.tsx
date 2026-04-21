@@ -7,6 +7,7 @@ import {
   type FileBrowserPreviewUpdate,
 } from './components/file-browser-lazy.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
+import { RECONNECT_GRACE_MS } from '@shared/ack-protocol.js';
 import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate } from './p2p-run-mapping.js';
 import { useTranslation } from 'react-i18next';
 import { ErrorBoundary } from './components/ErrorBoundary.js';
@@ -699,6 +700,14 @@ export function App() {
   const [daemonOnline, setDaemonOnline] = useState(false);
   const sessionListRetryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stoppedNavTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Debounce the "Daemon Offline" badge. The server broadcasts
+  // DAEMON_MSG.DISCONNECTED the instant the daemon WS closes, then waits
+  // RECONNECT_GRACE_MS before actually declaring the daemon offline (inflight
+  // commands are replayed silently if the daemon returns in time). Without
+  // this matching delay on the client, a 200 ms pod restart or network blip
+  // flashes "Daemon Offline" even though the daemon is back before the grace
+  // window expires and the user's turn never fails.
+  const daemonOfflineGraceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [idleAlerts, setIdleAlerts] = useState<Set<string>>(new Set());
   const [idleFlashTokens, setIdleFlashTokens] = useState<Map<string, number>>(() => new Map());
@@ -1275,7 +1284,17 @@ export function App() {
             });
           }, 5000);
         }
-        if (msg.event === 'disconnected') { setConnected(false); setConnecting(true); setDaemonOnline(false); }
+        if (msg.event === 'disconnected') {
+          setConnected(false); setConnecting(true); setDaemonOnline(false);
+          // Cancel any pending debounce — the browser-server WS dropped so
+          // the grace-window flip would be redundant (badge now shows
+          // "Connecting"/"Offline", not "Daemon Offline") and could later
+          // fire in a stale state after a reconnect cycle.
+          if (daemonOfflineGraceTimerRef.current) {
+            clearTimeout(daemonOfflineGraceTimerRef.current);
+            daemonOfflineGraceTimerRef.current = null;
+          }
+        }
         if (msg.session && !msg.session.startsWith('deck_sub_')) {
           setSessions((prev) => {
             // Stopped → remove the tab immediately
@@ -1333,7 +1352,14 @@ export function App() {
           msg.sessions,
           watchSubInputs,
         );
-        // Daemon is connected — mark this server as online now
+        // Daemon is connected — mark this server as online now. Also cancel
+        // any pending disconnect→offline timer: receiving a session_list is
+        // proof that the daemon is alive even without a DAEMON_MSG.RECONNECTED
+        // (e.g. first connect after a page reload during a grace window).
+        if (daemonOfflineGraceTimerRef.current) {
+          clearTimeout(daemonOfflineGraceTimerRef.current);
+          daemonOfflineGraceTimerRef.current = null;
+        }
         setDaemonOnline(true);
         if (sessionListRetryRef.current) { clearTimeout(sessionListRetryRef.current); sessionListRetryRef.current = null; }
         setServers((prev) => prev.map((s) =>
@@ -1724,9 +1750,23 @@ export function App() {
         setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 8000);
       }
       if (msg.type === DAEMON_MSG.DISCONNECTED) {
-        // Daemon went offline — keep existing session data visible, just update status
-        setDaemonOnline(false);
+        // Mark projection stale immediately — that's just a data-freshness
+        // hint, not the user-facing status badge. But do NOT flip the
+        // "Daemon Offline" badge yet: the server side still has a
+        // RECONNECT_GRACE_MS window during which the daemon can reconnect
+        // and inflight commands are replayed without surfacing any failure.
+        // Matching that grace period here prevents the badge from flashing
+        // on every pod restart / brief network blip while the user's turn
+        // is actually landing fine. If the daemon does stay gone, the
+        // server will broadcast MSG_DAEMON_OFFLINE (no reconnect event) and
+        // this timer fires, putting the badge into the Daemon-Offline
+        // state. RECONNECTED / session_list clear the timer below.
         watchProjectionStore.setSnapshotStatus('stale');
+        if (daemonOfflineGraceTimerRef.current) clearTimeout(daemonOfflineGraceTimerRef.current);
+        daemonOfflineGraceTimerRef.current = setTimeout(() => {
+          daemonOfflineGraceTimerRef.current = null;
+          setDaemonOnline(false);
+        }, RECONNECT_GRACE_MS);
       }
       if (msg.type === 'daemon.error') {
         // Surface uncaught daemon errors as a toast so users aren't left in the dark.
@@ -1788,6 +1828,13 @@ export function App() {
         }
       }
       if (msg.type === DAEMON_MSG.RECONNECTED) {
+        // Daemon came back within (or after) the grace window — cancel any
+        // pending "flip to offline" so the badge never flashes red for a
+        // reconnect that actually succeeded.
+        if (daemonOfflineGraceTimerRef.current) {
+          clearTimeout(daemonOfflineGraceTimerRef.current);
+          daemonOfflineGraceTimerRef.current = null;
+        }
         setDaemonOnline(true);
         // Daemon process (re)started — all its subscriptions are gone.
         // Re-subscribe active targets first, then stagger the rest to avoid a herd.
@@ -1856,6 +1903,7 @@ export function App() {
       setLatencyMs(null);
       setDaemonStats(null);
       if (sessionListRetryRef.current) { clearTimeout(sessionListRetryRef.current); sessionListRetryRef.current = null; }
+      if (daemonOfflineGraceTimerRef.current) { clearTimeout(daemonOfflineGraceTimerRef.current); daemonOfflineGraceTimerRef.current = null; }
       for (const timer of resubscribeTimersRef.current) clearTimeout(timer);
       resubscribeTimersRef.current.clear();
     };
