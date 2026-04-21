@@ -381,34 +381,66 @@ type DurableSignals = {
 };
 
 function extractDurableSignalsFromSummary(summary: string): DurableSignals {
-  const empty: DurableSignals = { decisions: [], constraints: [], preferences: [] };
-  const match = summary.match(/##\s+Key Decisions\s*\n([\s\S]*?)(?:\n##\s+|$)/i);
-  const section = match?.[1]?.trim();
-  if (!section) return empty;
-
   const signals: DurableSignals = { decisions: [], constraints: [], preferences: [] };
-  const lines = section
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean);
-  for (const line of lines) {
-    const normalized = line.replace(/^[*-]\s*/, '').trim();
-    if (!normalized) continue;
-    if (/^key decisions?:/i.test(normalized)) {
-      pushDurableItems(signals.decisions, normalized.replace(/^key decisions?:/i, '').trim());
-      continue;
+
+  const decisionsSection = extractSummarySection(summary, 'Key Decisions');
+  if (decisionsSection) {
+    const lines = decisionsSection
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+    for (const line of lines) {
+      const normalized = line.replace(/^[*-]\s*/, '').trim();
+      if (!normalized) continue;
+      if (/^key decisions?:/i.test(normalized)) {
+        pushDurableItems(signals.decisions, normalized.replace(/^key decisions?:/i, '').trim());
+        continue;
+      }
+      if (/^constraints?:/i.test(normalized)) {
+        pushDurableItems(signals.constraints, normalized.replace(/^constraints?:/i, '').trim());
+        continue;
+      }
+      if (/^preferences?:/i.test(normalized)) {
+        pushDurableItems(signals.preferences, normalized.replace(/^preferences?:/i, '').trim());
+        continue;
+      }
+      pushUnique(signals.decisions, normalized);
     }
-    if (/^constraints?:/i.test(normalized)) {
-      pushDurableItems(signals.constraints, normalized.replace(/^constraints?:/i, '').trim());
-      continue;
-    }
-    if (/^preferences?:/i.test(normalized)) {
-      pushDurableItems(signals.preferences, normalized.replace(/^preferences?:/i, '').trim());
-      continue;
-    }
-    pushUnique(signals.decisions, normalized);
   }
+
+  // User-Pinned Notes: content the user explicitly asked us to remember
+  // (in any language — the compressor prompt recognises the INTENT, not a
+  // keyword list). Each non-empty line is promoted to a durable preference
+  // verbatim so "记住 X" survives both compression AND the durable-memory
+  // promotion filter. Preferences is the right bucket because these are
+  // user-authored instructions that persist across sessions; decisions and
+  // constraints have implementation-specific semantics the user didn't
+  // necessarily intend.
+  const pinnedSection = extractSummarySection(summary, 'User-Pinned Notes');
+  if (pinnedSection) {
+    const lines = pinnedSection
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+    for (const line of lines) {
+      // Strip leading bullet markers but otherwise keep the line EXACTLY as
+      // the compressor produced it — the compressor is already instructed
+      // to preserve the user's original words.
+      const normalized = line.replace(/^[*-]\s*/, '').trim();
+      if (!normalized) continue;
+      pushUnique(signals.preferences, normalized);
+    }
+  }
+
   return signals;
+}
+
+/** Extract the body of a `## <title>` section up to the next `## ` or EOF. */
+function extractSummarySection(summary: string, title: string): string | null {
+  const escaped = title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`##\\s+${escaped}\\s*\\n([\\s\\S]*?)(?:\\n##\\s+|$)`, 'i');
+  const match = summary.match(re);
+  return match?.[1]?.trim() ?? null;
 }
 
 function pushDurableItems(bucket: string[], value: string): void {
