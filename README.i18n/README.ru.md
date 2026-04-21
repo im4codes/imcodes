@@ -255,7 +255,7 @@ git clone https://github.com/im4codes/imcodes.git && cd imcodes
 docker compose up -d
 ```
 
-Сгенерированный `docker-compose.yml` уже использует `pgvector/pgvector:pg16` для PostgreSQL.
+Сгенерированный `docker-compose.yml` уже использует `pgvector/pgvector:pg18` для PostgreSQL.
 
 ## Windows (экспериментально)
 

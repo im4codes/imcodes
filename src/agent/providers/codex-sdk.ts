@@ -64,6 +64,11 @@ interface CodexSdkSessionState {
 }
 
 function toolFromItem(item: Record<string, any>, lifecycle: 'started' | 'completed'): ToolCallEvent | null {
+  const meaningfulString = (value: unknown): string | undefined => {
+    if (typeof value !== 'string') return undefined;
+    const trimmed = value.trim();
+    return trimmed ? trimmed : undefined;
+  };
   switch (item.type) {
     case 'commandExecution':
       return {
@@ -155,11 +160,11 @@ function toolFromItem(item: Record<string, any>, lifecycle: 'started' | 'complet
       // `JSON.stringify(input)` — that's where the
       // `{"query":"","action":{"type":"other"}}` screen artifact came from.
       const action = item.action as Record<string, unknown> | undefined;
-      const actionType = typeof action?.type === 'string' ? action.type : undefined;
-      const actionQuery = typeof action?.query === 'string' ? action.query : undefined;
-      const actionPattern = typeof action?.pattern === 'string' ? action.pattern : undefined;
-      const actionUrl = typeof action?.url === 'string' ? action.url : undefined;
-      const topLevelQuery = typeof item.query === 'string' ? item.query : undefined;
+      const actionType = meaningfulString(action?.type);
+      const actionQuery = meaningfulString(action?.query);
+      const actionPattern = meaningfulString(action?.pattern);
+      const actionUrl = meaningfulString(action?.url);
+      const topLevelQuery = meaningfulString(item.query);
       // Pick the single best human-readable label for the flat `input.query`
       // slot. Priority: explicit query → pattern → url → bracketed action
       // type (`(other)` / `(open_page)`) for the no-info fallback. The UI

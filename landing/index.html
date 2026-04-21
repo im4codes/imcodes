@@ -418,7 +418,7 @@ imcodes bind https://imc.example.com/bind/&lt;api-key&gt;</div>
   <div class="code-block">git clone https://github.com/im4codes/imcodes.git && cd imcodes
 ./gen-env.sh imc.example.com <span class="comment"># generates .env, prints admin password</span>
 docker compose up -d</div>
-  <p style="color:var(--dim); font-size:12px; margin-top:8px;" data-i18n="sh_manual_pgvector">Generated docker-compose.yml uses pgvector/pgvector:pg16 for PostgreSQL.</p>
+  <p style="color:var(--dim); font-size:12px; margin-top:8px;" data-i18n="sh_manual_pgvector">Generated docker-compose.yml uses pgvector/pgvector:pg18 for PostgreSQL.</p>
 </section>
 
 <section>
@@ -513,7 +513,7 @@ const I18N = {
     oc_4: 'Saved to <code>~/.imcodes/openclaw.json</code> so the daemon can reconnect automatically',
     oc_5: 'Use <code>imcodes disconnect openclaw</code> to remove the saved config',
     oc_note: 'Only tested on macOS so far. Remote plain-text <code>ws://</code> URLs require <code>--insecure</code>.',
-    sh_manual_pgvector: 'Generated docker-compose.yml uses pgvector/pgvector:pg16 for PostgreSQL.',
+    sh_manual_pgvector: 'Generated docker-compose.yml uses pgvector/pgvector:pg18 for PostgreSQL.',
   },
   'zh-CN': {
     tagline: '给 AI agent 的 IM。共享记忆、受监督执行，以及跨模型审计。',
@@ -584,7 +584,7 @@ const I18N = {
     oc_note: '目前只在 macOS 上测试过。远程明文 <code>ws://</code> 地址需要加 <code>--insecure</code>。',
     sh_intro: '在一台机器上部署服务端和守护进程。需要 Docker 和指向该服务器的域名。',
     sh_desc: '自动生成配置、启动 PostgreSQL + 服务端 + Caddy（自动 HTTPS）、创建管理员账户并绑定本地守护进程。凭证在最后打印。',
-    sh_connect: '连接其他机器：', sh_manual: '手动部署：', sh_manual_pgvector: '生成的 docker-compose.yml 已默认使用 pgvector/pgvector:pg16 作为 PostgreSQL 镜像。',
+    sh_connect: '连接其他机器：', sh_manual: '手动部署：', sh_manual_pgvector: '生成的 docker-compose.yml 已默认使用 pgvector/pgvector:pg18 作为 PostgreSQL 镜像。',
     req_os: 'macOS、Linux 或 Windows（原生试验性；<a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> 完全支持）',
     req_mux: 'tmux（Linux/macOS/WSL）。Windows 原生使用 ConPTY（内置）。',
     about_text: '个人项目。几乎完全由 <a href="https://github.com/anthropics/claude-code">Claude Code</a> 构建，<a href="https://github.com/openai/codex">Codex</a> 和 <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a> 也有重要贡献。',
@@ -659,7 +659,7 @@ const I18N = {
     oc_note: '目前只在 macOS 上測試過。遠端明文 <code>ws://</code> 位址需要加上 <code>--insecure</code>。',
     sh_intro: '在一台機器上部署伺服器和守護程序。需要 Docker 和指向該伺服器的網域。',
     sh_desc: '自動產生設定、啟動 PostgreSQL + 伺服器 + Caddy（自動 HTTPS）、建立管理員帳戶並綁定本地守護程序。憑證在最後列印。',
-    sh_connect: '連接其他機器：', sh_manual: '手動部署：', sh_manual_pgvector: '產生的 docker-compose.yml 已經預設使用 pgvector/pgvector:pg16 作為 PostgreSQL 映像。',
+    sh_connect: '連接其他機器：', sh_manual: '手動部署：', sh_manual_pgvector: '產生的 docker-compose.yml 已經預設使用 pgvector/pgvector:pg18 作為 PostgreSQL 映像。',
     req_os: 'macOS、Linux 或 Windows（原生試驗性；<a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> 完全支援）',
     req_mux: 'tmux（Linux/macOS/WSL）。Windows 原生使用 ConPTY（內建）。',
     about_text: '個人專案。幾乎完全由 <a href="https://github.com/anthropics/claude-code">Claude Code</a> 建構，<a href="https://github.com/openai/codex">Codex</a> 和 <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a> 也有重要貢獻。',
@@ -734,7 +734,7 @@ const I18N = {
     oc_note: 'Only tested on macOS so far. Remote plain-text <code>ws://</code> URLs require <code>--insecure</code>.',
     sh_intro: '1台のマシンにサーバーとデーモンをデプロイ。DockerとDNS設定済みのドメインが必要です。',
     sh_desc: '設定を自動生成、PostgreSQL + サーバー + Caddy（自動HTTPS）を起動、管理者アカウントを作成しローカルデーモンをバインド。認証情報は最後に表示されます。',
-    sh_connect: '追加マシンの接続：', sh_manual: '手動セットアップ：', sh_manual_pgvector: '生成される docker-compose.yml は PostgreSQL に pgvector/pgvector:pg16 を使用します。',
+    sh_connect: '追加マシンの接続：', sh_manual: '手動セットアップ：', sh_manual_pgvector: '生成される docker-compose.yml は PostgreSQL に pgvector/pgvector:pg18 を使用します。',
     req_os: 'macOS、Linux、または Windows（ネイティブは実験的、<a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> は完全対応）',
     req_mux: 'tmux（Linux/macOS/WSL）。Windows ネイティブは ConPTY（組み込み）を使用。',
     about_text: '個人プロジェクト。ほぼ全てを <a href="https://github.com/anthropics/claude-code">Claude Code</a> が構築、<a href="https://github.com/openai/codex">Codex</a> と <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a> も重要な貢献。',
@@ -809,7 +809,7 @@ const I18N = {
     oc_note: 'Only tested on macOS so far. Remote plain-text <code>ws://</code> URLs require <code>--insecure</code>.',
     sh_intro: '단일 머신에 서버와 데몬을 배포합니다. Docker와 서버를 가리키는 도메인이 필요합니다.',
     sh_desc: '모든 설정 자동 생성, PostgreSQL + 서버 + Caddy(자동 HTTPS) 시작, 관리자 계정 생성 및 로컬 데몬 바인딩. 자격 증명은 마지막에 출력됩니다.',
-    sh_connect: '추가 머신 연결:', sh_manual: '수동 설정:', sh_manual_pgvector: '생성되는 docker-compose.yml 은 PostgreSQL 이미지로 pgvector/pgvector:pg16 을 사용합니다.',
+    sh_connect: '추가 머신 연결:', sh_manual: '수동 설정:', sh_manual_pgvector: '생성되는 docker-compose.yml 은 PostgreSQL 이미지로 pgvector/pgvector:pg18 을 사용합니다.',
     req_os: 'macOS, Linux 또는 Windows (네이티브 실험적; <a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> 완전 지원)',
     req_mux: 'tmux (Linux/macOS/WSL). Windows 네이티브는 ConPTY (기본 내장) 사용.',
     about_text: '개인 프로젝트. 거의 전적으로 <a href="https://github.com/anthropics/claude-code">Claude Code</a>가 구축, <a href="https://github.com/openai/codex">Codex</a>와 <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a>도 중요한 기여.',
@@ -884,7 +884,7 @@ const I18N = {
     oc_note: 'Only tested on macOS so far. Remote plain-text <code>ws://</code> URLs require <code>--insecure</code>.',
     sh_intro: 'Despliega servidor + daemon en una sola máquina. Requiere Docker y un dominio con DNS apuntando al servidor.',
     sh_desc: 'Genera toda la configuración, inicia PostgreSQL + servidor + Caddy con HTTPS automático, crea la cuenta admin y vincula el daemon local. Las credenciales se imprimen al final.',
-    sh_connect: 'Para conectar máquinas adicionales:', sh_manual: 'Configuración manual:', sh_manual_pgvector: 'El docker-compose.yml generado ya usa pgvector/pgvector:pg16 para PostgreSQL.',
+    sh_connect: 'Para conectar máquinas adicionales:', sh_manual: 'Configuración manual:', sh_manual_pgvector: 'El docker-compose.yml generado ya usa pgvector/pgvector:pg18 para PostgreSQL.',
     req_os: 'macOS, Linux o Windows (nativo experimental; <a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> totalmente soportado)',
     req_mux: 'tmux (Linux/macOS/WSL). Windows nativo usa ConPTY (integrado).',
     about_text: 'Proyecto personal. Construido casi en su totalidad por <a href="https://github.com/anthropics/claude-code">Claude Code</a>, con contribuciones de <a href="https://github.com/openai/codex">Codex</a> y <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a>.',
@@ -959,7 +959,7 @@ const I18N = {
     oc_note: 'Only tested on macOS so far. Remote plain-text <code>ws://</code> URLs require <code>--insecure</code>.',
     sh_intro: 'Разверните сервер + демон на одной машине. Требуется Docker и домен с DNS, указывающим на сервер.',
     sh_desc: 'Автоматически генерирует конфигурацию, запускает PostgreSQL + сервер + Caddy с автоматическим HTTPS, создаёт учётную запись администратора и привязывает локальный демон. Данные для входа выводятся в конце.',
-    sh_connect: 'Подключение дополнительных машин:', sh_manual: 'Ручная настройка:', sh_manual_pgvector: 'Сгенерированный docker-compose.yml уже использует pgvector/pgvector:pg16 для PostgreSQL.',
+    sh_connect: 'Подключение дополнительных машин:', sh_manual: 'Ручная настройка:', sh_manual_pgvector: 'Сгенерированный docker-compose.yml уже использует pgvector/pgvector:pg18 для PostgreSQL.',
     req_os: 'macOS, Linux или Windows (нативная поддержка экспериментальная; <a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> полностью поддерживается)',
     req_mux: 'tmux (Linux/macOS/WSL). Нативный Windows использует ConPTY (встроенный).',
     about_text: 'Личный проект. Почти полностью создан <a href="https://github.com/anthropics/claude-code">Claude Code</a>, со значительным вкладом <a href="https://github.com/openai/codex">Codex</a> и <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a>.',
