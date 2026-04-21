@@ -44,6 +44,7 @@ import {
   type SessionSupervisionSnapshot,
   type SupervisionMode,
 } from '@shared/supervision-config.js';
+import { FILE_TRANSFER_LIMITS } from '@shared/transport/file-transfer.js';
 
 interface Props {
   ws: WsClient | null;
@@ -115,6 +116,8 @@ interface Props {
   /** Optional local optimistic update when transport config changes through quick controls. */
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
 }
+
+const MAX_UPLOAD_SIZE_MB = Math.round(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE / (1024 * 1024));
 
 type MenuAction = 'restart' | 'new' | 'stop';
 type ModelChoice = 'opus[1M]' | 'sonnet' | 'haiku';
@@ -1830,7 +1833,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         if (body.includes('daemon_offline')) {
           setUploadError(t('upload.daemon_offline'));
         } else if (body.includes('file_too_large')) {
-          setUploadError(t('upload.file_too_large', { max: 20 }));
+          setUploadError(t('upload.file_too_large', { max: MAX_UPLOAD_SIZE_MB }));
         } else {
           setUploadError(t('upload.upload_failed'));
         }

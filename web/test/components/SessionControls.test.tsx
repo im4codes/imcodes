@@ -59,6 +59,9 @@ vi.mock('react-i18next', () => ({
       if (key === 'upload.long_text_attached') {
         return `Large pasted text attached as ${String(opts?.name ?? '')}`;
       }
+      if (key === 'upload.file_too_large') {
+        return `File too large (max ${String(opts?.max ?? '')}MB)`;
+      }
       if (key === 'upload.long_text_requires_attachment') {
         return 'Paste is too large for inline input here. Upload it as a file instead.';
       }
