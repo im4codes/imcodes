@@ -386,10 +386,37 @@ export function App() {
     vv.addEventListener('resize', update);
     document.addEventListener('focusin', onFocusIn);
     document.addEventListener('focusout', onFocusOut);
+    // App-resume recovery: when the app returns from background (push-notification
+    // tap, switcher, home-button), the OS dismisses the keyboard + blurs inputs at
+    // the native layer, but the WebView doesn't always fire matching focusout /
+    // visualViewport resize events. Without this handler, `inputFocused`/
+    // `hadKeyboardOpen` stay truthy and the `.input-focused` / `.kb-open` classes
+    // stick on <html>, hiding the sub-session bar (styles.css lines 983/989)
+    // even though the keyboard is gone — which is exactly what users see after
+    // tapping a notification ("底部的 sub-session 按钮没了").
+    const onResume = () => {
+      if (document.visibilityState !== 'visible') return;
+      const active = document.activeElement as HTMLElement | null;
+      const activeIsInput = !!active && (
+        active.tagName === 'INPUT'
+        || active.tagName === 'TEXTAREA'
+        || active.getAttribute('contenteditable') === 'true'
+        || active.classList.contains('xterm-helper-textarea')
+      );
+      // If the OS dismissed focus during background, blur the stale element so
+      // update() reflects reality. If focus genuinely survived, keep it.
+      if (!activeIsInput) {
+        inputFocused = false;
+        hadKeyboardOpen = false;
+      }
+      update();
+    };
+    document.addEventListener('visibilitychange', onResume);
     return () => {
       vv.removeEventListener('resize', update);
       document.removeEventListener('focusin', onFocusIn);
       document.removeEventListener('focusout', onFocusOut);
+      document.removeEventListener('visibilitychange', onResume);
     };
   }, []);
 
