@@ -191,6 +191,14 @@ async function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord
   return {
     type: 'subsession.sync',
     id,
+    // Current state (idle/running/queued/stopped/error) — the web side (see
+    // `useSubSessions.ts subsession.sync/created handlers`) already reads
+    // this field, but the daemon previously sent metadata only, which left
+    // freshly-loaded sub-sessions stuck with `state: 'unknown'` → gray dot
+    // in the sidebar until the next live `session.state` event arrived.
+    // For an idle session with no recent state change, that next event
+    // might never come, so the dot could stay gray indefinitely.
+    state: r?.state ?? null,
     sessionType: r?.agentType ?? null,
     cwd: r?.projectDir ?? null,
     shellBin: null,

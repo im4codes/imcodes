@@ -466,15 +466,25 @@ export async function startup(): Promise<DaemonContext> {
         if (P2P_TERMINAL_RUN_STATUSES.has(run.status)) continue;
         try { serverLink.send({ type: 'p2p.run_save', run: serializeP2pRun(run) }); } catch { /* ignore */ }
       }
-      // Re-sync all active sub-sessions so server DB and frontend stay in sync
+      // Re-sync all sub-sessions (including idle ones) so server DB and
+      // frontend stay in sync. The previous `state === 'running'` filter
+      // left idle sub-sessions with `state: 'unknown'` in the web sidebar
+      // after WS reconnect, which rendered as a stuck gray dot that only
+      // flipped to the correct color when the next live state transition
+      // happened — sometimes never, for genuinely-quiet sessions.
+      // Only skip terminal states that should have been cleaned up already.
       for (const session of listSessions()) {
         if (!session.name.startsWith('deck_sub_')) continue;
-        if (session.state !== 'running') continue;
+        if (session.state === 'stopped') continue;
         const id = session.name.slice('deck_sub_'.length);
         try {
           serverLink.send({
             type: 'subsession.sync',
             id,
+            // Including state here fixes "sidebar sub-session dot stuck
+            // gray after reconnect" — see buildSubSessionSync for the
+            // equivalent fix on the regular sync path.
+            state: session.state ?? null,
             sessionType: session.agentType,
             cwd: session.projectDir || null,
             label: session.label ?? null,
