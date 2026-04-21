@@ -119,7 +119,7 @@ interface Props {
 type MenuAction = 'restart' | 'new' | 'stop';
 type ModelChoice = 'opus[1M]' | 'sonnet' | 'haiku';
 
-const INLINE_PASTE_TEXT_CHAR_LIMIT = 12000;
+const INLINE_PASTE_TEXT_CHAR_LIMIT = 1200;
 
 function buildPastedTextFileName(now = new Date()): string {
   const compact = now.toISOString().replace(/[:.]/g, '-');
