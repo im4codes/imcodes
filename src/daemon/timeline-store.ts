@@ -4,7 +4,7 @@
  * Storage: ~/.imcodes/timeline/{sessionName}.jsonl
  */
 
-import { mkdirSync, appendFileSync, readFileSync, writeFileSync, readdirSync, statSync, unlinkSync, openSync, readSync, fstatSync, closeSync } from 'fs';
+import { mkdirSync, appendFileSync, writeFileSync, readdirSync, statSync, unlinkSync, openSync, readSync, fstatSync, closeSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import type { TimelineEvent } from './timeline-event.js';
@@ -142,20 +142,13 @@ class TimelineStore {
    */
   truncate(sessionName: string, keepLast = MAX_EVENTS_PER_FILE): void {
     const filePath = this.filePath(sessionName);
-    let raw: string;
-    try {
-      raw = readFileSync(filePath, 'utf-8');
-    } catch {
-      return;
-    }
+    const newestFirst = readTailLines(filePath, keepLast + 1);
+    if (newestFirst.length <= keepLast) return;
 
-    const lines = raw.trimEnd().split('\n').filter(l => l.length > 0);
-    if (lines.length <= keepLast) return;
-
-    const kept = lines.slice(lines.length - keepLast);
+    const kept = newestFirst.slice(0, keepLast).reverse();
     try {
       writeFileSync(filePath, kept.join('\n') + '\n');
-      logger.info({ sessionName, before: lines.length, after: kept.length }, 'TimelineStore: truncated');
+      logger.info({ sessionName, after: kept.length }, 'TimelineStore: truncated');
     } catch (err) {
       logger.debug({ err, sessionName }, 'TimelineStore: truncate write failed');
     }

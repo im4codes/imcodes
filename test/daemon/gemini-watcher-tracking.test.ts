@@ -22,6 +22,7 @@ vi.mock('../../src/store/session-store.js', () => ({
 
 vi.mock('fs/promises', () => ({
   readFile: vi.fn(),
+  open: vi.fn(),
   stat: vi.fn(),
   readdir: vi.fn().mockResolvedValue([]),
   watch: vi.fn(),
@@ -196,5 +197,32 @@ describe('Gemini watcher — rotation preserves message processing', () => {
     // Should have processed all 6 messages from the new file
     expect(state.seenCount).toBe(6);
     expect(state.lastUpdated).toBe('ts-rotated');
+  });
+
+  it('tail-parses oversized conversation files instead of full readFile', async () => {
+    const tailChunk = [
+      ',{"type":"user","content":[{"text":"hello from user"}],"timestamp":"2026-01-01T00:00:00Z"}',
+      ',{"type":"gemini","content":"reply from gemini","timestamp":"2026-01-01T00:00:01Z"}',
+      ']}',
+    ].join('');
+    const tailBuffer = Buffer.from(tailChunk, 'utf8');
+    const fileHandle = {
+      read: vi.fn(async (buffer: Buffer) => {
+        tailBuffer.copy(buffer, 0);
+        return { bytesRead: tailBuffer.length, buffer };
+      }),
+      close: vi.fn(async () => undefined),
+    };
+
+    vi.mocked(fs.stat).mockResolvedValue({ mtimeMs: 4000, size: 10 * 1024 * 1024, ino: 3 } as any);
+    vi.mocked(fs.open).mockResolvedValue(fileHandle as any);
+
+    const state = makeState();
+    await pollTick('test', state);
+
+    expect(fs.readFile).not.toHaveBeenCalled();
+    expect(fs.open).toHaveBeenCalledWith('/tmp/session.json', 'r');
+    expect(state._oversizedRecentMessageIds).toHaveLength(2);
+    expect(state.lastConversationStatus).toBe('idle');
   });
 });
