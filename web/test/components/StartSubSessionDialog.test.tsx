@@ -120,6 +120,26 @@ describe('StartSubSessionDialog', () => {
     expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, { thinking: 'high' });
   });
 
+  it('clicking the backdrop does not call onClose', () => {
+    const onClose = vi.fn();
+    const { container } = render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={vi.fn()}
+        onClose={onClose}
+      />,
+    );
+
+    const backdrop = container.querySelector('.dialog-overlay') as HTMLElement | null;
+    expect(backdrop).not.toBeNull();
+    fireEvent.click(backdrop!, { target: backdrop });
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
   it('does not show CC preset controls for claude-code-sdk sub-sessions', () => {
     const onStart = vi.fn();
     const ws = makeWs();

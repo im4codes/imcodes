@@ -322,7 +322,6 @@ export function NewSessionDialog({
   }, [agentType]);
 
   const handleKey = (e: KeyboardEvent) => {
-    if (e.key === "Escape" && !starting) onClose();
     if (e.key === "Enter" && !starting) handleStart();
   };
 
@@ -336,9 +335,6 @@ export function NewSessionDialog({
         alignItems: "center",
         justifyContent: "center",
         zIndex: 9999,
-      }}
-      onClick={(e) => {
-        if (e.target === e.currentTarget && !starting) onClose();
       }}
       onKeyDown={handleKey}
       role="dialog"

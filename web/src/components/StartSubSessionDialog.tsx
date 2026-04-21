@@ -158,7 +158,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
       : [];
 
   return (
-    <div class="dialog-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+    <div class="dialog-overlay">
       <div class="dialog" style={{ width: 380 }}>
         <div class="dialog-header">
           <span>New Sub-Session</span>

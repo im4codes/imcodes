@@ -123,6 +123,12 @@ const INLINE_PASTE_TEXT_CHAR_LIMIT = 1200;
 
 type ComposerAttachment = { path: string; name: string };
 
+function buildComposerDraftScope(activeSession: SessionInfo | null, subSessionId?: string): string | null {
+  if (subSessionId && subSessionId.trim()) return `sub:${subSessionId.trim()}`;
+  if (activeSession?.name?.trim()) return `session:${activeSession.name.trim()}`;
+  return null;
+}
+
 function buildPastedTextFileName(now = new Date()): string {
   const compact = now.toISOString().replace(/[:.]/g, '-');
   return `pasted-text-${compact}.txt`;
@@ -532,8 +538,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, []);
 
   // Persist input draft across unmount/remount (sub-session minimize/restore)
-  const draftKey = activeSession ? `rcc_draft_${activeSession.name}` : null;
-  const attachmentDraftKey = activeSession ? `rcc_draft_attachments_${activeSession.name}` : null;
+  const composerDraftScope = buildComposerDraftScope(activeSession, subSessionId);
+  const draftKey = composerDraftScope ? `rcc_draft_${composerDraftScope}` : null;
+  const attachmentDraftKey = composerDraftScope ? `rcc_draft_attachments_${composerDraftScope}` : null;
+  const [hydratedAttachmentDraftKey, setHydratedAttachmentDraftKey] = useState<string | null>(null);
   useEffect(() => {
     if (!draftKey || !divRef.current) return;
     const saved = sessionStorage.getItem(draftKey);
@@ -548,6 +556,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [draftKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
+    setHydratedAttachmentDraftKey(null);
     if (!attachmentDraftKey) {
       setAttachments([]);
       attachmentDraftRef.current = [];
@@ -556,28 +565,19 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     const saved = parseStoredComposerAttachments(sessionStorage.getItem(attachmentDraftKey));
     setAttachments(saved);
     attachmentDraftRef.current = saved;
-    return () => {
-      try {
-        if (attachmentDraftRef.current.length > 0) {
-          sessionStorage.setItem(attachmentDraftKey, JSON.stringify(attachmentDraftRef.current));
-        }
-        else sessionStorage.removeItem(attachmentDraftKey);
-      } catch {
-        /* ignore */
-      }
-    };
+    setHydratedAttachmentDraftKey(attachmentDraftKey);
   }, [attachmentDraftKey]);
 
   useEffect(() => {
     attachmentDraftRef.current = attachments;
-    if (!attachmentDraftKey) return;
+    if (!attachmentDraftKey || hydratedAttachmentDraftKey !== attachmentDraftKey) return;
     try {
       if (attachments.length > 0) sessionStorage.setItem(attachmentDraftKey, JSON.stringify(attachments));
       else sessionStorage.removeItem(attachmentDraftKey);
     } catch {
       /* ignore */
     }
-  }, [attachmentDraftKey, attachments]);
+  }, [attachmentDraftKey, attachments, hydratedAttachmentDraftKey]);
 
   useEffect(() => () => {
     if (sendWarningTimerRef.current) clearTimeout(sendWarningTimerRef.current);

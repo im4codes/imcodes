@@ -157,21 +157,20 @@ describe('NewSessionDialog', () => {
     }));
   });
 
-  it('pressing Escape calls onClose', () => {
+  it('pressing Escape does not call onClose', () => {
     const onClose = vi.fn();
     const { container } = render(<NewSessionDialog ws={makeWs() as any} onClose={onClose} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
     const dialog = container.querySelector('[role="dialog"]')!;
     fireEvent.keyDown(dialog, { key: 'Escape' });
-    expect(onClose).toHaveBeenCalledOnce();
+    expect(onClose).not.toHaveBeenCalled();
   });
 
-  it('clicking the backdrop calls onClose', () => {
+  it('clicking the backdrop does not call onClose', () => {
     const onClose = vi.fn();
     const { container } = render(<NewSessionDialog ws={makeWs() as any} onClose={onClose} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
     const backdrop = container.querySelector('[role="dialog"]')!;
-    // Simulate clicking the backdrop element itself (currentTarget === target)
     fireEvent.click(backdrop, { target: backdrop });
-    expect(onClose).toHaveBeenCalledOnce();
+    expect(onClose).not.toHaveBeenCalled();
   });
 
   it('matches started events for non-ASCII project names deterministically', () => {

@@ -2554,6 +2554,99 @@ afterEach(() => {
     });
   });
 
+  it('restores uploaded attachment badges when switching back to the same sub-session', async () => {
+    uploadFileMock.mockResolvedValue({ attachment: { daemonPath: '/tmp/persisted-sub-attachment.txt' } });
+    const ws = makeWs();
+    const { rerender } = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'deck_sub_sub-1' })}
+        subSessionId="sub-1"
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    fireEvent.paste(input, {
+      clipboardData: {
+        getData: (type: string) => type === 'text/plain' ? 'x'.repeat(1300) : '',
+      },
+    });
+
+    await waitFor(() => {
+      expect(document.querySelector('.attachment-badge-name')?.textContent).toMatch(/^pasted-text-.*\.txt$/);
+    });
+    const badgeName = document.querySelector('.attachment-badge-name')?.textContent ?? '';
+
+    rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'deck_sub_sub-2' })}
+        subSessionId="sub-2"
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    expect(document.querySelector('.attachment-badge-name')).toBeNull();
+
+    rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'deck_sub_sub-1' })}
+        subSessionId="sub-1"
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(document.querySelector('.attachment-badge-name')?.textContent).toBe(badgeName);
+    });
+  });
+
+  it('does not clear stored attachments when another control surface mounts for the same sub-session', async () => {
+    uploadFileMock.mockResolvedValue({ attachment: { daemonPath: '/tmp/shared-sub-attachment.txt' } });
+    const ws = makeWs();
+    const first = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'deck_sub_shared' })}
+        subSessionId="sub-shared"
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = within(first.container).getByRole('textbox') as HTMLDivElement;
+    fireEvent.paste(input, {
+      clipboardData: {
+        getData: (type: string) => type === 'text/plain' ? 'x'.repeat(1300) : '',
+      },
+    });
+
+    await waitFor(() => {
+      expect(first.container.querySelector('.attachment-badge-name')?.textContent).toMatch(/^pasted-text-.*\.txt$/);
+    });
+    const badgeName = first.container.querySelector('.attachment-badge-name')?.textContent ?? '';
+
+    const second = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'deck_sub_shared' })}
+        subSessionId="sub-shared"
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(second.container.querySelector('.attachment-badge-name')?.textContent).toBe(badgeName);
+    });
+    expect(first.container.querySelector('.attachment-badge-name')?.textContent).toBe(badgeName);
+  });
+
   it('blocks oversized plain-text paste when upload context is unavailable', async () => {
     render(
       <SessionControls
