@@ -2,7 +2,11 @@
  * @vitest-environment jsdom
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { SUPERVISION_USER_DEFAULT_PREF_KEY } from '@shared/supervision-config.js';
+import {
+  DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
+  DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
+  SUPERVISION_USER_DEFAULT_PREF_KEY,
+} from '@shared/supervision-config.js';
 import { CODEX_MODEL_IDS } from '../../src/shared/models/options.js';
 import {
   fetchSupervisorDefaults,
@@ -48,6 +52,8 @@ describe('supervision API helpers', () => {
       model: CODEX_MODEL_IDS[0],
       timeoutMs: 20_000,
       promptVersion: 'custom_prompt_v1',
+      maxAutoContinueStreak: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
+      maxAutoContinueTotal: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
@@ -69,6 +75,8 @@ describe('supervision API helpers', () => {
       model: 'qwen3-coder-plus',
       timeoutMs: 15_000,
       promptVersion: 'supervision_decision_v1',
+      maxAutoContinueStreak: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
+      maxAutoContinueTotal: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
@@ -81,6 +89,8 @@ describe('supervision API helpers', () => {
             model: 'qwen3-coder-plus',
             timeoutMs: 15_000,
             promptVersion: 'supervision_decision_v1',
+            maxAutoContinueStreak: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
+            maxAutoContinueTotal: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
           },
         }),
       }),

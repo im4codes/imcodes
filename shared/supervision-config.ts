@@ -55,6 +55,8 @@ export const SUPERVISION_DEFAULT_TIMEOUT_MS = 12_000;
 export const SUPERVISION_DEFAULT_MAX_PARSE_RETRIES = 1;
 export const SUPERVISION_DEFAULT_AUDIT_MODE: SupervisionAuditMode = 'audit';
 export const SUPERVISION_DEFAULT_MAX_AUDIT_LOOPS = 2;
+export const SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_STREAK = 2;
+export const SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_TOTAL = 8;
 export const SUPERVISION_DEFAULT_PROMPT_VERSION = SUPERVISION_CONTRACT_IDS.DECISION;
 export const SUPERVISION_DEFAULT_TASK_RUN_PROMPT_VERSION = SUPERVISION_CONTRACT_IDS.TASK_RUN_STATUS;
 
@@ -107,6 +109,8 @@ export type SessionSupervisionSnapshotIssue =
   | 'invalid_global_custom_instructions'
   | 'invalid_preset'
   | 'invalid_max_parse_retries'
+  | 'invalid_max_auto_continue_streak'
+  | 'invalid_max_auto_continue_total'
   | 'missing_audit_mode'
   | 'invalid_audit_mode'
   | 'invalid_max_audit_loops'
@@ -126,6 +130,8 @@ export interface SupervisorDefaultConfig {
   model: string;
   timeoutMs: number;
   promptVersion: string;
+  maxAutoContinueStreak: number;
+  maxAutoContinueTotal: number;
   /**
    * Optional global supervision custom instructions. Free text appended to the
    * supervisor prompt for every Auto-enabled session that does not set
@@ -165,6 +171,8 @@ export interface SessionSupervisionSnapshot extends SupervisorDefaultConfig {
    */
   globalCustomInstructions?: string;
   maxParseRetries: number;
+  maxAutoContinueStreak: number;
+  maxAutoContinueTotal: number;
   auditMode: SupervisionAuditMode;
   maxAuditLoops: number;
   taskRunPromptVersion: string;
@@ -184,6 +192,12 @@ function normalizePositiveInteger(value: unknown, fallback: number, minimum = 1)
   if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
   const int = Math.floor(value);
   return int >= minimum ? int : fallback;
+}
+
+function normalizeNonNegativeInteger(value: unknown, fallback: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
+  const int = Math.floor(value);
+  return int >= 0 ? int : fallback;
 }
 
 export function isSupportedSupervisionBackend(value: string | null | undefined): value is SharedContextRuntimeBackend {
@@ -238,6 +252,8 @@ export function normalizeSupervisorDefaultConfig(
     model,
     timeoutMs: normalizePositiveInteger(merged.timeoutMs, SUPERVISION_DEFAULT_TIMEOUT_MS, 1),
     promptVersion: trimString(merged.promptVersion) ?? SUPERVISION_DEFAULT_PROMPT_VERSION,
+    maxAutoContinueStreak: normalizeNonNegativeInteger(merged.maxAutoContinueStreak, SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_STREAK),
+    maxAutoContinueTotal: normalizeNonNegativeInteger(merged.maxAutoContinueTotal, SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_TOTAL),
     ...(customInstructions ? { customInstructions } : {}),
     ...(preset ? { preset } : {}),
   };
@@ -299,6 +315,12 @@ export function getSessionSupervisionSnapshotIssues(
   if (typeof record.maxParseRetries !== 'number' || !Number.isFinite(record.maxParseRetries) || Math.floor(record.maxParseRetries) < 1) {
     issues.push('invalid_max_parse_retries');
   }
+  if (typeof record.maxAutoContinueStreak !== 'number' || !Number.isFinite(record.maxAutoContinueStreak) || Math.floor(record.maxAutoContinueStreak) < 0) {
+    issues.push('invalid_max_auto_continue_streak');
+  }
+  if (typeof record.maxAutoContinueTotal !== 'number' || !Number.isFinite(record.maxAutoContinueTotal) || Math.floor(record.maxAutoContinueTotal) < 0) {
+    issues.push('invalid_max_auto_continue_total');
+  }
 
   if (mode === SUPERVISION_MODE.SUPERVISED_AUDIT) {
     if (record.auditMode == null || record.auditMode === '') issues.push('missing_audit_mode');
@@ -329,6 +351,8 @@ export function normalizeSessionSupervisionSnapshot(
     : false;
   const globalCustomInstructions = trimString(merged.globalCustomInstructions);
   const maxParseRetries = normalizePositiveInteger(merged.maxParseRetries, SUPERVISION_DEFAULT_MAX_PARSE_RETRIES, 1);
+  const maxAutoContinueStreak = normalizeNonNegativeInteger(merged.maxAutoContinueStreak, SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_STREAK);
+  const maxAutoContinueTotal = normalizeNonNegativeInteger(merged.maxAutoContinueTotal, SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_TOTAL);
   const auditMode = isSupportedSupervisionAuditMode(merged.auditMode) ? merged.auditMode : SUPERVISION_DEFAULT_AUDIT_MODE;
   const maxAuditLoops = normalizePositiveInteger(merged.maxAuditLoops, SUPERVISION_DEFAULT_MAX_AUDIT_LOOPS, 1);
   return {
@@ -340,6 +364,8 @@ export function normalizeSessionSupervisionSnapshot(
     ...(customInstructionsOverride ? { customInstructionsOverride: true } : {}),
     ...(globalCustomInstructions ? { globalCustomInstructions } : {}),
     maxParseRetries,
+    maxAutoContinueStreak,
+    maxAutoContinueTotal,
     auditMode,
     maxAuditLoops,
     taskRunPromptVersion: trimString(merged.taskRunPromptVersion) ?? SUPERVISION_DEFAULT_TASK_RUN_PROMPT_VERSION,
@@ -479,6 +505,8 @@ export const TASK_RUN_PROMPT_VERSION = SUPERVISION_DEFAULT_TASK_RUN_PROMPT_VERSI
 export const DEFAULT_SUPERVISION_AUDIT_MODE = SUPERVISION_DEFAULT_AUDIT_MODE;
 export const DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS = SUPERVISION_DEFAULT_MAX_AUDIT_LOOPS;
 export const DEFAULT_SUPERVISION_MAX_PARSE_RETRIES = SUPERVISION_DEFAULT_MAX_PARSE_RETRIES;
+export const DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK = SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_STREAK;
+export const DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL = SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_TOTAL;
 
 export function parseTaskRunTerminalStateDetailsFromText(text: string): ParsedTaskRunTerminalState {
   const matches = [...text.matchAll(/<!--\s*IMCODES_TASK_RUN:\s*(COMPLETE|NEEDS_INPUT|BLOCKED)\s*-->/g)];

@@ -64,7 +64,12 @@ async function cleanupProjectDir() {
   projectDir = null;
 }
 
-async function seedSession(mode: 'supervised' | 'supervised_audit' = 'supervised_audit', withOpenSpecChange = false, maxAuditLoops = 2) {
+async function seedSession(
+  mode: 'supervised' | 'supervised_audit' = 'supervised_audit',
+  withOpenSpecChange = false,
+  maxAuditLoops = 2,
+  overrides: Record<string, unknown> = {},
+) {
   const snapshot = normalizeSessionSupervisionSnapshot({
     mode: mode === 'supervised' ? SUPERVISION_MODE.SUPERVISED : SUPERVISION_MODE.SUPERVISED_AUDIT,
     backend: 'codex-sdk',
@@ -75,6 +80,7 @@ async function seedSession(mode: 'supervised' | 'supervised_audit' = 'supervised
     auditMode: 'audit',
     maxAuditLoops,
     taskRunPromptVersion: 'task_run_status_v1',
+    ...overrides,
   });
   const seededProjectDir = await seedProjectDir(withOpenSpecChange);
   upsertSession({
@@ -198,6 +204,103 @@ describe('SupervisionAutomation', () => {
         }),
       }),
     ]));
+  });
+
+  it('stops after the configured repeated continue streak for the same bucket', async () => {
+    const snapshot = await seedSession('supervised', false, 2, {
+      maxAutoContinueStreak: 2,
+      maxAutoContinueTotal: 0,
+    });
+    mockSupervisionDecide
+      .mockResolvedValueOnce({ decision: 'continue', reason: 'write tests for the missing cases', confidence: 0.7 })
+      .mockResolvedValueOnce({ decision: 'continue', reason: 'write tests for edge cases too', confidence: 0.7 })
+      .mockResolvedValueOnce({ decision: 'continue', reason: 'write tests for regressions as well', confidence: 0.7 });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-streak', 'implement the feature', snapshot);
+    beginRun('cmd-streak', 'implement the feature');
+
+    completeTurn('implemented the code');
+    await sleep(25);
+    completeTurn('added a first batch of tests');
+    await sleep(25);
+    completeTurn('added another batch of tests');
+    await sleep(25);
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    expect(timelineEmitter.replay('deck_supervision_brain', 0).events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'assistant.text',
+        payload: expect.objectContaining({
+          automationKind: 'supervision-warning',
+          text: '⚠️ Automation reached the repeated auto-continue limit (2) for test_verify; handing control back to the human.',
+        }),
+      }),
+    ]));
+  });
+
+  it('allows different continue types until the hard total limit is reached', async () => {
+    const snapshot = await seedSession('supervised', false, 2, {
+      maxAutoContinueStreak: 2,
+      maxAutoContinueTotal: 2,
+    });
+    mockSupervisionDecide
+      .mockResolvedValueOnce({ decision: 'continue', reason: 'write missing tests', confidence: 0.7 })
+      .mockResolvedValueOnce({ decision: 'continue', reason: 'restart the daemon to pick up the config', confidence: 0.7 })
+      .mockResolvedValueOnce({ decision: 'continue', reason: 'inspect the logs again', confidence: 0.7 });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-total', 'implement the feature', snapshot);
+    beginRun('cmd-total', 'implement the feature');
+
+    completeTurn('implemented the code');
+    await sleep(25);
+    completeTurn('added tests');
+    await sleep(25);
+    completeTurn('restarted the daemon');
+    await sleep(25);
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    expect(timelineEmitter.replay('deck_supervision_brain', 0).events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'assistant.text',
+        payload: expect.objectContaining({
+          automationKind: 'supervision-warning',
+          text: '⚠️ Automation reached the auto-continue hard limit (2); handing control back to the human.',
+        }),
+      }),
+    ]));
+  });
+
+  it('treats zero auto-continue limits as unlimited', async () => {
+    const snapshot = await seedSession('supervised', false, 2, {
+      maxAutoContinueStreak: 0,
+      maxAutoContinueTotal: 0,
+    });
+    mockSupervisionDecide
+      .mockResolvedValueOnce({ decision: 'continue', reason: 'write missing tests', confidence: 0.7 })
+      .mockResolvedValueOnce({ decision: 'continue', reason: 'write more missing tests', confidence: 0.7 })
+      .mockResolvedValueOnce({ decision: 'continue', reason: 'write final missing tests', confidence: 0.7 });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-unlimited', 'implement the feature', snapshot);
+    beginRun('cmd-unlimited', 'implement the feature');
+
+    completeTurn('implemented the code');
+    await sleep(25);
+    completeTurn('added a first batch of tests');
+    await sleep(25);
+    completeTurn('added a second batch of tests');
+    await sleep(25);
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(3);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      continueLoops: 3,
+      continueStreakCount: 3,
+      lastContinueBucket: 'test_verify',
+    });
   });
 
   it('emits and clears a supervision waiting status around completion evaluation', async () => {

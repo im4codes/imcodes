@@ -9,6 +9,8 @@ import { SESSION_AGENT_TYPES, TRANSPORT_SESSION_AGENT_TYPES, type SessionAgentTy
 import type { SharedContextRuntimeBackend } from '@shared/context-types.js';
 import { doesSharedContextBackendSupportPresets, isKnownSharedContextModelForBackend } from '@shared/shared-context-runtime-config.js';
 import {
+  DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
+  DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
   buildTransportConfigWithSupervision,
   DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS,
   DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
@@ -76,6 +78,8 @@ type SupervisionDraft = {
    */
   customInstructionsOverride?: boolean;
   maxParseRetries?: number;
+  maxAutoContinueStreak?: number;
+  maxAutoContinueTotal?: number;
   auditMode?: SupervisionAuditMode;
   maxAuditLoops?: number;
   taskRunPromptVersion?: string;
@@ -88,7 +92,7 @@ type SupervisionDraft = {
 // to decide merging.
 type SupervisionRuntimeDraft = Pick<
   SupervisionDraft,
-  'backend' | 'model' | 'preset' | 'timeoutMs' | 'promptVersion' | 'customInstructions'
+  'backend' | 'model' | 'preset' | 'timeoutMs' | 'promptVersion' | 'customInstructions' | 'maxAutoContinueStreak' | 'maxAutoContinueTotal'
 >;
 
 function timeoutMsToUiSeconds(timeoutMs: number | undefined): number {
@@ -530,6 +534,8 @@ export function SessionSettingsDialog({
             preset: resolvedDefaults.preset,
             timeoutMs: resolvedDefaults.timeoutMs,
             promptVersion: resolvedDefaults.promptVersion,
+            maxAutoContinueStreak: prev.maxAutoContinueStreak ?? resolvedDefaults.maxAutoContinueStreak ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
+            maxAutoContinueTotal: prev.maxAutoContinueTotal ?? resolvedDefaults.maxAutoContinueTotal ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
             maxParseRetries: prev.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
             maxAuditLoops: prev.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS,
             taskRunPromptVersion: prev.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION,
@@ -550,6 +556,8 @@ export function SessionSettingsDialog({
   const supervisionCustomInstructions = typeof supervision.customInstructions === 'string' ? supervision.customInstructions : '';
   const supervisionCustomInstructionsOverride = supervision.customInstructionsOverride === true;
   const supervisionParseRetries = supervision.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES;
+  const supervisionAutoContinueStreak = supervision.maxAutoContinueStreak ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK;
+  const supervisionAutoContinueTotal = supervision.maxAutoContinueTotal ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL;
   const supervisionAuditMode = supervision.auditMode;
   const supervisionAuditLoops = supervision.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS;
   const taskRunPromptVersion = supervision.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION;
@@ -561,6 +569,8 @@ export function SessionSettingsDialog({
   const supervisorDefaultsPromptVersion = supervisorDefaults.promptVersion ?? SUPERVISION_PROMPT_VERSION;
   const supervisorDefaultsModelOptions = supervisorDefaultsBackend ? getSupervisionModelOptions(supervisorDefaultsBackend) : [];
   const supervisorDefaultsCustomInstructions = typeof supervisorDefaults.customInstructions === 'string' ? supervisorDefaults.customInstructions : '';
+  const supervisorDefaultsAutoContinueStreak = supervisorDefaults.maxAutoContinueStreak ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK;
+  const supervisorDefaultsAutoContinueTotal = supervisorDefaults.maxAutoContinueTotal ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL;
   const supervisionPreset = typeof supervision.preset === 'string' ? supervision.preset : '';
   const supervisorDefaultsPreset = typeof supervisorDefaults.preset === 'string' ? supervisorDefaults.preset : '';
   // Gate preset picker visibility: needs a ws channel to fetch presets, a
@@ -605,6 +615,8 @@ export function SessionSettingsDialog({
       ? { globalCustomInstructions: supervisorDefaultsCustomInstructions.trim() }
       : {}),
     maxParseRetries: supervisionParseRetries,
+    maxAutoContinueStreak: supervisionAutoContinueStreak,
+    maxAutoContinueTotal: supervisionAutoContinueTotal,
     ...(isAuditMode
       ? {
           auditMode: supervisionAuditMode,
@@ -618,6 +630,8 @@ export function SessionSettingsDialog({
     supervision.mode,
     supervisionAuditLoops,
     supervisionAuditMode,
+    supervisionAutoContinueStreak,
+    supervisionAutoContinueTotal,
     supervisionBackend,
     supervisionCustomInstructions,
     supervisionCustomInstructionsOverride,
@@ -681,6 +695,8 @@ export function SessionSettingsDialog({
           timeoutMs: prev.timeoutMs ?? DEFAULT_SUPERVISION_TIMEOUT_MS,
           promptVersion: prev.promptVersion ?? SUPERVISION_PROMPT_VERSION,
           customInstructions: prev.customInstructions,
+          maxAutoContinueStreak: prev.maxAutoContinueStreak ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
+          maxAutoContinueTotal: prev.maxAutoContinueTotal ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
           maxParseRetries: prev.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
           auditMode: prev.auditMode,
           maxAuditLoops: prev.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS,
@@ -695,6 +711,8 @@ export function SessionSettingsDialog({
           timeoutMs: prev.timeoutMs ?? DEFAULT_SUPERVISION_TIMEOUT_MS,
           promptVersion: prev.promptVersion ?? SUPERVISION_PROMPT_VERSION,
           customInstructions: prev.customInstructions,
+          maxAutoContinueStreak: prev.maxAutoContinueStreak ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
+          maxAutoContinueTotal: prev.maxAutoContinueTotal ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
           maxParseRetries: prev.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
           auditMode: prev.auditMode,
           maxAuditLoops: prev.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS,
@@ -708,6 +726,8 @@ export function SessionSettingsDialog({
         timeoutMs: prev.timeoutMs ?? DEFAULT_SUPERVISION_TIMEOUT_MS,
         promptVersion: prev.promptVersion ?? SUPERVISION_PROMPT_VERSION,
         customInstructions: prev.customInstructions,
+        maxAutoContinueStreak: prev.maxAutoContinueStreak ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
+        maxAutoContinueTotal: prev.maxAutoContinueTotal ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
         maxParseRetries: prev.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
         taskRunPromptVersion: prev.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION,
       };
@@ -745,6 +765,8 @@ export function SessionSettingsDialog({
           model: supervisorDefaultsModel.trim(),
           timeoutMs: supervisorDefaultsTimeout,
           promptVersion: supervisorDefaultsPromptVersion,
+          maxAutoContinueStreak: supervisorDefaultsAutoContinueStreak,
+          maxAutoContinueTotal: supervisorDefaultsAutoContinueTotal,
           // Optional free-text global supervision instructions. Empty string
           // is normalized to undefined by the shared helper.
           customInstructions: supervisorDefaultsCustomInstructions.trim() || undefined,
@@ -836,9 +858,44 @@ export function SessionSettingsDialog({
           onBackendChange={(nextBackend) => {
             setSupervisorDefaults((prev) => ({ ...prev, ...updateRuntimeDraft(prev, nextBackend) }));
           }}
-          onModelChange={(model) => setSupervisorDefaults((prev) => ({ ...prev, model }))}
-          onTimeoutChange={(seconds) => setSupervisorDefaults((prev) => ({ ...prev, timeoutMs: timeoutUiSecondsToMs(seconds) }))}
-        />
+              onModelChange={(model) => setSupervisorDefaults((prev) => ({ ...prev, model }))}
+              onTimeoutChange={(seconds) => setSupervisorDefaults((prev) => ({ ...prev, timeoutMs: timeoutUiSecondsToMs(seconds) }))}
+            />
+
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 12 }}>
+          <div>
+            <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.maxAutoContinueStreak')}</div>
+            <input
+              class="input"
+              type="number"
+              min={0}
+              value={String(supervisorDefaultsAutoContinueStreak)}
+              onInput={(e) => {
+                const value = Number.parseInt((e.target as HTMLInputElement).value, 10);
+                setSupervisorDefaults((prev) => ({ ...prev, maxAutoContinueStreak: Number.isFinite(value) && value >= 0 ? value : DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK }));
+              }}
+              style={{ width: '100%' }}
+              disabled={saving}
+            />
+            <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>{t('session.supervision.maxAutoContinueStreakHelp')}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.maxAutoContinueTotal')}</div>
+            <input
+              class="input"
+              type="number"
+              min={0}
+              value={String(supervisorDefaultsAutoContinueTotal)}
+              onInput={(e) => {
+                const value = Number.parseInt((e.target as HTMLInputElement).value, 10);
+                setSupervisorDefaults((prev) => ({ ...prev, maxAutoContinueTotal: Number.isFinite(value) && value >= 0 ? value : DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL }));
+              }}
+              style={{ width: '100%' }}
+              disabled={saving}
+            />
+            <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>{t('session.supervision.maxAutoContinueTotalHelp')}</div>
+          </div>
+        </div>
 
         {showDefaultsPresetPicker && (
           <SupervisionPresetPicker
@@ -936,6 +993,42 @@ export function SessionSettingsDialog({
               onModelChange={(model) => setSupervision((prev) => ({ ...prev, model }))}
               onTimeoutChange={(seconds) => setSupervision((prev) => ({ ...prev, timeoutMs: timeoutUiSecondsToMs(seconds) }))}
             />
+
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 12 }}>
+              <div>
+                <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.maxAutoContinueStreak')}</div>
+                <input
+                  class="input"
+                  type="number"
+                  min={0}
+                  value={String(supervisionAutoContinueStreak)}
+                  onInput={(e) => {
+                    const value = Number.parseInt((e.target as HTMLInputElement).value, 10);
+                    setSupervision((prev) => ({ ...prev, maxAutoContinueStreak: Number.isFinite(value) && value >= 0 ? value : DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK }));
+                  }}
+                  style={{ width: '100%' }}
+                  disabled={saving}
+                />
+                <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>{t('session.supervision.maxAutoContinueStreakHelp')}</div>
+              </div>
+
+              <div>
+                <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.maxAutoContinueTotal')}</div>
+                <input
+                  class="input"
+                  type="number"
+                  min={0}
+                  value={String(supervisionAutoContinueTotal)}
+                  onInput={(e) => {
+                    const value = Number.parseInt((e.target as HTMLInputElement).value, 10);
+                    setSupervision((prev) => ({ ...prev, maxAutoContinueTotal: Number.isFinite(value) && value >= 0 ? value : DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL }));
+                  }}
+                  style={{ width: '100%' }}
+                  disabled={saving}
+                />
+                <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>{t('session.supervision.maxAutoContinueTotalHelp')}</div>
+              </div>
+            </div>
 
             {showSessionPresetPicker && (
               <SupervisionPresetPicker
@@ -1057,6 +1150,12 @@ export function SessionSettingsDialog({
               </div>
               <div style={{ fontSize: 12, color: '#94a3b8' }}>
                 {t('session.supervision.summaryTimeout', { value: `${supervisionTimeoutSeconds} s` })}
+              </div>
+              <div style={{ fontSize: 12, color: '#94a3b8' }}>
+                {t('session.supervision.summaryContinueLimits', {
+                  streak: supervisionAutoContinueStreak,
+                  total: supervisionAutoContinueTotal,
+                })}
               </div>
               <div style={{ fontSize: 12, color: '#94a3b8' }}>
                 {t('session.supervision.summaryCustomInstructions', {

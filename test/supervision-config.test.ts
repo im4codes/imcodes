@@ -4,6 +4,8 @@ import { DEFAULT_PRIMARY_CONTEXT_MODEL } from '../shared/context-model-defaults.
 import {
   AUDIT_VERDICT_MARKERS,
   DEFAULT_SUPERVISION_BACKEND,
+  DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
+  DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
   SUPERVISION_AUDIT_MODES,
   SUPERVISION_CONTRACT_IDS,
   SUPERVISION_DEFAULT_AUDIT_MODE,
@@ -42,6 +44,8 @@ describe('supervision config helpers', () => {
     expect(config.model).toBe(CODEX_MODEL_IDS[0]);
     expect(config.timeoutMs).toBe(DEFAULT_SUPERVISION_TIMEOUT_MS);
     expect(config.promptVersion).toBe(SUPERVISION_DEFAULT_PROMPT_VERSION);
+    expect(config.maxAutoContinueStreak).toBe(DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK);
+    expect(config.maxAutoContinueTotal).toBe(DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL);
   });
 
   it('falls back to the backend default model when the model is invalid', () => {
@@ -79,9 +83,24 @@ describe('supervision config helpers', () => {
     expect(snapshot.promptVersion).toBe(SUPERVISION_CONTRACT_IDS.DECISION_REPAIR);
     expect(snapshot.customInstructions).toBe('Prefer tests before complete.');
     expect(snapshot.maxParseRetries).toBe(2);
+    expect(snapshot.maxAutoContinueStreak).toBe(DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK);
+    expect(snapshot.maxAutoContinueTotal).toBe(DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL);
     expect(snapshot.auditMode).toBe('audit>plan');
     expect(snapshot.maxAuditLoops).toBe(3);
     expect(snapshot.taskRunPromptVersion).toBe(SUPERVISION_CONTRACT_IDS.TASK_RUN_STATUS);
+  });
+
+  it('accepts zero auto-continue limits and preserves them in snapshots', () => {
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk',
+      model: CODEX_MODEL_IDS[0],
+      maxAutoContinueStreak: 0,
+      maxAutoContinueTotal: 0,
+    });
+
+    expect(snapshot.maxAutoContinueStreak).toBe(0);
+    expect(snapshot.maxAutoContinueTotal).toBe(0);
   });
 
   it('flags invalid persisted supervision snapshots instead of silently activating normalized automation', () => {
@@ -95,6 +114,8 @@ describe('supervision config helpers', () => {
         promptVersion: '',
         customInstructions: { invalid: true },
         maxParseRetries: 0,
+        maxAutoContinueStreak: -1,
+        maxAutoContinueTotal: -1,
         auditMode: 'not-an-audit-mode' as never,
         maxAuditLoops: 0,
         taskRunPromptVersion: '',
@@ -243,6 +264,22 @@ describe('supervision config helpers', () => {
         customInstructionsOverride: 'yes',
       });
       expect(issues).toContain('invalid_custom_instructions_override');
+    });
+
+    it('surfaces invalid auto-continue limit issues for negative values', () => {
+      const issues = getSessionSupervisionSnapshotIssues({
+        mode: SUPERVISION_MODE.SUPERVISED,
+        backend: 'codex-sdk',
+        model: CODEX_MODEL_IDS[0],
+        timeoutMs: 12_000,
+        promptVersion: SUPERVISION_DEFAULT_PROMPT_VERSION,
+        maxParseRetries: 1,
+        maxAutoContinueStreak: -1,
+        maxAutoContinueTotal: -2,
+      });
+
+      expect(issues).toContain('invalid_max_auto_continue_streak');
+      expect(issues).toContain('invalid_max_auto_continue_total');
     });
 
     it('round-trips globalCustomInstructions cache on the session snapshot', () => {

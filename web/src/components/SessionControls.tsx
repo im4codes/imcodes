@@ -884,6 +884,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         model: defaults.model,
         timeoutMs: defaults.timeoutMs,
         promptVersion: defaults.promptVersion,
+        maxAutoContinueStreak: defaults.maxAutoContinueStreak,
+        maxAutoContinueTotal: defaults.maxAutoContinueTotal,
       };
     }
 
