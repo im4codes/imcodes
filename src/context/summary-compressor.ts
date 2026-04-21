@@ -15,6 +15,7 @@ import type { TransportProvider, ProviderError } from '../agent/transport-provid
 import type { AgentMessage } from '../../shared/agent-message.js';
 import { randomUUID } from 'node:crypto';
 import logger from '../util/logger.js';
+import { resolveClaudeCodePathForSdk } from '../agent/transport-paths.js';
 import {
   resolveProcessingProviderSessionConfig,
   type ProcessingBackendSelection as CompressionBackendSelection,
@@ -482,9 +483,13 @@ async function sendViaSdkQuery(prompt: string): Promise<string> {
   delete process.env.CLAUDECODE;
   try {
     let result = '';
+    const pathToClaudeCodeExecutable = resolveClaudeCodePathForSdk();
     for await (const msg of query({
       prompt: COMPRESSOR_SYSTEM_PROMPT + '\n\n' + prompt,
-      options: { maxTurns: 1 },
+      options: {
+        maxTurns: 1,
+        pathToClaudeCodeExecutable,
+      },
     })) {
       if (msg.type === 'assistant') {
         const content = (msg as { message?: { content?: unknown } }).message?.content;

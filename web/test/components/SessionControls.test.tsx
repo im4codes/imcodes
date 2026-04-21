@@ -1941,7 +1941,7 @@ afterEach(() => {
     }));
   });
 
-  it('falls back to Settings when heavy mode needs audit config', async () => {
+  it('upgrades supervised mode to audit mode with default audit config', async () => {
     const ws = makeWs();
     const onSettings = vi.fn();
     render(
@@ -1971,9 +1971,18 @@ afterEach(() => {
     fireEvent.click(screen.getByRole('button', { name: /supervised_audit$/i }));
 
     await waitFor(() => {
-      expect(onSettings).toHaveBeenCalled();
+      expect(patchSessionMock).toHaveBeenCalledWith('srv1', 'codex-sdk-session', expect.objectContaining({
+        transportConfig: expect.objectContaining({
+          supervision: expect.objectContaining({
+            mode: 'supervised_audit',
+            auditMode: 'audit',
+            maxAuditLoops: 2,
+            taskRunPromptVersion: 'task_run_status_v1',
+          }),
+        }),
+      }));
     });
-    expect(patchSessionMock).not.toHaveBeenCalled();
+    expect(onSettings).not.toHaveBeenCalled();
   });
 
   it('falls back to Settings when heavy mode snapshot is present but audit config is invalid', async () => {

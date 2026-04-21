@@ -25,7 +25,7 @@ import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 import logger from '../../util/logger.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
-import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
+import { normalizeTransportCwd, resolveClaudeCodePathForSdk, resolveExecutableForSpawn } from '../transport-paths.js';
 
 const CLAUDE_BIN = 'claude';
 const DEFAULT_PERMISSION_MODE: PermissionMode = 'bypassPermissions';
@@ -114,7 +114,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
   private statusCallbacks: Array<(sessionId: string, status: ProviderStatusUpdate) => void> = [];
 
   async connect(config: ProviderConfig): Promise<void> {
-    const binaryPath = this.resolveBinaryPath(config);
+    const binaryPath = this.getConfiguredBinaryPath(config);
     const resolved = resolveExecutableForSpawn(binaryPath);
     await access(resolved.executable, fsConstants.X_OK).catch(async () => {
       const { execFile } = await import('node:child_process');
@@ -300,11 +300,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       } : {}),
     };
     options.spawnClaudeCodeProcess = (req: { command: string; args: string[]; cwd?: string; env?: Record<string, string>; signal?: AbortSignal }) => {
-      const finalCommand = this.windowsSpawnOverride?.executable ?? req.command;
-      const finalArgs = this.windowsSpawnOverride
-        ? [...this.windowsSpawnOverride.prependArgs, ...req.args]
-        : req.args;
-      const child = spawn(finalCommand, finalArgs, {
+      const child = spawn(req.command, req.args, {
         cwd: req.cwd,
         env: req.env,
         signal: req.signal,
@@ -575,21 +571,13 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     return DEFAULT_PERMISSION_MODE;
   }
 
-  private resolveBinaryPath(config: ProviderConfig | null): string {
-    const raw = typeof config?.binaryPath === 'string' && config.binaryPath.trim() ? config.binaryPath : CLAUDE_BIN;
-    // For windows + .cmd shim, the SDK can't spawn this directly.
-    // We pass it to the SDK as a marker, then override spawn via
-    // spawnClaudeCodeProcess (see send()).
-    if (process.platform === 'win32') {
-      const resolved = resolveExecutableForSpawn(raw);
-      this.windowsSpawnOverride = resolved.prependArgs.length > 0
-        ? { executable: resolved.executable, prependArgs: resolved.prependArgs }
-        : null;
-      return resolved.executable;
-    }
-    return raw;
+  private getConfiguredBinaryPath(config: ProviderConfig | null): string {
+    return typeof config?.binaryPath === 'string' && config.binaryPath.trim() ? config.binaryPath : CLAUDE_BIN;
   }
-  private windowsSpawnOverride: { executable: string; prependArgs: string[] } | null = null;
+
+  private resolveBinaryPath(config: ProviderConfig | null): string {
+    return resolveClaudeCodePathForSdk(this.getConfiguredBinaryPath(config));
+  }
 
   private emitSessionInfo(sessionId: string, info: SessionInfoUpdate): void {
     for (const cb of this.sessionInfoCallbacks) cb(sessionId, info);
