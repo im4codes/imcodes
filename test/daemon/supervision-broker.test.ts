@@ -691,8 +691,9 @@ describe('SupervisionBroker', () => {
       const prompt = String(provider.send.mock.calls[0]?.[1] ?? '');
       // Both layers present with global first, double-newline, then session.
       expect(prompt).toContain('GLOBAL-PERSONA-ABC\n\nSESSION-EXTRA-XYZ');
-      // The human-readable header is also present.
-      expect(prompt).toContain('Session-specific supervision instructions from the user:');
+      // Merged heading reflects the real source (both layers present) and
+      // frames the block as supervision-enforced rules, not chat hints.
+      expect(prompt).toContain('Supervision rules set by the user (global baseline first, then session-specific additions — supervision enforces all of them):');
     });
 
     it('uses only session text when the override flag is set', async () => {

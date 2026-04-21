@@ -568,3 +568,53 @@ export function resolveEffectiveCustomInstructions(
     snapshot.customInstructionsOverride,
   );
 }
+
+/** Where the effective custom-instructions block came from. Drives the
+ *  human-readable label shown to the supervisor prompt so the user's global
+ *  defaults aren't mislabeled as a session-specific override. */
+export type SupervisionCustomInstructionsSource = 'global' | 'session' | 'merged' | 'none';
+
+export interface SupervisionCustomInstructionsDetail {
+  /** Trimmed, merged text ready to inject into the prompt. Empty when
+   *  `source === 'none'`. */
+  text: string;
+  source: SupervisionCustomInstructionsSource;
+}
+
+/**
+ * Classify the three custom-instruction inputs into an effective text + a
+ * source tag. The tag is what supervision-prompts uses to pick the right
+ * label ("Global…" vs "Session-specific…" vs "User supervision instructions
+ * (global + per-session override)") so the prompt never misattributes the
+ * user's intent. Defaults-only → 'global'. Session-only (either because
+ * there is no global, or because override=true) → 'session'. Both present
+ * without override → 'merged'. Nothing set → 'none'.
+ */
+export function classifySupervisionCustomInstructions(
+  global: string | null | undefined,
+  session: string | null | undefined,
+  override: boolean | null | undefined,
+): SupervisionCustomInstructionsDetail {
+  const g = typeof global === 'string' ? global.trim() : '';
+  const s = typeof session === 'string' ? session.trim() : '';
+  if (override === true) {
+    if (!s) return { text: '', source: 'none' };
+    return { text: s, source: 'session' };
+  }
+  if (!g && !s) return { text: '', source: 'none' };
+  if (!g) return { text: s, source: 'session' };
+  if (!s) return { text: g, source: 'global' };
+  return { text: `${g}\n\n${s}`, source: 'merged' };
+}
+
+/** Snapshot-shaped convenience wrapper around classifySupervisionCustomInstructions. */
+export function resolveSupervisionCustomInstructionsDetail(
+  snapshot: Partial<SessionSupervisionSnapshot> | null | undefined,
+): SupervisionCustomInstructionsDetail {
+  if (!snapshot) return { text: '', source: 'none' };
+  return classifySupervisionCustomInstructions(
+    snapshot.globalCustomInstructions,
+    snapshot.customInstructions,
+    snapshot.customInstructionsOverride,
+  );
+}

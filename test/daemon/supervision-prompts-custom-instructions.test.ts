@@ -35,7 +35,7 @@ function makeRequest(snapshotPartial: Partial<Parameters<typeof normalizeSession
 }
 
 describe('supervision prompt custom-instructions merge', () => {
-  it('concatenates global + session when override is false', () => {
+  it('concatenates global + session when override is false and labels it as merged', () => {
     const req = makeRequest({
       customInstructions: 'always cite a test path',
       globalCustomInstructions: 'prefer TDD style',
@@ -46,9 +46,16 @@ describe('supervision prompt custom-instructions merge', () => {
     // Expect concat order: global first, blank line, then session.
     expect(prompt.indexOf('prefer TDD style')).toBeLessThan(prompt.indexOf('always cite a test path'));
     expect(prompt).toContain('prefer TDD style\n\nalways cite a test path');
+    // Merged heading kicks in only when BOTH sides are non-empty and
+    // override is false. Wording frames these as RULES the supervisor
+    // enforces, matching the cross-party semantics (supervisor judges
+    // against them; target session must comply with them).
+    expect(prompt).toContain('Supervision rules set by the user (global baseline first, then session-specific additions — supervision enforces all of them):');
+    // Must not mislabel the merged case as pure session-specific.
+    expect(prompt).not.toMatch(/Session-specific supervision rules set by the user[^\n]*\nprefer TDD style/);
   });
 
-  it('uses only session when override is true', () => {
+  it('uses only session and keeps the session-specific heading when override is true', () => {
     const req = makeRequest({
       customInstructions: 'session only text',
       globalCustomInstructions: 'this should be ignored',
@@ -57,38 +64,47 @@ describe('supervision prompt custom-instructions merge', () => {
     const prompt = buildSupervisionDecisionPrompt(req);
     expect(prompt).toContain('session only text');
     expect(prompt).not.toContain('this should be ignored');
+    expect(prompt).toContain('Session-specific supervision rules set by the user (supervision enforces these on this session):');
+    expect(prompt).not.toContain('Global supervision rules set by the user');
   });
 
-  it('falls back to global when session is empty and override is false', () => {
+  it('falls back to global when session is empty and labels it as global', () => {
     const req = makeRequest({
       customInstructions: '',
       globalCustomInstructions: 'global fallback',
     });
     const prompt = buildSupervisionDecisionPrompt(req);
     expect(prompt).toContain('global fallback');
+    // This is the original reported bug: pure-global must not be
+    // mislabeled as "Session-specific".
+    expect(prompt).toContain('Global supervision rules set by the user (supervision enforces these on every session, including this one):');
+    expect(prompt).not.toMatch(/Session-specific supervision rules set by the user[^\n]*\nglobal fallback/);
   });
 
-  it('omits the custom-instructions block entirely when both empty', () => {
+  it('omits the supervision-rules block entirely when both empty', () => {
     const req = makeRequest({
       customInstructions: '',
       globalCustomInstructions: '',
     });
     const prompt = buildSupervisionDecisionPrompt(req);
-    expect(prompt).not.toContain('Session-specific supervision instructions');
+    expect(prompt).not.toContain('Session-specific supervision rules');
+    expect(prompt).not.toContain('Global supervision rules');
+    expect(prompt).not.toContain('Supervision rules set by the user');
   });
 
-  it('passes the merged value into the repair prompt', () => {
+  it('passes the merged value into the repair prompt with the merged heading', () => {
     const req = makeRequest({
       customInstructions: 'retry me',
       globalCustomInstructions: 'global retry',
     });
     const prompt = buildSupervisionDecisionRepairPrompt(req, '{"bad":"json"}');
     expect(prompt).toContain('global retry\n\nretry me');
+    expect(prompt).toContain('Supervision rules set by the user (global baseline first, then session-specific additions — supervision enforces all of them):');
   });
 
-  it('buildSupervisionContinuePrompt keeps the single-arg contract with caller-merged value', () => {
-    // Continue prompt takes a pre-merged string — automation is responsible
-    // for calling resolveEffectiveCustomInstructions before invoking.
+  it('buildSupervisionContinuePrompt keeps the bare-string contract labeled session-specific', () => {
+    // Bare string keeps historic behavior: treated as session-specific
+    // (callers without snapshot context default to the session heading).
     const prompt = buildSupervisionContinuePrompt(
       'the task',
       'last assistant turn',
@@ -96,5 +112,18 @@ describe('supervision prompt custom-instructions merge', () => {
       'PRE-MERGED TEXT',
     );
     expect(prompt).toContain('PRE-MERGED TEXT');
+    expect(prompt).toContain('Session-specific supervision rules set by the user (supervision enforces these on this session):');
+  });
+
+  it('buildSupervisionContinuePrompt accepts a detail object and uses the source label', () => {
+    const prompt = buildSupervisionContinuePrompt(
+      'the task',
+      'last assistant turn',
+      'keep going',
+      { text: 'always commit', source: 'global' },
+    );
+    expect(prompt).toContain('always commit');
+    expect(prompt).toContain('Global supervision rules set by the user (supervision enforces these on every session, including this one):');
+    expect(prompt).not.toContain('Session-specific supervision rules set by the user');
   });
 });

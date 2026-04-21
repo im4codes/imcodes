@@ -2,18 +2,48 @@ import {
   AUDIT_VERDICT_MARKERS,
   SUPERVISION_CONTRACT_IDS,
   TASK_RUN_STATUS_MARKERS,
-  resolveEffectiveCustomInstructions,
+  classifySupervisionCustomInstructions,
+  resolveSupervisionCustomInstructionsDetail,
+  type SupervisionCustomInstructionsDetail,
 } from '../../shared/supervision-config.js';
 import { SUPERVISION_IMCODES_BACKGROUND_DOCS } from './imcodes-workflow-docs.js';
 import type { SupervisionBrokerRequest } from './supervision-broker.js';
 
-function buildCustomInstructionsSection(customInstructions: string | undefined): string {
-  const trimmed = customInstructions?.trim();
-  if (!trimmed) return '';
-  return [
-    'Session-specific supervision instructions from the user:',
-    trimmed,
-  ].join('\n');
+/**
+ * Render the user-provided supervision-rules block for a supervision prompt,
+ * labeling it according to where the text actually came from.
+ *
+ * These are not free-form "custom instructions" the target session can ignore
+ * — they are rules the USER set for supervision to enforce. Both the
+ * supervisor judge (decision prompt) and the target session (continue prompt)
+ * read the same block: the supervisor uses it to judge complete/continue/
+ * ask_human, and the target session uses it to understand what supervision
+ * is going to hold it accountable for. That symmetry is why decision and
+ * continue prompts share this exact heading.
+ *
+ * Before: the label was hardcoded to "Session-specific supervision
+ * instructions from the user:" even when the text was really the user's
+ * GLOBAL default (set in the supervisor-defaults panel and applied to
+ * every session). That mislabeled the scope AND dropped the
+ * "supervision-enforced rule" framing, making it read like a per-session
+ * chat hint. Now we pick the heading from the source classification.
+ */
+function buildCustomInstructionsSection(detail: SupervisionCustomInstructionsDetail | undefined): string {
+  if (!detail || !detail.text.trim()) return '';
+  const heading = ((): string => {
+    switch (detail.source) {
+      case 'global':
+        return 'Global supervision rules set by the user (supervision enforces these on every session, including this one):';
+      case 'session':
+        return 'Session-specific supervision rules set by the user (supervision enforces these on this session):';
+      case 'merged':
+        return 'Supervision rules set by the user (global baseline first, then session-specific additions — supervision enforces all of them):';
+      case 'none':
+      default:
+        return 'Session-specific supervision rules set by the user (supervision enforces these on this session):';
+    }
+  })();
+  return [heading, detail.text].join('\n');
 }
 
 function buildImcodesWorkflowBackgroundSection(): string {
@@ -38,7 +68,7 @@ export function buildSupervisionDecisionPrompt(
     '- If the assistant proposes a concrete next engineering step such as adding tests, fixing issues, verifying results, committing, or pushing, treat that as not complete yet.',
     '- Do not choose complete when the assistant itself indicates remaining work, TODOs, missing validation, or a follow-up implementation step.',
     buildImcodesWorkflowBackgroundSection(),
-    buildCustomInstructionsSection(resolveEffectiveCustomInstructions(request.snapshot)),
+    buildCustomInstructionsSection(resolveSupervisionCustomInstructionsDetail(request.snapshot)),
     request.description ? `Context: ${request.description}` : '',
     'Task request:',
     request.taskRequest,
@@ -59,7 +89,7 @@ export function buildSupervisionDecisionRepairPrompt(
     '{"decision":"complete|continue|ask_human","reason":"...","confidence":0.0}',
     'If the assistant response mentions remaining implementation work like tests, fixes, verification, commit/push, or another concrete next engineering step, return continue instead of complete.',
     buildImcodesWorkflowBackgroundSection(),
-    buildCustomInstructionsSection(resolveEffectiveCustomInstructions(request.snapshot)),
+    buildCustomInstructionsSection(resolveSupervisionCustomInstructionsDetail(request.snapshot)),
     'Previous invalid output:',
     previousOutput,
     'Task request:',
@@ -73,7 +103,14 @@ export function buildSupervisionContinuePrompt(
   taskRequest: string,
   assistantResponse: string | undefined,
   reason: string,
-  customInstructions?: string,
+  /**
+   * Pre-classified custom-instructions. A plain `string` is accepted for
+   * backward compatibility — it will be treated as session-specific, matching
+   * the historical label. Callers with access to the snapshot should pass the
+   * detail form (or use `resolveSupervisionCustomInstructionsDetail`) so the
+   * heading reflects the real origin (global / session / merged).
+   */
+  customInstructions?: string | SupervisionCustomInstructionsDetail,
   contractId: string = SUPERVISION_CONTRACT_IDS.CONTINUE,
 ): string {
   // Continue prompt goes to the TARGET session's chat (user-visible), not to
@@ -95,6 +132,13 @@ export function buildSupervisionContinuePrompt(
   // payload rather than from server-side history; dropping them risks the
   // agent losing task framing mid-run. They're cheap (a few KB) compared to
   // the background block we removed.
+  // Normalize: a bare string keeps the old "session-specific" label; a
+  // detail object drives the correct heading per its `source` tag. Both
+  // empty → section is omitted entirely.
+  const detail: SupervisionCustomInstructionsDetail | undefined =
+    typeof customInstructions === 'string'
+      ? classifySupervisionCustomInstructions(undefined, customInstructions, undefined)
+      : customInstructions;
   return [
     `[Contract: ${contractId}]`,
     'Continue working on the same task.',
@@ -102,7 +146,7 @@ export function buildSupervisionContinuePrompt(
     'Do not restart from scratch or restate completed work.',
     'Focus only on the remaining steps needed to finish the task.',
     'If you are truly blocked or need clarification, say that explicitly.',
-    buildCustomInstructionsSection(customInstructions),
+    buildCustomInstructionsSection(detail),
     '',
     'Original task request:',
     taskRequest,

@@ -15,7 +15,7 @@ import {
   SUPERVISION_UNAVAILABLE_REASONS,
   extractSessionSupervisionSnapshot,
   parseAuditVerdictDetailsFromText,
-  resolveEffectiveCustomInstructions,
+  resolveSupervisionCustomInstructionsDetail,
   type SessionSupervisionSnapshot,
   type SupervisionUnavailableReason,
   type TaskRunTerminalState,
@@ -943,11 +943,15 @@ class SupervisionAutomation {
     // at dispatch time. The session-scoped snapshot mirror can be stale when
     // the user updated defaults from a different session's dialog — the
     // daemon-side cache layer (`supervisor-defaults-cache.ts`) covers that gap.
+    // Pass the classified detail (text + source tag) so the continue prompt's
+    // heading reflects whether the instruction came from the user's global
+    // defaults, a session-specific override, or a merge of both — previously
+    // globals were mislabeled as "Session-specific".
     const continuePrompt = buildSupervisionContinuePrompt(
       current.userText,
       current.lastAssistantText,
       reason,
-      resolveEffectiveCustomInstructions(enrichSnapshotWithGlobalDefaults(current.snapshot)),
+      resolveSupervisionCustomInstructionsDetail(enrichSnapshotWithGlobalDefaults(current.snapshot)),
     );
     current.continueLoops += 1;
     current.sawAssistantOutput = false;
