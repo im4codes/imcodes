@@ -2,9 +2,10 @@
  * Watches Gemini CLI conversation JSON files for structured events.
  */
 
-import { watch, readdir, stat, readFile } from 'fs/promises';
+import { watch, readdir, stat, readFile, open } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
+import { createHash } from 'crypto';
 import { timelineEmitter } from './timeline-emitter.js';
 import { capturePane } from '../agent/tmux.js';
 import { detectStatus } from '../agent/detect.js';
@@ -20,6 +21,9 @@ const POLL_INTERVAL_MS = 1500; // Balanced: responsive enough without causing st
 const IDLE_LOCK_MS = 2000;    // After emitting idle, ignore terminal noise for this long
 const RUNNING_LOCK_MS = 3000; // After emitting running, don't transition to idle for this long
 const RETRY_DELAY_MS = 100;
+const FULL_READ_LIMIT_BYTES = 4 * 1024 * 1024; // 4 MiB
+const TAIL_READ_LIMIT_BYTES = 2 * 1024 * 1024; // 2 MiB
+const OVERSIZED_TAIL_MESSAGE_LIMIT = 48;
 const pendingGeminiFileTools = new Map<string, { id: string; name: string; args?: unknown; ts?: number }>();
 const completedGeminiFileTools = new Set<string>();
 const MAX_TRACKED_GEMINI_FILE_TOOLS = 512;
@@ -92,6 +96,93 @@ async function findLatestSessionFile(excludeClaimed = true): Promise<string | nu
     }
   }
   return bestPath;
+}
+
+type GeminiConversationSnapshot = {
+  lastUpdated: string;
+  messages: any[];
+  sessionId?: string;
+  truncated?: boolean;
+};
+
+function extractTopLevelJsonObjects(chunk: string): string[] {
+  const objects: string[] = [];
+  let inString = false;
+  let escaped = false;
+  let depth = 0;
+  let start = -1;
+
+  for (let i = 0; i < chunk.length; i++) {
+    const ch = chunk[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (ch === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === '{') {
+      if (depth === 0) start = i;
+      depth += 1;
+      continue;
+    }
+    if (ch === '}') {
+      if (depth === 0) continue;
+      depth -= 1;
+      if (depth === 0 && start >= 0) {
+        objects.push(chunk.slice(start, i + 1));
+        start = -1;
+      }
+    }
+  }
+
+  return objects;
+}
+
+async function readOversizedConversationTail(filePath: string, fileSize: number): Promise<GeminiConversationSnapshot | null> {
+  let fh: Awaited<ReturnType<typeof open>> | null = null;
+  try {
+    fh = await open(filePath, 'r');
+    const readSize = Math.min(fileSize, TAIL_READ_LIMIT_BYTES);
+    const buf = Buffer.allocUnsafe(readSize);
+    const { bytesRead } = await fh.read(buf, 0, readSize, fileSize - readSize);
+    if (bytesRead === 0) return null;
+
+    const chunk = buf.subarray(0, bytesRead).toString('utf8');
+    const objects = extractTopLevelJsonObjects(chunk);
+    const messages = objects
+      .flatMap((raw) => {
+        try {
+          const parsed = JSON.parse(raw) as Record<string, unknown>;
+          const type = parsed.type;
+          if (type === 'user' || type === 'gemini' || type === 'info') return [parsed];
+        } catch {
+          /* ignore malformed tail fragments */
+        }
+        return [];
+      })
+      .slice(-OVERSIZED_TAIL_MESSAGE_LIMIT);
+
+    if (messages.length === 0) return null;
+    return {
+      lastUpdated: '',
+      messages,
+      truncated: true,
+    };
+  } catch {
+    return null;
+  } finally {
+    if (fh) await fh.close().catch(() => {});
+  }
 }
 
 // ── Message parsing ────────────────────────────────────────────────────────────
@@ -256,6 +347,8 @@ export interface WatcherState {
   turnHadAssistantText?: boolean;
   /** Prevent repeated retrack attempts for the same no-text running→idle turn. */
   noTextRetrackAttempted?: boolean;
+  /** Tail fingerprints used when the conversation file is too large for full parse. */
+  _oversizedRecentMessageIds?: string[];
 }
 
 const watchers = new Map<string, WatcherState>();
@@ -472,6 +565,10 @@ function inferConversationStatus(conv: any): 'running' | 'idle' | null {
 async function readConversation(filePath: string, sessionName?: string): Promise<any | null> {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
+      const fileStat = await stat(filePath);
+      if (fileStat.size > FULL_READ_LIMIT_BYTES) {
+        return await readOversizedConversationTail(filePath, fileStat.size);
+      }
       const raw = await readFile(filePath, 'utf8');
       if (!raw.trim()) continue;
       return JSON.parse(raw);
@@ -482,6 +579,28 @@ async function readConversation(filePath: string, sessionName?: string): Promise
   // All retries exhausted — log so we can diagnose tracking failures
   logger.warn({ sessionName, filePath }, 'gemini-watcher: readConversation exhausted retries');
   return null;
+}
+
+function buildGeminiMessageFingerprint(msg: any): string {
+  return createHash('sha1')
+    .update(JSON.stringify({
+      type: msg?.type ?? null,
+      timestamp: msg?.timestamp ?? null,
+      content: msg?.content ?? null,
+      thoughts: msg?.thoughts ?? null,
+      toolCalls: msg?.toolCalls ?? null,
+      tokens: msg?.tokens ?? null,
+      model: msg?.model ?? null,
+    }))
+    .digest('hex');
+}
+
+function arraysEqual(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) return false;
+  for (let i = 0; i < left.length; i++) {
+    if (left[i] !== right[i]) return false;
+  }
+  return true;
 }
 
 export async function pollTick(sessionName: string, state: WatcherState): Promise<void> {
@@ -541,19 +660,51 @@ async function pollTickInner(sessionName: string, state: WatcherState): Promise<
   const conversationStatus = inferConversationStatus(conv);
   state.lastConversationStatus = conversationStatus;
 
-  if (conv.lastUpdated === state.lastUpdated && conv.messages.length === state.seenCount) {
+  const isTruncatedTail = conv.truncated === true;
+  const recentMessageIds = isTruncatedTail
+    ? conv.messages.map((msg: any) => buildGeminiMessageFingerprint(msg))
+    : [];
+  const previousRecentMessageIds = state._oversizedRecentMessageIds ?? [];
+
+  if (!isTruncatedTail && conv.lastUpdated === state.lastUpdated && conv.messages.length === state.seenCount) {
     // JSON unchanged — terminal spinner is ground truth.
     // terminalThinkingCheck handles all state transitions via assertSpinnerGate.
     await terminalThinkingCheck(sessionName, state);
     return;
   }
 
-  const lastIdx = conv.messages.length - 1;
-  const isUpdate = conv.messages.length === state.seenCount && lastIdx >= 0;
-  const messagesToProcess = isUpdate ? [conv.messages[lastIdx]] : conv.messages.slice(state.seenCount);
+  let lastIdx = conv.messages.length - 1;
+  let isUpdate = conv.messages.length === state.seenCount && lastIdx >= 0;
+  let messagesToProcess = isUpdate ? [conv.messages[lastIdx]] : conv.messages.slice(state.seenCount);
 
-  state.seenCount = conv.messages.length;
-  state.lastUpdated = conv.lastUpdated;
+  if (isTruncatedTail) {
+    const sameExceptLast = recentMessageIds.length > 0
+      && previousRecentMessageIds.length === recentMessageIds.length
+      && arraysEqual(previousRecentMessageIds.slice(0, -1), recentMessageIds.slice(0, -1))
+      && previousRecentMessageIds[previousRecentMessageIds.length - 1] !== recentMessageIds[recentMessageIds.length - 1];
+    if (sameExceptLast) {
+      lastIdx = conv.messages.length - 1;
+      isUpdate = lastIdx >= 0;
+      messagesToProcess = lastIdx >= 0 ? [conv.messages[lastIdx]] : [];
+    } else {
+      const previousSet = new Set(previousRecentMessageIds);
+      messagesToProcess = conv.messages.filter((_: any, index: number) => !previousSet.has(recentMessageIds[index] ?? ''));
+      isUpdate = false;
+      lastIdx = conv.messages.length - 1;
+    }
+    if (messagesToProcess.length === 0 && arraysEqual(previousRecentMessageIds, recentMessageIds)) {
+      await terminalThinkingCheck(sessionName, state);
+      return;
+    }
+  }
+
+  state.seenCount = isTruncatedTail
+    ? Math.max(state.seenCount, conv.messages.length)
+    : conv.messages.length;
+  state.lastUpdated = isTruncatedTail
+    ? `__oversized__:${state._lastMtimeMs ?? 0}:${state._lastSize ?? 0}`
+    : conv.lastUpdated;
+  state._oversizedRecentMessageIds = isTruncatedTail ? recentMessageIds : undefined;
   state._terminalThinkingEmitted = false; // Reset: JSON has content now, terminal-based thinking no longer needed
 
   for (let i = 0; i < messagesToProcess.length; i++) {
@@ -619,6 +770,7 @@ function activateFile(sessionName: string, state: WatcherState, newFile: string)
   state._lastIno = undefined;
   state._readFailCount = 0;
   state._terminalThinkingEmitted = false;
+  state._oversizedRecentMessageIds = undefined;
   state.idleConfirmCount = 0;
   if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
 
@@ -645,8 +797,11 @@ export async function startWatching(sessionName: string, sessionUuid: string): P
     const conv = await readConversation(found, sessionName);
     if (conv) {
       state.seenCount = conv.messages.length;
-      state.lastUpdated = conv.lastUpdated;
+      state.lastUpdated = conv.truncated ? '__oversized__' : conv.lastUpdated;
       state.lastConversationStatus = inferConversationStatus(conv);
+      if (conv.truncated) {
+        state._oversizedRecentMessageIds = conv.messages.map((msg: any) => buildGeminiMessageFingerprint(msg));
+      }
       // Seed _lastMsgLen so the first pollTick "changed file" path doesn't
       // treat a metadata-only update (lastUpdated timestamp) as new content.
       const lastMsg = conv.messages[conv.messages.length - 1];
@@ -724,8 +879,11 @@ export async function startWatchingDiscovered(
                 claimedFiles.set(fullPath, sessionName);
                 state.sessionUuid = conv.sessionId;
                 state.seenCount = conv.messages?.length ?? 0;
-                state.lastUpdated = conv.lastUpdated ?? '';
+                state.lastUpdated = conv.truncated ? '__oversized__' : (conv.lastUpdated ?? '');
                 state.lastConversationStatus = inferConversationStatus(conv);
+                if (conv.truncated) {
+                  state._oversizedRecentMessageIds = conv.messages.map((msg: any) => buildGeminiMessageFingerprint(msg));
+                }
                 const lm = conv.messages?.[conv.messages.length - 1];
                 state._lastMsgLen = typeof lm?.content === 'string' ? lm.content.length : -1;
                 // Persist to local session store so daemon restarts can use the UUID

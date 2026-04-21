@@ -121,9 +121,32 @@ type ModelChoice = 'opus[1M]' | 'sonnet' | 'haiku';
 
 const INLINE_PASTE_TEXT_CHAR_LIMIT = 1200;
 
+type ComposerAttachment = { path: string; name: string };
+
 function buildPastedTextFileName(now = new Date()): string {
   const compact = now.toISOString().replace(/[:.]/g, '-');
   return `pasted-text-${compact}.txt`;
+}
+
+function parseStoredComposerAttachments(raw: string | null): ComposerAttachment[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((entry) => {
+      if (!entry || typeof entry !== 'object') return [];
+      const path = typeof (entry as { path?: unknown }).path === 'string'
+        ? (entry as { path: string }).path.trim()
+        : '';
+      const name = typeof (entry as { name?: unknown }).name === 'string'
+        ? (entry as { name: string }).name.trim()
+        : '';
+      if (!path || !name) return [];
+      return [{ path, name }];
+    });
+  } catch {
+    return [];
+  }
 }
 type CodexModelChoice = 'gpt-5.4' | 'gpt-5.4-mini' | 'gpt-5.2';
 type QwenModelChoice = string;
@@ -458,13 +481,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   // History navigation state
   const histIdxRef = useRef(-1);   // -1 = not navigating; 0 = most recent
   const draftRef = useRef('');      // saved unsent text while navigating
+  const attachmentDraftRef = useRef<ComposerAttachment[]>([]);
   // File upload state
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [sendWarning, setSendWarning] = useState<string | null>(null);
-  const [attachments, setAttachments] = useState<Array<{ path: string; name: string }>>([]);
+  const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
   const sendWarningTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [localTransportConfig, setLocalTransportConfig] = useState<Record<string, unknown> | null>(activeSession?.transportConfig ?? null);
 
@@ -509,6 +533,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   // Persist input draft across unmount/remount (sub-session minimize/restore)
   const draftKey = activeSession ? `rcc_draft_${activeSession.name}` : null;
+  const attachmentDraftKey = activeSession ? `rcc_draft_attachments_${activeSession.name}` : null;
   useEffect(() => {
     if (!draftKey || !divRef.current) return;
     const saved = sessionStorage.getItem(draftKey);
@@ -521,6 +546,38 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       if (draftKey) sessionStorage.setItem(draftKey, text);
     };
   }, [draftKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!attachmentDraftKey) {
+      setAttachments([]);
+      attachmentDraftRef.current = [];
+      return;
+    }
+    const saved = parseStoredComposerAttachments(sessionStorage.getItem(attachmentDraftKey));
+    setAttachments(saved);
+    attachmentDraftRef.current = saved;
+    return () => {
+      try {
+        if (attachmentDraftRef.current.length > 0) {
+          sessionStorage.setItem(attachmentDraftKey, JSON.stringify(attachmentDraftRef.current));
+        }
+        else sessionStorage.removeItem(attachmentDraftKey);
+      } catch {
+        /* ignore */
+      }
+    };
+  }, [attachmentDraftKey]);
+
+  useEffect(() => {
+    attachmentDraftRef.current = attachments;
+    if (!attachmentDraftKey) return;
+    try {
+      if (attachments.length > 0) sessionStorage.setItem(attachmentDraftKey, JSON.stringify(attachments));
+      else sessionStorage.removeItem(attachmentDraftKey);
+    } catch {
+      /* ignore */
+    }
+  }, [attachmentDraftKey, attachments]);
 
   useEffect(() => () => {
     if (sendWarningTimerRef.current) clearTimeout(sendWarningTimerRef.current);
@@ -884,6 +941,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         model: defaults.model,
         timeoutMs: defaults.timeoutMs,
         promptVersion: defaults.promptVersion,
+        maxAutoContinueStreak: defaults.maxAutoContinueStreak,
+        maxAutoContinueTotal: defaults.maxAutoContinueTotal,
       };
     }
 
@@ -1506,6 +1565,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         histIdxRef.current = -1;
         draftRef.current = '';
         if (draftKey) sessionStorage.removeItem(draftKey);
+        if (attachmentDraftKey) sessionStorage.removeItem(attachmentDraftKey);
       }
       return;
     }
@@ -1547,8 +1607,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       histIdxRef.current = -1;
       draftRef.current = '';
       if (draftKey) sessionStorage.removeItem(draftKey);
+      if (attachmentDraftKey) sessionStorage.removeItem(attachmentDraftKey);
     }
-  }, [activeSession, draftKey, editingQueuedMessageId, onRemoveQuote, onSend, quickData, quotes, sendQueuedMessageMutation, sendSessionMessage]);
+  }, [activeSession, attachmentDraftKey, draftKey, editingQueuedMessageId, onRemoveQuote, onSend, quickData, quotes, sendQueuedMessageMutation, sendSessionMessage]);
 
   const handleQueuedMessageEdit = useCallback((entry: { clientMessageId: string; text: string }) => {
     if (!isEditableQueuedEntry(entry)) return;

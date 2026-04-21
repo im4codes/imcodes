@@ -219,7 +219,8 @@ export function Sidebar({ collapsed, serverId, pinnedPanels: _pinnedPanels, onDr
 /** Load persisted collapsed state from localStorage */
 export function loadSidebarCollapsed(): boolean {
   try {
-    return localStorage.getItem(LS_COLLAPSED) === 'true';
+    const value = localStorage.getItem(LS_COLLAPSED);
+    return value === '1' || value === 'true';
   } catch {
     return false;
   }
@@ -228,6 +229,6 @@ export function loadSidebarCollapsed(): boolean {
 /** Persist collapsed state to localStorage */
 export function saveSidebarCollapsed(collapsed: boolean): void {
   try {
-    localStorage.setItem(LS_COLLAPSED, String(collapsed));
+    localStorage.setItem(LS_COLLAPSED, collapsed ? '1' : '0');
   } catch { /* ignore */ }
 }

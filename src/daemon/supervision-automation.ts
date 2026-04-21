@@ -11,6 +11,8 @@ import { getCachedGlobalCustomInstructions } from './supervisor-defaults-cache.j
 import logger from '../util/logger.js';
 import {
   SUPERVISION_CONTRACT_IDS,
+  SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_STREAK,
+  SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_TOTAL,
   SUPERVISION_MODE,
   SUPERVISION_UNAVAILABLE_REASONS,
   extractSessionSupervisionSnapshot,
@@ -53,18 +55,6 @@ function enrichSnapshotWithGlobalDefaults(
 
 type TaskRunPhase = 'execution' | 'auditing';
 
-/**
- * Hard cap on auto-dispatched continue turns per task-run.
- *
- * Was 8 historically — but even when the supervisor returned specific-looking
- * `continue` verdicts, running 8 cycles before handing back to the user
- * amplified any residual ambiguity into a frustrating back-and-forth. Per
- * user direction (issue: "不断拉扯"), we now allow AT MOST 2 auto-continue
- * dispatches before escalating to `ask_human`. If two concrete nextActions
- * didn't close the gap, the pattern is stuck in a loop the supervisor can't
- * resolve autonomously — surface it to the human.
- */
-const MAX_AUTO_CONTINUE_STEPS = 2;
 const SUPERVISION_WAITING_LABEL = 'Supervised: analyzing completion...';
 const SUPERVISION_AUDIT_WAITING_LABEL = 'Supervised: running automated audit...';
 const SUPERVISION_COMPLETE_LABEL = 'Supervised: task looks complete.';
@@ -82,6 +72,8 @@ interface ActiveTaskRunState {
   userText: string;
   phase: TaskRunPhase;
   continueLoops: number;
+  continueStreakCount: number;
+  lastContinueBucket?: string;
   evaluating: boolean;
   sawAssistantOutput: boolean;
   lastAssistantText?: string;
@@ -131,6 +123,37 @@ type DirEntryLike = {
 
 function trimString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function normalizeContinueBucketText(value: string | undefined): string {
+  return (value ?? '')
+    .toLowerCase()
+    .replace(/[`"'“”‘’]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function classifyContinueBucket(decision: { nextAction?: string; gap?: string; reason: string }): string {
+  const text = normalizeContinueBucketText([
+    decision.nextAction,
+    decision.gap,
+    decision.reason,
+  ].filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0).join(' '));
+  if (!text) return 'generic';
+
+  const categories: Array<{ key: string; pattern: RegExp }> = [
+    { key: 'commit_push', pattern: /\b(commit|push|git push|git commit|merge|sync|提交|推送|合并)\b/iu },
+    { key: 'test_verify', pattern: /\b(test|tests|testing|verify|verification|validate|validation|regression|vitest|pytest|jest|检查|验证|测试|回归)\b/iu },
+    { key: 'audit_review', pattern: /\b(audit|review|审计|审核|评审)\b/iu },
+    { key: 'fix_repair', pattern: /\b(fix|repair|bug|regression|修复|返工|rework)\b/iu },
+    { key: 'implement_code', pattern: /\b(implement|code|edit|change|update|refactor|write|add|实现|修改|编写|补充|重构)\b/iu },
+    { key: 'docs_spec', pattern: /\b(doc|docs|documentation|spec|openspec|proposal|design|文档|规范|设计|proposal)\b/iu },
+    { key: 'deploy_restart', pattern: /\b(deploy|release|restart|daemon|发布|部署|重启)\b/iu },
+    { key: 'investigate', pattern: /\b(check|inspect|investigate|diagnose|analyze|look into|查看|排查|分析|调查)\b/iu },
+  ];
+  const matched = categories.find((entry) => entry.pattern.test(text));
+  if (matched) return matched.key;
+  return text.slice(0, 120);
 }
 
 function formatUnavailableReason(reason: SupervisionUnavailableReason | undefined): string | null {
@@ -645,6 +668,7 @@ class SupervisionAutomation {
       userText: text,
       phase: 'execution',
       continueLoops: 0,
+      continueStreakCount: 0,
       evaluating: false,
       sawAssistantOutput: false,
       reworkDispatches: 0,
@@ -772,11 +796,29 @@ class SupervisionAutomation {
         return;
       }
       case 'continue': {
-        if (latest.continueLoops >= MAX_AUTO_CONTINUE_STEPS) {
-          this.emitWarning(run.sessionName, `Automation reached the auto-continue limit (${MAX_AUTO_CONTINUE_STEPS}); handing control back to the human.`);
+        const continueBucket = classifyContinueBucket({
+          reason: decision.reason,
+          nextAction: decision.nextAction,
+          gap: decision.gap,
+        });
+        const nextStreakCount = latest.lastContinueBucket === continueBucket
+          ? latest.continueStreakCount + 1
+          : 1;
+        const maxAutoContinueStreak = latest.snapshot.maxAutoContinueStreak ?? SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_STREAK;
+        const maxAutoContinueTotal = latest.snapshot.maxAutoContinueTotal ?? SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_TOTAL;
+
+        if (maxAutoContinueStreak > 0 && nextStreakCount > maxAutoContinueStreak) {
+          this.emitWarning(run.sessionName, `Automation reached the repeated auto-continue limit (${maxAutoContinueStreak}) for ${continueBucket}; handing control back to the human.`);
           this.finishRun(run.sessionName, 'needs_input');
           return;
         }
+        if (maxAutoContinueTotal > 0 && latest.continueLoops >= maxAutoContinueTotal) {
+          this.emitWarning(run.sessionName, `Automation reached the auto-continue hard limit (${maxAutoContinueTotal}); handing control back to the human.`);
+          this.finishRun(run.sessionName, 'needs_input');
+          return;
+        }
+        latest.lastContinueBucket = continueBucket;
+        latest.continueStreakCount = nextStreakCount;
         // Forward the full decision so the continue prompt can lead with
         // the supervisor's concrete nextAction. Without this, the target
         // agent only sees the reason and has to infer what to do next —

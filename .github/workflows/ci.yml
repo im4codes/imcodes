@@ -10,6 +10,7 @@ on:
 
 env:
   NODE_VERSION_PRIMARY: '24'
+  NODE_VERSION_SERVER: '22'
 
 jobs:
   # ── Lint ──────────────────────────────────────────────────────────────────
@@ -188,7 +189,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION_PRIMARY }}
+          node-version: ${{ env.NODE_VERSION_SERVER }}
           cache: 'npm'
           cache-dependency-path: package-lock.json
       - run: npm ci

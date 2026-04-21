@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import type { CompressionInput } from '../../src/context/summary-compressor.js';
 
 /**
@@ -154,5 +157,52 @@ describe('summary-compressor — concurrent compressWithSdk calls serialize', ()
     expect(state.order.filter((e) => e.startsWith('end:'))).toHaveLength(
       state.order.filter((e) => e.startsWith('start:')).length,
     );
+  });
+
+  it('passes a resolved Claude path into direct SDK compression on Windows', async () => {
+    const origPlatform = process.platform;
+    const origPath = process.env.PATH;
+    const origPathExt = process.env.PATHEXT;
+    const origAppData = process.env.APPDATA;
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'summary-compressor-claude-path-'));
+    const npmDir = path.join(tmpDir, 'npm');
+    const scriptDir = path.join(npmDir, 'node_modules', '@anthropic-ai', 'claude-code', 'bin');
+    fs.mkdirSync(scriptDir, { recursive: true });
+    fs.writeFileSync(path.join(scriptDir, 'claude.js'), '#!/usr/bin/env node\n');
+    fs.writeFileSync(
+      path.join(npmDir, 'claude.cmd'),
+      '@ECHO off\r\n' +
+      'CALL :find_dp0\r\n' +
+      'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.js" %*\r\n',
+    );
+
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    process.env.PATH = '';
+    process.env.APPDATA = tmpDir;
+    process.env.PATHEXT = '.com;.exe;.bat;.cmd';
+
+    queryMock.mockImplementation(async function* (arg: { options?: Record<string, unknown> }) {
+      expect(String(arg.options?.pathToClaudeCodeExecutable ?? '').replace(/\\/g, '/'))
+        .toContain('node_modules/@anthropic-ai/claude-code/bin/claude.js');
+      yield {
+        type: 'assistant',
+        message: {
+          content: [{ type: 'text', text: 'SUMMARY' }],
+        },
+      };
+    });
+
+    try {
+      const { compressWithSdk } = await import('../../src/context/summary-compressor.js');
+      const result = await compressWithSdk(makeInput('windows-path'));
+      expect(result.summary).toBe('SUMMARY');
+      expect(result.fromSdk).toBe(true);
+    } finally {
+      Object.defineProperty(process, 'platform', { value: origPlatform });
+      process.env.PATH = origPath;
+      if (origAppData === undefined) delete process.env.APPDATA; else process.env.APPDATA = origAppData;
+      if (origPathExt === undefined) delete process.env.PATHEXT; else process.env.PATHEXT = origPathExt;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });

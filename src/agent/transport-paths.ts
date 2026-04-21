@@ -31,7 +31,10 @@ export function resolveBinaryOnWindows(name: string): string {
   // OS delimiter (':' on Linux), which breaks tests that fake
   // `process.platform = 'win32'` on a posix CI runner.
   const WIN_DELIMITER = ';';
-  const pathDirs = (process.env.PATH ?? '').split(WIN_DELIMITER).filter(Boolean);
+  const pathDirs = uniqueNonEmpty([
+    ...(process.env.PATH ?? '').split(WIN_DELIMITER),
+    ...getWindowsGlobalCliDirs(),
+  ]);
   const pathExtRaw = process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD';
   const exts = pathExtRaw.split(WIN_DELIMITER).filter(Boolean);
   const hasExt = exts.some((e) => name.toLowerCase().endsWith(e.toLowerCase()));
@@ -50,12 +53,56 @@ export function resolveBinaryOnWindows(name: string): string {
   return name;
 }
 
+function uniqueNonEmpty(values: Array<string | undefined>): string[] {
+  return [...new Set(values.filter((value): value is string => typeof value === 'string' && value.trim().length > 0))];
+}
+
+function getWindowsGlobalCliDirs(): string[] {
+  return uniqueNonEmpty([
+    process.env.APPDATA ? path.join(process.env.APPDATA, 'npm') : undefined,
+    process.env.USERPROFILE ? path.join(process.env.USERPROFILE, 'AppData', 'Roaming', 'npm') : undefined,
+  ]);
+}
+
+function getWindowsClaudeInstallCandidates(name: string): string[] {
+  const basename = path.basename(name);
+  const hasExt = /\.[^\\/]+$/.test(basename);
+  const fileNames = hasExt ? [basename] : [basename, `${basename}.exe`, `${basename}.cmd`, `${basename}.bat`];
+  const dirs = uniqueNonEmpty([
+    ...getWindowsGlobalCliDirs(),
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'Claude') : undefined,
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'Claude Code') : undefined,
+    process.env.ProgramFiles ? path.join(process.env.ProgramFiles, 'Claude') : undefined,
+    process.env.ProgramFiles ? path.join(process.env.ProgramFiles, 'Claude Code') : undefined,
+    process.env['ProgramFiles(x86)'] ? path.join(process.env['ProgramFiles(x86)'], 'Claude') : undefined,
+    process.env['ProgramFiles(x86)'] ? path.join(process.env['ProgramFiles(x86)'], 'Claude Code') : undefined,
+  ]);
+  return dirs.flatMap((dir) => fileNames.map((fileName) => path.join(dir, fileName)));
+}
+
 export function resolveBinaryWithWindowsFallbacks(name: string, windowsCandidates: string[] = []): string {
   if (process.platform !== 'win32') return name;
   for (const candidate of windowsCandidates) {
     if (candidate && existsSync(candidate)) return candidate;
   }
   return resolveBinaryOnWindows(name);
+}
+
+/** Resolve a CLI path suitable for passing to an SDK option like
+ *  `pathToClaudeCodeExecutable`.
+ *
+ *  On Windows, npm global installs usually expose `claude.cmd`, but SDKs that
+ *  spawn the path directly without `shell: true` need either a real `.exe` or
+ *  the underlying `.js` entrypoint. This helper converts npm shims to their
+ *  script path and also searches common per-user install locations when the
+ *  daemon service PATH is sparse. */
+export function resolveClaudeCodePathForSdk(name = 'claude'): string {
+  if (process.platform !== 'win32') return name;
+  const resolved = resolveBinaryWithWindowsFallbacks(name, getWindowsClaudeInstallCandidates(name));
+  if (/\.(cmd|bat)$/i.test(resolved)) {
+    return parseNpmCmdShim(resolved) ?? resolved;
+  }
+  return resolved;
 }
 
 /** Result of resolving a binary that may be an npm .cmd shim.

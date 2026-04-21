@@ -19,6 +19,7 @@ vi.mock('react-i18next', () => ({
       if (params?.value && typeof params.value === 'string') return `${leaf}:${params.value}`;
       if (params?.backend && params?.model) return `${leaf}:${params.backend}:${params.model}`;
       if (params?.auditMode && params?.loops != null) return `${leaf}:${params.auditMode}:${params.loops}`;
+      if (params?.streak != null && params?.total != null) return `${leaf}:${params.streak}:${params.total}`;
       if (params?.promptVersion) return `${leaf}:${params.promptVersion}`;
       return leaf;
     },
@@ -33,6 +34,16 @@ vi.mock('../../src/api.js', () => ({
 }));
 
 import { SessionSettingsDialog } from '../../src/components/SessionSettingsDialog.js';
+
+function inputForLabel(label: string, index = 0): HTMLInputElement {
+  const labels = screen.getAllByText(label);
+  const container = labels[index]?.parentElement;
+  const input = container?.querySelector('input');
+  if (!(input instanceof HTMLInputElement)) {
+    throw new Error(`Missing input for label ${label} at index ${index}`);
+  }
+  return input;
+}
 
 describe('SessionSettingsDialog supervision', () => {
   beforeEach(() => {
@@ -139,6 +150,8 @@ describe('SessionSettingsDialog supervision', () => {
       model: CODEX_MODEL_IDS[0],
       timeoutMs: 18_000,
       promptVersion: 'supervision_decision_v1',
+      maxAutoContinueStreak: 4,
+      maxAutoContinueTotal: 9,
     });
 
     render(
@@ -161,6 +174,8 @@ describe('SessionSettingsDialog supervision', () => {
 
     fireEvent.change(screen.getAllByRole('combobox')[3]!, { target: { value: 'supervised' } });
     expect(screen.getAllByDisplayValue('18').length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByDisplayValue('4').length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByDisplayValue('9').length).toBeGreaterThanOrEqual(2);
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
     await waitFor(() => {
@@ -195,6 +210,8 @@ describe('SessionSettingsDialog supervision', () => {
             promptVersion: 'supervision_decision_v1',
             customInstructions: 'Always prefer adding tests before claiming completion.',
             maxParseRetries: 1,
+            maxAutoContinueStreak: 2,
+            maxAutoContinueTotal: 8,
             auditMode: 'review>plan',
             maxAuditLoops: 3,
             taskRunPromptVersion: 'task_run_status_v1',
@@ -208,9 +225,61 @@ describe('SessionSettingsDialog supervision', () => {
     expect(screen.getByText('summaryMode:supervised_audit')).toBeDefined();
     expect(screen.getByText(`summaryBackendModel:codex_sdk:${CODEX_MODEL_IDS[0]}`)).toBeDefined();
     expect(screen.getByText('summaryTimeout:9 s')).toBeDefined();
+    expect(screen.getByText('summaryContinueLimits:2:8')).toBeDefined();
     expect(screen.getByText('summaryCustomInstructions:summaryCustomInstructionsSet')).toBeDefined();
     expect(screen.getByText('summaryAudit:review_plan:3')).toBeDefined();
     expect(screen.getByText('summaryMeta:supervision_decision_v1')).toBeDefined();
+  });
+
+  it('saves global auto-continue defaults together with the session override', async () => {
+    fetchSupervisorDefaultsMock.mockResolvedValue({
+      backend: 'codex-sdk',
+      model: CODEX_MODEL_IDS[0],
+      timeoutMs: 12_000,
+      promptVersion: 'supervision_decision_v1',
+      maxAutoContinueStreak: 2,
+      maxAutoContinueTotal: 8,
+    });
+
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        transportConfig={null}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(fetchSupervisorDefaultsMock).toHaveBeenCalled();
+    });
+
+    fireEvent.input(inputForLabel('maxAutoContinueStreak', 0), { target: { value: '5' } });
+    fireEvent.input(inputForLabel('maxAutoContinueTotal', 0), { target: { value: '11' } });
+    fireEvent.change(screen.getAllByRole('combobox')[3]!, { target: { value: 'supervised' } });
+    fireEvent.input(inputForLabel('maxAutoContinueStreak', 1), { target: { value: '3' } });
+    fireEvent.input(inputForLabel('maxAutoContinueTotal', 1), { target: { value: '6' } });
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => {
+      expect(saveSupervisorDefaultsMock).toHaveBeenCalledWith(expect.objectContaining({
+        maxAutoContinueStreak: 5,
+        maxAutoContinueTotal: 11,
+      }));
+      expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', expect.objectContaining({
+        transportConfig: expect.objectContaining({
+          supervision: expect.objectContaining({
+            maxAutoContinueStreak: 3,
+            maxAutoContinueTotal: 6,
+          }),
+        }),
+      }));
+    });
   });
 
   it('persists qwen preset selection via the preset picker when ws fetches presets', async () => {

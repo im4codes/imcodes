@@ -1941,7 +1941,7 @@ afterEach(() => {
     }));
   });
 
-  it('falls back to Settings when heavy mode needs audit config', async () => {
+  it('upgrades supervised mode to audit mode with default audit config', async () => {
     const ws = makeWs();
     const onSettings = vi.fn();
     render(
@@ -1971,9 +1971,18 @@ afterEach(() => {
     fireEvent.click(screen.getByRole('button', { name: /supervised_audit$/i }));
 
     await waitFor(() => {
-      expect(onSettings).toHaveBeenCalled();
+      expect(patchSessionMock).toHaveBeenCalledWith('srv1', 'codex-sdk-session', expect.objectContaining({
+        transportConfig: expect.objectContaining({
+          supervision: expect.objectContaining({
+            mode: 'supervised_audit',
+            auditMode: 'audit',
+            maxAuditLoops: 2,
+            taskRunPromptVersion: 'task_run_status_v1',
+          }),
+        }),
+      }));
     });
-    expect(patchSessionMock).not.toHaveBeenCalled();
+    expect(onSettings).not.toHaveBeenCalled();
   });
 
   it('falls back to Settings when heavy mode snapshot is present but audit config is invalid', async () => {
@@ -2493,6 +2502,55 @@ afterEach(() => {
     expectSendPayload(ws, {
       sessionName: 'my-session',
       text: '@/tmp/pasted-text.txt',
+    });
+  });
+
+  it('restores uploaded attachment badges when switching back to the same main session', async () => {
+    uploadFileMock.mockResolvedValue({ attachment: { daemonPath: '/tmp/persisted-attachment.txt' } });
+    const ws = makeWs();
+    const { rerender } = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'session-a' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    fireEvent.paste(input, {
+      clipboardData: {
+        getData: (type: string) => type === 'text/plain' ? 'x'.repeat(1300) : '',
+      },
+    });
+
+    await waitFor(() => {
+      expect(document.querySelector('.attachment-badge-name')?.textContent).toMatch(/^pasted-text-.*\.txt$/);
+    });
+    const badgeName = document.querySelector('.attachment-badge-name')?.textContent ?? '';
+
+    rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'session-b' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    expect(document.querySelector('.attachment-badge-name')).toBeNull();
+
+    rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'session-a' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(document.querySelector('.attachment-badge-name')?.textContent).toBe(badgeName);
     });
   });
 

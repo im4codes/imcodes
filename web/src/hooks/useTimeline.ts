@@ -140,6 +140,8 @@ const ECHO_WINDOW_MS = 500;
 const USER_MSG_DEDUP_WINDOW_MS = 5_000;
 const PROVISIONAL_TRANSPORT_HISTORY_PREFIX = 'transport-history:';
 const OPTIMISTIC_EVENT_ID_PREFIX = 'optimistic:';
+const TIMELINE_SNAPSHOT_STORAGE_PREFIX = 'rcc_timeline_snapshot:';
+const MAX_PERSISTED_SNAPSHOT_EVENTS = 50;
 // If no confirmation arrives within this window we auto-flip the pending bubble to
 // "failed" so the user can retry rather than stare at a perpetual spinner.
 const OPTIMISTIC_TIMEOUT_MS = 30_000;
@@ -165,6 +167,7 @@ function getCachedEvents(cacheKey: string): TimelineEvent[] | undefined {
 function setCachedEvents(cacheKey: string, events: TimelineEvent[]): void {
   eventsCache.set(cacheKey, events);
   markCacheAccess(cacheKey);
+  persistTimelineSnapshot(cacheKey, events);
   const listeners = cacheListeners.get(cacheKey);
   if (listeners) {
     for (const listener of listeners) listener(events);
@@ -208,6 +211,45 @@ function pruneTimelineCache(): void {
 
 function scopeCacheKey(serverId: string | null | undefined, sessionId: string): string {
   return serverId ? `${serverId}:${sessionId}` : sessionId;
+}
+
+function getTimelineSnapshotStorageKey(cacheKey: string): string {
+  return `${TIMELINE_SNAPSHOT_STORAGE_PREFIX}${cacheKey}`;
+}
+
+function loadPersistedTimelineSnapshot(cacheKey: string): TimelineEvent[] {
+  try {
+    const raw = localStorage.getItem(getTimelineSnapshotStorageKey(cacheKey));
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((event): event is TimelineEvent => (
+      !!event
+      && typeof event === 'object'
+      && typeof (event as TimelineEvent).eventId === 'string'
+      && typeof (event as TimelineEvent).type === 'string'
+      && typeof (event as TimelineEvent).sessionId === 'string'
+      && typeof (event as TimelineEvent).ts === 'number'
+      && typeof (event as TimelineEvent).payload === 'object'
+    ));
+  } catch {
+    return [];
+  }
+}
+
+function persistTimelineSnapshot(cacheKey: string, events: TimelineEvent[]): void {
+  try {
+    if (events.length === 0) {
+      localStorage.removeItem(getTimelineSnapshotStorageKey(cacheKey));
+      return;
+    }
+    const tail = events.length > MAX_PERSISTED_SNAPSHOT_EVENTS
+      ? events.slice(events.length - MAX_PERSISTED_SNAPSHOT_EVENTS)
+      : events;
+    localStorage.setItem(getTimelineSnapshotStorageKey(cacheKey), JSON.stringify(tail));
+  } catch {
+    // best-effort
+  }
 }
 
 function isProvisionalTransportHistoryEvent(event: TimelineEvent): boolean {
@@ -300,6 +342,19 @@ export function __resetTimelineCacheForTests(): void {
   lastHttpBackfillOkAt.clear();
 }
 
+export function __clearPersistedTimelineSnapshotsForTests(): void {
+  try {
+    const keys: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key?.startsWith(TIMELINE_SNAPSHOT_STORAGE_PREFIX)) keys.push(key);
+    }
+    for (const key of keys) localStorage.removeItem(key);
+  } catch {
+    // ignore
+  }
+}
+
 /**
  * Test-only entry point for the same wipe the app does on long-hide /
  * pageshow restore. Exposed so tests can verify the cooldown actually
@@ -363,6 +418,7 @@ export function useTimeline(
   // IDB + memory cache key: scope by serverId to prevent cross-server pollution
   // when different servers share the same session name (e.g. deck_cd_brain).
   const cacheKey = sessionId ? scopeCacheKey(serverId, sessionId) : sessionId;
+  const wsConnected = !!ws?.connected;
   const cacheKeyRef = useRef(cacheKey);
   cacheKeyRef.current = cacheKey;
   const [events, setEvents] = useState<TimelineEvent[]>([]);
@@ -409,7 +465,7 @@ export function useTimeline(
     if (memCached && memCached.length > 0) {
       setEvents(memCached);
       setLoading(false);
-      if (ws?.connected) {
+      if (wsConnected) {
         setRefreshing(true);
         historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
       }
@@ -421,11 +477,26 @@ export function useTimeline(
       return () => { cancelled = true; };
     }
 
+    // 1.5 Synchronous localStorage snapshot — instant restore across full page
+    // reloads before IndexedDB/network complete. This is intentionally only a
+    // tail snapshot for first paint; IndexedDB remains the fuller local source.
+    const localSnapshot = loadPersistedTimelineSnapshot(cacheKey!);
+    if (localSnapshot.length > 0) {
+      setCachedEvents(cacheKey!, localSnapshot);
+      setEvents((prev) => (prev === localSnapshot ? prev : localSnapshot));
+      setLoading(false);
+      if (wsConnected) {
+        setRefreshing(true);
+        historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
+      }
+      fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS });
+    }
+
     // 2. Already loaded this session — skip reload (prevents flash-of-empty on minimize/restore)
     if (historyLoadedRef.current === cacheKey) {
       setLoading(false);
       // Just request incremental updates
-      if (ws?.connected) {
+      if (wsConnected) {
         setRefreshing(true);
         historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
       }
@@ -437,7 +508,7 @@ export function useTimeline(
     }
 
     // 3. IndexedDB cache → daemon history (first load for this session in this page session)
-    setLoading(true);
+    if (localSnapshot.length === 0) setLoading(true);
     const load = async () => {
       const db = sharedDb;
       if (!db) return;
@@ -456,7 +527,7 @@ export function useTimeline(
         setEvents((prev) => (prev === restored ? prev : restored));
         setLoading(false);
         historyLoadedRef.current = cacheKeyRef.current;
-        if (ws?.connected) {
+        if (wsConnected) {
           setRefreshing(true);
           historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
         }
@@ -469,7 +540,7 @@ export function useTimeline(
         seqRef.current = 0;
         if (cancelled) return;
         setEvents([]);
-        if (ws?.connected) {
+        if (wsConnected) {
           historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId);
         } else {
           setLoading(false);
@@ -490,7 +561,7 @@ export function useTimeline(
     };
     load().catch(() => {});
     return () => { cancelled = true; };
-  }, [sessionId, ws]);
+  }, [cacheKey, sessionId, ws, wsConnected]);
 
   // Map of commandId → optimistic eventId for O(1) lookup on command.ack / dedup.
   const optimisticIdsByCommandRef = useRef(new Map<string, string>());
