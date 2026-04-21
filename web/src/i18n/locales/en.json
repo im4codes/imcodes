@@ -635,6 +635,8 @@
     "uploading": "Uploading...",
     "upload_failed": "Upload failed",
     "file_too_large": "File too large (max {{max}}MB)",
+    "long_text_attached": "Large pasted text attached as {{name}}",
+    "long_text_requires_attachment": "Paste is too large for inline input here. Upload it as a file instead.",
     "download_file": "Download",
     "downloading": "Downloading...",
     "preview_unavailable": "Preview unavailable",

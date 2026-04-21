@@ -635,6 +635,8 @@
     "uploading": "上传中...",
     "upload_failed": "上传失败",
     "file_too_large": "文件过大（最大 {{max}}MB）",
+    "long_text_attached": "超长粘贴内容已作为 {{name}} 附件添加",
+    "long_text_requires_attachment": "这段粘贴内容太长，不能直接放进输入框，请改为文件上传。",
     "download_file": "下载",
     "downloading": "下载中...",
     "preview_unavailable": "无法预览",

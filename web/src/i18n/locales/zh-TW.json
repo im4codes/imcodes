@@ -635,6 +635,8 @@
     "uploading": "上傳中...",
     "upload_failed": "上傳失敗",
     "file_too_large": "檔案過大（最大 {{max}}MB）",
+    "long_text_attached": "過長貼上內容已作為 {{name}} 附件加入",
+    "long_text_requires_attachment": "這段貼上內容太長，不能直接放進輸入框，請改成檔案上傳。",
     "download_file": "下載",
     "downloading": "下載中...",
     "preview_unavailable": "無法預覽",
