@@ -255,11 +255,33 @@ function SupervisionIntroCard({ t }: { t: (key: string, params?: Record<string, 
 }
 
 /**
+ * Pull the preset's pinned model out of its env bundle. CcPreset stores
+ * provider credentials + model under ANTHROPIC_MODEL (mirrored into
+ * OPENAI_MODEL for OpenAI-compatible endpoints, e.g. qwen --auth-type anthropic
+ * against a MiniMax/GLM/Kimi gateway). The daemon's getQwenPresetTransportConfig
+ * reads the same field and treats it as authoritative at launch — we use it
+ * here so the supervision UI reflects the effective model the moment the user
+ * picks a preset, instead of showing a stale Qwen default alongside.
+ */
+function getPresetPinnedModel(
+  presets: Array<{ name: string; env?: Record<string, string> }>,
+  presetName: string | undefined,
+): string | undefined {
+  if (!presetName) return undefined;
+  const target = presetName.trim().toLowerCase();
+  if (!target) return undefined;
+  const match = presets.find((p) => p.name.trim().toLowerCase() === target);
+  const model = match?.env?.ANTHROPIC_MODEL ?? match?.env?.OPENAI_MODEL;
+  const trimmed = typeof model === 'string' ? model.trim() : '';
+  return trimmed || undefined;
+}
+
+/**
  * Qwen preset picker — renders a chip row (including a "none" clear chip) for
  * backends that support presets. Kept lightweight and decoupled from the
- * broader shared-context panel's unified selector since supervision has no
- * preset-pinned model dimension today (the broker resolves the pinned model
- * via `resolveProcessingProviderSessionConfig`).
+ * broader shared-context panel's unified selector. The preset's pinned model
+ * (from env.ANTHROPIC_MODEL) is auto-applied by the parent's onChange handler
+ * so the model dropdown never shows a value that contradicts the preset.
  */
 function SupervisionPresetPicker({
   t,
@@ -824,7 +846,15 @@ export function SessionSettingsDialog({
             saving={saving}
             presets={ccPresets}
             value={supervisorDefaultsPreset}
-            onChange={(next) => setSupervisorDefaults((prev) => ({ ...prev, preset: next }))}
+            onChange={(next) => setSupervisorDefaults((prev) => {
+              // When a preset is chosen, pin the model to the preset's own
+              // ANTHROPIC_MODEL so the picker doesn't keep a stale Qwen default
+              // visible while the daemon is actually routing through MiniMax /
+              // GLM / Kimi. Clearing the preset leaves the model untouched —
+              // the user may have had a vanilla Qwen model they want to keep.
+              const pinned = getPresetPinnedModel(ccPresets, next);
+              return { ...prev, preset: next, ...(pinned ? { model: pinned } : {}) };
+            })}
             noneLabel={t('session.supervision.presetNone')}
             labelKey="session.supervision.presetLabel"
             helpKey="session.supervision.presetHelp"
@@ -913,7 +943,16 @@ export function SessionSettingsDialog({
                 saving={saving}
                 presets={ccPresets}
                 value={supervisionPreset}
-                onChange={(next) => setSupervision((prev) => ({ ...prev, preset: next }))}
+                onChange={(next) => setSupervision((prev) => {
+                  // Pin the preset's ANTHROPIC_MODEL into the draft so the
+                  // model dropdown immediately reflects the model the daemon
+                  // will actually spawn (preset wins at launch anyway — see
+                  // getQwenPresetTransportConfig). Clearing the preset keeps
+                  // the current model so we don't silently lose the user's
+                  // last selection.
+                  const pinned = getPresetPinnedModel(ccPresets, next);
+                  return { ...prev, preset: next, ...(pinned ? { model: pinned } : {}) };
+                })}
                 noneLabel={t('session.supervision.presetNone')}
                 labelKey="session.supervision.presetLabel"
                 helpKey="session.supervision.presetHelp"
