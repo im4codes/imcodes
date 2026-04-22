@@ -226,6 +226,30 @@ describe('ChatView file-change cards', () => {
     });
   });
 
+  it('renders created-file exact previews without an empty removed block', () => {
+    const events = [
+      makeEvent('file.change', {
+        batch: {
+          provider: 'codex-sdk',
+          patches: [
+            {
+              filePath: '/repo/src/new-file.ts',
+              operation: 'create',
+              confidence: 'exact',
+              unifiedDiff: '@@ -0,0 +1 @@\n+export const created = true;',
+            },
+          ],
+        },
+      }),
+    ];
+
+    const { container } = render(<ChatView events={events} loading={false} ws={{} as any} workdir="/repo" sessionId="session-a" />);
+
+    expect(container.textContent).toContain('export const created = true;');
+    expect(container.querySelector('.chat-file-change-diff-label-removed')).toBeNull();
+    expect(container.querySelector('.chat-file-change-diff-label-added')?.textContent).toBe('+');
+  });
+
   it('keeps renamed and deleted entries actionable through the file browser handoff', async () => {
     const events = [
       makeEvent('file.change', {

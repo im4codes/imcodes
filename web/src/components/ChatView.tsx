@@ -1777,6 +1777,7 @@ function extractStackedPreviewFromUnifiedDiff(
 }
 
 function buildPlainPreviewLines(text: string): FileChangePreviewLine[] {
+  if (!text) return [];
   return text.replace(/\r\n/g, '\n').split('\n').map((line) => ({ text: line }));
 }
 
@@ -1920,24 +1921,30 @@ function ExactFilePatch({ patch }: { patch: FileChangePatch }) {
   const afterLines = unifiedPreview?.after ?? buildPlainPreviewLines(patch.afterText ?? '');
   const beforePreview = clampPreviewLines(beforeLines);
   const afterPreview = clampPreviewLines(afterLines);
+  const showRemoved = patch.operation !== 'create' || beforePreview.lines.length > 0;
+  const showAdded = patch.operation !== 'delete' || afterPreview.lines.length > 0;
   return (
     <div class="chat-file-change-diff">
-      <FileChangePreviewBlock
-        marker="-"
-        markerTitle={t('chat.file_change_removed')}
-        lines={beforePreview.lines}
-        truncated={beforePreview.truncated}
-        emptyText={t('chat.file_change_no_before')}
-        className="chat-file-change-diff-label chat-file-change-diff-label-removed"
-      />
-      <FileChangePreviewBlock
-        marker="+"
-        markerTitle={t('chat.file_change_added')}
-        lines={afterPreview.lines}
-        truncated={afterPreview.truncated}
-        emptyText={t('chat.file_change_no_after')}
-        className="chat-file-change-diff-label chat-file-change-diff-label-added"
-      />
+      {showRemoved && (
+        <FileChangePreviewBlock
+          marker="-"
+          markerTitle={t('chat.file_change_removed')}
+          lines={beforePreview.lines}
+          truncated={beforePreview.truncated}
+          emptyText={t('chat.file_change_no_before')}
+          className="chat-file-change-diff-label chat-file-change-diff-label-removed"
+        />
+      )}
+      {showAdded && (
+        <FileChangePreviewBlock
+          marker="+"
+          markerTitle={t('chat.file_change_added')}
+          lines={afterPreview.lines}
+          truncated={afterPreview.truncated}
+          emptyText={t('chat.file_change_no_after')}
+          className="chat-file-change-diff-label chat-file-change-diff-label-added"
+        />
+      )}
     </div>
   );
 }

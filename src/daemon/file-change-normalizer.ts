@@ -35,6 +35,18 @@ function asNumber(value: unknown): number | undefined {
   return undefined;
 }
 
+function looksLikeUnifiedDiff(value: string | undefined): boolean {
+  if (!value) return false;
+  const normalized = value.replace(/\r\n/g, '\n');
+  return normalized.startsWith('@@ ')
+    || normalized.startsWith('diff ')
+    || normalized.startsWith('--- ')
+    || normalized.startsWith('+++ ')
+    || /\n@@ -\d/.test(normalized)
+    || /\n--- /.test(normalized)
+    || /\n\+\+\+ /.test(normalized);
+}
+
 function detectOperation(value: unknown, fallback: FileChangeOperation = 'unknown'): FileChangeOperation {
   const normalized = String(value ?? '').toLowerCase();
   if (!normalized) return fallback;
@@ -162,12 +174,13 @@ function normalizeGenericToolPatch(
     rawRecord?.content,
     rawRecord?.text,
   );
-  const unifiedDiff = asStringAny(
+  const diffText = asStringAny(
     inputRecord?.diff,
     inputRecord?.patch,
     rawRecord?.diff,
     rawRecord?.patch,
   );
+  const unifiedDiff = looksLikeUnifiedDiff(diffText) ? diffText : undefined;
   const hunks = firstDefinedHunks(
     inputRecord?.hunks,
     inputRecord?.ranges,
@@ -179,14 +192,25 @@ function normalizeGenericToolPatch(
     asRecord(rawRecord?.toolUseResult)?.ranges,
   );
   const operation = detectOperation(
-    inputRecord?.operation ?? inputRecord?.op ?? inputRecord?.type ?? rawRecord?.operation ?? rawRecord?.op ?? rawRecord?.type ?? toolName,
-    beforeText && afterText ? 'update' : afterText ? 'update' : 'unknown',
+    inputRecord?.operation
+      ?? inputRecord?.op
+      ?? inputRecord?.type
+      ?? asRecord(inputRecord?.kind)?.type
+      ?? rawRecord?.operation
+      ?? rawRecord?.op
+      ?? rawRecord?.type
+      ?? asRecord(rawRecord?.kind)?.type
+      ?? toolName,
+    beforeText && afterText ? 'update' : afterText || diffText ? 'update' : 'unknown',
   );
-  const confidence: FileChangeConfidence = beforeText && afterText
+  const inlineText = unifiedDiff ? undefined : diffText;
+  const normalizedBeforeText = beforeText ?? (inlineText && operation === 'delete' ? inlineText : undefined);
+  const normalizedAfterText = afterText ?? (inlineText && operation !== 'delete' ? inlineText : undefined);
+  const confidence: FileChangeConfidence = normalizedBeforeText && normalizedAfterText
     ? 'exact'
     : unifiedDiff
       ? 'exact'
-      : afterText
+      : normalizedBeforeText || normalizedAfterText
         ? 'derived'
         : 'coarse';
 
@@ -195,8 +219,8 @@ function normalizeGenericToolPatch(
     operation,
     confidence,
     ...(oldPath ? { oldPath } : {}),
-    ...(beforeText ? { beforeText } : {}),
-    ...(afterText ? { afterText } : {}),
+    ...(normalizedBeforeText ? { beforeText: normalizedBeforeText } : {}),
+    ...(normalizedAfterText ? { afterText: normalizedAfterText } : {}),
     ...(unifiedDiff ? { unifiedDiff } : {}),
     ...(hunks ? { hunks } : {}),
     ...(toolCallId ? { toolCallId } : {}),
@@ -217,16 +241,20 @@ function normalizeCodexFileChangePatch(change: unknown, toolCallId?: string): Fi
   if (!filePath) return null;
   const beforeText = asStringAny(record.beforeText, record.before, record.oldText, record.oldContent);
   const afterText = asStringAny(record.afterText, record.after, record.newText, record.newContent, record.content);
-  const unifiedDiff = asStringAny(record.unifiedDiff, record.patch, record.diff);
+  const diffText = asStringAny(record.unifiedDiff, record.patch, record.diff);
+  const unifiedDiff = looksLikeUnifiedDiff(diffText) ? diffText : undefined;
   const hunks = normalizeHunks(record.hunks ?? record.ranges);
   const oldPath = asStringAny(record.oldPath, record.previousPath, record.fromPath);
-  const operation = detectOperation(record.operation ?? record.op ?? record.kind ?? record.type,
-    oldPath ? 'rename' : beforeText || afterText || unifiedDiff ? 'update' : 'unknown');
-  const confidence: FileChangeConfidence = beforeText && afterText
+  const operation = detectOperation(record.operation ?? record.op ?? asRecord(record.kind)?.type ?? record.kind ?? record.type,
+    oldPath ? 'rename' : beforeText || afterText || diffText ? 'update' : 'unknown');
+  const inlineText = unifiedDiff ? undefined : diffText;
+  const normalizedBeforeText = beforeText ?? (inlineText && operation === 'delete' ? inlineText : undefined);
+  const normalizedAfterText = afterText ?? (inlineText && operation !== 'delete' ? inlineText : undefined);
+  const confidence: FileChangeConfidence = normalizedBeforeText && normalizedAfterText
     ? 'exact'
     : unifiedDiff
       ? 'exact'
-      : afterText
+      : normalizedBeforeText || normalizedAfterText
         ? 'derived'
         : 'coarse';
 
@@ -235,8 +263,8 @@ function normalizeCodexFileChangePatch(change: unknown, toolCallId?: string): Fi
     operation,
     confidence,
     ...(oldPath ? { oldPath } : {}),
-    ...(beforeText ? { beforeText } : {}),
-    ...(afterText ? { afterText } : {}),
+    ...(normalizedBeforeText ? { beforeText: normalizedBeforeText } : {}),
+    ...(normalizedAfterText ? { afterText: normalizedAfterText } : {}),
     ...(unifiedDiff ? { unifiedDiff } : {}),
     ...(hunks ? { hunks } : {}),
     ...(toolCallId ? { toolCallId } : {}),
