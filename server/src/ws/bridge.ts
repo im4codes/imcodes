@@ -51,7 +51,7 @@ import {
   type PreviewWsOpenedMessage,
 } from '../../../shared/preview-types.js';
 import { LocalWebPreviewRegistry } from '../preview/registry.js';
-import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions } from '../db/queries.js';
+import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent } from '../db/queries.js';
 import logger from '../util/logger.js';
 import { pickReadableSessionDisplay } from '../../../shared/session-display.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
@@ -968,12 +968,17 @@ export class WsBridge {
 
     // ── Timeline events: session-scoped ───────────────────────────────────────
     if (type === 'timeline.event') {
-      const sessionId = (msg.event as Record<string, unknown> | undefined)?.sessionId as string | undefined;
-      if (!sessionId) {
+      const rawEvent = msg.event as Record<string, unknown> | undefined;
+      const sessionId = rawEvent?.sessionId as string | undefined;
+      if (!rawEvent || !sessionId) {
         logger.warn({ serverId: this.serverId }, 'timeline.event missing sessionId — discarded');
         return;
       }
-      this.ingestRecentTextFromTimelineEvent(msg.event as Record<string, unknown>);
+      this.ingestRecentTextFromTimelineEvent(rawEvent);
+      if (this.db) {
+        void upsertSessionTextTailCacheEvent(this.db, this.serverId, rawEvent)
+          .catch((err) => logger.warn({ err, serverId: this.serverId, sessionId }, 'Failed to update session_text_tail_cache'));
+      }
       this.sendToSessionSubscribers(sessionId, JSON.stringify(msg));
       return;
     }

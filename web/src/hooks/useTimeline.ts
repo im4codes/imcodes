@@ -28,9 +28,10 @@ function localizedAckFailureReason(reason: AckFailureReason): string {
 
 import { useEffect, useRef, useState, useCallback } from 'preact/hooks';
 import type { WsClient, TimelineEvent, ServerMessage } from '../ws-client.js';
+import type { TimelineConfidence, TimelineSource } from '../../../src/shared/timeline/types.js';
 import { TimelineDB } from '../timeline-db.js';
 import { mergeTimelineEvents, preferTimelineEvent } from '../../../src/shared/timeline/merge.js';
-import { fetchTimelineHistoryHttp } from '../api.js';
+import { fetchTimelineHistoryHttp, fetchTimelineTextTailHttp, type TimelineTextTailItem } from '../api.js';
 
 // Singleton DB shared across all useTimeline instances — opened once at module load.
 // This avoids per-hook open() latency and ensures the DB is ready before any hook queries it.
@@ -366,6 +367,30 @@ function getTimelineHistoryAfterTs(events: TimelineEvent[]): number | undefined 
   return Math.max(0, maxTs - TIMELINE_HISTORY_AFTER_TS_OVERLAP_MS);
 }
 
+function timelineEventFromTextTailItem(sessionId: string, item: TimelineTextTailItem): TimelineEvent | null {
+  if (typeof item.eventId !== 'string' || !item.eventId) return null;
+  if (typeof item.ts !== 'number' || !Number.isFinite(item.ts)) return null;
+  if (item.type !== 'user.message' && item.type !== 'assistant.text') return null;
+  if (typeof item.text !== 'string' || item.text.trim().length === 0) return null;
+  const source: TimelineSource = item.source === 'hook' || item.source === 'terminal-parse' || item.source === 'terminal-spinner'
+    ? item.source
+    : 'daemon';
+  const confidence: TimelineConfidence = item.confidence === 'medium' || item.confidence === 'low'
+    ? item.confidence
+    : 'high';
+  return {
+    eventId: item.eventId,
+    sessionId,
+    ts: item.ts,
+    epoch: 0,
+    seq: 0,
+    source,
+    confidence,
+    type: item.type,
+    payload: { text: item.text },
+  };
+}
+
 export function __getTimelineCacheKeysForTests(): string[] {
   return [...eventsCache.keys()];
 }
@@ -467,12 +492,31 @@ export function useTimeline(
     setHasOlderHistory(true);
 
     let cancelled = false;
+    let textTailStarted = false;
+
+    const startTextTailBootstrap = (): void => {
+      if (textTailStarted || !serverId || !sessionId || !cacheKey) return;
+      textTailStarted = true;
+      const expectedCacheKey = cacheKey;
+      const expectedSessionId = sessionId;
+      void fetchTimelineTextTailHttp(serverId, expectedSessionId)
+        .then((result) => {
+          if (cancelled || cacheKeyRef.current !== expectedCacheKey || !result || result.events.length === 0) return;
+          const recovered = result.events
+            .map((item) => timelineEventFromTextTailItem(expectedSessionId, item))
+            .filter((event): event is TimelineEvent => event !== null);
+          if (recovered.length === 0) return;
+          mergeEvents(recovered);
+        })
+        .catch(() => { /* fail-open: authoritative history flow continues */ });
+    };
 
     // 1. Module-level memory cache — instant restore (e.g. window reopen)
     const memCached = getCachedEvents(cacheKey!);
     if (memCached && memCached.length > 0) {
       setEvents(memCached);
       setLoading(false);
+      startTextTailBootstrap();
       if (wsConnected) {
         setRefreshing(true);
         historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
@@ -493,6 +537,7 @@ export function useTimeline(
       setCachedEvents(cacheKey!, localSnapshot);
       setEvents((prev) => (prev === localSnapshot ? prev : localSnapshot));
       setLoading(false);
+      startTextTailBootstrap();
       if (wsConnected) {
         setRefreshing(true);
         historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
@@ -503,6 +548,7 @@ export function useTimeline(
     // 2. Already loaded this session — skip reload (prevents flash-of-empty on minimize/restore)
     if (historyLoadedRef.current === cacheKey) {
       setLoading(false);
+      startTextTailBootstrap();
       // Just request incremental updates
       if (wsConnected) {
         setRefreshing(true);
@@ -535,6 +581,7 @@ export function useTimeline(
         setEvents((prev) => (prev === restored ? prev : restored));
         setLoading(false);
         historyLoadedRef.current = cacheKeyRef.current;
+        startTextTailBootstrap();
         if (wsConnected) {
           setRefreshing(true);
           historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
@@ -548,6 +595,7 @@ export function useTimeline(
         seqRef.current = 0;
         if (cancelled) return;
         setEvents([]);
+        startTextTailBootstrap();
         if (wsConnected) {
           historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId);
         } else {

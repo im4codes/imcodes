@@ -784,6 +784,45 @@ export async function fetchTimelineHistoryHttp(
   }
 }
 
+export interface TimelineTextTailItem {
+  eventId: string;
+  ts: number;
+  type: 'user.message' | 'assistant.text';
+  text: string;
+  source?: string;
+  confidence?: string;
+}
+
+/**
+ * Fetch the PostgreSQL-backed recent text-tail cache for one session.
+ *
+ * This is a non-authoritative bootstrap path intended to surface the latest
+ * completed text messages quickly while the existing WS/full-history flow
+ * continues to reconcile authoritative state.
+ *
+ * Returns null (not throw) on expected transient failures so callers can fail
+ * open and continue with the normal timeline bootstrap.
+ */
+export async function fetchTimelineTextTailHttp(
+  serverId: string,
+  sessionName: string,
+): Promise<{ events: TimelineTextTailItem[] } | null> {
+  const params = new URLSearchParams();
+  params.set('sessionName', sessionName);
+  try {
+    const result = await apiFetch<{ sessionName: string; events: TimelineTextTailItem[] }>(
+      `/api/server/${encodeURIComponent(serverId)}/timeline/text-tail?${params.toString()}`,
+      { method: 'GET' },
+    );
+    return {
+      events: Array.isArray(result.events) ? result.events : [],
+    };
+  } catch (err) {
+    if (err instanceof ApiError && (err.status === 401 || err.status === 403)) throw err;
+    return null;
+  }
+}
+
 export async function deleteSubSession(serverId: string, subId: string): Promise<void> {
   await apiFetch(`/api/server/${serverId}/sub-sessions/${subId}`, { method: 'DELETE' });
 }

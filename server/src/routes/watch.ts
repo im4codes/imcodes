@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import type { Env } from '../env.js';
-import { getServersByUserId, getDbSessionsByServer, getSubSessionsByServer, getUserPref } from '../db/queries.js';
+import { getServersByUserId, getDbSessionsByServer, getSubSessionsByServer, getUserPref, getSessionTextTailCache } from '../db/queries.js';
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { WsBridge } from '../ws/bridge.js';
 import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
@@ -354,5 +354,28 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
     if (message === 'daemon_offline') return c.json({ error: 'daemon_offline' }, 503);
     if (message === 'timeout') return c.json({ error: 'timeline_timeout' }, 504);
     return c.json({ error: 'relay_failed' }, 502);
+  }
+});
+
+watchRoutes.get('/server/:id/timeline/text-tail', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id')!;
+  const role = await resolveServerRole(c.env.DB, serverId, userId);
+  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+
+  const sessionName = c.req.query('sessionName')?.trim();
+  if (!sessionName) return c.json({ error: 'session_name_required' }, 400);
+
+  try {
+    const events = await getSessionTextTailCache(c.env.DB, serverId, sessionName);
+    c.header(IMCODES_POD_HEADER, getPodIdentity());
+    return c.json({ sessionName, events });
+  } catch (err) {
+    logger.warn({
+      serverId,
+      sessionName,
+      err: err instanceof Error ? err.message : String(err),
+    }, 'timeline.text-tail failed');
+    return c.json({ error: 'cache_read_failed' }, 500);
   }
 });

@@ -12,7 +12,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // Hoisted mock: must run before useTimeline is imported so the hook picks up
 // our spy rather than the real apiFetch wrapper.
 const fetchSpy = vi.hoisted(() => vi.fn());
-vi.mock('../src/api.js', () => ({ fetchTimelineHistoryHttp: fetchSpy }));
+const fetchTextTailSpy = vi.hoisted(() => vi.fn());
+vi.mock('../src/api.js', () => ({
+  fetchTimelineHistoryHttp: fetchSpy,
+  fetchTimelineTextTailHttp: fetchTextTailSpy,
+}));
 
 import { render, screen, cleanup, act, waitFor } from '@testing-library/preact';
 import { h } from 'preact';
@@ -30,6 +34,8 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     __resetTimelineCacheForTests();
     cleanup();
     fetchSpy.mockReset();
+    fetchTextTailSpy.mockReset();
+    fetchTextTailSpy.mockResolvedValue(null);
   });
   afterEach(() => {
     vi.useRealTimers();

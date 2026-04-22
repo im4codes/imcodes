@@ -8,6 +8,7 @@ const mockGetServersByUserId = vi.fn();
 const mockGetDbSessionsByServer = vi.fn();
 const mockGetSubSessionsByServer = vi.fn();
 const mockGetUserPref = vi.fn();
+const mockGetSessionTextTailCache = vi.fn();
 const mockRequestTimelineHistory = vi.fn();
 const mockGetRecentText = vi.fn();
 const mockGetRecentTextForWatch = vi.fn();
@@ -30,6 +31,7 @@ vi.mock('../src/db/queries.js', () => ({
   getDbSessionsByServer: (...args: unknown[]) => mockGetDbSessionsByServer(...args),
   getSubSessionsByServer: (...args: unknown[]) => mockGetSubSessionsByServer(...args),
   getUserPref: (...args: unknown[]) => mockGetUserPref(...args),
+  getSessionTextTailCache: (...args: unknown[]) => mockGetSessionTextTailCache(...args),
   getServerById: vi.fn(async () => ({ id: 'srv-1' })),
 }));
 
@@ -91,6 +93,7 @@ describe('Watch routes', () => {
     mockGetDbSessionsByServer.mockResolvedValue([]);
     mockGetSubSessionsByServer.mockResolvedValue([]);
     mockGetUserPref.mockResolvedValue(null);
+    mockGetSessionTextTailCache.mockResolvedValue([]);
     mockGetRecentText.mockReturnValue([]);
     mockGetRecentTextForWatch.mockResolvedValue([]);
     mockGetActiveMainSessions.mockReturnValue([]);
@@ -335,12 +338,56 @@ describe('Watch routes', () => {
     await expect(res.json()).resolves.toEqual({ error: 'daemon_offline' });
   });
 
+  it('GET /api/server/:id/timeline/text-tail returns cached entries', async () => {
+    mockGetSessionTextTailCache.mockResolvedValue([
+      { eventId: 'e1', ts: 100, type: 'user.message', text: 'hi' },
+      { eventId: 'e2', ts: 200, type: 'assistant.text', text: 'hello', source: 'daemon', confidence: 'high' },
+    ]);
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/text-tail?sessionName=deck_proj_brain');
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get(IMCODES_POD_HEADER)).toBe('pod-a');
+    await expect(res.json()).resolves.toEqual({
+      sessionName: 'deck_proj_brain',
+      events: [
+        { eventId: 'e1', ts: 100, type: 'user.message', text: 'hi' },
+        { eventId: 'e2', ts: 200, type: 'assistant.text', text: 'hello', source: 'daemon', confidence: 'high' },
+      ],
+    });
+  });
+
+  it('GET /api/server/:id/timeline/text-tail returns empty list when no cache exists', async () => {
+    mockGetSessionTextTailCache.mockResolvedValue([]);
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/text-tail?sessionName=deck_proj_brain');
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      sessionName: 'deck_proj_brain',
+      events: [],
+    });
+  });
+
+  it('GET /api/server/:id/timeline/text-tail isolates cache read failures', async () => {
+    mockGetSessionTextTailCache.mockRejectedValue(new Error('db down'));
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/text-tail?sessionName=deck_proj_brain');
+
+    expect(res.status).toBe(500);
+    await expect(res.json()).resolves.toEqual({ error: 'cache_read_failed' });
+  });
+
   it('watch routes return 403 when the user has no access to the server', async () => {
     mockResolveServerRole.mockResolvedValue('none');
     const app = await buildTestApp();
 
     const sessionsRes = await app.request('/api/watch/sessions?serverId=srv-1');
     const historyRes = await app.request('/api/server/srv-1/timeline/history?sessionName=deck_proj_brain');
+    const tailRes = await app.request('/api/server/srv-1/timeline/text-tail?sessionName=deck_proj_brain');
     const sendRes = await app.request('/api/server/srv-1/session/send', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -352,6 +399,9 @@ describe('Watch routes', () => {
 
     expect(historyRes.status).toBe(403);
     await expect(historyRes.json()).resolves.toEqual({ error: 'forbidden' });
+
+    expect(tailRes.status).toBe(403);
+    await expect(tailRes.json()).resolves.toEqual({ error: 'forbidden' });
 
     expect(sendRes.status).toBe(403);
     await expect(sendRes.json()).resolves.toEqual({

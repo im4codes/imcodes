@@ -4,7 +4,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const fetchSpy = vi.hoisted(() => vi.fn());
-vi.mock('../src/api.js', () => ({ fetchTimelineHistoryHttp: fetchSpy }));
+const fetchTextTailSpy = vi.hoisted(() => vi.fn());
+vi.mock('../src/api.js', () => ({
+  fetchTimelineHistoryHttp: fetchSpy,
+  fetchTimelineTextTailHttp: fetchTextTailSpy,
+}));
 
 import { act, cleanup, render, screen, waitFor } from '@testing-library/preact';
 import { h } from 'preact';
@@ -21,6 +25,8 @@ describe('native app resume refresh chain', () => {
     __resetTimelineCacheForTests();
     cleanup();
     fetchSpy.mockReset();
+    fetchTextTailSpy.mockReset();
+    fetchTextTailSpy.mockResolvedValue(null);
   });
 
   afterEach(() => {
