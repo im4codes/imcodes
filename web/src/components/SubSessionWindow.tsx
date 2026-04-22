@@ -58,6 +58,17 @@ interface Props {
 
 type ViewMode = 'terminal' | 'chat';
 
+const IDLE_HISTORY_STATUS = {
+  phase: 'idle',
+  steps: {
+    cache: 'skipped',
+    textTail: 'skipped',
+    daemon: 'skipped',
+    http: 'skipped',
+    older: 'skipped',
+  },
+} as const;
+
 const LOCAL_KEY = (id: string) => `rcc_subsession_${id}`;
 const DEFAULT_W = 620;
 const DEFAULT_H = 620;
@@ -115,10 +126,11 @@ export function SubSessionWindow({
   const {
     events,
     refreshing,
-    historyStatus,
+    historyStatus: timelineHistoryStatus,
     addOptimisticUserMessage,
     removeOptimisticMessage,
   } = useTimeline(sub.sessionName, ws, serverId);
+  const historyStatus = timelineHistoryStatus ?? IDLE_HISTORY_STATUS;
   const quickData = useQuickData();
 
   // Earliest ts of the current continuous thinking sequence (shared logic).

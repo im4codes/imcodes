@@ -24,6 +24,17 @@ import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 
 type ViewMode = 'terminal' | 'chat';
 
+const IDLE_HISTORY_STATUS = {
+  phase: 'idle',
+  steps: {
+    cache: 'skipped',
+    textTail: 'skipped',
+    daemon: 'skipped',
+    http: 'skipped',
+    older: 'skipped',
+  },
+} as const;
+
 export interface SessionPaneProps {
   serverId: string;
   session: SessionInfo;
@@ -108,13 +119,14 @@ export function SessionPane({
     events: timelineEvents,
     loading: timelineLoading,
     refreshing: timelineRefreshing,
-    historyStatus,
+    historyStatus: timelineHistoryStatus,
     loadingOlder: timelineLoadingOlder,
     hasOlderHistory: timelineHasOlderHistory,
     addOptimisticUserMessage,
     removeOptimisticMessage,
     loadOlderEvents,
   } = useTimeline(sessionName, ws, serverId);
+  const historyStatus = timelineHistoryStatus ?? IDLE_HISTORY_STATUS;
 
   // ── Quotes ────────────────────────────────────────────────────────────────
   const [quotes, setQuotes] = useState<string[]>([]);

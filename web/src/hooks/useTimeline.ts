@@ -448,7 +448,7 @@ export interface TimelineHistoryStatus {
   steps: Record<TimelineHistoryStepKey, TimelineHistoryStepState>;
 }
 
-function createIdleHistoryStatus(): TimelineHistoryStatus {
+export function createIdleHistoryStatus(): TimelineHistoryStatus {
   return {
     phase: 'idle',
     steps: {
