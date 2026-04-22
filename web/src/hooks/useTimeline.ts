@@ -32,6 +32,7 @@ import type { TimelineConfidence, TimelineSource } from '../../../src/shared/tim
 import { TimelineDB } from '../timeline-db.js';
 import { mergeTimelineEvents, preferTimelineEvent } from '../../../src/shared/timeline/merge.js';
 import { fetchTimelineHistoryHttp, fetchTimelineTextTailHttp, type TimelineTextTailItem } from '../api.js';
+import { normalizeTransportPendingEntries } from '../transport-queue.js';
 
 // Singleton DB shared across all useTimeline instances — opened once at module load.
 // This avoids per-hook open() latency and ensures the DB is ready before any hook queries it.
@@ -743,6 +744,29 @@ export function useTimeline(
     });
   }, [clearOptimisticTimer]);
 
+  const reconcileQueuedOptimisticMessages = useCallback((pendingEntries: unknown, pendingMessages: unknown) => {
+    const queuedEntries = normalizeTransportPendingEntries(pendingEntries, pendingMessages, sessionId);
+    if (queuedEntries.length === 0) return;
+    const queuedIds = new Set(queuedEntries.map((entry) => entry.clientMessageId).filter(Boolean));
+    if (queuedIds.size === 0) return;
+    setEvents((prev) => {
+      const base = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
+      let changed = false;
+      const next = base.filter((event) => {
+        if (event.type !== 'user.message' || event.payload.pending !== true) return true;
+        const commandId = typeof event.payload.commandId === 'string' ? event.payload.commandId : '';
+        if (!commandId || !queuedIds.has(commandId)) return true;
+        optimisticIdsByCommandRef.current.delete(commandId);
+        clearOptimisticTimer(commandId);
+        changed = true;
+        return false;
+      });
+      if (!changed) return base;
+      if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, next);
+      return next;
+    });
+  }, [clearOptimisticTimer, sessionId]);
+
   // Immediately show a user message before the daemon confirms it.
   // The real event (from WS) will remove the pending version on arrival.
   // When `commandId` is provided, the bubble reconciles deterministically with
@@ -992,6 +1016,9 @@ export function useTimeline(
       if (msg.type === 'timeline.event') {
         const event = msg.event;
         if (event.sessionId !== sessionId) return;
+        if (event.type === 'session.state' && event.payload?.state === 'queued') {
+          reconcileQueuedOptimisticMessages(event.payload.pendingMessageEntries, event.payload.pendingMessages);
+        }
 
         // Echo dedup: hide assistant.text that echoes a recent user message (e.g. prompt repeat).
         // Read current events via ref (avoid unnecessary setEvents call that returns prev unchanged).
@@ -1306,7 +1333,7 @@ export function useTimeline(
 
     const unsub = ws.onMessage(handler);
     return unsub;
-  }, [ws, sessionId, appendEvent, loading, mergeEvents, replaceEvents, serverId, updateHistoryStep]);
+  }, [ws, sessionId, appendEvent, clearOptimisticTimer, loading, markOptimisticFailed, mergeEvents, reconcileQueuedOptimisticMessages, replaceEvents, serverId, updateHistoryStep]);
 
   useEffect(() => {
     if (loading || refreshing || httpRefreshing || textTailRefreshing || loadingOlder) return;

@@ -133,6 +133,42 @@ describe('useTimeline optimistic send flow', () => {
     expect(ref.current!.events[0].payload.pending).toBeFalsy();
   });
 
+  it('removes a transport optimistic bubble when the daemon authoritatively queues the send', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_queue' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('queue me', 'cmd-queued');
+    });
+    expect(ref.current!.events).toHaveLength(1);
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'queued-state-1',
+          sessionId: 'deck_opt_queue',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 4,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'session.state',
+          payload: {
+            state: 'queued',
+            pendingMessages: ['queue me'],
+            pendingMessageEntries: [{ clientMessageId: 'cmd-queued', text: 'queue me' }],
+          },
+        },
+      } as unknown as ServerMessage);
+    });
+
+    expect(ref.current!.events).toHaveLength(1);
+    expect(ref.current!.events[0].type).toBe('session.state');
+  });
+
   it('late echo also clears a previously-failed bubble (retry arrived)', () => {
     const ref = { current: null as HookRef };
     const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };

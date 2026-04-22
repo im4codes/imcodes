@@ -372,7 +372,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
                     || (typeof extras.p2pMode === 'string' && extras.p2pMode.length > 0)
                     || (extras.p2pSessionConfig != null && typeof extras.p2pSessionConfig === 'object')
                   );
-                  if (isP2pSend || isTransportRuntime(sub)) return;
+                  if (isP2pSend) return;
                   addOptimisticUserMessage?.(text, meta?.commandId, {
                     ...(meta?.attachments ? { attachments: meta.attachments } : {}),
                     ...(meta?.extra ? { resendExtra: meta.extra } : {}),
