@@ -10,6 +10,13 @@ import { getUserPref, saveUserPref } from '../api.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '@shared/effort-levels.js';
 import { getSessionAgentGroups, getSessionAgentLabel, SESSION_AGENT_GROUP_LABEL_KEYS } from './session-agent-options.js';
 import { QwenCodingPlanHint } from './QwenCodingPlanHint.js';
+import {
+  buildCcPresetFromDraft,
+  createCcPresetDraftFromPreset,
+  createDefaultCcPresetDraft,
+  type CcPresetEntry,
+  type CcPresetDraft,
+} from './cc-preset-form.js';
 
 const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
 const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
@@ -47,20 +54,29 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   const [ocSelectedSession, setOcSelectedSession] = useState('');
 
   // CC env presets
-  const [ccPresets, setCcPresets] = useState<Array<{ name: string; env: Record<string, string>; contextWindow?: number; initMessage?: string }>>([]);
+  const [ccPresets, setCcPresets] = useState<CcPresetEntry[]>([]);
   const [ccPreset, setCcPreset] = useState<string>('');
   const [ccInitPrompt, setCcInitPrompt] = useState<string>('');
   const [showPresetEditor, setShowPresetEditor] = useState(false);
+  const defaultPresetDraft = createDefaultCcPresetDraft();
   const [newPresetName, setNewPresetName] = useState('');
-  const [newPresetBaseUrl, setNewPresetBaseUrl] = useState('');
+  const [newPresetBaseUrl, setNewPresetBaseUrl] = useState(defaultPresetDraft.baseUrl);
   const [newPresetToken, setNewPresetToken] = useState('');
-  const [newPresetModel, setNewPresetModel] = useState('');
-  const [newPresetCtx, setNewPresetCtx] = useState('1000000');
-  const [newPresetCustomEnv, setNewPresetCustomEnv] = useState<Array<{ key: string; value: string }>>([]);
-  const DEFAULT_INIT_MSG = 'For web searches, use: curl -s "https://html.duckduckgo.com/html/?q=QUERY" | head -200. Replace QUERY with URL-encoded search terms.';
-  const [newPresetInit, setNewPresetInit] = useState(DEFAULT_INIT_MSG);
+  const [newPresetModel, setNewPresetModel] = useState(defaultPresetDraft.model);
+  const [newPresetCtx, setNewPresetCtx] = useState(defaultPresetDraft.contextWindow);
+  const [newPresetCustomEnv, setNewPresetCustomEnv] = useState<Array<{ key: string; value: string }>>(defaultPresetDraft.customEnv);
+  const [newPresetInit, setNewPresetInit] = useState(defaultPresetDraft.initMessage);
   const [presetError, setPresetError] = useState('');
   const fmtCtx = (v: string) => { const n = parseInt(v, 10); if (!n) return ''; if (n >= 1000000) return `${(n/1000000).toFixed(n%1000000===0?0:1)}M`; if (n >= 1000) return `${(n/1000).toFixed(0)}K`; return String(n); };
+  const applyPresetDraft = (draft: CcPresetDraft) => {
+    setNewPresetName(draft.name);
+    setNewPresetBaseUrl(draft.baseUrl);
+    setNewPresetToken(draft.token);
+    setNewPresetModel(draft.model);
+    setNewPresetCtx(draft.contextWindow);
+    setNewPresetCustomEnv(draft.customEnv);
+    setNewPresetInit(draft.initMessage);
+  };
 
   // Remote sessions come from the provider status hook (pushed on connect, cached in DB)
   const ocRemoteSessions = getRemoteSessions('openclaw');
@@ -377,17 +393,19 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                   </div>
                   <button type="button" class="btn btn-primary" style={{ fontSize: 11, padding: '3px 10px' }} disabled={!newPresetName.trim() || !newPresetBaseUrl.trim()}
                     onClick={() => {
-                      const env: Record<string, string> = { ANTHROPIC_BASE_URL: newPresetBaseUrl.trim(), CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1', CLAUDE_CODE_ATTRIBUTION_HEADER: '0' };
-                      if (newPresetToken.trim()) env['ANTHROPIC_AUTH_TOKEN'] = newPresetToken.trim();
-                      if (newPresetModel.trim()) env['ANTHROPIC_MODEL'] = newPresetModel.trim();
-                      for (const { key, value } of newPresetCustomEnv) { if (key.trim()) env[key.trim()] = value; }
-                      const preset: any = { name: newPresetName.trim(), env };
-                      if (newPresetCtx) preset.contextWindow = parseInt(newPresetCtx, 10);
-                      if (newPresetInit.trim()) preset.initMessage = newPresetInit.trim();
+                      const preset = buildCcPresetFromDraft({
+                        name: newPresetName,
+                        baseUrl: newPresetBaseUrl,
+                        token: newPresetToken,
+                        model: newPresetModel,
+                        contextWindow: newPresetCtx,
+                        customEnv: newPresetCustomEnv,
+                        initMessage: newPresetInit,
+                      });
                       const updated = [...ccPresets.filter(p => p.name !== preset.name), preset];
                       setCcPresets(updated);
                       try { ws?.send({ type: 'cc.presets.save', presets: updated }); } catch {}
-                      setNewPresetName(''); setNewPresetBaseUrl(''); setNewPresetToken(''); setNewPresetModel(''); setNewPresetCtx('1000000'); setNewPresetInit(DEFAULT_INIT_MSG); setNewPresetCustomEnv([]);
+                      applyPresetDraft(createDefaultCcPresetDraft());
                       setCcPreset(preset.name); setPresetError('');
                     }}
                   >Save</button>
@@ -398,10 +416,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                           <span style={{ color: '#e2e8f0' }}>{p.name} <span style={{ color: '#475569' }}>{p.env['ANTHROPIC_MODEL'] ?? ''}</span></span>
                           <div style={{ display: 'flex', gap: 4 }}>
                             <button type="button" style={{ background: 'none', border: 'none', color: '#3b82f6', cursor: 'pointer', fontSize: 10 }} onClick={() => {
-                              setNewPresetName(p.name); setNewPresetBaseUrl(p.env['ANTHROPIC_BASE_URL'] ?? ''); setNewPresetToken(p.env['ANTHROPIC_AUTH_TOKEN'] ?? ''); setNewPresetModel(p.env['ANTHROPIC_MODEL'] ?? '');
-                              setNewPresetCtx(p.contextWindow ? String(p.contextWindow) : '1000000'); setNewPresetInit(p.initMessage ?? DEFAULT_INIT_MSG);
-                              const knownKeys = new Set(['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_MODEL', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', 'CLAUDE_CODE_ATTRIBUTION_HEADER']);
-                              setNewPresetCustomEnv(Object.entries(p.env).filter(([k]) => !knownKeys.has(k)).map(([key, value]) => ({ key, value })));
+                              applyPresetDraft(createCcPresetDraftFromPreset(p));
                             }}>Edit</button>
                             <button type="button" style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', fontSize: 10 }} onClick={() => { const u = ccPresets.filter(x => x.name !== p.name); setCcPresets(u); try { ws?.send({ type: 'cc.presets.save', presets: u }); } catch {} if (ccPreset === p.name) setCcPreset(''); }}>Del</button>
                           </div>

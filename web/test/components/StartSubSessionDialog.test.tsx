@@ -227,6 +227,30 @@ describe('StartSubSessionDialog', () => {
     });
   });
 
+  it('prefills default qwen preset values instead of leaving placeholders only', async () => {
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
+    await waitFor(() => expect(screen.getByText('api_provider')).toBeDefined());
+    fireEvent.click(screen.getByRole('button', { name: /api_provider_add_edit/i }));
+
+    expect(screen.getByDisplayValue('https://api.minimax.io/anthropic')).toBeDefined();
+    expect(screen.getByDisplayValue('MiniMax-M2.7')).toBeDefined();
+    expect(screen.getByDisplayValue('API_TIMEOUT_MS')).toBeDefined();
+    expect(screen.getByDisplayValue('3000000')).toBeDefined();
+    expect(screen.getByDisplayValue('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC')).toBeDefined();
+  });
+
   it('passes thinking level for qwen sub-sessions', () => {
     const onStart = vi.fn();
     render(

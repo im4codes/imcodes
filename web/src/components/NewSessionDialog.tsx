@@ -22,6 +22,13 @@ import {
   supportsDynamicTransportModels,
 } from "../hooks/useTransportModels.js";
 import { QwenCodingPlanHint } from "./QwenCodingPlanHint.js";
+import {
+  buildCcPresetFromDraft,
+  createCcPresetDraftFromPreset,
+  createDefaultCcPresetDraft,
+  type CcPresetDraft,
+  type CcPresetEntry,
+} from "./cc-preset-form.js";
 
 const DEFAULT_SHELL_KEY = "default_shell";
 // Fallback suggestions used only when the daemon probe returns an empty list
@@ -74,29 +81,21 @@ export function NewSessionDialog({
   const agentGroups = getSessionAgentGroups("new-session");
 
   // CC env presets
-  const [ccPresets, setCcPresets] = useState<
-    Array<{
-      name: string;
-      env: Record<string, string>;
-      contextWindow?: number;
-      initMessage?: string;
-    }>
-  >([]);
+  const [ccPresets, setCcPresets] = useState<CcPresetEntry[]>([]);
   const [ccPreset, setCcPreset] = useState<string>("");
   const [ccInitPrompt, setCcInitPrompt] = useState<string>("");
   const [showPresetEditor, setShowPresetEditor] = useState(false);
   // New preset form
+  const defaultPresetDraft = createDefaultCcPresetDraft();
   const [newPresetName, setNewPresetName] = useState("");
-  const [newPresetBaseUrl, setNewPresetBaseUrl] = useState("");
+  const [newPresetBaseUrl, setNewPresetBaseUrl] = useState(defaultPresetDraft.baseUrl);
   const [newPresetToken, setNewPresetToken] = useState("");
-  const [newPresetModel, setNewPresetModel] = useState("");
-  const [newPresetCtx, setNewPresetCtx] = useState("1000000");
+  const [newPresetModel, setNewPresetModel] = useState(defaultPresetDraft.model);
+  const [newPresetCtx, setNewPresetCtx] = useState(defaultPresetDraft.contextWindow);
   const [newPresetCustomEnv, setNewPresetCustomEnv] = useState<
     Array<{ key: string; value: string }>
-  >([]);
-  const DEFAULT_INIT_MSG =
-    'For web searches, use: curl -s "https://html.duckduckgo.com/html/?q=QUERY" | head -200. Replace QUERY with URL-encoded search terms.';
-  const [newPresetInit, setNewPresetInit] = useState(DEFAULT_INIT_MSG);
+  >(defaultPresetDraft.customEnv);
+  const [newPresetInit, setNewPresetInit] = useState(defaultPresetDraft.initMessage);
   const fmtCtx = (v: string) => {
     const n = parseInt(v, 10);
     if (!n) return "";
@@ -104,6 +103,15 @@ export function NewSessionDialog({
       return `${(n / 1000000).toFixed(n % 1000000 === 0 ? 0 : 1)}M`;
     if (n >= 1000) return `${(n / 1000).toFixed(0)}K`;
     return String(n);
+  };
+  const applyPresetDraft = (draft: CcPresetDraft) => {
+    setNewPresetName(draft.name);
+    setNewPresetBaseUrl(draft.baseUrl);
+    setNewPresetToken(draft.token);
+    setNewPresetModel(draft.model);
+    setNewPresetCtx(draft.contextWindow);
+    setNewPresetCustomEnv(draft.customEnv);
+    setNewPresetInit(draft.initMessage);
   };
 
   // OpenClaw-specific state
@@ -853,23 +861,15 @@ export function NewSessionDialog({
                         : 1,
                   }}
                   onClick={() => {
-                    const env: Record<string, string> = {
-                      ANTHROPIC_BASE_URL: newPresetBaseUrl.trim(),
-                      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
-                      CLAUDE_CODE_ATTRIBUTION_HEADER: "0",
-                    };
-                    if (newPresetToken.trim())
-                      env["ANTHROPIC_AUTH_TOKEN"] = newPresetToken.trim();
-                    if (newPresetModel.trim())
-                      env["ANTHROPIC_MODEL"] = newPresetModel.trim();
-                    for (const { key, value } of newPresetCustomEnv) {
-                      if (key.trim()) env[key.trim()] = value;
-                    }
-                    const preset: any = { name: newPresetName.trim(), env };
-                    if (newPresetCtx)
-                      preset.contextWindow = parseInt(newPresetCtx, 10);
-                    if (newPresetInit.trim())
-                      preset.initMessage = newPresetInit.trim();
+                    const preset = buildCcPresetFromDraft({
+                      name: newPresetName,
+                      baseUrl: newPresetBaseUrl,
+                      token: newPresetToken,
+                      model: newPresetModel,
+                      contextWindow: newPresetCtx,
+                      customEnv: newPresetCustomEnv,
+                      initMessage: newPresetInit,
+                    });
                     const updated = [
                       ...ccPresets.filter((p) => p.name !== preset.name),
                       preset,
@@ -878,13 +878,7 @@ export function NewSessionDialog({
                     try {
                       ws?.send({ type: "cc.presets.save", presets: updated });
                     } catch {}
-                    setNewPresetName("");
-                    setNewPresetBaseUrl("");
-                    setNewPresetToken("");
-                    setNewPresetModel("");
-                    setNewPresetCtx("1000000");
-                    setNewPresetInit(DEFAULT_INIT_MSG);
-                    setNewPresetCustomEnv([]);
+                    applyPresetDraft(createDefaultCcPresetDraft());
                     setCcPreset(preset.name);
                   }}
                 >
@@ -937,34 +931,7 @@ export function NewSessionDialog({
                               fontSize: 11,
                             }}
                             onClick={() => {
-                              setNewPresetName(p.name);
-                              setNewPresetBaseUrl(
-                                p.env["ANTHROPIC_BASE_URL"] ?? "",
-                              );
-                              setNewPresetToken(
-                                p.env["ANTHROPIC_AUTH_TOKEN"] ?? "",
-                              );
-                              setNewPresetModel(p.env["ANTHROPIC_MODEL"] ?? "");
-                              setNewPresetCtx(
-                                p.contextWindow
-                                  ? String(p.contextWindow)
-                                  : "1000000",
-                              );
-                              setNewPresetInit(
-                                p.initMessage ?? DEFAULT_INIT_MSG,
-                              );
-                              const knownKeys = new Set([
-                                "ANTHROPIC_BASE_URL",
-                                "ANTHROPIC_AUTH_TOKEN",
-                                "ANTHROPIC_MODEL",
-                                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
-                                "CLAUDE_CODE_ATTRIBUTION_HEADER",
-                              ]);
-                              setNewPresetCustomEnv(
-                                Object.entries(p.env)
-                                  .filter(([k]) => !knownKeys.has(k))
-                                  .map(([key, value]) => ({ key, value })),
-                              );
+                              applyPresetDraft(createCcPresetDraftFromPreset(p));
                             }}
                           >
                             Edit

@@ -25,6 +25,7 @@ import { NewSessionDialog } from '../../src/components/NewSessionDialog.js';
 
 const makeWs = () => ({
   sendSessionCommand: vi.fn(),
+  send: vi.fn(),
   connected: true,
   onMessage: vi.fn().mockReturnValue(() => {}),
   subSessionDetectShells: vi.fn(),
@@ -298,6 +299,36 @@ describe('NewSessionDialog', () => {
       ccPreset: 'MiniMax',
       thinking: 'high',
     }));
+  });
+
+  it('saves qwen presets with the new default env template', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    agentTypeSelect.value = 'qwen';
+    fireEvent.input(agentTypeSelect, { target: { value: agentTypeSelect.value } });
+    await waitFor(() => expect(screen.getByText('api_provider')).toBeDefined());
+
+    fireEvent.click(screen.getByText('api_provider_add_edit'));
+    fireEvent.input(screen.getByPlaceholderText('e.g. MiniMax'), { target: { value: 'MiniMax' } });
+    fireEvent.click(screen.getByRole('button', { name: /save preset/i }));
+
+    expect(ws.send).toHaveBeenCalledWith({
+      type: 'cc.presets.save',
+      presets: [
+        expect.objectContaining({
+          name: 'MiniMax',
+          env: expect.objectContaining({
+            ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+            ANTHROPIC_MODEL: 'MiniMax-M2.7',
+            API_TIMEOUT_MS: '3000000',
+            CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+            CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
+          }),
+        }),
+      ],
+    });
   });
 
   it('includes thinking level when starting qwen', async () => {
