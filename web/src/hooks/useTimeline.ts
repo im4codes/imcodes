@@ -440,6 +440,15 @@ export interface UseTimelineResult {
   loadOlderEvents: () => void;
 }
 
+export interface UseTimelineOptions {
+  /**
+   * Only the active/visible timeline should trigger opportunistic HTTP
+   * backfills. Inactive mounted timelines still stay warm via cache + WS
+   * events, but they must not hammer `/timeline/history/full`.
+   */
+  isActiveSession?: boolean;
+}
+
 export type TimelineHistoryPhase = 'idle' | 'bootstrap' | 'refresh' | 'older';
 export type TimelineHistoryStepState = 'pending' | 'running' | 'done' | 'skipped';
 export type TimelineHistoryStepKey = 'cache' | 'textTail' | 'daemon' | 'http' | 'older';
@@ -479,10 +488,12 @@ export function useTimeline(
   sessionId: string | null,
   ws: WsClient | null,
   serverId?: string | null,
+  options?: UseTimelineOptions,
 ): UseTimelineResult {
   // IDB + memory cache key: scope by serverId to prevent cross-server pollution
   // when different servers share the same session name (e.g. deck_cd_brain).
   const cacheKey = sessionId ? scopeCacheKey(serverId, sessionId) : sessionId;
+  const isActiveSession = options?.isActiveSession ?? true;
   const wsConnected = !!ws?.connected;
   const cacheKeyRef = useRef(cacheKey);
   cacheKeyRef.current = cacheKey;
@@ -595,7 +606,9 @@ export function useTimeline(
       // was minimized/backgrounded since the memory cache can be stale.
       // Kept short (~200ms) because the UI is already visible; this is
       // strictly additive catch-up, merged by eventId.
-      fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' });
+      if (isActiveSession) {
+        fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' });
+      }
       return () => { cancelled = true; };
     }
 
@@ -614,7 +627,9 @@ export function useTimeline(
         setRefreshing(true);
         historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
       }
-      fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' });
+      if (isActiveSession) {
+        fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' });
+      }
     }
 
     // 2. Already loaded this session — skip reload (prevents flash-of-empty on minimize/restore)
@@ -631,7 +646,9 @@ export function useTimeline(
       // Same reasoning as path 1 — back-fill in the background so the
       // re-opened window is guaranteed to reflect authoritative daemon
       // state, not whatever the WS subscription happened to catch.
-      fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' });
+      if (isActiveSession) {
+        fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' });
+      }
       return () => { cancelled = true; };
     }
 
@@ -665,7 +682,9 @@ export function useTimeline(
         // Background HTTP backfill — IDB is authoritative only up to the
         // last time a WS event landed; if the user closed the tab mid-chat
         // and reopened later there may be a gap between IDB and daemon.
-        fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' });
+        if (isActiveSession) {
+          fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' });
+        }
       } else {
         epochRef.current = 0;
         seqRef.current = 0;
@@ -683,12 +702,14 @@ export function useTimeline(
         // Cold load — no IDB cache, no memory cache. Still fire the same
         // delayed HTTP backfill so an empty timeline can recover missed
         // daemon-side events without waiting for a later reconnect.
-        fireHttpBackfillRef.current(200, { cooldownMs: 0, phase: 'bootstrap' });
+        if (isActiveSession) {
+          fireHttpBackfillRef.current(200, { cooldownMs: 0, phase: 'bootstrap' });
+        }
       }
     };
     load().catch(() => {});
     return () => { cancelled = true; };
-  }, [cacheKey, sessionId, ws, wsConnected]);
+  }, [cacheKey, isActiveSession, sessionId, ws, wsConnected]);
 
   // Map of commandId → optimistic eventId for O(1) lookup on command.ack / dedup.
   const optimisticIdsByCommandRef = useRef(new Map<string, string>());
@@ -937,7 +958,7 @@ export function useTimeline(
    *     trigger simply tries again.
    */
   const fireHttpBackfill = useCallback((delayMs: number, opts?: { cooldownMs?: number; phase?: 'bootstrap' | 'refresh' }) => {
-    if (!serverId || !sessionId) return;
+    if (!isActiveSession || !serverId || !sessionId) return;
     const cooldownMs = opts?.cooldownMs ?? 0;
     const phase = opts?.phase ?? 'refresh';
     const backfillSessionId = sessionId;
@@ -976,7 +997,7 @@ export function useTimeline(
           if (httpBackfillInFlightRef.current === 0) setHttpRefreshing(false);
         });
     }, delayMs);
-  }, [serverId, sessionId, cacheKey, mergeEvents, idbPutEvents, updateHistoryStep]);
+  }, [isActiveSession, serverId, sessionId, cacheKey, mergeEvents, idbPutEvents, updateHistoryStep]);
 
   // Stable indirection — lets the session-mount effect below call the latest
   // `fireHttpBackfill` without having to list it (and transitively its five
@@ -998,6 +1019,7 @@ export function useTimeline(
   // each call, and `fireHttpBackfill` itself no-ops when either is unset.
   useEffect(() => {
     const handler = (): void => {
+      if (!isActiveSession) return;
       const now = Date.now();
       if (now - lastActiveRefreshAtRef.current < 250) return;
       lastActiveRefreshAtRef.current = now;
@@ -1005,7 +1027,7 @@ export function useTimeline(
     };
     window.addEventListener(ACTIVE_TIMELINE_REFRESH_EVENT, handler);
     return () => window.removeEventListener(ACTIVE_TIMELINE_REFRESH_EVENT, handler);
-  }, []);
+  }, [isActiveSession]);
 
   // Listen for WS messages
   useEffect(() => {
@@ -1347,7 +1369,7 @@ export function useTimeline(
 
     const unsub = ws.onMessage(handler);
     return unsub;
-  }, [ws, sessionId, appendEvent, clearOptimisticTimer, loading, markOptimisticFailed, mergeEvents, reconcileQueuedOptimisticMessages, replaceEvents, serverId, updateHistoryStep]);
+  }, [isActiveSession, ws, sessionId, appendEvent, clearOptimisticTimer, loading, markOptimisticFailed, mergeEvents, reconcileQueuedOptimisticMessages, replaceEvents, serverId, updateHistoryStep]);
 
   useEffect(() => {
     if (loading || refreshing || httpRefreshing || textTailRefreshing || loadingOlder) return;
