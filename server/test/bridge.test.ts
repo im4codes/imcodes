@@ -1799,7 +1799,7 @@ describe('WsBridge', () => {
       expect(payload.body).toContain('ready for input');
     });
 
-    it('sends push even when mobile client is connected (badge must increment)', async () => {
+    it('suppresses push when a mobile client is connected', async () => {
       const { dispatchPush } = await import('../src/routes/push.js');
       const { bridge, daemonWs } = await setupPushBridge();
 
@@ -1812,7 +1812,7 @@ describe('WsBridge', () => {
       }));
       await flushAsync();
 
-      expect(dispatchPush).toHaveBeenCalled();
+      expect(dispatchPush).not.toHaveBeenCalled();
     });
 
     it('sends push when only desktop browser is connected', async () => {

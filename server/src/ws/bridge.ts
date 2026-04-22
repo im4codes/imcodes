@@ -2549,9 +2549,6 @@ export class WsBridge {
   }
 
   private async dispatchEventPush(db: Database, env: Env, msg: Record<string, unknown>): Promise<void> {
-    // Always send APNs push — iOS handles foreground display via UNUserNotificationCenterDelegate.
-    // Badge count must increment regardless of app state.
-
     // Dedup: same session idle/error can fire from both hook and timeline paths
     const sessionKey = `${msg.type}:${msg.session ?? msg.sessionId ?? ''}`;
     const now = Date.now();
@@ -2561,6 +2558,12 @@ export class WsBridge {
 
     const server = await db.queryOne<{ user_id: string; name: string }>('SELECT user_id, name FROM servers WHERE id = $1', [this.serverId]);
     if (!server) return;
+
+    for (const mobileWs of this.mobileSockets) {
+      if (mobileWs.readyState !== WebSocket.OPEN) continue;
+      if (this.browserUserIds.get(mobileWs) !== server.user_id) continue;
+      return;
+    }
 
     const { dispatchPush } = await import('../routes/push.js').catch((err) => {
       logger.error({ err }, 'Failed to import push module — push notifications disabled');

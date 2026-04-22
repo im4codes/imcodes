@@ -152,7 +152,7 @@ describe('push notification content', () => {
 });
 
 describe('push with mobile connected', () => {
-  it('sends push even when mobile client is connected (badge must increment)', async () => {
+  it('suppresses push when mobile client is connected', async () => {
     const { dispatchPush } = await import('../src/routes/push.js');
     const { bridge, daemonWs } = await setupAuthenticatedDaemon();
 
@@ -165,7 +165,7 @@ describe('push with mobile connected', () => {
     }));
     await flushAsync();
 
-    expect(dispatchPush).toHaveBeenCalled();
+    expect(dispatchPush).not.toHaveBeenCalled();
   });
 
   it('sends push when only desktop browser is connected', async () => {
@@ -185,16 +185,4 @@ describe('push with mobile connected', () => {
     expect(dispatchPush).toHaveBeenCalled();
   });
 
-  it('sends push even when mobile client is connected (badge must always increment)', async () => {
-    const { dispatchPush } = await import('../src/routes/push.js');
-    const { bridge, daemonWs } = await setupAuthenticatedDaemon();
-
-    const mobileWs = new MockWs();
-    bridge.handleBrowserConnection(mobileWs as never, userId, db, true);
-
-    // Push should fire even with mobile connected
-    daemonWs.emit('message', JSON.stringify({ type: 'session.idle', session: 'deck_cd_brain' }));
-    await flushAsync();
-    expect(dispatchPush).toHaveBeenCalled();
-  });
 });
