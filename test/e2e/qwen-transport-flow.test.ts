@@ -172,6 +172,7 @@ vi.mock('../../src/daemon/cc-presets.js', () => ({
       OPENAI_API_KEY: 'test-token',
     },
     model: 'MiniMax-M2.7',
+    availableModels: ['MiniMax-M2.7'],
     contextWindow: 200000,
     settings: {
       security: { auth: { selectedType: 'anthropic' } },
@@ -191,8 +192,15 @@ vi.mock('../../src/daemon/cc-presets.js', () => ({
   getPreset: vi.fn(async (presetName: string) => presetName === 'MiniMax' ? ({
     name: 'MiniMax',
     env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+    defaultModel: 'MiniMax-M2.7',
+    availableModels: [{ id: 'MiniMax-M2.7', name: 'minimax' }],
     contextWindow: 200000,
   }) : null),
+  getPresetEffectiveModel: vi.fn((preset: { defaultModel?: string; env?: Record<string, string> }) => preset.defaultModel ?? preset.env?.ANTHROPIC_MODEL),
+  getPresetAvailableModelIds: vi.fn((preset: { availableModels?: Array<{ id: string }>; defaultModel?: string; env?: Record<string, string> }) => {
+    const discovered = preset.availableModels?.map((item) => item.id) ?? [];
+    return discovered.length > 0 ? discovered : (preset.defaultModel ?? preset.env?.ANTHROPIC_MODEL ? [preset.defaultModel ?? String(preset.env?.ANTHROPIC_MODEL)] : []);
+  }),
   getCachedPresetContextWindow: vi.fn((presetName: string) => presetName === 'MiniMax' ? 200000 : undefined),
 }));
 
