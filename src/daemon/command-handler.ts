@@ -169,10 +169,14 @@ function emitCommandAckReliable(
  * is computed FRESH (same as buildSessionList for main sessions) rather than
  * reading stale values from the session store.
  */
-async function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord>): Promise<Record<string, unknown>> {
+async function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord>): Promise<Record<string, unknown> | null> {
   const sessionName = subSessionName(id);
   const record = getSession(sessionName);
   const r = { ...record, ...overrides };
+  if (!r?.agentType) {
+    logger.warn({ id, sessionName }, 'Skipping subsession.sync without agentType');
+    return null;
+  }
 
   // Compute transport display metadata fresh — matches session-list.ts hydration logic.
   // The session store may have stale or missing metadata during early launch/update windows.
@@ -200,7 +204,7 @@ async function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord
     // For an idle session with no recent state change, that next event
     // might never come, so the dot could stay gray indefinitely.
     state: r?.state ?? null,
-    sessionType: r?.agentType ?? null,
+    sessionType: r.agentType,
     cwd: r?.projectDir ?? null,
     shellBin: null,
     ccSessionId: r?.ccSessionId ?? null,
@@ -233,6 +237,16 @@ async function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord
     quotaMeta: freshDisplay.quotaMeta ?? r?.quotaMeta ?? null,
     effort: r?.effort ?? null,
   };
+}
+
+async function sendSubSessionSync(
+  serverLink: ServerLink,
+  id: string,
+  overrides?: Partial<SessionRecord>,
+): Promise<void> {
+  const payload = await buildSubSessionSync(id, overrides);
+  if (!payload) return;
+  serverLink.send(payload);
 }
 
 function normalizeTransportConfigUpdate(value: unknown): Record<string, unknown> | undefined {
@@ -301,7 +315,7 @@ async function handleSubSessionTransportConfigUpdate(cmd: Record<string, unknown
   supervisionAutomation.applySnapshotUpdate(sessionName, extractSessionSupervisionSnapshot(nextTransportConfig ?? null));
   const id = sessionName.replace(/^deck_sub_/, '');
   try {
-    serverLink.send(await buildSubSessionSync(id, { transportConfig: nextTransportConfig }));
+    await sendSubSessionSync(serverLink, id, { transportConfig: nextTransportConfig });
   } catch {
     // not connected
   }
@@ -428,7 +442,7 @@ function getDefaultThinkingLevel(agentType: string | undefined): TransportEffort
 async function syncSubSessionIfNeeded(sessionName: string, serverLink: ServerLink): Promise<void> {
   if (!sessionName.startsWith('deck_sub_')) return;
   const subId = sessionName.slice('deck_sub_'.length);
-  try { serverLink.send(await buildSubSessionSync(subId)); } catch { /* ignore */ }
+  try { await sendSubSessionSync(serverLink, subId); } catch { /* ignore */ }
 }
 
 /**
@@ -544,9 +558,7 @@ function refreshQwenQuotaUsageLabels(serverLink?: ServerLink): void {
     // Re-sync sub-sessions so their quota usage labels update in the browser
     if (session.name.startsWith('deck_sub_')) {
       const subId = session.name.replace(/^deck_sub_/, '');
-      if (serverLink) void buildSubSessionSync(subId).then((payload) => {
-        serverLink.send(payload);
-      }).catch(() => { /* not connected */ });
+      if (serverLink) void sendSubSessionSync(serverLink, subId).catch(() => { /* not connected */ });
     }
   }
   if (serverLink) void handleGetSessions(serverLink);
@@ -568,7 +580,7 @@ export async function refreshCodexQuotaMetadata(serverLink?: ServerLink): Promis
     if (!session.name.startsWith('deck_sub_')) continue;
     const subId = session.name.replace(/^deck_sub_/, '');
     try {
-      serverLink.send(await buildSubSessionSync(subId));
+      await sendSubSessionSync(serverLink, subId);
     } catch {
       // not connected
     }
@@ -975,12 +987,8 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
           upsertSession({ ...record, label: nextLabel, updatedAt: Date.now() });
           logger.info({ sessionName: sName, label }, 'subsession.rename: label updated');
           const id = sName.replace(/^deck_sub_/, '');
-          void buildSubSessionSync(id, { label: nextLabel }).then((payload) => {
-            try {
-              serverLink.send(payload);
-            } catch {
-              // not connected
-            }
+          void sendSubSessionSync(serverLink, id, { label: nextLabel }).catch(() => {
+            // not connected
           });
         }
       }
@@ -3042,7 +3050,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
       });
       // Sync to server DB
       try {
-        serverLink.send(await buildSubSessionSync(id));
+        await sendSubSessionSync(serverLink, id);
       } catch { /* not connected */ }
     } catch (e: unknown) {
       logger.error({ err: e, id, type }, 'subsession.start failed (transport)');
@@ -3074,7 +3082,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
     });
     // Sync to server DB so frontend can see the sub-session
     try {
-      serverLink.send(await buildSubSessionSync(id));
+      await sendSubSessionSync(serverLink, id);
     } catch { /* not connected */ }
   } catch (e: unknown) {
     logger.error({ err: e, id }, 'subsession.start failed');
@@ -3121,7 +3129,7 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
           transportConfig: ('transportConfig' in cmd ? (cmd.transportConfig as Record<string, unknown> | null) : undefined),
         });
         try {
-          serverLink.send(await buildSubSessionSync(id));
+          await sendSubSessionSync(serverLink, id);
         } catch { /* not connected */ }
       } catch (e: unknown) {
         logger.error({ err: e, sessionName: sName }, 'subsession.restart failed');
@@ -3139,7 +3147,7 @@ async function handleSubSessionRebuildAll(cmd: Record<string, unknown>, serverLi
   await rebuildSubSessions(subSessions).catch((e: unknown) => logger.error({ err: e }, 'subsession.rebuild_all failed'));
   for (const sub of subSessions) {
     try {
-      serverLink.send(await buildSubSessionSync(sub.id));
+      await sendSubSessionSync(serverLink, sub.id);
     } catch (e) {
       logger.warn({ err: e, id: sub.id }, 'Failed to sync rebuilt sub-session');
     }
@@ -3177,7 +3185,7 @@ async function handleSubSessionSetModel(cmd: Record<string, unknown>, serverLink
     await startSubSession({ id, type: 'codex', cwd: cwd ?? null, codexModel: model });
     // Sync restarted sub-session to server DB
     try {
-      serverLink.send(await buildSubSessionSync(id));
+      await sendSubSessionSync(serverLink, id);
     } catch { /* not connected */ }
   } catch (e: unknown) {
     logger.error({ err: e, sessionName, model }, 'subsession.set_model restart failed');

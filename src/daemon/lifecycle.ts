@@ -476,6 +476,11 @@ export async function startup(): Promise<DaemonContext> {
       for (const session of listSessions()) {
         if (!session.name.startsWith('deck_sub_')) continue;
         if (session.state === 'stopped') continue;
+        const sessionType = typeof session.agentType === 'string' && session.agentType ? session.agentType : null;
+        if (!sessionType) {
+          logger.warn({ sessionName: session.name }, 'Skipping subsession.sync during lifecycle restore without agentType');
+          continue;
+        }
         const id = session.name.slice('deck_sub_'.length);
         try {
           serverLink.send({
@@ -485,7 +490,7 @@ export async function startup(): Promise<DaemonContext> {
             // gray after reconnect" — see buildSubSessionSync for the
             // equivalent fix on the regular sync path.
             state: session.state ?? null,
-            sessionType: session.agentType,
+            sessionType,
             cwd: session.projectDir || null,
             label: session.label ?? null,
             ccSessionId: session.ccSessionId ?? null,

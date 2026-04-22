@@ -51,7 +51,7 @@ import {
   type PreviewWsOpenedMessage,
 } from '../../../shared/preview-types.js';
 import { LocalWebPreviewRegistry } from '../preview/registry.js';
-import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent } from '../db/queries.js';
+import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, getSubSessionById, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent } from '../db/queries.js';
 import logger from '../util/logger.js';
 import { pickReadableSessionDisplay } from '../../../shared/session-display.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
@@ -1080,33 +1080,43 @@ export class WsBridge {
         const agentType = typeof msg.sessionType === 'string' && msg.sessionType ? msg.sessionType : undefined;
         this.activeSubSessions.set(subSessionName, { name: subSessionName, label, parentSession, agentType });
       }
-      void createSubSession(
-        this.db,
-        msg.id as string,
-        this.serverId,
-        msg.sessionType as string,
-        (msg.shellBin as string) || null,
-        (msg.cwd as string) || null,
-        (msg.label as string) || null,
-        (msg.ccSessionId as string) || null,
-        (msg.geminiSessionId as string) || null,
-        (msg.parentSession as string) || null,
-        (msg.runtimeType as string) || null,
-        (msg.providerId as string) || null,
-        (msg.providerSessionId as string) || null,
-        (msg.description as string) || null,
-        (msg.ccPresetId as string) || null,
-        (msg.requestedModel as string) || null,
-        ((msg.activeModel as string) || (msg.modelDisplay as string)) || null,
-        (msg.effort as string) || null,
-        (msg.transportConfig as Record<string, unknown>) || null,
-      ).then(() => {
+      void (async () => {
+        const requestedType = typeof msg.sessionType === 'string' && msg.sessionType.trim()
+          ? msg.sessionType.trim()
+          : null;
+        const persisted = requestedType ? null : await getSubSessionById(this.db, msg.id as string, this.serverId).catch(() => null);
+        const sessionType = requestedType ?? persisted?.type ?? null;
+        if (!sessionType) {
+          logger.warn({ id: msg.id }, 'Skipping sub-session DB sync without sessionType');
+          return;
+        }
+        await createSubSession(
+          this.db,
+          msg.id as string,
+          this.serverId,
+          sessionType,
+          (msg.shellBin as string) || null,
+          (msg.cwd as string) || null,
+          (msg.label as string) || null,
+          (msg.ccSessionId as string) || null,
+          (msg.geminiSessionId as string) || null,
+          (msg.parentSession as string) || null,
+          (msg.runtimeType as string) || null,
+          (msg.providerId as string) || null,
+          (msg.providerSessionId as string) || null,
+          (msg.description as string) || null,
+          (msg.ccPresetId as string) || null,
+          (msg.requestedModel as string) || null,
+          ((msg.activeModel as string) || (msg.modelDisplay as string)) || null,
+          (msg.effort as string) || null,
+          (msg.transportConfig as Record<string, unknown>) || null,
+        );
         // Notify browsers so sub-session appears immediately without page refresh
         this.broadcastToBrowsers(JSON.stringify({
           type: 'subsession.created',
           id: msg.id,
           sessionName: `deck_sub_${msg.id}`,
-          sessionType: msg.sessionType,
+          sessionType,
           cwd: msg.cwd || null,
           label: msg.label || null,
           parentSession: msg.parentSession || null,
@@ -1128,7 +1138,7 @@ export class WsBridge {
           quotaMeta: msg.quotaMeta || null,
           state: (msg.state as string) || 'idle',
         }));
-      }).catch((e) => logger.error({ err: e, id: msg.id }, 'Failed to sync sub-session to DB'));
+      })().catch((e) => logger.error({ err: e, id: msg.id }, 'Failed to sync sub-session to DB'));
       return;
     }
     if (type === 'subsession.update_gemini_id' && this.db) {
