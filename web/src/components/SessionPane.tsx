@@ -125,7 +125,9 @@ export function SessionPane({
     addOptimisticUserMessage,
     removeOptimisticMessage,
     loadOlderEvents,
-  } = useTimeline(sessionName, ws, serverId);
+  } = useTimeline(sessionName, ws, serverId, {
+    isActiveSession: isActive,
+  });
   const historyStatus = timelineHistoryStatus ?? IDLE_HISTORY_STATUS;
 
   // ── Quotes ────────────────────────────────────────────────────────────────

@@ -35,7 +35,9 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
   const sessionName = panel.props?.sessionName as string;
   const pinnedViewMode = panel.props?.viewMode as 'terminal' | 'chat' | undefined;
   const { t } = useTranslation();
-  const { events, refreshing, historyStatus } = useTimeline(sessionName, ctx.ws, ctx.serverId);
+  const { events, refreshing, historyStatus } = useTimeline(sessionName, ctx.ws, ctx.serverId, {
+    isActiveSession: ctx.activeSession === sessionName,
+  });
   const liveSub = ctx.subSessions.find(s => s.sessionName === sessionName);
 
   // Derive usage/thinking state from timeline events (same as SubSessionWindow)

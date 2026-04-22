@@ -86,7 +86,9 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   // daemon echo).
   const timeline = isShell
     ? { events: [], refreshing: false, addOptimisticUserMessage: undefined, removeOptimisticMessage: undefined }
-    : useTimeline(sub.sessionName, ws, serverId);
+    : useTimeline(sub.sessionName, ws, serverId, {
+      isActiveSession: !!isFocused,
+    });
   const { events, refreshing } = timeline;
   const addOptimisticUserMessage = 'addOptimisticUserMessage' in timeline ? timeline.addOptimisticUserMessage : undefined;
   const removeOptimisticMessage = 'removeOptimisticMessage' in timeline ? timeline.removeOptimisticMessage : undefined;

@@ -129,7 +129,9 @@ export function SubSessionWindow({
     historyStatus: timelineHistoryStatus,
     addOptimisticUserMessage,
     removeOptimisticMessage,
-  } = useTimeline(sub.sessionName, ws, serverId);
+  } = useTimeline(sub.sessionName, ws, serverId, {
+    isActiveSession: active,
+  });
   const historyStatus = timelineHistoryStatus ?? IDLE_HISTORY_STATUS;
   const quickData = useQuickData();
 
