@@ -525,7 +525,7 @@ function findScrollParent(start: HTMLElement): HTMLElement {
   return start;
 }
 
-export function ChatView({ events, loading, refreshing: _refreshing, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir, serverId, onQuote, agentType: _agentType, onResendFailed }: Props) {
+export function ChatView({ events, loading, refreshing = false, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir, serverId, onQuote, agentType: _agentType, onResendFailed }: Props) {
   const { t } = useTranslation();
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -1059,8 +1059,16 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
           ⊞
         </button>
       )}
-      {/* refreshing indicator removed — gap-fill is invisible to the user */}
       <div class="chat-main">
+        {!preview && refreshing && (
+          <div
+            class="chat-refreshing"
+            aria-label={t('chat.refreshing_history', 'Updating history')}
+            title={t('chat.refreshing_history', 'Updating history')}
+          >
+            <span class="chat-refreshing-spinner" aria-hidden="true" />
+          </div>
+        )}
         {pinnedAboveViewport && lastSentUserMessage && (
           <div
             class={`chat-pinned-last-sent${pinnedExpanded ? ' chat-pinned-expanded' : ''}`}

@@ -427,8 +427,10 @@ export function useTimeline(
   const [hasOlderHistory, setHasOlderHistory] = useState(true);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [httpRefreshing, setHttpRefreshing] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const loadingOlderRef = useRef(false); // Synchronous guard against duplicate pagination requests
+  const httpBackfillInFlightRef = useRef(0);
   const epochRef = useRef<number>(0);
   const seqRef = useRef<number>(0);
   const replayRequestIdRef = useRef<string | null>(null);
@@ -450,11 +452,15 @@ export function useTimeline(
   useEffect(() => {
     if (!sessionId) {
       setLoading(false);
+      setHttpRefreshing(false);
+      httpBackfillInFlightRef.current = 0;
       resetOlderState();
       return;
     }
 
     setRefreshing(false);
+    setHttpRefreshing(false);
+    httpBackfillInFlightRef.current = 0;
     resetOlderState();
     setHasOlderHistory(true);
 
@@ -804,6 +810,8 @@ export function useTimeline(
         if (ev.type === 'user.message' && (ev as { payload?: { pending?: boolean } }).payload?.pending) continue;
         if (typeof ev.ts === 'number' && (afterTs === undefined || ev.ts > afterTs)) afterTs = ev.ts;
       }
+      httpBackfillInFlightRef.current += 1;
+      setHttpRefreshing(true);
       void fetchTimelineHistoryHttp(serverId, backfillSessionId, {
         afterTs,
         limit: MAX_MEMORY_EVENTS,
@@ -820,7 +828,11 @@ export function useTimeline(
         if (recovered.length === 0) return;
         mergeEvents(recovered);
         idbPutEvents(recovered);
-      }).catch(() => { /* opportunistic — WS path is primary; don't stamp cooldown */ });
+      }).catch(() => { /* opportunistic — WS path is primary; don't stamp cooldown */ })
+        .finally(() => {
+          httpBackfillInFlightRef.current = Math.max(0, httpBackfillInFlightRef.current - 1);
+          if (httpBackfillInFlightRef.current === 0) setHttpRefreshing(false);
+        });
     }, delayMs);
   }, [serverId, sessionId, cacheKey, mergeEvents, idbPutEvents]);
 
@@ -1172,7 +1184,7 @@ export function useTimeline(
   return {
     events,
     loading,
-    refreshing,
+    refreshing: refreshing || httpRefreshing,
     loadingOlder,
     hasOlderHistory,
     addOptimisticUserMessage,

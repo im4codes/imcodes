@@ -120,6 +120,19 @@ describe('ChatView', () => {
     });
   });
 
+  it('shows a small refreshing spinner while history gap-fill is in progress', () => {
+    const { container } = render(
+      <ChatView
+        events={[] as any}
+        loading={false}
+        refreshing
+        sessionId="deck_sub_preview"
+      />,
+    );
+
+    expect(container.querySelector('.chat-refreshing-spinner')).not.toBeNull();
+  });
+
   it('forces the main chat view to follow streamed updates with the same timestamp', async () => {
     const initialEvents = [
       {

@@ -843,7 +843,8 @@ body {
 .chat-mode { display: inline-block; background: #1e1338; color: #a78bfa; padding: 2px 8px; border-radius: 4px; font-size: 11px; }
 .chat-system { text-align: center; color: #475569; font-size: 11px; padding: 4px 0; }
 .chat-loading { text-align: center; color: #475569; padding: 24px; }
-.chat-refreshing { text-align: center; color: #475569; font-size: 11px; padding: 4px 0; flex-shrink: 0; }
+.chat-refreshing { position: absolute; top: 8px; right: 10px; z-index: 4; width: 18px; height: 18px; border-radius: 999px; background: rgba(15, 23, 42, 0.88); border: 1px solid #334155; display: flex; align-items: center; justify-content: center; pointer-events: none; }
+.chat-refreshing-spinner { width: 10px; height: 10px; border: 1.5px solid #475569; border-top-color: #60a5fa; border-radius: 50%; animation: chat-spinner-rotate 0.8s linear infinite; }
 .chat-thinking-bar { color: #94a3b8; font-size: 12px; padding: 6px 16px; background: #1e293b; border-top: 1px solid #334155; flex-shrink: 0; }
 .chat-thinking-dots { animation: thinking-pulse 1.2s ease-in-out infinite; letter-spacing: 2px; }
 .chat-thinking { padding: 2px 0; }
