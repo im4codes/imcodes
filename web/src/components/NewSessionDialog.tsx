@@ -30,6 +30,7 @@ import {
   type CcPresetEntry,
 } from "./cc-preset-form.js";
 import { CC_PRESET_MSG } from "@shared/cc-presets.js";
+import type { CcPreset } from "@shared/cc-presets.js";
 
 const DEFAULT_SHELL_KEY = "default_shell";
 // Fallback suggestions used only when the daemon probe returns an empty list
@@ -190,7 +191,7 @@ export function NewSessionDialog({
           setCcPresets((current) => [
             ...current.filter((preset) => preset.name !== msg.preset?.name),
             msg.preset,
-          ]);
+          ].filter((preset): preset is CcPreset => preset !== undefined));
           if (newPresetName.trim().toLowerCase() === msg.preset.name.trim().toLowerCase()) {
             applyPresetDraft(createCcPresetDraftFromPreset(msg.preset));
           }

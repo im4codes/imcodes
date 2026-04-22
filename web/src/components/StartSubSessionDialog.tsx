@@ -17,7 +17,7 @@ import {
   type CcPresetEntry,
   type CcPresetDraft,
 } from './cc-preset-form.js';
-import { CC_PRESET_MSG } from '@shared/cc-presets.js';
+import { CC_PRESET_MSG, type CcPreset } from '@shared/cc-presets.js';
 
 const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
 const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
@@ -138,7 +138,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
           setCcPresets((current) => [
             ...current.filter((preset) => preset.name !== msg.preset?.name),
             msg.preset,
-          ]);
+          ].filter((preset): preset is CcPreset => preset !== undefined));
           if (newPresetName.trim().toLowerCase() === msg.preset.name.trim().toLowerCase()) {
             applyPresetDraft(createCcPresetDraftFromPreset(msg.preset));
           }
