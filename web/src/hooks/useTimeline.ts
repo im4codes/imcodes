@@ -455,6 +455,7 @@ export function useTimeline(
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [httpRefreshing, setHttpRefreshing] = useState(false);
+  const [textTailRefreshing, setTextTailRefreshing] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const loadingOlderRef = useRef(false); // Synchronous guard against duplicate pagination requests
   const httpBackfillInFlightRef = useRef(0);
@@ -480,6 +481,7 @@ export function useTimeline(
     if (!sessionId) {
       setLoading(false);
       setHttpRefreshing(false);
+      setTextTailRefreshing(false);
       httpBackfillInFlightRef.current = 0;
       resetOlderState();
       return;
@@ -487,6 +489,7 @@ export function useTimeline(
 
     setRefreshing(false);
     setHttpRefreshing(false);
+    setTextTailRefreshing(false);
     httpBackfillInFlightRef.current = 0;
     resetOlderState();
     setHasOlderHistory(true);
@@ -499,6 +502,7 @@ export function useTimeline(
       textTailStarted = true;
       const expectedCacheKey = cacheKey;
       const expectedSessionId = sessionId;
+      setTextTailRefreshing(true);
       void fetchTimelineTextTailHttp(serverId, expectedSessionId)
         .then((result) => {
           if (cancelled || cacheKeyRef.current !== expectedCacheKey || !result || result.events.length === 0) return;
@@ -508,7 +512,10 @@ export function useTimeline(
           if (recovered.length === 0) return;
           mergeEvents(recovered);
         })
-        .catch(() => { /* fail-open: authoritative history flow continues */ });
+        .catch(() => { /* fail-open: authoritative history flow continues */ })
+        .finally(() => {
+          if (!cancelled && cacheKeyRef.current === expectedCacheKey) setTextTailRefreshing(false);
+        });
     };
 
     // 1. Module-level memory cache — instant restore (e.g. window reopen)
@@ -597,6 +604,7 @@ export function useTimeline(
         setEvents([]);
         startTextTailBootstrap();
         if (wsConnected) {
+          setRefreshing(true);
           historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId);
         } else {
           setLoading(false);
@@ -1208,7 +1216,7 @@ export function useTimeline(
   return {
     events,
     loading,
-    refreshing: refreshing || httpRefreshing,
+    refreshing: refreshing || httpRefreshing || textTailRefreshing,
     loadingOlder,
     hasOlderHistory,
     addOptimisticUserMessage,

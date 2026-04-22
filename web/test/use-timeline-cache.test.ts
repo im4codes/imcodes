@@ -23,6 +23,16 @@ import {
   useTimeline,
 } from '../src/hooks/useTimeline.js';
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 function makeEvents(sessionId: string, count: number): TimelineEvent[] {
   return Array.from({ length: count }, (_, idx) => ({
     eventId: `${sessionId}-${idx}`,
@@ -347,6 +357,46 @@ describe('useTimeline global cache bounds', () => {
     });
   });
 
+  it('marks refreshing while PG text-tail bootstrap is in flight after restoring a snapshot', async () => {
+    const sessionName = `deck_text_tail_refreshing_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    const pendingTextTail = deferred<{ events: Array<{ eventId: string; ts: number; type: 'assistant.text'; text: string }> } | null>();
+
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-snap-1`,
+      sessionId: sessionName,
+      ts: 1,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'snapshot history' },
+    }, serverId);
+
+    fetchTextTailSpy.mockReturnValue(pendingTextTail.promise);
+
+    function Probe() {
+      const { refreshing } = useTimeline(sessionName, null, serverId);
+      return h('div', { 'data-testid': 'probe', 'data-refreshing': String(refreshing) }, 'probe');
+    }
+
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').getAttribute('data-refreshing')).toBe('true');
+    });
+
+    await act(async () => {
+      pendingTextTail.resolve({ events: [] });
+      await pendingTextTail.promise;
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').getAttribute('data-refreshing')).toBe('false');
+    });
+  });
+
   it('bootstraps from local snapshot, then PG text tail, before later authoritative reconciliation', async () => {
     const sessionName = `deck_text_tail_bootstrap_${Date.now()}`;
     const serverId = `srv-${Date.now()}`;
@@ -453,6 +503,46 @@ describe('useTimeline global cache bounds', () => {
 
     await waitFor(() => {
       expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName);
+    });
+  });
+
+  it('marks refreshing during a cold WS history bootstrap with no local cache', async () => {
+    const sessionName = `deck_cold_history_refreshing_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest: vi.fn(() => 'history-cold-refreshing'),
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { refreshing } = useTimeline(sessionName, ws, serverId);
+      return h('div', { 'data-testid': 'probe', 'data-refreshing': String(refreshing) }, 'probe');
+    }
+
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').getAttribute('data-refreshing')).toBe('true');
+    });
+
+    await act(async () => {
+      handler?.({
+        type: 'timeline.history',
+        sessionName,
+        requestId: 'history-cold-refreshing',
+        epoch: 1,
+        events: [],
+      } as ServerMessage);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').getAttribute('data-refreshing')).toBe('false');
     });
   });
 
