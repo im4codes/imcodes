@@ -44,6 +44,12 @@ sharedDb.open().catch(() => {});
 const eventsCache = new Map<string, TimelineEvent[]>();
 const eventsCacheAccess = new Map<string, number>();
 const cacheListeners = new Map<string, Set<(events: TimelineEvent[]) => void>>();
+const lastHttpBackfillOkAt = new Map<string, number>();
+const MOUNT_BACKFILL_COOLDOWN_MS = 60_000;
+
+function resetBackfillCooldowns(): void {
+  lastHttpBackfillOkAt.clear();
+}
 
 /**
  * Custom DOM event fired when an ALREADY-MOUNTED timeline hook should force
@@ -66,9 +72,9 @@ const cacheListeners = new Map<string, Set<(events: TimelineEvent[]) => void>>()
 export const ACTIVE_TIMELINE_REFRESH_EVENT = 'deck:active-timeline-refresh';
 
 // On every visibility transition we record when the document went hidden;
-// on the return-to-visible side we always emit a refresh request so the
-// mounted timeline for the active session can immediately pull any missed
-// daemon-side events.
+// on the return-to-visible side we clear the mount cooldown and emit a
+// refresh request so the mounted timeline for the active session can
+// immediately pull any missed daemon-side events.
 //
 // Guard against non-browser environments (vitest node / SSR):
 // `document`/`window` may be undefined at import time.
@@ -82,6 +88,7 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
     // visible: notify the mounted timeline hook for the active session.
     const wasHidden = hiddenAt !== null;
     if (wasHidden) {
+      resetBackfillCooldowns();
       try { window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT)); } catch { /* older browsers */ }
     }
     hiddenAt = null;
@@ -92,6 +99,7 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
   // stale relative to whatever landed in the meantime.
   window.addEventListener('pageshow', (ev) => {
     if ((ev as PageTransitionEvent).persisted) {
+      resetBackfillCooldowns();
       try { window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT)); } catch { /* ignore */ }
     }
   });
@@ -307,6 +315,11 @@ export function __resetTimelineCacheForTests(): void {
   eventsCache.clear();
   eventsCacheAccess.clear();
   cacheListeners.clear();
+  lastHttpBackfillOkAt.clear();
+}
+
+export function __resetBackfillCooldownsForTests(): void {
+  resetBackfillCooldowns();
 }
 
 export function __clearPersistedTimelineSnapshotsForTests(): void {
@@ -437,7 +450,7 @@ export function useTimeline(
       // was minimized/backgrounded since the memory cache can be stale.
       // Kept short (~200ms) because the UI is already visible; this is
       // strictly additive catch-up, merged by eventId.
-      fireHttpBackfillRef.current(200);
+      fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS });
       return () => { cancelled = true; };
     }
 
@@ -453,7 +466,7 @@ export function useTimeline(
         setRefreshing(true);
         historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
       }
-      fireHttpBackfillRef.current(200);
+      fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS });
     }
 
     // 2. Already loaded this session — skip reload (prevents flash-of-empty on minimize/restore)
@@ -467,7 +480,7 @@ export function useTimeline(
       // Same reasoning as path 1 — back-fill in the background so the
       // re-opened window is guaranteed to reflect authoritative daemon
       // state, not whatever the WS subscription happened to catch.
-      fireHttpBackfillRef.current(200);
+      fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS });
       return () => { cancelled = true; };
     }
 
@@ -498,7 +511,7 @@ export function useTimeline(
         // Background HTTP backfill — IDB is authoritative only up to the
         // last time a WS event landed; if the user closed the tab mid-chat
         // and reopened later there may be a gap between IDB and daemon.
-        fireHttpBackfillRef.current(200);
+        fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS });
       } else {
         epochRef.current = 0;
         seqRef.current = 0;
@@ -512,7 +525,7 @@ export function useTimeline(
         // Cold load — no IDB cache, no memory cache. Still fire the same
         // delayed HTTP backfill so an empty timeline can recover missed
         // daemon-side events without waiting for a later reconnect.
-        fireHttpBackfillRef.current(200);
+        fireHttpBackfillRef.current(200, { cooldownMs: 0 });
       }
     };
     load().catch(() => {});
@@ -714,12 +727,12 @@ export function useTimeline(
    * history before this fires.
    *
    * Call sites:
-   *   - Session mount / switch (~200ms): cached history should render
-   *     immediately, then be reconciled against authoritative daemon state.
-   *     We intentionally do NOT apply a revisit cooldown here — a stale
-   *     message list is worse than one extra lightweight HTTP read.
+   *   - Session mount / switch (~200ms): cached history renders immediately,
+   *     then a background backfill reconciles against authoritative daemon
+   *     state. Re-visits within 60 seconds reuse the previous successful
+   *     result to avoid hammering HTTP while the app stays active.
    *   - WS reconnect (~600ms): covers the ~10–100ms subscribe-race
- *     window on the bridge where live events can be silently dropped.
+   *     window on the bridge where live events can be silently dropped.
    *     Missing events after a disconnect is exactly what this read exists
    *     to recover.
    *
@@ -727,17 +740,22 @@ export function useTimeline(
    *   - `serverId` is unknown → skipped (self-hosted deploys require it).
    *   - The user switches session mid-flight → the cacheKey-guard in the
    *     timeout callback discards results for the old session.
-   *   - Backfill returns zero events → request still counts as complete and
-   *     the spinner clears.
+   *   - Backfill returns zero events → a successful no-gap result still arms
+   *     the mount cooldown.
    *   - Backfill returns null / rejects → WS path remains primary; the next
    *     trigger simply tries again.
    */
-  const fireHttpBackfill = useCallback((delayMs: number) => {
+  const fireHttpBackfill = useCallback((delayMs: number, opts?: { cooldownMs?: number }) => {
     if (!serverId || !sessionId) return;
+    const cooldownMs = opts?.cooldownMs ?? 0;
     const backfillSessionId = sessionId;
     const backfillCacheKey = cacheKey;
     setTimeout(() => {
       if (cacheKeyRef.current !== backfillCacheKey) return;
+      if (backfillCacheKey && cooldownMs > 0) {
+        const lastOk = lastHttpBackfillOkAt.get(backfillCacheKey);
+        if (lastOk !== undefined && Date.now() - lastOk < cooldownMs) return;
+      }
       // Recompute the cursor at fire time, not call time — the UI may have
       // received fresh WS events during the delay window and we don't want
       // to redownload them.
@@ -756,6 +774,7 @@ export function useTimeline(
         limit: MAX_MEMORY_EVENTS,
       }).then((result) => {
         if (!result) return;
+        if (backfillCacheKey) lastHttpBackfillOkAt.set(backfillCacheKey, Date.now());
         if (result.events.length === 0) return;
         if (cacheKeyRef.current !== backfillCacheKey) return;
         const recovered = result.events.filter(

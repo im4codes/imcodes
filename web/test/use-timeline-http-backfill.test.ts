@@ -18,8 +18,10 @@ import { render, screen, cleanup, act, waitFor } from '@testing-library/preact';
 import { h } from 'preact';
 import type { ServerMessage, TimelineEvent, WsClient } from '../src/ws-client.js';
 import {
+  __resetBackfillCooldownsForTests,
   __resetTimelineCacheForTests,
   ingestTimelineEventForCache,
+  ACTIVE_TIMELINE_REFRESH_EVENT,
   useTimeline,
 } from '../src/hooks/useTimeline.js';
 
@@ -306,11 +308,9 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     });
   });
 
-  it('re-fires the mount-time backfill when revisiting the same session shortly after', async () => {
-    // Regression: cached history rendered instantly, but a 60s revisit
-    // cooldown meant re-entering the same session could keep showing stale
-    // messages without any HTTP reconciliation. Every mount must now re-fire
-    // the lightweight backfill.
+  it('skips the mount-time backfill when revisiting the same session shortly after', async () => {
+    // Re-entering the same session while the app remains active should not
+    // hammer HTTP on every tap. The mount path stays cooldown-limited.
     const sessionName = `deck_http_backfill_revisit_${Date.now()}`;
     const serverId = `srv-revisit-${Date.now()}`;
 
@@ -351,14 +351,62 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     first.unmount();
     fetchSpy.mockClear();
 
-    // --- Second mount, ~10 seconds later: still must refire ---
+    // --- Second mount, ~10 seconds later: should be skipped by cooldown ---
     await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
     const second = render(h(Probe));
     await waitFor(() => {
       expect(screen.getByTestId('probe').textContent).toBe('mounted');
     });
     await act(async () => { await vi.advanceTimersByTimeAsync(250); });
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).not.toHaveBeenCalled();
     second.unmount();
+  });
+
+  it('app activation clears the mount cooldown and forces a fresh backfill for the active session', async () => {
+    const sessionName = `deck_http_backfill_resume_${Date.now()}`;
+    const serverId = `srv-resume-${Date.now()}`;
+
+    fetchSpy.mockResolvedValue({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-seed`,
+      sessionId: sessionName,
+      ts: 1000,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'seed' },
+    }, serverId);
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineHistoryRequest: vi.fn(() => 'history-resume'),
+    } as unknown as WsClient;
+
+    function Probe() {
+      useTimeline(sessionName, ws, serverId);
+      return h('div', { 'data-testid': 'probe' }, 'mounted');
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('mounted');
+    });
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    fetchSpy.mockClear();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    __resetBackfillCooldownsForTests();
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT));
+    });
+    await act(async () => { await vi.advanceTimersByTimeAsync(10); });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 });
