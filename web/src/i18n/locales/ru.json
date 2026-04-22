@@ -34,6 +34,7 @@
     "session_state": "Сессия {{state}}",
     "load_older": "Загрузить старые сообщения",
     "loading_older": "Загрузка...",
+    "refreshing_history": "Обновление истории…",
     "thinking_running": "Думаю · {{sec}}s",
     "thinking_done": "Думал {{sec}}s",
     "show_file_panel": "Открыть панель файлов",

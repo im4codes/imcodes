@@ -34,6 +34,7 @@
     "session_state": "세션 {{state}}",
     "load_older": "이전 메시지 불러오기",
     "loading_older": "로딩 중...",
+    "refreshing_history": "기록을 업데이트하는 중…",
     "thinking_running": "생각 중 · {{sec}}s",
     "thinking_done": "{{sec}}s 동안 생각함",
     "show_file_panel": "파일 패널 열기",
