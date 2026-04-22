@@ -570,6 +570,7 @@ describe('useTimeline global cache bounds', () => {
         handler = next;
         return () => { handler = null; };
       },
+      sendTimelineReplayRequest: vi.fn(() => 'replay-after-ts'),
       sendTimelineHistoryRequest,
     } as unknown as WsClient;
 
@@ -1049,6 +1050,7 @@ describe('useTimeline global cache bounds', () => {
         handler = next;
         return () => { handler = null; };
       },
+      sendTimelineReplayRequest: vi.fn(() => 'replay-after-ts'),
       sendTimelineHistoryRequest,
     } as unknown as WsClient;
 
@@ -1072,6 +1074,7 @@ describe('useTimeline global cache bounds', () => {
       handler?.({ type: 'session.event', event: 'connected', session: '', state: 'connected' } as ServerMessage);
     });
 
+    expect(ws.sendTimelineReplayRequest).toHaveBeenCalledWith(sessionName, 2, 1);
     expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
     expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300, 4999);
   });

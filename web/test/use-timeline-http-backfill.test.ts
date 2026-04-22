@@ -79,6 +79,7 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
         handler = next;
         return () => { handler = null; };
       },
+      sendTimelineReplayRequest: vi.fn(() => 'replay-reconnect'),
       sendTimelineHistoryRequest: vi.fn(() => 'history-reconnect'),
     } as unknown as WsClient;
 
@@ -109,6 +110,11 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
       handler?.({ type: 'session.event', event: 'connected', session: '', state: 'connected' } as ServerMessage);
     });
 
+    expect(ws.sendTimelineReplayRequest).toHaveBeenCalledWith(
+      sessionName,
+      3,
+      1,
+    );
     expect(ws.sendTimelineHistoryRequest).toHaveBeenCalledWith(
       sessionName,
       300,
@@ -151,6 +157,7 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
         handler = next;
         return () => { handler = null; };
       },
+      sendTimelineReplayRequest: vi.fn(() => 'replay-no-server'),
       sendTimelineHistoryRequest: vi.fn(() => 'history-no-server'),
     } as unknown as WsClient;
 
@@ -202,6 +209,7 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
         handler = next;
         return () => { handler = null; };
       },
+      sendTimelineReplayRequest: vi.fn(() => 'replay-fail'),
       sendTimelineHistoryRequest: vi.fn(() => 'history-fail'),
     } as unknown as WsClient;
 
@@ -280,6 +288,7 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     const ws: WsClient = {
       connected: true,
       onMessage: () => () => {},
+      sendTimelineReplayRequest: vi.fn(() => 'replay-mount'),
       sendTimelineHistoryRequest: vi.fn(() => 'history-mount'),
     } as unknown as WsClient;
 
@@ -343,6 +352,7 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     const ws: WsClient = {
       connected: true,
       onMessage: () => () => {},
+      sendTimelineReplayRequest: vi.fn(() => 'replay-cd'),
       sendTimelineHistoryRequest: vi.fn(() => 'history-cd'),
     } as unknown as WsClient;
 
@@ -395,6 +405,7 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     const ws: WsClient = {
       connected: true,
       onMessage: () => () => {},
+      sendTimelineReplayRequest: vi.fn(() => 'replay-resume'),
       sendTimelineHistoryRequest: vi.fn(() => 'history-resume'),
     } as unknown as WsClient;
 

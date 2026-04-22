@@ -745,7 +745,7 @@ export function useTimeline(
   }, [clearOptimisticTimer]);
 
   const reconcileQueuedOptimisticMessages = useCallback((pendingEntries: unknown, pendingMessages: unknown) => {
-    const queuedEntries = normalizeTransportPendingEntries(pendingEntries, pendingMessages, sessionId);
+    const queuedEntries = normalizeTransportPendingEntries(pendingEntries, pendingMessages, sessionId ?? '');
     if (queuedEntries.length === 0) return;
     const queuedIds = new Set(queuedEntries.map((entry) => entry.clientMessageId).filter(Boolean));
     if (queuedIds.size === 0) return;
@@ -1237,18 +1237,21 @@ export function useTimeline(
       if (msg.type === 'session.event' && (msg as { event: string }).event === 'disconnected') {
         if (loadingOlderRef.current) resetOlderState();
       }
-      // ── Browser WS reconnected: fill gaps using afterTs for reliability ──
-      // Always use timestamp-based history (not seq-based replay) to avoid
-      // epoch mismatch and seq desync issues on mobile (app killed/backgrounded).
+      // ── Browser WS reconnected: recover both in-memory streaming deltas and
+      //    persisted history gaps. `timeline.history(afterTs)` is the durable
+      //    path, but it cannot recover assistant streaming deltas because the
+      //    daemon intentionally does not persist `streaming: true` updates.
+      //    Pair it with `timeline.replay(afterSeq, epoch)` so same-daemon
+      //    reconnects can recover active transport turns from the in-memory
+      //    ring buffer while history still covers durable gap-fill.
       //
       // The afterTs cursor is the max ts of any event currently rendered for
       // this session — server replays only events with ts > afterTs. Without
       // this cursor the server dumped a MAX_MEMORY_EVENTS-sized recent window,
       // which (a) re-downloaded events we already had and (b) silently lost
       // anything older than that window if the disconnect gap exceeded the
-      // window. Now we catch up exactly the missed range. If we have no local
-      // events (first connect / fresh tab) we omit afterTs and get the
-      // standard recent window.
+      // window. If we have no local events (first connect / fresh tab) we omit
+      // afterTs and get the standard recent window.
       if (msg.type === 'session.event' && (msg as { event: string }).event === 'connected') {
         if (ws && sessionId) {
           setHistoryStatus({
@@ -1262,6 +1265,17 @@ export function useTimeline(
             },
           });
           const current = eventsRef.current;
+          const replayAfterSeq = seqRef.current > 0
+            ? seqRef.current
+            : current.reduce((max, event) => Math.max(max, event.seq), 0);
+          const replayEpoch = epochRef.current > 0
+            ? epochRef.current
+            : (current.length > 0 ? current[current.length - 1]?.epoch ?? 0 : 0);
+          if (current.length > 0 && replayAfterSeq > 0 && replayEpoch > 0) {
+            replayRequestIdRef.current = ws.sendTimelineReplayRequest(sessionId, replayAfterSeq, replayEpoch);
+          } else {
+            replayRequestIdRef.current = null;
+          }
           const afterTs = getTimelineHistoryAfterTs(current);
           historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS, afterTs);
 
