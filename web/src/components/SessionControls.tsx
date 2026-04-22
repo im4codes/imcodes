@@ -591,9 +591,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [activeSession?.name, activeSession?.transportConfig]);
 
   useEffect(() => {
-    if (effectiveRuntimeType !== 'transport') {
-      setPendingTransportApproval(null);
-    }
+    setPendingTransportApproval((current) => {
+      if (!current) return current;
+      if (effectiveRuntimeType !== 'transport') return null;
+      return current.sessionId === activeSession?.name ? current : null;
+    });
   }, [activeSession?.name, effectiveRuntimeType]);
 
   const connected = !!ws?.connected;

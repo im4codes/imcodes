@@ -2097,6 +2097,59 @@ afterEach(() => {
     expect(ws.respondTransportApproval).toHaveBeenCalledWith('codex-sdk-session', 'approval-1', true);
   });
 
+  it('clears stale approval banners when switching between transport sessions', async () => {
+    const ws = makeWs();
+    const { rerender } = render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({
+          name: 'transport-a',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(ws.onMessage).toHaveBeenCalled();
+    });
+
+    await act(async () => {
+      for (const call of ws.onMessage.mock.calls) {
+        const handler = call[0] as ((msg: unknown) => void) | undefined;
+        handler?.({
+          type: TRANSPORT_MSG.CHAT_APPROVAL,
+          sessionId: 'transport-a',
+          requestId: 'approval-stale',
+          description: 'Allow file write',
+          tool: 'shell',
+        });
+      }
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('Approval required')).toBeDefined();
+    });
+
+    rerender(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({
+          name: 'transport-b',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.queryByText('Approval required')).toBeNull();
+      expect(screen.queryByText('shell wants approval')).toBeNull();
+    });
+  });
+
   it('treats copilot-sdk sessions as transport even when runtimeType is omitted', async () => {
     const ws = makeWs();
 
