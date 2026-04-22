@@ -5,6 +5,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, fireEvent, cleanup, within, waitFor, act } from '@testing-library/preact';
 import { useState } from 'preact/hooks';
+import { FILE_TRANSFER_LIMITS } from '../../../shared/transport/file-transfer.js';
 
 const DEFAULT_INNER_WIDTH = 1280;
 
@@ -2671,6 +2672,11 @@ afterEach(() => {
     expect(execCommandMock).not.toHaveBeenCalled();
     expect(input.textContent).toBe('');
     expect(await screen.findByText('Paste is too large for inline input here. Upload it as a file instead.')).toBeDefined();
+  });
+
+  it('uses the shared 2GB upload limit for user-facing size calculations', () => {
+    expect(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE).toBe(2 * 1024 * 1024 * 1024);
+    expect(Math.round(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE / (1024 * 1024))).toBe(2048);
   });
 
   // TODO: fix — file upload mock doesn't trigger state update in jsdom
