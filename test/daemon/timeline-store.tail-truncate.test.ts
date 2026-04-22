@@ -7,8 +7,13 @@ describe('timeline-store truncate', () => {
   const originalHome = process.env.HOME;
   const originalUserProfile = process.env.USERPROFILE;
   let tempHome: string | null = null;
+  let importedProjection: typeof import('../../src/daemon/timeline-projection.js').timelineProjection | null = null;
 
-  afterEach(() => {
+  afterEach(async () => {
+    if (importedProjection) {
+      await importedProjection.shutdown();
+    }
+    importedProjection = null;
     vi.restoreAllMocks();
     vi.resetModules();
     if (originalHome === undefined) delete process.env.HOME;
@@ -33,7 +38,11 @@ describe('timeline-store truncate', () => {
         }),
       };
     });
-    const { timelineStore } = await import('../../src/daemon/timeline-store.js');
+    const [{ timelineStore }, { timelineProjection }] = await Promise.all([
+      import('../../src/daemon/timeline-store.js'),
+      import('../../src/daemon/timeline-projection.js'),
+    ]);
+    importedProjection = timelineProjection;
 
     const filePath = join(tempHome, '.imcodes', 'timeline', 'oversized_session.jsonl');
     mkdirSync(join(tempHome, '.imcodes', 'timeline'), { recursive: true });
@@ -56,7 +65,11 @@ describe('timeline-store truncate', () => {
     process.env.HOME = tempHome;
     process.env.USERPROFILE = tempHome;
 
-    const { timelineStore } = await import('../../src/daemon/timeline-store.js');
+    const [{ timelineStore }, { timelineProjection }] = await Promise.all([
+      import('../../src/daemon/timeline-store.js'),
+      import('../../src/daemon/timeline-projection.js'),
+    ]);
+    importedProjection = timelineProjection;
 
     const filePath = join(tempHome, '.imcodes', 'timeline', 'tail_read_session.jsonl');
     mkdirSync(join(tempHome, '.imcodes', 'timeline'), { recursive: true });
