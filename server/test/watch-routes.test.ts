@@ -400,6 +400,84 @@ describe('Watch routes', () => {
     );
   });
 
+  it('GET /api/server/:id/timeline/text-tail paginates daemon history until it collects 50 recent text events', async () => {
+    mockGetSessionTextTailCache.mockResolvedValue([]);
+
+    const pageOne = Array.from({ length: 500 }, (_, index) => {
+      const ts = 1000 + index;
+      if (index >= 475) {
+        return {
+          eventId: `text-${index - 475}`,
+          sessionId: 'deck_proj_brain',
+          ts,
+          type: index % 2 === 0 ? 'user.message' : 'assistant.text',
+          payload: { text: `page-one-${index - 475}` },
+        };
+      }
+      return {
+        eventId: `tool-${index}`,
+        sessionId: 'deck_proj_brain',
+        ts,
+        type: 'tool.result',
+        payload: { output: `tool-${index}` },
+      };
+    });
+    const pageTwo = Array.from({ length: 500 }, (_, index) => {
+      const ts = 500 + index;
+      if (index >= 470) {
+        return {
+          eventId: `older-${index - 470}`,
+          sessionId: 'deck_proj_brain',
+          ts,
+          type: index % 2 === 0 ? 'assistant.text' : 'user.message',
+          payload: { text: `page-two-${index - 470}` },
+        };
+      }
+      return {
+        eventId: `state-${index}`,
+        sessionId: 'deck_proj_brain',
+        ts,
+        type: 'session.state',
+        payload: { state: 'idle' },
+      };
+    });
+
+    mockRequestTimelineHistory
+      .mockResolvedValueOnce({ epoch: 1, events: pageOne })
+      .mockResolvedValueOnce({ epoch: 1, events: pageTwo });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/text-tail?sessionName=deck_proj_brain');
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.sessionName).toBe('deck_proj_brain');
+    expect(body.events).toHaveLength(50);
+    expect(body.events[0]).toEqual({ eventId: 'older-5', ts: 975, type: 'user.message', text: 'page-two-5' });
+    expect(body.events.at(-1)).toEqual({ eventId: 'text-24', ts: 1499, type: 'assistant.text', text: 'page-one-24' });
+    expect(mockRequestTimelineHistory).toHaveBeenCalledTimes(2);
+    expect(mockRequestTimelineHistory).toHaveBeenNthCalledWith(1, {
+      sessionName: 'deck_proj_brain',
+      limit: 500,
+      timeoutMs: 1500,
+    });
+    expect(mockRequestTimelineHistory).toHaveBeenNthCalledWith(2, {
+      sessionName: 'deck_proj_brain',
+      limit: 500,
+      timeoutMs: 1500,
+      beforeTs: 1001,
+    });
+    expect(mockReplaceSessionTextTailCache).toHaveBeenCalledWith(
+      expect.anything(),
+      'srv-1',
+      'deck_proj_brain',
+      expect.arrayContaining([
+        { eventId: 'older-25', ts: 995, type: 'user.message', text: 'page-two-25' },
+        { eventId: 'text-24', ts: 1499, type: 'assistant.text', text: 'page-one-24' },
+      ]),
+    );
+  });
+
   it('GET /api/server/:id/timeline/text-tail returns empty list when no cache exists', async () => {
     mockGetSessionTextTailCache.mockResolvedValue([]);
 
