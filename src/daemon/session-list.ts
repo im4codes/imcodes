@@ -149,13 +149,16 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
   // a synchronous .map() callback. The preset model takes priority over
   // qwenRuntime available models for display so preset sessions (e.g. MiniMax)
   // show the correct model even when qwenRuntime hasn't loaded yet.
-  const presetModelBySession = new Map<string, string | undefined>();
+  const presetModelBySession = new Map<string, { defaultModel?: string; availableModels: string[] }>();
   if (needsQwenHydration) {
-    const { getPreset } = await import('./cc-presets.js');
+    const { getPreset, getPresetAvailableModelIds, getPresetEffectiveModel } = await import('./cc-presets.js');
     for (const s of sessions) {
       if (s.agentType === 'qwen' && s.ccPreset) {
         const preset = await getPreset(s.ccPreset);
-        presetModelBySession.set(s.name, preset?.env?.['ANTHROPIC_MODEL']?.trim() || undefined);
+        presetModelBySession.set(s.name, {
+          defaultModel: preset ? getPresetEffectiveModel(preset) : undefined,
+          availableModels: preset ? getPresetAvailableModelIds(preset) : [],
+        });
       }
     }
   }
@@ -224,7 +227,9 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
     // No longer available". Non-preset qwen sessions keep the OAuth-derived
     // tier labels so users see the real state of their CLI auth.
     const presetActive = !!s.ccPreset;
-    const presetModel = presetModelBySession.get(s.name);
+    const presetConfig = presetModelBySession.get(s.name);
+    const presetModel = presetConfig?.defaultModel;
+    const presetModels = presetConfig?.availableModels ?? [];
 
     const qwenAuthType = presetActive
       ? QWEN_AUTH_TYPES.API_KEY
@@ -232,18 +237,25 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
     const qwenAuthLimit = presetActive
       ? undefined
       : (s.qwenAuthLimit ?? qwenRuntime?.authLimit);
-    const qwenAvailableModels = presetActive && presetModel
-      ? [presetModel]
+    const qwenAvailableModels = presetActive
+      ? (presetModels.length
+          ? presetModels
+          : (s.qwenAvailableModels?.length
+              ? s.qwenAvailableModels
+              : (qwenRuntime?.availableModels?.length ? qwenRuntime.availableModels : undefined)))
       : (s.qwenAvailableModels?.length
           ? s.qwenAvailableModels
           : (qwenRuntime?.availableModels?.length ? qwenRuntime.availableModels : undefined));
-    const qwenModel = presetModel ?? s.qwenModel ?? qwenAvailableModels?.[0];
-    // modelDisplay: prefer preset's pinned model, then session's existing
-    // modelDisplay, then the effective qwenModel. This ensures the preset
-    // model (MiniMax-M2.7) displays correctly even when qwenRuntime's
-    // availableModels hasn't loaded yet or the session was restored from
-    // persisted state without the preset context.
-    const displayModel = presetModel ?? s.modelDisplay ?? qwenModel;
+    const qwenModel = presetActive
+      ? ((s.qwenModel && qwenAvailableModels?.includes(s.qwenModel))
+          ? s.qwenModel
+          : (presetModel ?? qwenAvailableModels?.[0] ?? s.qwenModel))
+      : (s.qwenModel ?? qwenAvailableModels?.[0]);
+    // For preset-backed sessions, keep a valid user-selected model visible.
+    // Fall back to the preset default only when the stored selection is stale.
+    const displayModel = presetActive
+      ? (qwenModel ?? presetModel ?? s.modelDisplay)
+      : (s.modelDisplay ?? qwenModel);
     const displayMetadata = getQwenDisplayMetadata({
       model: displayModel,
       authType: qwenAuthType,

@@ -10,18 +10,10 @@
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import type { CcPreset, CcPresetModelInfo } from '../../shared/cc-presets.js';
 import logger from '../util/logger.js';
 
 const PRESETS_PATH = join(homedir(), '.imcodes', 'cc-presets.json');
-
-export interface CcPreset {
-  name: string;
-  env: Record<string, string>;
-  /** Context window size for this model (e.g. 200000, 1000000). Used for UI progress bar accuracy. */
-  contextWindow?: number;
-  /** Message injected into the session after launch (e.g. search instructions for non-Anthropic providers). */
-  initMessage?: string;
-}
 
 let cachedPresets: CcPreset[] | null = null;
 
@@ -36,11 +28,66 @@ const MODEL_ALIASES = [
   'ANTHROPIC_DEFAULT_HAIKU_MODEL',
 ];
 
+function normalizePresetModel(raw: unknown): CcPresetModelInfo | null {
+  if (typeof raw === 'string') {
+    const id = raw.trim();
+    return id ? { id } : null;
+  }
+  if (!raw || typeof raw !== 'object') return null;
+  const record = raw as Record<string, unknown>;
+  const id = typeof record.id === 'string' ? record.id.trim() : '';
+  if (!id) return null;
+  const name = typeof record.name === 'string' ? record.name.trim() : '';
+  return name ? { id, name } : { id };
+}
+
+function normalizePreset(raw: unknown): CcPreset | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const record = raw as Record<string, unknown>;
+  const name = typeof record.name === 'string' ? record.name.trim() : '';
+  if (!name) return null;
+  const envRecord = record.env && typeof record.env === 'object'
+    ? Object.entries(record.env as Record<string, unknown>).reduce<Record<string, string>>((acc, [key, value]) => {
+        if (typeof value === 'string') acc[key] = value;
+        return acc;
+      }, {})
+    : {};
+  const availableModels = Array.isArray(record.availableModels)
+    ? record.availableModels
+        .map((item) => normalizePresetModel(item))
+        .filter((item): item is CcPresetModelInfo => item !== null)
+    : undefined;
+  const defaultModel = typeof record.defaultModel === 'string'
+    ? record.defaultModel.trim()
+    : '';
+  return {
+    name,
+    env: envRecord,
+    ...(typeof record.contextWindow === 'number' ? { contextWindow: record.contextWindow } : {}),
+    ...(typeof record.initMessage === 'string' ? { initMessage: record.initMessage } : {}),
+    ...(record.transportMode === 'qwen-compatible-api' || record.transportMode === 'claude-cli-preset'
+      ? { transportMode: record.transportMode }
+      : {}),
+    ...(record.authType === 'anthropic' ? { authType: record.authType } : {}),
+    ...(availableModels?.length ? { availableModels } : {}),
+    ...(defaultModel ? { defaultModel } : {}),
+    ...(typeof record.lastDiscoveredAt === 'number' ? { lastDiscoveredAt: record.lastDiscoveredAt } : {}),
+    ...(typeof record.modelDiscoveryError === 'string' ? { modelDiscoveryError: record.modelDiscoveryError } : {}),
+  };
+}
+
+function normalizePresets(raw: unknown): CcPreset[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((item) => normalizePreset(item))
+    .filter((item): item is CcPreset => item !== null);
+}
+
 export async function loadPresets(): Promise<CcPreset[]> {
   if (cachedPresets) return cachedPresets;
   try {
     const raw = await fs.readFile(PRESETS_PATH, 'utf8');
-    cachedPresets = JSON.parse(raw) as CcPreset[];
+    cachedPresets = normalizePresets(JSON.parse(raw));
     return cachedPresets;
   } catch {
     cachedPresets = [];
@@ -49,8 +96,8 @@ export async function loadPresets(): Promise<CcPreset[]> {
 }
 
 export async function savePresets(presets: CcPreset[]): Promise<void> {
-  cachedPresets = presets;
-  await fs.writeFile(PRESETS_PATH, JSON.stringify(presets, null, 2), 'utf8');
+  cachedPresets = normalizePresets(presets);
+  await fs.writeFile(PRESETS_PATH, JSON.stringify(cachedPresets, null, 2), 'utf8');
 }
 
 function normalizePresetName(name: string): string {
@@ -61,6 +108,20 @@ export async function getPreset(name: string): Promise<CcPreset | undefined> {
   const presets = await loadPresets();
   const normalized = normalizePresetName(name);
   return presets.find((p) => normalizePresetName(p.name) === normalized);
+}
+
+export function getPresetEffectiveModel(preset: Pick<CcPreset, 'defaultModel' | 'env'>): string | undefined {
+  const model = preset.defaultModel?.trim() || preset.env['ANTHROPIC_MODEL']?.trim() || '';
+  return model || undefined;
+}
+
+export function getPresetAvailableModelIds(preset: Pick<CcPreset, 'availableModels' | 'defaultModel' | 'env'>): string[] {
+  const discovered = preset.availableModels
+    ?.map((item) => item.id.trim())
+    .filter(Boolean) ?? [];
+  if (discovered.length > 0) return [...new Set(discovered)];
+  const fallback = getPresetEffectiveModel(preset);
+  return fallback ? [fallback] : [];
 }
 
 /**
@@ -76,6 +137,8 @@ export async function resolvePresetEnv(presetName: string, ccSessionId?: string)
   if (env['ANTHROPIC_AUTH_TOKEN'] && !env['ANTHROPIC_API_KEY']) {
     env['ANTHROPIC_API_KEY'] = env['ANTHROPIC_AUTH_TOKEN'];
   }
+  const effectiveModel = getPresetEffectiveModel(preset);
+  if (effectiveModel) env['ANTHROPIC_MODEL'] = effectiveModel;
   // Auto-fill model aliases from ANTHROPIC_MODEL
   if (env['ANTHROPIC_MODEL']) {
     for (const alias of MODEL_ALIASES) {
@@ -100,7 +163,7 @@ export async function getPresetTransportOverrides(presetName: string): Promise<{
   const preset = await getPreset(presetName);
   if (!preset) return {};
   const env = await resolvePresetEnv(presetName);
-  const configuredModel = env['ANTHROPIC_MODEL']?.trim() || undefined;
+  const configuredModel = getPresetEffectiveModel(preset);
   const configuredBaseUrl = env['ANTHROPIC_BASE_URL']?.trim() || undefined;
   const runtimeFacts = [
     `Authoritative runtime fact: this session is using the Claude Code preset "${preset.name}".`,
@@ -122,6 +185,7 @@ export async function getQwenPresetTransportConfig(presetName: string): Promise<
   env: Record<string, string>;
   settings?: Record<string, unknown>;
   model?: string;
+  availableModels?: string[];
   systemPrompt?: string;
   contextWindow?: number;
 }> {
@@ -129,7 +193,8 @@ export async function getQwenPresetTransportConfig(presetName: string): Promise<
   if (!preset) return { env: {} };
 
   const resolvedEnv = await resolvePresetEnv(presetName);
-  const model = resolvedEnv['ANTHROPIC_MODEL']?.trim() || undefined;
+  const availableModels = getPresetAvailableModelIds(preset);
+  const model = getPresetEffectiveModel(preset) ?? availableModels[0];
   const baseUrl = resolvedEnv['ANTHROPIC_BASE_URL']?.trim() || undefined;
   const apiKey = resolvedEnv['ANTHROPIC_API_KEY']?.trim()
     || resolvedEnv['ANTHROPIC_AUTH_TOKEN']?.trim()
@@ -150,7 +215,8 @@ export async function getQwenPresetTransportConfig(presetName: string): Promise<
   }
   if (model) env['ANTHROPIC_MODEL'] = model;
 
-  const settings: Record<string, unknown> | undefined = (baseUrl && apiKey && model)
+  const providerModels = availableModels.length > 0 ? availableModels : (model ? [model] : []);
+  const settings: Record<string, unknown> | undefined = (baseUrl && apiKey && providerModels.length > 0)
     ? {
         security: {
           auth: {
@@ -158,24 +224,22 @@ export async function getQwenPresetTransportConfig(presetName: string): Promise<
           },
         },
         model: {
-          name: model,
+          name: model ?? providerModels[0],
         },
         modelProviders: {
-          anthropic: [
-            {
-              id: model,
-              name: preset.name,
-              envKey: 'ANTHROPIC_API_KEY',
-              baseUrl,
-              ...(preset.contextWindow
-                ? {
-                    generationConfig: {
-                      contextWindowSize: preset.contextWindow,
-                    },
-                  }
-                : {}),
-            },
-          ],
+          anthropic: providerModels.map((providerModelId) => ({
+            id: providerModelId,
+            name: preset.availableModels?.find((item) => item.id === providerModelId)?.name?.trim() || providerModelId,
+            envKey: 'ANTHROPIC_API_KEY',
+            baseUrl,
+            ...(preset.contextWindow
+              ? {
+                  generationConfig: {
+                    contextWindowSize: preset.contextWindow,
+                  },
+                }
+              : {}),
+          })),
         },
       }
     : undefined;
@@ -201,9 +265,89 @@ export async function getQwenPresetTransportConfig(presetName: string): Promise<
     env,
     ...(settings ? { settings } : {}),
     ...(model ? { model } : {}),
+    ...(availableModels.length ? { availableModels } : {}),
     ...(runtimeFacts ? { systemPrompt: runtimeFacts } : {}),
     ...(preset.contextWindow ? { contextWindow: preset.contextWindow } : {}),
   };
+}
+
+function getDiscoveryCandidates(baseUrl: string): string[] {
+  const trimmed = baseUrl.trim().replace(/\/+$/, '');
+  if (!trimmed) return [];
+  const candidates = new Set<string>();
+  if (trimmed.endsWith('/models')) {
+    candidates.add(trimmed);
+  } else {
+    candidates.add(`${trimmed}/models`);
+    if (!/\/v\d+(?:$|\/)/.test(trimmed)) candidates.add(`${trimmed}/v1/models`);
+  }
+  return [...candidates];
+}
+
+function parseDiscoveredModels(payload: unknown): CcPresetModelInfo[] {
+  const record = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
+  const rawModels = Array.isArray(record.data)
+    ? record.data
+    : Array.isArray(record.models)
+      ? record.models
+      : [];
+  const seen = new Set<string>();
+  const models: CcPresetModelInfo[] = [];
+  for (const item of rawModels) {
+    if (!item || typeof item !== 'object') continue;
+    const model = item as Record<string, unknown>;
+    const id = typeof model.id === 'string' ? model.id.trim() : '';
+    if (!id || seen.has(id)) continue;
+    const displayName = typeof model.display_name === 'string'
+      ? model.display_name.trim()
+      : typeof model.name === 'string'
+        ? model.name.trim()
+        : '';
+    seen.add(id);
+    models.push(displayName ? { id, name: displayName } : { id });
+  }
+  return models;
+}
+
+export async function discoverPresetModels(preset: CcPreset): Promise<{
+  availableModels: CcPresetModelInfo[];
+  defaultModel?: string;
+  endpoint: string;
+}> {
+  const env = { ...preset.env };
+  const baseUrl = env['ANTHROPIC_BASE_URL']?.trim() || '';
+  const apiKey = env['ANTHROPIC_API_KEY']?.trim() || env['ANTHROPIC_AUTH_TOKEN']?.trim() || '';
+  if (!baseUrl) throw new Error('Preset is missing ANTHROPIC_BASE_URL');
+  if (!apiKey) throw new Error('Preset is missing ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN');
+
+  let lastError: Error | null = null;
+  for (const endpoint of getDiscoveryCandidates(baseUrl)) {
+    try {
+      const response = await fetch(endpoint, {
+        headers: {
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+          accept: 'application/json',
+        },
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status} ${response.statusText}`.trim());
+      }
+      const payload = await response.json() as unknown;
+      const availableModels = parseDiscoveredModels(payload);
+      if (availableModels.length === 0) {
+        throw new Error('No models returned by compatible API');
+      }
+      const existingModel = getPresetEffectiveModel(preset);
+      const defaultModel = availableModels.some((item) => item.id === existingModel)
+        ? existingModel
+        : (availableModels[0]?.id ?? undefined);
+      return { availableModels, defaultModel, endpoint };
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+    }
+  }
+  throw lastError ?? new Error('Failed to discover models');
 }
 
 /** Default init message for non-Anthropic providers (no native web search). */

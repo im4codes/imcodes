@@ -1,9 +1,6 @@
-export interface CcPresetEntry {
-  name: string;
-  env: Record<string, string>;
-  contextWindow?: number;
-  initMessage?: string;
-}
+import type { CcPreset, CcPresetModelInfo } from '@shared/cc-presets.js';
+
+export type CcPresetEntry = CcPreset;
 
 export interface CcPresetDraft {
   name: string;
@@ -13,6 +10,7 @@ export interface CcPresetDraft {
   contextWindow: string;
   customEnv: Array<{ key: string; value: string }>;
   initMessage: string;
+  availableModels: CcPresetModelInfo[];
 }
 
 export const DEFAULT_CC_PRESET_BASE_URL = 'https://api.minimax.io/anthropic';
@@ -46,6 +44,7 @@ export function createDefaultCcPresetDraft(): CcPresetDraft {
     contextWindow: DEFAULT_CC_PRESET_CONTEXT_WINDOW,
     customEnv: cloneCustomEnv(DEFAULT_CC_PRESET_CUSTOM_ENV_TEMPLATE),
     initMessage: DEFAULT_CC_PRESET_INIT_MSG,
+    availableModels: [],
   };
 }
 
@@ -54,29 +53,38 @@ export function createCcPresetDraftFromPreset(preset: CcPresetEntry): CcPresetDr
     name: preset.name,
     baseUrl: preset.env.ANTHROPIC_BASE_URL ?? DEFAULT_CC_PRESET_BASE_URL,
     token: preset.env.ANTHROPIC_AUTH_TOKEN ?? '',
-    model: preset.env.ANTHROPIC_MODEL ?? DEFAULT_CC_PRESET_MODEL,
+    model: preset.defaultModel ?? preset.env.ANTHROPIC_MODEL ?? DEFAULT_CC_PRESET_MODEL,
     contextWindow: preset.contextWindow ? String(preset.contextWindow) : DEFAULT_CC_PRESET_CONTEXT_WINDOW,
     customEnv: Object.entries(preset.env)
       .filter(([key]) => !INLINE_ENV_KEYS.has(key))
       .map(([key, value]) => ({ key, value })),
     initMessage: preset.initMessage ?? DEFAULT_CC_PRESET_INIT_MSG,
+    availableModels: preset.availableModels ?? [],
   };
 }
 
 export function buildCcPresetFromDraft(draft: CcPresetDraft): CcPresetEntry {
+  const model = draft.model.trim();
   const env: Record<string, string> = {
     ANTHROPIC_BASE_URL: draft.baseUrl.trim(),
     CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
   };
   if (draft.token.trim()) env.ANTHROPIC_AUTH_TOKEN = draft.token.trim();
-  if (draft.model.trim()) env.ANTHROPIC_MODEL = draft.model.trim();
+  if (model) env.ANTHROPIC_MODEL = model;
   for (const { key, value } of draft.customEnv) {
     if (key.trim()) env[key.trim()] = value;
   }
 
-  const preset: CcPresetEntry = { name: draft.name.trim(), env };
+  const preset: CcPresetEntry = {
+    name: draft.name.trim(),
+    env,
+    transportMode: 'qwen-compatible-api',
+    authType: 'anthropic',
+  };
   const contextWindow = parseInt(draft.contextWindow, 10);
   if (contextWindow) preset.contextWindow = contextWindow;
   if (draft.initMessage.trim()) preset.initMessage = draft.initMessage.trim();
+  if (draft.availableModels.length > 0) preset.availableModels = draft.availableModels;
+  if (model) preset.defaultModel = model;
   return preset;
 }

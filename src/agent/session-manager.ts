@@ -1227,14 +1227,9 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         const { getQwenPresetTransportConfig } = await import('../daemon/cc-presets.js');
         const presetConfig = await getQwenPresetTransportConfig(s.ccPreset);
         extraEnv = { ...(extraEnv ?? {}), ...presetConfig.env };
-        // Preset is authoritative: its model overrides any stored value (e.g. a
-        // pre-preset session persisted `qwenModel: 'coder-model'` that is no
-        // longer valid under --auth-type anthropic). Restricting the available
-        // list to the preset model prevents the downstream fallback from
-        // reverting to the OAuth `coder-model` placeholder.
-        if (presetConfig.model) {
-          effectiveRequestedModel = presetConfig.model;
-          availableQwenModels = [presetConfig.model];
+        if (presetConfig.availableModels?.length) availableQwenModels = presetConfig.availableModels;
+        if (!effectiveRequestedModel || (availableQwenModels.length > 0 && !availableQwenModels.includes(effectiveRequestedModel))) {
+          effectiveRequestedModel = presetConfig.model ?? availableQwenModels[0] ?? effectiveRequestedModel;
         }
         transportSettings = presetConfig.settings;
         // Override the qwen CLI's built-in "I am Qwen Code" identity with the
@@ -1440,27 +1435,22 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   });
   const contextBootstrap = await resolveRuntimeContextBootstrap();
   runtime.setContextBootstrapResolver(resolveRuntimeContextBootstrap);
-  if (agentType === 'qwen') {
-    const qwenRuntime = await getQwenRuntimeConfig().catch(() => null);
-    qwenAuthType = qwenRuntime?.authType;
-    qwenAuthLimit = qwenRuntime?.authLimit;
-    availableQwenModels = qwenRuntime?.availableModels ?? [];
-    if (effectiveCcPreset) {
-      const { getQwenPresetTransportConfig } = await import('../daemon/cc-presets.js');
-      const presetConfig = await getQwenPresetTransportConfig(effectiveCcPreset);
-      transportEnv = { ...(transportEnv ?? {}), ...presetConfig.env };
-      // Preset is authoritative — its model overrides any stored/requested
-      // model, and we restrict the available list so the fallback below can't
-      // revert to the OAuth placeholder (`coder-model`). We're spawning qwen
-      // with `--auth-type anthropic` against a BYO API key, so the OAuth tier
-      // labels ("Free", "No longer available") don't apply — clear them.
-      if (presetConfig.model) {
-        requestedTransportModel = presetConfig.model;
-        availableQwenModels = [presetConfig.model];
-      }
-      presetContextWindow = presetConfig.contextWindow;
-      if (presetConfig.settings) transportSettings = presetConfig.settings;
-      if (presetConfig.systemPrompt) transportSystemPrompt = presetConfig.systemPrompt;
+    if (agentType === 'qwen') {
+      const qwenRuntime = await getQwenRuntimeConfig().catch(() => null);
+      qwenAuthType = qwenRuntime?.authType;
+      qwenAuthLimit = qwenRuntime?.authLimit;
+      availableQwenModels = qwenRuntime?.availableModels ?? [];
+      if (effectiveCcPreset) {
+        const { getQwenPresetTransportConfig } = await import('../daemon/cc-presets.js');
+        const presetConfig = await getQwenPresetTransportConfig(effectiveCcPreset);
+        transportEnv = { ...(transportEnv ?? {}), ...presetConfig.env };
+        if (presetConfig.availableModels?.length) availableQwenModels = presetConfig.availableModels;
+        if (!requestedTransportModel || (availableQwenModels.length > 0 && !availableQwenModels.includes(requestedTransportModel))) {
+          requestedTransportModel = presetConfig.model ?? availableQwenModels[0] ?? requestedTransportModel;
+        }
+        presetContextWindow = presetConfig.contextWindow;
+        if (presetConfig.settings) transportSettings = presetConfig.settings;
+        if (presetConfig.systemPrompt) transportSystemPrompt = presetConfig.systemPrompt;
       qwenAuthType = QWEN_AUTH_TYPES.API_KEY;
       qwenAuthLimit = undefined;
     }

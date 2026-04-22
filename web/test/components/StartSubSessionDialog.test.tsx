@@ -193,7 +193,12 @@ describe('StartSubSessionDialog', () => {
       handler({
         type: 'cc.presets.list_response',
         presets: [
-          { name: 'MiniMax', env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' } },
+          {
+            name: 'MiniMax',
+            env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+            defaultModel: 'MiniMax-M2.7',
+            availableModels: [{ id: 'MiniMax-M2.7' }, { id: 'MiniMax-Text-01' }],
+          },
         ],
       });
       return () => {};
@@ -212,7 +217,7 @@ describe('StartSubSessionDialog', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
-    await waitFor(() => expect(screen.getByText('api_provider')).toBeDefined());
+    await waitFor(() => expect(screen.getByText('Compatible API (via Qwen)')).toBeDefined());
     expect(screen.getByText('qwen_provider_selected_hint')).toBeDefined();
     const presetSelect = (screen.getAllByRole('combobox') as HTMLSelectElement[])
       .find((select) => Array.from(select.options).some((option) => option.value === 'MiniMax'));
@@ -223,6 +228,7 @@ describe('StartSubSessionDialog', () => {
 
     expect(onStart).toHaveBeenCalledWith('qwen', undefined, '/tmp', undefined, {
       ccPreset: 'MiniMax',
+      requestedModel: 'MiniMax-M2.7',
       thinking: 'high',
     });
   });
@@ -241,7 +247,7 @@ describe('StartSubSessionDialog', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
-    await waitFor(() => expect(screen.getByText('api_provider')).toBeDefined());
+    await waitFor(() => expect(screen.getByText('Compatible API (via Qwen)')).toBeDefined());
     fireEvent.click(screen.getByRole('button', { name: /api_provider_add_edit/i }));
 
     expect(screen.getByDisplayValue('https://api.minimax.io/anthropic')).toBeDefined();

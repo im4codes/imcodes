@@ -29,6 +29,7 @@ import {
   type CcPresetDraft,
   type CcPresetEntry,
 } from "./cc-preset-form.js";
+import { CC_PRESET_MSG } from "@shared/cc-presets.js";
 
 const DEFAULT_SHELL_KEY = "default_shell";
 // Fallback suggestions used only when the daemon probe returns an empty list
@@ -96,6 +97,11 @@ export function NewSessionDialog({
     Array<{ key: string; value: string }>
   >(defaultPresetDraft.customEnv);
   const [newPresetInit, setNewPresetInit] = useState(defaultPresetDraft.initMessage);
+  const [newPresetAvailableModels, setNewPresetAvailableModels] = useState(
+    defaultPresetDraft.availableModels,
+  );
+  const [presetError, setPresetError] = useState("");
+  const [discoveringPreset, setDiscoveringPreset] = useState(false);
   const fmtCtx = (v: string) => {
     const n = parseInt(v, 10);
     if (!n) return "";
@@ -112,7 +118,35 @@ export function NewSessionDialog({
     setNewPresetCtx(draft.contextWindow);
     setNewPresetCustomEnv(draft.customEnv);
     setNewPresetInit(draft.initMessage);
+    setNewPresetAvailableModels(draft.availableModels);
   };
+  const buildCurrentPresetDraft = (): CcPresetDraft => ({
+    name: newPresetName,
+    baseUrl: newPresetBaseUrl,
+    token: newPresetToken,
+    model: newPresetModel,
+    contextWindow: newPresetCtx,
+    customEnv: newPresetCustomEnv,
+    initMessage: newPresetInit,
+    availableModels: newPresetAvailableModels,
+  });
+  const persistPresetDraft = (): CcPresetEntry => {
+    const preset = buildCcPresetFromDraft(buildCurrentPresetDraft());
+    const updated = [...ccPresets.filter((p) => p.name !== preset.name), preset];
+    setCcPresets(updated);
+    try {
+      ws?.send({ type: CC_PRESET_MSG.SAVE, presets: updated });
+    } catch {}
+    return preset;
+  };
+  const selectedCcPreset = useMemo(
+    () => ccPresets.find((preset) => preset.name === ccPreset),
+    [ccPreset, ccPresets],
+  );
+  const qwenPresetModels = useMemo(
+    () => selectedCcPreset?.availableModels?.map((item) => item.id) ?? [],
+    [selectedCcPreset],
+  );
 
   // OpenClaw-specific state
   const [ocMode, setOcMode] = useState<OpenClawMode>("new");
@@ -147,8 +181,26 @@ export function NewSessionDialog({
         }
       }
       // Listen for CC presets response
-      if (msg.type === "cc.presets.list_response") {
+      if (msg.type === CC_PRESET_MSG.LIST_RESPONSE) {
         setCcPresets((msg as any).presets ?? []);
+      }
+      if (msg.type === CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE) {
+        setDiscoveringPreset(false);
+        if (msg.preset) {
+          setCcPresets((current) => [
+            ...current.filter((preset) => preset.name !== msg.preset?.name),
+            msg.preset,
+          ]);
+          if (newPresetName.trim().toLowerCase() === msg.preset.name.trim().toLowerCase()) {
+            applyPresetDraft(createCcPresetDraftFromPreset(msg.preset));
+          }
+          if (ccPreset === msg.preset.name || !ccPreset) setCcPreset(msg.preset.name);
+          const nextModel = msg.preset.defaultModel
+            ?? msg.preset.availableModels?.[0]?.id
+            ?? msg.preset.env.ANTHROPIC_MODEL;
+          if (nextModel) setRequestedModel(nextModel);
+        }
+        setPresetError(msg.ok ? "" : (msg.error ?? "Failed to discover models"));
       }
       // Listen for openclaw remote session list response
       const raw = msg as unknown as Record<string, unknown>;
@@ -160,7 +212,7 @@ export function NewSessionDialog({
     });
     ws.subSessionDetectShells?.();
     try {
-      ws.send({ type: "cc.presets.list" });
+      ws.send({ type: CC_PRESET_MSG.LIST });
     } catch {
       /* ws may not support send in test */
     }
@@ -271,7 +323,9 @@ export function NewSessionDialog({
       if (ccInitPrompt.trim() && agentType === "claude-code")
         extra.ccInitPrompt = ccInitPrompt.trim();
       if (
-        (agentType === "copilot-sdk" || agentType === "cursor-headless") &&
+        (agentType === "copilot-sdk"
+          || agentType === "cursor-headless"
+          || agentType === "qwen") &&
         requestedModel.trim()
       ) {
         extra.requestedModel = requestedModel.trim();
@@ -311,7 +365,9 @@ export function NewSessionDialog({
               : [];
   const supportsCcPreset = agentType === "claude-code" || agentType === "qwen";
   const supportsModelSelection =
-    agentType === "copilot-sdk" || agentType === "cursor-headless";
+    agentType === "copilot-sdk"
+    || agentType === "cursor-headless"
+    || (agentType === "qwen" && !!selectedCcPreset);
   const dynamicModelsAgentType = supportsDynamicTransportModels(agentType)
     ? agentType
     : null;
@@ -320,14 +376,34 @@ export function NewSessionDialog({
     if (transportModels.models.length > 0) {
       return transportModels.models.map((m) => m.id);
     }
+    if (agentType === "qwen") {
+      return qwenPresetModels.length > 0
+        ? qwenPresetModels
+        : (selectedCcPreset?.defaultModel ? [selectedCcPreset.defaultModel] : []);
+    }
     if (agentType === "copilot-sdk") return [...COPILOT_SDK_MODEL_FALLBACK];
     if (agentType === "cursor-headless") return [...CURSOR_HEADLESS_MODEL_FALLBACK];
     return [] as string[];
-  }, [transportModels.models, agentType]);
+  }, [transportModels.models, agentType, qwenPresetModels, selectedCcPreset]);
 
   useEffect(() => {
     setThinking("high");
   }, [agentType]);
+
+  useEffect(() => {
+    if (agentType !== "qwen") return;
+    const fallbackModel =
+      selectedCcPreset?.defaultModel ?? selectedCcPreset?.env.ANTHROPIC_MODEL ?? "";
+    if (modelSuggestions.length === 0) {
+      if (!requestedModel && fallbackModel) setRequestedModel(fallbackModel);
+      return;
+    }
+    if (!requestedModel || !modelSuggestions.includes(requestedModel)) {
+      setRequestedModel(
+        modelSuggestions.includes(fallbackModel) ? fallbackModel : modelSuggestions[0],
+      );
+    }
+  }, [agentType, modelSuggestions, requestedModel, selectedCcPreset]);
 
   const handleKey = (e: KeyboardEvent) => {
     if (e.key === "Enter" && !starting) handleStart();
@@ -503,22 +579,38 @@ export function NewSessionDialog({
         {supportsModelSelection && (
           <div class="form-group">
             <label>{t("session.supervision.model")}</label>
-            <input
-              type="text"
-              list={`new-session-model-options-${agentType}`}
-              placeholder={t("session.supervision.selectModel")}
-              value={requestedModel}
-              disabled={starting}
-              onInput={(e) =>
-                setRequestedModel((e.target as HTMLInputElement).value)
-              }
-              autoComplete="off"
-              autoCorrect="off"
-              autoCapitalize="off"
-              spellcheck={false}
-              data-lpignore="true"
-              data-1p-ignore
-            />
+            {agentType === "qwen" && modelSuggestions.length > 0 ? (
+              <select
+                value={requestedModel}
+                disabled={starting}
+                onInput={(e) =>
+                  setRequestedModel((e.target as HTMLSelectElement).value)
+                }
+              >
+                {modelSuggestions.map((model) => (
+                  <option key={model} value={model}>
+                    {model}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input
+                type="text"
+                list={`new-session-model-options-${agentType}`}
+                placeholder={t("session.supervision.selectModel")}
+                value={requestedModel}
+                disabled={starting}
+                onInput={(e) =>
+                  setRequestedModel((e.target as HTMLInputElement).value)
+                }
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="off"
+                spellcheck={false}
+                data-lpignore="true"
+                data-1p-ignore
+              />
+            )}
             {modelSuggestions.length > 0 && (
               <datalist id={`new-session-model-options-${agentType}`}>
                 {modelSuggestions.map((model) => (
@@ -540,7 +632,7 @@ export function NewSessionDialog({
                   alignItems: "center",
                 }}
               >
-                <span>{t("new_session.api_provider")}</span>
+                <span>{agentType === "qwen" ? "Compatible API (via Qwen)" : t("new_session.api_provider")}</span>
                 <button
                   type="button"
                   style={{
@@ -581,8 +673,8 @@ export function NewSessionDialog({
                   {ccPresets.map((p) => (
                     <option key={p.name} value={p.name}>
                       {p.name}
-                      {p.env["ANTHROPIC_MODEL"]
-                        ? ` (${p.env["ANTHROPIC_MODEL"]})`
+                      {(p.defaultModel ?? p.env["ANTHROPIC_MODEL"])
+                        ? ` (${p.defaultModel ?? p.env["ANTHROPIC_MODEL"]})`
                         : ""}
                     </option>
                   ))}
@@ -683,6 +775,37 @@ export function NewSessionDialog({
                     />
                   </div>
                 ))}
+                {newPresetAvailableModels.length > 0 && (
+                  <div style={{ marginBottom: 5 }}>
+                    <div
+                      style={{ fontSize: 10, color: "#64748b", marginBottom: 2 }}
+                    >
+                      Discovered Models
+                    </div>
+                    <select
+                      value={newPresetModel}
+                      onInput={(e) =>
+                        setNewPresetModel((e.target as HTMLSelectElement).value)
+                      }
+                      style={{
+                        width: "100%",
+                        background: "#1e293b",
+                        border: "1px solid #334155",
+                        color: "#e2e8f0",
+                        padding: "5px 8px",
+                        borderRadius: 4,
+                        fontSize: 12,
+                        boxSizing: "border-box",
+                      }}
+                    >
+                      {newPresetAvailableModels.map((item) => (
+                        <option key={item.id} value={item.id}>
+                          {item.name ? `${item.name} (${item.id})` : item.id}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
                 <div style={{ marginBottom: 5 }}>
                   <div
                     style={{ fontSize: 10, color: "#64748b", marginBottom: 2 }}
@@ -844,6 +967,11 @@ export function NewSessionDialog({
                     }}
                   />
                 </div>
+                {presetError && (
+                  <div style={{ color: "#ef4444", fontSize: 11, marginBottom: 6 }}>
+                    {presetError}
+                  </div>
+                )}
                 <button
                   type="button"
                   disabled={!newPresetName.trim() || !newPresetBaseUrl.trim()}
@@ -861,28 +989,61 @@ export function NewSessionDialog({
                         : 1,
                   }}
                   onClick={() => {
-                    const preset = buildCcPresetFromDraft({
-                      name: newPresetName,
-                      baseUrl: newPresetBaseUrl,
-                      token: newPresetToken,
-                      model: newPresetModel,
-                      contextWindow: newPresetCtx,
-                      customEnv: newPresetCustomEnv,
-                      initMessage: newPresetInit,
-                    });
-                    const updated = [
-                      ...ccPresets.filter((p) => p.name !== preset.name),
-                      preset,
-                    ];
-                    setCcPresets(updated);
-                    try {
-                      ws?.send({ type: "cc.presets.save", presets: updated });
-                    } catch {}
+                    const preset = persistPresetDraft();
                     applyPresetDraft(createDefaultCcPresetDraft());
                     setCcPreset(preset.name);
+                    setPresetError("");
                   }}
                 >
                   Save Preset
+                </button>
+                <button
+                  type="button"
+                  disabled={
+                    discoveringPreset
+                    || !newPresetName.trim()
+                    || !newPresetBaseUrl.trim()
+                    || !newPresetToken.trim()
+                  }
+                  style={{
+                    background: "#0f766e",
+                    border: "none",
+                    color: "#fff",
+                    padding: "4px 12px",
+                    borderRadius: 4,
+                    cursor: "pointer",
+                    fontSize: 12,
+                    marginLeft: 8,
+                    opacity:
+                      discoveringPreset
+                      || !newPresetName.trim()
+                      || !newPresetBaseUrl.trim()
+                      || !newPresetToken.trim()
+                        ? 0.5
+                        : 1,
+                  }}
+                  onClick={() => {
+                    if (!ws?.connected) {
+                      setPresetError("Daemon offline");
+                      return;
+                    }
+                    const preset = persistPresetDraft();
+                    setCcPreset(preset.name);
+                    setDiscoveringPreset(true);
+                    setPresetError("");
+                    try {
+                      ws.send({
+                        type: CC_PRESET_MSG.DISCOVER_MODELS,
+                        requestId: `cc-preset-discover-${Date.now()}`,
+                        presetName: preset.name,
+                      });
+                    } catch {
+                      setDiscoveringPreset(false);
+                      setPresetError("Failed to send discover request");
+                    }
+                  }}
+                >
+                  {discoveringPreset ? "Discovering..." : "Discover Models"}
                 </button>
 
                 {/* Existing presets — edit/delete */}
@@ -932,6 +1093,7 @@ export function NewSessionDialog({
                             }}
                             onClick={() => {
                               applyPresetDraft(createCcPresetDraftFromPreset(p));
+                              setPresetError(p.modelDiscoveryError ?? "");
                             }}
                           >
                             Edit
@@ -952,7 +1114,7 @@ export function NewSessionDialog({
                               setCcPresets(updated);
                               try {
                                 ws?.send({
-                                  type: "cc.presets.save",
+                                  type: CC_PRESET_MSG.SAVE,
                                   presets: updated,
                                 });
                               } catch {}

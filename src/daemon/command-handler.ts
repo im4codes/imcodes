@@ -60,6 +60,7 @@ import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from '.
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import { CC_PRESET_MSG, type CcPreset } from '../../shared/cc-presets.js';
 import { MEMORY_WS } from '../../shared/memory-ws.js';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG } from '../../shared/p2p-config-events.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
@@ -1094,11 +1095,14 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case 'p2p.status':
       void handleP2pStatus(cmd, serverLink);
       break;
-    case 'cc.presets.list':
+    case CC_PRESET_MSG.LIST:
       void handleCcPresetsList(serverLink);
       break;
-    case 'cc.presets.save':
+    case CC_PRESET_MSG.SAVE:
       void handleCcPresetsSave(cmd, serverLink);
+      break;
+    case CC_PRESET_MSG.DISCOVER_MODELS:
+      void handleCcPresetsDiscoverModels(cmd, serverLink);
       break;
     case SHARED_CONTEXT_RUNTIME_CONFIG_MSG.APPLY:
       void handleSharedContextRuntimeConfigApply(cmd);
@@ -4842,16 +4846,88 @@ export async function listProviderSessions(providerId: string): Promise<Array<{ 
 async function handleCcPresetsList(serverLink: ServerLink): Promise<void> {
   const { loadPresets } = await import('./cc-presets.js');
   const presets = await loadPresets();
-  serverLink.send({ type: 'cc.presets.list_response', presets });
+  serverLink.send({ type: CC_PRESET_MSG.LIST_RESPONSE, presets });
 }
 
 async function handleCcPresetsSave(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
-  const presets = cmd.presets as Array<{ name: string; env: Record<string, string> }> | undefined;
+  const presets = cmd.presets as CcPreset[] | undefined;
   if (!presets) return;
   const { savePresets, invalidateCache } = await import('./cc-presets.js');
   invalidateCache();
   await savePresets(presets);
-  serverLink.send({ type: 'cc.presets.save_response', ok: true });
+  serverLink.send({ type: CC_PRESET_MSG.SAVE_RESPONSE, ok: true });
+}
+
+async function handleCcPresetsDiscoverModels(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
+  const presetName = typeof cmd.presetName === 'string' ? cmd.presetName.trim() : '';
+  if (!presetName) {
+    serverLink.send({
+      type: CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE,
+      ...(requestId ? { requestId } : {}),
+      presetName,
+      ok: false,
+      error: 'presetName is required',
+    });
+    return;
+  }
+
+  const { discoverPresetModels, loadPresets, savePresets, getPreset } = await import('./cc-presets.js');
+  const presets = await loadPresets();
+  const preset = await getPreset(presetName);
+  if (!preset) {
+    serverLink.send({
+      type: CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE,
+      ...(requestId ? { requestId } : {}),
+      presetName,
+      ok: false,
+      error: `Preset "${presetName}" not found`,
+    });
+    return;
+  }
+
+  const normalizedName = preset.name.trim().toLowerCase();
+  try {
+    const discovered = await discoverPresetModels(preset);
+    const updatedPreset: CcPreset = {
+      ...preset,
+      transportMode: preset.transportMode ?? 'qwen-compatible-api',
+      authType: preset.authType ?? 'anthropic',
+      availableModels: discovered.availableModels,
+      ...(discovered.defaultModel ? { defaultModel: discovered.defaultModel } : {}),
+      lastDiscoveredAt: Date.now(),
+      modelDiscoveryError: undefined,
+    };
+    await savePresets(presets.map((item) => (
+      item.name.trim().toLowerCase() === normalizedName ? updatedPreset : item
+    )));
+    serverLink.send({
+      type: CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE,
+      ...(requestId ? { requestId } : {}),
+      presetName: updatedPreset.name,
+      ok: true,
+      preset: updatedPreset,
+      models: discovered.availableModels,
+      endpoint: discovered.endpoint,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const updatedPreset: CcPreset = {
+      ...preset,
+      modelDiscoveryError: message,
+    };
+    await savePresets(presets.map((item) => (
+      item.name.trim().toLowerCase() === normalizedName ? updatedPreset : item
+    )));
+    serverLink.send({
+      type: CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE,
+      ...(requestId ? { requestId } : {}),
+      presetName: updatedPreset.name,
+      ok: false,
+      error: message,
+      preset: updatedPreset,
+    });
+  }
 }
 
 async function handleSharedContextRuntimeConfigApply(cmd: Record<string, unknown>): Promise<void> {
