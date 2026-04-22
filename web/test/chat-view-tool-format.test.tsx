@@ -151,6 +151,45 @@ describe('ChatView tool payload formatting', () => {
     expect(screen.getByText('output')).toBeDefined();
   });
 
+  it('prefers the completed WebSearch query over a generic started-state fallback label', () => {
+    const events = [
+      makeEvent({
+        eventId: 'transport-tool:test:websearch-late:call',
+        type: 'tool.call',
+        payload: {
+          tool: 'WebSearch',
+          input: { query: '(other)' },
+          detail: {
+            kind: 'webSearch',
+            summary: '(other)',
+            input: { query: '(other)', action: { type: 'other' } },
+            meta: { actionType: 'other' },
+          },
+        },
+      }),
+      makeEvent({
+        eventId: 'transport-tool:test:websearch-late:result',
+        type: 'tool.result',
+        payload: {
+          detail: {
+            kind: 'webSearch',
+            summary: 'apple stock today',
+            input: { query: 'apple stock today', action: { type: 'search', query: 'apple stock today' } },
+            meta: { actionType: 'search' },
+          },
+        },
+      }),
+    ];
+
+    render(<ChatView events={events} loading={false} />);
+
+    expect(screen.getByText('WebSearch')).toBeDefined();
+    expect(screen.getAllByText(/apple stock today/).length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByText('details'));
+    expect(screen.getByText('input')).toBeDefined();
+    expect(screen.queryByText(/\(other\)/)).toBeNull();
+  });
+
   it('shows a single timestamp on the final merged tool row', () => {
     const events = [
       makeEvent({

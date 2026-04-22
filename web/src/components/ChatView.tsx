@@ -242,6 +242,48 @@ function summarizeToolInput(
   return formatToolPayloadValue(rawRecord.input);
 }
 
+function isGenericWebSearchLabel(value: string | undefined): boolean {
+  if (!value) return false;
+  return /^\((?:other|open_page|find_in_page|search|web_search)\)$/i.test(value.trim());
+}
+
+function pickMergedToolInput(
+  toolName: string,
+  callInput: string,
+  resultInput: string,
+): string {
+  if (toolName === 'WebSearch' && resultInput) {
+    if (!callInput || isGenericWebSearchLabel(callInput)) return resultInput;
+  }
+  return callInput || resultInput;
+}
+
+function pickMergedToolDetailInput(
+  toolName: string,
+  callDetail: unknown,
+  resultDetail: unknown,
+): unknown {
+  const callInput = summarizeToolInput(undefined, callDetail);
+  const resultInput = summarizeToolInput((resultDetail as any)?.input, resultDetail);
+  if (toolName === 'WebSearch' && resultInput) {
+    if (!callInput || isGenericWebSearchLabel(callInput)) return (resultDetail as any)?.input;
+  }
+  return (callDetail as any)?.input ?? (resultDetail as any)?.input;
+}
+
+function pickMergedToolDetailMeta(
+  toolName: string,
+  callDetail: unknown,
+  resultDetail: unknown,
+): unknown {
+  const callInput = summarizeToolInput(undefined, callDetail);
+  const resultInput = summarizeToolInput((resultDetail as any)?.input, resultDetail);
+  if (toolName === 'WebSearch' && resultInput) {
+    if (!callInput || isGenericWebSearchLabel(callInput)) return (resultDetail as any)?.meta ?? (callDetail as any)?.meta;
+  }
+  return (callDetail as any)?.meta ?? (resultDetail as any)?.meta;
+}
+
 function formatToolDetailJson(value: unknown): string | null {
   if (value == null) return null;
   if (typeof value === 'string') return value;
@@ -328,8 +370,9 @@ function buildViewItems(events: TimelineEvent[]): ViewItem[] {
         const toolName = String(ev.payload.tool ?? 'tool');
         // tool.call from transport SDK may have no input yet (streamed incrementally).
         // Fall back to the result's detail.input which has the complete args.
-        const inputText = summarizeToolInput(ev.payload.input, ev.payload.detail)
-          || summarizeToolInput((next.payload.detail as any)?.input, next.payload.detail);
+        const callInput = summarizeToolInput(ev.payload.input, ev.payload.detail);
+        const resultInput = summarizeToolInput((next.payload.detail as any)?.input, next.payload.detail);
+        const inputText = pickMergedToolInput(toolName, callInput, resultInput);
         const input = inputText ? ` ${inputText}` : '';
         const status = next.payload.error ? `✗ ${String(next.payload.error)}` : '✓';
         const output = !next.payload.error ? formatToolPayloadValue(next.payload.output) : undefined;
@@ -1558,18 +1601,22 @@ const ChatEvent = memo(function ChatEvent({
     }
 
     case 'tool.call': {
+      const toolName = String(event.payload.tool ?? 'tool');
       const callDetail = event.payload._callDetail ?? event.payload.detail;
       const resultDetail = event.payload._resultDetail;
       const shouldShowTime = showTime || event.payload._merged === true;
       // Fall back to result detail for input — transport SDK tool.call may arrive without input
-      const toolInput = summarizeToolInput(event.payload.input, callDetail)
-        || summarizeToolInput((resultDetail as any)?.input, resultDetail);
+      const callInput = summarizeToolInput(event.payload.input, callDetail);
+      const resultInput = summarizeToolInput((resultDetail as any)?.input, resultDetail);
+      const toolInput = pickMergedToolInput(toolName, callInput, resultInput);
+      const detailInput = pickMergedToolDetailInput(toolName, callDetail, resultDetail);
+      const detailMeta = pickMergedToolDetailMeta(toolName, callDetail, resultDetail);
       const toolOutput = event.payload._output ? String(event.payload._output) : undefined;
       return (
         <ToolBlockFold>
           <div class="chat-event chat-tool">
             <span class="chat-tool-icon">{'>'}</span>
-            <span class="chat-tool-name">{String(event.payload.tool ?? 'tool')}</span>
+            <span class="chat-tool-name">{toolName}</span>
             {toolInput && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInput, onPathClick, undefined, onDownload)}</span>}
             {shouldShowTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{new Date(event.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>}
           </div>
@@ -1581,9 +1628,9 @@ const ChatEvent = memo(function ChatEvent({
           {(callDetail || resultDetail) && (
             <details class="chat-tool-detail">
               <summary class="chat-tool-detail-summary">{t('chat.tool_detail_toggle')}</summary>
-              <ToolDetailSection label={t('chat.tool_detail_input')} value={(callDetail as any)?.input} />
+              <ToolDetailSection label={t('chat.tool_detail_input')} value={detailInput} />
               <ToolDetailSection label={t('chat.tool_detail_output')} value={(resultDetail as any)?.output} />
-              <ToolDetailSection label={t('chat.tool_detail_meta')} value={(callDetail as any)?.meta ?? (resultDetail as any)?.meta} />
+              <ToolDetailSection label={t('chat.tool_detail_meta')} value={detailMeta} />
               <ToolDetailSection label={t('chat.tool_detail_raw')} value={(callDetail as any)?.raw ?? (resultDetail as any)?.raw} />
             </details>
           )}
