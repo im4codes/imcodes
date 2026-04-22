@@ -44,13 +44,44 @@ describe('timeline-store projection fallbacks', () => {
     return { timelineStore, sessionId };
   }
 
+  it('does not mirror into the projection when the authoritative JSONL append fails', async () => {
+    tempHome = mkdtempSync(join(tmpdir(), 'imcodes-timeline-projection-fallback-'));
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+
+    vi.doMock('fs', async () => {
+      const actual = await vi.importActual<typeof import('fs')>('fs');
+      return {
+        ...actual,
+        appendFileSync: vi.fn(() => {
+          throw new Error('append failed');
+        }),
+      };
+    });
+
+    const { timelineStore } = await import('../../src/daemon/timeline-store.js');
+    timelineStore.append({
+      eventId: 'evt-fail',
+      sessionId: 'append-failure',
+      ts: 1,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'nope', streaming: false },
+    });
+
+    expect(projectionMocks.recordAppendedEvent).not.toHaveBeenCalled();
+  });
+
   it('falls back to JSONL for readPreferred when projection history is unavailable', async () => {
     projectionMocks.queryHistory.mockResolvedValue(null);
     const sessionId = 'fallback-session';
     const { timelineStore } = await loadStoreWithHistory([
       {
         eventId: 'evt-1',
-        sessionId: 'fallback-session',
+        sessionId,
         ts: 1,
         seq: 1,
         epoch: 1,
@@ -61,7 +92,7 @@ describe('timeline-store projection fallbacks', () => {
       },
       {
         eventId: 'evt-2',
-        sessionId: 'fallback-session',
+        sessionId,
         ts: 2,
         seq: 2,
         epoch: 1,
@@ -90,7 +121,7 @@ describe('timeline-store projection fallbacks', () => {
     const { timelineStore } = await loadStoreWithHistory([
       {
         eventId: 'evt-1',
-        sessionId: 'fallback-session',
+        sessionId,
         ts: 10,
         seq: 1,
         epoch: 7,
@@ -101,7 +132,7 @@ describe('timeline-store projection fallbacks', () => {
       },
       {
         eventId: 'evt-2',
-        sessionId: 'fallback-session',
+        sessionId,
         ts: 11,
         seq: 2,
         epoch: 7,
@@ -112,7 +143,7 @@ describe('timeline-store projection fallbacks', () => {
       },
       {
         eventId: 'evt-3',
-        sessionId: 'fallback-session',
+        sessionId,
         ts: 12,
         seq: 3,
         epoch: 7,
@@ -130,13 +161,13 @@ describe('timeline-store projection fallbacks', () => {
     expect(completed.map((event) => event.eventId)).toEqual(['evt-2', 'evt-3']);
   });
 
-  it.skip('should fall back to JSONL latest markers when the projection returns null without throwing', async () => {
+  it('falls back to JSONL latest markers when the projection returns null without throwing', async () => {
     projectionMocks.getLatest.mockResolvedValue(null);
     const sessionId = 'fallback-session';
     const { timelineStore } = await loadStoreWithHistory([
       {
         eventId: 'evt-1',
-        sessionId: 'fallback-session',
+        sessionId,
         ts: 10,
         seq: 1,
         epoch: 7,
@@ -147,7 +178,7 @@ describe('timeline-store projection fallbacks', () => {
       },
       {
         eventId: 'evt-3',
-        sessionId: 'fallback-session',
+        sessionId,
         ts: 12,
         seq: 3,
         epoch: 7,
