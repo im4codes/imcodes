@@ -241,4 +241,36 @@ describe('UsageFooter', () => {
     expect(screen.getByText(/5h 43% 2m/)).toBeDefined();
     expect(screen.getByText(/7d 34% 1d02h/)).toBeDefined();
   });
+
+  it('renders history fetch steps beneath the ctx bar while history is loading', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 2000,
+          cacheTokens: 1000,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
+        sessionName="deck_test_brain"
+        historyStatus={{
+          phase: 'bootstrap',
+          steps: {
+            cache: 'done',
+            textTail: 'running',
+            daemon: 'pending',
+            http: 'pending',
+            older: 'skipped',
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByText('session.history_loading_label')).toBeDefined();
+    expect(screen.getByText('session.history_step_cache')).toBeDefined();
+    expect(screen.getByText('session.history_step_text_tail')).toBeDefined();
+    expect(screen.getByText('session.history_step_daemon')).toBeDefined();
+    expect(container.querySelector('.session-history-progress')).toBeTruthy();
+    expect(container.querySelector('.session-history-step.running')).toBeTruthy();
+    expect(container.querySelector('.session-history-step.pending')).toBeTruthy();
+  });
 });

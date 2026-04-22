@@ -108,6 +108,7 @@ export function SessionPane({
     events: timelineEvents,
     loading: timelineLoading,
     refreshing: timelineRefreshing,
+    historyStatus,
     loadingOlder: timelineLoadingOlder,
     hasOlderHistory: timelineHasOlderHistory,
     addOptimisticUserMessage,
@@ -187,6 +188,7 @@ export function SessionPane({
   );
   const shouldShowFooter = !!(
     lastUsage
+    || historyStatus.phase !== 'idle'
     || activeThinkingTs
     || activeToolCall
     || statusText
@@ -313,6 +315,7 @@ export function SessionPane({
           statusText={statusText}
           activeToolCall={activeToolCall}
           now={thinkingNow}
+          historyStatus={historyStatus}
         />
       )}
 

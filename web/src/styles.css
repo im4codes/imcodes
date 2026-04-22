@@ -1024,6 +1024,14 @@ body {
 /* Usage footer — between chat/terminal and input controls */
 .session-usage-footer { flex-shrink: 0; padding: 4px 10px 3px; background: #0f1117; border-top: 1px solid #1e293b; }
 .session-ctx-bar { position: relative; width: 100%; height: 5px; background: #1e293b; border-radius: 3px; overflow: hidden; margin-bottom: 3px; }
+.session-history-progress { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; min-width: 0; }
+.session-history-progress-label { font-size: 9px; color: #64748b; white-space: nowrap; flex-shrink: 0; }
+.session-history-progress-steps { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; min-width: 0; }
+.session-history-step { display: inline-flex; align-items: center; gap: 3px; font-size: 9px; line-height: 1.2; color: #64748b; white-space: nowrap; }
+.session-history-step-icon { display: inline-block; width: 10px; text-align: center; color: inherit; opacity: 0.9; }
+.session-history-step.running { color: #60a5fa; }
+.session-history-step.pending { color: #94a3b8; }
+.session-history-step.done { color: #34d399; }
 .session-usage-codex-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 4px; align-items: center; }
 .session-usage-codex-quota { display: flex; flex-direction: column; align-items: flex-end; gap: 1px; margin-bottom: 2px; }
 .session-usage-codex-line { color: #64748b; font-size: 9px; line-height: 1.2; text-align: right; }
