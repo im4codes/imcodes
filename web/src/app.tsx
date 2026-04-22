@@ -100,6 +100,8 @@ import {
   shouldShowInitialConnectingGate,
 } from './server-selection.js';
 import { installNativeAppResumeRefresh } from './app-resume-refresh.js';
+import { markServerLive, markServerOffline } from './server-online-state.js';
+import { MSG_DAEMON_ONLINE, MSG_DAEMON_OFFLINE } from '@shared/ack-protocol.js';
 
 const DashboardPage = lazy(() => import('./pages/DashboardPage.js').then((m) => ({ default: m.DashboardPage })));
 const DiscussionsPage = lazy(() => import('./pages/DiscussionsPage.js').then((m) => ({ default: m.DiscussionsPage })));
@@ -1386,9 +1388,7 @@ export function App() {
         }
         setDaemonOnline(true);
         if (sessionListRetryRef.current) { clearTimeout(sessionListRetryRef.current); sessionListRetryRef.current = null; }
-        setServers((prev) => prev.map((s) =>
-          s.id === selectedServerId ? { ...s, lastHeartbeatAt: Date.now() } : s,
-        ));
+        setServers((prev) => markServerLive(prev, selectedServerId));
         const newSessions = msg.sessions.filter((s) => !s.name.startsWith('deck_sub_'));
         setSessions((prev) => newSessions.map((s) => {
           const existing = prev.find((p) => p.name === s.name);
@@ -1790,7 +1790,25 @@ export function App() {
         daemonOfflineGraceTimerRef.current = setTimeout(() => {
           daemonOfflineGraceTimerRef.current = null;
           setDaemonOnline(false);
+          setServers((prev) => markServerOffline(prev, selectedServerId));
         }, RECONNECT_GRACE_MS);
+      }
+      if (msg.type === MSG_DAEMON_ONLINE || msg.type === DAEMON_MSG.RECONNECTED) {
+        if (daemonOfflineGraceTimerRef.current) {
+          clearTimeout(daemonOfflineGraceTimerRef.current);
+          daemonOfflineGraceTimerRef.current = null;
+        }
+        setDaemonOnline(true);
+        setServers((prev) => markServerLive(prev, selectedServerId));
+      }
+      if (msg.type === MSG_DAEMON_OFFLINE) {
+        if (daemonOfflineGraceTimerRef.current) {
+          clearTimeout(daemonOfflineGraceTimerRef.current);
+          daemonOfflineGraceTimerRef.current = null;
+        }
+        setDaemonOnline(false);
+        setServers((prev) => markServerOffline(prev, selectedServerId));
+        watchProjectionStore.setSnapshotStatus('stale');
       }
       if (msg.type === 'daemon.error') {
         // Surface uncaught daemon errors as a toast so users aren't left in the dark.
