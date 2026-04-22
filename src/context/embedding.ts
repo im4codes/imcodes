@@ -6,7 +6,7 @@
  * Lazy-loaded on first call — subsequent calls reuse the pipeline.
  */
 
-import { EMBEDDING_MODEL, EMBEDDING_DTYPE, EMBEDDING_DIM, cosineSimilarity } from '../../shared/embedding-config.js';
+import { EMBEDDING_MODEL, EMBEDDING_DTYPE, EMBEDDING_DIM } from '../../shared/embedding-config.js';
 import logger from '../util/logger.js';
 
 // Re-export shared constants for backward compatibility with existing imports
