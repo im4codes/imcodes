@@ -31,6 +31,8 @@ const CLAUDE_BIN = 'claude';
 const DEFAULT_PERMISSION_MODE: PermissionMode = 'bypassPermissions';
 const CANCEL_INTERRUPT_TIMEOUT_MS = 1_500;
 const FORCE_KILL_TIMEOUT_MS = 500;
+const TRANSIENT_RETRY_DELAY_MS = 250;
+const TRANSIENT_RETRY_MAX_ATTEMPTS = 1;
 
 interface ClaudeSdkSessionState {
   routeId: string;
@@ -246,7 +248,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Claude SDK session is already busy', true);
     }
     const payload = normalizeProviderPayload(payloadOrMessage, _attachments, extraSystemPrompt);
-    await this.startQuery(sessionId, state, payload, true);
+    await this.startQuery(sessionId, state, payload, true, TRANSIENT_RETRY_MAX_ATTEMPTS);
   }
 
   async cancel(sessionId: string): Promise<void> {
@@ -270,6 +272,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     state: ClaudeSdkSessionState,
     payload: ProviderContextPayload,
     allowResumeFallback: boolean,
+    transientRetryBudget: number,
   ): Promise<void> {
     state.currentText = '';
     state.currentMessageId = null;
@@ -319,7 +322,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
 
     const q = query({ prompt: payload.assembledMessage, options: options as any });
     state.currentQuery = q;
-    void this.consumeQuery(sessionId, state, q, payload, allowResumeFallback);
+    void this.consumeQuery(sessionId, state, q, payload, allowResumeFallback, transientRetryBudget);
   }
 
   private async consumeQuery(
@@ -328,6 +331,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     q: ReturnType<typeof query>,
     payload: ProviderContextPayload,
     allowResumeFallback: boolean,
+    transientRetryBudget: number,
   ): Promise<void> {
     let pendingError: ProviderError | null = null;
     try {
@@ -345,6 +349,9 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
         ? this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Claude turn cancelled', true, err)
         : this.normalizeError(err);
     } finally {
+      const sawVisibleTurnProgress = state.currentText.length > 0
+        || state.emittedToolStates.size > 0
+        || state.toolCalls.size > 0;
       state.currentQuery = null;
       state.currentChild = null;
       const pendingComplete = state.pendingComplete;
@@ -355,7 +362,22 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       if (!pendingComplete && pendingError && allowResumeFallback && state.started && this.isMissingResumeError(pendingError.message)) {
         state.started = false;
         logger.info({ provider: this.id, sessionId, resumeId: state.resumeId }, 'Claude SDK resume failed; retrying with sessionId');
-        await this.startQuery(sessionId, state, payload, false);
+        await this.startQuery(sessionId, state, payload, false, transientRetryBudget);
+        return;
+      }
+      if (
+        !pendingComplete
+        && pendingError
+        && transientRetryBudget > 0
+        && !sawVisibleTurnProgress
+        && this.isRetryableTransientError(pendingError)
+      ) {
+        logger.info(
+          { provider: this.id, sessionId, resumeId: state.resumeId, message: pendingError.message },
+          'Claude SDK transient provider error; retrying turn once',
+        );
+        await new Promise((resolve) => setTimeout(resolve, TRANSIENT_RETRY_DELAY_MS));
+        await this.startQuery(sessionId, state, payload, allowResumeFallback, transientRetryBudget - 1);
         return;
       }
       if (pendingComplete) {
@@ -653,6 +675,19 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
 
   private isMissingResumeError(message: string): boolean {
     return /no conversation found|session .* not found|unknown session|invalid session/i.test(message);
+  }
+
+  private isRetryableTransientError(error: ProviderError): boolean {
+    if (
+      error.code === PROVIDER_ERROR_CODES.CANCELLED
+      || error.code === PROVIDER_ERROR_CODES.AUTH_FAILED
+      || error.code === PROVIDER_ERROR_CODES.CONFIG_ERROR
+      || error.code === PROVIDER_ERROR_CODES.SESSION_NOT_FOUND
+      || error.code === PROVIDER_ERROR_CODES.PROVIDER_NOT_FOUND
+    ) {
+      return false;
+    }
+    return /premature close|fetch failed|connection error|socket hang up|econnreset|etimedout|network error/i.test(error.message);
   }
 
   private makeError(code: string, message: string, recoverable: boolean, details?: unknown): ProviderError {

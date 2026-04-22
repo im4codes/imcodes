@@ -8,7 +8,6 @@ import type {
   ProjectionSessionMeta,
   ProjectionWorkerEnvelope,
   ProjectionWorkerRequestType,
-  ProjectionWorkerRequestMap,
   ProjectionWorkerResponse,
 } from './timeline-projection-types.js';
 

@@ -1,5 +1,3 @@
-import type { ToolCallEvent } from '../../../shared/agent-message.js';
-
 type CursorRecord = Record<string, unknown>;
 
 export interface CursorSessionInitEvent {
