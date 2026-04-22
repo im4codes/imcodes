@@ -7,12 +7,13 @@ import logger from '../util/logger.js';
 import type {
   ProjectionSessionMeta,
   ProjectionWorkerEnvelope,
+  ProjectionWorkerRequestMap,
   ProjectionWorkerRequestType,
   ProjectionWorkerResponse,
   TimelineProjectionQuery,
 } from './timeline-projection-types.js';
 
-export type TimelineProjectionQueryOpts = Omit<TimelineProjectionQuery, 'sessionId' | 'types'>;
+export interface TimelineProjectionQueryOpts extends Omit<TimelineProjectionQuery, 'sessionId' | 'types'> {}
 
 export interface TimelineProjectionLatest {
   epoch: number;

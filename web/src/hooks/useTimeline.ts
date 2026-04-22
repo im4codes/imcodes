@@ -440,11 +440,6 @@ export interface UseTimelineResult {
   loadOlderEvents: () => void;
 }
 
-export interface UseTimelineOptions {
-  /** Only active timeline sessions should schedule HTTP full-history backfill. */
-  isActiveSession?: boolean;
-}
-
 export type TimelineHistoryPhase = 'idle' | 'bootstrap' | 'refresh' | 'older';
 export type TimelineHistoryStepState = 'pending' | 'running' | 'done' | 'skipped';
 export type TimelineHistoryStepKey = 'cache' | 'textTail' | 'daemon' | 'http' | 'older';
@@ -484,9 +479,7 @@ export function useTimeline(
   sessionId: string | null,
   ws: WsClient | null,
   serverId?: string | null,
-  options: UseTimelineOptions = {},
 ): UseTimelineResult {
-  const isActiveSession = options.isActiveSession ?? true;
   // IDB + memory cache key: scope by serverId to prevent cross-server pollution
   // when different servers share the same session name (e.g. deck_cd_brain).
   const cacheKey = sessionId ? scopeCacheKey(serverId, sessionId) : sessionId;
@@ -529,11 +522,10 @@ export function useTimeline(
 
   useEffect(() => {
     if (!cacheKey) return;
-    if (!isActiveSession) return;
     return subscribeCache(cacheKey, (nextEvents) => {
       setEvents((prev) => (prev === nextEvents ? prev : nextEvents));
     });
-  }, [cacheKey, isActiveSession]);
+  }, [cacheKey]);
 
   // Reset on session change — but DON'T clear events when sessionId becomes null
   // (window minimized). The memory cache (eventsCache) preserves them for instant
@@ -548,8 +540,6 @@ export function useTimeline(
       resetOlderState();
       return;
     }
-
-    if (!isActiveSession) return;
 
     setRefreshing(false);
     setHttpRefreshing(false);
@@ -947,7 +937,7 @@ export function useTimeline(
    *     trigger simply tries again.
    */
   const fireHttpBackfill = useCallback((delayMs: number, opts?: { cooldownMs?: number; phase?: 'bootstrap' | 'refresh' }) => {
-    if (!serverId || !sessionId || !isActiveSession) return;
+    if (!serverId || !sessionId) return;
     const cooldownMs = opts?.cooldownMs ?? 0;
     const phase = opts?.phase ?? 'refresh';
     const backfillSessionId = sessionId;
@@ -1008,7 +998,6 @@ export function useTimeline(
   // each call, and `fireHttpBackfill` itself no-ops when either is unset.
   useEffect(() => {
     const handler = (): void => {
-      if (!isActiveSession) return;
       const now = Date.now();
       if (now - lastActiveRefreshAtRef.current < 250) return;
       lastActiveRefreshAtRef.current = now;
@@ -1016,7 +1005,7 @@ export function useTimeline(
     };
     window.addEventListener(ACTIVE_TIMELINE_REFRESH_EVENT, handler);
     return () => window.removeEventListener(ACTIVE_TIMELINE_REFRESH_EVENT, handler);
-  }, [isActiveSession]);
+  }, []);
 
   // Listen for WS messages
   useEffect(() => {
@@ -1264,7 +1253,6 @@ export function useTimeline(
       // window. If we have no local events (first connect / fresh tab) we omit
       // afterTs and get the standard recent window.
       if (msg.type === 'session.event' && (msg as { event: string }).event === 'connected') {
-        if (!isActiveSession) return;
         if (ws && sessionId) {
           setHistoryStatus({
             phase: 'refresh',

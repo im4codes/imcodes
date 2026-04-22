@@ -59,7 +59,7 @@ import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
 const AUTH_TIMEOUT_MS = 5000;
 const MAX_QUEUE_SIZE = 100;
 const MAX_BROWSER_PAYLOAD = 65536; // 64KB (subsession.rebuild_all can include many sessions)
-const BROWSER_RATE_LIMIT = 240;   // messages (desktop with pinned panels sends 30+ on init)
+const BROWSER_RATE_LIMIT = 120;   // messages (desktop with pinned panels sends 30+ on init)
 const BROWSER_RATE_WINDOW = 10_000; // 10s
 const QUEUE_MAX_BYTES = 1024 * 1024; // 1MB per (session, browser) — increased from 512KB to reduce stream_reset cascades
 
