@@ -242,6 +242,8 @@ jobs:
       - name: Prime tmux server (ensures socket dir exists)
         run: tmux new-session -d -s init && tmux kill-session -t init
       - run: npm ci
+      - name: Install web deps (active timeline refresh e2e wrapper invokes web vitest)
+        run: ./scripts/ci-npm-ci.sh web
       - name: Run pipe-pane e2e tests
         run: npx vitest run test/e2e/pipe-pane-stream.test.ts
       - name: Run other e2e tests
