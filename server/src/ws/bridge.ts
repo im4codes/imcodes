@@ -1066,6 +1066,7 @@ export class WsBridge {
 
     // ── Sub-session sync: daemon creates sub-sessions → persist to DB ────────
     if (type === 'subsession.sync' && this.db) {
+      const db = this.db;
       if (isKnownTestSessionLike({
         name: typeof msg.id === 'string' ? `deck_sub_${msg.id}` : undefined,
         cwd: typeof msg.cwd === 'string' ? msg.cwd : undefined,
@@ -1084,14 +1085,14 @@ export class WsBridge {
         const requestedType = typeof msg.sessionType === 'string' && msg.sessionType.trim()
           ? msg.sessionType.trim()
           : null;
-        const persisted = requestedType ? null : await getSubSessionById(this.db, msg.id as string, this.serverId).catch(() => null);
+        const persisted = requestedType ? null : await getSubSessionById(db, msg.id as string, this.serverId).catch(() => null);
         const sessionType = requestedType ?? persisted?.type ?? null;
         if (!sessionType) {
           logger.warn({ id: msg.id }, 'Skipping sub-session DB sync without sessionType');
           return;
         }
         await createSubSession(
-          this.db,
+          db,
           msg.id as string,
           this.serverId,
           sessionType,
