@@ -112,7 +112,7 @@ async function pollTick(sessionName: string, state: WatcherState): Promise<void>
     let sessionId = record?.opencodeSessionId;
     if (!record?.projectDir || !sessionId) return;
 
-    const recentTimeline = timelineStore.read(sessionName, { limit: 200 });
+    const recentTimeline = await timelineStore.readPreferred(sessionName, { limit: 200 });
     const hasAssistantHistory = hasAssistantLikeTimeline(recentTimeline);
     if (!hasAssistantHistory) {
       const latestUserTs = getLatestUserMessageTs(recentTimeline);

@@ -39,9 +39,9 @@ import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 import { isTransportAgent } from '../agent/detect.js';
 
 /** Get the last assistant.text from a session's timeline (for push notification context). */
-function getLastAssistantText(sessionName: string): string | undefined {
+async function getLastAssistantText(sessionName: string): Promise<string | undefined> {
   try {
-    const events = timelineStore.read(sessionName, { limit: 100 });
+    const events = await timelineStore.readByTypesPreferred(sessionName, ['assistant.text'], { limit: 100 });
     for (let i = events.length - 1; i >= 0; i--) {
       if (events[i].type === 'assistant.text') {
         const text = (events[i].payload as Record<string, unknown>)?.text;
@@ -559,7 +559,7 @@ export async function startup(): Promise<DaemonContext> {
   });
 
   for (const session of listSessions()) {
-    const history = timelineStore.read(session.name, { limit: 100 });
+    const history = await timelineStore.readPreferred(session.name, { limit: 100 });
     if (history.length === 0) continue;
     void liveContextIngestion.backfillSessionFromEvents(session.name, history).catch((err) => {
       logger.warn({ err, session: session.name }, 'Shared-context timeline backfill failed');
@@ -675,8 +675,11 @@ export async function startup(): Promise<DaemonContext> {
       if (event.type === 'session.state' && (event.payload as Record<string, unknown>).state === 'idle') {
         const rec = listSessions().find((s) => s.name === event.sessionId);
         if (rec?.agentType === 'shell' || rec?.agentType === 'script') return;
-        const lastText = getLastAssistantText(event.sessionId);
-        serverLink!.send({ type: 'timeline.event', event, ...(lastText ? { lastText } : {}) });
+        void getLastAssistantText(event.sessionId).then((lastText) => {
+          serverLink!.send({ type: 'timeline.event', event, ...(lastText ? { lastText } : {}) });
+        }).catch(() => {
+          serverLink!.send({ type: 'timeline.event', event });
+        });
       } else {
         serverLink!.sendTimelineEvent(event);
       }
@@ -727,15 +730,25 @@ export async function startup(): Promise<DaemonContext> {
         if (record?.agentType === 'shell' || record?.agentType === 'script') return;
         // notifySessionIdle is handled by the unified timeline listener below
         // Include last assistant text for push notification context
-        const lastText = getLastAssistantText(payload.session);
-        serverLink.send({
-          type: 'session.idle',
-          session: payload.session,
-          project: display.project,
-          agentType: payload.agentType,
-          ...(lastText ? { lastText } : {}),
-          ...(display.label ? { label: display.label } : {}),
-          ...(display.parentLabel ? { parentLabel: display.parentLabel } : {}),
+        void getLastAssistantText(payload.session).then((lastText) => {
+          serverLink.send({
+            type: 'session.idle',
+            session: payload.session,
+            project: display.project,
+            agentType: payload.agentType,
+            ...(lastText ? { lastText } : {}),
+            ...(display.label ? { label: display.label } : {}),
+            ...(display.parentLabel ? { parentLabel: display.parentLabel } : {}),
+          });
+        }).catch(() => {
+          serverLink.send({
+            type: 'session.idle',
+            session: payload.session,
+            project: display.project,
+            agentType: payload.agentType,
+            ...(display.label ? { label: display.label } : {}),
+            ...(display.parentLabel ? { parentLabel: display.parentLabel } : {}),
+          });
         });
       } else if (payload.event === 'notification') {
         serverLink.send({

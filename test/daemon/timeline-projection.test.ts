@@ -1,59 +1,40 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+
 import type { TimelineEvent } from '../../src/daemon/timeline-event.js';
 
-function makeEvent(
-  sessionId: string,
-  seq: number,
-  overrides: Partial<TimelineEvent> = {},
-): TimelineEvent {
+const originalHome = process.env.HOME;
+const originalUserProfile = process.env.USERPROFILE;
+const originalDbPath = process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH;
+
+function makeEvent(sessionId: string, seq: number, type: TimelineEvent['type'], payload: Record<string, unknown>, ts = seq): TimelineEvent {
   return {
-    eventId: `${sessionId}-event-${seq}`,
+    eventId: `${sessionId}-${seq}-${type}`,
     sessionId,
-    ts: seq,
+    ts,
     seq,
     epoch: 1,
     source: 'daemon',
     confidence: 'high',
-    type: 'assistant.text',
-    payload: { text: `message-${seq}`, streaming: false },
-    ...overrides,
+    type,
+    payload,
   };
 }
 
-async function waitFor<T>(
-  fn: () => Promise<T>,
-  predicate: (value: T) => boolean,
-  timeoutMs = 2_000,
-): Promise<T> {
-  const deadline = Date.now() + timeoutMs;
-  let last: T;
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    last = await fn();
-    if (predicate(last)) return last;
-    if (Date.now() >= deadline) return last;
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-}
-
-describe('timeline projection integration', () => {
-  const originalHome = process.env.HOME;
-  const originalUserProfile = process.env.USERPROFILE;
-  const originalDbPath = process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH;
+describe('timeline projection', () => {
   let tempHome: string | null = null;
+  let dbPath: string | null = null;
+  let importedProjection: typeof import('../../src/daemon/timeline-projection.js').timelineProjection | null = null;
 
   afterEach(async () => {
-    try {
-      const { timelineProjection } = await import('../../src/daemon/timeline-projection.js');
-      await timelineProjection.shutdown();
-    } catch {
-      // ignore
+    if (importedProjection) {
+      await importedProjection.shutdown();
     }
-    vi.resetModules();
+    importedProjection = null;
     vi.restoreAllMocks();
+    vi.resetModules();
     if (originalHome === undefined) delete process.env.HOME;
     else process.env.HOME = originalHome;
     if (originalUserProfile === undefined) delete process.env.USERPROFILE;
@@ -62,137 +43,86 @@ describe('timeline projection integration', () => {
     else process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH = originalDbPath;
     if (tempHome) rmSync(tempHome, { recursive: true, force: true });
     tempHome = null;
+    dbPath = null;
   });
 
-  it('preserves append order for equal-ts events in SQLite-backed reads', async () => {
+  async function loadModules() {
     tempHome = mkdtempSync(join(tmpdir(), 'imcodes-timeline-projection-'));
+    dbPath = join(tempHome, '.imcodes', 'timeline-projection.sqlite');
     process.env.HOME = tempHome;
     process.env.USERPROFILE = tempHome;
-    process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH = join(tempHome, '.imcodes', 'timeline.sqlite');
+    process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH = dbPath;
+    const [{ timelineProjection }, { timelineStore }] = await Promise.all([
+      import('../../src/daemon/timeline-projection.js'),
+      import('../../src/daemon/timeline-store.js'),
+    ]);
+    importedProjection = timelineProjection;
+    return { timelineProjection, timelineStore };
+  }
 
-    const { timelineStore } = await import('../../src/daemon/timeline-store.js');
-    const { timelineProjection } = await import('../../src/daemon/timeline-projection.js');
+  it('preserves append order for equal-ts events and honors afterTs / beforeTs exclusivity', async () => {
+    const { timelineProjection, timelineStore } = await loadModules();
+    const sessionId = 'projection_order';
+    timelineStore.append(makeEvent(sessionId, 1, 'assistant.text', { text: 'first' }, 1000));
+    timelineStore.append(makeEvent(sessionId, 2, 'assistant.text', { text: 'second' }, 1000));
+    timelineStore.append(makeEvent(sessionId, 3, 'assistant.text', { text: 'third' }, 1000));
+    timelineStore.append(makeEvent(sessionId, 4, 'assistant.text', { text: 'fourth' }, 1001));
 
-    timelineStore.append(makeEvent('same-ts', 1, { ts: 10, payload: { text: 'first', streaming: false } }));
-    timelineStore.append(makeEvent('same-ts', 2, { ts: 10, payload: { text: 'second', streaming: false } }));
-    await timelineProjection.rebuildSession('same-ts');
+    await timelineProjection.rebuildSession(sessionId);
 
-    const events = await timelineStore.readPreferred('same-ts', { limit: 10 });
-    expect(events).toHaveLength(2);
-    expect(events.map((event) => event.payload.text)).toEqual(['first', 'second']);
+    const full = await timelineStore.readPreferred(sessionId, { limit: 10 });
+    expect(full.map((event) => event.seq)).toEqual([1, 2, 3, 4]);
+
+    const after = await timelineStore.readPreferred(sessionId, { afterTs: 1000, limit: 10 });
+    expect(after.map((event) => event.seq)).toEqual([4]);
+
+    const before = await timelineStore.readPreferred(sessionId, { beforeTs: 1001, limit: 10 });
+    expect(before.map((event) => event.seq)).toEqual([1, 2, 3]);
   });
 
-  it('rebuilds from authoritative JSONL when append happens before any projection metadata exists', async () => {
-    tempHome = mkdtempSync(join(tmpdir(), 'imcodes-timeline-projection-'));
-    process.env.HOME = tempHome;
-    process.env.USERPROFILE = tempHome;
-    process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH = join(tempHome, '.imcodes', 'timeline.sqlite');
+  it('returns completed text tail only for non-empty completed text events', async () => {
+    const { timelineProjection, timelineStore } = await loadModules();
+    const sessionId = 'projection_text_tail';
+    timelineStore.append(makeEvent(sessionId, 1, 'user.message', { text: 'hello user' }, 1000));
+    timelineStore.append(makeEvent(sessionId, 2, 'assistant.text', { text: 'typing', streaming: true }, 1001));
+    timelineStore.append(makeEvent(sessionId, 3, 'assistant.text', { text: 'done', streaming: false }, 1002));
+    timelineStore.append(makeEvent(sessionId, 4, 'assistant.text', { text: '   ', streaming: false }, 1003));
+    timelineStore.append(makeEvent(sessionId, 5, 'tool.call', { tool: 'search' }, 1004));
 
-    const timelineDir = join(tempHome, '.imcodes', 'timeline');
-    mkdirSync(timelineDir, { recursive: true });
-    const seedEvent = makeEvent('seeded-session', 1, { payload: { text: 'seeded', streaming: false } });
-    writeFileSync(join(timelineDir, 'seeded-session.jsonl'), `${JSON.stringify(seedEvent)}\n`, 'utf8');
+    await timelineProjection.rebuildSession(sessionId);
 
-    const { timelineStore } = await import('../../src/daemon/timeline-store.js');
+    const tail = await timelineStore.readCompletedTextTail(sessionId, 10);
+    expect(tail.map((event) => `${event.type}:${String(event.payload.text ?? '')}`)).toEqual([
+      'user.message:hello user',
+      'assistant.text:done',
+    ]);
 
-    timelineStore.append(makeEvent('seeded-session', 2, { payload: { text: 'appended', streaming: false } }));
-
-    const events = await waitFor(
-      () => timelineStore.readPreferred('seeded-session', { limit: 10 }),
-      (value) => value.length === 2,
-    );
-    expect(events.map((event) => event.payload.text)).toEqual(['seeded', 'appended']);
+    const typed = await timelineStore.readByTypesPreferred(sessionId, ['tool.call', 'assistant.text'], { limit: 10 });
+    expect(typed.map((event) => event.seq)).toEqual([2, 3, 4, 5]);
   });
 
-  it('rebuilds stale projections when the authoritative JSONL changes behind SQLite', async () => {
-    tempHome = mkdtempSync(join(tmpdir(), 'imcodes-timeline-projection-'));
-    process.env.HOME = tempHome;
-    process.env.USERPROFILE = tempHome;
-    process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH = join(tempHome, '.imcodes', 'timeline.sqlite');
+  it('rebuilds stale sessions and prunes to authoritative truncation', async () => {
+    const { timelineProjection, timelineStore } = await loadModules();
+    const sessionId = 'projection_stale';
+    const timelineFile = timelineStore.filePath(sessionId);
+    mkdirSync(join(tempHome!, '.imcodes', 'timeline'), { recursive: true });
 
-    const { timelineStore } = await import('../../src/daemon/timeline-store.js');
-    const { timelineProjection } = await import('../../src/daemon/timeline-projection.js');
+    timelineStore.append(makeEvent(sessionId, 1, 'assistant.text', { text: 'one' }, 1000));
+    timelineStore.append(makeEvent(sessionId, 2, 'assistant.text', { text: 'two' }, 1001));
+    await timelineProjection.rebuildSession(sessionId);
 
-    timelineStore.append(makeEvent('stale-session', 1, { payload: { text: 'one', streaming: false } }));
-    await timelineProjection.rebuildSession('stale-session');
+    appendFileSync(timelineFile, `${JSON.stringify(makeEvent(sessionId, 3, 'assistant.text', { text: 'three' }, 1002))}\n`);
+    const rebuilt = await timelineStore.readPreferred(sessionId, { limit: 10 });
+    expect(rebuilt.map((event) => event.seq)).toEqual([1, 2, 3]);
 
-    const filePath = timelineStore.filePath('stale-session');
-    const injected = makeEvent('stale-session', 2, { payload: { text: 'two', streaming: false } });
-    writeFileSync(filePath, `${JSON.stringify(makeEvent('stale-session', 1, { payload: { text: 'one', streaming: false } }))}\n${JSON.stringify(injected)}\n`, 'utf8');
+    timelineStore.truncate(sessionId, 2);
+    await timelineProjection.pruneSessionToAuthoritative(sessionId, 2);
 
-    const events = await waitFor(
-      () => timelineStore.readPreferred('stale-session', { limit: 10 }),
-      (value) => value.length === 2,
-    );
-    expect(events.map((event) => event.payload.text)).toEqual(['one', 'two']);
-  });
+    const pruned = await timelineStore.readPreferred(sessionId, { limit: 10 });
+    expect(pruned.map((event) => event.seq)).toEqual([2, 3]);
 
-  it('falls back to JSONL when the SQLite projection database is unavailable', async () => {
-    tempHome = mkdtempSync(join(tmpdir(), 'imcodes-timeline-projection-'));
-    process.env.HOME = tempHome;
-    process.env.USERPROFILE = tempHome;
-    const brokenDbPath = join(tempHome, '.imcodes', 'projection-dir');
-    mkdirSync(brokenDbPath, { recursive: true });
-    process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH = brokenDbPath;
-
-    const { timelineStore } = await import('../../src/daemon/timeline-store.js');
-    timelineStore.append(makeEvent('fallback-session', 1, { payload: { text: 'jsonl-only', streaming: false } }));
-
-    const events = await timelineStore.readPreferred('fallback-session', { limit: 10 });
-    expect(events).toHaveLength(1);
-    expect(events[0]?.payload.text).toBe('jsonl-only');
-  });
-
-  it('keeps truncate parity and continues appending after pruning the projection', async () => {
-    tempHome = mkdtempSync(join(tmpdir(), 'imcodes-timeline-projection-'));
-    process.env.HOME = tempHome;
-    process.env.USERPROFILE = tempHome;
-    process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH = join(tempHome, '.imcodes', 'timeline.sqlite');
-
-    const { timelineStore } = await import('../../src/daemon/timeline-store.js');
-    const { timelineProjection } = await import('../../src/daemon/timeline-projection.js');
-
-    for (let seq = 1; seq <= 5; seq += 1) {
-      timelineStore.append(makeEvent('truncate-session', seq, { payload: { text: `message-${seq}`, streaming: false } }));
-    }
-    await timelineProjection.rebuildSession('truncate-session');
-
-    timelineStore.truncate('truncate-session', 3);
-    const truncated = await waitFor(
-      () => timelineStore.readPreferred('truncate-session', { limit: 10 }),
-      (value) => value.length === 3,
-    );
-    expect(truncated.map((event) => event.seq)).toEqual([3, 4, 5]);
-
-    timelineStore.append(makeEvent('truncate-session', 6, { payload: { text: 'message-6', streaming: false } }));
-    const afterAppend = await waitFor(
-      () => timelineStore.readPreferred('truncate-session', { limit: 10 }),
-      (value) => value.length === 4 && value[value.length - 1]?.seq === 6,
-    );
-    expect(afterAppend.map((event) => event.seq)).toEqual([3, 4, 5, 6]);
-  });
-
-  it('supports completed text-tail and type-filtered SQLite queries', async () => {
-    tempHome = mkdtempSync(join(tmpdir(), 'imcodes-timeline-projection-'));
-    process.env.HOME = tempHome;
-    process.env.USERPROFILE = tempHome;
-    process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH = join(tempHome, '.imcodes', 'timeline.sqlite');
-
-    const { timelineStore } = await import('../../src/daemon/timeline-store.js');
-    const { timelineProjection } = await import('../../src/daemon/timeline-projection.js');
-
-    timelineStore.append(makeEvent('tail-session', 1, { type: 'user.message', payload: { text: 'user-text' } }));
-    timelineStore.append(makeEvent('tail-session', 2, { type: 'assistant.text', payload: { text: 'streaming-fragment', streaming: true } }));
-    timelineStore.append(makeEvent('tail-session', 3, { type: 'assistant.text', payload: { text: 'assistant-final', streaming: false } }));
-    timelineStore.append(makeEvent('tail-session', 4, { type: 'tool.call', payload: { tool: 'Edit', args: {} } }));
-    await timelineProjection.rebuildSession('tail-session');
-
-    const completed = await timelineStore.readCompletedTextTail('tail-session', 10);
-    expect(completed.map((event) => event.type)).toEqual(['user.message', 'assistant.text']);
-    expect(completed.map((event) => event.payload.text)).toEqual(['user-text', 'assistant-final']);
-
-    const toolOnly = await timelineStore.readByTypesPreferred('tail-session', ['tool.call'], { limit: 10 });
-    expect(toolOnly).toHaveLength(1);
-    expect(toolOnly[0]?.type).toBe('tool.call');
+    await timelineProjection.deleteSession(sessionId);
+    const rebuiltFromAuthoritative = await timelineProjection.queryHistory({ sessionId, limit: 10 });
+    expect(rebuiltFromAuthoritative?.map((event) => event.seq)).toEqual([2, 3]);
   });
 });

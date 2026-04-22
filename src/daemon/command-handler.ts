@@ -2893,7 +2893,7 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
   // Do NOT filter by epoch — history should include events across daemon restarts.
   const readLimit = Math.min(limit * 6, 10000);
   const tRead0 = Date.now();
-  const events = timelineStore.read(sessionName, { limit: readLimit, afterTs, beforeTs });
+  const events = await timelineStore.readPreferred(sessionName, { limit: readLimit, afterTs, beforeTs });
   readMs = Date.now() - tRead0;
 
   // Content-aware limit: session.state events don't count toward the budget.

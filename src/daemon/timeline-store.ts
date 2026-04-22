@@ -9,8 +9,9 @@ import { join } from 'path';
 import { homedir } from 'os';
 import type { TimelineEvent } from './timeline-event.js';
 import logger from '../util/logger.js';
+import { timelineProjection, type TimelineProjectionQueryOpts } from './timeline-projection.js';
 
-const TIMELINE_DIR = join(homedir(), '.imcodes', 'timeline');
+export const TIMELINE_DIR = join(homedir(), '.imcodes', 'timeline');
 const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const MAX_EVENTS_PER_FILE = 5000;
 
@@ -18,7 +19,7 @@ const MAX_EVENTS_PER_FILE = 5000;
  * Read the last N lines from a file by reading backward from the end in chunks.
  * Much faster than readFileSync + split for large files when only tail is needed.
  */
-function readTailLines(filePath: string, maxLines: number): string[] {
+export function readTailLines(filePath: string, maxLines: number): string[] {
   let fd: number;
   try {
     fd = openSync(filePath, 'r');
@@ -73,7 +74,7 @@ class TimelineStore {
     this.initialized = true;
   }
 
-  private filePath(sessionName: string): string {
+  filePath(sessionName: string): string {
     // Sanitize session name for filesystem
     const safe = sessionName.replace(/[^a-zA-Z0-9_-]/g, '_');
     return join(TIMELINE_DIR, `${safe}.jsonl`);
@@ -84,6 +85,9 @@ class TimelineStore {
     this.ensureDir();
     try {
       appendFileSync(this.filePath(event.sessionId), JSON.stringify(event) + '\n');
+      void timelineProjection.recordAppendedEvent(event).catch((err) => {
+        logger.debug({ err, sessionId: event.sessionId, eventId: event.eventId }, 'TimelineProjection: append mirror failed');
+      });
     } catch (err) {
       logger.debug({ err, sessionId: event.sessionId }, 'TimelineStore: append failed');
     }
@@ -122,6 +126,52 @@ class TimelineStore {
     return events.reverse(); // restore ts order
   }
 
+  async readPreferred(
+    sessionName: string,
+    opts?: { afterTs?: number; beforeTs?: number; limit?: number },
+  ): Promise<TimelineEvent[]> {
+    const projected = await timelineProjection.queryHistory({
+      sessionId: sessionName,
+      afterTs: opts?.afterTs,
+      beforeTs: opts?.beforeTs,
+      limit: opts?.limit,
+    });
+    if (projected) return projected;
+    return this.read(sessionName, opts);
+  }
+
+  async readByTypesPreferred(
+    sessionName: string,
+    types: TimelineEvent['type'][],
+    opts?: TimelineProjectionQueryOpts,
+  ): Promise<TimelineEvent[]> {
+    const projected = await timelineProjection.queryByTypes({
+      sessionId: sessionName,
+      types,
+      afterTs: opts?.afterTs,
+      beforeTs: opts?.beforeTs,
+      limit: opts?.limit,
+    });
+    if (projected) return projected;
+    return this.read(sessionName, opts).filter((event) => types.includes(event.type));
+  }
+
+  async readCompletedTextTail(sessionName: string, limit = 50): Promise<TimelineEvent[]> {
+    const projected = await timelineProjection.queryCompletedTextTail(sessionName, limit);
+    if (projected) return projected;
+    return this.read(sessionName, { limit: Math.max(limit * 6, 500) }).filter((event) => {
+      if (event.type === 'user.message') {
+        return typeof event.payload?.text === 'string' && event.payload.text.trim().length > 0;
+      }
+      if (event.type === 'assistant.text') {
+        return event.payload?.streaming !== true
+          && typeof event.payload?.text === 'string'
+          && event.payload.text.trim().length > 0;
+      }
+      return false;
+    }).slice(-limit);
+  }
+
   /**
    * Get the latest epoch and seq for a session (from the last line).
    */
@@ -137,6 +187,16 @@ class TimelineStore {
     return null;
   }
 
+  async getLatestPreferred(sessionName: string): Promise<{ epoch: number; seq: number } | null> {
+    try {
+      const projected = await timelineProjection.getLatest(sessionName);
+      if (projected) return projected;
+    } catch {
+      // fall through to JSONL
+    }
+    return this.getLatest(sessionName);
+  }
+
   /**
    * Truncate old events from a session file, keeping only the last N events.
    */
@@ -148,6 +208,9 @@ class TimelineStore {
     const kept = newestFirst.slice(0, keepLast).reverse();
     try {
       writeFileSync(filePath, kept.join('\n') + '\n');
+      void timelineProjection.pruneSessionToAuthoritative(sessionName, keepLast).catch((err) => {
+        logger.debug({ err, sessionName }, 'TimelineProjection: prune after truncate failed');
+      });
       logger.info({ sessionName, after: kept.length }, 'TimelineStore: truncated');
     } catch (err) {
       logger.debug({ err, sessionName }, 'TimelineStore: truncate write failed');
@@ -185,6 +248,10 @@ class TimelineStore {
           const stat = statSync(fullPath);
           if (now - stat.mtimeMs > MAX_AGE_MS) {
             unlinkSync(fullPath);
+            const sessionName = file.replace('.jsonl', '');
+            void timelineProjection.deleteSession(sessionName).catch((err) => {
+              logger.debug({ err, sessionName }, 'TimelineProjection: delete after cleanup failed');
+            });
             logger.info({ file }, 'TimelineStore: deleted old file');
           }
         } catch { /* skip */ }
@@ -192,6 +259,9 @@ class TimelineStore {
     } catch (err) {
       logger.debug({ err }, 'TimelineStore: cleanup failed');
     }
+    void timelineProjection.checkpointIfNeeded().catch((err) => {
+      logger.debug({ err }, 'TimelineProjection: cleanup checkpoint failed');
+    });
   }
 }
 
