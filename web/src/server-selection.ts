@@ -3,8 +3,20 @@ export interface SelectableServerInfo {
   name: string;
 }
 
+export interface OnlineServerInfo extends SelectableServerInfo {
+  status: string;
+  lastHeartbeatAt: number | null;
+}
+
 export interface NamedSessionInfo {
   name: string;
+}
+
+export function isServerOnline(server: Pick<OnlineServerInfo, 'status' | 'lastHeartbeatAt'> | null | undefined): boolean {
+  if (!server) return false;
+  if (server.status === 'offline') return false;
+  if (!server.lastHeartbeatAt) return false;
+  return Date.now() - server.lastHeartbeatAt < 60_000;
 }
 
 export function hasSelectedServer(
@@ -49,4 +61,18 @@ export function hasResolvedActiveSession(
 ): boolean {
   if (!activeSession) return false;
   return sessions.some((session) => session.name === activeSession);
+}
+
+export type DaemonBadgeState = 'online' | 'connecting' | 'offline';
+
+export function getDaemonBadgeState(
+  connected: boolean,
+  connecting: boolean,
+  daemonOnline: boolean,
+  selectedServer: Pick<OnlineServerInfo, 'status' | 'lastHeartbeatAt'> | null | undefined,
+): DaemonBadgeState {
+  if (connected) {
+    return daemonOnline || isServerOnline(selectedServer) ? 'online' : 'offline';
+  }
+  return connecting ? 'connecting' : 'offline';
 }

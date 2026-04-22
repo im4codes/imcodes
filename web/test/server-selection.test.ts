@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  getDaemonBadgeState,
   getSelectedServerName,
   hasResolvedActiveSession,
   hasSelectedServer,
+  isServerOnline,
   shouldResetSelectedServer,
   shouldShowInitialConnectingGate,
 } from '../src/server-selection.js';
@@ -83,5 +85,55 @@ describe('hasResolvedActiveSession', () => {
       { name: 'deck_proj_brain' },
       { name: 'deck_proj_w1' },
     ])).toBe(true);
+  });
+});
+
+describe('isServerOnline', () => {
+  it('returns true for a recent non-offline heartbeat', () => {
+    expect(isServerOnline({
+      id: 'srv-1',
+      name: 'Server One',
+      status: 'online',
+      lastHeartbeatAt: Date.now() - 5_000,
+    })).toBe(true);
+  });
+
+  it('returns false for explicit offline or stale heartbeats', () => {
+    expect(isServerOnline({
+      id: 'srv-1',
+      name: 'Server One',
+      status: 'offline',
+      lastHeartbeatAt: Date.now(),
+    })).toBe(false);
+    expect(isServerOnline({
+      id: 'srv-1',
+      name: 'Server One',
+      status: 'online',
+      lastHeartbeatAt: Date.now() - 61_000,
+    })).toBe(false);
+  });
+});
+
+describe('getDaemonBadgeState', () => {
+  it('stays online when the selected server heartbeat still proves the daemon is up', () => {
+    expect(getDaemonBadgeState(true, false, false, {
+      id: 'srv-1',
+      name: 'Server One',
+      status: 'online',
+      lastHeartbeatAt: Date.now() - 5_000,
+    })).toBe('online');
+  });
+
+  it('falls back to offline only when both websocket state and server heartbeat say offline', () => {
+    expect(getDaemonBadgeState(true, false, false, {
+      id: 'srv-1',
+      name: 'Server One',
+      status: 'offline',
+      lastHeartbeatAt: Date.now() - 61_000,
+    })).toBe('offline');
+  });
+
+  it('uses connecting when the browser websocket itself is still reconnecting', () => {
+    expect(getDaemonBadgeState(false, true, false, null)).toBe('connecting');
   });
 });

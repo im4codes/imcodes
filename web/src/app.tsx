@@ -92,8 +92,10 @@ import { pickReadableSessionDisplay } from '@shared/session-display.js';
 import { updateMainSessionLabel } from './session-label-api.js';
 import { buildDocumentTitle } from './tab-title.js';
 import {
+  getDaemonBadgeState,
   getSelectedServerName,
   hasResolvedActiveSession,
+  isServerOnline,
   shouldResetSelectedServer,
   shouldShowInitialConnectingGate,
 } from './server-selection.js';
@@ -164,12 +166,6 @@ interface ServerInfo {
   status: string;
   lastHeartbeatAt: number | null;
   createdAt: number;
-}
-
-function isServerOnline(s: ServerInfo): boolean {
-  if (s.status === 'offline') return false;
-  if (!s.lastHeartbeatAt) return false;
-  return Date.now() - s.lastHeartbeatAt < 60_000; // 60s — heartbeat is 5s, allow for network jitter
 }
 
 export function App() {
@@ -2582,6 +2578,10 @@ export function App() {
     sessionsLoaded,
   );
   const resolvedActiveSessionExists = hasResolvedActiveSession(activeSession, sessions);
+  const selectedServerInfo = selectedServerId
+    ? servers.find((server) => server.id === selectedServerId) ?? null
+    : null;
+  const daemonBadgeState = getDaemonBadgeState(connected, connecting, daemonOnline, selectedServerInfo);
 
   useEffect(() => {
     if (showInitialConnectingGate) {
@@ -2884,8 +2884,12 @@ export function App() {
                   </button>
                 )}
                 <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 0, lineHeight: 1.2 }}>
-                  <span class={`badge ${connected ? (daemonOnline ? 'badge-online' : 'badge-connecting') : connecting ? 'badge-connecting' : 'badge-offline'}`} style={{ fontSize: 10 }}>
-                    {connected ? (daemonOnline ? '● Online' : (<><span class="connecting-dot" />{' Daemon Offline'}</>)) : connecting ? (<><span class="connecting-dot" />{' Connecting'}</>) : '○ Offline'}
+                  <span class={`badge ${daemonBadgeState === 'online' ? 'badge-online' : daemonBadgeState === 'connecting' ? 'badge-connecting' : 'badge-offline'}`} style={{ fontSize: 10 }}>
+                    {daemonBadgeState === 'online'
+                      ? '● Online'
+                      : daemonBadgeState === 'connecting'
+                        ? (<><span class="connecting-dot" />{' Connecting'}</>)
+                        : (<><span class="connecting-dot" />{' Daemon Offline'}</>)}
                   </span>
                   <span style={{ fontSize: 9, color: '#475569' }}>
                     {(() => { try { const d = new Date(__BUILD_TIME__); return `v${d.getMonth()+1}/${d.getDate()} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`; } catch { return ''; } })()}
