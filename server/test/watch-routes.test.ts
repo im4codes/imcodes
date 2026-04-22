@@ -9,6 +9,7 @@ const mockGetDbSessionsByServer = vi.fn();
 const mockGetSubSessionsByServer = vi.fn();
 const mockGetUserPref = vi.fn();
 const mockGetSessionTextTailCache = vi.fn();
+const mockReplaceSessionTextTailCache = vi.fn();
 const mockRequestTimelineHistory = vi.fn();
 const mockGetRecentText = vi.fn();
 const mockGetRecentTextForWatch = vi.fn();
@@ -26,14 +27,19 @@ vi.mock('../src/security/authorization.js', () => ({
   resolveServerRole: (...args: unknown[]) => mockResolveServerRole(...args as []),
 }));
 
-vi.mock('../src/db/queries.js', () => ({
-  getServersByUserId: (...args: unknown[]) => mockGetServersByUserId(...args),
-  getDbSessionsByServer: (...args: unknown[]) => mockGetDbSessionsByServer(...args),
-  getSubSessionsByServer: (...args: unknown[]) => mockGetSubSessionsByServer(...args),
-  getUserPref: (...args: unknown[]) => mockGetUserPref(...args),
-  getSessionTextTailCache: (...args: unknown[]) => mockGetSessionTextTailCache(...args),
-  getServerById: vi.fn(async () => ({ id: 'srv-1' })),
-}));
+vi.mock('../src/db/queries.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/db/queries.js')>();
+  return {
+    ...actual,
+    getServersByUserId: (...args: unknown[]) => mockGetServersByUserId(...args),
+    getDbSessionsByServer: (...args: unknown[]) => mockGetDbSessionsByServer(...args),
+    getSubSessionsByServer: (...args: unknown[]) => mockGetSubSessionsByServer(...args),
+    getUserPref: (...args: unknown[]) => mockGetUserPref(...args),
+    getSessionTextTailCache: (...args: unknown[]) => mockGetSessionTextTailCache(...args),
+    replaceSessionTextTailCache: (...args: unknown[]) => mockReplaceSessionTextTailCache(...args),
+    getServerById: vi.fn(async () => ({ id: 'srv-1' })),
+  };
+});
 
 vi.mock('../src/ws/bridge.js', () => ({
   WsBridge: {
@@ -94,6 +100,7 @@ describe('Watch routes', () => {
     mockGetSubSessionsByServer.mockResolvedValue([]);
     mockGetUserPref.mockResolvedValue(null);
     mockGetSessionTextTailCache.mockResolvedValue([]);
+    mockReplaceSessionTextTailCache.mockResolvedValue(undefined);
     mockGetRecentText.mockReturnValue([]);
     mockGetRecentTextForWatch.mockResolvedValue([]);
     mockGetActiveMainSessions.mockReturnValue([]);
@@ -358,6 +365,41 @@ describe('Watch routes', () => {
     });
   });
 
+  it('GET /api/server/:id/timeline/text-tail backfills missing recent text from daemon history and rewrites cache', async () => {
+    mockGetSessionTextTailCache.mockResolvedValue([
+      { eventId: 'e-old', ts: 100, type: 'user.message', text: 'old cached' },
+    ]);
+    mockRequestTimelineHistory.mockResolvedValue({
+      epoch: 1,
+      events: [
+        { eventId: 'e-old', sessionId: 'deck_proj_brain', ts: 100, type: 'user.message', payload: { text: 'old cached' } },
+        { eventId: 'e-new', sessionId: 'deck_proj_brain', ts: 200, type: 'assistant.text', payload: { text: 'new live text' } },
+        { eventId: 'e-stream', sessionId: 'deck_proj_brain', ts: 210, type: 'assistant.text', payload: { text: 'ignore me', streaming: true } },
+      ],
+    });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/text-tail?sessionName=deck_proj_brain');
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      sessionName: 'deck_proj_brain',
+      events: [
+        { eventId: 'e-old', ts: 100, type: 'user.message', text: 'old cached' },
+        { eventId: 'e-new', ts: 200, type: 'assistant.text', text: 'new live text' },
+      ],
+    });
+    expect(mockReplaceSessionTextTailCache).toHaveBeenCalledWith(
+      expect.anything(),
+      'srv-1',
+      'deck_proj_brain',
+      [
+        { eventId: 'e-old', ts: 100, type: 'user.message', text: 'old cached' },
+        { eventId: 'e-new', ts: 200, type: 'assistant.text', text: 'new live text' },
+      ],
+    );
+  });
+
   it('GET /api/server/:id/timeline/text-tail returns empty list when no cache exists', async () => {
     mockGetSessionTextTailCache.mockResolvedValue([]);
 
@@ -379,6 +421,23 @@ describe('Watch routes', () => {
 
     expect(res.status).toBe(500);
     await expect(res.json()).resolves.toEqual({ error: 'cache_read_failed' });
+  });
+
+  it('GET /api/server/:id/timeline/text-tail falls back to cached entries when daemon history backfill fails', async () => {
+    mockGetSessionTextTailCache.mockResolvedValue([
+      { eventId: 'e1', ts: 100, type: 'user.message', text: 'cached only' },
+    ]);
+    mockRequestTimelineHistory.mockRejectedValue(new Error('daemon_offline'));
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/text-tail?sessionName=deck_proj_brain');
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      sessionName: 'deck_proj_brain',
+      events: [{ eventId: 'e1', ts: 100, type: 'user.message', text: 'cached only' }],
+    });
+    expect(mockReplaceSessionTextTailCache).not.toHaveBeenCalled();
   });
 
   it('watch routes return 403 when the user has no access to the server', async () => {

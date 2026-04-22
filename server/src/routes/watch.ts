@@ -1,6 +1,15 @@
 import { Hono } from 'hono';
 import type { Env } from '../env.js';
-import { getServersByUserId, getDbSessionsByServer, getSubSessionsByServer, getUserPref, getSessionTextTailCache } from '../db/queries.js';
+import {
+  getServersByUserId,
+  getDbSessionsByServer,
+  getSubSessionsByServer,
+  getUserPref,
+  getSessionTextTailCache,
+  collectSessionTextTailCacheItems,
+  mergeSessionTextTailCacheItems,
+  replaceSessionTextTailCache,
+} from '../db/queries.js';
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { WsBridge } from '../ws/bridge.js';
 import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
@@ -8,6 +17,7 @@ import { getPodIdentity } from '../util/pod-identity.js';
 import logger from '../util/logger.js';
 
 export const watchRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
+const TEXT_TAIL_HISTORY_BACKFILL_LIMIT = 400;
 
 type WatchSessionState = 'working' | 'idle' | 'error' | 'stopped';
 
@@ -367,7 +377,31 @@ watchRoutes.get('/server/:id/timeline/text-tail', requireAuth(), async (c) => {
   if (!sessionName) return c.json({ error: 'session_name_required' }, 400);
 
   try {
-    const events = await getSessionTextTailCache(c.env.DB, serverId, sessionName);
+    const cached = await getSessionTextTailCache(c.env.DB, serverId, sessionName);
+    let events = cached;
+    try {
+      const response = await WsBridge.get(serverId).requestTimelineHistory({
+        sessionName,
+        limit: TEXT_TAIL_HISTORY_BACKFILL_LIMIT,
+        timeoutMs: 1500,
+      });
+      const live = collectSessionTextTailCacheItems(
+        sessionName,
+        Array.isArray(response.events) ? response.events : [],
+      );
+      if (live.length > 0) {
+        events = mergeSessionTextTailCacheItems(cached, live);
+        if (JSON.stringify(events) !== JSON.stringify(cached)) {
+          await replaceSessionTextTailCache(c.env.DB, serverId, sessionName, events);
+        }
+      }
+    } catch (err) {
+      logger.info({
+        serverId,
+        sessionName,
+        err: err instanceof Error ? err.message : String(err),
+      }, 'timeline.text-tail backfill skipped');
+    }
     c.header(IMCODES_POD_HEADER, getPodIdentity());
     return c.json({ sessionName, events });
   } catch (err) {

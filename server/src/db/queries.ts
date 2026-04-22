@@ -185,6 +185,22 @@ function mergeSessionTextTailCacheEvents(
     : merged;
 }
 
+export function mergeSessionTextTailCacheItems(
+  existing: SessionTextTailCacheItem[],
+  incoming: SessionTextTailCacheItem[],
+): SessionTextTailCacheItem[] {
+  const deduped = new Map<string, SessionTextTailCacheItem>();
+  for (const item of existing) deduped.set(item.eventId, item);
+  for (const item of incoming) deduped.set(item.eventId, item);
+  const merged = [...deduped.values()].sort((a, b) => {
+    if (a.ts !== b.ts) return a.ts - b.ts;
+    return a.eventId.localeCompare(b.eventId);
+  });
+  return merged.length > SESSION_TEXT_TAIL_CACHE_LIMIT
+    ? merged.slice(merged.length - SESSION_TEXT_TAIL_CACHE_LIMIT)
+    : merged;
+}
+
 export function classifySessionTextTailEvent(rawEvent: Record<string, unknown>): ClassifiedSessionTextTailEvent | null {
   const sessionName = typeof rawEvent.sessionId === 'string' ? rawEvent.sessionId : null;
   const eventId = typeof rawEvent.eventId === 'string' ? rawEvent.eventId : null;
@@ -201,6 +217,20 @@ export function classifySessionTextTailEvent(rawEvent: Record<string, unknown>):
   if (typeof rawEvent.source === 'string' && rawEvent.source.trim()) item.source = rawEvent.source.trim();
   if (typeof rawEvent.confidence === 'string' && rawEvent.confidence.trim()) item.confidence = rawEvent.confidence.trim();
   return { sessionName, item };
+}
+
+export function collectSessionTextTailCacheItems(
+  sessionName: string,
+  rawEvents: unknown[],
+): SessionTextTailCacheItem[] {
+  const items: SessionTextTailCacheItem[] = [];
+  for (const raw of rawEvents) {
+    if (!raw || typeof raw !== 'object') continue;
+    const classified = classifySessionTextTailEvent(raw as Record<string, unknown>);
+    if (!classified || classified.sessionName !== sessionName) continue;
+    items.push(classified.item);
+  }
+  return mergeSessionTextTailCacheItems([], items);
 }
 
 // ── Users ─────────────────────────────────────────────────────────────────
@@ -692,6 +722,23 @@ export async function getSessionTextTailCache(
   return events.length > SESSION_TEXT_TAIL_CACHE_LIMIT
     ? events.slice(events.length - SESSION_TEXT_TAIL_CACHE_LIMIT)
     : events;
+}
+
+export async function replaceSessionTextTailCache(
+  db: Database,
+  serverId: string,
+  sessionName: string,
+  events: SessionTextTailCacheItem[],
+): Promise<void> {
+  const bounded = mergeSessionTextTailCacheItems([], events);
+  const latestTs = bounded.length > 0 ? bounded[bounded.length - 1]!.ts : null;
+  await db.execute(
+    `INSERT INTO session_text_tail_cache (server_id, session_name, events, latest_ts, updated_at)
+     VALUES ($1, $2, $3::jsonb, $4, NOW())
+     ON CONFLICT (server_id, session_name)
+     DO UPDATE SET events = EXCLUDED.events, latest_ts = EXCLUDED.latest_ts, updated_at = NOW()`,
+    [serverId, sessionName, JSON.stringify(bounded), latestTs],
+  );
 }
 
 // ── Quick data ────────────────────────────────────────────────────────────
