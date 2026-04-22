@@ -13,7 +13,7 @@ import { timelineEmitter } from './timeline-emitter.js';
 import { timelineStore } from './timeline-store.js';
 import type { MemoryContextTimelinePayload } from '../shared/timeline/types.js';
 import { emitSessionInlineError } from './session-error.js';
-import { enqueueResend, getResendEntries, getResendCount, clearResend } from './transport-resend-queue.js';
+import { enqueueResend, getResendEntries, clearResend } from './transport-resend-queue.js';
 import {
   startSubSession,
   stopSubSession,
@@ -78,7 +78,6 @@ import { getSavedP2pConfig, upsertSavedP2pConfig } from '../store/p2p-config-sto
 import { getProcessedProjectionStats, queryPendingContextEvents, queryProcessedProjections, recordMemoryHits } from '../store/context-store.js';
 import {
   isKnownTestProjectName,
-  isKnownTestSessionLike,
   isKnownTestSessionName,
 } from '../../shared/test-session-guard.js';
 import {
