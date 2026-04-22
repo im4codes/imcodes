@@ -88,7 +88,7 @@ describe('native app resume refresh chain', () => {
 
     await act(async () => {
       appStateListener?.({ isActive: true });
-      await vi.advanceTimersByTimeAsync(10);
+      await vi.advanceTimersByTimeAsync(100);
     });
 
     expect(reconnectNow).toHaveBeenCalledWith(true);
@@ -96,10 +96,85 @@ describe('native app resume refresh chain', () => {
     expect(fetchSpy).toHaveBeenCalledWith(
       serverId,
       sessionName,
-      expect.objectContaining({ afterTs: 1000 }),
+      expect.objectContaining({ afterTs: 999 }),
     );
 
     removeListener();
     expect(removeSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('native resume still refreshes after the timeline remounts in the same resume window', async () => {
+    const sessionName = `deck_resume_remount_${Date.now()}`;
+    const serverId = `srv-remount-${Date.now()}`;
+    const reconnectNow = vi.fn();
+    let appStateListener: ((state: { isActive: boolean }) => void) | null = null;
+
+    fetchSpy.mockResolvedValue({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-seed`,
+      sessionId: sessionName,
+      ts: 1000,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'seed' },
+    }, serverId);
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineHistoryRequest: vi.fn(() => 'history-resume-remount'),
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, ws, serverId);
+      return h('div', { 'data-testid': 'probe' }, String(events.length));
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const first = render(h(Probe));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('1');
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    first.unmount();
+    fetchSpy.mockClear();
+
+    await installNativeAppResumeRefresh(
+      true,
+      reconnectNow,
+      {
+        addListener: async (_eventName, listener) => {
+          appStateListener = listener;
+          return { remove: vi.fn() };
+        },
+      },
+    );
+
+    await act(async () => {
+      appStateListener?.({ isActive: true });
+    });
+
+    render(h(Probe));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('1');
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+    });
+
+    expect(reconnectNow).toHaveBeenCalledWith(true);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledWith(
+      serverId,
+      sessionName,
+      expect.objectContaining({ afterTs: 999 }),
+    );
   });
 });

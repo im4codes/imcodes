@@ -1,4 +1,4 @@
-import { dispatchActiveTimelineRefresh } from './hooks/useTimeline.js';
+import { requestActiveTimelineRefresh } from './hooks/useTimeline.js';
 
 export interface NativeAppStateApi {
   addListener(
@@ -16,7 +16,7 @@ export async function installNativeAppResumeRefresh(
   const handle = await appApi.addListener('appStateChange', ({ isActive }) => {
     if (!isActive) return;
     reconnectNow(true);
-    dispatchActiveTimelineRefresh();
+    requestActiveTimelineRefresh({ resetCooldowns: true });
   });
   return () => {
     const result = handle.remove();

@@ -76,6 +76,18 @@ export function dispatchActiveTimelineRefresh(): void {
   try { window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT)); } catch { /* ignore */ }
 }
 
+export function requestActiveTimelineRefresh(options?: { resetCooldowns?: boolean }): void {
+  if (typeof window === 'undefined') return;
+  if (options?.resetCooldowns) resetBackfillCooldowns();
+  dispatchActiveTimelineRefresh();
+  const fireLater = (): void => dispatchActiveTimelineRefresh();
+  if (typeof window.requestAnimationFrame === 'function') {
+    window.requestAnimationFrame(() => window.requestAnimationFrame(fireLater));
+    return;
+  }
+  window.setTimeout(fireLater, 32);
+}
+
 // On every visibility transition we record when the document went hidden;
 // on the return-to-visible side we clear the mount cooldown and emit a
 // refresh request so the mounted timeline for the active session can
@@ -115,6 +127,7 @@ const MAX_HISTORY_EVENTS = 2000;
 const MAX_CACHED_SESSIONS = 12;
 const MAX_TOTAL_CACHED_EVENTS = 12_000;
 const ECHO_WINDOW_MS = 500;
+const TIMELINE_HISTORY_AFTER_TS_OVERLAP_MS = 1;
 // Dedup window for user.message from JSONL vs web-UI-sent: JSONL watcher polls every 2s,
 // so the same message can arrive twice (once from command-handler, once from JSONL).
 // 5s is enough to catch the JSONL delay without hiding legitimate repeated messages.
@@ -338,6 +351,19 @@ export function __clearPersistedTimelineSnapshotsForTests(): void {
   } catch {
     // ignore
   }
+}
+
+function getTimelineHistoryAfterTs(events: TimelineEvent[]): number | undefined {
+  let maxTs: number | undefined;
+  for (const ev of events) {
+    // Pending optimistic bubbles carry `ts = Date.now()` from the client
+    // clock — exclude them so a skewed client clock can't accidentally
+    // filter out legitimately-missed server events.
+    if (ev.type === 'user.message' && (ev as { payload?: { pending?: boolean } }).payload?.pending) continue;
+    if (typeof ev.ts === 'number' && (maxTs === undefined || ev.ts > maxTs)) maxTs = ev.ts;
+  }
+  if (maxTs === undefined) return undefined;
+  return Math.max(0, maxTs - TIMELINE_HISTORY_AFTER_TS_OVERLAP_MS);
 }
 
 export function __getTimelineCacheKeysForTests(): string[] {
@@ -764,14 +790,7 @@ export function useTimeline(
       // Recompute the cursor at fire time, not call time — the UI may have
       // received fresh WS events during the delay window and we don't want
       // to redownload them.
-      let afterTs: number | undefined;
-      for (const ev of eventsRef.current) {
-        // Pending optimistic bubbles carry `ts = Date.now()` from the client
-        // clock — exclude them so a skewed client clock can't accidentally
-        // filter out legitimately-missed server events.
-        if (ev.type === 'user.message' && (ev as { payload?: { pending?: boolean } }).payload?.pending) continue;
-        if (typeof ev.ts === 'number' && (afterTs === undefined || ev.ts > afterTs)) afterTs = ev.ts;
-      }
+      const afterTs = getTimelineHistoryAfterTs(eventsRef.current);
       httpBackfillInFlightRef.current += 1;
       setHttpRefreshing(true);
       void fetchTimelineHistoryHttp(serverId, backfillSessionId, {
@@ -802,6 +821,7 @@ export function useTimeline(
   // mount effect to re-run on every render.
   const fireHttpBackfillRef = useRef(fireHttpBackfill);
   fireHttpBackfillRef.current = fireHttpBackfill;
+  const lastActiveRefreshAtRef = useRef(0);
 
   // Force-refresh the active session when the app comes back to the
   // foreground or a push-notification is tapped. Listener is intentionally
@@ -815,6 +835,9 @@ export function useTimeline(
   // each call, and `fireHttpBackfill` itself no-ops when either is unset.
   useEffect(() => {
     const handler = (): void => {
+      const now = Date.now();
+      if (now - lastActiveRefreshAtRef.current < 250) return;
+      lastActiveRefreshAtRef.current = now;
       fireHttpBackfillRef.current(0);
     };
     window.addEventListener(ACTIVE_TIMELINE_REFRESH_EVENT, handler);
@@ -1049,14 +1072,7 @@ export function useTimeline(
       if (msg.type === 'session.event' && (msg as { event: string }).event === 'connected') {
         if (ws && sessionId) {
           const current = eventsRef.current;
-          let afterTs: number | undefined;
-          for (const ev of current) {
-            // Pending optimistic bubbles carry `ts = Date.now()` from the
-            // client clock — exclude them so a skewed client clock can't
-            // accidentally filter out legitimately-missed server events.
-            if (ev.type === 'user.message' && (ev as { payload?: { pending?: boolean } }).payload?.pending) continue;
-            if (typeof ev.ts === 'number' && (afterTs === undefined || ev.ts > afterTs)) afterTs = ev.ts;
-          }
+          const afterTs = getTimelineHistoryAfterTs(current);
           historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS, afterTs);
 
           // Fire HTTP backfill with a ~600ms delay to let the bridge's async

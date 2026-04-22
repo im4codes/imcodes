@@ -103,6 +103,12 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
       handler?.({ type: 'session.event', event: 'connected', session: '', state: 'connected' } as ServerMessage);
     });
 
+    expect(ws.sendTimelineHistoryRequest).toHaveBeenCalledWith(
+      sessionName,
+      300,
+      7499,
+    );
+
     // Before the delay expires, backfill should not have fired.
     expect(fetchSpy).not.toHaveBeenCalled();
 
@@ -119,7 +125,7 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     expect(fetchSpy).toHaveBeenCalledWith(
       serverId,
       sessionName,
-      expect.objectContaining({ afterTs: 7500 }),
+      expect.objectContaining({ afterTs: 7499 }),
     );
 
     await waitFor(() => {
@@ -299,7 +305,7 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     expect(fetchSpy).toHaveBeenCalledWith(
       serverId,
       sessionName,
-      expect.objectContaining({ afterTs: 6000 }),
+      expect.objectContaining({ afterTs: 5999 }),
     );
 
     // Recovered event merged into the rendered view.
