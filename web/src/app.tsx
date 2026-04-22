@@ -86,7 +86,7 @@ import {
   mergeTransportPendingMessagesForRunningState,
   normalizeTransportPendingEntries,
 } from './transport-queue.js';
-import { ingestTimelineEventForCache, ACTIVE_TIMELINE_REFRESH_EVENT } from './hooks/useTimeline.js';
+import { ingestTimelineEventForCache } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
 import { updateMainSessionLabel } from './session-label-api.js';
@@ -97,6 +97,7 @@ import {
   shouldResetSelectedServer,
   shouldShowInitialConnectingGate,
 } from './server-selection.js';
+import { installNativeAppResumeRefresh } from './app-resume-refresh.js';
 
 const DashboardPage = lazy(() => import('./pages/DashboardPage.js').then((m) => ({ default: m.DashboardPage })));
 const DiscussionsPage = lazy(() => import('./pages/DiscussionsPage.js').then((m) => ({ default: m.DiscussionsPage })));
@@ -1899,21 +1900,12 @@ export function App() {
 
     let removeAppStateListener: (() => void) | null = null;
     if (isNative()) {
-      void import('@capacitor/app').then(({ App }) =>
-        App.addListener('appStateChange', ({ isActive }) => {
-          if (isActive) {
-            ws.reconnectNow(true);
-            // Native resume: WebView `visibilitychange` is unreliable on some
-            // iOS versions, so explicitly signal the active timeline to
-            // force-pull history. Safe to fire even when visibilitychange
-            // also fires — useTimeline's listener is idempotent (cooldownMs=0
-            // but rate-limited by the 200ms setTimeout in fireHttpBackfill).
-            try { window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT)); } catch { /* ignore */ }
-          }
-        }).then((listener) => {
-          removeAppStateListener = () => { void listener.remove(); };
-        }).catch(() => {})
-      ).catch(() => {});
+      void import('@capacitor/app')
+        .then(({ App }) => installNativeAppResumeRefresh(true, (force) => ws.reconnectNow(force), App))
+        .then((cleanup) => {
+          removeAppStateListener = cleanup;
+        })
+        .catch(() => {});
     }
 
     return () => {

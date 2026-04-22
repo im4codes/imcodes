@@ -71,6 +71,11 @@ function resetBackfillCooldowns(): void {
  */
 export const ACTIVE_TIMELINE_REFRESH_EVENT = 'deck:active-timeline-refresh';
 
+export function dispatchActiveTimelineRefresh(): void {
+  if (typeof window === 'undefined') return;
+  try { window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT)); } catch { /* ignore */ }
+}
+
 // On every visibility transition we record when the document went hidden;
 // on the return-to-visible side we clear the mount cooldown and emit a
 // refresh request so the mounted timeline for the active session can
@@ -89,7 +94,7 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
     const wasHidden = hiddenAt !== null;
     if (wasHidden) {
       resetBackfillCooldowns();
-      try { window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT)); } catch { /* older browsers */ }
+      dispatchActiveTimelineRefresh();
     }
     hiddenAt = null;
   };
@@ -100,7 +105,7 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
   window.addEventListener('pageshow', (ev) => {
     if ((ev as PageTransitionEvent).persisted) {
       resetBackfillCooldowns();
-      try { window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT)); } catch { /* ignore */ }
+      dispatchActiveTimelineRefresh();
     }
   });
 }
