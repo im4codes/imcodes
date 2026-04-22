@@ -730,7 +730,8 @@ describe('useTimeline global cache bounds', () => {
     const sendTimelineHistoryRequest = vi.fn(() => 'history-reconnect');
 
     // Seed the shared cache so the hook mounts with known events — the
-    // most recent has ts=5000, which should become afterTs on reconnect.
+    // most recent has ts=5000, so reconnect should request from 4999 to keep
+    // a 1ms overlap and avoid dropping an event on the boundary.
     ingestTimelineEventForCache({
       eventId: `${sessionName}-ingest-1`,
       sessionId: sessionName,
@@ -778,12 +779,12 @@ describe('useTimeline global cache bounds', () => {
     sendTimelineHistoryRequest.mockClear();
 
     // Simulate browser WS reconnect. useTimeline should now gap-fill using
-    // afterTs = max ts of currently-rendered events (5000).
+    // afterTs = max ts of currently-rendered events minus the 1ms overlap.
     await act(async () => {
       handler?.({ type: 'session.event', event: 'connected', session: '', state: 'connected' } as ServerMessage);
     });
 
     expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
-    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300, 5000);
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300, 4999);
   });
 });
