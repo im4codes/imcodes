@@ -62,7 +62,8 @@ function postSend(port: number, body: Record<string, unknown>, headers?: Record<
     const data = JSON.stringify(body);
     const req = http.request({
       hostname: '127.0.0.1', port, path: '/send', method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': String(data.length), ...headers },
+      agent: false,
+      headers: { 'Content-Type': 'application/json', 'Content-Length': String(data.length), Connection: 'close', ...headers },
     }, (res) => {
       let body = '';
       res.on('data', (chunk) => { body += chunk; });
@@ -79,9 +80,9 @@ function postSend(port: number, body: Record<string, unknown>, headers?: Record<
 
 function postRaw(port: number, path: string, body: string, contentType?: string): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
-    const headers: Record<string, string> = { 'Content-Length': String(Buffer.byteLength(body)) };
+    const headers: Record<string, string> = { 'Content-Length': String(Buffer.byteLength(body)), Connection: 'close' };
     if (contentType) headers['Content-Type'] = contentType;
-    const req = http.request({ hostname: '127.0.0.1', port, path, method: 'POST', headers }, (res) => {
+    const req = http.request({ hostname: '127.0.0.1', port, path, method: 'POST', headers, agent: false }, (res) => {
       let respBody = '';
       res.on('data', (chunk) => { respBody += chunk; });
       res.on('end', () => resolve({ status: res.statusCode!, body: respBody }));
@@ -127,8 +128,10 @@ describe('Hook server /send endpoint', () => {
     port = result.port;
   });
 
-  afterEach(() => {
-    server.close();
+  afterEach(async () => {
+    await new Promise<void>((resolve) => {
+      server.close(() => resolve());
+    });
   });
 
   // ── Content-Type validation ──────────────────────────────────────────────
