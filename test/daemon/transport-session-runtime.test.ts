@@ -143,6 +143,20 @@ describe('TransportSessionRuntime', () => {
     expect(mock.provider.send).toHaveBeenCalledTimes(1);
   });
 
+  it('tracks the active dispatch payload for restart-based replay', async () => {
+    runtime.send('retry me', 'msg-retry');
+    await flushDispatch();
+
+    expect(runtime.activeDispatchEntries).toEqual([
+      { clientMessageId: 'msg-retry', text: 'retry me' },
+    ]);
+
+    mock.fireError('sess-1');
+    expect(runtime.activeDispatchEntries).toEqual([
+      { clientMessageId: 'msg-retry', text: 'retry me' },
+    ]);
+  });
+
   it('send() merges description and runtime prompt into normalized systemText', async () => {
     const r = new TransportSessionRuntime(mock.provider, 'x');
     await r.initialize({ ...defaultConfig, description: 'expert', systemPrompt: 'runtime only' });
@@ -934,6 +948,7 @@ describe('TransportSessionRuntime', () => {
     expect(runtime.sending).toBe(false);
     expect(runtime.pendingCount).toBe(0);
     expect(runtime.pendingEntries).toEqual([]);
+    expect(runtime.activeDispatchEntries).toEqual([]);
   });
 
   it('getHistory() returns a copy', () => {

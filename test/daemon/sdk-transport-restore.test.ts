@@ -6,7 +6,8 @@ const mocks = vi.hoisted(() => {
   const store = new Map<string, Record<string, any>>();
   const claudeRuns: Array<{ options: Record<string, unknown>; prompt: string }> = [];
   const codexRuns: Array<{ mode: 'start' | 'resume'; id: string | null; options: Record<string, unknown>; input: string }> = [];
-  return { store, claudeRuns, codexRuns };
+  const claudeFailures = new Map<string, number>();
+  return { store, claudeRuns, codexRuns, claudeFailures };
 });
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
@@ -79,6 +80,13 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
   query: vi.fn(({ prompt, options }: { prompt: string; options: Record<string, unknown> }) => {
     mocks.claudeRuns.push({ prompt, options });
     async function* gen() {
+      if (prompt.includes('[transport-retry-once]')) {
+        const seen = mocks.claudeFailures.get(prompt) ?? 0;
+        mocks.claudeFailures.set(prompt, seen + 1);
+        if (seen === 0) {
+          throw new Error('simulated transport failure');
+        }
+      }
       yield { type: 'system', subtype: 'init', session_id: String(options.resume ?? options.sessionId), model: 'claude-sonnet-4-6' };
       yield { type: 'result', subtype: 'success', is_error: false, session_id: String(options.resume ?? options.sessionId), result: prompt.includes('token') ? 'BANANA' : 'ACK', usage: { input_tokens: 11, output_tokens: 2, cache_read_input_tokens: 0 } };
     }
@@ -137,6 +145,7 @@ vi.mock('../../src/agent/brain-dispatcher.js', () => ({ BrainDispatcher: vi.fn()
 import { connectProvider, disconnectAll } from '../../src/agent/provider-registry.js';
 import { getTransportRuntime, launchTransportSession, relaunchSessionWithSettings, restoreTransportSessions, setSessionEventCallback } from '../../src/agent/session-manager.js';
 import { newSession } from '../../src/agent/tmux.js';
+import { getResendCount } from '../../src/daemon/transport-resend-queue.js';
 
 const flush = async () => {
   for (let i = 0; i < 4; i++) await new Promise((resolve) => setTimeout(resolve, 0));
@@ -149,6 +158,7 @@ describe('sdk transport session restore', () => {
     mocks.store.clear();
     mocks.claudeRuns.length = 0;
     mocks.codexRuns.length = 0;
+    mocks.claudeFailures.clear();
     setSessionEventCallback(() => {});
   });
 
@@ -271,6 +281,43 @@ describe('sdk transport session restore', () => {
     expect(mocks.store.get('deck_sdk_new_brain')?.contextNamespace).toEqual({ scope: 'personal', projectId: 'sdk-launch-visible' });
     expect(mocks.store.get('deck_sdk_new_brain')?.contextNamespaceDiagnostics).toEqual(['namespace:explicit']);
     expect(onSessionEvent).toHaveBeenCalledWith('started', 'deck_sdk_new_brain', 'idle');
+  });
+
+  it('auto-restarts an errored transport runtime and replays the failed turn', async () => {
+    await connectProvider('claude-code-sdk', {});
+    await launchTransportSession({
+      name: 'deck_sdk_retry_brain',
+      projectName: 'sdkretry',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/sdk-retry',
+      requestedModel: 'sonnet',
+      ccSessionId: 'cc-session-retry',
+    });
+
+    const firstRuntime = getTransportRuntime('deck_sdk_retry_brain');
+    expect(firstRuntime).toBeDefined();
+
+    firstRuntime!.send('Please retry me [transport-retry-once]', 'cmd-retry-1');
+
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      if (mocks.claudeRuns.length >= 2 && getResendCount('deck_sdk_retry_brain') === 0) break;
+      await flush();
+    }
+
+    expect(mocks.claudeRuns).toHaveLength(2);
+    expect(mocks.claudeRuns[0]).toMatchObject({
+      prompt: 'Please retry me [transport-retry-once]',
+      options: expect.objectContaining({ resume: 'cc-session-retry' }),
+    });
+    expect(mocks.claudeRuns[1]).toMatchObject({
+      prompt: 'Please retry me [transport-retry-once]',
+      options: expect.objectContaining({ resume: 'cc-session-retry' }),
+    });
+    expect(getResendCount('deck_sdk_retry_brain')).toBe(0);
+    expect(getTransportRuntime('deck_sdk_retry_brain')).toBeDefined();
+    expect(getTransportRuntime('deck_sdk_retry_brain')).not.toBe(firstRuntime);
   });
 
   it('emits startup memory.context when the first transport turn carries the seeded memory', { timeout: 30_000 }, async () => {

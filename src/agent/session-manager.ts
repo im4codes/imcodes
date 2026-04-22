@@ -9,7 +9,7 @@ import type { AgentDriver } from './drivers/base.js';
 import type { AgentType } from './detect.js';
 import { isTransportAgent } from './detect.js';
 import { RUNTIME_TYPES } from './session-runtime.js';
-import { TransportSessionRuntime } from './transport-session-runtime.js';
+import { TransportSessionRuntime, type PendingTransportMessage } from './transport-session-runtime.js';
 import { ensureProviderConnected, getProvider } from './provider-registry.js';
 import type { SessionInfoUpdate } from './transport-provider.js';
 import { setupCCStopHook } from './signal.js';
@@ -45,7 +45,7 @@ import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
 import { closeSingleSession, collectProjectCloseTargets, type CloseFailure, type CloseTreeResult } from './session-close.js';
 import { cleanupKnownTestTerminalSessions } from './startup-test-session-cleanup.js';
-import { clearResend, drainResend, getResendCount } from '../daemon/transport-resend-queue.js';
+import { clearResend, drainResend, enqueueResend, getResendCount, getResendEntries } from '../daemon/transport-resend-queue.js';
 
 /** Start JSONL watcher for a CC session — uses specific file if ccSessionId known, else directory scan. */
 function startCCWatcher(sessionName: string, projectDir: string, ccSessionId?: string): void {
@@ -927,6 +927,111 @@ export async function relaunchSessionWithSettings(
 
 /** In-memory map of active transport session runtimes */
 const transportRuntimes = new Map<string, TransportSessionRuntime>();
+const transportErrorRecoveryInFlight = new Map<string, Promise<boolean>>();
+const transportErrorRecoveryTimestamps = new Map<string, number[]>();
+
+function queueTransportErrorResendEntries(sessionName: string, entries: PendingTransportMessage[]): number {
+  if (entries.length === 0) return getResendCount(sessionName);
+  const existingCommandIds = new Set(getResendEntries(sessionName).map((entry) => entry.commandId));
+  for (const entry of entries) {
+    if (existingCommandIds.has(entry.clientMessageId)) continue;
+    enqueueResend(sessionName, {
+      text: entry.text,
+      commandId: entry.clientMessageId,
+      ...(entry.attachments?.length ? { attachments: entry.attachments } : {}),
+      queuedAt: Date.now(),
+    });
+    existingCommandIds.add(entry.clientMessageId);
+  }
+  return getResendCount(sessionName);
+}
+
+async function recoverTransportRuntimeAfterError(
+  sessionName: string,
+  runtime: TransportSessionRuntime,
+): Promise<boolean> {
+  const existingRecovery = transportErrorRecoveryInFlight.get(sessionName);
+  if (existingRecovery) return existingRecovery;
+
+  const recovery = (async () => {
+    const record = getSession(sessionName);
+    if (!record || record.runtimeType !== RUNTIME_TYPES.TRANSPORT || !isTransportAgent(record.agentType as AgentType)) {
+      return false;
+    }
+
+    const now = Date.now();
+    const windowStart = now - RESTART_WINDOW_MS;
+    const recentRecoveries = (transportErrorRecoveryTimestamps.get(sessionName) ?? []).filter((ts) => ts > windowStart);
+    if (recentRecoveries.length >= MAX_RESTARTS) {
+      logger.error({ sessionName }, 'Transport error recovery loop detected — refusing auto-restart');
+      timelineEmitter.emit(sessionName, 'assistant.text', {
+        text: `⚠️ Transport recovery stopped after ${MAX_RESTARTS} automatic restart attempts in 5 minutes.`,
+        streaming: false,
+        memoryExcluded: true,
+      }, { source: 'daemon', confidence: 'high' });
+      return false;
+    }
+    transportErrorRecoveryTimestamps.set(sessionName, [...recentRecoveries, now]);
+
+    const failedEntries = runtime.activeDispatchEntries;
+    const pendingCount = queueTransportErrorResendEntries(sessionName, failedEntries);
+    if (pendingCount > 0) {
+      const queued = getResendEntries(sessionName);
+      timelineEmitter.emit(sessionName, 'assistant.text', {
+        text: `⏳ Provider error detected — restarting and auto-resending ${pendingCount} queued message${pendingCount === 1 ? '' : 's'}.`,
+        streaming: false,
+        memoryExcluded: true,
+      }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'session.state', {
+        state: 'queued',
+        pendingCount,
+        pendingMessages: queued.map((entry) => entry.text),
+        pendingMessageEntries: queued.map((entry) => ({ clientMessageId: entry.commandId, text: entry.text })),
+      }, { source: 'daemon', confidence: 'high' });
+    }
+
+    await stopTransportRuntimeSession(sessionName).catch((err) => {
+      logger.warn({ err, sessionName }, 'Failed to stop errored transport runtime before auto-restart');
+    });
+
+    await launchTransportSession({
+      name: record.name,
+      projectName: record.projectName,
+      role: record.role,
+      agentType: record.agentType as AgentType,
+      projectDir: record.projectDir,
+      label: record.label,
+      description: record.description,
+      requestedModel: record.requestedModel,
+      effort: record.effort,
+      transportConfig: record.transportConfig,
+      ccPreset: (record.agentType === 'claude-code-sdk' || record.agentType === 'qwen') ? record.ccPreset : undefined,
+      ...(record.agentType === 'claude-code-sdk' && record.ccSessionId ? { ccSessionId: record.ccSessionId } : {}),
+      ...(record.agentType === 'codex-sdk' && record.codexSessionId ? { codexSessionId: record.codexSessionId } : {}),
+      ...((record.agentType === 'cursor-headless' || record.agentType === 'copilot-sdk') && record.providerResumeId
+        ? { providerResumeId: record.providerResumeId }
+        : {}),
+      ...(record.agentType === 'openclaw' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
+      ...(record.agentType === 'qwen' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
+      ...(record.parentSession ? { parentSession: record.parentSession } : {}),
+      ...(record.userCreated ? { userCreated: true } : {}),
+    });
+    return true;
+  })().catch((err) => {
+    logger.error({ err, sessionName }, 'Transport auto-restart after error failed');
+    timelineEmitter.emit(sessionName, 'assistant.text', {
+      text: `⚠️ Auto-restart failed: ${err instanceof Error ? err.message : String(err)}`,
+      streaming: false,
+      memoryExcluded: true,
+    }, { source: 'daemon', confidence: 'high' });
+    return false;
+  }).finally(() => {
+    transportErrorRecoveryInFlight.delete(sessionName);
+  });
+
+  transportErrorRecoveryInFlight.set(sessionName, recovery);
+  return recovery;
+}
 
 /** Wire up onStatusChange and onDrain callbacks for a transport runtime. */
 function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: string): void {
@@ -947,6 +1052,9 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
       payload.pendingMessageEntries = runtime.pendingEntries;
     }
     timelineEmitter.emit(sessionName, 'session.state', payload, { source: 'daemon', confidence: 'high' });
+    if (status === 'error') {
+      void recoverTransportRuntimeAfterError(sessionName, runtime);
+    }
   };
   runtime.onDrain = (messages, merged, count) => {
     for (const entry of messages) {

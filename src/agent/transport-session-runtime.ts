@@ -95,6 +95,8 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   /** Messages queued while a turn is in flight. Drained and merged on turn completion. */
   private _pendingMessages: PendingTransportMessage[] = [];
+  /** Original message entries for the currently in-flight dispatch. */
+  private _activeDispatchEntries: PendingTransportMessage[] = [];
 
   /** Callback fired when pending messages are drained into a new turn. */
   private _onDrain?: (messages: PendingTransportMessage[], mergedMessage: string, count: number) => void;
@@ -120,6 +122,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._history.push(message);
         this._activeTurn?.resolve();
         this._activeTurn = null;
+        this._activeDispatchEntries = [];
         // Drain pending messages before transitioning to idle.
         // If there are queued messages, merge and send — status stays running.
         if (!this._drainPending()) {
@@ -134,7 +137,10 @@ export class TransportSessionRuntime implements SessionRuntime {
         // Only drain pending on recoverable/cancel errors — unrecoverable errors
         // (auth failure, provider down) would just fail again and consume queued messages.
         const canDrain = error.code === 'CANCELLED' || error.recoverable;
-        if (canDrain && this._drainPending()) return;
+        if (canDrain) {
+          this._activeDispatchEntries = [];
+          if (this._drainPending()) return;
+        }
         this.setStatus(error.code === 'CANCELLED' ? 'idle' : 'error');
       }),
       ...(this.provider.onSessionInfo ? [this.provider.onSessionInfo((sid: string, info: SessionInfoUpdate) => {
@@ -188,6 +194,8 @@ export class TransportSessionRuntime implements SessionRuntime {
   get pendingMessages(): string[] { return this._pendingMessages.map((entry) => entry.text); }
   /** Snapshot of queued messages waiting to be drained (stable entity ids for UI/edit/undo). */
   get pendingEntries(): PendingTransportMessage[] { return this._pendingMessages.map((entry) => ({ ...entry })); }
+  /** Snapshot of the message entries currently being dispatched. */
+  get activeDispatchEntries(): PendingTransportMessage[] { return this._activeDispatchEntries.map((entry) => ({ ...entry })); }
 
   setContextBootstrapResolver(
     resolver: (() => Promise<TransportContextBootstrap>) | undefined,
@@ -253,16 +261,18 @@ export class TransportSessionRuntime implements SessionRuntime {
       throw new Error('TransportSessionRuntime not initialized — call initialize() first');
     }
 
+    const entry: PendingTransportMessage = {
+      clientMessageId: clientMessageId ?? randomUUID(),
+      text: message,
+      ...(attachments?.length ? { attachments } : {}),
+    };
+
     if (this._sending) {
-      this._pendingMessages.push({
-        clientMessageId: clientMessageId ?? randomUUID(),
-        text: message,
-        ...(attachments?.length ? { attachments } : {}),
-      });
+      this._pendingMessages.push(entry);
       return 'queued';
     }
 
-    this._dispatchTurn(message, clientMessageId, attachments);
+    this._dispatchTurn(message, entry.clientMessageId, attachments, [entry]);
     return 'sent';
   }
 
@@ -307,6 +317,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this.setStatus('idle');
     this._sending = false;
     this._activeTurn = null;
+    this._activeDispatchEntries = [];
     this._pendingMessages = [];
     // Per-session memory injection history is daemon-scoped to this session;
     // a kill ends that scope. clear() is called on session.clear separately.
@@ -324,7 +335,12 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   /** Dispatch a single turn to the provider. Assumes _sending is false. */
-  private _dispatchTurn(message: string, clientMessageId?: string, attachments?: TransportAttachment[]): void {
+  private _dispatchTurn(
+    message: string,
+    clientMessageId?: string,
+    attachments?: TransportAttachment[],
+    dispatchedEntries?: PendingTransportMessage[],
+  ): void {
     this._history.push({
       id: randomUUID(),
       sessionId: this._providerSessionId!,
@@ -337,6 +353,11 @@ export class TransportSessionRuntime implements SessionRuntime {
 
     this.setStatus('thinking');
     this._sending = true;
+    this._activeDispatchEntries = (dispatchedEntries ?? [{
+      clientMessageId: clientMessageId ?? randomUUID(),
+      text: message,
+      ...(attachments?.length ? { attachments } : {}),
+    }]).map((entry) => ({ ...entry }));
 
     let resolve!: () => void;
     let reject!: (err: ProviderError) => void;
@@ -429,6 +450,8 @@ export class TransportSessionRuntime implements SessionRuntime {
                 : { code: 'PROVIDER_ERROR', message: String(err), recoverable: false }),
         );
         this._activeTurn = null;
+        // Preserve the in-flight payload so session-manager can replay it
+        // after automatically rebuilding the transport runtime.
         // Don't drain on async send failure — the provider is likely broken.
       });
   }
@@ -454,6 +477,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       merged,
       messages.length === 1 ? messages[0]?.clientMessageId : undefined,
       attachments.length > 0 ? attachments : undefined,
+      messages,
     );
     return true;
   }
