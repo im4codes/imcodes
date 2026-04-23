@@ -1,6 +1,6 @@
 import { parentPort, workerData } from 'node:worker_threads';
 import { createRequire } from 'node:module';
-import { mkdirSync, statSync, existsSync, readFileSync } from 'node:fs';
+import { mkdirSync, statSync, existsSync, readFileSync, openSync, readSync, closeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import type { TimelineEvent, TimelineEventType } from './timeline-event.js';
@@ -8,7 +8,6 @@ import type {
   ProjectionSessionMeta,
   ProjectionWorkerEnvelope,
   ProjectionWorkerRequestType,
-  ProjectionWorkerRequestMap,
   ProjectionWorkerResponse,
 } from './timeline-projection-types.js';
 
@@ -176,6 +175,45 @@ function parseLinesAscending(sessionId: string): TimelineEvent[] {
   return events;
 }
 
+function parseAppendedEvents(sessionId: string, startOffset: number, endOffset: number): TimelineEvent[] | null {
+  const filePath = sessionFilePath(sessionId);
+  if (!existsSync(filePath)) return [];
+  if (endOffset <= startOffset) return [];
+
+  let fd: number | null = null;
+  try {
+    fd = openSync(filePath, 'r');
+    const expectedLength = endOffset - startOffset;
+    const buf = Buffer.alloc(expectedLength);
+    let totalRead = 0;
+    while (totalRead < expectedLength) {
+      const bytesRead = readSync(fd, buf, totalRead, expectedLength - totalRead, startOffset + totalRead);
+      if (bytesRead <= 0) break;
+      totalRead += bytesRead;
+    }
+    if (totalRead !== expectedLength) return null;
+
+    const raw = buf.toString('utf8');
+    if (!raw.trim()) return [];
+
+    const events: TimelineEvent[] = [];
+    for (const line of raw.split('\n')) {
+      if (!line) continue;
+      try {
+        const event = JSON.parse(line) as TimelineEvent;
+        if (event.sessionId === sessionId) events.push(event);
+      } catch {
+        return null;
+      }
+    }
+    return events;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
 function extractTextAndStreaming(event: TimelineEvent): { text: string | null; streaming: number } {
   const text = typeof event.payload?.text === 'string' ? event.payload.text : null;
   const streaming = event.payload?.streaming === true ? 1 : 0;
@@ -250,6 +288,72 @@ async function rebuildSessionInternal(sessionId: string): Promise<boolean> {
   return promise;
 }
 
+function markSessionReady(
+  sessionId: string,
+  meta: ProjectionSessionMeta | null,
+  fileMeta: { exists: boolean; size: number; mtimeMs: number },
+): void {
+  upsertSessionMeta(sessionId, {
+    lastProjectedAppendOrdinal: meta?.lastProjectedAppendOrdinal ?? 0,
+    sourceFileSizeBytes: fileMeta.size,
+    sourceFileMtimeMs: fileMeta.mtimeMs,
+    status: fileMeta.exists ? 'ready' : 'missing',
+    lastRebuiltAt: meta?.lastRebuiltAt ?? null,
+  });
+}
+
+async function syncSessionDelta(sessionId: string, meta: ProjectionSessionMeta): Promise<boolean> {
+  const fileMeta = currentFileMeta(sessionId);
+  if (!fileMeta.exists) {
+    deleteSessionRows(sessionId);
+    return false;
+  }
+
+  if (fileMeta.size === meta.sourceFileSizeBytes) {
+    // JSONL is append-only. If only mtime drifted, just refresh the tracked
+    // source metadata instead of rebuilding the full projection.
+    if (fileMeta.mtimeMs !== meta.sourceFileMtimeMs) {
+      markSessionReady(sessionId, meta, fileMeta);
+    }
+    return true;
+  }
+
+  if (fileMeta.size < meta.sourceFileSizeBytes || fileMeta.mtimeMs < meta.sourceFileMtimeMs) {
+    await rebuildSessionInternal(sessionId);
+    return true;
+  }
+
+  const appendedEvents = parseAppendedEvents(sessionId, meta.sourceFileSizeBytes, fileMeta.size);
+  if (appendedEvents === null) {
+    await rebuildSessionInternal(sessionId);
+    return true;
+  }
+
+  if (appendedEvents.length === 0) {
+    markSessionReady(sessionId, meta, fileMeta);
+    return true;
+  }
+
+  const database = ensureDb();
+  runInTransaction(() => {
+    let appendOrdinal = meta.lastProjectedAppendOrdinal;
+    for (const event of appendedEvents) {
+      appendOrdinal += 1;
+      insertProjectedEvent(database, sessionId, appendOrdinal, event);
+    }
+    upsertSessionMeta(sessionId, {
+      lastProjectedAppendOrdinal: appendOrdinal,
+      sourceFileSizeBytes: fileMeta.size,
+      sourceFileMtimeMs: fileMeta.mtimeMs,
+      status: 'ready',
+      lastRebuiltAt: meta.lastRebuiltAt,
+    });
+  });
+  writesSinceCheckpoint += appendedEvents.length;
+  maybeCheckpoint();
+  return true;
+}
+
 async function ensureFreshSession(sessionId: string): Promise<boolean> {
   const meta = readSessionMeta(sessionId);
   const fileMeta = currentFileMeta(sessionId);
@@ -261,18 +365,12 @@ async function ensureFreshSession(sessionId: string): Promise<boolean> {
     await rebuildSessionInternal(sessionId);
     return true;
   }
-  if (meta.status !== 'ready'
-    || meta.projectionVersion !== PROJECTION_VERSION
-    || meta.sourceFileSizeBytes !== fileMeta.size
-    || meta.sourceFileMtimeMs !== fileMeta.mtimeMs) {
-    upsertSessionMeta(sessionId, {
-      lastProjectedAppendOrdinal: meta.lastProjectedAppendOrdinal,
-      sourceFileSizeBytes: fileMeta.size,
-      sourceFileMtimeMs: fileMeta.mtimeMs,
-      status: 'stale',
-      lastRebuiltAt: meta.lastRebuiltAt,
-    });
+  if (meta.status !== 'ready' || meta.projectionVersion !== PROJECTION_VERSION) {
     await rebuildSessionInternal(sessionId);
+    return true;
+  }
+  if (meta.sourceFileSizeBytes !== fileMeta.size || meta.sourceFileMtimeMs !== fileMeta.mtimeMs) {
+    await syncSessionDelta(sessionId, meta);
   }
   return true;
 }
@@ -312,7 +410,11 @@ async function handleRecordAppendedEvent(event: TimelineEvent): Promise<boolean>
     || fileMeta.size !== meta.sourceFileSizeBytes + appendedBytes
     || fileMeta.mtimeMs < meta.sourceFileMtimeMs
   ) {
-    await rebuildSessionInternal(event.sessionId);
+    if (meta && meta.status === 'ready' && meta.projectionVersion === PROJECTION_VERSION) {
+      await syncSessionDelta(event.sessionId, meta);
+    } else {
+      await rebuildSessionInternal(event.sessionId);
+    }
     return true;
   }
   const database = ensureDb();

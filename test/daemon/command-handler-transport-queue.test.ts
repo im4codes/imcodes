@@ -585,6 +585,12 @@ describe('handleWebCommand transport queue behavior', () => {
       status: 'accepted',
       session: 'deck_transport_brain',
     });
+    expect(stopTransportRuntimeSessionMock).toHaveBeenCalledWith('deck_transport_brain');
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_transport_brain',
+      agentType: 'claude-code-sdk',
+      projectName: 'transport',
+    }));
 
     // 2. NO user.message timeline event — the agent hasn't seen this message
     //    yet, it's sitting in the daemon's resend queue. Emitting a
@@ -646,6 +652,38 @@ describe('handleWebCommand transport queue behavior', () => {
 
     // Cleanup so later tests start from empty state.
     clearAllResend();
+  });
+
+  it('persists a transport error record when subsession.start fails before runtime creation', async () => {
+    launchTransportSessionMock.mockRejectedValueOnce(new Error('provider bootstrap failed'));
+
+    handleWebCommand({
+      type: 'subsession.start',
+      id: 'cursor_fail',
+      sessionType: 'cursor-headless',
+      cwd: '/tmp/project',
+      parentSession: 'deck_proj_brain',
+      requestedModel: 'gpt-5.4',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_sub_cursor_fail',
+      agentType: 'cursor-headless',
+      projectDir: '/tmp/project',
+      runtimeType: 'transport',
+      providerId: 'cursor-headless',
+      state: 'error',
+      parentSession: 'deck_proj_brain',
+      requestedModel: 'gpt-5.4',
+      userCreated: true,
+    }));
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_sub_cursor_fail',
+      'session.state',
+      expect.objectContaining({ state: 'error', error: 'provider bootstrap failed' }),
+      expect.objectContaining({ source: 'daemon' }),
+    );
   });
 
   it('tracks supervision task intents while offline so Auto still follows the resent turn', async () => {

@@ -109,4 +109,53 @@ describe('getQwenRuntimeConfig', () => {
     expect(config.authType).toBe(QWEN_AUTH_TYPES.OAUTH);
     expect(config.authLimit).toBe('Up to 1,000 requests/day');
   });
+
+  it('prefers settings auth/model resolution over misleading auth status output', async () => {
+    childProcessMock.execFile.mockImplementation((...args: any[]) => {
+      const cb = args.at(-1);
+      cb?.(null, [
+        'Authentication Method: Alibaba Cloud Coding Plan (Incomplete)',
+        'Issue: API key not found in environment or settings',
+      ].join('\n'), '');
+      return {} as never;
+    });
+    fsMock.readFile.mockResolvedValue(JSON.stringify({
+      security: { auth: { selectedType: 'openai' } },
+      tokenPlan: { region: 'china' },
+      model: { name: 'qwen3.6-plus' },
+      modelProviders: {
+        openai: [
+          {
+            id: 'qwen3.6-plus',
+            envKey: 'BAILIAN_TOKEN_PLAN_API_KEY',
+            baseUrl: 'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1',
+          },
+          {
+            id: 'glm-5',
+            envKey: 'BAILIAN_TOKEN_PLAN_API_KEY',
+            baseUrl: 'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1',
+          },
+          {
+            id: 'MiniMax-M2.5',
+            envKey: 'BAILIAN_TOKEN_PLAN_API_KEY',
+            baseUrl: 'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1',
+          },
+          {
+            id: 'deepseek-v3.2',
+            envKey: 'BAILIAN_TOKEN_PLAN_API_KEY',
+            baseUrl: 'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1',
+          },
+        ],
+      },
+    }));
+
+    const config = await getQwenRuntimeConfig(true);
+    expect(config.authType).toBe(QWEN_AUTH_TYPES.API_KEY);
+    expect(config.availableModels).toEqual([
+      'qwen3.6-plus',
+      'glm-5',
+      'MiniMax-M2.5',
+      'deepseek-v3.2',
+    ]);
+  });
 });

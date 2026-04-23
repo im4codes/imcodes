@@ -101,10 +101,6 @@ export function buildProviderContextPayload(
   provider: TransportProvider,
   input: TransportRuntimeAssemblyInput,
 ): ProviderContextPayload {
-  const namespace = input.namespace ?? {
-    scope: 'personal',
-    projectId: 'transport-default',
-  };
   const { supportClass, authority } = resolveTransportDispatchAuthority(provider, input);
   const sanitizedRecall = {
     startupMemory: authority.authoritySource === 'processed_local' ? input.startupMemory : undefined,
