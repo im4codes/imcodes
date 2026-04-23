@@ -87,6 +87,10 @@ async function readAuthStatus(): Promise<{ authType: QwenAuthType | null; authLi
   }
 }
 
+function isKnownAuthType(authType: QwenAuthType): boolean {
+  return authType !== QWEN_AUTH_TYPES.UNKNOWN;
+}
+
 function detectAuthTypeFromSettings(settings: QwenSettings | null): QwenAuthType {
   const selectedType = settings?.security?.auth?.selectedType;
   if (selectedType === QWEN_AUTH_TYPES.OAUTH) return QWEN_AUTH_TYPES.OAUTH;
@@ -124,7 +128,10 @@ export async function getQwenRuntimeConfig(force = false): Promise<QwenRuntimeCo
 
   const settings = await readSettings();
   const status = await readAuthStatus();
-  const authType = status?.authType ?? detectAuthTypeFromSettings(settings);
+  const authTypeFromSettings = detectAuthTypeFromSettings(settings);
+  const authType = isKnownAuthType(authTypeFromSettings)
+    ? authTypeFromSettings
+    : (status?.authType ?? authTypeFromSettings);
   const availableModels = getAvailableModelsFromSettings(settings, authType);
 
   const value = {

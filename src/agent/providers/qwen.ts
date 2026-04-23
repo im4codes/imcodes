@@ -472,7 +472,7 @@ export class QwenProvider implements TransportProvider {
         || state.emittedToolSignatures.size > 0;
     };
 
-    const maybeRetryTransientError = async (messageText: string, details?: unknown): Promise<boolean> => {
+    const maybeRetryTransientError = async (messageText: string, _details?: unknown): Promise<boolean> => {
       if (retryScheduled || transientRetryBudget <= 0) return false;
       if (sawVisibleTurnProgress()) return false;
       if (!this.isRetryableTransientError(messageText)) return false;
