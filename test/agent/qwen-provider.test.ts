@@ -71,6 +71,8 @@ import { TransportSessionRuntime } from '../../src/agent/transport-session-runti
 import type { ToolCallEvent } from '../../src/agent/transport-provider.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
 function lastSpawn() {
   const entry = childProcessMock.spawned.at(-1);
   if (!entry) throw new Error('No spawned qwen process');
@@ -360,14 +362,15 @@ describe('QwenProvider', () => {
     expect(first.file === 'qwen' || /node(\.exe)?$/i.test(first.file)).toBe(true);
     expect(first.cwd).toBe('/tmp/project');
     expect(first.args).toContain('--session-id');
-    expect(first.args).toContain('sess-1');
+    const firstSessionId = first.args[first.args.indexOf('--session-id') + 1];
+    expect(firstSessionId).toMatch(UUID_PATTERN);
     expect(first.args).not.toContain('--resume');
     expect(first.args).toContain('--append-system-prompt');
     expect(first.args).toContain('Be concise');
     expect(first.args).toContain('--model');
     expect(first.args).toContain('qwen3-coder-plus');
 
-    first.child.stdout.write(`${JSON.stringify({ type: 'system', subtype: 'session_start', session_id: 'sess-1' })}\n`);
+    first.child.stdout.write(`${JSON.stringify({ type: 'system', subtype: 'session_start', session_id: firstSessionId })}\n`);
     first.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'msg-1' } } })}\n`);
     first.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Hel' } } })}\n`);
     first.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'lo' } } })}\n`);
@@ -381,8 +384,25 @@ describe('QwenProvider', () => {
     await provider.send('sess-1', 'again');
     const second = lastSpawn();
     expect(second.args).toContain('--resume');
-    expect(second.args).toContain('sess-1');
+    expect(second.args).toContain(firstSessionId);
     expect(second.args).not.toContain('--session-id');
+  });
+
+  it('uses a provided UUID resumeId when restoring qwen sessions', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    const resumeId = 'dd09c62c-4cb2-41be-a2f7-a5682760e3b1';
+    await provider.createSession({
+      sessionKey: 'sess-resume-id',
+      cwd: '/tmp/project',
+      resumeId,
+    });
+
+    await provider.send('sess-resume-id', 'hello');
+    const run = lastSpawn();
+    expect(run.args).toContain('--resume');
+    expect(run.args).toContain(resumeId);
+    expect(run.args).not.toContain('--session-id');
   });
 
   it('maps normalized payloads into qwen CLI prompt/system arguments', async () => {
@@ -706,6 +726,41 @@ describe('QwenProvider', () => {
     await flushIO();
 
     expect(errors).toEqual(['bad request']);
+  });
+
+  it('surfaces qwen synthetic API auth failures as AUTH_FAILED errors', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-auth-fail', cwd: '/tmp/project' });
+
+    const errors: Array<{ code: string; message: string }> = [];
+    const completed: string[] = [];
+    provider.onError((_sid, err) => errors.push({ code: err.code, message: err.message }));
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+
+    await provider.send('sess-auth-fail', 'hello');
+    const run = lastSpawn();
+    run.child.stdout.write(`${JSON.stringify({
+      type: 'assistant',
+      message: {
+        id: 'msg-auth-fail',
+        content: [{ type: 'text', text: '[API Error: 401 invalid access token or token expired]' }],
+      },
+    })}\n`);
+    run.child.stdout.write(`${JSON.stringify({
+      type: 'result',
+      is_error: false,
+      result: '[API Error: 401 invalid access token or token expired]',
+    })}\n`);
+    run.child.emit('close', 0, null);
+    await flushIO();
+    await flushIO();
+
+    expect(completed).toEqual([]);
+    expect(errors).toEqual([{
+      code: 'AUTH_FAILED',
+      message: '401 invalid access token or token expired',
+    }]);
   });
 
   it('retries a transient Premature close once before surfacing an error', async () => {

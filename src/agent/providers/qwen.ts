@@ -34,6 +34,7 @@ const execFileAsync = promisify(execFile);
 const QWEN_BIN = 'qwen';
 const TRANSIENT_RETRY_DELAY_MS = 250;
 const TRANSIENT_RETRY_MAX_ATTEMPTS = 1;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 /**
  * Auth types accepted by the qwen CLI's `--auth-type` flag.
@@ -64,6 +65,16 @@ function resolveCliAuthType(settings: string | Record<string, unknown> | undefin
   const selected = (auth as Record<string, unknown>).selectedType;
   if (typeof selected !== 'string') return undefined;
   return QWEN_CLI_AUTH_TYPES.has(selected) ? selected : undefined;
+}
+
+function isUuid(value: string | undefined): value is string {
+  return typeof value === 'string' && UUID_PATTERN.test(value);
+}
+
+function extractSyntheticApiError(text: string | undefined): string | undefined {
+  if (typeof text !== 'string') return undefined;
+  const match = text.trim().match(/^\[API Error:\s*(.+)\]$/i);
+  return match?.[1]?.trim() || undefined;
 }
 
 interface QwenSessionState {
@@ -255,9 +266,14 @@ export class QwenProvider implements TransportProvider {
   async createSession(config: SessionConfig): Promise<string> {
     const sessionId = config.bindExistingKey ?? config.sessionKey;
     const existing = this.sessions.get(sessionId);
+    const qwenConversationId = existing?.qwenConversationId
+      ?? (isUuid(config.resumeId) ? config.resumeId : undefined)
+      ?? (isUuid(config.bindExistingKey) ? config.bindExistingKey : undefined)
+      ?? (isUuid(config.sessionKey) ? config.sessionKey : undefined)
+      ?? randomUUID();
     this.sessions.set(sessionId, {
       cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
-      started: !!(config.bindExistingKey || config.skipCreate || existing?.started),
+      started: !!(config.resumeId || config.bindExistingKey || config.skipCreate || existing?.started),
       description: config.description ?? existing?.description,
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
       env: config.env ?? existing?.env,
@@ -265,7 +281,7 @@ export class QwenProvider implements TransportProvider {
       settings: config.settings ?? existing?.settings,
       settingsDir: existing?.settingsDir,
       settingsPath: existing?.settingsPath,
-      qwenConversationId: existing?.qwenConversationId ?? sessionId,
+      qwenConversationId,
       child: existing?.child ?? null,
       currentMessageId: existing?.currentMessageId ?? null,
       currentText: existing?.currentText ?? '',
@@ -371,7 +387,7 @@ export class QwenProvider implements TransportProvider {
       settings: undefined,
       settingsDir: undefined,
       settingsPath: undefined,
-      qwenConversationId: sessionId,
+      qwenConversationId: randomUUID(),
       child: null,
       currentMessageId: null,
       currentText: '',
@@ -471,9 +487,11 @@ export class QwenProvider implements TransportProvider {
     const emitError = (messageText: string, details?: unknown): void => {
       if (sawError || completed) return;
       sawError = true;
-      const code = state.cancelled ? 'CANCELLED' : PROVIDER_ERROR_CODES.PROVIDER_ERROR;
-      const recoverable = state.cancelled ? true : false;
-      this.errorCallbacks.forEach((cb) => cb(sessionId, this.makeError(code, messageText, recoverable, details)));
+      const errorCode = state.cancelled
+        ? PROVIDER_ERROR_CODES.CANCELLED
+        : (this.isAuthFailureMessage(messageText) ? PROVIDER_ERROR_CODES.AUTH_FAILED : PROVIDER_ERROR_CODES.PROVIDER_ERROR);
+      const recoverable = errorCode === PROVIDER_ERROR_CODES.CANCELLED;
+      this.errorCallbacks.forEach((cb) => cb(sessionId, this.makeError(errorCode, messageText, recoverable, details)));
     };
 
     const emitComplete = (text: string, messageId?: string, metadata?: Record<string, unknown>): void => {
@@ -656,6 +674,13 @@ export class QwenProvider implements TransportProvider {
         }
         const finalText = collectAssistantText(payload.message?.content);
         if (finalText) {
+          const syntheticApiError = extractSyntheticApiError(finalText);
+          if (syntheticApiError) {
+            void maybeRetryTransientError(syntheticApiError, payload).then((retried) => {
+              if (!retried) emitError(syntheticApiError, payload);
+            });
+            return;
+          }
           state.pendingFinalText = finalText;
           state.pendingFinalMetadata = {
             ...(state.model || payload.message?.model ? { model: state.model ?? payload.message?.model } : {}),
@@ -693,6 +718,13 @@ export class QwenProvider implements TransportProvider {
           const errorText = payload.error?.message || stderrBuf || 'Qwen execution failed';
           void maybeRetryTransientError(errorText, payload).then((retried) => {
             if (!retried) emitError(errorText, payload);
+          });
+          return;
+        }
+        const syntheticApiError = extractSyntheticApiError(payload.result);
+        if (syntheticApiError) {
+          void maybeRetryTransientError(syntheticApiError, payload).then((retried) => {
+            if (!retried) emitError(syntheticApiError, payload);
           });
           return;
         }
@@ -791,6 +823,10 @@ export class QwenProvider implements TransportProvider {
 
   private isRetryableTransientError(message: string): boolean {
     return /premature close|fetch failed|connection error|socket hang up|econnreset|etimedout|network error/i.test(message);
+  }
+
+  private isAuthFailureMessage(message: string): boolean {
+    return /invalid access token|token expired|unauthorized|authentication failed|401\b/i.test(message);
   }
 
   private emitStatus(sessionId: string, state: QwenSessionState, status: ProviderStatusUpdate): void {
