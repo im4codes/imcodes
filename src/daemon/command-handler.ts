@@ -1844,6 +1844,23 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     const status = isLegacy ? 'accepted_legacy' : 'accepted';
     timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
     emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status });
+    // Best-effort resume for sessions that failed to launch or whose runtime
+    // vanished outside the provider reconnect path. The resend queue drains on
+    // successful relaunch, so the queued user message still delivers.
+    void runExclusiveSessionRelaunch(sessionName, async () => {
+      try {
+        await resumeTransportRuntimeAfterLoss(record);
+      } catch (err) {
+        logger.error({ err, sessionName }, 'auto-resume after missing transport runtime failed');
+        const resumeErr = err instanceof Error ? err.message : String(err);
+        timelineEmitter.emit(
+          sessionName,
+          'assistant.text',
+          { text: `⚠️ Auto-resume failed: ${resumeErr}. Restart the session manually to recover.`, streaming: false, memoryExcluded: true },
+          { source: 'daemon', confidence: 'high' },
+        );
+      }
+    });
     return;
   }
   if (transportRuntime && !transportRuntime.providerSessionId) {
@@ -3054,6 +3071,38 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
       } catch { /* not connected */ }
     } catch (e: unknown) {
       logger.error({ err: e, id, type }, 'subsession.start failed (transport)');
+      const now = Date.now();
+      const errMsg = e instanceof Error ? e.message : String(e);
+      const existing = getSession(sessionName);
+      const errorRecord: SessionRecord = {
+        name: sessionName,
+        projectName: existing?.projectName ?? sessionName,
+        role: existing?.role ?? 'w1',
+        agentType: type,
+        projectDir: existing?.projectDir ?? ((cwd as string) || process.cwd()),
+        state: 'error',
+        restarts: existing?.restarts ?? 0,
+        restartTimestamps: existing?.restartTimestamps ?? [],
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+        runtimeType: 'transport',
+        providerId: type,
+        ...(description ? { description } : {}),
+        ...(ccPreset ? { ccPreset } : {}),
+        ...(effort ? { effort } : {}),
+        ...(parentSession ? { parentSession } : {}),
+        ...(cmd.requestedModel || cmd.model
+          ? { requestedModel: ((cmd.requestedModel as string | undefined) ?? (cmd.model as string | undefined)) }
+          : {}),
+        userCreated: true,
+      };
+      upsertSession(errorRecord);
+      timelineEmitter.emit(
+        sessionName,
+        'session.state',
+        { state: 'error', error: errMsg },
+        { source: 'daemon', confidence: 'high' },
+      );
     }
     return;
   }
