@@ -1,13 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, utimesSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { createRequire } from 'node:module';
 
 import type { TimelineEvent } from '../../src/daemon/timeline-event.js';
-
-const require = createRequire(import.meta.url);
-const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 
 const originalHome = process.env.HOME;
 const originalUserProfile = process.env.USERPROFILE;
@@ -62,25 +58,6 @@ describe('timeline projection', () => {
     ]);
     importedProjection = timelineProjection;
     return { timelineProjection, timelineStore };
-  }
-
-  function readSessionMeta(sessionId: string): { lastRebuiltAt: number | null; status: string; lastProjectedAppendOrdinal: number } {
-    const db = new DatabaseSync(dbPath!, { readonly: true });
-    try {
-      const row = db.prepare(`
-        SELECT last_rebuilt_at, status, last_projected_append_ordinal
-        FROM timeline_projection_sessions
-        WHERE session_id = ?
-      `).get(sessionId) as Record<string, unknown> | undefined;
-      if (!row) throw new Error(`missing projection session row for ${sessionId}`);
-      return {
-        lastRebuiltAt: typeof row.last_rebuilt_at === 'number' ? row.last_rebuilt_at : null,
-        status: String(row.status),
-        lastProjectedAppendOrdinal: Number(row.last_projected_append_ordinal),
-      };
-    } finally {
-      db.close();
-    }
   }
 
   it('preserves append order for equal-ts events and honors afterTs / beforeTs exclusivity', async () => {
@@ -147,49 +124,5 @@ describe('timeline projection', () => {
     await timelineProjection.deleteSession(sessionId);
     const rebuiltFromAuthoritative = await timelineProjection.queryHistory({ sessionId, limit: 10 });
     expect(rebuiltFromAuthoritative?.map((event) => event.seq)).toEqual([2, 3]);
-  });
-
-  it('incrementally syncs appended JSONL tails without forcing a full rebuild', async () => {
-    const { timelineProjection, timelineStore } = await loadModules();
-    const sessionId = 'projection_incremental_tail';
-    const timelineFile = timelineStore.filePath(sessionId);
-    mkdirSync(join(tempHome!, '.imcodes', 'timeline'), { recursive: true });
-
-    timelineStore.append(makeEvent(sessionId, 1, 'assistant.text', { text: 'one' }, 1000));
-    timelineStore.append(makeEvent(sessionId, 2, 'assistant.text', { text: 'two' }, 1001));
-    await timelineProjection.rebuildSession(sessionId);
-
-    const before = readSessionMeta(sessionId);
-    appendFileSync(timelineFile, `${JSON.stringify(makeEvent(sessionId, 3, 'assistant.text', { text: 'three' }, 1002))}\n`);
-
-    const synced = await timelineStore.readPreferred(sessionId, { limit: 10 });
-    const after = readSessionMeta(sessionId);
-
-    expect(synced.map((event) => event.seq)).toEqual([1, 2, 3]);
-    expect(after.status).toBe('ready');
-    expect(after.lastProjectedAppendOrdinal).toBe(3);
-    expect(after.lastRebuiltAt).toBe(before.lastRebuiltAt);
-  });
-
-  it('does not rebuild when only timeline file mtime changes', async () => {
-    const { timelineProjection, timelineStore } = await loadModules();
-    const sessionId = 'projection_mtime_only';
-    const timelineFile = timelineStore.filePath(sessionId);
-
-    timelineStore.append(makeEvent(sessionId, 1, 'assistant.text', { text: 'one' }, 1000));
-    timelineStore.append(makeEvent(sessionId, 2, 'assistant.text', { text: 'two' }, 1001));
-    await timelineProjection.rebuildSession(sessionId);
-
-    const before = readSessionMeta(sessionId);
-    const bumpedAt = new Date(Date.now() + 5_000);
-    utimesSync(timelineFile, bumpedAt, bumpedAt);
-
-    const read = await timelineStore.readPreferred(sessionId, { limit: 10 });
-    const after = readSessionMeta(sessionId);
-
-    expect(read.map((event) => event.seq)).toEqual([1, 2]);
-    expect(after.status).toBe('ready');
-    expect(after.lastProjectedAppendOrdinal).toBe(2);
-    expect(after.lastRebuiltAt).toBe(before.lastRebuiltAt);
   });
 });

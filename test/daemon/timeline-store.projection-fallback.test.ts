@@ -17,15 +17,6 @@ vi.mock('../../src/daemon/timeline-projection.js', () => ({
   timelineProjection: projectionMocks,
 }));
 
-vi.mock('../../src/util/logger.js', () => ({
-  default: {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-  },
-}));
-
 describe('timeline-store projection fallbacks', () => {
   const originalHome = process.env.HOME;
   const originalUserProfile = process.env.USERPROFILE;
@@ -38,7 +29,7 @@ describe('timeline-store projection fallbacks', () => {
     else process.env.HOME = originalHome;
     if (originalUserProfile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = originalUserProfile;
-    if (tempHome) rmSync(tempHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    if (tempHome) rmSync(tempHome, { recursive: true, force: true });
     tempHome = null;
   });
 

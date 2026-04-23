@@ -154,6 +154,21 @@ export interface P2pRun {
 
 const activeRuns = new Map<string, P2pRun>();
 
+const P2P_REMINDER_TEMPLATES: Record<string, string> = {
+  en: enLocale.p2p.final_original_request_reminder,
+  'zh-CN': zhCNLocale.p2p.final_original_request_reminder,
+  'zh-TW': zhTWLocale.p2p.final_original_request_reminder,
+  ja: jaLocale.p2p.final_original_request_reminder,
+  ko: koLocale.p2p.final_original_request_reminder,
+  es: esLocale.p2p.final_original_request_reminder,
+  ru: ruLocale.p2p.final_original_request_reminder,
+};
+
+function buildOriginalRequestReminder(userText: string, locale?: string): string {
+  const template = P2P_REMINDER_TEMPLATES[locale ?? ''] ?? P2P_REMINDER_TEMPLATES.en;
+  return template.replace('{{request}}', userText);
+}
+
 const P2P_POST_SUMMARY_EXECUTE_TEMPLATES: Record<string, string> = {
   en: enLocale.p2p.post_summary_execute_prompt,
   'zh-CN': zhCNLocale.p2p.post_summary_execute_prompt,
