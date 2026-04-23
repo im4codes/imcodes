@@ -60,6 +60,7 @@ import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from '.
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import { CC_PRESET_MSG, type CcPreset } from '../../shared/cc-presets.js';
 import { MEMORY_WS } from '../../shared/memory-ws.js';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG } from '../../shared/p2p-config-events.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
@@ -168,10 +169,14 @@ function emitCommandAckReliable(
  * is computed FRESH (same as buildSessionList for main sessions) rather than
  * reading stale values from the session store.
  */
-async function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord>): Promise<Record<string, unknown>> {
+async function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord>): Promise<Record<string, unknown> | null> {
   const sessionName = subSessionName(id);
   const record = getSession(sessionName);
   const r = { ...record, ...overrides };
+  if (!r?.agentType) {
+    logger.warn({ id, sessionName }, 'Skipping subsession.sync without agentType');
+    return null;
+  }
 
   // Compute transport display metadata fresh — matches session-list.ts hydration logic.
   // The session store may have stale or missing metadata during early launch/update windows.
@@ -199,7 +204,7 @@ async function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord
     // For an idle session with no recent state change, that next event
     // might never come, so the dot could stay gray indefinitely.
     state: r?.state ?? null,
-    sessionType: r?.agentType ?? null,
+    sessionType: r.agentType,
     cwd: r?.projectDir ?? null,
     shellBin: null,
     ccSessionId: r?.ccSessionId ?? null,
@@ -232,6 +237,16 @@ async function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord
     quotaMeta: freshDisplay.quotaMeta ?? r?.quotaMeta ?? null,
     effort: r?.effort ?? null,
   };
+}
+
+async function sendSubSessionSync(
+  serverLink: ServerLink,
+  id: string,
+  overrides?: Partial<SessionRecord>,
+): Promise<void> {
+  const payload = await buildSubSessionSync(id, overrides);
+  if (!payload) return;
+  serverLink.send(payload);
 }
 
 function normalizeTransportConfigUpdate(value: unknown): Record<string, unknown> | undefined {
@@ -300,7 +315,7 @@ async function handleSubSessionTransportConfigUpdate(cmd: Record<string, unknown
   supervisionAutomation.applySnapshotUpdate(sessionName, extractSessionSupervisionSnapshot(nextTransportConfig ?? null));
   const id = sessionName.replace(/^deck_sub_/, '');
   try {
-    serverLink.send(await buildSubSessionSync(id, { transportConfig: nextTransportConfig }));
+    await sendSubSessionSync(serverLink, id, { transportConfig: nextTransportConfig });
   } catch {
     // not connected
   }
@@ -427,7 +442,7 @@ function getDefaultThinkingLevel(agentType: string | undefined): TransportEffort
 async function syncSubSessionIfNeeded(sessionName: string, serverLink: ServerLink): Promise<void> {
   if (!sessionName.startsWith('deck_sub_')) return;
   const subId = sessionName.slice('deck_sub_'.length);
-  try { serverLink.send(await buildSubSessionSync(subId)); } catch { /* ignore */ }
+  try { await sendSubSessionSync(serverLink, subId); } catch { /* ignore */ }
 }
 
 /**
@@ -543,9 +558,7 @@ function refreshQwenQuotaUsageLabels(serverLink?: ServerLink): void {
     // Re-sync sub-sessions so their quota usage labels update in the browser
     if (session.name.startsWith('deck_sub_')) {
       const subId = session.name.replace(/^deck_sub_/, '');
-      if (serverLink) void buildSubSessionSync(subId).then((payload) => {
-        serverLink.send(payload);
-      }).catch(() => { /* not connected */ });
+      if (serverLink) void sendSubSessionSync(serverLink, subId).catch(() => { /* not connected */ });
     }
   }
   if (serverLink) void handleGetSessions(serverLink);
@@ -567,7 +580,7 @@ export async function refreshCodexQuotaMetadata(serverLink?: ServerLink): Promis
     if (!session.name.startsWith('deck_sub_')) continue;
     const subId = session.name.replace(/^deck_sub_/, '');
     try {
-      serverLink.send(await buildSubSessionSync(subId));
+      await sendSubSessionSync(serverLink, subId);
     } catch {
       // not connected
     }
@@ -974,12 +987,8 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
           upsertSession({ ...record, label: nextLabel, updatedAt: Date.now() });
           logger.info({ sessionName: sName, label }, 'subsession.rename: label updated');
           const id = sName.replace(/^deck_sub_/, '');
-          void buildSubSessionSync(id, { label: nextLabel }).then((payload) => {
-            try {
-              serverLink.send(payload);
-            } catch {
-              // not connected
-            }
+          void sendSubSessionSync(serverLink, id, { label: nextLabel }).catch(() => {
+            // not connected
           });
         }
       }
@@ -1094,11 +1103,14 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case 'p2p.status':
       void handleP2pStatus(cmd, serverLink);
       break;
-    case 'cc.presets.list':
+    case CC_PRESET_MSG.LIST:
       void handleCcPresetsList(serverLink);
       break;
-    case 'cc.presets.save':
+    case CC_PRESET_MSG.SAVE:
       void handleCcPresetsSave(cmd, serverLink);
+      break;
+    case CC_PRESET_MSG.DISCOVER_MODELS:
+      void handleCcPresetsDiscoverModels(cmd, serverLink);
       break;
     case SHARED_CONTEXT_RUNTIME_CONFIG_MSG.APPLY:
       void handleSharedContextRuntimeConfigApply(cmd);
@@ -2889,7 +2901,7 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
   // Do NOT filter by epoch — history should include events across daemon restarts.
   const readLimit = Math.min(limit * 6, 10000);
   const tRead0 = Date.now();
-  const events = timelineStore.read(sessionName, { limit: readLimit, afterTs, beforeTs });
+  const events = await timelineStore.readPreferred(sessionName, { limit: readLimit, afterTs, beforeTs });
   readMs = Date.now() - tRead0;
 
   // Content-aware limit: session.state events don't count toward the budget.
@@ -3038,7 +3050,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
       });
       // Sync to server DB
       try {
-        serverLink.send(await buildSubSessionSync(id));
+        await sendSubSessionSync(serverLink, id);
       } catch { /* not connected */ }
     } catch (e: unknown) {
       logger.error({ err: e, id, type }, 'subsession.start failed (transport)');
@@ -3070,7 +3082,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
     });
     // Sync to server DB so frontend can see the sub-session
     try {
-      serverLink.send(await buildSubSessionSync(id));
+      await sendSubSessionSync(serverLink, id);
     } catch { /* not connected */ }
   } catch (e: unknown) {
     logger.error({ err: e, id }, 'subsession.start failed');
@@ -3117,7 +3129,7 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
           transportConfig: ('transportConfig' in cmd ? (cmd.transportConfig as Record<string, unknown> | null) : undefined),
         });
         try {
-          serverLink.send(await buildSubSessionSync(id));
+          await sendSubSessionSync(serverLink, id);
         } catch { /* not connected */ }
       } catch (e: unknown) {
         logger.error({ err: e, sessionName: sName }, 'subsession.restart failed');
@@ -3135,7 +3147,7 @@ async function handleSubSessionRebuildAll(cmd: Record<string, unknown>, serverLi
   await rebuildSubSessions(subSessions).catch((e: unknown) => logger.error({ err: e }, 'subsession.rebuild_all failed'));
   for (const sub of subSessions) {
     try {
-      serverLink.send(await buildSubSessionSync(sub.id));
+      await sendSubSessionSync(serverLink, sub.id);
     } catch (e) {
       logger.warn({ err: e, id: sub.id }, 'Failed to sync rebuilt sub-session');
     }
@@ -3173,7 +3185,7 @@ async function handleSubSessionSetModel(cmd: Record<string, unknown>, serverLink
     await startSubSession({ id, type: 'codex', cwd: cwd ?? null, codexModel: model });
     // Sync restarted sub-session to server DB
     try {
-      serverLink.send(await buildSubSessionSync(id));
+      await sendSubSessionSync(serverLink, id);
     } catch { /* not connected */ }
   } catch (e: unknown) {
     logger.error({ err: e, sessionName, model }, 'subsession.set_model restart failed');
@@ -3692,6 +3704,100 @@ async function handleFileSearch(cmd: Record<string, unknown>, serverLink: Server
 }
 
 const FS_LIST_DEADLINE_MS = 10_000;
+const FS_LIST_CACHE_TTL_MS = 5_000;
+
+interface FsLsSnapshot {
+  resolvedPath: string;
+  dirSignature: string;
+  entries: Array<Record<string, unknown>>;
+}
+
+const fsListCache = new Map<string, { expiresAt: number; value: FsLsSnapshot }>();
+const fsListInflight = new Map<string, Promise<FsLsSnapshot>>();
+const fsListGenerations = new Map<string, number>();
+
+function getFsListCacheKey(realPath: string, includeFiles: boolean, includeMetadata: boolean): string {
+  return `${realPath}::${includeFiles ? 'files' : 'dirs'}::${includeMetadata ? 'meta' : 'plain'}`;
+}
+
+async function loadFsListSnapshot(real: string, includeFiles: boolean, includeMetadata: boolean): Promise<FsLsSnapshot> {
+  const dirents = await fsReaddir(real, { withFileTypes: true });
+  const filtered = dirents.filter((d) => d.isDirectory() || (includeFiles && d.isFile()));
+
+  const entries = await Promise.all(filtered.map(async (d) => {
+    const entry: Record<string, unknown> = { name: d.name, path: nodePath.join(real, d.name), isDir: d.isDirectory(), hidden: d.name.startsWith('.') };
+    if (includeMetadata && !d.isDirectory()) {
+      try {
+        const filePath = nodePath.join(real, d.name);
+        const fileStat = await fsStat(filePath);
+        entry.size = fileStat.size;
+        const ext = nodePath.extname(d.name).toLowerCase().slice(1);
+        entry.mime = MIME_MAP[ext] || undefined;
+        const handle = createProjectFileHandle(filePath, d.name, entry.mime as string | undefined, fileStat.size);
+        entry.downloadId = handle.id;
+      } catch { /* stat failed, skip metadata */ }
+    }
+    return entry;
+  }));
+
+  entries.sort((a, b) => {
+    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+    if (a.hidden !== b.hidden) return (a.hidden ? 1 : 0) - (b.hidden ? 1 : 0);
+    return (a.name as string).localeCompare(b.name as string);
+  });
+
+  return {
+    resolvedPath: real,
+    dirSignature: await safeStatSignature(real),
+    entries,
+  };
+}
+
+async function getFsListSnapshot(real: string, includeFiles: boolean, includeMetadata: boolean): Promise<FsLsSnapshot> {
+  const dirSignature = await safeStatSignature(real);
+  const cacheKey = getFsListCacheKey(real, includeFiles, includeMetadata);
+  const cached = fsListCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now() && cached.value.dirSignature === dirSignature) {
+    return cached.value;
+  }
+
+  const generation = getResourceGeneration(fsListGenerations, real);
+  const inflightKey = `${cacheKey}::${generation}`;
+  const inflight = fsListInflight.get(inflightKey);
+  if (inflight) return await inflight;
+
+  const promise = loadFsListSnapshot(real, includeFiles, includeMetadata)
+    .then(async (value) => {
+      const currentSignature = await safeStatSignature(real);
+      if (getResourceGeneration(fsListGenerations, real) === generation && currentSignature === value.dirSignature) {
+        fsListCache.set(cacheKey, { value, expiresAt: Date.now() + FS_LIST_CACHE_TTL_MS });
+      }
+      return value;
+    })
+    .finally(() => {
+      fsListInflight.delete(inflightKey);
+    });
+  fsListInflight.set(inflightKey, promise);
+  return await promise;
+}
+
+function invalidateFsListCachesForPath(targetPath: string): void {
+  const realTarget = normalizeFsPath(targetPath);
+  bumpResourceGeneration(fsListGenerations, realTarget);
+  fsListCache.delete(getFsListCacheKey(realTarget, false, false));
+  fsListCache.delete(getFsListCacheKey(realTarget, true, false));
+  fsListCache.delete(getFsListCacheKey(realTarget, false, true));
+  fsListCache.delete(getFsListCacheKey(realTarget, true, true));
+
+  const parent = nodePath.dirname(realTarget);
+  if (parent !== realTarget) {
+    bumpResourceGeneration(fsListGenerations, parent);
+    fsListCache.delete(getFsListCacheKey(parent, false, false));
+    fsListCache.delete(getFsListCacheKey(parent, true, false));
+    fsListCache.delete(getFsListCacheKey(parent, false, true));
+    fsListCache.delete(getFsListCacheKey(parent, true, true));
+  }
+}
 
 async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const rawPath = cmd.path as string | undefined;
@@ -3768,36 +3874,12 @@ async function handleFsListInner(resolved: string, rawPath: string, requestId: s
     return;
   }
 
-  const dirents = await fsReaddir(real, { withFileTypes: true });
-  const filtered = dirents.filter((d) => d.isDirectory() || (includeFiles && d.isFile()));
+  const snapshot = await getFsListSnapshot(real, includeFiles, includeMetadata);
 
-  const entries = await Promise.all(filtered.map(async (d) => {
-    const entry: Record<string, unknown> = { name: d.name, path: nodePath.join(real, d.name), isDir: d.isDirectory(), hidden: d.name.startsWith('.') };
-    if (includeMetadata && !d.isDirectory()) {
-      try {
-        const filePath = nodePath.join(real, d.name);
-        const fileStat = await fsStat(filePath);
-        entry.size = fileStat.size;
-        const ext = nodePath.extname(d.name).toLowerCase().slice(1);
-        entry.mime = MIME_MAP[ext] || undefined;
-        // Generate a short-lived download handle
-        const handle = createProjectFileHandle(filePath, d.name, entry.mime as string | undefined, fileStat.size);
-        entry.downloadId = handle.id;
-      } catch { /* stat failed, skip metadata */ }
-    }
-    return entry;
-  }));
-
-  entries.sort((a, b) => {
-    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
-    if (a.hidden !== b.hidden) return (a.hidden ? 1 : 0) - (b.hidden ? 1 : 0);
-    return (a.name as string).localeCompare(b.name as string);
-  });
-
-  try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', entries }); } catch { /* ignore */ }
+  try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: snapshot.resolvedPath, status: 'ok', entries: snapshot.entries }); } catch { /* ignore */ }
 }
 
-const FS_READ_SIZE_LIMIT = 512 * 1024; // 512 KB
+const FS_READ_SIZE_LIMIT = 5 * 1024 * 1024; // 5 MB
 
 interface FsReadSnapshot {
   path: string;
@@ -4485,6 +4567,7 @@ async function handleFsMkdir(cmd: Record<string, unknown>, serverLink: ServerLin
     const { mkdir } = await import('fs/promises');
     await mkdir(resolved, { recursive: true });
     const real = await fsRealpath(resolved);
+    invalidateFsListCachesForPath(real);
     try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, resolvedPath: real, status: 'ok' }); } catch { /* ignore */ }
   } catch (err) {
     try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: err instanceof Error ? err.message : String(err) }); } catch { /* ignore */ }
@@ -4553,6 +4636,7 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
       // Write the file
       await fsWriteFile(real, content, 'utf-8');
       const newStats = await fsStat(real);
+      invalidateFsListCachesForPath(real);
       invalidateGitCachesForPath(real);
       try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', mtime: newStats.mtimeMs }); } catch { /* ignore */ }
     } catch (err) {
@@ -4572,6 +4656,7 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
       await fsWriteFile(resolved, content, 'utf-8');
       const newStats = await fsStat(resolved);
       const real = await fsRealpath(resolved);
+      invalidateFsListCachesForPath(real);
       invalidateGitCachesForPath(real);
       try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', mtime: newStats.mtimeMs }); } catch { /* ignore */ }
     } catch (err) {
@@ -4769,16 +4854,88 @@ export async function listProviderSessions(providerId: string): Promise<Array<{ 
 async function handleCcPresetsList(serverLink: ServerLink): Promise<void> {
   const { loadPresets } = await import('./cc-presets.js');
   const presets = await loadPresets();
-  serverLink.send({ type: 'cc.presets.list_response', presets });
+  serverLink.send({ type: CC_PRESET_MSG.LIST_RESPONSE, presets });
 }
 
 async function handleCcPresetsSave(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
-  const presets = cmd.presets as Array<{ name: string; env: Record<string, string> }> | undefined;
+  const presets = cmd.presets as CcPreset[] | undefined;
   if (!presets) return;
   const { savePresets, invalidateCache } = await import('./cc-presets.js');
   invalidateCache();
   await savePresets(presets);
-  serverLink.send({ type: 'cc.presets.save_response', ok: true });
+  serverLink.send({ type: CC_PRESET_MSG.SAVE_RESPONSE, ok: true });
+}
+
+async function handleCcPresetsDiscoverModels(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
+  const presetName = typeof cmd.presetName === 'string' ? cmd.presetName.trim() : '';
+  if (!presetName) {
+    serverLink.send({
+      type: CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE,
+      ...(requestId ? { requestId } : {}),
+      presetName,
+      ok: false,
+      error: 'presetName is required',
+    });
+    return;
+  }
+
+  const { discoverPresetModels, loadPresets, savePresets, getPreset } = await import('./cc-presets.js');
+  const presets = await loadPresets();
+  const preset = await getPreset(presetName);
+  if (!preset) {
+    serverLink.send({
+      type: CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE,
+      ...(requestId ? { requestId } : {}),
+      presetName,
+      ok: false,
+      error: `Preset "${presetName}" not found`,
+    });
+    return;
+  }
+
+  const normalizedName = preset.name.trim().toLowerCase();
+  try {
+    const discovered = await discoverPresetModels(preset);
+    const updatedPreset: CcPreset = {
+      ...preset,
+      transportMode: preset.transportMode ?? 'qwen-compatible-api',
+      authType: preset.authType ?? 'anthropic',
+      availableModels: discovered.availableModels,
+      ...(discovered.defaultModel ? { defaultModel: discovered.defaultModel } : {}),
+      lastDiscoveredAt: Date.now(),
+      modelDiscoveryError: undefined,
+    };
+    await savePresets(presets.map((item) => (
+      item.name.trim().toLowerCase() === normalizedName ? updatedPreset : item
+    )));
+    serverLink.send({
+      type: CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE,
+      ...(requestId ? { requestId } : {}),
+      presetName: updatedPreset.name,
+      ok: true,
+      preset: updatedPreset,
+      models: discovered.availableModels,
+      endpoint: discovered.endpoint,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const updatedPreset: CcPreset = {
+      ...preset,
+      modelDiscoveryError: message,
+    };
+    await savePresets(presets.map((item) => (
+      item.name.trim().toLowerCase() === normalizedName ? updatedPreset : item
+    )));
+    serverLink.send({
+      type: CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE,
+      ...(requestId ? { requestId } : {}),
+      presetName: updatedPreset.name,
+      ok: false,
+      error: message,
+      preset: updatedPreset,
+    });
+  }
 }
 
 async function handleSharedContextRuntimeConfigApply(cmd: Record<string, unknown>): Promise<void> {

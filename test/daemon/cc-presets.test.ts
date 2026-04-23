@@ -86,7 +86,7 @@ describe('cc presets', () => {
           anthropic: [
             {
               id: 'MiniMax-M2.7',
-              name: 'minimax',
+              name: 'MiniMax-M2.7',
               envKey: 'ANTHROPIC_API_KEY',
               baseUrl: 'https://api.minimax.io/anthropic',
               generationConfig: {
@@ -103,5 +103,38 @@ describe('cc presets', () => {
     expect(result.systemPrompt).toContain('MiniMax-M2.7');
     expect(result.systemPrompt).toContain('https://api.minimax.io/anthropic');
     expect(result.systemPrompt).toMatch(/not running on Qwen/i);
+  });
+
+  it('uses discovered compatible-api models when building qwen transport config', async () => {
+    const { savePresets, getQwenPresetTransportConfig } = await import('../../src/daemon/cc-presets.js');
+
+    await savePresets([
+      {
+        name: 'minimax',
+        env: {
+          ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+          ANTHROPIC_AUTH_TOKEN: 'test-token',
+          ANTHROPIC_MODEL: 'MiniMax-M2.7',
+        },
+        defaultModel: 'MiniMax-M2.7',
+        availableModels: [
+          { id: 'MiniMax-M2.7', name: 'MiniMax M2.7' },
+          { id: 'MiniMax-Text-01' },
+        ],
+      },
+    ]);
+
+    const result = await getQwenPresetTransportConfig('minimax');
+    expect(result.model).toBe('MiniMax-M2.7');
+    expect(result.availableModels).toEqual(['MiniMax-M2.7', 'MiniMax-Text-01']);
+    expect(result.settings).toMatchObject({
+      model: { name: 'MiniMax-M2.7' },
+      modelProviders: {
+        anthropic: [
+          expect.objectContaining({ id: 'MiniMax-M2.7', name: 'MiniMax M2.7' }),
+          expect.objectContaining({ id: 'MiniMax-Text-01', name: 'MiniMax-Text-01' }),
+        ],
+      },
+    });
   });
 });

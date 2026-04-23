@@ -5,6 +5,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, fireEvent, cleanup, within, waitFor, act } from '@testing-library/preact';
 import { useState } from 'preact/hooks';
+import { FILE_TRANSFER_LIMITS } from '../../../shared/transport/file-transfer.js';
 
 const DEFAULT_INNER_WIDTH = 1280;
 
@@ -58,6 +59,9 @@ vi.mock('react-i18next', () => ({
       }
       if (key === 'upload.long_text_attached') {
         return `Large pasted text attached as ${String(opts?.name ?? '')}`;
+      }
+      if (key === 'upload.file_too_large') {
+        return `File too large (max ${String(opts?.max ?? '')}MB)`;
       }
       if (key === 'upload.long_text_requires_attachment') {
         return 'Paste is too large for inline input here. Upload it as a file instead.';
@@ -2093,6 +2097,59 @@ afterEach(() => {
     expect(ws.respondTransportApproval).toHaveBeenCalledWith('codex-sdk-session', 'approval-1', true);
   });
 
+  it('clears stale approval banners when switching between transport sessions', async () => {
+    const ws = makeWs();
+    const { rerender } = render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({
+          name: 'transport-a',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(ws.onMessage).toHaveBeenCalled();
+    });
+
+    await act(async () => {
+      for (const call of ws.onMessage.mock.calls) {
+        const handler = call[0] as ((msg: unknown) => void) | undefined;
+        handler?.({
+          type: TRANSPORT_MSG.CHAT_APPROVAL,
+          sessionId: 'transport-a',
+          requestId: 'approval-stale',
+          description: 'Allow file write',
+          tool: 'shell',
+        });
+      }
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('Approval required')).toBeDefined();
+    });
+
+    rerender(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({
+          name: 'transport-b',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.queryByText('Approval required')).toBeNull();
+      expect(screen.queryByText('shell wants approval')).toBeNull();
+    });
+  });
+
   it('treats copilot-sdk sessions as transport even when runtimeType is omitted', async () => {
     const ws = makeWs();
 
@@ -2554,6 +2611,99 @@ afterEach(() => {
     });
   });
 
+  it('restores uploaded attachment badges when switching back to the same sub-session', async () => {
+    uploadFileMock.mockResolvedValue({ attachment: { daemonPath: '/tmp/persisted-sub-attachment.txt' } });
+    const ws = makeWs();
+    const { rerender } = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'deck_sub_sub-1' })}
+        subSessionId="sub-1"
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    fireEvent.paste(input, {
+      clipboardData: {
+        getData: (type: string) => type === 'text/plain' ? 'x'.repeat(1300) : '',
+      },
+    });
+
+    await waitFor(() => {
+      expect(document.querySelector('.attachment-badge-name')?.textContent).toMatch(/^pasted-text-.*\.txt$/);
+    });
+    const badgeName = document.querySelector('.attachment-badge-name')?.textContent ?? '';
+
+    rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'deck_sub_sub-2' })}
+        subSessionId="sub-2"
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    expect(document.querySelector('.attachment-badge-name')).toBeNull();
+
+    rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'deck_sub_sub-1' })}
+        subSessionId="sub-1"
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(document.querySelector('.attachment-badge-name')?.textContent).toBe(badgeName);
+    });
+  });
+
+  it('does not clear stored attachments when another control surface mounts for the same sub-session', async () => {
+    uploadFileMock.mockResolvedValue({ attachment: { daemonPath: '/tmp/shared-sub-attachment.txt' } });
+    const ws = makeWs();
+    const first = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'deck_sub_shared' })}
+        subSessionId="sub-shared"
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = within(first.container).getByRole('textbox') as HTMLDivElement;
+    fireEvent.paste(input, {
+      clipboardData: {
+        getData: (type: string) => type === 'text/plain' ? 'x'.repeat(1300) : '',
+      },
+    });
+
+    await waitFor(() => {
+      expect(first.container.querySelector('.attachment-badge-name')?.textContent).toMatch(/^pasted-text-.*\.txt$/);
+    });
+    const badgeName = first.container.querySelector('.attachment-badge-name')?.textContent ?? '';
+
+    const second = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'deck_sub_shared' })}
+        subSessionId="sub-shared"
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(second.container.querySelector('.attachment-badge-name')?.textContent).toBe(badgeName);
+    });
+    expect(first.container.querySelector('.attachment-badge-name')?.textContent).toBe(badgeName);
+  });
+
   it('blocks oversized plain-text paste when upload context is unavailable', async () => {
     render(
       <SessionControls
@@ -2575,6 +2725,11 @@ afterEach(() => {
     expect(execCommandMock).not.toHaveBeenCalled();
     expect(input.textContent).toBe('');
     expect(await screen.findByText('Paste is too large for inline input here. Upload it as a file instead.')).toBeDefined();
+  });
+
+  it('uses the shared 2GB upload limit for user-facing size calculations', () => {
+    expect(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE).toBe(2 * 1024 * 1024 * 1024);
+    expect(Math.round(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE / (1024 * 1024))).toBe(2048);
   });
 
   // TODO: fix — file upload mock doesn't trigger state update in jsdom

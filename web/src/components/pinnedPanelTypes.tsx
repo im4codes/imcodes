@@ -35,7 +35,9 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
   const sessionName = panel.props?.sessionName as string;
   const pinnedViewMode = panel.props?.viewMode as 'terminal' | 'chat' | undefined;
   const { t } = useTranslation();
-  const { events, refreshing } = useTimeline(sessionName, ctx.ws, ctx.serverId);
+  const { events, refreshing, historyStatus } = useTimeline(sessionName, ctx.ws, ctx.serverId, {
+    isActiveSession: ctx.activeSession === sessionName,
+  });
   const liveSub = ctx.subSessions.find(s => s.sessionName === sessionName);
 
   // Derive usage/thinking state from timeline events (same as SubSessionWindow)
@@ -78,7 +80,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           agentType={liveSub.type}
         />
       )}
-      {(lastUsage || activeThinkingTs || activeToolCall || statusText || liveSessionState === 'running' || liveSessionState === 'idle' || liveSub.planLabel || liveSub.quotaLabel || liveSub.quotaUsageLabel || liveSub.quotaMeta) && (
+      {(lastUsage || historyStatus.phase !== 'idle' || activeThinkingTs || activeToolCall || statusText || liveSessionState === 'running' || liveSessionState === 'idle' || liveSub.planLabel || liveSub.quotaLabel || liveSub.quotaUsageLabel || liveSub.quotaMeta) && (
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sessionName}
@@ -94,6 +96,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           statusText={statusText}
           activeToolCall={activeToolCall}
           now={thinkingNow}
+          historyStatus={historyStatus}
         />
       )}
       {(compactQuotaText || liveSub.planLabel) && (

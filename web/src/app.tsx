@@ -86,17 +86,22 @@ import {
   mergeTransportPendingMessagesForRunningState,
   normalizeTransportPendingEntries,
 } from './transport-queue.js';
-import { ingestTimelineEventForCache, ACTIVE_TIMELINE_REFRESH_EVENT } from './hooks/useTimeline.js';
+import { ingestTimelineEventForCache } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
 import { updateMainSessionLabel } from './session-label-api.js';
 import { buildDocumentTitle } from './tab-title.js';
 import {
+  getDaemonBadgeState,
   getSelectedServerName,
   hasResolvedActiveSession,
+  isServerOnline,
   shouldResetSelectedServer,
   shouldShowInitialConnectingGate,
 } from './server-selection.js';
+import { installNativeAppResumeRefresh } from './app-resume-refresh.js';
+import { markServerLive, markServerOffline } from './server-online-state.js';
+import { MSG_DAEMON_ONLINE, MSG_DAEMON_OFFLINE } from '@shared/ack-protocol.js';
 
 const DashboardPage = lazy(() => import('./pages/DashboardPage.js').then((m) => ({ default: m.DashboardPage })));
 const DiscussionsPage = lazy(() => import('./pages/DiscussionsPage.js').then((m) => ({ default: m.DiscussionsPage })));
@@ -163,12 +168,6 @@ interface ServerInfo {
   status: string;
   lastHeartbeatAt: number | null;
   createdAt: number;
-}
-
-function isServerOnline(s: ServerInfo): boolean {
-  if (s.status === 'offline') return false;
-  if (!s.lastHeartbeatAt) return false;
-  return Date.now() - s.lastHeartbeatAt < 60_000; // 60s — heartbeat is 5s, allow for network jitter
 }
 
 export function App() {
@@ -1389,9 +1388,7 @@ export function App() {
         }
         setDaemonOnline(true);
         if (sessionListRetryRef.current) { clearTimeout(sessionListRetryRef.current); sessionListRetryRef.current = null; }
-        setServers((prev) => prev.map((s) =>
-          s.id === selectedServerId ? { ...s, lastHeartbeatAt: Date.now() } : s,
-        ));
+        setServers((prev) => markServerLive(prev, selectedServerId));
         const newSessions = msg.sessions.filter((s) => !s.name.startsWith('deck_sub_'));
         setSessions((prev) => newSessions.map((s) => {
           const existing = prev.find((p) => p.name === s.name);
@@ -1793,7 +1790,25 @@ export function App() {
         daemonOfflineGraceTimerRef.current = setTimeout(() => {
           daemonOfflineGraceTimerRef.current = null;
           setDaemonOnline(false);
+          setServers((prev) => markServerOffline(prev, selectedServerId));
         }, RECONNECT_GRACE_MS);
+      }
+      if (msg.type === MSG_DAEMON_ONLINE || msg.type === DAEMON_MSG.RECONNECTED) {
+        if (daemonOfflineGraceTimerRef.current) {
+          clearTimeout(daemonOfflineGraceTimerRef.current);
+          daemonOfflineGraceTimerRef.current = null;
+        }
+        setDaemonOnline(true);
+        setServers((prev) => markServerLive(prev, selectedServerId));
+      }
+      if (msg.type === MSG_DAEMON_OFFLINE) {
+        if (daemonOfflineGraceTimerRef.current) {
+          clearTimeout(daemonOfflineGraceTimerRef.current);
+          daemonOfflineGraceTimerRef.current = null;
+        }
+        setDaemonOnline(false);
+        setServers((prev) => markServerOffline(prev, selectedServerId));
+        watchProjectionStore.setSnapshotStatus('stale');
       }
       if (msg.type === 'daemon.error') {
         // Surface uncaught daemon errors as a toast so users aren't left in the dark.
@@ -1899,21 +1914,12 @@ export function App() {
 
     let removeAppStateListener: (() => void) | null = null;
     if (isNative()) {
-      void import('@capacitor/app').then(({ App }) =>
-        App.addListener('appStateChange', ({ isActive }) => {
-          if (isActive) {
-            ws.reconnectNow(true);
-            // Native resume: WebView `visibilitychange` is unreliable on some
-            // iOS versions, so explicitly signal the active timeline to
-            // force-pull history. Safe to fire even when visibilitychange
-            // also fires — useTimeline's listener is idempotent (cooldownMs=0
-            // but rate-limited by the 200ms setTimeout in fireHttpBackfill).
-            try { window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT)); } catch { /* ignore */ }
-          }
-        }).then((listener) => {
-          removeAppStateListener = () => { void listener.remove(); };
-        }).catch(() => {})
-      ).catch(() => {});
+      void import('@capacitor/app')
+        .then(({ App }) => installNativeAppResumeRefresh(true, (force) => ws.reconnectNow(force), App))
+        .then((cleanup) => {
+          removeAppStateListener = cleanup;
+        })
+        .catch(() => {});
     }
 
     return () => {
@@ -2590,6 +2596,10 @@ export function App() {
     sessionsLoaded,
   );
   const resolvedActiveSessionExists = hasResolvedActiveSession(activeSession, sessions);
+  const selectedServerInfo = selectedServerId
+    ? servers.find((server) => server.id === selectedServerId) ?? null
+    : null;
+  const daemonBadgeState = getDaemonBadgeState(connected, connecting, daemonOnline, selectedServerInfo);
 
   useEffect(() => {
     if (showInitialConnectingGate) {
@@ -2892,8 +2902,12 @@ export function App() {
                   </button>
                 )}
                 <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 0, lineHeight: 1.2 }}>
-                  <span class={`badge ${connected ? (daemonOnline ? 'badge-online' : 'badge-connecting') : connecting ? 'badge-connecting' : 'badge-offline'}`} style={{ fontSize: 10 }}>
-                    {connected ? (daemonOnline ? '● Online' : (<><span class="connecting-dot" />{' Daemon Offline'}</>)) : connecting ? (<><span class="connecting-dot" />{' Connecting'}</>) : '○ Offline'}
+                  <span class={`badge ${daemonBadgeState === 'online' ? 'badge-online' : daemonBadgeState === 'connecting' ? 'badge-connecting' : 'badge-offline'}`} style={{ fontSize: 10 }}>
+                    {daemonBadgeState === 'online'
+                      ? '● Online'
+                      : daemonBadgeState === 'connecting'
+                        ? (<><span class="connecting-dot" />{' Connecting'}</>)
+                        : (<><span class="connecting-dot" />{' Daemon Offline'}</>)}
                   </span>
                   <span style={{ fontSize: 9, color: '#475569' }}>
                     {(() => { try { const d = new Date(__BUILD_TIME__); return `v${d.getMonth()+1}/${d.getDate()} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`; } catch { return ''; } })()}

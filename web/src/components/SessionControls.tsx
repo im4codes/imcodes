@@ -44,6 +44,7 @@ import {
   type SessionSupervisionSnapshot,
   type SupervisionMode,
 } from '@shared/supervision-config.js';
+import { FILE_TRANSFER_LIMITS } from '@shared/transport/file-transfer.js';
 
 interface Props {
   ws: WsClient | null;
@@ -116,12 +117,20 @@ interface Props {
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
 }
 
+const MAX_UPLOAD_SIZE_MB = Math.round(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE / (1024 * 1024));
+
 type MenuAction = 'restart' | 'new' | 'stop';
 type ModelChoice = 'opus[1M]' | 'sonnet' | 'haiku';
 
 const INLINE_PASTE_TEXT_CHAR_LIMIT = 1200;
 
 type ComposerAttachment = { path: string; name: string };
+
+function buildComposerDraftScope(activeSession: SessionInfo | null, subSessionId?: string): string | null {
+  if (subSessionId && subSessionId.trim()) return `sub:${subSessionId.trim()}`;
+  if (activeSession?.name?.trim()) return `session:${activeSession.name.trim()}`;
+  return null;
+}
 
 function buildPastedTextFileName(now = new Date()): string {
   const compact = now.toISOString().replace(/[:.]/g, '-');
@@ -532,8 +541,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, []);
 
   // Persist input draft across unmount/remount (sub-session minimize/restore)
-  const draftKey = activeSession ? `rcc_draft_${activeSession.name}` : null;
-  const attachmentDraftKey = activeSession ? `rcc_draft_attachments_${activeSession.name}` : null;
+  const composerDraftScope = buildComposerDraftScope(activeSession, subSessionId);
+  const draftKey = composerDraftScope ? `rcc_draft_${composerDraftScope}` : null;
+  const attachmentDraftKey = composerDraftScope ? `rcc_draft_attachments_${composerDraftScope}` : null;
+  const [hydratedAttachmentDraftKey, setHydratedAttachmentDraftKey] = useState<string | null>(null);
   useEffect(() => {
     if (!draftKey || !divRef.current) return;
     const saved = sessionStorage.getItem(draftKey);
@@ -548,6 +559,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [draftKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
+    setHydratedAttachmentDraftKey(null);
     if (!attachmentDraftKey) {
       setAttachments([]);
       attachmentDraftRef.current = [];
@@ -556,28 +568,19 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     const saved = parseStoredComposerAttachments(sessionStorage.getItem(attachmentDraftKey));
     setAttachments(saved);
     attachmentDraftRef.current = saved;
-    return () => {
-      try {
-        if (attachmentDraftRef.current.length > 0) {
-          sessionStorage.setItem(attachmentDraftKey, JSON.stringify(attachmentDraftRef.current));
-        }
-        else sessionStorage.removeItem(attachmentDraftKey);
-      } catch {
-        /* ignore */
-      }
-    };
+    setHydratedAttachmentDraftKey(attachmentDraftKey);
   }, [attachmentDraftKey]);
 
   useEffect(() => {
     attachmentDraftRef.current = attachments;
-    if (!attachmentDraftKey) return;
+    if (!attachmentDraftKey || hydratedAttachmentDraftKey !== attachmentDraftKey) return;
     try {
       if (attachments.length > 0) sessionStorage.setItem(attachmentDraftKey, JSON.stringify(attachments));
       else sessionStorage.removeItem(attachmentDraftKey);
     } catch {
       /* ignore */
     }
-  }, [attachmentDraftKey, attachments]);
+  }, [attachmentDraftKey, attachments, hydratedAttachmentDraftKey]);
 
   useEffect(() => () => {
     if (sendWarningTimerRef.current) clearTimeout(sendWarningTimerRef.current);
@@ -588,9 +591,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [activeSession?.name, activeSession?.transportConfig]);
 
   useEffect(() => {
-    if (effectiveRuntimeType !== 'transport') {
-      setPendingTransportApproval(null);
-    }
+    setPendingTransportApproval((current) => {
+      if (!current) return current;
+      if (effectiveRuntimeType !== 'transport') return null;
+      return current.sessionId === activeSession?.name ? current : null;
+    });
   }, [activeSession?.name, effectiveRuntimeType]);
 
   const connected = !!ws?.connected;
@@ -1830,7 +1835,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         if (body.includes('daemon_offline')) {
           setUploadError(t('upload.daemon_offline'));
         } else if (body.includes('file_too_large')) {
-          setUploadError(t('upload.file_too_large', { max: 20 }));
+          setUploadError(t('upload.file_too_large', { max: MAX_UPLOAD_SIZE_MB }));
         } else {
           setUploadError(t('upload.upload_failed'));
         }

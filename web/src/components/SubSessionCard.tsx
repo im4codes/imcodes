@@ -86,7 +86,9 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   // daemon echo).
   const timeline = isShell
     ? { events: [], refreshing: false, addOptimisticUserMessage: undefined, removeOptimisticMessage: undefined }
-    : useTimeline(sub.sessionName, ws, serverId);
+    : useTimeline(sub.sessionName, ws, serverId, {
+      isActiveSession: !!isFocused,
+    });
   const { events, refreshing } = timeline;
   const addOptimisticUserMessage = 'addOptimisticUserMessage' in timeline ? timeline.addOptimisticUserMessage : undefined;
   const removeOptimisticMessage = 'removeOptimisticMessage' in timeline ? timeline.removeOptimisticMessage : undefined;
@@ -372,7 +374,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
                     || (typeof extras.p2pMode === 'string' && extras.p2pMode.length > 0)
                     || (extras.p2pSessionConfig != null && typeof extras.p2pSessionConfig === 'object')
                   );
-                  if (isP2pSend || isTransportRuntime(sub)) return;
+                  if (isP2pSend) return;
                   addOptimisticUserMessage?.(text, meta?.commandId, {
                     ...(meta?.attachments ? { attachments: meta.attachments } : {}),
                     ...(meta?.extra ? { resendExtra: meta.extra } : {}),

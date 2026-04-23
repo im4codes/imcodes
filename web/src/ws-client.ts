@@ -9,6 +9,7 @@ import { REPO_MSG } from '@shared/repo-types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
+import { CC_PRESET_MSG, type CcPreset, type CcPresetModelInfo } from '@shared/cc-presets.js';
 import { MEMORY_WS } from '@shared/memory-ws.js';
 import {
   MSG_COMMAND_FAILED,
@@ -78,8 +79,9 @@ export type ServerMessage =
   | { type: 'p2p.status_response'; runId?: string; run?: any; runs?: any[] }
   | { type: 'p2p.list_discussions_response'; discussions: Array<{ id: string; fileName: string; path?: string; preview: string; mtime: number }> }
   | { type: 'p2p.read_discussion_response'; id?: string; requestId?: string; content?: string; error?: string }
-  | { type: 'cc.presets.list_response'; presets: Array<{ name: string; env: Record<string, string>; contextWindow?: number }> }
-  | { type: 'cc.presets.save_response'; ok: boolean }
+  | { type: typeof CC_PRESET_MSG.LIST_RESPONSE; presets: CcPreset[] }
+  | { type: typeof CC_PRESET_MSG.SAVE_RESPONSE; ok: boolean }
+  | { type: typeof CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE; requestId?: string; presetName: string; ok: boolean; preset?: CcPreset; models?: CcPresetModelInfo[]; endpoint?: string; error?: string }
   | FsGitDiffResponse
   | FsWriteResponse
   | FsMkdirResponse

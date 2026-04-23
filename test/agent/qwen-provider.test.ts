@@ -708,6 +708,55 @@ describe('QwenProvider', () => {
     expect(errors).toEqual(['bad request']);
   });
 
+  it('retries a transient Premature close once before surfacing an error', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-transient-retry', cwd: '/tmp/project' });
+
+    const errors: string[] = [];
+    const completed: string[] = [];
+    provider.onError((_sid, err) => errors.push(err.message));
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+
+    await provider.send('sess-transient-retry', 'retry me');
+    await waitForSpawnCount(1);
+    const first = lastSpawn();
+    first.child.stdout.write(`${JSON.stringify({ type: 'result', is_error: true, error: { message: 'API Error: Premature close' } })}\n`);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    await waitForSpawnCount(2);
+
+    const second = lastSpawn();
+    second.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-retry-ok', content: [{ type: 'text', text: 'OK' }] } })}\n`);
+    second.child.emit('close', 0, null);
+    await flushIO();
+    await flushIO();
+
+    expect(childProcessMock.spawn).toHaveBeenCalledTimes(2);
+    expect(completed).toEqual(['OK']);
+    expect(errors).toEqual([]);
+  });
+
+  it('does not retry transient errors after partial output has streamed', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-transient-partial', cwd: '/tmp/project' });
+
+    const errors: string[] = [];
+    provider.onError((_sid, err) => errors.push(err.message));
+
+    await provider.send('sess-transient-partial', 'partial first');
+    await waitForSpawnCount(1);
+    const run = lastSpawn();
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'msg-partial' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Par' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({ type: 'result', is_error: true, error: { message: 'API Error: Premature close' } })}\n`);
+    await flushIO();
+    await flushIO();
+
+    expect(childProcessMock.spawn).toHaveBeenCalledTimes(1);
+    expect(errors).toEqual(['API Error: Premature close']);
+  });
+
   it('cancel() terminates the child and emits a cancelled error', async () => {
     const provider = new QwenProvider();
     await provider.connect({});

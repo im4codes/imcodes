@@ -389,10 +389,7 @@ describe('SubSessionCard', () => {
     expect(props.hideShortcuts).toBeUndefined();
   });
 
-  it('does not add optimistic bubbles for transport sub-session card sends', () => {
-    // Transport sends can remain queued daemon-side. The compact card must
-    // not inject a committed-looking optimistic bubble before the daemon emits
-    // the authoritative user.message for the actual drain.
+  it('adds optimistic bubbles for transport sub-session card sends', () => {
     render(
       <SubSessionCard
         sub={makeSubSession({ runtimeType: 'transport' as any, type: 'claude-code-sdk' } as any)}
@@ -415,6 +412,9 @@ describe('SubSessionCard', () => {
       extra: { mode: 'quick' },
     });
 
-    expect(addOptimisticUserMessageSpy).not.toHaveBeenCalled();
+    expect(addOptimisticUserMessageSpy).toHaveBeenCalledWith('card-typed message', 'cmd-card-1', {
+      attachments: [{ kind: 'file', name: 'notes.md' }],
+      resendExtra: { mode: 'quick' },
+    });
   });
 });

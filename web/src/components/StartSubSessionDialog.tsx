@@ -1,7 +1,7 @@
 /**
  * StartSubSessionDialog — choose type (cc/cc-sdk/codex/codex-sdk/opencode/gemini/qwen/shell/openclaw) and launch a sub-session.
  */
-import { useState, useEffect } from 'preact/hooks';
+import { useState, useEffect, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { WsClient } from '../ws-client.js';
 import type { RemoteSession } from '../hooks/useProviderStatus.js';
@@ -10,6 +10,14 @@ import { getUserPref, saveUserPref } from '../api.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '@shared/effort-levels.js';
 import { getSessionAgentGroups, getSessionAgentLabel, SESSION_AGENT_GROUP_LABEL_KEYS } from './session-agent-options.js';
 import { QwenCodingPlanHint } from './QwenCodingPlanHint.js';
+import {
+  buildCcPresetFromDraft,
+  createCcPresetDraftFromPreset,
+  createDefaultCcPresetDraft,
+  type CcPresetEntry,
+  type CcPresetDraft,
+} from './cc-preset-form.js';
+import { CC_PRESET_MSG, type CcPreset } from '@shared/cc-presets.js';
 
 const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
 const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
@@ -47,20 +55,57 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   const [ocSelectedSession, setOcSelectedSession] = useState('');
 
   // CC env presets
-  const [ccPresets, setCcPresets] = useState<Array<{ name: string; env: Record<string, string>; contextWindow?: number; initMessage?: string }>>([]);
+  const [ccPresets, setCcPresets] = useState<CcPresetEntry[]>([]);
   const [ccPreset, setCcPreset] = useState<string>('');
   const [ccInitPrompt, setCcInitPrompt] = useState<string>('');
   const [showPresetEditor, setShowPresetEditor] = useState(false);
+  const defaultPresetDraft = createDefaultCcPresetDraft();
   const [newPresetName, setNewPresetName] = useState('');
-  const [newPresetBaseUrl, setNewPresetBaseUrl] = useState('');
+  const [newPresetBaseUrl, setNewPresetBaseUrl] = useState(defaultPresetDraft.baseUrl);
   const [newPresetToken, setNewPresetToken] = useState('');
-  const [newPresetModel, setNewPresetModel] = useState('');
-  const [newPresetCtx, setNewPresetCtx] = useState('1000000');
-  const [newPresetCustomEnv, setNewPresetCustomEnv] = useState<Array<{ key: string; value: string }>>([]);
-  const DEFAULT_INIT_MSG = 'For web searches, use: curl -s "https://html.duckduckgo.com/html/?q=QUERY" | head -200. Replace QUERY with URL-encoded search terms.';
-  const [newPresetInit, setNewPresetInit] = useState(DEFAULT_INIT_MSG);
+  const [newPresetModel, setNewPresetModel] = useState(defaultPresetDraft.model);
+  const [newPresetCtx, setNewPresetCtx] = useState(defaultPresetDraft.contextWindow);
+  const [newPresetCustomEnv, setNewPresetCustomEnv] = useState<Array<{ key: string; value: string }>>(defaultPresetDraft.customEnv);
+  const [newPresetInit, setNewPresetInit] = useState(defaultPresetDraft.initMessage);
+  const [newPresetAvailableModels, setNewPresetAvailableModels] = useState(defaultPresetDraft.availableModels);
   const [presetError, setPresetError] = useState('');
+  const [discoveringPreset, setDiscoveringPreset] = useState(false);
   const fmtCtx = (v: string) => { const n = parseInt(v, 10); if (!n) return ''; if (n >= 1000000) return `${(n/1000000).toFixed(n%1000000===0?0:1)}M`; if (n >= 1000) return `${(n/1000).toFixed(0)}K`; return String(n); };
+  const applyPresetDraft = (draft: CcPresetDraft) => {
+    setNewPresetName(draft.name);
+    setNewPresetBaseUrl(draft.baseUrl);
+    setNewPresetToken(draft.token);
+    setNewPresetModel(draft.model);
+    setNewPresetCtx(draft.contextWindow);
+    setNewPresetCustomEnv(draft.customEnv);
+    setNewPresetInit(draft.initMessage);
+    setNewPresetAvailableModels(draft.availableModels);
+  };
+  const buildCurrentPresetDraft = (): CcPresetDraft => ({
+    name: newPresetName,
+    baseUrl: newPresetBaseUrl,
+    token: newPresetToken,
+    model: newPresetModel,
+    contextWindow: newPresetCtx,
+    customEnv: newPresetCustomEnv,
+    initMessage: newPresetInit,
+    availableModels: newPresetAvailableModels,
+  });
+  const persistPresetDraft = (): CcPresetEntry => {
+    const preset = buildCcPresetFromDraft(buildCurrentPresetDraft());
+    const updated = [...ccPresets.filter((p) => p.name !== preset.name), preset];
+    setCcPresets(updated);
+    try { ws?.send({ type: CC_PRESET_MSG.SAVE, presets: updated }); } catch {}
+    return preset;
+  };
+  const selectedCcPreset = useMemo(
+    () => ccPresets.find((preset) => preset.name === ccPreset),
+    [ccPreset, ccPresets],
+  );
+  const qwenPresetModels = useMemo(
+    () => selectedCcPreset?.availableModels?.map((item) => item.id) ?? [],
+    [selectedCcPreset],
+  );
 
   // Remote sessions come from the provider status hook (pushed on connect, cached in DB)
   const ocRemoteSessions = getRemoteSessions('openclaw');
@@ -84,14 +129,32 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
         setDetectingShells(false);
         setShellBin((prev) => (msg.shells.includes(prev) ? prev : (msg.shells[0] ?? prev)));
       }
-      if (msg.type === 'cc.presets.list_response') {
+      if (msg.type === CC_PRESET_MSG.LIST_RESPONSE) {
         setCcPresets((msg as any).presets ?? []);
+      }
+      if (msg.type === CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE) {
+        setDiscoveringPreset(false);
+        if (msg.preset) {
+          setCcPresets((current) => [
+            ...current.filter((preset) => preset.name !== msg.preset?.name),
+            msg.preset,
+          ].filter((preset): preset is CcPreset => preset !== undefined));
+          if (newPresetName.trim().toLowerCase() === msg.preset.name.trim().toLowerCase()) {
+            applyPresetDraft(createCcPresetDraftFromPreset(msg.preset));
+          }
+          if (ccPreset === msg.preset.name || !ccPreset) setCcPreset(msg.preset.name);
+          const nextModel = msg.preset.defaultModel
+            ?? msg.preset.availableModels?.[0]?.id
+            ?? msg.preset.env.ANTHROPIC_MODEL;
+          if (nextModel) setRequestedModel(nextModel);
+        }
+        setPresetError(msg.ok ? '' : (msg.error ?? 'Failed to discover models'));
       }
     });
 
     setDetectingShells(true);
     ws.subSessionDetectShells();
-    try { ws.send({ type: 'cc.presets.list' }); } catch {}
+    try { ws.send({ type: CC_PRESET_MSG.LIST }); } catch {}
     return unsub;
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ws]);
@@ -106,6 +169,18 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   useEffect(() => {
     setThinking('high');
   }, [type]);
+
+  useEffect(() => {
+    if (type !== 'qwen') return;
+    const fallbackModel = selectedCcPreset?.defaultModel ?? selectedCcPreset?.env.ANTHROPIC_MODEL ?? '';
+    if (qwenPresetModels.length === 0) {
+      if (!requestedModel && fallbackModel) setRequestedModel(fallbackModel);
+      return;
+    }
+    if (!requestedModel || !qwenPresetModels.includes(requestedModel)) {
+      setRequestedModel(qwenPresetModels.includes(fallbackModel) ? fallbackModel : qwenPresetModels[0]);
+    }
+  }, [type, qwenPresetModels, requestedModel, selectedCcPreset]);
 
   const handleStart = () => {
     const desc = description.trim() || undefined;
@@ -133,7 +208,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     if (desc) extra.description = desc;
     if (ccPreset && (type === 'claude-code' || type === 'qwen')) extra.ccPreset = ccPreset;
     if (ccInitPrompt.trim() && type === 'claude-code') extra.ccInitPrompt = ccInitPrompt.trim();
-    if ((type === 'copilot-sdk' || type === 'cursor-headless') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
+    if ((type === 'copilot-sdk' || type === 'cursor-headless' || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
     if (type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'qwen') extra.thinking = thinking;
     onStart(type, selectedShell, cwd || undefined, label || undefined, Object.keys(extra).length > 0 ? extra : undefined);
   };
@@ -150,15 +225,17 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
             ? OPENCLAW_THINKING_LEVELS
             : [];
   const supportsCcPreset = type === 'claude-code' || type === 'qwen';
-  const supportsModelSelection = type === 'copilot-sdk' || type === 'cursor-headless';
+  const supportsModelSelection = type === 'copilot-sdk' || type === 'cursor-headless' || (type === 'qwen' && !!selectedCcPreset);
   const modelSuggestions = type === 'copilot-sdk'
-    ? COPILOT_SDK_MODEL_SUGGESTIONS
+    ? [...COPILOT_SDK_MODEL_SUGGESTIONS]
     : type === 'cursor-headless'
-      ? CURSOR_HEADLESS_MODEL_SUGGESTIONS
-      : [];
+      ? [...CURSOR_HEADLESS_MODEL_SUGGESTIONS]
+      : type === 'qwen'
+        ? (qwenPresetModels.length > 0 ? qwenPresetModels : (selectedCcPreset?.defaultModel ? [selectedCcPreset.defaultModel] : []))
+        : [];
 
   return (
-    <div class="dialog-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+    <div class="dialog-overlay">
       <div class="dialog" style={{ width: 380 }}>
         <div class="dialog-header">
           <span>New Sub-Session</span>
@@ -324,7 +401,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
             <>
               <div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-                  <span style={{ fontSize: 12, color: '#94a3b8' }}>{t('new_session.api_provider')}</span>
+                  <span style={{ fontSize: 12, color: '#94a3b8' }}>{type === 'qwen' ? 'Compatible API (via Qwen)' : t('new_session.api_provider')}</span>
                   <button type="button" style={{ background: 'none', border: 'none', color: '#3b82f6', cursor: 'pointer', fontSize: 11, padding: 0 }} onClick={() => setShowPresetEditor(!showPresetEditor)}>
                     {showPresetEditor ? `▾ ${t('common.close')}` : t('new_session.api_provider_add_edit')}
                   </button>
@@ -332,7 +409,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                 {ccPresets.length > 0 ? (
                   <select class="input" value={ccPreset} onInput={(e) => setCcPreset((e.target as HTMLSelectElement).value)} style={{ width: '100%' }}>
                     <option value="">{t('new_session.api_provider_default')}</option>
-                    {ccPresets.map((p) => <option key={p.name} value={p.name}>{p.name}{p.env['ANTHROPIC_MODEL'] ? ` (${p.env['ANTHROPIC_MODEL']})` : ''}</option>)}
+                    {ccPresets.map((p) => <option key={p.name} value={p.name}>{p.name}{(p.defaultModel ?? p.env['ANTHROPIC_MODEL']) ? ` (${p.defaultModel ?? p.env['ANTHROPIC_MODEL']})` : ''}</option>)}
                   </select>
                 ) : !showPresetEditor && (
                   <div style={{ fontSize: 11, color: '#475569' }}>{t('new_session.api_provider_default')}</div>
@@ -354,6 +431,16 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                       <input class="input" type={type ?? 'text'} placeholder={ph} value={val} onInput={(e) => set((e.target as HTMLInputElement).value)} style={{ width: '100%', fontSize: 11 }} />
                     </div>
                   ))}
+                  {newPresetAvailableModels.length > 0 && (
+                    <div style={{ marginBottom: 4 }}>
+                      <div style={{ fontSize: 9, color: '#64748b', marginBottom: 1 }}>Discovered Models</div>
+                      <select class="input" value={newPresetModel} onInput={(e) => setNewPresetModel((e.target as HTMLSelectElement).value)} style={{ width: '100%', fontSize: 11 }}>
+                        {newPresetAvailableModels.map((item) => (
+                          <option key={item.id} value={item.id}>{item.name ? `${item.name} (${item.id})` : item.id}</option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
                   <div style={{ marginBottom: 4 }}>
                     <div style={{ fontSize: 9, color: '#64748b', marginBottom: 1 }}>Context Window{newPresetCtx && <span style={{ color: '#3b82f6', marginLeft: 4 }}>{fmtCtx(newPresetCtx)}</span>}</div>
                     <input class="input" type="text" placeholder="1000000" value={newPresetCtx} onInput={(e) => setNewPresetCtx((e.target as HTMLInputElement).value)} style={{ width: '100%', fontSize: 11 }} />
@@ -377,33 +464,48 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                   </div>
                   <button type="button" class="btn btn-primary" style={{ fontSize: 11, padding: '3px 10px' }} disabled={!newPresetName.trim() || !newPresetBaseUrl.trim()}
                     onClick={() => {
-                      const env: Record<string, string> = { ANTHROPIC_BASE_URL: newPresetBaseUrl.trim(), CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1', CLAUDE_CODE_ATTRIBUTION_HEADER: '0' };
-                      if (newPresetToken.trim()) env['ANTHROPIC_AUTH_TOKEN'] = newPresetToken.trim();
-                      if (newPresetModel.trim()) env['ANTHROPIC_MODEL'] = newPresetModel.trim();
-                      for (const { key, value } of newPresetCustomEnv) { if (key.trim()) env[key.trim()] = value; }
-                      const preset: any = { name: newPresetName.trim(), env };
-                      if (newPresetCtx) preset.contextWindow = parseInt(newPresetCtx, 10);
-                      if (newPresetInit.trim()) preset.initMessage = newPresetInit.trim();
-                      const updated = [...ccPresets.filter(p => p.name !== preset.name), preset];
-                      setCcPresets(updated);
-                      try { ws?.send({ type: 'cc.presets.save', presets: updated }); } catch {}
-                      setNewPresetName(''); setNewPresetBaseUrl(''); setNewPresetToken(''); setNewPresetModel(''); setNewPresetCtx('1000000'); setNewPresetInit(DEFAULT_INIT_MSG); setNewPresetCustomEnv([]);
+                      const preset = persistPresetDraft();
+                      applyPresetDraft(createDefaultCcPresetDraft());
                       setCcPreset(preset.name); setPresetError('');
                     }}
                   >Save</button>
+                  <button
+                    type="button"
+                    class="btn btn-secondary"
+                    style={{ fontSize: 11, padding: '3px 10px', marginLeft: 8 }}
+                    disabled={discoveringPreset || !newPresetName.trim() || !newPresetBaseUrl.trim() || !newPresetToken.trim()}
+                    onClick={() => {
+                      if (!ws?.connected) {
+                        setPresetError('Daemon offline');
+                        return;
+                      }
+                      const preset = persistPresetDraft();
+                      setCcPreset(preset.name);
+                      setDiscoveringPreset(true);
+                      setPresetError('');
+                      try {
+                        ws.send({
+                          type: CC_PRESET_MSG.DISCOVER_MODELS,
+                          requestId: `cc-preset-discover-${Date.now()}`,
+                          presetName: preset.name,
+                        });
+                      } catch {
+                        setDiscoveringPreset(false);
+                        setPresetError('Failed to send discover request');
+                      }
+                    }}
+                  >{discoveringPreset ? 'Discovering...' : 'Discover Models'}</button>
                   {ccPresets.length > 0 && (
                     <div style={{ marginTop: 8, borderTop: '1px solid #334155', paddingTop: 6 }}>
                       {ccPresets.map((p) => (
                         <div key={p.name} style={{ display: 'flex', justifyContent: 'space-between', padding: '2px 0', fontSize: 11 }}>
-                          <span style={{ color: '#e2e8f0' }}>{p.name} <span style={{ color: '#475569' }}>{p.env['ANTHROPIC_MODEL'] ?? ''}</span></span>
+                          <span style={{ color: '#e2e8f0' }}>{p.name} <span style={{ color: '#475569' }}>{p.defaultModel ?? p.env['ANTHROPIC_MODEL'] ?? ''}</span></span>
                           <div style={{ display: 'flex', gap: 4 }}>
                             <button type="button" style={{ background: 'none', border: 'none', color: '#3b82f6', cursor: 'pointer', fontSize: 10 }} onClick={() => {
-                              setNewPresetName(p.name); setNewPresetBaseUrl(p.env['ANTHROPIC_BASE_URL'] ?? ''); setNewPresetToken(p.env['ANTHROPIC_AUTH_TOKEN'] ?? ''); setNewPresetModel(p.env['ANTHROPIC_MODEL'] ?? '');
-                              setNewPresetCtx(p.contextWindow ? String(p.contextWindow) : '1000000'); setNewPresetInit(p.initMessage ?? DEFAULT_INIT_MSG);
-                              const knownKeys = new Set(['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_MODEL', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', 'CLAUDE_CODE_ATTRIBUTION_HEADER']);
-                              setNewPresetCustomEnv(Object.entries(p.env).filter(([k]) => !knownKeys.has(k)).map(([key, value]) => ({ key, value })));
+                              applyPresetDraft(createCcPresetDraftFromPreset(p));
+                              setPresetError(p.modelDiscoveryError ?? '');
                             }}>Edit</button>
-                            <button type="button" style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', fontSize: 10 }} onClick={() => { const u = ccPresets.filter(x => x.name !== p.name); setCcPresets(u); try { ws?.send({ type: 'cc.presets.save', presets: u }); } catch {} if (ccPreset === p.name) setCcPreset(''); }}>Del</button>
+                            <button type="button" style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', fontSize: 10 }} onClick={() => { const u = ccPresets.filter(x => x.name !== p.name); setCcPresets(u); try { ws?.send({ type: CC_PRESET_MSG.SAVE, presets: u }); } catch {} if (ccPreset === p.name) setCcPreset(''); }}>Del</button>
                           </div>
                         </div>
                       ))}
@@ -441,15 +543,28 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
           {supportsModelSelection && (
             <div>
               <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('session.supervision.model')}</div>
-              <input
-                class="input"
-                type="text"
-                list={`sub-session-model-options-${type}`}
-                placeholder={t('session.supervision.selectModel')}
-                value={requestedModel}
-                onInput={(e) => setRequestedModel((e.target as HTMLInputElement).value)}
-                style={{ width: '100%' }}
-              />
+              {type === 'qwen' && modelSuggestions.length > 0 ? (
+                <select
+                  class="input"
+                  value={requestedModel}
+                  onInput={(e) => setRequestedModel((e.target as HTMLSelectElement).value)}
+                  style={{ width: '100%' }}
+                >
+                  {modelSuggestions.map((model) => (
+                    <option key={model} value={model}>{model}</option>
+                  ))}
+                </select>
+              ) : (
+                <input
+                  class="input"
+                  type="text"
+                  list={`sub-session-model-options-${type}`}
+                  placeholder={t('session.supervision.selectModel')}
+                  value={requestedModel}
+                  onInput={(e) => setRequestedModel((e.target as HTMLInputElement).value)}
+                  style={{ width: '100%' }}
+                />
+              )}
               {modelSuggestions.length > 0 && (
                 <datalist id={`sub-session-model-options-${type}`}>
                   {modelSuggestions.map((model) => (

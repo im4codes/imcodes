@@ -58,6 +58,17 @@ interface Props {
 
 type ViewMode = 'terminal' | 'chat';
 
+const IDLE_HISTORY_STATUS = {
+  phase: 'idle',
+  steps: {
+    cache: 'skipped',
+    textTail: 'skipped',
+    daemon: 'skipped',
+    http: 'skipped',
+    older: 'skipped',
+  },
+} as const;
+
 const LOCAL_KEY = (id: string) => `rcc_subsession_${id}`;
 const DEFAULT_W = 620;
 const DEFAULT_H = 620;
@@ -115,9 +126,13 @@ export function SubSessionWindow({
   const {
     events,
     refreshing,
+    historyStatus: timelineHistoryStatus,
     addOptimisticUserMessage,
     removeOptimisticMessage,
-  } = useTimeline(sub.sessionName, ws, serverId);
+  } = useTimeline(sub.sessionName, ws, serverId, {
+    isActiveSession: active,
+  });
+  const historyStatus = timelineHistoryStatus ?? IDLE_HISTORY_STATUS;
   const quickData = useQuickData();
 
   // Earliest ts of the current continuous thinking sequence (shared logic).
@@ -501,7 +516,7 @@ export function SubSessionWindow({
       </div>
 
       {/* Usage footer — shared component */}
-      {(lastUsage || activeThinkingTs || activeToolCall || statusText || liveSessionState === 'running' || liveSessionState === 'idle' || sessionInfo?.planLabel || sessionInfo?.quotaLabel || sessionInfo?.quotaUsageLabel || sessionInfo?.quotaMeta) && (
+      {(lastUsage || historyStatus.phase !== 'idle' || activeThinkingTs || activeToolCall || statusText || liveSessionState === 'running' || liveSessionState === 'idle' || sessionInfo?.planLabel || sessionInfo?.quotaLabel || sessionInfo?.quotaUsageLabel || sessionInfo?.quotaMeta) && (
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sub.sessionName}
@@ -517,6 +532,7 @@ export function SubSessionWindow({
           statusText={statusText}
           activeToolCall={activeToolCall}
           now={thinkingNow}
+          historyStatus={historyStatus}
         />
       )}
 
@@ -543,7 +559,7 @@ export function SubSessionWindow({
             || (typeof extras.p2pMode === 'string' && extras.p2pMode.length > 0)
             || (extras.p2pSessionConfig != null && typeof extras.p2pSessionConfig === 'object')
           );
-          if (isP2pSend || effectiveRuntimeType === 'transport') return;
+          if (isP2pSend) return;
           addOptimisticUserMessage(text, meta?.commandId, {
             ...(meta?.attachments ? { attachments: meta.attachments } : {}),
             ...(meta?.extra ? { resendExtra: meta.extra } : {}),

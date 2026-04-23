@@ -1,6 +1,16 @@
 import { Hono } from 'hono';
 import type { Env } from '../env.js';
-import { getServersByUserId, getDbSessionsByServer, getSubSessionsByServer, getUserPref } from '../db/queries.js';
+import {
+  getServersByUserId,
+  getDbSessionsByServer,
+  getSubSessionsByServer,
+  getUserPref,
+  getSessionTextTailCache,
+  collectSessionTextTailCacheItems,
+  mergeSessionTextTailCacheItems,
+  replaceSessionTextTailCache,
+  SESSION_TEXT_TAIL_CACHE_LIMIT,
+} from '../db/queries.js';
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { WsBridge } from '../ws/bridge.js';
 import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
@@ -8,6 +18,9 @@ import { getPodIdentity } from '../util/pod-identity.js';
 import logger from '../util/logger.js';
 
 export const watchRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
+const TEXT_TAIL_HISTORY_PAGE_LIMIT = 500;
+const TEXT_TAIL_HISTORY_MAX_PAGES = 6;
+const TEXT_TAIL_HISTORY_TIMEOUT_MS = 1500;
 
 type WatchSessionState = 'working' | 'idle' | 'error' | 'stopped';
 
@@ -50,6 +63,61 @@ function titleForMainSession(session: { project_name: string; label: string | nu
 function titleForSubSession(sub: { id: string; label: string | null; type: string }): string {
   if (sub.label?.trim()) return sub.label.trim();
   return sub.type || sub.id;
+}
+
+async function backfillSessionTextTailFromDaemon(
+  serverId: string,
+  sessionName: string,
+  cached: Awaited<ReturnType<typeof getSessionTextTailCache>>,
+): Promise<Awaited<ReturnType<typeof getSessionTextTailCache>>> {
+  let events = cached;
+  let beforeTs: number | undefined;
+  const seenPages = new Set<string>();
+
+  for (let page = 0; page < TEXT_TAIL_HISTORY_MAX_PAGES; page++) {
+    if (events.length >= SESSION_TEXT_TAIL_CACHE_LIMIT) break;
+
+    const response = await WsBridge.get(serverId).requestTimelineHistory({
+      sessionName,
+      limit: TEXT_TAIL_HISTORY_PAGE_LIMIT,
+      timeoutMs: TEXT_TAIL_HISTORY_TIMEOUT_MS,
+      ...(beforeTs !== undefined ? { beforeTs } : {}),
+    });
+    const rawEvents = Array.isArray(response.events)
+      ? response.events.filter((event): event is Record<string, unknown> => !!event && typeof event === 'object')
+      : [];
+    if (rawEvents.length === 0) break;
+
+    const fingerprint = JSON.stringify([
+      rawEvents.length,
+      rawEvents[0]?.eventId,
+      rawEvents[0]?.ts,
+      rawEvents.at(-1)?.eventId,
+      rawEvents.at(-1)?.ts,
+    ]);
+    if (seenPages.has(fingerprint)) break;
+    seenPages.add(fingerprint);
+
+    const live = collectSessionTextTailCacheItems(sessionName, rawEvents);
+    if (live.length > 0) {
+      events = mergeSessionTextTailCacheItems(events, live);
+    }
+
+    if (rawEvents.length < TEXT_TAIL_HISTORY_PAGE_LIMIT) break;
+
+    let oldestTs: number | undefined;
+    for (const event of rawEvents) {
+      if (typeof event.ts !== 'number' || !Number.isFinite(event.ts)) continue;
+      oldestTs = oldestTs === undefined ? event.ts : Math.min(oldestTs, event.ts);
+    }
+    if (oldestTs === undefined) break;
+
+    // Keep a 1ms overlap on the page boundary so same-ts events are not
+    // skipped when the next page is requested.
+    beforeTs = oldestTs + 1;
+  }
+
+  return events;
 }
 
 function sanitizeWatchTimelineEvent(raw: unknown): {
@@ -354,5 +422,41 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
     if (message === 'daemon_offline') return c.json({ error: 'daemon_offline' }, 503);
     if (message === 'timeout') return c.json({ error: 'timeline_timeout' }, 504);
     return c.json({ error: 'relay_failed' }, 502);
+  }
+});
+
+watchRoutes.get('/server/:id/timeline/text-tail', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id')!;
+  const role = await resolveServerRole(c.env.DB, serverId, userId);
+  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+
+  const sessionName = c.req.query('sessionName')?.trim();
+  if (!sessionName) return c.json({ error: 'session_name_required' }, 400);
+
+  try {
+    const cached = await getSessionTextTailCache(c.env.DB, serverId, sessionName);
+    let events = cached;
+    try {
+      events = await backfillSessionTextTailFromDaemon(serverId, sessionName, cached);
+      if (JSON.stringify(events) !== JSON.stringify(cached)) {
+        await replaceSessionTextTailCache(c.env.DB, serverId, sessionName, events);
+      }
+    } catch (err) {
+      logger.info({
+        serverId,
+        sessionName,
+        err: err instanceof Error ? err.message : String(err),
+      }, 'timeline.text-tail backfill skipped');
+    }
+    c.header(IMCODES_POD_HEADER, getPodIdentity());
+    return c.json({ sessionName, events });
+  } catch (err) {
+    logger.warn({
+      serverId,
+      sessionName,
+      err: err instanceof Error ? err.message : String(err),
+    }, 'timeline.text-tail failed');
+    return c.json({ error: 'cache_read_failed' }, 500);
   }
 });

@@ -28,9 +28,11 @@ function localizedAckFailureReason(reason: AckFailureReason): string {
 
 import { useEffect, useRef, useState, useCallback } from 'preact/hooks';
 import type { WsClient, TimelineEvent, ServerMessage } from '../ws-client.js';
+import type { TimelineConfidence, TimelineSource } from '../../../src/shared/timeline/types.js';
 import { TimelineDB } from '../timeline-db.js';
 import { mergeTimelineEvents, preferTimelineEvent } from '../../../src/shared/timeline/merge.js';
-import { fetchTimelineHistoryHttp } from '../api.js';
+import { fetchTimelineHistoryHttp, fetchTimelineTextTailHttp, type TimelineTextTailItem } from '../api.js';
+import { normalizeTransportPendingEntries } from '../transport-queue.js';
 
 // Singleton DB shared across all useTimeline instances — opened once at module load.
 // This avoids per-hook open() latency and ensures the DB is ready before any hook queries it.
@@ -44,32 +46,16 @@ sharedDb.open().catch(() => {});
 const eventsCache = new Map<string, TimelineEvent[]>();
 const eventsCacheAccess = new Map<string, number>();
 const cacheListeners = new Map<string, Set<(events: TimelineEvent[]) => void>>();
-
-// Cross-hook-instance, cross-mount memo of the last time the HTTP backfill
-// for a given `cacheKey` (server+session scope) completed. Consulted by the
-// mount-time backfill path so that rapidly switching between the same two
-// windows (open A → open B → open A again) doesn't re-hit the daemon store
-// for every visit. Only updated on a SUCCESSFUL fetch — null/error responses
-// leave the timestamp unchanged so the next mount retries promptly. The WS
-// reconnect path deliberately bypasses this cooldown because a reconnect
-// indicates a real connection gap where missed events are probable.
 const lastHttpBackfillOkAt = new Map<string, number>();
 const MOUNT_BACKFILL_COOLDOWN_MS = 60_000;
 
-/**
- * Wipe all mount-backfill cooldown stamps. Called when the app has been
- * backgrounded long enough that missed events become likely (mobile app
- * resumed from background, laptop lid opened, browser tab restored after
- * a long hide). Callers supply their own gate — the function itself is
- * unconditional.
- */
 function resetBackfillCooldowns(): void {
   lastHttpBackfillOkAt.clear();
 }
 
 /**
  * Custom DOM event fired when an ALREADY-MOUNTED timeline hook should force
- * an immediate HTTP backfill, bypassing its mount-time cooldown. Triggers:
+ * an immediate HTTP backfill. Triggers:
  *
  *   1. Visibility returning from hidden (any duration). Typical case: user
  *      opens the app from a push notification and lands on a session that
@@ -87,13 +73,27 @@ function resetBackfillCooldowns(): void {
  */
 export const ACTIVE_TIMELINE_REFRESH_EVENT = 'deck:active-timeline-refresh';
 
+export function dispatchActiveTimelineRefresh(): void {
+  if (typeof window === 'undefined') return;
+  try { window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT)); } catch { /* ignore */ }
+}
+
+export function requestActiveTimelineRefresh(options?: { resetCooldowns?: boolean }): void {
+  if (typeof window === 'undefined') return;
+  if (options?.resetCooldowns) resetBackfillCooldowns();
+  dispatchActiveTimelineRefresh();
+  const fireLater = (): void => dispatchActiveTimelineRefresh();
+  if (typeof window.requestAnimationFrame === 'function') {
+    window.requestAnimationFrame(() => window.requestAnimationFrame(fireLater));
+    return;
+  }
+  window.setTimeout(fireLater, 32);
+}
+
 // On every visibility transition we record when the document went hidden;
-// on the return-to-visible side we always emit a refresh request, and for
-// long-hide gaps we ALSO wipe cooldowns so the next mount of any other
-// session re-hits HTTP. Previously only the >=60s path did anything, which
-// meant short-hide wake-ups (push-notification tap, lock-screen glance,
-// alt-tab during typing) never surfaced newer messages until the user
-// navigated away and back.
+// on the return-to-visible side we clear the mount cooldown and emit a
+// refresh request so the mounted timeline for the active session can
+// immediately pull any missed daemon-side events.
 //
 // Guard against non-browser environments (vitest node / SSR):
 // `document`/`window` may be undefined at import time.
@@ -105,15 +105,10 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
       return;
     }
     // visible: notify the mounted timeline hook for the active session.
-    // Cooldown reset is restricted to long hides because it affects ALL
-    // cached sessions, not just the visible one.
     const wasHidden = hiddenAt !== null;
-    const hiddenMs = wasHidden ? Date.now() - (hiddenAt ?? 0) : 0;
-    if (wasHidden && hiddenMs >= MOUNT_BACKFILL_COOLDOWN_MS) {
-      resetBackfillCooldowns();
-    }
     if (wasHidden) {
-      try { window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT)); } catch { /* older browsers */ }
+      resetBackfillCooldowns();
+      dispatchActiveTimelineRefresh();
     }
     hiddenAt = null;
   };
@@ -124,7 +119,7 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
   window.addEventListener('pageshow', (ev) => {
     if ((ev as PageTransitionEvent).persisted) {
       resetBackfillCooldowns();
-      try { window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT)); } catch { /* ignore */ }
+      dispatchActiveTimelineRefresh();
     }
   });
 }
@@ -134,6 +129,7 @@ const MAX_HISTORY_EVENTS = 2000;
 const MAX_CACHED_SESSIONS = 12;
 const MAX_TOTAL_CACHED_EVENTS = 12_000;
 const ECHO_WINDOW_MS = 500;
+const TIMELINE_HISTORY_AFTER_TS_OVERLAP_MS = 1;
 // Dedup window for user.message from JSONL vs web-UI-sent: JSONL watcher polls every 2s,
 // so the same message can arrive twice (once from command-handler, once from JSONL).
 // 5s is enough to catch the JSONL delay without hiding legitimate repeated messages.
@@ -342,6 +338,10 @@ export function __resetTimelineCacheForTests(): void {
   lastHttpBackfillOkAt.clear();
 }
 
+export function __resetBackfillCooldownsForTests(): void {
+  resetBackfillCooldowns();
+}
+
 export function __clearPersistedTimelineSnapshotsForTests(): void {
   try {
     const keys: string[] = [];
@@ -355,13 +355,41 @@ export function __clearPersistedTimelineSnapshotsForTests(): void {
   }
 }
 
-/**
- * Test-only entry point for the same wipe the app does on long-hide /
- * pageshow restore. Exposed so tests can verify the cooldown actually
- * gets cleared without having to mock `document.visibilityState`.
- */
-export function __resetBackfillCooldownsForTests(): void {
-  resetBackfillCooldowns();
+function getTimelineHistoryAfterTs(events: TimelineEvent[]): number | undefined {
+  let maxTs: number | undefined;
+  for (const ev of events) {
+    // Pending optimistic bubbles carry `ts = Date.now()` from the client
+    // clock — exclude them so a skewed client clock can't accidentally
+    // filter out legitimately-missed server events.
+    if (ev.type === 'user.message' && (ev as { payload?: { pending?: boolean } }).payload?.pending) continue;
+    if (typeof ev.ts === 'number' && (maxTs === undefined || ev.ts > maxTs)) maxTs = ev.ts;
+  }
+  if (maxTs === undefined) return undefined;
+  return Math.max(0, maxTs - TIMELINE_HISTORY_AFTER_TS_OVERLAP_MS);
+}
+
+function timelineEventFromTextTailItem(sessionId: string, item: TimelineTextTailItem): TimelineEvent | null {
+  if (typeof item.eventId !== 'string' || !item.eventId) return null;
+  if (typeof item.ts !== 'number' || !Number.isFinite(item.ts)) return null;
+  if (item.type !== 'user.message' && item.type !== 'assistant.text') return null;
+  if (typeof item.text !== 'string' || item.text.trim().length === 0) return null;
+  const source: TimelineSource = item.source === 'hook' || item.source === 'terminal-parse' || item.source === 'terminal-spinner'
+    ? item.source
+    : 'daemon';
+  const confidence: TimelineConfidence = item.confidence === 'medium' || item.confidence === 'low'
+    ? item.confidence
+    : 'high';
+  return {
+    eventId: item.eventId,
+    sessionId,
+    ts: item.ts,
+    epoch: 0,
+    seq: 0,
+    source,
+    confidence,
+    type: item.type,
+    payload: { text: item.text },
+  };
 }
 
 export function __getTimelineCacheKeysForTests(): string[] {
@@ -385,6 +413,8 @@ export interface UseTimelineResult {
   loading: boolean;
   /** True while gap-filling after a cache hit — content is visible but may be stale */
   refreshing: boolean;
+  /** Structured history-fetch progress shown under the ctx bar while history is loading. */
+  historyStatus: TimelineHistoryStatus;
   /** True while loading older events via backward pagination */
   loadingOlder: boolean;
   /** False when backward pagination returned 0 events (no more history to load) */
@@ -410,14 +440,60 @@ export interface UseTimelineResult {
   loadOlderEvents: () => void;
 }
 
+export interface UseTimelineOptions {
+  /**
+   * Only the active/visible timeline should trigger opportunistic HTTP
+   * backfills. Inactive mounted timelines still stay warm via cache + WS
+   * events, but they must not hammer `/timeline/history/full`.
+   */
+  isActiveSession?: boolean;
+}
+
+export type TimelineHistoryPhase = 'idle' | 'bootstrap' | 'refresh' | 'older';
+export type TimelineHistoryStepState = 'pending' | 'running' | 'done' | 'skipped';
+export type TimelineHistoryStepKey = 'cache' | 'textTail' | 'daemon' | 'http' | 'older';
+
+export interface TimelineHistoryStatus {
+  phase: TimelineHistoryPhase;
+  steps: Record<TimelineHistoryStepKey, TimelineHistoryStepState>;
+}
+
+export function createIdleHistoryStatus(): TimelineHistoryStatus {
+  return {
+    phase: 'idle',
+    steps: {
+      cache: 'skipped',
+      textTail: 'skipped',
+      daemon: 'skipped',
+      http: 'skipped',
+      older: 'skipped',
+    },
+  };
+}
+
+function createBootstrapHistoryStatus(opts: { canTextTail: boolean; canDaemon: boolean; canHttp: boolean }): TimelineHistoryStatus {
+  return {
+    phase: 'bootstrap',
+    steps: {
+      cache: 'running',
+      textTail: opts.canTextTail ? 'pending' : 'skipped',
+      daemon: opts.canDaemon ? 'pending' : 'skipped',
+      http: opts.canHttp ? 'pending' : 'skipped',
+      older: 'skipped',
+    },
+  };
+}
+
 export function useTimeline(
   sessionId: string | null,
   ws: WsClient | null,
   serverId?: string | null,
+  options?: UseTimelineOptions,
 ): UseTimelineResult {
   // IDB + memory cache key: scope by serverId to prevent cross-server pollution
   // when different servers share the same session name (e.g. deck_cd_brain).
   const cacheKey = sessionId ? scopeCacheKey(serverId, sessionId) : sessionId;
+  const isActiveSession = options?.isActiveSession ?? true;
   const wsConnected = !!ws?.connected;
   const cacheKeyRef = useRef(cacheKey);
   cacheKeyRef.current = cacheKey;
@@ -427,8 +503,12 @@ export function useTimeline(
   const [hasOlderHistory, setHasOlderHistory] = useState(true);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [httpRefreshing, setHttpRefreshing] = useState(false);
+  const [textTailRefreshing, setTextTailRefreshing] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
+  const [historyStatus, setHistoryStatus] = useState<TimelineHistoryStatus>(() => createIdleHistoryStatus());
   const loadingOlderRef = useRef(false); // Synchronous guard against duplicate pagination requests
+  const httpBackfillInFlightRef = useRef(0);
   const epochRef = useRef<number>(0);
   const seqRef = useRef<number>(0);
   const replayRequestIdRef = useRef<string | null>(null);
@@ -436,6 +516,20 @@ export function useTimeline(
   const olderRequestIdRef = useRef<string | null>(null);
   const historyLoadedRef = useRef<string | null>(null); // tracks which session has been loaded
   const historyRetryRef = useRef(0); // retry count for empty history responses
+
+  const updateHistoryStep = useCallback((
+    step: TimelineHistoryStepKey,
+    state: TimelineHistoryStepState,
+    phase?: Exclude<TimelineHistoryPhase, 'idle'>,
+  ) => {
+    setHistoryStatus((prev) => ({
+      phase: phase ?? prev.phase,
+      steps: {
+        ...prev.steps,
+        [step]: state,
+      },
+    }));
+  }, []);
 
   useEffect(() => {
     if (!cacheKey) return;
@@ -450,22 +544,61 @@ export function useTimeline(
   useEffect(() => {
     if (!sessionId) {
       setLoading(false);
+      setHttpRefreshing(false);
+      setTextTailRefreshing(false);
+      setHistoryStatus(createIdleHistoryStatus());
+      httpBackfillInFlightRef.current = 0;
       resetOlderState();
       return;
     }
 
     setRefreshing(false);
+    setHttpRefreshing(false);
+    setTextTailRefreshing(false);
+    setHistoryStatus(createBootstrapHistoryStatus({
+      canTextTail: !!serverId,
+      canDaemon: wsConnected,
+      canHttp: !!serverId,
+    }));
+    httpBackfillInFlightRef.current = 0;
     resetOlderState();
     setHasOlderHistory(true);
 
     let cancelled = false;
+    let textTailStarted = false;
+
+    const startTextTailBootstrap = (): void => {
+      if (textTailStarted || !serverId || !sessionId || !cacheKey) return;
+      textTailStarted = true;
+      const expectedCacheKey = cacheKey;
+      const expectedSessionId = sessionId;
+      updateHistoryStep('textTail', 'running', 'bootstrap');
+      setTextTailRefreshing(true);
+      void fetchTimelineTextTailHttp(serverId, expectedSessionId)
+        .then((result) => {
+          if (cancelled || cacheKeyRef.current !== expectedCacheKey || !result || result.events.length === 0) return;
+          const recovered = result.events
+            .map((item) => timelineEventFromTextTailItem(expectedSessionId, item))
+            .filter((event): event is TimelineEvent => event !== null);
+          if (recovered.length === 0) return;
+          mergeEvents(recovered);
+        })
+        .catch(() => { /* fail-open: authoritative history flow continues */ })
+        .finally(() => {
+          updateHistoryStep('textTail', 'done', 'bootstrap');
+          if (!cancelled && cacheKeyRef.current === expectedCacheKey) setTextTailRefreshing(false);
+        });
+    };
 
     // 1. Module-level memory cache — instant restore (e.g. window reopen)
     const memCached = getCachedEvents(cacheKey!);
     if (memCached && memCached.length > 0) {
+      updateHistoryStep('cache', 'done', 'bootstrap');
       setEvents(memCached);
       setLoading(false);
+      startTextTailBootstrap();
       if (wsConnected) {
+        updateHistoryStep('daemon', 'running', 'bootstrap');
         setRefreshing(true);
         historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
       }
@@ -473,7 +606,9 @@ export function useTimeline(
       // was minimized/backgrounded since the memory cache can be stale.
       // Kept short (~200ms) because the UI is already visible; this is
       // strictly additive catch-up, merged by eventId.
-      fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS });
+      if (isActiveSession) {
+        fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' });
+      }
       return () => { cancelled = true; };
     }
 
@@ -482,28 +617,38 @@ export function useTimeline(
     // tail snapshot for first paint; IndexedDB remains the fuller local source.
     const localSnapshot = loadPersistedTimelineSnapshot(cacheKey!);
     if (localSnapshot.length > 0) {
+      updateHistoryStep('cache', 'done', 'bootstrap');
       setCachedEvents(cacheKey!, localSnapshot);
       setEvents((prev) => (prev === localSnapshot ? prev : localSnapshot));
       setLoading(false);
+      startTextTailBootstrap();
       if (wsConnected) {
+        updateHistoryStep('daemon', 'running', 'bootstrap');
         setRefreshing(true);
         historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
       }
-      fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS });
+      if (isActiveSession) {
+        fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' });
+      }
     }
 
     // 2. Already loaded this session — skip reload (prevents flash-of-empty on minimize/restore)
     if (historyLoadedRef.current === cacheKey) {
+      updateHistoryStep('cache', 'done', 'bootstrap');
       setLoading(false);
+      startTextTailBootstrap();
       // Just request incremental updates
       if (wsConnected) {
+        updateHistoryStep('daemon', 'running', 'bootstrap');
         setRefreshing(true);
         historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
       }
       // Same reasoning as path 1 — back-fill in the background so the
       // re-opened window is guaranteed to reflect authoritative daemon
       // state, not whatever the WS subscription happened to catch.
-      fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS });
+      if (isActiveSession) {
+        fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' });
+      }
       return () => { cancelled = true; };
     }
 
@@ -523,45 +668,48 @@ export function useTimeline(
         if (cancelled) return;
         const existing = getSharedTimelineBase(cacheKey!, eventsRef.current, MAX_MEMORY_EVENTS);
         const restored = mergeTimelineEvents(existing, stored, MAX_MEMORY_EVENTS);
+        updateHistoryStep('cache', 'done', 'bootstrap');
         setCachedEvents(cacheKey!, restored);
         setEvents((prev) => (prev === restored ? prev : restored));
         setLoading(false);
         historyLoadedRef.current = cacheKeyRef.current;
+        startTextTailBootstrap();
         if (wsConnected) {
+          updateHistoryStep('daemon', 'running', 'bootstrap');
           setRefreshing(true);
           historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
         }
         // Background HTTP backfill — IDB is authoritative only up to the
         // last time a WS event landed; if the user closed the tab mid-chat
         // and reopened later there may be a gap between IDB and daemon.
-        fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS });
+        if (isActiveSession) {
+          fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' });
+        }
       } else {
         epochRef.current = 0;
         seqRef.current = 0;
         if (cancelled) return;
+        updateHistoryStep('cache', 'done', 'bootstrap');
         setEvents([]);
+        startTextTailBootstrap();
         if (wsConnected) {
+          updateHistoryStep('daemon', 'running', 'bootstrap');
+          setRefreshing(true);
           historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId);
         } else {
           setLoading(false);
         }
-        // Cold load — no IDB cache, no memory cache. Skip the
-        // MOUNT_BACKFILL_COOLDOWN_MS gate: with zero cached events the UI
-        // is showing "No events yet", so a cooldown from a prior session's
-        // mount on this page (unrelated cacheKey can't trigger it, but a
-        // prior cold-mount of *this* session in the same page session can)
-        // would leave the user staring at an empty timeline until the next
-        // WS event. That's exactly the symptom users report after opening
-        // a chat via push notification — the mount effect runs inside
-        // React's render tick but ACTIVE_TIMELINE_REFRESH_EVENT dispatched
-        // by the notification handler can race with listener attachment.
-        // Passing cooldownMs=0 here guarantees the fetch actually fires.
-        fireHttpBackfillRef.current(200, { cooldownMs: 0 });
+        // Cold load — no IDB cache, no memory cache. Still fire the same
+        // delayed HTTP backfill so an empty timeline can recover missed
+        // daemon-side events without waiting for a later reconnect.
+        if (isActiveSession) {
+          fireHttpBackfillRef.current(200, { cooldownMs: 0, phase: 'bootstrap' });
+        }
       }
     };
     load().catch(() => {});
     return () => { cancelled = true; };
-  }, [cacheKey, sessionId, ws, wsConnected]);
+  }, [cacheKey, isActiveSession, sessionId, ws, wsConnected]);
 
   // Map of commandId → optimistic eventId for O(1) lookup on command.ack / dedup.
   const optimisticIdsByCommandRef = useRef(new Map<string, string>());
@@ -616,6 +764,29 @@ export function useTimeline(
       return next;
     });
   }, [clearOptimisticTimer]);
+
+  const reconcileQueuedOptimisticMessages = useCallback((pendingEntries: unknown, pendingMessages: unknown) => {
+    const queuedEntries = normalizeTransportPendingEntries(pendingEntries, pendingMessages, sessionId ?? '');
+    if (queuedEntries.length === 0) return;
+    const queuedIds = new Set(queuedEntries.map((entry) => entry.clientMessageId).filter(Boolean));
+    if (queuedIds.size === 0) return;
+    setEvents((prev) => {
+      const base = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
+      let changed = false;
+      const next = base.filter((event) => {
+        if (event.type !== 'user.message' || event.payload.pending !== true) return true;
+        const commandId = typeof event.payload.commandId === 'string' ? event.payload.commandId : '';
+        if (!commandId || !queuedIds.has(commandId)) return true;
+        optimisticIdsByCommandRef.current.delete(commandId);
+        clearOptimisticTimer(commandId);
+        changed = true;
+        return false;
+      });
+      if (!changed) return base;
+      if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, next);
+      return next;
+    });
+  }, [clearOptimisticTimer, sessionId]);
 
   // Immediately show a user message before the daemon confirms it.
   // The real event (from WS) will remove the pending version on arrival.
@@ -685,6 +856,16 @@ export function useTimeline(
     if (!cached || cached.length === 0) return;
     const oldestTs = Math.min(...cached.map((e) => e.ts));
     loadingOlderRef.current = true;
+    setHistoryStatus({
+      phase: 'older',
+      steps: {
+        cache: 'done',
+        textTail: 'skipped',
+        daemon: 'skipped',
+        http: 'skipped',
+        older: 'running',
+      },
+    });
     setLoadingOlder(true);
     olderRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS, undefined, oldestTs);
     // Timeout: if response never arrives (packet loss, disconnect), reset after 10s
@@ -758,37 +939,32 @@ export function useTimeline(
    * history before this fires.
    *
    * Call sites:
-   *   - Session mount / switch (`cooldownMs = 60_000`): "user just opened a
-   *     window". If the previous backfill for this same session succeeded
-   *     less than a minute ago — e.g. user is flicking A → B → A — don't
-   *     rehit the daemon store; the freshly cached result is authoritative
-   *     enough.
-   *   - WS reconnect (`cooldownMs = 0`): covers the ~10–100ms subscribe-race
+   *   - Session mount / switch (~200ms): cached history renders immediately,
+   *     then a background backfill reconciles against authoritative daemon
+   *     state. Re-visits within 60 seconds reuse the previous successful
+   *     result to avoid hammering HTTP while the app stays active.
+   *   - WS reconnect (~600ms): covers the ~10–100ms subscribe-race
    *     window on the bridge where live events can be silently dropped.
-   *     Reconnects imply a real connection gap, so they deliberately bypass
-   *     the cooldown — missing events after a disconnect is exactly what
-   *     this read exists to recover.
+   *     Missing events after a disconnect is exactly what this read exists
+   *     to recover.
    *
    * Safe to call when:
    *   - `serverId` is unknown → skipped (self-hosted deploys require it).
    *   - The user switches session mid-flight → the cacheKey-guard in the
    *     timeout callback discards results for the old session.
-   *   - Backfill returns zero events → cooldown stamp still recorded (the
-   *     fetch confirmed "no gap").
-   *   - Backfill returns null / rejects → cooldown stamp is NOT recorded so
-   *     the next attempt tries again promptly.
+   *   - Backfill returns zero events → a successful no-gap result still arms
+   *     the mount cooldown.
+   *   - Backfill returns null / rejects → WS path remains primary; the next
+   *     trigger simply tries again.
    */
-  const fireHttpBackfill = useCallback((delayMs: number, opts?: { cooldownMs?: number }) => {
-    if (!serverId || !sessionId) return;
+  const fireHttpBackfill = useCallback((delayMs: number, opts?: { cooldownMs?: number; phase?: 'bootstrap' | 'refresh' }) => {
+    if (!isActiveSession || !serverId || !sessionId) return;
     const cooldownMs = opts?.cooldownMs ?? 0;
+    const phase = opts?.phase ?? 'refresh';
     const backfillSessionId = sessionId;
     const backfillCacheKey = cacheKey;
     setTimeout(() => {
       if (cacheKeyRef.current !== backfillCacheKey) return;
-      // Cooldown is enforced AT FIRE TIME (after the delay) rather than at
-      // call time so two back-to-back switches landing inside the delay
-      // window still observe the correct gap relative to the previous
-      // confirmed fetch.
       if (backfillCacheKey && cooldownMs > 0) {
         const lastOk = lastHttpBackfillOkAt.get(backfillCacheKey);
         if (lastOk !== undefined && Date.now() - lastOk < cooldownMs) return;
@@ -796,21 +972,15 @@ export function useTimeline(
       // Recompute the cursor at fire time, not call time — the UI may have
       // received fresh WS events during the delay window and we don't want
       // to redownload them.
-      let afterTs: number | undefined;
-      for (const ev of eventsRef.current) {
-        // Pending optimistic bubbles carry `ts = Date.now()` from the client
-        // clock — exclude them so a skewed client clock can't accidentally
-        // filter out legitimately-missed server events.
-        if (ev.type === 'user.message' && (ev as { payload?: { pending?: boolean } }).payload?.pending) continue;
-        if (typeof ev.ts === 'number' && (afterTs === undefined || ev.ts > afterTs)) afterTs = ev.ts;
-      }
+      const afterTs = getTimelineHistoryAfterTs(eventsRef.current);
+      httpBackfillInFlightRef.current += 1;
+      updateHistoryStep('http', 'running', phase);
+      setHttpRefreshing(true);
       void fetchTimelineHistoryHttp(serverId, backfillSessionId, {
         afterTs,
         limit: MAX_MEMORY_EVENTS,
       }).then((result) => {
-        if (!result) return; // null = transient failure, don't stamp cooldown
-        // Any non-null response (including zero-events "no gap") counts as
-        // confirmed-up-to-now and arms the cooldown.
+        if (!result) return;
         if (backfillCacheKey) lastHttpBackfillOkAt.set(backfillCacheKey, Date.now());
         if (result.events.length === 0) return;
         if (cacheKeyRef.current !== backfillCacheKey) return;
@@ -820,9 +990,14 @@ export function useTimeline(
         if (recovered.length === 0) return;
         mergeEvents(recovered);
         idbPutEvents(recovered);
-      }).catch(() => { /* opportunistic — WS path is primary; don't stamp cooldown */ });
+      }).catch(() => { /* opportunistic — WS path is primary */ })
+        .finally(() => {
+          httpBackfillInFlightRef.current = Math.max(0, httpBackfillInFlightRef.current - 1);
+          updateHistoryStep('http', 'done', phase);
+          if (httpBackfillInFlightRef.current === 0) setHttpRefreshing(false);
+        });
     }, delayMs);
-  }, [serverId, sessionId, cacheKey, mergeEvents, idbPutEvents]);
+  }, [isActiveSession, serverId, sessionId, cacheKey, mergeEvents, idbPutEvents, updateHistoryStep]);
 
   // Stable indirection — lets the session-mount effect below call the latest
   // `fireHttpBackfill` without having to list it (and transitively its five
@@ -830,6 +1005,7 @@ export function useTimeline(
   // mount effect to re-run on every render.
   const fireHttpBackfillRef = useRef(fireHttpBackfill);
   fireHttpBackfillRef.current = fireHttpBackfill;
+  const lastActiveRefreshAtRef = useRef(0);
 
   // Force-refresh the active session when the app comes back to the
   // foreground or a push-notification is tapped. Listener is intentionally
@@ -843,11 +1019,15 @@ export function useTimeline(
   // each call, and `fireHttpBackfill` itself no-ops when either is unset.
   useEffect(() => {
     const handler = (): void => {
-      fireHttpBackfillRef.current(0, { cooldownMs: 0 });
+      if (!isActiveSession) return;
+      const now = Date.now();
+      if (now - lastActiveRefreshAtRef.current < 250) return;
+      lastActiveRefreshAtRef.current = now;
+      fireHttpBackfillRef.current(0, { phase: 'refresh' });
     };
     window.addEventListener(ACTIVE_TIMELINE_REFRESH_EVENT, handler);
     return () => window.removeEventListener(ACTIVE_TIMELINE_REFRESH_EVENT, handler);
-  }, []);
+  }, [isActiveSession]);
 
   // Listen for WS messages
   useEffect(() => {
@@ -858,6 +1038,9 @@ export function useTimeline(
       if (msg.type === 'timeline.event') {
         const event = msg.event;
         if (event.sessionId !== sessionId) return;
+        if (event.type === 'session.state' && event.payload?.state === 'queued') {
+          reconcileQueuedOptimisticMessages(event.payload.pendingMessageEntries, event.payload.pendingMessages);
+        }
 
         // Echo dedup: hide assistant.text that echoes a recent user message (e.g. prompt repeat).
         // Read current events via ref (avoid unnecessary setEvents call that returns prev unchanged).
@@ -950,6 +1133,7 @@ export function useTimeline(
           .map((event, index) => convertTransportHistoryRecordToTimelineEvent(sessionId, event, index))
           .filter((event): event is TimelineEvent => event != null);
         if (provisionalEvents.length === 0) return;
+        updateHistoryStep('daemon', 'done', 'bootstrap');
         replaceEvents(provisionalEvents);
         setLoading(false);
         return;
@@ -961,6 +1145,7 @@ export function useTimeline(
 
         // Handle backward pagination response
         if (msg.requestId && msg.requestId === olderRequestIdRef.current) {
+          updateHistoryStep('older', 'done', 'older');
           resetOlderState();
           if (msg.events.length > 0) {
             mergeEvents(msg.events, MAX_HISTORY_EVENTS);
@@ -981,6 +1166,7 @@ export function useTimeline(
             historyRequestIdRef.current = null;
           }
         }
+        updateHistoryStep('daemon', 'done', loading ? 'bootstrap' : 'refresh');
         historyLoadedRef.current = cacheKeyRef.current;
 
         epochRef.current = msg.epoch;
@@ -1020,6 +1206,7 @@ export function useTimeline(
         if (msg.sessionName !== sessionId) return;
         if (msg.requestId && msg.requestId !== replayRequestIdRef.current) return;
         replayRequestIdRef.current = null;
+        updateHistoryStep('daemon', 'done', 'refresh');
         const { events: replayEvents, truncated, epoch } = msg;
 
         // Update epoch — don't clear events, ts-sort handles cross-epoch order
@@ -1054,6 +1241,16 @@ export function useTimeline(
           return cleaned;
         });
         if (ws && sessionId) {
+          setHistoryStatus({
+            phase: 'refresh',
+            steps: {
+              cache: 'done',
+              textTail: 'skipped',
+              daemon: 'running',
+              http: serverId ? 'pending' : 'skipped',
+              older: 'skipped',
+            },
+          });
           setRefreshing(true);
           historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
         }
@@ -1062,29 +1259,46 @@ export function useTimeline(
       if (msg.type === 'session.event' && (msg as { event: string }).event === 'disconnected') {
         if (loadingOlderRef.current) resetOlderState();
       }
-      // ── Browser WS reconnected: fill gaps using afterTs for reliability ──
-      // Always use timestamp-based history (not seq-based replay) to avoid
-      // epoch mismatch and seq desync issues on mobile (app killed/backgrounded).
+      // ── Browser WS reconnected: recover both in-memory streaming deltas and
+      //    persisted history gaps. `timeline.history(afterTs)` is the durable
+      //    path, but it cannot recover assistant streaming deltas because the
+      //    daemon intentionally does not persist `streaming: true` updates.
+      //    Pair it with `timeline.replay(afterSeq, epoch)` so same-daemon
+      //    reconnects can recover active transport turns from the in-memory
+      //    ring buffer while history still covers durable gap-fill.
       //
       // The afterTs cursor is the max ts of any event currently rendered for
       // this session — server replays only events with ts > afterTs. Without
       // this cursor the server dumped a MAX_MEMORY_EVENTS-sized recent window,
       // which (a) re-downloaded events we already had and (b) silently lost
       // anything older than that window if the disconnect gap exceeded the
-      // window. Now we catch up exactly the missed range. If we have no local
-      // events (first connect / fresh tab) we omit afterTs and get the
-      // standard recent window.
+      // window. If we have no local events (first connect / fresh tab) we omit
+      // afterTs and get the standard recent window.
       if (msg.type === 'session.event' && (msg as { event: string }).event === 'connected') {
         if (ws && sessionId) {
+          setHistoryStatus({
+            phase: 'refresh',
+            steps: {
+              cache: 'done',
+              textTail: 'skipped',
+              daemon: 'running',
+              http: serverId ? 'pending' : 'skipped',
+              older: 'skipped',
+            },
+          });
           const current = eventsRef.current;
-          let afterTs: number | undefined;
-          for (const ev of current) {
-            // Pending optimistic bubbles carry `ts = Date.now()` from the
-            // client clock — exclude them so a skewed client clock can't
-            // accidentally filter out legitimately-missed server events.
-            if (ev.type === 'user.message' && (ev as { payload?: { pending?: boolean } }).payload?.pending) continue;
-            if (typeof ev.ts === 'number' && (afterTs === undefined || ev.ts > afterTs)) afterTs = ev.ts;
+          const replayAfterSeq = seqRef.current > 0
+            ? seqRef.current
+            : current.reduce((max, event) => Math.max(max, event.seq), 0);
+          const replayEpoch = epochRef.current > 0
+            ? epochRef.current
+            : (current.length > 0 ? current[current.length - 1]?.epoch ?? 0 : 0);
+          if (current.length > 0 && replayAfterSeq > 0 && replayEpoch > 0) {
+            replayRequestIdRef.current = ws.sendTimelineReplayRequest(sessionId, replayAfterSeq, replayEpoch);
+          } else {
+            replayRequestIdRef.current = null;
           }
+          const afterTs = getTimelineHistoryAfterTs(current);
           historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS, afterTs);
 
           // Fire HTTP backfill with a ~600ms delay to let the bridge's async
@@ -1093,7 +1307,7 @@ export function useTimeline(
           // `sendToSessionSubscribers`, finds the browser not-yet-subscribed,
           // and gets silently dropped. The HTTP path reads daemon store
           // directly (unicast request-response, no subscription routing).
-          fireHttpBackfillRef.current(600);
+          fireHttpBackfillRef.current(600, { phase: 'refresh' });
         }
       }
 
@@ -1155,7 +1369,12 @@ export function useTimeline(
 
     const unsub = ws.onMessage(handler);
     return unsub;
-  }, [ws, sessionId, appendEvent, mergeEvents, replaceEvents]);
+  }, [isActiveSession, ws, sessionId, appendEvent, clearOptimisticTimer, loading, markOptimisticFailed, mergeEvents, reconcileQueuedOptimisticMessages, replaceEvents, serverId, updateHistoryStep]);
+
+  useEffect(() => {
+    if (loading || refreshing || httpRefreshing || textTailRefreshing || loadingOlder) return;
+    setHistoryStatus((prev) => (prev.phase === 'idle' ? prev : createIdleHistoryStatus()));
+  }, [httpRefreshing, loading, loadingOlder, refreshing, textTailRefreshing]);
 
   // Clear outstanding optimistic timers on unmount / session change so that a
   // dismissed chat window can't fire a delayed markOptimisticFailed into an
@@ -1172,7 +1391,8 @@ export function useTimeline(
   return {
     events,
     loading,
-    refreshing,
+    refreshing: refreshing || httpRefreshing || textTailRefreshing,
+    historyStatus,
     loadingOlder,
     hasOlderHistory,
     addOptimisticUserMessage,

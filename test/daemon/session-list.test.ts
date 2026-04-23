@@ -158,6 +158,8 @@ describe('buildSessionList', () => {
       getPreset: vi.fn(async (name: string) => name === 'minimax'
         ? { name: 'minimax', env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' } }
         : undefined),
+      getPresetEffectiveModel: vi.fn((preset: { env?: Record<string, string> }) => preset.env?.ANTHROPIC_MODEL),
+      getPresetAvailableModelIds: vi.fn((preset: { env?: Record<string, string> }) => preset.env?.ANTHROPIC_MODEL ? [preset.env.ANTHROPIC_MODEL] : []),
     }));
 
     const { buildSessionList } = await import('../../src/daemon/session-list.js');
@@ -173,6 +175,51 @@ describe('buildSessionList', () => {
     expect(sessions[0].qwenAuthLimit).toBeUndefined();
     expect(sessions[0].quotaLabel).toBeUndefined();
     expect(sessions[0].quotaUsageLabel).toBeUndefined();
+  });
+
+  it('preset-backed qwen sessions keep discovered model lists and active selected model', async () => {
+    const store = await import('../../src/store/session-store.js');
+    store.upsertSession({
+      name: 'deck_qwen_multi_brain',
+      projectName: 'demo',
+      role: 'brain',
+      agentType: 'qwen',
+      runtimeType: 'transport',
+      providerId: 'qwen',
+      providerSessionId: 'sid-preset-multi',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      ccPreset: 'minimax',
+      qwenModel: 'MiniMax-Text-01',
+      qwenAvailableModels: ['coder-model'],
+    });
+
+    vi.doMock('../../src/daemon/cc-presets.js', () => ({
+      getPreset: vi.fn(async () => ({
+        name: 'minimax',
+        env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+        defaultModel: 'MiniMax-M2.7',
+        availableModels: [
+          { id: 'MiniMax-M2.7', name: 'MiniMax M2.7' },
+          { id: 'MiniMax-Text-01' },
+        ],
+      })),
+      getPresetEffectiveModel: vi.fn((preset: { defaultModel?: string; env?: Record<string, string> }) => preset.defaultModel ?? preset.env?.ANTHROPIC_MODEL),
+      getPresetAvailableModelIds: vi.fn((preset: { availableModels?: Array<{ id: string }> }) => preset.availableModels?.map((item) => item.id) ?? []),
+    }));
+
+    const { buildSessionList } = await import('../../src/daemon/session-list.js');
+    const sessions = await buildSessionList();
+    expect(sessions[0]).toMatchObject({
+      qwenAuthType: 'api-key',
+      qwenAvailableModels: ['MiniMax-M2.7', 'MiniMax-Text-01'],
+      qwenModel: 'MiniMax-Text-01',
+      modelDisplay: 'MiniMax-Text-01',
+      planLabel: 'BYO',
+    });
   });
 
   it('preserves the session transportConfig snapshot in the list surface', async () => {

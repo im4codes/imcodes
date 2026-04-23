@@ -51,7 +51,7 @@ import {
   type PreviewWsOpenedMessage,
 } from '../../../shared/preview-types.js';
 import { LocalWebPreviewRegistry } from '../preview/registry.js';
-import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions } from '../db/queries.js';
+import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, getSubSessionById, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent } from '../db/queries.js';
 import logger from '../util/logger.js';
 import { pickReadableSessionDisplay } from '../../../shared/session-display.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
@@ -968,12 +968,17 @@ export class WsBridge {
 
     // ── Timeline events: session-scoped ───────────────────────────────────────
     if (type === 'timeline.event') {
-      const sessionId = (msg.event as Record<string, unknown> | undefined)?.sessionId as string | undefined;
-      if (!sessionId) {
+      const rawEvent = msg.event as Record<string, unknown> | undefined;
+      const sessionId = rawEvent?.sessionId as string | undefined;
+      if (!rawEvent || !sessionId) {
         logger.warn({ serverId: this.serverId }, 'timeline.event missing sessionId — discarded');
         return;
       }
-      this.ingestRecentTextFromTimelineEvent(msg.event as Record<string, unknown>);
+      this.ingestRecentTextFromTimelineEvent(rawEvent);
+      if (this.db) {
+        void upsertSessionTextTailCacheEvent(this.db, this.serverId, rawEvent)
+          .catch((err) => logger.warn({ err, serverId: this.serverId, sessionId }, 'Failed to update session_text_tail_cache'));
+      }
       this.sendToSessionSubscribers(sessionId, JSON.stringify(msg));
       return;
     }
@@ -1061,6 +1066,7 @@ export class WsBridge {
 
     // ── Sub-session sync: daemon creates sub-sessions → persist to DB ────────
     if (type === 'subsession.sync' && this.db) {
+      const db = this.db;
       if (isKnownTestSessionLike({
         name: typeof msg.id === 'string' ? `deck_sub_${msg.id}` : undefined,
         cwd: typeof msg.cwd === 'string' ? msg.cwd : undefined,
@@ -1075,33 +1081,43 @@ export class WsBridge {
         const agentType = typeof msg.sessionType === 'string' && msg.sessionType ? msg.sessionType : undefined;
         this.activeSubSessions.set(subSessionName, { name: subSessionName, label, parentSession, agentType });
       }
-      void createSubSession(
-        this.db,
-        msg.id as string,
-        this.serverId,
-        msg.sessionType as string,
-        (msg.shellBin as string) || null,
-        (msg.cwd as string) || null,
-        (msg.label as string) || null,
-        (msg.ccSessionId as string) || null,
-        (msg.geminiSessionId as string) || null,
-        (msg.parentSession as string) || null,
-        (msg.runtimeType as string) || null,
-        (msg.providerId as string) || null,
-        (msg.providerSessionId as string) || null,
-        (msg.description as string) || null,
-        (msg.ccPresetId as string) || null,
-        (msg.requestedModel as string) || null,
-        ((msg.activeModel as string) || (msg.modelDisplay as string)) || null,
-        (msg.effort as string) || null,
-        (msg.transportConfig as Record<string, unknown>) || null,
-      ).then(() => {
+      void (async () => {
+        const requestedType = typeof msg.sessionType === 'string' && msg.sessionType.trim()
+          ? msg.sessionType.trim()
+          : null;
+        const persisted = requestedType ? null : await getSubSessionById(db, msg.id as string, this.serverId).catch(() => null);
+        const sessionType = requestedType ?? persisted?.type ?? null;
+        if (!sessionType) {
+          logger.warn({ id: msg.id }, 'Skipping sub-session DB sync without sessionType');
+          return;
+        }
+        await createSubSession(
+          db,
+          msg.id as string,
+          this.serverId,
+          sessionType,
+          (msg.shellBin as string) || null,
+          (msg.cwd as string) || null,
+          (msg.label as string) || null,
+          (msg.ccSessionId as string) || null,
+          (msg.geminiSessionId as string) || null,
+          (msg.parentSession as string) || null,
+          (msg.runtimeType as string) || null,
+          (msg.providerId as string) || null,
+          (msg.providerSessionId as string) || null,
+          (msg.description as string) || null,
+          (msg.ccPresetId as string) || null,
+          (msg.requestedModel as string) || null,
+          ((msg.activeModel as string) || (msg.modelDisplay as string)) || null,
+          (msg.effort as string) || null,
+          (msg.transportConfig as Record<string, unknown>) || null,
+        );
         // Notify browsers so sub-session appears immediately without page refresh
         this.broadcastToBrowsers(JSON.stringify({
           type: 'subsession.created',
           id: msg.id,
           sessionName: `deck_sub_${msg.id}`,
-          sessionType: msg.sessionType,
+          sessionType,
           cwd: msg.cwd || null,
           label: msg.label || null,
           parentSession: msg.parentSession || null,
@@ -1123,7 +1139,7 @@ export class WsBridge {
           quotaMeta: msg.quotaMeta || null,
           state: (msg.state as string) || 'idle',
         }));
-      }).catch((e) => logger.error({ err: e, id: msg.id }, 'Failed to sync sub-session to DB'));
+      })().catch((e) => logger.error({ err: e, id: msg.id }, 'Failed to sync sub-session to DB'));
       return;
     }
     if (type === 'subsession.update_gemini_id' && this.db) {
@@ -2533,9 +2549,6 @@ export class WsBridge {
   }
 
   private async dispatchEventPush(db: Database, env: Env, msg: Record<string, unknown>): Promise<void> {
-    // Always send APNs push — iOS handles foreground display via UNUserNotificationCenterDelegate.
-    // Badge count must increment regardless of app state.
-
     // Dedup: same session idle/error can fire from both hook and timeline paths
     const sessionKey = `${msg.type}:${msg.session ?? msg.sessionId ?? ''}`;
     const now = Date.now();
@@ -2545,6 +2558,12 @@ export class WsBridge {
 
     const server = await db.queryOne<{ user_id: string; name: string }>('SELECT user_id, name FROM servers WHERE id = $1', [this.serverId]);
     if (!server) return;
+
+    for (const mobileWs of this.mobileSockets) {
+      if (mobileWs.readyState !== WebSocket.OPEN) continue;
+      if (this.browserUserIds.get(mobileWs) !== server.user_id) continue;
+      return;
+    }
 
     const { dispatchPush } = await import('../routes/push.js').catch((err) => {
       logger.error({ err }, 'Failed to import push module — push notifications disabled');

@@ -97,6 +97,31 @@ describe('file-change-normalizer', () => {
     ]);
   });
 
+  it('treats raw add diffs as file content instead of empty unified diff previews', () => {
+    const batch = normalizeCodexSdkFileChange({
+      toolCallId: 'cx-add',
+      detail: {
+        input: {
+          changes: [
+            {
+              path: 'src/new-file.ts',
+              kind: { type: 'add' },
+              diff: 'export const created = true;\nconsole.log(created);\n',
+            },
+          ],
+        },
+      },
+    });
+
+    expect(batch?.patches[0]).toEqual(expect.objectContaining({
+      filePath: 'src/new-file.ts',
+      operation: 'create',
+      confidence: 'derived',
+      afterText: 'export const created = true;\nconsole.log(created);\n',
+    }));
+    expect(batch?.patches[0]?.unifiedDiff).toBeUndefined();
+  });
+
   it('preserves explicit range metadata when providers include it directly', () => {
     const batch = normalizeOpenCodeFileChange({
       id: 'oc-range',

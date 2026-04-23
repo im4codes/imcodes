@@ -52,6 +52,10 @@ import {
   getDiscussionsByServer,
   insertDiscussionRound,
   getDiscussionRounds,
+  classifySessionTextTailEvent,
+  getSessionTextTailCache,
+  upsertSessionTextTailCacheEvent,
+  SESSION_TEXT_TAIL_CACHE_LIMIT,
   upsertOrchestrationRun,
   getOrchestrationRunById,
   getActiveOrchestrationRuns,
@@ -82,7 +86,7 @@ describe('runMigrations', () => {
     const tables = [
       'users', 'platform_identities', 'servers', 'channel_bindings',
       'platform_bots', 'api_keys', 'refresh_tokens', 'idempotency_records',
-      'auth_nonces', 'audit_log', 'pending_binds', 'sessions', 'cron_jobs', 'cron_executions',
+      'auth_nonces', 'audit_log', 'pending_binds', 'sessions', 'session_text_tail_cache', 'cron_jobs', 'cron_executions',
       'teams', 'team_members', 'push_subscriptions',
     ];
 
@@ -243,6 +247,16 @@ describe('runMigrations', () => {
     );
     expect(idx?.indexname).toBe('idx_shared_context_projections_status');
   });
+
+  it('session_text_tail_cache has updated_at index (migration 043)', async () => {
+    const idx = await db.queryOne<{ indexname: string }>(
+      `SELECT indexname FROM pg_indexes
+       WHERE tablename = 'session_text_tail_cache'
+         AND indexname = 'idx_session_text_tail_cache_updated_at'`,
+      [],
+    );
+    expect(idx?.indexname).toBe('idx_session_text_tail_cache_updated_at');
+  });
 });
 
 // ── 2. Database wrapper ─────────────────────────────────────────────────────
@@ -271,6 +285,126 @@ describe('Database wrapper', () => {
     );
     expect(rows).toHaveLength(1);
     expect(rows[0].id).toBe(userId);
+  });
+});
+
+describe('session_text_tail_cache', () => {
+  const serverId = `tail-srv-${Math.random().toString(36).slice(2)}`;
+  const userId = `tail-user-${Math.random().toString(36).slice(2)}`;
+  const sessionName = `deck_tail_${Math.random().toString(36).slice(2)}`;
+
+  beforeAll(async () => {
+    await createUser(db, userId);
+    await createServer(db, serverId, userId, 'tail-server', 'hash-tail');
+  });
+
+  it('classifies only completed non-empty text events', () => {
+    expect(classifySessionTextTailEvent({
+      eventId: 'e-user',
+      sessionId: sessionName,
+      ts: 1,
+      type: 'user.message',
+      payload: { text: 'hello' },
+      source: 'daemon',
+      confidence: 'high',
+    })).toEqual({
+      sessionName,
+      item: {
+        eventId: 'e-user',
+        ts: 1,
+        type: 'user.message',
+        text: 'hello',
+        source: 'daemon',
+        confidence: 'high',
+      },
+    });
+
+    expect(classifySessionTextTailEvent({
+      eventId: 'e-stream',
+      sessionId: sessionName,
+      ts: 2,
+      type: 'assistant.text',
+      payload: { text: 'partial', streaming: true },
+    })).toBeNull();
+
+    expect(classifySessionTextTailEvent({
+      eventId: 'e-empty',
+      sessionId: sessionName,
+      ts: 3,
+      type: 'assistant.text',
+      payload: { text: '   ' },
+    })).toBeNull();
+
+    expect(classifySessionTextTailEvent({
+      eventId: 'e-tool',
+      sessionId: sessionName,
+      ts: 4,
+      type: 'tool.call',
+      payload: { text: 'nope' },
+    })).toBeNull();
+  });
+
+  it('overwrites by eventId and retains only the newest 50 cached entries', async () => {
+    await db.execute('DELETE FROM session_text_tail_cache WHERE server_id = $1 AND session_name = $2', [serverId, sessionName]);
+
+    for (let i = 1; i <= SESSION_TEXT_TAIL_CACHE_LIMIT + 5; i++) {
+      await upsertSessionTextTailCacheEvent(db, serverId, {
+        eventId: `e-${i}`,
+        sessionId: sessionName,
+        ts: i,
+        type: i % 2 === 0 ? 'assistant.text' : 'user.message',
+        payload: { text: `message ${i}` },
+      });
+    }
+
+    await upsertSessionTextTailCacheEvent(db, serverId, {
+      eventId: `e-${SESSION_TEXT_TAIL_CACHE_LIMIT + 5}`,
+      sessionId: sessionName,
+      ts: SESSION_TEXT_TAIL_CACHE_LIMIT + 5,
+      type: 'assistant.text',
+      payload: { text: 'updated latest message' },
+      source: 'daemon',
+      confidence: 'high',
+    });
+
+    const events = await getSessionTextTailCache(db, serverId, sessionName);
+    expect(events).toHaveLength(SESSION_TEXT_TAIL_CACHE_LIMIT);
+    expect(events[0]?.eventId).toBe('e-6');
+    expect(events.at(-1)).toEqual({
+      eventId: `e-${SESSION_TEXT_TAIL_CACHE_LIMIT + 5}`,
+      ts: SESSION_TEXT_TAIL_CACHE_LIMIT + 5,
+      type: 'assistant.text',
+      text: 'updated latest message',
+      source: 'daemon',
+      confidence: 'high',
+    });
+  });
+
+  it('treats malformed rows as empty and rebuilds from the current event', async () => {
+    const malformedSession = `${sessionName}-malformed`;
+    await db.execute('DELETE FROM session_text_tail_cache WHERE server_id = $1 AND session_name = $2', [serverId, malformedSession]);
+    await db.execute(
+      `INSERT INTO session_text_tail_cache (server_id, session_name, events, latest_ts, updated_at)
+       VALUES ($1, $2, $3::jsonb, $4, NOW())`,
+      [serverId, malformedSession, JSON.stringify({ bad: true }), 123],
+    );
+
+    await upsertSessionTextTailCacheEvent(db, serverId, {
+      eventId: 'e-rebuild',
+      sessionId: malformedSession,
+      ts: 999,
+      type: 'assistant.text',
+      payload: { text: 'rebuilt' },
+    });
+
+    await expect(getSessionTextTailCache(db, serverId, malformedSession)).resolves.toEqual([
+      {
+        eventId: 'e-rebuild',
+        ts: 999,
+        type: 'assistant.text',
+        text: 'rebuilt',
+      },
+    ]);
   });
 });
 
@@ -590,6 +724,129 @@ describe('sessions', () => {
     await deleteDbSession(db, serverId, 'deck_proj_w1');
     const sessions = await getDbSessionsByServer(db, serverId);
     expect(sessions.find(s => s.name === 'deck_proj_w1')).toBeUndefined();
+  });
+});
+
+describe('session_text_tail_cache', () => {
+  let userId: string;
+  let serverId: string;
+
+  beforeAll(async () => {
+    userId = 'tail-user-' + Math.random().toString(36).slice(2);
+    serverId = 'tail-srv-' + Math.random().toString(36).slice(2);
+    await createUser(db, userId);
+    await createServer(db, serverId, userId, 'tail-server', 'hash-tail');
+  });
+
+  it('classifySessionTextTailEvent accepts non-empty user and completed assistant text only', () => {
+    expect(classifySessionTextTailEvent({
+      sessionId: 'deck_proj_brain',
+      eventId: 'u1',
+      ts: 10,
+      type: 'user.message',
+      payload: { text: ' hello ' },
+      source: 'daemon',
+    })).toEqual({
+      sessionName: 'deck_proj_brain',
+      item: { eventId: 'u1', ts: 10, type: 'user.message', text: 'hello', source: 'daemon' },
+    });
+    expect(classifySessionTextTailEvent({
+      sessionId: 'deck_proj_brain',
+      eventId: 'a1',
+      ts: 11,
+      type: 'assistant.text',
+      payload: { text: ' done ', streaming: false },
+      confidence: 'high',
+    })).toEqual({
+      sessionName: 'deck_proj_brain',
+      item: { eventId: 'a1', ts: 11, type: 'assistant.text', text: 'done', confidence: 'high' },
+    });
+    expect(classifySessionTextTailEvent({
+      sessionId: 'deck_proj_brain',
+      eventId: 'a2',
+      ts: 12,
+      type: 'assistant.text',
+      payload: { text: 'stream', streaming: true },
+    })).toBeNull();
+    expect(classifySessionTextTailEvent({
+      sessionId: 'deck_proj_brain',
+      eventId: 'x1',
+      ts: 13,
+      type: 'tool.call',
+      payload: { text: 'nope' },
+    })).toBeNull();
+  });
+
+  it('upsertSessionTextTailCacheEvent overwrites by eventId and returns ascending cached rows', async () => {
+    const sessionName = `deck_proj_tail_${Math.random().toString(36).slice(2)}`;
+    await upsertSessionTextTailCacheEvent(db, serverId, {
+      sessionId: sessionName,
+      eventId: 'dup-1',
+      ts: 100,
+      type: 'assistant.text',
+      payload: { text: 'first value' },
+    });
+    await upsertSessionTextTailCacheEvent(db, serverId, {
+      sessionId: sessionName,
+      eventId: 'dup-1',
+      ts: 110,
+      type: 'assistant.text',
+      payload: { text: 'final value' },
+      confidence: 'high',
+    });
+    await upsertSessionTextTailCacheEvent(db, serverId, {
+      sessionId: sessionName,
+      eventId: 'u-1',
+      ts: 90,
+      type: 'user.message',
+      payload: { text: 'older user' },
+    });
+
+    const cached = await getSessionTextTailCache(db, serverId, sessionName);
+    expect(cached).toEqual([
+      { eventId: 'u-1', ts: 90, type: 'user.message', text: 'older user' },
+      { eventId: 'dup-1', ts: 110, type: 'assistant.text', text: 'final value', confidence: 'high' },
+    ]);
+  });
+
+  it('treats malformed existing cache payloads as empty and rebuilds safely', async () => {
+    const sessionName = `deck_proj_malformed_${Math.random().toString(36).slice(2)}`;
+    await db.execute(
+      `INSERT INTO session_text_tail_cache (server_id, session_name, events, latest_ts, updated_at)
+       VALUES ($1, $2, $3::jsonb, $4, NOW())`,
+      [serverId, sessionName, JSON.stringify({ nope: true }), 1],
+    );
+
+    await upsertSessionTextTailCacheEvent(db, serverId, {
+      sessionId: sessionName,
+      eventId: 'rebuild-1',
+      ts: 200,
+      type: 'assistant.text',
+      payload: { text: 'rebuilt' },
+    });
+
+    const cached = await getSessionTextTailCache(db, serverId, sessionName);
+    expect(cached).toEqual([
+      { eventId: 'rebuild-1', ts: 200, type: 'assistant.text', text: 'rebuilt' },
+    ]);
+  });
+
+  it('hard-retains only the newest 50 cached entries per session', async () => {
+    const sessionName = `deck_proj_limit_${Math.random().toString(36).slice(2)}`;
+    for (let i = 0; i < SESSION_TEXT_TAIL_CACHE_LIMIT + 5; i++) {
+      await upsertSessionTextTailCacheEvent(db, serverId, {
+        sessionId: sessionName,
+        eventId: `ev-${i}`,
+        ts: i,
+        type: i % 2 === 0 ? 'user.message' : 'assistant.text',
+        payload: { text: `msg-${i}` },
+      });
+    }
+
+    const cached = await getSessionTextTailCache(db, serverId, sessionName);
+    expect(cached).toHaveLength(SESSION_TEXT_TAIL_CACHE_LIMIT);
+    expect(cached[0]?.eventId).toBe('ev-5');
+    expect(cached.at(-1)?.eventId).toBe(`ev-${SESSION_TEXT_TAIL_CACHE_LIMIT + 4}`);
   });
 });
 

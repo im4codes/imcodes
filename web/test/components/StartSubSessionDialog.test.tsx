@@ -120,6 +120,26 @@ describe('StartSubSessionDialog', () => {
     expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, { thinking: 'high' });
   });
 
+  it('clicking the backdrop does not call onClose', () => {
+    const onClose = vi.fn();
+    const { container } = render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={vi.fn()}
+        onClose={onClose}
+      />,
+    );
+
+    const backdrop = container.querySelector('.dialog-overlay') as HTMLElement | null;
+    expect(backdrop).not.toBeNull();
+    fireEvent.click(backdrop!, { target: backdrop });
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
   it('does not show CC preset controls for claude-code-sdk sub-sessions', () => {
     const onStart = vi.fn();
     const ws = makeWs();
@@ -173,7 +193,12 @@ describe('StartSubSessionDialog', () => {
       handler({
         type: 'cc.presets.list_response',
         presets: [
-          { name: 'MiniMax', env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' } },
+          {
+            name: 'MiniMax',
+            env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+            defaultModel: 'MiniMax-M2.7',
+            availableModels: [{ id: 'MiniMax-M2.7' }, { id: 'MiniMax-Text-01' }],
+          },
         ],
       });
       return () => {};
@@ -192,7 +217,7 @@ describe('StartSubSessionDialog', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
-    await waitFor(() => expect(screen.getByText('api_provider')).toBeDefined());
+    await waitFor(() => expect(screen.getByText('Compatible API (via Qwen)')).toBeDefined());
     expect(screen.getByText('qwen_provider_selected_hint')).toBeDefined();
     const presetSelect = (screen.getAllByRole('combobox') as HTMLSelectElement[])
       .find((select) => Array.from(select.options).some((option) => option.value === 'MiniMax'));
@@ -203,8 +228,33 @@ describe('StartSubSessionDialog', () => {
 
     expect(onStart).toHaveBeenCalledWith('qwen', undefined, '/tmp', undefined, {
       ccPreset: 'MiniMax',
+      requestedModel: 'MiniMax-M2.7',
       thinking: 'high',
     });
+  });
+
+  it('prefills default qwen preset values instead of leaving placeholders only', async () => {
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
+    await waitFor(() => expect(screen.getByText('Compatible API (via Qwen)')).toBeDefined());
+    fireEvent.click(screen.getByRole('button', { name: /api_provider_add_edit/i }));
+
+    expect(screen.getByDisplayValue('https://api.minimax.io/anthropic')).toBeDefined();
+    expect(screen.getByDisplayValue('MiniMax-M2.7')).toBeDefined();
+    expect(screen.getByDisplayValue('API_TIMEOUT_MS')).toBeDefined();
+    expect(screen.getByDisplayValue('3000000')).toBeDefined();
+    expect(screen.getByDisplayValue('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC')).toBeDefined();
   });
 
   it('passes thinking level for qwen sub-sessions', () => {

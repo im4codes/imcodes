@@ -471,7 +471,7 @@ export async function readSubSessionResponse(sessionName: string): Promise<{ sta
     ? (record.state === 'idle' ? 'idle' : 'thinking')
     : detectStatus(lines, agentType);
   if (status !== 'idle') return { status: 'working' };
-  const events = timelineStore.read(sessionName);
+  const events = await timelineStore.readPreferred(sessionName);
   const lastUserMsgIdx = events.map((e) => e.type).lastIndexOf('user.message');
   const responseEvents = lastUserMsgIdx >= 0 ? events.slice(lastUserMsgIdx + 1) : events;
   const textParts = responseEvents.filter((e) => e.type === 'assistant.text').map((e) => String(e.payload.text ?? ''));

@@ -1,4 +1,5 @@
 import { useTranslation } from 'react-i18next';
+import { isServerOnline } from '../server-selection.js';
 
 interface ServerInfo {
   id: string;
@@ -42,7 +43,7 @@ export function ServerIconBar({ servers, activeServerId, onSelectServer, onServe
       )}
       {servers.map((server) => {
         const isActive = server.id === activeServerId;
-        const isOnline = server.status !== 'offline' && server.lastHeartbeatAt != null && Date.now() - server.lastHeartbeatAt < 60_000;
+        const isOnline = isServerOnline(server);
         return (
           <button
             key={server.id}

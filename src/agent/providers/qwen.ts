@@ -32,6 +32,8 @@ import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-p
 
 const execFileAsync = promisify(execFile);
 const QWEN_BIN = 'qwen';
+const TRANSIENT_RETRY_DELAY_MS = 250;
+const TRANSIENT_RETRY_MAX_ATTEMPTS = 1;
 
 /**
  * Auth types accepted by the qwen CLI's `--auth-type` flag.
@@ -353,6 +355,7 @@ export class QwenProvider implements TransportProvider {
     _attachments?: TransportAttachment[],
     extraSystemPrompt?: string,
     allowResumeFallback = true,
+    transientRetryBudget = TRANSIENT_RETRY_MAX_ATTEMPTS,
   ): Promise<void> {
     if (!this.config) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Qwen provider not connected', false);
@@ -444,6 +447,26 @@ export class QwenProvider implements TransportProvider {
     let completed = false;
     let sawError = false;
     let stderrBuf = '';
+    let retryScheduled = false;
+
+    const sawVisibleTurnProgress = (): boolean => {
+      return state.currentText.length > 0
+        || !!state.pendingFinalText
+        || state.toolUseById.size > 0
+        || state.emittedToolSignatures.size > 0;
+    };
+
+    const maybeRetryTransientError = async (messageText: string, details?: unknown): Promise<boolean> => {
+      if (retryScheduled || transientRetryBudget <= 0) return false;
+      if (sawVisibleTurnProgress()) return false;
+      if (!this.isRetryableTransientError(messageText)) return false;
+      retryScheduled = true;
+      state.child = null;
+      logger.info({ provider: this.id, sessionId, message: messageText }, 'Qwen transient provider error; retrying turn once');
+      await new Promise((resolve) => setTimeout(resolve, TRANSIENT_RETRY_DELAY_MS));
+      await this.send(sessionId, payload, _attachments, extraSystemPrompt, allowResumeFallback, transientRetryBudget - 1);
+      return true;
+    };
 
     const emitError = (messageText: string, details?: unknown): void => {
       if (sawError || completed) return;
@@ -667,7 +690,10 @@ export class QwenProvider implements TransportProvider {
       if (payload.type === 'result') {
         this.clearStatus(sessionId, state);
         if (payload.is_error) {
-          emitError(payload.error?.message || stderrBuf || 'Qwen execution failed', payload);
+          const errorText = payload.error?.message || stderrBuf || 'Qwen execution failed';
+          void maybeRetryTransientError(errorText, payload).then((retried) => {
+            if (!retried) emitError(errorText, payload);
+          });
           return;
         }
         const resultText = typeof payload.result === 'string' && payload.result.trim()
@@ -718,7 +744,10 @@ export class QwenProvider implements TransportProvider {
           });
           return;
         }
-        emitError(stderrBuf.trim() || `Qwen exited with code ${code ?? 'null'}${signal ? ` (${signal})` : ''}`);
+        const errorText = stderrBuf.trim() || `Qwen exited with code ${code ?? 'null'}${signal ? ` (${signal})` : ''}`;
+        void maybeRetryTransientError(errorText, { code, signal, stderr: stderrBuf }).then((retried) => {
+          if (!retried) emitError(errorText);
+        });
       }
     });
 
@@ -730,7 +759,9 @@ export class QwenProvider implements TransportProvider {
     // uncaughtException and crash the daemon.
     child.on('error', (err) => {
       logger.error({ provider: this.id, err }, 'Qwen child process error');
-      emitError(err.message, err);
+      void maybeRetryTransientError(err.message, err).then((retried) => {
+        if (!retried) emitError(err.message, err);
+      });
     });
   }
 
@@ -756,6 +787,10 @@ export class QwenProvider implements TransportProvider {
 
   private makeError(code: string, message: string, recoverable: boolean, details?: unknown): ProviderError {
     return { code, message, recoverable, details };
+  }
+
+  private isRetryableTransientError(message: string): boolean {
+    return /premature close|fetch failed|connection error|socket hang up|econnreset|etimedout|network error/i.test(message);
   }
 
   private emitStatus(sessionId: string, state: QwenSessionState, status: ProviderStatusUpdate): void {

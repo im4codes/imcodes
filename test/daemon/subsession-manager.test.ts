@@ -23,7 +23,7 @@ const {
   getDriverMock: vi.fn(),
   getSessionMock: vi.fn(() => null),
   capturePaneMock: vi.fn().mockResolvedValue([]),
-  timelineReadMock: vi.fn(() => []),
+  timelineReadMock: vi.fn(() => Promise.resolve([])),
   geminiStartWatchingMock: vi.fn().mockResolvedValue(undefined),
   geminiIsWatchingMock: vi.fn().mockReturnValue(false),
   codexStartWatchingByIdMock: vi.fn().mockResolvedValue(undefined),
@@ -115,7 +115,7 @@ vi.mock('../../src/daemon/memory-inject.js', () => ({
 }));
 
 vi.mock('../../src/daemon/timeline-store.js', () => ({
-  timelineStore: { read: timelineReadMock, append: vi.fn() },
+  timelineStore: { readPreferred: timelineReadMock, read: timelineReadMock, append: vi.fn() },
 }));
 
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({
@@ -515,7 +515,7 @@ describe('readSubSessionResponse()', () => {
     vi.clearAllMocks();
     sessionExistsMock.mockResolvedValue(true);
     capturePaneMock.mockResolvedValue(['still running']);
-    timelineReadMock.mockReturnValue([
+    timelineReadMock.mockResolvedValue([
       { type: 'user.message', payload: { text: 'hi' } },
       { type: 'assistant.text', payload: { text: 'done' } },
     ]);

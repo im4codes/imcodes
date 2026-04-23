@@ -25,6 +25,7 @@ import { NewSessionDialog } from '../../src/components/NewSessionDialog.js';
 
 const makeWs = () => ({
   sendSessionCommand: vi.fn(),
+  send: vi.fn(),
   connected: true,
   onMessage: vi.fn().mockReturnValue(() => {}),
   subSessionDetectShells: vi.fn(),
@@ -157,21 +158,20 @@ describe('NewSessionDialog', () => {
     }));
   });
 
-  it('pressing Escape calls onClose', () => {
+  it('pressing Escape does not call onClose', () => {
     const onClose = vi.fn();
     const { container } = render(<NewSessionDialog ws={makeWs() as any} onClose={onClose} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
     const dialog = container.querySelector('[role="dialog"]')!;
     fireEvent.keyDown(dialog, { key: 'Escape' });
-    expect(onClose).toHaveBeenCalledOnce();
+    expect(onClose).not.toHaveBeenCalled();
   });
 
-  it('clicking the backdrop calls onClose', () => {
+  it('clicking the backdrop does not call onClose', () => {
     const onClose = vi.fn();
     const { container } = render(<NewSessionDialog ws={makeWs() as any} onClose={onClose} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
     const backdrop = container.querySelector('[role="dialog"]')!;
-    // Simulate clicking the backdrop element itself (currentTarget === target)
     fireEvent.click(backdrop, { target: backdrop });
-    expect(onClose).toHaveBeenCalledOnce();
+    expect(onClose).not.toHaveBeenCalled();
   });
 
   it('matches started events for non-ASCII project names deterministically', () => {
@@ -271,7 +271,12 @@ describe('NewSessionDialog', () => {
       handler({
         type: 'cc.presets.list_response',
         presets: [
-          { name: 'MiniMax', env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' } },
+          {
+            name: 'MiniMax',
+            env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+            defaultModel: 'MiniMax-M2.7',
+            availableModels: [{ id: 'MiniMax-M2.7' }, { id: 'MiniMax-Text-01' }],
+          },
         ],
       });
       return () => {};
@@ -282,7 +287,7 @@ describe('NewSessionDialog', () => {
     const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
     agentTypeSelect.value = 'qwen';
     fireEvent.input(agentTypeSelect, { target: { value: agentTypeSelect.value } });
-    await waitFor(() => expect(screen.getByText('api_provider')).toBeDefined());
+    await waitFor(() => expect(screen.getByText('Compatible API (via Qwen)')).toBeDefined());
     expect(screen.getByText('qwen_provider_selected_hint')).toBeDefined();
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
     fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
@@ -297,8 +302,91 @@ describe('NewSessionDialog', () => {
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
       agentType: 'qwen',
       ccPreset: 'MiniMax',
+      requestedModel: 'MiniMax-M2.7',
       thinking: 'high',
     }));
+  });
+
+  it('saves qwen presets with the new default env template', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    agentTypeSelect.value = 'qwen';
+    fireEvent.input(agentTypeSelect, { target: { value: agentTypeSelect.value } });
+    await waitFor(() => expect(screen.getByText('Compatible API (via Qwen)')).toBeDefined());
+
+    fireEvent.click(screen.getByText('api_provider_add_edit'));
+    fireEvent.input(screen.getByPlaceholderText('e.g. MiniMax'), { target: { value: 'MiniMax' } });
+    fireEvent.click(screen.getByRole('button', { name: /save preset/i }));
+
+    expect(ws.send).toHaveBeenCalledWith({
+      type: 'cc.presets.save',
+      presets: [
+        expect.objectContaining({
+          name: 'MiniMax',
+          transportMode: 'qwen-compatible-api',
+          authType: 'anthropic',
+          defaultModel: 'MiniMax-M2.7',
+          env: expect.objectContaining({
+            ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+            ANTHROPIC_MODEL: 'MiniMax-M2.7',
+            API_TIMEOUT_MS: '3000000',
+            CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+            CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
+          }),
+        }),
+      ],
+    });
+  });
+
+  it('applies discovered preset models and uses the updated default model for qwen', async () => {
+    const ws = makeWs();
+    let onMessage: ((msg: unknown) => void) | undefined;
+    ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
+      onMessage = handler;
+      handler({
+        type: 'cc.presets.list_response',
+        presets: [],
+      });
+      return () => {};
+    });
+
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    fireEvent.input(agentTypeSelect, { target: { value: 'qwen' } });
+    fireEvent.click(screen.getByText('api_provider_add_edit'));
+    fireEvent.input(screen.getByPlaceholderText('e.g. MiniMax'), { target: { value: 'MiniMax' } });
+    fireEvent.input(screen.getByPlaceholderText('your-api-key'), { target: { value: 'secret' } });
+    fireEvent.click(screen.getByRole('button', { name: /discover models/i }));
+    onMessage?.({
+      type: 'cc.presets.discover_models_response',
+      ok: true,
+      presetName: 'MiniMax',
+      preset: {
+        name: 'MiniMax',
+        env: {
+          ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+          ANTHROPIC_AUTH_TOKEN: 'secret',
+          ANTHROPIC_MODEL: 'MiniMax-M2.7',
+        },
+        defaultModel: 'MiniMax-Text-01',
+        availableModels: [{ id: 'MiniMax-M2.7' }, { id: 'MiniMax-Text-01' }],
+      },
+    });
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    await waitFor(() => {
+      expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+        agentType: 'qwen',
+        ccPreset: 'MiniMax',
+        requestedModel: 'MiniMax-Text-01',
+      }));
+    });
   });
 
   it('includes thinking level when starting qwen', async () => {

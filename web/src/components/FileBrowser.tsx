@@ -145,6 +145,90 @@ type FsNode = {
   isLoading?: boolean;
 };
 
+interface FileBrowserSnapshot {
+  savedAt: number;
+  currentLabel: string;
+  rootChildren: FsNode[];
+}
+
+const FILE_BROWSER_SNAPSHOT_TTL_MS = 5 * 60_000;
+const FILE_BROWSER_SNAPSHOT_MAX_NODES = 400;
+const FILE_BROWSER_SNAPSHOT_KEY_PREFIX = 'rcc_fb_snapshot_v1';
+
+function buildFileBrowserSnapshotKey(
+  startPath: string,
+  includeFiles: boolean,
+  showHidden: boolean,
+  serverId?: string,
+): string {
+  return [
+    FILE_BROWSER_SNAPSHOT_KEY_PREFIX,
+    serverId || 'local',
+    includeFiles ? 'files' : 'dirs',
+    showHidden ? 'hidden' : 'visible',
+    startPath,
+  ].join(':');
+}
+
+function countFsNodes(nodes: readonly FsNode[]): number {
+  let count = 0;
+  const stack = [...nodes];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (!node) continue;
+    count += 1;
+    if (node.children && node.children.length > 0) stack.push(...node.children);
+  }
+  return count;
+}
+
+function loadFileBrowserSnapshot(
+  startPath: string,
+  includeFiles: boolean,
+  showHidden: boolean,
+  serverId?: string,
+): FileBrowserSnapshot | null {
+  try {
+    const raw = localStorage.getItem(buildFileBrowserSnapshotKey(startPath, includeFiles, showHidden, serverId));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<FileBrowserSnapshot>;
+    if (!parsed || typeof parsed !== 'object') return null;
+    if (typeof parsed.savedAt !== 'number' || Date.now() - parsed.savedAt > FILE_BROWSER_SNAPSHOT_TTL_MS) return null;
+    if (typeof parsed.currentLabel !== 'string' || !Array.isArray(parsed.rootChildren)) return null;
+    return {
+      savedAt: parsed.savedAt,
+      currentLabel: parsed.currentLabel,
+      rootChildren: parsed.rootChildren as FsNode[],
+    };
+  } catch {
+    return null;
+  }
+}
+
+function saveFileBrowserSnapshot(
+  startPath: string,
+  includeFiles: boolean,
+  showHidden: boolean,
+  currentLabel: string,
+  rootChildren: FsNode[],
+  serverId?: string,
+): void {
+  try {
+    if (countFsNodes(rootChildren) > FILE_BROWSER_SNAPSHOT_MAX_NODES) return;
+    const snapshot: FileBrowserSnapshot = {
+      savedAt: Date.now(),
+      currentLabel,
+      rootChildren,
+    };
+    localStorage.setItem(
+      buildFileBrowserSnapshotKey(startPath, includeFiles, showHidden, serverId),
+      JSON.stringify(snapshot),
+    );
+  } catch {
+    /* ignore */
+  }
+}
+
 export type FileBrowserPreviewState =
   | { status: 'idle' }
   | { status: 'loading'; path: string }
@@ -242,13 +326,19 @@ export function FileBrowser({
   const isMulti = mode === 'file-multi';
 
   const startPath = initialPath || '~';
+  const initialTreeSnapshot = loadFileBrowserSnapshot(startPath, includeFiles, false, serverId);
   const [data, setData] = useState<FsNode[]>([
-    { id: startPath, name: startPath, isDir: true, children: [] },
+    {
+      id: startPath,
+      name: startPath,
+      isDir: true,
+      children: initialTreeSnapshot?.rootChildren ?? [],
+    },
   ]);
   const [selectedPaths, setSelectedPaths] = useState<Set<string>>(
     () => new Set(highlightPath ? [highlightPath] : []),
   );
-  const [currentLabel, setCurrentLabel] = useState(startPath);
+  const [currentLabel, setCurrentLabel] = useState(initialTreeSnapshot?.currentLabel ?? startPath);
   const [error, setError] = useState<string | null>(null);
   const [showHidden, setShowHidden] = useState(false);
   const [preview, setPreview] = useState<FileBrowserPreviewState>(() => initialPreview ?? { status: 'idle' });
@@ -337,6 +427,12 @@ export function FileBrowser({
     };
   }, []);
 
+  useEffect(() => {
+    const root = data[0];
+    if (!root || root.isLoading || !root.children) return;
+    saveFileBrowserSnapshot(startPath, includeFiles, showHidden, currentLabel, root.children, serverId);
+  }, [currentLabel, data, includeFiles, serverId, showHidden, startPath]);
+
   const getActivePreviewCycle = useCallback((path?: string): PendingPreviewRequest | null => {
     const active = activePreviewCycleRef.current;
     if (!active) return null;
@@ -362,7 +458,10 @@ export function FileBrowser({
     setData((prev) => updateNode(prev, nodePath, { isLoading: true }));
     let requestId: string;
     try {
-      requestId = ws.fsListDir(nodePath, includeFiles, !!serverId);
+      // Keep the initial directory list lightweight. The tree currently only
+      // renders names/dir flags, so per-file metadata (size/mime/downloadId)
+      // just adds avoidable stat work on first open, especially on mobile.
+      requestId = ws.fsListDir(nodePath, includeFiles, false);
     } catch {
       setData((prev) => updateNode(prev, nodePath, { isLoading: false }));
       return;
@@ -691,11 +790,13 @@ export function FileBrowser({
       activePreviewCycleRef.current = null;
       for (const timer of timersRef.current.values()) clearTimeout(timer);
       timersRef.current.clear();
-      setData([{ id: startPath, name: startPath, isDir: true, children: [] }]);
+      const cached = loadFileBrowserSnapshot(startPath, includeFiles, showHidden, serverId);
+      setData([{ id: startPath, name: startPath, isDir: true, children: cached?.rootChildren ?? [] }]);
+      setCurrentLabel(cached?.currentLabel ?? startPath);
       setError(null);
     }
     fetchDir(startPath);
-  }, [startPath, fetchDir]);
+  }, [fetchDir, includeFiles, serverId, showHidden, startPath]);
 
   useEffect(() => {
     if (!changesRootPath) return;
@@ -840,9 +941,11 @@ export function FileBrowser({
   // Reload tree when showHidden changes
   useEffect(() => {
     loadedRef.current.clear();
-    setData([{ id: startPath, name: startPath, isDir: true, children: [] }]);
+    const cached = loadFileBrowserSnapshot(startPath, includeFiles, showHidden, serverId);
+    setData([{ id: startPath, name: startPath, isDir: true, children: cached?.rootChildren ?? [] }]);
+    setCurrentLabel(cached?.currentLabel ?? startPath);
     fetchDir(startPath);
-  }, [showHidden]);
+  }, [fetchDir, includeFiles, serverId, showHidden, startPath]);
 
   const toggleExpand = useCallback((nodeId: string) => {
     setExpandedPaths((prev) => {

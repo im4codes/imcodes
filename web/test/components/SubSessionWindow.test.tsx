@@ -747,10 +747,7 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     expect(view.container.querySelector('.idle-flash-layer--frame')).toBeNull();
   });
 
-  it('does not add optimistic bubbles for transport sub-session window sends', async () => {
-    // Transport sends may remain queued until the runtime is ready. The window
-    // must wait for the authoritative daemon echo instead of advancing the
-    // timeline immediately with an optimistic bubble.
+  it('adds optimistic bubbles for transport sub-session window sends', async () => {
     const sub = makeSubSession({ type: 'claude-code-sdk', runtimeType: 'transport' as any } as any);
 
     render(
@@ -781,7 +778,10 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
       extra: { foo: 'bar' },
     });
 
-    expect(addOptimisticUserMessageSpy).not.toHaveBeenCalled();
+    expect(addOptimisticUserMessageSpy).toHaveBeenCalledWith('hello from sub', 'cmd-sub-42', {
+      attachments: [{ kind: 'file', name: 'a.txt' }],
+      resendExtra: { foo: 'bar' },
+    });
   });
 
   it('wires onResendFailed into ChatView so retry works from sub-session bubbles', async () => {

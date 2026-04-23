@@ -96,6 +96,143 @@ export interface QuickData {
   phrases: string[];
 }
 
+export const SESSION_TEXT_TAIL_CACHE_LIMIT = 50;
+
+export interface SessionTextTailCacheItem {
+  eventId: string;
+  ts: number;
+  type: 'user.message' | 'assistant.text';
+  text: string;
+  source?: string;
+  confidence?: string;
+}
+
+interface DbSessionTextTailCacheRow {
+  server_id: string;
+  session_name: string;
+  events: SessionTextTailCacheItem[] | string | null;
+  latest_ts: number | null;
+  updated_at: Date;
+}
+
+interface ClassifiedSessionTextTailEvent {
+  sessionName: string;
+  item: SessionTextTailCacheItem;
+}
+
+function normalizeSessionTextTailText(text: unknown): string | null {
+  if (typeof text !== 'string') return null;
+  const trimmed = text.trim();
+  return trimmed || null;
+}
+
+function isSessionTextTailType(type: unknown): type is SessionTextTailCacheItem['type'] {
+  return type === 'user.message' || type === 'assistant.text';
+}
+
+function parseSessionTextTailCacheEvents(
+  raw: SessionTextTailCacheItem[] | string | null | undefined,
+): SessionTextTailCacheItem[] {
+  let parsed: unknown = raw;
+  if (typeof parsed === 'string') {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(parsed)) return [];
+  const items: SessionTextTailCacheItem[] = [];
+  for (const entry of parsed) {
+    if (!entry || typeof entry !== 'object') return [];
+    const row = entry as Record<string, unknown>;
+    if (
+      typeof row.eventId !== 'string'
+      || typeof row.ts !== 'number'
+      || !isSessionTextTailType(row.type)
+      || typeof row.text !== 'string'
+    ) {
+      return [];
+    }
+    const text = normalizeSessionTextTailText(row.text);
+    if (!text) return [];
+    const item: SessionTextTailCacheItem = {
+      eventId: row.eventId,
+      ts: row.ts,
+      type: row.type,
+      text,
+    };
+    if (typeof row.source === 'string' && row.source.trim()) item.source = row.source.trim();
+    if (typeof row.confidence === 'string' && row.confidence.trim()) item.confidence = row.confidence.trim();
+    items.push(item);
+  }
+  return items;
+}
+
+function mergeSessionTextTailCacheEvents(
+  existing: SessionTextTailCacheItem[],
+  incoming: SessionTextTailCacheItem,
+): SessionTextTailCacheItem[] {
+  const deduped = new Map<string, SessionTextTailCacheItem>();
+  for (const item of existing) deduped.set(item.eventId, item);
+  deduped.set(incoming.eventId, incoming);
+  const merged = [...deduped.values()].sort((a, b) => {
+    if (a.ts !== b.ts) return a.ts - b.ts;
+    return a.eventId.localeCompare(b.eventId);
+  });
+  return merged.length > SESSION_TEXT_TAIL_CACHE_LIMIT
+    ? merged.slice(merged.length - SESSION_TEXT_TAIL_CACHE_LIMIT)
+    : merged;
+}
+
+export function mergeSessionTextTailCacheItems(
+  existing: SessionTextTailCacheItem[],
+  incoming: SessionTextTailCacheItem[],
+): SessionTextTailCacheItem[] {
+  const deduped = new Map<string, SessionTextTailCacheItem>();
+  for (const item of existing) deduped.set(item.eventId, item);
+  for (const item of incoming) deduped.set(item.eventId, item);
+  const merged = [...deduped.values()].sort((a, b) => {
+    if (a.ts !== b.ts) return a.ts - b.ts;
+    return a.eventId.localeCompare(b.eventId);
+  });
+  return merged.length > SESSION_TEXT_TAIL_CACHE_LIMIT
+    ? merged.slice(merged.length - SESSION_TEXT_TAIL_CACHE_LIMIT)
+    : merged;
+}
+
+export function classifySessionTextTailEvent(rawEvent: Record<string, unknown>): ClassifiedSessionTextTailEvent | null {
+  const sessionName = typeof rawEvent.sessionId === 'string' ? rawEvent.sessionId : null;
+  const eventId = typeof rawEvent.eventId === 'string' ? rawEvent.eventId : null;
+  const ts = typeof rawEvent.ts === 'number' ? rawEvent.ts : null;
+  const type = isSessionTextTailType(rawEvent.type) ? rawEvent.type : null;
+  const payload = rawEvent.payload && typeof rawEvent.payload === 'object'
+    ? rawEvent.payload as Record<string, unknown>
+    : null;
+  if (!sessionName || !eventId || ts === null || !type || !payload) return null;
+  if (type === 'assistant.text' && payload.streaming === true) return null;
+  const text = normalizeSessionTextTailText(payload.text);
+  if (!text) return null;
+  const item: SessionTextTailCacheItem = { eventId, ts, type, text };
+  if (typeof rawEvent.source === 'string' && rawEvent.source.trim()) item.source = rawEvent.source.trim();
+  if (typeof rawEvent.confidence === 'string' && rawEvent.confidence.trim()) item.confidence = rawEvent.confidence.trim();
+  return { sessionName, item };
+}
+
+export function collectSessionTextTailCacheItems(
+  sessionName: string,
+  rawEvents: unknown[],
+): SessionTextTailCacheItem[] {
+  const items: SessionTextTailCacheItem[] = [];
+  for (const raw of rawEvents) {
+    if (!raw || typeof raw !== 'object') continue;
+    const classified = classifySessionTextTailEvent(raw as Record<string, unknown>);
+    if (!classified || classified.sessionName !== sessionName) continue;
+    items.push(classified.item);
+  }
+  return mergeSessionTextTailCacheItems([], items);
+}
+
 // ── Users ─────────────────────────────────────────────────────────────────
 
 export async function createUser(db: Database, id: string): Promise<DbUser> {
@@ -539,6 +676,68 @@ export async function updateSession(
   await db.execute(
     `UPDATE sessions SET ${parts.join(', ')} WHERE server_id = $${idx++} AND name = $${idx++}`,
     vals,
+  );
+}
+
+export async function upsertSessionTextTailCacheEvent(
+  db: Database,
+  serverId: string,
+  rawEvent: Record<string, unknown>,
+): Promise<void> {
+  const classified = classifySessionTextTailEvent(rawEvent);
+  if (!classified) return;
+  await db.transaction(async (tx) => {
+    const row = await tx.queryOne<Pick<DbSessionTextTailCacheRow, 'events'>>(
+      `SELECT events
+         FROM session_text_tail_cache
+        WHERE server_id = $1 AND session_name = $2
+        FOR UPDATE`,
+      [serverId, classified.sessionName],
+    );
+    const existing = parseSessionTextTailCacheEvents(row?.events ?? null);
+    const events = mergeSessionTextTailCacheEvents(existing, classified.item);
+    const latestTs = events.length > 0 ? events[events.length - 1]!.ts : null;
+    await tx.execute(
+      `INSERT INTO session_text_tail_cache (server_id, session_name, events, latest_ts, updated_at)
+       VALUES ($1, $2, $3::jsonb, $4, NOW())
+       ON CONFLICT (server_id, session_name)
+       DO UPDATE SET events = EXCLUDED.events, latest_ts = EXCLUDED.latest_ts, updated_at = NOW()`,
+      [serverId, classified.sessionName, JSON.stringify(events), latestTs],
+    );
+  });
+}
+
+export async function getSessionTextTailCache(
+  db: Database,
+  serverId: string,
+  sessionName: string,
+): Promise<SessionTextTailCacheItem[]> {
+  const row = await db.queryOne<Pick<DbSessionTextTailCacheRow, 'events'>>(
+    `SELECT events
+       FROM session_text_tail_cache
+      WHERE server_id = $1 AND session_name = $2`,
+    [serverId, sessionName],
+  );
+  const events = parseSessionTextTailCacheEvents(row?.events ?? null);
+  return events.length > SESSION_TEXT_TAIL_CACHE_LIMIT
+    ? events.slice(events.length - SESSION_TEXT_TAIL_CACHE_LIMIT)
+    : events;
+}
+
+export async function replaceSessionTextTailCache(
+  db: Database,
+  serverId: string,
+  sessionName: string,
+  events: SessionTextTailCacheItem[],
+): Promise<void> {
+  const bounded = mergeSessionTextTailCacheItems([], events);
+  const latestTs = bounded.length > 0 ? bounded[bounded.length - 1]!.ts : null;
+  await db.execute(
+    `INSERT INTO session_text_tail_cache (server_id, session_name, events, latest_ts, updated_at)
+     VALUES ($1, $2, $3::jsonb, $4, NOW())
+     ON CONFLICT (server_id, session_name)
+     DO UPDATE SET events = EXCLUDED.events, latest_ts = EXCLUDED.latest_ts, updated_at = NOW()`,
+    [serverId, sessionName, JSON.stringify(bounded), latestTs],
   );
 }
 

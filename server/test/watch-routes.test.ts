@@ -8,6 +8,8 @@ const mockGetServersByUserId = vi.fn();
 const mockGetDbSessionsByServer = vi.fn();
 const mockGetSubSessionsByServer = vi.fn();
 const mockGetUserPref = vi.fn();
+const mockGetSessionTextTailCache = vi.fn();
+const mockReplaceSessionTextTailCache = vi.fn();
 const mockRequestTimelineHistory = vi.fn();
 const mockGetRecentText = vi.fn();
 const mockGetRecentTextForWatch = vi.fn();
@@ -25,13 +27,19 @@ vi.mock('../src/security/authorization.js', () => ({
   resolveServerRole: (...args: unknown[]) => mockResolveServerRole(...args as []),
 }));
 
-vi.mock('../src/db/queries.js', () => ({
-  getServersByUserId: (...args: unknown[]) => mockGetServersByUserId(...args),
-  getDbSessionsByServer: (...args: unknown[]) => mockGetDbSessionsByServer(...args),
-  getSubSessionsByServer: (...args: unknown[]) => mockGetSubSessionsByServer(...args),
-  getUserPref: (...args: unknown[]) => mockGetUserPref(...args),
-  getServerById: vi.fn(async () => ({ id: 'srv-1' })),
-}));
+vi.mock('../src/db/queries.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/db/queries.js')>();
+  return {
+    ...actual,
+    getServersByUserId: (...args: unknown[]) => mockGetServersByUserId(...args),
+    getDbSessionsByServer: (...args: unknown[]) => mockGetDbSessionsByServer(...args),
+    getSubSessionsByServer: (...args: unknown[]) => mockGetSubSessionsByServer(...args),
+    getUserPref: (...args: unknown[]) => mockGetUserPref(...args),
+    getSessionTextTailCache: (...args: unknown[]) => mockGetSessionTextTailCache(...args),
+    replaceSessionTextTailCache: (...args: unknown[]) => mockReplaceSessionTextTailCache(...args),
+    getServerById: vi.fn(async () => ({ id: 'srv-1' })),
+  };
+});
 
 vi.mock('../src/ws/bridge.js', () => ({
   WsBridge: {
@@ -91,6 +99,8 @@ describe('Watch routes', () => {
     mockGetDbSessionsByServer.mockResolvedValue([]);
     mockGetSubSessionsByServer.mockResolvedValue([]);
     mockGetUserPref.mockResolvedValue(null);
+    mockGetSessionTextTailCache.mockResolvedValue([]);
+    mockReplaceSessionTextTailCache.mockResolvedValue(undefined);
     mockGetRecentText.mockReturnValue([]);
     mockGetRecentTextForWatch.mockResolvedValue([]);
     mockGetActiveMainSessions.mockReturnValue([]);
@@ -335,12 +345,186 @@ describe('Watch routes', () => {
     await expect(res.json()).resolves.toEqual({ error: 'daemon_offline' });
   });
 
+  it('GET /api/server/:id/timeline/text-tail returns cached entries', async () => {
+    mockGetSessionTextTailCache.mockResolvedValue([
+      { eventId: 'e1', ts: 100, type: 'user.message', text: 'hi' },
+      { eventId: 'e2', ts: 200, type: 'assistant.text', text: 'hello', source: 'daemon', confidence: 'high' },
+    ]);
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/text-tail?sessionName=deck_proj_brain');
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get(IMCODES_POD_HEADER)).toBe('pod-a');
+    await expect(res.json()).resolves.toEqual({
+      sessionName: 'deck_proj_brain',
+      events: [
+        { eventId: 'e1', ts: 100, type: 'user.message', text: 'hi' },
+        { eventId: 'e2', ts: 200, type: 'assistant.text', text: 'hello', source: 'daemon', confidence: 'high' },
+      ],
+    });
+  });
+
+  it('GET /api/server/:id/timeline/text-tail backfills missing recent text from daemon history and rewrites cache', async () => {
+    mockGetSessionTextTailCache.mockResolvedValue([
+      { eventId: 'e-old', ts: 100, type: 'user.message', text: 'old cached' },
+    ]);
+    mockRequestTimelineHistory.mockResolvedValue({
+      epoch: 1,
+      events: [
+        { eventId: 'e-old', sessionId: 'deck_proj_brain', ts: 100, type: 'user.message', payload: { text: 'old cached' } },
+        { eventId: 'e-new', sessionId: 'deck_proj_brain', ts: 200, type: 'assistant.text', payload: { text: 'new live text' } },
+        { eventId: 'e-stream', sessionId: 'deck_proj_brain', ts: 210, type: 'assistant.text', payload: { text: 'ignore me', streaming: true } },
+      ],
+    });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/text-tail?sessionName=deck_proj_brain');
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      sessionName: 'deck_proj_brain',
+      events: [
+        { eventId: 'e-old', ts: 100, type: 'user.message', text: 'old cached' },
+        { eventId: 'e-new', ts: 200, type: 'assistant.text', text: 'new live text' },
+      ],
+    });
+    expect(mockReplaceSessionTextTailCache).toHaveBeenCalledWith(
+      expect.anything(),
+      'srv-1',
+      'deck_proj_brain',
+      [
+        { eventId: 'e-old', ts: 100, type: 'user.message', text: 'old cached' },
+        { eventId: 'e-new', ts: 200, type: 'assistant.text', text: 'new live text' },
+      ],
+    );
+  });
+
+  it('GET /api/server/:id/timeline/text-tail paginates daemon history until it collects 50 recent text events', async () => {
+    mockGetSessionTextTailCache.mockResolvedValue([]);
+
+    const pageOne = Array.from({ length: 500 }, (_, index) => {
+      const ts = 1000 + index;
+      if (index >= 475) {
+        return {
+          eventId: `text-${index - 475}`,
+          sessionId: 'deck_proj_brain',
+          ts,
+          type: index % 2 === 0 ? 'user.message' : 'assistant.text',
+          payload: { text: `page-one-${index - 475}` },
+        };
+      }
+      return {
+        eventId: `tool-${index}`,
+        sessionId: 'deck_proj_brain',
+        ts,
+        type: 'tool.result',
+        payload: { output: `tool-${index}` },
+      };
+    });
+    const pageTwo = Array.from({ length: 500 }, (_, index) => {
+      const ts = 500 + index;
+      if (index >= 470) {
+        return {
+          eventId: `older-${index - 470}`,
+          sessionId: 'deck_proj_brain',
+          ts,
+          type: index % 2 === 0 ? 'assistant.text' : 'user.message',
+          payload: { text: `page-two-${index - 470}` },
+        };
+      }
+      return {
+        eventId: `state-${index}`,
+        sessionId: 'deck_proj_brain',
+        ts,
+        type: 'session.state',
+        payload: { state: 'idle' },
+      };
+    });
+
+    mockRequestTimelineHistory
+      .mockResolvedValueOnce({ epoch: 1, events: pageOne })
+      .mockResolvedValueOnce({ epoch: 1, events: pageTwo });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/text-tail?sessionName=deck_proj_brain');
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.sessionName).toBe('deck_proj_brain');
+    expect(body.events).toHaveLength(50);
+    expect(body.events[0]).toEqual({ eventId: 'older-5', ts: 975, type: 'user.message', text: 'page-two-5' });
+    expect(body.events.at(-1)).toEqual({ eventId: 'text-24', ts: 1499, type: 'assistant.text', text: 'page-one-24' });
+    expect(mockRequestTimelineHistory).toHaveBeenCalledTimes(2);
+    expect(mockRequestTimelineHistory).toHaveBeenNthCalledWith(1, {
+      sessionName: 'deck_proj_brain',
+      limit: 500,
+      timeoutMs: 1500,
+    });
+    expect(mockRequestTimelineHistory).toHaveBeenNthCalledWith(2, {
+      sessionName: 'deck_proj_brain',
+      limit: 500,
+      timeoutMs: 1500,
+      beforeTs: 1001,
+    });
+    expect(mockReplaceSessionTextTailCache).toHaveBeenCalledWith(
+      expect.anything(),
+      'srv-1',
+      'deck_proj_brain',
+      expect.arrayContaining([
+        { eventId: 'older-25', ts: 995, type: 'user.message', text: 'page-two-25' },
+        { eventId: 'text-24', ts: 1499, type: 'assistant.text', text: 'page-one-24' },
+      ]),
+    );
+  });
+
+  it('GET /api/server/:id/timeline/text-tail returns empty list when no cache exists', async () => {
+    mockGetSessionTextTailCache.mockResolvedValue([]);
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/text-tail?sessionName=deck_proj_brain');
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      sessionName: 'deck_proj_brain',
+      events: [],
+    });
+  });
+
+  it('GET /api/server/:id/timeline/text-tail isolates cache read failures', async () => {
+    mockGetSessionTextTailCache.mockRejectedValue(new Error('db down'));
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/text-tail?sessionName=deck_proj_brain');
+
+    expect(res.status).toBe(500);
+    await expect(res.json()).resolves.toEqual({ error: 'cache_read_failed' });
+  });
+
+  it('GET /api/server/:id/timeline/text-tail falls back to cached entries when daemon history backfill fails', async () => {
+    mockGetSessionTextTailCache.mockResolvedValue([
+      { eventId: 'e1', ts: 100, type: 'user.message', text: 'cached only' },
+    ]);
+    mockRequestTimelineHistory.mockRejectedValue(new Error('daemon_offline'));
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/text-tail?sessionName=deck_proj_brain');
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      sessionName: 'deck_proj_brain',
+      events: [{ eventId: 'e1', ts: 100, type: 'user.message', text: 'cached only' }],
+    });
+    expect(mockReplaceSessionTextTailCache).not.toHaveBeenCalled();
+  });
+
   it('watch routes return 403 when the user has no access to the server', async () => {
     mockResolveServerRole.mockResolvedValue('none');
     const app = await buildTestApp();
 
     const sessionsRes = await app.request('/api/watch/sessions?serverId=srv-1');
     const historyRes = await app.request('/api/server/srv-1/timeline/history?sessionName=deck_proj_brain');
+    const tailRes = await app.request('/api/server/srv-1/timeline/text-tail?sessionName=deck_proj_brain');
     const sendRes = await app.request('/api/server/srv-1/session/send', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -352,6 +536,9 @@ describe('Watch routes', () => {
 
     expect(historyRes.status).toBe(403);
     await expect(historyRes.json()).resolves.toEqual({ error: 'forbidden' });
+
+    expect(tailRes.status).toBe(403);
+    await expect(tailRes.json()).resolves.toEqual({ error: 'forbidden' });
 
     expect(sendRes.status).toBe(403);
     await expect(sendRes.json()).resolves.toEqual({

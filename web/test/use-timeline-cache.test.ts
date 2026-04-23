@@ -7,6 +7,12 @@ import { h } from 'preact';
 import type { ServerMessage, TimelineEvent, WsClient } from '../src/ws-client.js';
 import { TimelineDB } from '../src/timeline-db.js';
 import { mergeTimelineEvents } from '../../src/shared/timeline/merge.js';
+const fetchHistorySpy = vi.hoisted(() => vi.fn());
+const fetchTextTailSpy = vi.hoisted(() => vi.fn());
+vi.mock('../src/api.js', () => ({
+  fetchTimelineHistoryHttp: fetchHistorySpy,
+  fetchTimelineTextTailHttp: fetchTextTailSpy,
+}));
 import {
   __clearPersistedTimelineSnapshotsForTests,
   __getTimelineCacheKeysForTests,
@@ -16,6 +22,16 @@ import {
   ingestTimelineEventForCache,
   useTimeline,
 } from '../src/hooks/useTimeline.js';
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
 
 function makeEvents(sessionId: string, count: number): TimelineEvent[] {
   return Array.from({ length: count }, (_, idx) => ({
@@ -36,6 +52,10 @@ describe('useTimeline global cache bounds', () => {
     __resetTimelineCacheForTests();
     __clearPersistedTimelineSnapshotsForTests();
     cleanup();
+    fetchHistorySpy.mockReset();
+    fetchTextTailSpy.mockReset();
+    fetchHistorySpy.mockResolvedValue(null);
+    fetchTextTailSpy.mockResolvedValue(null);
   });
 
   afterEach(() => {
@@ -337,6 +357,124 @@ describe('useTimeline global cache bounds', () => {
     });
   });
 
+  it('marks refreshing while PG text-tail bootstrap is in flight after restoring a snapshot', async () => {
+    const sessionName = `deck_text_tail_refreshing_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    const pendingTextTail = deferred<{ events: Array<{ eventId: string; ts: number; type: 'assistant.text'; text: string }> } | null>();
+
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-snap-1`,
+      sessionId: sessionName,
+      ts: 1,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'snapshot history' },
+    }, serverId);
+
+    fetchTextTailSpy.mockReturnValue(pendingTextTail.promise);
+
+    function Probe() {
+      const { refreshing } = useTimeline(sessionName, null, serverId);
+      return h('div', { 'data-testid': 'probe', 'data-refreshing': String(refreshing) }, 'probe');
+    }
+
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').getAttribute('data-refreshing')).toBe('true');
+    });
+
+    await act(async () => {
+      pendingTextTail.resolve({ events: [] });
+      await pendingTextTail.promise;
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').getAttribute('data-refreshing')).toBe('false');
+    });
+  });
+
+  it('bootstraps from local snapshot, then PG text tail, before later authoritative reconciliation', async () => {
+    const sessionName = `deck_text_tail_bootstrap_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-snap-1`,
+      sessionId: sessionName,
+      ts: 10,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'snapshot history' },
+    }, serverId);
+
+    fetchTextTailSpy.mockResolvedValue({
+      events: [{
+        eventId: `${sessionName}-tail-1`,
+        ts: 20,
+        type: 'assistant.text',
+        text: 'pg tail text',
+        source: 'daemon',
+        confidence: 'high',
+      }],
+    });
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest: () => 'history-text-tail',
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, ws, serverId);
+      return h('div', { 'data-testid': 'probe' }, events.map((event) => String(event.payload.text ?? '')).join('|'));
+    }
+
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('snapshot history');
+    });
+
+    await waitFor(() => {
+      expect(fetchTextTailSpy).toHaveBeenCalledWith(serverId, sessionName);
+      expect(screen.getByTestId('probe').textContent).toBe('snapshot history|pg tail text');
+    });
+
+    await act(async () => {
+      handler?.({
+        type: 'timeline.history',
+        sessionName,
+        requestId: 'history-text-tail',
+        epoch: 2,
+        events: [{
+          eventId: `${sessionName}-auth-1`,
+          sessionId: sessionName,
+          ts: 30,
+          epoch: 2,
+          seq: 3,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'assistant.text',
+          payload: { text: 'authoritative text' },
+        }],
+      } as ServerMessage);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('snapshot history|pg tail text|authoritative text');
+    });
+  });
+
   it('requests timeline history when the socket connects after the first mount', async () => {
     const sessionName = `deck_late_connect_${Date.now()}`;
     const serverId = `srv-${Date.now()}`;
@@ -368,6 +506,46 @@ describe('useTimeline global cache bounds', () => {
     });
   });
 
+  it('marks refreshing during a cold WS history bootstrap with no local cache', async () => {
+    const sessionName = `deck_cold_history_refreshing_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest: vi.fn(() => 'history-cold-refreshing'),
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { refreshing } = useTimeline(sessionName, ws, serverId);
+      return h('div', { 'data-testid': 'probe', 'data-refreshing': String(refreshing) }, 'probe');
+    }
+
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').getAttribute('data-refreshing')).toBe('true');
+    });
+
+    await act(async () => {
+      handler?.({
+        type: 'timeline.history',
+        sessionName,
+        requestId: 'history-cold-refreshing',
+        epoch: 1,
+        events: [],
+      } as ServerMessage);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').getAttribute('data-refreshing')).toBe('false');
+    });
+  });
+
   it('renders immediately from globally ingested timeline events before the first history request returns', async () => {
     const sessionName = `deck_sub_codex_sdk_${Date.now()}`;
     const serverId = `srv-${Date.now()}`;
@@ -392,6 +570,7 @@ describe('useTimeline global cache bounds', () => {
         handler = next;
         return () => { handler = null; };
       },
+      sendTimelineReplayRequest: vi.fn(() => 'replay-after-ts'),
       sendTimelineHistoryRequest,
     } as unknown as WsClient;
 
@@ -479,6 +658,116 @@ describe('useTimeline global cache bounds', () => {
 
     await waitFor(() => {
       expect(screen.getByTestId('probe').textContent).toBe('stored history|live transport send');
+    });
+  });
+
+  it('merges PG text tail by eventId without regressing newer local entries', async () => {
+    const sessionName = `deck_text_tail_merge_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-same`,
+      sessionId: sessionName,
+      ts: 50,
+      epoch: 9,
+      seq: 9,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'newer local copy', extra: 'keep-me' },
+    }, serverId);
+
+    fetchTextTailSpy.mockResolvedValue({
+      events: [{
+        eventId: `${sessionName}-same`,
+        ts: 50,
+        type: 'assistant.text',
+        text: 'older tail copy',
+        source: 'daemon',
+        confidence: 'high',
+      }, {
+        eventId: `${sessionName}-tail-new`,
+        ts: 60,
+        type: 'user.message',
+        text: 'new tail entry',
+      }],
+    });
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, null, serverId);
+      return h(
+        'div',
+        { 'data-testid': 'probe' },
+        events.map((event) => String(event.payload.text ?? '')).join('|'),
+      );
+    }
+
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(fetchTextTailSpy).toHaveBeenCalledWith(serverId, sessionName);
+      expect(screen.getByTestId('probe').textContent).toBe('newer local copy|new tail entry');
+    });
+  });
+
+  it('fails open when the text-tail endpoint fails and continues with the existing timeline bootstrap', async () => {
+    const sessionName = `deck_text_tail_fail_open_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+
+    fetchTextTailSpy.mockResolvedValue(null);
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest: () => 'history-fail-open',
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events, loading } = useTimeline(sessionName, ws, serverId);
+      return h(
+        'div',
+        {
+          'data-testid': 'probe',
+          'data-loading': String(loading),
+        },
+        events.map((event) => String(event.payload.text ?? '')).join('|'),
+      );
+    }
+
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(fetchTextTailSpy).toHaveBeenCalledWith(serverId, sessionName);
+      expect(screen.getByTestId('probe').getAttribute('data-loading')).toBe('true');
+    });
+
+    await act(async () => {
+      handler?.({
+        type: 'timeline.history',
+        sessionName,
+        requestId: 'history-fail-open',
+        epoch: 1,
+        events: [{
+          eventId: `${sessionName}-auth`,
+          sessionId: sessionName,
+          ts: 1,
+          epoch: 1,
+          seq: 1,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'assistant.text',
+          payload: { text: 'authoritative fallback' },
+        }],
+      } as ServerMessage);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('authoritative fallback');
+      expect(screen.getByTestId('probe').getAttribute('data-loading')).toBe('false');
     });
   });
 
@@ -730,7 +1019,8 @@ describe('useTimeline global cache bounds', () => {
     const sendTimelineHistoryRequest = vi.fn(() => 'history-reconnect');
 
     // Seed the shared cache so the hook mounts with known events — the
-    // most recent has ts=5000, which should become afterTs on reconnect.
+    // most recent has ts=5000, so reconnect should request from 4999 to keep
+    // a 1ms overlap and avoid dropping an event on the boundary.
     ingestTimelineEventForCache({
       eventId: `${sessionName}-ingest-1`,
       sessionId: sessionName,
@@ -760,6 +1050,7 @@ describe('useTimeline global cache bounds', () => {
         handler = next;
         return () => { handler = null; };
       },
+      sendTimelineReplayRequest: vi.fn(() => 'replay-after-ts'),
       sendTimelineHistoryRequest,
     } as unknown as WsClient;
 
@@ -778,12 +1069,13 @@ describe('useTimeline global cache bounds', () => {
     sendTimelineHistoryRequest.mockClear();
 
     // Simulate browser WS reconnect. useTimeline should now gap-fill using
-    // afterTs = max ts of currently-rendered events (5000).
+    // afterTs = max ts of currently-rendered events minus the 1ms overlap.
     await act(async () => {
       handler?.({ type: 'session.event', event: 'connected', session: '', state: 'connected' } as ServerMessage);
     });
 
+    expect(ws.sendTimelineReplayRequest).toHaveBeenCalledWith(sessionName, 2, 1);
     expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
-    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300, 5000);
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300, 4999);
   });
 });

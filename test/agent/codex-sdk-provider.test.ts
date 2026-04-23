@@ -555,6 +555,46 @@ describe('CodexSdkProvider', () => {
     expect(detail.meta?.actionType).toBe('other');
   });
 
+  it('surfaces the final WebSearch query on completion even if started emitted only a generic fallback', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-websearch-late-query', cwd: '/tmp/project' });
+
+    const tools: Array<{ status: string; input: unknown; detail?: unknown }> = [];
+    provider.onToolCall((_, tool) => tools.push({ status: tool.status, input: tool.input, detail: tool.detail }));
+
+    await provider.send('route-websearch-late-query', 'search');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-late', type: 'webSearch', action: { type: 'other' } } },
+    });
+    child.emits({
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          id: 'ws-late',
+          type: 'webSearch',
+          query: 'apple stock today',
+          action: { type: 'search', query: 'apple stock today' },
+        },
+      },
+    });
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+    await flush();
+
+    expect(tools).toHaveLength(2);
+    expect(tools[0].status).toBe('running');
+    expect(tools[0].input).toEqual({ query: '(other)' });
+    expect(tools[1].status).toBe('complete');
+    expect(tools[1].input).toEqual({ query: 'apple stock today' });
+    const detail = tools[1].detail as { summary?: string; input?: Record<string, unknown> };
+    expect(detail.summary).toBe('apple stock today');
+    expect(detail.input).toEqual({ query: 'apple stock today', action: { type: 'search', query: 'apple stock today' } });
+  });
+
   it('applies thinking level to subsequent Codex SDK turns', async () => {
     const provider = new CodexSdkProvider();
     await provider.connect({ binaryPath: 'codex' });

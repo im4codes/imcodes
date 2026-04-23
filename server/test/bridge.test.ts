@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { WsBridge } from '../src/ws/bridge.js';
+import * as dbQueries from '../src/db/queries.js';
 
 // ── Mock WebSocket ─────────────────────────────────────────────────────────────
 
@@ -49,13 +50,15 @@ function packFrame(sessionName: string, payload: Buffer): Buffer {
 // ── Mock DB ────────────────────────────────────────────────────────────────────
 
 function makeDb(tokenHash: string) {
-  return {
+  const db = {
     queryOne: async () => ({ token_hash: tokenHash }),
     query: async () => [],
     execute: async () => ({ changes: 1 }),
     exec: async () => {},
+    transaction: async <T>(fn: (tx: import('../src/db/client.js').Database) => Promise<T>) => fn(db as unknown as import('../src/db/client.js').Database),
     close: () => {},
-  } as unknown as import('../src/db/client.js').Database;
+  };
+  return db as unknown as import('../src/db/client.js').Database;
 }
 
 // ── Mock crypto + push ─────────────────────────────────────────────────────────
@@ -985,6 +988,28 @@ describe('WsBridge', () => {
       expect(browserA.sentStrings.length).toBeGreaterThan(0);
       expect(browserB.sentStrings.length).toBeGreaterThan(0);
     });
+
+    it('timeline.event still reaches subscribers when text-tail cache write fails', async () => {
+      const spy = vi.spyOn(dbQueries, 'upsertSessionTextTailCacheEvent').mockRejectedValueOnce(new Error('db down'));
+      const { daemonWs, browserA, browserB } = await setupTwoBrowsers();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          sessionId: 'session-a',
+          eventId: 'tail-fail-1',
+          ts: 123,
+          type: 'assistant.text',
+          payload: { text: 'still delivered' },
+        },
+      }));
+      await flushAsync();
+
+      expect(browserA.sentStrings.some((msg) => msg.includes('tail-fail-1'))).toBe(true);
+      expect(browserB.sentStrings.length).toBe(0);
+      expect(spy).toHaveBeenCalled();
+      spy.mockRestore();
+    });
   });
 
   // ── P0: default-deny — missing session identifier → discard, NOT broadcast ─
@@ -1774,7 +1799,7 @@ describe('WsBridge', () => {
       expect(payload.body).toContain('ready for input');
     });
 
-    it('sends push even when mobile client is connected (badge must increment)', async () => {
+    it('suppresses push when a mobile client is connected', async () => {
       const { dispatchPush } = await import('../src/routes/push.js');
       const { bridge, daemonWs } = await setupPushBridge();
 
@@ -1787,7 +1812,7 @@ describe('WsBridge', () => {
       }));
       await flushAsync();
 
-      expect(dispatchPush).toHaveBeenCalled();
+      expect(dispatchPush).not.toHaveBeenCalled();
     });
 
     it('sends push when only desktop browser is connected', async () => {
@@ -2636,6 +2661,39 @@ describe('WsBridge', () => {
         { eventId: 'e1', type: 'assistant.text', text: 'first', ts: 1 },
         { eventId: 'e3', type: 'user.message', text: 'second', ts: 3 },
       ]);
+    });
+
+    it('fails open when session_text_tail_cache update throws', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      const db = makeDb('valid-hash') as import('../src/db/client.js').Database & { transaction: ReturnType<typeof vi.fn> };
+      db.transaction = vi.fn(async () => { throw new Error('write failed'); }) as never;
+      const browserWs = new MockWs();
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      bridge.handleBrowserConnection(browserWs as never, 'user-1', db);
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'deck_proj_brain' }));
+      await flushAsync();
+      browserWs.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          eventId: 'e1',
+          sessionId: 'deck_proj_brain',
+          ts: 1,
+          type: 'assistant.text',
+          payload: { text: 'still delivered' },
+        },
+      }));
+      await flushAsync();
+
+      expect(browserWs.sentStrings.some((msg) => msg.includes('"type":"timeline.event"'))).toBe(true);
+      expect(errorSpy).toHaveBeenCalled();
     });
   });
 });

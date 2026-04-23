@@ -24,6 +24,17 @@ import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 
 type ViewMode = 'terminal' | 'chat';
 
+const IDLE_HISTORY_STATUS = {
+  phase: 'idle',
+  steps: {
+    cache: 'skipped',
+    textTail: 'skipped',
+    daemon: 'skipped',
+    http: 'skipped',
+    older: 'skipped',
+  },
+} as const;
+
 export interface SessionPaneProps {
   serverId: string;
   session: SessionInfo;
@@ -108,12 +119,16 @@ export function SessionPane({
     events: timelineEvents,
     loading: timelineLoading,
     refreshing: timelineRefreshing,
+    historyStatus: timelineHistoryStatus,
     loadingOlder: timelineLoadingOlder,
     hasOlderHistory: timelineHasOlderHistory,
     addOptimisticUserMessage,
     removeOptimisticMessage,
     loadOlderEvents,
-  } = useTimeline(sessionName, ws, serverId);
+  } = useTimeline(sessionName, ws, serverId, {
+    isActiveSession: isActive,
+  });
+  const historyStatus = timelineHistoryStatus ?? IDLE_HISTORY_STATUS;
 
   // ── Quotes ────────────────────────────────────────────────────────────────
   const [quotes, setQuotes] = useState<string[]>([]);
@@ -187,6 +202,7 @@ export function SessionPane({
   );
   const shouldShowFooter = !!(
     lastUsage
+    || historyStatus.phase !== 'idle'
     || activeThinkingTs
     || activeToolCall
     || statusText
@@ -313,6 +329,7 @@ export function SessionPane({
           statusText={statusText}
           activeToolCall={activeToolCall}
           now={thinkingNow}
+          historyStatus={historyStatus}
         />
       )}
 
@@ -324,13 +341,9 @@ export function SessionPane({
           inputRef={inputRef}
           onAfterAction={onAfterAction}
           onSend={(_name, text, meta) => {
-            // Transport sessions already get an authoritative user.message echo
-            // from the daemon (with allowDuplicate=true) that carries the same
-            // commandId via payload.clientMessageId, so the optimistic bubble
-            // reconciles cleanly. Non-transport sessions depend on the JSONL
-            // watcher or terminal scraper, which can lag several seconds — the
-            // optimistic bubble is the whole point of this path. Either way,
-            // attaching commandId lets the "red !" retry path work uniformly.
+            // Always inject the optimistic user bubble for normal chat sends.
+            // Transport echoes reconcile by commandId, and queued sends are
+            // removed from the timeline once the daemon emits queued state.
             //
             // EXCEPT for P2P commands: `@@all(discuss) xxx` / `@@label(audit) xxx`
             // is a command to start a P2P run — not a chat message to the
@@ -348,7 +361,6 @@ export function SessionPane({
               || (extras.p2pSessionConfig != null && typeof extras.p2pSessionConfig === 'object')
             );
             if (isP2pSend) return;
-            if (effectiveRuntimeType === 'transport') return;
             addOptimisticUserMessage(text, meta?.commandId, {
               ...(meta?.attachments ? { attachments: meta.attachments } : {}),
               ...(meta?.extra ? { resendExtra: meta.extra } : {}),

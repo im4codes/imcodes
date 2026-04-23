@@ -242,6 +242,48 @@ function summarizeToolInput(
   return formatToolPayloadValue(rawRecord.input);
 }
 
+function isGenericWebSearchLabel(value: string | undefined): boolean {
+  if (!value) return false;
+  return /^\((?:other|open_page|find_in_page|search|web_search)\)$/i.test(value.trim());
+}
+
+function pickMergedToolInput(
+  toolName: string,
+  callInput: string,
+  resultInput: string,
+): string {
+  if (toolName === 'WebSearch' && resultInput) {
+    if (!callInput || isGenericWebSearchLabel(callInput)) return resultInput;
+  }
+  return callInput || resultInput;
+}
+
+function pickMergedToolDetailInput(
+  toolName: string,
+  callDetail: unknown,
+  resultDetail: unknown,
+): unknown {
+  const callInput = summarizeToolInput(undefined, callDetail);
+  const resultInput = summarizeToolInput((resultDetail as any)?.input, resultDetail);
+  if (toolName === 'WebSearch' && resultInput) {
+    if (!callInput || isGenericWebSearchLabel(callInput)) return (resultDetail as any)?.input;
+  }
+  return (callDetail as any)?.input ?? (resultDetail as any)?.input;
+}
+
+function pickMergedToolDetailMeta(
+  toolName: string,
+  callDetail: unknown,
+  resultDetail: unknown,
+): unknown {
+  const callInput = summarizeToolInput(undefined, callDetail);
+  const resultInput = summarizeToolInput((resultDetail as any)?.input, resultDetail);
+  if (toolName === 'WebSearch' && resultInput) {
+    if (!callInput || isGenericWebSearchLabel(callInput)) return (resultDetail as any)?.meta ?? (callDetail as any)?.meta;
+  }
+  return (callDetail as any)?.meta ?? (resultDetail as any)?.meta;
+}
+
 function formatToolDetailJson(value: unknown): string | null {
   if (value == null) return null;
   if (typeof value === 'string') return value;
@@ -328,11 +370,12 @@ function buildViewItems(events: TimelineEvent[]): ViewItem[] {
         const toolName = String(ev.payload.tool ?? 'tool');
         // tool.call from transport SDK may have no input yet (streamed incrementally).
         // Fall back to the result's detail.input which has the complete args.
-        const inputText = summarizeToolInput(ev.payload.input, ev.payload.detail)
-          || summarizeToolInput((next.payload.detail as any)?.input, next.payload.detail);
+        const callInput = summarizeToolInput(ev.payload.input, ev.payload.detail);
+        const resultInput = summarizeToolInput((next.payload.detail as any)?.input, next.payload.detail);
+        const inputText = pickMergedToolInput(toolName, callInput, resultInput);
         const input = inputText ? ` ${inputText}` : '';
         const status = next.payload.error ? `✗ ${String(next.payload.error)}` : '✓';
-        const output = !next.payload.error && next.payload.output ? String(next.payload.output) : undefined;
+        const output = !next.payload.error ? formatToolPayloadValue(next.payload.output) : undefined;
         consolidated.push({
           ...ev,
           type: 'tool.call',
@@ -525,7 +568,7 @@ function findScrollParent(start: HTMLElement): HTMLElement {
   return start;
 }
 
-export function ChatView({ events, loading, refreshing: _refreshing, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir, serverId, onQuote, agentType: _agentType, onResendFailed }: Props) {
+export function ChatView({ events, loading, refreshing = false, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir, serverId, onQuote, agentType: _agentType, onResendFailed }: Props) {
   const { t } = useTranslation();
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -1059,8 +1102,16 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
           ⊞
         </button>
       )}
-      {/* refreshing indicator removed — gap-fill is invisible to the user */}
       <div class="chat-main">
+        {!preview && refreshing && (
+          <div
+            class="chat-refreshing"
+            aria-label={t('chat.refreshing_history', 'Updating history')}
+            title={t('chat.refreshing_history', 'Updating history')}
+          >
+            <span class="chat-refreshing-spinner" aria-hidden="true" />
+          </div>
+        )}
         {pinnedAboveViewport && lastSentUserMessage && (
           <div
             class={`chat-pinned-last-sent${pinnedExpanded ? ' chat-pinned-expanded' : ''}`}
@@ -1396,7 +1447,7 @@ function ToolCallGroup({
             </button>
           )
         )}
-        {last && <ChatEvent event={last} onPathClick={onPathClick} onDownload={onDownload} serverId={serverId} />}
+        {last && <ChatEvent event={last} onPathClick={onPathClick} onDownload={onDownload} serverId={serverId} showTime />}
         {expanded && middle.length > 0 && (
           <button class="chat-tool-fold-btn" onClick={() => setExpanded(false)}>
             {t('chat.tool_group_collapse')}
@@ -1483,6 +1534,7 @@ const ChatEvent = memo(function ChatEvent({
   onDownload,
   serverId,
   onResendFailed,
+  showTime,
 }: {
   event: TimelineEvent;
   nextTs?: number;
@@ -1491,6 +1543,7 @@ const ChatEvent = memo(function ChatEvent({
   onDownload?: (path: string) => void;
   serverId?: string;
   onResendFailed?: (commandId: string, text: string) => void;
+  showTime?: boolean;
 }) {
   const { t } = useTranslation();
   switch (event.type) {
@@ -1548,18 +1601,24 @@ const ChatEvent = memo(function ChatEvent({
     }
 
     case 'tool.call': {
+      const toolName = String(event.payload.tool ?? 'tool');
       const callDetail = event.payload._callDetail ?? event.payload.detail;
       const resultDetail = event.payload._resultDetail;
+      const shouldShowTime = showTime || event.payload._merged === true;
       // Fall back to result detail for input — transport SDK tool.call may arrive without input
-      const toolInput = summarizeToolInput(event.payload.input, callDetail)
-        || summarizeToolInput((resultDetail as any)?.input, resultDetail);
+      const callInput = summarizeToolInput(event.payload.input, callDetail);
+      const resultInput = summarizeToolInput((resultDetail as any)?.input, resultDetail);
+      const toolInput = pickMergedToolInput(toolName, callInput, resultInput);
+      const detailInput = pickMergedToolDetailInput(toolName, callDetail, resultDetail);
+      const detailMeta = pickMergedToolDetailMeta(toolName, callDetail, resultDetail);
       const toolOutput = event.payload._output ? String(event.payload._output) : undefined;
       return (
         <ToolBlockFold>
           <div class="chat-event chat-tool">
             <span class="chat-tool-icon">{'>'}</span>
-            <span class="chat-tool-name">{String(event.payload.tool ?? 'tool')}</span>
+            <span class="chat-tool-name">{toolName}</span>
             {toolInput && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInput, onPathClick, undefined, onDownload)}</span>}
+            {shouldShowTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{new Date(event.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>}
           </div>
           {toolOutput && (
             <div class="chat-event chat-tool chat-tool-result-preview">
@@ -1569,9 +1628,9 @@ const ChatEvent = memo(function ChatEvent({
           {(callDetail || resultDetail) && (
             <details class="chat-tool-detail">
               <summary class="chat-tool-detail-summary">{t('chat.tool_detail_toggle')}</summary>
-              <ToolDetailSection label={t('chat.tool_detail_input')} value={(callDetail as any)?.input} />
+              <ToolDetailSection label={t('chat.tool_detail_input')} value={detailInput} />
               <ToolDetailSection label={t('chat.tool_detail_output')} value={(resultDetail as any)?.output} />
-              <ToolDetailSection label={t('chat.tool_detail_meta')} value={(callDetail as any)?.meta ?? (resultDetail as any)?.meta} />
+              <ToolDetailSection label={t('chat.tool_detail_meta')} value={detailMeta} />
               <ToolDetailSection label={t('chat.tool_detail_raw')} value={(callDetail as any)?.raw ?? (resultDetail as any)?.raw} />
             </details>
           )}
@@ -1595,6 +1654,7 @@ const ChatEvent = memo(function ChatEvent({
             ) : (
               <span class="chat-tool-output">done</span>
             )}
+            {showTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{new Date(event.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>}
           </div>
           {detail && (
             <details class="chat-tool-detail">
@@ -1717,6 +1777,7 @@ function extractStackedPreviewFromUnifiedDiff(
 }
 
 function buildPlainPreviewLines(text: string): FileChangePreviewLine[] {
+  if (!text) return [];
   return text.replace(/\r\n/g, '\n').split('\n').map((line) => ({ text: line }));
 }
 
@@ -1860,24 +1921,30 @@ function ExactFilePatch({ patch }: { patch: FileChangePatch }) {
   const afterLines = unifiedPreview?.after ?? buildPlainPreviewLines(patch.afterText ?? '');
   const beforePreview = clampPreviewLines(beforeLines);
   const afterPreview = clampPreviewLines(afterLines);
+  const showRemoved = patch.operation !== 'create' || beforePreview.lines.length > 0;
+  const showAdded = patch.operation !== 'delete' || afterPreview.lines.length > 0;
   return (
     <div class="chat-file-change-diff">
-      <FileChangePreviewBlock
-        marker="-"
-        markerTitle={t('chat.file_change_removed')}
-        lines={beforePreview.lines}
-        truncated={beforePreview.truncated}
-        emptyText={t('chat.file_change_no_before')}
-        className="chat-file-change-diff-label chat-file-change-diff-label-removed"
-      />
-      <FileChangePreviewBlock
-        marker="+"
-        markerTitle={t('chat.file_change_added')}
-        lines={afterPreview.lines}
-        truncated={afterPreview.truncated}
-        emptyText={t('chat.file_change_no_after')}
-        className="chat-file-change-diff-label chat-file-change-diff-label-added"
-      />
+      {showRemoved && (
+        <FileChangePreviewBlock
+          marker="-"
+          markerTitle={t('chat.file_change_removed')}
+          lines={beforePreview.lines}
+          truncated={beforePreview.truncated}
+          emptyText={t('chat.file_change_no_before')}
+          className="chat-file-change-diff-label chat-file-change-diff-label-removed"
+        />
+      )}
+      {showAdded && (
+        <FileChangePreviewBlock
+          marker="+"
+          markerTitle={t('chat.file_change_added')}
+          lines={afterPreview.lines}
+          truncated={afterPreview.truncated}
+          emptyText={t('chat.file_change_no_after')}
+          className="chat-file-change-diff-label chat-file-change-diff-label-added"
+        />
+      )}
     </div>
   );
 }

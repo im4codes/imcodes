@@ -28,7 +28,7 @@ vi.mock('../../src/daemon/timeline-emitter.js', () => ({
 }));
 
 vi.mock('../../src/daemon/timeline-store.js', () => ({
-  timelineStore: { read: mocks.timelineRead },
+  timelineStore: { readPreferred: mocks.timelineRead, read: mocks.timelineRead },
 }));
 
 import { startWatching, stopWatching, isWatching, __testOnly } from '../../src/daemon/opencode-watcher.js';
@@ -41,7 +41,7 @@ describe('opencode-watcher', () => {
     mocks.readOpenCodeSessionMessagesSince.mockResolvedValue([]);
     mocks.buildTimelineEventsFromOpenCodeExport.mockReturnValue([]);
     mocks.discoverLatestOpenCodeSessionId.mockResolvedValue(undefined);
-    mocks.timelineRead.mockReturnValue([]);
+    mocks.timelineRead.mockResolvedValue([]);
   });
 
   afterEach(() => {
@@ -50,7 +50,7 @@ describe('opencode-watcher', () => {
   });
 
   it('starts polling without replaying full history, then emits only new delta events', async () => {
-    mocks.timelineRead.mockReturnValue([{ type: 'assistant.text' }]);
+    mocks.timelineRead.mockResolvedValue([{ type: 'assistant.text' }]);
     await startWatching('deck_sub_oc', '/proj', 'sid-1');
     expect(isWatching('deck_sub_oc')).toBe(true);
 
@@ -100,7 +100,7 @@ describe('opencode-watcher', () => {
 
   it('bootstraps from earliest timeline user message when store createdAt is too new', async () => {
     mocks.getSession.mockReturnValue({ name: 'deck_sub_oc', projectDir: '/proj', opencodeSessionId: 'sid-1', createdAt: 900 });
-    mocks.timelineRead.mockReturnValue([
+    mocks.timelineRead.mockResolvedValue([
       { type: 'user.message', ts: 600 },
       { type: 'command.ack', ts: 601 },
       { type: 'session.state', ts: 950 },
@@ -127,7 +127,7 @@ describe('opencode-watcher', () => {
 
   it('rebinds fresh session to latest sqlite session when store is still pinned to an older opencode session', async () => {
     mocks.getSession.mockReturnValue({ name: 'deck_sub_oc', projectDir: '/proj', opencodeSessionId: 'sid-old', createdAt: 900 });
-    mocks.timelineRead.mockReturnValue([
+    mocks.timelineRead.mockResolvedValue([
       { type: 'user.message', ts: 1000 },
       { type: 'command.ack', ts: 1001 },
     ]);
@@ -159,7 +159,7 @@ describe('opencode-watcher', () => {
 
 
   it('uses latest structured timeline timestamp to fetch missing assistant delta after restart', async () => {
-    mocks.timelineRead.mockReturnValue([
+    mocks.timelineRead.mockResolvedValue([
       { type: 'assistant.text', ts: 700 },
       { type: 'user.message', ts: 1000 },
       { type: 'command.ack', ts: 1001 },
@@ -185,7 +185,7 @@ describe('opencode-watcher', () => {
   });
 
   it('does not advance cursor past assistant rows that exist before their parts are committed', async () => {
-    mocks.timelineRead.mockReturnValue([{ type: 'assistant.text', ts: 700 }]);
+    mocks.timelineRead.mockResolvedValue([{ type: 'assistant.text', ts: 700 }]);
     mocks.readOpenCodeSessionMessagesSince
       .mockResolvedValueOnce([
         { info: { id: 'm-user', role: 'user', time: { created: 1000 } }, parts: [] },
