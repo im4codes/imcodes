@@ -9,11 +9,13 @@
  *     the pending tool-call state lives in the worker and would be lost —
  *     logging and continuing on main is simpler and safe.)
  *
- * The worker is enabled by default. `IM4CODES_JSONL_WORKER` serves as an
- * operational kill switch — set it to `0`/`false`/`no`/`off` to force every
- * drain through the main-thread fallback (useful for diagnostics or if we
- * ever need to disable the worker in production without a redeploy).
- * See `isJsonlWorkerEnabled()` below.
+ * The worker is **disabled by default**: the project's hot paths are moving
+ * to SDK-based transport providers, and every agent's chat now runs through
+ * `timeline-projection-worker` for persistence — so the main-thread parseLine
+ * cost on Claude JSONL is no longer a priority to offload. The worker code
+ * is kept in-tree (plus its parity tests) as an opt-in escape hatch: set
+ * `IM4CODES_JSONL_WORKER=1` (or true/yes/on) to turn it back on without a
+ * redeploy.
  */
 
 import { Worker } from 'node:worker_threads';
@@ -44,15 +46,15 @@ function getWorkerModuleUrl(): URL {
 /**
  * `true` if the pool should be used in place of main-thread parseLine.
  *
- * Default: `true` (worker is on). The env var is an operational kill switch
- * — set `IM4CODES_JSONL_WORKER` to any of `0`, `false`, `no`, `off`, or the
- * empty string to disable the worker and force main-thread parsing.
+ * Default: `false`. Set `IM4CODES_JSONL_WORKER` to `1`/`true`/`yes`/`on` to
+ * opt in (e.g. if a specific deployment notices JSONL parsing pressure on
+ * the main event loop).
  */
 export function isJsonlWorkerEnabled(): boolean {
   const raw = process.env.IM4CODES_JSONL_WORKER;
-  if (raw === undefined) return true;
+  if (!raw) return false;
   const v = raw.trim().toLowerCase();
-  return !(v === '' || v === '0' || v === 'false' || v === 'no' || v === 'off');
+  return v === '1' || v === 'true' || v === 'yes' || v === 'on';
 }
 
 interface PendingEntry {

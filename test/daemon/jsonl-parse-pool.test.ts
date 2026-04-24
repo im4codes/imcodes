@@ -20,32 +20,32 @@ function jsonlLine(obj: Record<string, unknown>): string {
   return JSON.stringify(obj);
 }
 
-describe('isJsonlWorkerEnabled (worker on by default)', () => {
+describe('isJsonlWorkerEnabled (opt-in, worker off by default)', () => {
   const originalEnv = process.env.IM4CODES_JSONL_WORKER;
   afterEach(() => {
     if (originalEnv === undefined) delete process.env.IM4CODES_JSONL_WORKER;
     else process.env.IM4CODES_JSONL_WORKER = originalEnv;
   });
 
-  it('returns true when env var is unset (default on)', async () => {
+  it('returns false when env var is unset (default off)', async () => {
     const { isJsonlWorkerEnabled } = await import('../../src/daemon/jsonl-parse-pool.js');
     delete process.env.IM4CODES_JSONL_WORKER;
-    expect(isJsonlWorkerEnabled()).toBe(true);
+    expect(isJsonlWorkerEnabled()).toBe(false);
   });
 
-  it('returns false only for explicit kill-switch values', async () => {
+  it('returns true for explicit opt-in values', async () => {
     const { isJsonlWorkerEnabled } = await import('../../src/daemon/jsonl-parse-pool.js');
-    for (const v of ['0', 'false', 'FALSE', 'no', 'off', 'OFF', '', '  0  ']) {
+    for (const v of ['1', 'true', 'TRUE', 'yes', 'on', '  on  ']) {
       process.env.IM4CODES_JSONL_WORKER = v;
-      expect(isJsonlWorkerEnabled()).toBe(false);
+      expect(isJsonlWorkerEnabled()).toBe(true);
     }
   });
 
-  it('returns true for any other value (only explicit off disables)', async () => {
+  it('returns false for other values', async () => {
     const { isJsonlWorkerEnabled } = await import('../../src/daemon/jsonl-parse-pool.js');
-    for (const v of ['1', 'true', 'yes', 'on', 'random', 'enabled']) {
+    for (const v of ['0', 'false', 'no', 'off', 'random', '']) {
       process.env.IM4CODES_JSONL_WORKER = v;
-      expect(isJsonlWorkerEnabled()).toBe(true);
+      expect(isJsonlWorkerEnabled()).toBe(false);
     }
   });
 });

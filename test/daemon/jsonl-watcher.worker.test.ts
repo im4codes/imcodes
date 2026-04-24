@@ -121,9 +121,9 @@ afterEach(async () => {
  */
 async function runFixture(useWorker: boolean, fixtureLines: string[]): Promise<CapturedEvent[]> {
   captured.length = 0;
-  // IM4CODES_JSONL_WORKER is "on by default, set to 0 to disable".
-  if (useWorker) delete process.env.IM4CODES_JSONL_WORKER;
-  else process.env.IM4CODES_JSONL_WORKER = '0';
+  // IM4CODES_JSONL_WORKER is opt-in (default off). Set to `1` to enable.
+  if (useWorker) process.env.IM4CODES_JSONL_WORKER = '1';
+  else delete process.env.IM4CODES_JSONL_WORKER;
 
   // Force a fresh watcher/pool module instance each run.
   vi.resetModules();
@@ -255,7 +255,7 @@ describe('jsonl-watcher parity: worker ON vs worker OFF', () => {
   }, 20000);
 
   it('falls back to main thread when worker is unavailable', async () => {
-    delete process.env.IM4CODES_JSONL_WORKER; // default: worker enabled
+    process.env.IM4CODES_JSONL_WORKER = '1'; // opt into the worker path for this test
     captured.length = 0;
     vi.resetModules();
 

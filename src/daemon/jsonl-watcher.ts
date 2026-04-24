@@ -159,11 +159,12 @@ async function findLatestJsonl(dir: string): Promise<string | null> {
 // only owns I/O and event dispatch.
 //
 // Strategy:
-//   - By default: drained batches are shipped to the worker pool; failures
-//     (crash / timeout / permanentlyDisabled) automatically fall back to the
-//     main-thread context.
-//   - `IM4CODES_JSONL_WORKER=0` (or false/no/off) forces every drain through
-//     the main-thread fallback — operational kill switch only.
+//   - Default: drained batches are parsed synchronously on main using
+//     `mainParseCtx`. Code path identical to pre-worker behaviour.
+//   - Opt-in `IM4CODES_JSONL_WORKER=1`: drained batches ship to the worker
+//     pool; crash / timeout automatically falls back to the main-thread
+//     context (same pure parser). Intended for deployments that observe
+//     main-loop pressure from heavy Claude JSONL streams.
 //
 // `emitRecentHistory` (one-shot at session start) always runs on main using a
 // throwaway context, because (a) it's infrequent and (b) we want to filter
@@ -171,12 +172,6 @@ async function findLatestJsonl(dir: string): Promise<string | null> {
 
 /** Main-thread fallback state (only used when worker disabled or failed). */
 const mainParseCtx: ParseContext = createParseContext();
-
-function dispatchEmits(emits: EmitInstruction[]): void {
-  for (const em of emits) {
-    timelineEmitter.emit(em.sessionName, em.type, em.payload, em.metadata);
-  }
-}
 
 // ── Per-session watcher state ─────────────────────────────────────────────────
 
