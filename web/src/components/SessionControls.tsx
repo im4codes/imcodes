@@ -32,7 +32,7 @@ import type { P2pSavedConfig } from '@shared/p2p-modes.js';
 import { getQwenAuthTier, QWEN_AUTH_TIERS } from '@shared/qwen-auth.js';
 import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/qwen-models.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, normalizeClaudeCodeModelId } from '../../../src/shared/models/options.js';
-import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '@shared/effort-levels.js';
+import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
 import { useTransportModels, supportsDynamicTransportModels } from '../hooks/useTransportModels.js';
 import {
   buildTransportConfigWithSupervision,
@@ -2473,7 +2473,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                     class={`menu-item ${currentThinking === level ? 'menu-item-active' : ''}`}
                     onClick={() => handleThinkingSelect(level)}
                   >
-                    {currentThinking === level ? '● ' : '○ '}{level}
+                    {currentThinking === level ? '● ' : '○ '}{formatEffortLevel(level)}
                   </button>
                 ))}
               </div>

@@ -15,6 +15,7 @@ import {
   COPILOT_SDK_EFFORT_LEVELS,
   OPENCLAW_THINKING_LEVELS,
   QWEN_EFFORT_LEVELS,
+  formatEffortLevel,
   type TransportEffortLevel,
 } from "@shared/effort-levels.js";
 import {
@@ -571,7 +572,7 @@ export function NewSessionDialog({
             >
               {thinkingLevels.map((level) => (
                 <option key={level} value={level}>
-                  {level}
+                  {formatEffortLevel(level)}
                 </option>
               ))}
             </select>

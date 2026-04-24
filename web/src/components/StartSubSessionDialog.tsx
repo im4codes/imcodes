@@ -7,7 +7,7 @@ import type { WsClient } from '../ws-client.js';
 import type { RemoteSession } from '../hooks/useProviderStatus.js';
 import { FileBrowser } from './file-browser-lazy.js';
 import { getUserPref, saveUserPref } from '../api.js';
-import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '@shared/effort-levels.js';
+import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
 import { getSessionAgentGroups, getSessionAgentLabel, SESSION_AGENT_GROUP_LABEL_KEYS } from './session-agent-options.js';
 import { QwenCodingPlanHint } from './QwenCodingPlanHint.js';
 import {
@@ -534,7 +534,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                 style={{ width: '100%' }}
               >
                 {thinkingLevels.map((level) => (
-                  <option key={level} value={level}>{level}</option>
+                  <option key={level} value={level}>{formatEffortLevel(level)}</option>
                 ))}
               </select>
             </div>
