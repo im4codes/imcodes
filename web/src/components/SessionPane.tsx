@@ -113,6 +113,7 @@ export function SessionPane({
   onPendingPrefillApplied,
 }: SessionPaneProps) {
   const sessionName = session.name;
+  const hasChatTimeline = session.agentType !== 'shell' && session.agentType !== 'script';
 
   // ── Timeline ────────────────────────────────────────────────────────────────
   const {
@@ -127,6 +128,7 @@ export function SessionPane({
     loadOlderEvents,
   } = useTimeline(sessionName, ws, serverId, {
     isActiveSession: isActive,
+    disableHistory: !hasChatTimeline,
   });
   const historyStatus = timelineHistoryStatus ?? IDLE_HISTORY_STATUS;
 
@@ -361,6 +363,7 @@ export function SessionPane({
               || (extras.p2pSessionConfig != null && typeof extras.p2pSessionConfig === 'object')
             );
             if (isP2pSend) return;
+            if (!hasChatTimeline) return;
             addOptimisticUserMessage(text, meta?.commandId, {
               ...(meta?.attachments ? { attachments: meta.attachments } : {}),
               ...(meta?.extra ? { resendExtra: meta.extra } : {}),

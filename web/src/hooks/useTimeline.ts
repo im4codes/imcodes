@@ -447,6 +447,11 @@ export interface UseTimelineOptions {
    * events, but they must not hammer `/timeline/history/full`.
    */
   isActiveSession?: boolean;
+  /**
+   * Shell/script process sessions have no chat timeline. When disabled, the
+   * hook stays idle and skips daemon/HTTP/text-tail history work entirely.
+   */
+  disableHistory?: boolean;
 }
 
 export type TimelineHistoryPhase = 'idle' | 'bootstrap' | 'refresh' | 'older';
@@ -494,6 +499,7 @@ export function useTimeline(
   // when different servers share the same session name (e.g. deck_cd_brain).
   const cacheKey = sessionId ? scopeCacheKey(serverId, sessionId) : sessionId;
   const isActiveSession = options?.isActiveSession ?? true;
+  const disableHistory = options?.disableHistory ?? false;
   const wsConnected = !!ws?.connected;
   const cacheKeyRef = useRef(cacheKey);
   cacheKeyRef.current = cacheKey;
@@ -549,6 +555,19 @@ export function useTimeline(
       setHistoryStatus(createIdleHistoryStatus());
       httpBackfillInFlightRef.current = 0;
       resetOlderState();
+      return;
+    }
+    if (disableHistory) {
+      setEvents([]);
+      setLoading(false);
+      setRefreshing(false);
+      setHttpRefreshing(false);
+      setTextTailRefreshing(false);
+      setHistoryStatus(createIdleHistoryStatus());
+      httpBackfillInFlightRef.current = 0;
+      resetOlderState();
+      setHasOlderHistory(false);
+      historyLoadedRef.current = cacheKeyRef.current;
       return;
     }
 
@@ -709,7 +728,7 @@ export function useTimeline(
     };
     load().catch(() => {});
     return () => { cancelled = true; };
-  }, [cacheKey, isActiveSession, sessionId, ws, wsConnected]);
+  }, [cacheKey, disableHistory, isActiveSession, sessionId, ws, wsConnected]);
 
   // Map of commandId → optimistic eventId for O(1) lookup on command.ack / dedup.
   const optimisticIdsByCommandRef = useRef(new Map<string, string>());
@@ -850,6 +869,7 @@ export function useTimeline(
 
   // Load older events (backward pagination)
   const loadOlderEvents = useCallback(() => {
+    if (disableHistory) return;
     if (!ws?.connected || !sessionId || loadingOlderRef.current) return;
     const key = cacheKeyRef.current;
     const cached = key ? getCachedEvents(key) : undefined;
@@ -871,7 +891,7 @@ export function useTimeline(
     // Timeout: if response never arrives (packet loss, disconnect), reset after 10s
     if (olderTimeoutRef.current) clearTimeout(olderTimeoutRef.current);
     olderTimeoutRef.current = setTimeout(resetOlderState, 10_000);
-  }, [ws, sessionId]);
+  }, [disableHistory, ws, sessionId]);
 
   // Append or replace a single event by eventId.
   // Same eventId → replace in place (supports streaming transport updates).
@@ -958,7 +978,7 @@ export function useTimeline(
    *     trigger simply tries again.
    */
   const fireHttpBackfill = useCallback((delayMs: number, opts?: { cooldownMs?: number; phase?: 'bootstrap' | 'refresh' }) => {
-    if (!isActiveSession || !serverId || !sessionId) return;
+    if (disableHistory || !isActiveSession || !serverId || !sessionId) return;
     const cooldownMs = opts?.cooldownMs ?? 0;
     const phase = opts?.phase ?? 'refresh';
     const backfillSessionId = sessionId;
@@ -997,7 +1017,7 @@ export function useTimeline(
           if (httpBackfillInFlightRef.current === 0) setHttpRefreshing(false);
         });
     }, delayMs);
-  }, [isActiveSession, serverId, sessionId, cacheKey, mergeEvents, idbPutEvents, updateHistoryStep]);
+  }, [disableHistory, isActiveSession, serverId, sessionId, cacheKey, mergeEvents, idbPutEvents, updateHistoryStep]);
 
   // Stable indirection — lets the session-mount effect below call the latest
   // `fireHttpBackfill` without having to list it (and transitively its five
@@ -1018,6 +1038,7 @@ export function useTimeline(
   // `fireHttpBackfillRef.current` reads the latest sessionId/serverId on
   // each call, and `fireHttpBackfill` itself no-ops when either is unset.
   useEffect(() => {
+    if (disableHistory) return;
     const handler = (): void => {
       if (!isActiveSession) return;
       const now = Date.now();
@@ -1027,11 +1048,11 @@ export function useTimeline(
     };
     window.addEventListener(ACTIVE_TIMELINE_REFRESH_EVENT, handler);
     return () => window.removeEventListener(ACTIVE_TIMELINE_REFRESH_EVENT, handler);
-  }, [isActiveSession]);
+  }, [disableHistory, isActiveSession]);
 
   // Listen for WS messages
   useEffect(() => {
-    if (!ws || !sessionId) return;
+    if (disableHistory || !ws || !sessionId) return;
 
     const handler = (msg: ServerMessage) => {
       // ── Real-time event ──
@@ -1369,7 +1390,7 @@ export function useTimeline(
 
     const unsub = ws.onMessage(handler);
     return unsub;
-  }, [isActiveSession, ws, sessionId, appendEvent, clearOptimisticTimer, loading, markOptimisticFailed, mergeEvents, reconcileQueuedOptimisticMessages, replaceEvents, serverId, updateHistoryStep]);
+  }, [disableHistory, isActiveSession, ws, sessionId, appendEvent, clearOptimisticTimer, loading, markOptimisticFailed, mergeEvents, reconcileQueuedOptimisticMessages, replaceEvents, serverId, updateHistoryStep]);
 
   useEffect(() => {
     if (loading || refreshing || httpRefreshing || textTailRefreshing || loadingOlder) return;

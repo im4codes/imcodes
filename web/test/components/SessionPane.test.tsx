@@ -8,6 +8,7 @@ import { h } from 'preact';
 const addOptimisticUserMessageMock = vi.fn();
 let timelineEventsMock: any[] = [];
 let activeToolCallMock = false;
+const useTimelineMock = vi.fn();
 const terminalViewSpy = vi.fn(() => null);
 const chatViewSpy = vi.fn(() => null);
 
@@ -36,16 +37,19 @@ vi.mock('../../src/components/SessionControls.js', () => ({
 }));
 const removeOptimisticMessageMock = vi.fn();
 vi.mock('../../src/hooks/useTimeline.js', () => ({
-  useTimeline: () => ({
-    events: timelineEventsMock,
-    loading: false,
-    refreshing: false,
-    loadingOlder: false,
-    hasOlderHistory: false,
-    addOptimisticUserMessage: addOptimisticUserMessageMock,
-    removeOptimisticMessage: removeOptimisticMessageMock,
-    loadOlderEvents: vi.fn(),
-  }),
+  useTimeline: (...args: any[]) => {
+    useTimelineMock(...args);
+    return {
+      events: timelineEventsMock,
+      loading: false,
+      refreshing: false,
+      loadingOlder: false,
+      hasOlderHistory: false,
+      addOptimisticUserMessage: addOptimisticUserMessageMock,
+      removeOptimisticMessage: removeOptimisticMessageMock,
+      loadOlderEvents: vi.fn(),
+    };
+  },
 }));
 vi.mock('../../src/thinking-utils.js', () => ({
   getActiveThinkingTs: () => null,
@@ -69,6 +73,7 @@ import { SessionPane } from '../../src/components/SessionPane.js';
 describe('SessionPane', () => {
   beforeEach(() => {
     addOptimisticUserMessageMock.mockReset();
+    useTimelineMock.mockReset();
     timelineEventsMock = [];
     activeToolCallMock = false;
     terminalViewSpy.mockClear();
@@ -191,6 +196,40 @@ describe('SessionPane', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'send' }));
     expect(addOptimisticUserMessageMock).toHaveBeenCalledWith('queued text', 'test-cmd-1', {});
+  });
+
+  it('disables chat timeline bootstrap and optimistic bubbles for shell sessions', () => {
+    render(
+      <SessionPane
+        serverId="s1"
+        session={{
+          name: 'deck_shell_brain',
+          project: 'test',
+          role: 'brain',
+          agentType: 'shell',
+          state: 'idle',
+          runtimeType: 'process',
+          projectDir: '/tmp/test',
+        } as any}
+        sessions={[]}
+        subSessions={[]}
+        ws={null}
+        connected={false}
+        isActive={true}
+        viewMode="terminal"
+        quickData={{} as any}
+      />,
+    );
+
+    expect(useTimelineMock).toHaveBeenCalledWith(
+      'deck_shell_brain',
+      null,
+      's1',
+      expect.objectContaining({ isActiveSession: true, disableHistory: true }),
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'send' }));
+    expect(addOptimisticUserMessageMock).not.toHaveBeenCalled();
   });
 
   it('prefers timeline tail running state over stale outer idle state for footer status', () => {

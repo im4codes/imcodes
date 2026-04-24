@@ -111,6 +111,49 @@ describe('useTimeline global cache bounds', () => {
     expect(screen.getByTestId('window').textContent).toBe('3');
   });
 
+  it('stays idle for shell/script sessions with history disabled', async () => {
+    const sessionName = `deck_shell_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    const sendTimelineHistoryRequest = vi.fn(() => 'history-shell');
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineHistoryRequest,
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events, loading, refreshing, hasOlderHistory, historyStatus } = useTimeline(sessionName, ws, serverId, {
+        disableHistory: true,
+      });
+      return h(
+        'div',
+        {
+          'data-testid': 'probe',
+          'data-loading': String(loading),
+          'data-refreshing': String(refreshing),
+          'data-older': String(hasOlderHistory),
+          'data-phase': historyStatus.phase,
+        },
+        String(events.length),
+      );
+    }
+
+    render(h(Probe));
+
+    await waitFor(() => {
+      const probe = screen.getByTestId('probe');
+      expect(probe.textContent).toBe('0');
+      expect(probe.getAttribute('data-loading')).toBe('false');
+      expect(probe.getAttribute('data-refreshing')).toBe('false');
+      expect(probe.getAttribute('data-older')).toBe('false');
+      expect(probe.getAttribute('data-phase')).toBe('idle');
+    });
+
+    expect(sendTimelineHistoryRequest).not.toHaveBeenCalled();
+    expect(fetchTextTailSpy).not.toHaveBeenCalled();
+    expect(fetchHistorySpy).not.toHaveBeenCalled();
+  });
+
   it('keeps active session cache resident so a late stale instance cannot wipe history on the next event', async () => {
     const sessionName = `deck_transport_live_${Date.now()}`;
     const cacheKey = `srv:${sessionName}`;
