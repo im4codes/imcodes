@@ -88,6 +88,10 @@ async function createProvider(id: string): Promise<TransportProvider> {
       const { QwenProvider } = await import('./providers/qwen.js');
       return new QwenProvider();
     }
+    case 'gemini-sdk': {
+      const { GeminiSdkProvider } = await import('./providers/gemini-sdk.js');
+      return new GeminiSdkProvider();
+    }
     case 'claude-code-sdk': {
       const { ClaudeCodeSdkProvider } = await import('./providers/claude-code-sdk.js');
       return new ClaudeCodeSdkProvider();

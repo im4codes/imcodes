@@ -6,6 +6,7 @@ export const SESSION_AGENT_TYPES = [
   'copilot-sdk',
   'cursor-headless',
   'opencode',
+  'gemini-sdk',
   'gemini',
   'qwen',
   'openclaw',
@@ -22,6 +23,7 @@ export const TRANSPORT_SESSION_AGENT_TYPES = [
   'codex-sdk',
   'copilot-sdk',
   'cursor-headless',
+  'gemini-sdk',
   'qwen',
   'openclaw',
 ] as const;
