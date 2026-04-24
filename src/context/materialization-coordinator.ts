@@ -10,7 +10,7 @@ import type {
 } from '../../shared/context-types.js';
 import { isMemoryEligibleEvent } from '../../shared/context-types.js';
 import { getContextModelConfig } from './context-model-config.js';
-import { buildLocalFallbackSummary, compressWithSdk, type CompressionResult } from './summary-compressor.js';
+import { compressWithSdk, type CompressionResult } from './summary-compressor.js';
 import { isMemoryNoiseSummary, isMemoryNoiseTurn } from '../../shared/memory-noise-patterns.js';
 import {
   clearDirtyTarget,
@@ -58,9 +58,13 @@ const DEFAULT_THRESHOLDS: MaterializationThresholds = {
 };
 
 /**
- * Max consecutive SDK failures before committing the local fallback.
- * Beyond this, we accept the fallback summary and delete staged events
- * to avoid unbounded growth.
+ * Max consecutive SDK failures before we abandon the current batch.
+ * Beyond this, staged events are discarded and NO projection is written —
+ * the previous real summary (if any) stays intact. This prevents the
+ * "structured summary unavailable" local fallback from ever being
+ * persisted to memory, which would otherwise compound across failures
+ * (each new fallback prepends the previous one via `previousSummary`,
+ * producing the nested "--- Updated ---" chains observed in the field).
  */
 const MAX_SDK_RETRY_ATTEMPTS = 3;
 
@@ -139,7 +143,12 @@ export class MaterializationCoordinator {
     const previousProjections = listProcessedProjections(target.namespace, 'recent_summary');
     const previousSummary = previousProjections.length > 0 ? previousProjections[0].summary : undefined;
 
-    // Compress with SDK (primary → backup → local fallback)
+    // Compress with SDK (primary → backup). When all SDK attempts fail the
+    // compressor still returns a CompressionResult (with `fromSdk: false` and
+    // a local-fallback summary string) — but under the current design we
+    // DISCARD that fallback text entirely. The coordinator never persists
+    // non-SDK summaries, so the "⚠️ Structured summary unavailable" warning
+    // can no longer leak into durable memory.
     const compressFn = this._compressor ?? compressWithSdk;
     let compression: CompressionResult;
     try {
@@ -150,9 +159,11 @@ export class MaterializationCoordinator {
         targetTokens: 500,
       });
     } catch {
-      // SDK completely failed — use local fallback summary
+      // Compressor itself threw (not just a provider failure the compressor
+      // swallowed into a local-fallback result). Treat as fromSdk: false and
+      // let the abandonment/retry logic below decide what to do.
       compression = {
-        summary: buildLocalFallback(events, previousSummary),
+        summary: '',
         model: 'local-fallback',
         backend: 'none',
         usedBackup: false,
@@ -160,7 +171,11 @@ export class MaterializationCoordinator {
       };
     }
 
-    if (isMemoryNoiseSummary(compression.summary)) {
+    // Only SDK-produced summaries are ever filtered by `isMemoryNoiseSummary`.
+    // A fromSdk: false result means "no real summary was produced" — the
+    // fallback branch below owns that case; we don't treat it as noise.
+    if (compression.fromSdk && isMemoryNoiseSummary(compression.summary)) {
+      deleteTentativeProjections(target.namespace, 'recent_summary');
       deleteStagedEventsByIds(sourceEventIds);
       updateContextJob(job.id, 'completed', { now });
       clearDirtyTarget(target);
@@ -171,21 +186,68 @@ export class MaterializationCoordinator {
       };
     }
 
-    // Decide whether this is a "final commit" or a "tentative save".
-    // - SDK succeeded → commit (delete raw events, clear dirty, mark completed)
-    // - SDK failed but retry budget remaining → tentative save (keep raw events,
-    //   mark materialization_failed so next trigger retries with SDK)
-    // - SDK failed AND retry budget exhausted → commit the fallback anyway
-    //   (accept the coarse local summary to avoid unbounded growth)
+    // Three outcomes for the current batch:
+    //   1. SDK succeeded                           → commit the real summary
+    //   2. SDK failed, retry budget remaining      → keep staged events,
+    //                                                 mark job failed for retry.
+    //                                                 NO projection is written —
+    //                                                 prior committed summary
+    //                                                 (if any) remains untouched.
+    //   3. SDK failed, retry budget exhausted      → abandon batch: discard
+    //                                                 staged events, clear dirty
+    //                                                 target, mark job completed.
+    //                                                 NO projection is written;
+    //                                                 the last real summary
+    //                                                 (if any) stays intact.
+    //
+    // Rationale: the local-fallback summary text contains a user-visible
+    // "⚠️ Structured summary unavailable" warning plus raw conversation
+    // transcripts, and `buildLocalFallbackSummary` prepends the previous
+    // summary + "--- Updated ---" on every call. Persisting it caused the
+    // warning to compound across retries, polluting the memory store with
+    // nested error banners. Choosing to store nothing on failure matches
+    // the user intent: "a period of backend downtime means a gap in memory,
+    // not a scar."
     const priorFailures = countConsecutiveFailedJobs(target);
     const sdkFailed = !compression.fromSdk;
-    const retryBudgetExhausted = priorFailures >= MAX_SDK_RETRY_ATTEMPTS;
-    const shouldRetry = sdkFailed && !retryBudgetExhausted;
 
-    // Remove prior tentative summaries before writing the new result.
-    // - SDK succeeded on retry → replace tentative with proper summary
-    // - SDK still failed → replace prior tentative with new tentative
-    // - Retry budget exhausted → replace tentative with committed fallback
+    if (sdkFailed) {
+      const retryBudgetExhausted = priorFailures >= MAX_SDK_RETRY_ATTEMPTS;
+      // Any legacy tentative rows from earlier versions of this code get
+      // scrubbed here — the new design never writes tentatives, so the only
+      // tentative rows that can exist are pre-migration leftovers.
+      deleteTentativeProjections(target.namespace, 'recent_summary');
+
+      if (retryBudgetExhausted) {
+        // Abandon batch: delete staged events, clear dirty target so we
+        // don't keep re-triggering for the same data. Job status is
+        // 'completed' (not 'materialization_failed') so the next fresh
+        // batch starts with a clean failure counter.
+        deleteStagedEventsByIds(sourceEventIds);
+        updateContextJob(job.id, 'completed', { now,
+          error: `SDK compression abandoned after ${priorFailures} consecutive failures — events discarded, no summary written`,
+        });
+        clearDirtyTarget(target);
+        return {
+          replicationQueued: false,
+          compression,
+          filteredOut: true,
+        };
+      }
+
+      // Retry path: keep staged events, leave dirty target in place, mark
+      // job materialization_failed so the next trigger retries SDK.
+      updateContextJob(job.id, 'materialization_failed', { now,
+        error: `SDK compression unavailable (attempt ${priorFailures + 1}/${MAX_SDK_RETRY_ATTEMPTS}) — kept raw events for retry`,
+      });
+      return {
+        replicationQueued: false,
+        compression,
+      };
+    }
+
+    // SDK succeeded — commit the real summary. Also scrub any legacy
+    // tentative rows that might have been left behind by prior code.
     if (priorFailures > 0) {
       deleteTentativeProjections(target.namespace, 'recent_summary');
     }
@@ -209,8 +271,6 @@ export class MaterializationCoordinator {
         compressionFromSdk: compression.fromSdk,
         eventCount: events.length,
         hadPreviousSummary: !!previousSummary,
-        tentative: shouldRetry,                    // marked as tentative when retrying
-        retryAttempt: shouldRetry ? priorFailures + 1 : undefined,
       },
       createdAt: now,
       updatedAt: now,
@@ -223,33 +283,25 @@ export class MaterializationCoordinator {
       now,
     );
 
-    // Only queue for replication if this is a final commit (not tentative)
-    if (!shouldRetry) {
-      const replicationState = getReplicationState(target.namespace);
-      const pendingProjectionIds = [
-        ...(replicationState?.pendingProjectionIds ?? []),
-        summaryProjection.id,
-        ...(durableProjection ? [durableProjection.id] : []),
-      ];
-      setReplicationState(target.namespace, {
-        pendingProjectionIds: Array.from(new Set(pendingProjectionIds)),
-        lastReplicatedAt: replicationState?.lastReplicatedAt,
-        lastError: replicationState?.lastError,
-      });
-      deleteStagedEventsByIds(sourceEventIds);
-      updateContextJob(job.id, 'completed', { now });
-      clearDirtyTarget(target);
-    } else {
-      // Tentative: keep staged events for next retry. Don't clear dirty target.
-      updateContextJob(job.id, 'materialization_failed', { now,
-        error: `SDK compression unavailable (attempt ${priorFailures + 1}/${MAX_SDK_RETRY_ATTEMPTS}) — kept raw events for retry`,
-      });
-    }
+    const replicationState = getReplicationState(target.namespace);
+    const pendingProjectionIds = [
+      ...(replicationState?.pendingProjectionIds ?? []),
+      summaryProjection.id,
+      ...(durableProjection ? [durableProjection.id] : []),
+    ];
+    setReplicationState(target.namespace, {
+      pendingProjectionIds: Array.from(new Set(pendingProjectionIds)),
+      lastReplicatedAt: replicationState?.lastReplicatedAt,
+      lastError: replicationState?.lastError,
+    });
+    deleteStagedEventsByIds(sourceEventIds);
+    updateContextJob(job.id, 'completed', { now });
+    clearDirtyTarget(target);
 
     return {
       summaryProjection,
       durableProjection,
-      replicationQueued: !shouldRetry,
+      replicationQueued: true,
       compression,
     };
   }
@@ -310,12 +362,6 @@ export class MaterializationCoordinator {
     }
     return undefined;
   }
-}
-
-// Local fallback — reused when SDK compression is not called (e.g. tests, offline).
-// Delegates to summary-compressor's shared fallback to keep logic in one place.
-function buildLocalFallback(events: LocalContextEvent[], previousSummary?: string): string {
-  return buildLocalFallbackSummary(events, previousSummary);
 }
 
 function buildDurableProjection(

@@ -3005,7 +3005,10 @@ afterEach(() => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: /^medium$/i }));
-    fireEvent.click(screen.getByRole('button', { name: /high/i }));
+    // Menu items render as "○ <Label>" / "● <Label>" with a formatted label
+    // (e.g. "○ High", "○ Extra High"). Use an exact string match so we hit
+    // "High" and not "Extra High" (which `/high/i` would also match).
+    fireEvent.click(screen.getByRole('button', { name: '○ High' }));
 
     expectSendPayload(ws, {
       sessionName: 'codex-sdk-session',
