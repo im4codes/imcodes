@@ -20,6 +20,7 @@ vi.mock('../../src/agent/codex-runtime-config.js', () => ({
   getCodexRuntimeConfig: vi.fn(async () => ({
     planLabel: 'Pro',
     quotaLabel: expect.stringContaining('5h 11%'),
+    availableModels: ['gpt-5.5', 'gpt-5.4-mini'],
   })),
 }));
 
@@ -89,6 +90,7 @@ describe('buildSessionList', () => {
     expect(sessions[0]).toMatchObject({
       planLabel: 'Pro',
       quotaLabel: expect.stringContaining('5h 11%'),
+      codexAvailableModels: ['gpt-5.5', 'gpt-5.4-mini'],
     });
   });
 

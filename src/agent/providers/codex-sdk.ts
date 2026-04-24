@@ -42,6 +42,13 @@ type PendingRequest = {
   reject: (error: Error) => void;
 };
 
+export interface CodexDiscoveredModel {
+  id: string;
+  name?: string;
+  supportsReasoningEffort?: boolean;
+  isDefault?: boolean;
+}
+
 interface CodexSdkSessionState {
   routeId: string;
   cwd: string;
@@ -701,6 +708,49 @@ export class CodexSdkProvider implements TransportProvider {
         return payload && typeof payload === 'object' ? payload as Record<string, unknown> : undefined;
       }
       return undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async readModelList(): Promise<CodexDiscoveredModel[] | undefined> {
+    if (!this.child || !this.child.stdin.writable) return undefined;
+    try {
+      const discovered: CodexDiscoveredModel[] = [];
+      const seen = new Set<string>();
+      let cursor: string | null = null;
+      do {
+        const result = await this.request('model/list', {
+          includeHidden: false,
+          limit: 100,
+          ...(cursor ? { cursor } : {}),
+        });
+        const data = Array.isArray(result?.data) ? result.data : [];
+        for (const entry of data) {
+          if (!entry || typeof entry !== 'object') continue;
+          const modelId = typeof entry.model === 'string' && entry.model.trim()
+            ? entry.model.trim()
+            : typeof entry.id === 'string' && entry.id.trim()
+              ? entry.id.trim()
+              : '';
+          if (!modelId || seen.has(modelId)) continue;
+          seen.add(modelId);
+          discovered.push({
+            id: modelId,
+            ...(typeof entry.displayName === 'string' && entry.displayName.trim()
+              ? { name: entry.displayName.trim() }
+              : {}),
+            ...(Array.isArray(entry.supportedReasoningEfforts) && entry.supportedReasoningEfforts.length > 0
+              ? { supportsReasoningEffort: true }
+              : {}),
+            ...(entry.isDefault === true ? { isDefault: true } : {}),
+          });
+        }
+        cursor = typeof result?.nextCursor === 'string' && result.nextCursor.trim()
+          ? result.nextCursor.trim()
+          : null;
+      } while (cursor);
+      return discovered;
     } catch {
       return undefined;
     }

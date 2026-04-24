@@ -207,6 +207,56 @@ describe('CodexSdkProvider', () => {
     expect(resumeReq?.params?.threadId).toBe('thread-existing');
   });
 
+  it('lists codex models across paginated model/list responses', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+
+    const resultPromise = provider.readModelList();
+    const child = childProcessMock.children[0];
+    const firstRequest = child.requests.find((req) => req.method === 'model/list');
+    expect(firstRequest?.params).toMatchObject({ includeHidden: false, limit: 100 });
+
+    child.emits({
+      id: firstRequest?.id,
+      result: {
+        data: [
+          {
+            id: 'mod-1',
+            model: 'gpt-5.5',
+            displayName: 'GPT-5.5',
+            supportedReasoningEfforts: ['low', 'high'],
+            isDefault: true,
+          },
+        ],
+        nextCursor: 'cursor-2',
+      },
+    });
+    await flush();
+
+    const secondRequest = child.requests.filter((req) => req.method === 'model/list')[1];
+    expect(secondRequest?.params).toMatchObject({ cursor: 'cursor-2', includeHidden: false, limit: 100 });
+    child.emits({
+      id: secondRequest?.id,
+      result: {
+        data: [
+          {
+            id: 'mod-2',
+            model: 'gpt-5.4-mini',
+            displayName: 'GPT-5.4 Mini',
+            supportedReasoningEfforts: [],
+            isDefault: false,
+          },
+        ],
+        nextCursor: null,
+      },
+    });
+
+    await expect(resultPromise).resolves.toEqual([
+      { id: 'gpt-5.5', name: 'GPT-5.5', supportsReasoningEffort: true, isDefault: true },
+      { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini' },
+    ]);
+  });
+
   it('maps normalized payloads into a message-side codex context block', async () => {
     const provider = new CodexSdkProvider();
     await provider.connect({ binaryPath: 'codex' });

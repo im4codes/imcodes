@@ -236,6 +236,7 @@ export function SubSessionWindow({
     qwenModel: sub.qwenModel ?? undefined,
     qwenAuthType: sub.qwenAuthType ?? undefined,
     qwenAvailableModels: sub.qwenAvailableModels ?? undefined,
+    codexAvailableModels: sub.codexAvailableModels ?? undefined,
     modelDisplay: sub.modelDisplay ?? undefined,
     planLabel: sub.planLabel ?? undefined,
     quotaLabel: sub.quotaLabel ?? undefined,

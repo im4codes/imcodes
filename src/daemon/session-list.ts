@@ -31,6 +31,7 @@ export interface SessionListItem extends SessionContextBootstrapState {
   qwenAvailableModels?: string[];
   copilotAvailableModels?: string[];
   cursorAvailableModels?: string[];
+  codexAvailableModels?: string[];
   modelDisplay?: string;
   planLabel?: string;
   permissionLabel?: string;
@@ -80,6 +81,7 @@ function baseItem(s: SessionRecord): SessionListItem {
     qwenAvailableModels: s.qwenAvailableModels,
     copilotAvailableModels: s.copilotAvailableModels,
     cursorAvailableModels: s.cursorAvailableModels,
+    codexAvailableModels: s.codexAvailableModels,
     modelDisplay: s.modelDisplay ?? s.activeModel,
     planLabel: s.planLabel,
     permissionLabel: s.permissionLabel,
@@ -176,6 +178,7 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
     }
     if (s.agentType === 'codex' || s.agentType === 'codex-sdk') {
       const hydrated: Partial<SessionRecord> = {
+        ...(codexRuntime?.availableModels?.length ? { codexAvailableModels: codexRuntime.availableModels } : {}),
         planLabel: codexRuntime?.planLabel,
         permissionLabel: getPermissionLabel(s.agentType),
         quotaLabel: codexRuntime?.quotaLabel,
@@ -184,6 +187,7 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
       };
       if (
         hydrated.planLabel !== s.planLabel
+        || !arraysEqual(hydrated.codexAvailableModels, s.codexAvailableModels)
         || hydrated.permissionLabel !== s.permissionLabel
         || hydrated.quotaLabel !== s.quotaLabel
         || hydrated.quotaUsageLabel != s.quotaUsageLabel

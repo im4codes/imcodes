@@ -50,6 +50,7 @@ export interface IncomingSessionListEntry {
   qwenAuthType?: string;
   qwenAuthLimit?: string;
   qwenAvailableModels?: string[];
+  codexAvailableModels?: string[];
   modelDisplay?: string;
   planLabel?: string;
   quotaLabel?: string;
@@ -111,6 +112,7 @@ export function mergeSessionListEntry(
     qwenAuthType: incoming.qwenAuthType ?? existing?.qwenAuthType,
     qwenAuthLimit: incoming.qwenAuthLimit ?? existing?.qwenAuthLimit,
     qwenAvailableModels: incoming.qwenAvailableModels ?? existing?.qwenAvailableModels,
+    codexAvailableModels: incoming.codexAvailableModels ?? existing?.codexAvailableModels,
     modelDisplay: incoming.modelDisplay ?? incoming.activeModel ?? existing?.modelDisplay,
     planLabel: incoming.planLabel,
     quotaLabel: incoming.quotaLabel,

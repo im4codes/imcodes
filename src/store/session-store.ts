@@ -58,6 +58,9 @@ export interface SessionRecord extends SessionContextBootstrapState {
   /** Cursor models reported by `cursor-agent --list-models`. Hydrated by
    *  `buildSessionList` for `cursor-headless` agent sessions. */
   cursorAvailableModels?: string[];
+  /** Codex SDK models reported by the app-server `model/list` RPC. Hydrated
+   *  for `codex-sdk` sessions so the web picker can reflect the live model set. */
+  codexAvailableModels?: string[];
   /** Generic display model override for UI footer/header. */
   modelDisplay?: string;
   /** User-requested transport model persisted for restart/rebuild/cross-device restore. */

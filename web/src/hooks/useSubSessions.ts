@@ -166,6 +166,7 @@ export function useSubSessions(
                 ...(m.qwenModel != null && { qwenModel: m.qwenModel }),
                 ...(m.qwenAuthType != null && { qwenAuthType: m.qwenAuthType }),
                 ...(m.qwenAvailableModels != null && { qwenAvailableModels: m.qwenAvailableModels }),
+                ...(m.codexAvailableModels != null && { codexAvailableModels: m.codexAvailableModels }),
                 updatedAt: Date.now(),
               };
               return updated;
@@ -190,6 +191,7 @@ export function useSubSessions(
               activeModel: m.activeModel ?? m.modelDisplay ?? null,
               qwenAuthType: m.qwenAuthType ?? null,
               qwenAvailableModels: m.qwenAvailableModels ?? null,
+              codexAvailableModels: m.codexAvailableModels ?? null,
               modelDisplay: m.modelDisplay ?? null,
               planLabel: m.planLabel ?? null,
               quotaLabel: m.quotaLabel ?? null,
@@ -229,6 +231,7 @@ export function useSubSessions(
               ...(m.cwd !== undefined ? { cwd: m.cwd } : {}),
               ...(m.label !== undefined ? { label: m.label } : {}),
               ...(m.qwenModel !== undefined ? { qwenModel: m.qwenModel } : {}),
+              ...(m.codexAvailableModels !== undefined ? { codexAvailableModels: m.codexAvailableModels } : {}),
               ...(m.requestedModel !== undefined ? { requestedModel: m.requestedModel } : {}),
               ...(m.activeModel !== undefined ? { activeModel: m.activeModel } : {}),
               ...(m.modelDisplay !== undefined ? { modelDisplay: m.modelDisplay } : {}),

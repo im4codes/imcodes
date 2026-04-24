@@ -16,12 +16,12 @@ export interface TransportModelState {
 }
 
 /** Agent types that support dynamic model discovery via `transport.list_models`. */
-export type TransportAgentTypeWithModels = 'copilot-sdk' | 'cursor-headless';
+export type TransportAgentTypeWithModels = 'copilot-sdk' | 'cursor-headless' | 'codex-sdk';
 
 export function supportsDynamicTransportModels(
   agentType: string | undefined | null,
 ): agentType is TransportAgentTypeWithModels {
-  return agentType === 'copilot-sdk' || agentType === 'cursor-headless';
+  return agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'codex-sdk';
 }
 
 /** Fetch and cache the list of available models for a transport agent type.

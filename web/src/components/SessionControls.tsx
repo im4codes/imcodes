@@ -157,7 +157,7 @@ function parseStoredComposerAttachments(raw: string | null): ComposerAttachment[
     return [];
   }
 }
-type CodexModelChoice = 'gpt-5.4' | 'gpt-5.4-mini' | 'gpt-5.2';
+type CodexModelChoice = string;
 type QwenModelChoice = string;
 type P2pMode = string; // 'solo' | single modes | combo pipelines like 'brainstorm>discuss>plan' | typeof P2P_CONFIG_MODE
 
@@ -165,7 +165,7 @@ const MODEL_STORAGE_KEY = 'imcodes-model';
 const CODEX_MODEL_STORAGE_KEY = 'imcodes-codex-model';
 const QWEN_MODEL_STORAGE_KEY = 'imcodes-qwen-model';
 const P2P_COMBO_CONFIRM_SKIP_PREF_KEY = 'p2p_combo_direct_send_skip_confirm';
-const CODEX_MODELS: CodexModelChoice[] = [...CODEX_MODEL_IDS] as CodexModelChoice[];
+const CODEX_MODELS: CodexModelChoice[] = [...CODEX_MODEL_IDS];
 const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
 const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
 const P2P_BASE_MODES = ['solo', 'audit', 'review', 'plan', 'brainstorm', 'discuss', P2P_CONFIG_MODE] as const;
@@ -337,7 +337,7 @@ function loadModel(): ModelChoice | null {
 function loadCodexModel(): CodexModelChoice | null {
   try {
     const v = localStorage.getItem(CODEX_MODEL_STORAGE_KEY);
-    if (CODEX_MODELS.includes(v as CodexModelChoice)) return v as CodexModelChoice;
+    if (v?.trim()) return v;
   } catch { /* ignore */ }
   return null;
 }
@@ -633,8 +633,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       if (model !== normalizedClaudeModel) setModel(normalizedClaudeModel);
     }
     // Codex models
-    if (detectedModel.startsWith('gpt-') && CODEX_MODELS.includes(detectedModel as CodexModelChoice)) {
-      if (codexModel !== detectedModel) setCodexModel(detectedModel as CodexModelChoice);
+    if (detectedModel.startsWith('gpt-')) {
+      if (codexModel !== detectedModel) setCodexModel(detectedModel);
     }
     if (activeSession?.agentType === 'qwen' && detectedModel) {
       if (qwenModel !== detectedModel) setQwenModel(detectedModel as QwenModelChoice);
@@ -706,6 +706,18 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     isCursorHeadless,
     activeSession?.copilotAvailableModels,
     activeSession?.cursorAvailableModels,
+  ]);
+  const codexModelSuggestions: readonly string[] = useMemo(() => {
+    if (activeSession?.agentType !== 'codex-sdk') return CODEX_MODELS;
+    if (dynamicTransportModels.models.length > 0) {
+      return dynamicTransportModels.models.map((m) => m.id);
+    }
+    if (activeSession?.codexAvailableModels?.length) return activeSession.codexAvailableModels;
+    return CODEX_MODELS;
+  }, [
+    activeSession?.agentType,
+    activeSession?.codexAvailableModels,
+    dynamicTransportModels.models,
   ]);
   const genericTransportModel = activeSession?.activeModel
     ?? activeSession?.requestedModel
@@ -2374,7 +2386,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             </button>
             {modelOpen && (
               <div class="menu-dropdown">
-                {CODEX_MODELS.map((m) => (
+                {codexModelSuggestions.map((m) => (
                   <button
                     key={m}
                     class={`menu-item ${codexModel === m ? 'menu-item-active' : ''}`}

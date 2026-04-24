@@ -3013,6 +3013,45 @@ afterEach(() => {
     });
   });
 
+  it('prefers dynamically discovered codex-sdk models over the static fallback list', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'codex-sdk-session',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+          activeModel: 'gpt-5.4',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const request = ws.send.mock.calls.find((call) => call[0]?.type === 'transport.list_models')?.[0];
+    expect(request).toMatchObject({ type: 'transport.list_models', agentType: 'codex-sdk' });
+
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: 'codex-sdk',
+      requestId: request?.requestId,
+      models: [
+        { id: 'gpt-5.5', name: 'GPT-5.5', supportsReasoningEffort: true },
+        { id: 'gpt-5.5-mini', name: 'GPT-5.5 Mini' },
+      ],
+      defaultModel: 'gpt-5.5',
+      isAuthenticated: true,
+    }));
+
+    fireEvent.click(screen.getByRole('button', { name: /^default$/i }));
+    fireEvent.click(screen.getAllByRole('button', { name: /gpt-5.5/i })[0]!);
+
+    expectSendPayload(ws, {
+      sessionName: 'codex-sdk-session',
+      text: '/model gpt-5.5',
+    });
+  });
+
   it('shows a model selector for copilot-sdk and sends /model', () => {
     const ws = makeWs();
     render(

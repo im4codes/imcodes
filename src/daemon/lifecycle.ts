@@ -504,6 +504,7 @@ export async function startup(): Promise<DaemonContext> {
             qwenModel: session.qwenModel ?? null,
             qwenAuthType: session.qwenAuthType ?? null,
             qwenAvailableModels: session.qwenAvailableModels ?? null,
+            codexAvailableModels: session.codexAvailableModels ?? null,
             requestedModel: session.requestedModel ?? null,
             activeModel: session.activeModel ?? session.modelDisplay ?? null,
             modelDisplay: session.modelDisplay ?? null,
@@ -802,7 +803,7 @@ async function autoReconnectProviders(): Promise<void> {
     const { connectProvider, ensureProviderConnected } = await import('../agent/provider-registry.js');
     const { restoreTransportSessions } = await import('../agent/session-manager.js');
 
-    for (const providerId of ['qwen', 'claude-code-sdk', 'codex-sdk', 'cursor-headless', 'copilot-sdk'] as const) {
+    for (const providerId of ['qwen', 'gemini-sdk', 'claude-code-sdk', 'codex-sdk', 'cursor-headless', 'copilot-sdk'] as const) {
       if (!listSessions().some((s) => s.runtimeType === 'transport' && s.providerId === providerId)) continue;
       try {
         await ensureProviderConnected(providerId, {});

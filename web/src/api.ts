@@ -577,6 +577,7 @@ export interface SubSessionData {
   qwenModel?: string | null;
   qwenAuthType?: string | null;
   qwenAvailableModels?: string[] | null;
+  codexAvailableModels?: string[] | null;
   requestedModel?: string | null;
   activeModel?: string | null;
   modelDisplay?: string | null;

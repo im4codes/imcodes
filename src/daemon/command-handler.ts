@@ -229,6 +229,7 @@ async function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord
     qwenAuthType: r?.qwenAuthType ?? null,
     qwenAuthLimit: r?.qwenAuthLimit ?? null,
     qwenAvailableModels: r?.qwenAvailableModels ?? null,
+    codexAvailableModels: r?.codexAvailableModels ?? null,
     modelDisplay: freshDisplay.modelDisplay ?? r?.modelDisplay ?? null,
     planLabel: freshDisplay.planLabel ?? r?.planLabel ?? null,
     quotaLabel: freshDisplay.quotaLabel ?? r?.quotaLabel ?? null,
@@ -2186,7 +2187,13 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       }
       if (record?.agentType === 'codex-sdk' && modelMatch) {
         const nextModel = modelMatch[1];
-        if (!CODEX_MODEL_IDS.includes(nextModel as any)) {
+        const sdkDisplay = await getCodexRuntimeConfig(true).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig);
+        const availableModels = sdkDisplay.availableModels?.length
+          ? sdkDisplay.availableModels
+          : record.codexAvailableModels?.length
+            ? record.codexAvailableModels
+            : [...CODEX_MODEL_IDS];
+        if (!availableModels.includes(nextModel)) {
           emitTransportUserMessage(text);
           timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Unknown Codex model: ${nextModel}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
           timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Codex model: ${nextModel}` });
@@ -2194,12 +2201,12 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           return;
         }
         transportRuntime.setAgentId(nextModel);
-        const sdkDisplay = await getCodexRuntimeConfig(true).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig);
         const nextRecord = {
           ...record,
           requestedModel: nextModel,
           activeModel: nextModel,
           modelDisplay: nextModel,
+          ...(availableModels.length ? { codexAvailableModels: availableModels } : {}),
           planLabel: sdkDisplay.planLabel,
           quotaLabel: sdkDisplay.quotaLabel,
           quotaUsageLabel: sdkDisplay.quotaUsageLabel,
@@ -4848,6 +4855,21 @@ async function handleTransportListModels(
           ...(m.supportsReasoningEffort ? { supportsReasoningEffort: true } : {}),
         })),
         isAuthenticated: cfg.isAuthenticated,
+        ...(cfg.probeError ? { error: cfg.probeError } : {}),
+      });
+      return;
+    }
+    if (agentType === 'codex-sdk') {
+      const { getCodexRuntimeConfig } = await import('../agent/codex-runtime-config.js');
+      const cfg = await getCodexRuntimeConfig(force);
+      reply({
+        models: (cfg.models ?? []).map((m) => ({
+          id: m.id,
+          ...(m.name ? { name: m.name } : {}),
+          ...(m.supportsReasoningEffort ? { supportsReasoningEffort: true } : {}),
+        })),
+        ...(cfg.defaultModel ? { defaultModel: cfg.defaultModel } : {}),
+        ...(typeof cfg.isAuthenticated === 'boolean' ? { isAuthenticated: cfg.isAuthenticated } : {}),
         ...(cfg.probeError ? { error: cfg.probeError } : {}),
       });
       return;
