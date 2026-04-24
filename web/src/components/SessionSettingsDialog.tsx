@@ -268,15 +268,20 @@ function SupervisionIntroCard({ t }: { t: (key: string, params?: Record<string, 
  * picks a preset, instead of showing a stale Qwen default alongside.
  */
 function getPresetPinnedModel(
-  presets: Array<{ name: string; env?: Record<string, string> }>,
+  presets: Array<{ name: string; env?: Record<string, string>; availableModels?: Array<{ id: string }>; defaultModel?: string }>,
   presetName: string | undefined,
 ): string | undefined {
   if (!presetName) return undefined;
   const target = presetName.trim().toLowerCase();
   if (!target) return undefined;
   const match = presets.find((p) => p.name.trim().toLowerCase() === target);
-  const model = match?.env?.ANTHROPIC_MODEL ?? match?.env?.OPENAI_MODEL;
-  const trimmed = typeof model === 'string' ? model.trim() : '';
+  if (!match) return undefined;
+  // Prefer the discovered defaultModel (set by cc.presets.discover_models);
+  // fall back to the env-pinned model used by the daemon at launch.
+  const discovered = typeof match.defaultModel === 'string' ? match.defaultModel.trim() : '';
+  if (discovered) return discovered;
+  const envModel = match.env?.ANTHROPIC_MODEL ?? match.env?.OPENAI_MODEL;
+  const trimmed = typeof envModel === 'string' ? envModel.trim() : '';
   return trimmed || undefined;
 }
 
@@ -483,7 +488,12 @@ export function SessionSettingsDialog({
   // Qwen presets (env bundles) fetched from the daemon via the same
   // `cc.presets.list` WS channel the Shared Context panel uses. Stays empty
   // when `ws` is not provided — the picker hides itself in that case.
-  const [ccPresets, setCcPresets] = useState<Array<{ name: string; env?: Record<string, string> }>>([]);
+  const [ccPresets, setCcPresets] = useState<Array<{
+    name: string;
+    env?: Record<string, string>;
+    availableModels?: Array<{ id: string; name?: string }>;
+    defaultModel?: string;
+  }>>([]);
 
   useEffect(() => {
     setLabel(initLabel);
@@ -503,7 +513,7 @@ export function SessionSettingsDialog({
   useEffect(() => {
     if (!ws) return;
     const unsub = ws.onMessage((msg) => {
-      const m = msg as { type?: string; presets?: Array<{ name: string; env?: Record<string, string> }> };
+      const m = msg as { type?: string; presets?: Array<{ name: string; env?: Record<string, string>; availableModels?: Array<{ id: string; name?: string }>; defaultModel?: string }> };
       if (m.type === 'cc.presets.list_response') {
         setCcPresets(m.presets ?? []);
       }
@@ -561,13 +571,23 @@ export function SessionSettingsDialog({
   const supervisionAuditMode = supervision.auditMode;
   const supervisionAuditLoops = supervision.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS;
   const taskRunPromptVersion = supervision.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION;
-  const modelOptions = supervisionBackend ? getSupervisionModelOptions(supervisionBackend) : [];
+  const supervisionPresetEntry = ccPresets.find((p) => p.name === (typeof supervision.preset === 'string' ? supervision.preset.trim() : ''));
+  const modelOptions = supervisionBackend
+    ? (supervisionPresetEntry?.availableModels?.length
+        ? supervisionPresetEntry.availableModels.map((m) => m.id)
+        : getSupervisionModelOptions(supervisionBackend))
+    : [];
   const supervisorDefaultsBackend = normalizeBackendValue(String(supervisorDefaults.backend ?? ''));
   const supervisorDefaultsModel = typeof supervisorDefaults.model === 'string' ? supervisorDefaults.model : '';
   const supervisorDefaultsTimeout = supervisorDefaults.timeoutMs ?? DEFAULT_SUPERVISION_TIMEOUT_MS;
   const supervisorDefaultsTimeoutSeconds = timeoutMsToUiSeconds(supervisorDefaultsTimeout);
   const supervisorDefaultsPromptVersion = supervisorDefaults.promptVersion ?? SUPERVISION_PROMPT_VERSION;
-  const supervisorDefaultsModelOptions = supervisorDefaultsBackend ? getSupervisionModelOptions(supervisorDefaultsBackend) : [];
+  const supervisorDefaultsPresetEntry = ccPresets.find((p) => p.name === (typeof supervisorDefaults.preset === 'string' ? supervisorDefaults.preset.trim() : ''));
+  const supervisorDefaultsModelOptions = supervisorDefaultsBackend
+    ? (supervisorDefaultsPresetEntry?.availableModels?.length
+        ? supervisorDefaultsPresetEntry.availableModels.map((m) => m.id)
+        : getSupervisionModelOptions(supervisorDefaultsBackend))
+    : [];
   const supervisorDefaultsCustomInstructions = typeof supervisorDefaults.customInstructions === 'string' ? supervisorDefaults.customInstructions : '';
   const supervisorDefaultsAutoContinueStreak = supervisorDefaults.maxAutoContinueStreak ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK;
   const supervisorDefaultsAutoContinueTotal = supervisorDefaults.maxAutoContinueTotal ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL;
