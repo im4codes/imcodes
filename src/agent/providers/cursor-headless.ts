@@ -7,6 +7,7 @@ import type {
   ProviderCapabilities,
   ProviderConfig,
   ProviderError,
+  ProviderModelList,
   SessionConfig,
   SessionInfoUpdate,
   ProviderStatusUpdate,
@@ -548,6 +549,20 @@ export class CursorHeadlessProvider implements TransportProvider {
 
   async restoreSession(sessionId: string): Promise<boolean> {
     return !!this.getSessionState(sessionId);
+  }
+
+  async listModels(force?: boolean): Promise<ProviderModelList> {
+    try {
+      const { getCursorRuntimeConfig } = await import('../cursor-runtime-config.js');
+      const cfg = await getCursorRuntimeConfig(force ?? false);
+      return {
+        models: cfg.availableModels.map((id) => ({ id })),
+        ...(cfg.defaultModel ? { defaultModel: cfg.defaultModel } : {}),
+        isAuthenticated: cfg.isAuthenticated,
+      };
+    } catch (err) {
+      return { models: [], error: err instanceof Error ? err.message : String(err) };
+    }
   }
 
   async cancel(sessionId: string): Promise<void> {

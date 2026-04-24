@@ -8,6 +8,7 @@ import type {
   ProviderCapabilities,
   ProviderConfig,
   ProviderError,
+  ProviderModelList,
   SessionConfig,
   SessionInfoUpdate,
   ProviderStatusUpdate,
@@ -710,6 +711,25 @@ export class CodexSdkProvider implements TransportProvider {
       return undefined;
     } catch {
       return undefined;
+    }
+  }
+
+  async listModels(force?: boolean): Promise<ProviderModelList> {
+    try {
+      const { getCodexRuntimeConfig } = await import('../codex-runtime-config.js');
+      const cfg = await getCodexRuntimeConfig(force ?? false);
+      return {
+        models: (cfg.models ?? []).map((m) => ({
+          id: m.id,
+          ...(m.name ? { name: m.name } : {}),
+          ...(m.supportsReasoningEffort ? { supportsReasoningEffort: true } : {}),
+        })),
+        ...(cfg.defaultModel ? { defaultModel: cfg.defaultModel } : {}),
+        ...(typeof cfg.isAuthenticated === 'boolean' ? { isAuthenticated: cfg.isAuthenticated } : {}),
+        ...(cfg.probeError ? { error: cfg.probeError } : {}),
+      };
+    } catch (err) {
+      return { models: [], error: err instanceof Error ? err.message : String(err) };
     }
   }
 

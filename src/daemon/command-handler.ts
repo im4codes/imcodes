@@ -4851,57 +4851,11 @@ async function handleTransportListModels(
     } catch { /* not connected */ }
   };
   try {
-    if (agentType === 'cursor-headless') {
-      const { getCursorRuntimeConfig } = await import('../agent/cursor-runtime-config.js');
-      const cfg = await getCursorRuntimeConfig(force);
-      reply({
-        models: cfg.availableModels.map((id) => ({ id })),
-        ...(cfg.defaultModel ? { defaultModel: cfg.defaultModel } : {}),
-        isAuthenticated: cfg.isAuthenticated,
-      });
-      return;
-    }
-    if (agentType === 'copilot-sdk') {
-      const { getCopilotRuntimeConfig } = await import('../agent/copilot-runtime-config.js');
-      const cfg = await getCopilotRuntimeConfig(force);
-      reply({
-        models: cfg.models.map((m) => ({
-          id: m.id,
-          ...(m.name ? { name: m.name } : {}),
-          ...(m.supportsReasoningEffort ? { supportsReasoningEffort: true } : {}),
-        })),
-        isAuthenticated: cfg.isAuthenticated,
-        ...(cfg.probeError ? { error: cfg.probeError } : {}),
-      });
-      return;
-    }
-    if (agentType === 'codex-sdk') {
-      const { getCodexRuntimeConfig } = await import('../agent/codex-runtime-config.js');
-      const cfg = await getCodexRuntimeConfig(force);
-      reply({
-        models: (cfg.models ?? []).map((m) => ({
-          id: m.id,
-          ...(m.name ? { name: m.name } : {}),
-          ...(m.supportsReasoningEffort ? { supportsReasoningEffort: true } : {}),
-        })),
-        ...(cfg.defaultModel ? { defaultModel: cfg.defaultModel } : {}),
-        ...(typeof cfg.isAuthenticated === 'boolean' ? { isAuthenticated: cfg.isAuthenticated } : {}),
-        ...(cfg.probeError ? { error: cfg.probeError } : {}),
-      });
-      return;
-    }
-    if (agentType === 'gemini-sdk') {
-      const { getGeminiRuntimeConfig } = await import('../agent/gemini-runtime-config.js');
-      const cfg = await getGeminiRuntimeConfig(force);
-      reply({
-        models: cfg.models.map((m) => ({
-          id: m.id,
-          ...(m.name ? { name: m.name } : {}),
-        })),
-        ...(cfg.defaultModel ? { defaultModel: cfg.defaultModel } : {}),
-        ...(typeof cfg.isAuthenticated === 'boolean' ? { isAuthenticated: cfg.isAuthenticated } : {}),
-        ...(cfg.probeError ? { error: cfg.probeError } : {}),
-      });
+    const { getProvider } = await import('../agent/provider-registry.js');
+    const provider = getProvider(agentType);
+    if (provider && typeof provider.listModels === 'function') {
+      const result = await provider.listModels(force);
+      reply(result);
       return;
     }
     reply({ models: [], error: `Unsupported agentType: ${agentType || '(missing)'}` });

@@ -75,6 +75,7 @@ import type {
   ProviderCapabilities,
   ProviderConfig,
   ProviderError,
+  ProviderModelList,
   SessionConfig,
   SessionInfoUpdate,
   ProviderStatusUpdate,
@@ -597,12 +598,7 @@ export class GeminiSdkProvider implements TransportProvider {
     logger.debug({ provider: this.id, count: this.cachedModels.length, default: this.cachedDefaultModel }, 'Gemini models cached');
   }
 
-  /**
-   * Return the list of available Gemini models and the current default.
-   * If no session has been created yet, probes ACP by opening a temporary
-   * session and closing it. Called by gemini-runtime-config.ts.
-   */
-  async readModelList(): Promise<{ models: Array<{ id: string; name?: string }>; defaultModel?: string }> {
+  async listModels(_force?: boolean): Promise<ProviderModelList> {
     if (!this.cachedModels) {
       if (this.connection) {
         await this.initPromise;
@@ -625,6 +621,7 @@ export class GeminiSdkProvider implements TransportProvider {
     return {
       models: this.cachedModels ?? [],
       ...(this.cachedDefaultModel ? { defaultModel: this.cachedDefaultModel } : {}),
+      isAuthenticated: (this.cachedModels?.length ?? 0) > 0,
     };
   }
 
