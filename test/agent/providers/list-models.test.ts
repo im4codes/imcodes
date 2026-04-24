@@ -112,6 +112,53 @@ describe('CursorHeadlessProvider.listModels', () => {
   });
 });
 
+// ── GeminiSdkProvider ────────────────────────────────────────────────────────
+
+describe('GeminiSdkProvider.listModels', () => {
+  it('probes for models via newSession if not cached', async () => {
+    const { GeminiSdkProvider } = await import('../../../src/agent/providers/gemini-sdk.js');
+    const provider = new GeminiSdkProvider();
+
+    // Mock the connection and its prompt/newSession methods
+    const mockConnection = {
+      initialize: vi.fn().mockResolvedValue({}),
+      newSession: vi.fn().mockResolvedValue({
+        sessionId: 'test-session',
+        models: {
+          availableModels: [{ modelId: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash' }],
+          currentModelId: 'gemini-2.0-flash',
+        },
+      }),
+      closeSession: vi.fn().mockResolvedValue({}),
+    };
+    (provider as any).connection = mockConnection;
+    (provider as any).initPromise = Promise.resolve();
+
+    const result = await provider.listModels();
+    expect(mockConnection.newSession).toHaveBeenCalled();
+    expect(result.models[0]?.id).toBe('gemini-2.0-flash');
+    expect(result.defaultModel).toBe('gemini-2.0-flash');
+    expect(result.isAuthenticated).toBe(true);
+  });
+
+  it('respects force=true by clearing cache', async () => {
+    const { GeminiSdkProvider } = await import('../../../src/agent/providers/gemini-sdk.js');
+    const provider = new GeminiSdkProvider();
+    (provider as any).cachedModels = [{ id: 'old' }];
+    (provider as any).connection = {
+      newSession: vi.fn().mockResolvedValue({
+        sessionId: 'new',
+        models: { availableModels: [{ modelId: 'new' }] },
+      }),
+      closeSession: vi.fn().mockResolvedValue({}),
+    };
+    (provider as any).initPromise = Promise.resolve();
+
+    const result = await provider.listModels(true);
+    expect(result.models[0]?.id).toBe('new');
+  });
+});
+
 // ── ProviderModelList contract ────────────────────────────────────────────────
 
 describe('ProviderModelList contract', () => {

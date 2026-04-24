@@ -2244,7 +2244,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted', session: sessionName }); } catch {}
         return;
       }
-      if ((record?.agentType === 'copilot-sdk' || record?.agentType === 'cursor-headless') && modelMatch) {
+      if ((record?.agentType === 'copilot-sdk' || record?.agentType === 'cursor-headless' || record?.agentType === 'gemini-sdk') && modelMatch) {
         const nextModel = modelMatch[1];
         transportRuntime.setAgentId(nextModel);
         const nextRecord = {
@@ -4851,8 +4851,18 @@ async function handleTransportListModels(
     } catch { /* not connected */ }
   };
   try {
-    const { getProvider } = await import('../agent/provider-registry.js');
-    const provider = getProvider(agentType);
+    const { getProvider, ensureProviderConnected } = await import('../agent/provider-registry.js');
+    let provider = getProvider(agentType);
+
+    // Auto-connect local providers if missing, so we can probe for models
+    if (!provider && (agentType === 'gemini-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless')) {
+      try {
+        provider = await ensureProviderConnected(agentType, {});
+      } catch (err) {
+        logger.debug({ provider: agentType, err }, 'Auto-connect for model listing failed');
+      }
+    }
+
     if (provider && typeof provider.listModels === 'function') {
       const result = await provider.listModels(force);
       reply(result);

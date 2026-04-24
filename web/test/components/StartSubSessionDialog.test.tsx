@@ -303,6 +303,30 @@ describe('StartSubSessionDialog', () => {
     });
   });
 
+  it('passes requestedModel for gemini-sdk sub-sessions', () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /gemini_sdk/i }));
+    const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
+    fireEvent.input(selects[0], { target: { value: 'gemini-2.5-flash' } });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledWith('gemini-sdk', undefined, '/tmp', undefined, {
+      requestedModel: 'gemini-2.5-flash',
+    });
+  });
+
   it('passes requestedModel for cursor-headless sub-sessions', () => {
     const onStart = vi.fn();
     render(

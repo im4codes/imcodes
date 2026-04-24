@@ -18,9 +18,11 @@ import {
   type CcPresetDraft,
 } from './cc-preset-form.js';
 import { CC_PRESET_MSG, type CcPreset } from '@shared/cc-presets.js';
+import { GEMINI_MODEL_IDS } from '../../../src/shared/models/options.js';
 
 const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
 const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
+const GEMINI_SDK_MODEL_SUGGESTIONS = [...GEMINI_MODEL_IDS] as const;
 
 interface Props {
   ws: WsClient | null;
@@ -208,7 +210,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     if (desc) extra.description = desc;
     if (ccPreset && (type === 'claude-code' || type === 'qwen')) extra.ccPreset = ccPreset;
     if (ccInitPrompt.trim() && type === 'claude-code') extra.ccInitPrompt = ccInitPrompt.trim();
-    if ((type === 'copilot-sdk' || type === 'cursor-headless' || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
+    if ((type === 'copilot-sdk' || type === 'cursor-headless' || type === 'gemini-sdk' || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
     if (type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'qwen') extra.thinking = thinking;
     onStart(type, selectedShell, cwd || undefined, label || undefined, Object.keys(extra).length > 0 ? extra : undefined);
   };
@@ -225,14 +227,16 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
             ? OPENCLAW_THINKING_LEVELS
             : [];
   const supportsCcPreset = type === 'claude-code' || type === 'qwen';
-  const supportsModelSelection = type === 'copilot-sdk' || type === 'cursor-headless' || (type === 'qwen' && !!selectedCcPreset);
+  const supportsModelSelection = type === 'copilot-sdk' || type === 'cursor-headless' || type === 'gemini-sdk' || (type === 'qwen' && !!selectedCcPreset);
   const modelSuggestions = type === 'copilot-sdk'
     ? [...COPILOT_SDK_MODEL_SUGGESTIONS]
     : type === 'cursor-headless'
       ? [...CURSOR_HEADLESS_MODEL_SUGGESTIONS]
       : type === 'qwen'
         ? (qwenPresetModels.length > 0 ? qwenPresetModels : (selectedCcPreset?.defaultModel ? [selectedCcPreset.defaultModel] : []))
-        : [];
+        : type === 'gemini-sdk'
+          ? [...GEMINI_SDK_MODEL_SUGGESTIONS]
+          : [];
 
   return (
     <div class="dialog-overlay">

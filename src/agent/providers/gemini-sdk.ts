@@ -598,7 +598,11 @@ export class GeminiSdkProvider implements TransportProvider {
     logger.debug({ provider: this.id, count: this.cachedModels.length, default: this.cachedDefaultModel }, 'Gemini models cached');
   }
 
-  async listModels(_force?: boolean): Promise<ProviderModelList> {
+  async listModels(force?: boolean): Promise<ProviderModelList> {
+    if (force) {
+      this.cachedModels = null;
+      this.cachedDefaultModel = null;
+    }
     if (!this.cachedModels) {
       if (this.connection) {
         await this.initPromise;

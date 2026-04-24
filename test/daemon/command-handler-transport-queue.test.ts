@@ -1311,6 +1311,38 @@ describe('handleWebCommand transport queue behavior', () => {
     }));
   });
 
+  it('switches model for gemini-sdk transport sessions via /model', async () => {
+    const setAgentId = vi.fn();
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'gemini-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+      requestedModel: 'gemini-2.5-pro',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'provider-route-1',
+      setAgentId,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/model gemini-2.5-flash',
+      commandId: 'cmd-model-gemini',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(setAgentId).toHaveBeenCalledWith('gemini-2.5-flash');
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      requestedModel: 'gemini-2.5-flash',
+      activeModel: 'gemini-2.5-flash',
+      modelDisplay: 'gemini-2.5-flash',
+    }));
+  });
+
   it('switches model for cursor-headless transport sessions via /model', async () => {
     const setAgentId = vi.fn();
     getSessionMock.mockReturnValue({

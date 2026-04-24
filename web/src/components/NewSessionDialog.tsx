@@ -32,12 +32,14 @@ import {
 } from "./cc-preset-form.js";
 import { CC_PRESET_MSG } from "@shared/cc-presets.js";
 import type { CcPreset } from "@shared/cc-presets.js";
+import { GEMINI_MODEL_IDS } from "../../../src/shared/models/options.js";
 
 const DEFAULT_SHELL_KEY = "default_shell";
 // Fallback suggestions used only when the daemon probe returns an empty list
 // (offline/unauthenticated). The live list comes from the dynamic models hook.
 const CURSOR_HEADLESS_MODEL_FALLBACK = ["auto", "composer-2-fast", "gpt-5.2"] as const;
-const COPILOT_SDK_MODEL_FALLBACK = ["gpt-5", "claude-sonnet-4.5"] as const;
+const COPILOT_SDK_MODEL_FALLBACK = ["gpt-5.4", "gpt-5.4-mini"] as const;
+const GEMINI_SDK_MODEL_FALLBACK = [...GEMINI_MODEL_IDS];
 
 interface Props {
   ws: WsClient | null;
@@ -390,6 +392,7 @@ export function NewSessionDialog({
     }
     if (agentType === "copilot-sdk") return [...COPILOT_SDK_MODEL_FALLBACK];
     if (agentType === "cursor-headless") return [...CURSOR_HEADLESS_MODEL_FALLBACK];
+    if (agentType === "gemini-sdk") return [...GEMINI_SDK_MODEL_FALLBACK];
     return [] as string[];
   }, [transportModels.models, agentType, qwenPresetModels, selectedCcPreset]);
 
@@ -586,14 +589,27 @@ export function NewSessionDialog({
         {supportsModelSelection && (
           <div class="form-group">
             <label>{t("session.supervision.model")}</label>
-            {agentType === "qwen" && modelSuggestions.length > 0 ? (
+            {modelSuggestions.length > 0 ? (
               <select
                 value={requestedModel}
                 disabled={starting}
                 onInput={(e) =>
                   setRequestedModel((e.target as HTMLSelectElement).value)
                 }
+                style={{
+                  width: "100%",
+                  background: "#0f172a",
+                  border: "1px solid #334155",
+                  color: "#e2e8f0",
+                  borderRadius: 4,
+                  padding: "8px 12px",
+                  fontSize: 13,
+                  appearance: "auto",
+                }}
               >
+                {!requestedModel && (
+                  <option value="">{t("new_session.default_model")}</option>
+                )}
                 {modelSuggestions.map((model) => (
                   <option key={model} value={model}>
                     {model}

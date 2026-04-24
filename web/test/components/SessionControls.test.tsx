@@ -3129,6 +3129,30 @@ afterEach(() => {
     });
   });
 
+  it('shows a model selector for gemini-sdk and sends /model', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'gemini-sdk-session',
+          agentType: 'gemini-sdk',
+          runtimeType: 'transport',
+          activeModel: 'gemini-2.5-pro',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /^gemini-2.5-pro$/i }));
+    fireEvent.click(screen.getAllByRole('button', { name: /gemini-2.5-flash/i })[0]!);
+
+    expectSendPayload(ws, {
+      sessionName: 'gemini-sdk-session',
+      text: '/model gemini-2.5-flash',
+    });
+  });
+
   it('shows a model selector for cursor-headless and sends /model', () => {
     const ws = makeWs();
     render(
