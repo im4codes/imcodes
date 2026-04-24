@@ -326,7 +326,8 @@ export function NewSessionDialog({
       if (ccInitPrompt.trim() && agentType === "claude-code")
         extra.ccInitPrompt = ccInitPrompt.trim();
       if (
-        (agentType === "copilot-sdk"
+        (agentType === "claude-code-sdk"
+          || agentType === "copilot-sdk"
           || agentType === "cursor-headless"
           || agentType === "gemini-sdk"
           || agentType === "qwen") &&
@@ -369,7 +370,8 @@ export function NewSessionDialog({
               : [];
   const supportsCcPreset = agentType === "claude-code" || agentType === "qwen";
   const supportsModelSelection =
-    agentType === "copilot-sdk"
+    agentType === "claude-code-sdk"
+    || agentType === "copilot-sdk"
     || agentType === "cursor-headless"
     || agentType === "gemini-sdk"
     || (agentType === "qwen" && !!selectedCcPreset);

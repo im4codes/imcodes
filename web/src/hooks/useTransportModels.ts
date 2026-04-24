@@ -17,12 +17,12 @@ export interface TransportModelState {
 }
 
 /** Agent types that support dynamic model discovery via `transport.list_models`. */
-export type TransportAgentTypeWithModels = 'copilot-sdk' | 'cursor-headless' | 'codex-sdk' | 'gemini-sdk';
+export type TransportAgentTypeWithModels = 'claude-code-sdk' | 'copilot-sdk' | 'cursor-headless' | 'codex-sdk' | 'gemini-sdk';
 
 export function supportsDynamicTransportModels(
   agentType: string | undefined | null,
 ): agentType is TransportAgentTypeWithModels {
-  return agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'codex-sdk' || agentType === 'gemini-sdk';
+  return agentType === 'claude-code-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'codex-sdk' || agentType === 'gemini-sdk';
 }
 
 /** Fetch and cache the list of available models for a transport agent type.
