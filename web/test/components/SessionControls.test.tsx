@@ -1677,7 +1677,7 @@ afterEach(() => {
     />);
 
     fireEvent.click(screen.getByRole('button', { name: /^medium$/i }));
-    fireEvent.click(screen.getByRole('button', { name: /high/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^○ high$/i }));
     expectSendPayload(ws, {
       sessionName: 'qwen-session',
       text: '/thinking high',
@@ -3053,6 +3053,56 @@ afterEach(() => {
       sessionName: 'codex-sdk-session',
       text: '/model gpt-5.5',
     });
+  });
+
+  it('retries codex-sdk model discovery after websocket reconnect', async () => {
+    const ws = makeWs();
+    ws.connected = false;
+    const view = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'codex-sdk-session',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+          activeModel: 'gpt-5.4',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(ws.send.mock.calls.find((call) => call[0]?.type === 'transport.list_models')).toBeUndefined();
+
+    ws.connected = true;
+    view.rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'codex-sdk-session',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+          activeModel: 'gpt-5.4',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const request = ws.send.mock.calls.find((call) => call[0]?.type === 'transport.list_models')?.[0];
+    expect(request).toMatchObject({ type: 'transport.list_models', agentType: 'codex-sdk' });
+
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: 'codex-sdk',
+      requestId: request?.requestId,
+      models: [
+        { id: 'gpt-5.5', name: 'GPT-5.5' },
+      ],
+      defaultModel: 'gpt-5.5',
+      isAuthenticated: true,
+    }));
+
+    fireEvent.click(screen.getByRole('button', { name: /^default$/i }));
+    expect(screen.getByRole('button', { name: /gpt-5.5/i })).toBeDefined();
   });
 
   it('shows a model selector for copilot-sdk and sends /model', () => {
