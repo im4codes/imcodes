@@ -11,6 +11,8 @@ interface Props {
   connected?: boolean;
   /** When false, keep the terminal mounted but pause expensive live work. */
   active?: boolean;
+  /** Optimize for embedded preview cards: coalesce raw writes and reduce idle work. */
+  preview?: boolean;
   onDiff?: (applyDiff: (diff: TerminalDiff) => void) => void;
   onHistory?: (applyHistory: (content: string) => void) => void;
   /** Receives a function that focuses the xterm terminal — call it to restore keyboard to xterm. */
@@ -23,7 +25,22 @@ interface Props {
   mobileInput?: boolean;
 }
 
-export function TerminalView({ sessionName, ws, connected, active = true, onDiff, onHistory, onFocusFn, onFitFn, onScrollBottomFn, mobileInput }: Props) {
+const PREVIEW_RAW_FLUSH_MS = 32;
+const PREVIEW_RAW_MAX_BYTES = 16 * 1024;
+const PREVIEW_DIFF_SUPPRESS_AFTER_RAW_MS = 1000;
+
+function concatChunks(chunks: Uint8Array[], totalBytes: number): Uint8Array {
+  if (chunks.length === 1) return chunks[0];
+  const combined = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return combined;
+}
+
+export function TerminalView({ sessionName, ws, connected, active = true, preview = false, onDiff, onHistory, onFocusFn, onFitFn, onScrollBottomFn, mobileInput }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -32,6 +49,12 @@ export function TerminalView({ sessionName, ws, connected, active = true, onDiff
   wsRef.current = ws;
   const activeRef = useRef(active);
   activeRef.current = active;
+  const previewRef = useRef(preview);
+  previewRef.current = preview;
+  const pendingRawChunksRef = useRef<Uint8Array[]>([]);
+  const pendingRawBytesRef = useRef(0);
+  const rawFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastRawWriteAtRef = useRef(0);
 
   // Touch scroll tracking: suppress auto-scroll for 1s after user releases touch
   const lastTouchEndRef = useRef<number>(0);
@@ -58,6 +81,59 @@ export function TerminalView({ sessionName, ws, connected, active = true, onDiff
   const scrollHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [showScrollbar, setShowScrollbar] = useState(false);
 
+  const clearRawFlushTimer = useCallback(() => {
+    if (rawFlushTimerRef.current) {
+      clearTimeout(rawFlushTimerRef.current);
+      rawFlushTimerRef.current = null;
+    }
+  }, []);
+
+  const discardPendingRaw = useCallback(() => {
+    clearRawFlushTimer();
+    pendingRawChunksRef.current = [];
+    pendingRawBytesRef.current = 0;
+  }, [clearRawFlushTimer]);
+
+  const writeRawToTerminal = useCallback((data: Uint8Array) => {
+    const term = termRef.current;
+    if (!term) return;
+    lastRawWriteAtRef.current = Date.now();
+    writingCountRef.current++;
+    term.write(data, () => {
+      writingCountRef.current--;
+      // Snap to bottom after each PTY write. CC redraws its UI from cursor-home
+      // (\x1b[H) which makes xterm follow the cursor to the top; snapping here
+      // ensures the viewport stays at the bottom showing the latest output.
+      term.scrollToBottom();
+    });
+  }, []);
+
+  const flushPendingRaw = useCallback(() => {
+    clearRawFlushTimer();
+    const chunks = pendingRawChunksRef.current;
+    const totalBytes = pendingRawBytesRef.current;
+    if (chunks.length === 0 || totalBytes === 0) return;
+    pendingRawChunksRef.current = [];
+    pendingRawBytesRef.current = 0;
+    writeRawToTerminal(concatChunks(chunks, totalBytes));
+  }, [clearRawFlushTimer, writeRawToTerminal]);
+
+  const enqueueRawWrite = useCallback((data: Uint8Array) => {
+    if (!previewRef.current) {
+      writeRawToTerminal(data);
+      return;
+    }
+    pendingRawChunksRef.current.push(data);
+    pendingRawBytesRef.current += data.byteLength;
+    if (pendingRawBytesRef.current >= PREVIEW_RAW_MAX_BYTES) {
+      flushPendingRaw();
+      return;
+    }
+    if (!rawFlushTimerRef.current) {
+      rawFlushTimerRef.current = setTimeout(flushPendingRaw, PREVIEW_RAW_FLUSH_MS);
+    }
+  }, [flushPendingRaw, writeRawToTerminal]);
+
   useEffect(() => {
     const term = new Terminal({
       theme: {
@@ -70,9 +146,9 @@ export function TerminalView({ sessionName, ws, connected, active = true, onDiff
       fontSize: 13,
       lineHeight: 1.4,
       convertEol: true,
-      scrollback: 5000,
+      scrollback: preview ? 2000 : 5000,
       allowTransparency: false,
-      cursorBlink: true,
+      cursorBlink: !preview,
       // On mobile: disable xterm stdin unless mobileInput is set (shell sessions
       // need keyboard for interactive SSH-like input).
       disableStdin: isMobile && !mobileInput,
@@ -230,6 +306,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, onDiff
 
     return () => {
       if (fitTimer) clearTimeout(fitTimer);
+      discardPendingRaw();
       window.removeEventListener('focus', onWindowFocus);
       document.removeEventListener('visibilitychange', onVisibilityChange);
       observer.disconnect();
@@ -250,6 +327,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, onDiff
     const ws = wsRef.current;
     if (term && ws) {
       ws.sendResize(sessionName, term.cols, term.rows);
+      try { ws.sendSnapshotRequest(sessionName); } catch { /* ignore */ }
     }
   }, [active, connected, sessionName]);
 
@@ -258,36 +336,37 @@ export function TerminalView({ sessionName, ws, connected, active = true, onDiff
   // allowing multiple TerminalViews for the same session (e.g. preview card + window).
   useEffect(() => {
     if (!ws || !active) return;
-    return ws.onTerminalRaw(sessionName, (data: Uint8Array) => {
-      const term = termRef.current;
-      if (!term) return;
-      writingCountRef.current++;
-      term.write(data, () => {
-        writingCountRef.current--;
-        // Snap to bottom after each PTY write. CC redraws its UI from cursor-home
-        // (\x1b[H) which makes xterm follow the cursor to the top; snapping here
-        // ensures the viewport stays at the bottom showing the latest output.
-        term.scrollToBottom();
-      });
-    });
-  }, [active, ws, sessionName]);
+    const unsub = ws.onTerminalRaw(sessionName, enqueueRawWrite);
+    return () => {
+      unsub();
+      discardPendingRaw();
+    };
+  }, [active, discardPendingRaw, enqueueRawWrite, ws, sessionName]);
 
   // Handle terminal.stream_reset — reset xterm state so stale ANSI doesn't corrupt (Task 5.4)
   useEffect(() => {
     if (!ws || !active) return;
     const unsub = ws.onMessage((msg) => {
       if (msg.type === 'terminal.stream_reset' && msg.session === sessionName) {
+        discardPendingRaw();
         termRef.current?.reset();
         linesRef.current = [];
       }
     });
     return unsub;
-  }, [active, ws, sessionName]);
+  }, [active, discardPendingRaw, ws, sessionName]);
 
   const applyDiff = useCallback((diff: TerminalDiff) => {
     if (!activeRef.current) return;
     const term = termRef.current;
     if (!term) return;
+    if (
+      previewRef.current
+      && lastRawWriteAtRef.current > 0
+      && Date.now() - lastRawWriteAtRef.current < PREVIEW_DIFF_SUPPRESS_AFTER_RAW_MS
+    ) {
+      return;
+    }
 
     const lines = linesRef.current;
     for (const [lineIdx, content] of diff.lines) {

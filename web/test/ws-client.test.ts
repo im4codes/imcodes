@@ -371,6 +371,41 @@ describe('WsClient', () => {
       client.disconnect();
     });
 
+    it('keeps raw mode while a raw hold is active despite passive resubscribe', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+
+      client.subscribeTerminal('shell-card', false);
+      expect(JSON.parse(lastWs!.send.mock.calls.at(-1)?.[0] as string)).toEqual({
+        type: 'terminal.subscribe',
+        session: 'shell-card',
+        raw: false,
+      });
+
+      const release = client.holdTerminalRaw('shell-card');
+      expect(JSON.parse(lastWs!.send.mock.calls.at(-1)?.[0] as string)).toEqual({
+        type: 'terminal.subscribe',
+        session: 'shell-card',
+        raw: true,
+      });
+
+      client.subscribeTerminal('shell-card', false);
+      expect(JSON.parse(lastWs!.send.mock.calls.at(-1)?.[0] as string)).toEqual({
+        type: 'terminal.subscribe',
+        session: 'shell-card',
+        raw: true,
+      });
+
+      release();
+      expect(JSON.parse(lastWs!.send.mock.calls.at(-1)?.[0] as string)).toEqual({
+        type: 'terminal.subscribe',
+        session: 'shell-card',
+        raw: false,
+      });
+
+      client.disconnect();
+    });
+
     it('replays remembered terminal subscriptions immediately after reconnect', async () => {
       vi.useFakeTimers();
       const client = new WsClient('http://localhost:8787', 'srv-1');

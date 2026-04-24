@@ -105,6 +105,21 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   const [quickPanelOpen, setQuickPanelOpen] = useState(false);
   const [overlayOpen, setOverlayOpen] = useState(false);
 
+  // Shell/script cards render a live xterm preview. Keep them in raw mode so
+  // command output is delivered immediately instead of waiting for passive
+  // terminal snapshots; cleanup downgrades back to passive because App owns the
+  // global sub-session subscription.
+  useEffect(() => {
+    if (!isShell || !ws || !connected) return;
+    if (typeof ws.holdTerminalRaw === 'function') {
+      return ws.holdTerminalRaw(sub.sessionName);
+    }
+    try { ws.subscribeTerminal(sub.sessionName, true); } catch { /* ignore */ }
+    return () => {
+      try { ws.subscribeTerminal(sub.sessionName, false); } catch { /* ignore */ }
+    };
+  }, [connected, isShell, sub.sessionName, ws]);
+
   // ── Retry failed send ─────────────────────────────────────────────────────
   // Same contract as SessionPane / SubSessionWindow. Shell/script sub-sessions
   // don't expose the optimistic helpers (no chat timeline), so the handler
@@ -302,12 +317,14 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
 
       {/* Preview — scrollable, auto-scrolls to bottom on new content */}
       <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-        <div class="subcard-preview" ref={previewRef}>
+        <div class={`subcard-preview${isShell ? ' subcard-preview-terminal' : ''}`} ref={previewRef}>
           {isShell ? (
             <TerminalView
               sessionName={sub.sessionName}
               ws={ws}
               connected={connected}
+              preview
+              mobileInput
               onDiff={(apply) => onDiff(sub.sessionName, apply)}
               onHistory={(apply) => onHistory(sub.sessionName, apply)}
               onScrollBottomFn={(fn) => { termScrollRef.current = fn; }}

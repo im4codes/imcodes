@@ -950,6 +950,8 @@ body {
 .subcard-ctx-cache { position: absolute; left: 0; top: 0; height: 100%; background: #818cf8; border-radius: 2px; }
 
 .subcard-preview { flex: 1; overflow-y: auto; overflow-x: hidden; }
+.subcard-preview-terminal { display: flex; min-height: 0; }
+.subcard-preview-terminal .terminal-wrap { width: 100%; height: 100%; min-height: 0; }
 .subcard-scroll-bottom { position: absolute; bottom: 6px; right: 10px; width: 26px; height: 26px; border-radius: 50%; background: #334155; border: 1px solid #475569; color: #e2e8f0; font-size: 14px; cursor: pointer; display: flex; align-items: center; justify-content: center; z-index: 5; opacity: 0.8; transition: opacity 0.15s; line-height: 1; padding: 0; }
 .subcard-scroll-bottom:hover { opacity: 1; background: #3b82f6; border-color: #3b82f6; }
 .subcard-resize-handle { position: absolute; top: 0; right: -8px; width: 20px; height: 100%; cursor: ew-resize; background: transparent; z-index: 10; transition: background 0.15s; touch-action: none; }

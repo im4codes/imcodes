@@ -8,6 +8,7 @@ import { cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
 
 const chatScrollBottomSpy = vi.fn();
 const terminalScrollBottomSpy = vi.fn();
+const terminalViewPropsSpy = vi.fn();
 let timelineEvents = [{ type: 'assistant.text', payload: { text: 'hello' } }];
 
 vi.mock('react-i18next', () => ({
@@ -26,7 +27,9 @@ vi.mock('../../src/components/ChatView.js', () => ({
 }));
 
 vi.mock('../../src/components/TerminalView.js', () => ({
-  TerminalView: ({ onScrollBottomFn }: any) => {
+  TerminalView: (props: any) => {
+    terminalViewPropsSpy(props);
+    const { onScrollBottomFn } = props;
     useEffect(() => {
       onScrollBottomFn?.(terminalScrollBottomSpy);
     }, [onScrollBottomFn]);
@@ -265,6 +268,34 @@ describe('SubSessionCard', () => {
       expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', { sessionName: 'deck_sub_sub-card-1', text: 'echo hi' });
       expect(terminalScrollBottomSpy).toHaveBeenCalled();
     });
+  });
+
+  it('keeps shell cards in raw terminal preview mode', async () => {
+    const releaseRaw = vi.fn();
+    const ws = { holdTerminalRaw: vi.fn(() => releaseRaw), subscribeTerminal: vi.fn() } as any;
+    const view = render(
+      <SubSessionCard
+        sub={makeSubSession({ type: 'shell', shellBin: '/bin/bash' })}
+        ws={ws}
+        connected={true}
+        isOpen={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(ws.holdTerminalRaw).toHaveBeenCalledWith('deck_sub_sub-card-1');
+    });
+
+    const props = terminalViewPropsSpy.mock.calls.at(-1)?.[0];
+    expect(props.preview).toBe(true);
+    expect(props.mobileInput).toBe(true);
+    expect(ws.subscribeTerminal).not.toHaveBeenCalled();
+
+    view.unmount();
+    expect(releaseRaw).toHaveBeenCalledOnce();
   });
 
   it('renders the stop button in transport fallback input mode and sends /stop', async () => {

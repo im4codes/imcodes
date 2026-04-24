@@ -158,8 +158,12 @@ export class WsClient {
   /** Per-session callbacks for raw PTY binary frames. Supports multiple subscribers per session. */
   private _terminalRawHandlers = new Map<string, Set<(data: Uint8Array) => void>>();
 
-  /** Desired terminal subscription mode per session. Replayed on browser reconnect. */
+  /** Effective terminal subscription mode per session. Replayed on browser reconnect. */
   private terminalSubscriptions = new Map<string, boolean>();
+  /** Base terminal mode requested by ordinary subscribeTerminal callers. */
+  private terminalBaseSubscriptions = new Map<string, boolean>();
+  /** Raw-mode holds used by embedded live terminal surfaces that must not be downgraded by passive subscriptions. */
+  private terminalRawHolds = new Map<string, number>();
 
   /** Desired transport-chat subscriptions per session. Replayed on browser reconnect. */
   private transportSubscriptions = new Set<string>();
@@ -280,15 +284,48 @@ export class WsClient {
   }
 
   subscribeTerminal(sessionName: string, raw: boolean): void {
-    this.terminalSubscriptions.set(sessionName, raw);
-    if (!this._connected) return;
-    this.send({ type: 'terminal.subscribe', session: sessionName, raw });
+    this.terminalBaseSubscriptions.set(sessionName, raw);
+    this.syncTerminalSubscription(sessionName);
   }
 
   unsubscribeTerminal(sessionName: string): void {
+    this.terminalBaseSubscriptions.delete(sessionName);
+    if ((this.terminalRawHolds.get(sessionName) ?? 0) > 0) {
+      this.syncTerminalSubscription(sessionName);
+      return;
+    }
     this.terminalSubscriptions.delete(sessionName);
     if (!this._connected) return;
     this.send({ type: 'terminal.unsubscribe', session: sessionName });
+  }
+
+  holdTerminalRaw(sessionName: string): () => void {
+    this.terminalRawHolds.set(sessionName, (this.terminalRawHolds.get(sessionName) ?? 0) + 1);
+    this.syncTerminalSubscription(sessionName);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const next = Math.max(0, (this.terminalRawHolds.get(sessionName) ?? 0) - 1);
+      if (next === 0) this.terminalRawHolds.delete(sessionName);
+      else this.terminalRawHolds.set(sessionName, next);
+      this.syncTerminalSubscription(sessionName);
+    };
+  }
+
+  private syncTerminalSubscription(sessionName: string): void {
+    const hasBase = this.terminalBaseSubscriptions.has(sessionName);
+    const raw = (this.terminalBaseSubscriptions.get(sessionName) ?? false)
+      || (this.terminalRawHolds.get(sessionName) ?? 0) > 0;
+    if (!hasBase && !raw) {
+      this.terminalSubscriptions.delete(sessionName);
+      if (!this._connected) return;
+      this.send({ type: 'terminal.unsubscribe', session: sessionName });
+      return;
+    }
+    this.terminalSubscriptions.set(sessionName, raw);
+    if (!this._connected) return;
+    this.send({ type: 'terminal.subscribe', session: sessionName, raw });
   }
 
   /** Subscribe to transport chat events for a session (history replay + live approval/tool updates). */
