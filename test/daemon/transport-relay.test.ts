@@ -148,7 +148,7 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(opts.eventId).toBe('transport:sess-a:msg-abc');
     });
 
-    it('throttles streaming updates to at most one emit every 80ms and keeps the latest text', () => {
+    it('throttles streaming updates to at most one emit every 40ms and keeps the latest text', () => {
       vi.useFakeTimers();
       vi.setSystemTime(new Date('2026-04-08T00:00:00.000Z'));
 
@@ -162,7 +162,7 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(emitMock).toHaveBeenCalledTimes(1);
       expect(emitMock.mock.calls[0][2].text).toBe('a');
 
-      vi.advanceTimersByTime(79);
+      vi.advanceTimersByTime(39);
       expect(emitMock).toHaveBeenCalledTimes(1);
 
       vi.advanceTimersByTime(1);
@@ -208,7 +208,7 @@ describe('transport-relay (timeline-emitter based)', () => {
       fireDelta('sess-b', makeDelta({ messageId: 'msg-b', delta: 'B2' }));
 
       expect(emitMock.mock.calls.filter(c => c[1] === 'assistant.text')).toHaveLength(2);
-      vi.advanceTimersByTime(80);
+      vi.advanceTimersByTime(40);
 
       const textCalls = emitMock.mock.calls.filter(c => c[1] === 'assistant.text');
       expect(textCalls).toHaveLength(4);
