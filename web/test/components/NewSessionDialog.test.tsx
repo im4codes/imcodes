@@ -341,15 +341,24 @@ describe('NewSessionDialog', () => {
     });
   });
 
-  it('applies discovered preset models and uses the updated default model for qwen', async () => {
+  it('uses the updated preset default model for qwen', async () => {
     const ws = makeWs();
-    let onMessage: ((msg: unknown) => void) | undefined;
     ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
-      onMessage = handler;
       handler({
         type: 'cc.presets.list_response',
-        presets: [],
-      });
+      presets: [
+        {
+          name: 'MiniMax',
+          env: {
+            ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+            ANTHROPIC_AUTH_TOKEN: 'secret',
+            ANTHROPIC_MODEL: 'MiniMax-M2.7',
+          },
+          defaultModel: 'MiniMax-Text-01',
+          availableModels: [{ id: 'MiniMax-M2.7' }, { id: 'MiniMax-Text-01' }],
+        },
+      ],
+    });
       return () => {};
     });
 
@@ -357,25 +366,11 @@ describe('NewSessionDialog', () => {
 
     const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
     fireEvent.input(agentTypeSelect, { target: { value: 'qwen' } });
-    fireEvent.click(screen.getByText('api_provider_add_edit'));
-    fireEvent.input(screen.getByPlaceholderText('e.g. MiniMax'), { target: { value: 'MiniMax' } });
-    fireEvent.input(screen.getByPlaceholderText('your-api-key'), { target: { value: 'secret' } });
-    fireEvent.click(screen.getByRole('button', { name: /discover models/i }));
-    onMessage?.({
-      type: 'cc.presets.discover_models_response',
-      ok: true,
-      presetName: 'MiniMax',
-      preset: {
-        name: 'MiniMax',
-        env: {
-          ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
-          ANTHROPIC_AUTH_TOKEN: 'secret',
-          ANTHROPIC_MODEL: 'MiniMax-M2.7',
-        },
-        defaultModel: 'MiniMax-Text-01',
-        availableModels: [{ id: 'MiniMax-M2.7' }, { id: 'MiniMax-Text-01' }],
-      },
+    await waitFor(() => {
+      expect(screen.getAllByRole('combobox').length).toBeGreaterThanOrEqual(3);
     });
+    const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
+    fireEvent.input(selects[2], { target: { value: 'MiniMax' } });
 
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
     fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });

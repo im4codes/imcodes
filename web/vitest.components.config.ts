@@ -10,6 +10,7 @@ export default defineConfig({
     exclude: ['**/node_modules/**'],
     environment: 'jsdom',
     globals: false,
+    setupFiles: ['./test/setup-jsdom-storage.ts'],
     poolOptions: { forks: { execArgv: ['--max-old-space-size=6144'] } },
   },
 });
