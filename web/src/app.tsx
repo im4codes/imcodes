@@ -86,7 +86,7 @@ import {
   mergeTransportPendingMessagesForRunningState,
   normalizeTransportPendingEntries,
 } from './transport-queue.js';
-import { ingestTimelineEventForCache } from './hooks/useTimeline.js';
+import { ingestTimelineEventForCache, requestActiveTimelineRefresh } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
 import { updateMainSessionLabel } from './session-label-api.js';
@@ -1903,19 +1903,32 @@ export function App() {
     setConnecting(true);
     ws.connect();
 
-    // Reconnect immediately when the app returns from background. On mobile/native,
-    // force a fresh socket because the WebView can resume with a stale-open socket
-    // that never receives timeline events even though readyState still says OPEN.
-    const shouldForceResumeReconnect = isNative() || /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+    // Probe the browser-server socket when the tab returns to the foreground.
+    // While the probe is waiting for pong, WsClient marks itself disconnected
+    // so the first user send cannot disappear into a stale-open socket.
+    let lastResumeCheckAt = 0;
+    const handleResume = () => {
+      const now = Date.now();
+      if (now - lastResumeCheckAt < 500) return;
+      lastResumeCheckAt = now;
+      ws.probeConnection();
+      requestActiveTimelineRefresh({ resetCooldowns: true });
+    };
     const onVisibility = () => {
-      if (document.visibilityState === 'visible') ws.reconnectNow(shouldForceResumeReconnect);
+      if (document.visibilityState === 'hidden') return;
+      handleResume();
     };
     document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('focus', handleResume);
+    const onPageShow = (ev: PageTransitionEvent) => {
+      if (ev.persisted) handleResume();
+    };
+    window.addEventListener('pageshow', onPageShow);
 
     let removeAppStateListener: (() => void) | null = null;
     if (isNative()) {
       void import('@capacitor/app')
-        .then(({ App }) => installNativeAppResumeRefresh(true, (force) => ws.reconnectNow(force), App))
+        .then(({ App }) => installNativeAppResumeRefresh(true, () => ws.probeConnection(), App))
         .then((cleanup) => {
           removeAppStateListener = cleanup;
         })
@@ -1924,6 +1937,8 @@ export function App() {
 
     return () => {
       document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('focus', handleResume);
+      window.removeEventListener('pageshow', onPageShow);
       removeAppStateListener?.();
       unsub();
       unsubStats();

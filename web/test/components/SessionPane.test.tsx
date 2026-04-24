@@ -198,6 +198,48 @@ describe('SessionPane', () => {
     expect(addOptimisticUserMessageMock).toHaveBeenCalledWith('queued text', 'test-cmd-1', {});
   });
 
+  it('keeps the failed retry bubble when resend cannot write to the socket', () => {
+    timelineEventsMock = [{
+      type: 'user.message',
+      payload: { text: 'retry me', failed: true, commandId: 'failed-cmd' },
+    }];
+    const ws = {
+      connected: true,
+      sendSessionCommand: vi.fn(() => {
+        throw new Error('WebSocket not connected');
+      }),
+    };
+
+    render(
+      <SessionPane
+        serverId="s1"
+        session={{
+          name: 'deck_test_brain',
+          project: 'test',
+          role: 'brain',
+          agentType: 'codex',
+          state: 'idle',
+          runtimeType: 'process',
+          projectDir: '/tmp/test',
+        } as any}
+        sessions={[]}
+        subSessions={[]}
+        ws={ws as any}
+        connected={true}
+        isActive={true}
+        viewMode="chat"
+        quickData={{} as any}
+      />,
+    );
+
+    const props = chatViewSpy.mock.calls.at(-1)?.[0] as { onResendFailed?: (commandId: string, text: string) => void };
+    props.onResendFailed?.('failed-cmd', 'retry me');
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledOnce();
+    expect(removeOptimisticMessageMock).not.toHaveBeenCalled();
+    expect(addOptimisticUserMessageMock).not.toHaveBeenCalled();
+  });
+
   it('disables chat timeline bootstrap and optimistic bubbles for shell sessions', () => {
     render(
       <SessionPane

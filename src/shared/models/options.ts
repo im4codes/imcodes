@@ -13,6 +13,7 @@ export const CODEX_MODEL_IDS = ['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex-spark'
 export type CodexModelId = typeof CODEX_MODEL_IDS[number];
 
 export const GEMINI_MODEL_IDS = [
+  'auto',
   'gemini-2.5-pro',
   'gemini-2.5-flash',
   'gemini-2.0-flash-exp',
@@ -21,3 +22,7 @@ export const GEMINI_MODEL_IDS = [
   'gemini-1.5-flash',
 ] as const;
 export type GeminiModelId = typeof GEMINI_MODEL_IDS[number];
+
+export function mergeModelSuggestions(...groups: ReadonlyArray<readonly string[]>): string[] {
+  return [...new Set(groups.flat())];
+}

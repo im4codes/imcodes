@@ -3145,11 +3145,12 @@ afterEach(() => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: /^gemini-2.5-pro$/i }));
-    fireEvent.click(screen.getAllByRole('button', { name: /gemini-2.5-flash/i })[0]!);
+    const menu = document.querySelector('.menu-dropdown') as HTMLElement;
+    fireEvent.click(within(menu).getByRole('button', { name: /auto/i }));
 
     expectSendPayload(ws, {
       sessionName: 'gemini-sdk-session',
-      text: '/model gemini-2.5-flash',
+      text: '/model auto',
     });
   });
 
@@ -3208,7 +3209,9 @@ afterEach(() => {
     }));
 
     fireEvent.click(screen.getByRole('button', { name: /^gemini-2.5-pro$/i }));
-    fireEvent.click(screen.getByRole('button', { name: /gemini-2.5-flash/i }));
+    const menu = document.querySelector('.menu-dropdown') as HTMLElement;
+    expect(within(menu).getByRole('button', { name: /auto/i })).toBeDefined();
+    fireEvent.click(within(menu).getByRole('button', { name: /gemini-2.5-flash/i }));
 
     expectSendPayload(ws, {
       sessionName: 'gemini-sdk-session',

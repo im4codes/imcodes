@@ -32,7 +32,7 @@ import {
 } from "./cc-preset-form.js";
 import { CC_PRESET_MSG } from "@shared/cc-presets.js";
 import type { CcPreset } from "@shared/cc-presets.js";
-import { GEMINI_MODEL_IDS } from "../../../src/shared/models/options.js";
+import { GEMINI_MODEL_IDS, mergeModelSuggestions } from "../../../src/shared/models/options.js";
 
 const DEFAULT_SHELL_KEY = "default_shell";
 // Fallback suggestions used only when the daemon probe returns an empty list
@@ -383,7 +383,10 @@ export function NewSessionDialog({
   const transportModels = useTransportModels(ws, dynamicModelsAgentType);
   const modelSuggestions = useMemo(() => {
     if (transportModels.models.length > 0) {
-      return transportModels.models.map((m) => m.id);
+      const dynamicModelIds = transportModels.models.map((m) => m.id);
+      return agentType === "gemini-sdk"
+        ? mergeModelSuggestions(GEMINI_SDK_MODEL_FALLBACK, dynamicModelIds)
+        : dynamicModelIds;
     }
     if (agentType === "qwen") {
       return qwenPresetModels.length > 0

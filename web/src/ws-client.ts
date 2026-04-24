@@ -134,9 +134,9 @@ const RECONNECT_MAX_MS = 30000;
 const HEARTBEAT_MS = 10000; // lowered from 25s for faster dead-connection detection
 /** If no pong arrives within this window after a ping, assume the socket is a
  *  half-open zombie (iOS/Android commonly leave the TCP open after aggressive
- *  background eviction) and force a fresh reconnect. 2× heartbeat gives one
- *  interval of slack for genuinely slow networks before we tear it down. */
-const PONG_TIMEOUT_MS = HEARTBEAT_MS * 2;
+ *  background eviction) and force a fresh reconnect. */
+const PONG_TIMEOUT_MS = 2_000;
+const RESUME_PROBE_TIMEOUT_MS = 2_000;
 
 export class WsClient {
   private ws: WebSocket | null = null;
@@ -152,6 +152,7 @@ export class WsClient {
   private _pingLatency: number | null = null;
   private _pingSentAt: number | null = null;
   private _pongTimer: ReturnType<typeof setTimeout> | null = null;
+  private _resumeProbeTimer: ReturnType<typeof setTimeout> | null = null;
   private _onLatency: ((ms: number) => void) | null = null;
 
   /** Per-session callbacks for raw PTY binary frames. Supports multiple subscribers per session. */
@@ -228,7 +229,7 @@ export class WsClient {
   }
 
   send(msg: object): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+    if (!this._connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
       throw new Error('WebSocket not connected');
     }
     const json = JSON.stringify(msg);
@@ -236,6 +237,41 @@ export class WsClient {
       throw new Error('Message too large');
     }
     this.ws.send(json);
+  }
+
+  /**
+   * Actively verify a foregrounded browser socket before allowing new sends.
+   * Backgrounded tabs can resume with readyState=OPEN while the path to the
+   * server is dead; a short ping/pong probe catches that without refreshing
+   * healthy sockets.
+   */
+  probeConnection(timeoutMs = RESUME_PROBE_TIMEOUT_MS): void {
+    if (this._destroyed) return;
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.reconnectNow(false);
+      return;
+    }
+
+    const wasConnected = this._connected;
+    this._connected = false;
+    if (wasConnected) {
+      this.dispatch({ type: 'session.event', event: 'disconnected', session: '', state: 'disconnected' });
+    }
+
+    if (this._resumeProbeTimer) clearTimeout(this._resumeProbeTimer);
+    try {
+      this._pingSentAt = Date.now();
+      this.ws.send(JSON.stringify({ type: 'ping' }));
+    } catch {
+      this.reconnectNow(true);
+      return;
+    }
+
+    this._resumeProbeTimer = setTimeout(() => {
+      this._resumeProbeTimer = null;
+      if (this._destroyed) return;
+      this.reconnectNow(true);
+    }, timeoutMs);
   }
 
   onMessage(handler: MessageHandler): () => void {
@@ -597,6 +633,14 @@ export class WsClient {
             clearTimeout(this._pongTimer);
             this._pongTimer = null;
           }
+          if (this._resumeProbeTimer) {
+            clearTimeout(this._resumeProbeTimer);
+            this._resumeProbeTimer = null;
+            if (!this._connected) {
+              this._connected = true;
+              this.dispatch({ type: 'session.event', event: 'connected', session: '', state: 'connected' });
+            }
+          }
           return;
         }
         if (msg.type === 'terminal.stream_reset') {
@@ -724,10 +768,14 @@ export class WsClient {
 
     if (force && this.ws) {
       const staleSocket = this.ws;
+      const wasConnected = this._connected;
       this.ws = null;
       this._connected = false;
       this._connecting = false;
       this.clearTimers();
+      if (wasConnected) {
+        this.dispatch({ type: 'session.event', event: 'disconnected', session: '', state: 'disconnected' });
+      }
       try { staleSocket.close(4001, 'client refresh'); } catch { /* ignore */ }
     }
 
@@ -772,9 +820,11 @@ export class WsClient {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     if (this._pongTimer) clearTimeout(this._pongTimer);
+    if (this._resumeProbeTimer) clearTimeout(this._resumeProbeTimer);
     this.reconnectTimer = null;
     this.heartbeatTimer = null;
     this._pongTimer = null;
+    this._resumeProbeTimer = null;
     this._pingSentAt = null;
   }
 

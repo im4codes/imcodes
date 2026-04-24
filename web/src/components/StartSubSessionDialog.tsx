@@ -19,7 +19,7 @@ import {
   type CcPresetDraft,
 } from './cc-preset-form.js';
 import { CC_PRESET_MSG, type CcPreset } from '@shared/cc-presets.js';
-import { GEMINI_MODEL_IDS } from '../../../src/shared/models/options.js';
+import { GEMINI_MODEL_IDS, mergeModelSuggestions } from '../../../src/shared/models/options.js';
 
 const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
 const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
@@ -243,7 +243,9 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   const supportsModelSelection = type === 'copilot-sdk' || type === 'cursor-headless' || type === 'gemini-sdk' || (type === 'qwen' && !!selectedCcPreset);
   const modelSuggestions = useMemo(() => (
     transportModels.models.length > 0
-      ? transportModels.models.map((model) => model.id)
+      ? (type === 'gemini-sdk'
+        ? mergeModelSuggestions(GEMINI_SDK_MODEL_SUGGESTIONS, transportModels.models.map((model) => model.id))
+        : transportModels.models.map((model) => model.id))
       : type === 'copilot-sdk'
         ? [...COPILOT_SDK_MODEL_SUGGESTIONS]
         : type === 'cursor-headless'

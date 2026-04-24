@@ -654,6 +654,46 @@ describe('handleWebCommand transport queue behavior', () => {
     clearAllResend();
   });
 
+  it('queues SDK sends by agentType when runtimeType has not propagated yet', async () => {
+    const { clearAllResend, getResendEntries } = await import('../../src/daemon/transport-resend-queue.js');
+    clearAllResend();
+
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'gemini-sdk',
+      providerId: 'gemini-sdk',
+      state: 'idle',
+    });
+    getTransportRuntimeMock.mockReturnValue(undefined);
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/model gemini-2.5-pro',
+      commandId: 'cmd-missing-runtime-type-model',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'command.ack',
+      { commandId: 'cmd-missing-runtime-type-model', status: 'accepted' },
+    );
+    expect(emitMock).not.toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'user.message',
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(getResendEntries('deck_transport_brain')).toEqual([
+      expect.objectContaining({ text: '/model gemini-2.5-pro', commandId: 'cmd-missing-runtime-type-model' }),
+    ]);
+
+    clearAllResend();
+  });
+
   it('persists a transport error record when subsession.start fails before runtime creation', async () => {
     launchTransportSessionMock.mockRejectedValueOnce(new Error('provider bootstrap failed'));
 
@@ -1330,16 +1370,16 @@ describe('handleWebCommand transport queue behavior', () => {
     handleWebCommand({
       type: 'session.send',
       session: 'deck_transport_brain',
-      text: '/model gemini-2.5-flash',
+      text: '/model auto',
       commandId: 'cmd-model-gemini',
     }, serverLink as any);
     await flushAsync();
 
-    expect(setAgentId).toHaveBeenCalledWith('gemini-2.5-flash');
+    expect(setAgentId).toHaveBeenCalledWith('auto');
     expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
-      requestedModel: 'gemini-2.5-flash',
-      activeModel: 'gemini-2.5-flash',
-      modelDisplay: 'gemini-2.5-flash',
+      requestedModel: 'auto',
+      activeModel: 'auto',
+      modelDisplay: 'auto',
     }));
   });
 

@@ -124,15 +124,19 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     const attachmentsFromFailure = failedEvent && Array.isArray(failedEvent.payload.attachments)
       ? (failedEvent.payload.attachments as Array<Record<string, unknown>>)
       : undefined;
-    removeOptimisticMessage(commandId);
     const newCommandId = globalThis.crypto?.randomUUID?.()
       ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    ws.sendSessionCommand('send', {
-      sessionName: sub.sessionName,
-      text,
-      ...(resendExtra ?? {}),
-      commandId: newCommandId,
-    });
+    try {
+      ws.sendSessionCommand('send', {
+        sessionName: sub.sessionName,
+        text,
+        ...(resendExtra ?? {}),
+        commandId: newCommandId,
+      });
+    } catch {
+      return;
+    }
+    removeOptimisticMessage(commandId);
     if (!isTransportRuntime(sub)) {
       addOptimisticUserMessage(text, newCommandId, {
         ...(attachmentsFromFailure ? { attachments: attachmentsFromFailure } : {}),

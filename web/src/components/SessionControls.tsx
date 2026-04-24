@@ -31,7 +31,7 @@ import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import type { P2pSavedConfig } from '@shared/p2p-modes.js';
 import { getQwenAuthTier, QWEN_AUTH_TIERS } from '@shared/qwen-auth.js';
 import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/qwen-models.js';
-import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, normalizeClaudeCodeModelId } from '../../../src/shared/models/options.js';
+import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions, normalizeClaudeCodeModelId } from '../../../src/shared/models/options.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
 import { useTransportModels, supportsDynamicTransportModels } from '../hooks/useTransportModels.js';
 import {
@@ -688,7 +688,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const dynamicTransportModels = useTransportModels(ws, dynamicModelsAgentType);
   const genericTransportModelSuggestions: readonly string[] = useMemo(() => {
     if (dynamicTransportModels.models.length > 0) {
-      return dynamicTransportModels.models.map((m) => m.id);
+      const dynamicModelIds = dynamicTransportModels.models.map((m) => m.id);
+      return isGeminiSdk
+        ? mergeModelSuggestions(GEMINI_SDK_MODEL_SUGGESTIONS, dynamicModelIds)
+        : dynamicModelIds;
     }
     if (isCopilot) {
       const probed = activeSession?.copilotAvailableModels;

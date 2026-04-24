@@ -161,16 +161,19 @@ export function SessionPane({
     const attachmentsFromFailure = failedEvent && Array.isArray(failedEvent.payload.attachments)
       ? (failedEvent.payload.attachments as Array<Record<string, unknown>>)
       : undefined;
-    // Remove the old failed bubble first so we don't end up with two copies.
-    removeOptimisticMessage(commandId);
     const newCommandId = globalThis.crypto?.randomUUID?.()
       ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    ws.sendSessionCommand('send', {
-      sessionName,
-      text,
-      ...(resendExtra ?? {}),
-      commandId: newCommandId,
-    });
+    try {
+      ws.sendSessionCommand('send', {
+        sessionName,
+        text,
+        ...(resendExtra ?? {}),
+        commandId: newCommandId,
+      });
+    } catch {
+      return;
+    }
+    removeOptimisticMessage(commandId);
     addOptimisticUserMessage(text, newCommandId, {
       ...(attachmentsFromFailure ? { attachments: attachmentsFromFailure } : {}),
       ...(resendExtra ? { resendExtra } : {}),

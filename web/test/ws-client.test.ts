@@ -193,16 +193,27 @@ describe('WsClient', () => {
   it('force reconnect refreshes a stale-open socket and replays subscriptions', async () => {
     vi.useFakeTimers();
     const client = new WsClient('http://localhost:8787', 'srv-1');
+    const handler = vi.fn();
+    client.onMessage(handler);
     client.connect();
     await vi.advanceTimersByTimeAsync(0);
     lastWs!.emit('open');
     const firstWs = lastWs!;
+    handler.mockClear();
 
     client.subscribeTerminal('chat-session', false);
     client.subscribeTransportSession('transport-session');
     firstWs.send.mockClear();
 
     client.reconnectNow(true);
+    expect(client.connected).toBe(false);
+    expect(handler).toHaveBeenCalledWith({
+      type: 'session.event',
+      event: 'disconnected',
+      session: '',
+      state: 'disconnected',
+    });
+    expect(() => client.send({ type: 'session.send', sessionName: 's', text: 'lost guard' })).toThrow('WebSocket not connected');
     await vi.advanceTimersByTimeAsync(0);
 
     const secondWs = lastWs!;
@@ -220,6 +231,63 @@ describe('WsClient', () => {
     vi.useRealTimers();
   });
 
+  it('foreground probe blocks sends until pong confirms the socket', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    const handler = vi.fn();
+    client.onMessage(handler);
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const socket = lastWs!;
+    handler.mockClear();
+    socket.send.mockClear();
+
+    client.probeConnection();
+
+    expect(client.connected).toBe(false);
+    expect(handler).toHaveBeenCalledWith({
+      type: 'session.event',
+      event: 'disconnected',
+      session: '',
+      state: 'disconnected',
+    });
+    expect(JSON.parse(socket.send.mock.calls[0][0] as string)).toEqual({ type: 'ping' });
+    expect(() => client.send({ type: 'session.send', sessionName: 's', text: 'guarded' })).toThrow('WebSocket not connected');
+
+    socket.emit('message', { data: JSON.stringify({ type: 'pong' }) });
+    expect(client.connected).toBe(true);
+    expect(handler).toHaveBeenCalledWith({
+      type: 'session.event',
+      event: 'connected',
+      session: '',
+      state: 'connected',
+    });
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('foreground probe force-reconnects when pong does not arrive', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const firstWs = lastWs!;
+    firstWs.send.mockClear();
+
+    client.probeConnection();
+    await vi.advanceTimersByTimeAsync(2_000);
+    for (let i = 0; i < 5; i++) await vi.advanceTimersByTimeAsync(0);
+
+    expect(firstWs.readyState).toBe(MockWebSocket.CLOSED);
+    expect(lastWs).not.toBe(firstWs);
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
   it('send() throws when not connected', () => {
     const client = new WsClient('http://localhost:8787', 'srv-1');
     expect(() => client.send({ type: 'ping' })).toThrow('WebSocket not connected');
@@ -231,7 +299,7 @@ describe('WsClient', () => {
       // eviction without propagating close() to the WebView — the old client
       // believed it was "connected" indefinitely while no events arrived.
       // Now we ping every HEARTBEAT_MS (10s) and force-reconnect if no pong
-      // arrives within 2× that window.
+      // arrives within the 2s watchdog window.
       vi.useFakeTimers();
       const client = new WsClient('http://localhost:8787', 'srv-1');
       client.connect();
@@ -245,8 +313,8 @@ describe('WsClient', () => {
       );
       expect(initialPings.length).toBeGreaterThanOrEqual(1);
 
-      // Walk past the 20s watchdog without ever sending a pong.
-      await vi.advanceTimersByTimeAsync(20_000);
+      // Walk past the 2s watchdog without ever sending a pong.
+      await vi.advanceTimersByTimeAsync(2_000);
       // reconnectNow(true) fires synchronously, but openSocket() awaits a
       // ticket fetch Promise — flush several microtask turns so the new
       // MockWebSocket is constructed before we assert.
@@ -266,8 +334,9 @@ describe('WsClient', () => {
       lastWs!.emit('open');
       const firstWs = lastWs!;
 
-      // Simulate a healthy server that pongs every ping.
+      // Simulate a healthy server that pongs immediately after each ping.
       for (let i = 0; i < 5; i++) {
+        firstWs.emit('message', { data: JSON.stringify({ type: 'pong' }) });
         await vi.advanceTimersByTimeAsync(10_000); // one heartbeat interval
         firstWs.emit('message', { data: JSON.stringify({ type: 'pong' }) });
       }

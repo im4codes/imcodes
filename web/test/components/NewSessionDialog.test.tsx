@@ -447,4 +447,44 @@ describe('NewSessionDialog', () => {
       requestedModel: 'gpt-5.2',
     }));
   });
+
+  it('keeps auto in gemini-sdk options when dynamic models are discovered', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
+    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    agentTypeSelect.value = 'gemini-sdk';
+    fireEvent.input(agentTypeSelect, { target: { value: 'gemini-sdk' } });
+
+    await waitFor(() => {
+      expect(ws.send.mock.calls.some((call) => (
+        call[0]?.type === 'transport.list_models' && call[0]?.agentType === 'gemini-sdk'
+      ))).toBe(true);
+    });
+    const request = ws.send.mock.calls.find((call) => (
+      call[0]?.type === 'transport.list_models' && call[0]?.agentType === 'gemini-sdk'
+    ))?.[0];
+    expect(request).toMatchObject({ type: 'transport.list_models', agentType: 'gemini-sdk' });
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: 'gemini-sdk',
+      requestId: request?.requestId,
+      models: [
+        { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro' },
+        { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' },
+      ],
+    }));
+
+    await waitFor(() => expect(screen.getByRole('option', { name: 'auto' })).toBeDefined());
+    const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
+    fireEvent.input(selects[1], { target: { value: 'auto' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'gemini-sdk',
+      requestedModel: 'auto',
+    }));
+  });
 });

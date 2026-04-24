@@ -1816,7 +1816,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       eventId ? { source: 'daemon', confidence: 'high', eventId } : undefined,
     );
   };
-  if (!transportRuntime && record?.runtimeType === 'transport') {
+  const isTransportSession = record?.runtimeType === 'transport'
+    || (typeof record?.agentType === 'string' && isTransportAgent(record.agentType));
+  if (!transportRuntime && isTransportSession) {
     // No runtime — provider is still (re)connecting. Queue the message for
     // automatic redelivery once `restoreTransportSessions()` rebuilds the
     // runtime instead of dropping it on the floor.

@@ -319,11 +319,11 @@ describe('StartSubSessionDialog', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /gemini_sdk/i }));
     const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
-    fireEvent.input(selects[0], { target: { value: 'gemini-2.5-flash' } });
+    fireEvent.input(selects[0], { target: { value: 'auto' } });
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
     expect(onStart).toHaveBeenCalledWith('gemini-sdk', undefined, '/tmp', undefined, {
-      requestedModel: 'gemini-2.5-flash',
+      requestedModel: 'auto',
     });
   });
 
