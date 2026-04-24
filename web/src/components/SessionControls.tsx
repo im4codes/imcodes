@@ -677,12 +677,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   //   1. `useTransportModels` — live daemon probe via `transport.list_models`
   //      WS round-trip. Works uniformly for main sessions AND sub-sessions
   //      (sub-session SessionInfo records aren't hydrated with
-  //      copilot/cursorAvailableModels, so we can't rely on activeSession).
-  //   2. `activeSession?.{copilot,cursor}AvailableModels` — the cached
+  //      provider-specific availableModels, so we can't rely on activeSession).
+  //   2. `activeSession?.{copilot,cursor}AvailableModels` — cached
   //      hydration set by `buildSessionList()` for main sessions (first
   //      paint before the WS probe reply arrives).
-  //   3. Hardcoded suggestion constants — offline/no-probe fallback so the
-  //      picker never renders empty.
+  //   3. Provider-specific fallback constants where available.
   const dynamicModelsAgentType = supportsDynamicTransportModels(activeSession?.agentType)
     ? activeSession!.agentType
     : null;

@@ -10,6 +10,7 @@ import { getUserPref, saveUserPref } from '../api.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
 import { getSessionAgentGroups, getSessionAgentLabel, SESSION_AGENT_GROUP_LABEL_KEYS } from './session-agent-options.js';
 import { QwenCodingPlanHint } from './QwenCodingPlanHint.js';
+import { useTransportModels, supportsDynamicTransportModels } from '../hooks/useTransportModels.js';
 import {
   buildCcPresetFromDraft,
   createCcPresetDraftFromPreset,
@@ -175,14 +176,24 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   useEffect(() => {
     if (type !== 'qwen') return;
     const fallbackModel = selectedCcPreset?.defaultModel ?? selectedCcPreset?.env.ANTHROPIC_MODEL ?? '';
-    if (qwenPresetModels.length === 0) {
-      if (!requestedModel && fallbackModel) setRequestedModel(fallbackModel);
-      return;
-    }
-    if (!requestedModel || !qwenPresetModels.includes(requestedModel)) {
-      setRequestedModel(qwenPresetModels.includes(fallbackModel) ? fallbackModel : qwenPresetModels[0]);
-    }
-  }, [type, qwenPresetModels, requestedModel, selectedCcPreset]);
+    setRequestedModel((current) => {
+      if (qwenPresetModels.length === 0) {
+        return current || fallbackModel;
+      }
+      if (
+        fallbackModel
+        && current === selectedCcPreset?.env.ANTHROPIC_MODEL
+        && current !== fallbackModel
+        && qwenPresetModels.includes(fallbackModel)
+      ) {
+        return fallbackModel;
+      }
+      if (!current || !qwenPresetModels.includes(current)) {
+        return qwenPresetModels.includes(fallbackModel) ? fallbackModel : qwenPresetModels[0];
+      }
+      return current;
+    });
+  }, [type, qwenPresetModels, selectedCcPreset]);
 
   const handleStart = () => {
     const desc = description.trim() || undefined;
@@ -227,16 +238,22 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
             ? OPENCLAW_THINKING_LEVELS
             : [];
   const supportsCcPreset = type === 'claude-code' || type === 'qwen';
+  const dynamicModelsAgentType = supportsDynamicTransportModels(type) ? type : null;
+  const transportModels = useTransportModels(ws, dynamicModelsAgentType);
   const supportsModelSelection = type === 'copilot-sdk' || type === 'cursor-headless' || type === 'gemini-sdk' || (type === 'qwen' && !!selectedCcPreset);
-  const modelSuggestions = type === 'copilot-sdk'
-    ? [...COPILOT_SDK_MODEL_SUGGESTIONS]
-    : type === 'cursor-headless'
-      ? [...CURSOR_HEADLESS_MODEL_SUGGESTIONS]
-      : type === 'qwen'
-        ? (qwenPresetModels.length > 0 ? qwenPresetModels : (selectedCcPreset?.defaultModel ? [selectedCcPreset.defaultModel] : []))
-        : type === 'gemini-sdk'
-          ? [...GEMINI_SDK_MODEL_SUGGESTIONS]
-          : [];
+  const modelSuggestions = useMemo(() => (
+    transportModels.models.length > 0
+      ? transportModels.models.map((model) => model.id)
+      : type === 'copilot-sdk'
+        ? [...COPILOT_SDK_MODEL_SUGGESTIONS]
+        : type === 'cursor-headless'
+          ? [...CURSOR_HEADLESS_MODEL_SUGGESTIONS]
+          : type === 'qwen'
+            ? (qwenPresetModels.length > 0 ? qwenPresetModels : (selectedCcPreset?.defaultModel ? [selectedCcPreset.defaultModel] : []))
+            : type === 'gemini-sdk'
+              ? [...GEMINI_SDK_MODEL_SUGGESTIONS]
+              : []
+  ), [transportModels.models, type, qwenPresetModels, selectedCcPreset]);
 
   return (
     <div class="dialog-overlay">

@@ -404,16 +404,24 @@ export function NewSessionDialog({
     if (agentType !== "qwen") return;
     const fallbackModel =
       selectedCcPreset?.defaultModel ?? selectedCcPreset?.env.ANTHROPIC_MODEL ?? "";
-    if (modelSuggestions.length === 0) {
-      if (!requestedModel && fallbackModel) setRequestedModel(fallbackModel);
-      return;
-    }
-    if (!requestedModel || !modelSuggestions.includes(requestedModel)) {
-      setRequestedModel(
-        modelSuggestions.includes(fallbackModel) ? fallbackModel : modelSuggestions[0],
-      );
-    }
-  }, [agentType, modelSuggestions, requestedModel, selectedCcPreset]);
+    setRequestedModel((current) => {
+      if (modelSuggestions.length === 0) {
+        return current || fallbackModel;
+      }
+      if (
+        fallbackModel
+        && current === selectedCcPreset?.env.ANTHROPIC_MODEL
+        && current !== fallbackModel
+        && modelSuggestions.includes(fallbackModel)
+      ) {
+        return fallbackModel;
+      }
+      if (!current || !modelSuggestions.includes(current)) {
+        return modelSuggestions.includes(fallbackModel) ? fallbackModel : modelSuggestions[0];
+      }
+      return current;
+    });
+  }, [agentType, modelSuggestions, selectedCcPreset]);
 
   const handleKey = (e: KeyboardEvent) => {
     if (e.key === "Enter" && !starting) handleStart();

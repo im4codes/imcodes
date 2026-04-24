@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/preact';
+import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/preact';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -23,13 +23,22 @@ vi.mock('../../src/components/FileBrowser.js', () => ({
 
 import { NewSessionDialog } from '../../src/components/NewSessionDialog.js';
 
-const makeWs = () => ({
-  sendSessionCommand: vi.fn(),
-  send: vi.fn(),
-  connected: true,
-  onMessage: vi.fn().mockReturnValue(() => {}),
-  subSessionDetectShells: vi.fn(),
-});
+const makeWs = () => {
+  const handlers = new Set<(msg: unknown) => void>();
+  return {
+    sendSessionCommand: vi.fn(),
+    send: vi.fn(),
+    connected: true,
+    onMessage: vi.fn((handler: (msg: unknown) => void) => {
+      handlers.add(handler);
+      return () => handlers.delete(handler);
+    }),
+    emit: (msg: unknown) => {
+      handlers.forEach((handler) => handler(msg));
+    },
+    subSessionDetectShells: vi.fn(),
+  };
+};
 
 describe('NewSessionDialog', () => {
   afterEach(() => {
@@ -343,37 +352,33 @@ describe('NewSessionDialog', () => {
 
   it('uses the updated preset default model for qwen', async () => {
     const ws = makeWs();
-    ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
-      handler({
-        type: 'cc.presets.list_response',
-      presets: [
-        {
-          name: 'MiniMax',
-          env: {
-            ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
-            ANTHROPIC_AUTH_TOKEN: 'secret',
-            ANTHROPIC_MODEL: 'MiniMax-M2.7',
-          },
-          defaultModel: 'MiniMax-Text-01',
-          availableModels: [{ id: 'MiniMax-M2.7' }, { id: 'MiniMax-Text-01' }],
-        },
-      ],
-    });
-      return () => {};
-    });
-
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
     const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
     fireEvent.input(agentTypeSelect, { target: { value: 'qwen' } });
-    await waitFor(() => {
-      expect(screen.getAllByRole('combobox').length).toBeGreaterThanOrEqual(3);
-    });
-    const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
-    fireEvent.input(selects[2], { target: { value: 'MiniMax' } });
+    fireEvent.click(screen.getByText('api_provider_add_edit'));
+    fireEvent.input(screen.getByPlaceholderText('e.g. MiniMax'), { target: { value: 'MiniMax' } });
+    fireEvent.input(screen.getByPlaceholderText('your-api-key'), { target: { value: 'secret' } });
+    fireEvent.click(screen.getByRole('button', { name: /discover models/i }));
+    act(() => ws.emit({
+      type: 'cc.presets.discover_models_response',
+      ok: true,
+      presetName: 'MiniMax',
+      preset: {
+        name: 'MiniMax',
+        env: {
+          ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+          ANTHROPIC_AUTH_TOKEN: 'secret',
+          ANTHROPIC_MODEL: 'MiniMax-M2.7',
+        },
+        defaultModel: 'MiniMax-Text-01',
+        availableModels: [{ id: 'MiniMax-M2.7' }, { id: 'MiniMax-Text-01' }],
+      },
+    }));
 
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
     fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
+    await waitFor(() => expect(screen.getByDisplayValue('MiniMax-Text-01')).toBeDefined());
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
 
     await waitFor(() => {

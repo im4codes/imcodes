@@ -349,4 +349,27 @@ describe('StartSubSessionDialog', () => {
       requestedModel: 'gpt-5.2',
     });
   });
+
+  it('passes requestedModel for gemini-sdk sub-sessions', () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /gemini_sdk/i }));
+    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'gemini-2.5-pro' } });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledWith('gemini-sdk', undefined, '/tmp', undefined, {
+      requestedModel: 'gemini-2.5-pro',
+    });
+  });
 });

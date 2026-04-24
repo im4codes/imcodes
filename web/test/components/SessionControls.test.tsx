@@ -3176,4 +3176,43 @@ afterEach(() => {
       text: '/model gpt-5.2',
     });
   });
+
+  it('shows dynamically discovered gemini-sdk models and sends /model', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'gemini-sdk-session',
+          agentType: 'gemini-sdk',
+          runtimeType: 'transport',
+          activeModel: 'gemini-2.5-pro',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const request = ws.send.mock.calls.find((call) => call[0]?.type === 'transport.list_models')?.[0];
+    expect(request).toMatchObject({ type: 'transport.list_models', agentType: 'gemini-sdk' });
+
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: 'gemini-sdk',
+      requestId: request?.requestId,
+      models: [
+        { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro' },
+        { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' },
+      ],
+      defaultModel: 'gemini-2.5-pro',
+      isAuthenticated: true,
+    }));
+
+    fireEvent.click(screen.getByRole('button', { name: /^gemini-2.5-pro$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /gemini-2.5-flash/i }));
+
+    expectSendPayload(ws, {
+      sessionName: 'gemini-sdk-session',
+      text: '/model gemini-2.5-flash',
+    });
+  });
 });

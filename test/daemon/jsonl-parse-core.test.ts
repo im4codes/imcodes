@@ -231,8 +231,8 @@ describe('jsonl-parse-core', () => {
       presetContextWindow: 400_000,
     });
     const usage = emits.find((e) => e.type === 'usage.update');
-    // claude-sonnet-4 infers to 200_000 which takes precedence over preset.
-    expect(usage!.payload.contextWindow).toBe(200_000);
+    // claude-sonnet-4 infers to 1M which takes precedence over preset.
+    expect(usage!.payload.contextWindow).toBe(1_000_000);
   });
 
   it('ignores invalid JSON and empty lines', () => {
