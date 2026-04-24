@@ -518,6 +518,61 @@ describe('useTimeline global cache bounds', () => {
     });
   });
 
+  it('treats daemon history as background once fast text tail renders visible history', async () => {
+    const sessionName = `deck_text_tail_background_daemon_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    const sendTimelineHistoryRequest = vi.fn(() => 'history-background-daemon');
+
+    fetchTextTailSpy.mockResolvedValue({
+      events: [{
+        eventId: `${sessionName}-tail-1`,
+        ts: 20,
+        type: 'assistant.text',
+        text: 'fast tail recovered',
+        source: 'daemon',
+        confidence: 'high',
+      }],
+    });
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineHistoryRequest,
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events, refreshing, historyStatus } = useTimeline(sessionName, ws, serverId, {
+        isActiveSession: false,
+      });
+      return h(
+        'div',
+        {
+          'data-testid': 'probe',
+          'data-refreshing': String(refreshing),
+          'data-phase': historyStatus.phase,
+          'data-daemon': historyStatus.steps.daemon,
+        },
+        events.map((event) => String(event.payload.text ?? '')).join('|'),
+      );
+    }
+
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(fetchTextTailSpy).toHaveBeenCalledWith(serverId, sessionName);
+      expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName);
+      expect(screen.getByTestId('probe').textContent).toBe('fast tail recovered');
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').getAttribute('data-refreshing')).toBe('false');
+      expect(['idle', 'bootstrap']).toContain(screen.getByTestId('probe').getAttribute('data-phase'));
+      if (screen.getByTestId('probe').getAttribute('data-phase') === 'bootstrap') {
+        expect(screen.getByTestId('probe').getAttribute('data-daemon')).toBe('done');
+      }
+    });
+  });
+
   it('requests timeline history when the socket connects after the first mount', async () => {
     const sessionName = `deck_late_connect_${Date.now()}`;
     const serverId = `srv-${Date.now()}`;

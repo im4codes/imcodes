@@ -586,6 +586,24 @@ export function useTimeline(
     let cancelled = false;
     let textTailStarted = false;
 
+    const markDaemonHistoryBackground = (): void => {
+      updateHistoryStep('daemon', 'done', 'bootstrap');
+      setRefreshing(false);
+    };
+
+    const requestDaemonHistory = (visible: boolean, limit?: number): void => {
+      if (!wsConnected || !ws) return;
+      if (visible) {
+        updateHistoryStep('daemon', 'running', 'bootstrap');
+        setRefreshing(true);
+      } else {
+        markDaemonHistoryBackground();
+      }
+      historyRequestIdRef.current = limit === undefined
+        ? ws.sendTimelineHistoryRequest(sessionId)
+        : ws.sendTimelineHistoryRequest(sessionId, limit);
+    };
+
     const startTextTailBootstrap = (): void => {
       if (textTailStarted || !serverId || !sessionId || !cacheKey) return;
       textTailStarted = true;
@@ -601,6 +619,8 @@ export function useTimeline(
             .filter((event): event is TimelineEvent => event !== null);
           if (recovered.length === 0) return;
           mergeEvents(recovered);
+          setLoading(false);
+          markDaemonHistoryBackground();
         })
         .catch(() => { /* fail-open: authoritative history flow continues */ })
         .finally(() => {
@@ -616,11 +636,7 @@ export function useTimeline(
       setEvents(memCached);
       setLoading(false);
       startTextTailBootstrap();
-      if (wsConnected) {
-        updateHistoryStep('daemon', 'running', 'bootstrap');
-        setRefreshing(true);
-        historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
-      }
+      requestDaemonHistory(false, MAX_MEMORY_EVENTS);
       // Background HTTP backfill — catches events missed while this window
       // was minimized/backgrounded since the memory cache can be stale.
       // Kept short (~200ms) because the UI is already visible; this is
@@ -641,11 +657,7 @@ export function useTimeline(
       setEvents((prev) => (prev === localSnapshot ? prev : localSnapshot));
       setLoading(false);
       startTextTailBootstrap();
-      if (wsConnected) {
-        updateHistoryStep('daemon', 'running', 'bootstrap');
-        setRefreshing(true);
-        historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
-      }
+      requestDaemonHistory(false, MAX_MEMORY_EVENTS);
       if (isActiveSession) {
         fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' });
       }
@@ -657,11 +669,7 @@ export function useTimeline(
       setLoading(false);
       startTextTailBootstrap();
       // Just request incremental updates
-      if (wsConnected) {
-        updateHistoryStep('daemon', 'running', 'bootstrap');
-        setRefreshing(true);
-        historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
-      }
+      requestDaemonHistory(false, MAX_MEMORY_EVENTS);
       // Same reasoning as path 1 — back-fill in the background so the
       // re-opened window is guaranteed to reflect authoritative daemon
       // state, not whatever the WS subscription happened to catch.
@@ -693,11 +701,7 @@ export function useTimeline(
         setLoading(false);
         historyLoadedRef.current = cacheKeyRef.current;
         startTextTailBootstrap();
-        if (wsConnected) {
-          updateHistoryStep('daemon', 'running', 'bootstrap');
-          setRefreshing(true);
-          historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
-        }
+        requestDaemonHistory(false, MAX_MEMORY_EVENTS);
         // Background HTTP backfill — IDB is authoritative only up to the
         // last time a WS event landed; if the user closed the tab mid-chat
         // and reopened later there may be a gap between IDB and daemon.
@@ -712,9 +716,7 @@ export function useTimeline(
         setEvents([]);
         startTextTailBootstrap();
         if (wsConnected) {
-          updateHistoryStep('daemon', 'running', 'bootstrap');
-          setRefreshing(true);
-          historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId);
+          requestDaemonHistory(true);
         } else {
           setLoading(false);
         }

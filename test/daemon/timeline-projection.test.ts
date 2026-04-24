@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, utimesSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 
@@ -50,12 +50,13 @@ describe('timeline projection', () => {
     dbPath = null;
   });
 
-  async function loadModules() {
+  async function loadModules(prepareDb?: (path: string) => void) {
     tempHome = mkdtempSync(join(tmpdir(), 'imcodes-timeline-projection-'));
     dbPath = join(tempHome, '.imcodes', 'timeline-projection.sqlite');
     process.env.HOME = tempHome;
     process.env.USERPROFILE = tempHome;
     process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH = dbPath;
+    prepareDb?.(dbPath);
     const [{ timelineProjection }, { timelineStore }] = await Promise.all([
       import('../../src/daemon/timeline-projection.js'),
       import('../../src/daemon/timeline-store.js'),
@@ -83,6 +84,55 @@ describe('timeline projection', () => {
     }
   }
 
+  function listProjectionEventIndexes(): string[] {
+    const db = new DatabaseSync(dbPath!, { readonly: true });
+    try {
+      return (db.prepare(`PRAGMA index_list('timeline_projection_events')`).all() as Array<Record<string, unknown>>)
+        .map((row) => String(row.name))
+        .sort();
+    } finally {
+      db.close();
+    }
+  }
+
+  function createLegacyProjectionDbWithoutIndexes(path: string): void {
+    mkdirSync(dirname(path), { recursive: true });
+    const db = new DatabaseSync(path);
+    try {
+      db.exec(`
+        CREATE TABLE timeline_projection_events (
+          session_id TEXT NOT NULL,
+          append_ordinal INTEGER NOT NULL,
+          event_id TEXT NOT NULL,
+          ts INTEGER NOT NULL,
+          seq INTEGER NOT NULL,
+          epoch INTEGER NOT NULL,
+          type TEXT NOT NULL,
+          source TEXT NOT NULL,
+          confidence TEXT NOT NULL,
+          streaming INTEGER NOT NULL DEFAULT 0,
+          hidden INTEGER NOT NULL DEFAULT 0,
+          text TEXT,
+          payload_json TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          PRIMARY KEY(session_id, append_ordinal)
+        );
+        CREATE TABLE timeline_projection_sessions (
+          session_id TEXT PRIMARY KEY,
+          last_projected_append_ordinal INTEGER NOT NULL,
+          source_file_size_bytes INTEGER NOT NULL,
+          source_file_mtime_ms INTEGER NOT NULL,
+          projection_version INTEGER NOT NULL,
+          status TEXT NOT NULL,
+          last_rebuilt_at INTEGER
+        );
+      `);
+    } finally {
+      db.close();
+    }
+  }
+
   it('preserves append order for equal-ts events and honors afterTs / beforeTs exclusivity', async () => {
     const { timelineProjection, timelineStore } = await loadModules();
     const sessionId = 'projection_order';
@@ -101,6 +151,21 @@ describe('timeline projection', () => {
 
     const before = await timelineStore.readPreferred(sessionId, { beforeTs: 1001, limit: 10 });
     expect(before.map((event) => event.seq)).toEqual([1, 2, 3]);
+  });
+
+  it('migrates an existing SQLite projection database by creating missing query indexes', async () => {
+    const { timelineProjection } = await loadModules(createLegacyProjectionDbWithoutIndexes);
+
+    expect(listProjectionEventIndexes()).not.toContain('idx_timeline_projection_events_session_type_ts');
+
+    await timelineProjection.queryHistory({ sessionId: 'legacy_missing_session', limit: 1 });
+
+    expect(listProjectionEventIndexes()).toEqual(expect.arrayContaining([
+      'idx_timeline_projection_events_session_streaming_ts',
+      'idx_timeline_projection_events_session_ts',
+      'idx_timeline_projection_events_session_type_ts',
+      'sqlite_autoindex_timeline_projection_events_1',
+    ]));
   });
 
   it('returns completed text tail only for non-empty completed text events', async () => {

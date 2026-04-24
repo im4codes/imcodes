@@ -11,7 +11,7 @@ import { terminalStreamer, type StreamSubscriber } from './terminal-streamer.js'
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { timelineStore } from './timeline-store.js';
-import type { MemoryContextTimelinePayload } from '../shared/timeline/types.js';
+import { TIMELINE_HISTORY_CONTENT_TYPES, TIMELINE_HISTORY_STATE_TYPES, type MemoryContextTimelinePayload } from '../shared/timeline/types.js';
 import { emitSessionInlineError } from './session-error.js';
 import { enqueueResend, getResendEntries, clearResend } from './transport-resend-queue.js';
 import {
@@ -2937,22 +2937,31 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
   let readMs = 0;
   let synthesizeMs = 0;
 
-  // Read generously from disk — session.state events are excluded from the limit budget
-  // so we need to read more to ensure enough substantive events.
+  // Query content by type instead of over-reading and filtering in JS. SQLite
+  // has (session_id, type, ts) indexes; using them keeps the common path near
+  // O(requested rows) instead of decoding thousands of unrelated state events.
   // Do NOT filter by epoch — history should include events across daemon restarts.
-  const readLimit = Math.min(limit * 6, 10000);
   const tRead0 = Date.now();
-  const events = await timelineStore.readPreferred(sessionName, { limit: readLimit, afterTs, beforeTs });
+  const substantive = await timelineStore.readByTypesPreferred(
+    sessionName,
+    [...TIMELINE_HISTORY_CONTENT_TYPES],
+    { limit, afterTs, beforeTs },
+  );
+  let stateEvents: typeof substantive = [];
+  if (substantive.length > 0) {
+    const cutoffTs = substantive[0]!.ts;
+    const stateAfterTs = afterTs === undefined ? cutoffTs - 1 : Math.max(afterTs, cutoffTs - 1);
+    stateEvents = await timelineStore.readByTypesPreferred(
+      sessionName,
+      [...TIMELINE_HISTORY_STATE_TYPES],
+      { limit: Math.max(limit * 2, 100), afterTs: stateAfterTs, beforeTs },
+    );
+  }
+  const events = [...substantive, ...stateEvents].sort((a, b) => a.ts - b.ts);
   readMs = Date.now() - tRead0;
 
   // Content-aware limit: session.state events don't count toward the budget.
   // This prevents idle↔running oscillation storms from crowding out user.message events.
-  const substantive: typeof events = [];
-  const stateEvents: typeof events = [];
-  for (const ev of events) {
-    if (ev.type === 'session.state') stateEvents.push(ev);
-    else substantive.push(ev);
-  }
   // Trim substantive to the requested limit
   const trimmedSubstantive = substantive.length > limit ? substantive.slice(substantive.length - limit) : substantive;
   // Interleave state events that fall within the trimmed time range

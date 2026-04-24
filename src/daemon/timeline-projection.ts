@@ -22,7 +22,7 @@ export interface TimelineProjectionLatest {
 
 export type TimelineProjectionStatus = 'missing' | 'building' | 'ready' | 'stale' | 'corrupt';
 
-const DEFAULT_QUERY_TIMEOUT_MS = 75;
+const DEFAULT_QUERY_TIMEOUT_MS = 500;
 const DEFAULT_WRITE_TIMEOUT_MS = 2_000;
 
 function getProjectionDbPath(): string {

@@ -28,6 +28,26 @@ export type TimelineEventType =
   | 'ask.question'
   | 'memory.context';
 
+export const TIMELINE_HISTORY_CONTENT_TYPES = [
+  'user.message',
+  'assistant.text',
+  'assistant.thinking',
+  'tool.call',
+  'tool.result',
+  TIMELINE_EVENT_FILE_CHANGE,
+  'mode.state',
+  'terminal.snapshot',
+  'command.ack',
+  'agent.status',
+  'usage.update',
+  'ask.question',
+  'memory.context',
+] as const satisfies readonly TimelineEventType[];
+
+export const TIMELINE_HISTORY_STATE_TYPES = [
+  'session.state',
+] as const satisfies readonly TimelineEventType[];
+
 export type TimelineSource = 'daemon' | 'hook' | 'terminal-parse' | 'terminal-spinner';
 export type TimelineConfidence = 'high' | 'medium' | 'low';
 

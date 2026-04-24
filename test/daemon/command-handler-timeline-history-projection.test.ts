@@ -4,6 +4,7 @@ const {
   getSessionMock,
   upsertSessionMock,
   readPreferredMock,
+  readByTypesPreferredMock,
   exportOpenCodeSessionMock,
   buildTimelineEventsFromOpenCodeExportMock,
   buildSessionListMock,
@@ -11,6 +12,7 @@ const {
   getSessionMock: vi.fn(),
   upsertSessionMock: vi.fn(),
   readPreferredMock: vi.fn(),
+  readByTypesPreferredMock: vi.fn(),
   exportOpenCodeSessionMock: vi.fn(),
   buildTimelineEventsFromOpenCodeExportMock: vi.fn(),
   buildSessionListMock: vi.fn(async () => []),
@@ -54,7 +56,7 @@ vi.mock('../../src/daemon/timeline-store.js', () => ({
     read: vi.fn(() => []),
     readPreferred: readPreferredMock,
     readCompletedTextTail: vi.fn(),
-    readByTypesPreferred: vi.fn(),
+    readByTypesPreferred: readByTypesPreferredMock,
     getLatest: vi.fn(() => null),
     getLatestPreferred: vi.fn(() => null),
     clear: vi.fn(),
@@ -91,18 +93,24 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    readPreferredMock.mockReset();
+    readByTypesPreferredMock.mockReset();
     getSessionMock.mockReturnValue(undefined);
     buildTimelineEventsFromOpenCodeExportMock.mockReturnValue([]);
     exportOpenCodeSessionMock.mockResolvedValue({});
   });
 
-  it('uses readPreferred and preserves substantive budgeting plus session.state interleaving', async () => {
-    readPreferredMock.mockResolvedValue([
-      { eventId: 's0', sessionId: 'deck_hist', ts: 1000, seq: 1, epoch: 1, source: 'daemon', confidence: 'high', type: 'session.state', payload: { state: 'idle' } },
-      { eventId: 'u1', sessionId: 'deck_hist', ts: 1010, seq: 2, epoch: 1, source: 'daemon', confidence: 'high', type: 'user.message', payload: { text: 'hello' } },
-      { eventId: 's1', sessionId: 'deck_hist', ts: 1020, seq: 3, epoch: 1, source: 'daemon', confidence: 'high', type: 'session.state', payload: { state: 'running' } },
-      { eventId: 'a1', sessionId: 'deck_hist', ts: 1030, seq: 4, epoch: 1, source: 'daemon', confidence: 'high', type: 'assistant.text', payload: { text: 'world', streaming: false } },
-    ]);
+  it('uses type-filtered reads and preserves substantive budgeting plus session.state interleaving', async () => {
+    readByTypesPreferredMock.mockImplementation(async (_session: string, types: string[]) => (
+      types.includes('session.state')
+        ? [
+          { eventId: 's1', sessionId: 'deck_hist', ts: 1020, seq: 3, epoch: 1, source: 'daemon', confidence: 'high', type: 'session.state', payload: { state: 'running' } },
+        ]
+        : [
+          { eventId: 'u1', sessionId: 'deck_hist', ts: 1010, seq: 2, epoch: 1, source: 'daemon', confidence: 'high', type: 'user.message', payload: { text: 'hello' } },
+          { eventId: 'a1', sessionId: 'deck_hist', ts: 1030, seq: 4, epoch: 1, source: 'daemon', confidence: 'high', type: 'assistant.text', payload: { text: 'world', streaming: false } },
+        ]
+    ));
 
     handleWebCommand({
       type: 'timeline.history_request',
@@ -112,7 +120,12 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
     }, serverLink as any);
     await flushAsync();
 
-    expect(readPreferredMock).toHaveBeenCalledWith('deck_hist', { limit: 12, afterTs: undefined, beforeTs: undefined });
+    expect(readByTypesPreferredMock).toHaveBeenCalledTimes(2);
+    expect(readByTypesPreferredMock.mock.calls[0][0]).toBe('deck_hist');
+    expect(readByTypesPreferredMock.mock.calls[0][2]).toEqual({ limit: 2, afterTs: undefined, beforeTs: undefined });
+    expect(readByTypesPreferredMock.mock.calls[1][0]).toBe('deck_hist');
+    expect(readByTypesPreferredMock.mock.calls[1][1]).toEqual(['session.state']);
+    expect(readByTypesPreferredMock.mock.calls[1][2]).toEqual({ limit: 100, afterTs: 1009, beforeTs: undefined });
     expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'timeline.history',
       sessionName: 'deck_hist',
@@ -126,10 +139,49 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
     }));
   });
 
+  it('queries content types directly instead of over-reading state storms', async () => {
+    readByTypesPreferredMock.mockImplementation(async (_session: string, types: string[]) => (
+      types.includes('session.state')
+        ? [
+          { eventId: 's1', sessionId: 'deck_state_storm', ts: 1020, seq: 3, epoch: 1, source: 'daemon', confidence: 'high', type: 'session.state', payload: { state: 'running' } },
+        ]
+        : [
+          { eventId: 'u1', sessionId: 'deck_state_storm', ts: 1010, seq: 2, epoch: 1, source: 'daemon', confidence: 'high', type: 'user.message', payload: { text: 'hello' } },
+          { eventId: 'a1', sessionId: 'deck_state_storm', ts: 1030, seq: 4, epoch: 1, source: 'daemon', confidence: 'high', type: 'assistant.text', payload: { text: 'world', streaming: false } },
+        ]
+    ));
+
+    handleWebCommand({
+      type: 'timeline.history_request',
+      sessionName: 'deck_state_storm',
+      requestId: 'hist-state-storm',
+      limit: 2,
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(readByTypesPreferredMock).toHaveBeenCalledTimes(2);
+    expect(readByTypesPreferredMock.mock.calls[0][0]).toBe('deck_state_storm');
+    expect(readByTypesPreferredMock.mock.calls[0][2]).toEqual({ limit: 2, afterTs: undefined, beforeTs: undefined });
+    expect(readByTypesPreferredMock.mock.calls[1][0]).toBe('deck_state_storm');
+    expect(readByTypesPreferredMock.mock.calls[1][1]).toEqual(['session.state']);
+    expect(readByTypesPreferredMock.mock.calls[1][2]).toEqual({ limit: 100, afterTs: 1009, beforeTs: undefined });
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'timeline.history',
+      requestId: 'hist-state-storm',
+      events: [
+        expect.objectContaining({ eventId: 'u1' }),
+        expect.objectContaining({ eventId: 's1' }),
+        expect.objectContaining({ eventId: 'a1' }),
+      ],
+    }));
+  });
+
   it('keeps existing OpenCode synthesis/replacement behavior after SQLite-backed base retrieval', async () => {
-    readPreferredMock.mockResolvedValue([
-      { eventId: 's0', sessionId: 'deck_oc', ts: 1000, seq: 1, epoch: 1, source: 'daemon', confidence: 'high', type: 'session.state', payload: { state: 'idle' } },
-    ]);
+    readByTypesPreferredMock.mockImplementation(async (_session: string, types: string[]) => (
+      types.includes('session.state')
+        ? [{ eventId: 's0', sessionId: 'deck_oc', ts: 1000, seq: 1, epoch: 1, source: 'daemon', confidence: 'high', type: 'session.state', payload: { state: 'idle' } }]
+        : []
+    ));
     getSessionMock.mockReturnValue({
       name: 'deck_oc',
       agentType: 'opencode',
@@ -149,7 +201,7 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
     }, serverLink as any);
     await flushAsync();
 
-    expect(readPreferredMock).toHaveBeenCalledWith('deck_oc', { limit: 30, afterTs: undefined, beforeTs: undefined });
+    expect(readByTypesPreferredMock).toHaveBeenCalledWith('deck_oc', expect.arrayContaining(['user.message', 'assistant.text']), { limit: 5, afterTs: undefined, beforeTs: undefined });
     expect(exportOpenCodeSessionMock).toHaveBeenCalledWith('/tmp/project', 'oc-1');
     expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'timeline.history',

@@ -3,9 +3,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const {
   readMock,
   readPreferredMock,
+  readByTypesPreferredMock,
 } = vi.hoisted(() => ({
   readMock: vi.fn(),
   readPreferredMock: vi.fn(),
+  readByTypesPreferredMock: vi.fn(),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -44,6 +46,7 @@ vi.mock('../../src/daemon/timeline-store.js', () => ({
     append: vi.fn(),
     read: readMock,
     readPreferred: readPreferredMock,
+    readByTypesPreferred: readByTypesPreferredMock,
     clear: vi.fn(),
   },
 }));
@@ -74,7 +77,24 @@ describe('command-handler timeline.history_request SQLite parity', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     readMock.mockReturnValue([]);
-    readPreferredMock.mockResolvedValue([
+    readPreferredMock.mockResolvedValue([]);
+    readByTypesPreferredMock.mockImplementation(async (_session: string, types: string[]) => {
+      if (types.includes('session.state')) {
+        return [
+          {
+            eventId: 'state-1',
+            sessionId: 'deck_proj_brain',
+            ts: 101,
+            seq: 2,
+            epoch: 1,
+            source: 'daemon',
+            confidence: 'high',
+            type: 'session.state',
+            payload: { state: 'running' },
+          },
+        ];
+      }
+      return [
       {
         eventId: 'user-1',
         sessionId: 'deck_proj_brain',
@@ -87,17 +107,6 @@ describe('command-handler timeline.history_request SQLite parity', () => {
         payload: { text: 'Question' },
       },
       {
-        eventId: 'state-1',
-        sessionId: 'deck_proj_brain',
-        ts: 101,
-        seq: 2,
-        epoch: 1,
-        source: 'daemon',
-        confidence: 'high',
-        type: 'session.state',
-        payload: { state: 'running' },
-      },
-      {
         eventId: 'assistant-1',
         sessionId: 'deck_proj_brain',
         ts: 102,
@@ -108,7 +117,8 @@ describe('command-handler timeline.history_request SQLite parity', () => {
         type: 'assistant.text',
         payload: { text: 'Answer', streaming: false },
       },
-    ]);
+      ];
+    });
   });
 
   it('uses readPreferred for timeline.history_request while preserving current response shape', async () => {
@@ -120,7 +130,12 @@ describe('command-handler timeline.history_request SQLite parity', () => {
     }, serverLink as never);
     await flushAsync();
 
-    expect(readPreferredMock).toHaveBeenCalledWith('deck_proj_brain', { limit: 12, afterTs: undefined, beforeTs: undefined });
+    expect(readByTypesPreferredMock).toHaveBeenCalledTimes(2);
+    expect(readByTypesPreferredMock.mock.calls[0][0]).toBe('deck_proj_brain');
+    expect(readByTypesPreferredMock.mock.calls[0][2]).toEqual({ limit: 2, afterTs: undefined, beforeTs: undefined });
+    expect(readByTypesPreferredMock.mock.calls[1][0]).toBe('deck_proj_brain');
+    expect(readByTypesPreferredMock.mock.calls[1][1]).toEqual(['session.state']);
+    expect(readByTypesPreferredMock.mock.calls[1][2]).toEqual({ limit: 100, afterTs: 99, beforeTs: undefined });
     expect(readMock).not.toHaveBeenCalled();
     expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'timeline.history',
