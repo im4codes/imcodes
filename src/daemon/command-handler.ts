@@ -1280,7 +1280,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       try { serverLink.send({ type: 'session.error', project, message }); } catch { /* ignore */ }
       return;
     }
-    if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless') {
+    if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'gemini-sdk') {
       logger.info({ project, agentType }, 'SDK fresh session.start removing stale main-session store record');
       removeSession(`deck_${project}_brain`);
     }
@@ -1290,7 +1290,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       brainType: agentType as ProjectConfig['brainType'],
       workerTypes: [],
       label,
-      fresh: agentType === 'claude-code-sdk' || agentType === 'codex-sdk',
+      fresh: agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'gemini-sdk',
       extraEnv,
       ccPreset: ccPresetName,
       effort,
@@ -1331,6 +1331,22 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         projectName: project,
         role: 'brain',
         agentType: agentType as 'copilot-sdk' | 'cursor-headless',
+        projectDir: dir,
+        fresh: true,
+        ...(requestedModel ? { requestedModel } : {}),
+        label,
+        effort,
+      });
+    } else if (agentType === 'gemini-sdk') {
+      // Gemini SDK shares the codex-sdk shape: fresh launch, optional requested
+      // model, no ccPreset, no resume id (ACP issues a fresh sessionId on the
+      // first turn and persists it via ~/.gemini/tmp/<project>/chats/).
+      logger.info({ project }, 'SDK fresh session.start launching new Gemini SDK main session');
+      await launchTransportSession({
+        name: `deck_${project}_brain`,
+        projectName: project,
+        role: 'brain',
+        agentType: 'gemini-sdk',
         projectDir: dir,
         fresh: true,
         ...(requestedModel ? { requestedModel } : {}),

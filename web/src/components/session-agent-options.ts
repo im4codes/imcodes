@@ -51,6 +51,14 @@ const SESSION_AGENT_CHOICES: SessionAgentChoice[] = [
     surfaces: ['new-session', 'sub-session'],
   },
   {
+    id: 'gemini-sdk',
+    icon: '♊',
+    fallbackLabel: 'Gemini SDK',
+    labelKey: 'session.agentType.gemini_sdk',
+    group: 'transport',
+    surfaces: ['new-session', 'sub-session'],
+  },
+  {
     id: 'qwen',
     icon: '千',
     fallbackLabel: 'Qwen Code',

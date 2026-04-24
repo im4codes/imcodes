@@ -54,6 +54,7 @@ type AgentType =
   | "cursor-headless"
   | "opencode"
   | "gemini"
+  | "gemini-sdk"
   | "openclaw"
   | "qwen";
 type OpenClawMode = "new" | "bind";

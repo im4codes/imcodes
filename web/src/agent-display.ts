@@ -15,6 +15,7 @@ export const AGENT_BADGE_CONFIG: Record<string, AgentBadgeConfig> = {
   'openclaw': { label: 'oc', color: '#f97316', autoLabelPrefix: 'OC' },
   'qwen': { label: 'qw', color: '#0f766e', autoLabelPrefix: 'Qw' },
   'gemini': { label: 'gm', color: '#1d4ed8', autoLabelPrefix: 'Gm' },
+  'gemini-sdk': { label: 'gm', color: '#1d4ed8', autoLabelPrefix: 'Gm' },
   'shell': { label: 'sh', color: '#475569', autoLabelPrefix: 'Sh' },
   'script': { label: 'sc', color: '#64748b', autoLabelPrefix: 'Sc' },
 };
@@ -24,6 +25,7 @@ const LEGACY_AUTO_LABEL_PATTERNS: Array<{ pattern: RegExp; prefix: string }> = [
   { pattern: /^codex-sdk(\d+)?$/i, prefix: 'Cx' },
   { pattern: /^copilot-sdk(\d+)?$/i, prefix: 'Co' },
   { pattern: /^cursor-headless(\d+)?$/i, prefix: 'Cu' },
+  { pattern: /^gemini-sdk(\d+)?$/i, prefix: 'Gm' },
 ];
 
 export function getAgentBadgeConfig(agentType: string | null | undefined): AgentBadgeConfig | null {

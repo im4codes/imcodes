@@ -62,15 +62,16 @@ describe('NewSessionDialog', () => {
     const optgroups = Array.from(select.querySelectorAll('optgroup'));
     expect(optgroups.map((group) => group.label)).toEqual(['SDK', 'CLI']);
     const options = Array.from(select.options).map((o) => o.value);
-    expect(options.slice(0, 6)).toEqual([
+    expect(options.slice(0, 7)).toEqual([
       'claude-code-sdk',
       'codex-sdk',
       'copilot-sdk',
       'cursor-headless',
+      'gemini-sdk',
       'qwen',
       'openclaw',
     ]);
-    expect(options.slice(6)).toEqual([
+    expect(options.slice(7)).toEqual([
       'claude-code',
       'codex',
       'opencode',

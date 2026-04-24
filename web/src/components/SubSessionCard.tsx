@@ -31,6 +31,7 @@ const TYPE_ICON: Record<string, string> = {
   'openclaw': '☁️',
   'qwen': '千',
   'gemini': '♊',
+  'gemini-sdk': '♊',
   'shell': '🐚',
   'script': '🔄',
 };

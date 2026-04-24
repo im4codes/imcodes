@@ -141,7 +141,8 @@
       "claude_code_cli": "Claude Code CLI",
       "codex_cli": "Codex CLI",
       "copilot_sdk": "Copilot",
-      "cursor_headless": "Cursor"
+      "cursor_headless": "Cursor",
+      "gemini_sdk": "Gemini SDK"
     },
     "agentGroup": {
       "transport_sdk": "SDK",
