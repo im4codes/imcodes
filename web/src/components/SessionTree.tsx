@@ -13,7 +13,7 @@
  * Task 2.6: Main click → onSelectSession; sub-session click → onSelectSubSession.
  */
 
-import { useState } from 'preact/hooks';
+import { useEffect, useState } from 'preact/hooks';
 import { memo } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { SessionInfo } from '../types.js';
@@ -25,6 +25,7 @@ import { IdleFlashLayer } from './IdleFlashLayer.js';
 import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 
 interface Props {
+  serverId?: string | null;
   sessions: SessionInfo[];
   subSessions: SubSession[];
   activeSession: string | null;
@@ -142,15 +143,28 @@ function SessionNode({
 
 // ── Collapse state persistence ────────────────────────────────────────────────
 const LS_COLLAPSED_KEY = 'rcc_tree_collapsed';
-function loadCollapsed(): Set<string> {
-  try { const raw = localStorage.getItem(LS_COLLAPSED_KEY); return raw ? new Set(JSON.parse(raw)) : new Set(); } catch { return new Set(); }
+function collapsedStorageKey(serverId?: string | null): string {
+  return serverId ? `${LS_COLLAPSED_KEY}:${serverId}` : LS_COLLAPSED_KEY;
 }
-function saveCollapsed(set: Set<string>) {
-  try { localStorage.setItem(LS_COLLAPSED_KEY, JSON.stringify([...set])); } catch { /* ignore */ }
+function loadCollapsed(serverId?: string | null): Set<string> {
+  try {
+    const scopedRaw = localStorage.getItem(collapsedStorageKey(serverId));
+    if (scopedRaw) return new Set(JSON.parse(scopedRaw));
+    const legacyRaw = localStorage.getItem(LS_COLLAPSED_KEY);
+    return legacyRaw ? new Set(JSON.parse(legacyRaw)) : new Set();
+  } catch {
+    return new Set();
+  }
+}
+function saveCollapsed(serverId: string | null | undefined, set: Set<string>) {
+  try {
+    localStorage.setItem(collapsedStorageKey(serverId), JSON.stringify([...set]));
+  } catch { /* ignore */ }
 }
 
 // ── Main component ────────────────────────────────────────────────────────────
 function SessionTreeInner({
+  serverId,
   sessions,
   subSessions,
   activeSession,
@@ -163,13 +177,27 @@ function SessionTreeInner({
   onNewSubSession,
 }: Props) {
   const { t } = useTranslation();
-  const [collapsed, setCollapsed] = useState<Set<string>>(loadCollapsed);
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => loadCollapsed(serverId));
+
+  useEffect(() => {
+    setCollapsed(loadCollapsed(serverId));
+  }, [serverId]);
+
+  useEffect(() => {
+    const validNames = new Set(sessions.map((session) => session.name));
+    setCollapsed((prev) => {
+      const next = new Set([...prev].filter((name) => validNames.has(name)));
+      if (next.size === prev.size) return prev;
+      saveCollapsed(serverId, next);
+      return next;
+    });
+  }, [serverId, sessions]);
 
   const toggleCollapse = (name: string) => {
     setCollapsed((prev) => {
       const next = new Set(prev);
       if (next.has(name)) next.delete(name); else next.add(name);
-      saveCollapsed(next);
+      saveCollapsed(serverId, next);
       return next;
     });
   };
@@ -177,12 +205,12 @@ function SessionTreeInner({
   const collapseAll = () => {
     const all = new Set(sessions.map(s => s.name));
     setCollapsed(all);
-    saveCollapsed(all);
+    saveCollapsed(serverId, all);
   };
 
   const expandAll = () => {
     setCollapsed(new Set());
-    saveCollapsed(new Set());
+    saveCollapsed(serverId, new Set());
   };
 
   const allCollapsed = sessions.length > 0 && sessions.every(s => collapsed.has(s.name));

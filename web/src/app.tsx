@@ -2678,6 +2678,7 @@ export function App() {
             </div>
             {/* Session tree */}
             <SessionTree
+              serverId={selectedServerId}
               sessions={sessions}
               subSessions={subSessions}
               activeSession={activeSession}
@@ -3205,6 +3206,7 @@ export function App() {
               )}
               {/* Session tree — collapsible via sidebar toggle */}
               {!mobileHideTabBar && <SessionTree
+                serverId={selectedServerId}
                 sessions={sessions}
                 subSessions={subSessions}
                 activeSession={activeSession}
