@@ -574,6 +574,14 @@ interface WatcherState {
   status: WatcherStatus;
   /** CC session UUID — used to look up preset contextWindow for usage events. */
   ccSessionId?: string;
+  /**
+   * Waiting-for-file state. When `startWatchingFile` can't find the target
+   * JSONL within its 120s fast-poll, it leaves a slow `setInterval` probe
+   * running so that as soon as the user's first turn materialises the file,
+   * the watcher activates. `stopWatching()` clears this timer.
+   */
+  pendingFilePath?: string;
+  pendingProbeTimer?: ReturnType<typeof setInterval>;
 }
 
 const watchers = new Map<string, WatcherState>();
@@ -860,6 +868,10 @@ export function stopWatching(sessionName: string): void {
   state.status = 'stopped';
   state.abort.abort();
   if (state.pollTimer) clearInterval(state.pollTimer);
+  // Clear the slow stat-probe that waits for a delayed JSONL file in the
+  // pre-activation path. Left running, it would keep hitting `stat()` on
+  // a path whose session has been torn down.
+  if (state.pendingProbeTimer) clearInterval(state.pendingProbeTimer);
   watchers.delete(sessionName);
   unregisterWatcherControl(sessionName);
   releaseFiles(sessionName);
@@ -889,7 +901,9 @@ export async function startWatchingFile(sessionName: string, filePath: string, c
   const control = watcherControl(sessionName);
   registerWatcherControl(sessionName, control);
 
-  // Poll until the specific file appears (up to 120s — CC needs first conversation).
+  // Fast-poll the specific file for up to 120s (~1s interval). Matches the
+  // common case where the file materialises within a minute or two of the
+  // user starting the session.
   let appeared = false;
   for (let i = 0; i < 120 && !state.stopped; i++) {
     try {
@@ -900,10 +914,57 @@ export async function startWatchingFile(sessionName: string, filePath: string, c
       await new Promise((r) => setTimeout(r, 1000));
     }
   }
-  if (!appeared || state.stopped) {
-    // Timeout or stopped — clean up to avoid phantom watcher
-    logger.warn({ sessionName, filePath }, 'jsonl-watcher: file never appeared, cleaning up phantom watcher');
-    state.stopped = true;
+
+  // If the file STILL isn't there after 120s, DO NOT clean up. CC only
+  // creates the per-session JSONL on the first user turn, which can easily
+  // be more than two minutes after the sub-session was restored from the
+  // daemon's session store. The previous "clean up phantom watcher" branch
+  // left the session permanently unwatched: Claude's assistant replies
+  // landed on disk afterwards but nothing emitted them, so the chat UI
+  // showed user messages with no response bubble.
+  //
+  // Instead, keep the watcher alive and switch to a slow stat-probe every
+  // 10s. Activation happens as soon as the file appears (or the session is
+  // stopped). The slow probe costs ~1 stat() per 10s — negligible.
+  if (!appeared && !state.stopped) {
+    logger.info(
+      { sessionName, filePath },
+      'jsonl-watcher: file not yet created after 120s fast-poll, switching to slow probe (kept alive)',
+    );
+    const started = Date.now();
+    state.pendingFilePath = filePath;
+    const slowProbe = setInterval(async () => {
+      if (state.stopped) {
+        clearInterval(slowProbe);
+        return;
+      }
+      try {
+        await stat(filePath);
+      } catch {
+        return;
+      }
+      clearInterval(slowProbe);
+      if (state.stopped) return;
+      logger.info(
+        { sessionName, filePath, waitedMs: Date.now() - started },
+        'jsonl-watcher: file appeared after slow probe, activating',
+      );
+      try {
+        await activateFile(sessionName, state, filePath);
+        state.status = 'active';
+        startDrainPoll(sessionName, state);
+        void watchFile(sessionName, state, filePath);
+      } catch (err) {
+        logger.warn({ sessionName, filePath, err }, 'jsonl-watcher: failed to activate file after slow probe');
+      }
+    }, 10_000);
+    // Hand the timer to watcher state so stopWatching() can clear it.
+    state.pendingProbeTimer = slowProbe;
+    return control;
+  }
+
+  if (state.stopped) {
+    // Session was explicitly stopped while we were waiting — clean exit.
     state.status = 'stopped';
     watchers.delete(sessionName);
     releaseFiles(sessionName);
@@ -912,13 +973,27 @@ export async function startWatchingFile(sessionName: string, filePath: string, c
 
   await activateFile(sessionName, state, filePath);
   state.status = 'active';
+  startDrainPoll(sessionName, state);
+  void watchFile(sessionName, state, filePath);
+  return control;
+}
 
-  // Poll drains new lines every 2s; rotation scan every 10s as fallback (fs.watch is primary).
+/**
+ * Start the standard drain + rotation-check poll loop for an active watcher.
+ * Runs every 2s: drain new lines from the active file, and every 5th tick
+ * (10s) scan the project dir for a newer JSONL that CC rotated into on
+ * context overflow. fs.watch is the primary rotation trigger — this poll
+ * is a fallback for platforms where fs.watch events are unreliable.
+ *
+ * Extracted so the slow-probe path in `startWatchingFile` can reuse the
+ * identical startup sequence once the file finally appears, instead of
+ * duplicating the body.
+ */
+function startDrainPoll(sessionName: string, state: WatcherState): void {
+  if (state.pollTimer) return; // already running
   let pollCount = 0;
   state.pollTimer = setInterval(async () => {
     await drainNewLines(sessionName, state);
-
-    // Fallback rotation scan every 10s (5 ticks × 2s) in case fs.watch misses events.
     pollCount++;
     if (pollCount % 5 === 0 && state.activeFile) {
       try {
@@ -932,8 +1007,6 @@ export async function startWatchingFile(sessionName: string, filePath: string, c
       } catch { /* ignore */ }
     }
   }, 2000);
-  void watchFile(sessionName, state, filePath);
-  return control;
 }
 
 async function watchFile(sessionName: string, state: WatcherState, filePath: string): Promise<void> {
