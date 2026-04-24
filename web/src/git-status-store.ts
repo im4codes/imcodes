@@ -27,12 +27,21 @@ interface SharedChangesEntry {
   files: ChangeFile[];
   updatedAt: number;
   inFlightRequestId: string | null;
+  /** Wall-clock timestamp when `inFlightRequestId` was set — used to detect
+   *  stuck requests whose response never arrived (WS drop, daemon restart,
+   *  serverLink.send throw, etc.). Without this, a dropped response would
+   *  leave `inFlightRequestId` pinned forever and every subsequent refresh
+   *  would silently take the "queued & return" branch. */
+  inFlightStartedAt: number;
   queued: boolean;
   listeners: Set<SharedChangesListener>;
   ws: WsClient | null;
 }
 
 export const SHARED_CHANGES_TTL_MS = 5_000;
+/** If no response comes back for this long, treat the in-flight request as
+ *  lost and fire a new one instead of queuing behind it forever. */
+export const SHARED_CHANGES_INFLIGHT_TIMEOUT_MS = 15_000;
 
 const sharedChangesByKey = new Map<string, SharedChangesEntry>();
 const sharedChangesRequestKey = new Map<string, string>();
@@ -63,10 +72,30 @@ export function getSharedChangesKey(ws: WsClient, repoPath: string): string {
 function getEntry(key: string): SharedChangesEntry {
   let entry = sharedChangesByKey.get(key);
   if (!entry) {
-    entry = { repoPath: '', files: [], updatedAt: 0, inFlightRequestId: null, queued: false, listeners: new Set(), ws: null };
+    entry = {
+      repoPath: '',
+      files: [],
+      updatedAt: 0,
+      inFlightRequestId: null,
+      inFlightStartedAt: 0,
+      queued: false,
+      listeners: new Set(),
+      ws: null,
+    };
     sharedChangesByKey.set(key, entry);
   }
   return entry;
+}
+
+/** Drop a stuck in-flight request so a fresh one can replace it. Safe to call
+ *  even if nothing is in flight. The matching entry in `sharedChangesRequestKey`
+ *  is also removed, so a late-arriving response with the abandoned id becomes
+ *  a no-op in `settleSharedChangesRequest`. */
+function abandonInFlight(entry: SharedChangesEntry): void {
+  if (!entry.inFlightRequestId) return;
+  sharedChangesRequestKey.delete(entry.inFlightRequestId);
+  entry.inFlightRequestId = null;
+  entry.inFlightStartedAt = 0;
 }
 
 export function subscribeSharedChanges(key: string, listener: SharedChangesListener): () => void {
@@ -101,12 +130,25 @@ export function requestSharedChanges(ws: WsClient, repoPath: string, force = fal
     publish(key, entry.files);
     return;
   }
+  // Sweep stuck in-flight requests so a dropped response can't pin the entry
+  // in "queued" mode forever. `force` is user-initiated (refresh button) and
+  // always wins over a pending request; non-force paths (30s poll, mount
+  // subscribes) bail out quickly if an in-flight request is still within the
+  // timeout window.
   if (entry.inFlightRequestId) {
-    entry.queued = true;
-    return;
+    const stale = entry.inFlightStartedAt > 0
+      && (Date.now() - entry.inFlightStartedAt) > SHARED_CHANGES_INFLIGHT_TIMEOUT_MS;
+    if (force || stale) {
+      abandonInFlight(entry);
+    } else {
+      entry.queued = true;
+      return;
+    }
   }
   const requestId = ws.fsGitStatus(repoPath, { includeStats: true });
   entry.inFlightRequestId = requestId;
+  entry.inFlightStartedAt = Date.now();
+  entry.queued = false;
   sharedChangesRequestKey.set(requestId, key);
 }
 
@@ -116,9 +158,17 @@ export function settleSharedChangesRequest(requestId: string, files: ChangeFile[
   sharedChangesRequestKey.delete(requestId);
   const entry = sharedChangesByKey.get(key);
   if (!entry) return true;
-  entry.inFlightRequestId = null;
+  // Only clear in-flight tracking when this response matches the current
+  // request. A force-refresh may have already kicked off a newer request
+  // with a different id; in that case we still publish the fresh files (no
+  // reason to discard perfectly good data) but must NOT null out the newer
+  // request's in-flight state.
+  if (entry.inFlightRequestId === requestId) {
+    entry.inFlightRequestId = null;
+    entry.inFlightStartedAt = 0;
+  }
   if (files) publish(key, files);
-  if (entry.queued && entry.ws) {
+  if (entry.queued && entry.ws && !entry.inFlightRequestId) {
     entry.queued = false;
     requestSharedChanges(entry.ws, entry.repoPath, true);
   }
