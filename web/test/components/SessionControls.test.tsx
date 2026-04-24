@@ -3005,7 +3005,7 @@ afterEach(() => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: /^medium$/i }));
-    fireEvent.click(screen.getByRole('button', { name: /high/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^high$/i }));
 
     expectSendPayload(ws, {
       sessionName: 'codex-sdk-session',
