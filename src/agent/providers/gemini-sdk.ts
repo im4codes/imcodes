@@ -169,6 +169,10 @@ export class GeminiSdkProvider implements TransportProvider {
   private connection: ClientSideConnection | null = null;
   /** Resolves once `initialize` has completed so subsequent RPCs can proceed. */
   private initPromise: Promise<void> | null = null;
+  /** Models returned by the first ACP `newSession` call, cached for the
+   *  lifetime of this provider connection. Populated on first session create. */
+  private cachedModels: Array<{ id: string; name?: string }> | null = null;
+  private cachedDefaultModel: string | null = null;
 
   async connect(config: ProviderConfig): Promise<void> {
     await this.startAcpServer(config);
@@ -182,6 +186,8 @@ export class GeminiSdkProvider implements TransportProvider {
     this.sessions.clear();
     this.config = null;
     this.initPromise = null;
+    this.cachedModels = null;
+    this.cachedDefaultModel = null;
   }
 
   async createSession(config: SessionConfig): Promise<string> {
@@ -517,6 +523,7 @@ export class GeminiSdkProvider implements TransportProvider {
             state.replaying = false;
           }
           state.loaded = true;
+          this.cacheModelsFromSessionResponse(loadResult);
           this.applySessionMetadata(sessionId, state, loadResult);
         } catch (err) {
           logger.info(
@@ -571,8 +578,54 @@ export class GeminiSdkProvider implements TransportProvider {
     state.loaded = true;
     state.modeApplied = false;
     this.acpToRoute.set(state.acpSessionId, sessionId);
+    this.cacheModelsFromSessionResponse(result);
     this.applySessionMetadata(sessionId, state, result);
     this.emitSessionInfo(sessionId, { resumeId: state.acpSessionId });
+  }
+
+  private cacheModelsFromSessionResponse(result: NewSessionResponse | import('@agentclientprotocol/sdk').LoadSessionResponse): void {
+    if (this.cachedModels) return; // already cached
+    const models = (result as NewSessionResponse).models;
+    if (!models) return;
+    const available = models.availableModels;
+    if (!Array.isArray(available) || available.length === 0) return;
+    this.cachedModels = available.map((m: Record<string, unknown>) => ({
+      id: String(m.modelId ?? m.id ?? ''),
+      ...(m.name ? { name: String(m.name) } : {}),
+    })).filter((m) => m.id);
+    this.cachedDefaultModel = typeof models.currentModelId === 'string' ? models.currentModelId : null;
+    logger.debug({ provider: this.id, count: this.cachedModels.length, default: this.cachedDefaultModel }, 'Gemini models cached');
+  }
+
+  /**
+   * Return the list of available Gemini models and the current default.
+   * If no session has been created yet, probes ACP by opening a temporary
+   * session and closing it. Called by gemini-runtime-config.ts.
+   */
+  async readModelList(): Promise<{ models: Array<{ id: string; name?: string }>; defaultModel?: string }> {
+    if (!this.cachedModels) {
+      if (this.connection) {
+        await this.initPromise;
+        try {
+          const result: NewSessionResponse = await this.connection.newSession({
+            cwd: normalizeTransportCwd(process.cwd()) ?? process.cwd(),
+            mcpServers: [],
+          });
+          this.cacheModelsFromSessionResponse(result);
+          // Close the probe session best-effort so it doesn't accumulate
+          const closer = (this.connection as AcpAgent).closeSession;
+          if (typeof closer === 'function') {
+            void closer.call(this.connection, { sessionId: result.sessionId }).catch(() => {});
+          }
+        } catch (err) {
+          logger.debug({ provider: this.id, err }, 'Gemini model probe failed (non-fatal)');
+        }
+      }
+    }
+    return {
+      models: this.cachedModels ?? [],
+      ...(this.cachedDefaultModel ? { defaultModel: this.cachedDefaultModel } : {}),
+    };
   }
 
   private applySessionMetadata(

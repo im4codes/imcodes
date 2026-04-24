@@ -4890,6 +4890,20 @@ async function handleTransportListModels(
       });
       return;
     }
+    if (agentType === 'gemini-sdk') {
+      const { getGeminiRuntimeConfig } = await import('../agent/gemini-runtime-config.js');
+      const cfg = await getGeminiRuntimeConfig(force);
+      reply({
+        models: cfg.models.map((m) => ({
+          id: m.id,
+          ...(m.name ? { name: m.name } : {}),
+        })),
+        ...(cfg.defaultModel ? { defaultModel: cfg.defaultModel } : {}),
+        ...(typeof cfg.isAuthenticated === 'boolean' ? { isAuthenticated: cfg.isAuthenticated } : {}),
+        ...(cfg.probeError ? { error: cfg.probeError } : {}),
+      });
+      return;
+    }
     reply({ models: [], error: `Unsupported agentType: ${agentType || '(missing)'}` });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

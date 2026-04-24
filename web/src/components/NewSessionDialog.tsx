@@ -328,6 +328,7 @@ export function NewSessionDialog({
       if (
         (agentType === "copilot-sdk"
           || agentType === "cursor-headless"
+          || agentType === "gemini-sdk"
           || agentType === "qwen") &&
         requestedModel.trim()
       ) {
@@ -370,6 +371,7 @@ export function NewSessionDialog({
   const supportsModelSelection =
     agentType === "copilot-sdk"
     || agentType === "cursor-headless"
+    || agentType === "gemini-sdk"
     || (agentType === "qwen" && !!selectedCcPreset);
   const dynamicModelsAgentType = supportsDynamicTransportModels(agentType)
     ? agentType
