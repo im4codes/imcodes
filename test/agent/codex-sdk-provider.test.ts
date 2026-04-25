@@ -105,6 +105,21 @@ vi.mock('../../src/util/logger.js', () => ({
   default: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
+// Mock the codex runtime config so tests can pretend specific models are
+// (or aren't) in codex's built-in catalog. Defaults to "no models known"
+// — individual tests can override with codexRuntimeConfigMock.set([...]).
+const codexRuntimeConfigMock = vi.hoisted(() => ({
+  catalog: ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.2'],
+  set(catalog: string[]) { this.catalog = catalog; },
+  reset() { this.catalog = ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.2']; },
+}));
+vi.mock('../../src/agent/codex-runtime-config.js', () => ({
+  getCodexRuntimeConfig: vi.fn(async () => ({
+    availableModels: codexRuntimeConfigMock.catalog,
+    models: codexRuntimeConfigMock.catalog.map((id) => ({ id })),
+  })),
+}));
+
 import { CodexSdkProvider } from '../../src/agent/providers/codex-sdk.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 
@@ -189,12 +204,12 @@ describe('CodexSdkProvider', () => {
     ]);
     expect(threadStartReq?.params?.sandbox).toBe('danger-full-access');
     expect(threadStartReq?.params?.approvalPolicy).toBe('never');
-    // baseInstructions MUST be sent on thread/start: codex-cli forwards it to
-    // the upstream Responses API as `instructions`, which third-party
-    // providers (minimax, openrouter) reject with 400 "Instructions are
-    // required" when missing. Don't drop this field.
-    expect(typeof threadStartReq?.params?.baseInstructions).toBe('string');
-    expect((threadStartReq?.params?.baseInstructions as string).length).toBeGreaterThan(0);
+    // No model selected → resolveBaseInstructionsOverride returns undefined
+    // → we omit baseInstructions and let codex use its default for the
+    // chosen model. This preserves codex's high-quality bundled prompt for
+    // OpenAI models. (Per-model override behavior is exercised by the
+    // dedicated baseInstructions tests below.)
+    expect(threadStartReq?.params?.baseInstructions).toBeUndefined();
     expect(turnStartReq?.params?.sandboxPolicy).toEqual({ type: 'dangerFullAccess' });
     expect(turnStartReq?.params?.approvalPolicy).toBe('never');
     expect(deltas).toEqual(['O', 'OK']);
@@ -211,6 +226,77 @@ describe('CodexSdkProvider', () => {
     const child = childProcessMock.children[0];
     const resumeReq = child.requests.find((req) => req.method === 'thread/resume');
     expect(resumeReq?.params?.threadId).toBe('thread-existing');
+  });
+
+  // ── baseInstructions override decision ─────────────────────────────────
+  // Codex bundles a 14 KB carefully-tuned prompt for each model in its own
+  // catalog. For those, we MUST NOT override (replacing the prompt
+  // meaningfully degrades agent quality). For unknown / third-party models
+  // (e.g. minimax via `wire_api = "responses"`), codex's fallback is empty
+  // and the upstream API rejects with `Instructions are required` — so we
+  // MUST send a non-empty fallback.
+
+  it('omits baseInstructions on thread/start when model is in codex catalog (gpt-5.4)', async () => {
+    codexRuntimeConfigMock.set(['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini']);
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-cat', cwd: '/tmp/project', agentId: 'gpt-5.4' });
+    await provider.send('route-cat', 'hello');
+    const child = childProcessMock.children[0];
+    const threadStartReq = child.requests.find((req) => req.method === 'thread/start');
+    expect(threadStartReq?.params?.model).toBe('gpt-5.4');
+    expect(threadStartReq?.params?.baseInstructions).toBeUndefined();
+    codexRuntimeConfigMock.reset();
+  });
+
+  it('sends fallback baseInstructions on thread/start when model is NOT in codex catalog (custom provider)', async () => {
+    codexRuntimeConfigMock.set(['gpt-5.5', 'gpt-5.4']);
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-mini', cwd: '/tmp/project', agentId: 'codex-MiniMax-M2.5' });
+    await provider.send('route-mini', 'hello');
+    const child = childProcessMock.children[0];
+    const threadStartReq = child.requests.find((req) => req.method === 'thread/start');
+    expect(threadStartReq?.params?.model).toBe('codex-MiniMax-M2.5');
+    expect(typeof threadStartReq?.params?.baseInstructions).toBe('string');
+    expect((threadStartReq?.params?.baseInstructions as string).length).toBeGreaterThan(20);
+    codexRuntimeConfigMock.reset();
+  });
+
+  it('sends fallback baseInstructions on thread/resume for non-catalog model (heals previously-broken threads)', async () => {
+    codexRuntimeConfigMock.set(['gpt-5.5']);
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({
+      sessionKey: 'route-resume-mini',
+      cwd: '/tmp/project',
+      resumeId: 'thread-stored',
+      agentId: 'codex-MiniMax-M2.5',
+    });
+    await provider.send('route-resume-mini', 'hello');
+    const child = childProcessMock.children[0];
+    const resumeReq = child.requests.find((req) => req.method === 'thread/resume');
+    expect(resumeReq?.params?.threadId).toBe('thread-stored');
+    expect(typeof resumeReq?.params?.baseInstructions).toBe('string');
+    expect((resumeReq?.params?.baseInstructions as string).length).toBeGreaterThan(20);
+    codexRuntimeConfigMock.reset();
+  });
+
+  it('omits baseInstructions on thread/resume when model is in codex catalog', async () => {
+    codexRuntimeConfigMock.set(['gpt-5.5', 'gpt-5.4']);
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({
+      sessionKey: 'route-resume-cat',
+      cwd: '/tmp/project',
+      resumeId: 'thread-cat',
+      agentId: 'gpt-5.4',
+    });
+    await provider.send('route-resume-cat', 'hello');
+    const child = childProcessMock.children[0];
+    const resumeReq = child.requests.find((req) => req.method === 'thread/resume');
+    expect(resumeReq?.params?.baseInstructions).toBeUndefined();
+    codexRuntimeConfigMock.reset();
   });
 
   it('lists codex models across paginated model/list responses', async () => {

@@ -26,29 +26,65 @@ import type { TransportAttachment } from '../../../shared/transport-attachments.
 import logger from '../../util/logger.js';
 import { CODEX_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
+import { getCodexRuntimeConfig } from '../codex-runtime-config.js';
 
 const CODEX_BIN = 'codex';
 const CANCEL_INTERRUPT_TIMEOUT_MS = 1_500;
 
 /**
- * Default `baseInstructions` we send with `thread/start`.
+ * Fallback `baseInstructions` we send with `thread/start` / `thread/resume`
+ * when the active model is **not** in codex-cli's built-in catalog (e.g.
+ * `codex-MiniMax-M2.5` routed via `[model_providers.minimax]` with
+ * `wire_api = "responses"` in `~/.codex/config.toml`).
  *
- * Background: codex-cli ≥ 0.125 forwards the thread's `baseInstructions` as
- * the OpenAI Responses API `instructions` field. The Responses API (and
- * third-party providers that proxy it via `wire_api = "responses"`, e.g.
- * MiniMax, OpenRouter) reject requests where `instructions` is missing or
- * empty with `{"type":"invalid_request_error","message":"Instructions are
- * required"}`. The default OpenAI provider tolerates omission, but other
- * providers do not — and we want a single code path that works everywhere.
+ * Background: codex forwards the session's `baseInstructions` as the OpenAI
+ * Responses API `instructions` field. For models in codex's own catalog
+ * (gpt-5.x, etc.), codex bundles a 14 KB carefully-tuned prompt and uses
+ * it as the default — overriding it would meaningfully degrade agent
+ * quality. But for unknown / third-party models, codex's `model_info`
+ * defaults to an empty string, and OpenAI-Responses-style providers
+ * (MiniMax, OpenRouter) reject requests with empty `instructions` as
+ * `{"detail":"Instructions are required"}` (or the equivalent OpenAI
+ * `invalid_request_error`).
  *
- * Keep this prompt short and provider-neutral. It only shapes the agent's
- * "frame"; the user's per-turn `systemText` is still prepended into the
- * turn input below, so context-injected instructions still take precedence.
+ * Strategy (see `shouldOverrideBaseInstructions` below):
+ *   - Known catalog model → omit `baseInstructions`, keep codex's default
+ *   - Unknown model (custom provider) → send this fallback so the upstream
+ *     request is well-formed
+ *
+ * Keep this prompt short and provider-neutral; the user's per-turn
+ * `systemText` is still prepended into `turn/start` input.
  */
-const DEFAULT_BASE_INSTRUCTIONS =
+const FALLBACK_BASE_INSTRUCTIONS =
   'You are Codex, an AI coding assistant integrated into IM.codes. ' +
   'Follow the user\'s instructions precisely. ' +
   'Use available tools to inspect, edit, and run code as needed.';
+
+/**
+ * Resolve whether we need to override `baseInstructions` for the given
+ * model. Returns the override string if needed, or `undefined` to let
+ * codex-cli fall back to its built-in per-model default.
+ *
+ * Errors during catalog discovery are treated as "unknown model" — we send
+ * the override so the request still works, at the cost of replacing
+ * codex's prompt for one turn.
+ */
+async function resolveBaseInstructionsOverride(model: string | undefined): Promise<string | undefined> {
+  // No model selected → codex picks its known default (gpt-5.5 etc.) which
+  // has a built-in prompt. Don't override.
+  if (!model) return undefined;
+  try {
+    const cfg = await getCodexRuntimeConfig();
+    const known = (cfg.availableModels ?? []).map((id) => id.trim().toLowerCase());
+    if (known.includes(model.trim().toLowerCase())) return undefined;
+    return FALLBACK_BASE_INSTRUCTIONS;
+  } catch {
+    // Discovery failed (no auth, codex offline, etc.) — be defensive and
+    // send the fallback. Worst case: one turn uses our shorter prompt
+    // instead of codex's default.
+    return FALLBACK_BASE_INSTRUCTIONS;
+  }
+}
 
 type JsonRpcResponse = {
   id?: number;
@@ -501,10 +537,25 @@ export class CodexSdkProvider implements TransportProvider {
 
   private async ensureThreadLoaded(sessionId: string, state: CodexSdkSessionState): Promise<void> {
     if (state.threadId && state.loaded) return;
+
+    // Decide whether to override `baseInstructions`. For models in codex's
+    // own catalog we DO NOT override — codex bundles a 14 KB carefully-tuned
+    // prompt per model and replacing it with our short fallback meaningfully
+    // degrades agent quality. For unknown / third-party models (custom
+    // `model_providers` with `wire_api = "responses"`), codex's fallback is
+    // an empty string, which the Responses API rejects with 400 — so we
+    // must supply a non-empty `baseInstructions` ourselves.
+    const baseInstructionsOverride = await resolveBaseInstructionsOverride(state.model);
+
     if (state.threadId) {
+      // Resume must also carry the override: previously-broken threads were
+      // persisted with empty base_instructions, and codex's resolution
+      // priority (override > stored history > model default) means our
+      // override on resume is the only way to repair them mid-flight.
       const result = await this.request('thread/resume', {
         threadId: state.threadId,
         ...(state.model ? { model: state.model } : {}),
+        ...(baseInstructionsOverride ? { baseInstructions: baseInstructionsOverride } : {}),
       });
       const resumedId = result?.thread?.id ?? state.threadId;
       state.threadId = resumedId;
@@ -519,11 +570,8 @@ export class CodexSdkProvider implements TransportProvider {
       approvalPolicy: 'never',
       sandbox: 'danger-full-access',
       personality: 'none',
-      // Always send baseInstructions — required by the Responses API, which
-      // third-party providers (e.g. minimax, openrouter via wire_api =
-      // "responses") strictly enforce. See DEFAULT_BASE_INSTRUCTIONS above.
-      baseInstructions: DEFAULT_BASE_INSTRUCTIONS,
       ...(state.model ? { model: state.model } : {}),
+      ...(baseInstructionsOverride ? { baseInstructions: baseInstructionsOverride } : {}),
     });
     const threadId = result?.thread?.id;
     if (!threadId) {
