@@ -626,31 +626,41 @@ describe('RepoPage', () => {
 
   // ── Detect timeout ──────────────────────────────────────────────────────────
 
-  it('shows timeout error with projectDir if no detect response within 10s', async () => {
+  it('retries detect timeouts before showing an error', async () => {
     vi.useFakeTimers();
-    const { ws } = makeWs();
+    const { ws, repoDetect } = makeWs();
     render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
 
-    // Advance past the 10s timeout
+    for (let i = 0; i < 3; i++) {
+      await act(async () => {
+        vi.advanceTimersByTime(10_001);
+      });
+      expect(screen.queryByText(/Detect timeout/)).toBeNull();
+      await act(async () => {
+        vi.advanceTimersByTime(1_201);
+      });
+    }
+
     await act(async () => {
       vi.advanceTimersByTime(10_001);
     });
 
     vi.useRealTimers();
 
-    // The timeout error message should appear
     const errorElements = screen.getAllByText(/Detect timeout/);
     expect(errorElements.length).toBeGreaterThanOrEqual(1);
-    // Should mention "10s" in the error
     expect(errorElements[0].textContent).toContain('10s');
+    expect(repoDetect).toHaveBeenCalledTimes(4);
   });
 
-  it('shows send error when WS is not connected', async () => {
+  it('retries transient WS send failures before showing an error', async () => {
+    vi.useFakeTimers();
+    const repoDetect = vi.fn(() => { throw new Error('WebSocket not connected'); });
     // Create a ws mock where repoDetect throws (simulating disconnected WS)
     const failWs = {
       connected: false,
       onMessage: (_handler: (msg: any) => void) => () => {},
-      repoDetect: () => { throw new Error('WebSocket not connected'); },
+      repoDetect,
       repoListIssues: vi.fn(),
       repoListPRs: vi.fn(),
       repoListBranches: vi.fn(),
@@ -659,11 +669,27 @@ describe('RepoPage', () => {
 
     render(<RepoPage ws={failWs} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
 
-    // Should immediately show send error
+    // Transient disconnected sends stay in loading/retry instead of failing immediately.
     await act(async () => {});
+    expect(screen.queryByText(/Send failed/)).toBeNull();
+
+    for (let i = 0; i < 2; i++) {
+      await act(async () => {
+        vi.advanceTimersByTime(1_201);
+      });
+      expect(screen.queryByText(/Send failed/)).toBeNull();
+    }
+
+    await act(async () => {
+      vi.advanceTimersByTime(1_201);
+    });
+
+    vi.useRealTimers();
+
     const errorElements = screen.getAllByText(/Send failed/);
     expect(errorElements.length).toBeGreaterThanOrEqual(1);
     expect(errorElements[0].textContent).toContain('WebSocket not connected');
+    expect(repoDetect).toHaveBeenCalledTimes(4);
   });
 
   it('does not show timeout if detect response arrives before 10s', async () => {
