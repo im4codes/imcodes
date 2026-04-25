@@ -61,7 +61,14 @@ import { PUSH_TIMELINE_EVENT_MAX_AGE_MS, TIMELINE_SUPPRESS_PUSH_FIELD } from '..
 const AUTH_TIMEOUT_MS = 5000;
 const MAX_QUEUE_SIZE = 100;
 const MAX_BROWSER_PAYLOAD = 65536; // 64KB (subsession.rebuild_all can include many sessions)
-const BROWSER_RATE_LIMIT = 120;   // messages (desktop with pinned panels sends 30+ on init)
+// Desktop with pinned panels + many sessions can fire 60+ subscribe/repo/repo
+// detect / fs.git_status / chat.subscribe / ping messages on initial connect.
+// A reconnect within 10s doubles that. 120 was right at the cliff edge and
+// caused user-typed `session.send` messages to be dropped (and surfaced as
+// instant `command.failed`) when the limiter consumed all tokens during init.
+// 300 gives 3x headroom for normal init bursts without making abuse easier:
+// real abuse patterns send orders-of-magnitude more.
+const BROWSER_RATE_LIMIT = 300;
 const BROWSER_RATE_WINDOW = 10_000; // 10s
 const QUEUE_MAX_BYTES = 1024 * 1024; // 1MB per (session, browser) — increased from 512KB to reduce stream_reset cascades
 
@@ -1703,8 +1710,20 @@ export class WsBridge {
       return;
     }
 
-    if (this.graceTimer) {
-      // Transient outage — buffer for replay when the daemon reconnects.
+    // Buffer if either:
+    //   (a) we are inside the post-disconnect grace window (`graceTimer` set)
+    //   (b) a daemon WS is open but the auth handshake hasn't completed yet
+    //       (`daemonWs` exists, `authenticated` is still false). Without (b),
+    //       sends arriving during the brief auth window after a grace-expired
+    //       reconnect were INSTANT-FAILED with reason=daemon_offline even
+    //       though the daemon is literally about to come back. This was the
+    //       "发消息瞬间失败, 连点 retry n 次才成功" symptom: each click only
+    //       had a chance to land in the lucky few-ms window after auth
+    //       completed but before the user's eyes registered the green badge.
+    //       The buffered entries are replayed by `replayInflightToDaemon()`
+    //       when the auth `replayInflightToDaemon` call fires (line ~516).
+    const daemonHandshakeInProgress = !!this.daemonWs && !this.authenticated;
+    if (this.graceTimer || daemonHandshakeInProgress) {
       const entry: InflightCommand = {
         commandId,
         sessionName,
@@ -1720,7 +1739,7 @@ export class WsBridge {
       return;
     }
 
-    // Fully offline (grace already expired): fail fast.
+    // Fully offline (no daemon WS, no grace window): fail fast.
     this.emitCommandFailed(ws, commandId, sessionName, ACK_FAILURE_DAEMON_OFFLINE);
   }
 

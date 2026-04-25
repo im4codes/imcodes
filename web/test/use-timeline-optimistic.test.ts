@@ -5,7 +5,7 @@
  *   addOptimisticUserMessage → spinner
  *   command.ack error         → red "!" (markOptimisticFailed)
  *   echoed user.message       → cleanup (matches by commandId first, text second)
- *   30s timeout               → auto-fail
+ *   optimistic timeout (60s)  → auto-fail
  *   removeOptimisticMessage   → explicit cleanup (retry path)
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -298,8 +298,9 @@ describe('useTimeline optimistic send flow', () => {
         retryable: true,
       } as unknown as ServerMessage);
     });
+    // Advance past OPTIMISTIC_TIMEOUT_MS (60s) so any auto-fail timer fires.
     act(() => {
-      vi.advanceTimersByTime(30_001);
+      vi.advanceTimersByTime(60_001);
     });
 
     expect(ref.current!.events).toHaveLength(1);
@@ -307,7 +308,7 @@ describe('useTimeline optimistic send flow', () => {
     expect(ref.current!.events[0].payload.failed).toBeFalsy();
   });
 
-  it('auto-fails after the 30s timeout when no ack and no echo arrive', () => {
+  it('auto-fails after the optimistic timeout when no ack and no echo arrive', () => {
     const ref = { current: null as HookRef };
     const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
     const { Probe } = captureHookRef(ref, handlerBox);
@@ -318,8 +319,9 @@ describe('useTimeline optimistic send flow', () => {
     });
     expect(ref.current!.events[0].payload.pending).toBe(true);
 
+    // OPTIMISTIC_TIMEOUT_MS is 60s; advance just past that to trigger auto-fail.
     act(() => {
-      vi.advanceTimersByTime(30_001);
+      vi.advanceTimersByTime(60_001);
     });
 
     expect(ref.current!.events[0].payload.pending).toBe(false);
@@ -345,9 +347,9 @@ describe('useTimeline optimistic send flow', () => {
         session: 'deck_opt_f',
       } as unknown as ServerMessage);
     });
-    // Even past the 30s mark the bubble must not auto-fail — daemon acked.
+    // Even past the optimistic timeout the bubble must not auto-fail — daemon acked.
     act(() => {
-      vi.advanceTimersByTime(60_000);
+      vi.advanceTimersByTime(120_000);
     });
 
     expect(ref.current!.events[0].payload.pending).toBe(false);

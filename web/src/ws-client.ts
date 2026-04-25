@@ -660,6 +660,15 @@ export class WsClient {
       this._connected = true;
       this.reconnectAttempt = 0;
       this.startHeartbeat();
+      // Reset per-session stream-reset bookkeeping on reconnect. Without this,
+      // any cooldown/retry counters accumulated against the old socket carry
+      // over and can immediately suppress the first batch of resubscribes on
+      // the new socket. Stale `retryTimer`s from the old socket are cleared
+      // so they don't fire after we've already re-issued subscribes here.
+      for (const state of this.resetState.values()) {
+        if (state.retryTimer) clearTimeout(state.retryTimer);
+      }
+      this.resetState.clear();
       for (const [session, raw] of this.terminalSubscriptions) {
         try {
           this.send({ type: 'terminal.subscribe', session, raw });
@@ -764,7 +773,15 @@ export class WsClient {
 
   /**
    * Handle terminal.stream_reset: schedule resubscribe with exponential backoff.
-   * Cooldown: 3+ resets within 60s → 30s pause before retrying.
+   * Cooldown: ≥8 resets within 60s → 5s pause, then ACTIVELY resubscribe.
+   *
+   * Critical bug fix: previously the cooldown handler only cleared `inCooldown`
+   * and `retryCount` but did NOT trigger a fresh subscribe — it relied on the
+   * NEXT stream_reset arriving to re-enter this method. If the server has
+   * stopped sending resets (e.g. it's waiting on the browser to re-subscribe),
+   * the terminal stayed frozen indefinitely until the user refreshed. This is
+   * the "终端卡住不更新, 刷新后恢复" symptom users reported. The fix is to
+   * always schedule an active resubscribe at the end of cooldown.
    */
   private handleStreamReset(session: string): void {
     const now = Date.now();
@@ -781,14 +798,33 @@ export class WsClient {
     }
     state.count++;
 
-    // Cooldown: ≥5 resets in 60s → 5s pause (relaxed from 3/30s to reduce perceived freezes)
-    if (state.count >= 5 && !state.inCooldown) {
+    // Cooldown: ≥8 resets in 60s → 5s pause (raised from 5 to give more headroom
+    // before entering cooldown — most reset bursts during heavy output settle
+    // within 6-7 events). After cooldown, we proactively resubscribe so the
+    // terminal cannot be left in a permanently-frozen state.
+    if (state.count >= 8 && !state.inCooldown) {
       state.inCooldown = true;
+      if (state.retryTimer) {
+        clearTimeout(state.retryTimer);
+        state.retryTimer = null;
+      }
       setTimeout(() => {
         const s = this.resetState.get(session);
-        if (s === state) {
-          s.inCooldown = false;
-          s.retryCount = 0;
+        if (s !== state) return;
+        s.inCooldown = false;
+        s.retryCount = 0;
+        s.count = 0;
+        s.windowStart = Date.now();
+        // ACTIVELY resubscribe at end of cooldown — without this, the terminal
+        // is permanently frozen until user manually refreshes the page. Server
+        // is authoritative about subscription state (it would not have sent
+        // stream_reset if we weren't subscribed), so always resubscribe.
+        if (!this._destroyed && this._connected) {
+          try {
+            this.subscribeTerminal(session, true);
+          } catch {
+            // ignore — handled by next reset/reconnect
+          }
         }
       }, 5_000);
       return; // Don't resubscribe during cooldown

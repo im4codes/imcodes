@@ -353,6 +353,63 @@ describe('WsBridge — command ack reliability', () => {
     expect(bridge._getInflightCountForTest()).toBe(0);
   });
 
+  it('after grace expiry: buffers sends arriving during the daemon auth handshake (no fast-fail)', async () => {
+    // Repro for "发消息瞬间失败, 连点 retry n 次才成功":
+    //   1. daemon disconnects, RECONNECT_GRACE_MS expires → daemon_offline announced
+    //   2. daemon reconnects (WS open) but auth handshake hasn't completed yet
+    //   3. user sends a message in this brief window
+    //   Previously: handleOutboundSessionSend saw isDaemonConnected()=false
+    //   AND graceTimer=null (cleared on grace expiry) → instant command.failed
+    //   Now: the handshake-in-progress branch buffers the message and
+    //   replays it via replayInflightToDaemon() once auth completes.
+    vi.useFakeTimers();
+    const bridge = WsBridge.get(serverId);
+    const daemonWs = await connectAndAuthenticateDaemon(bridge, serverId);
+    const browser = addBrowserSubscriber(bridge, 'deck_test_brain');
+
+    daemonWs.close();
+    await flushAsync();
+    vi.advanceTimersByTime(RECONNECT_GRACE_MS + 100);
+    await flushAsync();
+    vi.useRealTimers();
+
+    expect(bridge._isDaemonOfflineAnnouncedForTest()).toBe(true);
+
+    // Daemon WS reopens but auth message has NOT been sent yet
+    const daemonWs2 = new MockWs();
+    bridge.handleDaemonConnection(daemonWs2 as never, makeDb('valid-hash') as never, {} as never);
+    await flushAsync();
+
+    // Browser sends in the auth-handshake window
+    browser.emit('message', Buffer.from(JSON.stringify({
+      type: 'session.send',
+      sessionName: 'deck_test_brain',
+      text: 'hi during handshake',
+      commandId: 'C-HANDSHAKE',
+    })));
+    await flushAsync();
+
+    // Should NOT have been instant-failed
+    const failedDuringHandshake = browser.sentByType(MSG_COMMAND_FAILED)
+      .filter((m) => m.commandId === 'C-HANDSHAKE');
+    expect(failedDuringHandshake).toHaveLength(0);
+    expect(bridge._getInflightCountForTest()).toBe(1);
+
+    // Should NOT have been forwarded to the daemon yet (still buffered)
+    const beforeAuth = daemonWs2.sentByType('session.send')
+      .filter((m) => m.commandId === 'C-HANDSHAKE');
+    expect(beforeAuth).toHaveLength(0);
+
+    // Now complete auth handshake — the buffered message should replay
+    daemonWs2.emit('message', Buffer.from(JSON.stringify({ type: 'auth', serverId, token: 't' })));
+    await flushAsync();
+
+    const afterAuth = daemonWs2.sentByType('session.send')
+      .filter((m) => m.commandId === 'C-HANDSHAKE');
+    expect(afterAuth).toHaveLength(1);
+    expect(afterAuth[0].text).toBe('hi during handshake');
+  });
+
   it('daemon.online broadcast fires on first auth and on reconnect', async () => {
     const bridge = WsBridge.get(serverId);
     const browser = addBrowserSubscriber(bridge, 'deck_test_brain');

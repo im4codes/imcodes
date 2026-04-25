@@ -139,7 +139,16 @@ const TIMELINE_SNAPSHOT_STORAGE_PREFIX = 'rcc_timeline_snapshot:';
 const MAX_PERSISTED_SNAPSHOT_EVENTS = 50;
 // If no confirmation arrives within this window we auto-flip the pending bubble to
 // "failed" so the user can retry rather than stare at a perpetual spinner.
-const OPTIMISTIC_TIMEOUT_MS = 30_000;
+//
+// Sized to comfortably cover the server's full ack-reliability budget so we
+// don't race ahead of `command.failed`:
+//   - RECONNECT_GRACE_MS (10s) + ACK_TIMEOUT_MS * (RETRY_LIMIT + 1) (8 * 6 = 48s)
+//     = 58s worst case before the server gives up.
+// Add a small buffer (2s) so the server's authoritative `command.failed` (with
+// its specific reason string) reaches the bubble before our local timeout
+// fires with the generic "timeout" reason. The previous 30s value caused
+// false-positive timeouts on every server retry sequence.
+const OPTIMISTIC_TIMEOUT_MS = 60_000;
 
 /** Normalize text for echo comparison: strip prompt prefixes, collapse whitespace. */
 function normalizeForEcho(text: string): string {

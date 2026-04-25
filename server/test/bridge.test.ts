@@ -323,7 +323,9 @@ describe('WsBridge', () => {
 
     it('drops with error after rate limit exceeded', async () => {
       const { daemonWs, browserWs } = await setupBridge();
-      for (let i = 0; i < 120; i++) {
+      // Rate limit is 300 messages / 10s window — exhaust the window then
+      // verify the next message is dropped with rate_limited error.
+      for (let i = 0; i < 300; i++) {
         browserWs.emit('message', JSON.stringify({ type: 'get_sessions' }));
       }
       const countBefore = daemonWs.sent.length;
