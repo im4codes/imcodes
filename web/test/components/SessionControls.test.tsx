@@ -1671,6 +1671,66 @@ afterEach(() => {
     expect(screen.getByText('queue this while busy')).toBeDefined();
   });
 
+  it('surfaces a normal send as locally failed when the socket write throws', () => {
+    const ws = makeWs();
+    ws.sendSessionCommand.mockImplementation(() => {
+      throw new Error('WebSocket not connected');
+    });
+    const onSend = vi.fn();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'idle',
+        })}
+        quickData={makeQuickData() as any}
+        onSend={onSend}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'must not vanish';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+
+    expect(onSend).toHaveBeenCalledWith('qwen-session', 'must not vanish', expect.objectContaining({
+      commandId: expect.any(String),
+      localFailure: 'WebSocket not connected',
+    }));
+  });
+
+  it('keeps a running transport send visible as failed when the socket write throws', () => {
+    const ws = makeWs();
+    ws.sendSessionCommand.mockImplementation(() => {
+      throw new Error('WebSocket not connected');
+    });
+    const onSend = vi.fn();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+        onSend={onSend}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'failed queued send';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+
+    expect(onSend).not.toHaveBeenCalled();
+    expect(screen.getByText('failed queued send')).toBeDefined();
+    expect(screen.getByLabelText('sendFailedLabel')).toBeDefined();
+    expect(screen.getByRole('button', { name: 'retrySend' })).toBeDefined();
+  });
+
   it('keeps an optimistic queue entry across transient non-running session snapshots', () => {
     const ws = makeWs();
     const onSend = vi.fn();

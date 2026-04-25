@@ -59,6 +59,7 @@ vi.mock('../../src/thinking-utils.js', () => ({
 }));
 
 const addOptimisticUserMessageSpy = vi.fn();
+const markOptimisticFailedSpy = vi.fn();
 const retryOptimisticMessageSpy = vi.fn();
 
 vi.mock('../../src/hooks/useTimeline.js', () => ({
@@ -69,6 +70,7 @@ vi.mock('../../src/hooks/useTimeline.js', () => ({
     // blow up when a test triggers user interaction. Real behavior is
     // covered by the useTimeline unit tests.
     addOptimisticUserMessage: addOptimisticUserMessageSpy,
+    markOptimisticFailed: markOptimisticFailedSpy,
     retryOptimisticMessage: retryOptimisticMessageSpy,
   }),
 }));

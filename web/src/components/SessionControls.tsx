@@ -83,6 +83,7 @@ interface Props {
       commandId: string;
       attachments?: Array<Record<string, unknown>>;
       extra?: Record<string, unknown>;
+      localFailure?: string;
     },
   ) => void;
   /** Sub-session overrides — when set, menu actions use these instead of main session commands. */
@@ -1672,12 +1673,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return { text: cleanText, extra };
   }, [activeSession, applySavedP2pConfigSelection, i18n?.language, p2pExcludeSameType, p2pMode, p2pSavedConfig, sessions, subSessions, ws]);
 
-  // Returns the commandId on success (so the caller can drive optimistic UI
-  // reconciliation via command.ack / the echoed user.message) or null when the
-  // preconditions (ws, session) aren't satisfied.
-  const sendSessionMessage = useCallback((text: string, extra: Record<string, unknown> = {}): string | null => {
+  const makeCommandId = useCallback(() => (
+    globalThis.crypto?.randomUUID?.() ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`
+  ), []);
+
+  const sendSessionMessage = useCallback((text: string, extra: Record<string, unknown> = {}, commandId = makeCommandId()): string | null => {
     if (!ws || !activeSession) return null;
-    const commandId = globalThis.crypto?.randomUUID?.() ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     ws.sendSessionCommand('send', {
       sessionName: activeSession.name,
       text,
@@ -1685,7 +1686,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       commandId,
     });
     return commandId;
-  }, [activeSession, ws]);
+  }, [activeSession, makeCommandId, ws]);
 
   const sendQueuedMessageMutation = useCallback((type: 'session.edit_queued_message' | 'session.undo_queued_message', payload: Record<string, unknown>) => {
     if (!ws || !activeSession) return false;
@@ -1745,12 +1746,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       return;
     }
     quickData.recordHistory(payload.text, activeSession.name);
-    let commandId: string | null = null;
+    const commandId = makeCommandId();
+    let localFailure: string | undefined;
     try {
-      commandId = sendSessionMessage(payload.text, payload.extra);
-      if (!commandId) return;
-    } catch {
-      return;
+      if (!sendSessionMessage(payload.text, payload.extra, commandId)) return;
+    } catch (err) {
+      localFailure = err instanceof Error ? err.message : String(err || 'Send failed');
     }
     const shouldShowAsQueued = effectiveRuntimeType === 'transport'
       && isRunningSessionState(activeSession.state)
@@ -1760,7 +1761,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       setOptimisticQueuedEntries((prev) => {
         const source = prev ?? incomingQueuedTransportEntries;
         if (source.some((entry) => entry.clientMessageId === commandId)) return source;
-        return [...source, { clientMessageId: commandId!, text: payload.text, status: 'sending' }];
+        return [...source, { clientMessageId: commandId, text: payload.text, status: localFailure ? 'failed' : 'sending' }];
       });
     }
     // Snapshot attachments before clearComposer wipes them so the optimistic
@@ -1777,6 +1778,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         commandId,
         ...(attachmentSnapshot ? { attachments: attachmentSnapshot } : {}),
         ...(payload.extra && Object.keys(payload.extra).length > 0 ? { extra: payload.extra } : {}),
+        ...(localFailure ? { localFailure } : {}),
       });
     }
     if (options?.clearComposer) {
@@ -1797,7 +1799,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       if (draftKey) sessionStorage.removeItem(draftKey);
       if (attachmentDraftKey) sessionStorage.removeItem(attachmentDraftKey);
     }
-  }, [activeSession, attachmentDraftKey, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, onRemoveQuote, onSend, quickData, quotes, sendQueuedMessageMutation, sendSessionMessage]);
+  }, [activeSession, attachmentDraftKey, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, makeCommandId, onRemoveQuote, onSend, quickData, quotes, sendQueuedMessageMutation, sendSessionMessage]);
 
   const handleQueuedMessageEdit = useCallback((entry: { clientMessageId: string; text: string }) => {
     if (!isEditableQueuedEntry(entry)) return;
@@ -1830,7 +1832,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const handleQueuedMessageRetry = useCallback((entry: LocalQueuedTransportEntry) => {
     if (entry.status !== 'failed') return;
-    const commandId = sendSessionMessage(entry.text);
+    let commandId: string | null = null;
+    try {
+      commandId = sendSessionMessage(entry.text);
+    } catch {
+      commandId = null;
+    }
     if (!commandId) return;
     setOptimisticQueuedEntries((prev) => {
       const source = prev ?? [];

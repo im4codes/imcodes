@@ -124,6 +124,7 @@ export function SessionPane({
     loadingOlder: timelineLoadingOlder,
     hasOlderHistory: timelineHasOlderHistory,
     addOptimisticUserMessage,
+    markOptimisticFailed,
     retryOptimisticMessage,
     loadOlderEvents,
   } = useTimeline(sessionName, ws, serverId, {
@@ -368,6 +369,9 @@ export function SessionPane({
               ...(meta?.attachments ? { attachments: meta.attachments } : {}),
               ...(meta?.extra ? { resendExtra: meta.extra } : {}),
             });
+            if (meta?.commandId && meta.localFailure) {
+              markOptimisticFailed(meta.commandId, meta.localFailure);
+            }
             scrollToBottom();
           }}
           onStopProject={onStopProject}

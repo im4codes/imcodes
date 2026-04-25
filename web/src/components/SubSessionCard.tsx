@@ -92,6 +92,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     });
   const { events, refreshing } = timeline;
   const addOptimisticUserMessage = 'addOptimisticUserMessage' in timeline ? timeline.addOptimisticUserMessage : undefined;
+  const markOptimisticFailed = 'markOptimisticFailed' in timeline ? timeline.markOptimisticFailed : undefined;
   const retryOptimisticMessage = 'retryOptimisticMessage' in timeline ? timeline.retryOptimisticMessage : undefined;
   const termScrollRef = useRef<(() => void) | null>(null);
   const chatScrollRef = useRef<(() => void) | null>(null);
@@ -398,6 +399,9 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
                     ...(meta?.attachments ? { attachments: meta.attachments } : {}),
                     ...(meta?.extra ? { resendExtra: meta.extra } : {}),
                   });
+                  if (meta?.commandId && meta.localFailure) {
+                    markOptimisticFailed?.(meta.commandId, meta.localFailure);
+                  }
                   scrollToBottom();
                 }}
               />

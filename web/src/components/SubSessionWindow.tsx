@@ -128,6 +128,7 @@ export function SubSessionWindow({
     refreshing,
     historyStatus: timelineHistoryStatus,
     addOptimisticUserMessage,
+    markOptimisticFailed,
     retryOptimisticMessage,
   } = useTimeline(sub.sessionName, ws, serverId, {
     isActiveSession: active,
@@ -565,6 +566,9 @@ export function SubSessionWindow({
             ...(meta?.attachments ? { attachments: meta.attachments } : {}),
             ...(meta?.extra ? { resendExtra: meta.extra } : {}),
           });
+          if (meta?.commandId && meta.localFailure) {
+            markOptimisticFailed(meta.commandId, meta.localFailure);
+          }
           scrollToBottom();
         }}
         onSubRestart={onRestart}

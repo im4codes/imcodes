@@ -41,6 +41,7 @@ vi.mock('../../src/components/TerminalView.js', () => ({
 }));
 
 const addOptimisticUserMessageSpy = vi.fn();
+const markOptimisticFailedSpy = vi.fn();
 const retryOptimisticMessageSpy = vi.fn();
 
 vi.mock('../../src/hooks/useTimeline.js', () => ({
@@ -51,6 +52,7 @@ vi.mock('../../src/hooks/useTimeline.js', () => ({
     // real wiring. Shell sub-sessions deliberately skip useTimeline and the
     // card falls back to no-op; that path is covered by its own test.
     addOptimisticUserMessage: addOptimisticUserMessageSpy,
+    markOptimisticFailed: markOptimisticFailedSpy,
     retryOptimisticMessage: retryOptimisticMessageSpy,
   }),
 }));

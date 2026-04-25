@@ -6,6 +6,7 @@ import { render, screen, cleanup, fireEvent } from '@testing-library/preact';
 import { h } from 'preact';
 
 const addOptimisticUserMessageMock = vi.fn();
+const markOptimisticFailedMock = vi.fn();
 const retryOptimisticMessageMock = vi.fn();
 let timelineEventsMock: any[] = [];
 let activeToolCallMock = false;
@@ -20,7 +21,7 @@ vi.mock('../../src/components/SessionControls.js', () => ({
     onSend?: (
       sessionName: string,
       text: string,
-      meta?: { commandId: string; attachments?: Array<Record<string, unknown>>; extra?: Record<string, unknown> },
+      meta?: { commandId: string; attachments?: Array<Record<string, unknown>>; extra?: Record<string, unknown>; localFailure?: string },
     ) => void;
     activeSession?: { name: string } | null;
   }) => (
@@ -46,6 +47,7 @@ vi.mock('../../src/hooks/useTimeline.js', () => ({
       loadingOlder: false,
       hasOlderHistory: false,
       addOptimisticUserMessage: addOptimisticUserMessageMock,
+      markOptimisticFailed: markOptimisticFailedMock,
       retryOptimisticMessage: retryOptimisticMessageMock,
       loadOlderEvents: vi.fn(),
     };
@@ -73,6 +75,7 @@ import { SessionPane } from '../../src/components/SessionPane.js';
 describe('SessionPane', () => {
   beforeEach(() => {
     addOptimisticUserMessageMock.mockReset();
+    markOptimisticFailedMock.mockReset();
     retryOptimisticMessageMock.mockReset();
     useTimelineMock.mockReset();
     timelineEventsMock = [];
