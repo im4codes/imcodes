@@ -286,13 +286,13 @@ describe('WsClient', () => {
     firstWs.send.mockClear();
 
     client.probeConnection();
-    // First watchdog window (5s): no pong yet — still on the same socket.
-    await vi.advanceTimersByTimeAsync(5_000);
+    // First watchdog window (8s): no pong yet — still on the same socket.
+    await vi.advanceTimersByTimeAsync(8_000);
     expect(firstWs.readyState).toBe(MockWebSocket.OPEN);
     expect(lastWs).toBe(firstWs);
 
     // Second watchdog window also misses → force reconnect.
-    await vi.advanceTimersByTimeAsync(5_000);
+    await vi.advanceTimersByTimeAsync(8_000);
     for (let i = 0; i < 5; i++) await vi.advanceTimersByTimeAsync(0);
 
     expect(firstWs.readyState).toBe(MockWebSocket.CLOSED);
@@ -369,7 +369,7 @@ describe('WsClient', () => {
       // eviction without propagating close() to the WebView — the old client
       // believed it was "connected" indefinitely while no events arrived.
       // Now we ping every HEARTBEAT_MS (10s) and force-reconnect if two
-      // consecutive 2s watchdog windows miss their pongs.
+      // consecutive 8s watchdog windows miss their pongs.
       vi.useFakeTimers();
       const client = new WsClient('http://localhost:8787', 'srv-1');
       client.connect();
@@ -383,13 +383,13 @@ describe('WsClient', () => {
       );
       expect(initialPings.length).toBeGreaterThanOrEqual(1);
 
-      // Walk past the first 5s watchdog without ever sending a pong.
-      await vi.advanceTimersByTimeAsync(5_000);
+      // Walk past the first 8s watchdog without ever sending a pong.
+      await vi.advanceTimersByTimeAsync(8_000);
       expect(firstWs.readyState).toBe(MockWebSocket.OPEN);
       expect(lastWs).toBe(firstWs);
 
       // The confirming ping also missed; now the client reconnects.
-      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.advanceTimersByTimeAsync(8_000);
       // reconnectNow(true) fires synchronously, but openSocket() awaits a
       // ticket fetch Promise — flush several microtask turns so the new
       // MockWebSocket is constructed before we assert.
@@ -545,7 +545,13 @@ describe('WsClient', () => {
       vi.useRealTimers();
     });
 
-    it('retries terminal.stream_reset with raw=true', async () => {
+    it('recovers from terminal.stream_reset by requesting a fresh snapshot (no resubscribe needed)', async () => {
+      // The server keeps the subscription alive across an overflow stream_reset
+      // (it just clears its per-(session, ws) queue and notifies the client).
+      // So the client only needs to request a snapshot — re-subscribing was
+      // the OLD design and could leave the terminal frozen during the
+      // exponential backoff. New contract: a single snapshot request, no
+      // backoff, no resubscribe, never frozen.
       const client = await connectClient();
       vi.useFakeTimers();
       lastWs!.send.mockClear();
@@ -559,16 +565,14 @@ describe('WsClient', () => {
           }),
         });
 
-        await vi.advanceTimersByTimeAsync(1000);
-        expect(lastWs!.send).toHaveBeenCalled();
-        // After my snapshot-on-reset fix, the LAST send is still the
-        // terminal.subscribe (fired from the backoff timer). The snapshot
-        // request fires synchronously BEFORE the backoff timer, so we
-        // assert it appears among the calls but isn't the latest one.
+        // Snapshot fires synchronously on receipt; advance timers a generous
+        // amount and verify no resubscribe ever follows.
+        await vi.advanceTimersByTimeAsync(20_000);
         const sendCalls = lastWs!.send.mock.calls.map((c: [string]) => {
           try { return JSON.parse(c[0] as string) as Record<string, unknown>; } catch { return {}; }
         });
-        expect(sendCalls.some((m) => m.type === 'terminal.subscribe' && m.session === 'stream-session' && m.raw === true)).toBe(true);
+        expect(sendCalls.some((m) => m.type === 'terminal.snapshot_request' && m.sessionName === 'stream-session')).toBe(true);
+        expect(sendCalls.some((m) => m.type === 'terminal.subscribe')).toBe(false);
       } finally {
         client.disconnect();
         vi.useRealTimers();
@@ -611,38 +615,42 @@ describe('WsClient', () => {
       }
     });
 
-    it('on stream_reset cooldown: skips snapshot request to avoid hammering the server', async () => {
-      // After 8 resets in 60s, the cooldown logic should NOT also fire a
-      // snapshot request — the server is already overwhelmed and the
-      // resubscribe at end of cooldown takes care of recovery.
+    it('rate-limits snapshot requests during a reset burst (one snapshot per 500ms window)', async () => {
+      // A burst of stream_reset events (e.g. heavy output overflowing the
+      // server queue several times in a single tick) must NOT result in a
+      // snapshot request per reset — that would hammer the server. Instead
+      // the client collapses bursts into one snapshot per 500ms window. A
+      // pending snapshot is scheduled at the end of the window so the
+      // terminal is GUARANTEED to recover even after the burst settles.
       const client = await connectClient();
       vi.useFakeTimers();
       try {
-        // Fire 8 resets to trigger cooldown.
+        // 8 resets in the same tick → exactly ONE synchronous snapshot, the
+        // remaining 7 collapse into a single deferred snapshot at end of
+        // window.
         for (let i = 0; i < 8; i++) {
           lastWs!.emit('message', {
             data: JSON.stringify({
               type: 'terminal.stream_reset',
-              session: 'cool-session',
+              session: 'burst-session',
               reason: 'backpressure',
             }),
           });
         }
-        // The 9th reset arrives DURING cooldown — must not fire another
-        // snapshot request.
-        lastWs!.send.mockClear();
-        lastWs!.emit('message', {
-          data: JSON.stringify({
-            type: 'terminal.stream_reset',
-            session: 'cool-session',
-            reason: 'backpressure',
-          }),
-        });
-        const sendCalls = lastWs!.send.mock.calls.map((c: [string]) => {
+        let sendCalls = lastWs!.send.mock.calls.map((c: [string]) => {
           try { return JSON.parse(c[0] as string) as Record<string, unknown>; } catch { return {}; }
         });
-        const snapshotRequests = sendCalls.filter((m) => m.type === 'terminal.snapshot_request');
-        expect(snapshotRequests).toHaveLength(0);
+        let snapshots = sendCalls.filter((m) => m.type === 'terminal.snapshot_request');
+        expect(snapshots).toHaveLength(1);
+
+        // Advance past the rate-limit window — the deferred snapshot fires
+        // exactly once and the terminal is recovered.
+        await vi.advanceTimersByTimeAsync(600);
+        sendCalls = lastWs!.send.mock.calls.map((c: [string]) => {
+          try { return JSON.parse(c[0] as string) as Record<string, unknown>; } catch { return {}; }
+        });
+        snapshots = sendCalls.filter((m) => m.type === 'terminal.snapshot_request');
+        expect(snapshots).toHaveLength(2);
       } finally {
         client.disconnect();
         vi.useRealTimers();

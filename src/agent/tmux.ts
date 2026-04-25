@@ -325,16 +325,20 @@ export async function sendKeys(session: string, keys: string, opts?: SendKeysOpt
     const c = await conpty();
     const isLong = keys.length > 200 || keys.includes('\n');
     await c.conptySendText(session, keys);
-    // Delay before Enter — keep a minimum floor so the foreground app has time
-    // to consume the preceding text before Enter lands.
-    const delay = isLong ? 500 : Math.max(180, Math.min(80 + Math.floor(keys.length / 10) * 5, 1000));
+    // Delay before Enter — small floor so the foreground app has time to
+    // consume the preceding text before Enter lands. Old floor was 180ms
+    // tuned for slow paste; for typical chat sends 40ms is plenty and the
+    // agent's own input debounce handles anything faster.
+    const delay = isLong ? 200 : Math.max(40, Math.min(40 + Math.floor(keys.length / 20), 200));
     await new Promise<void>((r) => setTimeout(r, delay));
     await c.conptySendEnter(session);
-    // Safety net: 3s delayed Enter for long text (empty-line Enter is a no-op)
+    // Safety net: delayed Enter for long text only (empty-line Enter is a no-op).
+    // Reduced 3s → 1.2s — long enough for the agent to render its prompt, short
+    // enough not to interfere with the next message.
     if (isLong) {
       setTimeout(async () => {
         try { c.conptySendEnter(session); } catch { /* ignore */ }
-      }, 3_000);
+      }, 1_200);
     }
     return;
   }
@@ -366,16 +370,23 @@ export async function sendKeys(session: string, keys: string, opts?: SendKeysOpt
     await rawSendText(session, keys);
   }
 
-  // Delay before Enter — keep a minimum floor so the foreground app has time
-  // to consume the preceding text before Enter lands.
-  const delay = isLong ? 500 : Math.max(180, Math.min(80 + Math.floor(keys.length / 10) * 5, 1000));
+  // Delay before Enter — small floor so the foreground app has time to
+  // consume the preceding text before Enter lands. Old floor (180ms) was
+  // tuned for slow paste; for typical chat sends 40ms is plenty.
+  const delay = isLong ? 200 : Math.max(40, Math.min(40 + Math.floor(keys.length / 20), 200));
   await new Promise<void>((r) => setTimeout(r, delay));
   await rawSendEnter(session);
 
-  // Safety net: 3s delayed Enter for ALL sends (empty-line Enter is a no-op for idle agents)
-  setTimeout(async () => {
-    try { await rawSendEnter(session); } catch { /* ignore */ }
-  }, 3_000);
+  // Safety net: delayed Enter for long-text sends only (the file-read flow can
+  // leave the agent at a partial line). Skipping for short sends — empty-line
+  // Enter is harmless for idle agents but accumulates churn during rapid back
+  // and forth, and was contributing to perceived latency. 1.2s is enough to
+  // clear the agent's input handler.
+  if (isLong) {
+    setTimeout(async () => {
+      try { await rawSendEnter(session); } catch { /* ignore */ }
+    }, 1_200);
+  }
 }
 
 /** @deprecated Use sendKeys — kept as alias for backward compat. */

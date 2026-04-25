@@ -652,12 +652,12 @@ describe('WsBridge', () => {
       // on what arrives AFTER overflow.
       daemonWs.sent.length = 0;
 
-      // Push 2 MB of binary frame data (well past 1 MB QUEUE_MAX_BYTES).
+      // Push >4 MB of binary frame data (well past 4 MB QUEUE_MAX_BYTES).
       // Because StallingMockWs never calls the send callback, bufferedBytes
       // monotonically climbs until overflow fires.
       const chunk = Buffer.alloc(64 * 1024, 0x42); // 64 KB per frame
       const frame = packFrame('sessOverflow', chunk);
-      for (let i = 0; i < 32; i++) {
+      for (let i = 0; i < 80; i++) {
         daemonWs.emit('message', frame, true);
       }
       await flushAsync();
@@ -705,7 +705,7 @@ describe('WsBridge', () => {
       const { bridge, daemonWs } = await setupAuth();
 
       // Use a non-stalling browser this time. Force overflow by sending a
-      // single >1 MB frame in one shot (the queue checks size before
+      // single >4 MB frame in one shot (the queue checks size before
       // dispatching to ws.send, so this directly exceeds QUEUE_MAX_BYTES).
       const browserWs = new MockWs();
       bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
@@ -713,7 +713,7 @@ describe('WsBridge', () => {
       await flushAsync();
       browserWs.sent.length = 0;
 
-      const huge = Buffer.alloc(1024 * 1024 + 100, 0x44); // > 1 MB
+      const huge = Buffer.alloc(4 * 1024 * 1024 + 100, 0x44); // > 4 MB
       const hugeFrame = packFrame('sessFreshQueue', huge);
       daemonWs.emit('message', hugeFrame, true);
       await flushAsync();

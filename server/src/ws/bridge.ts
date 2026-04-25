@@ -70,7 +70,13 @@ const MAX_BROWSER_PAYLOAD = 65536; // 64KB (subsession.rebuild_all can include m
 // real abuse patterns send orders-of-magnitude more.
 const BROWSER_RATE_LIMIT = 300;
 const BROWSER_RATE_WINDOW = 10_000; // 10s
-const QUEUE_MAX_BYTES = 1024 * 1024; // 1MB per (session, browser) — increased from 512KB to reduce stream_reset cascades
+// 4MB per (session, browser). Heavy output (build logs, large `cat`, log tail)
+// can burst tens of KB per frame; at 1MB the queue overflowed within a few
+// frames during heavy output and triggered stream_reset cascades, which the
+// browser then de-rated to "几秒一次更新". 4MB gives ~1s of breathing room
+// at typical egress rates without holding meaningful memory (a single ws
+// per session, queue is reset on overflow anyway).
+const QUEUE_MAX_BYTES = 4 * 1024 * 1024;
 
 /**
  * Safe ws.send: checks readyState, wraps in try/catch.
@@ -1002,7 +1008,10 @@ export class WsBridge {
         void upsertSessionTextTailCacheEvent(this.db, this.serverId, rawEvent)
           .catch((err) => logger.warn({ err, serverId: this.serverId, sessionId }, 'Failed to update session_text_tail_cache'));
       }
-      this.sendToSessionSubscribers(sessionId, JSON.stringify(msg));
+      // Bypass TerminalForwardQueue: timeline events are control-plane and
+      // must never queue behind PTY data. Critical for cancel/stop UX —
+      // session.state(idle) used to arrive seconds after the push notification.
+      this.sendJsonToSessionSubscribers(sessionId, JSON.stringify(msg));
       return;
     }
 
@@ -1034,7 +1043,8 @@ export class WsBridge {
         logger.warn({ serverId: this.serverId, type }, 'timeline message missing sessionName — discarded');
         return;
       }
-      this.sendToSessionSubscribers(sessionName, JSON.stringify(msg));
+      // Control-plane: bypass the PTY queue (see sendJsonToSessionSubscribers).
+      this.sendJsonToSessionSubscribers(sessionName, JSON.stringify(msg));
       return;
     }
 
@@ -1056,7 +1066,9 @@ export class WsBridge {
         this.seenCommandAcks.set(commandId, Date.now());
         this.clearInflightOnAck(commandId);
       }
-      this.sendToSessionSubscribers(sessionName, JSON.stringify(msg));
+      // Control-plane: bypass the PTY queue. command.ack drives the UI
+      // optimistic-bubble state — must never head-of-line block.
+      this.sendJsonToSessionSubscribers(sessionName, JSON.stringify(msg));
       return;
     }
 
@@ -1072,7 +1084,8 @@ export class WsBridge {
         logger.warn({ serverId: this.serverId }, 'subsession.response missing sessionName — discarded');
         return;
       }
-      this.sendToSessionSubscribers(sessionName, JSON.stringify(msg));
+      // Control-plane: bypass the PTY queue.
+      this.sendJsonToSessionSubscribers(sessionName, JSON.stringify(msg));
       return;
     }
 
@@ -1083,7 +1096,11 @@ export class WsBridge {
         logger.warn({ serverId: this.serverId, type }, 'session notification missing session — discarded');
         return;
       }
-      this.sendToSessionSubscribers(sessionName, JSON.stringify(msg));
+      // Control-plane: bypass the PTY queue. session.idle is the WS twin
+      // of the cancel/stop push notification — must arrive without queueing
+      // behind PTY frames so the browser spinner clears in lockstep with
+      // the push.
+      this.sendJsonToSessionSubscribers(sessionName, JSON.stringify(msg));
       return;
     }
 
@@ -1465,6 +1482,58 @@ export class WsBridge {
       if (!sessions.has(sessionName)) continue;
       const queue = this.getOrCreateQueue(sessionName, ws);
       queue.send(ws, data, () => this.handleQueueOverflow(sessionName, ws));
+    }
+  }
+
+  /**
+   * Direct JSON delivery to session subscribers — bypasses the per-(session, ws)
+   * TerminalForwardQueue used for backpressure on heavy PTY output AND fans
+   * out across BOTH terminal-mode and transport-mode subscriptions.
+   *
+   * Why this exists:
+   *
+   * 1. Control-plane messages (command.ack, session.state, session.idle,
+   *    timeline.event with assistant.text/user.message, etc.) are tiny but
+   *    latency-critical. When PTY frames are queued (e.g. agent was streaming
+   *    a long response right before a cancel), the old path queued cancel JSON
+   *    behind hundreds of KB of PTY data — the push notification (out-of-band
+   *    APNs/FCM) arrived seconds before the WS confirmation, leaving the
+   *    browser spinner hanging. Direct `safeSend` jumps the queue.
+   *
+   * 2. Session subscriptions live in TWO maps: `browserSubscriptions` (filled
+   *    by `terminal.subscribe`, used by process/tmux agents) and
+   *    `transportSubscriptions` (filled by `chat.subscribe`, used by SDK
+   *    agents like qwen / openclaw / codex-sdk / cursor-headless). Transport
+   *    agents have no tmux pane so the web client never issues
+   *    `terminal.subscribe` for them — meaning the browser appears in
+   *    `transportSubscriptions` only.
+   *
+   *    Before this fan-out, control-plane messages routed via
+   *    `browserSubscriptions` alone NEVER REACHED transport-only browsers.
+   *    Result: the user pressed stop on a Codex-SDK / Qwen session, the SDK
+   *    cancel completed, the push notification fired (proving the daemon
+   *    saw idle), but the browser's chat record never received the matching
+   *    session.idle / command.ack / session.state events — they were silently
+   *    dropped on the floor. The chat list spinner stayed on indefinitely.
+   *
+   *    Fanning out to BOTH maps fixes that. Same WS may live in both maps
+   *    simultaneously (a process session that the user also has chat-mode
+   *    subscriptions to); we dedup per-WS so the same JSON is never sent
+   *    twice.
+   */
+  private sendJsonToSessionSubscribers(sessionName: string, json: string): void {
+    const sent = new Set<WebSocket>();
+    for (const [ws, sessions] of this.browserSubscriptions) {
+      if (!sessions.has(sessionName)) continue;
+      if (sent.has(ws)) continue;
+      sent.add(ws);
+      safeSend(ws, json);
+    }
+    for (const [ws, sessions] of this.transportSubscriptions) {
+      if (!sessions.has(sessionName)) continue;
+      if (sent.has(ws)) continue;
+      sent.add(ws);
+      safeSend(ws, json);
     }
   }
 

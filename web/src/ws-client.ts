@@ -142,8 +142,14 @@ const HEARTBEAT_MS = 10000; // lowered from 25s for faster dead-connection detec
  *  detection time is still bounded at ~10s (one missed window + one confirming
  *  ping + miss). Truly dead sockets are caught well before any TCP-level
  *  timeout, but live-but-jittery sockets are no longer torn down. */
-const PONG_TIMEOUT_MS = 5_000;
-const RESUME_PROBE_TIMEOUT_MS = 5_000;
+// Bumped 5s → 8s. Cellular handoff and CPU-busy daemons regularly took 5–7s
+// to ack a ping; the old 5s window forced spurious reconnects (with the full
+// resubscribe replay), surfacing as "终端订阅一会就断了". With
+// `PONG_MISSES_BEFORE_RECONNECT = 2` the worst-case detection window is
+// ~16s of true silence — still well within the user's tolerance for noticing
+// a dead tab.
+const PONG_TIMEOUT_MS = 8_000;
+const RESUME_PROBE_TIMEOUT_MS = 8_000;
 const PONG_MISSES_BEFORE_RECONNECT = 2;
 /** If we received a pong within this window, treat the socket as already
  *  proven alive and skip the resume probe. This eliminates UI churn (and the
@@ -189,13 +195,19 @@ export class WsClient {
   /** Desired transport-chat subscriptions per session. Replayed on browser reconnect. */
   private transportSubscriptions = new Set<string>();
 
-  /** Per-session stream reset recovery state. */
+  /** Per-session stream reset recovery state.
+   *  - lastSnapshotAt: rate-limits snapshot requests to avoid hammering the
+   *    server during reset bursts (one outstanding snapshot every
+   *    SNAPSHOT_REQUEST_MIN_INTERVAL_MS).
+   *  - pendingSnapshot: a deferred snapshot timer when we're rate-limited;
+   *    guarantees the terminal will eventually catch up even if every reset
+   *    fell within the rate-limit window.
+   *  No cooldown / no retry budget — overflow recovery is now driven entirely
+   *  by re-snapshotting (which the server-side queue-reset path supports).
+   *  The terminal can never be permanently frozen by a burst of resets. */
   private resetState = new Map<string, {
-    count: number;
-    windowStart: number;
-    retryCount: number;
-    inCooldown: boolean;
-    retryTimer: ReturnType<typeof setTimeout> | null;
+    lastSnapshotAt: number;
+    pendingSnapshot: ReturnType<typeof setTimeout> | null;
   }>();
 
   constructor(baseUrl: string, serverId: string) {
@@ -660,13 +672,11 @@ export class WsClient {
       this._connected = true;
       this.reconnectAttempt = 0;
       this.startHeartbeat();
-      // Reset per-session stream-reset bookkeeping on reconnect. Without this,
-      // any cooldown/retry counters accumulated against the old socket carry
-      // over and can immediately suppress the first batch of resubscribes on
-      // the new socket. Stale `retryTimer`s from the old socket are cleared
-      // so they don't fire after we've already re-issued subscribes here.
+      // Reset per-session stream-reset bookkeeping on reconnect. Stale pending
+      // snapshot timers from the old socket are cleared so they don't fire
+      // after we've already re-issued subscribes here.
       for (const state of this.resetState.values()) {
-        if (state.retryTimer) clearTimeout(state.retryTimer);
+        if (state.pendingSnapshot) clearTimeout(state.pendingSnapshot);
       }
       this.resetState.clear();
       for (const [session, raw] of this.terminalSubscriptions) {
@@ -763,107 +773,71 @@ export class WsClient {
     this._terminalRawHandlers.get(sessionName)?.forEach((h) => h(ptyData));
   }
 
-  /** Called when data arrives for a session — confirms stream is healthy, resets retry budget. */
-  private confirmStreamRecovery(session: string): void {
-    const state = this.resetState.get(session);
-    if (state && state.retryCount > 0) {
-      state.retryCount = 0;
-    }
+  /** Called when data arrives for a session — confirms stream is healthy. */
+  private confirmStreamRecovery(_session: string): void {
+    // No-op in the rate-limit-only design. The server keeps the subscription
+    // alive across overflow (queue is reset, not unsubscribed), so a healthy
+    // data flow naturally proves recovery without any client-side state.
   }
 
   /**
-   * Handle terminal.stream_reset: schedule resubscribe with exponential backoff.
-   * Cooldown: ≥8 resets within 60s → 5s pause, then ACTIVELY resubscribe.
+   * Handle terminal.stream_reset: ALWAYS recover by requesting a fresh
+   * snapshot, never freeze the terminal.
    *
-   * Critical bug fix: previously the cooldown handler only cleared `inCooldown`
-   * and `retryCount` but did NOT trigger a fresh subscribe — it relied on the
-   * NEXT stream_reset arriving to re-enter this method. If the server has
-   * stopped sending resets (e.g. it's waiting on the browser to re-subscribe),
-   * the terminal stayed frozen indefinitely until the user refreshed. This is
-   * the "终端卡住不更新, 刷新后恢复" symptom users reported. The fix is to
-   * always schedule an active resubscribe at the end of cooldown.
+   * Design (replaces the old retry-with-cooldown path):
+   *   - Server keeps the subscription alive across overflow — it just sends
+   *     stream_reset + clears its per-(session, ws) queue. So all the client
+   *     needs to do on every reset is request a snapshot to re-sync the
+   *     visible screen.
+   *   - To avoid hammering the server when overflows cascade (a single heavy
+   *     output burst can fire many resets in flight), snapshot requests are
+   *     rate-limited to one per SNAPSHOT_REQUEST_MIN_INTERVAL_MS. Resets
+   *     arriving within the window schedule a deferred snapshot at the end of
+   *     the window, so the terminal is GUARANTEED to recover even after a
+   *     burst.
+   *   - No cooldown that blanks the screen for 5s. No exponential backoff.
+   *   - No "max retries" that leaves the terminal frozen. The previous design
+   *     could enter a permanently-stuck state ("终端卡住不更新, 刷新后恢复");
+   *     this design cannot.
    */
   private handleStreamReset(session: string): void {
+    if (!this._connected) return;
+    const SNAPSHOT_REQUEST_MIN_INTERVAL_MS = 500;
     const now = Date.now();
     let state = this.resetState.get(session);
     if (!state) {
-      state = { count: 0, windowStart: now, retryCount: 0, inCooldown: false, retryTimer: null };
+      state = { lastSnapshotAt: 0, pendingSnapshot: null };
       this.resetState.set(session, state);
     }
 
-    // Reset count window every 60s
-    if (now - state.windowStart > 60_000) {
-      state.count = 0;
-      state.windowStart = now;
-    }
-    state.count++;
-
-    // Optimistic snapshot fetch: with the server-side overflow fix the
-    // subscription stays alive across stream_reset, so we just need a fresh
-    // snapshot to recover the dropped frames. Doing this BEFORE the
-    // backoff resubscribe path means the user sees content again within
-    // one round-trip even when reset bursts cascade into cooldown.
-    if (this._connected && !state.inCooldown) {
+    const sinceLast = now - state.lastSnapshotAt;
+    if (sinceLast >= SNAPSHOT_REQUEST_MIN_INTERVAL_MS) {
+      // Window open — fire snapshot now.
+      state.lastSnapshotAt = now;
       try {
         this.send({ type: 'terminal.snapshot_request', sessionName: session });
       } catch {
-        // ignore — the resubscribe path below will still try to recover
+        // ws not open right now; the next reset (or the reconnect resubscribe
+        // replay) will recover.
       }
-    }
-
-    // Cooldown: ≥8 resets in 60s → 5s pause (raised from 5 to give more headroom
-    // before entering cooldown — most reset bursts during heavy output settle
-    // within 6-7 events). After cooldown, we proactively resubscribe so the
-    // terminal cannot be left in a permanently-frozen state.
-    if (state.count >= 8 && !state.inCooldown) {
-      state.inCooldown = true;
-      if (state.retryTimer) {
-        clearTimeout(state.retryTimer);
-        state.retryTimer = null;
-      }
-      setTimeout(() => {
-        const s = this.resetState.get(session);
-        if (s !== state) return;
-        s.inCooldown = false;
-        s.retryCount = 0;
-        s.count = 0;
-        s.windowStart = Date.now();
-        // ACTIVELY resubscribe at end of cooldown — without this, the terminal
-        // is permanently frozen until user manually refreshes the page. Server
-        // is authoritative about subscription state (it would not have sent
-        // stream_reset if we weren't subscribed), so always resubscribe.
-        if (!this._destroyed && this._connected) {
-          try {
-            this.subscribeTerminal(session, true);
-          } catch {
-            // ignore — handled by next reset/reconnect
-          }
-        }
-      }, 5_000);
-      return; // Don't resubscribe during cooldown
-    }
-
-    if (state.inCooldown) return;
-
-    if (state.retryCount >= 5) {
-      // Max retries — let handler show user-facing prompt (already dispatched)
       return;
     }
 
-    const delays = [1000, 2000, 4000, 8000, 16000];
-    const delay = delays[Math.min(state.retryCount, delays.length - 1)];
-    state.retryCount++;
-
-    if (state.retryTimer) clearTimeout(state.retryTimer);
-    state.retryTimer = setTimeout(() => {
+    // Inside the rate-limit window — defer one snapshot to the end of the
+    // window. If a deferred snapshot is already scheduled, leave it alone:
+    // multiple resets in the same window collapse into a single snapshot.
+    if (state.pendingSnapshot) return;
+    const remaining = SNAPSHOT_REQUEST_MIN_INTERVAL_MS - sinceLast;
+    state.pendingSnapshot = setTimeout(() => {
       const s = this.resetState.get(session);
-      if (s) s.retryTimer = null;
-      // retryCount is NOT reset here — only reset when data actually flows
-      // (confirmStreamRecovery called from handleRawFrame on first received frame)
-      if (!this._destroyed && this._connected) {
-        this.subscribeTerminal(session, true);
-      }
-    }, delay);
+      if (!s) return;
+      s.pendingSnapshot = null;
+      if (this._destroyed || !this._connected) return;
+      s.lastSnapshotAt = Date.now();
+      try {
+        this.send({ type: 'terminal.snapshot_request', sessionName: session });
+      } catch { /* covered by next reset / reconnect */ }
+    }, remaining);
   }
 
   private scheduleReconnect(): void {

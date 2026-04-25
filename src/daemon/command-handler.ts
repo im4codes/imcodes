@@ -1966,25 +1966,43 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       emitTransportUserMessage(text);
       // Explicit stop discards any queued resend work — the user asked for a halt.
       clearResend(sessionName);
+
+      // ── CRITICAL UX: ack the stop BEFORE awaiting the SDK cancel ───────────
+      // The SDK's cancel() does an HTTP abort + cleanup which can take seconds
+      // (especially when the provider is waiting for an in-flight request to
+      // tear down). Push notifications fire from the SDK's own onComplete
+      // callback independently and arrive within ~one round-trip; if we
+      // awaited cancel() first, the WS ack would lag the push by the full
+      // SDK shutdown time, leaving the browser's stop button spinning while
+      // the phone already buzzed.
+      //
+      // The user pressed stop. The daemon received it. That's all the ack
+      // confirms — the actual cancel runs in the background and surfaces
+      // failure as an inline session error if needed.
+      const stopStatus = isLegacy ? 'accepted_legacy' : 'accepted';
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: stopStatus });
       try {
-        supervisionAutomation.cancelSession(sessionName);
-        await transportRuntime.cancel();
-        // Mark session for fresh start so daemon restart doesn't resume the stuck conversation
-        if (record?.agentType === 'qwen') {
-          upsertSession({ ...record, qwenFreshOnResume: true, updatedAt: Date.now() });
-        }
-        const stopStatus = isLegacy ? 'accepted_legacy' : 'accepted';
-        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: stopStatus });
+        serverLink.send({ type: 'command.ack', commandId: effectiveId, status: stopStatus, session: sessionName });
+      } catch { /* */ }
+
+      // Background cancel — fire-and-forget. Errors surface as inline timeline
+      // events so the user sees them without the spinner having ever waited.
+      void (async () => {
         try {
-          serverLink.send({ type: 'command.ack', commandId: effectiveId, status: stopStatus, session: sessionName });
-        } catch { /* */ }
-      } catch (err) {
-        const errMsg = describeTransportSendError(err);
-        logger.error({ sessionName, err }, 'session.stop (transport) failed');
-        timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Stop failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
-        try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg }); } catch { /* */ }
-      }
+          supervisionAutomation.cancelSession(sessionName);
+          await transportRuntime.cancel();
+          // Mark session for fresh start so daemon restart doesn't resume the
+          // stuck conversation
+          if (record?.agentType === 'qwen') {
+            upsertSession({ ...record, qwenFreshOnResume: true, updatedAt: Date.now() });
+          }
+        } catch (err) {
+          const errMsg = describeTransportSendError(err);
+          logger.error({ sessionName, err }, 'session.stop (transport) failed');
+          timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Stop failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
+        }
+      })();
       return;
     }
     if (text.trim() === '/clear' && supportsTransportClear(record?.agentType)) {
@@ -2441,6 +2459,39 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   }
 }
 
+/** Emit command.ack to local timeline + outbox + server. Idempotent per commandId. */
+function emitCommandAck(
+  sessionName: string,
+  commandId: string,
+  status: 'accepted' | 'accepted_legacy' | 'error',
+  error: string | undefined,
+  serverLink: Pick<ServerLink, 'send'> | undefined,
+): void {
+  const ackPayload: Record<string, unknown> = { commandId, status };
+  if (error) ackPayload.error = error;
+  timelineEmitter.emit(sessionName, 'command.ack', ackPayload);
+  const outbox = getDefaultAckOutbox();
+  outbox.enqueue({
+    commandId,
+    sessionName,
+    status,
+    error,
+    ts: Date.now(),
+  }).catch((err) => {
+    logger.error({ commandId, err }, 'ackOutbox.enqueue failed');
+  });
+  try {
+    const wireMsg: Record<string, unknown> = { type: MSG_COMMAND_ACK, commandId, status, session: sessionName };
+    if (error) wireMsg.error = error;
+    serverLink?.send(wireMsg);
+    outbox.markAcked(commandId).catch((err) => {
+      logger.warn({ commandId, err }, 'ackOutbox.markAcked failed');
+    });
+  } catch (err) {
+    logger.warn({ commandId, err }, 'command.ack send failed, queued for retry');
+  }
+}
+
 async function sendProcessSessionMessage(
   sessionName: string,
   finalText: string,
@@ -2452,6 +2503,23 @@ async function sendProcessSessionMessage(
     serverLink?: Pick<ServerLink, 'send'>;
   },
 ): Promise<void> {
+  // ── Step 1: Confirm receipt to the user IMMEDIATELY ─────────────────────────
+  // This is the daemon-receipt confirmation. It happens BEFORE the mutex,
+  // BEFORE memory recall, BEFORE any tmux work — so the spinner clears in one
+  // WS RTT regardless of how busy the agent or daemon is. The actual delivery
+  // to the agent happens in the background.
+  const payload: Record<string, unknown> = { text: options?.originalText ?? finalText };
+  if (attachments.length > 0) payload.attachments = attachments;
+  if (options?.commandId) payload.commandId = options.commandId;
+  const userEvent = timelineEmitter.emit(sessionName, 'user.message', payload);
+  if (options?.commandId) {
+    const status = options.isLegacy ? 'accepted_legacy' : 'accepted';
+    emitCommandAck(sessionName, options.commandId, status, undefined, options.serverLink);
+  }
+
+  // ── Step 2: Acquire per-session mutex to serialize tmux delivery ────────────
+  // The mutex preserves message ordering when multiple sends queue up. The ack
+  // above is already out — the user no longer waits on this lock.
   const release = await getMutex(sessionName).acquire();
   try {
     const agentType = getSession(sessionName)?.agentType ?? 'unknown';
@@ -2461,18 +2529,37 @@ async function sendProcessSessionMessage(
       sendText = await rewritePathsForSandbox(sessionName, finalText);
     }
 
-    const memoryContext = await prependLocalMemory(sendText, sessionName);
-    sendText = memoryContext.text;
+    // ── Step 3: Memory recall — best-effort, NO deadline ─────────────────────
+    // Recall is purely advisory; it augments the prompt with related past work
+    // when available. A slow or failing recall MUST NOT delay the message —
+    // the user only cares that the agent gets the prompt. If recall succeeds
+    // we prepend; otherwise we send the raw text.
+    let memoryContext: Awaited<ReturnType<typeof prependLocalMemory>> = { text: sendText };
+    try {
+      memoryContext = await prependLocalMemory(sendText, sessionName);
+      sendText = memoryContext.text;
+    } catch (recallErr) {
+      logger.warn({ sessionName, err: recallErr }, 'memory recall failed — sending without memory injection');
+      // Fall through with the original sendText. Agent still gets the message;
+      // user just doesn't get the related-past-work block.
+    }
 
-    await sendShellAwareCommand(sessionName, sendText, agentType);
-    const payload: Record<string, unknown> = { text: options?.originalText ?? finalText };
-    if (attachments.length > 0) payload.attachments = attachments;
-    // Thread the client commandId through to the user.message event so the
-    // web UI can reconcile its optimistic "sending" bubble deterministically
-    // instead of falling back to text-based matching (which fails when the
-    // agent echoes a normalized or memory-prepended version of the prompt).
-    if (options?.commandId) payload.commandId = options.commandId;
-    const userEvent = timelineEmitter.emit(sessionName, 'user.message', payload);
+    // ── Step 4: Deliver to tmux. Failures here surface as inline errors ──────
+    try {
+      await sendShellAwareCommand(sessionName, sendText, agentType);
+    } catch (sendErr) {
+      const errMsg = sendErr instanceof Error ? sendErr.message : String(sendErr);
+      logger.error({ sessionName, err: sendErr }, 'sendShellAwareCommand failed after ack');
+      try {
+        emitSessionInlineError(sessionName, `Failed to deliver message to agent: ${errMsg}`);
+      } catch { /* best-effort */ }
+      throw sendErr;
+    }
+
+    // ── Step 5: Post-delivery — emit memory.context + record hits ────────────
+    // Order matters — memory.context comes AFTER user.message and AFTER
+    // successful agent delivery so a failed send doesn't pollute recall
+    // analytics.
     if (memoryContext.timelinePayload && userEvent) {
       timelineEmitter.emit(sessionName, 'memory.context', {
         ...memoryContext.timelinePayload,
@@ -2482,62 +2569,15 @@ async function sendProcessSessionMessage(
         try { recordMemoryHits(memoryContext.hitIds); } catch { /* non-fatal */ }
       }
     }
-    if (options?.commandId) {
-      const status = options.isLegacy ? 'accepted_legacy' : 'accepted';
-      timelineEmitter.emit(sessionName, 'command.ack', { commandId: options.commandId, status });
-      const outbox = getDefaultAckOutbox();
-      // Enqueue BEFORE the network send so a thrown send() doesn't lose the ack.
-      // In-memory update is synchronous; disk persistence is fire-and-forget to
-      // avoid holding the per-session mutex on file I/O.
-      outbox.enqueue({
-        commandId: options.commandId,
-        sessionName,
-        status,
-        ts: Date.now(),
-      }).catch((err) => {
-        logger.error({ commandId: options.commandId, err }, 'ackOutbox.enqueue failed');
-      });
-      try {
-        options.serverLink?.send({ type: MSG_COMMAND_ACK, commandId: options.commandId, status, session: sessionName });
-        // Delivery accepted by the transport; server LRU dedup handles any later
-        // outbox replay. Tombstone locally so we don't retransmit on reconnect.
-        outbox.markAcked(options.commandId).catch((err) => {
-          logger.warn({ commandId: options.commandId, err }, 'ackOutbox.markAcked failed');
-        });
-      } catch (err) {
-        // Do NOT silently swallow — the entry stays in the outbox (fire-and-forget
-        // disk write is already in flight) and will be flushed on the next
-        // successful server-link auth.
-        logger.warn({ commandId: options.commandId, err }, 'command.ack send failed, queued for retry');
-      }
-    }
+
     if (agentType === 'opencode') {
       const { scheduleCatchup } = await import('./opencode-watcher.js');
       scheduleCatchup(sessionName);
     }
   } catch (err) {
-    if (options?.commandId) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      timelineEmitter.emit(sessionName, 'command.ack', { commandId: options.commandId, status: 'error', error: errMsg });
-      const outbox = getDefaultAckOutbox();
-      outbox.enqueue({
-        commandId: options.commandId,
-        sessionName,
-        status: 'error',
-        error: errMsg,
-        ts: Date.now(),
-      }).catch((enqueueErr) => {
-        logger.error({ commandId: options.commandId, err: enqueueErr }, 'ackOutbox.enqueue (error ack) failed');
-      });
-      try {
-        options.serverLink?.send({ type: MSG_COMMAND_ACK, commandId: options.commandId, status: 'error', session: sessionName, error: errMsg });
-        outbox.markAcked(options.commandId).catch((mErr) => {
-          logger.warn({ commandId: options.commandId, err: mErr }, 'ackOutbox.markAcked (error ack) failed');
-        });
-      } catch (sendErr) {
-        logger.warn({ commandId: options.commandId, err: sendErr }, 'command.ack (error) send failed, queued for retry');
-      }
-    }
+    // The ack is already out (status: accepted). Surface failures as inline
+    // session errors via the path above; we do NOT downgrade the ack to error
+    // because the user has already been told their message was received.
     throw err;
   } finally {
     release();
