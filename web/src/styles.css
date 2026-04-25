@@ -1992,6 +1992,8 @@ body {
 .fb-icon-spin { display: inline-block; animation: spin 0.8s linear infinite; }
 .fb-preview-image { display: flex; align-items: center; justify-content: center; padding: 16px; overflow: auto; background: #0a0f1a; min-height: 0; flex: 1; }
 .fb-preview-image img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 4px; background: repeating-conic-gradient(#1e293b 0% 25%, #0f172a 0% 50%) 0 0 / 16px 16px; cursor: zoom-in; }
+.fb-preview-video { display: flex; align-items: center; justify-content: center; padding: 16px; overflow: hidden; background: #0a0f1a; min-height: 0; flex: 1; }
+.fb-preview-video video { max-width: 100%; max-height: 100%; width: 100%; border-radius: 4px; background: #000; outline: none; }
 .fb-lightbox { position: fixed; inset: 0; z-index: 9999; background: rgba(0,0,0,0.85); display: flex; align-items: center; justify-content: center; cursor: zoom-out; }
 .fb-lightbox img { max-width: 92vw; max-height: 92vh; object-fit: contain; border-radius: 6px; cursor: default; }
 .fb-lightbox-close { position: absolute; top: 16px; right: 16px; background: rgba(255,255,255,0.15); border: none; color: #fff; font-size: 20px; width: 36px; height: 36px; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; }

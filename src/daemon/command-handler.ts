@@ -4017,7 +4017,21 @@ async function handleFsListInner(resolved: string, rawPath: string, requestId: s
   try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: snapshot.resolvedPath, status: 'ok', entries: snapshot.entries }); } catch { /* ignore */ }
 }
 
-const FS_READ_SIZE_LIMIT = 5 * 1024 * 1024; // 5 MB
+const FS_READ_SIZE_LIMIT = 100 * 1024 * 1024; // 100 MB
+
+// Video files are not transferred over WS — the browser fetches them via the
+// HTTP download endpoint and plays them with <video>. We just need to detect
+// the MIME and check the size against this limit.
+const VIDEO_MIME: Record<string, string> = {
+  mp4: 'video/mp4',
+  m4v: 'video/mp4',
+  mov: 'video/quicktime',
+  webm: 'video/webm',
+  ogv: 'video/ogg',
+  ogg: 'video/ogg',
+  mkv: 'video/x-matroska',
+  avi: 'video/x-msvideo',
+};
 
 interface FsReadSnapshot {
   path: string;
@@ -4121,7 +4135,6 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
     const stats = await fsStat(real);
     const fileSignature = `${stats.mtimeMs}:${stats.size}`;
 
-    // Image files: send as base64 with a higher size limit (5 MB)
     const ext = nodePath.extname(real).toLowerCase().slice(1);
     const IMAGE_MIME: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', ico: 'image/x-icon', bmp: 'image/bmp', svg: 'image/svg+xml' };
     // Office documents: send as base64 for frontend preview (PDF.js, docx-preview, xlsx)
@@ -4130,8 +4143,12 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
       docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
       xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     };
-    const mimeType = IMAGE_MIME[ext] ?? OFFICE_MIME[ext];
-    const sizeLimit = mimeType ? 5 * 1024 * 1024 : FS_READ_SIZE_LIMIT;
+    const videoMime = VIDEO_MIME[ext];
+    const mimeType = IMAGE_MIME[ext] ?? OFFICE_MIME[ext] ?? videoMime;
+    // Unified preview size cap (100 MB). Video, image, office, and text all
+    // share the same ceiling — videos are streamed via HTTP rather than the
+    // base64-over-WS path, so the cap is enforced for sanity, not transport.
+    const sizeLimit = FS_READ_SIZE_LIMIT;
 
     // Always generate a download handle so the file can be downloaded even if preview fails
     const fileName = nodePath.basename(real);
@@ -4139,6 +4156,28 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
 
     if (stats.size > sizeLimit) {
       try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: 'file_too_large', previewReason: 'too_large', downloadId: handle.id }); } catch { /* ignore */ }
+      return;
+    }
+
+    // Video files: skip WS content transfer entirely. The browser fetches
+    // the file via the HTTP download endpoint using the downloadId handle
+    // and plays it with <video>. Sending 100 MB as base64 over WS would
+    // be wasteful and break streaming/seek behavior.
+    if (videoMime) {
+      try {
+        serverLink.send({
+          type: 'fs.read_response',
+          requestId,
+          path: rawPath,
+          resolvedPath: real,
+          status: 'ok',
+          mimeType: videoMime,
+          previewMode: 'stream',
+          size: stats.size,
+          downloadId: handle.id,
+          mtime: stats.mtimeMs,
+        });
+      } catch { /* ignore */ }
       return;
     }
 
