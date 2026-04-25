@@ -1711,6 +1711,82 @@ afterEach(() => {
     expect(screen.getByText('do not disappear')).toBeDefined();
   });
 
+  it('does not clear a new local queue entry when an older daemon queue drains', () => {
+    const ws = makeWs();
+    const view = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessages: ['old daemon queued'],
+          transportPendingMessageEntries: [{ clientMessageId: 'old-daemon-id', text: 'old daemon queued' }],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(screen.getByText('old daemon queued')).toBeDefined();
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'new local send must stay';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+    expect(screen.getByText('new local send must stay')).toBeDefined();
+
+    view.rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessages: [],
+          transportPendingMessageEntries: [],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.queryByText('old daemon queued')).toBeNull();
+    expect(screen.getByText('new local send must stay')).toBeDefined();
+  });
+
+  it('marks a local queued send failed instead of removing it when command.failed arrives', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'failed but visible';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+    const sent = ws.sendSessionCommand.mock.calls[0]?.[1] as { commandId: string };
+
+    act(() => {
+      ws.emit({
+        type: 'command.failed',
+        session: 'qwen-session',
+        commandId: sent.commandId,
+        reason: 'daemon_offline',
+        retryable: true,
+      });
+    });
+
+    expect(screen.getByText('failed but visible')).toBeDefined();
+    expect(screen.getByLabelText('sendFailedLabel')).toBeDefined();
+    expect(screen.getByRole('button', { name: 'retrySend' })).toBeDefined();
+  });
+
   it('lets an authoritative daemon queue snapshot replace optimistic queue entries', () => {
     const ws = makeWs();
     const view = render(
@@ -1729,6 +1805,7 @@ afterEach(() => {
     input.textContent = 'local only';
     fireEvent.input(input);
     fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+    const sent = ws.sendSessionCommand.mock.calls[0]?.[1] as { commandId: string };
     expect(screen.getByText('local only')).toBeDefined();
 
     view.rerender(
@@ -1739,7 +1816,7 @@ afterEach(() => {
           agentType: 'qwen',
           state: 'running',
           transportPendingMessages: ['daemon queued'],
-          transportPendingMessageEntries: [{ clientMessageId: 'daemon-id', text: 'daemon queued' }],
+          transportPendingMessageEntries: [{ clientMessageId: sent.commandId, text: 'daemon queued' }],
         })}
         quickData={makeQuickData() as any}
       />,

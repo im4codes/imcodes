@@ -258,6 +258,25 @@ body {
   flex: 1;
   min-width: 0;
 }
+.controls-queued-item-status {
+  width: 8px;
+  height: 8px;
+  margin-top: 4px;
+  border-radius: 999px;
+  flex-shrink: 0;
+  background: #fbbf24;
+}
+.controls-queued-item-status-sending {
+  background: #38bdf8;
+  animation: queued-status-pulse 1s ease-in-out infinite;
+}
+.controls-queued-item-status-failed {
+  background: #fb7185;
+}
+@keyframes queued-status-pulse {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 1; }
+}
 .controls-queued-item-actions {
   display: inline-flex;
   align-items: center;
