@@ -22,6 +22,7 @@
   "scripts": {
     "build": "tsc",
     "postbuild": "node scripts/copy-worker-bootstraps.mjs && node scripts/mark-bin-executable.mjs",
+    "prepack": "node scripts/strip-onnxruntime-gpu.mjs",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.ts",
     "test": "vitest run",
@@ -41,6 +42,7 @@
     "@agentclientprotocol/sdk": "^0.20.0",
     "@anthropic-ai/claude-agent-sdk": "^0.2.92",
     "@github/copilot-sdk": "^0.2.2",
+    "@huggingface/transformers": "^4.1.0",
     "@openai/codex-sdk": "^0.125.0",
     "commander": "^12.1.0",
     "croner": "^10.0.1",
@@ -71,7 +73,9 @@
     "**/*": "grep -qvE 'API_KEY|SECRET|PASSWORD|TOKEN|PRIVATE_KEY' || (echo 'Error: Potential sensitive information detected in your commit!' && exit 1)"
   },
   "optionalDependencies": {
-    "node-pty": "^1.1.0",
-    "@huggingface/transformers": "^4.1.0"
-  }
+    "node-pty": "^1.1.0"
+  },
+  "bundleDependencies": [
+    "@huggingface/transformers"
+  ]
 }
