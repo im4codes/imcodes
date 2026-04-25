@@ -153,6 +153,7 @@ export class WsClient {
   private _pingSentAt: number | null = null;
   private _pongTimer: ReturnType<typeof setTimeout> | null = null;
   private _resumeProbeTimer: ReturnType<typeof setTimeout> | null = null;
+  private _visibilityListener: (() => void) | null = null;
   private _onLatency: ((ms: number) => void) | null = null;
 
   /** Per-session callbacks for raw PTY binary frames. Supports multiple subscribers per session. */
@@ -827,6 +828,11 @@ export class WsClient {
     // still "connected" indefinitely while no new events ever arrive — which
     // is exactly the "回前台后消息不同步" symptom users reported.
     const armPing = () => {
+      if (this.isDocumentHidden()) {
+        this.clearPongWatchdog();
+        this._pingSentAt = null;
+        return;
+      }
       try {
         this._pingSentAt = Date.now();
         this.send({ type: 'ping' });
@@ -849,6 +855,7 @@ export class WsClient {
         }, PONG_TIMEOUT_MS);
       }
     };
+    this.installVisibilityListener();
     armPing(); // send first ping immediately for initial latency
     this.heartbeatTimer = setInterval(armPing, HEARTBEAT_MS);
   }
@@ -856,13 +863,40 @@ export class WsClient {
   private clearTimers(): void {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
-    if (this._pongTimer) clearTimeout(this._pongTimer);
+    this.clearPongWatchdog();
     if (this._resumeProbeTimer) clearTimeout(this._resumeProbeTimer);
+    if (this._visibilityListener && typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this._visibilityListener);
+    }
     this.reconnectTimer = null;
     this.heartbeatTimer = null;
-    this._pongTimer = null;
+    this._visibilityListener = null;
     this._resumeProbeTimer = null;
     this._pingSentAt = null;
+  }
+
+  private isDocumentHidden(): boolean {
+    return typeof document !== 'undefined' && document.visibilityState === 'hidden';
+  }
+
+  private clearPongWatchdog(): void {
+    if (!this._pongTimer) return;
+    clearTimeout(this._pongTimer);
+    this._pongTimer = null;
+  }
+
+  private installVisibilityListener(): void {
+    if (this._visibilityListener || typeof document === 'undefined') return;
+    this._visibilityListener = () => {
+      if (!this.isDocumentHidden()) return;
+      // Desktop browsers aggressively throttle background timers. A ping sent
+      // just before tab hiding can have its pong callback delayed past the
+      // foreground 2s watchdog, causing false reconnect loops and subscription
+      // churn. Foreground resume still runs probeConnection() with the 2s SLA.
+      this.clearPongWatchdog();
+      this._pingSentAt = null;
+    };
+    document.addEventListener('visibilitychange', this._visibilityListener);
   }
 
   private dispatch(msg: ServerMessage): void {

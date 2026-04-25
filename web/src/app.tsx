@@ -1377,6 +1377,7 @@ export function App() {
           ws.requestSessionList();
           ws.discussionList();
           ws.p2pStatus();
+          requestActiveTimelineRefresh({ resetCooldowns: true });
           // Timeout: if session_list never arrives, stop blocking the UI
           if (sessionListRetryRef.current) clearTimeout(sessionListRetryRef.current);
           sessionListRetryRef.current = setTimeout(() => {

@@ -40,6 +40,13 @@ const flushAsync = () => new Promise<void>((r) => setTimeout(r, 0));
 
 let lastWs: MockWebSocket | null;
 
+function setDocumentVisibility(state: DocumentVisibilityState): void {
+  Object.defineProperty(document, 'visibilityState', {
+    configurable: true,
+    get: () => state,
+  });
+}
+
 async function connectClient(): Promise<WsClient> {
   const client = new WsClient('http://localhost:8787', 'srv-1');
   client.connect();
@@ -53,6 +60,7 @@ describe('WsClient', () => {
 
   beforeEach(() => {
     lastWs = null;
+    setDocumentVisibility('visible');
     MockWS = class extends MockWebSocket {
       constructor(url: string) {
         super(url);
@@ -343,6 +351,32 @@ describe('WsClient', () => {
 
       // Still on the same socket — the watchdog was cleared by each pong.
       expect(lastWs).toBe(firstWs);
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('does not force-reconnect from the heartbeat watchdog while the tab is hidden', async () => {
+      vi.useFakeTimers();
+      let visibilityState: DocumentVisibilityState = 'visible';
+      Object.defineProperty(document, 'visibilityState', {
+        configurable: true,
+        get: () => visibilityState,
+      });
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      const firstWs = lastWs!;
+
+      visibilityState = 'hidden';
+      document.dispatchEvent(new Event('visibilitychange'));
+
+      await vi.advanceTimersByTimeAsync(32_000);
+      for (let i = 0; i < 5; i++) await vi.advanceTimersByTimeAsync(0);
+
+      expect(lastWs).toBe(firstWs);
+      expect(firstWs.readyState).toBe(MockWebSocket.OPEN);
 
       client.disconnect();
       vi.useRealTimers();
