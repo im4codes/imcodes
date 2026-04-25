@@ -39,6 +39,31 @@ function toSessionName(id: string): string {
   return `deck_sub_${id}`;
 }
 
+function mergeLoadedSubSession(s: SubSessionData, existing?: SubSession): SubSession {
+  const base: SubSession = {
+    ...s,
+    runtimeType: s.runtimeType ?? getSessionRuntimeType(s.type),
+    sessionName: toSessionName(s.id),
+    state: 'unknown' as const,
+  };
+  if (!existing) return base;
+  const preserveCodexDisplay = isCodexFamily(base.type);
+  return {
+    ...base,
+    state: existing.state !== 'unknown' ? existing.state : base.state,
+    transportPendingMessages: existing.transportPendingMessages ?? base.transportPendingMessages,
+    transportPendingMessageEntries: existing.transportPendingMessageEntries ?? base.transportPendingMessageEntries,
+    ...(preserveCodexDisplay ? {
+      codexAvailableModels: base.codexAvailableModels ?? existing.codexAvailableModels ?? null,
+      modelDisplay: base.modelDisplay ?? existing.modelDisplay ?? null,
+      planLabel: base.planLabel ?? existing.planLabel ?? null,
+      quotaLabel: base.quotaLabel ?? existing.quotaLabel ?? null,
+      quotaUsageLabel: base.quotaUsageLabel ?? existing.quotaUsageLabel ?? null,
+      quotaMeta: base.quotaMeta ?? existing.quotaMeta ?? null,
+    } : {}),
+  };
+}
+
 export function useSubSessions(
   serverId: string | null,
   ws: WsClient | null,
@@ -72,12 +97,10 @@ export function useSubSessions(
           if (gen !== loadGenRef.current) return;
           console.warn(`[sub-sessions] loaded ${list.length} for server ${serverId}`);
           loadedGenRef.current = gen;
-          setSubSessions(list.map((s) => ({
-            ...s,
-            runtimeType: s.runtimeType ?? getSessionRuntimeType(s.type),
-            sessionName: toSessionName(s.id),
-            state: 'unknown' as const,
-          })));
+          setSubSessions((prev) => list.map((s) => mergeLoadedSubSession(
+            s,
+            prev.find((existing) => existing.id === s.id),
+          )));
           setLoadedServerId(serverId);
         })
         .catch((err) => {
@@ -150,7 +173,7 @@ export function useSubSessions(
                 ...(m.modelDisplay != null && { modelDisplay: m.modelDisplay }),
                 ...(m.requestedModel !== undefined && { requestedModel: m.requestedModel }),
                 ...(m.activeModel !== undefined && { activeModel: m.activeModel }),
-                ...(m.planLabel != null && { planLabel: m.planLabel }),
+                ...((m.planLabel != null || (!preserveQuota && m.planLabel === null)) ? { planLabel: m.planLabel } : {}),
                 ...((m.quotaLabel != null || (!preserveQuota && m.quotaLabel === null)) ? { quotaLabel: m.quotaLabel } : {}),
                 ...((m.quotaUsageLabel != null || (!preserveQuota && m.quotaUsageLabel === null)) ? { quotaUsageLabel: m.quotaUsageLabel } : {}),
                 ...((m.quotaMeta != null || (!preserveQuota && m.quotaMeta === null)) ? { quotaMeta: m.quotaMeta } : {}),
@@ -172,7 +195,7 @@ export function useSubSessions(
                 ...(m.qwenModel != null && { qwenModel: m.qwenModel }),
                 ...(m.qwenAuthType != null && { qwenAuthType: m.qwenAuthType }),
                 ...(m.qwenAvailableModels != null && { qwenAvailableModels: m.qwenAvailableModels }),
-                ...(m.codexAvailableModels != null && { codexAvailableModels: m.codexAvailableModels }),
+                ...((m.codexAvailableModels != null || (!preserveQuota && m.codexAvailableModels === null)) ? { codexAvailableModels: m.codexAvailableModels } : {}),
                 updatedAt: Date.now(),
               };
               return updated;
@@ -238,11 +261,11 @@ export function useSubSessions(
               ...(m.cwd !== undefined ? { cwd: m.cwd } : {}),
               ...(m.label !== undefined ? { label: m.label } : {}),
               ...(m.qwenModel !== undefined ? { qwenModel: m.qwenModel } : {}),
-              ...(m.codexAvailableModels !== undefined ? { codexAvailableModels: m.codexAvailableModels } : {}),
+              ...((m.codexAvailableModels != null || (!preserveQuota && m.codexAvailableModels === null)) ? { codexAvailableModels: m.codexAvailableModels } : {}),
               ...(m.requestedModel !== undefined ? { requestedModel: m.requestedModel } : {}),
               ...(m.activeModel !== undefined ? { activeModel: m.activeModel } : {}),
               ...(m.modelDisplay !== undefined ? { modelDisplay: m.modelDisplay } : {}),
-              ...(m.planLabel !== undefined ? { planLabel: m.planLabel } : {}),
+              ...((m.planLabel != null || (!preserveQuota && m.planLabel === null)) ? { planLabel: m.planLabel } : {}),
               ...((m.quotaLabel != null || (!preserveQuota && m.quotaLabel === null)) ? { quotaLabel: m.quotaLabel } : {}),
               ...((m.quotaUsageLabel != null || (!preserveQuota && m.quotaUsageLabel === null)) ? { quotaUsageLabel: m.quotaUsageLabel } : {}),
               ...((m.quotaMeta != null || (!preserveQuota && m.quotaMeta === null)) ? { quotaMeta: m.quotaMeta } : {}),

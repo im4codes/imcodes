@@ -710,7 +710,10 @@ export function App() {
         quotaUsageLabel: undefined,
         quotaMeta: undefined,
       }));
-      setSessions(mapped);
+      setSessions((prev) => mapped.map((s) => {
+        const existing = prev.find((p) => p.name === s.name);
+        return mergeSessionListEntry(s as IncomingSessionListEntry, existing);
+      }));
       // Only mark loaded if we got data — empty means daemon hasn't synced yet,
       // so wait for WS session_list to avoid flashing "No active sessions"
       if (mapped.length > 0) {

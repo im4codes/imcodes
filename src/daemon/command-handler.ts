@@ -180,7 +180,7 @@ async function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord
 
   // Compute transport display metadata fresh — matches session-list.ts hydration logic.
   // The session store may have stale or missing metadata during early launch/update windows.
-  const freshDisplay: Partial<Pick<SessionRecord, 'modelDisplay' | 'planLabel' | 'quotaLabel' | 'quotaUsageLabel' | 'quotaMeta'>> = r?.agentType === 'qwen'
+  const freshDisplay: Partial<Pick<SessionRecord, 'modelDisplay' | 'codexAvailableModels' | 'planLabel' | 'quotaLabel' | 'quotaUsageLabel' | 'quotaMeta'>> = r?.agentType === 'qwen'
     ? getQwenDisplayMetadata({
         model: r?.qwenModel,
         authType: r?.qwenAuthType,
@@ -189,8 +189,8 @@ async function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord
       })
     : r?.agentType === 'claude-code-sdk'
       ? await getClaudeSdkRuntimeConfig().catch(() => ({}))
-      : r?.agentType === 'codex-sdk'
-        ? await getCodexRuntimeConfig().catch(() => ({}))
+      : (r?.agentType === 'codex' || r?.agentType === 'codex-sdk')
+        ? mergeCodexDisplayMetadata(await getCodexRuntimeConfig().catch(() => ({})), r)
     : {};
 
   return {
@@ -230,7 +230,7 @@ async function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord
     qwenAuthType: r?.qwenAuthType ?? null,
     qwenAuthLimit: r?.qwenAuthLimit ?? null,
     qwenAvailableModels: r?.qwenAvailableModels ?? null,
-    codexAvailableModels: r?.codexAvailableModels ?? null,
+    codexAvailableModels: freshDisplay.codexAvailableModels ?? r?.codexAvailableModels ?? null,
     modelDisplay: freshDisplay.modelDisplay ?? r?.modelDisplay ?? null,
     planLabel: freshDisplay.planLabel ?? r?.planLabel ?? null,
     quotaLabel: freshDisplay.quotaLabel ?? r?.quotaLabel ?? null,

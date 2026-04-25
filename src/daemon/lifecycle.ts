@@ -511,6 +511,7 @@ export async function startup(): Promise<DaemonContext> {
             planLabel: session.planLabel ?? null,
             quotaLabel: session.quotaLabel ?? null,
             quotaUsageLabel: session.quotaUsageLabel ?? null,
+            quotaMeta: session.quotaMeta ?? null,
             effort: session.effort ?? null,
             transportConfig: session.transportConfig ?? null,
           });
