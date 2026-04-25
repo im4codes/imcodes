@@ -124,7 +124,7 @@ export function SessionPane({
     loadingOlder: timelineLoadingOlder,
     hasOlderHistory: timelineHasOlderHistory,
     addOptimisticUserMessage,
-    removeOptimisticMessage,
+    retryOptimisticMessage,
     loadOlderEvents,
   } = useTimeline(sessionName, ws, serverId, {
     isActiveSession: isActive,
@@ -143,9 +143,8 @@ export function SessionPane({
 
   // ── Retry failed send ─────────────────────────────────────────────────────
   // Reads the failed optimistic bubble from the timeline cache (it stores the
-  // original text + extras), clears it, and dispatches a fresh session.send
-  // with a new commandId. The new optimistic bubble is added immediately so
-  // the user sees the "sending" state without a round-trip to SessionControls.
+  // original text + extras), dispatches a fresh session.send with a new
+  // commandId, and updates the existing bubble in place.
   const timelineEventsRef = useRef(timelineEvents);
   timelineEventsRef.current = timelineEvents;
   const handleResendFailed = useCallback((commandId: string, text: string) => {
@@ -173,12 +172,11 @@ export function SessionPane({
     } catch {
       return;
     }
-    removeOptimisticMessage(commandId);
-    addOptimisticUserMessage(text, newCommandId, {
+    retryOptimisticMessage(commandId, newCommandId, text, {
       ...(attachmentsFromFailure ? { attachments: attachmentsFromFailure } : {}),
       ...(resendExtra ? { resendExtra } : {}),
     });
-  }, [addOptimisticUserMessage, connected, removeOptimisticMessage, sessionName, ws]);
+  }, [connected, retryOptimisticMessage, sessionName, ws]);
 
   // ── Usage & thinking state ──────────────────────────────────────────────────
   const lastUsage = useMemo(() => extractLatestUsage(timelineEvents), [timelineEvents]);

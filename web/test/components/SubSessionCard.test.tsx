@@ -7,6 +7,7 @@ import { useEffect } from 'preact/hooks';
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
 
 const chatScrollBottomSpy = vi.fn();
+const chatViewPropsSpy = vi.fn();
 const terminalScrollBottomSpy = vi.fn();
 const terminalViewPropsSpy = vi.fn();
 let timelineEvents = [{ type: 'assistant.text', payload: { text: 'hello' } }];
@@ -18,7 +19,9 @@ vi.mock('react-i18next', () => ({
 }));
 
 vi.mock('../../src/components/ChatView.js', () => ({
-  ChatView: ({ onScrollBottomFn }: any) => {
+  ChatView: (props: any) => {
+    chatViewPropsSpy(props);
+    const { onScrollBottomFn } = props;
     useEffect(() => {
       onScrollBottomFn?.(chatScrollBottomSpy);
     }, [onScrollBottomFn]);
@@ -38,7 +41,7 @@ vi.mock('../../src/components/TerminalView.js', () => ({
 }));
 
 const addOptimisticUserMessageSpy = vi.fn();
-const removeOptimisticMessageSpy = vi.fn();
+const retryOptimisticMessageSpy = vi.fn();
 
 vi.mock('../../src/hooks/useTimeline.js', () => ({
   useTimeline: () => ({
@@ -48,7 +51,7 @@ vi.mock('../../src/hooks/useTimeline.js', () => ({
     // real wiring. Shell sub-sessions deliberately skip useTimeline and the
     // card falls back to no-op; that path is covered by its own test.
     addOptimisticUserMessage: addOptimisticUserMessageSpy,
-    removeOptimisticMessage: removeOptimisticMessageSpy,
+    retryOptimisticMessage: retryOptimisticMessageSpy,
   }),
 }));
 
@@ -447,5 +450,51 @@ describe('SubSessionCard', () => {
       attachments: [{ kind: 'file', name: 'notes.md' }],
       resendExtra: { mode: 'quick' },
     });
+  });
+
+  it('keeps a new optimistic bubble visible when retrying a failed transport card send', () => {
+    timelineEvents = [{
+      eventId: 'failed-send',
+      type: 'user.message',
+      payload: {
+        text: 'retry from card',
+        failed: true,
+        commandId: 'old-card-cmd',
+        _resendExtra: { mode: 'quick' },
+        attachments: [{ kind: 'file', name: 'notes.md' }],
+      },
+    }];
+    const ws = { sendSessionCommand: vi.fn() } as any;
+
+    render(
+      <SubSessionCard
+        sub={makeSubSession({ runtimeType: 'transport' as any, type: 'claude-code-sdk' } as any)}
+        ws={ws}
+        connected={true}
+        isOpen={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        quickData={{ data: [], recordHistory: vi.fn() } as any}
+      />,
+    );
+
+    const props = chatViewPropsSpy.mock.calls.at(-1)?.[0] as { onResendFailed?: (commandId: string, text: string) => void };
+    props.onResendFailed?.('old-card-cmd', 'retry from card');
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+      sessionName: 'deck_sub_sub-card-1',
+      text: 'retry from card',
+      mode: 'quick',
+    }));
+    expect(retryOptimisticMessageSpy).toHaveBeenCalledWith(
+      'old-card-cmd',
+      expect.any(String),
+      'retry from card',
+      {
+        attachments: [{ kind: 'file', name: 'notes.md' }],
+        resendExtra: { mode: 'quick' },
+      },
+    );
   });
 });

@@ -86,13 +86,13 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   // (message goes straight to the timeline with a spinner, reconciled by the
   // daemon echo).
   const timeline = isShell
-    ? { events: [], refreshing: false, addOptimisticUserMessage: undefined, removeOptimisticMessage: undefined }
+    ? { events: [], refreshing: false, addOptimisticUserMessage: undefined, retryOptimisticMessage: undefined }
     : useTimeline(sub.sessionName, ws, serverId, {
       isActiveSession: !!isFocused,
     });
   const { events, refreshing } = timeline;
   const addOptimisticUserMessage = 'addOptimisticUserMessage' in timeline ? timeline.addOptimisticUserMessage : undefined;
-  const removeOptimisticMessage = 'removeOptimisticMessage' in timeline ? timeline.removeOptimisticMessage : undefined;
+  const retryOptimisticMessage = 'retryOptimisticMessage' in timeline ? timeline.retryOptimisticMessage : undefined;
   const termScrollRef = useRef<(() => void) | null>(null);
   const chatScrollRef = useRef<(() => void) | null>(null);
   const cardInputRef = useRef<HTMLInputElement>(null);
@@ -127,7 +127,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   const eventsRef = useRef(events);
   eventsRef.current = events;
   const handleResendFailed = useCallback((commandId: string, text: string) => {
-    if (!ws || !connected || !addOptimisticUserMessage || !removeOptimisticMessage) return;
+    if (!ws || !connected || !retryOptimisticMessage) return;
     const failedEvent = eventsRef.current.find(
       (e) => e.type === 'user.message'
         && e.payload.failed === true
@@ -151,14 +151,11 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     } catch {
       return;
     }
-    removeOptimisticMessage(commandId);
-    if (!isTransportRuntime(sub)) {
-      addOptimisticUserMessage(text, newCommandId, {
-        ...(attachmentsFromFailure ? { attachments: attachmentsFromFailure } : {}),
-        ...(resendExtra ? { resendExtra } : {}),
-      });
-    }
-  }, [addOptimisticUserMessage, connected, removeOptimisticMessage, sub.sessionName, ws]);
+    retryOptimisticMessage(commandId, newCommandId, text, {
+      ...(attachmentsFromFailure ? { attachments: attachmentsFromFailure } : {}),
+      ...(resendExtra ? { resendExtra } : {}),
+    });
+  }, [connected, retryOptimisticMessage, sub.sessionName, ws]);
 
   // Build a SessionInfo for SessionControls compact mode
   const sessionInfo = useMemo<SessionInfo>(() => ({

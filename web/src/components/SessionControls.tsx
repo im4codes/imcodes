@@ -118,6 +118,31 @@ interface Props {
 }
 
 const MAX_UPLOAD_SIZE_MB = Math.round(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE / (1024 * 1024));
+const TRANSPORT_QUEUE_HIDDEN_KEY_PREFIX = 'imcodes:transport-queue-hidden:';
+
+function transportQueueHiddenStorageKey(serverId: string | undefined, sessionName: string): string {
+  const serverPart = encodeURIComponent(serverId || 'local');
+  const sessionPart = encodeURIComponent(sessionName);
+  return `${TRANSPORT_QUEUE_HIDDEN_KEY_PREFIX}${serverPart}:${sessionPart}`;
+}
+
+function readTransportQueueHidden(serverId: string | undefined, sessionName: string | undefined): boolean {
+  if (!sessionName) return false;
+  try {
+    return window.localStorage.getItem(transportQueueHiddenStorageKey(serverId, sessionName)) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function writeTransportQueueHidden(storageKey: string | null, hidden: boolean): void {
+  if (!storageKey) return;
+  try {
+    window.localStorage.setItem(storageKey, hidden ? '1' : '0');
+  } catch {
+    // localStorage may be unavailable in privacy modes; keep in-memory state.
+  }
+}
 
 type MenuAction = 'restart' | 'new' | 'stop';
 type ModelChoice = 'opus[1M]' | 'sonnet' | 'haiku';
@@ -442,8 +467,19 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModel);
   const [qwenModel, setQwenModel] = useState<QwenModelChoice | null>(loadQwenModel);
   const [editingQueuedMessageId, setEditingQueuedMessageId] = useState<string | null>(null);
-  const [queuedHintExpanded, setQueuedHintExpanded] = useState(false);
-  const toggleQueuedHintExpanded = useCallback(() => setQueuedHintExpanded((v) => !v), []);
+  const queuedHiddenStorageKey = useMemo(() => (
+    activeSession?.name ? transportQueueHiddenStorageKey(serverId, activeSession.name) : null
+  ), [activeSession?.name, serverId]);
+  const [queuedHintExpanded, setQueuedHintExpanded] = useState(() => (
+    !readTransportQueueHidden(serverId, activeSession?.name)
+  ));
+  const toggleQueuedHintExpanded = useCallback(() => {
+    setQueuedHintExpanded((expanded) => {
+      const nextExpanded = !expanded;
+      writeTransportQueueHidden(queuedHiddenStorageKey, !nextExpanded);
+      return nextExpanded;
+    });
+  }, [queuedHiddenStorageKey]);
   const [optimisticQueuedEntries, setOptimisticQueuedEntries] = useState<Array<{ clientMessageId: string; text: string }> | null>(null);
   const [mobileComposerMultiline, setMobileComposerMultiline] = useState(false);
   const [mobileComposerExpanded, setMobileComposerExpanded] = useState(false);
@@ -476,7 +512,17 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         activeSession?.name ?? '',
       )
     : [];
-  const queuedTransportEntries = optimisticQueuedEntries ?? incomingQueuedTransportEntries;
+  const queuedTransportEntries = useMemo(() => {
+    if (optimisticQueuedEntries === null) return incomingQueuedTransportEntries;
+    if (optimisticQueuedEntries.length === 0) return [];
+    if (incomingQueuedTransportEntries.length === 0) return optimisticQueuedEntries;
+    const byId = new Map<string, { clientMessageId: string; text: string }>();
+    for (const entry of incomingQueuedTransportEntries) byId.set(entry.clientMessageId, entry);
+    for (const entry of optimisticQueuedEntries) {
+      byId.set(entry.clientMessageId, entry);
+    }
+    return [...byId.values()];
+  }, [incomingQueuedTransportEntries, optimisticQueuedEntries]);
   const queuedTransportMessages = queuedTransportEntries.map((entry) => entry.text);
   const queuedTransportLatestMessage = queuedTransportMessages[queuedTransportMessages.length - 1] ?? '';
   const editingQueuedEntry = editingQueuedMessageId
@@ -819,6 +865,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return () => onOverlayOpenChange?.(false);
   }, [mobileFileBrowserOpen, onOverlayOpenChange, overlayOpen]);
 
+  useEffect(() => {
+    setQueuedHintExpanded(!readTransportQueueHidden(serverId, activeSession?.name));
+  }, [activeSession?.name, serverId]);
 
   useEffect(() => {
     if (!editingQueuedMessageId) return;
@@ -832,17 +881,24 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     [incomingQueuedTransportEntries],
   );
   const lastIncomingQueuedTransportEntriesKeyRef = useRef(incomingQueuedTransportEntriesKey);
+  const lastIncomingQueuedTransportEntriesCountRef = useRef(incomingQueuedTransportEntries.length);
   useEffect(() => {
     if (effectiveRuntimeType !== 'transport') {
       setOptimisticQueuedEntries(null);
       lastIncomingQueuedTransportEntriesKeyRef.current = incomingQueuedTransportEntriesKey;
+      lastIncomingQueuedTransportEntriesCountRef.current = incomingQueuedTransportEntries.length;
       return;
     }
-    if (lastIncomingQueuedTransportEntriesKeyRef.current !== incomingQueuedTransportEntriesKey) {
+    const previousCount = lastIncomingQueuedTransportEntriesCountRef.current;
+    const incomingChanged = lastIncomingQueuedTransportEntriesKeyRef.current !== incomingQueuedTransportEntriesKey;
+    if (incomingChanged && incomingQueuedTransportEntries.length > 0) {
+      setOptimisticQueuedEntries(null);
+    } else if (incomingChanged && previousCount > 0 && incomingQueuedTransportEntries.length === 0) {
       setOptimisticQueuedEntries(null);
     }
     lastIncomingQueuedTransportEntriesKeyRef.current = incomingQueuedTransportEntriesKey;
-  }, [activeSession?.name, effectiveRuntimeType, incomingQueuedTransportEntriesKey]);
+    lastIncomingQueuedTransportEntriesCountRef.current = incomingQueuedTransportEntries.length;
+  }, [activeSession?.name, effectiveRuntimeType, incomingQueuedTransportEntries.length, incomingQueuedTransportEntriesKey]);
 
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
@@ -1556,6 +1612,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const finalizeSend = useCallback((payload: PendingSendPayload, options?: { clearComposer?: boolean }) => {
     if (!activeSession) return;
+    const isP2pSend = (
+      Array.isArray(payload.extra.p2pAtTargets) && payload.extra.p2pAtTargets.length > 0
+      || (typeof payload.extra.p2pMode === 'string' && payload.extra.p2pMode.length > 0)
+      || (payload.extra.p2pSessionConfig != null && typeof payload.extra.p2pSessionConfig === 'object')
+    );
     if (editingQueuedMessageId && effectiveRuntimeType === 'transport') {
       try {
         if (!sendQueuedMessageMutation('session.edit_queued_message', {
@@ -1602,6 +1663,17 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     } catch {
       return;
     }
+    const shouldShowAsQueued = effectiveRuntimeType === 'transport'
+      && isRunningSessionState(activeSession.state)
+      && !isP2pSend
+      && !payload.text.trim().startsWith('/');
+    if (shouldShowAsQueued) {
+      setOptimisticQueuedEntries((prev) => {
+        const source = prev ?? incomingQueuedTransportEntries;
+        if (source.some((entry) => entry.clientMessageId === commandId)) return source;
+        return [...source, { clientMessageId: commandId!, text: payload.text }];
+      });
+    }
     // Snapshot attachments before clearComposer wipes them so the optimistic
     // bubble surfaces the same badges the confirmed message will.
     const attachmentSnapshot = attachments.length > 0
@@ -1609,13 +1681,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           id: a.path,
           daemonPath: a.path,
           originalName: a.name,
-        }))
+      }))
       : undefined;
-    onSend?.(activeSession.name, payload.text, {
-      commandId,
-      ...(attachmentSnapshot ? { attachments: attachmentSnapshot } : {}),
-      ...(payload.extra && Object.keys(payload.extra).length > 0 ? { extra: payload.extra } : {}),
-    });
+    if (!shouldShowAsQueued) {
+      onSend?.(activeSession.name, payload.text, {
+        commandId,
+        ...(attachmentSnapshot ? { attachments: attachmentSnapshot } : {}),
+        ...(payload.extra && Object.keys(payload.extra).length > 0 ? { extra: payload.extra } : {}),
+      });
+    }
     if (options?.clearComposer) {
       pendingAtTargetsRef.current = [];
       pendingConfigOverrideRef.current = null;
@@ -1634,7 +1708,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       if (draftKey) sessionStorage.removeItem(draftKey);
       if (attachmentDraftKey) sessionStorage.removeItem(attachmentDraftKey);
     }
-  }, [activeSession, attachmentDraftKey, draftKey, editingQueuedMessageId, onRemoveQuote, onSend, quickData, quotes, sendQueuedMessageMutation, sendSessionMessage]);
+  }, [activeSession, attachmentDraftKey, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, onRemoveQuote, onSend, quickData, quotes, sendQueuedMessageMutation, sendSessionMessage]);
 
   const handleQueuedMessageEdit = useCallback((entry: { clientMessageId: string; text: string }) => {
     if (!isEditableQueuedEntry(entry)) return;

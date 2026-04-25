@@ -215,6 +215,64 @@ describe('Ack reliability — daemon ↔ server integration', () => {
     expect(failed[0].reason).toBe('ack_timeout');
   });
 
+  it('weak network retry: ack timeout can be retried with a fresh commandId and late old ack does not poison the retry', async () => {
+    vi.useFakeTimers();
+    const bridge = WsBridge.get(serverId);
+    const daemonWs = await connectAndAuthDaemon(bridge, serverId);
+    const browser = await connectBrowser(bridge, 'deck_storecheck_brain');
+
+    browser.emit('message', Buffer.from(JSON.stringify({
+      type: 'session.send',
+      sessionName: 'deck_storecheck_brain',
+      text: 'unstable send',
+      commandId: 'INT-C3-WEAK-OLD',
+    })));
+    await flush();
+    expect(daemonWs.sentByType('session.send').filter((msg) => msg.commandId === 'INT-C3-WEAK-OLD')).toHaveLength(1);
+
+    vi.advanceTimersByTime(ACK_TIMEOUT_MS + 100);
+    await flush();
+
+    const timeoutFailures = browser.sentByType(MSG_COMMAND_FAILED).filter((msg) =>
+      msg.commandId === 'INT-C3-WEAK-OLD' && msg.reason === 'ack_timeout',
+    );
+    expect(timeoutFailures).toHaveLength(1);
+
+    browser.emit('message', Buffer.from(JSON.stringify({
+      type: 'session.send',
+      sessionName: 'deck_storecheck_brain',
+      text: 'unstable send',
+      commandId: 'INT-C3-WEAK-RETRY',
+    })));
+    await flush();
+    expect(daemonWs.sentByType('session.send').filter((msg) => msg.commandId === 'INT-C3-WEAK-RETRY')).toHaveLength(1);
+
+    daemonWs.emit('message', Buffer.from(JSON.stringify({
+      type: MSG_COMMAND_ACK,
+      commandId: 'INT-C3-WEAK-RETRY',
+      status: 'accepted',
+      session: 'deck_storecheck_brain',
+    })));
+    await flush();
+
+    daemonWs.emit('message', Buffer.from(JSON.stringify({
+      type: MSG_COMMAND_ACK,
+      commandId: 'INT-C3-WEAK-OLD',
+      status: 'accepted',
+      session: 'deck_storecheck_brain',
+    })));
+    await flush();
+
+    vi.advanceTimersByTime(ACK_TIMEOUT_MS + 100);
+    await flush();
+
+    const retryAcks = browser.sentByType(MSG_COMMAND_ACK).filter((msg) => msg.commandId === 'INT-C3-WEAK-RETRY');
+    expect(retryAcks).toHaveLength(1);
+    const retryFailures = browser.sentByType(MSG_COMMAND_FAILED).filter((msg) => msg.commandId === 'INT-C3-WEAK-RETRY');
+    expect(retryFailures).toHaveLength(0);
+    expect(daemonWs.sentByType('session.send').filter((msg) => msg.commandId === 'INT-C3-WEAK-OLD')).toHaveLength(1);
+  });
+
   it('accepted command.ack reaches the browser and cancels the server ack timeout', async () => {
     vi.useFakeTimers();
     const bridge = WsBridge.get(serverId);

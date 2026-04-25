@@ -35,6 +35,7 @@ import { getQwenDisplayMetadata } from './provider-display.js';
 import { getQwenOAuthQuotaUsageLabel } from './provider-quota.js';
 import { getClaudeSdkRuntimeConfig } from './sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from './codex-runtime-config.js';
+import { mergeCodexDisplayMetadata } from './codex-display.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import { isClaudeCodeFamily, isCodexFamily } from '../../shared/agent-types.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
@@ -1610,7 +1611,10 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     if (!opts.fresh && transportResumeId) {
       effectiveSkipCreate = true;
     }
-    sdkDisplay = await getCodexRuntimeConfig().catch(() => ({}));
+    sdkDisplay = mergeCodexDisplayMetadata(
+      await getCodexRuntimeConfig().catch(() => ({})),
+      existing,
+    );
   } else if (agentType === 'cursor-headless' || agentType === 'copilot-sdk') {
     effectiveSessionKey = randomUUID();
     effectiveBindExistingKey = undefined;
@@ -1856,7 +1860,10 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
 
   let familyDisplay: Pick<SessionRecord, 'planLabel' | 'quotaLabel' | 'quotaUsageLabel' | 'quotaMeta'> | undefined;
   if (agentType === 'codex') {
-    familyDisplay = await getCodexRuntimeConfig().catch(() => ({}));
+    familyDisplay = mergeCodexDisplayMetadata(
+      await getCodexRuntimeConfig().catch(() => ({})),
+      getSession(name),
+    );
   } else if (agentType === 'claude-code' && !opts.ccPreset) {
     familyDisplay = undefined;
   }

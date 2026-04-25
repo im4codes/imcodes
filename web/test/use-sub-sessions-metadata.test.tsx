@@ -210,6 +210,69 @@ describe('sub-session metadata via subsession.sync', () => {
     expect(captured[0].effort).toBe('high');
   });
 
+  it('preserves codex-sdk quota metadata when a later sync carries null quota fields', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'cxsdk_quota_stable',
+      sessionName: 'deck_sub_cxsdk_quota_stable',
+      sessionType: 'codex-sdk',
+      state: 'running',
+      planLabel: 'Pro',
+      quotaLabel: '5h 11% 2h03m 4/6 14:40',
+      quotaMeta: {
+        primary: { usedPercent: 11, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+      },
+    }));
+
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'cxsdk_quota_stable',
+      quotaLabel: null,
+      quotaUsageLabel: null,
+      quotaMeta: null,
+    }));
+
+    expect(captured[0].planLabel).toBe('Pro');
+    expect(captured[0].quotaLabel).toBe('5h 11% 2h03m 4/6 14:40');
+    expect(captured[0].quotaMeta?.primary?.usedPercent).toBe(11);
+  });
+
+  it('clears non-codex quota metadata when a later sync carries null quota fields', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'qwen_quota_clear',
+      sessionName: 'deck_sub_qwen_quota_clear',
+      sessionType: 'qwen',
+      state: 'running',
+      planLabel: 'Free',
+      quotaLabel: '1,000/day',
+      quotaUsageLabel: 'today 5/1000',
+      quotaMeta: {
+        primary: { usedPercent: 5, windowDurationMins: 1440, resetsAt: 1_800_000_000 },
+      },
+    }));
+
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'qwen_quota_clear',
+      quotaLabel: null,
+      quotaUsageLabel: null,
+      quotaMeta: null,
+    }));
+
+    expect(captured[0].quotaLabel).toBeNull();
+    expect(captured[0].quotaUsageLabel).toBeNull();
+    expect(captured[0].quotaMeta).toBeNull();
+  });
+
   it('partial sync keeps existing values', async () => {
     const { ws, send } = createMockWs();
     render(<Harness ws={ws} connected={true} />);

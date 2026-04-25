@@ -29,7 +29,7 @@ function captureHookRef(ref: { current: HookRef }, handlerBox: { fn: ((msg: Serv
       handlerBox.fn = next;
       return () => { handlerBox.fn = null; };
     },
-    sendTimelineHistoryRequest: () => 'history-req',
+    sendTimelineHistoryRequest: vi.fn(() => 'history-req'),
   } as unknown as WsClient;
 
   function Probe({ sessionId }: { sessionId: string }) {
@@ -133,6 +133,58 @@ describe('useTimeline optimistic send flow', () => {
     const texts = ref.current!.events.map((e) => e.payload.text);
     expect(texts).toEqual(['hello (normalized)']);
     expect(ref.current!.events[0].payload.pending).toBeFalsy();
+  });
+
+  it('replaces the pending bubble in place when the authoritative user.message arrives', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_in_place_success' }));
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'assistant-before',
+          sessionId: 'deck_opt_in_place_success',
+          ts: Date.now() - 20,
+          epoch: 1,
+          seq: 1,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'assistant.text',
+          payload: { text: 'before' },
+        },
+      } as unknown as ServerMessage);
+    });
+    act(() => {
+      ref.current!.addOptimisticUserMessage('keep my slot', 'cmd-in-place-success');
+    });
+    const optimisticId = ref.current!.events[1].eventId;
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'real-in-place-success',
+          sessionId: 'deck_opt_in_place_success',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 2,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'user.message',
+          payload: { text: 'keep my slot', commandId: 'cmd-in-place-success' },
+        },
+      } as unknown as ServerMessage);
+    });
+
+    expect(ref.current!.events.map((event) => event.eventId)).toEqual([
+      'assistant-before',
+      'real-in-place-success',
+    ]);
+    expect(ref.current!.events.map((event) => event.eventId)).not.toContain(optimisticId);
+    expect(ref.current!.events[1].payload.pending).toBeFalsy();
   });
 
   it('removes a transport optimistic bubble when the daemon authoritatively queues the send', () => {
@@ -246,6 +298,9 @@ describe('useTimeline optimistic send flow', () => {
         retryable: true,
       } as unknown as ServerMessage);
     });
+    act(() => {
+      vi.advanceTimersByTime(30_001);
+    });
 
     expect(ref.current!.events).toHaveLength(1);
     expect(ref.current!.events[0].eventId).toBe('real-user-confirmed');
@@ -298,6 +353,314 @@ describe('useTimeline optimistic send flow', () => {
     expect(ref.current!.events[0].payload.pending).toBe(false);
     expect(ref.current!.events[0].payload.acked).toBe(true);
     expect(ref.current!.events[0].payload.failed).toBeFalsy();
+  });
+
+  it('settles a pending bubble from command.ack delivered as a timeline event', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_timeline_ack' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('timeline ack', 'cmd-timeline-ack');
+    });
+    expect(ref.current!.events[0].payload.pending).toBe(true);
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'ack-event-1',
+          sessionId: 'deck_opt_timeline_ack',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 2,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'command.ack',
+          payload: { commandId: 'cmd-timeline-ack', status: 'accepted' },
+        },
+      } as unknown as ServerMessage);
+    });
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+
+    const optimistic = ref.current!.events.find((event) => event.eventId.includes('cmd-timeline-ack'));
+    expect(optimistic?.payload.pending).toBe(false);
+    expect(optimistic?.payload.acked).toBe(true);
+    expect(optimistic?.payload.failed).toBeFalsy();
+  });
+
+  it('marks a pending bubble failed from command.ack error delivered as a timeline event', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_timeline_ack_error' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('timeline ack error', 'cmd-timeline-ack-error');
+    });
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'ack-error-event-1',
+          sessionId: 'deck_opt_timeline_ack_error',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 2,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'command.ack',
+          payload: { commandId: 'cmd-timeline-ack-error', status: 'error', error: 'duplicate_command_id' },
+        },
+      } as unknown as ServerMessage);
+    });
+
+    const optimistic = ref.current!.events.find((event) => event.eventId.includes('cmd-timeline-ack-error'));
+    expect(optimistic?.payload.pending).toBe(false);
+    expect(optimistic?.payload.failed).toBe(true);
+    expect(optimistic?.payload.failureReason).toBe('duplicate_command_id');
+  });
+
+  it('settles a pending bubble from command.ack recovered through history', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_history_ack' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('history ack', 'cmd-history-ack');
+    });
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.history',
+        sessionName: 'deck_opt_history_ack',
+        requestId: 'history-req',
+        epoch: 1,
+        events: [{
+          eventId: 'history-ack-event-1',
+          sessionId: 'deck_opt_history_ack',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 3,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'command.ack',
+          payload: { commandId: 'cmd-history-ack', status: 'accepted' },
+        }],
+      } as unknown as ServerMessage);
+    });
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+
+    const optimistic = ref.current!.events.find((event) => event.eventId.includes('cmd-history-ack'));
+    expect(optimistic?.payload.pending).toBe(false);
+    expect(optimistic?.payload.acked).toBe(true);
+    expect(optimistic?.payload.failed).toBeFalsy();
+  });
+
+  it('keeps pending optimistic sends visible across daemon reconnect until history reconciles them', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { ws, Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_reconnect_pending' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('still visible', 'cmd-reconnect-visible');
+    });
+
+    act(() => {
+      handlerBox.fn?.({ type: 'daemon.reconnected' } as unknown as ServerMessage);
+    });
+
+    expect(ref.current!.events).toHaveLength(1);
+    expect(ref.current!.events[0].payload.pending).toBe(true);
+    expect(ref.current!.events[0].payload.text).toBe('still visible');
+    expect(ws.sendTimelineHistoryRequest).toHaveBeenCalledWith('deck_opt_reconnect_pending', 300);
+  });
+
+  it('does not show ack_timeout failure when authoritative history arrives', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_timeout_recovered' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('arrived anyway', 'cmd-timeout-recovered');
+    });
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'command.failed',
+        commandId: 'cmd-timeout-recovered',
+        session: 'deck_opt_timeout_recovered',
+        reason: 'ack_timeout',
+        retryable: true,
+      } as unknown as ServerMessage);
+    });
+
+    expect(ref.current!.events[0].payload.pending).toBe(true);
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'real-timeout-recovered',
+          sessionId: 'deck_opt_timeout_recovered',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 9,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'user.message',
+          payload: { text: 'arrived anyway', commandId: 'cmd-timeout-recovered' },
+        },
+      } as unknown as ServerMessage);
+    });
+    expect(ref.current!.events).toHaveLength(1);
+    expect(ref.current!.events[0].eventId).toBe('real-timeout-recovered');
+    expect(ref.current!.events[0].payload.failed).toBeFalsy();
+  });
+
+  it('settles a pending send when later assistant progress proves the session is processing it', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_progress_settled' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('work on this', 'cmd-progress-settled');
+    });
+    expect(ref.current!.events[0].payload.pending).toBe(true);
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'assistant-progress-1',
+          sessionId: 'deck_opt_progress_settled',
+          ts: Date.now() + 10,
+          epoch: 1,
+          seq: 10,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'assistant.text',
+          payload: { text: 'I am working on it', streaming: true },
+        },
+      } as unknown as ServerMessage);
+    });
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+
+    const optimistic = ref.current!.events.find((event) => event.eventId.includes('cmd-progress-settled'));
+    expect(optimistic?.payload.pending).toBe(false);
+    expect(optimistic?.payload.acked).toBe(true);
+    expect(optimistic?.payload.failed).toBeFalsy();
+  });
+
+  it('uses linked memory context to replace a stuck spinner with the real sent message', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_memory_reconciled' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('local text with attachment', 'cmd-memory-reconciled');
+    });
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'real-memory-user',
+          sessionId: 'deck_opt_memory_reconciled',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 10,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'user.message',
+          payload: { text: 'server normalized text' },
+        },
+      } as unknown as ServerMessage);
+    });
+    expect(ref.current!.events).toHaveLength(2);
+    expect(ref.current!.events[0].payload.pending).toBe(true);
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'memory-for-real-user',
+          sessionId: 'deck_opt_memory_reconciled',
+          ts: Date.now() + 1,
+          epoch: 1,
+          seq: 11,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'memory.context',
+          payload: { relatedToEventId: 'real-memory-user', items: [] },
+        },
+      } as unknown as ServerMessage);
+    });
+
+    expect(ref.current!.events.map((event) => event.eventId)).toEqual([
+      'real-memory-user',
+      'memory-for-real-user',
+    ]);
+    expect(ref.current!.events[0].payload.pending).toBeFalsy();
+  });
+
+  it('updates a failed retry bubble in place with the new command id', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_retry_in_place' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('retry same slot', 'cmd-old-retry');
+      ref.current!.markOptimisticFailed('cmd-old-retry', 'timeout');
+    });
+    const eventId = ref.current!.events[0].eventId;
+
+    act(() => {
+      ref.current!.retryOptimisticMessage('cmd-old-retry', 'cmd-new-retry', 'retry same slot', {
+        resendExtra: { mode: 'quick' },
+      });
+    });
+
+    expect(ref.current!.events).toHaveLength(1);
+    expect(ref.current!.events[0].eventId).toBe(eventId);
+    expect(ref.current!.events[0].payload.commandId).toBe('cmd-new-retry');
+    expect(ref.current!.events[0].payload.pending).toBe(true);
+    expect(ref.current!.events[0].payload.failed).toBe(false);
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'real-new-retry',
+          sessionId: 'deck_opt_retry_in_place',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 12,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'user.message',
+          payload: { text: 'retry same slot', commandId: 'cmd-new-retry' },
+        },
+      } as unknown as ServerMessage);
+    });
+
+    expect(ref.current!.events).toHaveLength(1);
+    expect(ref.current!.events[0].eventId).toBe('real-new-retry');
+    expect(ref.current!.events[0].payload.pending).toBeFalsy();
   });
 
   it('persists an acked local send across refresh and replaces it with authoritative history by commandId', async () => {
@@ -374,7 +737,7 @@ describe('useTimeline optimistic send flow', () => {
         type: 'command.failed',
         commandId: 'cmd-refresh-failed',
         session: 'deck_opt_refresh_failed',
-        reason: 'ack_timeout',
+        reason: 'daemon_error',
         retryable: true,
       } as unknown as ServerMessage);
     });

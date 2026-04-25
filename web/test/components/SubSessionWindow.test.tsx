@@ -15,8 +15,13 @@ vi.mock('../../src/components/TerminalView.js', () => ({
   TerminalView: () => null,
 }));
 
+const chatViewPropsSpy = vi.fn();
+
 vi.mock('../../src/components/ChatView.js', () => ({
-  ChatView: () => null,
+  ChatView: (props: any) => {
+    chatViewPropsSpy(props);
+    return null;
+  },
 }));
 
 const sessionControlsSpy = vi.fn((props: any) => (
@@ -54,7 +59,7 @@ vi.mock('../../src/thinking-utils.js', () => ({
 }));
 
 const addOptimisticUserMessageSpy = vi.fn();
-const removeOptimisticMessageSpy = vi.fn();
+const retryOptimisticMessageSpy = vi.fn();
 
 vi.mock('../../src/hooks/useTimeline.js', () => ({
   useTimeline: () => ({
@@ -64,7 +69,7 @@ vi.mock('../../src/hooks/useTimeline.js', () => ({
     // blow up when a test triggers user interaction. Real behavior is
     // covered by the useTimeline unit tests.
     addOptimisticUserMessage: addOptimisticUserMessageSpy,
-    removeOptimisticMessage: removeOptimisticMessageSpy,
+    retryOptimisticMessage: retryOptimisticMessageSpy,
   }),
 }));
 
@@ -784,19 +789,28 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     });
   });
 
-  it('wires onResendFailed into ChatView so retry works from sub-session bubbles', async () => {
+  it('keeps a new optimistic bubble visible when retrying a failed transport window send', async () => {
     // Also a regression: the failed optimistic bubble in a sub-session had no
     // retry button because onResendFailed was never threaded through to
-    // ChatView. We now pass a handler; verify it's present and callable.
-    const ChatViewModule = await import('../../src/components/ChatView.js');
-    const chatViewSpy = vi.fn((_props: any) => null);
-    (ChatViewModule as unknown as { ChatView: typeof chatViewSpy }).ChatView = chatViewSpy;
-
+    // ChatView. Transport retries must also create a fresh local bubble instead
+    // of removing the failed bubble and leaving the user with no visible state.
+    timelineEventsMock = [{
+      eventId: 'failed-window-send',
+      type: 'user.message',
+      payload: {
+        text: 'retry from window',
+        failed: true,
+        commandId: 'old-window-cmd',
+        _resendExtra: { mode: 'quick' },
+        attachments: [{ kind: 'file', name: 'notes.md' }],
+      },
+    }];
     const sub = makeSubSession({ type: 'claude-code-sdk', runtimeType: 'transport' as any } as any);
+    const retryWs = { ...ws, sendSessionCommand: vi.fn() } as any;
     render(
       <SubSessionWindow
         sub={sub}
-        ws={ws}
+        ws={retryWs}
         connected={true}
         active={true}
         onDiff={vi.fn()}
@@ -810,12 +824,24 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
       />,
     );
 
-    // ChatView may not render directly because of the initial view mode. In
-    // that case, skip — the assertion above (`onSend` wiring) already covers
-    // the core regression. When ChatView does render we expect a function.
-    const chatCall = chatViewSpy.mock.calls.at(-1)?.[0] as { onResendFailed?: unknown } | undefined;
-    if (chatCall) {
-      expect(typeof chatCall.onResendFailed).toBe('function');
-    }
+    const chatCall = chatViewPropsSpy.mock.calls.at(-1)?.[0] as { onResendFailed?: (commandId: string, text: string) => void };
+    expect(typeof chatCall.onResendFailed).toBe('function');
+
+    chatCall.onResendFailed?.('old-window-cmd', 'retry from window');
+
+    expect(retryWs.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+      sessionName: sub.sessionName,
+      text: 'retry from window',
+      mode: 'quick',
+    }));
+    expect(retryOptimisticMessageSpy).toHaveBeenCalledWith(
+      'old-window-cmd',
+      expect.any(String),
+      'retry from window',
+      {
+        attachments: [{ kind: 'file', name: 'notes.md' }],
+        resendExtra: { mode: 'quick' },
+      },
+    );
   });
 });

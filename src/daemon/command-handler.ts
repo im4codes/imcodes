@@ -58,6 +58,7 @@ import {
 import { CODEX_MODEL_IDS, normalizeClaudeCodeModelId } from '../shared/models/options.js';
 import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from '../agent/sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
+import { mergeCodexDisplayMetadata } from '../agent/codex-display.js';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import { CC_PRESET_MSG, type CcPreset } from '../../shared/cc-presets.js';
@@ -2217,9 +2218,10 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       }
       if (record?.agentType === 'codex-sdk' && modelMatch) {
         const nextModel = modelMatch[1];
-        const sdkDisplay = await getCodexRuntimeConfig(true).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig);
-        const availableModels = sdkDisplay.availableModels?.length
-          ? sdkDisplay.availableModels
+        const sdkRuntime = await getCodexRuntimeConfig(true).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig);
+        const sdkDisplay = mergeCodexDisplayMetadata(sdkRuntime, record);
+        const availableModels = sdkRuntime.availableModels?.length
+          ? sdkRuntime.availableModels
           : record.codexAvailableModels?.length
             ? record.codexAvailableModels
             : [...CODEX_MODEL_IDS];
@@ -2237,9 +2239,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           activeModel: nextModel,
           modelDisplay: nextModel,
           ...(availableModels.length ? { codexAvailableModels: availableModels } : {}),
-          planLabel: sdkDisplay.planLabel,
-          quotaLabel: sdkDisplay.quotaLabel,
-          quotaUsageLabel: sdkDisplay.quotaUsageLabel,
+          ...sdkDisplay,
           updatedAt: Date.now(),
         };
         upsertSession(nextRecord);

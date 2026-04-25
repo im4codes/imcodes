@@ -1535,8 +1535,6 @@ afterEach(() => {
       />,
     );
 
-    // Compact pill is shown by default — click to expand
-    fireEvent.click(screen.getByRole('button', { name: /2 queued/i }));
     expect(document.querySelector('.controls-queued-hint')).toBeTruthy();
     expect(screen.getByText('queued first')).toBeDefined();
     expect(screen.getByText('queued second')).toBeDefined();
@@ -1560,8 +1558,6 @@ afterEach(() => {
       />,
     );
 
-    // Compact pill is shown by default — click to expand
-    fireEvent.click(screen.getByRole('button', { name: /2 queued/i }));
     expect(screen.getByText('queued first')).toBeDefined();
     expect(screen.getByText('queued second')).toBeDefined();
   });
@@ -1646,6 +1642,144 @@ afterEach(() => {
     });
   });
 
+  it('shows a running transport send in the queue instead of injecting a timeline bubble', () => {
+    const ws = makeWs();
+    const onSend = vi.fn();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+        onSend={onSend}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'queue this while busy';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+
+    expectSendPayload(ws, {
+      sessionName: 'qwen-session',
+      text: 'queue this while busy',
+    });
+    expect(onSend).not.toHaveBeenCalled();
+    expect(screen.getByText('queue this while busy')).toBeDefined();
+  });
+
+  it('keeps an optimistic queue entry across transient non-running session snapshots', () => {
+    const ws = makeWs();
+    const onSend = vi.fn();
+    const view = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+        onSend={onSend}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'do not disappear';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+    expect(screen.getByText('do not disappear')).toBeDefined();
+
+    view.rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'idle',
+          transportPendingMessages: [],
+          transportPendingMessageEntries: [],
+        })}
+        quickData={makeQuickData() as any}
+        onSend={onSend}
+      />,
+    );
+
+    expect(screen.getByText('do not disappear')).toBeDefined();
+  });
+
+  it('lets an authoritative daemon queue snapshot replace optimistic queue entries', () => {
+    const ws = makeWs();
+    const view = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'local only';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+    expect(screen.getByText('local only')).toBeDefined();
+
+    view.rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessages: ['daemon queued'],
+          transportPendingMessageEntries: [{ clientMessageId: 'daemon-id', text: 'daemon queued' }],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.getByText('daemon queued')).toBeDefined();
+    expect(screen.queryByText('local only')).toBeNull();
+  });
+
+  it('does not queue transport slash commands while running', () => {
+    const ws = makeWs();
+    const onSend = vi.fn();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+        onSend={onSend}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = '/clear';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+
+    expectSendPayload(ws, {
+      sessionName: 'qwen-session',
+      text: '/clear',
+    });
+    expect(onSend).toHaveBeenCalledWith('qwen-session', '/clear', expect.objectContaining({
+      commandId: expect.any(String),
+    }));
+    expect(screen.queryByRole('button', { name: '1 queued' })).toBeNull();
+  });
+
   it('qwen oauth model dropdown only shows coder-model even if stale model list exists', () => {
     render(<SessionControls
       ws={makeWs() as any}
@@ -1704,14 +1838,12 @@ afterEach(() => {
         quickData={makeQuickData() as any}
       />,
     );
-    // Compact pill is shown by default — click to expand
-    fireEvent.click(screen.getByRole('button', { name: /2 queued/i }));
     expect(screen.getByText('transport_send_queued')).toBeDefined();
     expect(screen.getByText('queued send')).toBeDefined();
     expect(screen.getByText('second queued send')).toBeDefined();
   });
 
-  it('can collapse queued transport messages to latest-only view', () => {
+  it('can hide queued transport messages into a compact count pill', () => {
     const runningSession = makeSession({
       name: 'qwen-session',
       agentType: 'qwen',
@@ -1731,20 +1863,17 @@ afterEach(() => {
       />,
     );
 
-    // Compact pill is shown by default — click to expand first
-    fireEvent.click(screen.getByRole('button', { name: /2 queued/i }));
+    expect(screen.getByText('queued send')).toBeDefined();
+    expect(screen.getByText('second queued send')).toBeDefined();
     fireEvent.click(screen.getByRole('button', { name: 'hide' }));
 
-    // Collapsed state is now a compact pill — only a count, no latest-only
-    // summary or message preview (took too much vertical space on mobile).
-    // The pill itself is the button that expands the full list back.
     expect(screen.getByRole('button', { name: '2 queued' })).toBeDefined();
     expect(screen.queryByText('queued send')).toBeNull();
     expect(screen.queryByText('second queued send')).toBeNull();
     expect(screen.queryByText('2 queued · showing latest only')).toBeNull();
   });
 
-  it('remembers collapsed queued transport messages globally', () => {
+  it('remembers queued transport message visibility per session and defaults to visible', () => {
     const runningSession = makeSession({
       name: 'qwen-session',
       agentType: 'qwen',
@@ -1764,12 +1893,25 @@ afterEach(() => {
       />,
     );
 
-    // Compact pill is shown by default — click to expand
+    expect(screen.getByText('queued send')).toBeDefined();
+    expect(screen.getByText('second queued send')).toBeDefined();
+    expect(screen.queryByText('2 queued · showing latest only')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'hide' }));
+    expect(screen.getByRole('button', { name: '2 queued' })).toBeDefined();
+    cleanup();
+
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={runningSession}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
     expect(screen.getByRole('button', { name: '2 queued' })).toBeDefined();
     expect(screen.queryByText('queued send')).toBeNull();
-    expect(screen.queryByText('second queued send')).toBeNull();
-    expect(screen.queryByText('2 queued · showing latest only')).toBeNull();
-    // Click pill to expand and verify messages appear
+
     fireEvent.click(screen.getByRole('button', { name: /2 queued/i }));
     expect(screen.getByText('queued send')).toBeDefined();
     expect(screen.getByText('second queued send')).toBeDefined();
@@ -1795,8 +1937,6 @@ afterEach(() => {
       />,
     );
 
-    // Compact pill is shown by default — click to expand first
-    fireEvent.click(screen.getByRole('button', { name: /1 queued/i }));
     fireEvent.click(screen.getByRole('button', { name: /edit/i }));
     const input = screen.getByRole('textbox') as HTMLDivElement;
     expect(input.textContent).toBe('queued send');
@@ -1836,8 +1976,6 @@ afterEach(() => {
       />,
     );
 
-    // Compact pill is shown by default — click to expand first
-    fireEvent.click(screen.getByRole('button', { name: /1 queued/i }));
     fireEvent.click(screen.getByRole('button', { name: /delete/i }));
 
     expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({

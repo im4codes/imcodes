@@ -128,7 +128,7 @@ export function SubSessionWindow({
     refreshing,
     historyStatus: timelineHistoryStatus,
     addOptimisticUserMessage,
-    removeOptimisticMessage,
+    retryOptimisticMessage,
   } = useTimeline(sub.sessionName, ws, serverId, {
     isActiveSession: active,
   });
@@ -158,9 +158,8 @@ export function SubSessionWindow({
 
   // ── Retry failed send ─────────────────────────────────────────────────────
   // Mirrors the main-session SessionPane handler so optimistic-UX behavior is
-  // uniform: locate the failed bubble in the timeline cache, clear it, dispatch
-  // a fresh session.send with a new commandId, and re-inject an optimistic
-  // "sending" bubble immediately.
+  // uniform: locate the failed bubble in the timeline cache, dispatch a fresh
+  // session.send with a new commandId, and update the existing bubble in place.
   const eventsRef = useRef(events);
   eventsRef.current = events;
   const handleResendFailed = useCallback((commandId: string, text: string) => {
@@ -188,14 +187,11 @@ export function SubSessionWindow({
     } catch {
       return;
     }
-    removeOptimisticMessage(commandId);
-    if (effectiveRuntimeType !== 'transport') {
-      addOptimisticUserMessage(text, newCommandId, {
-        ...(attachmentsFromFailure ? { attachments: attachmentsFromFailure } : {}),
-        ...(resendExtra ? { resendExtra } : {}),
-      });
-    }
-  }, [addOptimisticUserMessage, connected, removeOptimisticMessage, sub.sessionName, ws]);
+    retryOptimisticMessage(commandId, newCommandId, text, {
+      ...(attachmentsFromFailure ? { attachments: attachmentsFromFailure } : {}),
+      ...(resendExtra ? { resendExtra } : {}),
+    });
+  }, [connected, retryOptimisticMessage, sub.sessionName, ws]);
 
   const thinkingNow = useNowTicker(!!activeThinkingTs && active);
   const isShell = sub.type === 'shell' || sub.type === 'script';

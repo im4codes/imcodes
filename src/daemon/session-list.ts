@@ -6,6 +6,7 @@ import { getQwenDisplayMetadata } from '../agent/provider-display.js';
 import { getQwenOAuthQuotaUsageLabel } from '../agent/provider-quota.js';
 import { getClaudeSdkRuntimeConfig } from '../agent/sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
+import { mergeCodexDisplayMetadata } from '../agent/codex-display.js';
 import { getCopilotRuntimeConfig } from '../agent/copilot-runtime-config.js';
 import { getCursorRuntimeConfig } from '../agent/cursor-runtime-config.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
@@ -178,12 +179,8 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
     }
     if (s.agentType === 'codex' || s.agentType === 'codex-sdk') {
       const hydrated: Partial<SessionRecord> = {
-        ...(codexRuntime?.availableModels?.length ? { codexAvailableModels: codexRuntime.availableModels } : {}),
-        planLabel: codexRuntime?.planLabel,
+        ...mergeCodexDisplayMetadata(codexRuntime, s),
         permissionLabel: getPermissionLabel(s.agentType),
-        quotaLabel: codexRuntime?.quotaLabel,
-        quotaUsageLabel: codexRuntime?.quotaUsageLabel,
-        quotaMeta: codexRuntime?.quotaMeta,
       };
       if (
         hydrated.planLabel !== s.planLabel

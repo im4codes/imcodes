@@ -6,6 +6,7 @@ import { render, screen, cleanup, fireEvent } from '@testing-library/preact';
 import { h } from 'preact';
 
 const addOptimisticUserMessageMock = vi.fn();
+const retryOptimisticMessageMock = vi.fn();
 let timelineEventsMock: any[] = [];
 let activeToolCallMock = false;
 const useTimelineMock = vi.fn();
@@ -35,7 +36,6 @@ vi.mock('../../src/components/SessionControls.js', () => ({
     </button>
   ),
 }));
-const removeOptimisticMessageMock = vi.fn();
 vi.mock('../../src/hooks/useTimeline.js', () => ({
   useTimeline: (...args: any[]) => {
     useTimelineMock(...args);
@@ -46,7 +46,7 @@ vi.mock('../../src/hooks/useTimeline.js', () => ({
       loadingOlder: false,
       hasOlderHistory: false,
       addOptimisticUserMessage: addOptimisticUserMessageMock,
-      removeOptimisticMessage: removeOptimisticMessageMock,
+      retryOptimisticMessage: retryOptimisticMessageMock,
       loadOlderEvents: vi.fn(),
     };
   },
@@ -73,6 +73,7 @@ import { SessionPane } from '../../src/components/SessionPane.js';
 describe('SessionPane', () => {
   beforeEach(() => {
     addOptimisticUserMessageMock.mockReset();
+    retryOptimisticMessageMock.mockReset();
     useTimelineMock.mockReset();
     timelineEventsMock = [];
     activeToolCallMock = false;
@@ -236,7 +237,7 @@ describe('SessionPane', () => {
     props.onResendFailed?.('failed-cmd', 'retry me');
 
     expect(ws.sendSessionCommand).toHaveBeenCalledOnce();
-    expect(removeOptimisticMessageMock).not.toHaveBeenCalled();
+    expect(retryOptimisticMessageMock).not.toHaveBeenCalled();
     expect(addOptimisticUserMessageMock).not.toHaveBeenCalled();
   });
 

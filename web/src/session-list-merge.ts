@@ -52,9 +52,9 @@ export interface IncomingSessionListEntry {
   qwenAvailableModels?: string[];
   codexAvailableModels?: string[];
   modelDisplay?: string;
-  planLabel?: string;
-  quotaLabel?: string;
-  quotaUsageLabel?: string;
+  planLabel?: string | null;
+  quotaLabel?: string | null;
+  quotaUsageLabel?: string | null;
   quotaMeta?: SessionInfo['quotaMeta'];
   effort?: SessionInfo['effort'];
   transportConfig?: Record<string, unknown> | null;
@@ -66,6 +66,7 @@ export function mergeSessionListEntry(
   incoming: IncomingSessionListEntry,
   existing: SessionInfo | undefined,
 ): SessionInfo {
+  const isCodexFamily = incoming.agentType === 'codex' || incoming.agentType === 'codex-sdk';
   const shouldKeepPendingQueue = incoming.state === 'queued' || incoming.state === 'running';
   const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(incoming, 'transportPendingMessages');
   const hasPendingEntriesField = Object.prototype.hasOwnProperty.call(incoming, 'transportPendingMessageEntries');
@@ -114,10 +115,10 @@ export function mergeSessionListEntry(
     qwenAvailableModels: incoming.qwenAvailableModels ?? existing?.qwenAvailableModels,
     codexAvailableModels: incoming.codexAvailableModels ?? existing?.codexAvailableModels,
     modelDisplay: incoming.modelDisplay ?? incoming.activeModel ?? existing?.modelDisplay,
-    planLabel: incoming.planLabel,
-    quotaLabel: incoming.quotaLabel,
-    quotaUsageLabel: incoming.quotaUsageLabel,
-    quotaMeta: incoming.quotaMeta ?? existing?.quotaMeta,
+    planLabel: incoming.planLabel ?? (isCodexFamily ? existing?.planLabel : undefined),
+    quotaLabel: incoming.quotaLabel ?? (isCodexFamily ? existing?.quotaLabel : undefined),
+    quotaUsageLabel: incoming.quotaUsageLabel ?? (isCodexFamily ? existing?.quotaUsageLabel : undefined),
+    quotaMeta: incoming.quotaMeta ?? (isCodexFamily ? existing?.quotaMeta : undefined),
     effort: incoming.effort ?? existing?.effort,
     transportConfig: mergeTransportConfigPreservingSupervision(
       incoming.transportConfig,

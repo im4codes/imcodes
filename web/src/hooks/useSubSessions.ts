@@ -31,6 +31,10 @@ export interface SubSession extends SubSessionData {
   transportPendingMessageEntries?: import('../transport-queue.js').TransportPendingMessageEntry[] | null;
 }
 
+function isCodexFamily(agentType: string | null | undefined): boolean {
+  return agentType === 'codex' || agentType === 'codex-sdk';
+}
+
 function toSessionName(id: string): string {
   return `deck_sub_${id}`;
 }
@@ -137,6 +141,8 @@ export function useSubSessions(
             const existingIdx = prev.findIndex((s) => s.id === m.id);
             if (existingIdx !== -1) {
               const updated = [...prev];
+              const existing = updated[existingIdx];
+              const preserveQuota = isCodexFamily(existing.type);
               updated[existingIdx] = { ...updated[existingIdx],
                 ...(m.state != null && { state: m.state as SubSession['state'] }),
                 ...(m.cwd != null && { cwd: m.cwd }),
@@ -145,9 +151,9 @@ export function useSubSessions(
                 ...(m.requestedModel !== undefined && { requestedModel: m.requestedModel }),
                 ...(m.activeModel !== undefined && { activeModel: m.activeModel }),
                 ...(m.planLabel != null && { planLabel: m.planLabel }),
-                ...(m.quotaLabel != null && { quotaLabel: m.quotaLabel }),
-                ...(m.quotaUsageLabel != null && { quotaUsageLabel: m.quotaUsageLabel }),
-                ...(m.quotaMeta !== undefined && { quotaMeta: m.quotaMeta }),
+                ...((m.quotaLabel != null || (!preserveQuota && m.quotaLabel === null)) ? { quotaLabel: m.quotaLabel } : {}),
+                ...((m.quotaUsageLabel != null || (!preserveQuota && m.quotaUsageLabel === null)) ? { quotaUsageLabel: m.quotaUsageLabel } : {}),
+                ...((m.quotaMeta != null || (!preserveQuota && m.quotaMeta === null)) ? { quotaMeta: m.quotaMeta } : {}),
                 ...(m.effort != null && { effort: m.effort }),
                 ...(m.transportConfig !== undefined && {
                   transportConfig: mergeTransportConfigPreservingSupervision(
@@ -226,6 +232,7 @@ export function useSubSessions(
         if (m.id) {
           setSubSessions((prev) => prev.map((s) => {
             if (s.id !== m.id) return s;
+            const preserveQuota = isCodexFamily(s.type);
             return { ...s,
               ...(m.state ? { state: m.state as SubSession['state'] } : {}),
               ...(m.cwd !== undefined ? { cwd: m.cwd } : {}),
@@ -236,9 +243,9 @@ export function useSubSessions(
               ...(m.activeModel !== undefined ? { activeModel: m.activeModel } : {}),
               ...(m.modelDisplay !== undefined ? { modelDisplay: m.modelDisplay } : {}),
               ...(m.planLabel !== undefined ? { planLabel: m.planLabel } : {}),
-              ...(m.quotaLabel !== undefined ? { quotaLabel: m.quotaLabel } : {}),
-              ...(m.quotaUsageLabel !== undefined ? { quotaUsageLabel: m.quotaUsageLabel } : {}),
-              ...(m.quotaMeta !== undefined ? { quotaMeta: m.quotaMeta } : {}),
+              ...((m.quotaLabel != null || (!preserveQuota && m.quotaLabel === null)) ? { quotaLabel: m.quotaLabel } : {}),
+              ...((m.quotaUsageLabel != null || (!preserveQuota && m.quotaUsageLabel === null)) ? { quotaUsageLabel: m.quotaUsageLabel } : {}),
+              ...((m.quotaMeta != null || (!preserveQuota && m.quotaMeta === null)) ? { quotaMeta: m.quotaMeta } : {}),
               ...(m.effort !== undefined ? { effort: m.effort } : {}),
               ...(m.transportConfig !== undefined ? {
                 transportConfig: mergeTransportConfigPreservingSupervision(

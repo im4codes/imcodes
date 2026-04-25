@@ -267,6 +267,16 @@ function isLocalOptimisticUserMessage(event: TimelineEvent): boolean {
   return event.type === 'user.message' && event.eventId.startsWith(OPTIMISTIC_EVENT_ID_PREFIX);
 }
 
+function isAuthoritativeSendProgressEvent(event: TimelineEvent): boolean {
+  if (event.type === 'assistant.text' || event.type === 'tool.call' || event.type === 'tool.result') return true;
+  if (event.type === 'memory.context' && typeof event.payload.relatedToEventId === 'string') return true;
+  if (event.type === 'session.state') {
+    const state = String(event.payload.state ?? '');
+    return state === 'running' || state === 'idle';
+  }
+  return false;
+}
+
 function removeReconciledLocalUserMessages(
   base: TimelineEvent[],
   incoming: readonly TimelineEvent[],
@@ -445,6 +455,16 @@ export interface UseTimelineResult {
   markOptimisticFailed: (commandId: string, error?: string) => void;
   /** Remove an optimistic message by commandId (used by retry before re-sending). */
   removeOptimisticMessage: (commandId: string) => void;
+  /** Update a failed optimistic message in place for retry with a fresh commandId. */
+  retryOptimisticMessage: (
+    oldCommandId: string,
+    newCommandId: string,
+    text: string,
+    opts?: {
+      attachments?: Array<Record<string, unknown>>;
+      resendExtra?: Record<string, unknown>;
+    },
+  ) => void;
   /** Load older events before the earliest currently loaded event. */
   loadOlderEvents: () => void;
 }
@@ -838,6 +858,126 @@ export function useTimeline(
     });
   }, [clearOptimisticTimer, rememberSettledCommandId]);
 
+  const settleOptimisticByCommandAck = useCallback((commandId: string, status: string, error?: unknown) => {
+    if (!commandId || !status) return;
+    if (status === 'error' || status === 'conflict') {
+      markOptimisticFailed(commandId, typeof error === 'string' ? error : status);
+      return;
+    }
+    markOptimisticAccepted(commandId);
+  }, [markOptimisticAccepted, markOptimisticFailed]);
+
+  const settleOptimisticByCommandAckEvent = useCallback((event: TimelineEvent) => {
+    if (event.type !== 'command.ack') return;
+    const commandId = typeof event.payload.commandId === 'string' ? event.payload.commandId : '';
+    const status = typeof event.payload.status === 'string' ? event.payload.status : '';
+    settleOptimisticByCommandAck(commandId, status, event.payload.error);
+  }, [settleOptimisticByCommandAck]);
+
+  const retryOptimisticMessage = useCallback((
+    oldCommandId: string,
+    newCommandId: string,
+    text: string,
+    opts?: {
+      attachments?: Array<Record<string, unknown>>;
+      resendExtra?: Record<string, unknown>;
+    },
+  ) => {
+    if (!sessionId || !oldCommandId || !newCommandId) return;
+    const eventId = optimisticIdsByCommandRef.current.get(oldCommandId);
+    optimisticIdsByCommandRef.current.delete(oldCommandId);
+    clearOptimisticTimer(oldCommandId);
+    optimisticIdsByCommandRef.current.set(newCommandId, eventId ?? `${OPTIMISTIC_EVENT_ID_PREFIX}${sessionId}:${newCommandId}`);
+    clearOptimisticTimer(newCommandId);
+    const timer = setTimeout(() => {
+      markOptimisticFailed(newCommandId, 'timeout');
+    }, OPTIMISTIC_TIMEOUT_MS);
+    optimisticTimersRef.current.set(newCommandId, timer);
+
+    setEvents((prev) => {
+      const base = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
+      const idx = eventId ? base.findIndex((e) => e.eventId === eventId) : -1;
+      const payload: Record<string, unknown> = {
+        text,
+        pending: true,
+        failed: false,
+        commandId: newCommandId,
+      };
+      if (opts?.attachments && opts.attachments.length > 0) payload.attachments = opts.attachments;
+      if (opts?.resendExtra && Object.keys(opts.resendExtra).length > 0) payload._resendExtra = opts.resendExtra;
+      if (idx >= 0) {
+        const existing = base[idx]!;
+        const updated = [...base];
+        updated[idx] = {
+          ...existing,
+          ts: Date.now(),
+          payload: {
+            ...existing.payload,
+            ...payload,
+          },
+        };
+        delete updated[idx]!.payload.failureReason;
+        delete updated[idx]!.payload.acked;
+        if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, updated);
+        return updated;
+      }
+      const optimisticId = `${OPTIMISTIC_EVENT_ID_PREFIX}${sessionId}:${newCommandId}`;
+      optimisticIdsByCommandRef.current.set(newCommandId, optimisticId);
+      const event: TimelineEvent = {
+        eventId: optimisticId,
+        type: 'user.message',
+        sessionId,
+        ts: Date.now(),
+        epoch: 0,
+        seq: 0,
+        source: 'daemon',
+        confidence: 'high',
+        payload,
+      };
+      const result = [...base, event];
+      if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, result);
+      return result;
+    });
+  }, [clearOptimisticTimer, markOptimisticFailed, sessionId]);
+
+  const settleOptimisticByTimelineProgress = useCallback((progressEvent: TimelineEvent) => {
+    if (!isAuthoritativeSendProgressEvent(progressEvent)) return;
+    const pendingCommands = [...optimisticIdsByCommandRef.current.entries()];
+    if (pendingCommands.length === 0) return;
+    const base = getSharedTimelineBase(cacheKeyRef.current, eventsRef.current, MAX_MEMORY_EVENTS);
+    for (const [commandId, optimisticId] of pendingCommands) {
+      if (settledCommandIdsRef.current.has(commandId)) continue;
+      const optimisticEvent = base.find((event) => event.eventId === optimisticId);
+      if (!optimisticEvent || optimisticEvent.type !== 'user.message') continue;
+      if (!optimisticEvent.payload.pending && !optimisticEvent.payload.failed) continue;
+      if (typeof optimisticEvent.ts === 'number' && progressEvent.ts + 1_000 < optimisticEvent.ts) continue;
+      const relatedToEventId = progressEvent.type === 'memory.context' && typeof progressEvent.payload.relatedToEventId === 'string'
+        ? progressEvent.payload.relatedToEventId
+        : '';
+      if (relatedToEventId) {
+        const relatedUserMessage = base.find((event) => event.eventId === relatedToEventId && event.type === 'user.message');
+        if (relatedUserMessage) {
+          setEvents((prev) => {
+            const current = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
+            const optimisticIdx = current.findIndex((event) => event.eventId === optimisticId);
+            if (optimisticIdx < 0) return current;
+            const next = current.filter((event) => event.eventId !== relatedToEventId);
+            const idx = next.findIndex((event) => event.eventId === optimisticId);
+            if (idx < 0) return current;
+            next[idx] = relatedUserMessage;
+            if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, next);
+            return next;
+          });
+          optimisticIdsByCommandRef.current.delete(commandId);
+          clearOptimisticTimer(commandId);
+          rememberSettledCommandId(commandId);
+          continue;
+        }
+      }
+      markOptimisticAccepted(commandId);
+    }
+  }, [clearOptimisticTimer, markOptimisticAccepted, rememberSettledCommandId]);
+
   // Immediately show a user message before the daemon confirms it.
   // The real event (from WS) will remove the pending version on arrival.
   // When `commandId` is provided, the bubble reconciles deterministically with
@@ -1045,6 +1185,10 @@ export function useTimeline(
         );
         if (recovered.length === 0) return;
         mergeEvents(recovered);
+        for (const recoveredEvent of recovered) {
+          settleOptimisticByCommandAckEvent(recoveredEvent);
+          settleOptimisticByTimelineProgress(recoveredEvent);
+        }
         idbPutEvents(recovered);
       }).catch(() => { /* opportunistic — WS path is primary */ })
         .finally(() => {
@@ -1055,7 +1199,7 @@ export function useTimeline(
           }
         });
     }, delayMs);
-  }, [disableHistory, isActiveSession, serverId, sessionId, cacheKey, mergeEvents, idbPutEvents, updateHistoryStep]);
+  }, [disableHistory, isActiveSession, serverId, sessionId, cacheKey, mergeEvents, idbPutEvents, settleOptimisticByCommandAckEvent, settleOptimisticByTimelineProgress, updateHistoryStep]);
 
   // Stable indirection — lets the session-mount effect below call the latest
   // `fireHttpBackfill` without having to list it (and transitively its five
@@ -1100,6 +1244,7 @@ export function useTimeline(
         if (event.type === 'session.state' && event.payload?.state === 'queued') {
           reconcileQueuedOptimisticMessages(event.payload.pendingMessageEntries, event.payload.pendingMessages);
         }
+        settleOptimisticByCommandAckEvent(event);
 
         // Echo dedup: hide assistant.text that echoes a recent user message (e.g. prompt repeat).
         // Read current events via ref (avoid unnecessary setEvents call that returns prev unchanged).
@@ -1117,8 +1262,10 @@ export function useTimeline(
 
         // user.message: remove matching optimistic (pending) event, then dedup
         // against already-confirmed events (JSONL watcher re-emits same text ~2s later).
+        let userMessageAlreadyMerged = false;
         if (event.type === 'user.message' && event.payload.text) {
           const text = String(event.payload.text).trim();
+          const normalizedText = normalizeForEcho(text);
           const allowDuplicate = event.payload.allowDuplicate === true;
           // Transport path already attaches the originating commandId as
           // `clientMessageId` in the payload; prefer that for reconciliation
@@ -1133,39 +1280,60 @@ export function useTimeline(
           setEvents((prev) => {
             const base = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
             // 1) Prefer commandId-based reconciliation: remove the optimistic
-            //    bubble that matches this echo's commandId regardless of state
-            //    (pending OR failed — a late echo means the send eventually
-            //    succeeded and the red "!" was spurious).
-            let cleaned = base;
+            //    bubble that matches this echo's commandId regardless of state.
+            //    Replace in place so retry/success preserve the original visual
+            //    position and linked memory.context cards attach to the real id.
             if (echoCommandId) {
               const optimisticId = optimisticIdsByCommandRef.current.get(echoCommandId);
               if (optimisticId) {
-                cleaned = base.filter((e) => e.eventId !== optimisticId);
+                const idx = base.findIndex((e) => e.eventId === optimisticId);
                 optimisticIdsByCommandRef.current.delete(echoCommandId);
                 clearOptimisticTimer(echoCommandId);
+                rememberSettledCommandId(echoCommandId);
+                if (idx >= 0) {
+                  const updated = [...base];
+                  updated[idx] = event;
+                  if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, updated);
+                  userMessageAlreadyMerged = true;
+                  return updated;
+                }
               }
               rememberSettledCommandId(echoCommandId);
             }
             // 2) Fallback to text-based cleanup for legacy emit paths (tmux
             //    JSONL scrapers, etc.) that don't propagate commandId.
-            const withoutPending = cleaned.filter(
-              (e) => !(
+            const optimisticTextIdx = base.findIndex(
+              (e) =>
                 e.type === 'user.message'
                 && (e.payload.pending || e.payload.failed)
-                && String(e.payload.text ?? '').trim() === text
-              ),
+                && normalizeForEcho(String(e.payload.text ?? '')) === normalizedText,
             );
-            if (withoutPending.length < base.length) {
-              for (const removed of cleaned) {
-                if (withoutPending.includes(removed) || removed.type !== 'user.message') continue;
-                const removedCommandId = typeof removed.payload.commandId === 'string'
-                  ? removed.payload.commandId
-                  : '';
-                if (!removedCommandId) continue;
+            if (optimisticTextIdx >= 0) {
+              const removed = base[optimisticTextIdx]!;
+              const removedCommandId = typeof removed.payload.commandId === 'string'
+                ? removed.payload.commandId
+                : '';
+              if (removedCommandId) {
                 optimisticIdsByCommandRef.current.delete(removedCommandId);
                 clearOptimisticTimer(removedCommandId);
                 rememberSettledCommandId(removedCommandId);
               }
+              const updated = [...base];
+              updated[optimisticTextIdx] = event;
+              if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, updated);
+              userMessageAlreadyMerged = true;
+              return updated;
+            }
+            const withoutPending = base.filter(
+              (e) => {
+                if (e.type !== 'user.message' || (!e.payload.pending && !e.payload.failed)) return true;
+                const candidateCommandId = typeof e.payload.commandId === 'string'
+                  ? e.payload.commandId
+                  : '';
+                return candidateCommandId !== echoCommandId;
+              },
+            );
+            if (withoutPending.length < base.length) {
               if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, withoutPending);
               return withoutPending;
             }
@@ -1185,12 +1353,14 @@ export function useTimeline(
           if (skipAppend) return;
         }
 
+        settleOptimisticByTimelineProgress(event);
+
 
         // Update epoch tracker — don't clear events on epoch change;
         // history response will merge the authoritative set, and ts-sort handles cross-epoch order.
         epochRef.current = event.epoch;
         seqRef.current = Math.max(seqRef.current, event.seq);
-        appendEvent(event);
+        if (!userMessageAlreadyMerged) appendEvent(event);
 
         idbPutEvents([event]);
       }
@@ -1256,6 +1426,10 @@ export function useTimeline(
           } else {
             mergeEvents(msg.events);
           }
+          for (const historyEvent of msg.events) {
+            settleOptimisticByCommandAckEvent(historyEvent);
+            settleOptimisticByTimelineProgress(historyEvent);
+          }
           idbPutEvents(msg.events);
         } else if (historyRetryRef.current < 2 && ws?.connected && eventsRef.current.length === 0) {
           // Empty response with no cached events — retry once after a short delay
@@ -1290,6 +1464,10 @@ export function useTimeline(
           const maxSeq = replayEvents.reduce((max, e) => Math.max(max, e.seq), 0);
           seqRef.current = Math.max(seqRef.current, maxSeq);
           mergeEvents(replayEvents);
+          for (const replayEvent of replayEvents) {
+            settleOptimisticByCommandAckEvent(replayEvent);
+            settleOptimisticByTimelineProgress(replayEvent);
+          }
           idbPutEvents(replayEvents);
         }
         setRefreshing(false);
@@ -1297,19 +1475,12 @@ export function useTimeline(
 
       // ── Reconnect: daemon restarted → epoch changed, replay is useless. Request only new events. ──
       if (msg.type === DAEMON_MSG.RECONNECTED) {
-        // Clear pending optimistic messages — they were sent to the old connection
-        // and we can't guarantee they reached the agent. The history replay below
-        // will bring back any messages that were actually processed. Failed
-        // bubbles stay put so the user can still retry them.
-        for (const timer of optimisticTimersRef.current.values()) clearTimeout(timer);
-        optimisticTimersRef.current.clear();
-        optimisticIdsByCommandRef.current.clear();
-        setEvents((prev) => {
-          const base = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
-          const cleaned = base.filter((e) => !(e.type === 'user.message' && e.payload.pending));
-          if (cleaned.length !== base.length && cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, cleaned);
-          return cleaned;
-        });
+        // Keep local optimistic bubbles visible across reconnect. The daemon may
+        // have received and persisted the send while the browser missed the ack
+        // or the live timeline echo; removing the bubble here makes the message
+        // appear to vanish until a manual refresh. History/backfill below will
+        // reconcile confirmed sends by commandId/text, and the existing timeout
+        // still marks genuinely unconfirmed sends as retryable.
         if (ws && sessionId) {
           setHistoryStatus({
             phase: 'refresh',
@@ -1317,12 +1488,13 @@ export function useTimeline(
               cache: 'done',
               textTail: 'skipped',
               daemon: 'running',
-              http: 'skipped',
+              http: serverId ? 'pending' : 'skipped',
               older: 'skipped',
             },
           });
           setRefreshing(true);
           historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
+          fireHttpBackfillRef.current(600, { phase: 'refresh', visible: true });
         }
       }
       // ── Browser WS disconnected: reset in-flight pagination to prevent stuck state ──
@@ -1396,14 +1568,7 @@ export function useTimeline(
         const status = typeof (msg as { status?: unknown }).status === 'string'
           ? (msg as { status: string }).status
           : '';
-        const isFailure = status === 'error' || status === 'conflict';
-        if (isFailure) {
-          const errorField = (msg as unknown as Record<string, unknown>).error;
-          const reason = typeof errorField === 'string' ? errorField : status;
-          markOptimisticFailed(commandId, reason);
-        } else if (status) {
-          markOptimisticAccepted(commandId);
-        }
+        settleOptimisticByCommandAck(commandId, status, (msg as unknown as Record<string, unknown>).error);
       }
 
       // ── command.failed: server-surfaced fast failure (daemon_offline / ack_timeout).
@@ -1424,6 +1589,10 @@ export function useTimeline(
         const reasonStr: AckFailureReason = (reason === 'ack_timeout' || reason === 'daemon_error')
           ? reason
           : 'daemon_offline';
+        if (reasonStr === 'ack_timeout') {
+          fireHttpBackfillRef.current(0, { phase: 'refresh', visible: true });
+          return;
+        }
         markOptimisticFailed(commandId, localizedAckFailureReason(reasonStr));
       }
 
@@ -1439,7 +1608,7 @@ export function useTimeline(
 
     const unsub = ws.onMessage(handler);
     return unsub;
-  }, [disableHistory, isActiveSession, ws, sessionId, appendEvent, clearOptimisticTimer, loading, markOptimisticAccepted, markOptimisticFailed, mergeEvents, reconcileQueuedOptimisticMessages, rememberSettledCommandId, replaceEvents, serverId, updateHistoryStep]);
+  }, [disableHistory, isActiveSession, ws, sessionId, appendEvent, clearOptimisticTimer, loading, markOptimisticFailed, mergeEvents, reconcileQueuedOptimisticMessages, rememberSettledCommandId, replaceEvents, serverId, settleOptimisticByCommandAck, settleOptimisticByCommandAckEvent, settleOptimisticByTimelineProgress, updateHistoryStep]);
 
   useEffect(() => {
     if (loading || refreshing || httpRefreshing || loadingOlder) return;
@@ -1470,6 +1639,7 @@ export function useTimeline(
     addOptimisticUserMessage,
     markOptimisticFailed,
     removeOptimisticMessage,
+    retryOptimisticMessage,
     loadOlderEvents,
   };
 }

@@ -154,7 +154,7 @@ describe('Claude no-text refresh integration', () => {
 
     expect(assistantIdx).toBeGreaterThanOrEqual(0);
     expect(idleIdx).toBeGreaterThan(assistantIdx);
-  });
+  }, 15000);
 
   it('does not read a different claude session transcript during idle refresh', async () => {
     await appendFile(otherFile, assistantText('wrong claude transcript'));

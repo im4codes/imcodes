@@ -188,6 +188,66 @@ describe('mergeSessionListEntry — general field behavior', () => {
     expect(merged.effort).toBe('high');
   });
 
+  it('preserves codex quota display when a transient broadcast omits or nulls it', () => {
+    const existing = makeExisting({
+      agentType: 'codex',
+      planLabel: 'Pro',
+      quotaLabel: '5h 22% 1h10m 4/6 14:40',
+      quotaUsageLabel: 'legacy usage text',
+      quotaMeta: {
+        primary: { usedPercent: 22, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+      },
+    });
+
+    const omitted = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      agentType: 'codex',
+    }, existing);
+    expect(omitted.planLabel).toBe('Pro');
+    expect(omitted.quotaLabel).toBe('5h 22% 1h10m 4/6 14:40');
+    expect(omitted.quotaUsageLabel).toBe('legacy usage text');
+    expect(omitted.quotaMeta?.primary?.usedPercent).toBe(22);
+
+    const nulled = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      agentType: 'codex',
+      planLabel: null,
+      quotaLabel: null,
+      quotaUsageLabel: null,
+      quotaMeta: null,
+    }, existing);
+    expect(nulled.planLabel).toBe('Pro');
+    expect(nulled.quotaLabel).toBe('5h 22% 1h10m 4/6 14:40');
+    expect(nulled.quotaUsageLabel).toBe('legacy usage text');
+    expect(nulled.quotaMeta?.primary?.usedPercent).toBe(22);
+  });
+
+  it('allows non-codex quota display to clear when daemon reports no quota', () => {
+    const existing = makeExisting({
+      agentType: 'qwen',
+      planLabel: 'Free',
+      quotaLabel: '1,000/day',
+      quotaUsageLabel: 'today 5/1000',
+      quotaMeta: {
+        primary: { usedPercent: 5, windowDurationMins: 1440, resetsAt: 1_800_000_000 },
+      },
+    });
+
+    const merged = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      agentType: 'qwen',
+      planLabel: null,
+      quotaLabel: null,
+      quotaUsageLabel: null,
+      quotaMeta: null,
+    }, existing);
+
+    expect(merged.planLabel).toBeUndefined();
+    expect(merged.quotaLabel).toBeUndefined();
+    expect(merged.quotaUsageLabel).toBeUndefined();
+    expect(merged.quotaMeta).toBeUndefined();
+  });
+
   it('preserves and infers transport runtime type when a partial broadcast omits runtimeType', () => {
     const merged = mergeSessionListEntry({
       ...BASE_INCOMING,

@@ -500,4 +500,61 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
 
     expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
+
+  it('uses HTTP-backfilled command.ack to settle an optimistic send when the live ack was missed', async () => {
+    const sessionName = `deck_http_backfill_ack_${Date.now()}`;
+    const serverId = `srv-http-ack-${Date.now()}`;
+
+    fetchSpy.mockResolvedValue({
+      events: [{
+        eventId: `${sessionName}-ack`,
+        sessionId: sessionName,
+        ts: 2000,
+        epoch: 1,
+        seq: 2,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'command.ack',
+        payload: { commandId: 'cmd-http-backfill-ack', status: 'accepted' },
+      }],
+      epoch: 1,
+      hasMore: false,
+      nextCursor: null,
+    });
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineReplayRequest: vi.fn(() => 'replay-http-ack'),
+      sendTimelineHistoryRequest: vi.fn(() => 'history-http-ack'),
+    } as unknown as WsClient;
+
+    let timeline: ReturnType<typeof useTimeline> | null = null;
+    function Probe() {
+      timeline = useTimeline(sessionName, ws, serverId);
+      const pending = timeline.events.find((event) => event.eventId.includes('cmd-http-backfill-ack'))?.payload.pending;
+      const acked = timeline.events.find((event) => event.eventId.includes('cmd-http-backfill-ack'))?.payload.acked;
+      return h('div', { 'data-testid': 'probe' }, `pending:${String(pending)} acked:${String(acked)}`);
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toContain('pending:undefined');
+    });
+
+    await act(async () => {
+      timeline!.addOptimisticUserMessage('needs ack recovery', 'cmd-http-backfill-ack');
+    });
+    expect(screen.getByTestId('probe').textContent).toContain('pending:true');
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toContain('pending:false');
+      expect(screen.getByTestId('probe').textContent).toContain('acked:true');
+    });
+  });
 });
