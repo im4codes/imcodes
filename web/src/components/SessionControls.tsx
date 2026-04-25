@@ -169,6 +169,10 @@ function buildPastedTextFileName(now = new Date()): string {
   return `pasted-text-${compact}.txt`;
 }
 
+function normalizeQueuedText(text: string): string {
+  return text.replace(/\s+/g, ' ').trim();
+}
+
 function parseStoredComposerAttachments(raw: string | null): ComposerAttachment[] {
   if (!raw) return [];
   try {
@@ -440,7 +444,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking: _activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved }: Props) {
   const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -512,6 +516,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const showRunningSweep = !compact && isRunningSessionState(activeSession?.state);
   const effectiveRuntimeType = activeSession ? resolveSessionInfoRuntimeType(activeSession) : undefined;
+  const transportSendShouldQueue = effectiveRuntimeType === 'transport'
+    && !!activeSession
+    && (isRunningSessionState(activeSession.state) || activeThinking);
   const incomingQueuedTransportEntries = effectiveRuntimeType === 'transport'
     ? normalizeTransportPendingEntries(
         activeSession?.transportPendingMessageEntries,
@@ -927,11 +934,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   useEffect(() => {
     if (!ws || !activeSession) return;
     return ws.onMessage((msg: ServerMessage) => {
-      const removeLocalQueuedEntry = (commandId: string) => {
-        if (!commandId) return;
+      const removeLocalQueuedEntry = (commandId: string, text?: string) => {
+        if (!commandId && !text) return;
+        const normalizedText = typeof text === 'string' ? normalizeQueuedText(text) : '';
         setOptimisticQueuedEntries((prev) => {
           if (!prev) return prev;
-          const next = prev.filter((entry) => entry.clientMessageId !== commandId);
+          const next = prev.filter((entry) => {
+            if (commandId && entry.clientMessageId === commandId) return false;
+            if (!commandId && normalizedText && normalizeQueuedText(entry.text) === normalizedText) return false;
+            return true;
+          });
           return next.length > 0 ? next : null;
         });
       };
@@ -972,14 +984,19 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           : typeof event.payload.clientMessageId === 'string'
             ? event.payload.clientMessageId
             : '';
-        removeLocalQueuedEntry(commandId);
+        removeLocalQueuedEntry(commandId, typeof event.payload.text === 'string' ? event.payload.text : undefined);
       } else if (event.type === 'session.state') {
+        const hasPendingSnapshot = Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessageEntries')
+          || Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessages');
         const queuedEntries = normalizeTransportPendingEntries(
           event.payload.pendingMessageEntries,
           event.payload.pendingMessages,
           activeSession.name,
         );
-        if (queuedEntries.length === 0) return;
+        if (queuedEntries.length === 0) {
+          if (hasPendingSnapshot) setOptimisticQueuedEntries(null);
+          return;
+        }
         const queuedIds = new Set(queuedEntries.map((entry) => entry.clientMessageId));
         setOptimisticQueuedEntries((prev) => {
           if (!prev) return prev;
@@ -1769,7 +1786,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       localFailure = err instanceof Error ? err.message : String(err || 'Send failed');
     }
     const shouldShowAsQueued = effectiveRuntimeType === 'transport'
-      && isRunningSessionState(activeSession.state)
+      && transportSendShouldQueue
       && !isP2pSend
       && !payload.text.trim().startsWith('/');
     if (shouldShowAsQueued) {
@@ -1814,7 +1831,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       if (draftKey) sessionStorage.removeItem(draftKey);
       if (attachmentDraftKey) sessionStorage.removeItem(attachmentDraftKey);
     }
-  }, [activeSession, attachmentDraftKey, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, makeCommandId, onRemoveQuote, onSend, quickData, quotes, sendQueuedMessageMutation, sendSessionMessage]);
+  }, [activeSession, attachmentDraftKey, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, makeCommandId, onRemoveQuote, onSend, quickData, quotes, sendQueuedMessageMutation, sendSessionMessage, transportSendShouldQueue]);
 
   const handleQueuedMessageEdit = useCallback((entry: { clientMessageId: string; text: string }) => {
     if (!isEditableQueuedEntry(entry)) return;

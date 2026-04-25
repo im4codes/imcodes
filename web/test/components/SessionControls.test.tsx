@@ -1673,6 +1673,36 @@ afterEach(() => {
     expect(screen.getByText('queue this while busy')).toBeDefined();
   });
 
+  it('uses active thinking as a busy signal for transport sends even before session.state catches up', () => {
+    const ws = makeWs();
+    const onSend = vi.fn();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'idle',
+        })}
+        activeThinking={true}
+        quickData={makeQuickData() as any}
+        onSend={onSend}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'queue from thinking';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+
+    expectSendPayload(ws, {
+      sessionName: 'qwen-session',
+      text: 'queue from thinking',
+    });
+    expect(onSend).not.toHaveBeenCalled();
+    expect(screen.getByText('queue from thinking')).toBeDefined();
+  });
+
   it('surfaces a normal send as locally failed when the socket write throws', () => {
     const ws = makeWs();
     ws.sendSessionCommand.mockImplementation(() => {
@@ -1878,6 +1908,90 @@ afterEach(() => {
 
     expect(screen.queryByText('old daemon queued')).toBeNull();
     expect(screen.getByText('new local send must stay')).toBeDefined();
+  });
+
+  it('clears optimistic queue entries when daemon sends an authoritative empty pending snapshot', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'queued then drained';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+    expect(screen.getByText('queued then drained')).toBeDefined();
+
+    act(() => {
+      ws.emit({
+        type: 'timeline.event',
+        event: {
+          eventId: 'state-empty-pending',
+          sessionId: 'qwen-session',
+          type: 'session.state',
+          ts: Date.now(),
+          seq: 1,
+          epoch: 1,
+          source: 'daemon',
+          confidence: 'high',
+          payload: {
+            state: 'running',
+            pendingMessages: [],
+            pendingMessageEntries: [],
+          },
+        },
+      });
+    });
+
+    expect(screen.queryByText('queued then drained')).toBeNull();
+  });
+
+  it('clears an optimistic queue entry by text when the authoritative user.message lacks ids', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'queued text fallback';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+    expect(screen.getByText('queued text fallback')).toBeDefined();
+
+    act(() => {
+      ws.emit({
+        type: 'timeline.event',
+        event: {
+          eventId: 'user-message-no-id',
+          sessionId: 'qwen-session',
+          type: 'user.message',
+          ts: Date.now(),
+          seq: 1,
+          epoch: 1,
+          source: 'daemon',
+          confidence: 'high',
+          payload: { text: 'queued   text fallback' },
+        },
+      });
+    });
+
+    expect(screen.queryByText('queued text fallback')).toBeNull();
   });
 
   it('marks a local queued send failed instead of removing it when command.failed arrives', () => {
