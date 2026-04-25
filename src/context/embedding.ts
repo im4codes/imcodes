@@ -19,6 +19,12 @@ function resolveEmbeddingCacheDir(): string {
 // Lazy-loaded pipeline singleton
 let pipelineInstance: any = null;
 let loadingPromise: Promise<any> | null = null;
+/** Sticky flag set when the optional `@huggingface/transformers` module is
+ *  not installed (it lives in `optionalDependencies` and may legitimately
+ *  be absent — e.g. when a user's npm install skipped its onnxruntime-node
+ *  postinstall under restrictive networks). Without this, every embedding
+ *  call would retry the dynamic import and re-emit the same warning. */
+let unavailable = false;
 
 // ── Float32 ⇄ Buffer helpers ────────────────────────────────────────────────
 // Used by the persistent embedding store in context-store.ts to stash the
@@ -46,6 +52,7 @@ export function decodeEmbedding(buf: Buffer | Uint8Array | null | undefined): Fl
 
 async function getPipeline(): Promise<any> {
   if (pipelineInstance) return pipelineInstance;
+  if (unavailable) throw new Error('embedding model unavailable');
   if (loadingPromise) return loadingPromise;
 
   loadingPromise = (async () => {
@@ -62,7 +69,17 @@ async function getPipeline(): Promise<any> {
       return p;
     } catch (err) {
       loadingPromise = null;
-      logger.warn({ err }, 'Failed to load embedding model — semantic search disabled');
+      // ERR_MODULE_NOT_FOUND → the optional dep is absent. Don't keep
+      // retrying / re-warning on every call; just disable semantic search
+      // for this process lifetime. Other failures (network, OOM) keep the
+      // retry path so a transient blip doesn't permanently disable us.
+      const code = (err as { code?: string } | null)?.code;
+      if (code === 'ERR_MODULE_NOT_FOUND' || code === 'MODULE_NOT_FOUND') {
+        unavailable = true;
+        logger.warn('@huggingface/transformers not installed — semantic search disabled (install it to enable)');
+      } else {
+        logger.warn({ err }, 'Failed to load embedding model — semantic search disabled');
+      }
       throw err;
     }
   })();
