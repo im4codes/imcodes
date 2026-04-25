@@ -242,4 +242,50 @@ describe('UsageFooter', () => {
     expect(screen.getByText(/7d 34% 1d02h/)).toBeDefined();
   });
 
+  // ── Shell / script sessions are not "agents" ────────────────────────────────
+  //
+  // Regression: shell + script terminals fired session.state(running) on any
+  // raw bytes (idle detection runs without a structured watcher), and the
+  // footer used `sessionState === 'running'` as the only check to render
+  // "Agent working..." That wording was wrong for a plain shell — running
+  // `top` or `tail -f` should not look like an AI is busy. Suppress the
+  // live-status UI entirely for these session types.
+
+  it('does NOT show "Agent working..." for shell sessions even when sessionState=running', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
+        sessionName="deck_shell_brain"
+        sessionState="running"
+        agentType="shell"
+      />,
+    );
+    expect(container.querySelector('.session-live-status-inline')).toBeNull();
+    expect(container.textContent ?? '').not.toContain('Agent working');
+  });
+
+  it('does NOT show "Agent working..." for script sessions even when sessionState=running', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
+        sessionName="deck_script_brain"
+        sessionState="running"
+        agentType="script"
+      />,
+    );
+    expect(container.querySelector('.session-live-status-inline')).toBeNull();
+    expect(container.textContent ?? '').not.toContain('Agent working');
+  });
+
+  it('does NOT show idle agent text for shell sessions', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
+        sessionName="deck_shell_brain"
+        sessionState="idle"
+        agentType="shell"
+      />,
+    );
+    expect(container.textContent ?? '').not.toContain('Agent idle');
+  });
 });

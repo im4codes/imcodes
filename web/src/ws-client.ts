@@ -798,6 +798,19 @@ export class WsClient {
     }
     state.count++;
 
+    // Optimistic snapshot fetch: with the server-side overflow fix the
+    // subscription stays alive across stream_reset, so we just need a fresh
+    // snapshot to recover the dropped frames. Doing this BEFORE the
+    // backoff resubscribe path means the user sees content again within
+    // one round-trip even when reset bursts cascade into cooldown.
+    if (this._connected && !state.inCooldown) {
+      try {
+        this.send({ type: 'terminal.snapshot_request', sessionName: session });
+      } catch {
+        // ignore — the resubscribe path below will still try to recover
+      }
+    }
+
     // Cooldown: ≥8 resets in 60s → 5s pause (raised from 5 to give more headroom
     // before entering cooldown — most reset bursts during heavy output settle
     // within 6-7 events). After cooldown, we proactively resubscribe so the

@@ -204,7 +204,12 @@ export function SessionPane({
     () => getTailSessionState(timelineEvents) ?? session.state ?? null,
     [timelineEvents, session.state],
   );
-  const shouldShowFooter = !!(
+  // shell / script sessions have no agent state, no token usage, no quota —
+  // suppress the footer entirely so they don't see misleading "Agent
+  // working..." text when raw bytes flow (idle detection fires session.state
+  // 'running' on any pipe-pane output, not just real agent activity).
+  const isAgentlessSession = session.agentType === 'shell' || session.agentType === 'script';
+  const shouldShowFooter = !isAgentlessSession && !!(
     lastUsage
     || activeThinkingTs
     || activeToolCall

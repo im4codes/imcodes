@@ -40,8 +40,15 @@ const fmt = (n: number) =>
 export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, now }: Props) {
   const { t } = useTranslation();
   const isCodexFamily = agentType === 'codex' || agentType === 'codex-sdk';
-  const hasActiveLiveWork = !!activeToolCall || !!activeThinkingTs;
-  const showLiveStatus = sessionState === 'running' || sessionState === 'idle' || hasActiveLiveWork;
+  // shell / script sessions are NOT agents — they're plain terminals. The
+  // daemon emits `session.state(running)` whenever raw bytes flow (idle
+  // detection runs even without a structured watcher), which previously
+  // surfaced as "Agent working..." in the footer. That wording is wrong
+  // for a shell prompt and confusing for users running `top`, tailing logs,
+  // etc. Skip the live-work UI entirely for these session types.
+  const isAgentless = agentType === 'shell' || agentType === 'script';
+  const hasActiveLiveWork = !isAgentless && (!!activeToolCall || !!activeThinkingTs);
+  const showLiveStatus = !isAgentless && (sessionState === 'running' || sessionState === 'idle' || hasActiveLiveWork);
   const [quotaNow, setQuotaNow] = useState(() => Date.now());
 
   const displayModel = modelOverride ?? usage.model;
@@ -98,14 +105,17 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   const monthlyCost = sessionCost > 0 ? getMonthlyCost() : 0;
   const modelLabel = shortModelLabel(displayModel);
   const inlineQuotaText = displayQuotaLabel;
-  const liveStatusMode = hasActiveLiveWork
-    ? (activeToolCall ? 'tool' : 'thinking')
-    : sessionState === 'running'
-      ? 'running'
-      : sessionState === 'idle'
-        ? (statusText ? (/^(?:supervised|auto):/i.test(statusText) ? 'result' : 'waiting') : 'idle')
-        : null;
+  const liveStatusMode = isAgentless
+    ? null
+    : hasActiveLiveWork
+      ? (activeToolCall ? 'tool' : 'thinking')
+      : sessionState === 'running'
+        ? 'running'
+        : sessionState === 'idle'
+          ? (statusText ? (/^(?:supervised|auto):/i.test(statusText) ? 'result' : 'waiting') : 'idle')
+          : null;
   const liveStatusText = useMemo(() => {
+    if (isAgentless) return null;
     if (hasActiveLiveWork || sessionState === 'running') {
       if (activeToolCall) return statusText || 'Tool running...';
       if (activeThinkingTs) return t('chat.thinking_running', { sec: Math.max(0, Math.round(((now ?? Date.now()) - activeThinkingTs) / 1000)) });
@@ -114,7 +124,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     if (sessionState === 'idle' && statusText) return statusText;
     if (sessionState === 'idle') return 'Agent idle — waiting for input';
     return null;
-  }, [activeThinkingTs, activeToolCall, hasActiveLiveWork, now, sessionState, statusText, t]);
+  }, [activeThinkingTs, activeToolCall, hasActiveLiveWork, isAgentless, now, sessionState, statusText, t]);
   const showInlineStatusText = liveStatusMode === 'running' || liveStatusMode === 'thinking' || liveStatusMode === 'tool' || liveStatusMode === 'waiting' || liveStatusMode === 'result';
   const codexQuotaLines = (agentType === 'codex' || agentType === 'codex-sdk')
     ? (displayQuotaLabel ?? '').split(' · ').filter(Boolean)

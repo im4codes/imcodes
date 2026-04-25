@@ -1492,16 +1492,37 @@ export class WsBridge {
 
     const sent = safeSend(ws, resetMsg, (err) => {
       if (err) {
-        // Send failed (socket CLOSING/CLOSED or threw) — force close
+        // Browser actually disconnected (socket CLOSING/CLOSED). Real cleanup
+        // — drop the subscription and force close.
+        this.removeBrowserSessionSubscription(ws, sessionName);
         try { ws.close(1011, 'backpressure_notify_failed'); } catch { /* ignore */ }
       }
     });
 
-    // Always remove subscription regardless of send success
-    this.removeBrowserSessionSubscription(ws, sessionName);
-
     if (!sent) {
       logger.warn({ serverId: this.serverId, sessionName }, 'Backpressure reset failed to send — socket closed');
+      return;
+    }
+
+    // Reset the per-(session, ws) queue to a fresh accounting state instead
+    // of unsubscribing. Prior behavior unsubscribed on every overflow which
+    // created a churn cycle on heavy shell output:
+    //   heavy stdout → 1MB queue → overflow → server unsubscribes → daemon
+    //   stops pipe-pane → client receives stream_reset → client retries
+    //   subscribe → daemon restarts pipe → flood begins again → overflow.
+    // Each cycle the client's `resetState` count climbs; once it crosses
+    // the cooldown threshold the terminal sits frozen for 5s, and if the
+    // session keeps producing output the cooldown re-engages indefinitely
+    // — which is exactly the "shell terminal 断流, 刷新才能恢复" symptom.
+    //
+    // By keeping the subscription alive we let the client treat the reset
+    // as a discontinuity (request a snapshot, redraw) without forcing a
+    // full re-subscribe roundtrip. The fresh queue gives us a clean budget
+    // for subsequent sends; orphaned in-flight callbacks from the old
+    // queue still decrement only their own (now-unreachable) counter.
+    const sessionQueues = this.terminalQueues.get(sessionName);
+    if (sessionQueues?.has(ws)) {
+      sessionQueues.set(ws, new TerminalForwardQueue());
     }
   }
 

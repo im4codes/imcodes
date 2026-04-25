@@ -561,11 +561,88 @@ describe('WsClient', () => {
 
         await vi.advanceTimersByTimeAsync(1000);
         expect(lastWs!.send).toHaveBeenCalled();
-        expect(JSON.parse(lastWs!.send.mock.calls.at(-1)[0] as string)).toEqual({
-          type: 'terminal.subscribe',
-          session: 'stream-session',
-          raw: true,
+        // After my snapshot-on-reset fix, the LAST send is still the
+        // terminal.subscribe (fired from the backoff timer). The snapshot
+        // request fires synchronously BEFORE the backoff timer, so we
+        // assert it appears among the calls but isn't the latest one.
+        const sendCalls = lastWs!.send.mock.calls.map((c: [string]) => {
+          try { return JSON.parse(c[0] as string) as Record<string, unknown>; } catch { return {}; }
         });
+        expect(sendCalls.some((m) => m.type === 'terminal.subscribe' && m.session === 'stream-session' && m.raw === true)).toBe(true);
+      } finally {
+        client.disconnect();
+        vi.useRealTimers();
+      }
+    });
+
+    it('on terminal.stream_reset: synchronously requests a snapshot for fast recovery', async () => {
+      // Regression: server-side overflow no longer unsubscribes, so the
+      // client only needs a fresh snapshot to recover the dropped frames.
+      // The snapshot request must fire IMMEDIATELY (synchronously) on
+      // receipt of stream_reset — without it, the user stares at frozen
+      // terminal content for the duration of the resubscribe backoff
+      // (1s minimum) even though the subscription is healthy.
+      const client = await connectClient();
+      vi.useFakeTimers();
+      lastWs!.send.mockClear();
+
+      try {
+        lastWs!.emit('message', {
+          data: JSON.stringify({
+            type: 'terminal.stream_reset',
+            session: 'snap-session',
+            reason: 'backpressure',
+          }),
+        });
+
+        // Snapshot request must have fired synchronously (no timers needed).
+        const sendCalls = lastWs!.send.mock.calls.map((c: [string]) => {
+          try { return JSON.parse(c[0] as string) as Record<string, unknown>; } catch { return {}; }
+        });
+        const snapshotRequests = sendCalls.filter((m) => m.type === 'terminal.snapshot_request');
+        expect(snapshotRequests).toHaveLength(1);
+        expect(snapshotRequests[0]).toEqual({
+          type: 'terminal.snapshot_request',
+          sessionName: 'snap-session',
+        });
+      } finally {
+        client.disconnect();
+        vi.useRealTimers();
+      }
+    });
+
+    it('on stream_reset cooldown: skips snapshot request to avoid hammering the server', async () => {
+      // After 8 resets in 60s, the cooldown logic should NOT also fire a
+      // snapshot request — the server is already overwhelmed and the
+      // resubscribe at end of cooldown takes care of recovery.
+      const client = await connectClient();
+      vi.useFakeTimers();
+      try {
+        // Fire 8 resets to trigger cooldown.
+        for (let i = 0; i < 8; i++) {
+          lastWs!.emit('message', {
+            data: JSON.stringify({
+              type: 'terminal.stream_reset',
+              session: 'cool-session',
+              reason: 'backpressure',
+            }),
+          });
+        }
+        // The 9th reset arrives DURING cooldown — must not fire another
+        // snapshot request.
+        lastWs!.send.mockClear();
+        lastWs!.emit('message', {
+          data: JSON.stringify({
+            type: 'terminal.stream_reset',
+            session: 'cool-session',
+            reason: 'backpressure',
+          }),
+        });
+        const sendCalls = lastWs!.send.mock.calls.map((c: [string]) => {
+          try { return JSON.parse(c[0] as string) as Record<string, unknown>; } catch { return {}; }
+        });
+        const snapshotRequests = sendCalls.filter((m) => m.type === 'terminal.snapshot_request');
+        expect(snapshotRequests).toHaveLength(0);
       } finally {
         client.disconnect();
         vi.useRealTimers();
