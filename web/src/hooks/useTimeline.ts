@@ -971,10 +971,10 @@ export function useTimeline(
         updateHistoryStep('http', 'running', phase);
         setHttpRefreshing(true);
       }
-      void fetchTimelineHistoryHttp(serverId, backfillSessionId, {
+      void Promise.resolve(fetchTimelineHistoryHttp(serverId, backfillSessionId, {
         afterTs,
         limit: MAX_MEMORY_EVENTS,
-      }).then((result) => {
+      })).then((result) => {
         if (!result) return;
         if (backfillCacheKey) lastHttpBackfillOkAt.set(backfillCacheKey, Date.now());
         if (result.events.length === 0) return;

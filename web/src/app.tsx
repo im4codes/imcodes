@@ -96,6 +96,8 @@ import {
   getSelectedServerName,
   hasResolvedActiveSession,
   isServerOnline,
+  pickAutoEntryServer,
+  pickMostRecentMainSession,
   shouldResetSelectedServer,
   shouldShowInitialConnectingGate,
 } from './server-selection.js';
@@ -170,6 +172,13 @@ interface ServerInfo {
   createdAt: number;
 }
 
+interface WatchSessionRow {
+  serverId: string;
+  sessionName: string;
+  previewUpdatedAt?: number;
+  isSubSession?: boolean;
+}
+
 export function App() {
   const { t: trans } = useTranslation();
   const [auth, setAuth] = useState<AuthState | null>(() => {
@@ -200,6 +209,8 @@ export function App() {
     setServersSynced(false);
     setSelectedServerId(null);
     setSelectedServerName(null);
+    setManualDashboard(false);
+    setAutoEnteringRecent(false);
   }, []);
 
   // Native: server URL state and readiness flag
@@ -213,9 +224,13 @@ export function App() {
   const [selectedServerId, setSelectedServerId] = useState<string | null>(
     () => resolveInitialServerId(),
   );
+  const selectedServerIdRef = useRef<string | null>(selectedServerId);
   const [selectedServerName, setSelectedServerName] = useState<string | null>(
     () => localStorage.getItem('rcc_server_name'),
   );
+  const [autoEnteringRecent, setAutoEnteringRecent] = useState(false);
+  const [manualDashboard, setManualDashboard] = useState(false);
+  const autoEntryRunRef = useRef(0);
   const [showMobileServerMenu, setShowMobileServerMenu] = useState(false);
   const [showMobileFileBrowser, setShowMobileFileBrowser] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
@@ -266,6 +281,7 @@ export function App() {
   }, [selectedServerId]);
 
   useEffect(() => {
+    selectedServerIdRef.current = selectedServerId;
     if (selectedServerId) {
       localStorage.setItem('rcc_server', selectedServerId);
       return;
@@ -1013,6 +1029,66 @@ export function App() {
     // scroll chat to bottom on session switch (rAF gives ChatView time to mount)
     if (name) requestAnimationFrame(() => chatScrollFnsRef.current.get(name)?.());
   }, [setOpenSubIds]);
+
+  useEffect(() => {
+    if (!auth || selectedServerId || !serversLoaded || servers.length === 0 || manualDashboard) return;
+    const runId = ++autoEntryRunRef.current;
+    let cancelled = false;
+    setAutoEnteringRecent(true);
+
+    const choose = async () => {
+      const savedServerId = localStorage.getItem('rcc_server');
+      const rows: WatchSessionRow[] = [];
+      await Promise.allSettled(servers.map(async (server) => {
+        const result = await apiFetch<{ sessions: WatchSessionRow[] }>(
+          `/api/watch/sessions?serverId=${encodeURIComponent(server.id)}`,
+        );
+        if (!Array.isArray(result.sessions)) return;
+        for (const row of result.sessions) {
+          if (!row || typeof row.sessionName !== 'string') continue;
+          rows.push({
+            serverId: typeof row.serverId === 'string' ? row.serverId : server.id,
+            sessionName: row.sessionName,
+            previewUpdatedAt: typeof row.previewUpdatedAt === 'number' ? row.previewUpdatedAt : undefined,
+            isSubSession: row.isSubSession === true,
+          });
+        }
+      }));
+      if (cancelled || runId !== autoEntryRunRef.current || selectedServerIdRef.current) return;
+
+      const recent = pickMostRecentMainSession(rows.filter((row) => typeof row.previewUpdatedAt === 'number'));
+      const fallback = pickAutoEntryServer(servers, savedServerId);
+      const savedFallbackSession = fallback ? localStorage.getItem(`rcc_session_${fallback.serverId}`) : null;
+      const firstMain = pickMostRecentMainSession(rows);
+      const selection = recent
+        ?? (fallback && savedFallbackSession ? { ...fallback, sessionName: savedFallbackSession } : null)
+        ?? firstMain
+        ?? fallback;
+      if (!selection) return;
+
+      const server = servers.find((item) => item.id === selection.serverId);
+      localStorage.setItem('rcc_server', selection.serverId);
+      if (server?.name) localStorage.setItem('rcc_server_name', server.name);
+      else localStorage.removeItem('rcc_server_name');
+      setSelectedServerId(selection.serverId);
+      setSelectedServerName(server?.name ?? null);
+      if (selection.sessionName) {
+        localStorage.setItem(`rcc_session_${selection.serverId}`, selection.sessionName);
+        setActiveSession(selection.sessionName);
+      } else {
+        const savedSession = localStorage.getItem(`rcc_session_${selection.serverId}`);
+        setActiveSession(savedSession);
+      }
+      writeHashState(selection.serverId, selection.sessionName ?? localStorage.getItem(`rcc_session_${selection.serverId}`));
+    };
+
+    void choose().finally(() => {
+      if (!cancelled && runId === autoEntryRunRef.current) setAutoEnteringRecent(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [auth, manualDashboard, selectedServerId, servers, serversLoaded, setActiveSession]);
 
   const wsRef = useRef<WsClient | null>(null);
   const [daemonStats, setDaemonStats] = useState<{ daemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number } | null>(null);
@@ -2211,6 +2287,8 @@ export function App() {
     setSelectedServerId(null);
     setDiscussions([]);
     setRepoContexts(new Map());
+    setManualDashboard(false);
+    setAutoEnteringRecent(false);
   }, [setActiveSession]);
 
   // Native only: log out + clear server URL → back to ServerSetupPage
@@ -2222,6 +2300,8 @@ export function App() {
   }, [handleLogout]);
 
   const handleSelectServer = useCallback(async (serverId: string, serverName?: string) => {
+    autoEntryRunRef.current++;
+    setManualDashboard(false);
     // Save current active session for the server we're leaving
     const prevServer = localStorage.getItem('rcc_server');
     const currentSession = localStorage.getItem('rcc_session');
@@ -2348,6 +2428,8 @@ export function App() {
   }, [handleSelectServer, navigateToSession]);
 
   const handleBackToDashboard = useCallback(() => {
+    autoEntryRunRef.current++;
+    setManualDashboard(true);
     localStorage.removeItem('rcc_server');
     localStorage.removeItem('rcc_server_name');
     localStorage.removeItem('rcc_session');
@@ -2657,7 +2739,7 @@ export function App() {
             sidebarCollapsed={sidebarCollapsed}
             onToggleSidebar={handleToggleSidebar}
             onSettings={() => setShowSettingsPage(true)}
-            onHome={() => setSelectedServerId(null)}
+            onHome={() => { autoEntryRunRef.current++; setManualDashboard(true); setSelectedServerId(null); }}
             isAdmin={isAdmin}
             onAdmin={() => setShowAdminPage(true)}
           />
@@ -2853,7 +2935,12 @@ export function App() {
 
       {/* Main */}
       <main class="main">
-        {!selectedServerId ? (
+        {!selectedServerId && !manualDashboard && (!serversLoaded || autoEnteringRecent || servers.length > 0) ? (
+          <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#64748b', flexDirection: 'column', gap: 12 }}>
+            <div class="spinner" />
+            <div>{trans('common.loading')}</div>
+          </div>
+        ) : !selectedServerId ? (
           <div style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
             <Suspense fallback={<div style={{ textAlign: 'center', padding: 48, color: '#64748b' }}>Loading...</div>}>
               <DashboardPage onSelectServer={handleSelectServer} onLogout={handleLogout} onServersLoaded={setServers} />

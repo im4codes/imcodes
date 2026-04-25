@@ -50,6 +50,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
   const [renameVal, setRenameVal] = useState('');
   const menuRef = useRef<HTMLDivElement>(null);
   const renameRef = useRef<HTMLInputElement>(null);
+  const tabBarRef = useRef<HTMLDivElement>(null);
 
   // Persisted order & pinned state via server-synced preferences.
   // Default to legacy localStorage values so existing users don't lose their arrangement.
@@ -114,6 +115,19 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
   useEffect(() => {
     if (renaming) setTimeout(() => renameRef.current?.select(), 0);
   }, [renaming]);
+
+  useEffect(() => {
+    if (!activeSession) return;
+    const frame = requestAnimationFrame(() => {
+      const activeTab = tabBarRef.current?.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]');
+      activeTab?.scrollIntoView?.({
+        block: 'nearest',
+        inline: 'center',
+        behavior: 'instant' as ScrollBehavior,
+      });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [activeSession, orderedSessions]);
 
   // External rename trigger (from ⋯ menu in SessionControls)
   useEffect(() => {
@@ -215,7 +229,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
   const menuY = ctx ? Math.min(ctx.y, window.innerHeight - 200) : 0;
 
   return (
-    <div class="tab-bar" role="tablist">
+    <div ref={tabBarRef} class="tab-bar" role="tablist">
       {sessions.length === 0 && sessionsLoaded && (
         <span class="tab-empty">No active sessions</span>
       )}
