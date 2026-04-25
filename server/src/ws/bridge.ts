@@ -30,6 +30,7 @@ import {
   ACK_FAILURE_DAEMON_ERROR,
   RECONNECT_GRACE_MS,
   ACK_TIMEOUT_MS,
+  ACK_TIMEOUT_RETRY_LIMIT,
   ACK_DEDUP_TTL_MS,
   INFLIGHT_GC_TTL_MS,
   type AckFailureReason,
@@ -244,6 +245,7 @@ interface InflightCommand {
   rawPayload: string;          // the original session.send JSON as received from browser
   state: InflightState;
   sentAt: number;              // when the inflight was created (dispatch or buffer)
+  dispatchAttempts: number;    // daemon sends attempted by the bridge
   timeoutTimer: ReturnType<typeof setTimeout> | null;
 }
 
@@ -1692,11 +1694,11 @@ export class WsBridge {
         rawPayload: raw,
         state: 'dispatched',
         sentAt: Date.now(),
+        dispatchAttempts: 0,
         timeoutTimer: null,
       };
-      entry.timeoutTimer = setTimeout(() => this.onAckTimeout(commandId), ACK_TIMEOUT_MS);
       this.inflightCommands.set(commandId, entry);
-      this.sendToDaemon(raw);
+      this.dispatchInflightToDaemon(entry, false);
       this.startAckHousekeepingIfNeeded();
       return;
     }
@@ -1710,6 +1712,7 @@ export class WsBridge {
         rawPayload: raw,
         state: 'buffered',
         sentAt: Date.now(),
+        dispatchAttempts: 0,
         timeoutTimer: null,
       };
       this.inflightCommands.set(commandId, entry);
@@ -1727,16 +1730,34 @@ export class WsBridge {
     for (const entry of ordered) {
       if (entry.state === 'acked') continue;
       try {
-        this.sendToDaemon(entry.rawPayload);
-        if (entry.state === 'buffered') {
-          entry.state = 'dispatched';
-        }
-        // Arm (or re-arm) ack timeout from "now" — daemon's perspective.
-        if (entry.timeoutTimer) clearTimeout(entry.timeoutTimer);
-        entry.timeoutTimer = setTimeout(() => this.onAckTimeout(entry.commandId), ACK_TIMEOUT_MS);
+        this.dispatchInflightToDaemon(entry, entry.dispatchAttempts > 0);
       } catch (err) {
         logger.warn({ commandId: entry.commandId, err }, 'replayInflightToDaemon failed for entry');
       }
+    }
+  }
+
+  private dispatchInflightToDaemon(entry: InflightCommand, markBridgeRetry: boolean): void {
+    const rawPayload = markBridgeRetry
+      ? this.withBridgeRetryMarker(entry.rawPayload, entry.dispatchAttempts + 1)
+      : entry.rawPayload;
+    this.sendToDaemon(rawPayload);
+    entry.dispatchAttempts += 1;
+    entry.state = 'dispatched';
+    if (entry.timeoutTimer) clearTimeout(entry.timeoutTimer);
+    entry.timeoutTimer = setTimeout(() => this.onAckTimeout(entry.commandId), ACK_TIMEOUT_MS);
+  }
+
+  private withBridgeRetryMarker(rawPayload: string, retryAttempt: number): string {
+    try {
+      const msg = JSON.parse(rawPayload) as Record<string, unknown>;
+      return JSON.stringify({
+        ...msg,
+        __bridgeRetry: true,
+        __bridgeRetryAttempt: retryAttempt,
+      });
+    } catch {
+      return rawPayload;
     }
   }
 
@@ -1758,6 +1779,28 @@ export class WsBridge {
     const entry = this.inflightCommands.get(commandId);
     if (!entry) return;
     if (entry.state === 'acked') return;
+    if (this.isDaemonConnected() && entry.dispatchAttempts <= ACK_TIMEOUT_RETRY_LIMIT) {
+      logger.warn(
+        {
+          serverId: this.serverId,
+          commandId,
+          sessionName: entry.sessionName,
+          dispatchAttempts: entry.dispatchAttempts,
+          retryLimit: ACK_TIMEOUT_RETRY_LIMIT,
+        },
+        'command.ack timeout — retrying session.send',
+      );
+      this.dispatchInflightToDaemon(entry, true);
+      return;
+    }
+    if (!this.isDaemonConnected() && this.graceTimer) {
+      entry.state = 'buffered';
+      if (entry.timeoutTimer) {
+        clearTimeout(entry.timeoutTimer);
+        entry.timeoutTimer = null;
+      }
+      return;
+    }
     logger.warn({ serverId: this.serverId, commandId, sessionName: entry.sessionName }, 'command.ack timeout');
     this.emitCommandFailed(entry.browser, commandId, entry.sessionName, ACK_FAILURE_ACK_TIMEOUT);
     this.removeInflight(commandId);

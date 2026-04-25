@@ -8,6 +8,7 @@ import {
   MSG_DAEMON_OFFLINE,
   RECONNECT_GRACE_MS,
   ACK_TIMEOUT_MS,
+  ACK_TIMEOUT_RETRY_LIMIT,
 } from '../../shared/ack-protocol.js';
 
 class MockWs extends EventEmitter {
@@ -246,10 +247,10 @@ describe('WsBridge — command ack reliability', () => {
     expect(bridge._getInflightCountForTest()).toBe(0);
   });
 
-  it('ack timeout fires command.failed ack_timeout when daemon stays silent', async () => {
+  it('ack timeout retries session.send before command.failed ack_timeout when daemon stays silent', async () => {
     vi.useFakeTimers();
     const bridge = WsBridge.get(serverId);
-    await connectAndAuthenticateDaemon(bridge, serverId);
+    const daemonWs = await connectAndAuthenticateDaemon(bridge, serverId);
     const browser = addBrowserSubscriber(bridge, 'deck_test_brain');
 
     browser.emit('message', Buffer.from(JSON.stringify({
@@ -259,6 +260,16 @@ describe('WsBridge — command ack reliability', () => {
       commandId: 'C4',
     })));
     await flushAsync();
+
+    for (let attempt = 1; attempt <= ACK_TIMEOUT_RETRY_LIMIT; attempt++) {
+      vi.advanceTimersByTime(ACK_TIMEOUT_MS + 100);
+      await flushAsync();
+      const forwarded = daemonWs.sentByType('session.send').filter((msg) => msg.commandId === 'C4');
+      expect(forwarded).toHaveLength(attempt + 1);
+      expect(forwarded[attempt].__bridgeRetry).toBe(true);
+      expect(forwarded[attempt].__bridgeRetryAttempt).toBe(attempt + 1);
+      expect(browser.sentByType(MSG_COMMAND_FAILED)).toHaveLength(0);
+    }
 
     vi.advanceTimersByTime(ACK_TIMEOUT_MS + 100);
     await flushAsync();

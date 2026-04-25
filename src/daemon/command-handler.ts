@@ -1568,6 +1568,10 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   // not wait for an ack timeout after the daemon has already seen this send.
   const dedup = getDedup(sessionName);
   if (dedup.has(effectiveId)) {
+    if ((cmd as any).__bridgeRetry === true) {
+      logger.debug({ sessionName, effectiveId }, 'session.send: bridge retry for commandId already owned by daemon, ignored');
+      return;
+    }
     logger.debug({ sessionName, effectiveId }, 'session.send: duplicate commandId, rejected');
     timelineEmitter.emit(sessionName, 'command.ack', {
       commandId: effectiveId,

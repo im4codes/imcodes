@@ -63,6 +63,9 @@ export const RECONNECT_GRACE_MS = 3_000;
 /** Per-command ack wait budget once the command has been dispatched to daemon. */
 export const ACK_TIMEOUT_MS = 5_000;
 
+/** Number of daemon redispatches before surfacing ack_timeout to the browser. */
+export const ACK_TIMEOUT_RETRY_LIMIT = 3;
+
 /** TTL for the server-side `seenCommandAcks` LRU that dedups replayed acks. */
 export const ACK_DEDUP_TTL_MS = 5 * 60_000;
 

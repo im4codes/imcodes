@@ -14,7 +14,7 @@ import { VoiceOverlay } from './VoiceOverlay.js';
 import { AtPicker } from './AtPicker.js';
 import { P2pConfigPanel } from './P2pConfigPanel.js';
 import { useP2pCustomCombos } from './p2p-combos.js';
-import { uploadFile, getUserPref, saveUserPref, onUserPrefChanged } from '../api.js';
+import { uploadFile, getUserPref, saveUserPref, onUserPrefChanged, sendSessionViaHttp } from '../api.js';
 import { fetchSupervisorDefaults, patchSession, patchSubSession } from '../api.js';
 import { isRunningSessionState } from '../thinking-utils.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
@@ -1581,7 +1581,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       (!!normalizedOptions.modeOverride && isComboMode(normalizedOptions.modeOverride)) ||
       (!!syntheticModeOverride && isComboMode(syntheticModeOverride))
     );
-    if (((!text && attachments.length === 0) && !allowEmptyCombo) || !ws || !activeSession) return null;
+    if (((!text && attachments.length === 0) && !allowEmptyCombo) || !activeSession) return null;
 
     // Build P2P routing as structured WS fields — keep text clean for display.
     const extra: Record<string, unknown> = {};
@@ -1646,13 +1646,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       text = text ? `${refs} ${text}` : refs;
     }
     return { text, extra };
-  }, [activeSession, applySavedP2pConfigSelection, attachments, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, sessions, subSessions, ws]);
+  }, [activeSession, applySavedP2pConfigSelection, attachments, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, sessions, subSessions]);
 
   const buildModeOnlySendPayload = useCallback((rawText: string, modeOverride?: string): PendingSendPayload | null => {
     const text = rawText.trim();
     const effectiveMode = modeOverride ?? p2pMode;
     const allowEmptyCombo = !!modeOverride && isComboMode(modeOverride);
-    if ((!text && !allowEmptyCombo) || !ws || !activeSession) return null;
+    if ((!text && !allowEmptyCombo) || !activeSession) return null;
 
     const extra: Record<string, unknown> = {};
     const manual = extractManualP2pTargets(text, buildManualP2pCandidates(sessions, subSessions));
@@ -1671,22 +1671,37 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     }
 
     return { text: cleanText, extra };
-  }, [activeSession, applySavedP2pConfigSelection, i18n?.language, p2pExcludeSameType, p2pMode, p2pSavedConfig, sessions, subSessions, ws]);
+  }, [activeSession, applySavedP2pConfigSelection, i18n?.language, p2pExcludeSameType, p2pMode, p2pSavedConfig, sessions, subSessions]);
 
   const makeCommandId = useCallback(() => (
     globalThis.crypto?.randomUUID?.() ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`
   ), []);
 
   const sendSessionMessage = useCallback((text: string, extra: Record<string, unknown> = {}, commandId = makeCommandId()): string | null => {
-    if (!ws || !activeSession) return null;
-    ws.sendSessionCommand('send', {
+    if (!activeSession) return null;
+    const payload = {
       sessionName: activeSession.name,
       text,
       ...extra,
       commandId,
-    });
+    };
+    if (!ws) {
+      if (!serverId) return null;
+      void sendSessionViaHttp(serverId, payload).catch((fallbackErr) => {
+        console.warn('session.send HTTP fallback failed', fallbackErr);
+      });
+      return commandId;
+    }
+    try {
+      ws.sendSessionCommand('send', payload);
+    } catch (err) {
+      if (!serverId) throw err;
+      void sendSessionViaHttp(serverId, payload).catch((fallbackErr) => {
+        console.warn('session.send HTTP fallback failed', fallbackErr);
+      });
+    }
     return commandId;
-  }, [activeSession, makeCommandId, ws]);
+  }, [activeSession, makeCommandId, serverId, ws]);
 
   const sendQueuedMessageMutation = useCallback((type: 'session.edit_queued_message' | 'session.undo_queued_message', payload: Record<string, unknown>) => {
     if (!ws || !activeSession) return false;

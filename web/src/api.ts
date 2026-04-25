@@ -459,6 +459,16 @@ export async function apiFetch<T = unknown>(
   return res.json() as Promise<T>;
 }
 
+export async function sendSessionViaHttp(
+  serverId: string,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  await apiFetch(`/api/server/${encodeURIComponent(serverId)}/session/send`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
 function isRetryableNonceExchangeError(error: unknown): boolean {
   if (error instanceof ApiError) {
     if (error.code === 'invalid_or_expired_nonce') return false;

@@ -155,6 +155,7 @@ const saveUserPrefMock = vi.fn().mockResolvedValue(undefined);
 const fetchSupervisorDefaultsMock = vi.fn().mockResolvedValue(null);
 const patchSessionMock = vi.fn().mockResolvedValue(undefined);
 const patchSubSessionMock = vi.fn().mockResolvedValue(undefined);
+const sendSessionViaHttpMock = vi.fn().mockResolvedValue(undefined);
 const onUserPrefChangedMock = vi.fn((cb: (key: string, value: unknown) => void) => {
   const handler = (event: Event) => {
     const detail = (event as CustomEvent<{ key?: string; value?: unknown }>).detail;
@@ -171,6 +172,7 @@ vi.mock('../../src/api.js', () => ({
   fetchSupervisorDefaults: (...args: unknown[]) => fetchSupervisorDefaultsMock(...args),
   patchSession: (...args: unknown[]) => patchSessionMock(...args),
   patchSubSession: (...args: unknown[]) => patchSubSessionMock(...args),
+  sendSessionViaHttp: (...args: unknown[]) => sendSessionViaHttpMock(...args),
   onUserPrefChanged: (...args: unknown[]) => onUserPrefChangedMock(...args as Parameters<typeof onUserPrefChangedMock>),
 }));
 
@@ -1698,6 +1700,72 @@ afterEach(() => {
     expect(onSend).toHaveBeenCalledWith('qwen-session', 'must not vanish', expect.objectContaining({
       commandId: expect.any(String),
       localFailure: 'WebSocket not connected',
+    }));
+  });
+
+  it('falls back to HTTP send when the socket write throws and serverId is available', () => {
+    const ws = makeWs();
+    ws.sendSessionCommand.mockImplementation(() => {
+      throw new Error('WebSocket not connected');
+    });
+    const onSend = vi.fn();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'idle',
+        })}
+        quickData={makeQuickData() as any}
+        onSend={onSend}
+        serverId="server-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'fallback send';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+
+    expect(sendSessionViaHttpMock).toHaveBeenCalledWith('server-1', expect.objectContaining({
+      sessionName: 'qwen-session',
+      text: 'fallback send',
+      commandId: expect.any(String),
+    }));
+    expect(onSend).toHaveBeenCalledWith('qwen-session', 'fallback send', expect.not.objectContaining({
+      localFailure: expect.any(String),
+    }));
+  });
+
+  it('falls back to HTTP send when ws is temporarily unavailable', () => {
+    const onSend = vi.fn();
+    render(
+      <SessionControls
+        ws={null}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'idle',
+        })}
+        quickData={makeQuickData() as any}
+        onSend={onSend}
+        serverId="server-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'http only send';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+
+    expect(sendSessionViaHttpMock).toHaveBeenCalledWith('server-1', expect.objectContaining({
+      sessionName: 'qwen-session',
+      text: 'http only send',
+      commandId: expect.any(String),
+    }));
+    expect(onSend).toHaveBeenCalledWith('qwen-session', 'http only send', expect.objectContaining({
+      commandId: expect.any(String),
     }));
   });
 

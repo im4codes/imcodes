@@ -8,7 +8,7 @@
  *      dedups, browser never sees failure.
  *   2. Long daemon-side WS disconnect (> grace window): server emits
  *      daemon.offline + command.failed.
- *   3. Ack timeout: server emits command.failed with reason=ack_timeout.
+ *   3. Ack timeout: server retries before command.failed reason=ack_timeout.
  *   4. Daemon process "crash" (outbox re-opened from disk): queued acks flush
  *      on next connect; server dedups.
  *
@@ -31,6 +31,7 @@ import {
   MSG_DAEMON_OFFLINE,
   RECONNECT_GRACE_MS,
   ACK_TIMEOUT_MS,
+  ACK_TIMEOUT_RETRY_LIMIT,
 } from '../shared/ack-protocol.js';
 
 class MockWs extends EventEmitter {
@@ -191,11 +192,11 @@ describe('Ack reliability — daemon ↔ server integration', () => {
     expect(failed[0].reason).toBe('daemon_offline');
   });
 
-  // ── 3. Ack timeout surfaces command.failed in ~5s, not 30s ──────────────
-  it('ack timeout: command.failed reason=ack_timeout fires at ACK_TIMEOUT_MS', async () => {
+  // ── 3. Ack timeout retries before surfacing command.failed ─────────────
+  it('ack timeout: retries session.send before command.failed reason=ack_timeout', async () => {
     vi.useFakeTimers();
     const bridge = WsBridge.get(serverId);
-    await connectAndAuthDaemon(bridge, serverId);
+    const daemonWs = await connectAndAuthDaemon(bridge, serverId);
     const browser = await connectBrowser(bridge, 'deck_storecheck_brain');
 
     browser.emit('message', Buffer.from(JSON.stringify({
@@ -206,6 +207,15 @@ describe('Ack reliability — daemon ↔ server integration', () => {
     })));
     await flush();
 
+    for (let attempt = 1; attempt <= ACK_TIMEOUT_RETRY_LIMIT; attempt++) {
+      vi.advanceTimersByTime(ACK_TIMEOUT_MS + 100);
+      await flush();
+      const sends = daemonWs.sentByType('session.send').filter((msg) => msg.commandId === 'INT-C3');
+      expect(sends).toHaveLength(attempt + 1);
+      expect(sends[attempt].__bridgeRetry).toBe(true);
+      expect(browser.sentByType(MSG_COMMAND_FAILED)).toHaveLength(0);
+    }
+
     vi.advanceTimersByTime(ACK_TIMEOUT_MS + 100);
     await flush();
 
@@ -215,7 +225,7 @@ describe('Ack reliability — daemon ↔ server integration', () => {
     expect(failed[0].reason).toBe('ack_timeout');
   });
 
-  it('weak network retry: ack timeout can be retried with a fresh commandId and late old ack does not poison the retry', async () => {
+  it('weak network retry: server redispatches the same commandId and late old ack does not poison a manual retry', async () => {
     vi.useFakeTimers();
     const bridge = WsBridge.get(serverId);
     const daemonWs = await connectAndAuthDaemon(bridge, serverId);
@@ -230,8 +240,10 @@ describe('Ack reliability — daemon ↔ server integration', () => {
     await flush();
     expect(daemonWs.sentByType('session.send').filter((msg) => msg.commandId === 'INT-C3-WEAK-OLD')).toHaveLength(1);
 
-    vi.advanceTimersByTime(ACK_TIMEOUT_MS + 100);
-    await flush();
+    for (let attempt = 0; attempt <= ACK_TIMEOUT_RETRY_LIMIT; attempt++) {
+      vi.advanceTimersByTime(ACK_TIMEOUT_MS + 100);
+      await flush();
+    }
 
     const timeoutFailures = browser.sentByType(MSG_COMMAND_FAILED).filter((msg) =>
       msg.commandId === 'INT-C3-WEAK-OLD' && msg.reason === 'ack_timeout',
@@ -270,7 +282,7 @@ describe('Ack reliability — daemon ↔ server integration', () => {
     expect(retryAcks).toHaveLength(1);
     const retryFailures = browser.sentByType(MSG_COMMAND_FAILED).filter((msg) => msg.commandId === 'INT-C3-WEAK-RETRY');
     expect(retryFailures).toHaveLength(0);
-    expect(daemonWs.sentByType('session.send').filter((msg) => msg.commandId === 'INT-C3-WEAK-OLD')).toHaveLength(1);
+    expect(daemonWs.sentByType('session.send').filter((msg) => msg.commandId === 'INT-C3-WEAK-OLD')).toHaveLength(ACK_TIMEOUT_RETRY_LIMIT + 1);
   });
 
   it('accepted command.ack reaches the browser and cancels the server ack timeout', async () => {
