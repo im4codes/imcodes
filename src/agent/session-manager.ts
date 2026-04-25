@@ -1381,7 +1381,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
       transportRuntimes.set(s.name, runtime);
       const actualProviderSid = runtime.providerSessionId ?? effectiveSessionKey;
       registerProviderRoute(actualProviderSid, s.name);
-      upsertSession({
+      const restoredRecord: SessionRecord = {
         ...s,
         state: 'idle',
         updatedAt: Date.now(),
@@ -1423,7 +1423,15 @@ export async function restoreTransportSessions(providerId: string): Promise<void
             ? undefined
             : ((qwenRuntime?.authType ?? s.qwenAuthType) === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined),
         }),
-      });
+      };
+      upsertSession(restoredRecord);
+      emitSessionPersist(restoredRecord, s.name);
+      timelineEmitter.emit(s.name, 'session.state', {
+        state: 'idle',
+        pendingCount: runtime.pendingCount,
+        pendingMessages: runtime.pendingMessages,
+        pendingMessageEntries: runtime.pendingEntries,
+      }, { source: 'daemon', confidence: 'high' });
       logger.info({ session: s.name, providerId: s.providerId, providerSid: s.providerSessionId, freshAfterCancel }, 'Restored transport session runtime');
 
       // Drain messages that arrived while the provider was offline. The
