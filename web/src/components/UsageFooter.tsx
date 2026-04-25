@@ -9,7 +9,6 @@ import { shortModelLabel } from '../model-label.js';
 import { getSessionCost, getWeeklyCost, getMonthlyCost, formatCost } from '../cost-tracker.js';
 import type { UsageData } from '../usage-data.js';
 import { formatProviderQuotaLabel, type ProviderQuotaMeta } from '@shared/provider-quota.js';
-import type { TimelineHistoryStatus, TimelineHistoryStepKey } from '../hooks/useTimeline.js';
 
 interface Props {
   usage: UsageData;
@@ -31,8 +30,6 @@ interface Props {
   activeToolCall?: boolean;
   /** Current timestamp for thinking timer (updated every second). */
   now?: number;
-  /** Visible history-fetch progress beneath the ctx bar while waiting for history. */
-  historyStatus?: TimelineHistoryStatus | null;
 }
 
 const fmt = (n: number) =>
@@ -40,7 +37,7 @@ const fmt = (n: number) =>
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
-export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, now, historyStatus }: Props) {
+export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, now }: Props) {
   const { t } = useTranslation();
   const isCodexFamily = agentType === 'codex' || agentType === 'codex-sdk';
   const hasActiveLiveWork = !!activeToolCall || !!activeThinkingTs;
@@ -122,48 +119,12 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   const codexQuotaLines = (agentType === 'codex' || agentType === 'codex-sdk')
     ? (displayQuotaLabel ?? '').split(' · ').filter(Boolean)
     : [];
-  const historySteps = useMemo(() => {
-    if (!historyStatus || historyStatus.phase === 'idle') return [];
-    const order: TimelineHistoryStepKey[] = ['cache', 'textTail', 'daemon', 'http', 'older'];
-    return order
-      .map((key) => ({ key, state: historyStatus.steps[key] }))
-      .filter((step) => step.state !== 'skipped')
-      .map((step) => ({
-        ...step,
-        label: step.key === 'cache'
-          ? t('session.history_step_cache')
-          : step.key === 'textTail'
-            ? t('session.history_step_text_tail')
-            : step.key === 'daemon'
-              ? t('session.history_step_daemon')
-              : step.key === 'http'
-                ? t('session.history_step_http')
-                : t('session.history_step_older'),
-      }));
-  }, [historyStatus, t]);
-  const showHistoryProgress = historySteps.some((step) => step.state === 'pending' || step.state === 'running');
-
   return (
     <div class="session-usage-footer" title={tip} data-agent-type={agentType ?? undefined}>
       {total > 0 && (
         <div class="session-ctx-bar">
           <div class="session-ctx-cache" style={{ width: `${cachePct}%` }} />
           <div class="session-ctx-input" style={{ width: `${newPct}%`, left: `${cachePct}%` }} />
-        </div>
-      )}
-      {showHistoryProgress && (
-        <div class="session-history-progress" aria-live="polite">
-          <span class="session-history-progress-label">{t('session.history_loading_label')}</span>
-          <span class="session-history-progress-steps">
-            {historySteps.map((step) => (
-              <span key={step.key} class={`session-history-step ${step.state}`}>
-                <span class="session-history-step-icon" aria-hidden="true">
-                  {step.state === 'done' ? '✓' : step.state === 'running' ? '…' : '○'}
-                </span>
-                {step.label}
-              </span>
-            ))}
-          </span>
         </div>
       )}
       {codexQuotaLines.length > 0 && (

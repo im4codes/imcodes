@@ -131,6 +131,32 @@ describe('ChatView', () => {
     );
 
     expect(container.querySelector('.chat-refreshing-spinner')).not.toBeNull();
+    expect(container.querySelector('.chat-history-overlay')).not.toBeNull();
+  });
+
+  it('renders history fetch progress as a bottom overlay instead of footer layout content', () => {
+    const { container } = render(
+      <ChatView
+        events={[] as any}
+        loading={false}
+        historyStatus={{
+          phase: 'bootstrap',
+          steps: {
+            cache: 'done',
+            textTail: 'running',
+            daemon: 'pending',
+            http: 'pending',
+            older: 'skipped',
+          },
+        }}
+        sessionId="deck_sub_preview"
+      />,
+    );
+
+    expect(container.querySelector('.chat-history-overlay')).not.toBeNull();
+    expect(container.querySelector('.chat-history-step.running')).not.toBeNull();
+    expect(container.querySelector('.chat-history-step.pending')).not.toBeNull();
+    expect(container.querySelector('.session-history-progress')).toBeNull();
   });
 
   it('forces the main chat view to follow streamed updates with the same timestamp', async () => {

@@ -508,6 +508,7 @@ export function SubSessionWindow({
             events={events}
             loading={false}
             refreshing={refreshing}
+            historyStatus={historyStatus}
             sessionId={sub.sessionName}
             onScrollBottomFn={onChatScrollBottomFn}
             ws={ws}
@@ -521,7 +522,7 @@ export function SubSessionWindow({
       </div>
 
       {/* Usage footer — shared component */}
-      {(lastUsage || historyStatus.phase !== 'idle' || activeThinkingTs || activeToolCall || statusText || liveSessionState === 'running' || liveSessionState === 'idle' || sessionInfo?.planLabel || sessionInfo?.quotaLabel || sessionInfo?.quotaUsageLabel || sessionInfo?.quotaMeta) && (
+      {(lastUsage || activeThinkingTs || activeToolCall || statusText || liveSessionState === 'running' || liveSessionState === 'idle' || sessionInfo?.planLabel || sessionInfo?.quotaLabel || sessionInfo?.quotaUsageLabel || sessionInfo?.quotaMeta) && (
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sub.sessionName}
@@ -537,7 +538,6 @@ export function SubSessionWindow({
           statusText={statusText}
           activeToolCall={activeToolCall}
           now={thinkingNow}
-          historyStatus={historyStatus}
         />
       )}
 

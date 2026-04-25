@@ -71,6 +71,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           events={events}
           loading={false}
           refreshing={refreshing}
+          historyStatus={historyStatus}
           sessionId={sessionName}
           sessionState={liveSessionState ?? undefined}
           ws={ctx.ws}
@@ -80,7 +81,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           agentType={liveSub.type}
         />
       )}
-      {(lastUsage || historyStatus.phase !== 'idle' || activeThinkingTs || activeToolCall || statusText || liveSessionState === 'running' || liveSessionState === 'idle' || liveSub.planLabel || liveSub.quotaLabel || liveSub.quotaUsageLabel || liveSub.quotaMeta) && (
+      {(lastUsage || activeThinkingTs || activeToolCall || statusText || liveSessionState === 'running' || liveSessionState === 'idle' || liveSub.planLabel || liveSub.quotaLabel || liveSub.quotaUsageLabel || liveSub.quotaMeta) && (
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sessionName}
@@ -96,7 +97,6 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           statusText={statusText}
           activeToolCall={activeToolCall}
           now={thinkingNow}
-          historyStatus={historyStatus}
         />
       )}
       {(compactQuotaText || liveSub.planLabel) && (

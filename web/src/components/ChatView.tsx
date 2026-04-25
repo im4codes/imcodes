@@ -14,12 +14,15 @@ import { FileBrowser } from './file-browser-lazy.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
+import type { TimelineHistoryStatus, TimelineHistoryStepKey } from '../hooks/useTimeline.js';
 
 interface Props {
   events: TimelineEvent[];
   loading: boolean;
   /** True while gap-filling new events after a cache hit */
   refreshing?: boolean;
+  /** Visible history-fetch progress shown as a non-layout overlay. */
+  historyStatus?: TimelineHistoryStatus | null;
   /** True while loading older events via backward pagination */
   loadingOlder?: boolean;
   /** False when no more history is available */
@@ -568,7 +571,7 @@ function findScrollParent(start: HTMLElement): HTMLElement {
   return start;
 }
 
-export function ChatView({ events, loading, refreshing = false, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir, serverId, onQuote, agentType: _agentType, onResendFailed }: Props) {
+export function ChatView({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir, serverId, onQuote, agentType: _agentType, onResendFailed }: Props) {
   const { t } = useTranslation();
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -1090,6 +1093,27 @@ export function ChatView({ events, loading, refreshing = false, loadingOlder, ha
   }, [isTouchDevice, preview, openCtxMenu]);
 
   const canShowFilePanel = !preview && !!ws;
+  const historySteps = useMemo(() => {
+    if (!historyStatus || historyStatus.phase === 'idle') return [];
+    const order: TimelineHistoryStepKey[] = ['cache', 'textTail', 'daemon', 'http', 'older'];
+    return order
+      .map((key) => ({ key, state: historyStatus.steps[key] }))
+      .filter((step) => step.state !== 'skipped')
+      .map((step) => ({
+        ...step,
+        label: step.key === 'cache'
+          ? t('session.history_step_cache')
+          : step.key === 'textTail'
+            ? t('session.history_step_text_tail')
+            : step.key === 'daemon'
+              ? t('session.history_step_daemon')
+              : step.key === 'http'
+                ? t('session.history_step_http')
+                : t('session.history_step_older'),
+      }));
+  }, [historyStatus, t]);
+  const showHistoryProgress = !preview && historySteps.some((step) => step.state === 'pending' || step.state === 'running');
+  const showRefreshOverlay = !preview && (showHistoryProgress || refreshing);
 
   return (
     <div class={`chat-view-wrap${canShowFilePanel && showFilePanel ? ' chat-split' : ''}`}>
@@ -1103,13 +1127,28 @@ export function ChatView({ events, loading, refreshing = false, loadingOlder, ha
         </button>
       )}
       <div class="chat-main">
-        {!preview && refreshing && (
+        {showRefreshOverlay && (
           <div
-            class="chat-refreshing"
+            class={`chat-history-overlay${showHistoryProgress ? ' has-steps' : ''}`}
             aria-label={t('chat.refreshing_history', 'Updating history')}
             title={t('chat.refreshing_history', 'Updating history')}
           >
             <span class="chat-refreshing-spinner" aria-hidden="true" />
+            {showHistoryProgress && (
+              <>
+                <span class="chat-history-overlay-label">{t('session.history_loading_label')}</span>
+                <span class="chat-history-overlay-steps">
+                  {historySteps.map((step) => (
+                    <span key={step.key} class={`chat-history-step ${step.state}`}>
+                      <span class="chat-history-step-icon" aria-hidden="true">
+                        {step.state === 'done' ? '✓' : step.state === 'running' ? '…' : '○'}
+                      </span>
+                      {step.label}
+                    </span>
+                  ))}
+                </span>
+              </>
+            )}
           </div>
         )}
         {pinnedAboveViewport && lastSentUserMessage && (
