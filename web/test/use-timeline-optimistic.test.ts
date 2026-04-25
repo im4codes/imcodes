@@ -9,11 +9,12 @@
  *   removeOptimisticMessage   → explicit cleanup (retry path)
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, act, cleanup } from '@testing-library/preact';
+import { render, act, cleanup, waitFor } from '@testing-library/preact';
 import { h } from 'preact';
 import { useEffect } from 'preact/hooks';
 import type { ServerMessage, WsClient } from '../src/ws-client.js';
 import {
+  __clearPersistedTimelineSnapshotsForTests,
   __resetTimelineCacheForTests,
   useTimeline,
   type UseTimelineResult,
@@ -45,6 +46,7 @@ function captureHookRef(ref: { current: HookRef }, handlerBox: { fn: ((msg: Serv
 describe('useTimeline optimistic send flow', () => {
   beforeEach(() => {
     __resetTimelineCacheForTests();
+    __clearPersistedTimelineSnapshotsForTests();
     cleanup();
     vi.useFakeTimers();
   });
@@ -270,7 +272,7 @@ describe('useTimeline optimistic send flow', () => {
     expect(ref.current!.events[0].payload.failureReason).toBe('timeout');
   });
 
-  it('success-ish command.ack cancels the failure timer', () => {
+  it('success-ish command.ack marks the local bubble sent and cancels the failure timer', () => {
     const ref = { current: null as HookRef };
     const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
     const { Probe } = captureHookRef(ref, handlerBox);
@@ -293,8 +295,104 @@ describe('useTimeline optimistic send flow', () => {
       vi.advanceTimersByTime(60_000);
     });
 
-    expect(ref.current!.events[0].payload.pending).toBe(true);
+    expect(ref.current!.events[0].payload.pending).toBe(false);
+    expect(ref.current!.events[0].payload.acked).toBe(true);
     expect(ref.current!.events[0].payload.failed).toBeFalsy();
+  });
+
+  it('persists an acked local send across refresh and replaces it with authoritative history by commandId', async () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_refresh_ack' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('@/tmp/file.png hello', 'cmd-refresh-ack');
+    });
+    act(() => {
+      handlerBox.fn?.({
+        type: 'command.ack',
+        commandId: 'cmd-refresh-ack',
+        status: 'accepted',
+        session: 'deck_opt_refresh_ack',
+      } as unknown as ServerMessage);
+    });
+    expect(ref.current!.events[0].payload.pending).toBe(false);
+    expect(ref.current!.events[0].payload.acked).toBe(true);
+
+    cleanup();
+    __resetTimelineCacheForTests();
+
+    const refAfterReload = { current: null as HookRef };
+    const handlerAfterReload = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe: ReloadProbe } = captureHookRef(refAfterReload, handlerAfterReload);
+    render(h(ReloadProbe, { sessionId: 'deck_opt_refresh_ack' }));
+
+    await waitFor(() => {
+      expect(refAfterReload.current!.events).toHaveLength(1);
+      expect(refAfterReload.current!.events[0].payload.acked).toBe(true);
+    });
+
+    act(() => {
+      handlerAfterReload.fn?.({
+        type: 'timeline.history',
+        sessionName: 'deck_opt_refresh_ack',
+        requestId: 'history-req',
+        epoch: 1,
+        events: [{
+          eventId: 'real-refresh-ack',
+          sessionId: 'deck_opt_refresh_ack',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 3,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'user.message',
+          payload: { text: '@/tmp/file.png hello (authoritative)', commandId: 'cmd-refresh-ack' },
+        }],
+      } as unknown as ServerMessage);
+    });
+
+    await waitFor(() => {
+      expect(refAfterReload.current!.events).toHaveLength(1);
+      expect(refAfterReload.current!.events[0].eventId).toBe('real-refresh-ack');
+      expect(refAfterReload.current!.events[0].payload.text).toBe('@/tmp/file.png hello (authoritative)');
+    });
+  });
+
+  it('persists a failed local send across refresh so the retry affordance survives', async () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_refresh_failed' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('will fail', 'cmd-refresh-failed');
+    });
+    act(() => {
+      handlerBox.fn?.({
+        type: 'command.failed',
+        commandId: 'cmd-refresh-failed',
+        session: 'deck_opt_refresh_failed',
+        reason: 'ack_timeout',
+        retryable: true,
+      } as unknown as ServerMessage);
+    });
+    expect(ref.current!.events[0].payload.failed).toBe(true);
+
+    cleanup();
+    __resetTimelineCacheForTests();
+
+    const refAfterReload = { current: null as HookRef };
+    const handlerAfterReload = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe: ReloadProbe } = captureHookRef(refAfterReload, handlerAfterReload);
+    render(h(ReloadProbe, { sessionId: 'deck_opt_refresh_failed' }));
+
+    await waitFor(() => {
+      expect(refAfterReload.current!.events).toHaveLength(1);
+      expect(refAfterReload.current!.events[0].payload.failed).toBe(true);
+      expect(refAfterReload.current!.events[0].payload.pending).toBe(false);
+    });
   });
 
   it('removeOptimisticMessage deletes the entry (retry path)', () => {

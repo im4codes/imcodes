@@ -619,6 +619,29 @@ describe('qwen transport flow e2e', () => {
         entry.clientMessageId === 'cmd-qwen-queued' && entry.text === 'queued second'),
     );
     expect(queuedState).toBeTruthy();
+    const queuedUserBeforeDrain = mocks.emitted.find((e) =>
+      e.session === SESSION
+      && e.type === 'user.message'
+      && e.payload.clientMessageId === 'cmd-qwen-queued'
+    );
+    expect(queuedUserBeforeDrain).toBeUndefined();
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: 'command.ack',
+      commandId: 'cmd-qwen-queued',
+      status: 'accepted',
+      session: SESSION,
+    });
+    const queuedServerAcks = serverLink.send.mock.calls.filter(([msg]: [Record<string, unknown>]) =>
+      msg.type === 'command.ack' && msg.commandId === 'cmd-qwen-queued',
+    );
+    expect(queuedServerAcks).toHaveLength(1);
+    const queuedTimelineAck = mocks.emitted.find((e) =>
+      e.session === SESSION
+      && e.type === 'command.ack'
+      && e.payload.commandId === 'cmd-qwen-queued'
+      && e.payload.status === 'accepted'
+    );
+    expect(queuedTimelineAck).toBeDefined();
 
     handleWebCommand({ type: 'get_sessions' }, serverLink);
     await flushAsync();
@@ -641,15 +664,37 @@ describe('qwen transport flow e2e', () => {
     const stored = mocks.store.get(SESSION);
     const providerSessionId = typeof stored?.providerSessionId === 'string' ? stored.providerSessionId : '';
     expect(providerSessionId).toBeTruthy();
+    const drainStartIndex = mocks.emitted.length;
     provider?.flushPending(providerSessionId);
     await flushAsync();
 
-    const drainedUser = mocks.emitted.find((e) =>
+    const drainedEvents = mocks.emitted.slice(drainStartIndex);
+    const drainedUsers = drainedEvents.filter((e) =>
       e.session === SESSION
       && e.type === 'user.message'
       && e.payload.clientMessageId === 'cmd-qwen-queued'
     );
-    expect(drainedUser?.payload.text).toBe('queued second');
+    expect(drainedUsers).toHaveLength(1);
+    expect(drainedUsers[0]?.payload.text).toBe('queued second');
+    const allQueuedUsers = mocks.emitted.filter((e) =>
+      e.session === SESSION
+      && e.type === 'user.message'
+      && e.payload.clientMessageId === 'cmd-qwen-queued'
+    );
+    expect(allQueuedUsers).toHaveLength(1);
+    const queuedAssistantFinal = drainedEvents.find((e) =>
+      e.session === SESSION
+      && e.type === 'assistant.text'
+      && e.payload.streaming === false
+      && e.payload.text === 'Qwen: queued second'
+    );
+    expect(queuedAssistantFinal).toBeDefined();
+    const queuedStateAfterDrain = drainedEvents.find((e) =>
+      e.session === SESSION
+      && e.type === 'session.state'
+      && e.payload.state === 'queued'
+    );
+    expect(queuedStateAfterDrain).toBeUndefined();
 
 
     const idleStateEvents = mocks.emitted.filter((e) =>

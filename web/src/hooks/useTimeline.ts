@@ -251,6 +251,40 @@ function isProvisionalTransportHistoryEvent(event: TimelineEvent): boolean {
   return event.eventId.startsWith(PROVISIONAL_TRANSPORT_HISTORY_PREFIX);
 }
 
+function getUserMessageCommandId(event: TimelineEvent): string | undefined {
+  if (event.type !== 'user.message') return undefined;
+  const commandId = typeof event.payload.commandId === 'string'
+    ? event.payload.commandId.trim()
+    : '';
+  if (commandId) return commandId;
+  const clientMessageId = typeof event.payload.clientMessageId === 'string'
+    ? event.payload.clientMessageId.trim()
+    : '';
+  return clientMessageId || undefined;
+}
+
+function isLocalOptimisticUserMessage(event: TimelineEvent): boolean {
+  return event.type === 'user.message' && event.eventId.startsWith(OPTIMISTIC_EVENT_ID_PREFIX);
+}
+
+function removeReconciledLocalUserMessages(
+  base: TimelineEvent[],
+  incoming: readonly TimelineEvent[],
+): TimelineEvent[] {
+  const commandIds = new Set<string>();
+  for (const event of incoming) {
+    const commandId = getUserMessageCommandId(event);
+    if (commandId) commandIds.add(commandId);
+  }
+  if (commandIds.size === 0) return base;
+  const filtered = base.filter((event) => {
+    if (!isLocalOptimisticUserMessage(event)) return true;
+    const commandId = getUserMessageCommandId(event);
+    return !commandId || !commandIds.has(commandId);
+  });
+  return filtered.length === base.length ? base : filtered;
+}
+
 function convertTransportHistoryRecordToTimelineEvent(
   sessionId: string,
   record: Record<string, unknown>,
@@ -764,7 +798,7 @@ export function useTimeline(
       const base = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
       let changed = false;
       const next = base.filter((event) => {
-        if (event.type !== 'user.message' || event.payload.pending !== true) return true;
+        if (!isLocalOptimisticUserMessage(event)) return true;
         const commandId = typeof event.payload.commandId === 'string' ? event.payload.commandId : '';
         if (!commandId || !queuedIds.has(commandId)) return true;
         optimisticIdsByCommandRef.current.delete(commandId);
@@ -778,6 +812,31 @@ export function useTimeline(
       return next;
     });
   }, [clearOptimisticTimer, rememberSettledCommandId, sessionId]);
+
+  const markOptimisticAccepted = useCallback((commandId: string) => {
+    if (!commandId) return;
+    const eventId = optimisticIdsByCommandRef.current.get(commandId);
+    clearOptimisticTimer(commandId);
+    rememberSettledCommandId(commandId);
+    if (!eventId) return;
+    setEvents((prev) => {
+      const base = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
+      const idx = base.findIndex((e) => e.eventId === eventId);
+      if (idx < 0) return base;
+      const existing = base[idx]!;
+      const payload: Record<string, unknown> = {
+        ...existing.payload,
+        pending: false,
+        failed: false,
+        acked: true,
+      };
+      delete payload.failureReason;
+      const updated = [...base];
+      updated[idx] = { ...existing, payload };
+      if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, updated);
+      return updated;
+    });
+  }, [clearOptimisticTimer, rememberSettledCommandId]);
 
   // Immediately show a user message before the daemon confirms it.
   // The real event (from WS) will remove the pending version on arrival.
@@ -870,7 +929,8 @@ export function useTimeline(
   // New eventId → append to end.
   const appendEvent = useCallback((event: TimelineEvent) => {
     setEvents((prev) => {
-      const base = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
+      const sharedBase = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
+      const base = removeReconciledLocalUserMessages(sharedBase, [event]);
       // Fast path: check last few events for same-ID replacement
       for (let i = base.length - 1; i >= Math.max(0, base.length - 10); i--) {
         if (base[i].eventId === event.eventId) {
@@ -898,7 +958,8 @@ export function useTimeline(
    *  Uses two-pointer merge instead of concatenate + full sort. */
   const mergeEvents = useCallback((incoming: TimelineEvent[], maxEvents = MAX_MEMORY_EVENTS) => {
     setEvents((prev) => {
-      const base = getSharedTimelineBase(cacheKeyRef.current, prev, maxEvents);
+      const sharedBase = getSharedTimelineBase(cacheKeyRef.current, prev, maxEvents);
+      const base = removeReconciledLocalUserMessages(sharedBase, incoming);
       const result = mergeTimelineEvents(base, incoming, maxEvents);
       if (result === base) return base;
       if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, result);
@@ -1341,7 +1402,7 @@ export function useTimeline(
           const reason = typeof errorField === 'string' ? errorField : status;
           markOptimisticFailed(commandId, reason);
         } else if (status) {
-          clearOptimisticTimer(commandId);
+          markOptimisticAccepted(commandId);
         }
       }
 
@@ -1378,7 +1439,7 @@ export function useTimeline(
 
     const unsub = ws.onMessage(handler);
     return unsub;
-  }, [disableHistory, isActiveSession, ws, sessionId, appendEvent, clearOptimisticTimer, loading, markOptimisticFailed, mergeEvents, reconcileQueuedOptimisticMessages, rememberSettledCommandId, replaceEvents, serverId, updateHistoryStep]);
+  }, [disableHistory, isActiveSession, ws, sessionId, appendEvent, clearOptimisticTimer, loading, markOptimisticAccepted, markOptimisticFailed, mergeEvents, reconcileQueuedOptimisticMessages, rememberSettledCommandId, replaceEvents, serverId, updateHistoryStep]);
 
   useEffect(() => {
     if (loading || refreshing || httpRefreshing || loadingOlder) return;

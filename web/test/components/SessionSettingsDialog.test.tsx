@@ -372,6 +372,84 @@ describe('SessionSettingsDialog supervision', () => {
     });
   });
 
+  it('syncs the global qwen preset model list and selects the preset default model', async () => {
+    const sent: Array<Record<string, unknown>> = [];
+    const handlers = new Set<(message: unknown) => void>();
+    const wsStub = {
+      send(message: Record<string, unknown>) { sent.push(message); },
+      onMessage(handler: (message: unknown) => void) {
+        handlers.add(handler);
+        return () => { handlers.delete(handler); };
+      },
+    };
+
+    fetchSupervisorDefaultsMock.mockResolvedValue({
+      backend: 'qwen',
+      model: 'qwen3-coder-plus',
+      preset: 'MiniMax',
+      timeoutMs: 12_000,
+      promptVersion: 'supervision_decision_v1',
+    });
+
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="qwen"
+        transportConfig={null}
+        ws={wsStub as unknown as import('../../src/ws-client.js').WsClient}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(fetchSupervisorDefaultsMock).toHaveBeenCalled();
+      expect(sent.some((m) => m.type === 'cc.presets.list')).toBe(true);
+    });
+
+    await act(async () => {
+      for (const h of handlers) {
+        h({
+          type: 'cc.presets.list_response',
+          presets: [
+            {
+              name: 'MiniMax',
+              env: { ANTHROPIC_MODEL: 'MiniMax-M2.5' },
+              defaultModel: 'MiniMax-M2.5',
+              availableModels: [
+                { id: 'MiniMax-M2.5' },
+                { id: 'MiniMax-M2.7' },
+              ],
+            },
+          ],
+        });
+      }
+    });
+
+    const globalModelSelect = screen.getAllByRole('combobox')[2] as HTMLSelectElement;
+    await waitFor(() => {
+      expect(globalModelSelect.value).toBe('MiniMax-M2.5');
+    });
+    const optionValues = [...globalModelSelect.options].map((option) => option.value);
+    expect(optionValues).toContain('MiniMax-M2.5');
+    expect(optionValues).toContain('MiniMax-M2.7');
+    expect(optionValues).not.toContain('qwen3-coder-plus');
+
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => {
+      expect(saveSupervisorDefaultsMock).toHaveBeenCalledWith(expect.objectContaining({
+        backend: 'qwen',
+        model: 'MiniMax-M2.5',
+        preset: 'MiniMax',
+      }));
+    });
+  });
+
   it('persists customInstructionsOverride=true when user checks the override checkbox, and drops the global cache for that session', async () => {
     // Simulate a user who already has global custom instructions saved.
     fetchSupervisorDefaultsMock.mockResolvedValue({

@@ -95,6 +95,13 @@ type SupervisionRuntimeDraft = Pick<
   'backend' | 'model' | 'preset' | 'timeoutMs' | 'promptVersion' | 'customInstructions' | 'maxAutoContinueStreak' | 'maxAutoContinueTotal'
 >;
 
+type CcPresetSummary = {
+  name: string;
+  env?: Record<string, string>;
+  availableModels?: Array<{ id: string; name?: string }>;
+  defaultModel?: string;
+};
+
 function timeoutMsToUiSeconds(timeoutMs: number | undefined): number {
   const safeMs = typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0
     ? timeoutMs
@@ -268,7 +275,7 @@ function SupervisionIntroCard({ t }: { t: (key: string, params?: Record<string, 
  * picks a preset, instead of showing a stale Qwen default alongside.
  */
 function getPresetPinnedModel(
-  presets: Array<{ name: string; env?: Record<string, string>; availableModels?: Array<{ id: string }>; defaultModel?: string }>,
+  presets: readonly CcPresetSummary[],
   presetName: string | undefined,
 ): string | undefined {
   if (!presetName) return undefined;
@@ -283,6 +290,38 @@ function getPresetPinnedModel(
   const envModel = match.env?.ANTHROPIC_MODEL ?? match.env?.OPENAI_MODEL;
   const trimmed = typeof envModel === 'string' ? envModel.trim() : '';
   return trimmed || undefined;
+}
+
+function getPresetModelOptions(
+  presets: readonly CcPresetSummary[],
+  presetName: string | undefined,
+): string[] {
+  if (!presetName) return [];
+  const target = presetName.trim().toLowerCase();
+  if (!target) return [];
+  const match = presets.find((p) => p.name.trim().toLowerCase() === target);
+  if (!match) return [];
+  const options: string[] = [];
+  const add = (value: string | undefined) => {
+    const trimmed = value?.trim();
+    if (trimmed && !options.includes(trimmed)) options.push(trimmed);
+  };
+  add(match.defaultModel);
+  add(match.env?.ANTHROPIC_MODEL);
+  add(match.env?.OPENAI_MODEL);
+  for (const model of match.availableModels ?? []) add(model.id);
+  return options;
+}
+
+function resolvePresetModel(
+  presets: readonly CcPresetSummary[],
+  presetName: string | undefined,
+  currentModel: string | undefined,
+): string | undefined {
+  const options = getPresetModelOptions(presets, presetName);
+  if (options.length === 0) return undefined;
+  const current = currentModel?.trim();
+  return current && options.includes(current) ? current : options[0];
 }
 
 /**
@@ -304,7 +343,7 @@ function SupervisionPresetPicker({
 }: {
   t: (key: string, params?: Record<string, unknown>) => string;
   saving: boolean;
-  presets: Array<{ name: string; env?: Record<string, string> }>;
+  presets: readonly CcPresetSummary[];
   value: string;
   onChange: (next: string | undefined) => void;
   noneLabel: string;
@@ -488,12 +527,7 @@ export function SessionSettingsDialog({
   // Qwen presets (env bundles) fetched from the daemon via the same
   // `cc.presets.list` WS channel the Shared Context panel uses. Stays empty
   // when `ws` is not provided — the picker hides itself in that case.
-  const [ccPresets, setCcPresets] = useState<Array<{
-    name: string;
-    env?: Record<string, string>;
-    availableModels?: Array<{ id: string; name?: string }>;
-    defaultModel?: string;
-  }>>([]);
+  const [ccPresets, setCcPresets] = useState<CcPresetSummary[]>([]);
 
   useEffect(() => {
     setLabel(initLabel);
@@ -513,7 +547,7 @@ export function SessionSettingsDialog({
   useEffect(() => {
     if (!ws) return;
     const unsub = ws.onMessage((msg) => {
-      const m = msg as { type?: string; presets?: Array<{ name: string; env?: Record<string, string>; availableModels?: Array<{ id: string; name?: string }>; defaultModel?: string }> };
+      const m = msg as { type?: string; presets?: CcPresetSummary[] };
       if (m.type === 'cc.presets.list_response') {
         setCcPresets(m.presets ?? []);
       }
@@ -521,6 +555,32 @@ export function SessionSettingsDialog({
     try { ws.send({ type: 'cc.presets.list' }); } catch { /* ws may not support send in tests */ }
     return unsub;
   }, [ws]);
+
+  useEffect(() => {
+    if (ccPresets.length === 0) return;
+    setSupervisorDefaults((prev) => {
+      const backend = normalizeBackendValue(String(prev.backend ?? ''));
+      if (!backend || !doesSharedContextBackendSupportPresets(backend) || !prev.preset) return prev;
+      const resolvedModel = resolvePresetModel(ccPresets, prev.preset, prev.model);
+      if (!resolvedModel || prev.model === resolvedModel) return prev;
+      return { ...prev, model: resolvedModel };
+    });
+    setSupervision((prev) => {
+      const backend = normalizeBackendValue(String(prev.backend ?? ''));
+      if (!backend || !doesSharedContextBackendSupportPresets(backend) || !prev.preset) return prev;
+      const resolvedModel = resolvePresetModel(ccPresets, prev.preset, prev.model);
+      if (!resolvedModel || prev.model === resolvedModel) return prev;
+      return { ...prev, model: resolvedModel };
+    });
+  }, [
+    ccPresets,
+    supervisorDefaults.backend,
+    supervisorDefaults.model,
+    supervisorDefaults.preset,
+    supervision.backend,
+    supervision.model,
+    supervision.preset,
+  ]);
 
   useEffect(() => {
     if (!isSupportedTransport) return;
@@ -572,9 +632,10 @@ export function SessionSettingsDialog({
   const supervisionAuditLoops = supervision.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS;
   const taskRunPromptVersion = supervision.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION;
   const supervisionPresetEntry = ccPresets.find((p) => p.name === (typeof supervision.preset === 'string' ? supervision.preset.trim() : ''));
+  const supervisionPresetModelOptions = getPresetModelOptions(ccPresets, supervision.preset);
   const modelOptions = supervisionBackend
-    ? (supervisionPresetEntry?.availableModels?.length
-        ? supervisionPresetEntry.availableModels.map((m) => m.id)
+    ? (supervisionPresetEntry && supervisionPresetModelOptions.length > 0
+        ? supervisionPresetModelOptions
         : getSupervisionModelOptions(supervisionBackend))
     : [];
   const supervisorDefaultsBackend = normalizeBackendValue(String(supervisorDefaults.backend ?? ''));
@@ -583,9 +644,10 @@ export function SessionSettingsDialog({
   const supervisorDefaultsTimeoutSeconds = timeoutMsToUiSeconds(supervisorDefaultsTimeout);
   const supervisorDefaultsPromptVersion = supervisorDefaults.promptVersion ?? SUPERVISION_PROMPT_VERSION;
   const supervisorDefaultsPresetEntry = ccPresets.find((p) => p.name === (typeof supervisorDefaults.preset === 'string' ? supervisorDefaults.preset.trim() : ''));
+  const supervisorDefaultsPresetModelOptions = getPresetModelOptions(ccPresets, supervisorDefaults.preset);
   const supervisorDefaultsModelOptions = supervisorDefaultsBackend
-    ? (supervisorDefaultsPresetEntry?.availableModels?.length
-        ? supervisorDefaultsPresetEntry.availableModels.map((m) => m.id)
+    ? (supervisorDefaultsPresetEntry && supervisorDefaultsPresetModelOptions.length > 0
+        ? supervisorDefaultsPresetModelOptions
         : getSupervisionModelOptions(supervisorDefaultsBackend))
     : [];
   const supervisorDefaultsCustomInstructions = typeof supervisorDefaults.customInstructions === 'string' ? supervisorDefaults.customInstructions : '';

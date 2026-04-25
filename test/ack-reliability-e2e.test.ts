@@ -214,6 +214,43 @@ describe('Ack reliability — daemon ↔ server integration', () => {
     expect(failed[0].reason).toBe('ack_timeout');
   });
 
+  it('accepted command.ack reaches the browser and cancels the server ack timeout', async () => {
+    vi.useFakeTimers();
+    const bridge = WsBridge.get(serverId);
+    const daemonWs = await connectAndAuthDaemon(bridge, serverId);
+    const browser = await connectBrowser(bridge, 'deck_storecheck_brain');
+
+    browser.emit('message', Buffer.from(JSON.stringify({
+      type: 'session.send',
+      sessionName: 'deck_storecheck_brain',
+      text: 'hi',
+      commandId: 'INT-C3-ACK',
+    })));
+    await flush();
+
+    daemonWs.emit('message', Buffer.from(JSON.stringify({
+      type: MSG_COMMAND_ACK,
+      commandId: 'INT-C3-ACK',
+      status: 'accepted',
+      session: 'deck_storecheck_brain',
+    })));
+    await flush();
+
+    const acks = browser.sentByType(MSG_COMMAND_ACK).filter((a) => a.commandId === 'INT-C3-ACK');
+    expect(acks).toHaveLength(1);
+    expect(acks[0]).toEqual(expect.objectContaining({
+      commandId: 'INT-C3-ACK',
+      status: 'accepted',
+      session: 'deck_storecheck_brain',
+    }));
+
+    vi.advanceTimersByTime(ACK_TIMEOUT_MS + 100);
+    await flush();
+
+    const failed = browser.sentByType(MSG_COMMAND_FAILED).filter((msg) => msg.commandId === 'INT-C3-ACK');
+    expect(failed).toHaveLength(0);
+  });
+
   // ── 4. Daemon "crash" (outbox reloaded from disk) → flush on reconnect ──
   it('outbox survives process restart: reloaded ack flushes on next connect, server dedups', async () => {
     const bridge = WsBridge.get(serverId);

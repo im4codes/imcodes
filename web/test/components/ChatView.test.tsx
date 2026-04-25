@@ -183,6 +183,47 @@ describe('ChatView', () => {
     });
   });
 
+  it('does not render queued session.state events in the chat timeline', async () => {
+    const { queryByText } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'queued-state',
+            type: 'session.state',
+            sessionId: 'deck_q',
+            ts: 1000,
+            epoch: 1,
+            seq: 1,
+            source: 'daemon',
+            confidence: 'high',
+            payload: {
+              state: 'queued',
+              pendingMessageEntries: [{ clientMessageId: 'cmd-q', text: 'queued text' }],
+            },
+          },
+          {
+            eventId: 'assistant-after',
+            type: 'assistant.text',
+            sessionId: 'deck_q',
+            ts: 1001,
+            epoch: 1,
+            seq: 2,
+            source: 'daemon',
+            confidence: 'high',
+            payload: { text: 'visible assistant text' },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_q"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(queryByText('visible assistant text')).toBeDefined();
+    });
+    expect(queryByText('queued')).toBeNull();
+  });
+
 
   it('renders memory context as a collapsible timeline card linked to the current message', async () => {
     const { container, getByText } = render(

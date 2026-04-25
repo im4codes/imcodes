@@ -321,7 +321,7 @@ function buildViewItems(events: TimelineEvent[]): ViewItem[] {
   // - agent.status, usage.update: stats, not chat content
   // - mode.state: shown elsewhere (tabs/header)
   // - command.ack, terminal.snapshot: internal plumbing
-  // - session.state running/idle: live status belongs in footer/header, not chat history
+  // - session.state running/idle/queued: live status belongs in footer/header/queue UI, not chat history
   const visible = events.filter(
     (e) =>
       !e.hidden &&
@@ -330,7 +330,7 @@ function buildViewItems(events: TimelineEvent[]): ViewItem[] {
       e.type !== 'mode.state' &&
       e.type !== 'command.ack' &&
       e.type !== 'terminal.snapshot' &&
-      !(e.type === 'session.state' && (e.payload.state === 'running' || e.payload.state === 'idle')) &&
+      !(e.type === 'session.state' && (e.payload.state === 'running' || e.payload.state === 'idle' || e.payload.state === 'queued')) &&
       e.type !== 'assistant.thinking',
   );
 
