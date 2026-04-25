@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID } from '../../shared/ack-protocol.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 
@@ -494,6 +495,40 @@ describe('handleWebCommand transport queue behavior', () => {
       expect.objectContaining({ state: 'queued' }),
       expect.anything(),
     );
+  });
+
+  it('rejects a duplicate commandId without dispatching it to the transport runtime again', async () => {
+    const transportSend = vi.fn(() => 'sent');
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send: transportSend,
+      pendingCount: 0,
+    });
+
+    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: 'sent once', commandId: 'cmd-dup-transport' }, serverLink as any);
+    await flushAsync();
+    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: 'sent twice', commandId: 'cmd-dup-transport' }, serverLink as any);
+    await flushAsync();
+
+    expect(transportSend).toHaveBeenCalledTimes(1);
+    expect(transportSend).toHaveBeenCalledWith('sent once', 'cmd-dup-transport');
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {
+      commandId: 'cmd-dup-transport',
+      status: 'error',
+      error: COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID,
+    });
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: 'command.ack',
+      commandId: 'cmd-dup-transport',
+      status: 'error',
+      session: 'deck_transport_brain',
+      error: COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID,
+    });
+    const userMessages = emitMock.mock.calls.filter((call) =>
+      call[0] === 'deck_transport_brain' && call[1] === 'user.message'
+      && (call[2] as Record<string, unknown>)?.commandId === 'cmd-dup-transport',
+    );
+    expect(userMessages).toHaveLength(1);
   });
 
   it('passes the raw user message to transport runtime assembly without client-side context shaping', async () => {

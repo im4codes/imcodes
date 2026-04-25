@@ -32,6 +32,11 @@ export const ACK_FAILURE_DAEMON_OFFLINE: AckFailureReason = 'daemon_offline';
 export const ACK_FAILURE_ACK_TIMEOUT: AckFailureReason = 'ack_timeout';
 export const ACK_FAILURE_DAEMON_ERROR: AckFailureReason = 'daemon_error';
 
+// ── command.ack error strings ───────────────────────────────────────────────
+
+/** The daemon has already accepted or rejected this client-generated command id. */
+export const COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID = 'duplicate_command_id' as const;
+
 // ── Message payload shapes ──────────────────────────────────────────────────
 
 export interface CommandFailedMessage {

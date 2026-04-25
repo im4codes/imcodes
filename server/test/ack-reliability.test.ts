@@ -119,6 +119,32 @@ describe('WsBridge — command ack reliability', () => {
     expect(bridge._getInflightCountForTest()).toBe(1);
   });
 
+  it('does not forward an in-flight duplicate commandId to the daemon', async () => {
+    const bridge = WsBridge.get(serverId);
+    const daemonWs = await connectAndAuthenticateDaemon(bridge, serverId);
+    const browser = addBrowserSubscriber(bridge, 'deck_test_brain');
+
+    browser.emit('message', Buffer.from(JSON.stringify({
+      type: 'session.send',
+      sessionName: 'deck_test_brain',
+      text: 'hi',
+      commandId: 'C1-INFLIGHT-DUP',
+    })));
+    browser.emit('message', Buffer.from(JSON.stringify({
+      type: 'session.send',
+      sessionName: 'deck_test_brain',
+      text: 'hi again',
+      commandId: 'C1-INFLIGHT-DUP',
+    })));
+    await flushAsync();
+
+    const forwarded = daemonWs.sentByType('session.send')
+      .filter((msg) => msg.commandId === 'C1-INFLIGHT-DUP');
+    expect(forwarded).toHaveLength(1);
+    expect(forwarded[0].text).toBe('hi');
+    expect(bridge._getInflightCountForTest()).toBe(1);
+  });
+
   it('clears inflight and dedups replayed ack via seenCommandAcks', async () => {
     const bridge = WsBridge.get(serverId);
     const daemonWs = await connectAndAuthenticateDaemon(bridge, serverId);

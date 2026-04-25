@@ -25,7 +25,7 @@ import {
 } from './subsession-manager.js';
 import logger from '../util/logger.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
-import { MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
+import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID, MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
 import { homedir } from 'os';
 import { readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, stat as fsStat, writeFile as fsWriteFile } from 'node:fs/promises';
 import * as nodePath from 'node:path';
@@ -1563,10 +1563,22 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     logger.warn({ sessionName, effectiveId }, 'session.send: missing commandId — using server-generated fallback');
   }
 
-  // Dedup: silently ignore duplicate commandIds
+  // Dedup: reject duplicate commandIds explicitly so the browser/server does
+  // not wait for an ack timeout after the daemon has already seen this send.
   const dedup = getDedup(sessionName);
   if (dedup.has(effectiveId)) {
-    logger.debug({ sessionName, effectiveId }, 'session.send: duplicate commandId, ignored');
+    logger.debug({ sessionName, effectiveId }, 'session.send: duplicate commandId, rejected');
+    timelineEmitter.emit(sessionName, 'command.ack', {
+      commandId: effectiveId,
+      status: 'error',
+      error: COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID,
+    });
+    emitCommandAckReliable(serverLink, {
+      commandId: effectiveId,
+      sessionName,
+      status: 'error',
+      error: COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID,
+    });
     return;
   }
   dedup.add(effectiveId);

@@ -1035,7 +1035,7 @@ export class WsBridge {
       if (commandId) {
         // Dedup replayed acks from daemon outbox flush (sticky-pod keeps this
         // LRU authoritative within a pod lifetime).
-        if (this.seenCommandAcks.has(commandId)) {
+        if (this.seenCommandAcks.has(commandId) && !this.inflightCommands.has(commandId)) {
           logger.debug({ serverId: this.serverId, commandId }, 'command.ack dedup — dropping replay');
           return;
         }
@@ -1673,10 +1673,9 @@ export class WsBridge {
     raw: string,
   ): void {
     // Guard: if we already have an inflight for this commandId, the browser is
-    // retrying / double-sending. The daemon-side user.message 5s dedup will
-    // absorb duplicates, but we still skip creating a second inflight entry.
+    // retrying / double-sending. Keep the existing inflight and wait for its
+    // ack/timeout instead of forwarding another copy to the daemon.
     if (this.inflightCommands.has(commandId)) {
-      this.sendToDaemon(raw);
       return;
     }
 

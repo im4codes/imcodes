@@ -25,6 +25,7 @@ import { join } from 'path';
 import { WsBridge } from '../server/src/ws/bridge.js';
 import { AckOutbox } from '../src/daemon/ack-outbox.js';
 import {
+  COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID,
   MSG_COMMAND_ACK,
   MSG_COMMAND_FAILED,
   MSG_DAEMON_OFFLINE,
@@ -248,6 +249,59 @@ describe('Ack reliability — daemon ↔ server integration', () => {
     await flush();
 
     const failed = browser.sentByType(MSG_COMMAND_FAILED).filter((msg) => msg.commandId === 'INT-C3-ACK');
+    expect(failed).toHaveLength(0);
+  });
+
+  it('relays daemon duplicate-command rejection for a commandId that was already acked', async () => {
+    vi.useFakeTimers();
+    const bridge = WsBridge.get(serverId);
+    const daemonWs = await connectAndAuthDaemon(bridge, serverId);
+    const browser = await connectBrowser(bridge, 'deck_storecheck_brain');
+
+    browser.emit('message', Buffer.from(JSON.stringify({
+      type: 'session.send',
+      sessionName: 'deck_storecheck_brain',
+      text: 'hi',
+      commandId: 'INT-C3-DUP',
+    })));
+    await flush();
+
+    daemonWs.emit('message', Buffer.from(JSON.stringify({
+      type: MSG_COMMAND_ACK,
+      commandId: 'INT-C3-DUP',
+      status: 'accepted',
+      session: 'deck_storecheck_brain',
+    })));
+    await flush();
+
+    browser.emit('message', Buffer.from(JSON.stringify({
+      type: 'session.send',
+      sessionName: 'deck_storecheck_brain',
+      text: 'hi duplicate',
+      commandId: 'INT-C3-DUP',
+    })));
+    await flush();
+
+    daemonWs.emit('message', Buffer.from(JSON.stringify({
+      type: MSG_COMMAND_ACK,
+      commandId: 'INT-C3-DUP',
+      status: 'error',
+      session: 'deck_storecheck_brain',
+      error: COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID,
+    })));
+    await flush();
+
+    const duplicateAcks = browser.sentByType(MSG_COMMAND_ACK).filter((ack) =>
+      ack.commandId === 'INT-C3-DUP'
+      && ack.status === 'error'
+      && ack.error === COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID,
+    );
+    expect(duplicateAcks).toHaveLength(1);
+
+    vi.advanceTimersByTime(ACK_TIMEOUT_MS + 100);
+    await flush();
+
+    const failed = browser.sentByType(MSG_COMMAND_FAILED).filter((msg) => msg.commandId === 'INT-C3-DUP');
     expect(failed).toHaveLength(0);
   });
 
