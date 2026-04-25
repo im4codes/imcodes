@@ -51,8 +51,20 @@ function buildLogger(): pino.Logger {
   try { mkdirSync(LOG_DIR, { recursive: true }); } catch { /* ignore */ }
   rotateLogs();
 
+  // Attach an error handler to the file destination. SonicBoom (pino's
+  // underlying stream) emits 'error' events for ENOENT / EACCES / EPIPE
+  // when the log file is unlinked or its parent dir is removed. Without a
+  // handler, those become uncaught exceptions and crash the process —
+  // which has bitten CI on test runs where `afterEach` rm -rf's a temp
+  // HOME dir while async pino writes are still in flight, and could in
+  // production crash the daemon after disk-full / log-rotation races.
+  // Logging is best-effort; swallow the failure so the rest of the daemon
+  // keeps running.
+  const fileDest = pino.destination({ dest: LOG_FILE, append: true, sync: false });
+  fileDest.on('error', () => { /* best-effort log writes; ignore stream errors */ });
+
   const streams: pino.StreamEntry[] = [
-    { level: 'info', stream: pino.destination({ dest: LOG_FILE, append: true, sync: false }) },
+    { level: 'info', stream: fileDest },
   ];
   // Only add stdout if it's a real TTY (avoids EPIPE crash when daemon runs detached)
   if (process.stdout.isTTY) {
