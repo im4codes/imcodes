@@ -30,7 +30,7 @@ import { useEffect, useRef, useState, useCallback } from 'preact/hooks';
 import type { WsClient, TimelineEvent, ServerMessage } from '../ws-client.js';
 import { TimelineDB } from '../timeline-db.js';
 import { mergeTimelineEvents, preferTimelineEvent } from '../../../src/shared/timeline/merge.js';
-import { fetchTimelineHistoryHttp } from '../api.js';
+import { fetchTimelineHistoryHttp, sendSessionViaHttp } from '../api.js';
 import { normalizeTransportPendingEntries } from '../transport-queue.js';
 
 // Singleton DB shared across all useTimeline instances — opened once at module load.
@@ -140,15 +140,29 @@ const MAX_PERSISTED_SNAPSHOT_EVENTS = 50;
 // If no confirmation arrives within this window we auto-flip the pending bubble to
 // "failed" so the user can retry rather than stare at a perpetual spinner.
 //
-// Sized to comfortably cover the server's full ack-reliability budget so we
-// don't race ahead of `command.failed`:
+// Sized to comfortably cover the server's full ack-reliability budget AND the
+// client-side auto-retry + HTTP fallback chain so we don't race ahead of
+// `command.failed` or interrupt an in-flight retry:
 //   - RECONNECT_GRACE_MS (10s) + ACK_TIMEOUT_MS * (RETRY_LIMIT + 1) (8 * 6 = 48s)
-//     = 58s worst case before the server gives up.
-// Add a small buffer (2s) so the server's authoritative `command.failed` (with
-// its specific reason string) reaches the bubble before our local timeout
-// fires with the generic "timeout" reason. The previous 30s value caused
-// false-positive timeouts on every server retry sequence.
-const OPTIMISTIC_TIMEOUT_MS = 60_000;
+//     = 58s worst case before the server first gives up.
+//   - Plus client retries (CLIENT_RETRY_DELAYS_MS sum ≈ 6s) + HTTP fallback (~5s).
+// Total comfortable budget ~75s. We pick 90s so even worst-case retries
+// complete before the optimistic timeout marks the bubble as a generic
+// "timeout" failure (which would skip the retry path's specific reason).
+const OPTIMISTIC_TIMEOUT_MS = 90_000;
+
+/**
+ * Per-attempt backoff for client-side auto-retry of failed sends. The user's
+ * stated policy is: "发送失败至少重试 2-3 次后再 HTTP watch 兜底，最终失败"
+ * — i.e. don't surface failure on the first server-side `command.failed`,
+ * give the network a few more chances, then fall back to the HTTP send
+ * endpoint, and only after all of that mark the bubble red.
+ *
+ * Total WS retry budget = sum of delays = 6s, comfortably less than the
+ * server's grace window so the daemon has time to reconnect between attempts.
+ */
+const CLIENT_RETRY_DELAYS_MS = [800, 2000, 3200] as const;
+const CLIENT_RETRY_MAX_ATTEMPTS = CLIENT_RETRY_DELAYS_MS.length; // 3 WS attempts before HTTP fallback
 
 /** Normalize text for echo comparison: strip prompt prefixes, collapse whitespace. */
 function normalizeForEcho(text: string): string {
@@ -716,7 +730,14 @@ export function useTimeline(
         seqRef.current = 0;
         if (cancelled) return;
         updateHistoryStep('cache', 'done', 'bootstrap');
-        setEvents([]);
+        // Preserve any optimistic user messages added by the user before the
+        // cold IDB load completed. Without this guard, a fast send right
+        // after mount (before async load() finishes) gets wiped out — and
+        // when `command.failed` arrives, the auto-retry path can't find the
+        // optimistic event to settle it. Authoritative timeline events from
+        // the daemon will arrive shortly after via WS / HTTP backfill and
+        // reconcile (matched by commandId).
+        setEvents((prev) => prev.filter(isLocalOptimisticUserMessage));
         if (wsConnected) {
           requestDaemonHistory(true);
         } else {
@@ -741,6 +762,17 @@ export function useTimeline(
   const settledCommandIdsRef = useRef(new Set<string>());
   const settledCommandOrderRef = useRef<string[]>([]);
 
+  // Per-commandId auto-retry bookkeeping. `attempts` counts only WS retries
+  // (HTTP fallback is the final attempt and isn't counted). `timer` lets us
+  // cancel a pending retry if the message settles (ack/echo) before the
+  // backoff fires. `payloads` snapshots the message text + extra at first
+  // failure so a transient empty `events` array (async IDB load completing
+  // mid-retry) can't strand the retry chain without something to send. Maps
+  // are pruned in `clearAutoRetryState`.
+  const autoRetryAttemptsRef = useRef(new Map<string, number>());
+  const autoRetryTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  const autoRetryPayloadsRef = useRef(new Map<string, { text: string; extra: Record<string, unknown> }>());
+
   const rememberSettledCommandId = useCallback((commandId: string) => {
     if (!commandId || settledCommandIdsRef.current.has(commandId)) return;
     settledCommandIdsRef.current.add(commandId);
@@ -759,6 +791,20 @@ export function useTimeline(
     }
   }, []);
 
+  // Drop any pending auto-retry timer + attempt counter + cached payload for
+  // this commandId. Called when the message is settled (ack / echo / explicit
+  // retry / mark failed) so a delayed retry can't resurrect a settled bubble.
+  const clearAutoRetryState = useCallback((commandId: string) => {
+    if (!commandId) return;
+    const timer = autoRetryTimersRef.current.get(commandId);
+    if (timer) {
+      clearTimeout(timer);
+      autoRetryTimersRef.current.delete(commandId);
+    }
+    autoRetryAttemptsRef.current.delete(commandId);
+    autoRetryPayloadsRef.current.delete(commandId);
+  }, []);
+
   // Flip a pending optimistic entry to failed state (red "!" bubble with retry).
   const markOptimisticFailed = useCallback((commandId: string, error?: string) => {
     if (!commandId) return;
@@ -766,6 +812,7 @@ export function useTimeline(
     const eventId = optimisticIdsByCommandRef.current.get(commandId);
     if (!eventId) return;
     clearOptimisticTimer(commandId);
+    clearAutoRetryState(commandId);
     setEvents((prev) => {
       const base = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
       const idx = base.findIndex((e) => e.eventId === eventId);
@@ -799,7 +846,134 @@ export function useTimeline(
       if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, updated);
       return updated;
     });
-  }, [clearOptimisticTimer, rememberSettledCommandId]);
+  }, [clearAutoRetryState, clearOptimisticTimer, rememberSettledCommandId]);
+
+  /**
+   * Auto-retry an optimistic send when the server surfaces `command.failed`.
+   *
+   * Strategy (per "发送失败至少重试 2-3 次后再 HTTP watch 兜底，最终失败"):
+   *   1. WS retry up to CLIENT_RETRY_MAX_ATTEMPTS times with exponential
+   *      backoff. Same `commandId` is reused — the server clears inflight on
+   *      `command.failed` (and dedup only blocks already-acked ids), so a
+   *      replay with the same id is treated as a fresh dispatch.
+   *   2. After WS retries exhausted, attempt one HTTP-send via the pod-sticky
+   *      `/api/server/:serverId/session/send` endpoint. This succeeds even
+   *      when the browser WS is broken because it doesn't depend on the same
+   *      socket — only on serverId routing reaching the daemon's pod.
+   *   3. Only after both fail, mark the bubble red so the user sees failure.
+   *
+   * The bubble stays in `pending` state throughout the retry chain so the
+   * user doesn't see flicker between "❌" and "↻". The optimistic 90s timer
+   * (separate) is the ultimate safety net if every retry is silently dropped.
+   */
+  const scheduleAutoRetry = useCallback((
+    commandId: string,
+    sessionName: string,
+    reasonStr: AckFailureReason,
+  ) => {
+    if (!commandId) return;
+    if (settledCommandIdsRef.current.has(commandId)) return;
+    const eventId = optimisticIdsByCommandRef.current.get(commandId);
+    if (!eventId) {
+      // Optimistic event was removed — nothing to retry, just mark failed.
+      markOptimisticFailed(commandId, localizedAckFailureReason(reasonStr));
+      return;
+    }
+
+    // We pull the latest pending payload from `eventsRef` if available, AND
+    // snapshot it the first time so a transient empty `events` (e.g. async
+    // IDB load completing during retry backoff) can't strand the retry chain.
+    const event = eventsRef.current.find((e) => e.eventId === eventId);
+    if (event && event.payload && event.payload.pending === false && event.payload.failed !== true) {
+      // Already accepted/settled — don't retry.
+      return;
+    }
+    const cachedPayload = autoRetryPayloadsRef.current.get(commandId);
+    const eventText = String(event?.payload?.text ?? cachedPayload?.text ?? '');
+    const eventExtra = (event?.payload?._resendExtra && typeof event.payload._resendExtra === 'object')
+      ? (event.payload._resendExtra as Record<string, unknown>)
+      : (cachedPayload?.extra ?? {});
+
+    const text = eventText;
+    if (!text) {
+      markOptimisticFailed(commandId, localizedAckFailureReason(reasonStr));
+      return;
+    }
+    const resendExtra = eventExtra;
+    // Snapshot for subsequent retries in this chain.
+    autoRetryPayloadsRef.current.set(commandId, { text, extra: resendExtra });
+
+    const attempts = autoRetryAttemptsRef.current.get(commandId) ?? 0;
+
+    // Exhausted WS retries → HTTP fallback (one shot), then mark failed.
+    if (attempts >= CLIENT_RETRY_MAX_ATTEMPTS) {
+      if (!serverId) {
+        markOptimisticFailed(commandId, localizedAckFailureReason(reasonStr));
+        return;
+      }
+      // Bump beyond CLIENT_RETRY_MAX_ATTEMPTS so a duplicate command.failed
+      // (e.g. server retries inside `replayInflightToDaemon`) does not stack
+      // a second HTTP attempt while the first is still in flight.
+      autoRetryAttemptsRef.current.set(commandId, attempts + 1);
+      const httpPayload: Record<string, unknown> = {
+        sessionName,
+        text,
+        commandId,
+        ...resendExtra,
+      };
+      void sendSessionViaHttp(serverId, httpPayload).then(() => {
+        // HTTP returns 2xx — daemon accepted the message via REST path.
+        // The authoritative `user.message` echo will arrive via WS and
+        // settle the bubble; we do NOT mark accepted here because HTTP
+        // success only proves the server enqueued, not that the agent saw it.
+      }).catch(() => {
+        markOptimisticFailed(commandId, localizedAckFailureReason(reasonStr));
+      });
+      return;
+    }
+
+    // Schedule the next WS retry. Cancel any prior pending timer for this
+    // commandId so a flurry of duplicate `command.failed` events (rare but
+    // possible on rapid daemon flap) doesn't queue multiple retries.
+    const existingTimer = autoRetryTimersRef.current.get(commandId);
+    if (existingTimer) clearTimeout(existingTimer);
+
+    const delay = CLIENT_RETRY_DELAYS_MS[Math.min(attempts, CLIENT_RETRY_DELAYS_MS.length - 1)];
+    autoRetryAttemptsRef.current.set(commandId, attempts + 1);
+
+    const timer = setTimeout(() => {
+      autoRetryTimersRef.current.delete(commandId);
+      // Re-check state at fire time: user may have manually retried, or the
+      // echo / ack could have arrived during the backoff. We tolerate the
+      // optimistic event temporarily missing from `eventsRef` (async IDB
+      // load can briefly empty the array between failure and retry-fire) —
+      // settledCommandIdsRef is the authoritative "stop retrying" signal.
+      if (settledCommandIdsRef.current.has(commandId)) return;
+      const stillTracked = optimisticIdsByCommandRef.current.get(commandId);
+      if (stillTracked !== eventId) return;
+      const currentEvent = eventsRef.current.find((e) => e.eventId === eventId);
+      if (currentEvent && currentEvent.payload && currentEvent.payload.pending === false && currentEvent.payload.failed !== true) {
+        // Was settled (acked) during the backoff.
+        return;
+      }
+
+      const wsClient = ws;
+      if (wsClient && wsClient.connected) {
+        try {
+          wsClient.sendSessionCommand('send', { sessionName, text, commandId, ...resendExtra });
+          return;
+        } catch {
+          // WS threw — fall through to HTTP fallback this iteration by
+          // jumping the attempts counter to MAX so the next retry-trigger
+          // (or this synthetic one) goes the HTTP route.
+        }
+      }
+      // WS unavailable (or threw) — short-circuit to HTTP fallback.
+      autoRetryAttemptsRef.current.set(commandId, CLIENT_RETRY_MAX_ATTEMPTS);
+      scheduleAutoRetry(commandId, sessionName, reasonStr);
+    }, delay);
+    autoRetryTimersRef.current.set(commandId, timer);
+  }, [markOptimisticFailed, serverId, ws]);
 
   // Remove an optimistic entry entirely — used by the retry button so the retry
   // doesn't leave behind the failed bubble (the fresh send re-renders it).
@@ -808,6 +982,7 @@ export function useTimeline(
     const eventId = optimisticIdsByCommandRef.current.get(commandId);
     optimisticIdsByCommandRef.current.delete(commandId);
     clearOptimisticTimer(commandId);
+    clearAutoRetryState(commandId);
     if (!eventId) return;
     setEvents((prev) => {
       const base = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
@@ -816,7 +991,7 @@ export function useTimeline(
       if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, next);
       return next;
     });
-  }, [clearOptimisticTimer]);
+  }, [clearAutoRetryState, clearOptimisticTimer]);
 
   const reconcileQueuedOptimisticMessages = useCallback((pendingEntries: unknown, pendingMessages: unknown) => {
     const queuedEntries = normalizeTransportPendingEntries(pendingEntries, pendingMessages, sessionId ?? '');
@@ -846,6 +1021,7 @@ export function useTimeline(
     if (!commandId) return;
     const eventId = optimisticIdsByCommandRef.current.get(commandId);
     clearOptimisticTimer(commandId);
+    clearAutoRetryState(commandId);
     rememberSettledCommandId(commandId);
     if (!eventId) return;
     setEvents((prev) => {
@@ -1580,11 +1756,12 @@ export function useTimeline(
         settleOptimisticByCommandAck(commandId, status, (msg as unknown as Record<string, unknown>).error);
       }
 
-      // ── command.failed: server-surfaced fast failure (daemon_offline / ack_timeout).
-      //    The server already owns retry coordination (buffer during grace, replay
-      //    on reconnect), so the web does NOT maintain its own retry queue — we
-      //    just flip the optimistic bubble to failed state so the user can retry
-      //    manually when they choose. ──
+      // ── command.failed: server-surfaced send failure.
+      //    Policy: do NOT immediately flash red. Auto-retry up to
+      //    CLIENT_RETRY_MAX_ATTEMPTS times via WS, then HTTP fallback, then
+      //    mark failed. This honors the "至少重试 2-3 次后再 HTTP 兜底，最终
+      //    失败" preference and matches what users intuitively expect: a
+      //    transient network blip should not surface as a red error. ──
       if (msg.type === MSG_COMMAND_FAILED) {
         const failedSession = typeof (msg as { session?: unknown }).session === 'string'
           ? (msg as { session: string }).session
@@ -1599,10 +1776,18 @@ export function useTimeline(
           ? reason
           : 'daemon_offline';
         if (reasonStr === 'ack_timeout') {
+          // ack_timeout means the server already retried 5x with the daemon
+          // connected — further client retries won't help, but the message
+          // MAY have actually landed and the ack got lost. Let the HTTP
+          // backfill recover the echo from the daemon's persisted store.
           fireHttpBackfillRef.current(0, { phase: 'refresh', visible: true });
           return;
         }
-        markOptimisticFailed(commandId, localizedAckFailureReason(reasonStr));
+        // daemon_offline / daemon_error → WS retry chain → HTTP fallback → fail.
+        // The bubble stays pending the whole time so the user doesn't see
+        // a "fail then succeed" flicker.
+        const retrySessionName = failedSession ?? sessionId;
+        scheduleAutoRetry(commandId, retrySessionName, reasonStr);
       }
 
       // ── daemon.online / daemon.offline: purely advisory status signals.
@@ -1617,7 +1802,7 @@ export function useTimeline(
 
     const unsub = ws.onMessage(handler);
     return unsub;
-  }, [disableHistory, isActiveSession, ws, sessionId, appendEvent, clearOptimisticTimer, loading, markOptimisticFailed, mergeEvents, reconcileQueuedOptimisticMessages, rememberSettledCommandId, replaceEvents, serverId, settleOptimisticByCommandAck, settleOptimisticByCommandAckEvent, settleOptimisticByTimelineProgress, updateHistoryStep]);
+  }, [disableHistory, isActiveSession, ws, sessionId, appendEvent, clearOptimisticTimer, loading, markOptimisticFailed, mergeEvents, reconcileQueuedOptimisticMessages, rememberSettledCommandId, replaceEvents, scheduleAutoRetry, serverId, settleOptimisticByCommandAck, settleOptimisticByCommandAckEvent, settleOptimisticByTimelineProgress, updateHistoryStep]);
 
   useEffect(() => {
     if (loading || refreshing || httpRefreshing || loadingOlder) return;

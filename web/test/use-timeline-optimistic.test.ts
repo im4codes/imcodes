@@ -13,12 +13,38 @@ import { render, act, cleanup, waitFor } from '@testing-library/preact';
 import { h } from 'preact';
 import { useEffect } from 'preact/hooks';
 import type { ServerMessage, WsClient } from '../src/ws-client.js';
+
+// Mock api.js so tests can control whether the HTTP-send fallback "succeeds"
+// (resolves) or "fails" (rejects). The auto-retry-on-command.failed flow ends
+// with a single HTTP attempt before marking the bubble red — controlling this
+// resolution is what lets tests deterministically reach the failed state
+// without waiting for real network timeouts.
+vi.mock('../src/api.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/api.js')>();
+  return {
+    ...actual,
+    fetchTimelineHistoryHttp: vi.fn(async () => ({ events: [] })),
+    sendSessionViaHttp: vi.fn(async () => { throw new Error('http unavailable in test'); }),
+  };
+});
+
 import {
   __clearPersistedTimelineSnapshotsForTests,
   __resetTimelineCacheForTests,
   useTimeline,
   type UseTimelineResult,
 } from '../src/hooks/useTimeline.js';
+import { sendSessionViaHttp } from '../src/api.js';
+
+const sendSessionViaHttpMock = vi.mocked(sendSessionViaHttp);
+
+/**
+ * Total wall time for the auto-retry chain to reach its "give up and mark
+ * failed" state when HTTP fallback rejects: sum of CLIENT_RETRY_DELAYS_MS
+ * (800 + 2000 + 3200 = 6000ms) + a small buffer for the HTTP rejection
+ * promise to flush. The hook's internal constants are not exported.
+ */
+const AUTO_RETRY_EXHAUSTION_MS = 6_500;
 
 type HookRef = UseTimelineResult | null;
 
@@ -30,6 +56,10 @@ function captureHookRef(ref: { current: HookRef }, handlerBox: { fn: ((msg: Serv
       return () => { handlerBox.fn = null; };
     },
     sendTimelineHistoryRequest: vi.fn(() => 'history-req'),
+    // Auto-retry-on-command.failed re-sends via WS before falling back to
+    // HTTP. Mock both so tests can assert how many WS retries fired.
+    sendSessionCommand: vi.fn(() => undefined),
+    send: vi.fn(() => undefined),
   } as unknown as WsClient;
 
   function Probe({ sessionId }: { sessionId: string }) {
@@ -49,6 +79,10 @@ describe('useTimeline optimistic send flow', () => {
     __clearPersistedTimelineSnapshotsForTests();
     cleanup();
     vi.useFakeTimers();
+    sendSessionViaHttpMock.mockReset();
+    // Default: HTTP fallback rejects (matches "the network is broken" tests).
+    // Individual tests can override via `sendSessionViaHttpMock.mockResolvedValue`.
+    sendSessionViaHttpMock.mockRejectedValue(new Error('http unavailable in test'));
   });
 
   afterEach(() => {
@@ -298,9 +332,13 @@ describe('useTimeline optimistic send flow', () => {
         retryable: true,
       } as unknown as ServerMessage);
     });
-    // Advance past OPTIMISTIC_TIMEOUT_MS (60s) so any auto-fail timer fires.
+    // Advance past the auto-retry chain + the optimistic auto-fail timer so
+    // every code path that could mark/dedupe the bubble has had a chance to
+    // run. ack_timeout doesn't trigger the auto-retry, but the optimistic
+    // 90s timer might fire — when it tries to mark failed, the duplicate
+    // text + confirmed echo causes the optimistic to be removed instead.
     act(() => {
-      vi.advanceTimersByTime(60_001);
+      vi.advanceTimersByTime(91_000);
     });
 
     expect(ref.current!.events).toHaveLength(1);
@@ -319,9 +357,9 @@ describe('useTimeline optimistic send flow', () => {
     });
     expect(ref.current!.events[0].payload.pending).toBe(true);
 
-    // OPTIMISTIC_TIMEOUT_MS is 60s; advance just past that to trigger auto-fail.
+    // OPTIMISTIC_TIMEOUT_MS is 90s; advance just past that to trigger auto-fail.
     act(() => {
-      vi.advanceTimersByTime(60_001);
+      vi.advanceTimersByTime(90_001);
     });
 
     expect(ref.current!.events[0].payload.pending).toBe(false);
@@ -734,14 +772,30 @@ describe('useTimeline optimistic send flow', () => {
     act(() => {
       ref.current!.addOptimisticUserMessage('will fail', 'cmd-refresh-failed');
     });
-    act(() => {
-      handlerBox.fn?.({
-        type: 'command.failed',
-        commandId: 'cmd-refresh-failed',
-        session: 'deck_opt_refresh_failed',
-        reason: 'daemon_error',
-        retryable: true,
-      } as unknown as ServerMessage);
+    // The new auto-retry behavior keeps the bubble pending across multiple
+    // `command.failed` events until WS retries are exhausted AND the HTTP
+    // fallback rejects. To deterministically reach the "marked failed"
+    // state, drain through every retry slot (3 WS + 1 HTTP). The test's
+    // intent — that the failed bubble persists across refresh — is the
+    // assertion below; the retry-chain plumbing is covered by separate
+    // dedicated tests.
+    for (let i = 0; i < 4; i++) {
+      act(() => {
+        handlerBox.fn?.({
+          type: 'command.failed',
+          commandId: 'cmd-refresh-failed',
+          session: 'deck_opt_refresh_failed',
+          reason: 'daemon_error',
+          retryable: true,
+        } as unknown as ServerMessage);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3300);
+      });
+    }
+    // HTTP fallback (mocked to reject) propagates → markOptimisticFailed.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(50);
     });
     expect(ref.current!.events[0].payload.failed).toBe(true);
 
@@ -817,4 +871,230 @@ describe('useTimeline optimistic send flow', () => {
     expect(ref.current!.events).toHaveLength(1);
     expect(ref.current!.events[0].payload.text).toBe('once');
   });
+
+  // ── Auto-retry on command.failed (do not flash red on first failure) ───────
+
+  it('auto-retries via WS up to 3 times on command.failed before HTTP fallback', async () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { ws, Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_retry_ws' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('flaky', 'cmd-retry-ws');
+    });
+
+    // Server says no — but the bubble must NOT flash red. Auto-retry kicks in.
+    act(() => {
+      handlerBox.fn?.({
+        type: 'command.failed',
+        commandId: 'cmd-retry-ws',
+        session: 'deck_opt_retry_ws',
+        reason: 'daemon_offline',
+        retryable: true,
+      } as unknown as ServerMessage);
+    });
+    expect(ref.current!.events[0].payload.pending).toBe(true);
+    expect(ref.current!.events[0].payload.failed).toBeFalsy();
+
+    const wsSendSpy = vi.mocked((ws as unknown as { sendSessionCommand: (...args: unknown[]) => unknown }).sendSessionCommand);
+    wsSendSpy.mockClear();
+
+    // Each retry delay fires a fresh sendSessionCommand. Walk through the
+    // backoff and verify exactly one new WS dispatch per timer fire.
+    await act(async () => { await vi.advanceTimersByTimeAsync(800); });
+    expect(wsSendSpy).toHaveBeenCalledTimes(1);
+    expect(wsSendSpy.mock.calls[0]).toEqual([
+      'send',
+      expect.objectContaining({ commandId: 'cmd-retry-ws', text: 'flaky' }),
+    ]);
+
+    // Server fails again — schedule next retry.
+    act(() => {
+      handlerBox.fn?.({
+        type: 'command.failed',
+        commandId: 'cmd-retry-ws',
+        session: 'deck_opt_retry_ws',
+        reason: 'daemon_offline',
+        retryable: true,
+      } as unknown as ServerMessage);
+    });
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    expect(wsSendSpy).toHaveBeenCalledTimes(2);
+
+    // Third retry.
+    act(() => {
+      handlerBox.fn?.({
+        type: 'command.failed',
+        commandId: 'cmd-retry-ws',
+        session: 'deck_opt_retry_ws',
+        reason: 'daemon_offline',
+        retryable: true,
+      } as unknown as ServerMessage);
+    });
+    await act(async () => { await vi.advanceTimersByTimeAsync(3200); });
+    expect(wsSendSpy).toHaveBeenCalledTimes(3);
+
+    // Bubble still pending — no red flash during the retry chain.
+    expect(ref.current!.events[0].payload.pending).toBe(true);
+    expect(ref.current!.events[0].payload.failed).toBeFalsy();
+    expect(sendSessionViaHttpMock).not.toHaveBeenCalled();
+  });
+
+  it('falls back to HTTP send after WS retries are exhausted', async () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_retry_http' }));
+
+    // HTTP fallback succeeds — bubble should stay pending (waiting for the
+    // authoritative echo) instead of flipping to failed.
+    sendSessionViaHttpMock.mockResolvedValue(undefined);
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('http please', 'cmd-retry-http');
+    });
+
+    // Burn through all 3 WS retry slots by sending command.failed in a loop.
+    for (let i = 0; i < 3; i++) {
+      act(() => {
+        handlerBox.fn?.({
+          type: 'command.failed',
+          commandId: 'cmd-retry-http',
+          session: 'deck_opt_retry_http',
+          reason: 'daemon_offline',
+          retryable: true,
+        } as unknown as ServerMessage);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3300);
+      });
+    }
+
+    // 4th failure — at MAX retries → HTTP fallback fires.
+    act(() => {
+      handlerBox.fn?.({
+        type: 'command.failed',
+        commandId: 'cmd-retry-http',
+        session: 'deck_opt_retry_http',
+        reason: 'daemon_offline',
+        retryable: true,
+      } as unknown as ServerMessage);
+    });
+    await act(async () => { await vi.advanceTimersByTimeAsync(50); });
+
+    expect(sendSessionViaHttpMock).toHaveBeenCalledTimes(1);
+    expect(sendSessionViaHttpMock).toHaveBeenCalledWith(
+      'srv',
+      expect.objectContaining({ commandId: 'cmd-retry-http', text: 'http please' }),
+    );
+    // HTTP succeeded → bubble still pending, NOT failed.
+    expect(ref.current!.events[0].payload.pending).toBe(true);
+    expect(ref.current!.events[0].payload.failed).toBeFalsy();
+  });
+
+  it('marks failed only after every WS retry AND the HTTP fallback have rejected', async () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_retry_final' }));
+
+    // Default mockRejectedValue from beforeEach — HTTP fails.
+    act(() => {
+      ref.current!.addOptimisticUserMessage('all paths broken', 'cmd-retry-final');
+    });
+
+    // Single command.failed; the auto-retry will internally exhaust the WS
+    // slot, fall to HTTP, HTTP rejects, bubble is finally marked failed.
+    act(() => {
+      handlerBox.fn?.({
+        type: 'command.failed',
+        commandId: 'cmd-retry-final',
+        session: 'deck_opt_retry_final',
+        reason: 'daemon_offline',
+        retryable: true,
+      } as unknown as ServerMessage);
+    });
+
+    expect(ref.current!.events[0].payload.pending).toBe(true);
+    expect(ref.current!.events[0].payload.failed).toBeFalsy();
+
+    // Advance through the full retry chain, sending command.failed each time
+    // a WS retry "succeeds" (the mock is a no-op so server simulator doesn't
+    // exist — but the hook still schedules HTTP fallback at MAX attempts).
+    for (let i = 0; i < CLIENT_RETRY_DELAYS_SUM_PLUS_BUFFER_MS / 1000; i++) {
+      act(() => {
+        handlerBox.fn?.({
+          type: 'command.failed',
+          commandId: 'cmd-retry-final',
+          session: 'deck_opt_retry_final',
+          reason: 'daemon_offline',
+          retryable: true,
+        } as unknown as ServerMessage);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1100);
+      });
+    }
+    // Final HTTP fallback may need an extra microtask flush.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(50);
+    });
+
+    expect(sendSessionViaHttpMock).toHaveBeenCalled();
+    expect(ref.current!.events[0].payload.pending).toBe(false);
+    expect(ref.current!.events[0].payload.failed).toBe(true);
+  });
+
+  it('cancels pending auto-retry when the authoritative echo arrives', async () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { ws, Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_retry_cancel' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('eventually arrives', 'cmd-retry-cancel');
+    });
+    act(() => {
+      handlerBox.fn?.({
+        type: 'command.failed',
+        commandId: 'cmd-retry-cancel',
+        session: 'deck_opt_retry_cancel',
+        reason: 'daemon_error',
+        retryable: true,
+      } as unknown as ServerMessage);
+    });
+
+    // Echo arrives before the first retry timer fires — must cancel retry.
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'real-cancel',
+          sessionId: 'deck_opt_retry_cancel',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 1,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'user.message',
+          payload: { text: 'eventually arrives', commandId: 'cmd-retry-cancel' },
+        },
+      } as unknown as ServerMessage);
+    });
+
+    const wsSendSpy = vi.mocked((ws as unknown as { sendSessionCommand: (...args: unknown[]) => unknown }).sendSessionCommand);
+    wsSendSpy.mockClear();
+    sendSessionViaHttpMock.mockClear();
+    await act(async () => { await vi.advanceTimersByTimeAsync(AUTO_RETRY_EXHAUSTION_MS); });
+
+    // After echo settled the bubble, no further retries should have fired.
+    expect(wsSendSpy).not.toHaveBeenCalled();
+    expect(sendSessionViaHttpMock).not.toHaveBeenCalled();
+  });
 });
+
+// Local mirror of the hook's CLIENT_RETRY_DELAYS_MS sum (800+2000+3200=6000)
+// plus 1s buffer for the HTTP rejection promise to settle.
+const CLIENT_RETRY_DELAYS_SUM_PLUS_BUFFER_MS = 7_000;
