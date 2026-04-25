@@ -189,6 +189,12 @@ describe('CodexSdkProvider', () => {
     ]);
     expect(threadStartReq?.params?.sandbox).toBe('danger-full-access');
     expect(threadStartReq?.params?.approvalPolicy).toBe('never');
+    // baseInstructions MUST be sent on thread/start: codex-cli forwards it to
+    // the upstream Responses API as `instructions`, which third-party
+    // providers (minimax, openrouter) reject with 400 "Instructions are
+    // required" when missing. Don't drop this field.
+    expect(typeof threadStartReq?.params?.baseInstructions).toBe('string');
+    expect((threadStartReq?.params?.baseInstructions as string).length).toBeGreaterThan(0);
     expect(turnStartReq?.params?.sandboxPolicy).toEqual({ type: 'dangerFullAccess' });
     expect(turnStartReq?.params?.approvalPolicy).toBe('never');
     expect(deltas).toEqual(['O', 'OK']);

@@ -30,6 +30,26 @@ import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-p
 const CODEX_BIN = 'codex';
 const CANCEL_INTERRUPT_TIMEOUT_MS = 1_500;
 
+/**
+ * Default `baseInstructions` we send with `thread/start`.
+ *
+ * Background: codex-cli ≥ 0.125 forwards the thread's `baseInstructions` as
+ * the OpenAI Responses API `instructions` field. The Responses API (and
+ * third-party providers that proxy it via `wire_api = "responses"`, e.g.
+ * MiniMax, OpenRouter) reject requests where `instructions` is missing or
+ * empty with `{"type":"invalid_request_error","message":"Instructions are
+ * required"}`. The default OpenAI provider tolerates omission, but other
+ * providers do not — and we want a single code path that works everywhere.
+ *
+ * Keep this prompt short and provider-neutral. It only shapes the agent's
+ * "frame"; the user's per-turn `systemText` is still prepended into the
+ * turn input below, so context-injected instructions still take precedence.
+ */
+const DEFAULT_BASE_INSTRUCTIONS =
+  'You are Codex, an AI coding assistant integrated into IM.codes. ' +
+  'Follow the user\'s instructions precisely. ' +
+  'Use available tools to inspect, edit, and run code as needed.';
+
 type JsonRpcResponse = {
   id?: number;
   result?: Record<string, any>;
@@ -499,6 +519,10 @@ export class CodexSdkProvider implements TransportProvider {
       approvalPolicy: 'never',
       sandbox: 'danger-full-access',
       personality: 'none',
+      // Always send baseInstructions — required by the Responses API, which
+      // third-party providers (e.g. minimax, openrouter via wire_api =
+      // "responses") strictly enforce. See DEFAULT_BASE_INSTRUCTIONS above.
+      baseInstructions: DEFAULT_BASE_INSTRUCTIONS,
       ...(state.model ? { model: state.model } : {}),
     });
     const threadId = result?.thread?.id;
