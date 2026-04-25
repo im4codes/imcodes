@@ -102,7 +102,7 @@ import {
   shouldShowInitialConnectingGate,
 } from './server-selection.js';
 import { installNativeAppResumeRefresh } from './app-resume-refresh.js';
-import { markServerLive, markServerOffline } from './server-online-state.js';
+import { markServerLive, markServerOffline, touchServerHeartbeat } from './server-online-state.js';
 import { MSG_DAEMON_ONLINE, MSG_DAEMON_OFFLINE } from '@shared/ack-protocol.js';
 
 const DashboardPage = lazy(() => import('./pages/DashboardPage.js').then((m) => ({ default: m.DashboardPage })));
@@ -1974,7 +1974,19 @@ export function App() {
       }
     });
 
-    ws.onLatency((ms) => setLatencyMs(ms));
+    ws.onLatency((ms) => {
+      setLatencyMs(ms);
+      // Pong proves the WS to the server pod is alive. Refresh lastHeartbeatAt
+      // so the sidebar device dot stays green during quiet periods (no
+      // session_list / timeline events arriving). Without this, the 60s
+      // freshness window expires on idle daemons — especially when the tab is
+      // backgrounded and `loadServers()` polls are throttled — and the dot
+      // turns gray until *some* WS app-level message arrives (e.g. another
+      // client sends a message and the daemon broadcasts back). Use
+      // `touchServerHeartbeat` so a server that was explicitly marked offline
+      // via MSG_DAEMON_OFFLINE doesn't get accidentally promoted back online.
+      setServers((prev) => touchServerHeartbeat(prev, selectedServerId));
+    });
     const unsubStats = ws.onMessage((msg) => {
       if (msg.type === 'daemon.stats') {
         setDaemonStats({ daemonVersion: msg.daemonVersion, cpu: msg.cpu, memUsed: msg.memUsed, memTotal: msg.memTotal, load1: msg.load1, load5: msg.load5, load15: msg.load15, uptime: msg.uptime });

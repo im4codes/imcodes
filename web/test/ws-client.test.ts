@@ -286,15 +286,73 @@ describe('WsClient', () => {
     firstWs.send.mockClear();
 
     client.probeConnection();
-    await vi.advanceTimersByTimeAsync(2_000);
+    // First watchdog window (5s): no pong yet — still on the same socket.
+    await vi.advanceTimersByTimeAsync(5_000);
     expect(firstWs.readyState).toBe(MockWebSocket.OPEN);
     expect(lastWs).toBe(firstWs);
 
-    await vi.advanceTimersByTimeAsync(2_000);
+    // Second watchdog window also misses → force reconnect.
+    await vi.advanceTimersByTimeAsync(5_000);
     for (let i = 0; i < 5; i++) await vi.advanceTimersByTimeAsync(0);
 
     expect(firstWs.readyState).toBe(MockWebSocket.CLOSED);
     expect(lastWs).not.toBe(firstWs);
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('probeConnection short-circuits when a recent pong already proved liveness', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    const handler = vi.fn();
+    client.onMessage(handler);
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const socket = lastWs!;
+
+    // Heartbeat pong arrives — socket is provably alive.
+    socket.emit('message', { data: JSON.stringify({ type: 'pong' }) });
+    handler.mockClear();
+    socket.send.mockClear();
+
+    // A foreground probe immediately after should be a no-op:
+    //   - no extra ping is sent
+    //   - the socket is NOT marked disconnected (no UI flash)
+    client.probeConnection();
+    expect(client.connected).toBe(true);
+    expect(socket.send).not.toHaveBeenCalled();
+    expect(handler).not.toHaveBeenCalledWith(expect.objectContaining({ event: 'disconnected' }));
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('probeConnection coalesces back-to-back calls into a single in-flight probe', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const socket = lastWs!;
+    socket.send.mockClear();
+
+    // First probe: sends one ping.
+    client.probeConnection();
+    const pingsAfterFirst = socket.send.mock.calls.filter(
+      (c) => JSON.parse(c[0] as string).type === 'ping',
+    ).length;
+    expect(pingsAfterFirst).toBe(1);
+
+    // Stacking more probes from focus/pageshow/visibilitychange must not pile
+    // up extra pings while the first probe's watchdog is still armed.
+    client.probeConnection();
+    client.probeConnection();
+    const pingsAfterStacked = socket.send.mock.calls.filter(
+      (c) => JSON.parse(c[0] as string).type === 'ping',
+    ).length;
+    expect(pingsAfterStacked).toBe(1);
 
     client.disconnect();
     vi.useRealTimers();
@@ -325,13 +383,13 @@ describe('WsClient', () => {
       );
       expect(initialPings.length).toBeGreaterThanOrEqual(1);
 
-      // Walk past the first 2s watchdog without ever sending a pong.
-      await vi.advanceTimersByTimeAsync(2_000);
+      // Walk past the first 5s watchdog without ever sending a pong.
+      await vi.advanceTimersByTimeAsync(5_000);
       expect(firstWs.readyState).toBe(MockWebSocket.OPEN);
       expect(lastWs).toBe(firstWs);
 
       // The confirming ping also missed; now the client reconnects.
-      await vi.advanceTimersByTimeAsync(2_000);
+      await vi.advanceTimersByTimeAsync(5_000);
       // reconnectNow(true) fires synchronously, but openSocket() awaits a
       // ticket fetch Promise — flush several microtask turns so the new
       // MockWebSocket is constructed before we assert.

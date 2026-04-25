@@ -134,10 +134,24 @@ const RECONNECT_MAX_MS = 30000;
 const HEARTBEAT_MS = 10000; // lowered from 25s for faster dead-connection detection
 /** If no pong arrives within this window after a ping, assume the socket is a
  *  half-open zombie (iOS/Android commonly leave the TCP open after aggressive
- *  background eviction) and force a fresh reconnect. */
-const PONG_TIMEOUT_MS = 2_000;
-const RESUME_PROBE_TIMEOUT_MS = 2_000;
+ *  background eviction) and force a fresh reconnect.
+ *
+ *  Sized to absorb mobile/cellular jitter — 2s was too aggressive and produced
+ *  false-positive forced reconnects (and a flurry of resubscribe traffic) on
+ *  every momentary RTT spike. With `PONG_MISSES_BEFORE_RECONNECT = 2`, total
+ *  detection time is still bounded at ~10s (one missed window + one confirming
+ *  ping + miss). Truly dead sockets are caught well before any TCP-level
+ *  timeout, but live-but-jittery sockets are no longer torn down. */
+const PONG_TIMEOUT_MS = 5_000;
+const RESUME_PROBE_TIMEOUT_MS = 5_000;
 const PONG_MISSES_BEFORE_RECONNECT = 2;
+/** If we received a pong within this window, treat the socket as already
+ *  proven alive and skip the resume probe. This eliminates UI churn (and the
+ *  brief "disconnected" flash) when the user rapidly switches tabs / focuses
+ *  windows in quick succession — the ping/pong heartbeat already covers
+ *  liveness during normal use; foreground probes only need to fire after a
+ *  genuine sleep/background gap. */
+const PROBE_FRESHNESS_MS = 5_000;
 
 export class WsClient {
   private ws: WebSocket | null = null;
@@ -152,6 +166,9 @@ export class WsClient {
   private _destroyed = false;
   private _pingLatency: number | null = null;
   private _pingSentAt: number | null = null;
+  /** Wall-clock time of the last received pong. Used by `probeConnection` to
+   *  skip a resume probe when a recent heartbeat already proved liveness. */
+  private _lastPongAt = 0;
   private _pongTimer: ReturnType<typeof setTimeout> | null = null;
   private _resumeProbeTimer: ReturnType<typeof setTimeout> | null = null;
   private _visibilityListener: (() => void) | null = null;
@@ -252,6 +269,15 @@ export class WsClient {
    * Backgrounded tabs can resume with readyState=OPEN while the path to the
    * server is dead; a short ping/pong probe catches that without refreshing
    * healthy sockets.
+   *
+   * Stability guards (in order):
+   *   1. If a recent pong (within `PROBE_FRESHNESS_MS`) already proved the
+   *      socket is alive, skip the probe entirely — no disconnected flash,
+   *      no extra ping. Rapid visibility/focus toggles do not churn the UI.
+   *   2. If a probe is already in flight (`_resumeProbeTimer` armed), don't
+   *      restart it; the in-flight probe will resolve on its own.
+   *   3. Otherwise mark the socket unverified, dispatch `disconnected` so
+   *      `send()` callers can't push into a possibly-dead pipe, and ping.
    */
   probeConnection(timeoutMs = RESUME_PROBE_TIMEOUT_MS): void {
     if (this._destroyed) return;
@@ -260,6 +286,15 @@ export class WsClient {
       return;
     }
 
+    // Recent pong → socket is provably alive; nothing to do.
+    if (this._connected && this._lastPongAt > 0 && Date.now() - this._lastPongAt < PROBE_FRESHNESS_MS) {
+      return;
+    }
+
+    // Already probing — let the existing watchdog resolve. Avoids stacking
+    // multiple pings/timers when visibility/focus/pageshow all fire.
+    if (this._resumeProbeTimer) return;
+
     const wasConnected = this._connected;
     this._connected = false;
     if (wasConnected) {
@@ -267,7 +302,6 @@ export class WsClient {
     }
 
     this.clearPongWatchdog();
-    if (this._resumeProbeTimer) clearTimeout(this._resumeProbeTimer);
     this._resumeProbeMisses = 0;
     this.sendResumeProbePing(timeoutMs);
   }
@@ -656,6 +690,7 @@ export class WsClient {
         if (msg.type === 'pong') {
           this._missedHeartbeatPongs = 0;
           this._resumeProbeMisses = 0;
+          this._lastPongAt = Date.now();
           if (this._pingSentAt !== null) {
             this._pingLatency = Date.now() - this._pingSentAt;
             this._pingSentAt = null;

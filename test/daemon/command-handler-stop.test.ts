@@ -119,6 +119,29 @@ vi.mock('../../src/util/imc-dir.js', () => ({
   imcSubDir: vi.fn((dir: string, sub: string) => `${dir}/.imc/${sub}`),
 }));
 
+// `buildSubSessionSync` (used by `subsession.rename`) probes Codex/Claude/Qwen
+// runtime config to enrich the payload. The real probes hit local config
+// files / spawn helpers and do many awaits, which can outlast `flushAsync()`.
+// Stub them with sync resolved values so the rename test deterministically
+// reaches the `serverLink.send` call within a single tick flush.
+vi.mock('../../src/agent/codex-runtime-config.js', () => ({
+  getCodexRuntimeConfig: vi.fn().mockResolvedValue({}),
+}));
+vi.mock('../../src/agent/codex-display.js', () => ({
+  mergeCodexDisplayMetadata: vi.fn(() => ({})),
+}));
+vi.mock('../../src/agent/sdk-runtime-config.js', () => ({
+  getClaudeSdkRuntimeConfig: vi.fn().mockResolvedValue({}),
+  normalizeClaudeSdkModelForProvider: vi.fn((m: unknown) => m),
+}));
+vi.mock('../../src/agent/provider-display.js', () => ({
+  getQwenDisplayMetadata: vi.fn(() => ({})),
+}));
+vi.mock('../../src/agent/provider-quota.js', () => ({
+  getQwenOAuthQuotaUsageLabel: vi.fn(() => undefined),
+  recordQwenOAuthRequest: vi.fn(),
+}));
+
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
 
 const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
