@@ -146,6 +146,7 @@ import { connectProvider, disconnectAll } from '../../src/agent/provider-registr
 import { getTransportRuntime, launchTransportSession, relaunchSessionWithSettings, restoreTransportSessions, setSessionEventCallback, setSessionPersistCallback } from '../../src/agent/session-manager.js';
 import { newSession } from '../../src/agent/tmux.js';
 import { getResendCount } from '../../src/daemon/transport-resend-queue.js';
+import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 
 const flush = async () => {
   for (let i = 0; i < 4; i++) await new Promise((resolve) => setTimeout(resolve, 0));
@@ -297,6 +298,7 @@ describe('sdk transport session restore', () => {
       'session.state',
       expect.objectContaining({
         state: 'idle',
+        [TIMELINE_SUPPRESS_PUSH_FIELD]: true,
         pendingCount: 0,
         pendingMessages: [],
         pendingMessageEntries: [],

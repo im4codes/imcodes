@@ -16,6 +16,7 @@ import { buildMemoryContextTimelinePayload } from './memory-context-timeline.js'
 import { updateSessionState } from '../store/session-store.js';
 import { resolveContextWindow } from '../util/model-context.js';
 import { registerWatcherControl, unregisterWatcherControl, type WatcherControl } from './watcher-controls.js';
+import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 
 // ── Codex SQLite helpers ────────────────────────────────────────────────────────
 
@@ -169,6 +170,7 @@ function normalizePath(p: string): string {
 
 const finalAnswerBuffers = new Map<string, { text: string; timer: ReturnType<typeof setTimeout> }>();
 const sessionStates = new Map<string, 'running' | 'idle'>();
+const historyReplaySessions = new Set<string>();
 const FINAL_ANSWER_DEBOUNCE_MS = 600;
 
 function flushFinalAnswer(sessionName: string): void {
@@ -191,7 +193,10 @@ function emitSessionState(sessionName: string, state: 'running' | 'idle'): void 
       watcher.noTextRetrackAttempted = false;
     }
   }
-  timelineEmitter.emit(sessionName, 'session.state', { state }, { source: 'daemon', confidence: 'high' });
+  timelineEmitter.emit(sessionName, 'session.state', {
+    state,
+    ...(historyReplaySessions.has(sessionName) ? { [TIMELINE_SUPPRESS_PUSH_FIELD]: true } : {}),
+  }, { source: 'daemon', confidence: 'high' });
   updateSessionState(sessionName, state);
 }
 
@@ -321,10 +326,15 @@ async function emitRecentHistory(sessionName: string, filePath: string, model?: 
     const lines = chunk.split('\n');
     const startIdx = size > readSize ? 1 : 0;
 
-    for (let i = startIdx; i < lines.length; i++) {
-      const line = lines[i];
-      if (!line.trim()) continue;
-      parseLine(sessionName, line, model); // Simplified for this restoration fix
+    historyReplaySessions.add(sessionName);
+    try {
+      for (let i = startIdx; i < lines.length; i++) {
+        const line = lines[i];
+        if (!line.trim()) continue;
+        parseLine(sessionName, line, model); // Simplified for this restoration fix
+      }
+    } finally {
+      historyReplaySessions.delete(sessionName);
     }
   } catch {} finally { if (fh) await fh.close().catch(() => {}); }
 }

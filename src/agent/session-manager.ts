@@ -41,6 +41,7 @@ import { isClaudeCodeFamily, isCodexFamily } from '../../shared/agent-types.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 import { resolveTransportContextBootstrap } from './runtime-context-bootstrap.js';
 import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
+import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 
 import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
@@ -1428,6 +1429,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
       emitSessionPersist(restoredRecord, s.name);
       timelineEmitter.emit(s.name, 'session.state', {
         state: 'idle',
+        [TIMELINE_SUPPRESS_PUSH_FIELD]: true,
         pendingCount: runtime.pendingCount,
         pendingMessages: runtime.pendingMessages,
         pendingMessageEntries: runtime.pendingEntries,

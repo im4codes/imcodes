@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { WsBridge } from '../src/ws/bridge.js';
 import * as dbQueries from '../src/db/queries.js';
+import { PUSH_TIMELINE_EVENT_MAX_AGE_MS, TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 
 // ── Mock WebSocket ─────────────────────────────────────────────────────────────
 
@@ -1771,6 +1772,44 @@ describe('WsBridge', () => {
       const payload = vi.mocked(dispatchPush).mock.calls.at(-1)?.[0];
       expect(payload?.title).toBe('my-server · Worker Timeline · codex');
       expect(payload?.title).not.toContain('deck_sub_timeline-worker');
+    });
+
+    it('does not push stale timeline idle events replayed on daemon restart', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          sessionId: 'deck_cd_brain',
+          eventId: 'evt-stale-idle',
+          ts: Date.now() - PUSH_TIMELINE_EVENT_MAX_AGE_MS - 1_000,
+          type: 'session.state',
+          payload: { state: 'idle' },
+        },
+      }));
+      await flushAsync();
+
+      expect(dispatchPush).not.toHaveBeenCalled();
+    });
+
+    it('does not push timeline idle events explicitly marked as restore-only', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          sessionId: 'deck_cd_brain',
+          eventId: 'evt-restore-idle',
+          ts: Date.now(),
+          type: 'session.state',
+          payload: { state: 'idle', [TIMELINE_SUPPRESS_PUSH_FIELD]: true },
+        },
+      }));
+      await flushAsync();
+
+      expect(dispatchPush).not.toHaveBeenCalled();
     });
 
     it('uses lastText as push body for session.idle', async () => {

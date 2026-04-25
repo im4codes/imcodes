@@ -55,6 +55,7 @@ import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDisc
 import logger from '../util/logger.js';
 import { pickReadableSessionDisplay } from '../../../shared/session-display.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
+import { PUSH_TIMELINE_EVENT_MAX_AGE_MS, TIMELINE_SUPPRESS_PUSH_FIELD } from '../../../shared/push-notifications.js';
 
 const AUTH_TIMEOUT_MS = 5000;
 const MAX_QUEUE_SIZE = 100;
@@ -547,6 +548,10 @@ export class WsBridge {
           }
           // session.state idle from timeline (covers all agent types: CC, codex, gemini)
           if (event?.type === 'session.state' && (event.payload as Record<string, unknown>)?.state === 'idle') {
+            const payload = event.payload as Record<string, unknown>;
+            const eventTs = typeof event.ts === 'number' ? event.ts : undefined;
+            if (payload[TIMELINE_SUPPRESS_PUSH_FIELD] === true) return;
+            if (eventTs && Date.now() - eventTs > PUSH_TIMELINE_EVENT_MAX_AGE_MS) return;
             this.dispatchEventPush(db, env, {
               type: 'session.idle',
               session: event.sessionId ?? '',
