@@ -137,6 +137,7 @@ const HEARTBEAT_MS = 10000; // lowered from 25s for faster dead-connection detec
  *  background eviction) and force a fresh reconnect. */
 const PONG_TIMEOUT_MS = 2_000;
 const RESUME_PROBE_TIMEOUT_MS = 2_000;
+const PONG_MISSES_BEFORE_RECONNECT = 2;
 
 export class WsClient {
   private ws: WebSocket | null = null;
@@ -154,6 +155,8 @@ export class WsClient {
   private _pongTimer: ReturnType<typeof setTimeout> | null = null;
   private _resumeProbeTimer: ReturnType<typeof setTimeout> | null = null;
   private _visibilityListener: (() => void) | null = null;
+  private _missedHeartbeatPongs = 0;
+  private _resumeProbeMisses = 0;
   private _onLatency: ((ms: number) => void) | null = null;
 
   /** Per-session callbacks for raw PTY binary frames. Supports multiple subscribers per session. */
@@ -263,20 +266,10 @@ export class WsClient {
       this.dispatch({ type: 'session.event', event: 'disconnected', session: '', state: 'disconnected' });
     }
 
+    this.clearPongWatchdog();
     if (this._resumeProbeTimer) clearTimeout(this._resumeProbeTimer);
-    try {
-      this._pingSentAt = Date.now();
-      this.ws.send(JSON.stringify({ type: 'ping' }));
-    } catch {
-      this.reconnectNow(true);
-      return;
-    }
-
-    this._resumeProbeTimer = setTimeout(() => {
-      this._resumeProbeTimer = null;
-      if (this._destroyed) return;
-      this.reconnectNow(true);
-    }, timeoutMs);
+    this._resumeProbeMisses = 0;
+    this.sendResumeProbePing(timeoutMs);
   }
 
   onMessage(handler: MessageHandler): () => void {
@@ -661,6 +654,8 @@ export class WsClient {
       try {
         const msg = JSON.parse(ev.data as string) as ServerMessage;
         if (msg.type === 'pong') {
+          this._missedHeartbeatPongs = 0;
+          this._resumeProbeMisses = 0;
           if (this._pingSentAt !== null) {
             this._pingLatency = Date.now() - this._pingSentAt;
             this._pingSentAt = null;
@@ -830,9 +825,11 @@ export class WsClient {
     const armPing = () => {
       if (this.isDocumentHidden()) {
         this.clearPongWatchdog();
+        this._missedHeartbeatPongs = 0;
         this._pingSentAt = null;
         return;
       }
+      if (this._pongTimer) return;
       try {
         this._pingSentAt = Date.now();
         this.send({ type: 'ping' });
@@ -841,19 +838,20 @@ export class WsClient {
         // handler + scheduleReconnect take over.
         return;
       }
-      // Only arm a fresh watchdog if none is pending. A still-pending
-      // watchdog means the previous ping hasn't been ponged yet; resetting
-      // it here would just keep delaying detection forever on a dead
-      // socket. The pong handler is the only thing that clears it.
-      if (!this._pongTimer) {
-        this._pongTimer = setTimeout(() => {
-          this._pongTimer = null;
-          if (this._destroyed) return;
+      this._pongTimer = setTimeout(() => {
+        this._pongTimer = null;
+        if (this._destroyed) return;
+        this._missedHeartbeatPongs += 1;
+        if (this._missedHeartbeatPongs >= PONG_MISSES_BEFORE_RECONNECT) {
           // Socket is half-open. Force a fresh connection so subscriptions
           // and optimistic bubbles get re-synced via the reconnect path.
           this.reconnectNow(true);
-        }, PONG_TIMEOUT_MS);
-      }
+          return;
+        }
+        // One missed pong can be normal under short browser stalls. Confirm
+        // with a second immediate ping before tearing down the socket.
+        armPing();
+      }, PONG_TIMEOUT_MS);
     };
     this.installVisibilityListener();
     armPing(); // send first ping immediately for initial latency
@@ -873,6 +871,8 @@ export class WsClient {
     this._visibilityListener = null;
     this._resumeProbeTimer = null;
     this._pingSentAt = null;
+    this._missedHeartbeatPongs = 0;
+    this._resumeProbeMisses = 0;
   }
 
   private isDocumentHidden(): boolean {
@@ -892,11 +892,38 @@ export class WsClient {
       // Desktop browsers aggressively throttle background timers. A ping sent
       // just before tab hiding can have its pong callback delayed past the
       // foreground 2s watchdog, causing false reconnect loops and subscription
-      // churn. Foreground resume still runs probeConnection() with the 2s SLA.
+      // churn. Foreground resume still runs probeConnection() immediately,
+      // but now also requires two missed pongs before reconnecting.
       this.clearPongWatchdog();
+      this._missedHeartbeatPongs = 0;
       this._pingSentAt = null;
     };
     document.addEventListener('visibilitychange', this._visibilityListener);
+  }
+
+  private sendResumeProbePing(timeoutMs: number): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.reconnectNow(false);
+      return;
+    }
+    try {
+      this._pingSentAt = Date.now();
+      this.ws.send(JSON.stringify({ type: 'ping' }));
+    } catch {
+      this.reconnectNow(true);
+      return;
+    }
+
+    this._resumeProbeTimer = setTimeout(() => {
+      this._resumeProbeTimer = null;
+      if (this._destroyed) return;
+      this._resumeProbeMisses += 1;
+      if (this._resumeProbeMisses >= PONG_MISSES_BEFORE_RECONNECT) {
+        this.reconnectNow(true);
+        return;
+      }
+      this.sendResumeProbePing(timeoutMs);
+    }, timeoutMs);
   }
 
   private dispatch(msg: ServerMessage): void {

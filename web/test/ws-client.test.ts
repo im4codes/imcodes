@@ -276,7 +276,7 @@ describe('WsClient', () => {
     vi.useRealTimers();
   });
 
-  it('foreground probe force-reconnects when pong does not arrive', async () => {
+  it('foreground probe force-reconnects after two missed pongs', async () => {
     vi.useFakeTimers();
     const client = new WsClient('http://localhost:8787', 'srv-1');
     client.connect();
@@ -286,6 +286,10 @@ describe('WsClient', () => {
     firstWs.send.mockClear();
 
     client.probeConnection();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(firstWs.readyState).toBe(MockWebSocket.OPEN);
+    expect(lastWs).toBe(firstWs);
+
     await vi.advanceTimersByTimeAsync(2_000);
     for (let i = 0; i < 5; i++) await vi.advanceTimersByTimeAsync(0);
 
@@ -302,12 +306,12 @@ describe('WsClient', () => {
   });
 
   describe('dead-socket detection (pong timeout)', () => {
-    it('force-reconnects a new socket when no pong arrives within the watchdog window', async () => {
+    it('force-reconnects a new socket after two missed heartbeat pongs', async () => {
       // Regression: mobile OS commonly half-closes the TCP on background
       // eviction without propagating close() to the WebView — the old client
       // believed it was "connected" indefinitely while no events arrived.
-      // Now we ping every HEARTBEAT_MS (10s) and force-reconnect if no pong
-      // arrives within the 2s watchdog window.
+      // Now we ping every HEARTBEAT_MS (10s) and force-reconnect if two
+      // consecutive 2s watchdog windows miss their pongs.
       vi.useFakeTimers();
       const client = new WsClient('http://localhost:8787', 'srv-1');
       client.connect();
@@ -321,7 +325,12 @@ describe('WsClient', () => {
       );
       expect(initialPings.length).toBeGreaterThanOrEqual(1);
 
-      // Walk past the 2s watchdog without ever sending a pong.
+      // Walk past the first 2s watchdog without ever sending a pong.
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(firstWs.readyState).toBe(MockWebSocket.OPEN);
+      expect(lastWs).toBe(firstWs);
+
+      // The confirming ping also missed; now the client reconnects.
       await vi.advanceTimersByTimeAsync(2_000);
       // reconnectNow(true) fires synchronously, but openSocket() awaits a
       // ticket fetch Promise — flush several microtask turns so the new
