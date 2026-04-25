@@ -760,6 +760,7 @@ export async function fetchTimelineHistoryHttp(
   if (typeof opts.afterTs === 'number' && Number.isFinite(opts.afterTs)) params.set('afterTs', String(opts.afterTs));
   if (typeof opts.beforeTs === 'number' && Number.isFinite(opts.beforeTs)) params.set('beforeTs', String(opts.beforeTs));
   if (typeof opts.limit === 'number' && Number.isFinite(opts.limit)) params.set('limit', String(opts.limit));
+  const timeout = createTimeoutSignal(2_500);
   try {
     const result = await apiFetch<{
       sessionName: string;
@@ -769,6 +770,7 @@ export async function fetchTimelineHistoryHttp(
       nextCursor: number | null;
     }>(`/api/server/${encodeURIComponent(serverId)}/timeline/history/full?${params.toString()}`, {
       method: 'GET',
+      signal: timeout.signal,
     });
     return {
       events: Array.isArray(result.events) ? result.events : [],
@@ -782,6 +784,8 @@ export async function fetchTimelineHistoryHttp(
     // 503 daemon_offline / 504 timeout / network errors are transient — caller
     // should fall back to the WS path. Returning null lets the caller decide.
     return null;
+  } finally {
+    timeout.clear?.();
   }
 }
 

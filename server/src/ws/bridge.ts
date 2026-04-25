@@ -974,6 +974,15 @@ export class WsBridge {
         logger.warn({ serverId: this.serverId }, 'timeline.event missing sessionId — discarded');
         return;
       }
+      if (rawEvent.type === 'user.message') {
+        const payload = rawEvent.payload as Record<string, unknown> | undefined;
+        const commandId = typeof payload?.commandId === 'string'
+          ? payload.commandId
+          : typeof payload?.clientMessageId === 'string'
+            ? payload.clientMessageId
+            : '';
+        if (commandId) this.clearInflightOnAuthoritativeEcho(commandId);
+      }
       this.ingestRecentTextFromTimelineEvent(rawEvent);
       if (this.db) {
         void upsertSessionTextTailCacheEvent(this.db, this.serverId, rawEvent)
@@ -1761,6 +1770,13 @@ export class WsBridge {
     }
     // Leave the entry around briefly for housekeeping GC so duplicate acks
     // still hit dedup via `seenCommandAcks`.
+    this.removeInflight(commandId);
+  }
+
+  /** A user.message carrying the client command id means the daemon accepted it. */
+  private clearInflightOnAuthoritativeEcho(commandId: string): void {
+    const entry = this.inflightCommands.get(commandId);
+    if (!entry) return;
     this.removeInflight(commandId);
   }
 

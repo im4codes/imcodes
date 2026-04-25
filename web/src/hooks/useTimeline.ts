@@ -28,10 +28,9 @@ function localizedAckFailureReason(reason: AckFailureReason): string {
 
 import { useEffect, useRef, useState, useCallback } from 'preact/hooks';
 import type { WsClient, TimelineEvent, ServerMessage } from '../ws-client.js';
-import type { TimelineConfidence, TimelineSource } from '../../../src/shared/timeline/types.js';
 import { TimelineDB } from '../timeline-db.js';
 import { mergeTimelineEvents, preferTimelineEvent } from '../../../src/shared/timeline/merge.js';
-import { fetchTimelineHistoryHttp, fetchTimelineTextTailHttp, type TimelineTextTailItem } from '../api.js';
+import { fetchTimelineHistoryHttp } from '../api.js';
 import { normalizeTransportPendingEntries } from '../transport-queue.js';
 
 // Singleton DB shared across all useTimeline instances — opened once at module load.
@@ -368,30 +367,6 @@ function getTimelineHistoryAfterTs(events: TimelineEvent[]): number | undefined 
   return Math.max(0, maxTs - TIMELINE_HISTORY_AFTER_TS_OVERLAP_MS);
 }
 
-function timelineEventFromTextTailItem(sessionId: string, item: TimelineTextTailItem): TimelineEvent | null {
-  if (typeof item.eventId !== 'string' || !item.eventId) return null;
-  if (typeof item.ts !== 'number' || !Number.isFinite(item.ts)) return null;
-  if (item.type !== 'user.message' && item.type !== 'assistant.text') return null;
-  if (typeof item.text !== 'string' || item.text.trim().length === 0) return null;
-  const source: TimelineSource = item.source === 'hook' || item.source === 'terminal-parse' || item.source === 'terminal-spinner'
-    ? item.source
-    : 'daemon';
-  const confidence: TimelineConfidence = item.confidence === 'medium' || item.confidence === 'low'
-    ? item.confidence
-    : 'high';
-  return {
-    eventId: item.eventId,
-    sessionId,
-    ts: item.ts,
-    epoch: 0,
-    seq: 0,
-    source,
-    confidence,
-    type: item.type,
-    payload: { text: item.text },
-  };
-}
-
 export function __getTimelineCacheKeysForTests(): string[] {
   return [...eventsCache.keys()];
 }
@@ -476,12 +451,12 @@ export function createIdleHistoryStatus(): TimelineHistoryStatus {
   };
 }
 
-function createBootstrapHistoryStatus(opts: { canTextTail: boolean; canDaemon: boolean; canHttp: boolean }): TimelineHistoryStatus {
+function createBootstrapHistoryStatus(opts: { canDaemon: boolean; canHttp: boolean }): TimelineHistoryStatus {
   return {
     phase: 'bootstrap',
     steps: {
       cache: 'running',
-      textTail: opts.canTextTail ? 'pending' : 'skipped',
+      textTail: 'skipped',
       daemon: opts.canDaemon ? 'pending' : 'skipped',
       http: opts.canHttp ? 'pending' : 'skipped',
       older: 'skipped',
@@ -510,7 +485,6 @@ export function useTimeline(
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [httpRefreshing, setHttpRefreshing] = useState(false);
-  const [textTailRefreshing, setTextTailRefreshing] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [historyStatus, setHistoryStatus] = useState<TimelineHistoryStatus>(() => createIdleHistoryStatus());
   const loadingOlderRef = useRef(false); // Synchronous guard against duplicate pagination requests
@@ -551,7 +525,6 @@ export function useTimeline(
     if (!sessionId) {
       setLoading(false);
       setHttpRefreshing(false);
-      setTextTailRefreshing(false);
       setHistoryStatus(createIdleHistoryStatus());
       httpBackfillInFlightRef.current = 0;
       resetOlderState();
@@ -562,7 +535,6 @@ export function useTimeline(
       setLoading(false);
       setRefreshing(false);
       setHttpRefreshing(false);
-      setTextTailRefreshing(false);
       setHistoryStatus(createIdleHistoryStatus());
       httpBackfillInFlightRef.current = 0;
       resetOlderState();
@@ -573,18 +545,15 @@ export function useTimeline(
 
     setRefreshing(false);
     setHttpRefreshing(false);
-    setTextTailRefreshing(false);
     setHistoryStatus(createBootstrapHistoryStatus({
-      canTextTail: !!serverId,
       canDaemon: wsConnected,
-      canHttp: !!serverId,
+      canHttp: false,
     }));
     httpBackfillInFlightRef.current = 0;
     resetOlderState();
     setHasOlderHistory(true);
 
     let cancelled = false;
-    let textTailStarted = false;
 
     const markDaemonHistoryBackground = (): void => {
       updateHistoryStep('daemon', 'done', 'bootstrap');
@@ -604,38 +573,12 @@ export function useTimeline(
         : ws.sendTimelineHistoryRequest(sessionId, limit);
     };
 
-    const startTextTailBootstrap = (): void => {
-      if (textTailStarted || !serverId || !sessionId || !cacheKey) return;
-      textTailStarted = true;
-      const expectedCacheKey = cacheKey;
-      const expectedSessionId = sessionId;
-      updateHistoryStep('textTail', 'running', 'bootstrap');
-      setTextTailRefreshing(true);
-      void fetchTimelineTextTailHttp(serverId, expectedSessionId)
-        .then((result) => {
-          if (cancelled || cacheKeyRef.current !== expectedCacheKey || !result || result.events.length === 0) return;
-          const recovered = result.events
-            .map((item) => timelineEventFromTextTailItem(expectedSessionId, item))
-            .filter((event): event is TimelineEvent => event !== null);
-          if (recovered.length === 0) return;
-          mergeEvents(recovered);
-          setLoading(false);
-          markDaemonHistoryBackground();
-        })
-        .catch(() => { /* fail-open: authoritative history flow continues */ })
-        .finally(() => {
-          updateHistoryStep('textTail', 'done', 'bootstrap');
-          if (!cancelled && cacheKeyRef.current === expectedCacheKey) setTextTailRefreshing(false);
-        });
-    };
-
     // 1. Module-level memory cache — instant restore (e.g. window reopen)
     const memCached = getCachedEvents(cacheKey!);
     if (memCached && memCached.length > 0) {
       updateHistoryStep('cache', 'done', 'bootstrap');
       setEvents(memCached);
       setLoading(false);
-      startTextTailBootstrap();
       requestDaemonHistory(false, MAX_MEMORY_EVENTS);
       // Background HTTP backfill — catches events missed while this window
       // was minimized/backgrounded since the memory cache can be stale.
@@ -656,7 +599,6 @@ export function useTimeline(
       setCachedEvents(cacheKey!, localSnapshot);
       setEvents((prev) => (prev === localSnapshot ? prev : localSnapshot));
       setLoading(false);
-      startTextTailBootstrap();
       requestDaemonHistory(false, MAX_MEMORY_EVENTS);
       if (isActiveSession) {
         fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' });
@@ -667,7 +609,6 @@ export function useTimeline(
     if (historyLoadedRef.current === cacheKey) {
       updateHistoryStep('cache', 'done', 'bootstrap');
       setLoading(false);
-      startTextTailBootstrap();
       // Just request incremental updates
       requestDaemonHistory(false, MAX_MEMORY_EVENTS);
       // Same reasoning as path 1 — back-fill in the background so the
@@ -700,7 +641,6 @@ export function useTimeline(
         setEvents((prev) => (prev === restored ? prev : restored));
         setLoading(false);
         historyLoadedRef.current = cacheKeyRef.current;
-        startTextTailBootstrap();
         requestDaemonHistory(false, MAX_MEMORY_EVENTS);
         // Background HTTP backfill — IDB is authoritative only up to the
         // last time a WS event landed; if the user closed the tab mid-chat
@@ -714,7 +654,6 @@ export function useTimeline(
         if (cancelled) return;
         updateHistoryStep('cache', 'done', 'bootstrap');
         setEvents([]);
-        startTextTailBootstrap();
         if (wsConnected) {
           requestDaemonHistory(true);
         } else {
@@ -736,6 +675,18 @@ export function useTimeline(
   const optimisticIdsByCommandRef = useRef(new Map<string, string>());
   // Per-commandId timeout handle so we can flip perpetual-spinner entries to failed.
   const optimisticTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  const settledCommandIdsRef = useRef(new Set<string>());
+  const settledCommandOrderRef = useRef<string[]>([]);
+
+  const rememberSettledCommandId = useCallback((commandId: string) => {
+    if (!commandId || settledCommandIdsRef.current.has(commandId)) return;
+    settledCommandIdsRef.current.add(commandId);
+    settledCommandOrderRef.current.push(commandId);
+    while (settledCommandOrderRef.current.length > 500) {
+      const old = settledCommandOrderRef.current.shift();
+      if (old) settledCommandIdsRef.current.delete(old);
+    }
+  }, []);
 
   const clearOptimisticTimer = useCallback((commandId: string) => {
     const timer = optimisticTimersRef.current.get(commandId);
@@ -748,6 +699,7 @@ export function useTimeline(
   // Flip a pending optimistic entry to failed state (red "!" bubble with retry).
   const markOptimisticFailed = useCallback((commandId: string, error?: string) => {
     if (!commandId) return;
+    if (settledCommandIdsRef.current.has(commandId)) return;
     const eventId = optimisticIdsByCommandRef.current.get(commandId);
     if (!eventId) return;
     clearOptimisticTimer(commandId);
@@ -756,6 +708,23 @@ export function useTimeline(
       const idx = base.findIndex((e) => e.eventId === eventId);
       if (idx < 0) return base;
       const existing = base[idx]!;
+      const text = String(existing.payload.text ?? '').trim();
+      if (text) {
+        const hasConfirmedEcho = base.some((e) =>
+          e.type === 'user.message'
+          && e.eventId !== eventId
+          && !e.payload.pending
+          && !e.payload.failed
+          && String(e.payload.text ?? '').trim() === text,
+        );
+        if (hasConfirmedEcho) {
+          optimisticIdsByCommandRef.current.delete(commandId);
+          rememberSettledCommandId(commandId);
+          const next = base.filter((e) => e.eventId !== eventId);
+          if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, next);
+          return next;
+        }
+      }
       const payload: Record<string, unknown> = {
         ...existing.payload,
         pending: false,
@@ -767,7 +736,7 @@ export function useTimeline(
       if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, updated);
       return updated;
     });
-  }, [clearOptimisticTimer]);
+  }, [clearOptimisticTimer, rememberSettledCommandId]);
 
   // Remove an optimistic entry entirely — used by the retry button so the retry
   // doesn't leave behind the failed bubble (the fresh send re-renders it).
@@ -799,6 +768,7 @@ export function useTimeline(
         const commandId = typeof event.payload.commandId === 'string' ? event.payload.commandId : '';
         if (!commandId || !queuedIds.has(commandId)) return true;
         optimisticIdsByCommandRef.current.delete(commandId);
+        rememberSettledCommandId(commandId);
         clearOptimisticTimer(commandId);
         changed = true;
         return false;
@@ -807,7 +777,7 @@ export function useTimeline(
       if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, next);
       return next;
     });
-  }, [clearOptimisticTimer, sessionId]);
+  }, [clearOptimisticTimer, rememberSettledCommandId, sessionId]);
 
   // Immediately show a user message before the daemon confirms it.
   // The real event (from WS) will remove the pending version on arrival.
@@ -979,10 +949,11 @@ export function useTimeline(
    *   - Backfill returns null / rejects → WS path remains primary; the next
    *     trigger simply tries again.
    */
-  const fireHttpBackfill = useCallback((delayMs: number, opts?: { cooldownMs?: number; phase?: 'bootstrap' | 'refresh' }) => {
+  const fireHttpBackfill = useCallback((delayMs: number, opts?: { cooldownMs?: number; phase?: 'bootstrap' | 'refresh'; visible?: boolean }) => {
     if (disableHistory || !isActiveSession || !serverId || !sessionId) return;
     const cooldownMs = opts?.cooldownMs ?? 0;
     const phase = opts?.phase ?? 'refresh';
+    const visible = opts?.visible === true;
     const backfillSessionId = sessionId;
     const backfillCacheKey = cacheKey;
     setTimeout(() => {
@@ -995,9 +966,11 @@ export function useTimeline(
       // received fresh WS events during the delay window and we don't want
       // to redownload them.
       const afterTs = getTimelineHistoryAfterTs(eventsRef.current);
-      httpBackfillInFlightRef.current += 1;
-      updateHistoryStep('http', 'running', phase);
-      setHttpRefreshing(true);
+      if (visible) {
+        httpBackfillInFlightRef.current += 1;
+        updateHistoryStep('http', 'running', phase);
+        setHttpRefreshing(true);
+      }
       void fetchTimelineHistoryHttp(serverId, backfillSessionId, {
         afterTs,
         limit: MAX_MEMORY_EVENTS,
@@ -1014,9 +987,11 @@ export function useTimeline(
         idbPutEvents(recovered);
       }).catch(() => { /* opportunistic — WS path is primary */ })
         .finally(() => {
-          httpBackfillInFlightRef.current = Math.max(0, httpBackfillInFlightRef.current - 1);
-          updateHistoryStep('http', 'done', phase);
-          if (httpBackfillInFlightRef.current === 0) setHttpRefreshing(false);
+          if (visible) {
+            httpBackfillInFlightRef.current = Math.max(0, httpBackfillInFlightRef.current - 1);
+            updateHistoryStep('http', 'done', phase);
+            if (httpBackfillInFlightRef.current === 0) setHttpRefreshing(false);
+          }
         });
     }, delayMs);
   }, [disableHistory, isActiveSession, serverId, sessionId, cacheKey, mergeEvents, idbPutEvents, updateHistoryStep]);
@@ -1108,6 +1083,7 @@ export function useTimeline(
                 optimisticIdsByCommandRef.current.delete(echoCommandId);
                 clearOptimisticTimer(echoCommandId);
               }
+              rememberSettledCommandId(echoCommandId);
             }
             // 2) Fallback to text-based cleanup for legacy emit paths (tmux
             //    JSONL scrapers, etc.) that don't propagate commandId.
@@ -1119,6 +1095,16 @@ export function useTimeline(
               ),
             );
             if (withoutPending.length < base.length) {
+              for (const removed of cleaned) {
+                if (withoutPending.includes(removed) || removed.type !== 'user.message') continue;
+                const removedCommandId = typeof removed.payload.commandId === 'string'
+                  ? removed.payload.commandId
+                  : '';
+                if (!removedCommandId) continue;
+                optimisticIdsByCommandRef.current.delete(removedCommandId);
+                clearOptimisticTimer(removedCommandId);
+                rememberSettledCommandId(removedCommandId);
+              }
               if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, withoutPending);
               return withoutPending;
             }
@@ -1270,7 +1256,7 @@ export function useTimeline(
               cache: 'done',
               textTail: 'skipped',
               daemon: 'running',
-              http: serverId ? 'pending' : 'skipped',
+              http: 'skipped',
               older: 'skipped',
             },
           });
@@ -1392,12 +1378,12 @@ export function useTimeline(
 
     const unsub = ws.onMessage(handler);
     return unsub;
-  }, [disableHistory, isActiveSession, ws, sessionId, appendEvent, clearOptimisticTimer, loading, markOptimisticFailed, mergeEvents, reconcileQueuedOptimisticMessages, replaceEvents, serverId, updateHistoryStep]);
+  }, [disableHistory, isActiveSession, ws, sessionId, appendEvent, clearOptimisticTimer, loading, markOptimisticFailed, mergeEvents, reconcileQueuedOptimisticMessages, rememberSettledCommandId, replaceEvents, serverId, updateHistoryStep]);
 
   useEffect(() => {
-    if (loading || refreshing || httpRefreshing || textTailRefreshing || loadingOlder) return;
+    if (loading || refreshing || httpRefreshing || loadingOlder) return;
     setHistoryStatus((prev) => (prev.phase === 'idle' ? prev : createIdleHistoryStatus()));
-  }, [httpRefreshing, loading, loadingOlder, refreshing, textTailRefreshing]);
+  }, [httpRefreshing, loading, loadingOlder, refreshing]);
 
   // Clear outstanding optimistic timers on unmount / session change so that a
   // dismissed chat window can't fire a delayed markOptimisticFailed into an
@@ -1408,13 +1394,15 @@ export function useTimeline(
       for (const timer of timers.values()) clearTimeout(timer);
       timers.clear();
       optimisticIdsByCommandRef.current.clear();
+      settledCommandIdsRef.current.clear();
+      settledCommandOrderRef.current = [];
     };
   }, [sessionId]);
 
   return {
     events,
     loading,
-    refreshing: refreshing || httpRefreshing || textTailRefreshing,
+    refreshing: refreshing || httpRefreshing,
     historyStatus,
     loadingOlder,
     hasOlderHistory,

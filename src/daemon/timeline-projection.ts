@@ -121,7 +121,7 @@ class TimelineProjectionClient {
       const result = await this.request<{ source: 'sqlite'; events: TimelineEvent[] }, 'queryHistory'>('queryHistory', query, DEFAULT_QUERY_TIMEOUT_MS);
       return result.events;
     } catch (err) {
-      logger.debug({ err, sessionId: query.sessionId }, 'TimelineProjection: queryHistory fallback to JSONL');
+      logger.debug({ err, sessionId: query.sessionId }, 'TimelineProjection: queryHistory unavailable');
       return null;
     }
   }
@@ -130,7 +130,7 @@ class TimelineProjectionClient {
     try {
       return await this.request<TimelineProjectionLatest | null, 'queryLatest'>('queryLatest', { sessionId }, DEFAULT_QUERY_TIMEOUT_MS);
     } catch (err) {
-      logger.debug({ err, sessionId }, 'TimelineProjection: queryLatest fallback to JSONL');
+      logger.debug({ err, sessionId }, 'TimelineProjection: queryLatest unavailable');
       return null;
     }
   }
@@ -144,7 +144,7 @@ class TimelineProjectionClient {
       const result = await this.request<{ source: 'sqlite'; events: TimelineEvent[] }, 'queryCompletedTextTail'>('queryCompletedTextTail', { sessionId, limit }, DEFAULT_QUERY_TIMEOUT_MS);
       return result.events;
     } catch (err) {
-      logger.debug({ err, sessionId }, 'TimelineProjection: queryCompletedTextTail fallback to JSONL');
+      logger.debug({ err, sessionId }, 'TimelineProjection: queryCompletedTextTail unavailable');
       return null;
     }
   }
@@ -154,7 +154,7 @@ class TimelineProjectionClient {
       const result = await this.request<{ source: 'sqlite'; events: TimelineEvent[] }, 'queryByTypes'>('queryByTypes', query, DEFAULT_QUERY_TIMEOUT_MS);
       return result.events;
     } catch (err) {
-      logger.debug({ err, sessionId: query.sessionId, types: query.types }, 'TimelineProjection: queryByTypes fallback to JSONL');
+      logger.debug({ err, sessionId: query.sessionId, types: query.types }, 'TimelineProjection: queryByTypes unavailable');
       return null;
     }
   }

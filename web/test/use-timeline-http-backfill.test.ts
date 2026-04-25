@@ -29,6 +29,16 @@ import {
   useTimeline,
 } from '../src/hooks/useTimeline.js';
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 describe('useTimeline — HTTP backfill on WS reconnect', () => {
   beforeEach(() => {
     __resetTimelineCacheForTests();
@@ -326,6 +336,64 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     // Recovered event merged into the rendered view.
     await waitFor(() => {
       expect(screen.getByTestId('probe').textContent).toContain('mount-backfill');
+    });
+  });
+
+  it('keeps HTTP backfill silent while cached history is already visible', async () => {
+    const sessionName = `deck_http_backfill_silent_${Date.now()}`;
+    const serverId = `srv-silent-${Date.now()}`;
+    const pendingBackfill = deferred<{ events: []; epoch: number; hasMore: false; nextCursor: null }>();
+    fetchSpy.mockReturnValue(pendingBackfill.promise);
+
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-seed`,
+      sessionId: sessionName,
+      ts: 1000,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'cached' },
+    }, serverId);
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineReplayRequest: vi.fn(() => 'replay-silent'),
+      sendTimelineHistoryRequest: vi.fn(() => 'history-silent'),
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events, refreshing, historyStatus } = useTimeline(sessionName, ws, serverId);
+      return h(
+        'div',
+        {
+          'data-testid': 'probe',
+          'data-refreshing': String(refreshing),
+          'data-http': historyStatus.steps.http,
+        },
+        events.map((e) => String(e.payload.text ?? '')).join('|'),
+      );
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toContain('cached');
+    });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+    });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId('probe').getAttribute('data-refreshing')).toBe('false');
+    expect(screen.getByTestId('probe').getAttribute('data-http')).not.toBe('running');
+
+    await act(async () => {
+      pendingBackfill.resolve({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+      await pendingBackfill.promise;
     });
   });
 

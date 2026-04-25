@@ -208,6 +208,48 @@ describe('useTimeline optimistic send flow', () => {
     expect(ref.current!.events[0].payload.failed).toBeFalsy();
   });
 
+  it('drops a timed-out duplicate when the same text is already confirmed', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_confirmed_dup' }));
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'real-user-confirmed',
+          sessionId: 'deck_opt_confirmed_dup',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 5,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'user.message',
+          payload: { text: 'already sent' },
+        },
+      } as unknown as ServerMessage);
+    });
+    act(() => {
+      ref.current!.addOptimisticUserMessage('already sent', 'cmd-confirmed-dup');
+    });
+    expect(ref.current!.events).toHaveLength(2);
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'command.failed',
+        commandId: 'cmd-confirmed-dup',
+        session: 'deck_opt_confirmed_dup',
+        reason: 'ack_timeout',
+        retryable: true,
+      } as unknown as ServerMessage);
+    });
+
+    expect(ref.current!.events).toHaveLength(1);
+    expect(ref.current!.events[0].eventId).toBe('real-user-confirmed');
+    expect(ref.current!.events[0].payload.failed).toBeFalsy();
+  });
+
   it('auto-fails after the 30s timeout when no ack and no echo arrive', () => {
     const ref = { current: null as HookRef };
     const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };

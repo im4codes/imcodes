@@ -243,6 +243,52 @@ describe('WsBridge — command ack reliability', () => {
     expect(failed[0].reason).toBe('ack_timeout');
   });
 
+  it('authoritative user.message echo clears ack timeout even if command.ack is late', async () => {
+    vi.useFakeTimers();
+    const bridge = WsBridge.get(serverId);
+    const daemonWs = await connectAndAuthenticateDaemon(bridge, serverId);
+    const browser = addBrowserSubscriber(bridge, 'deck_test_brain');
+
+    browser.emit('message', Buffer.from(JSON.stringify({
+      type: 'session.send',
+      sessionName: 'deck_test_brain',
+      text: 'hi',
+      commandId: 'C4-echo',
+    })));
+    await flushAsync();
+    expect(bridge._getInflightCountForTest()).toBe(1);
+
+    daemonWs.emit('message', Buffer.from(JSON.stringify({
+      type: 'timeline.event',
+      event: {
+        eventId: 'evt-user-c4-echo',
+        sessionId: 'deck_test_brain',
+        type: 'user.message',
+        ts: Date.now(),
+        seq: 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        payload: { text: 'hi', commandId: 'C4-echo' },
+      },
+    })));
+    await flushAsync();
+    expect(bridge._getInflightCountForTest()).toBe(0);
+
+    vi.advanceTimersByTime(ACK_TIMEOUT_MS + 100);
+    await flushAsync();
+    expect(browser.sentByType(MSG_COMMAND_FAILED)).toHaveLength(0);
+
+    daemonWs.emit('message', Buffer.from(JSON.stringify({
+      type: MSG_COMMAND_ACK,
+      commandId: 'C4-echo',
+      status: 'accepted',
+      session: 'deck_test_brain',
+    })));
+    await flushAsync();
+    expect(bridge._hasSeenAckForTest('C4-echo')).toBe(true);
+  });
+
   it('send while daemon is fully offline (past grace) fails immediately', async () => {
     vi.useFakeTimers();
     const bridge = WsBridge.get(serverId);

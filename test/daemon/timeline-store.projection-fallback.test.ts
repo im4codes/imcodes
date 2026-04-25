@@ -26,7 +26,7 @@ vi.mock('../../src/util/logger.js', () => ({
   },
 }));
 
-describe('timeline-store projection fallbacks', () => {
+describe('timeline-store SQLite-preferred reads', () => {
   const originalHome = process.env.HOME;
   const originalUserProfile = process.env.USERPROFILE;
   let tempHome: string | null = null;
@@ -84,7 +84,7 @@ describe('timeline-store projection fallbacks', () => {
     expect(projectionMocks.recordAppendedEvent).not.toHaveBeenCalled();
   });
 
-  it('falls back to JSONL for readPreferred when projection history is unavailable', async () => {
+  it('returns an empty history when the SQLite projection is unavailable', async () => {
     projectionMocks.queryHistory.mockResolvedValue(null);
     const sessionId = 'fallback-session';
     const { timelineStore } = await loadStoreWithHistory([
@@ -113,7 +113,7 @@ describe('timeline-store projection fallbacks', () => {
     ], sessionId);
 
     const events = await timelineStore.readPreferred(sessionId, { limit: 10 });
-    expect(events.map((event) => event.eventId)).toEqual(['evt-1', 'evt-2']);
+    expect(events).toEqual([]);
     expect(projectionMocks.queryHistory).toHaveBeenCalledWith({
       sessionId,
       afterTs: undefined,
@@ -122,7 +122,7 @@ describe('timeline-store projection fallbacks', () => {
     });
   });
 
-  it('falls back to JSONL for typed reads and completed text tails', async () => {
+  it('returns empty typed reads and completed text tails when the SQLite projection is unavailable', async () => {
     projectionMocks.queryByTypes.mockResolvedValue(null);
     projectionMocks.queryCompletedTextTail.mockResolvedValue(null);
 
@@ -164,13 +164,13 @@ describe('timeline-store projection fallbacks', () => {
     ], sessionId);
 
     const typed = await timelineStore.readByTypesPreferred(sessionId, ['assistant.text'], { limit: 10 });
-    expect(typed.map((event) => event.eventId)).toEqual(['evt-3']);
+    expect(typed).toEqual([]);
 
     const completed = await timelineStore.readCompletedTextTail(sessionId, 10);
-    expect(completed.map((event) => event.eventId)).toEqual(['evt-2', 'evt-3']);
+    expect(completed).toEqual([]);
   });
 
-  it('falls back to JSONL latest markers when the projection returns null without throwing', async () => {
+  it('returns null latest markers when the SQLite projection returns null', async () => {
     projectionMocks.getLatest.mockResolvedValue(null);
     const sessionId = 'fallback-session';
     const { timelineStore } = await loadStoreWithHistory([
@@ -198,6 +198,6 @@ describe('timeline-store projection fallbacks', () => {
       },
     ], sessionId);
     const latest = await timelineStore.getLatestPreferred(sessionId);
-    expect(latest).toEqual({ epoch: 7, seq: 3 });
+    expect(latest).toBeNull();
   });
 });

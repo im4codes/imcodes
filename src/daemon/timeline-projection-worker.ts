@@ -288,6 +288,15 @@ async function rebuildSessionInternal(sessionId: string): Promise<boolean> {
   return promise;
 }
 
+function scheduleSessionRebuild(sessionId: string): void {
+  setImmediate(() => {
+    void rebuildSessionInternal(sessionId).catch(() => {
+      // Query paths must stay fast and fail-open; an explicit rebuild request or
+      // the next append/query can retry projection repair.
+    });
+  });
+}
+
 function markSessionReady(
   sessionId: string,
   meta: ProjectionSessionMeta | null,
@@ -354,7 +363,7 @@ async function syncSessionDelta(sessionId: string, meta: ProjectionSessionMeta):
   return true;
 }
 
-async function ensureFreshSession(sessionId: string): Promise<boolean> {
+function prepareSqliteRead(sessionId: string): boolean {
   const meta = readSessionMeta(sessionId);
   const fileMeta = currentFileMeta(sessionId);
   if (!fileMeta.exists) {
@@ -362,15 +371,19 @@ async function ensureFreshSession(sessionId: string): Promise<boolean> {
     return false;
   }
   if (!meta) {
-    await rebuildSessionInternal(sessionId);
-    return true;
+    scheduleSessionRebuild(sessionId);
+    return false;
   }
   if (meta.status !== 'ready' || meta.projectionVersion !== PROJECTION_VERSION) {
-    await rebuildSessionInternal(sessionId);
+    scheduleSessionRebuild(sessionId);
+    return true;
+  }
+  if (meta.sourceFileSizeBytes === fileMeta.size && meta.sourceFileMtimeMs !== fileMeta.mtimeMs) {
+    markSessionReady(sessionId, meta, fileMeta);
     return true;
   }
   if (meta.sourceFileSizeBytes !== fileMeta.size || meta.sourceFileMtimeMs !== fileMeta.mtimeMs) {
-    await syncSessionDelta(sessionId, meta);
+    scheduleSessionRebuild(sessionId);
   }
   return true;
 }
@@ -449,8 +462,7 @@ function buildRangeSql(base: string, afterTs?: number, beforeTs?: number): { sql
 }
 
 async function handleQueryHistory(sessionId: string, afterTs?: number, beforeTs?: number, limit = 500): Promise<{ source: 'sqlite'; events: TimelineEvent[] }> {
-  const fresh = await ensureFreshSession(sessionId);
-  if (!fresh) return { source: 'sqlite', events: [] };
+  if (!prepareSqliteRead(sessionId)) return { source: 'sqlite', events: [] };
   const boundedLimit = Math.max(1, Math.min(limit, 10_000));
   const { sql, params } = buildRangeSql(
     'SELECT * FROM timeline_projection_events WHERE session_id = ?',
@@ -462,8 +474,7 @@ async function handleQueryHistory(sessionId: string, afterTs?: number, beforeTs?
 }
 
 async function handleQueryLatest(sessionId: string): Promise<{ epoch: number; seq: number } | null> {
-  const fresh = await ensureFreshSession(sessionId);
-  if (!fresh) return null;
+  if (!prepareSqliteRead(sessionId)) return null;
   const row = ensureDb().prepare(`
     SELECT epoch, seq
     FROM timeline_projection_events
@@ -476,8 +487,7 @@ async function handleQueryLatest(sessionId: string): Promise<{ epoch: number; se
 }
 
 async function handleQueryCompletedTextTail(sessionId: string, limit = 50): Promise<{ source: 'sqlite'; events: TimelineEvent[] }> {
-  const fresh = await ensureFreshSession(sessionId);
-  if (!fresh) return { source: 'sqlite', events: [] };
+  if (!prepareSqliteRead(sessionId)) return { source: 'sqlite', events: [] };
   const boundedLimit = Math.max(1, Math.min(limit, 500));
   const rows = ensureDb().prepare(`
     SELECT *
@@ -495,8 +505,7 @@ async function handleQueryCompletedTextTail(sessionId: string, limit = 50): Prom
 }
 
 async function handleQueryByTypes(sessionId: string, types: TimelineEventType[], afterTs?: number, beforeTs?: number, limit = 500): Promise<{ source: 'sqlite'; events: TimelineEvent[] }> {
-  const fresh = await ensureFreshSession(sessionId);
-  if (!fresh) return { source: 'sqlite', events: [] };
+  if (!prepareSqliteRead(sessionId)) return { source: 'sqlite', events: [] };
   if (types.length === 0) return { source: 'sqlite', events: [] };
   const boundedLimit = Math.max(1, Math.min(limit, 10_000));
   const placeholders = types.map(() => '?').join(', ');

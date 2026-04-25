@@ -1,6 +1,10 @@
 /**
- * File-based timeline event store — one JSONL file per session.
- * Append-only writes, supports filtered reads for replay.
+ * Timeline event store.
+ *
+ * JSONL remains the append-only compatibility log, but user-facing history
+ * reads use the SQLite projection via `readPreferred` / `readByTypesPreferred`.
+ * The direct JSONL `read` method is kept for legacy replay callers only.
+ *
  * Storage: ~/.imcodes/timeline/{sessionName}.jsonl
  */
 
@@ -130,14 +134,12 @@ class TimelineStore {
     sessionName: string,
     opts?: { afterTs?: number; beforeTs?: number; limit?: number },
   ): Promise<TimelineEvent[]> {
-    const projected = await timelineProjection.queryHistory({
+    return await timelineProjection.queryHistory({
       sessionId: sessionName,
       afterTs: opts?.afterTs,
       beforeTs: opts?.beforeTs,
       limit: opts?.limit,
-    });
-    if (projected) return projected;
-    return this.read(sessionName, opts);
+    }) ?? [];
   }
 
   async readByTypesPreferred(
@@ -145,31 +147,17 @@ class TimelineStore {
     types: TimelineEvent['type'][],
     opts?: TimelineProjectionQueryOpts,
   ): Promise<TimelineEvent[]> {
-    const projected = await timelineProjection.queryByTypes({
+    return await timelineProjection.queryByTypes({
       sessionId: sessionName,
       types,
       afterTs: opts?.afterTs,
       beforeTs: opts?.beforeTs,
       limit: opts?.limit,
-    });
-    if (projected) return projected;
-    return this.read(sessionName, opts).filter((event) => types.includes(event.type));
+    }) ?? [];
   }
 
   async readCompletedTextTail(sessionName: string, limit = 50): Promise<TimelineEvent[]> {
-    const projected = await timelineProjection.queryCompletedTextTail(sessionName, limit);
-    if (projected) return projected;
-    return this.read(sessionName, { limit: Math.max(limit * 6, 500) }).filter((event) => {
-      if (event.type === 'user.message') {
-        return typeof event.payload?.text === 'string' && event.payload.text.trim().length > 0;
-      }
-      if (event.type === 'assistant.text') {
-        return event.payload?.streaming !== true
-          && typeof event.payload?.text === 'string'
-          && event.payload.text.trim().length > 0;
-      }
-      return false;
-    }).slice(-limit);
+    return await timelineProjection.queryCompletedTextTail(sessionName, limit) ?? [];
   }
 
   /**
@@ -188,13 +176,7 @@ class TimelineStore {
   }
 
   async getLatestPreferred(sessionName: string): Promise<{ epoch: number; seq: number } | null> {
-    try {
-      const projected = await timelineProjection.getLatest(sessionName);
-      if (projected) return projected;
-    } catch {
-      // fall through to JSONL
-    }
-    return this.getLatest(sessionName);
+    return await timelineProjection.getLatest(sessionName);
   }
 
   /**

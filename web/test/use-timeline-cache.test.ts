@@ -23,16 +23,6 @@ import {
   useTimeline,
 } from '../src/hooks/useTimeline.js';
 
-function deferred<T>() {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
-}
-
 function makeEvents(sessionId: string, count: number): TimelineEvent[] {
   return Array.from({ length: count }, (_, idx) => ({
     eventId: `${sessionId}-${idx}`,
@@ -400,140 +390,10 @@ describe('useTimeline global cache bounds', () => {
     });
   });
 
-  it('marks refreshing while PG text-tail bootstrap is in flight after restoring a snapshot', async () => {
-    const sessionName = `deck_text_tail_refreshing_${Date.now()}`;
+  it('does not use the PostgreSQL text-tail bootstrap path', async () => {
+    const sessionName = `deck_no_text_tail_${Date.now()}`;
     const serverId = `srv-${Date.now()}`;
-    const pendingTextTail = deferred<{ events: Array<{ eventId: string; ts: number; type: 'assistant.text'; text: string }> } | null>();
-
-    ingestTimelineEventForCache({
-      eventId: `${sessionName}-snap-1`,
-      sessionId: sessionName,
-      ts: 1,
-      epoch: 1,
-      seq: 1,
-      source: 'daemon',
-      confidence: 'high',
-      type: 'assistant.text',
-      payload: { text: 'snapshot history' },
-    }, serverId);
-
-    fetchTextTailSpy.mockReturnValue(pendingTextTail.promise);
-
-    function Probe() {
-      const { refreshing } = useTimeline(sessionName, null, serverId);
-      return h('div', { 'data-testid': 'probe', 'data-refreshing': String(refreshing) }, 'probe');
-    }
-
-    render(h(Probe));
-
-    await waitFor(() => {
-      expect(screen.getByTestId('probe').getAttribute('data-refreshing')).toBe('true');
-    });
-
-    await act(async () => {
-      pendingTextTail.resolve({ events: [] });
-      await pendingTextTail.promise;
-    });
-
-    await waitFor(() => {
-      expect(screen.getByTestId('probe').getAttribute('data-refreshing')).toBe('false');
-    });
-  });
-
-  it('bootstraps from local snapshot, then PG text tail, before later authoritative reconciliation', async () => {
-    const sessionName = `deck_text_tail_bootstrap_${Date.now()}`;
-    const serverId = `srv-${Date.now()}`;
-    let handler: ((msg: ServerMessage) => void) | null = null;
-
-    ingestTimelineEventForCache({
-      eventId: `${sessionName}-snap-1`,
-      sessionId: sessionName,
-      ts: 10,
-      epoch: 1,
-      seq: 1,
-      source: 'daemon',
-      confidence: 'high',
-      type: 'assistant.text',
-      payload: { text: 'snapshot history' },
-    }, serverId);
-
-    fetchTextTailSpy.mockResolvedValue({
-      events: [{
-        eventId: `${sessionName}-tail-1`,
-        ts: 20,
-        type: 'assistant.text',
-        text: 'pg tail text',
-        source: 'daemon',
-        confidence: 'high',
-      }],
-    });
-
-    const ws: WsClient = {
-      connected: true,
-      onMessage: (next: (msg: ServerMessage) => void) => {
-        handler = next;
-        return () => { handler = null; };
-      },
-      sendTimelineHistoryRequest: () => 'history-text-tail',
-    } as unknown as WsClient;
-
-    function Probe() {
-      const { events } = useTimeline(sessionName, ws, serverId);
-      return h('div', { 'data-testid': 'probe' }, events.map((event) => String(event.payload.text ?? '')).join('|'));
-    }
-
-    render(h(Probe));
-
-    await waitFor(() => {
-      expect(screen.getByTestId('probe').textContent).toBe('snapshot history');
-    });
-
-    await waitFor(() => {
-      expect(fetchTextTailSpy).toHaveBeenCalledWith(serverId, sessionName);
-      expect(screen.getByTestId('probe').textContent).toBe('snapshot history|pg tail text');
-    });
-
-    await act(async () => {
-      handler?.({
-        type: 'timeline.history',
-        sessionName,
-        requestId: 'history-text-tail',
-        epoch: 2,
-        events: [{
-          eventId: `${sessionName}-auth-1`,
-          sessionId: sessionName,
-          ts: 30,
-          epoch: 2,
-          seq: 3,
-          source: 'daemon',
-          confidence: 'high',
-          type: 'assistant.text',
-          payload: { text: 'authoritative text' },
-        }],
-      } as ServerMessage);
-    });
-
-    await waitFor(() => {
-      expect(screen.getByTestId('probe').textContent).toBe('snapshot history|pg tail text|authoritative text');
-    });
-  });
-
-  it('treats daemon history as background once fast text tail renders visible history', async () => {
-    const sessionName = `deck_text_tail_background_daemon_${Date.now()}`;
-    const serverId = `srv-${Date.now()}`;
-    const sendTimelineHistoryRequest = vi.fn(() => 'history-background-daemon');
-
-    fetchTextTailSpy.mockResolvedValue({
-      events: [{
-        eventId: `${sessionName}-tail-1`,
-        ts: 20,
-        type: 'assistant.text',
-        text: 'fast tail recovered',
-        source: 'daemon',
-        confidence: 'high',
-      }],
-    });
-
+    const sendTimelineHistoryRequest = vi.fn(() => 'history-no-text-tail');
     const ws: WsClient = {
       connected: true,
       onMessage: () => () => {},
@@ -541,35 +401,16 @@ describe('useTimeline global cache bounds', () => {
     } as unknown as WsClient;
 
     function Probe() {
-      const { events, refreshing, historyStatus } = useTimeline(sessionName, ws, serverId, {
-        isActiveSession: false,
-      });
-      return h(
-        'div',
-        {
-          'data-testid': 'probe',
-          'data-refreshing': String(refreshing),
-          'data-phase': historyStatus.phase,
-          'data-daemon': historyStatus.steps.daemon,
-        },
-        events.map((event) => String(event.payload.text ?? '')).join('|'),
-      );
+      const { historyStatus } = useTimeline(sessionName, ws, serverId);
+      return h('div', { 'data-testid': 'probe', 'data-text-tail': historyStatus.steps.textTail }, 'probe');
     }
 
     render(h(Probe));
 
     await waitFor(() => {
-      expect(fetchTextTailSpy).toHaveBeenCalledWith(serverId, sessionName);
       expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName);
-      expect(screen.getByTestId('probe').textContent).toBe('fast tail recovered');
-    });
-
-    await waitFor(() => {
-      expect(screen.getByTestId('probe').getAttribute('data-refreshing')).toBe('false');
-      expect(['idle', 'bootstrap']).toContain(screen.getByTestId('probe').getAttribute('data-phase'));
-      if (screen.getByTestId('probe').getAttribute('data-phase') === 'bootstrap') {
-        expect(screen.getByTestId('probe').getAttribute('data-daemon')).toBe('done');
-      }
+      expect(fetchTextTailSpy).not.toHaveBeenCalled();
+      expect(screen.getByTestId('probe').getAttribute('data-text-tail')).toBe('skipped');
     });
   });
 
@@ -756,116 +597,6 @@ describe('useTimeline global cache bounds', () => {
 
     await waitFor(() => {
       expect(screen.getByTestId('probe').textContent).toBe('stored history|live transport send');
-    });
-  });
-
-  it('merges PG text tail by eventId without regressing newer local entries', async () => {
-    const sessionName = `deck_text_tail_merge_${Date.now()}`;
-    const serverId = `srv-${Date.now()}`;
-
-    ingestTimelineEventForCache({
-      eventId: `${sessionName}-same`,
-      sessionId: sessionName,
-      ts: 50,
-      epoch: 9,
-      seq: 9,
-      source: 'daemon',
-      confidence: 'high',
-      type: 'assistant.text',
-      payload: { text: 'newer local copy', extra: 'keep-me' },
-    }, serverId);
-
-    fetchTextTailSpy.mockResolvedValue({
-      events: [{
-        eventId: `${sessionName}-same`,
-        ts: 50,
-        type: 'assistant.text',
-        text: 'older tail copy',
-        source: 'daemon',
-        confidence: 'high',
-      }, {
-        eventId: `${sessionName}-tail-new`,
-        ts: 60,
-        type: 'user.message',
-        text: 'new tail entry',
-      }],
-    });
-
-    function Probe() {
-      const { events } = useTimeline(sessionName, null, serverId);
-      return h(
-        'div',
-        { 'data-testid': 'probe' },
-        events.map((event) => String(event.payload.text ?? '')).join('|'),
-      );
-    }
-
-    render(h(Probe));
-
-    await waitFor(() => {
-      expect(fetchTextTailSpy).toHaveBeenCalledWith(serverId, sessionName);
-      expect(screen.getByTestId('probe').textContent).toBe('newer local copy|new tail entry');
-    });
-  });
-
-  it('fails open when the text-tail endpoint fails and continues with the existing timeline bootstrap', async () => {
-    const sessionName = `deck_text_tail_fail_open_${Date.now()}`;
-    const serverId = `srv-${Date.now()}`;
-    let handler: ((msg: ServerMessage) => void) | null = null;
-
-    fetchTextTailSpy.mockResolvedValue(null);
-
-    const ws: WsClient = {
-      connected: true,
-      onMessage: (next: (msg: ServerMessage) => void) => {
-        handler = next;
-        return () => { handler = null; };
-      },
-      sendTimelineHistoryRequest: () => 'history-fail-open',
-    } as unknown as WsClient;
-
-    function Probe() {
-      const { events, loading } = useTimeline(sessionName, ws, serverId);
-      return h(
-        'div',
-        {
-          'data-testid': 'probe',
-          'data-loading': String(loading),
-        },
-        events.map((event) => String(event.payload.text ?? '')).join('|'),
-      );
-    }
-
-    render(h(Probe));
-
-    await waitFor(() => {
-      expect(fetchTextTailSpy).toHaveBeenCalledWith(serverId, sessionName);
-      expect(screen.getByTestId('probe').getAttribute('data-loading')).toBe('true');
-    });
-
-    await act(async () => {
-      handler?.({
-        type: 'timeline.history',
-        sessionName,
-        requestId: 'history-fail-open',
-        epoch: 1,
-        events: [{
-          eventId: `${sessionName}-auth`,
-          sessionId: sessionName,
-          ts: 1,
-          epoch: 1,
-          seq: 1,
-          source: 'daemon',
-          confidence: 'high',
-          type: 'assistant.text',
-          payload: { text: 'authoritative fallback' },
-        }],
-      } as ServerMessage);
-    });
-
-    await waitFor(() => {
-      expect(screen.getByTestId('probe').textContent).toBe('authoritative fallback');
-      expect(screen.getByTestId('probe').getAttribute('data-loading')).toBe('false');
     });
   });
 
