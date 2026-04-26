@@ -173,15 +173,56 @@ describe('buildWindowsUpgradeBatch', () => {
 
   // ── npm install ──
 
-  it('raises NODE_OPTIONS heap limit before npm install while preserving existing flags', () => {
-    const nodeOptionsIdx = batch.indexOf('set "NODE_OPTIONS=%NODE_OPTIONS% --max-old-space-size=16384"');
-    const fallbackIdx = batch.indexOf('set "NODE_OPTIONS=--max-old-space-size=16384"');
+  it('overwrites (not appends) NODE_OPTIONS before npm install to avoid per-upgrade accumulation', () => {
+    // Bug history: the script used to do
+    //   set "NODE_OPTIONS=%NODE_OPTIONS% --max-old-space-size=16384"
+    // which appends one copy per upgrade.  Because the new daemon spawned
+    // by the script inherits this modified env, the next upgrade starts
+    // with a NODE_OPTIONS already containing the flag, appends another,
+    // and so on.  After ~38 upgrades we observed npm install crashing with
+    // "MemoryChunk allocation failed during deserialization" because V8
+    // tried to reserve a 16 GB heap on a tight VAS budget.
+    //
+    // Fix: save daemon's original value, OVERWRITE with a fresh single
+    // flag, and restore the original immediately after npm install so
+    // any spawned process (success-path watchdog OR abort-path relaunch)
+    // never inherits our temporary flag.
+    const saveIdx = batch.indexOf('set "ORIG_NODE_OPTIONS=%NODE_OPTIONS%"');
+    const setFreshIdx = batch.indexOf('set "NODE_OPTIONS=--max-old-space-size=4096"');
     const installIdx = batch.indexOf(`call "${INPUT.npmCmd}" install -g ${INPUT.pkgSpec}`);
-    expect(nodeOptionsIdx).toBeGreaterThan(-1);
-    expect(fallbackIdx).toBeGreaterThan(-1);
-    expect(nodeOptionsIdx).toBeLessThan(installIdx);
-    expect(fallbackIdx).toBeLessThan(installIdx);
-    expect(batch).toContain('echo Using NODE_OPTIONS=%NODE_OPTIONS% >> "%LOG_FILE%"');
+    const restoreIdx = batch.indexOf('set "NODE_OPTIONS=%ORIG_NODE_OPTIONS%"');
+    expect(saveIdx).toBeGreaterThan(-1);
+    expect(setFreshIdx).toBeGreaterThan(-1);
+    expect(restoreIdx).toBeGreaterThan(-1);
+    expect(saveIdx).toBeLessThan(setFreshIdx);
+    expect(setFreshIdx).toBeLessThan(installIdx);
+    // Restore must happen RIGHT AFTER install, before any abort branch
+    // that could re-spawn the daemon launcher.
+    expect(installIdx).toBeLessThan(restoreIdx);
+    // No appending form should remain — that was the bug.
+    expect(batch).not.toContain('%NODE_OPTIONS% --max-old-space-size');
+    // 16 GB heap was overkill for npm install and contributed to the OOM
+    // on tight-RAM systems; we use 4 GB now.
+    expect(batch).not.toContain('--max-old-space-size=16384');
+  });
+
+  it('restores NODE_OPTIONS before any post-install branch that may relaunch the daemon', () => {
+    // Every branch that calls `wscript "%VBS_LAUNCHER%"` (whether on
+    // install failure, version mismatch, or success-path step 6) MUST
+    // run AFTER NODE_OPTIONS is restored to its original value.
+    const restoreIdx = batch.indexOf('set "NODE_OPTIONS=%ORIG_NODE_OPTIONS%"');
+    expect(restoreIdx).toBeGreaterThan(-1);
+    let searchFrom = 0;
+    let found = 0;
+    while (true) {
+      const idx = batch.indexOf('wscript "%VBS_LAUNCHER%"', searchFrom);
+      if (idx === -1) break;
+      expect(idx).toBeGreaterThan(restoreIdx);
+      searchFrom = idx + 1;
+      found += 1;
+    }
+    // Sanity: at least one daemon-relaunch path must exist.
+    expect(found).toBeGreaterThan(0);
   });
 
   it('installs with quoted npm path', () => {
