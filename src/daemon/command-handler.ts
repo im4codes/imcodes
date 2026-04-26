@@ -3562,10 +3562,19 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
 
   const activeTransportSessions = getActiveTransportSessionsBlockingDaemonUpgrade();
   if (activeTransportSessions.length > 0) {
+    // Include per-session blocking reason — runtime.getStatus() can disagree
+    // with session.state (e.g. status='error' while session.state='idle'),
+    // and operators need to see the runtime-level reason to debug stuck
+    // upgrades. Pre-fix we only logged session.state which made the warning
+    // useless ("idle, idle" but still blocking).
+    const blockReasons = activeTransportSessions.map((session) => ({
+      name: session.name,
+      sessionState: session.state,
+      runtime: getTransportSessionUpgradeBlockReason(session.name),
+    }));
     logger.warn({
       targetVersion,
-      activeSessionNames: activeTransportSessions.map((session) => session.name),
-      activeSessionStates: activeTransportSessions.map((session) => session.state),
+      blockedSessions: blockReasons,
     }, 'daemon.upgrade: blocked because transport sessions have active turns');
     try {
       serverLink?.send({
@@ -3781,12 +3790,37 @@ export function getActiveP2pRunsBlockingDaemonUpgrade(runs = listP2pRuns()) {
   return runs.filter((run) => !P2P_TERMINAL_RUN_STATUSES.has(run.status));
 }
 
+/** Transport-runtime statuses that represent a genuine in-flight turn the
+ *  user is waiting on. `'error'` is intentionally NOT in this set — an
+ *  errored runtime is *stuck*, not active, and forever-blocking daemon
+ *  upgrades on it leaves the user no way out short of `imcodes service
+ *  restart` (which is exactly what the upgrade wants to do anyway). */
+const TRANSPORT_IN_PROGRESS_STATUSES: ReadonlySet<string> = new Set(['thinking', 'streaming']);
+
+/** Snapshot of why a transport session is currently blocking daemon upgrade.
+ *  Embedded in the upgrade-blocked log so future "why didn't it upgrade"
+ *  investigations can see the actual failing condition instead of guessing
+ *  whether session.state ('idle') or runtime.getStatus() ('error') is to blame. */
+export interface TransportUpgradeBlockReason {
+  status: string;
+  sending: boolean;
+  pendingCount: number;
+}
+
+export function getTransportSessionUpgradeBlockReason(sessionName: string): TransportUpgradeBlockReason | null {
+  const runtime = getTransportRuntime(sessionName);
+  if (!runtime) return null;
+  const status = runtime.getStatus();
+  const sending = !!runtime.sending;
+  const pendingCount = runtime.pendingCount ?? 0;
+  if (!TRANSPORT_IN_PROGRESS_STATUSES.has(status) && !sending && pendingCount === 0) return null;
+  return { status, sending, pendingCount };
+}
+
 export function getActiveTransportSessionsBlockingDaemonUpgrade(sessions = listSessions()) {
   return sessions.filter((session) => {
     if (session.runtimeType !== 'transport') return false;
-    const runtime = getTransportRuntime(session.name);
-    if (!runtime) return false;
-    return runtime.getStatus() !== 'idle' || runtime.sending || runtime.pendingCount > 0;
+    return getTransportSessionUpgradeBlockReason(session.name) !== null;
   });
 }
 
