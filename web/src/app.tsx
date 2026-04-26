@@ -2730,7 +2730,7 @@ export function App() {
         <div style={{ color: '#64748b', fontSize: 14 }}>{connecting ? trans('common.reconnecting') : trans('common.loading')}</div>
         {connectTimeout && (
           <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-            <button class="btn" style={{ background: '#334155', color: '#e2e8f0', fontSize: 12 }} onClick={() => { setSelectedServerId(null); localStorage.removeItem('rcc_server'); }}>
+            <button class="btn" style={{ background: '#334155', color: '#e2e8f0', fontSize: 12 }} onClick={handleBackToDashboard}>
               ← Back
             </button>
             <button class="btn" style={{ background: '#334155', color: '#e2e8f0', fontSize: 12 }} onClick={() => window.location.reload()}>
@@ -2755,7 +2755,7 @@ export function App() {
             sidebarCollapsed={sidebarCollapsed}
             onToggleSidebar={handleToggleSidebar}
             onSettings={() => setShowSettingsPage(true)}
-            onHome={() => { autoEntryRunRef.current++; setManualDashboard(true); setSelectedServerId(null); }}
+            onHome={handleBackToDashboard}
             isAdmin={isAdmin}
             onAdmin={() => setShowAdminPage(true)}
           />
@@ -3262,7 +3262,7 @@ export function App() {
               <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
                 <button
                   class="mobile-sidebar-hdr-btn"
-                  onClick={() => { setSelectedServerId(null); closeSidebar(); }}
+                  onClick={() => { handleBackToDashboard(); closeSidebar(); }}
                   title="Home"
                 >🏠</button>
                 <button
