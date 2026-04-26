@@ -52,6 +52,17 @@ function resetBackfillCooldowns(): void {
   lastHttpBackfillOkAt.clear();
 }
 
+/** Diagnostic logging for the backfill chain. Off by default; flip
+ *  `window.__deck_debug_backfill = true` from devtools to trace why an
+ *  expected backfill didn't fire on activation/reconnect/session-switch.
+ *  Output is intentionally compact so a Safari/iOS console can scrub it. */
+function backfillDebug(msg: string, data?: Record<string, unknown>): void {
+  if (typeof window === 'undefined') return;
+  if (!(window as unknown as { __deck_debug_backfill?: boolean }).__deck_debug_backfill) return;
+  // eslint-disable-next-line no-console
+  console.debug(`[backfill] ${msg}`, data ?? '');
+}
+
 /**
  * Custom DOM event fired when an ALREADY-MOUNTED timeline hook should force
  * an immediate HTTP backfill. Triggers:
@@ -1335,23 +1346,38 @@ export function useTimeline(
    *   - Backfill returns null / rejects → WS path remains primary; the next
    *     trigger simply tries again.
    */
-  const fireHttpBackfill = useCallback((delayMs: number, opts?: { cooldownMs?: number; phase?: 'bootstrap' | 'refresh'; visible?: boolean }) => {
-    if (disableHistory || !isActiveSession || !serverId || !sessionId) return;
+  // Retry schedule for transient HTTP backfill failures (daemon briefly
+  // offline at activation, pod miss during deploy, network blip on resume).
+  // Two retries cover the common ~3s WS-reconnect window after app foreground.
+  // After both retries fail we give up — the next activation/reconnect will
+  // fire a fresh backfill, and the WS path remains the primary.
+  const HTTP_BACKFILL_RETRY_DELAYS_MS = [800, 2000] as const;
+
+  const fireHttpBackfill = useCallback((delayMs: number, opts?: { cooldownMs?: number; phase?: 'bootstrap' | 'refresh'; visible?: boolean; _retryAttempt?: number }) => {
+    if (disableHistory || !isActiveSession || !serverId || !sessionId) {
+      backfillDebug('fireHttpBackfill: gated', { disableHistory, isActiveSession, hasServerId: !!serverId, hasSessionId: !!sessionId, sessionId });
+      return;
+    }
     const cooldownMs = opts?.cooldownMs ?? 0;
     const phase = opts?.phase ?? 'refresh';
     const visible = opts?.visible === true;
+    const retryAttempt = opts?._retryAttempt ?? 0;
     const backfillSessionId = sessionId;
     const backfillCacheKey = cacheKey;
     setTimeout(() => {
       if (cacheKeyRef.current !== backfillCacheKey) return;
       if (backfillCacheKey && cooldownMs > 0) {
         const lastOk = lastHttpBackfillOkAt.get(backfillCacheKey);
-        if (lastOk !== undefined && Date.now() - lastOk < cooldownMs) return;
+        if (lastOk !== undefined && Date.now() - lastOk < cooldownMs) {
+          backfillDebug('fireHttpBackfill: cooldown skip', { sessionId: backfillSessionId, lastOk, cooldownMs });
+          return;
+        }
       }
       // Recompute the cursor at fire time, not call time — the UI may have
       // received fresh WS events during the delay window and we don't want
       // to redownload them.
       const afterTs = getTimelineHistoryAfterTs(eventsRef.current);
+      backfillDebug('fireHttpBackfill: requesting', { sessionId: backfillSessionId, phase, afterTs, retryAttempt });
       if (visible) {
         httpBackfillInFlightRef.current += 1;
         updateHistoryStep('http', 'running', phase);
@@ -1361,14 +1387,32 @@ export function useTimeline(
         afterTs,
         limit: MAX_MEMORY_EVENTS,
       })).then((result) => {
-        if (!result) return;
+        if (!result) {
+          // Transient failure (daemon offline / pod miss / network blip).
+          // Retry with backoff if budget remains; otherwise give up — the WS
+          // path or next activation will catch up.
+          if (retryAttempt < HTTP_BACKFILL_RETRY_DELAYS_MS.length) {
+            const delay = HTTP_BACKFILL_RETRY_DELAYS_MS[retryAttempt];
+            backfillDebug('fireHttpBackfill: null result → retry', { sessionId: backfillSessionId, retryAttempt: retryAttempt + 1, delayMs: delay });
+            setTimeout(() => {
+              fireHttpBackfillRef.current(0, { ...opts, _retryAttempt: retryAttempt + 1 });
+            }, delay);
+          } else {
+            backfillDebug('fireHttpBackfill: null result → give up', { sessionId: backfillSessionId, retryAttempt });
+          }
+          return;
+        }
         if (backfillCacheKey) lastHttpBackfillOkAt.set(backfillCacheKey, Date.now());
-        if (result.events.length === 0) return;
+        if (result.events.length === 0) {
+          backfillDebug('fireHttpBackfill: no new events', { sessionId: backfillSessionId });
+          return;
+        }
         if (cacheKeyRef.current !== backfillCacheKey) return;
         const recovered = result.events.filter(
           (ev): ev is TimelineEvent => !!ev && typeof ev === 'object' && typeof (ev as TimelineEvent).eventId === 'string',
         );
         if (recovered.length === 0) return;
+        backfillDebug('fireHttpBackfill: merging', { sessionId: backfillSessionId, count: recovered.length });
         mergeEvents(recovered);
         for (const recoveredEvent of recovered) {
           settleOptimisticByCommandAckEvent(recoveredEvent);
@@ -1394,28 +1438,58 @@ export function useTimeline(
   fireHttpBackfillRef.current = fireHttpBackfill;
   const lastActiveRefreshAtRef = useRef(0);
 
+  // Stable ref for `isActiveSession` so the activation-event listener can
+  // read the LATEST value without re-attaching itself. Re-attaching the
+  // listener on every isActiveSession flip opened a race where an event
+  // dispatched in the same microtask as the flip (e.g. a foreground resume
+  // that also switches the active session via push-notification) landed
+  // between the cleanup and re-add, was silently dropped, and the user
+  // stared at stale chat content. The previous `[disableHistory, isActiveSession]`
+  // deps regression — see commits 1c178a4a/35d87485 — is what this fixes.
+  const isActiveSessionRef = useRef(isActiveSession);
+  isActiveSessionRef.current = isActiveSession;
+
   // Force-refresh the active session when the app comes back to the
-  // foreground or a push-notification is tapped. Listener is intentionally
-  // registered with NO deps so it stays attached across session switches:
-  // if we gated on [sessionId, serverId], React would tear down + re-add
-  // the listener on every navigate, and an ACTIVE_TIMELINE_REFRESH_EVENT
-  // dispatched synchronously in the same tick as setActiveSession() (see
-  // push-notifications.ts) would land in the gap and be silently dropped,
-  // leaving the user staring at "No events yet" after a notification tap.
-  // `fireHttpBackfillRef.current` reads the latest sessionId/serverId on
-  // each call, and `fireHttpBackfill` itself no-ops when either is unset.
+  // foreground or a push-notification is tapped. The listener stays
+  // attached across session switches and reads `isActiveSessionRef.current`
+  // at event time so only the currently-active hook fires the backfill —
+  // satisfying "fast cache 这些一定只触发激活窗口的".
   useEffect(() => {
     if (disableHistory) return;
     const handler = (): void => {
-      if (!isActiveSession) return;
+      if (!isActiveSessionRef.current) {
+        backfillDebug('activation event: gated by !isActiveSession', { sessionId });
+        return;
+      }
       const now = Date.now();
-      if (now - lastActiveRefreshAtRef.current < 250) return;
+      if (now - lastActiveRefreshAtRef.current < 250) {
+        backfillDebug('activation event: rate-limited', { sessionId });
+        return;
+      }
       lastActiveRefreshAtRef.current = now;
+      backfillDebug('activation event: firing backfill', { sessionId });
       fireHttpBackfillRef.current(0, { phase: 'refresh' });
     };
     window.addEventListener(ACTIVE_TIMELINE_REFRESH_EVENT, handler);
     return () => window.removeEventListener(ACTIVE_TIMELINE_REFRESH_EVENT, handler);
-  }, [disableHistory, isActiveSession]);
+  }, [disableHistory, sessionId]);
+
+  // Whenever this hook becomes the active session (false → true transition),
+  // fire an immediate backfill — satisfies "激活哪个触发哪个". The mount
+  // path already handles first-render bootstrap, so we explicitly skip
+  // mount and only react to subsequent flips. Using a ref makes the
+  // transition detection idempotent across re-renders that don't change
+  // `isActiveSession`.
+  const prevIsActiveRef = useRef(isActiveSession);
+  useEffect(() => {
+    if (disableHistory) return;
+    const prev = prevIsActiveRef.current;
+    prevIsActiveRef.current = isActiveSession;
+    if (!prev && isActiveSession) {
+      backfillDebug('isActiveSession false→true: firing backfill', { sessionId });
+      fireHttpBackfillRef.current(0, { phase: 'refresh' });
+    }
+  }, [isActiveSession, disableHistory, sessionId]);
 
   // Listen for WS messages
   useEffect(() => {

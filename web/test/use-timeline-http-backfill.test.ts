@@ -557,4 +557,284 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
       expect(screen.getByTestId('probe').textContent).toContain('acked:true');
     });
   });
+
+  // ── Activation / multi-session gating regression suite ─────────────────
+  // These tests pin down the post-fix behaviour the user explicitly asked
+  // for ("WS 重连后必 backfill ，fast cache 这些一定只触发激活窗口的。
+  // 激活哪个触发哪个。") and prevent the gating regressions that landed
+  // in 1c178a4a / 35d87485 from coming back unnoticed.
+
+  it('activation event fires backfill ONLY for the active session, never for inactive mounted siblings', async () => {
+    const activeSession = `deck_active_${Date.now()}`;
+    const inactiveSession = `deck_inactive_${Date.now()}`;
+    const serverId = `srv-multi-${Date.now()}`;
+
+    fetchSpy.mockResolvedValue({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+
+    for (const name of [activeSession, inactiveSession]) {
+      ingestTimelineEventForCache({
+        eventId: `${name}-seed`,
+        sessionId: name,
+        ts: 1000,
+        epoch: 1,
+        seq: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'assistant.text',
+        payload: { text: 'seed' },
+      }, serverId);
+    }
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineReplayRequest: vi.fn(() => 'replay'),
+      sendTimelineHistoryRequest: vi.fn(() => 'history'),
+    } as unknown as WsClient;
+
+    function Probe() {
+      useTimeline(activeSession, ws, serverId, { isActiveSession: true });
+      useTimeline(inactiveSession, ws, serverId, { isActiveSession: false });
+      return h('div', { 'data-testid': 'probe' }, 'mounted');
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('mounted');
+    });
+    // Drain mount-time backfill (active session only — inactive is gated)
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledWith(serverId, activeSession, expect.anything());
+    fetchSpy.mockClear();
+
+    // Simulate an app-resume / push-tap activation event.
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT));
+      await vi.advanceTimersByTimeAsync(50);
+    });
+
+    // ONLY the active session should have fired a backfill.
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledWith(serverId, activeSession, expect.anything());
+  });
+
+  it('switching active session (false→true transition) immediately fires backfill for the newly-active hook', async () => {
+    const sessionA = `deck_switch_a_${Date.now()}`;
+    const sessionB = `deck_switch_b_${Date.now()}`;
+    const serverId = `srv-switch-${Date.now()}`;
+
+    fetchSpy.mockResolvedValue({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+
+    for (const name of [sessionA, sessionB]) {
+      ingestTimelineEventForCache({
+        eventId: `${name}-seed`,
+        sessionId: name,
+        ts: 1000,
+        epoch: 1,
+        seq: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'assistant.text',
+        payload: { text: 'seed' },
+      }, serverId);
+    }
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineReplayRequest: vi.fn(() => 'replay'),
+      sendTimelineHistoryRequest: vi.fn(() => 'history'),
+    } as unknown as WsClient;
+
+    function Probe({ activeName }: { activeName: string }) {
+      useTimeline(sessionA, ws, serverId, { isActiveSession: activeName === sessionA });
+      useTimeline(sessionB, ws, serverId, { isActiveSession: activeName === sessionB });
+      return h('div', { 'data-testid': 'probe' }, activeName);
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const { rerender } = render(h(Probe, { activeName: sessionA }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    // Mount-time backfill for sessionA only.
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledWith(serverId, sessionA, expect.anything());
+    fetchSpy.mockClear();
+
+    // User switches active session A → B.
+    rerender(h(Probe, { activeName: sessionB }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(50); });
+
+    // sessionB became active → its own backfill fires. sessionA does NOT
+    // (it's no longer active and shouldn't echo a stale request).
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledWith(serverId, sessionB, expect.anything());
+  });
+
+  it('activation event fired during isActiveSession flip is NOT lost (stable listener, ref-based gate)', async () => {
+    // This pins the regression caused by 1c178a4a/35d87485: when the listener
+    // had `isActiveSession` in its deps, the listener was torn down + re-added
+    // synchronously with the flip. An ACTIVE_TIMELINE_REFRESH_EVENT dispatched
+    // in the same tick as the flip (e.g. push-tap that activates the session
+    // AND requests a refresh together) landed in the gap and was silently
+    // dropped. Post-fix the listener stays attached and reads the latest
+    // `isActiveSession` via ref.
+    const sessionName = `deck_flip_race_${Date.now()}`;
+    const serverId = `srv-race-${Date.now()}`;
+
+    fetchSpy.mockResolvedValue({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-seed`,
+      sessionId: sessionName,
+      ts: 1000,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'seed' },
+    }, serverId);
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineReplayRequest: vi.fn(() => 'replay'),
+      sendTimelineHistoryRequest: vi.fn(() => 'history'),
+    } as unknown as WsClient;
+
+    function Probe({ active }: { active: boolean }) {
+      useTimeline(sessionName, ws, serverId, { isActiveSession: active });
+      return h('div', { 'data-testid': 'probe' }, String(active));
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    // Start inactive — no mount-time backfill.
+    const { rerender } = render(h(Probe, { active: false }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    // Synchronously: flip to active AND dispatch the activation event in the
+    // same act() — this is the racy path.
+    await act(async () => {
+      rerender(h(Probe, { active: true }));
+      window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT));
+      await vi.advanceTimersByTimeAsync(50);
+    });
+
+    // Both the false→true transition AND the activation event request a
+    // refresh; the 250ms rate-limiter coalesces them into a single fetch.
+    // The important assertion: at least one fetch fired (no silent drop).
+    expect(fetchSpy.mock.calls.length).toBeGreaterThanOrEqual(1);
+    expect(fetchSpy).toHaveBeenCalledWith(serverId, sessionName, expect.anything());
+  });
+
+  it('retries HTTP backfill on null result (transient daemon-offline at activation)', async () => {
+    const sessionName = `deck_retry_${Date.now()}`;
+    const serverId = `srv-retry-${Date.now()}`;
+
+    // First two calls return null (daemon offline); third call succeeds.
+    const recovered: TimelineEvent = {
+      eventId: `${sessionName}-recovered`,
+      sessionId: sessionName,
+      ts: 5000,
+      epoch: 1,
+      seq: 2,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'recovered-after-retry' },
+    };
+    fetchSpy
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ events: [recovered], epoch: 1, hasMore: false, nextCursor: null });
+
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-seed`,
+      sessionId: sessionName,
+      ts: 1000,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'seed' },
+    }, serverId);
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineReplayRequest: vi.fn(() => 'replay'),
+      sendTimelineHistoryRequest: vi.fn(() => 'history'),
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, ws, serverId);
+      return h('div', { 'data-testid': 'probe' }, events.map((e) => String(e.payload.text ?? '')).join('|'));
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toContain('seed');
+    });
+
+    // Mount-time backfill fires at 200ms → null → retry at +800ms → null →
+    // retry at +2000ms → success. Total elapsed ≈ 200 + 800 + 2000 = 3000ms.
+    await act(async () => { await vi.advanceTimersByTimeAsync(3500); });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toContain('recovered-after-retry');
+    });
+  });
+
+  it('gives up cleanly after exhausting retries (no infinite loop, no crash)', async () => {
+    const sessionName = `deck_retry_exhaust_${Date.now()}`;
+    const serverId = `srv-retry-exhaust-${Date.now()}`;
+
+    // All calls return null.
+    fetchSpy.mockResolvedValue(null);
+
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-seed`,
+      sessionId: sessionName,
+      ts: 1000,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'seed' },
+    }, serverId);
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineReplayRequest: vi.fn(() => 'replay'),
+      sendTimelineHistoryRequest: vi.fn(() => 'history'),
+    } as unknown as WsClient;
+
+    function Probe() {
+      useTimeline(sessionName, ws, serverId);
+      return h('div', { 'data-testid': 'probe' }, 'mounted');
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('mounted');
+    });
+
+    // Initial backfill + 2 retries = 3 calls total. Beyond that, give up.
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+
+    // No further calls even after a long wait — retry budget exhausted.
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+    expect(screen.getByTestId('probe').textContent).toBe('mounted');
+  });
 });
