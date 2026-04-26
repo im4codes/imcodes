@@ -734,7 +734,10 @@ body {
 .chat-pinned-last-sent:focus-visible { outline: 2px solid #3b82f6; outline-offset: 1px; }
 .chat-pinned-last-sent-label { font-size: 10px; font-weight: 600; color: #93c5fd; letter-spacing: 0.05em; text-transform: uppercase; }
 .chat-pinned-last-sent-text { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; line-clamp: 2; overflow: hidden; text-overflow: ellipsis; word-break: break-word; white-space: pre-wrap; }
-.chat-pinned-last-sent.chat-pinned-expanded .chat-pinned-last-sent-text { display: block; -webkit-line-clamp: unset; line-clamp: unset; max-height: 40vh; overflow-y: auto; }
+/* Expanded state still caps at 3 lines — the toggle reveals one extra
+   line of context, never the full message. Tap-again jumps to the
+   message in chat history for the full content. */
+.chat-pinned-last-sent.chat-pinned-expanded .chat-pinned-last-sent-text { -webkit-line-clamp: 3; line-clamp: 3; }
 .chat-view { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 8px 12px; display: flex; flex-direction: column; gap: 2px; scrollbar-width: thin; scrollbar-color: #6366f1 #1e293b; }
 .chat-view-preview { justify-content: flex-end; }
 .chat-view::-webkit-scrollbar { width: 5px; }
