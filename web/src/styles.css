@@ -776,7 +776,13 @@ body {
 .chat-code-block { background: #1a1a2e; border-radius: 8px; margin: 8px 0; overflow: hidden; }
 .chat-code-block pre { margin: 0; padding: 12px; overflow-x: auto; -webkit-overflow-scrolling: touch; font-size: 13px; line-height: 1.4; }
 .chat-code-block code { font-family: 'Cascadia Code', 'Fira Code', 'SF Mono', monospace; color: #e2e8f0; }
+.chat-code-header { display: flex; align-items: center; justify-content: space-between; background: #2a2a4a; }
+.chat-code-header .chat-code-lang { background: transparent; padding: 4px 12px; }
 .chat-code-lang { background: #2a2a4a; color: #94a3b8; font-size: 11px; padding: 4px 12px; font-family: sans-serif; }
+.chat-code-copy-btn { display: inline-flex; align-items: center; justify-content: center; background: transparent; color: #94a3b8; border: none; padding: 4px 10px; cursor: pointer; line-height: 0; transition: color 0.15s; -webkit-tap-highlight-color: transparent; }
+.chat-code-copy-btn:hover { color: #e2e8f0; }
+.chat-code-copy-btn.is-copied { color: #34d399; }
+.chat-code-copy-btn svg { display: block; }
 .chat-inline-code { background: #1e293b; color: #93c5fd; padding: 1px 5px; border-radius: 3px; font-family: 'Cascadia Code', 'Fira Code', 'SF Mono', monospace; font-size: 0.9em; }
 .chat-tool { color: #94a3b8; font-size: 14px; line-height: 1.6; min-height: 28px; padding: 6px 10px; background: #1e293b; border-radius: 6px; border-left: 3px solid #3b82f6; overflow: visible; white-space: normal; word-break: break-all; flex-shrink: 0; }
 .chat-tool-icon { margin-right: 6px; font-weight: bold; color: #60a5fa; font-size: 14px; }
