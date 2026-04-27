@@ -129,7 +129,7 @@ describe('buildWindowsUpgradeBatch', () => {
   it('runs npm install BEFORE killing the old daemon or stale watchdogs', () => {
     // CRITICAL: npm install must happen while the old daemon is still alive.
     // That way, if install fails, the old daemon is unaffected.
-    const installIdx = batch.indexOf(`call "${INPUT.npmCmd}" install -g ${INPUT.pkgSpec}`);
+    const installIdx = batch.indexOf(`call "${INPUT.npmCmd}" install -g --ignore-scripts ${INPUT.pkgSpec}`);
     const killWatchdogIdx = batch.indexOf('taskkill /f /t /pid !STALE_WD!');
     const killDaemonIdx = batch.indexOf('taskkill /f /pid !OLD_DAEMON_PID!');
     expect(installIdx).toBeGreaterThan(-1);
@@ -197,6 +197,38 @@ describe('buildWindowsUpgradeBatch', () => {
     expect(batch).toMatch(/ping -n \d+ 127\.0\.0\.1 >nul 2>&1/);
   });
 
+  it('passes --ignore-scripts to global install (sharp install hook crashes during global install)', () => {
+    // strip-onnxruntime-gpu.mjs strips node_modules/sharp/ from the
+    // published tarball, forcing npm to re-resolve sharp at install
+    // time per platform.  When npm does that during a global install,
+    // sharp's install hook (`node install/check.js || npm run build`)
+    // fails with MODULE_NOT_FOUND on install/check.js, then falls back
+    // to `npm run build` which walks UP into imcodes's package.json
+    // and runs imcodes's `tsc` build (not on global PATH) — exit 127.
+    // --ignore-scripts skips the hook entirely; sharp's runtime binary
+    // (@img/sharp-<platform>-<arch>) is fetched as a regular optional
+    // dependency with no install script, so semantic search still works.
+    expect(batch).toContain('--ignore-scripts');
+    // Specifically on the global install line.
+    expect(batch).toMatch(/install -g --ignore-scripts/);
+  });
+
+  it('runs sharp repair if global install left an empty placeholder dir', () => {
+    // npm 10.x exhibits an empty-dir bug under `npm i -g <tarball>` where
+    // a stripped bundled dep (sharp) gets a placeholder created at
+    // <global>/imcodes/node_modules/sharp/ but nothing extracted into it.
+    // Detect via missing package.json and re-run install scoped to the
+    // imcodes package — this works because nested install doesn't trigger
+    // the same edge case.
+    expect(batch).toContain('node_modules\\sharp\\package.json');
+    expect(batch).toMatch(/sharp.*missing.*repairing/i);
+    expect(batch).toContain('install --no-save --ignore-scripts sharp@0.34.5');
+    // Repair only runs on the success path (don't waste time on aborted installs).
+    const installFailIdx = batch.indexOf('Install FAILED');
+    const repairIdx = batch.indexOf('install --no-save --ignore-scripts sharp');
+    expect(repairIdx).toBeGreaterThan(installFailIdx);
+  });
+
   it('uses BOTH PowerShell and wmic so it works on every Windows version', () => {
     // PowerShell works on Windows 7+; wmic is being removed from Windows 11
     // and Server 2025 images.  Try PowerShell first, fall back to wmic.
@@ -230,7 +262,7 @@ describe('buildWindowsUpgradeBatch', () => {
     // never inherits our temporary flag.
     const saveIdx = batch.indexOf('set "ORIG_NODE_OPTIONS=%NODE_OPTIONS%"');
     const setFreshIdx = batch.indexOf('set "NODE_OPTIONS=--max-old-space-size=4096"');
-    const installIdx = batch.indexOf(`call "${INPUT.npmCmd}" install -g ${INPUT.pkgSpec}`);
+    const installIdx = batch.indexOf(`call "${INPUT.npmCmd}" install -g --ignore-scripts ${INPUT.pkgSpec}`);
     const restoreIdx = batch.indexOf('set "NODE_OPTIONS=%ORIG_NODE_OPTIONS%"');
     expect(saveIdx).toBeGreaterThan(-1);
     expect(setFreshIdx).toBeGreaterThan(-1);
@@ -267,7 +299,7 @@ describe('buildWindowsUpgradeBatch', () => {
   });
 
   it('installs with quoted npm path', () => {
-    expect(batch).toContain(`call "${INPUT.npmCmd}" install -g ${INPUT.pkgSpec}`);
+    expect(batch).toContain(`call "${INPUT.npmCmd}" install -g --ignore-scripts ${INPUT.pkgSpec}`);
   });
 
   // ── Version verification ──

@@ -3912,13 +3912,56 @@ if [ -L "$GLOBAL_PKG" ]; then
 fi
 
 log "[step 2] installing ${pkgSpec}"
-if ! eval "$NPM_RUN install -g ${pkgSpec}" >> "$LOG" 2>&1; then
+# --ignore-scripts: \`scripts/strip-onnxruntime-gpu.mjs\` strips
+# \`node_modules/sharp/\` from the published tarball so npm re-resolves it on
+# the user's actual platform (otherwise the Linux-built bundle ships a
+# Linux-only sharp wrapper that can't load on macOS/Windows). When npm
+# re-resolves sharp during a global install, sharp's \`install\` hook
+# (\`node install/check.js || npm run build\`) fails with MODULE_NOT_FOUND
+# in a way we couldn't reproduce in nested project installs — npm seems
+# to half-extract sharp under \`<global>/imcodes/node_modules/sharp/\` (the
+# install/ directory ends up missing) and then runs the hook anyway. The
+# fallback \`npm run build\` then walks UP into imcodes's package.json,
+# tries to run imcodes's \`tsc\` build, and exits 127 because tsc isn't on
+# the global PATH. Net effect: every auto-upgrade since the strip-sharp
+# change has been failing with exit 127 and operators were getting
+# \`Cannot find module .../sharp/install/check.js\` in upgrade.log.
+#
+# Skipping install scripts is safe here because (a) sharp 0.34's runtime
+# binary is the prebuilt \`@img/sharp-<platform>-<arch>\` package (which
+# npm STILL fetches and unpacks because it's a regular optionalDependency
+# of sharp — no install script involvement), and (b) the only thing
+# install/check.js does is dlopen-test that prebuilt; if it fails
+# check.js falls back to compiling from source (npm run build), which
+# we never want on a user machine anyway.
+#
+# After the install we probe \`sharp/package.json\`. If npm left an empty
+# placeholder dir (the half-extract pathology above), do a one-shot
+# \`npm install\` from inside the global package to repopulate it. Run with
+# --ignore-scripts again for the same reason.
+if ! eval "$NPM_RUN install -g --ignore-scripts ${pkgSpec}" >> "$LOG" 2>&1; then
   log "[step 2] install FAILED (exit $?) — keeping current daemon running"
   log "=== upgrade aborted ==="
   sleep ${CLEANUP_AFTER_SEC} && rm -rf "${scriptDir}" &
   exit 0
 fi
 log "[step 2] install succeeded"
+
+# Sharp repair: detect the npm-global empty-dir bug and re-run sharp
+# install scoped to the imcodes package. This costs ~2 s when needed
+# and zero seconds when the install was clean.
+GLOBAL_ROOT_CHECK=$(eval "$NPM_RUN root -g" 2>/dev/null)
+SHARP_PKG_JSON="$GLOBAL_ROOT_CHECK/imcodes/node_modules/sharp/package.json"
+if [ ! -f "$SHARP_PKG_JSON" ]; then
+  log "[step 2.1] sharp/package.json missing — repairing via nested npm install"
+  # Remove the empty placeholder dir (npm install will recreate it).
+  rmdir "$GLOBAL_ROOT_CHECK/imcodes/node_modules/sharp" 2>/dev/null || true
+  if (cd "$GLOBAL_ROOT_CHECK/imcodes" && eval "$NPM_RUN install --no-save --ignore-scripts sharp@0.34.5") >> "$LOG" 2>&1; then
+    log "[step 2.1] sharp repair succeeded"
+  else
+    log "[step 2.1] sharp repair FAILED (exit $?) — semantic memory recall will sticky-disable"
+  fi
+fi
 
 # Read installed version directly from package.json — bypasses the
 # freshly-installed imcodes shebang (which can fail under the same

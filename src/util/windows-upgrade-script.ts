@@ -119,7 +119,18 @@ rem (node reads them into memory at load time), so npm CAN overwrite them\r
 rem safely while the old daemon keeps serving requests.  This is the key\r
 rem to guaranteeing the old daemon survives install failures.\r
 echo Installing ${pkgSpec}... >> "%LOG_FILE%"\r
-call "${npmCmd}" install -g ${pkgSpec} >> "%LOG_FILE%" 2>&1\r
+rem --ignore-scripts: see the matching block in command-handler.ts\r
+rem (handleDaemonUpgrade, "Sharp repair") for the full story.  TL;DR:\r
+rem strip-onnxruntime-gpu.mjs removes node_modules/sharp/ from the\r
+rem published tarball so npm re-resolves it per platform.  When npm does\r
+rem that during a global install, sharp's install hook can fail with\r
+rem MODULE_NOT_FOUND on install/check.js (npm appears to half-extract\r
+rem sharp), then fall back to npm-run-build which walks UP into\r
+rem imcodes's package.json and tries tsc.  exit 127.  Skipping install\r
+rem scripts is safe — the runtime sharp binary is the prebuilt\r
+rem @img/sharp-win32-x64 / @img/sharp-win32-arm64 package, which npm\r
+rem still fetches as a regular optionalDependency (no install script).\r
+call "${npmCmd}" install -g --ignore-scripts ${pkgSpec} >> "%LOG_FILE%" 2>&1\r
 set "INSTALL_EXIT=%errorlevel%"\r
 \r
 rem Restore the daemon's original NODE_OPTIONS NOW (right after npm install)\r
@@ -138,6 +149,28 @@ if %INSTALL_EXIT% neq 0 (\r
   if exist "%VBS_LAUNCHER%" wscript "%VBS_LAUNCHER%"\r
   wscript "%CLEANUP_VBS%" >nul 2>&1\r
   goto :done\r
+)\r
+\r
+rem Sharp repair: detect the npm-global empty-dir bug and re-run sharp\r
+rem install scoped to the imcodes package if needed.  Runs only after\r
+rem install succeeded — never on the abort path above.  Failure here\r
+rem doesn't block the upgrade; embedding will sticky-disable and log a\r
+rem clear "ERR_MODULE_NOT_FOUND" instead of the cryptic empty-dir state.\r
+for /f "usebackq delims=" %%p in (\`call "${npmCmd}" root -g 2^>nul\`) do if not defined GLOBAL_ROOT_CHECK set "GLOBAL_ROOT_CHECK=%%p"\r
+if defined GLOBAL_ROOT_CHECK (\r
+  if not exist "!GLOBAL_ROOT_CHECK!\\imcodes\\node_modules\\sharp\\package.json" (\r
+    echo sharp\\package.json missing — repairing via nested npm install >> "%LOG_FILE%"\r
+    rmdir "!GLOBAL_ROOT_CHECK!\\imcodes\\node_modules\\sharp" 2>nul\r
+    pushd "!GLOBAL_ROOT_CHECK!\\imcodes" >nul 2>&1\r
+    call "${npmCmd}" install --no-save --ignore-scripts sharp@0.34.5 >> "%LOG_FILE%" 2>&1\r
+    set "REPAIR_EXIT=!errorlevel!"\r
+    popd >nul 2>&1\r
+    if !REPAIR_EXIT! equ 0 (\r
+      echo sharp repair succeeded >> "%LOG_FILE%"\r
+    ) else (\r
+      echo sharp repair FAILED (exit !REPAIR_EXIT!) — semantic memory recall will sticky-disable >> "%LOG_FILE%"\r
+    )\r
+  )\r
 )\r
 \r
 rem ── Step 3: Verify the install (shim exists, version matches) ──────────\r
