@@ -111,6 +111,25 @@ export class TerminalStreamer {
    *  starts) on a leaking production daemon before this guard. */
   private pipeStartLocks = new Set<string>();
 
+  /** Grace period before tearing down a pipe whose subscriber count
+   *  dropped to zero. Without it, any browser-side subscriber churn
+   *  (component remount, transient WS hiccup, route flip) immediately
+   *  stops the pipe-pane stream — and the next subscribe restarts it.
+   *  On a dock with N visible sub-sessions a single re-render storm
+   *  produces N×2 pipe restart events in a few hundred ms; the user
+   *  sees the terminal "freeze for several seconds" while every pipe
+   *  spins back up + re-snapshots. The grace timer keeps the pipe
+   *  alive across the gap so a re-attaching subscriber attaches to the
+   *  SAME live pipe — no restart, no snapshot, no perceived freeze.
+   *
+   *  30s is comfortably longer than any plausible browser-side
+   *  unsubscribe→resubscribe round-trip while still being short
+   *  enough that a genuinely-departed user releases tmux capture-pane
+   *  / FIFO resources promptly.
+   */
+  private pipeStopGraceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private static readonly PIPE_STOP_GRACE_MS = 30_000;
+
   // Idle detection
   private lastRawAt = new Map<string, number>();
   private idleTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -131,6 +150,17 @@ export class TerminalStreamer {
     if (isTransportSessionName(sessionName)) {
       logger.debug({ sessionName }, 'Terminal streamer subscribe skipped for transport session');
       return () => { /* no-op */ };
+    }
+
+    // Cancel any pending teardown — a new subscriber arrived during the
+    // grace window, the existing pipe is still alive, no need to stop +
+    // restart. This is the path that turns a re-mount churn into a
+    // zero-cost no-op for the user.
+    const pendingStop = this.pipeStopGraceTimers.get(sessionName);
+    if (pendingStop) {
+      clearTimeout(pendingStop);
+      this.pipeStopGraceTimers.delete(sessionName);
+      logger.debug({ sessionName }, 'pipe-stop grace cancelled — new subscriber attached');
     }
 
     if (!this.subscribers.has(sessionName)) {
@@ -234,6 +264,27 @@ export class TerminalStreamer {
     subs.delete(subscriber);
 
     if (subs.size === 0) {
+      this.scheduleGracedStop(sessionName);
+    }
+  }
+
+  /**
+   * Schedule a graced pipe teardown when the subscriber count for a session
+   * dropped to zero. If a new subscriber attaches within the grace window
+   * (`subscribe()` cancels the timer), the existing pipe stays alive and the
+   * re-attach is a no-op — no pipe-pane stop+start, no snapshot, no
+   * perceptible "freeze". Used by both `unsubscribe()` (the user path) and
+   * `removeSubscriber()` (the internal overflow / error path).
+   */
+  private scheduleGracedStop(sessionName: string): void {
+    const existingTimer = this.pipeStopGraceTimers.get(sessionName);
+    if (existingTimer) clearTimeout(existingTimer);
+    const timer = setTimeout(() => {
+      this.pipeStopGraceTimers.delete(sessionName);
+      // Re-check: a subscriber may have attached during the grace window
+      // (and not yet left). Only tear down if subs are still 0.
+      const currentSubs = this.subscribers.get(sessionName);
+      if (!currentSubs || currentSubs.size > 0) return;
       this.subscribers.delete(sessionName);
       void this.stopPipe(sessionName);
       this.clearIdleTimer(sessionName);
@@ -242,7 +293,9 @@ export class TerminalStreamer {
       this.sizeCache.delete(sessionName);
       this.frameSeqs.delete(sessionName);
       resetParser(sessionName);
-    }
+    }, TerminalStreamer.PIPE_STOP_GRACE_MS);
+    this.pipeStopGraceTimers.set(sessionName, timer);
+    logger.debug({ sessionName, graceMs: TerminalStreamer.PIPE_STOP_GRACE_MS }, 'pipe-stop scheduled with grace');
   }
 
   /** Request an on-demand snapshot for all subscribers of a session. */
@@ -310,7 +363,17 @@ export class TerminalStreamer {
 
   /** Called by session-manager when a session restarts with a new pane. */
   async rebindSession(sessionName: string): Promise<void> {
-    if (!this.subscribers.has(sessionName)) return;
+    // Cancel any pending graced stop — rebind is an explicit "reattach
+    // pipe to fresh pane" signal that supersedes a passive teardown. If
+    // the grace fired AFTER rebind completed, it'd tear down the
+    // newly-started pipe.
+    const pendingStop = this.pipeStopGraceTimers.get(sessionName);
+    if (pendingStop) {
+      clearTimeout(pendingStop);
+      this.pipeStopGraceTimers.delete(sessionName);
+    }
+    const subs = this.subscribers.get(sessionName);
+    if (!subs || subs.size === 0) return;
     // Transport sessions don't have a pane to rebind — skip rather than
     // trigger the "paneId not available" error on every relaunch.
     if (isTransportSessionName(sessionName)) return;
@@ -326,9 +389,11 @@ export class TerminalStreamer {
       this.clearIdleTimer(sessionName);
     }
     for (const timer of this.retryTimers.values()) clearTimeout(timer);
+    for (const timer of this.pipeStopGraceTimers.values()) clearTimeout(timer);
     this.subscribers.clear();
     this.pipes.clear();
     this.retryTimers.clear();
+    this.pipeStopGraceTimers.clear();
     this.lastRawAt.clear();
     this.idleTimers.clear();
     this.idleState.clear();
@@ -582,11 +647,11 @@ export class TerminalStreamer {
     if (!subs) return;
     subs.delete(sub);
     if (subs.size === 0) {
-      this.subscribers.delete(sessionName);
-      void this.stopPipe(sessionName);
-      this.clearIdleTimer(sessionName);
-      this.lastRawAt.delete(sessionName);
-      this.idleState.delete(sessionName);
+      // Same grace path as unsubscribe — a fresh subscriber may attach
+      // immediately after an overflow / error removal (the client sees
+      // `terminal.stream_reset` and resubscribes). Without grace we'd
+      // re-restart the pipe; with grace we keep it alive across the gap.
+      this.scheduleGracedStop(sessionName);
     }
   }
 
@@ -596,6 +661,13 @@ export class TerminalStreamer {
     this.emitSessionStreamError(sessionName, err.message);
     for (const [sub] of subs) {
       try { sub.onError?.(err); } catch { /* ignore */ }
+    }
+    // Fundamentally broken — cancel any pending graced stop and tear down
+    // immediately. There's nothing recoverable to keep alive.
+    const pendingStop = this.pipeStopGraceTimers.get(sessionName);
+    if (pendingStop) {
+      clearTimeout(pendingStop);
+      this.pipeStopGraceTimers.delete(sessionName);
     }
     this.subscribers.delete(sessionName);
     void this.stopPipe(sessionName);
