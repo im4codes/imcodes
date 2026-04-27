@@ -10,6 +10,7 @@ import { resolveContextWindow } from '../model-context.js';
 import { shortModelLabel } from '../model-label.js';
 import { TerminalView } from './TerminalView.js';
 import { useTimeline } from '../hooks/useTimeline.js';
+import { sendSessionViaHttp } from '../api.js';
 import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff } from '../types.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
@@ -194,11 +195,35 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   }, [ws, connected, sub.sessionName, forceFollowLatest]);
 
   const handleTransportStop = useCallback(() => {
-    if (!ws || !connected || sub.state === 'stopped' || sub.state === 'stopping') return;
-    try {
-      ws.sendSessionCommand('send', { sessionName: sub.sessionName, text: '/stop' });
-    } catch { /* ignore */ }
-  }, [ws, connected, sub.sessionName, sub.state]);
+    // Stop is highest-priority — must fire even when the WS is briefly in
+    // probe-state (`_connected = false` during the post-resume ping/pong
+    // window). Previous behavior gated on `connected` AND swallowed any
+    // throw silently, so a stop tap landing during a visibility/focus
+    // tick disappeared. Now: skip the probe gate, try urgent WS first,
+    // fall back to HTTP on throw, surface only if both fail. The state
+    // gate (already-stopped / stopping) stays — those are valid no-ops.
+    if (sub.state === 'stopped' || sub.state === 'stopping') return;
+    const payload = { sessionName: sub.sessionName, text: '/stop' };
+    let wsThrown: unknown = null;
+    if (ws) {
+      try {
+        ws.sendSessionCommandUrgent('send', payload);
+        return;
+      } catch (err) {
+        wsThrown = err;
+      }
+    }
+    if (serverId) {
+      void sendSessionViaHttp(serverId, payload).catch((httpErr) => {
+        // eslint-disable-next-line no-console
+        console.warn('handleTransportStop: WS + HTTP both failed', { wsThrown, httpErr });
+      });
+      return;
+    }
+    // No WS, no serverId → nowhere to send. Surface so it's not invisible.
+    // eslint-disable-next-line no-console
+    console.warn('handleTransportStop: no transport available', { wsThrown });
+  }, [ws, sub.sessionName, sub.state, serverId]);
 
   const busy = useMemo(() => isVisuallyBusy(sub.state, !!getActiveThinkingTs(events)), [events, sub.state]);
   // Preview cards always follow the latest content.

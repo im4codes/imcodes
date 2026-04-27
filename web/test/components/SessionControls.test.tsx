@@ -213,6 +213,10 @@ const makeWs = () => {
   return {
     send: vi.fn(),
     sendSessionCommand: vi.fn(),
+    // Urgent variant for stop / cancel — bypasses the probe-state gate.
+    // Stop must reach the server even during a brief WS probe (`_connected
+    // = false` for ~50-200ms after focus/visibility ticks).
+    sendSessionCommandUrgent: vi.fn(),
     sendInput: vi.fn(),
     subscribeTransportSession: vi.fn(),
     unsubscribeTransportSession: vi.fn(),
@@ -230,15 +234,31 @@ const makeWs = () => {
   };
 };
 
+/** Helpers accept either path (regular `sendSessionCommand` or the urgent
+ *  variant `sendSessionCommandUrgent`) — caller's choice depends on whether
+ *  `text` is `/stop` (urgent) or anything else (regular). Tests that need
+ *  to pin the URGENT contract specifically assert on
+ *  `sendSessionCommandUrgent` directly. */
+function gatherSendCalls(ws: ReturnType<typeof makeWs>): Array<Record<string, unknown>> {
+  return [
+    ...ws.sendSessionCommand.mock.calls,
+    ...ws.sendSessionCommandUrgent.mock.calls,
+  ]
+    .filter(([cmd]) => cmd === 'send')
+    .map(([, p]) => p as Record<string, unknown>);
+}
+
 function expectSendPayload(ws: ReturnType<typeof makeWs>, payload: Record<string, unknown>): void {
-  expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+  expect(gatherSendCalls(ws)).toContainEqual(expect.objectContaining({
     ...payload,
     commandId: expect.any(String),
   }));
 }
 
 function expectLastSendPayload(ws: ReturnType<typeof makeWs>, payload: Record<string, unknown>): void {
-  expect(ws.sendSessionCommand).toHaveBeenLastCalledWith('send', expect.objectContaining({
+  const calls = gatherSendCalls(ws);
+  expect(calls.length).toBeGreaterThan(0);
+  expect(calls[calls.length - 1]).toEqual(expect.objectContaining({
     ...payload,
     commandId: expect.any(String),
   }));

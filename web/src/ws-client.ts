@@ -277,6 +277,45 @@ export class WsClient {
   }
 
   /**
+   * Bypass the probe-state gate (`_connected`) for urgent commands like
+   * `/stop`. Probe state is a heuristic — `readyState === OPEN` is the
+   * OS-level truth. Backgrounded tabs can resume with readyState=OPEN
+   * while the path is actually dead, which is why probeConnection() flips
+   * `_connected = false` until a fresh ping/pong confirms the path. But
+   * for STOP we want maximum chance of delivery: try the OS-open socket
+   * (likely still works on most resumes), and let the caller fall back to
+   * HTTP on throw. The previous "stop has highest priority" guarantee
+   * regressed when probeConnection() was added (a604c085) because every
+   * focus/visibility tick briefly marks the socket disconnected, and the
+   * normal `send()` refuses during that window — so a stop tap landing
+   * in that window was silently dropped (caught by `try { ... } catch
+   * { /* ignore *​/ }` in SubSessionCard).
+   *
+   * Throws if there's no socket at all or readyState isn't OPEN — those
+   * are real-deadness conditions where HTTP fallback IS necessary.
+   */
+  sendUrgent(msg: object): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error('WebSocket not connected');
+    }
+    const json = JSON.stringify(msg);
+    if (json.length > 60_000) {
+      throw new Error('Message too large');
+    }
+    this.ws.send(json);
+  }
+
+  /**
+   * Urgent variant of `sendSessionCommand` for stop / interrupt / cancel —
+   * bypasses the probe-state gate so a focus/visibility tick can't silently
+   * swallow it. Caller should still wrap in try/catch and HTTP-fallback
+   * on throw.
+   */
+  sendSessionCommandUrgent(command: 'stop' | 'send' | 'restart', payload: object = {}): void {
+    this.sendUrgent({ type: `session.${command}`, ...payload });
+  }
+
+  /**
    * Actively verify a foregrounded browser socket before allowing new sends.
    * Backgrounded tabs can resume with readyState=OPEN while the path to the
    * server is dead; a short ping/pong probe catches that without refreshing

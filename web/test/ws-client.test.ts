@@ -823,4 +823,74 @@ describe('WsClient', () => {
       client.disconnect();
     });
   });
+
+  describe('urgent send (stop / cancel high-priority path)', () => {
+    // Pins the user-reported "stop button stopped working again" regression.
+    // probeConnection() flips `_connected = false` for ~50-200 ms on every
+    // visibility/focus tick while it pings the server. During that window
+    // the regular `send()` rejects, and the stop-button code path silently
+    // swallowed the throw — so a stop tap landing in that window vanished.
+    // sendUrgent / sendSessionCommandUrgent bypass the probe gate (still
+    // checking the OS-level readyState). Caller HTTP-fallback handles the
+    // genuinely-dead-socket case.
+
+    it('sendUrgent succeeds when readyState is OPEN even if _connected=false', async () => {
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await flushAsync();
+      lastWs!.emit('open');
+      expect(client.connected).toBe(true);
+
+      const sentMessages: string[] = [];
+      const origSend = lastWs!.send.bind(lastWs);
+      lastWs!.send = (data: string) => { sentMessages.push(data); origSend(data); };
+
+      // Simulate the probe-state flip — _connected=false but socket still
+      // OPEN at the OS level (the exact regression window).
+      (client as unknown as { _connected: boolean })._connected = false;
+
+      // Regular send() rejects — sanity check that the gate IS in place.
+      expect(() => client.send({ type: 'session.send', text: 'normal' })).toThrow('WebSocket not connected');
+
+      // sendUrgent goes through.
+      expect(() => client.sendUrgent({ type: 'session.send', text: '/stop' })).not.toThrow();
+      expect(sentMessages).toHaveLength(1);
+      expect(JSON.parse(sentMessages[0])).toEqual({ type: 'session.send', text: '/stop' });
+
+      client.disconnect();
+    });
+
+    it('sendUrgent still throws when the socket is genuinely closed', async () => {
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await flushAsync();
+      lastWs!.emit('open');
+      lastWs!.emit('close', { code: 1006, reason: 'lost' });
+      // Socket is gone; even urgent send must throw so the caller falls
+      // back to HTTP rather than silently dropping.
+      expect(() => client.sendUrgent({ type: 'session.send', text: '/stop' })).toThrow('WebSocket not connected');
+    });
+
+    it('sendSessionCommandUrgent emits session.<command> with payload', async () => {
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await flushAsync();
+      lastWs!.emit('open');
+
+      const sentMessages: string[] = [];
+      const origSend = lastWs!.send.bind(lastWs);
+      lastWs!.send = (data: string) => { sentMessages.push(data); origSend(data); };
+
+      (client as unknown as { _connected: boolean })._connected = false;
+      client.sendSessionCommandUrgent('send', { sessionName: 'deck_brain', text: '/stop', commandId: 'cmd-1' });
+      expect(JSON.parse(sentMessages[0])).toEqual({
+        type: 'session.send',
+        sessionName: 'deck_brain',
+        text: '/stop',
+        commandId: 'cmd-1',
+      });
+
+      client.disconnect();
+    });
+  });
 });

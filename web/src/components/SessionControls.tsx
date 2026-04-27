@@ -1702,6 +1702,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       ...extra,
       commandId,
     };
+    // `/stop` is highest-priority — bypass the WS probe-state gate so a
+    // focus/visibility tick (probeConnection sets `_connected = false`
+    // for ~50-200 ms while pinging) doesn't drop it. Regular messages
+    // still go through the gated path: a probe-detected dead socket
+    // shouldn't accept a new message that would silently disappear,
+    // but the user's STOP intent must be honored on a best-effort basis.
+    const isStop = text === '/stop';
     if (!ws) {
       if (!serverId) return null;
       void sendSessionViaHttp(serverId, payload).catch((fallbackErr) => {
@@ -1710,7 +1717,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       return commandId;
     }
     try {
-      ws.sendSessionCommand('send', payload);
+      if (isStop) ws.sendSessionCommandUrgent('send', payload);
+      else ws.sendSessionCommand('send', payload);
     } catch (err) {
       if (!serverId) throw err;
       void sendSessionViaHttp(serverId, payload).catch((fallbackErr) => {
