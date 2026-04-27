@@ -321,21 +321,33 @@ describe('WsBridge', () => {
       expect(daemonWs.sent).toHaveLength(0);
     });
 
-    it('drops with error after rate limit exceeded', async () => {
+    it('forwards every message when BROWSER_RATE_LIMIT_ENABLED is off (current default)', async () => {
+      // The browser-side rate limiter is currently DISABLED by feature flag
+      // (BROWSER_RATE_LIMIT_ENABLED in server/src/ws/bridge.ts). Reasoning is
+      // documented at the constant: a desktop tab with pinned panels +
+      // multi-session reconnects fires 60–300 messages within ~2 s, blowing
+      // through the 300 / 10s window during normal init bursts. Dropped
+      // `session.send` messages then surface as instant `command.failed`,
+      // turning the optimistic bubble red within milliseconds — the wall-of-
+      // `rate_limited` symptom. Until the burst is reduced at source
+      // (coalescing fs.git_status / repo.detect, debouncing subscribe
+      // replays), the limiter stays off.
+      //
+      // This test asserts the disabled behaviour: 1000 messages all forward
+      // and no `rate_limited` error is ever emitted. Flip the flag back on
+      // and revert this test (see git log) when the burst-source fix lands.
       const { daemonWs, browserWs } = await setupBridge();
-      // Rate limit is 300 messages / 10s window — exhaust the window then
-      // verify the next message is dropped with rate_limited error.
-      for (let i = 0; i < 300; i++) {
+      for (let i = 0; i < 1000; i++) {
         browserWs.emit('message', JSON.stringify({ type: 'get_sessions' }));
       }
-      const countBefore = daemonWs.sent.length;
-      browserWs.emit('message', JSON.stringify({ type: 'get_sessions' }));
-      // Message not forwarded to daemon
-      expect(daemonWs.sent.length).toBe(countBefore);
-      // Error sent back to browser
-      const lastBrowserMsg = JSON.parse(browserWs.sent[browserWs.sent.length - 1] as string);
-      expect(lastBrowserMsg.type).toBe('error');
-      expect(lastBrowserMsg.code).toBe('rate_limited');
+      // Every message reaches the daemon (the bridge serialises `get_sessions`
+      // into `daemon.get_sessions` so length matches input count).
+      expect(daemonWs.sent.length).toBeGreaterThanOrEqual(1000);
+      // No browser ever received a `rate_limited` error.
+      const rateLimitedHits = browserWs.sent
+        .map((s) => { try { return JSON.parse(s as string); } catch { return null; } })
+        .filter((m) => m && m.type === 'error' && m.code === 'rate_limited');
+      expect(rateLimitedHits).toHaveLength(0);
     });
   });
 

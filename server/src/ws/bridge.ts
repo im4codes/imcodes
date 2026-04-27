@@ -70,6 +70,23 @@ const MAX_BROWSER_PAYLOAD = 65536; // 64KB (subsession.rebuild_all can include m
 // real abuse patterns send orders-of-magnitude more.
 const BROWSER_RATE_LIMIT = 300;
 const BROWSER_RATE_WINDOW = 10_000; // 10s
+/**
+ * Master switch for the per-browser rate limiter.
+ *
+ * Why this exists as a flag rather than a deletion: the browser-side burst
+ * problem isn't fixed yet (a reconnect or multi-panel desktop tab still
+ * fires 60+ messages within the first ~2 s, and a reconnect within the
+ * 10 s window doubles that). Turning the limiter off avoids the worst
+ * symptom — `session.send` getting dropped → instant `command.failed` →
+ * UI bubble flips to failed within milliseconds — which surfaces in
+ * production as the wall-of-`rate_limited`-errors users have been seeing.
+ *
+ * The proper fix is reducing the burst itself (coalescing fs.git_status /
+ * repo.detect, debouncing terminal.subscribe replays, etc.) rather than
+ * raising the limit further. Until that lands, leave this OFF. To turn
+ * the limiter back on, flip the flag — no other changes required.
+ */
+const BROWSER_RATE_LIMIT_ENABLED = false;
 // 4MB per (session, browser). Heavy output (build logs, large `cat`, log tail)
 // can burst tens of KB per frame; at 1MB the queue overflowed within a few
 // frames during heavy output and triggered stream_reset cascades, which the
@@ -660,8 +677,11 @@ export class WsBridge {
         return;
       }
 
-      // Browser rate limit — drop with error response so frontend can handle it
-      {
+      // Browser rate limit — drop with error response so frontend can handle it.
+      // Gated by BROWSER_RATE_LIMIT_ENABLED. See the constant's docs above for
+      // why it's currently off; the entire block is preserved (and inert) so
+      // re-enabling is a one-line flip with no semantic risk.
+      if (BROWSER_RATE_LIMIT_ENABLED) {
         const browserId = this.getBrowserId(ws);
         if (!this.browserRateLimiter.check(browserId, BROWSER_RATE_LIMIT, BROWSER_RATE_WINDOW)) {
           logger.warn({ serverId: this.serverId, type: msg.type }, 'Browser rate limit exceeded — dropped');
