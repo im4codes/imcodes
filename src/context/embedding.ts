@@ -175,7 +175,16 @@ export function getEmbeddingUnavailableReason(): string | null {
 
 /**
  * Generate a normalized embedding vector for a text string.
- * Returns a Float32Array of EMBEDDING_DIM dimensions, or null if model unavailable.
+ *
+ * Resolution order:
+ *   1. Local pipeline via `@huggingface/transformers` (fast path, ~5 ms).
+ *   2. Server fallback via `POST /api/embedding` if the daemon is bound
+ *      and the local pipeline is permanently unavailable (sharp empty
+ *      placeholders, onnxruntime DLOPEN failure on old CPUs, etc.).
+ *
+ * Returns a Float32Array of EMBEDDING_DIM dimensions, or null when both
+ * paths fail. The fallback only fires when the LOCAL pipeline has
+ * sticky-disabled — we never round-trip the network on the happy path.
  */
 export async function generateEmbedding(text: string): Promise<Float32Array | null> {
   try {
@@ -183,6 +192,14 @@ export async function generateEmbedding(text: string): Promise<Float32Array | nu
     const result = await pipe(text, { pooling: 'mean', normalize: true });
     return result.data as Float32Array;
   } catch {
+    // Local failed. If it's sticky-disabled (deterministic per-host),
+    // try the server fallback. Transient local failures fall through to
+    // null without burning a network call.
+    if (unavailable) {
+      const { tryServerEmbedding, isServerFallbackUnavailable } = await import('./embedding-server-fallback.js');
+      if (isServerFallbackUnavailable()) return null;
+      return await tryServerEmbedding(text);
+    }
     return null;
   }
 }
@@ -206,6 +223,25 @@ export async function generateEmbeddings(texts: string[]): Promise<(Float32Array
     }
     return results;
   } catch {
+    // Local pipeline dead. Fall back to server one-at-a-time when the
+    // local failure is deterministic. Server doesn't have a batch endpoint
+    // yet — sequential is fine because the batch path is only hot during
+    // recall and a sticky-disabled local pipeline is rare overall.
+    if (unavailable) {
+      const { tryServerEmbedding, isServerFallbackUnavailable } = await import('./embedding-server-fallback.js');
+      if (isServerFallbackUnavailable()) return texts.map(() => null);
+      const out: (Float32Array | null)[] = [];
+      for (const text of texts) {
+        out.push(await tryServerEmbedding(text));
+        if (isServerFallbackUnavailable()) {
+          // Server became unavailable mid-batch — fill the rest with null
+          // and break, don't keep firing requests at a sticky-disabled server.
+          while (out.length < texts.length) out.push(null);
+          break;
+        }
+      }
+      return out;
+    }
     return texts.map(() => null);
   }
 }

@@ -45,6 +45,7 @@ import { copyFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { ensureImcDir, imcSubDir } from '../util/imc-dir.js';
 import { buildWindowsCleanupScript, buildWindowsCleanupVbs, buildWindowsUpgradeBatch, buildWindowsUpgradeVbs } from '../util/windows-upgrade-script.js';
+import { buildBashSharpRepair } from '../util/sharp-repair-script.js';
 import { UPGRADE_LOCK_FILE, encodeVbsAsUtf16, encodeCmdAsUtf8Bom } from '../util/windows-launch-artifacts.js';
 import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
 import { sanitizeProjectName } from '../../shared/sanitize-project-name.js';
@@ -3947,21 +3948,7 @@ if ! eval "$NPM_RUN install -g --ignore-scripts ${pkgSpec}" >> "$LOG" 2>&1; then
 fi
 log "[step 2] install succeeded"
 
-# Sharp repair: detect the npm-global empty-dir bug and re-run sharp
-# install scoped to the imcodes package. This costs ~2 s when needed
-# and zero seconds when the install was clean.
-GLOBAL_ROOT_CHECK=$(eval "$NPM_RUN root -g" 2>/dev/null)
-SHARP_PKG_JSON="$GLOBAL_ROOT_CHECK/imcodes/node_modules/sharp/package.json"
-if [ ! -f "$SHARP_PKG_JSON" ]; then
-  log "[step 2.1] sharp/package.json missing — repairing via nested npm install"
-  # Remove the empty placeholder dir (npm install will recreate it).
-  rmdir "$GLOBAL_ROOT_CHECK/imcodes/node_modules/sharp" 2>/dev/null || true
-  if (cd "$GLOBAL_ROOT_CHECK/imcodes" && eval "$NPM_RUN install --no-save --ignore-scripts sharp@0.34.5") >> "$LOG" 2>&1; then
-    log "[step 2.1] sharp repair succeeded"
-  else
-    log "[step 2.1] sharp repair FAILED (exit $?) — semantic memory recall will sticky-disable"
-  fi
-fi
+${buildBashSharpRepair()}
 
 # Read installed version directly from package.json — bypasses the
 # freshly-installed imcodes shebang (which can fail under the same

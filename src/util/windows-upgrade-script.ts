@@ -1,3 +1,5 @@
+import { buildBatchSharpRepair } from './sharp-repair-script.js';
+
 export interface WindowsUpgradeScriptInput {
   logFile: string;
   scriptDir: string;
@@ -151,27 +153,7 @@ if %INSTALL_EXIT% neq 0 (\r
   goto :done\r
 )\r
 \r
-rem Sharp repair: detect the npm-global empty-dir bug and re-run sharp\r
-rem install scoped to the imcodes package if needed.  Runs only after\r
-rem install succeeded — never on the abort path above.  Failure here\r
-rem doesn't block the upgrade; embedding will sticky-disable and log a\r
-rem clear "ERR_MODULE_NOT_FOUND" instead of the cryptic empty-dir state.\r
-for /f "usebackq delims=" %%p in (\`call "${npmCmd}" root -g 2^>nul\`) do if not defined GLOBAL_ROOT_CHECK set "GLOBAL_ROOT_CHECK=%%p"\r
-if defined GLOBAL_ROOT_CHECK (\r
-  if not exist "!GLOBAL_ROOT_CHECK!\\imcodes\\node_modules\\sharp\\package.json" (\r
-    echo sharp\\package.json missing — repairing via nested npm install >> "%LOG_FILE%"\r
-    rmdir "!GLOBAL_ROOT_CHECK!\\imcodes\\node_modules\\sharp" 2>nul\r
-    pushd "!GLOBAL_ROOT_CHECK!\\imcodes" >nul 2>&1\r
-    call "${npmCmd}" install --no-save --ignore-scripts sharp@0.34.5 >> "%LOG_FILE%" 2>&1\r
-    set "REPAIR_EXIT=!errorlevel!"\r
-    popd >nul 2>&1\r
-    if !REPAIR_EXIT! equ 0 (\r
-      echo sharp repair succeeded >> "%LOG_FILE%"\r
-    ) else (\r
-      echo sharp repair FAILED (exit !REPAIR_EXIT!) — semantic memory recall will sticky-disable >> "%LOG_FILE%"\r
-    )\r
-  )\r
-)\r
+${buildBatchSharpRepair({ npmCmd })}\r
 \r
 rem ── Step 3: Verify the install (shim exists, version matches) ──────────\r
 set "NPM_PREFIX="\r
