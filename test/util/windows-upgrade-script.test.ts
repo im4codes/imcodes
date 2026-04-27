@@ -18,9 +18,22 @@ describe('buildWindowsCleanupScript', () => {
     const script = buildWindowsCleanupScript('C:\\Temp\\imcodes-upgrade-123');
     expect(script).toContain('@echo off');
     expect(script).toContain('chcp 65001 >nul 2>&1');
-    expect(script).toContain('timeout /t 120 /nobreak >nul');
+    // ping-based sleep — `timeout` fails under wscript-spawned cmd
+    // because there's no console for stdin.  See the regression test
+    // below for the full story.
+    expect(script).toContain('ping -n 121 127.0.0.1 >nul 2>&1');
     expect(script).toContain('for %%I in ("%~dp0.") do set "SCRIPT_DIR=%%~fI"');
     expect(script).toContain('rmdir /s /q "%SCRIPT_DIR%"');
+  });
+
+  it('NEVER uses `timeout /t` (regression: fails when launched via wscript)', () => {
+    // `timeout /t N /nobreak` requires a real console for stdin.  When
+    // run under a wscript-spawned cmd there is no console, so timeout
+    // aborts with exit code 1 immediately and the cleanup runs without
+    // its 120 s grace period — deleting the temp dir while diagnostic
+    // logs are still being written there.
+    const script = buildWindowsCleanupScript('C:\\Temp\\imcodes-upgrade-123');
+    expect(script).not.toMatch(/timeout \/t \d+/);
   });
 });
 
@@ -153,7 +166,35 @@ describe('buildWindowsUpgradeBatch', () => {
     expect(doneIdx).toBeGreaterThan(-1);
     const afterDone = batch.slice(doneIdx);
     expect(afterDone).toContain('if exist "%UPGRADE_LOCK%"');
-    expect(afterDone).toContain('del "%UPGRADE_LOCK%"');
+    expect(afterDone).toMatch(/del [^\r\n]*"%UPGRADE_LOCK%"/);
+  });
+
+  it('final safety-net falls back to PowerShell Remove-Item if del silently fails', () => {
+    // Real-world incident on 2026-04-27: `del "%UPGRADE_LOCK%" >nul 2>&1`
+    // returned 0 but the file persisted (suspected sharing violation /
+    // transient AV scan / weird ACL inheritance).  The watchdog spun
+    // forever logging "Upgrade in progress, waiting...".  Belt-and-
+    // suspenders: if del fails, retry with PowerShell Remove-Item.
+    const doneIdx = batch.indexOf(':done');
+    const afterDone = batch.slice(doneIdx);
+    expect(afterDone).toContain('Remove-Item -Force');
+    expect(afterDone).toContain('-LiteralPath');
+    // And log a WARNING if even that fails so the symptom is diagnosable
+    // from the upgrade log instead of being silent.
+    expect(afterDone).toMatch(/WARNING:.*upgrade\.lock still present/i);
+  });
+
+  it('NEVER uses `timeout /t` (regression: fails when launched via wscript)', () => {
+    // `timeout /t N /nobreak` requires a real console for stdin (it polls
+    // keypresses to detect interrupt).  When this batch is launched via
+    // wscript → cmd, the spawned cmd has NO console attached, so timeout
+    // aborts immediately with "Input redirection is not supported,
+    // exiting the process immediately."  No actual sleep happens, which
+    // breaks the post-install settle delay, the post-kill settle delay,
+    // and the health-check grace period.  Use ping instead.
+    expect(batch).not.toMatch(/timeout \/t \d+/);
+    // At least one ping-based sleep should be present
+    expect(batch).toMatch(/ping -n \d+ 127\.0\.0\.1 >nul 2>&1/);
   });
 
   it('uses BOTH PowerShell and wmic so it works on every Windows version', () => {

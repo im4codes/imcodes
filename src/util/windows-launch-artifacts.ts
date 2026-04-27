@@ -68,17 +68,32 @@ export async function writeWatchdogCmd(paths: LaunchPaths): Promise<void> {
     ? `call "%APPDATA%\\npm\\imcodes.cmd" start --foreground`
     : `call "${paths.nodeExe}" "${paths.imcodesScript}" start --foreground`;
 
+  // CRITICAL: use `ping`-based sleep instead of `timeout /t N /nobreak`.
+  // `timeout` requires a real console for stdin (it polls keypresses to
+  // detect interrupt).  When this watchdog is launched via wscript →
+  // WshShell.Run, the spawned cmd has NO console, so `timeout` aborts
+  // immediately with "Input redirection is not supported, exiting the
+  // process immediately." — meaning the watchdog spins at full CPU and
+  // logs thousands of "Upgrade in progress, waiting..." lines per minute.
+  // `ping -n N+1 127.0.0.1 >nul` waits ~N seconds with no console need.
+  //
+  // We also separate the lock-wait state from the post-daemon retry:
+  // logging ONCE on entry/exit instead of every poll, and polling at 30 s
+  // intervals during lock-wait (vs 5 s after a clean daemon exit).
   const watchdog = [
     '@echo off',
     'chcp 65001 >nul 2>&1',
     ':loop',
-    'if exist "%USERPROFILE%\\.imcodes\\upgrade.lock" (',
-    '  echo Upgrade in progress, waiting... >> "%USERPROFILE%\\.imcodes\\watchdog.log"',
-    '  timeout /t 5 /nobreak >nul',
-    '  goto loop',
-    ')',
+    'if exist "%USERPROFILE%\\.imcodes\\upgrade.lock" goto wait_lock',
     `${launchCmd} >> "%USERPROFILE%\\.imcodes\\watchdog.log" 2>&1`,
-    'timeout /t 5 /nobreak >nul',
+    'ping -n 6 127.0.0.1 >nul 2>&1',
+    'goto loop',
+    ':wait_lock',
+    'echo [%date% %time%] Upgrade in progress, waiting for lock to clear... >> "%USERPROFILE%\\.imcodes\\watchdog.log"',
+    ':wait_loop',
+    'ping -n 31 127.0.0.1 >nul 2>&1',
+    'if exist "%USERPROFILE%\\.imcodes\\upgrade.lock" goto wait_loop',
+    'echo [%date% %time%] Upgrade lock cleared, resuming. >> "%USERPROFILE%\\.imcodes\\watchdog.log"',
     'goto loop',
     '',
   ].join('\r\n');

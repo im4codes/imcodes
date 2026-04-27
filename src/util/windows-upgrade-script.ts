@@ -18,7 +18,10 @@ export function buildWindowsCleanupScript(scriptDir: string): string {
   return `@echo off\r
 chcp 65001 >nul 2>&1\r
 setlocal\r
-timeout /t 120 /nobreak >nul\r
+rem ping-based sleep: works when launched via wscript (no console for stdin),\r
+rem unlike "timeout /t N /nobreak" which aborts with "Input redirection is\r
+rem not supported" and returns immediately.  -n 121 ≈ 120 s wait.\r
+ping -n 121 127.0.0.1 >nul 2>&1\r
 for %%I in ("%~dp0.") do set "SCRIPT_DIR=%%~fI"\r
 rmdir /s /q "%SCRIPT_DIR%"\r
 `;
@@ -79,7 +82,8 @@ set "VBS_LAUNCHER=%USERPROFILE%\\.imcodes\\daemon-launcher.vbs"\r
 set "UPGRADE_LOCK=%USERPROFILE%\\.imcodes\\upgrade.lock"\r
 set "PIDFILE=%USERPROFILE%\\.imcodes\\daemon.pid"\r
 echo === imcodes upgrade started at %date% %time% === >> "%LOG_FILE%"\r
-timeout /t 2 /nobreak > nul\r
+rem ping-based sleep: timeout fails under wscript (no stdin console)\r
+ping -n 3 127.0.0.1 >nul 2>&1\r
 \r
 rem ── Step 1: Create upgrade lock — watchdog will pause (daemon keeps running) ──\r
 echo upgrade > "%UPGRADE_LOCK%"\r
@@ -202,7 +206,7 @@ if defined OLD_DAEMON_PID if not "!OLD_DAEMON_PID!"=="" (\r
   echo Stopping old daemon PID !OLD_DAEMON_PID!... >> "%LOG_FILE%"\r
   taskkill /f /pid !OLD_DAEMON_PID! >nul 2>&1\r
 )\r
-timeout /t 2 /nobreak >nul\r
+ping -n 3 127.0.0.1 >nul 2>&1\r
 \r
 rem ── Step 5: Regenerate launch chain with the new binary's paths ────────\r
 echo Regenerating daemon launch chain... >> "%LOG_FILE%"\r
@@ -230,7 +234,7 @@ echo Removing upgrade lock... >> "%LOG_FILE%"\r
 del "%UPGRADE_LOCK%" >nul 2>&1\r
 \r
 rem ── Step 8: Health-check the new daemon ────────────────────────────────\r
-timeout /t 10 /nobreak >nul\r
+ping -n 11 127.0.0.1 >nul 2>&1\r
 if exist "%PIDFILE%" (\r
   set /p DAEMON_PID=<"%PIDFILE%"\r
   tasklist /fi "PID eq !DAEMON_PID!" /nh 2^>nul | find "!DAEMON_PID!" >nul\r
@@ -248,9 +252,20 @@ rem ── Final safety net: make absolutely sure the lock is removed ───�
 rem If any of the above paths ended without deleting the lock (shouldn't\r
 rem happen, but defend in depth), remove it here so the watchdog can\r
 rem resume serving.  This protects against batch script crashes too.\r
+rem\r
+rem We try del first, then PowerShell Remove-Item as fallback — observed\r
+rem in the wild that del can silently fail (sharing violation, transient\r
+rem AV scan, weird ACL inheritance) even when the file is owned by us.\r
 if exist "%UPGRADE_LOCK%" (\r
   echo Final safety: removing lingering upgrade.lock >> "%LOG_FILE%"\r
-  del "%UPGRADE_LOCK%" >nul 2>&1\r
+  del /f /q "%UPGRADE_LOCK%" >nul 2>&1\r
+)\r
+if exist "%UPGRADE_LOCK%" (\r
+  echo del failed; falling back to PowerShell Remove-Item >> "%LOG_FILE%"\r
+  powershell -NoProfile -NonInteractive -Command "Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath \"%UPGRADE_LOCK%\"" >nul 2>&1\r
+)\r
+if exist "%UPGRADE_LOCK%" (\r
+  echo WARNING: upgrade.lock still present after both deletion attempts — watchdog will spin >> "%LOG_FILE%"\r
 )\r
 echo === upgrade done at %date% %time% === >> "%LOG_FILE%"\r
 `;

@@ -159,7 +159,7 @@ describe('writeWatchdogCmd', () => {
     expect(cmd).toContain('index.js');
   });
 
-  it('watchdog is an infinite loop with 5s retry', async () => {
+  it('watchdog is an infinite loop with ping-based 5s retry', async () => {
     const paths = {
       nodeExe: 'node.exe',
       imcodesScript: 'C:\\npm\\node_modules\\imcodes\\dist\\src\\index.js',
@@ -173,7 +173,57 @@ describe('writeWatchdogCmd', () => {
 
     expect(cmd).toContain(':loop');
     expect(cmd).toContain('goto loop');
-    expect(cmd).toContain('timeout /t 5');
+    // ping -n 6 127.0.0.1 ≈ 5 second wait — works in console-less wscript
+    // child processes where `timeout` aborts immediately.
+    expect(cmd).toContain('ping -n 6 127.0.0.1 >nul 2>&1');
+  });
+
+  it('NEVER uses `timeout /t` for sleep (regression: timeout fails under wscript)', async () => {
+    // `timeout /t N /nobreak` requires a real console for stdin (it polls
+    // keypresses to detect interrupt).  When the watchdog is launched via
+    // wscript → WshShell.Run, the spawned cmd has NO console attached, so
+    // `timeout` aborts immediately with "Input redirection is not
+    // supported, exiting the process immediately." — meaning no actual
+    // sleep happens.  Result: the watchdog spin-loops at full CPU and
+    // logs thousands of "waiting..." lines per minute.  Use ping instead.
+    const paths = {
+      nodeExe: 'node.exe',
+      imcodesScript: 'C:\\npm\\node_modules\\imcodes\\dist\\src\\index.js',
+      watchdogPath: 'out.cmd',
+      vbsPath: 'out.vbs',
+      logPath: 'out.log',
+    };
+    await writeWatchdogCmd(paths);
+    const cmd = written[paths.watchdogPath];
+    expect(cmd).not.toMatch(/timeout \/t \d+/);
+  });
+
+  it('lock-wait state logs only ONCE on entry/exit, not every poll', async () => {
+    // Regression: an earlier implementation logged "Upgrade in progress,
+    // waiting..." inside a 5-second poll loop, which combined with the
+    // `timeout`-fails-under-wscript bug filled the watchdog log with 25k+
+    // lines in 12 minutes during a stuck-lock incident.  The new shape
+    // uses two labels (`:wait_lock` for entry, `:wait_loop` for the poll
+    // body) so the entry message logs once, then we poll silently every
+    // 30 seconds, and log once more when the lock clears.
+    const paths = {
+      nodeExe: 'node.exe',
+      imcodesScript: 'C:\\npm\\node_modules\\imcodes\\dist\\src\\index.js',
+      watchdogPath: 'out.cmd',
+      vbsPath: 'out.vbs',
+      logPath: 'out.log',
+    };
+    await writeWatchdogCmd(paths);
+    const cmd = written[paths.watchdogPath];
+    expect(cmd).toContain(':wait_lock');
+    expect(cmd).toContain(':wait_loop');
+    // 30 s poll during lock-wait (vs 5 s after a clean daemon exit)
+    expect(cmd).toContain('ping -n 31 127.0.0.1 >nul 2>&1');
+    // Exactly one "waiting..." entry message (not inside the poll loop)
+    const waitingHits = (cmd.match(/Upgrade in progress, waiting/g) ?? []).length;
+    expect(waitingHits).toBe(1);
+    // And exactly one "cleared" exit message
+    expect(cmd).toContain('Upgrade lock cleared, resuming');
   });
 });
 
