@@ -4015,6 +4015,90 @@ if [ "$CMP" = "0" ]; then
 fi
 log "[step 3] version comparator: installed > current → restart"
 
+# ── Step 3.5: Regenerate launch chain with the new binary's paths ──────
+#
+# Why this exists: on Linux the systemd unit at
+# ~/.config/systemd/user/imcodes.service hard-codes ExecStart with the
+# absolute path to \`node\` and the imcodes entry script as they existed at
+# \`imcodes bind\` time. Any of these scenarios leaves it pointing at a
+# bin that no longer exists / no longer resolves correctly:
+#
+#   * user switches node via nvm/fnm/volta — \`/.../node/v22.x.x/bin/imcodes\`
+#     still resolves but a fresh \`npm i -g\` populated the new version's
+#     prefix instead, so the old absolute path is stale.
+#   * \`npm uninstall -g imcodes\` followed by reinstall under a different
+#     prefix (homebrew vs nvm vs system) leaves the symlink dangling.
+#   * any reorg of node versions where the bin sits at a new absolute path.
+#
+# Real-world hit: 116.62.239.78 daemon stuck on dev.1922 because the
+# unit's ExecStart pointed at /home/k/.nvm/versions/node/v22.22.2/bin/imcodes
+# from a prior install — \`systemctl restart imcodes\` succeeds in the
+# upgrade script's eyes but the spawned process crashes "Cannot find
+# module '/home/k/.../bin/imcodes'" (988 recorded crashes in daemon.log
+# before one of them finally caught a working state by lucky races).
+#
+# Windows already does the equivalent (Step 5 "Regenerate daemon launch
+# chain" in windows-upgrade-script.ts).  This mirrors that behavior for
+# Linux + macOS so a successful npm install is always followed by a
+# launch-chain pointing at the freshly-installed binary.
+#
+# Safe-by-design: we only touch ExecStart on Linux and ProgramArguments
+# on macOS. Other Environment= / Restart= / KillMode= settings the user
+# may have customised are preserved verbatim. If the unit / plist file
+# doesn't exist, we skip silently — the user may run via \`imcodes start\`
+# directly or have a non-standard launcher, neither of which we should
+# clobber.
+log "[step 3.5] regenerating launch chain"
+NEW_IMCODES_SCRIPT="$GLOBAL_ROOT/imcodes/dist/src/index.js"
+if [ ! -f "$NEW_IMCODES_SCRIPT" ]; then
+  log "[step 3.5] $NEW_IMCODES_SCRIPT not found — skipping (will rely on existing launch chain)"
+elif [ "$(uname)" = "Linux" ]; then
+  SVC="$HOME/.config/systemd/user/imcodes.service"
+  if [ -f "$SVC" ]; then
+    NEW_EXEC="ExecStart=$NODE $NEW_IMCODES_SCRIPT start --foreground"
+    OLD_EXEC=$(grep -m1 '^ExecStart=' "$SVC" || echo '(none)')
+    if [ "$OLD_EXEC" = "$NEW_EXEC" ]; then
+      log "[step 3.5] systemd ExecStart already current"
+    else
+      log "[step 3.5] rewriting ExecStart"
+      log "[step 3.5]   from: $OLD_EXEC"
+      log "[step 3.5]   to:   $NEW_EXEC"
+      # Use awk for portability — sed -i's in-place behavior differs
+      # between BSD (mac) and GNU (linux), and quoting the replacement
+      # gets thorny with paths that may contain '/'. awk on a temp
+      # file is unambiguous on every Unix.
+      if awk -v new="$NEW_EXEC" '
+        BEGIN { done = 0 }
+        /^ExecStart=/ { if (!done) { print new; done = 1; next } }
+        { print }
+      ' "$SVC" > "$SVC.new" && mv "$SVC.new" "$SVC"; then
+        systemctl --user daemon-reload >> "$LOG" 2>&1 && log "[step 3.5] systemd daemon-reload OK" || log "[step 3.5] systemd daemon-reload FAILED (non-fatal)"
+      else
+        log "[step 3.5] awk rewrite FAILED — keeping old unit (non-fatal)"
+        rm -f "$SVC.new"
+      fi
+    fi
+  else
+    log "[step 3.5] $SVC absent — nothing to rewrite"
+  fi
+elif [ "$(uname)" = "Darwin" ]; then
+  PLIST="$HOME/Library/LaunchAgents/imcodes.daemon.plist"
+  if [ -f "$PLIST" ]; then
+    if command -v plutil >/dev/null 2>&1; then
+      log "[step 3.5] rewriting plist ProgramArguments"
+      if plutil -replace ProgramArguments -json "[\\"$NODE\\",\\"$NEW_IMCODES_SCRIPT\\",\\"start\\",\\"--foreground\\"]" "$PLIST" >> "$LOG" 2>&1; then
+        log "[step 3.5] plutil rewrite OK"
+      else
+        log "[step 3.5] plutil rewrite FAILED (non-fatal)"
+      fi
+    else
+      log "[step 3.5] plutil not available — skipping plist regen"
+    fi
+  else
+    log "[step 3.5] $PLIST absent — nothing to rewrite"
+  fi
+fi
+
 log "[step 4] running restart command"
 # Wrap restartCmd in a subshell so its multi-line content captures all
 # stdout/stderr to LOG. The previous template-literal interpolation
@@ -4035,6 +4119,41 @@ if kill -0 ${oldDaemonPid} 2>/dev/null; then
   log "[step 4] WARN: old daemon PID ${oldDaemonPid} still alive after restart command"
 else
   log "[step 4] old daemon PID ${oldDaemonPid} terminated as expected"
+fi
+
+# ── Step 5: Health check — verify a NEW daemon is actually running ─────
+#
+# Why: a successful step 4 (e.g. "systemctl --user restart imcodes" returns 0
+# when the unit transitions to "activating") doesn't guarantee the new
+# daemon survives. systemd returns success once the spawned process forks,
+# but if its ExecStart fails (e.g. node crashes immediately on a stale
+# module path that survived step 3.5), Restart=always immediately re-spawns
+# it, and the failure repeats invisibly. The new daemon's PID is recorded
+# in ~/.imcodes/daemon.pid AFTER successful startup, so we can use the pid
+# file as a positive-liveness signal: read it 5–15 s after restart and
+# kill -0 it.
+#
+# If the daemon failed to come up after restart, we surface the symptom in
+# upgrade.log loudly so operators see "daemon NOT running after restart"
+# instead of a silent dead service.
+log "[step 5] post-restart health check"
+sleep 5
+HEALTH_PID=""
+for i in 1 2 3; do
+  if [ -f "$HOME/.imcodes/daemon.pid" ]; then
+    HEALTH_PID=$(cat "$HOME/.imcodes/daemon.pid" 2>/dev/null || true)
+    if [ -n "$HEALTH_PID" ] && kill -0 "$HEALTH_PID" 2>/dev/null && [ "$HEALTH_PID" != "${oldDaemonPid}" ]; then
+      log "[step 5] new daemon healthy: PID $HEALTH_PID (after \${i}x check)"
+      break
+    fi
+  fi
+  HEALTH_PID=""
+  sleep 3
+done
+if [ -z "$HEALTH_PID" ]; then
+  log "[step 5] WARN: no live new daemon after 14s — service unit may have a stale path or the new binary crashes on startup"
+  log "[step 5] WARN: check 'systemctl --user status imcodes' (linux) or 'log show --predicate \"subsystem == \\\"imcodes\\\"\"' (macos)"
+  log "[step 5] WARN: if path-stale, manually fix ExecStart in $HOME/.config/systemd/user/imcodes.service then 'systemctl --user daemon-reload && systemctl --user restart imcodes'"
 fi
 
 log "=== upgrade script done ==="
