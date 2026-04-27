@@ -609,7 +609,11 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     expect(fetchSpy).toHaveBeenCalledWith(serverId, activeSession, expect.anything());
     fetchSpy.mockClear();
 
-    // Simulate an app-resume / push-tap activation event.
+    // Simulate an app-resume / push-tap activation event. Real callers
+    // arrive via `requestActiveTimelineRefresh({ resetCooldowns: true })`
+    // which clears the 15s cooldown map first (because the user signaled
+    // they want fresh data, not a coalesced refire). We mirror that here.
+    __resetBackfillCooldownsForTests();
     await act(async () => {
       window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT));
       await vi.advanceTimersByTimeAsync(50);
@@ -836,6 +840,82 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
     expect(fetchSpy).toHaveBeenCalledTimes(3);
     expect(screen.getByTestId('probe').textContent).toBe('mounted');
+  });
+
+  it('15s cooldown coalesces back-to-back activation events for the same session', async () => {
+    // Pins the user-reported regression: clicking a session triggered 2-3
+    // backfills back-to-back (mount + isActiveSession transition + a stray
+    // activation event from the same focus/visibility tick), each one
+    // running a real HTTP roundtrip and re-rendering the chat. The 15s
+    // cooldown coalesces that burst into a single fetch. Real app-resume
+    // (`resetCooldowns: true`) clears the gate explicitly, but ordinary
+    // session-switch / re-focus must respect it.
+    const sessionName = `deck_cooldown_${Date.now()}`;
+    const serverId = `srv-cooldown-${Date.now()}`;
+
+    fetchSpy.mockResolvedValue({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-seed`,
+      sessionId: sessionName,
+      ts: 1000,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'seed' },
+    }, serverId);
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineReplayRequest: vi.fn(() => 'replay'),
+      sendTimelineHistoryRequest: vi.fn(() => 'history'),
+    } as unknown as WsClient;
+
+    function Probe() {
+      useTimeline(sessionName, ws, serverId, { isActiveSession: true });
+      return h('div', { 'data-testid': 'probe' }, 'mounted');
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe));
+    // Drain the mount-time backfill — successful fetch arms the cooldown.
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    fetchSpy.mockClear();
+
+    // Three activation events arrive in quick succession (e.g. focus,
+    // visibility, and appStateChange all firing within the same render
+    // commit on iOS). With the 15s cooldown they should coalesce: zero
+    // additional fetches.
+    for (let i = 0; i < 3; i++) {
+      await act(async () => {
+        window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT));
+        await vi.advanceTimersByTimeAsync(300);
+      });
+    }
+    expect(fetchSpy).toHaveBeenCalledTimes(0);
+
+    // Past 15s, a new activation event should fire.
+    await act(async () => { await vi.advanceTimersByTimeAsync(15_500); });
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT));
+      await vi.advanceTimersByTimeAsync(50);
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    // resetCooldowns (the app-resume path) must bypass the cooldown. Advance
+    // past the inner 250ms rate-limit too so the activation event isn't
+    // suppressed by the in-handler debounce that gates same-tick repeats.
+    __resetBackfillCooldownsForTests();
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT));
+      await vi.advanceTimersByTimeAsync(50);
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
   });
 
   it('activation backfill flips refreshing=true so the user sees a spinner', async () => {

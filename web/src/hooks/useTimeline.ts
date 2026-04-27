@@ -47,6 +47,25 @@ const eventsCacheAccess = new Map<string, number>();
 const cacheListeners = new Map<string, Set<(events: TimelineEvent[]) => void>>();
 const lastHttpBackfillOkAt = new Map<string, number>();
 const MOUNT_BACKFILL_COOLDOWN_MS = 60_000;
+/**
+ * Cooldown for "user signaled they want fresh data" refreshes (activation
+ * event, false→true active flip). Without it, opening or switching to a
+ * session can fire 2-3 backfills back-to-back: mount-time bootstrap +
+ * isActiveSession transition + a stray activation event from the same
+ * focus/visibility tick. Each fires a real HTTP roundtrip even when the WS
+ * timeline has no gap to fill, so the user sees the chat scroll-to-bottom
+ * jolt three times in succession.
+ *
+ * 15 s is short enough that a stale daemon never lingers past one human
+ * reaction-time worth of "wait and try again", but long enough to coalesce
+ * the burst that typically arrives in <500 ms when a session is clicked.
+ *
+ * `requestActiveTimelineRefresh({ resetCooldowns: true })` (called on
+ * confirmed app-resume from background) explicitly clears
+ * `lastHttpBackfillOkAt`, so a real foreground transition still bypasses
+ * this gate.
+ */
+const ACTIVE_REFRESH_COOLDOWN_MS = 15_000;
 
 function resetBackfillCooldowns(): void {
   lastHttpBackfillOkAt.clear();
@@ -1492,7 +1511,12 @@ export function useTimeline(
       // the refresh had even attempted to fire. The visible flag is
       // also the easiest user-side smoke test for this whole chain:
       // see the spinner = activation reached the active hook.
-      fireHttpBackfillRef.current(0, { phase: 'refresh', visible: true });
+      //
+      // `cooldownMs: 15s` so a session that's been refreshed in the last
+      // 15s does NOT refire on every focus/visibility/appStateChange tick.
+      // App-resume's resetCooldowns:true path explicitly clears the map
+      // so a real foreground from background still bypasses this.
+      fireHttpBackfillRef.current(0, { phase: 'refresh', visible: true, cooldownMs: ACTIVE_REFRESH_COOLDOWN_MS });
     };
     window.addEventListener(ACTIVE_TIMELINE_REFRESH_EVENT, handler);
     return () => window.removeEventListener(ACTIVE_TIMELINE_REFRESH_EVENT, handler);
@@ -1511,7 +1535,14 @@ export function useTimeline(
     prevIsActiveRef.current = isActiveSession;
     if (!prev && isActiveSession) {
       backfillDebug('isActiveSession false→true: firing backfill', { sessionId });
-      fireHttpBackfillRef.current(0, { phase: 'refresh', visible: true });
+      // 15 s cooldown so flipping back-to-back between two sessions doesn't
+      // re-fire when the destination session was just refreshed. Mount
+      // bootstrap already used `MOUNT_BACKFILL_COOLDOWN_MS` (60 s) for the
+      // first-render path; this is a shorter window for "switched away,
+      // came back" — long enough to coalesce activation-event + transition
+      // tick that often arrive in the same render commit, short enough that
+      // the user can manually pull-to-refresh by leaving and coming back.
+      fireHttpBackfillRef.current(0, { phase: 'refresh', visible: true, cooldownMs: ACTIVE_REFRESH_COOLDOWN_MS });
     }
   }, [isActiveSession, disableHistory, sessionId]);
 
