@@ -206,4 +206,54 @@ if (existsSync(ortWebDist)) {
   }
 }
 
+// 6. Strip `@img/sharp-*` platform-specific binary packages from the bundle.
+//    `sharp` declares ALL its native variants as `optionalDependencies` — npm
+//    only installs the ones whose os/cpu/libc match the current platform.
+//    But because we bundle `@huggingface/transformers` (which transitively
+//    pulls sharp), CI's Linux x64 install resolves only Linux x64 variants
+//    and bakes them into our tarball. Then macOS/Windows users `npm i -g
+//    imcodes` and npm chokes with `EBADPLATFORM` on `@img/sharp-linux-x64`.
+//
+//    Fix: remove every `@img/sharp-*` AND `@img/sharp-libvips-*` directory
+//    from the bundle. npm will see them in sharp's optional deps at install
+//    time and fetch the correct platform variant from the registry on the
+//    user's actual machine. Keep `@img/colour` — it's platform-independent.
+//
+//    This is the same class of bug as the fsevents one we just fixed (where
+//    a transitive optional dep got hard-bundled and broke wrong-platform
+//    installs); doing the strip in the same prepack step keeps the tarball
+//    portable across darwin/linux/windows × arm64/x64.
+const imgRoot = join(repoRoot, 'node_modules', '@img');
+if (existsSync(imgRoot)) {
+  let imgRemovedCount = 0;
+  let imgRemovedBytes = 0;
+  for (const name of readdirSync(imgRoot)) {
+    // Strip every binary variant — keep `@img/colour` (pure JS, portable).
+    if (!name.startsWith('sharp-') && !name.startsWith('sharp-libvips-')) continue;
+    const abs = join(imgRoot, name);
+    const bytes = dirSize(abs);
+    rmSync(abs, { recursive: true, force: true });
+    imgRemovedBytes += bytes;
+    imgRemovedCount += 1;
+    console.log(`  - node_modules/@img/${name} (${(bytes / 1024 / 1024).toFixed(1)} MB)`);
+  }
+  if (imgRemovedCount > 0) {
+    console.log(`[strip-onnxruntime-gpu] removed ${imgRemovedCount} @img/sharp-* dirs = ${(imgRemovedBytes / 1024 / 1024).toFixed(1)} MB (npm will fetch correct platform variant at install time)`);
+  }
+  // Also walk transformers' nested node_modules in case any @img got hoisted
+  // there instead of the top-level. Defensive — we've not seen this
+  // structure in our published tarballs but bundleDependencies behavior can
+  // vary across npm versions.
+  const transformersImgRoot = join(repoRoot, 'node_modules', '@huggingface', 'transformers', 'node_modules', '@img');
+  if (existsSync(transformersImgRoot)) {
+    for (const name of readdirSync(transformersImgRoot)) {
+      if (!name.startsWith('sharp-') && !name.startsWith('sharp-libvips-')) continue;
+      const abs = join(transformersImgRoot, name);
+      const bytes = dirSize(abs);
+      rmSync(abs, { recursive: true, force: true });
+      console.log(`  - (nested) ${join('node_modules/@huggingface/transformers/node_modules/@img', name)} (${(bytes / 1024 / 1024).toFixed(1)} MB)`);
+    }
+  }
+}
+
 console.log('[strip-onnxruntime-gpu] done.');
