@@ -1246,5 +1246,13 @@
       "snapshotTitle": "Persisted snapshot",
       "snapshotBindings": "Snapshot bindings"
     }
+  },
+  "embedding": {
+    "status_unknown": "エンベディング状態不明（古いデーモンまたは切断中）",
+    "status_ready": "エンベディング準備完了 — セマンティック検索はローカルで実行",
+    "status_loading": "エンベディングモデルを読み込み中…",
+    "status_fallback": "エンベディング: ローカルパイプライン利用不可、サーバーフォールバックを使用中",
+    "status_unavailable": "エンベディング利用不可 — このデーモンでセマンティック検索は無効",
+    "status_idle": "エンベディング待機中（本セッションでは未使用）"
   }
 }

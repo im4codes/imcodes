@@ -11,6 +11,7 @@ import { join } from 'node:path';
 
 import { EMBEDDING_MODEL, EMBEDDING_DTYPE, EMBEDDING_DIM } from '../../shared/embedding-config.js';
 import logger from '../util/logger.js';
+import { isServerFallbackUnavailable, tryServerEmbedding } from './embedding-server-fallback.js';
 
 // Re-export shared constants for backward compatibility with existing imports
 export { EMBEDDING_DIM, cosineSimilarity } from '../../shared/embedding-config.js';
@@ -174,6 +175,31 @@ export function getEmbeddingUnavailableReason(): string | null {
 }
 
 /**
+ * High-level embedding status for telemetry / UI display.
+ * See `shared/embedding-status.ts` for the wire-format type definition
+ * and `state` semantics.
+ *
+ * No side effects — never triggers a load, never makes a network call.
+ * Safe to call on every heartbeat.
+ */
+export type { EmbeddingStatus } from '../../shared/embedding-status.js';
+
+export function getEmbeddingStatus(): import('../../shared/embedding-status.js').EmbeddingStatus {
+  if (pipelineInstance) return { state: 'ready', reason: null };
+  if (loadingPromise) return { state: 'loading', reason: null };
+  if (!unavailable) return { state: 'idle', reason: null };
+
+  // Local has sticky-failed. Decide between `fallback` and `unavailable`
+  // by peeking at the server-fallback module's sticky flag. The accessor
+  // never triggers a network call or credential read — it only reads a
+  // module-level boolean.
+  if (isServerFallbackUnavailable()) {
+    return { state: 'unavailable', reason: unavailableReason };
+  }
+  return { state: 'fallback', reason: unavailableReason };
+}
+
+/**
  * Generate a normalized embedding vector for a text string.
  *
  * Resolution order:
@@ -196,7 +222,6 @@ export async function generateEmbedding(text: string): Promise<Float32Array | nu
     // try the server fallback. Transient local failures fall through to
     // null without burning a network call.
     if (unavailable) {
-      const { tryServerEmbedding, isServerFallbackUnavailable } = await import('./embedding-server-fallback.js');
       if (isServerFallbackUnavailable()) return null;
       return await tryServerEmbedding(text);
     }
@@ -228,7 +253,6 @@ export async function generateEmbeddings(texts: string[]): Promise<(Float32Array
     // yet — sequential is fine because the batch path is only hot during
     // recall and a sticky-disabled local pipeline is rare overall.
     if (unavailable) {
-      const { tryServerEmbedding, isServerFallbackUnavailable } = await import('./embedding-server-fallback.js');
       if (isServerFallbackUnavailable()) return texts.map(() => null);
       const out: (Float32Array | null)[] = [];
       for (const text of texts) {

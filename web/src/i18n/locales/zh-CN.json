@@ -1247,5 +1247,13 @@
       "snapshotTitle": "持久化快照",
       "snapshotBindings": "快照绑定数"
     }
+  },
+  "embedding": {
+    "status_unknown": "向量嵌入状态未知（旧版守护进程或连接已断开）",
+    "status_ready": "向量嵌入就绪 — 语义搜索使用本地模型",
+    "status_loading": "正在加载向量嵌入模型…",
+    "status_fallback": "向量嵌入：本地不可用，已切换到服务器回退",
+    "status_unavailable": "向量嵌入不可用 — 该守护进程的语义搜索已禁用",
+    "status_idle": "向量嵌入空闲（本次会话尚未使用）"
   }
 }

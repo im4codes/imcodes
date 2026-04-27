@@ -1247,5 +1247,13 @@
       "snapshotTitle": "持久化快照",
       "snapshotBindings": "快照綁定數"
     }
+  },
+  "embedding": {
+    "status_unknown": "向量嵌入狀態未知（舊版背景程序或連線已中斷）",
+    "status_ready": "向量嵌入就緒 — 語意搜尋使用本機模型",
+    "status_loading": "正在載入向量嵌入模型…",
+    "status_fallback": "向量嵌入：本機無法使用，已切換至伺服器備援",
+    "status_unavailable": "向量嵌入無法使用 — 此背景程序的語意搜尋已停用",
+    "status_idle": "向量嵌入閒置（本次工作階段尚未使用）"
   }
 }

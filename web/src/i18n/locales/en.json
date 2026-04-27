@@ -1247,5 +1247,13 @@
       "snapshotTitle": "Persisted snapshot",
       "snapshotBindings": "Snapshot bindings"
     }
+  },
+  "embedding": {
+    "status_unknown": "Embedding status unknown (older daemon or disconnected)",
+    "status_ready": "Embedding ready — semantic search runs locally",
+    "status_loading": "Embedding model loading…",
+    "status_fallback": "Embedding: local pipeline unavailable, using server fallback",
+    "status_unavailable": "Embedding unavailable — semantic search disabled on this daemon",
+    "status_idle": "Embedding idle (not yet used this session)"
   }
 }
