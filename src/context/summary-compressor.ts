@@ -339,8 +339,33 @@ export async function compressWithSdk(input: CompressionInput): Promise<Compress
   return enqueueExclusive(() => compressWithSdkInner(input));
 }
 
+/**
+ * Hard cap on the previous-summary text we feed back into the next compression.
+ *
+ * Background: the iterative-update prompt instructs the model to "PRESERVE all
+ * existing information" and to carry User-Pinned Notes forward verbatim. With
+ * unbounded feedback this drives a runaway snowball — namespaces in the field
+ * were observed reaching 46k–82k characters of `recent_summary` text, which
+ * then became the *input* of every subsequent compression. With ~50 compressions
+ * per active session per day, a single project was burning ~700k input tokens
+ * daily on re-summarising its own history. Capping the carried-over summary
+ * keeps each call's input bounded; the durable-memory projection (a separate
+ * write path) is still untruncated, so long-term memory is not lost — only the
+ * size of the prompt fed to the next iterative compression is bounded.
+ *
+ * 4000 chars ≈ 1000 tokens, leaving plenty of budget for new events + template.
+ */
+const PREVIOUS_SUMMARY_MAX_CHARS = 4000;
+
+function trimPreviousSummary(previousSummary: string | undefined): string | undefined {
+  if (!previousSummary) return previousSummary;
+  if (previousSummary.length <= PREVIOUS_SUMMARY_MAX_CHARS) return previousSummary;
+  return previousSummary.slice(0, PREVIOUS_SUMMARY_MAX_CHARS) + '\n\n[... earlier summary truncated to bound prompt size ...]';
+}
+
 async function compressWithSdkInner(input: CompressionInput): Promise<CompressionResult> {
-  const { events, previousSummary, modelConfig } = input;
+  const { events, modelConfig } = input;
+  const previousSummary = trimPreviousSummary(input.previousSummary);
   const targetTokens = input.targetTokens ?? 500;
 
   if (events.length === 0) {

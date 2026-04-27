@@ -52,7 +52,13 @@ export interface MaterializationResult {
 
 const DEFAULT_THRESHOLDS: MaterializationThresholds = {
   idleMs: 5 * 60_000,
-  eventCount: 5,
+  // Raised from 5 → 20 to cut compression frequency. With spark-class
+  // models priced per input token, summary-bloat (see PREVIOUS_SUMMARY_MAX_CHARS
+  // in summary-compressor.ts) was making each call expensive; firing on every
+  // 5 assistant turns burned the daily quota inside hours. 20-turn batches
+  // still capture meaningful work units (a typical task ≈ 10–30 turns) while
+  // reducing call count ~4×.
+  eventCount: 20,
   scheduleMs: 15 * 60_000,
   minIntervalMs: 10_000,
 };

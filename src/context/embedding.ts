@@ -6,14 +6,38 @@
  * Lazy-loaded on first call — subsequent calls reuse the pipeline.
  */
 
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+
 import { EMBEDDING_MODEL, EMBEDDING_DTYPE, EMBEDDING_DIM } from '../../shared/embedding-config.js';
 import logger from '../util/logger.js';
 
 // Re-export shared constants for backward compatibility with existing imports
 export { EMBEDDING_DIM, cosineSimilarity } from '../../shared/embedding-config.js';
 
+/**
+ * Resolve where transformers.js should cache the downloaded embedding model.
+ *
+ * Why this isn't just "leave it to transformers' default": transformers.js
+ * defaults to `<package-install-dir>/.cache` (i.e. inside
+ * `node_modules/@huggingface/transformers/.cache`). For ANY system-level
+ * imcodes install — `npm i -g` on Linux landing in `/usr/lib/node_modules/`,
+ * Homebrew installs under `/opt/homebrew/lib/node_modules/`, Docker images
+ * with the package owned by root, etc. — a non-root daemon process cannot
+ * write into that path and crashes the model load with EACCES on first use.
+ * Real-world hit on 172.16.253.212 (2026-04-27): every embedding attempt
+ * logged `EACCES: permission denied, mkdir
+ * '/usr/lib/node_modules/imcodes/node_modules/@huggingface/transformers/.cache'`
+ * and semantic memory recall was permanently disabled for the process.
+ *
+ * Defaulting to `~/.imcodes/embedding-cache/` makes the cache always live
+ * somewhere the daemon owns. Users / ops can still override via
+ * `IMCODES_EMBEDDING_CACHE_DIR` for shared caches, ramdisk, NFS, etc.
+ */
 function resolveEmbeddingCacheDir(): string {
-  return process.env.IMCODES_EMBEDDING_CACHE_DIR?.trim() || '';
+  const fromEnv = process.env.IMCODES_EMBEDDING_CACHE_DIR?.trim();
+  if (fromEnv) return fromEnv;
+  return join(homedir(), '.imcodes', 'embedding-cache');
 }
 
 // Lazy-loaded pipeline singleton
