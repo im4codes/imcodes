@@ -3531,6 +3531,62 @@ async function handleDiscussionStop(cmd: Record<string, unknown>): Promise<void>
   );
 }
 
+/** Compare two imcodes daemon version strings.
+ *
+ * Returns -1 / 0 / 1 like Array.sort comparators (a<b / equal / a>b).
+ *
+ * Format we accept: `<num>.<num>.<num>[-<pre>...]` — calver-style with optional
+ * dot-separated pre-release suffix. e.g.
+ *   `2026.4.1873`              (release)
+ *   `2026.4.1924-dev.1906`     (pre-release)
+ *
+ * Rules:
+ *  - Compare the dot-separated release segments numerically, left-to-right.
+ *  - If release segments tie, a version WITHOUT a pre-release suffix is
+ *    *greater* than one WITH (standard semver convention; pre is a step
+ *    *toward* the next release).
+ *  - If both have pre-release suffixes, compare those segment-wise; numeric
+ *    when both numeric, lexicographic otherwise.
+ *
+ * This is permissive about junk (non-numeric segments parse as 0) — we only
+ * use it to gate downgrade-prevention, never for anything strict.
+ */
+function compareDaemonVersions(a: string, b: string): -1 | 0 | 1 {
+  const parse = (v: string): { rel: number[]; pre: string[] | null } => {
+    const dash = v.indexOf('-');
+    const relStr = dash === -1 ? v : v.slice(0, dash);
+    const preStr = dash === -1 ? null : v.slice(dash + 1);
+    return {
+      rel: relStr.split('.').map((n) => Number.parseInt(n, 10) || 0),
+      pre: preStr ? preStr.split('.') : null,
+    };
+  };
+  const A = parse(a);
+  const B = parse(b);
+  const len = Math.max(A.rel.length, B.rel.length);
+  for (let i = 0; i < len; i++) {
+    const da = A.rel[i] ?? 0;
+    const db = B.rel[i] ?? 0;
+    if (da !== db) return da < db ? -1 : 1;
+  }
+  if (A.pre === null && B.pre === null) return 0;
+  if (A.pre === null) return 1; // a stable > b pre
+  if (B.pre === null) return -1;
+  const plen = Math.max(A.pre.length, B.pre.length);
+  for (let i = 0; i < plen; i++) {
+    const pa = A.pre[i] ?? '';
+    const pb = B.pre[i] ?? '';
+    const na = /^\d+$/.test(pa) ? Number.parseInt(pa, 10) : null;
+    const nb = /^\d+$/.test(pb) ? Number.parseInt(pb, 10) : null;
+    if (na !== null && nb !== null) {
+      if (na !== nb) return na < nb ? -1 : 1;
+    } else if (pa !== pb) {
+      return pa < pb ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
 /** daemon.upgrade — install latest via npm then restart service via a detached script.
  *
  * Safety rules:
@@ -3541,6 +3597,10 @@ async function handleDiscussionStop(cmd: Record<string, unknown>): Promise<void>
  *     so the daemon always comes back up (possibly on the old version).
  *  3. A short sleep before the restart gives the current daemon time to finish
  *     sending any in-flight messages.
+ *  4. Never DOWNGRADE: refuse to restart into an older version. The TS-side
+ *     check at top blocks pinned-target downgrades; the bash-side check after
+ *     `npm install` catches the `targetVersion === 'latest'` case where npm
+ *     may resolve to an older release than what's currently installed.
  */
 async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLink): Promise<void> {
   const activeRuns = getActiveP2pRunsBlockingDaemonUpgrade();
@@ -3595,6 +3655,45 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
   if (targetVersion && DAEMON_VERSION === targetVersion) {
     logger.info({ daemonVersion: DAEMON_VERSION, targetVersion }, 'daemon.upgrade: already at target version, skipping');
     return;
+  }
+  // Don't downgrade: if a specific targetVersion is named and our running
+  // daemon is already at or newer than it, skip. Without this, a server that
+  // pushes `latest` (or an older pinned version) can repeatedly clobber a
+  // newer dev/local build the operator has installed.
+  if (targetVersion && targetVersion !== 'latest' && compareDaemonVersions(DAEMON_VERSION, targetVersion) >= 0) {
+    logger.info({ daemonVersion: DAEMON_VERSION, targetVersion },
+      'daemon.upgrade: installed version is at or newer than target, refusing to downgrade');
+    return;
+  }
+  // For untargeted / `latest` upgrades, pre-flight against the npm registry —
+  // if our running version is already at or newer than what the registry
+  // resolves `imcodes@latest` to, skip the whole upgrade. This stops servers
+  // that blindly broadcast `latest` from clobbering a newer dev build's
+  // global install (npm install -g would replace the symlink/dir with the
+  // older registry release even if we then refused to restart, so we have to
+  // catch this BEFORE spawning the install).
+  if (!targetVersion || targetVersion === 'latest') {
+    try {
+      const res = await fetch('https://registry.npmjs.org/imcodes/latest', {
+        headers: { accept: 'application/json' },
+        // 5 s — registry should be fast; if it's not we'd rather skip the
+        // probe and fall through than block the daemon for long.
+        signal: AbortSignal.timeout(5000),
+      });
+      if (res.ok) {
+        const json = await res.json() as { version?: string };
+        const registryLatest = typeof json.version === 'string' ? json.version : null;
+        if (registryLatest && compareDaemonVersions(DAEMON_VERSION, registryLatest) >= 0) {
+          logger.info({ daemonVersion: DAEMON_VERSION, registryLatest },
+            'daemon.upgrade: registry "latest" is not newer than current, refusing to downgrade');
+          return;
+        }
+      } else {
+        logger.warn({ status: res.status }, 'daemon.upgrade: registry probe returned non-2xx, proceeding without pre-flight');
+      }
+    } catch (e) {
+      logger.warn({ err: e }, 'daemon.upgrade: registry probe failed, proceeding without pre-flight');
+    }
   }
 
   logger.info('daemon.upgrade: preparing upgrade script');
@@ -3672,29 +3771,79 @@ launchctl load -w "${plist}"`;
     return;
   }
 
-  // Resolve full npm path — bare `npm` may not work in detached shells (nvm not loaded)
-  const npmBin = join(dirname(process.execPath), 'npm');
-  const npmCmd = existsSync(npmBin) ? npmBin : 'npm';
+  // Resolve absolute paths to `node` and `npm-cli.js` and bake them into the
+  // upgrade script.
+  //
+  // Why this matters on Linux/macOS:
+  //   - `npm` itself is `#!/usr/bin/env node`, which fails when the upgrade
+  //     script runs in a non-interactive shell that doesn't have node on PATH
+  //     (very common with nvm/fnm/volta — their PATH setup lives in
+  //     ~/.bashrc which has the standard `case $- in *i*) ;; *) return;;`
+  //     guard, so non-interactive shells exit before nvm.sh is sourced).
+  //   - Calling `node` via absolute path AND invoking npm-cli.js directly
+  //     bypasses the shebang lookup entirely.
+  //   - We also export node's bin dir to PATH so anything *npm* spawns
+  //     (post-install scripts, node-gyp, the freshly-installed `imcodes`
+  //     binary itself for the version check) can also find node.
+  //
+  // Layout coverage (all of these put npm-cli.js at the same relative path):
+  //   - nvm:    ~/.nvm/versions/node/<ver>/{bin/node, lib/node_modules/npm/bin/npm-cli.js}
+  //   - fnm:    ~/.local/share/fnm/node-versions/<ver>/installation/{bin/node, lib/...}
+  //   - volta:  ~/.volta/tools/image/node/<ver>/{bin/node, lib/...}
+  //   - tarball/system: /usr/{bin/node, lib/node_modules/npm/bin/npm-cli.js}
+  //   - homebrew (macOS): /opt/homebrew/Cellar/node/<ver>/{bin/node, lib/...}
+  //   - snap:   /snap/node/current/{bin/node, lib/node_modules/...}
+  // If none of the candidates exist (extremely unusual), fall back to bare
+  // `npm` and rely on PATH — same behavior as before.
+  const nodeBin = process.execPath;
+  const nodeDir = dirname(nodeBin);
+  const npmCliCandidates = [
+    join(nodeDir, '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+    join(nodeDir, 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+  ];
+  const npmCliPath = npmCliCandidates.find((p) => existsSync(p));
+  // npmRunner: shell snippet that invokes npm with all needed args appended.
+  // When we have an absolute npm-cli.js: `"$NODE" "$NPM_CLI"` — no shebang lookup.
+  // Fallback: bare `npm` (PATH-dependent, original behavior).
+  const npmRunner = npmCliPath
+    ? `"${nodeBin}" "${npmCliPath}"`
+    : 'npm';
+  if (!npmCliPath) {
+    logger.warn({ nodeBin, tried: npmCliCandidates },
+      'daemon.upgrade: could not locate npm-cli.js, falling back to bare `npm` on PATH');
+  }
 
   const pkgSpec = targetVersion ? `imcodes@${targetVersion}` : 'imcodes@latest';
   const targetVer = targetVersion ?? 'latest';
+  const currentVer = DAEMON_VERSION;
   const script = `#!/bin/bash
 LOG="${logFile}"
 echo "=== imcodes upgrade started at $(date) ===" >> "$LOG"
+
+# Make node visible to anything spawned by this script (npm post-install
+# scripts, node-gyp, the freshly-installed imcodes binary for version check).
+# Critical on nvm/fnm/volta setups where node is NOT on PATH in non-interactive
+# shells (the standard ~/.bashrc non-interactive guard short-circuits before
+# nvm.sh is sourced).
+export PATH="${nodeDir}:$PATH"
+echo "PATH=$PATH" >> "$LOG"
+echo "node=${nodeBin}" >> "$LOG"
+echo "npm=${npmRunner}" >> "$LOG"
 
 # Give the running daemon a moment to finish sending its response
 sleep 3
 
 # Remove npm link if present — it shadows npm install and prevents real upgrades
-GLOBAL_PKG=$(${npmCmd} root -g 2>/dev/null)/imcodes
+GLOBAL_ROOT=$(${npmRunner} root -g 2>>"$LOG")
+GLOBAL_PKG="$GLOBAL_ROOT/imcodes"
 if [ -L "$GLOBAL_PKG" ]; then
   echo "Removing npm link ($GLOBAL_PKG -> $(readlink "$GLOBAL_PKG"))..." >> "$LOG"
-  ${npmCmd} uninstall -g imcodes >> "$LOG" 2>&1 || true
+  ${npmRunner} uninstall -g imcodes >> "$LOG" 2>&1 || true
 fi
 
 # Attempt npm install — only restart if install succeeds
 echo "Installing ${pkgSpec}..." >> "$LOG"
-if ! "${npmCmd}" install -g ${pkgSpec} >> "$LOG" 2>&1; then
+if ! ${npmRunner} install -g ${pkgSpec} >> "$LOG" 2>&1; then
   echo "Install FAILED (exit $?). Keeping current daemon running." >> "$LOG"
   echo "=== upgrade aborted at $(date) ===" >> "$LOG"
   sleep 60 && rm -rf "${scriptDir}" &
@@ -3702,12 +3851,57 @@ if ! "${npmCmd}" install -g ${pkgSpec} >> "$LOG" 2>&1; then
 fi
 echo "Install succeeded." >> "$LOG"
 
-# Verify installed version matches target (skip for "latest")
-INSTALLED_VER=$(imcodes --version 2>/dev/null || echo "unknown")
+# Verify installed version matches target (skip for "latest").
+# Read package.json directly via node — avoids relying on the freshly-installed
+# imcodes shebang resolving correctly (which can fail under the same
+# missing-node-on-PATH conditions that broke the install in the first place).
+GLOBAL_ROOT=$(${npmRunner} root -g 2>/dev/null)
+INSTALLED_VER=$("${nodeBin}" -e "try{process.stdout.write(require('$GLOBAL_ROOT/imcodes/package.json').version)}catch(e){process.exit(1)}" 2>/dev/null || echo "unknown")
 echo "Installed version: $INSTALLED_VER, target: ${targetVer}" >> "$LOG"
 if [ "${targetVer}" != "latest" ] && [ "$INSTALLED_VER" != "${targetVer}" ]; then
   echo "Version mismatch after install — keeping current daemon running." >> "$LOG"
   echo "=== upgrade aborted at $(date) ===" >> "$LOG"
+  sleep 60 && rm -rf "${scriptDir}" &
+  exit 0
+fi
+
+# Downgrade guard — if the freshly-installed version is OLDER than the daemon
+# we're currently running, do not restart. This catches the case where the
+# server pushes targetVersion=latest but npm's "latest" tag resolves to a
+# release that's older than a dev/pre-release the operator has installed.
+# Without this guard, a routine reconnect would silently downgrade the
+# daemon every time, blowing away local builds.
+CURRENT_VER="${currentVer}"
+"${nodeBin}" -e "
+  const a = process.argv[1], b = process.argv[2];
+  const parse = v => { const i = v.indexOf('-'); return { rel: (i<0?v:v.slice(0,i)).split('.').map(n => parseInt(n,10)||0), pre: i<0 ? null : v.slice(i+1).split('.') }; };
+  const A = parse(a), B = parse(b);
+  const len = Math.max(A.rel.length, B.rel.length);
+  for (let i = 0; i < len; i++) { const da = A.rel[i]||0, db = B.rel[i]||0; if (da !== db) process.exit(da < db ? 1 : 2); }
+  if (A.pre === null && B.pre === null) process.exit(0);
+  if (A.pre === null) process.exit(2);
+  if (B.pre === null) process.exit(1);
+  const plen = Math.max(A.pre.length, B.pre.length);
+  for (let i = 0; i < plen; i++) {
+    const pa = A.pre[i]||'', pb = B.pre[i]||'';
+    const na = /^\\d+\$/.test(pa) ? parseInt(pa,10) : null;
+    const nb = /^\\d+\$/.test(pb) ? parseInt(pb,10) : null;
+    if (na !== null && nb !== null) { if (na !== nb) process.exit(na < nb ? 1 : 2); }
+    else if (pa !== pb) process.exit(pa < pb ? 1 : 2);
+  }
+  process.exit(0);
+" "$INSTALLED_VER" "$CURRENT_VER"
+CMP=$?
+# Exit codes: 0=equal, 1=installed<current (downgrade), 2=installed>current (upgrade)
+if [ "$CMP" = "1" ]; then
+  echo "Installed version $INSTALLED_VER is OLDER than current $CURRENT_VER — refusing to downgrade." >> "$LOG"
+  echo "=== upgrade aborted at $(date) ===" >> "$LOG"
+  sleep 60 && rm -rf "${scriptDir}" &
+  exit 0
+fi
+if [ "$CMP" = "0" ]; then
+  echo "Installed version $INSTALLED_VER matches current — no restart needed." >> "$LOG"
+  echo "=== upgrade complete at $(date) (no-op) ===" >> "$LOG"
   sleep 60 && rm -rf "${scriptDir}" &
   exit 0
 fi
