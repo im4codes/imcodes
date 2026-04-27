@@ -19,12 +19,30 @@ function resolveEmbeddingCacheDir(): string {
 // Lazy-loaded pipeline singleton
 let pipelineInstance: any = null;
 let loadingPromise: Promise<any> | null = null;
-/** Sticky flag set when the optional `@huggingface/transformers` module is
- *  not installed (it lives in `optionalDependencies` and may legitimately
- *  be absent — e.g. when a user's npm install skipped its onnxruntime-node
- *  postinstall under restrictive networks). Without this, every embedding
- *  call would retry the dynamic import and re-emit the same warning. */
+/** Sticky flag set when semantic search is permanently unavailable for this
+ *  process. Two failure modes set it:
+ *
+ *    1. `ERR_MODULE_NOT_FOUND` — `@huggingface/transformers` (an optional
+ *       dep) wasn't installed, e.g. the user's npm install skipped its
+ *       onnxruntime-node postinstall under restrictive networks.
+ *
+ *    2. `ERR_DLOPEN_FAILED` — `onnxruntime-node`'s native binary cannot be
+ *       loaded. On Windows this typically means either:
+ *         - The CPU is missing AVX-512 / AVX-VNNI required by the prebuilt
+ *           onnxruntime.dll. We pin to onnxruntime-node@1.20.1 in the
+ *           package.json overrides specifically because 1.21+ Windows
+ *           prebuilds were compiled with /arch:AVX512, breaking every
+ *           Broadwell-EP and earlier x86 CPU. If even 1.20.1 fails, the CPU
+ *           is older than Haswell (no AVX2) — semantic search is genuinely
+ *           unsupported.
+ *         - DirectML.dll has been removed and System32's copy is
+ *           ABI-incompatible with the bundled onnxruntime.dll.
+ *
+ *  Both modes are deterministic: re-trying the import on every call burns
+ *  CPU and re-emits the same warning forever. Stickying the flag means we
+ *  log once and then quietly return null on subsequent calls. */
 let unavailable = false;
+let unavailableReason: string | null = null;
 
 // ── Float32 ⇄ Buffer helpers ────────────────────────────────────────────────
 // Used by the persistent embedding store in context-store.ts to stash the
@@ -50,9 +68,17 @@ export function decodeEmbedding(buf: Buffer | Uint8Array | null | undefined): Fl
   return out;
 }
 
+/** Sticky failure codes — these are deterministic per-machine, so retrying
+ *  burns CPU without ever recovering. See the unavailableReason doc above. */
+const STICKY_FAILURE_CODES: ReadonlySet<string> = new Set([
+  'ERR_MODULE_NOT_FOUND',
+  'MODULE_NOT_FOUND',
+  'ERR_DLOPEN_FAILED',
+]);
+
 async function getPipeline(): Promise<any> {
   if (pipelineInstance) return pipelineInstance;
-  if (unavailable) throw new Error('embedding model unavailable');
+  if (unavailable) throw new Error(`embedding model unavailable (${unavailableReason ?? 'unknown'})`);
   if (loadingPromise) return loadingPromise;
 
   loadingPromise = (async () => {
@@ -69,22 +95,58 @@ async function getPipeline(): Promise<any> {
       return p;
     } catch (err) {
       loadingPromise = null;
-      // ERR_MODULE_NOT_FOUND → the optional dep is absent. Don't keep
-      // retrying / re-warning on every call; just disable semantic search
-      // for this process lifetime. Other failures (network, OOM) keep the
-      // retry path so a transient blip doesn't permanently disable us.
       const code = (err as { code?: string } | null)?.code;
-      if (code === 'ERR_MODULE_NOT_FOUND' || code === 'MODULE_NOT_FOUND') {
+      // Deterministic failures get the sticky treatment so we don't re-try
+      // (and re-warn) on every embedding call for the rest of the process.
+      // Transient failures (network, OOM during model download) keep the
+      // retry path so a blip doesn't permanently kill semantic search.
+      if (code && STICKY_FAILURE_CODES.has(code)) {
         unavailable = true;
-        logger.warn('@huggingface/transformers not installed — semantic search disabled (install it to enable)');
+        unavailableReason = code;
+        if (code === 'ERR_DLOPEN_FAILED') {
+          // Almost always: onnxruntime.dll's prebuilt binary uses AVX-512 /
+          // AVX-VNNI instructions this CPU doesn't have (true on every x86
+          // CPU older than Skylake-X server / Ice Lake desktop), or the
+          // bundled DirectML.dll was stripped and System32's copy is ABI-
+          // incompatible. Print actionable detail; users with old hardware
+          // need to know "your CPU is too old for the bundled binary"
+          // rather than seeing a cryptic stack trace.
+          logger.warn(
+            { code, message: (err as { message?: string }).message },
+            'onnxruntime native binding failed to load (DLL init error). '
+              + 'Likely cause: CPU lacks AVX2 / AVX-512, or bundled DirectML.dll is missing. '
+              + 'Semantic memory recall disabled for this process.',
+          );
+        } else {
+          logger.warn(
+            { code },
+            '@huggingface/transformers not installed — semantic search disabled (install the optional dep to enable)',
+          );
+        }
       } else {
-        logger.warn({ err }, 'Failed to load embedding model — semantic search disabled');
+        logger.warn({ err }, 'Failed to load embedding model — will retry on next call');
       }
       throw err;
     }
   })();
 
   return loadingPromise;
+}
+
+/** Test-only: reset the sticky-disable state so each test starts fresh. */
+export function _resetEmbeddingStateForTests(): void {
+  pipelineInstance = null;
+  loadingPromise = null;
+  unavailable = false;
+  unavailableReason = null;
+}
+
+/** Returns the sticky-failure reason (e.g. 'ERR_DLOPEN_FAILED') if embedding
+ *  has been permanently disabled this process, else null. Useful for
+ *  surfacing actionable diagnostics in memory-recall code paths so the UI
+ *  can degrade gracefully instead of silently returning empty results. */
+export function getEmbeddingUnavailableReason(): string | null {
+  return unavailable ? unavailableReason : null;
 }
 
 /**

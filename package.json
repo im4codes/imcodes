@@ -75,6 +75,9 @@
   "optionalDependencies": {
     "node-pty": "^1.1.0"
   },
+  "overrides": {
+    "onnxruntime-node": "1.20.1"
+  },
   "bundleDependencies": [
     "@huggingface/transformers"
   ]
