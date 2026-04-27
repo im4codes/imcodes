@@ -9,6 +9,7 @@ import { formatProviderQuotaLabel } from '../../shared/provider-quota.js';
 
 const CACHE_TTL_MS = 30_000;
 const APP_SERVER_TIMEOUT_MS = 5_000;
+const MODELS_CACHE_FILE_TTL_MS = 30_000;
 
 export interface CodexModelInfo {
   id: string;
@@ -303,6 +304,101 @@ async function readCodexModelsViaAppServer(): Promise<CodexModelInfo[] | undefin
 }
 
 let cache: { expiresAt: number; value: CodexRuntimeConfig } | null = null;
+
+// ──────────────────────────────────────────────────────────────────────────
+// Per-model `base_instructions` lookup
+//
+// codex CLI persists the upstream model catalog (including the full
+// per-model `base_instructions` system prompt) to `~/.codex/models_cache.json`
+// after the first successful auth. Each prompt is 12–22 KB of carefully
+// tuned content that codex normally injects on its end when talking to
+// the OpenAI Responses API.
+//
+// Starting with codex CLI 0.125 + the OpenAI Responses API protocol change
+// of April 2026, the daemon-side JSON-RPC `thread/start` path (and the
+// `session_startup_prewarm` it triggers) no longer auto-fills `instructions`
+// from the embedded catalog. Sending a thread/start without an explicit
+// `baseInstructions` field results in:
+//
+//   {"type":"error","status":400,"error":{"type":"invalid_request_error",
+//     "message":"Instructions are required"}}
+//
+// Reading the prompt from this cache lets us forward the exact per-model
+// prompt codex itself would have used, with no quality regression for
+// catalog models. For unknown / third-party providers (e.g. minimax via
+// `wire_api = "responses"`) the cache won't have a matching slug — the
+// caller falls back to its provider-neutral default.
+// ──────────────────────────────────────────────────────────────────────────
+
+interface ModelsCacheData {
+  /** slug → base_instructions */
+  map: Map<string, string>;
+  /** Slugs in the order codex CLI listed them (newest first by convention). */
+  order: string[];
+}
+
+let modelsFileCache: { expiresAt: number; data: ModelsCacheData } | null = null;
+
+async function loadCodexModelsCache(): Promise<ModelsCacheData> {
+  const now = Date.now();
+  if (modelsFileCache && modelsFileCache.expiresAt > now) {
+    return modelsFileCache.data;
+  }
+  const map = new Map<string, string>();
+  const order: string[] = [];
+  try {
+    const raw = await readFile(join(homedir(), '.codex', 'models_cache.json'), 'utf8');
+    const parsed = JSON.parse(raw) as {
+      models?: Array<{ slug?: unknown; base_instructions?: unknown }>;
+    };
+    for (const entry of parsed.models ?? []) {
+      const slug = typeof entry.slug === 'string' ? entry.slug.trim().toLowerCase() : '';
+      const instructions = typeof entry.base_instructions === 'string' ? entry.base_instructions : '';
+      if (slug && instructions.length > 0 && !map.has(slug)) {
+        map.set(slug, instructions);
+        order.push(slug);
+      }
+    }
+  } catch {
+    // Missing file / parse error → empty map; caller falls back.
+  }
+  const data: ModelsCacheData = { map, order };
+  modelsFileCache = { expiresAt: now + MODELS_CACHE_FILE_TTL_MS, data };
+  return data;
+}
+
+/**
+ * Returns the `base_instructions` codex CLI itself would inject for `model`,
+ * sourced from `~/.codex/models_cache.json`.
+ *
+ * Resolution order, designed to stay safe across model bumps:
+ *
+ *   1. Exact slug match (case-insensitive). Best case — full per-model prompt.
+ *   2. If the model isn't in the cache (e.g. user picked a brand-new
+ *      `gpt-5.6` that codex CLI hasn't yet refreshed catalog for, or local
+ *      cache is stale), fall through to **the newest known prompt** in the
+ *      cache (`models[0]` — codex orders newest first). Better to use last
+ *      version's prompt than a 200-char generic fallback that loses 21 KB
+ *      of carefully tuned content.
+ *   3. Returns `undefined` only when the cache file itself is missing or
+ *      contains no usable entries — at which point the caller will use a
+ *      provider-neutral default.
+ */
+export async function getCodexBaseInstructions(model: string | undefined): Promise<string | undefined> {
+  const { map, order } = await loadCodexModelsCache();
+  if (model) {
+    const exact = map.get(model.trim().toLowerCase());
+    if (exact) return exact;
+  }
+  // Unknown model OR no model selected → use the most recently published
+  // prompt we have on disk. codex's models_cache.json lists the active /
+  // primary model first, so order[0] is the safest known prompt.
+  if (order.length > 0) {
+    const newest = map.get(order[0]!);
+    if (newest) return newest;
+  }
+  return undefined;
+}
 
 async function readCodexRateLimitsViaSingleton(): Promise<RateLimitSnapshot | undefined> {
   try {
