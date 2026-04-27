@@ -918,19 +918,20 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     expect(fetchSpy).toHaveBeenCalledTimes(2);
   });
 
-  it('activation backfill flips refreshing=true so the user sees a spinner', async () => {
-    // Pins the contract that activation events (push-tap, app-resume, focus,
-    // visibilitychange) flip the visible refreshing flag while the HTTP
-    // backfill is in-flight. Without this, the user resumes the app, sees
-    // no spinner, no new messages arrive (because of WS subscribe race or
-    // a transport-channel bug), and has no way to tell whether anything is
-    // happening — they perceive the app as frozen and pull-to-refresh
-    // manually. The visibility cue is also the easiest user-side smoke
-    // test for the whole activation chain.
-    const sessionName = `deck_activation_visible_${Date.now()}`;
-    const serverId = `srv-vis-${Date.now()}`;
+  it('activation backfill is SILENT (does not flip refreshing) to keep the chat scroll smooth', async () => {
+    // Pins the perf-regression we hit when activation backfill was made
+    // visible: every focus/visibility/appStateChange tick that fired a
+    // fetch ran setHttpRefreshing(true→false) — two state flips, two
+    // re-renders of a chat list with hundreds of events, perceptible
+    // scroll stutter. The activation path is now silent; visible
+    // feedback lives on real-recovery paths (mount bootstrap, WS
+    // reconnect, ack_timeout) that fire on confirmed events, not on
+    // every focus tick.
+    const sessionName = `deck_activation_silent_${Date.now()}`;
+    const serverId = `srv-silent-${Date.now()}`;
 
-    // Hold the fetch open so we can observe refreshing=true mid-flight.
+    // Hold the fetch open so we can observe refreshing during the
+    // window where the visible path WOULD have flipped it.
     const gate = deferred<{ events: TimelineEvent[]; epoch: number; hasMore: boolean; nextCursor: null }>();
     fetchSpy.mockReturnValue(gate.promise);
 
@@ -953,36 +954,47 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
       sendTimelineHistoryRequest: vi.fn(() => 'history'),
     } as unknown as WsClient;
 
-    let observedRefreshing: boolean | null = null;
+    const refreshingObservations: boolean[] = [];
     function Probe() {
       const { refreshing } = useTimeline(sessionName, ws, serverId, { isActiveSession: true });
-      observedRefreshing = refreshing;
+      refreshingObservations.push(refreshing);
       return h('div', { 'data-testid': 'probe' }, refreshing ? 'refreshing' : 'idle');
     }
 
     vi.useFakeTimers({ shouldAdvanceTime: true });
     render(h(Probe));
-    // Drain the mount-time backfill so the next fetch is unambiguously the
-    // activation one.
-    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
-    fetchSpy.mockClear();
-    fetchSpy.mockReturnValue(gate.promise);
 
-    // Fire activation event (e.g. app-resume).
-    await act(async () => {
-      window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT));
-      await vi.advanceTimersByTimeAsync(20);
-    });
-
-    // Backfill is in-flight → refreshing=true (so the UI spinner shows).
-    expect(observedRefreshing).toBe(true);
-    expect(screen.getByTestId('probe').textContent).toBe('refreshing');
-
-    // Resolve the fetch → refreshing flips back to false.
+    // Drain mount-time backfill (which IS visible, by design) and resolve
+    // it so the cooldown is armed and the activation event below is the
+    // only fetch we're observing.
     await act(async () => {
       gate.resolve({ events: [], epoch: 1, hasMore: false, nextCursor: null });
-      await vi.advanceTimersByTimeAsync(20);
+      await vi.advanceTimersByTimeAsync(250);
     });
-    expect(observedRefreshing).toBe(false);
+    fetchSpy.mockClear();
+    refreshingObservations.length = 0;
+
+    // Reset cooldowns so the activation event isn't gated by the mount-time
+    // success — we want to verify the visible flag, not the cooldown.
+    __resetBackfillCooldownsForTests();
+    const newGate = deferred<{ events: TimelineEvent[]; epoch: number; hasMore: boolean; nextCursor: null }>();
+    fetchSpy.mockReturnValue(newGate.promise);
+
+    // Activation event fires. Backfill should run (cooldowns cleared) but
+    // SILENT — no setHttpRefreshing(true).
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT));
+      await vi.advanceTimersByTimeAsync(50);
+    });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    // Critical assertion: no observation of refreshing=true during the
+    // window where the visible path would have flipped it.
+    expect(refreshingObservations.every((r) => r === false)).toBe(true);
+    expect(screen.getByTestId('probe').textContent).toBe('idle');
+
+    // Cleanup — resolve the dangling promise.
+    newGate.resolve({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+    await act(async () => { await vi.advanceTimersByTimeAsync(20); });
   });
 });

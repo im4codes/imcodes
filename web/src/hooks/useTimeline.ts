@@ -1503,20 +1503,22 @@ export function useTimeline(
       }
       lastActiveRefreshAtRef.current = now;
       backfillDebug('activation event: firing backfill', { sessionId });
-      // `visible: true` so the user gets a refresh-spinner cue when the
-      // chat refetches after app-resume / push-tap. Previously the
-      // activation backfill ran silently (visible defaulted to false) —
-      // when a user resumed the app, opened a session, and saw no
-      // animation + no new messages, they had no way to tell whether
-      // the refresh had even attempted to fire. The visible flag is
-      // also the easiest user-side smoke test for this whole chain:
-      // see the spinner = activation reached the active hook.
+      // SILENT (visible: false) — activation events fire on every focus /
+      // visibility / pageshow / appStateChange tick. Even with the 15s
+      // cooldown coalescing the burst, when a fetch DOES go through, the
+      // visible:true variant flips `setHttpRefreshing(true→false)` and
+      // every subscribed component re-renders. On a chat with hundreds
+      // of timeline events the back-to-back state flips visibly stutter
+      // the scroll. Recovery paths that genuinely need user-visible
+      // feedback (mount bootstrap, WS reconnect, ack_timeout) keep
+      // visible:true; activation is the high-frequency path that must
+      // stay imperceptible.
       //
       // `cooldownMs: 15s` so a session that's been refreshed in the last
       // 15s does NOT refire on every focus/visibility/appStateChange tick.
       // App-resume's resetCooldowns:true path explicitly clears the map
       // so a real foreground from background still bypasses this.
-      fireHttpBackfillRef.current(0, { phase: 'refresh', visible: true, cooldownMs: ACTIVE_REFRESH_COOLDOWN_MS });
+      fireHttpBackfillRef.current(0, { phase: 'refresh', cooldownMs: ACTIVE_REFRESH_COOLDOWN_MS });
     };
     window.addEventListener(ACTIVE_TIMELINE_REFRESH_EVENT, handler);
     return () => window.removeEventListener(ACTIVE_TIMELINE_REFRESH_EVENT, handler);
@@ -1535,14 +1537,13 @@ export function useTimeline(
     prevIsActiveRef.current = isActiveSession;
     if (!prev && isActiveSession) {
       backfillDebug('isActiveSession false→true: firing backfill', { sessionId });
-      // 15 s cooldown so flipping back-to-back between two sessions doesn't
-      // re-fire when the destination session was just refreshed. Mount
-      // bootstrap already used `MOUNT_BACKFILL_COOLDOWN_MS` (60 s) for the
-      // first-render path; this is a shorter window for "switched away,
-      // came back" — long enough to coalesce activation-event + transition
-      // tick that often arrive in the same render commit, short enough that
-      // the user can manually pull-to-refresh by leaving and coming back.
-      fireHttpBackfillRef.current(0, { phase: 'refresh', visible: true, cooldownMs: ACTIVE_REFRESH_COOLDOWN_MS });
+      // SILENT (visible: false). Same reasoning as the activation-event
+      // handler above — the false→true transition fires whenever the user
+      // taps a session card; coupling that with a refreshing-state flip
+      // re-renders the chat list and stutters the scroll. The 15s
+      // cooldown handles dedup against the activation-event tick that
+      // usually arrives in the same commit.
+      fireHttpBackfillRef.current(0, { phase: 'refresh', cooldownMs: ACTIVE_REFRESH_COOLDOWN_MS });
     }
   }, [isActiveSession, disableHistory, sessionId]);
 
