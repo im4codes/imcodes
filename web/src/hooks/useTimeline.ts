@@ -1346,6 +1346,14 @@ export function useTimeline(
    *   - Backfill returns null / rejects → WS path remains primary; the next
    *     trigger simply tries again.
    */
+  // Stable ref for `isActiveSession`. Declared up here (instead of below
+  // `fireHttpBackfill`) because the fire-gate reads it — keeping the ref
+  // declaration earlier in the source order avoids a TDZ trap if anything
+  // ever calls fireHttpBackfill synchronously during render (it doesn't
+  // today, but the dependency direction should be safe by construction).
+  const isActiveSessionRef = useRef(isActiveSession);
+  isActiveSessionRef.current = isActiveSession;
+
   // Retry schedule for transient HTTP backfill failures (daemon briefly
   // offline at activation, pod miss during deploy, network blip on resume).
   // Two retries cover the common ~3s WS-reconnect window after app foreground.
@@ -1354,8 +1362,16 @@ export function useTimeline(
   const HTTP_BACKFILL_RETRY_DELAYS_MS = [800, 2000] as const;
 
   const fireHttpBackfill = useCallback((delayMs: number, opts?: { cooldownMs?: number; phase?: 'bootstrap' | 'refresh'; visible?: boolean; _retryAttempt?: number }) => {
-    if (disableHistory || !isActiveSession || !serverId || !sessionId) {
-      backfillDebug('fireHttpBackfill: gated', { disableHistory, isActiveSession, hasServerId: !!serverId, hasSessionId: !!sessionId, sessionId });
+    // Read `isActiveSession` via ref so this gate always reflects the latest
+    // render's value, never a stale closure. The closure value only desynchs
+    // briefly during same-tick `setState` → render → effect sequences (e.g.
+    // push-tap that activates a session AND fires the activation event in
+    // the same microtask), but in practice that gap was wide enough to drop
+    // backfills on real iOS/Android resumes — even after f72193f6 removed
+    // `isActiveSession` from the listener's deps. Reading the ref closes
+    // the remaining hole.
+    if (disableHistory || !isActiveSessionRef.current || !serverId || !sessionId) {
+      backfillDebug('fireHttpBackfill: gated', { disableHistory, isActiveSession: isActiveSessionRef.current, hasServerId: !!serverId, hasSessionId: !!sessionId, sessionId });
       return;
     }
     const cooldownMs = opts?.cooldownMs ?? 0;
@@ -1438,16 +1454,16 @@ export function useTimeline(
   fireHttpBackfillRef.current = fireHttpBackfill;
   const lastActiveRefreshAtRef = useRef(0);
 
-  // Stable ref for `isActiveSession` so the activation-event listener can
-  // read the LATEST value without re-attaching itself. Re-attaching the
-  // listener on every isActiveSession flip opened a race where an event
-  // dispatched in the same microtask as the flip (e.g. a foreground resume
-  // that also switches the active session via push-notification) landed
-  // between the cleanup and re-add, was silently dropped, and the user
-  // stared at stale chat content. The previous `[disableHistory, isActiveSession]`
-  // deps regression — see commits 1c178a4a/35d87485 — is what this fixes.
-  const isActiveSessionRef = useRef(isActiveSession);
-  isActiveSessionRef.current = isActiveSession;
+  // (`isActiveSessionRef` declared above so the fire-gate can read it.)
+  //
+  // The listener reads `isActiveSessionRef.current` at event time so it
+  // stays correct across session-switches without re-attaching. Re-attaching
+  // on every isActiveSession flip opened a race where an event dispatched
+  // in the same microtask as the flip (e.g. a foreground resume that also
+  // switches the active session via push-notification) landed between the
+  // cleanup and re-add, was silently dropped, and the user stared at stale
+  // chat content. See commits 1c178a4a/35d87485 for the regression that
+  // f72193f6 fixed by pinning the listener deps to `[disableHistory, sessionId]`.
 
   // Force-refresh the active session when the app comes back to the
   // foreground or a push-notification is tapped. The listener stays
@@ -1468,7 +1484,15 @@ export function useTimeline(
       }
       lastActiveRefreshAtRef.current = now;
       backfillDebug('activation event: firing backfill', { sessionId });
-      fireHttpBackfillRef.current(0, { phase: 'refresh' });
+      // `visible: true` so the user gets a refresh-spinner cue when the
+      // chat refetches after app-resume / push-tap. Previously the
+      // activation backfill ran silently (visible defaulted to false) —
+      // when a user resumed the app, opened a session, and saw no
+      // animation + no new messages, they had no way to tell whether
+      // the refresh had even attempted to fire. The visible flag is
+      // also the easiest user-side smoke test for this whole chain:
+      // see the spinner = activation reached the active hook.
+      fireHttpBackfillRef.current(0, { phase: 'refresh', visible: true });
     };
     window.addEventListener(ACTIVE_TIMELINE_REFRESH_EVENT, handler);
     return () => window.removeEventListener(ACTIVE_TIMELINE_REFRESH_EVENT, handler);
@@ -1487,7 +1511,7 @@ export function useTimeline(
     prevIsActiveRef.current = isActiveSession;
     if (!prev && isActiveSession) {
       backfillDebug('isActiveSession false→true: firing backfill', { sessionId });
-      fireHttpBackfillRef.current(0, { phase: 'refresh' });
+      fireHttpBackfillRef.current(0, { phase: 'refresh', visible: true });
     }
   }, [isActiveSession, disableHistory, sessionId]);
 
