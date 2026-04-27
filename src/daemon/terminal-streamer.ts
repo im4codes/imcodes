@@ -91,6 +91,15 @@ interface PipeState {
   stream: Readable;
   cleanup: () => Promise<void>;
   retryCount: number;
+  /** tmux paneId the pipe-pane was attached to. Used by `subscribe()` to
+   *  detect "session was killed and re-created with the same name behind
+   *  our back" — a real-production scenario when session-manager rebuilds
+   *  a session under the same name with a fresh pane, AND a test-isolation
+   *  scenario when a test's afterEach kills the tmux session and the next
+   *  beforeEach recreates it before the previous pipe's cat subprocess saw
+   *  EOF. In both cases the recorded paneId is stale; reusing the pipe
+   *  reads from a dead pipe-pane and bytes silently never arrive. */
+  paneId?: string;
 }
 
 // ── TerminalStreamer ───────────────────────────────────────────────────────────
@@ -167,7 +176,25 @@ export class TerminalStreamer {
       this.subscribers.set(sessionName, new Map());
     }
     const subs = this.subscribers.get(sessionName)!;
-    const hasPipe = this.pipes.has(sessionName);
+    // Probe pipe health — `handlePipeClose` runs ASYNCHRONOUSLY when the cat
+    // subprocess sees EOF (tmux pane killed, pipe-pane dropped). If a
+    // subscribe arrives in the race window AFTER the pane died but BEFORE
+    // handlePipeClose fired (or for an idempotent restart-after-rename
+    // scenario where the pane was replaced under the same session name),
+    // `pipes.has(sessionName)` is still true but the underlying stream is
+    // destroyed. Treating that as a live pipe results in bootstrap reading
+    // from a dead cat → "no bytes ever arrive" symptom. Force a fresh
+    // start in that case.
+    const existingPipe = this.pipes.get(sessionName);
+    const pipeStale = existingPipe !== undefined
+      && (existingPipe.stream.destroyed || existingPipe.stream.readableEnded);
+    if (pipeStale) {
+      this.pipes.delete(sessionName);
+      try { existingPipe.stream.destroy(); } catch { /* ignore */ }
+      void existingPipe.cleanup().catch(() => { /* best-effort */ });
+      logger.debug({ sessionName }, 'subscribe: stale pipe detected, forcing fresh start');
+    }
+    const hasPipe = !pipeStale && this.pipes.has(sessionName);
 
     const subState: SubscriberState = {
       // If pipe already running, buffer raw bytes until snapshot delivered
@@ -189,6 +216,47 @@ export class TerminalStreamer {
     subState: SubscriberState,
     hasPipe: boolean,
   ): Promise<void> {
+    // Stale-pipe check (production + test): if we believed `hasPipe` was
+    // true based on the synchronous map check in subscribe(), verify the
+    // recorded paneId still matches tmux's current paneId for this
+    // session. Mismatch means the pane was destroyed and re-created
+    // under the same session name (real prod cases: session-manager
+    // restart, container respawn; test case: afterEach kills tmux,
+    // beforeEach recreates with same name). The old pipe-pane attaches
+    // to the dead pane and silently delivers no bytes — bootstrap would
+    // sit forever with snapshotPending=true. Force a fresh restart so
+    // the new subscriber gets a working pipe.
+    if (hasPipe && BACKEND !== 'conpty' && BACKEND !== 'wezterm') {
+      const existingPipe = this.pipes.get(sessionName);
+      const recordedPaneId = existingPipe?.paneId;
+      // Use sync getSession first (fast, no tmux call) and fall back to
+      // async tmux probe only when session-store doesn't know.
+      let currentPaneId = getSession(sessionName)?.paneId;
+      if (!currentPaneId) {
+        const fetched = getPaneId(sessionName);
+        currentPaneId = fetched != null ? await fetched.catch(() => undefined) : undefined;
+      }
+      if (recordedPaneId && currentPaneId && recordedPaneId !== currentPaneId) {
+        logger.info({ sessionName, recordedPaneId, currentPaneId }, 'subscribe: pane changed under us, restarting pipe');
+        if (existingPipe) {
+          this.pipes.delete(sessionName);
+          try { existingPipe.stream.destroy(); } catch { /* ignore */ }
+          void existingPipe.cleanup().catch(() => { /* best-effort */ });
+          try { await stopPipePaneStream(sessionName); } catch { /* best-effort */ }
+        }
+        // Drop snapshotPending — we'll get a fresh snapshot through the
+        // startPipe path below with the new pipe.
+        subState.snapshotPending = false;
+        // Drain any buffered raw bytes from the stale pipe — they're
+        // garbage from the dead pane, would corrupt the new screen state.
+        subState.rawBuffer = [];
+        subState.rawBufferBytes = 0;
+        // Treat as fresh subscriber — bootstrap will fall through to the
+        // `if (!hasPipe)` branch at the end of this function.
+        hasPipe = false;
+      }
+    }
+
     // 1. Take snapshot
     try {
       const size = await this.getSize(sessionName);
@@ -459,7 +527,7 @@ export class TerminalStreamer {
     try {
       const { stream, cleanup } = await startPipePaneStream(sessionName, paneId ?? '');
 
-      const pipeState: PipeState = { stream, cleanup, retryCount };
+      const pipeState: PipeState = { stream, cleanup, retryCount, paneId };
       this.pipes.set(sessionName, pipeState);
 
       stream.on('data', (chunk: unknown) => {
