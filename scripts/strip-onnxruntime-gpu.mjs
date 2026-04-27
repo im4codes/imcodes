@@ -206,30 +206,48 @@ if (existsSync(ortWebDist)) {
   }
 }
 
-// 6. Strip `@img/sharp-*` platform-specific binary packages from the bundle.
-//    `sharp` declares ALL its native variants as `optionalDependencies` — npm
-//    only installs the ones whose os/cpu/libc match the current platform.
-//    But because we bundle `@huggingface/transformers` (which transitively
-//    pulls sharp), CI's Linux x64 install resolves only Linux x64 variants
-//    and bakes them into our tarball. Then macOS/Windows users `npm i -g
-//    imcodes` and npm chokes with `EBADPLATFORM` on `@img/sharp-linux-x64`.
+// 6. Strip `sharp` wrapper + `@img/*` from the bundle so npm re-resolves
+//    the entire sharp dependency tree on the user's actual platform at
+//    install time. The previous fix (strip only `@img/sharp-*` binaries
+//    but keep `sharp` wrapper) didn't go far enough:
 //
-//    Fix: remove every `@img/sharp-*` AND `@img/sharp-libvips-*` directory
-//    from the bundle. npm will see them in sharp's optional deps at install
-//    time and fetch the correct platform variant from the registry on the
-//    user's actual machine. Keep `@img/colour` — it's platform-independent.
+//      a) macOS user runs `npm i -g imcodes`
+//      b) npm extracts the bundle → `node_modules/sharp/` is present
+//         (via @huggingface/transformers's bundleDependencies chain)
+//      c) npm sees sharp's `optionalDependencies` listing all platform
+//         variants (@img/sharp-darwin-arm64, …, @img/sharp-linux-x64)
+//      d) **Because sharp itself is already bundled**, npm treats the
+//         dep as resolved and DOES NOT walk its optionalDependencies
+//         to fetch the correct platform binary. The user is left with
+//         only @img/colour (kept as it's a non-platform regular dep).
+//      e) `require('sharp')` at runtime: "Could not load the sharp
+//         module using the darwin-arm64 runtime" → triggers the
+//         sticky-disable in src/util/embeddings.ts → semantic memory
+//         recall is permanently disabled for the daemon process.
+//      f) User: "怎么完全搜不到相关记忆了"
 //
-//    This is the same class of bug as the fsevents one we just fixed (where
-//    a transitive optional dep got hard-bundled and broke wrong-platform
-//    installs); doing the strip in the same prepack step keeps the tarball
-//    portable across darwin/linux/windows × arm64/x64.
+//    The minimal fix is to strip BOTH the platform-specific binaries
+//    AND the sharp wrapper itself from the bundle. npm at install time
+//    sees sharp listed in transformers's regular `dependencies`, fetches
+//    sharp from the registry on the user's actual platform, and that
+//    install correctly walks sharp's optionalDependencies to grab the
+//    matching @img/sharp-<platform>-<arch> binary.
+//
+//    Same family of bug as the fsevents one (a04ef030); both come from
+//    "transitive optional native dep got hard-bundled by CI's platform
+//    and rejected on the user's platform". Stripping the parent wrapper
+//    is the load-bearing fix — without it, optionalDependencies
+//    re-resolution doesn't kick in.
 const imgRoot = join(repoRoot, 'node_modules', '@img');
 if (existsSync(imgRoot)) {
   let imgRemovedCount = 0;
   let imgRemovedBytes = 0;
   for (const name of readdirSync(imgRoot)) {
-    // Strip every binary variant — keep `@img/colour` (pure JS, portable).
-    if (!name.startsWith('sharp-') && !name.startsWith('sharp-libvips-')) continue;
+    // Strip every @img package — colour is a regular dep of sharp, so
+    // letting npm re-resolve sharp will also re-fetch colour for us.
+    // Keeping colour while removing sharp/@img-binary leaves an
+    // inconsistent tree where npm sees colour bundled but sharp re-
+    // resolved → npm may complain about the version skew.
     const abs = join(imgRoot, name);
     const bytes = dirSize(abs);
     rmSync(abs, { recursive: true, force: true });
@@ -238,7 +256,7 @@ if (existsSync(imgRoot)) {
     console.log(`  - node_modules/@img/${name} (${(bytes / 1024 / 1024).toFixed(1)} MB)`);
   }
   if (imgRemovedCount > 0) {
-    console.log(`[strip-onnxruntime-gpu] removed ${imgRemovedCount} @img/sharp-* dirs = ${(imgRemovedBytes / 1024 / 1024).toFixed(1)} MB (npm will fetch correct platform variant at install time)`);
+    console.log(`[strip-onnxruntime-gpu] removed ${imgRemovedCount} @img/* dirs = ${(imgRemovedBytes / 1024 / 1024).toFixed(1)} MB`);
   }
   // Also walk transformers' nested node_modules in case any @img got hoisted
   // there instead of the top-level. Defensive — we've not seen this
@@ -247,13 +265,27 @@ if (existsSync(imgRoot)) {
   const transformersImgRoot = join(repoRoot, 'node_modules', '@huggingface', 'transformers', 'node_modules', '@img');
   if (existsSync(transformersImgRoot)) {
     for (const name of readdirSync(transformersImgRoot)) {
-      if (!name.startsWith('sharp-') && !name.startsWith('sharp-libvips-')) continue;
       const abs = join(transformersImgRoot, name);
       const bytes = dirSize(abs);
       rmSync(abs, { recursive: true, force: true });
       console.log(`  - (nested) ${join('node_modules/@huggingface/transformers/node_modules/@img', name)} (${(bytes / 1024 / 1024).toFixed(1)} MB)`);
     }
   }
+}
+
+// Strip the `sharp` wrapper itself so npm re-resolves it (and via its
+// optionalDependencies, the correct platform binary) at install time.
+// Check both top-level AND nested under transformers in case
+// bundleDependencies hoisting differs across npm versions.
+for (const sharpRoot of [
+  join(repoRoot, 'node_modules', 'sharp'),
+  join(repoRoot, 'node_modules', '@huggingface', 'transformers', 'node_modules', 'sharp'),
+]) {
+  if (!existsSync(sharpRoot)) continue;
+  const bytes = dirSize(sharpRoot);
+  rmSync(sharpRoot, { recursive: true, force: true });
+  const rel = sharpRoot.startsWith(repoRoot) ? sharpRoot.slice(repoRoot.length + 1) : sharpRoot;
+  console.log(`[strip-onnxruntime-gpu] removed ${rel} (${(bytes / 1024 / 1024).toFixed(1)} MB) — npm will re-resolve at install`);
 }
 
 console.log('[strip-onnxruntime-gpu] done.');
