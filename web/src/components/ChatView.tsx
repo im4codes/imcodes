@@ -13,7 +13,6 @@ import { parseUnifiedDiff } from '@shared/unified-diff.js';
 import { FileBrowser } from './file-browser-lazy.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
-import { useNowTicker } from '../hooks/useNowTicker.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
 import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 import type { TimelineHistoryStatus, TimelineHistoryStepKey } from '../hooks/useTimeline.js';
@@ -1407,9 +1406,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
               </button>
             </div>
           )}
-          {!loading && viewItems.map((item, idx) => {
-            const nextItem = viewItems[idx + 1];
-            const nextTs = nextItem?.ts ?? nextItem?.event?.ts;
+          {!loading && viewItems.map((item) => {
             if (item.type === 'assistant-block') {
               return (
                 <AssistantBlock
@@ -1428,11 +1425,11 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
             }
             const linkedEvents = item.linkedEvents ?? [];
             if (linkedEvents.length === 0) {
-              return <ChatEvent key={item.key} event={item.event!} nextTs={nextTs} onPathClick={pathClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />;
+              return <ChatEvent key={item.key} event={item.event!} onPathClick={pathClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />;
             }
             return (
               <div key={item.key} class="chat-linked-event-group">
-                <ChatEvent event={item.event!} nextTs={nextTs} onPathClick={pathClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />
+                <ChatEvent event={item.event!} onPathClick={pathClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />
                 {linkedEvents.map((linkedEvent) => (
                   <ChatEvent
                     key={linkedEvent.eventId}
@@ -1774,7 +1771,6 @@ function AttachmentDownloadButton({ att, serverId, onPathClick }: { att: { id: s
 
 const ChatEvent = memo(function ChatEvent({
   event,
-  nextTs,
   onPathClick,
   onFileChangeOpen,
   onDownload,
@@ -1783,7 +1779,6 @@ const ChatEvent = memo(function ChatEvent({
   showTime,
 }: {
   event: TimelineEvent;
-  nextTs?: number;
   onPathClick?: (p: string) => void;
   onFileChangeOpen?: (path: string, preferDiff?: boolean) => void;
   onDownload?: (path: string) => void;
@@ -1942,7 +1937,11 @@ const ChatEvent = memo(function ChatEvent({
     }
 
     case 'assistant.thinking':
-      return <ThinkingEvent event={event} endTs={nextTs} />;
+      // Per user preference: thinking events are hidden entirely from the
+      // timeline (both the live "thinking…" indicator and the finished
+      // "Thought for Xs" summary). The agent's running state and the memory
+      // context card already give enough signal that work is happening.
+      return null;
 
     case 'memory.context':
       return <MemoryContextEvent event={event} />;
@@ -2220,45 +2219,6 @@ function CoarseFilePatch({ patch }: { patch: FileChangePatch }) {
     </div>
   );
 }
-
-function ActiveThinkingLabel({ startTs }: { startTs: number }) {
-  const { t } = useTranslation();
-  const now = useNowTicker(true);
-  const sec = Math.max(0, Math.round((now - startTs) / 1000));
-  return <>{t('chat.thinking_running', { sec })}</>;
-}
-
-const ThinkingEvent = memo(function ThinkingEvent({ event, endTs }: { event: TimelineEvent; endTs?: number }) {
-  const { t } = useTranslation();
-  const [expanded, setExpanded] = useState(false);
-  const isActive = endTs === undefined;
-
-  const text = String(event.payload.text ?? '');
-  const preview = text.length > 100 ? text.slice(0, 100) + '…' : text;
-  const hasText = text.length > 0;
-
-  // Hide a finished thinking event that carries no text and ran for ~0s — it's
-  // an empty placeholder (no body to expand, no meaningful duration) and just
-  // adds visual noise like "~ Thought for 0s" to the timeline.
-  if (!isActive && !hasText) {
-    const sec = Math.max(0, Math.round((endTs! - (event.ts ?? endTs!)) / 1000));
-    if (sec <= 0) return null;
-  }
-
-  return (
-    <div class={`chat-event chat-thinking${isActive ? ' thinking-active' : ''}`}>
-      <button class={`chat-thinking-toggle${hasText ? '' : ' no-text'}`} onClick={hasText ? () => setExpanded(!expanded) : undefined}>
-        <span class={`chat-thinking-dot${isActive ? '' : ' done'}`}>{isActive ? '◌' : '~'}</span>
-        <span class="chat-thinking-label">
-          {isActive
-            ? <ActiveThinkingLabel startTs={event.ts ?? Date.now()} />
-            : t('chat.thinking_done', { sec: Math.max(0, Math.round((endTs - (event.ts ?? endTs)) / 1000)) })}
-        </span>
-        {hasText && <span class="chat-thinking-text">{expanded ? text : preview}</span>}
-      </button>
-    </div>
-  );
-});
 
 const MemoryContextEvent = memo(function MemoryContextEvent({ event }: { event: TimelineEvent }) {
   const { t } = useTranslation();
