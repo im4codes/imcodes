@@ -20,6 +20,7 @@ import { IdleFlashLayer } from './IdleFlashLayer.js';
 import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 import { EmbeddingStatusIcon } from './EmbeddingStatusIcon.js';
 import type { EmbeddingStatus } from '@shared/embedding-status.js';
+import { formatDaemonVersionShort } from '../util/format-version.js';
 
 interface DaemonStats {
   daemonVersion?: string | null;
@@ -393,7 +394,9 @@ export function SubSessionBar({ subSessions, openIds, idleFlashTokens, onOpen, o
               <span class="daemon-stats-inline" title={`${stats.daemonVersion ? `Daemon ${stats.daemonVersion} | ` : ''}Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}`}>
                 {stats.daemonVersion && (
                   <>
-                    <span style={{ color: '#94a3b8' }}>v{stats.daemonVersion}</span>
+                    {/* Display the short form (strips trailing -dev.NNN counter); the
+                        full version stays available in the title tooltip above. */}
+                    <span style={{ color: '#94a3b8' }}>v{formatDaemonVersionShort(stats.daemonVersion)}</span>
                     <span style={{ color: '#94a3b8' }}> · </span>
                   </>
                 )}
@@ -429,7 +432,8 @@ export function SubSessionBar({ subSessions, openIds, idleFlashTokens, onOpen, o
           const ei = { fontSize: '0.65em', verticalAlign: 'middle' } as const;
           return (
             <span class="daemon-stats-inline" title={`${stats.daemonVersion ? `v${stats.daemonVersion} | ` : ''}CPU ${stats.cpu}% | Mem ${memUsed}/${memTotal}${unit} | Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}`} style={{ whiteSpace: 'nowrap', fontSize: 10 }}>
-              {stats.daemonVersion && <span style={{ color: '#94a3b8' }}>v{stats.daemonVersion} </span>}
+              {/* Mobile-narrow stat strip — show short version; full string in title above. */}
+              {stats.daemonVersion && <span style={{ color: '#94a3b8' }}>v{formatDaemonVersionShort(stats.daemonVersion)} </span>}
               <span style={{ color: stats.cpu > 80 ? '#f87171' : stats.cpu > 50 ? '#fbbf24' : '#4ade80' }}><span style={ei}>⚙️</span>{stats.cpu}%</span>
               {' '}
               <span style={{ color: '#60a5fa' }}><span style={ei}>🧠</span>{memUsed}/{memTotal}{unit}</span>

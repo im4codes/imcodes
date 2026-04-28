@@ -1,5 +1,20 @@
 import { describe, it, expect, vi } from 'vitest';
 import { fireEvent, render } from '@testing-library/preact';
+
+// ChatMarkdown's CodeBlock uses react-i18next for the per-block copy button's
+// tooltip. The runtime build aliases react → preact/compat via @preact/preset-vite,
+// but vitest doesn't, so loading react-i18next directly crashes on its bare
+// `import 'react'`. Mock to a no-op translator — the tests below don't assert
+// on tooltip text.
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string) => {
+      const parts = key.split('.');
+      return parts[parts.length - 1];
+    },
+  }),
+}));
+
 import { ChatMarkdown } from '../../src/components/ChatMarkdown';
 
 describe('ChatMarkdown', () => {

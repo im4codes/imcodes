@@ -48,6 +48,7 @@ import {
   SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE,
 } from './components/pinnedPanelTypes.js';
 import { LocalWebPreviewPanel } from './components/LocalWebPreviewPanel.js';
+import { formatDaemonVersionShort } from './util/format-version.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
 import { mergeSessionListEntry, type IncomingSessionListEntry } from './session-list-merge.js';
 import { resolveSessionInfoRuntimeType } from './runtime-type.js';
@@ -2915,7 +2916,10 @@ export function App() {
           <div class="sidebar-stats">
             {daemonStats.daemonVersion && (
               <div class="sidebar-stats-row">
-                <span style={{ color: '#94a3b8' }}>Daemon v{daemonStats.daemonVersion}</span>
+                {/* Tooltip surfaces the full version (incl. dev counter) for support. */}
+                <span style={{ color: '#94a3b8' }} title={`Daemon v${daemonStats.daemonVersion}`}>
+                  Daemon v{formatDaemonVersionShort(daemonStats.daemonVersion)}
+                </span>
               </div>
             )}
             <div class="sidebar-stats-row">
@@ -3404,8 +3408,8 @@ export function App() {
             <div class="mobile-sidebar-footer">
               {daemonStats && connected && (
                 <div style={{ fontSize: 11, color: '#64748b', marginBottom: 4, display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <span>
-                    {daemonStats.daemonVersion && <span>v{daemonStats.daemonVersion} · </span>}
+                  <span title={daemonStats.daemonVersion ? `v${daemonStats.daemonVersion}` : undefined}>
+                    {daemonStats.daemonVersion && <span>v{formatDaemonVersionShort(daemonStats.daemonVersion)} · </span>}
                     CPU {daemonStats.cpu}% · Load {daemonStats.load1}
                   </span>
                   <button
