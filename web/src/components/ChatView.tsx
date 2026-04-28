@@ -2125,6 +2125,14 @@ const ThinkingEvent = memo(function ThinkingEvent({ event, endTs }: { event: Tim
   const preview = text.length > 100 ? text.slice(0, 100) + '…' : text;
   const hasText = text.length > 0;
 
+  // Hide a finished thinking event that carries no text and ran for ~0s — it's
+  // an empty placeholder (no body to expand, no meaningful duration) and just
+  // adds visual noise like "~ Thought for 0s" to the timeline.
+  if (!isActive && !hasText) {
+    const sec = Math.max(0, Math.round((endTs! - (event.ts ?? endTs!)) / 1000));
+    if (sec <= 0) return null;
+  }
+
   return (
     <div class={`chat-event chat-thinking${isActive ? ' thinking-active' : ''}`}>
       <button class={`chat-thinking-toggle${hasText ? '' : ' no-text'}`} onClick={hasText ? () => setExpanded(!expanded) : undefined}>
