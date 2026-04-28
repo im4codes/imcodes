@@ -1,3 +1,6 @@
+import { afterEach } from 'vitest';
+import { resetWebSharedCachesForTests } from './reset-shared-caches.js';
+
 const createMemoryStorage = () => {
   const store = new Map<string, string>();
   return {
@@ -39,3 +42,7 @@ const ensureStorage = (prop: 'localStorage' | 'sessionStorage') => {
 
 ensureStorage('localStorage');
 ensureStorage('sessionStorage');
+
+afterEach(async () => {
+  await resetWebSharedCachesForTests();
+});

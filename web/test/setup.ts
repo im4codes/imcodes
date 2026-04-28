@@ -6,6 +6,9 @@
  * without the standard methods which makes `localStorage.clear()` throw.
  */
 
+import { afterEach } from 'vitest';
+import { resetWebSharedCachesForTests } from './reset-shared-caches.js';
+
 function ensureStorage(name: 'localStorage' | 'sessionStorage'): void {
   const existing = globalThis[name];
   if (existing && typeof existing.clear === 'function' && typeof existing.setItem === 'function') {
@@ -45,21 +48,6 @@ if (typeof globalThis.cancelAnimationFrame !== 'function') {
   });
 }
 
-import { afterEach } from 'vitest';
-
 afterEach(async () => {
-  try {
-    const { __resetPrefCacheForTests } = await import('../src/hooks/usePref.js');
-    __resetPrefCacheForTests();
-  } catch { /* tests may mock dependencies during module loading */ }
-  try {
-    const { __resetSharedResourcesForTests } = await import('../src/stores/shared-resource.js');
-    __resetSharedResourcesForTests();
-  } catch { /* optional */ }
-  try {
-    const quickDataModule = await import('../src/components/QuickInputPanel.js');
-    if (typeof quickDataModule.__resetQuickDataForTests === 'function') {
-      quickDataModule.__resetQuickDataForTests();
-    }
-  } catch { /* optional; some suites mock QuickInputPanel or api.ts narrowly */ }
+  await resetWebSharedCachesForTests();
 });
