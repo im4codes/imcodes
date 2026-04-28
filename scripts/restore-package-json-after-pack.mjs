@@ -29,6 +29,29 @@ if (!existsSync(pkgPath)) {
   process.exit(0);
 }
 
+// CRITICAL: only restore for bare `npm pack` (the local-dev flow we
+// actually want to clean up after). The `postpack` lifecycle ALSO fires
+// during `npm publish`, AFTER the tarball is built but BEFORE npm reads
+// package.json to construct the registry manifest. Reverting here would
+// throw away the CI-side version bump (`npm version 2026.4.X-dev.Y` →
+// package.json) and the subsequent registry call would try to publish
+// the unbumped 0.1.2 — npm rejects with "cannot publish over previously
+// published version 0.1.2" and the whole release fails.
+//
+// Real-world hit: GitHub Actions run 25033788086 on commit 02e91cca.
+// npm pack succeeded with the bumped version inside the tarball
+// (imcodes-2026.4.1957-dev.1935.tgz), then this script reverted, then
+// npm publish read 0.1.2 and exploded.
+//
+// `npm_command` is set by npm itself for every lifecycle script. Skip
+// any non-pack invocation — publish/install/etc. must not see
+// package.json change mid-flow.
+const npmCommand = process.env.npm_command;
+if (npmCommand !== 'pack') {
+  console.log(`[restore-package-json-after-pack] npm_command=${npmCommand ?? '(unset)'} — only 'pack' triggers restore; skipping (e.g. npm publish must keep the bumped version visible to the registry call that runs AFTER postpack).`);
+  process.exit(0);
+}
+
 // Only attempt git restore if the repo root looks like a git working tree.
 // `.git` is usually a directory, but for worktrees it's a file pointing
 // at the real gitdir — accept either.
