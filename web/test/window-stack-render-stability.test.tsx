@@ -266,7 +266,28 @@ describe('Section 7.4 — dep-array hygiene (lint-style grep)', () => {
   it('app.tsx lists `stackVersion` in dep arrays where ordering matters, and never lists the stack instance itself', async () => {
     const fs = await import('node:fs/promises');
     const path = await import('node:path');
-    const appPath = path.join(process.cwd(), 'web', 'src', 'app.tsx');
+    // The vitest workspace runs this file under several configs (web project
+    // from the repo root, web-unit project from web/, with at least one
+    // transform pipeline that gives `import.meta.url` a non-`file://`
+    // scheme). Probe a small set of cwd-relative candidates instead of
+    // hard-coding either layout.
+    const cwd = process.cwd();
+    const candidates = [
+      path.resolve(cwd, 'src', 'app.tsx'),                  // cwd = web/
+      path.resolve(cwd, 'web', 'src', 'app.tsx'),           // cwd = repo root
+      path.resolve(cwd, '..', 'web', 'src', 'app.tsx'),     // cwd = web/test/ (defensive)
+    ];
+    let appPath: string | null = null;
+    for (const candidate of candidates) {
+      try {
+        await fs.access(candidate);
+        appPath = candidate;
+        break;
+      } catch { /* try next */ }
+    }
+    if (!appPath) {
+      throw new Error(`Could not locate web/src/app.tsx. cwd=${cwd}, tried: ${candidates.join(', ')}`);
+    }
     const src = await fs.readFile(appPath, 'utf8');
 
     // Forbidden patterns: stack object inside a hook dep array.
