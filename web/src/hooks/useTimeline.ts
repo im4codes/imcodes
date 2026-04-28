@@ -669,6 +669,26 @@ export function useTimeline(
 
     const requestDaemonHistory = (visible: boolean, limit?: number): void => {
       if (!wsConnected || !ws) return;
+      // Gate WS-side timeline.history_request behind isActiveSession the same
+      // way fireHttpBackfill is gated. SubSessionCard mounts one useTimeline
+      // per sub-session card; with the gate missing, every non-focused card
+      // also asked the daemon for history on mount/reconnect, which (a) drove
+      // the daemon to recoverOpenCodeSessionRecord + exportOpenCodeSession for
+      // OpenCode-typed cards the user never opened, and (b) overwhelmed the
+      // WS bridge with N concurrent timeline.history_request calls per
+      // reconnect. Inactive cards still render previews from memory/IDB
+      // cache and live WS event pushes; they don't need their own backfill.
+      //
+      // When the user later activates the card, this effect re-runs (the
+      // mount-effect dep array includes `isActiveSession`) and the gate
+      // passes — at which point the bootstrap path issues its history
+      // request as normal.
+      if (!isActiveSessionRef.current) {
+        updateHistoryStep('daemon', 'skipped', 'bootstrap');
+        setLoading(false);
+        setRefreshing(false);
+        return;
+      }
       if (visible) {
         updateHistoryStep('daemon', 'running', 'bootstrap');
         setRefreshing(true);
@@ -1746,11 +1766,16 @@ export function useTimeline(
             settleOptimisticByTimelineProgress(historyEvent);
           }
           idbPutEvents(msg.events);
-        } else if (historyRetryRef.current < 2 && ws?.connected && eventsRef.current.length === 0) {
+        } else if (historyRetryRef.current < 2 && ws?.connected && eventsRef.current.length === 0 && isActiveSessionRef.current) {
           // Empty response with no cached events — retry once after a short delay
-          // (defense-in-depth for transient bridge/daemon failures)
+          // (defense-in-depth for transient bridge/daemon failures).
+          // Gate by isActiveSession so non-focused SubSessionCards don't keep
+          // retrying forever when their backing session has no events yet.
           historyRetryRef.current++;
           setTimeout(() => {
+            // Re-check the flag at fire time — the user may have switched
+            // away in the 1-2s delay window.
+            if (!isActiveSessionRef.current) return;
             if (ws?.connected && sessionId) {
               historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
             }
@@ -1790,6 +1815,14 @@ export function useTimeline(
 
       // ── Reconnect: daemon restarted → epoch changed, replay is useless. Request only new events. ──
       if (msg.type === DAEMON_MSG.RECONNECTED) {
+        // Only the active card's hook should refresh from daemon — N
+        // SubSessionCards mounted in the bar would otherwise herd the daemon
+        // with N concurrent timeline.history_request RPCs on every daemon
+        // restart. Inactive cards' content stays warm via memory/IDB cache
+        // plus live WS events; the next time the user activates one, its
+        // hook's isActiveSession flips true and the active-session-refresh
+        // listener pulls fresh history then.
+        if (!isActiveSessionRef.current) return;
         // Keep local optimistic bubbles visible across reconnect. The daemon may
         // have received and persisted the send while the browser missed the ack
         // or the live timeline echo; removing the bubble here makes the message
@@ -1832,6 +1865,13 @@ export function useTimeline(
       // window. If we have no local events (first connect / fresh tab) we omit
       // afterTs and get the standard recent window.
       if (msg.type === 'session.event' && (msg as { event: string }).event === 'connected') {
+        // Same gate as the DAEMON_MSG.RECONNECTED path — restrict the
+        // browser-WS reconnect refresh to the active card's hook so we
+        // don't herd the daemon with N timeline.history_request +
+        // timeline.replay calls every reconnect. Inactive sub-session
+        // cards keep their cache and pick up live events; full history
+        // re-sync happens when the user next activates that card.
+        if (!isActiveSessionRef.current) return;
         if (ws && sessionId) {
           setHistoryStatus({
             phase: 'refresh',
