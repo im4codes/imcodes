@@ -46,6 +46,7 @@
     "tool_calls_toggle_show": "Показывать вызовы инструментов",
     "tool_calls_toggle_hide": "Скрывать вызовы инструментов",
     "tool_calls_toggle_undecided": "Выберите, как показывать активность ИИ",
+    "tool_calls_choose_prompt": "Выберите вид ↓",
     "tool_chooser_title": "Как показывать активность ИИ?",
     "tool_chooser_subtitle": "Вызовы инструментов, изменения файлов и рассуждения дают больше деталей, но загромождают вид.",
     "tool_chooser_simple_label": "Просто",

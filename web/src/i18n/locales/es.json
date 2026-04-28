@@ -46,6 +46,7 @@
     "tool_calls_toggle_show": "Mostrar llamadas a herramientas",
     "tool_calls_toggle_hide": "Ocultar llamadas a herramientas",
     "tool_calls_toggle_undecided": "Elige cómo ver la actividad de la IA",
+    "tool_calls_choose_prompt": "Elige vista ↓",
     "tool_chooser_title": "¿Cómo mostrar la actividad de la IA?",
     "tool_chooser_subtitle": "Las llamadas a herramientas, cambios de archivos y razonamiento aportan detalle pero pueden saturar.",
     "tool_chooser_simple_label": "Sencillo",

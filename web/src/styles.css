@@ -118,15 +118,67 @@ body {
 .shortcut-btn-wide { padding-left: 14px; padding-right: 14px; }
 .shortcut-btn-icon { width: 28px; min-width: 28px; padding: 4px 0; display: inline-flex; align-items: center; justify-content: center; }
 /* Tool-call toggle wrench (UsageFooter). Three visual states correspond to
- * the show_tool_calls preference: undecided (pulse), on (active), off (dim). */
-.shortcut-btn-tools { font-size: 13px; line-height: 1; opacity: 0.55; filter: grayscale(0.5); }
-.shortcut-btn-tools:hover:not(:disabled) { opacity: 0.95; filter: none; }
-.shortcut-btn-tools.is-on { background: #1e3a5f; border-color: #3b82f6; color: #93c5fd; opacity: 1; filter: none; }
-.shortcut-btn-tools.is-on:hover:not(:disabled) { background: #234c7a; border-color: #60a5fa; color: #dbeafe; }
+ * the show_tool_calls preference:
+ *   - off  → grey border, dim icon (default tool-row hidden state)
+ *   - on   → green border, full-color icon (developer view active)
+ *   - undecided → grey border with a pulsing green ring (drawing the user's
+ *                 eye to make the first-run choice). */
+.shortcut-btn-tools { font-size: 13px; line-height: 1; opacity: 0.6; filter: grayscale(0.5); border-color: #475569; }
+.shortcut-btn-tools:hover:not(:disabled) { opacity: 1; filter: none; border-color: #64748b; color: #cbd5e1; background: #1a2538; }
+.shortcut-btn-tools.is-on { background: #052e1a; border-color: #22c55e; color: #86efac; opacity: 1; filter: none; box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.35); }
+.shortcut-btn-tools.is-on:hover:not(:disabled) { background: #0a3d24; border-color: #4ade80; color: #bbf7d0; }
 .shortcut-btn-tools.is-undecided { animation: shortcut-btn-tools-pulse 2.4s ease-in-out infinite; }
 @keyframes shortcut-btn-tools-pulse {
-  0%, 100% { opacity: 0.55; box-shadow: 0 0 0 0 rgba(59, 130, 246, 0); }
-  50%      { opacity: 0.95; box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.18); }
+  0%, 100% { opacity: 0.6; box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+  50%      { opacity: 1;   box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.25); }
+}
+/* Wrapper lets us anchor the undecided-state bubble above the button. */
+.shortcut-btn-tools-wrapper { position: relative; display: inline-flex; align-items: center; }
+/* Speech bubble that prompts the user to make the first-run choice. Sits
+ * above the wrench, with a tail pointing down to the button. Removed from
+ * the DOM the moment the show_tool_calls preference is set. */
+.shortcut-btn-tools-bubble {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 5px 9px;
+  background: #14532d;
+  border: 1px solid #22c55e;
+  border-radius: 6px;
+  color: #bbf7d0;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.2;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(34, 197, 94, 0.25);
+  animation: shortcut-btn-tools-bubble-bob 2.4s ease-in-out infinite;
+  z-index: 5;
+}
+.shortcut-btn-tools-bubble::after {
+  content: '';
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  border: 5px solid transparent;
+  border-top-color: #22c55e;
+  filter: drop-shadow(0 1px 0 #14532d);
+}
+.shortcut-btn-tools-bubble::before {
+  content: '';
+  position: absolute;
+  top: calc(100% - 1px);
+  left: 50%;
+  transform: translateX(-50%);
+  border: 4px solid transparent;
+  border-top-color: #14532d;
+  z-index: 1;
+}
+@keyframes shortcut-btn-tools-bubble-bob {
+  0%, 100% { transform: translateX(-50%) translateY(0); }
+  50%      { transform: translateX(-50%) translateY(-2px); }
 }
 
 /* First-time tool-call view chooser shown above the chat timeline. */

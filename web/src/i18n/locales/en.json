@@ -46,6 +46,7 @@
     "tool_calls_toggle_show": "Show tool calls",
     "tool_calls_toggle_hide": "Hide tool calls",
     "tool_calls_toggle_undecided": "Choose how to view AI activity",
+    "tool_calls_choose_prompt": "Pick view ↓",
     "tool_chooser_title": "How should AI activity show?",
     "tool_chooser_subtitle": "Tool calls, file changes, and reasoning add detail but can feel busy.",
     "tool_chooser_simple_label": "Simple",

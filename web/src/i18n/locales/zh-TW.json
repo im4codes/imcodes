@@ -46,6 +46,7 @@
     "tool_calls_toggle_show": "顯示工具呼叫",
     "tool_calls_toggle_hide": "隱藏工具呼叫",
     "tool_calls_toggle_undecided": "選擇 AI 活動顯示方式",
+    "tool_calls_choose_prompt": "選擇檢視 ↓",
     "tool_chooser_title": "AI 活動如何顯示？",
     "tool_chooser_subtitle": "工具呼叫、檔案異動和思考過程資訊更完整，但視圖會更密。",
     "tool_chooser_simple_label": "簡潔",

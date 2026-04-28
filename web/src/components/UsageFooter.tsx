@@ -183,26 +183,43 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
           </span>
         )}
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-          <button
-            type="button"
-            class={`shortcut-btn shortcut-btn-icon shortcut-btn-tools${showToolCallsActive ? ' is-on' : ''}${showToolCallsUndecided ? ' is-undecided' : ''}`}
-            title={
-              showToolCallsActive
-                ? t('chat.tool_calls_toggle_hide')
-                : showToolCallsUndecided
-                  ? t('chat.tool_calls_toggle_undecided')
+          <span class="shortcut-btn-tools-wrapper">
+            {/* Undecided-state bubble. Points the user at the wrench so the
+             *  first-run choice surface is obvious even before they scroll
+             *  the chat (where the larger chooser banner lives). The bubble
+             *  unmounts automatically the moment `showToolCallsUndecided`
+             *  flips false — picking either banner button or clicking the
+             *  wrench saves the pref, which clears the undecided state. */}
+            {showToolCallsUndecided && (
+              <span
+                class="shortcut-btn-tools-bubble"
+                role="status"
+                aria-live="polite"
+              >
+                {t('chat.tool_calls_choose_prompt')}
+              </span>
+            )}
+            <button
+              type="button"
+              class={`shortcut-btn shortcut-btn-icon shortcut-btn-tools${showToolCallsActive ? ' is-on' : ''}${showToolCallsUndecided ? ' is-undecided' : ''}`}
+              title={
+                showToolCallsActive
+                  ? t('chat.tool_calls_toggle_hide')
+                  : showToolCallsUndecided
+                    ? t('chat.tool_calls_toggle_undecided')
+                    : t('chat.tool_calls_toggle_show')
+              }
+              aria-label={
+                showToolCallsActive
+                  ? t('chat.tool_calls_toggle_hide')
                   : t('chat.tool_calls_toggle_show')
-            }
-            aria-label={
-              showToolCallsActive
-                ? t('chat.tool_calls_toggle_hide')
-                : t('chat.tool_calls_toggle_show')
-            }
-            aria-pressed={showToolCallsActive}
-            onClick={handleShowToolCallsToggle}
-          >
-            🛠
-          </button>
+              }
+              aria-pressed={showToolCallsActive}
+              onClick={handleShowToolCallsToggle}
+            >
+              🛠
+            </button>
+          </span>
           {modelLabel && <span class="session-usage-model">{modelLabel}</span>}
           {total > 0 && <span class="session-usage-tokens">{fmt(total)} / {fmt(ctx)} ({pctStr}%)</span>}
           {inlineQuotaText && codexQuotaLines.length === 0 && <span class="session-usage-tokens">{inlineQuotaText}</span>}

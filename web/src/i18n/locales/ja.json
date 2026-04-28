@@ -46,6 +46,7 @@
     "tool_calls_toggle_show": "ツール呼び出しを表示",
     "tool_calls_toggle_hide": "ツール呼び出しを非表示",
     "tool_calls_toggle_undecided": "AI の動作の表示方法を選択",
+    "tool_calls_choose_prompt": "表示を選択 ↓",
     "tool_chooser_title": "AI の動作をどう表示しますか？",
     "tool_chooser_subtitle": "ツール呼び出し・ファイル変更・推論は詳細ですが画面が混み合います。",
     "tool_chooser_simple_label": "シンプル",

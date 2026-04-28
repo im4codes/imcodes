@@ -321,13 +321,41 @@ function ToolDetailSection({
  *  - Merge consecutive tool.call + tool.result pairs into compact single lines
  *  - Deduplicate consecutive session.state events with same state (keep last)
  */
+/**
+ * Event types that the show_tool_calls preference governs.
+ *
+ * When the preference is off (Simple view), the chat shows only natural-
+ * language turn content — `user.message`, `assistant.text`, plus errors and
+ * `ask.question` events that require user response. Everything in this set
+ * is debug/work-in-progress detail that a non-dev user does not want to
+ * see by default:
+ *
+ *   - `tool.call` / `tool.result` — every Bash/Read/etc. invocation the
+ *     agent makes (also implicitly hides the `tool-group` collapse UI).
+ *   - `file.change`              — the file-diff cards rendered for
+ *                                  apply_patch / file_change events.
+ *   - `memory.context`           — "Related history" recall results that
+ *                                  appear above user messages; useful for
+ *                                  agent introspection, noisy in casual
+ *                                  chat.
+ *
+ * `assistant.thinking` (reasoning) is already filtered unconditionally
+ * elsewhere in this filter, so it is intentionally NOT in this set.
+ */
+const TOOL_LIKE_EVENT_TYPES = new Set<string>([
+  'tool.call',
+  'tool.result',
+  'file.change',
+  'memory.context',
+]);
+
 function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewItem[] {
   // Filter out transient/noisy event types that don't belong in the chat log:
   // - agent.status, usage.update: stats, not chat content
   // - mode.state: shown elsewhere (tabs/header)
   // - command.ack, terminal.snapshot: internal plumbing
   // - session.state running/idle/queued: live status belongs in footer/header/queue UI, not chat history
-  // - tool.call/tool.result: optional — hidden when the user has the
+  // - TOOL_LIKE_EVENT_TYPES: optional — hidden when the user has the
   //   show_tool_calls preference off (or hasn't decided yet). Errors are
   //   still surfaced via assistant.text / dedicated error events.
   const visible = events.filter(
@@ -340,7 +368,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
       e.type !== 'terminal.snapshot' &&
       !(e.type === 'session.state' && (e.payload.state === 'running' || e.payload.state === 'idle' || e.payload.state === 'queued')) &&
       e.type !== 'assistant.thinking' &&
-      (showToolCalls || (e.type !== 'tool.call' && e.type !== 'tool.result')),
+      (showToolCalls || !TOOL_LIKE_EVENT_TYPES.has(e.type)),
   );
 
   // Pre-pass: merge tool.call+tool.result pairs, dedup session.state,
@@ -732,10 +760,11 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const showToolCalls = showToolCallsPref.value === true;
   const showToolCallsUndecided = showToolCallsPref.loaded && showToolCallsPref.value === null;
   // Only show the chooser banner when the user has events the toggle would
-  // actually affect. If the timeline has no tool calls, the choice is
-  // hypothetical and the prompt would be confusing.
+  // actually affect. If the timeline has no tool/file/memory rows, the
+  // choice is hypothetical and the prompt would be confusing. Mirrors the
+  // exact set the show_tool_calls preference governs in `buildViewItems`.
   const hasToolEvents = useMemo(
-    () => events.some((e) => e.type === 'tool.call' || e.type === 'tool.result'),
+    () => events.some((e) => TOOL_LIKE_EVENT_TYPES.has(e.type)),
     [events],
   );
   const showFirstTimeChooser = showToolCallsUndecided && hasToolEvents && !preview;
