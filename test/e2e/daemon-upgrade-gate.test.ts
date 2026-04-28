@@ -531,8 +531,11 @@ skipOnWindows('daemon.upgrade — Linux/macOS upgrade.sh contract', () => {
   it('retries up to 4 times on ETARGET with packument cache-clean between attempts', async () => {
     const sh = await captureUpgradeScript();
     // Loop bounded by MAX_ATTEMPTS=4 with explicit per-attempt back-off.
+    // 60/180/300s = 1m/3m/5m — the 5-min last gap is the deliberately
+    // wide window: a real production CDN edge took >2m to replicate
+    // and the previous 120s ceiling missed it.
     expect(sh).toMatch(/MAX_ATTEMPTS=4/);
-    expect(sh).toMatch(/RETRY_DELAYS=\(0 30 60 120\)/);
+    expect(sh).toMatch(/RETRY_DELAYS=\(0 60 180 300\)/);
     // ETARGET detection is the trigger; non-ETARGET must NOT retry.
     expect(sh).toMatch(/grep -qiE 'code ETARGET\|No matching version found'/);
     // Cache-clean between attempts so npm refetches origin instead of

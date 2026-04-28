@@ -3949,8 +3949,11 @@ log "[step 2] installing ${pkgSpec}"
 # response is a 200 missing the new version → npm exits with ETARGET.
 # Pre-fix this killed the upgrade for that release entirely (no retry,
 # next try only when the server broadcasts again). We now retry up to
-# 4 times with 30/60/120s back-off and bust the packument cache between
+# 4 times with 60/180/300s back-off (1m / 3m / 5m — the last gap is wide
+# enough to outlast a slow regional CDN: 2m wasn't enough on a real
+# replication-lagged edge node) and bust the packument cache between
 # attempts so npm refetches origin instead of serving the stale 200.
+# Total time-to-give-up: ~9 minutes from the first attempt.
 #
 # Non-ETARGET failures are NOT retried — they're typically deterministic
 # (network down, ENOSPC, registry auth issue). Logging the per-attempt
@@ -3961,7 +3964,8 @@ INSTALL_RC=1
 ATTEMPT=0
 MAX_ATTEMPTS=4
 # Indexed sequentially with $ATTEMPT (1-based), so element 0 is unused.
-RETRY_DELAYS=(0 30 60 120)
+# 60s / 180s / 300s — see the comment block above for sizing rationale.
+RETRY_DELAYS=(0 60 180 300)
 while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
   ATTEMPT=$((ATTEMPT + 1))
   log "[step 2] install attempt $ATTEMPT/$MAX_ATTEMPTS"
