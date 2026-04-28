@@ -7,6 +7,9 @@ import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { ChatView } from '../../src/components/ChatView.js';
 
 const chatMarkdownRenderSpy = vi.hoisted(() => vi.fn());
+const showToolCallsPref = vi.hoisted(() => ({
+  value: true as boolean | null,
+}));
 
 type ViewportListener = () => void;
 const visualViewportListeners = new Map<string, Set<ViewportListener>>();
@@ -47,15 +50,16 @@ vi.mock('../../src/components/FloatingPanel.js', () => ({
 }));
 
 // Force the show-tool-calls preference to "developer view" for ChatView's
-// timeline tests. Production default for an undecided pref is to HIDE tool
-// rows and surface a chooser banner; these tests assert tool-row markup, so
-// we opt into the developer branch up front. Other usePref features (parse,
-// save, etc.) aren't exercised here, so a minimal stub is enough.
+// timeline tests. Production default for an undecided pref is also developer
+// view, with a chooser prompt still visible; these tests assert tool-row
+// markup without the extra prompt unless they explicitly change this value.
+// Other usePref features (parse, save, etc.) aren't exercised here, so a
+// minimal stub is enough.
 vi.mock('../../src/hooks/usePref.js', () => ({
   parseBooleanish: (raw: unknown) => (raw === true || raw === 'true' ? true : raw === false || raw === 'false' ? false : null),
   usePref: () => ({
-    value: true,
-    rawValue: true,
+    value: showToolCallsPref.value,
+    rawValue: showToolCallsPref.value,
     loaded: true,
     loading: false,
     stale: false,
@@ -79,6 +83,7 @@ describe('ChatView', () => {
   afterEach(() => {
     cleanup();
     chatMarkdownRenderSpy.mockClear();
+    showToolCallsPref.value = true;
     clipboardWriteText.mockClear();
     visualViewportMock.height = 800;
     visualViewportListeners.clear();
@@ -86,6 +91,50 @@ describe('ChatView', () => {
 
   afterAll(() => {
     (window as Window & { visualViewport?: typeof visualViewportMock }).visualViewport = originalVisualViewport as any;
+  });
+
+  it('shows thinking details by default while the tool/detail preference is undecided', () => {
+    showToolCallsPref.value = null;
+
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'thinking-1',
+            type: 'assistant.thinking',
+            ts: Date.now() - 1000,
+            payload: { text: 'checking files' },
+          },
+        ] as any}
+        loading={false}
+        sessionId="test"
+      />,
+    );
+
+    expect(container.querySelector('.chat-thinking')).toBeTruthy();
+    expect(container.textContent ?? '').toContain('chat.thinking_running');
+  });
+
+  it('hides thinking details when the tool/detail preference is off', () => {
+    showToolCallsPref.value = false;
+
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'thinking-1',
+            type: 'assistant.thinking',
+            ts: Date.now() - 1000,
+            payload: { text: 'checking files' },
+          },
+        ] as any}
+        loading={false}
+        sessionId="test"
+      />,
+    );
+
+    expect(container.querySelector('.chat-thinking')).toBeNull();
+    expect(container.textContent ?? '').not.toContain('checking files');
   });
 
   it('keeps preview mode pinned to the bottom during streaming updates with the same timestamp', async () => {

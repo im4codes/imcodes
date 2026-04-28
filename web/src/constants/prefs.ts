@@ -9,7 +9,7 @@ export const PREF_KEY_P2P_CUSTOM_COMBOS = 'p2p_custom_combos';
  *   - `null`     → user has never decided. The chat shows a one-time chooser
  *                  banner (only if the current timeline contains tool events)
  *                  and the wrench pill renders in an "undecided" visual state.
- *                  Tool events are HIDDEN by default until the user picks.
+ *                  Developer details are SHOWN by default until the user picks.
  *   - `true`     → user opted into developer view. Tool events visible.
  *   - `false`    → user opted into simple chat view. Tool events hidden.
  *

@@ -42,27 +42,26 @@ const fmt = (n: number) =>
 export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, now }: Props) {
   const { t } = useTranslation();
   const isCodexFamily = agentType === 'codex' || agentType === 'codex-sdk';
-  // Wrench pill: tri-state toggle for "show tool calls in chat timeline".
+  // Wrench pill: tri-state toggle for "show developer details in chat timeline".
   // Sourced from usePref → SharedResource, so this UsageFooter and ChatView
   // share one GET / one listener / one cache entry per tab.
-  //   value === null  → undecided (first run; pill shows pulsing/dim state)
-  //   value === true  → developer view (pill highlighted, tool calls visible)
-  //   value === false → simple chat (pill dim, tool calls hidden)
+  //   value === null  → undecided (first run; defaults ON, pill shows prompt)
+  //   value === true  → developer view (pill highlighted, details visible)
+  //   value === false → simple chat (pill dim, details hidden)
   const showToolCallsPref = usePref<boolean>(PREF_KEY_SHOW_TOOL_CALLS, { parse: parseBooleanish });
   const showToolCallsValue = showToolCallsPref.value;
   const showToolCallsLoaded = showToolCallsPref.loaded;
-  const showToolCallsActive = showToolCallsValue === true;
+  const showToolCallsActive = showToolCallsValue !== false;
   const showToolCallsUndecided = showToolCallsLoaded && showToolCallsValue === null;
   const handleShowToolCallsToggle = useCallback(() => {
     // Tri-state click cycle:
-    //   undecided → true (Developer)
+    //   undecided → false (Simple; default is already Developer)
     //   true      → false (Simple)
     //   false     → true (Developer)
     // Once decided, the pill is a plain on/off toggle. The first click from
-    // an undecided state defaults to "true" so the user immediately sees the
-    // tool-call rows the pill controls — making the affordance discoverable
-    // even if they never see the chooser banner (e.g. older sessions).
-    const next = showToolCallsValue === true ? false : true;
+    // an undecided state closes the developer details the user is already
+    // seeing by default.
+    const next = showToolCallsValue === false ? true : false;
     void showToolCallsPref.save(next);
   }, [showToolCallsPref, showToolCallsValue]);
   // shell / script sessions are NOT agents — they're plain terminals. The

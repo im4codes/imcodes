@@ -338,15 +338,16 @@ function ToolDetailSection({
  *                                  appear above user messages; useful for
  *                                  agent introspection, noisy in casual
  *                                  chat.
- *
- * `assistant.thinking` (reasoning) is already filtered unconditionally
- * elsewhere in this filter, so it is intentionally NOT in this set.
+ *   - `assistant.thinking`       — reasoning/progress details. The wrench
+ *                                  defaults ON for undecided users, and a
+ *                                  click turns these details off.
  */
 const TOOL_LIKE_EVENT_TYPES = new Set<string>([
   'tool.call',
   'tool.result',
   'file.change',
   'memory.context',
+  'assistant.thinking',
 ]);
 
 function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewItem[] {
@@ -355,9 +356,9 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
   // - mode.state: shown elsewhere (tabs/header)
   // - command.ack, terminal.snapshot: internal plumbing
   // - session.state running/idle/queued: live status belongs in footer/header/queue UI, not chat history
-  // - TOOL_LIKE_EVENT_TYPES: optional — hidden when the user has the
-  //   show_tool_calls preference off (or hasn't decided yet). Errors are
-  //   still surfaced via assistant.text / dedicated error events.
+  // - TOOL_LIKE_EVENT_TYPES: optional developer details — hidden only when
+  //   the user has explicitly turned the wrench preference off. Undecided
+  //   users default to ON and see the first-run prompt.
   const visible = events.filter(
     (e) =>
       !e.hidden &&
@@ -367,7 +368,6 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
       e.type !== 'command.ack' &&
       e.type !== 'terminal.snapshot' &&
       !(e.type === 'session.state' && (e.payload.state === 'running' || e.payload.state === 'idle' || e.payload.state === 'queued')) &&
-      e.type !== 'assistant.thinking' &&
       (showToolCalls || !TOOL_LIKE_EVENT_TYPES.has(e.type)),
   );
 
@@ -750,14 +750,14 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const urlClickHandler = !preview ? handleUrlClick : undefined;
   const downloadHandler = serverId && ws ? handleDownload : undefined;
 
-  // Tool-call visibility preference (shared cache via usePref). Tri-state:
-  //   value === true  → developer view, show tool.call/tool.result rows
+  // Tool-call/detail visibility preference (shared cache via usePref). Tri-state:
+  //   value === true  → developer view, show tool/file/thinking rows
   //   value === false → simple chat, hide them
-  //   value === null  → undecided (first run); hide by default and surface a
+  //   value === null  → undecided (first run); show by default and surface a
   //                     one-time chooser banner above the timeline if the
-  //                     user has actually generated tool events.
+  //                     user has actually generated developer-detail events.
   const showToolCallsPref = usePref<boolean>(PREF_KEY_SHOW_TOOL_CALLS, { parse: parseBooleanish });
-  const showToolCalls = showToolCallsPref.value === true;
+  const showToolCalls = showToolCallsPref.value !== false;
   const showToolCallsUndecided = showToolCallsPref.loaded && showToolCallsPref.value === null;
   // Only show the chooser banner when the user has events the toggle would
   // actually affect. If the timeline has no tool/file/memory rows, the

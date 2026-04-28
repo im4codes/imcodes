@@ -2,8 +2,13 @@
  * @vitest-environment jsdom
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, screen, cleanup } from '@testing-library/preact';
+import { render, screen, cleanup, fireEvent } from '@testing-library/preact';
 import { h } from 'preact';
+
+const toolPref = vi.hoisted(() => ({
+  value: true as boolean | null,
+  save: vi.fn(async (_value: boolean) => undefined),
+}));
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -27,13 +32,55 @@ vi.mock('../src/cost-tracker.js', () => ({
   formatCost: (n: number) => `$${n.toFixed(2)}`,
 }));
 
+vi.mock('../src/hooks/usePref.js', () => ({
+  parseBooleanish: (raw: unknown) => (raw === true || raw === 'true' ? true : raw === false || raw === 'false' ? false : null),
+  usePref: () => ({
+    value: toolPref.value,
+    rawValue: toolPref.value,
+    loaded: true,
+    loading: false,
+    stale: false,
+    error: null,
+    save: toolPref.save,
+    set: () => undefined,
+    reload: async () => toolPref.value,
+  }),
+}));
+
 import { UsageFooter } from '../src/components/UsageFooter.js';
 
 afterEach(() => {
   cleanup();
+  toolPref.value = true;
+  toolPref.save.mockClear();
 });
 
 describe('UsageFooter', () => {
+  it('defaults the tools/thinking toggle on while undecided and first click turns it off', () => {
+    toolPref.value = null;
+
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 0,
+          cacheTokens: 0,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
+        sessionName="deck_test_brain"
+      />,
+    );
+
+    expect(container.querySelector('.shortcut-btn-tools-bubble')).toBeTruthy();
+    const button = container.querySelector('.shortcut-btn-tools') as HTMLButtonElement | null;
+    expect(button).toBeTruthy();
+    expect(button?.className).toContain('is-on');
+
+    fireEvent.click(button!);
+
+    expect(toolPref.save).toHaveBeenCalledWith(false);
+  });
+
   it('prioritizes active thinking over stale idle state and renders running states inline', () => {
     const { container, rerender } = render(
       <UsageFooter
