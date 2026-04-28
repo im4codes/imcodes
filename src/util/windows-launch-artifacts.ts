@@ -1,7 +1,7 @@
 import { writeFile, mkdir, stat, truncate } from 'fs/promises';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { execSync } from 'child_process';
-import { join, dirname } from 'path';
+import path, { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { homedir, tmpdir } from 'os';
 
@@ -43,29 +43,61 @@ export function resolveLaunchPaths(): LaunchPaths {
  *     so `[BOM]@echo off` becomes the unknown command "[BOM]@echo".
  *     => never write a BOM here.
  *
- *  2. To support non-ASCII paths (e.g. usernames with Chinese characters)
- *     we never hard-code absolute paths.  Instead we use environment-variable
- *     expansion (%USERPROFILE%, %APPDATA%) which cmd.exe resolves at runtime
- *     using the OS's native wide-character API — no encoding round-trip.
+ *  2. For paths that ALWAYS live under the user's profile (the lock file,
+ *     watchdog log) we use environment-variable expansion
+ *     (%USERPROFILE%, %APPDATA%) which cmd.exe resolves at runtime using
+ *     the OS's native wide-character API — no encoding round-trip.
  *
- *  3. Uses the npm global shim (`imcodes.cmd`) by default so the watchdog
- *     always launches whatever version is currently installed, even after
- *     npm upgrades.  Falls back to direct node+script for dev installs
- *     where the shim isn't on %APPDATA%\npm. */
+ *  3. For the npm-installed shim path we cannot blindly assume
+ *     `%APPDATA%\npm\imcodes.cmd` — that's only correct when the user's
+ *     npm global prefix happens to match the default.  With nvm / fnm /
+ *     volta / a custom `npm config set prefix`, npm writes to a totally
+ *     different location, and hardcoding `%APPDATA%\npm` makes the
+ *     watchdog launch an OLD stale shim left over from a previous default-
+ *     prefix install (or do nothing).  Symptom in the wild: user runs
+ *     `imcodes` upgrade, npm install succeeds against the real prefix,
+ *     daemon "restart" launches the stale `%APPDATA%\npm\imcodes.cmd`
+ *     and the version stays pinned at whatever was last default-prefix-
+ *     installed.  See commit log around 4/29/2026.
+ *
+ *     Resolution: derive the real prefix from THIS module's own install
+ *     path (`paths.imcodesScript`) — that's exactly where npm just put us
+ *     — and only use the `%APPDATA%\npm\` form when it provably matches.
+ *     Falls back to direct node+script for dev installs where there's no
+ *     shim at all. */
 export async function writeWatchdogCmd(paths: LaunchPaths): Promise<void> {
   await mkdir(dirname(paths.watchdogPath), { recursive: true });
-  // Detect whether the npm global shim exists.  When yes, the watchdog can
-  // use the parameter-free env-var path; when no (e.g. tests, dev installs)
-  // we fall back to a direct node+script invocation with absolute paths.
-  const npmGlobalBin = dirname(paths.imcodesScript).replace(/[/\\]node_modules[/\\]imcodes[/\\]dist[/\\]src$/i, '');
-  const shimPath = join(npmGlobalBin, 'imcodes.cmd');
+  // The watchdog .cmd is a Windows-only artifact and the input path uses
+  // backslashes. Use `path.win32.*` explicitly so the resolution behaves
+  // identically when this code is unit-tested on POSIX dev machines —
+  // otherwise POSIX `path.dirname` doesn't recognise backslashes and
+  // collapses the whole string to ".", silently breaking the npm-prefix
+  // detection below.
+  const npmGlobalBin = path.win32.dirname(paths.imcodesScript).replace(/[/\\]node_modules[/\\]imcodes[/\\]dist[/\\]src$/i, '');
+  const shimPath = path.win32.join(npmGlobalBin, 'imcodes.cmd');
   const useShim = existsSync(shimPath);
+
+  // Pick how to spell the shim path inside the watchdog .cmd:
+  //   - If the resolved shim is the default `%APPDATA%\npm\imcodes.cmd`
+  //     we keep the env-var form so non-ASCII usernames don't get
+  //     mangled by any UTF-8 ↔ ANSI round-trip in the .cmd file.
+  //   - Otherwise (custom prefix, nvm, fnm, volta, system nodejs install)
+  //     we MUST emit the absolute path — otherwise the watchdog launches
+  //     a stale shim at the default location and the user's npm-installed
+  //     upgrade is silently bypassed.
+  const appdataNpm = process.env.APPDATA ? path.win32.join(process.env.APPDATA, 'npm') : null;
+  const isDefaultPrefix = appdataNpm
+    ? npmGlobalBin.toLowerCase() === appdataNpm.toLowerCase()
+    : false;
+  const shimLaunchTarget = isDefaultPrefix
+    ? '%APPDATA%\\npm\\imcodes.cmd'
+    : shimPath;
 
   // Build the launch line.  Either form gets prefixed with `call ` so cmd.exe
   // returns to the loop after the daemon exits (without `call`, control would
   // hand off to the .cmd shim and never come back).
   const launchCmd = useShim
-    ? `call "%APPDATA%\\npm\\imcodes.cmd" start --foreground`
+    ? `call "${shimLaunchTarget}" start --foreground`
     : `call "${paths.nodeExe}" "${paths.imcodesScript}" start --foreground`;
 
   // CRITICAL: use `ping`-based sleep instead of `timeout /t N /nobreak`.
