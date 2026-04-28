@@ -3836,6 +3836,92 @@ log "[step 0] daemon PID at gen time: ${oldDaemonPid}"
 log "[step 0] node bin: ${nodeBin}"
 log "[step 0] target: ${pkgSpec} (current daemon version: ${currentVer})"
 
+# ── Single-flight guard ─────────────────────────────────────────────────
+#
+# npm global installs are NOT atomic: a failed or concurrent
+# \`npm install -g imcodes@...\` can remove/replace the global package while a
+# second upgrade has already installed a good copy.  Keep the old daemon
+# serving while the install runs, but allow only ONE upgrade script to touch
+# the global install / service restart path at a time.
+UPGRADE_LOCK_DIR="$HOME/.imcodes/upgrade.lock.d"
+UPGRADE_LOCK_PID="$UPGRADE_LOCK_DIR/pid"
+UPGRADE_LOCK_STARTED="$UPGRADE_LOCK_DIR/started"
+UPGRADE_LOCK_STALE_AFTER_SEC=1800
+UPGRADE_LOCK_HELD=0
+
+lock_age_seconds() {
+  local started now
+  started=$(cat "$UPGRADE_LOCK_STARTED" 2>/dev/null || true)
+  now=$(date +%s)
+  case "$started" in
+    ''|*[!0-9]*)
+      # If a prior process crashed between mkdir and writing the started
+      # file, fall back to the lock directory's mtime so it can still expire.
+      started=$(stat -c %Y "$UPGRADE_LOCK_DIR" 2>/dev/null || stat -f %m "$UPGRADE_LOCK_DIR" 2>/dev/null || echo "$now")
+      case "$started" in
+        ''|*[!0-9]*) echo 0 ;;
+        *) echo $((now - started)) ;;
+      esac
+      ;;
+    *) echo $((now - started)) ;;
+  esac
+}
+
+acquire_upgrade_lock() {
+  mkdir -p "$HOME/.imcodes" 2>/dev/null || true
+  while true; do
+    if mkdir "$UPGRADE_LOCK_DIR" 2>/dev/null; then
+      echo "$$" > "$UPGRADE_LOCK_PID" 2>/dev/null || true
+      date +%s > "$UPGRADE_LOCK_STARTED" 2>/dev/null || true
+      UPGRADE_LOCK_HELD=1
+      log "[step 0.5] acquired upgrade lock: $UPGRADE_LOCK_DIR"
+      return 0
+    fi
+
+    LOCK_OWNER=$(cat "$UPGRADE_LOCK_PID" 2>/dev/null || true)
+    LOCK_AGE=$(lock_age_seconds)
+    if [ -n "$LOCK_OWNER" ] && kill -0 "$LOCK_OWNER" 2>/dev/null; then
+      log "[step 0.5] another upgrade is already running (pid $LOCK_OWNER, age \${LOCK_AGE}s) — exiting without touching npm/service"
+      return 1
+    fi
+    if [ -z "$LOCK_OWNER" ] && [ "$LOCK_AGE" -lt "$UPGRADE_LOCK_STALE_AFTER_SEC" ]; then
+      log "[step 0.5] upgrade lock exists without owner (age \${LOCK_AGE}s) — treating as active, exiting"
+      return 1
+    fi
+
+    STALE_LOCK="\${UPGRADE_LOCK_DIR}.stale.$$"
+    log "[step 0.5] removing stale upgrade lock (owner: \${LOCK_OWNER:-unknown}, age \${LOCK_AGE}s)"
+    if mv "$UPGRADE_LOCK_DIR" "$STALE_LOCK" 2>/dev/null; then
+      rm -rf "$STALE_LOCK"
+      # Loop back and acquire with mkdir; if another process won the race,
+      # mkdir will fail and we'll re-check the new owner.
+      continue
+    fi
+
+    log "[step 0.5] lost race while clearing stale upgrade lock — exiting"
+    return 1
+  done
+}
+
+release_upgrade_lock() {
+  if [ "$UPGRADE_LOCK_HELD" = "1" ]; then
+    OWNER=$(cat "$UPGRADE_LOCK_PID" 2>/dev/null || true)
+    if [ "$OWNER" = "$$" ]; then
+      rm -rf "$UPGRADE_LOCK_DIR"
+      log "[step 0.5] released upgrade lock"
+    else
+      log "[step 0.5] not releasing upgrade lock; owner changed to \${OWNER:-unknown}"
+    fi
+  fi
+}
+
+if ! acquire_upgrade_lock; then
+  log "=== upgrade skipped: another upgrade is in progress ==="
+  sleep ${CLEANUP_AFTER_SEC} && rm -rf "${scriptDir}" &
+  exit 0
+fi
+trap release_upgrade_lock EXIT
+
 # Make node visible to everything we spawn (npm post-install scripts,
 # node-gyp, the freshly-installed imcodes --version probe, etc).
 # Critical on nvm/fnm/volta where node lives outside system PATH.

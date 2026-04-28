@@ -554,6 +554,24 @@ skipOnWindows('daemon.upgrade — Linux/macOS upgrade.sh contract', () => {
     expect(sh).toMatch(/tail -20 "\$INSTALL_OUT"/);
   });
 
+  it('uses an atomic single-flight lock before touching the global npm install', async () => {
+    const sh = await captureUpgradeScript();
+
+    const lockIdx = sh.indexOf('if mkdir "$UPGRADE_LOCK_DIR"');
+    const installIdx = sh.indexOf('install -g --ignore-scripts --prefer-online');
+    const restartIdx = sh.indexOf('log "[step 4] running restart command"');
+
+    expect(sh).toContain('UPGRADE_LOCK_DIR="$HOME/.imcodes/upgrade.lock.d"');
+    expect(sh).toContain('another upgrade is already running');
+    expect(sh).toContain('trap release_upgrade_lock EXIT');
+    expect(sh).toContain('mv "$UPGRADE_LOCK_DIR" "$STALE_LOCK"');
+    expect(lockIdx).toBeGreaterThan(-1);
+    expect(installIdx).toBeGreaterThan(-1);
+    expect(restartIdx).toBeGreaterThan(-1);
+    expect(lockIdx).toBeLessThan(installIdx);
+    expect(lockIdx).toBeLessThan(restartIdx);
+  });
+
   it('generated bash is syntactically valid (`bash -n` passes)', async () => {
     const sh = await captureUpgradeScript();
     // Use vi.importActual to bypass the fs mock above (which captures
