@@ -1187,6 +1187,7 @@ describe('FileBrowser', () => {
 
   it('lets a floating auto-preview switch to another file from the left file list while keeping Changes as a tab', async () => {
     const { ws, respond, sendMsg } = makeWsFactory();
+    const onPreviewStateChange = vi.fn();
     (ws.fsReadFile as any).mockImplementation((path: string) => `read-${path.split('/').pop()}`);
     (ws.fsGitDiff as any).mockImplementation((path: string) => `diff-${path.split('/').pop()}`);
 
@@ -1198,6 +1199,7 @@ describe('FileBrowser', () => {
         initialPath="/home/user"
         changesRootPath="/home/user"
         autoPreviewPath="/home/user/foo.ts"
+        onPreviewStateChange={onPreviewStateChange}
         onConfirm={vi.fn()}
       />,
     );
@@ -1223,6 +1225,11 @@ describe('FileBrowser', () => {
       '/home/user/foo.ts',
       '/home/user/bar.ts',
     ]);
+    expect(onPreviewStateChange.mock.calls.at(-1)?.[0]).toMatchObject({
+      path: '/home/user/bar.ts',
+      preferDiff: false,
+      preview: { status: 'loading', path: '/home/user/bar.ts' },
+    });
 
     await act(async () => {
       sendMsg({ type: 'fs.read_response', requestId: 'read-bar.ts', path: '/home/user/bar.ts', status: 'ok', content: 'bar content' });
@@ -1297,7 +1304,6 @@ describe('FileBrowser', () => {
         layout="panel"
         initialPath="/home/user"
         autoPreviewPath="/home/user/foo.ts"
-        onPreviewStateChange={onPreviewStateChange}
         onConfirm={vi.fn()}
       />,
     );

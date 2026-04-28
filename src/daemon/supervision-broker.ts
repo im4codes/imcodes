@@ -305,7 +305,7 @@ export class SupervisionBroker {
 
     const startedAt = this.now();
     const timeoutMs = snapshot.timeoutMs > 0 ? snapshot.timeoutMs : SUPERVISION_DEFAULT_TIMEOUT_MS;
-    const key = `${snapshot.backend}:${snapshot.model}`;
+    const key = `${snapshot.backend}:${snapshot.model}:${snapshot.preset ?? ''}`;
     const previous = this.queueChains.get(key) ?? Promise.resolve();
     let release!: () => void;
     const current = new Promise<void>((resolve) => { release = resolve; });
@@ -349,11 +349,19 @@ export class SupervisionBroker {
     // ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY / pinned ANTHROPIC_MODEL; for
     // everything else it short-circuits to `{ agentId: model }`. See
     // openspec change `supervision-qwen-preset-support` design §1.
-    const resolved = await resolveProcessingProviderSessionConfig({
-      backend: snapshot.backend,
-      model: snapshot.model,
-      preset: snapshot.preset,
-    });
+    let resolved: Awaited<ReturnType<typeof resolveProcessingProviderSessionConfig>>;
+    try {
+      resolved = await resolveProcessingProviderSessionConfig({
+        backend: snapshot.backend,
+        model: snapshot.model,
+        preset: snapshot.preset,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw Object.assign(new Error(message), {
+        supervisionUnavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
+      });
+    }
     const effectiveAgentId = resolved.agentId ?? snapshot.model;
 
     const providerSessionId = await provider.createSession({

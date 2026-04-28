@@ -762,6 +762,7 @@ export function FileBrowser({
     const loadingPreview: FileBrowserPreviewState = { status: 'loading', path: filePath };
     setPreview(loadingPreview);
     setShowDiff(preferDiff);
+    onPreviewStateChange?.({ path: filePath, preferDiff, preview: loadingPreview });
     if (!hasPendingPreviewWork('read', filePath, cycleId)) {
       const requestId = ws.fsReadFile(filePath);
       pendingReadRef.current.set(requestId, { path: filePath, cycleId });
@@ -770,7 +771,7 @@ export function FileBrowser({
       const diffId = ws.fsGitDiff(filePath);
       pendingGitDiffRef.current.set(diffId, { path: filePath, cycleId });
     }
-  }, [autoPreviewPath, getActivePreviewCycle, hasPendingPreviewWork, onPreviewFile, t, ws]);
+  }, [autoPreviewPath, getActivePreviewCycle, hasPendingPreviewWork, onPreviewFile, onPreviewStateChange, t, ws]);
 
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set([startPath]));
 

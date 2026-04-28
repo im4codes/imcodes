@@ -4,10 +4,10 @@ import { QWEN_MODEL_IDS } from './qwen-models.js';
 import {
   DEFAULT_CONTEXT_MODEL_BY_BACKEND,
   SHARED_CONTEXT_RUNTIME_BACKENDS,
-  doesSharedContextBackendSupportPresets,
   getDefaultSharedContextModelForBackend,
   inferSharedContextRuntimeBackend,
   isKnownSharedContextModelForBackend,
+  normalizeSharedContextPresetValue,
   normalizeSharedContextRuntimeBackend,
 } from './shared-context-runtime-config.js';
 import { COMBO_PRESETS } from './p2p-modes.js';
@@ -238,10 +238,9 @@ export function normalizeSupervisorDefaultConfig(
     ?? inferSharedContextRuntimeBackend(merged.model)
     ?? SUPERVISION_SUPPORTED_BACKENDS[0];
   // Presets are only meaningful for backends that declare preset support
-  // (currently qwen). We retain the trimmed value only in that case so
-  // switching to a non-preset backend silently drops the stored preset.
-  const rawPreset = trimString(merged.preset);
-  const preset = rawPreset && doesSharedContextBackendSupportPresets(normalizedBackend) ? rawPreset : undefined;
+  // (currently qwen). Reuse the shared runtime normalizer so supervision
+  // preserves the exact same trim/gating semantics as shared context config.
+  const preset = normalizeSharedContextPresetValue(normalizedBackend, typeof merged.preset === 'string' ? merged.preset : undefined);
   const rawModel = trimString(merged.model);
   const model = rawModel && isKnownSharedContextModelForBackend(normalizedBackend, rawModel, preset)
     ? rawModel

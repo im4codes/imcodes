@@ -116,7 +116,7 @@ function trimModelValue(value: string | undefined): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
-function normalizeSharedContextPresetValue(
+export function normalizeSharedContextPresetValue(
   backend: SharedContextRuntimeBackend | undefined,
   preset: string | undefined,
 ): string | undefined {
