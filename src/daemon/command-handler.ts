@@ -64,7 +64,7 @@ import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import { CC_PRESET_MSG, type CcPreset } from '../../shared/cc-presets.js';
 import { MEMORY_WS } from '../../shared/memory-ws.js';
-import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG } from '../../shared/p2p-config-events.js';
+import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG, MAX_P2P_PARTICIPANTS } from '../../shared/p2p-config-events.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import {
   CLAUDE_SDK_EFFORT_LEVELS,
@@ -644,29 +644,21 @@ function expandAllTargets(initiatorName: string, mode: string, excludeSameType =
     if (!inDomain) continue;
 
     if (sessionConfig) {
+      // Strict allowlist semantics: a saved P2P config is an INCLUSION list.
+      // ONLY sessions with `enabled: true` and a non-`skip` mode are eligible.
+      // Missing entries are EXCLUDED.
+      //
+      // Earlier "missing = include" semantics caused every new sub-session
+      // (created after the user's last save) to silently join the run, so
+      // selecting 3 members produced "all members" once any new sub-session
+      // was spawned. The Gate 1 / Gate 2 / cap=5 checks at command-handler
+      // entry now reject the empty-config case explicitly with a clear error
+      // (`NO_SAVED_CONFIG` / `NO_ENABLED_PARTICIPANTS`), so the strict
+      // allowlist never silently fails — it always either runs the picked
+      // set or surfaces a visible error.
       const entry = sessionConfig[s.name];
-      // Semantics: a saved P2P config is an EXCLUSION list plus a mode
-      // override table. Entries with `enabled: false` or `mode: 'skip'`
-      // are explicit opt-outs. MISSING entries default to INCLUDED,
-      // using `mode` (the dropdown / combo override) as their mode.
-      //
-      // Previous semantics ("missing = excluded") was too strict:
-      // whenever the user's saved config grew stale (sub-session names
-      // change on restart, new sessions join the project, etc.) every
-      // active session got filtered out → daemon emitted
-      // `P2P: config filtered all eligible structured-routing targets`
-      // → `command.ack error` with `no_configured_targets`. Combined
-      // with the web intercepting the optimistic bubble for P2P sends
-      // (so `markOptimisticFailed` becomes a no-op), the user
-      // experiences a silent failure where "P2P just doesn't start"
-      // with no visible error.
-      //
-      // Entries for CONFIGURED sessions still win — if a user opted a
-      // session out, it stays out. This change only rescues the stale-
-      // config case by treating never-configured sessions as "no
-      // preference expressed → include by default".
-      if (entry && (entry.enabled === false || entry.mode === 'skip')) continue;
-      const effectiveMode = (entry && mode === P2P_CONFIG_MODE) ? entry.mode : mode;
+      if (!entry || entry.enabled !== true || entry.mode === 'skip') continue;
+      const effectiveMode = (mode === P2P_CONFIG_MODE) ? entry.mode : mode;
       targets.push({ session: s.name, mode: effectiveMode });
     } else {
       targets.push({ session: s.name, mode });
@@ -1599,6 +1591,78 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const p2pSessionConfig = wantsStructuredP2pRouting
     ? await resolveStructuredP2pSessionConfig(sessionName, clientP2pSessionConfig)
     : undefined;
+
+  // ── P2P start gates (mandatory) ──
+  // GATE 1: every structured P2P start must have a saved config (either sent
+  //         from client or persisted on disk).
+  // GATE 2: that config must contain at least one participant explicitly
+  //         enabled with a non-skip mode — "no specific selected members → reject".
+  // CAP:    no more than MAX_P2P_PARTICIPANTS (=5) enabled members.
+  // Targeted, structured routing via the @ picker (`p2pAtTargets` with named
+  // sessions, no '__all__' token) is exempt from gates 1+2 because the user
+  // has explicitly named the targets in the message itself; the cap still
+  // applies. The gates' purpose is to prevent the dropdown / `__all__` paths
+  // from defaulting to "every active session" when saved config is missing.
+  if (wantsStructuredP2pRouting) {
+    const inlineAtTargets = (cmd as any).p2pAtTargets as Array<{ session: string; mode: string }> | undefined;
+    const hasNamedAtTargets =
+      Array.isArray(inlineAtTargets) &&
+      inlineAtTargets.length > 0 &&
+      inlineAtTargets.every((t) => t && typeof t.session === 'string' && t.session !== '__all__');
+
+    if (hasNamedAtTargets) {
+      // @ picker — explicit per-message targets. Only apply the cap.
+      if (inlineAtTargets!.length > MAX_P2P_PARTICIPANTS) {
+        logger.warn({ sessionName, count: inlineAtTargets!.length }, 'P2P start blocked: too many @ targets');
+        sendP2pTargetError(
+          serverLink,
+          sessionName,
+          effectiveId,
+          P2P_CONFIG_ERROR.TOO_MANY_PARTICIPANTS,
+          `P2P participants exceed the limit of ${MAX_P2P_PARTICIPANTS}`,
+        );
+        return;
+      }
+    } else {
+      // Dropdown / __all__ / config-mode path — must have saved config selecting members.
+      if (!p2pSessionConfig || typeof p2pSessionConfig !== 'object') {
+        logger.warn({ sessionName }, 'P2P start blocked: no saved P2P config');
+        sendP2pTargetError(
+          serverLink,
+          sessionName,
+          effectiveId,
+          P2P_CONFIG_ERROR.NO_SAVED_CONFIG,
+          'P2P requires a saved configuration before starting. Open the P2P settings panel and select members.',
+        );
+        return;
+      }
+      const enabledNames = Object.entries(p2pSessionConfig)
+        .filter(([, entry]) => entry && entry.enabled === true && entry.mode !== 'skip')
+        .map(([name]) => name);
+      if (enabledNames.length === 0) {
+        logger.warn({ sessionName }, 'P2P start blocked: saved config has no enabled members');
+        sendP2pTargetError(
+          serverLink,
+          sessionName,
+          effectiveId,
+          P2P_CONFIG_ERROR.NO_ENABLED_PARTICIPANTS,
+          'No P2P participants selected. Open settings and enable at least one member.',
+        );
+        return;
+      }
+      if (enabledNames.length > MAX_P2P_PARTICIPANTS) {
+        logger.warn({ sessionName, count: enabledNames.length }, 'P2P start blocked: too many enabled members');
+        sendP2pTargetError(
+          serverLink,
+          sessionName,
+          effectiveId,
+          P2P_CONFIG_ERROR.TOO_MANY_PARTICIPANTS,
+          `P2P participants exceed the limit of ${MAX_P2P_PARTICIPANTS}. Reduce selection in the settings panel.`,
+        );
+        return;
+      }
+    }
+  }
   let p2pRounds = (cmd as any).p2pRounds as number | undefined;
   let p2pExtraPrompt = (cmd as any).p2pExtraPrompt as string | undefined;
   const p2pLocale = (cmd as any).p2pLocale as string | undefined;

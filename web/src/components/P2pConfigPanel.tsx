@@ -11,6 +11,7 @@ import { P2pComboManager } from './P2pComboManager.js';
 import { useP2pCustomCombos } from './p2p-combos.js';
 import type { P2pSavedConfig, P2pSessionConfig } from '@shared/p2p-modes.js';
 import { BUILT_IN_ADVANCED_PRESETS } from '@shared/p2p-advanced.js';
+import { MAX_P2P_PARTICIPANTS } from '@shared/p2p-config-events.js';
 import type {
   P2pAdvancedPresetKey,
   P2pAdvancedRound,
@@ -364,7 +365,23 @@ export function P2pConfigPanel({
     markFormDirty();
     setSessionCfg((prev) => {
       const cur = prev[key] ?? { enabled: false, mode: 'audit' };
-      return { ...prev, [key]: { ...cur, enabled: !cur.enabled } };
+      const willEnable = !cur.enabled;
+      if (willEnable) {
+        // Enforce hard cap at toggle time so the UI never lets a user select more than MAX_P2P_PARTICIPANTS.
+        const currentlyEnabledCount = Object.entries(prev).filter(
+          ([k, e]) => k !== key && e?.enabled === true && e.mode !== 'skip',
+        ).length;
+        if (currentlyEnabledCount >= MAX_P2P_PARTICIPANTS) {
+          setSaveError(
+            t('p2p.settings_max_participants', 'P2P is limited to {{max}} participants. Disable one before enabling another.', {
+              max: MAX_P2P_PARTICIPANTS,
+            }),
+          );
+          return prev;
+        }
+        setSaveError(null);
+      }
+      return { ...prev, [key]: { ...cur, enabled: willEnable } };
     });
   };
 
@@ -385,6 +402,20 @@ export function P2pConfigPanel({
     const merged: P2pSessionConfig = {};
     for (const e of allEligible) {
       merged[e.key] = sessionCfg[e.key] ?? { enabled: false, mode: 'audit' };
+    }
+    // Enforce cap at save time too (defense-in-depth: stale configs loaded
+    // from disk may already exceed the cap; the daemon also enforces this
+    // gate, but we surface the error here for immediate UX feedback).
+    const enabledCount = Object.values(merged).filter((entry) => entry.enabled === true && entry.mode !== 'skip').length;
+    if (enabledCount > MAX_P2P_PARTICIPANTS) {
+      setSaveError(
+        t('p2p.settings_max_participants', 'P2P is limited to {{max}} participants. Disable {{over}} before saving.', {
+          max: MAX_P2P_PARTICIPANTS,
+          over: enabledCount - MAX_P2P_PARTICIPANTS,
+        }),
+      );
+      setSaving(false);
+      return;
     }
     let contextReducer: P2pContextReducerConfig | undefined;
     if (advancedPresetKey && contextReducerMode === 'reuse_existing_session' && contextReducerSession) {
