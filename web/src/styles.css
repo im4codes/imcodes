@@ -814,7 +814,7 @@ body {
    line of context, never the full message. Tap-again jumps to the
    message in chat history for the full content. */
 .chat-pinned-last-sent.chat-pinned-expanded .chat-pinned-last-sent-text { -webkit-line-clamp: 3; line-clamp: 3; }
-.chat-view { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 8px 12px; display: flex; flex-direction: column; gap: 2px; scrollbar-width: thin; scrollbar-color: #6366f1 #1e293b; }
+.chat-view { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 8px 12px; display: flex; flex-direction: column; gap: 2px; scrollbar-width: thin; scrollbar-color: #6366f1 #1e293b; overflow-anchor: none; }
 .chat-view-preview { justify-content: flex-end; }
 .chat-view::-webkit-scrollbar { width: 5px; }
 .chat-view::-webkit-scrollbar-track { background: #1e293b; border-radius: 3px; }

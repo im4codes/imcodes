@@ -624,6 +624,24 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const [showScrollBtn, setShowScrollBtn] = useState(false);
   const lastScrollTopRef = useRef(0);
   const suppressLoadOlderUntilRef = useRef(0);
+  // ── Programmatic-scroll guard ────────────────────────────────────────────
+  // `scrollToBottom` writes `el.scrollTop` directly, which fires a synthetic
+  // `scroll` event. Without disambiguation, `handleScroll` sees that synthetic
+  // event and recomputes `autoScrollRef.current = atBottom`, which usually
+  // happens to be true and is harmless — but during in-flight user scrolling
+  // the synthetic event can race against the user's real scroll, causing the
+  // follow state to flip in ways the user did not request. The guard ignores
+  // exactly ONE synthetic scroll event after a programmatic write, with a
+  // 200 ms watchdog so a missed/throttled event never swallows real input.
+  const programmaticIgnoreCountRef = useRef(0);
+  const programmaticIgnoreUntilRef = useRef(0);
+  // ── New-message counter while paused ──────────────────────────────────────
+  // When the user has scrolled up and follow is paused, the floating "↓"
+  // button surfaces an unread count so the paused state stays observable.
+  // Resets to 0 on re-engagement (manual click, scroll back near bottom,
+  // session switch).
+  const newSinceUnfollowRef = useRef(0);
+  const [newSinceUnfollow, setNewSinceUnfollow] = useState(0);
 
   // ── Pinned last-sent user message (appears only when scrolled off top) ──
   // When the user scrolls back through a long chat we want them to see what
@@ -777,23 +795,47 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
 
   const viewItems = useMemo(() => buildViewItems(events, showToolCalls), [events, showToolCalls]);
 
-  const scrollToBottom = () => {
+  const markProgrammaticScroll = () => {
+    // Bounded one-shot: skip exactly one upcoming synthetic scroll event.
+    programmaticIgnoreCountRef.current = 1;
+    // Watchdog: if the synthetic event is throttled or never fires, release
+    // the guard after 200ms so legitimate user input never gets swallowed.
+    programmaticIgnoreUntilRef.current = Date.now() + 200;
+  };
+
+  // Pure motion + optional policy. Default `engageFollow=true` preserves the
+  // public contract used by `onScrollBottomFn` parents (SessionPane,
+  // SubSessionWindow), which intentionally call this after the user sends a
+  // message and expect "force jump + re-engage".
+  const scrollToBottom = (engageFollow: boolean = true) => {
     const el = scrollRef.current;
     if (!el) return;
-    autoScrollRef.current = true;
+    if (engageFollow) {
+      autoScrollRef.current = true;
+      newSinceUnfollowRef.current = 0;
+      setNewSinceUnfollow(0);
+    }
     suppressLoadOlder();
+    markProgrammaticScroll();
     el.scrollTop = el.scrollHeight;
     lastScrollTopRef.current = el.scrollTop;
   };
+
+  // (No `followIfEngaged` helper: the two callsites that need it are also
+  // preview-aware, and inlining `if (preview || autoScrollRef.current)`
+  // there reads more clearly than threading preview-awareness through a
+  // helper that would otherwise have to capture the prop.)
 
   // On session change, reset scroll position to bottom
   useEffect(() => {
     autoScrollRef.current = true;
     hasInitialScrolledRef.current = false;
+    newSinceUnfollowRef.current = 0;
+    setNewSinceUnfollow(0);
     setShowScrollBtn(false);
     // Force scroll to bottom on tab switch — the auto-scroll effect may not fire
     // if no new events arrived while this tab was inactive.
-    requestAnimationFrame(() => scrollToBottom());
+    requestAnimationFrame(() => scrollToBottom(true));
   }, [sessionId]);
 
   // On mobile: when keyboard opens, viewport shrinks and scrollTop can reset to 0.
@@ -930,15 +972,33 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     if (preview) return;
     if (!hasInitialScrolledRef.current && lastVisibleTs > 0) {
       hasInitialScrolledRef.current = true;
-      scrollToBottom();
+      // Use the non-engaging variant. autoScrollRef is initialised to true,
+      // so on the genuine first mount this still scrolls. On rerenders that
+      // happen while the user has scrolled away (autoScrollRef=false), the
+      // session-change effect's reset of hasInitialScrolledRef can cause
+      // this branch to re-fire when lastVisibleTs next advances; in that
+      // window we MUST NOT engage follow because the user did not request
+      // it. The session-change effect itself already schedules an explicit
+      // force-jump rAF so the genuine session-switch case still re-engages.
+      if (autoScrollRef.current) scrollToBottom(false);
     }
   }, [lastVisibleTs]);
 
-  // Any visible content update should force-follow to the latest message.
+  // Any visible content update should follow IFF the user is currently
+  // engaged with auto-follow. Preview mode keeps its existing "always follow"
+  // contract because it is a tiny live monitor, not a reading surface.
   // Skip while prepending older history so anchor restoration can preserve position.
   useLayoutEffect(() => {
     if (loadingOlder || scrollAnchorRef.current) return;
-    scrollToBottom();
+    const shouldFollow = preview || autoScrollRef.current;
+    if (!shouldFollow) {
+      // User is reading older content; do not yank the viewport. Surface the
+      // arrival via the unread counter on the "↓" affordance.
+      newSinceUnfollowRef.current += 1;
+      setNewSinceUnfollow(newSinceUnfollowRef.current);
+      return;
+    }
+    scrollToBottom(false);
   }, [preview, viewItems, loading, loadingOlder]);
 
   // Restore scroll position after Load Older prepends events
@@ -959,12 +1019,22 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     prevVisibleTsRef.current = lastVisibleTs;
     if (!changed && !preview) return;
     requestAnimationFrame(() => {
-      scrollToBottom();
+      // Re-check inside the rAF callback so a state flip during the frame
+      // window (e.g. a user scroll-up that lands between schedule and fire)
+      // is honoured. Preview always follows by design.
+      if (preview || autoScrollRef.current) scrollToBottom(false);
     });
   }, [lastVisibleTs, preview]);
 
   const lastScrollActivityRef = useRef(Date.now());
-  const SCROLL_IDLE_RESUME_MS = 60_000;
+  // (Previously SCROLL_IDLE_RESUME_MS = 60_000 drove a setInterval that
+  // unilaterally re-engaged auto-follow + snapped to bottom 60s after the
+  // last scroll activity. That interval has been removed because it was
+  // exactly the "auto-update fights scroll experience" complaint that
+  // motivated this fix. Re-engagement now happens only via explicit user
+  // intent: scrolling back near the bottom (`reengageThreshold`), clicking
+  // the "↓" button, pressing the End key, switching sessions, or sending a
+  // new message.)
 
   // Scroll auto-trigger for Load Older
   const lastLoadOlderAtRef = useRef(0);
@@ -975,6 +1045,20 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const handleScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
+    // Programmatic-scroll guard: if a recent `scrollToBottom(...)` call
+    // marked an upcoming synthetic event AND the resulting scrollTop is
+    // actually at the bottom (i.e. our write succeeded), swallow exactly
+    // one event. Position-aware so iOS layout shifts that reset scrollTop
+    // to 0 still reach the transient-top-jump recovery branch below.
+    if (
+      programmaticIgnoreCountRef.current > 0
+      && Date.now() < programmaticIgnoreUntilRef.current
+      && el.scrollHeight - el.scrollTop - el.clientHeight < 50
+    ) {
+      programmaticIgnoreCountRef.current -= 1;
+      return;
+    }
+    programmaticIgnoreCountRef.current = 0;
     const scrollTop = el.scrollTop;
     const scrollHeight = el.scrollHeight;
     const clientHeight = el.clientHeight;
@@ -985,14 +1069,28 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       && Date.now() < suppressLoadOlderUntilRef.current;
     if (transientTopJump) {
       setShowScrollBtn(false);
-      requestAnimationFrame(() => scrollToBottom());
+      requestAnimationFrame(() => scrollToBottom(true));
       return;
     }
-    // Use generous threshold — 150px from bottom still counts as "at bottom"
-    const atBottom = scrollHeight - scrollTop - clientHeight < 150;
-    autoScrollRef.current = atBottom;
-    setShowScrollBtn(!atBottom);
-    if (!atBottom) lastScrollActivityRef.current = Date.now();
+    // Adaptive + hysteresis thresholds. Avoid flicker around the boundary
+    // (one threshold flapping during streaming layout) and avoid mobile
+    // over-engagement (a flat 150 px swallows ~42 % of a 360 px landscape
+    // viewport but only 14 % of a 1080 px desktop pane).
+    const distance = scrollHeight - scrollTop - clientHeight;
+    const disengageThreshold = Math.max(180, Math.round(0.25 * clientHeight));
+    const reengageThreshold = Math.max(60, Math.round(0.10 * clientHeight));
+    if (wasAutoFollowing && distance > disengageThreshold) {
+      autoScrollRef.current = false;
+      // Reset count so it starts fresh from this pause
+      newSinceUnfollowRef.current = 0;
+      setNewSinceUnfollow(0);
+    } else if (!wasAutoFollowing && distance < reengageThreshold) {
+      autoScrollRef.current = true;
+      newSinceUnfollowRef.current = 0;
+      setNewSinceUnfollow(0);
+    }
+    setShowScrollBtn(!autoScrollRef.current);
+    if (!autoScrollRef.current) lastScrollActivityRef.current = Date.now();
     lastScrollTopRef.current = scrollTop;
     // Auto-trigger load older when scrolled near top
     if (scrollTop < 100 && onLoadOlder && hasOlderHistory && !loadingOlder && !loading) {
@@ -1005,18 +1103,8 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     }
   };
 
-  // Resume auto-scroll after 1 min of scroll inactivity
-  useEffect(() => {
-    if (!showScrollBtn || preview) return;
-    const timer = setInterval(() => {
-      if (!autoScrollRef.current && Date.now() - lastScrollActivityRef.current >= SCROLL_IDLE_RESUME_MS) {
-        autoScrollRef.current = true;
-        setShowScrollBtn(false);
-        scrollToBottom();
-      }
-    }, 10_000);
-    return () => clearInterval(timer);
-  }, [showScrollBtn, preview]);
+  // (Removed: the 60-s idle-resume timer. See the comment near
+  // `lastScrollActivityRef` above for rationale.)
 
   // Keep the active chat pinned to bottom when layout changes reduce available height
   // (for example, when the sub-session bar appears after tab switch).
@@ -1224,7 +1312,17 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
               const root = scrollRef.current;
               if (!root) return;
               const target = findEventElement(root, lastSentUserMessage.eventId);
-              if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+              if (target) {
+                // Respect the OS reduced-motion preference — smooth scrolling
+                // is a vestibular-trigger axis for some users.
+                const reducedMotion = typeof window !== 'undefined'
+                  && window.matchMedia
+                  && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+                target.scrollIntoView({
+                  behavior: reducedMotion ? 'auto' : 'smooth',
+                  block: 'center',
+                });
+              }
             }}
           >
             <span class="chat-pinned-last-sent-label">{t('chat.pinned_last_sent_label', 'Last sent')}</span>
@@ -1232,6 +1330,16 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
           </div>
         )}
         <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} onScroll={preview ? undefined : handleScroll}
+          // Keyboard parity for the floating "↓" button: End force-engages
+          // follow and jumps to bottom. tabIndex={-1} keeps it scriptable
+          // without inserting it into the natural tab order.
+          tabIndex={preview ? undefined : -1}
+          onKeyDown={preview ? undefined : (e: KeyboardEvent) => {
+            if (e.key === 'End') {
+              e.preventDefault();
+              scrollToBottom(true);
+            }
+          }}
           onContextMenu={!preview && !isTouchDevice ? handleContextMenu : undefined}
           onClick={(highlightEl || ctxMenu) ? () => {
             // Ignore synthetic click from long-press release (within 400ms of menu opening)
@@ -1345,12 +1453,16 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
           <button
             class="chat-scroll-btn"
             onClick={() => {
-              autoScrollRef.current = true;
               setShowScrollBtn(false);
-              scrollToBottom();
+              scrollToBottom(true);
             }}
+            aria-label={
+              newSinceUnfollow > 0
+                ? `Jump to bottom (${newSinceUnfollow} new)`
+                : 'Jump to bottom'
+            }
           >
-            ↓
+            ↓{newSinceUnfollow > 0 ? ` ${newSinceUnfollow}` : ''}
           </button>
         )}
         {selMenu && !preview && (
