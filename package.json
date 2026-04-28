@@ -23,6 +23,7 @@
     "build": "tsc",
     "postbuild": "node scripts/copy-worker-bootstraps.mjs && node scripts/mark-bin-executable.mjs",
     "prepack": "node scripts/strip-onnxruntime-gpu.mjs",
+    "postpack": "node scripts/restore-package-json-after-pack.mjs",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.ts",
     "test": "vitest run",

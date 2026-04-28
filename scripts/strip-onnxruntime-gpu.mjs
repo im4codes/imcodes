@@ -288,4 +288,58 @@ for (const sharpRoot of [
   console.log(`[strip-onnxruntime-gpu] removed ${rel} (${(bytes / 1024 / 1024).toFixed(1)} MB) — npm will re-resolve at install`);
 }
 
+// 7. Neutralize imcodes's own lifecycle scripts in the to-be-published
+//    package.json so a transitive dep's install hook can't accidentally
+//    invoke `tsc` (or any other dev-only command) and crash the install.
+//
+// Real-world failure on big@172.16.253.213 (npm 11.12.1, node v24.15.0,
+// fresh `npm i -g imcodes@dev`):
+//
+//   1. npm extracts imcodes from the registry. Bundle correctly omits
+//      `node_modules/sharp/` (we strip it above), so npm re-resolves
+//      `sharp` and fetches it fresh.
+//   2. npm 11 + global install + nested deps half-extracts sharp under
+//      `imcodes/node_modules/sharp/` — the `install/` subdir is missing
+//      (the same documented npm bug we work around in command-handler.ts).
+//   3. sharp's lifecycle install is `node install/check.js || npm run build`.
+//      With install/check.js missing, the fallback runs `npm run build`.
+//   4. `npm run build` walks UP looking for the script and finds imcodes's
+//      `"build": "tsc"`. tsc isn't on the install-context PATH so it
+//      exits 127 → the entire `npm i -g imcodes` aborts.
+//
+// The daemon's auto-upgrade dodges this by passing `--ignore-scripts`,
+// but human users `npm i -g imcodes@dev` and get burned every time.
+//
+// Fix: rewrite EVERY lifecycle script in the published package.json to
+// the same no-op shell. Sharp's `|| npm run build` walks up, finds a
+// no-op build, exits 0 → its install hook succeeds → npm install
+// completes. Runtime is unaffected because (a) the published tarball
+// ships pre-built `dist/` so end users never need to compile, and
+// (b) the daemon CLI doesn't invoke any of these scripts at runtime.
+//
+// Local dev side-effect: this prepack mutates the working-tree
+// package.json. The accompanying `postpack` hook (added in
+// package.json) runs `git checkout -- package.json` to restore it
+// immediately after `npm pack` completes. If postpack doesn't run for
+// any reason (Ctrl+C, pack errored), restore manually with the same
+// command.
+const imcodesPkgPath = join(repoRoot, 'package.json');
+if (existsSync(imcodesPkgPath)) {
+  const imcodesPkg = JSON.parse(readFileSync(imcodesPkgPath, 'utf8'));
+  if (imcodesPkg.scripts && Object.keys(imcodesPkg.scripts).length > 0) {
+    const NOOP = 'echo "imcodes: published tarball, lifecycle scripts disabled"';
+    let count = 0;
+    for (const key of Object.keys(imcodesPkg.scripts)) {
+      if (imcodesPkg.scripts[key] !== NOOP) {
+        imcodesPkg.scripts[key] = NOOP;
+        count += 1;
+      }
+    }
+    if (count > 0) {
+      writeFileSync(imcodesPkgPath, JSON.stringify(imcodesPkg, null, 2) + '\n');
+      console.log(`[strip-onnxruntime-gpu] neutralized ${count} lifecycle script(s) in package.json (postpack will restore via git checkout)`);
+    }
+  }
+}
+
 console.log('[strip-onnxruntime-gpu] done.');
