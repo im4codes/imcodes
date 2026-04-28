@@ -15,6 +15,10 @@ vi.mock('../../src/components/TerminalView.js', () => ({
   TerminalView: () => null,
 }));
 
+vi.mock('../../src/components/FileBrowser.js', () => ({
+  FileBrowser: () => <div data-testid="file-browser-stub" />,
+}));
+
 const chatViewPropsSpy = vi.fn();
 
 vi.mock('../../src/components/ChatView.js', () => ({
@@ -845,5 +849,114 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
         resendExtra: { mode: 'quick' },
       },
     );
+  });
+});
+
+describe('SubSessionWindow desktop file-browser stack integration', () => {
+  const ws = {
+    subscribeTerminal: vi.fn(),
+    unsubscribeTerminal: vi.fn(),
+    sendSnapshotRequest: vi.fn(),
+    sendResize: vi.fn(),
+  } as any;
+
+  beforeEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+    timelineEventsMock = [];
+    activeToolCallMock = false;
+  });
+
+  it('uses desktopFileBrowserZIndex for the floating child file-browser when supplied', async () => {
+    const sub = makeSubSession({ type: 'claude-code-sdk', runtimeType: 'transport' as any } as any);
+    const { container, rerender } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={5010}
+        desktopFileBrowserZIndex={5777}
+        onDesktopFileBrowserOpen={vi.fn()}
+        onDesktopFileBrowserClose={vi.fn()}
+        onDesktopFileBrowserFocus={vi.fn()}
+        onFocus={vi.fn()}
+      />,
+    );
+    // Click the file-browser toggle button (📁 in the header) to open it.
+    const toggle = container.querySelector('button[title="picker.files"]') as HTMLButtonElement | null;
+    expect(toggle).toBeTruthy();
+    toggle!.click();
+    await waitFor(() => {
+      const fbPanel = document.querySelector(`[data-testid="floating-panel-subsession-filebrowser:${sub.id}"]`) as HTMLElement | null;
+      expect(fbPanel).toBeTruthy();
+      expect(fbPanel?.style.zIndex).toBe('5777');
+    });
+    // Re-render with no override → fallback to zIndex+1 path.
+    rerender(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={5010}
+        onFocus={vi.fn()}
+      />,
+    );
+  });
+
+  it('fires onDesktopFileBrowserOpen on open and onDesktopFileBrowserClose on close (desktop only)', async () => {
+    const onOpen = vi.fn();
+    const onClose = vi.fn();
+    const onFocus = vi.fn();
+    const sub = makeSubSession({ type: 'claude-code-sdk', runtimeType: 'transport' as any } as any);
+    const { container } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={5010}
+        onFocus={vi.fn()}
+        onDesktopFileBrowserOpen={onOpen}
+        onDesktopFileBrowserClose={onClose}
+        onDesktopFileBrowserFocus={onFocus}
+      />,
+    );
+    // The mount-time effect should fire onClose once (showFileBrowser starts false).
+    await waitFor(() => {
+      expect(onClose).toHaveBeenCalled();
+    });
+    onClose.mockClear();
+    onOpen.mockClear();
+
+    const toggle = container.querySelector('button[title="picker.files"]') as HTMLButtonElement | null;
+    toggle!.click();
+    await waitFor(() => {
+      expect(onOpen).toHaveBeenCalled();
+    });
+
+    toggle!.click(); // close again
+    await waitFor(() => {
+      expect(onClose).toHaveBeenCalled();
+    });
   });
 });

@@ -1,4 +1,12 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'preact/hooks';
+import {
+  MutableDesktopWindowStack,
+  DESKTOP_WINDOW_IDS,
+  DESKTOP_WINDOW_KINDS,
+  getFrontmostSubSessionId,
+  openSubIdsKey,
+  type DesktopWindowMeta,
+} from './window-stack.js';
 import { lazy, Suspense } from 'preact/compat';
 import {
   FileBrowser,
@@ -62,7 +70,7 @@ import {
   serializeP2pSavedConfig,
 } from './preferences/p2p-config-pref.js';
 import { resolveInitialServerId, resolveInitialSessionName, writeHashState } from './hooks/useHashState.js';
-import { useSubSessions } from './hooks/useSubSessions.js';
+import { useSubSessions, type SubSession } from './hooks/useSubSessions.js';
 import { useProviderStatus } from './hooks/useProviderStatus.js';
 import { DEFAULT_NEW_USER_GUIDE_PREF, shouldMarkNewUserGuidePending, shouldShowNewUserGuidePrompt, type NewUserGuidePref } from './onboarding.js';
 // useSwipeBack now handled inside FloatingPanel for discussion/repo pages
@@ -842,20 +850,68 @@ export function App() {
     return {};
   });
 
-  // z-index per sub-session window
-  const [subZIndexes, setSubZIndexes] = useState<Map<string, number>>(new Map());
+  // ── Desktop floating window stack ────────────────────────────────────────────
+  // Single shared ordering authority for all desktop, non-modal floating
+  // workspace windows (sub-sessions, file preview, file browser, repo, cron,
+  // discussions, shared-context, local web preview, delegated child windows).
+  //
+  // Held as a MUTABLE instance in a stable ref. React re-renders are driven by
+  // the version counter — components subscribe to `stackVersion`, NEVER to the
+  // stack object itself. See `web/src/window-stack.ts` and the openspec
+  // change `unify-floating-window-stack` (especially the "React State
+  // Integration (Normative)" section in `design.md`) for rules; the previous
+  // attempt (commit 31f2a56e, reverted) cloned the stack on every mutation
+  // and triggered a render/fetch storm on every pointer interaction.
+  const stackRef = useRef<MutableDesktopWindowStack | null>(null);
+  if (stackRef.current === null) stackRef.current = new MutableDesktopWindowStack();
+  const [stackVersion, setStackVersion] = useState(0);
+  const bumpStack = useCallback(() => setStackVersion((n) => n + 1), []);
+  const isMobileRef = useRef(/iPhone|iPad|iPod|Android/i.test(navigator.userAgent));
+
+  /** Idempotent register; raises if `bringToFront` is requested. Bumps version only on real change. */
+  const ensureDesktopWindow = useCallback((id: string, meta: DesktopWindowMeta, opts?: { bringToFront?: boolean }) => {
+    if (isMobileRef.current) return;
+    const stack = stackRef.current!;
+    let changed = stack.ensureWindow(id, meta);
+    if (opts?.bringToFront) {
+      if (stack.bringToFront(id)) changed = true;
+    }
+    if (changed) bumpStack();
+  }, []);
+
+  /** Raise an existing window. No-op (no version bump) if it is already frontmost. */
+  const bringDesktopWindowToFront = useCallback((id: string) => {
+    if (isMobileRef.current) return;
+    if (stackRef.current!.bringToFront(id)) bumpStack();
+  }, []);
+
+  /** Remove a window (and its children). Bumps only if anything was actually removed. */
+  const removeDesktopWindow = useCallback((id: string) => {
+    if (stackRef.current!.removeWindow(id)) bumpStack();
+  }, []);
+
+  /**
+   * Read effective z-index. Cheap and called during render. Consumers must
+   * re-render when `stackVersion` bumps — that's how the value updates.
+   */
+  const getDesktopWindowZIndex = useCallback((id: string, fallback: number): number => {
+    const z = stackRef.current!.getZIndex(id);
+    return z ?? fallback;
+  }, []);
+
   const [showSubDialog, setShowSubDialog] = useState(false);
   const [settingsTarget, setSettingsTarget] = useState<{ sessionName: string; subId?: string; label: string; description: string; cwd: string; type: string; parentSession?: string | null; transportConfig?: Record<string, unknown> | null } | null>(null);
 
-  // Derive focused (topmost) sub-session from z-indexes + open set
-  const focusedSubId = useMemo(() => {
-    let maxZ = -1;
-    let maxId: string | null = null;
-    for (const [id, z] of subZIndexes) {
-      if (openSubIds.has(id) && z > maxZ) { maxZ = z; maxId = id; }
-    }
-    return maxId;
-  }, [subZIndexes, openSubIds]);
+  // Derive focused (topmost) sub-session from the shared stack + open set.
+  // Dep list intentionally lists `stackVersion` (number) and `openSubIdsKey`
+  // (stable string) — never the stack object or the Set instance — so this
+  // memo only invalidates on real ordering / membership changes.
+  const openSubIdsKeyMemo = useMemo(() => openSubIdsKey(openSubIds), [openSubIds]);
+  const focusedSubId = useMemo(
+    () => (isMobileRef.current ? null : getFrontmostSubSessionId(stackRef.current!, openSubIds)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- deps are intentionally [stackVersion, key] to avoid invalidating on every Set re-creation
+    [stackVersion, openSubIdsKeyMemo],
+  );
   const flashIdleSession = useCallback((sessionName: string) => {
     setIdleFlashTokens((prev) => {
       const next = new Map(prev);
@@ -1002,35 +1058,179 @@ export function App() {
   // Alias for components that receive this prop
   const p2pSessionLabels = p2pSessionNames;
 
+  // Forward-declared ref populated below at the canonical assignment site
+  // (line ~1290) once `useSubSessions(...)` runs. Reading
+  // `subSessionsRef.current` BEFORE that point would yield an empty list, but
+  // `bringSubToFront` is only invoked from event handlers / effects, not
+  // during the initial synchronous render path.
+  const subSessionsRef = useRef<readonly SubSession[]>([]);
+
+  /**
+   * Sub-session bring-to-front. Wraps the shared stack so the rest of the
+   * codebase keeps the same affordance during migration. Ensures the window
+   * is registered first (idempotent), then raises it. The stack itself
+   * short-circuits no-ops, so calling this on the already-frontmost
+   * sub-session does NOT bump the version — that is the load-bearing
+   * render-stability guarantee.
+   */
   const bringSubToFront = useCallback((id: string) => {
-    setSubZIndexes((prev) => {
-      const max = prev.size > 0 ? Math.max(...prev.values()) : 6000;
-      const next = new Map(prev);
-      next.set(id, max + 1);
-      return next;
-    });
-  }, []);
+    if (isMobileRef.current) return;
+    const sub = subSessionsRef.current.find((candidate) => candidate.id === id);
+    ensureDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id), {
+      kind: DESKTOP_WINDOW_KINDS.subSession,
+      subId: id,
+      serverId: sub?.serverId ?? selectedServerIdRef.current ?? undefined,
+    }, { bringToFront: true });
+  }, [ensureDesktopWindow]);
 
   const toggleSubSession = useCallback((id: string) => {
-    const mobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+    const mobile = isMobileRef.current;
+    let willOpen = false;
     setOpenSubIds((prev) => {
       if (mobile) {
         // Exclusive on mobile: close if already open, otherwise open only this one
         if (prev.has(id)) return new Set();
+        willOpen = true;
         return new Set([id]);
       }
       const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
+      if (next.has(id)) {
+        next.delete(id);
+        willOpen = false;
+      } else {
+        next.add(id);
+        willOpen = true;
+      }
       return next;
     });
-    bringSubToFront(id);
-  }, [bringSubToFront]);
+    if (willOpen) {
+      bringSubToFront(id);
+    } else {
+      removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id));
+    }
+  }, [bringSubToFront, removeDesktopWindow]);
 
   const activeSessionRef = useRef(activeSession);
   activeSessionRef.current = activeSession;
   const sessionsRef = useRef(sessions);
   sessionsRef.current = sessions;
+
+  // ── Desktop window stack ↔ visibility-boolean sync ──────────────────────────
+  // For each managed singleton floating window, mirror its show-boolean into
+  // the stack. Opening = ensure + bring-to-front. Closing = remove. The
+  // stack's own short-circuit logic ensures no version bump when nothing
+  // changed (e.g. re-running the effect when an unrelated dep changes).
+  //
+  // Mobile is a no-op (the helpers themselves bail out on isMobileRef).
+  useEffect(() => {
+    if (showRepoPage) {
+      ensureDesktopWindow(DESKTOP_WINDOW_IDS.repo, {
+        kind: DESKTOP_WINDOW_KINDS.repo,
+        serverId: selectedServerId ?? undefined,
+      }, { bringToFront: true });
+    } else {
+      removeDesktopWindow(DESKTOP_WINDOW_IDS.repo);
+    }
+  }, [showRepoPage, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
+
+  useEffect(() => {
+    if (showCronManager) {
+      ensureDesktopWindow(DESKTOP_WINDOW_IDS.cronManager, {
+        kind: DESKTOP_WINDOW_KINDS.cronManager,
+        serverId: selectedServerId ?? undefined,
+      }, { bringToFront: true });
+    } else {
+      removeDesktopWindow(DESKTOP_WINDOW_IDS.cronManager);
+    }
+  }, [showCronManager, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
+
+  useEffect(() => {
+    if (showDiscussionsPage) {
+      ensureDesktopWindow(DESKTOP_WINDOW_IDS.discussions, {
+        kind: DESKTOP_WINDOW_KINDS.discussions,
+        serverId: selectedServerId ?? undefined,
+      }, { bringToFront: true });
+    } else {
+      removeDesktopWindow(DESKTOP_WINDOW_IDS.discussions);
+    }
+  }, [showDiscussionsPage, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
+
+  useEffect(() => {
+    if (showDesktopFileBrowser) {
+      ensureDesktopWindow(DESKTOP_WINDOW_IDS.fileBrowser, {
+        kind: DESKTOP_WINDOW_KINDS.fileBrowser,
+        serverId: selectedServerId ?? undefined,
+      }, { bringToFront: true });
+    } else {
+      removeDesktopWindow(DESKTOP_WINDOW_IDS.fileBrowser);
+    }
+  }, [showDesktopFileBrowser, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
+
+  useEffect(() => {
+    if (!selectedServerId) return;
+    const id = DESKTOP_WINDOW_IDS.localWebPreview(selectedServerId);
+    if (showDesktopLocalWebPreview) {
+      ensureDesktopWindow(id, {
+        kind: DESKTOP_WINDOW_KINDS.localWebPreview,
+        serverId: selectedServerId,
+      }, { bringToFront: true });
+    } else {
+      removeDesktopWindow(id);
+    }
+  }, [showDesktopLocalWebPreview, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
+
+  useEffect(() => {
+    if (showSharedContextManagement) {
+      ensureDesktopWindow(DESKTOP_WINDOW_IDS.sharedContextManagement, {
+        kind: DESKTOP_WINDOW_KINDS.sharedContextManagement,
+        serverId: selectedServerId ?? undefined,
+      }, { bringToFront: true });
+    } else {
+      removeDesktopWindow(DESKTOP_WINDOW_IDS.sharedContextManagement);
+    }
+  }, [showSharedContextManagement, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
+
+  useEffect(() => {
+    if (showSharedContextDiagnostics) {
+      ensureDesktopWindow(DESKTOP_WINDOW_IDS.sharedContextDiagnostics, {
+        kind: DESKTOP_WINDOW_KINDS.sharedContextDiagnostics,
+        serverId: selectedServerId ?? undefined,
+      }, { bringToFront: true });
+    } else {
+      removeDesktopWindow(DESKTOP_WINDOW_IDS.sharedContextDiagnostics);
+    }
+  }, [showSharedContextDiagnostics, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
+
+  useEffect(() => {
+    if (previewFileRequest) {
+      ensureDesktopWindow(DESKTOP_WINDOW_IDS.filePreview, {
+        kind: DESKTOP_WINDOW_KINDS.filePreview,
+        serverId: selectedServerId ?? undefined,
+      }, { bringToFront: true });
+    } else {
+      removeDesktopWindow(DESKTOP_WINDOW_IDS.filePreview);
+    }
+  }, [previewFileRequest, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
+
+  // Sub-session stack cleanup: remove a sub-session's stack entry whenever it
+  // leaves `openSubIds` (close, minimize, pin, server switch, etc.). This is
+  // the single authoritative place that GCs sub-session stack memberships;
+  // user-action open paths (toggleSubSession, bringSubToFront) handle
+  // ensure+bring on the way in.
+  const openSubIdsKeyForEffect = openSubIdsKeyMemo;
+  useEffect(() => {
+    if (isMobileRef.current) return;
+    const currentlyOpen = new Set(openSubIdsRef.current);
+    const stack = stackRef.current!;
+    let changed = false;
+    for (const entry of stack.getOrderForTests()) {
+      if (entry.meta.kind !== DESKTOP_WINDOW_KINDS.subSession) continue;
+      if (entry.meta.subId && !currentlyOpen.has(entry.meta.subId)) {
+        if (stack.removeWindow(entry.id)) changed = true;
+      }
+    }
+    if (changed) bumpStack();
+  }, [openSubIdsKeyForEffect]);
 
   const setActiveSession = useCallback((name: string | null, opts?: { keepSubWindows?: boolean }) => {
     if (name) localStorage.setItem('rcc_session', name);
@@ -1204,7 +1404,8 @@ export function App() {
   const chatScrollFnsRef = useRef<Map<string, () => void>>(new Map());
   const openSubIdsRef = useRef(openSubIds);
   openSubIdsRef.current = openSubIds;
-  const subSessionsRef = useRef(subSessions);
+  // subSessionsRef itself is declared earlier (forward-declared before
+  // bringSubToFront so the callback can close over it). Just sync each render.
   subSessionsRef.current = subSessions;
 
   useEffect(() => {
@@ -3190,7 +3391,7 @@ export function App() {
 
             {/* Desktop floating file browser */}
             {!isMobile && showDesktopFileBrowser && wsRef.current && activeSessionInfo && (
-              <FloatingPanel id="filebrowser" title={`📁 ${trans('picker.files')}`} onClose={() => setShowDesktopFileBrowser(false)} onPin={() => pinPanel('filebrowser', { sessionName: activeSession, projectDir: activeSessionInfo?.projectDir, serverId: selectedServerId }, () => setShowDesktopFileBrowser(false))} pinTooltip={trans('sidebar.pin_to_sidebar')} defaultW={420} defaultH={500}>
+              <FloatingPanel id="filebrowser" title={`📁 ${trans('picker.files')}`} onClose={() => setShowDesktopFileBrowser(false)} onPin={() => pinPanel('filebrowser', { sessionName: activeSession, projectDir: activeSessionInfo?.projectDir, serverId: selectedServerId }, () => setShowDesktopFileBrowser(false))} pinTooltip={trans('sidebar.pin_to_sidebar')} defaultW={420} defaultH={500} zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.fileBrowser, 5020)} onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.fileBrowser)}>
                 <FileBrowser
                   ws={wsRef.current}
                   serverId={selectedServerId}
@@ -3234,6 +3435,8 @@ export function App() {
                 pinTooltip={trans('sidebar.pin_to_sidebar')}
                 defaultW={860}
                 defaultH={640}
+                zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.localWebPreview(selectedServerId), 5030)}
+                onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.localWebPreview(selectedServerId))}
               >
                 <LocalWebPreviewPanel
                   serverId={selectedServerId}
@@ -3479,7 +3682,7 @@ export function App() {
       )}
 
       {showDiscussionsPage && selectedServerId && (
-        <FloatingPanel id="discussions" title={trans('p2p.discussions.title')} onClose={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }} defaultW={800} defaultH={600}>
+        <FloatingPanel id="discussions" title={trans('p2p.discussions.title')} onClose={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }} defaultW={800} defaultH={600} zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.discussions, 5040)} onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.discussions)}>
           <Suspense fallback={<div style={{ textAlign: 'center', padding: 48, color: '#64748b' }}>Loading...</div>}>
             <DiscussionsPage
               ws={wsRef.current}
@@ -3500,7 +3703,7 @@ export function App() {
       )}
 
       {showRepoPage && wsRef.current && activeSessionInfo?.projectDir && (
-        <FloatingPanel id="repo" title="Repository" onClose={() => setShowRepoPage(false)} onPin={() => pinPanel('repopage', { sessionName: activeSession, projectDir: activeSessionInfo?.projectDir, serverId: selectedServerId }, () => setShowRepoPage(false))} pinTooltip={trans('sidebar.pin_to_sidebar')} defaultW={800} defaultH={600}>
+        <FloatingPanel id="repo" title="Repository" onClose={() => setShowRepoPage(false)} onPin={() => pinPanel('repopage', { sessionName: activeSession, projectDir: activeSessionInfo?.projectDir, serverId: selectedServerId }, () => setShowRepoPage(false))} pinTooltip={trans('sidebar.pin_to_sidebar')} defaultW={800} defaultH={600} zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.repo, 5050)} onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.repo)}>
           <RepoPage ws={wsRef.current} projectDir={activeSessionInfo.projectDir} onBack={() => setShowRepoPage(false)} onCiEvent={(run) => {
             const id = Date.now();
             const icon = run.status === 'success' ? '✅' : '❌';
@@ -3530,6 +3733,8 @@ export function App() {
           onClose={() => setPreviewFileRequest(null)}
           defaultW={700}
           defaultH={500}
+          zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.filePreview, 5060)}
+          onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.filePreview)}
         >
           <FileBrowser
             key={previewFileRequest.rootPath ?? getFilePreviewInitialPath(previewFileRequest)}
@@ -3579,6 +3784,8 @@ export function App() {
             pinTooltip={trans('sidebar.pin_to_sidebar')}
             defaultW={700}
             defaultH={550}
+            zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.cronManager, 5070)}
+            onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.cronManager)}
           >
             <CronManager
               serverId={selectedServerId}
@@ -3611,6 +3818,8 @@ export function App() {
           pinTooltip={trans('sidebar.pin_to_sidebar')}
           defaultW={760}
           defaultH={620}
+          zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.sharedContextManagement, 5080)}
+          onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.sharedContextManagement)}
         >
           <SharedContextManagementPanel
             enterpriseId={typeof sharedContextManagementProps.enterpriseId === 'string' ? sharedContextManagementProps.enterpriseId : undefined}
@@ -3634,6 +3843,8 @@ export function App() {
           pinTooltip={trans('sidebar.pin_to_sidebar')}
           defaultW={760}
           defaultH={620}
+          zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.sharedContextDiagnostics, 5090)}
+          onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.sharedContextDiagnostics)}
         >
           <ContextDiagnosticsPanel
             enterpriseId={sharedContextDiagnosticsProps.enterpriseId}
@@ -3741,8 +3952,24 @@ export function App() {
               }}
               onSettings={() => setSettingsTarget({ sessionName: sub.sessionName, subId: sub.id, label: sub.label || '', description: sub.description || '', cwd: sub.cwd || '', type: sub.type, parentSession: sub.parentSession, transportConfig: sub.transportConfig ?? null })}
               onTransportConfigSaved={(transportConfig) => updateSubLocal(sub.id, { transportConfig })}
-              zIndex={subZIndexes.get(sub.id) ?? 6000}
+              zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.subSession(sub.id), 6000)}
               onFocus={() => bringSubToFront(sub.id)}
+              desktopFileBrowserZIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id), getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.subSession(sub.id), 6000) + 1)}
+              onDesktopFileBrowserOpen={() => {
+                ensureDesktopWindow(DESKTOP_WINDOW_IDS.subSession(sub.id), {
+                  kind: DESKTOP_WINDOW_KINDS.subSession,
+                  subId: sub.id,
+                  serverId: sub.serverId ?? selectedServerId ?? undefined,
+                });
+                ensureDesktopWindow(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id), {
+                  kind: DESKTOP_WINDOW_KINDS.subsessionFileBrowser,
+                  parentId: DESKTOP_WINDOW_IDS.subSession(sub.id),
+                  subId: sub.id,
+                  serverId: sub.serverId ?? selectedServerId ?? undefined,
+                }, { bringToFront: true });
+              }}
+              onDesktopFileBrowserFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id))}
+              onDesktopFileBrowserClose={() => removeDesktopWindow(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id))}
               onPin={(vm) => pinPanel('subsession', { sessionName: sub.sessionName, viewMode: vm, label: sub.label, serverId: selectedServerId }, () => setOpenSubIds((prev) => { const s = new Set(prev); s.delete(sub.id); return s; }))}
               sessions={sessions}
               subSessions={subSessionsSlim}
