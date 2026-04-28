@@ -78,6 +78,55 @@ describe('ChatMarkdown', () => {
     expect(onDownload).toHaveBeenCalledWith('./dist/report.pdf');
   });
 
+  it('detects file paths inside bash code blocks and preserves preview/download actions', () => {
+    const clicked: string[] = [];
+    const onDownload = vi.fn();
+    const { container } = render(
+      <ChatMarkdown
+        text={'```bash\n/home/big/Desktop/拼团经济模型v1.0.docx\n```'}
+        onPathClick={(path) => clicked.push(path)}
+        onDownload={onDownload}
+      />
+    );
+
+    const pathLink = container.querySelector('.chat-code-block .chat-path-link') as HTMLElement | null;
+    expect(pathLink).not.toBeNull();
+    expect(pathLink?.textContent).toBe('/home/big/Desktop/拼团经济模型v1.0.docx');
+    fireEvent.click(pathLink!);
+    expect(clicked).toEqual(['/home/big/Desktop/拼团经济模型v1.0.docx']);
+
+    const button = container.querySelector('.chat-code-block .chat-dl-btn') as HTMLButtonElement | null;
+    expect(button).not.toBeNull();
+    fireEvent.click(button!);
+    expect(onDownload).toHaveBeenCalledWith('/home/big/Desktop/拼团经济模型v1.0.docx');
+  });
+
+
+  it('code block copy button copies only the original code text, not rendered links or download buttons', () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+
+    const { container } = render(
+      <ChatMarkdown
+        text={'```bash\n/home/big/Desktop/拼团经济模型v1.0.docx\n```'}
+        onPathClick={() => {}}
+        onDownload={() => {}}
+      />
+    );
+
+    expect(container.querySelector('.chat-code-block .chat-path-link')).not.toBeNull();
+    expect(container.querySelector('.chat-code-block .chat-dl-btn')).not.toBeNull();
+
+    const copyButton = container.querySelector('.chat-code-copy-btn') as HTMLButtonElement | null;
+    expect(copyButton).not.toBeNull();
+    fireEvent.click(copyButton!);
+
+    expect(writeText).toHaveBeenCalledWith('/home/big/Desktop/拼团经济模型v1.0.docx');
+  });
+
   it('renders a download button for local markdown links with file extensions', () => {
     const onDownload = vi.fn();
     const { container } = render(

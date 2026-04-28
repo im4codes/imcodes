@@ -15,7 +15,19 @@ import { useTranslation } from 'react-i18next';
 
 // ── Code block with copy button ────────────────────────────────────────────
 
-function CodeBlock({ lang, text }: { lang?: string; text: string }) {
+function CodeBlock({
+  lang,
+  text,
+  onPathClick,
+  onUrlClick,
+  onDownload,
+}: {
+  lang?: string;
+  text: string;
+  onPathClick?: (path: string) => void;
+  onUrlClick?: (url: string) => void;
+  onDownload?: (path: string) => void;
+}) {
   const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
 
@@ -71,7 +83,7 @@ function CodeBlock({ lang, text }: { lang?: string; text: string }) {
           )}
         </button>
       </div>
-      <pre><code>{text}</code></pre>
+      <pre><code>{splitPathsAndUrlsInternal(text, onPathClick, onUrlClick, onDownload)}</code></pre>
     </div>
   );
 }
@@ -196,7 +208,7 @@ function renderToken(
 
     case 'code': {
       const t = token as Tokens.Code;
-      return <CodeBlock key={key} lang={t.lang} text={t.text} />;
+      return <CodeBlock key={key} lang={t.lang} text={t.text} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} />;
     }
 
     case 'link': {
