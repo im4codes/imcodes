@@ -14,6 +14,8 @@ import { FileBrowser } from './file-browser-lazy.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
+import { usePref, parseBooleanish } from '../hooks/usePref.js';
+import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 import type { TimelineHistoryStatus, TimelineHistoryStepKey } from '../hooks/useTimeline.js';
 
 interface Props {
@@ -319,12 +321,15 @@ function ToolDetailSection({
  *  - Merge consecutive tool.call + tool.result pairs into compact single lines
  *  - Deduplicate consecutive session.state events with same state (keep last)
  */
-function buildViewItems(events: TimelineEvent[]): ViewItem[] {
+function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewItem[] {
   // Filter out transient/noisy event types that don't belong in the chat log:
   // - agent.status, usage.update: stats, not chat content
   // - mode.state: shown elsewhere (tabs/header)
   // - command.ack, terminal.snapshot: internal plumbing
   // - session.state running/idle/queued: live status belongs in footer/header/queue UI, not chat history
+  // - tool.call/tool.result: optional — hidden when the user has the
+  //   show_tool_calls preference off (or hasn't decided yet). Errors are
+  //   still surfaced via assistant.text / dedicated error events.
   const visible = events.filter(
     (e) =>
       !e.hidden &&
@@ -334,7 +339,8 @@ function buildViewItems(events: TimelineEvent[]): ViewItem[] {
       e.type !== 'command.ack' &&
       e.type !== 'terminal.snapshot' &&
       !(e.type === 'session.state' && (e.payload.state === 'running' || e.payload.state === 'idle' || e.payload.state === 'queued')) &&
-      e.type !== 'assistant.thinking',
+      e.type !== 'assistant.thinking' &&
+      (showToolCalls || (e.type !== 'tool.call' && e.type !== 'tool.result')),
   );
 
   // Pre-pass: merge tool.call+tool.result pairs, dedup session.state,
@@ -716,7 +722,31 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const urlClickHandler = !preview ? handleUrlClick : undefined;
   const downloadHandler = serverId && ws ? handleDownload : undefined;
 
-  const viewItems = useMemo(() => buildViewItems(events), [events]);
+  // Tool-call visibility preference (shared cache via usePref). Tri-state:
+  //   value === true  → developer view, show tool.call/tool.result rows
+  //   value === false → simple chat, hide them
+  //   value === null  → undecided (first run); hide by default and surface a
+  //                     one-time chooser banner above the timeline if the
+  //                     user has actually generated tool events.
+  const showToolCallsPref = usePref<boolean>(PREF_KEY_SHOW_TOOL_CALLS, { parse: parseBooleanish });
+  const showToolCalls = showToolCallsPref.value === true;
+  const showToolCallsUndecided = showToolCallsPref.loaded && showToolCallsPref.value === null;
+  // Only show the chooser banner when the user has events the toggle would
+  // actually affect. If the timeline has no tool calls, the choice is
+  // hypothetical and the prompt would be confusing.
+  const hasToolEvents = useMemo(
+    () => events.some((e) => e.type === 'tool.call' || e.type === 'tool.result'),
+    [events],
+  );
+  const showFirstTimeChooser = showToolCallsUndecided && hasToolEvents && !preview;
+  const handleChooserPickDeveloper = useCallback(() => {
+    void showToolCallsPref.save(true);
+  }, [showToolCallsPref]);
+  const handleChooserPickSimple = useCallback(() => {
+    void showToolCallsPref.save(false);
+  }, [showToolCallsPref]);
+
+  const viewItems = useMemo(() => buildViewItems(events, showToolCalls), [events, showToolCalls]);
 
   const scrollToBottom = () => {
     const el = scrollRef.current;
@@ -1188,6 +1218,42 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
               {sessionState ? t('chat.session_state', { state: sessionState }) : t('chat.no_events')}
             </div>
           ) : null}
+          {/* First-time tool-call view chooser. Renders only when the user
+           *  has never picked AND the current timeline has tool events to
+           *  toggle. Picking either button writes the show_tool_calls
+           *  preference and removes the banner from every subscribed view
+           *  (same-tab fan-out via SharedResource). */}
+          {showFirstTimeChooser && (
+            <div
+              class="chat-tool-chooser"
+              role="region"
+              aria-label={t('chat.tool_chooser_title')}
+            >
+              <div class="chat-tool-chooser-title">{t('chat.tool_chooser_title')}</div>
+              <div class="chat-tool-chooser-subtitle">{t('chat.tool_chooser_subtitle')}</div>
+              <div class="chat-tool-chooser-actions">
+                <button
+                  type="button"
+                  class="chat-tool-chooser-btn chat-tool-chooser-btn-simple"
+                  onClick={handleChooserPickSimple}
+                >
+                  <span class="chat-tool-chooser-btn-icon" aria-hidden="true">💬</span>
+                  <span class="chat-tool-chooser-btn-label">{t('chat.tool_chooser_simple_label')}</span>
+                  <span class="chat-tool-chooser-btn-hint">{t('chat.tool_chooser_simple_hint')}</span>
+                </button>
+                <button
+                  type="button"
+                  class="chat-tool-chooser-btn chat-tool-chooser-btn-developer"
+                  onClick={handleChooserPickDeveloper}
+                >
+                  <span class="chat-tool-chooser-btn-icon" aria-hidden="true">🛠</span>
+                  <span class="chat-tool-chooser-btn-label">{t('chat.tool_chooser_developer_label')}</span>
+                  <span class="chat-tool-chooser-btn-hint">{t('chat.tool_chooser_developer_hint')}</span>
+                </button>
+              </div>
+              <div class="chat-tool-chooser-footnote">{t('chat.tool_chooser_footnote')}</div>
+            </div>
+          )}
           {!loading && !preview && onLoadOlder && viewItems.length > 0 && hasOlderHistory && (
             <div style={{ textAlign: 'center', padding: '8px 0' }}>
               <button

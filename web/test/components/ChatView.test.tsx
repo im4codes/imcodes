@@ -46,6 +46,26 @@ vi.mock('../../src/components/FloatingPanel.js', () => ({
   FloatingPanel: ({ children }: { children?: preact.ComponentChildren }) => <div>{children}</div>,
 }));
 
+// Force the show-tool-calls preference to "developer view" for ChatView's
+// timeline tests. Production default for an undecided pref is to HIDE tool
+// rows and surface a chooser banner; these tests assert tool-row markup, so
+// we opt into the developer branch up front. Other usePref features (parse,
+// save, etc.) aren't exercised here, so a minimal stub is enough.
+vi.mock('../../src/hooks/usePref.js', () => ({
+  parseBooleanish: (raw: unknown) => (raw === true || raw === 'true' ? true : raw === false || raw === 'false' ? false : null),
+  usePref: () => ({
+    value: true,
+    rawValue: true,
+    loaded: true,
+    loading: false,
+    stale: false,
+    error: null,
+    save: async () => undefined,
+    set: () => undefined,
+    reload: async () => true,
+  }),
+}));
+
 describe('ChatView', () => {
   const originalVisualViewport = window.visualViewport;
   const clipboardWriteText = vi.fn().mockResolvedValue(undefined);

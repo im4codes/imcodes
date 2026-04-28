@@ -2,13 +2,15 @@
  * UsageFooter — shared context bar + usage stats + cost display.
  * Used by both main session (app.tsx) and SubSessionWindow.
  */
-import { useEffect, useMemo, useState } from 'preact/hooks';
+import { useEffect, useMemo, useState, useCallback } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { resolveContextWindow } from '../model-context.js';
 import { shortModelLabel } from '../model-label.js';
 import { getSessionCost, getWeeklyCost, getMonthlyCost, formatCost } from '../cost-tracker.js';
 import type { UsageData } from '../usage-data.js';
 import { formatProviderQuotaLabel, type ProviderQuotaMeta } from '@shared/provider-quota.js';
+import { usePref, parseBooleanish } from '../hooks/usePref.js';
+import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 
 interface Props {
   usage: UsageData;
@@ -40,6 +42,29 @@ const fmt = (n: number) =>
 export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, now }: Props) {
   const { t } = useTranslation();
   const isCodexFamily = agentType === 'codex' || agentType === 'codex-sdk';
+  // Wrench pill: tri-state toggle for "show tool calls in chat timeline".
+  // Sourced from usePref → SharedResource, so this UsageFooter and ChatView
+  // share one GET / one listener / one cache entry per tab.
+  //   value === null  → undecided (first run; pill shows pulsing/dim state)
+  //   value === true  → developer view (pill highlighted, tool calls visible)
+  //   value === false → simple chat (pill dim, tool calls hidden)
+  const showToolCallsPref = usePref<boolean>(PREF_KEY_SHOW_TOOL_CALLS, { parse: parseBooleanish });
+  const showToolCallsValue = showToolCallsPref.value;
+  const showToolCallsLoaded = showToolCallsPref.loaded;
+  const showToolCallsActive = showToolCallsValue === true;
+  const showToolCallsUndecided = showToolCallsLoaded && showToolCallsValue === null;
+  const handleShowToolCallsToggle = useCallback(() => {
+    // Tri-state click cycle:
+    //   undecided → true (Developer)
+    //   true      → false (Simple)
+    //   false     → true (Developer)
+    // Once decided, the pill is a plain on/off toggle. The first click from
+    // an undecided state defaults to "true" so the user immediately sees the
+    // tool-call rows the pill controls — making the affordance discoverable
+    // even if they never see the chooser banner (e.g. older sessions).
+    const next = showToolCallsValue === true ? false : true;
+    void showToolCallsPref.save(next);
+  }, [showToolCallsPref, showToolCallsValue]);
   // shell / script sessions are NOT agents — they're plain terminals. The
   // daemon emits `session.state(running)` whenever raw bytes flow (idle
   // detection runs even without a structured watcher), which previously
@@ -158,6 +183,26 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
           </span>
         )}
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+          <button
+            type="button"
+            class={`shortcut-btn shortcut-btn-icon shortcut-btn-tools${showToolCallsActive ? ' is-on' : ''}${showToolCallsUndecided ? ' is-undecided' : ''}`}
+            title={
+              showToolCallsActive
+                ? t('chat.tool_calls_toggle_hide')
+                : showToolCallsUndecided
+                  ? t('chat.tool_calls_toggle_undecided')
+                  : t('chat.tool_calls_toggle_show')
+            }
+            aria-label={
+              showToolCallsActive
+                ? t('chat.tool_calls_toggle_hide')
+                : t('chat.tool_calls_toggle_show')
+            }
+            aria-pressed={showToolCallsActive}
+            onClick={handleShowToolCallsToggle}
+          >
+            🛠
+          </button>
           {modelLabel && <span class="session-usage-model">{modelLabel}</span>}
           {total > 0 && <span class="session-usage-tokens">{fmt(total)} / {fmt(ctx)} ({pctStr}%)</span>}
           {inlineQuotaText && codexQuotaLines.length === 0 && <span class="session-usage-tokens">{inlineQuotaText}</span>}

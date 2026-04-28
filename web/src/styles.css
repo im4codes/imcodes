@@ -117,6 +117,30 @@ body {
 .shortcut-btn:disabled { opacity: 0.4; cursor: default; }
 .shortcut-btn-wide { padding-left: 14px; padding-right: 14px; }
 .shortcut-btn-icon { width: 28px; min-width: 28px; padding: 4px 0; display: inline-flex; align-items: center; justify-content: center; }
+/* Tool-call toggle wrench (UsageFooter). Three visual states correspond to
+ * the show_tool_calls preference: undecided (pulse), on (active), off (dim). */
+.shortcut-btn-tools { font-size: 13px; line-height: 1; opacity: 0.55; filter: grayscale(0.5); }
+.shortcut-btn-tools:hover:not(:disabled) { opacity: 0.95; filter: none; }
+.shortcut-btn-tools.is-on { background: #1e3a5f; border-color: #3b82f6; color: #93c5fd; opacity: 1; filter: none; }
+.shortcut-btn-tools.is-on:hover:not(:disabled) { background: #234c7a; border-color: #60a5fa; color: #dbeafe; }
+.shortcut-btn-tools.is-undecided { animation: shortcut-btn-tools-pulse 2.4s ease-in-out infinite; }
+@keyframes shortcut-btn-tools-pulse {
+  0%, 100% { opacity: 0.55; box-shadow: 0 0 0 0 rgba(59, 130, 246, 0); }
+  50%      { opacity: 0.95; box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.18); }
+}
+
+/* First-time tool-call view chooser shown above the chat timeline. */
+.chat-tool-chooser { margin: 12px 16px; padding: 14px 16px; background: linear-gradient(180deg, #0f1d33 0%, #0d1729 100%); border: 1px solid #1e3a5f; border-radius: 8px; color: #cbd5e1; }
+.chat-tool-chooser-title { font-size: 13px; font-weight: 600; color: #e2e8f0; margin-bottom: 2px; }
+.chat-tool-chooser-subtitle { font-size: 11px; color: #94a3b8; margin-bottom: 12px; }
+.chat-tool-chooser-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+.chat-tool-chooser-btn { flex: 1 1 180px; min-width: 160px; display: grid; grid-template-columns: auto 1fr; grid-template-rows: auto auto; column-gap: 10px; align-items: center; padding: 10px 12px; background: #0b1729; border: 1px solid #334155; border-radius: 6px; color: #cbd5e1; cursor: pointer; transition: all 0.12s; text-align: left; font-family: inherit; }
+.chat-tool-chooser-btn:hover { background: #142845; border-color: #3b82f6; color: #e2e8f0; }
+.chat-tool-chooser-btn-icon { grid-row: 1 / span 2; font-size: 22px; line-height: 1; }
+.chat-tool-chooser-btn-label { font-size: 12px; font-weight: 600; color: #e2e8f0; }
+.chat-tool-chooser-btn-hint { font-size: 11px; color: #94a3b8; }
+.chat-tool-chooser-btn-developer:hover { border-color: #60a5fa; }
+.chat-tool-chooser-footnote { font-size: 10px; color: #64748b; margin-top: 10px; }
 .shortcut-btn-auto { display: inline-flex; align-items: center; gap: 5px; padding-left: 8px; padding-right: 8px; font-weight: 600; }
 .shortcut-btn-auto-dot { width: 6px; height: 6px; border-radius: 999px; flex-shrink: 0; }
 .shortcut-btn-auto-label { letter-spacing: 0.01em; }
