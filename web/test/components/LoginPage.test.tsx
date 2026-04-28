@@ -31,6 +31,8 @@ const {
   preferencesSetMock: vi.fn(),
 }));
 
+const passwordLoginMock = vi.hoisted(() => vi.fn());
+
 vi.mock('../../src/api.js', () => ({
   configureApiKey: (...args: unknown[]) => configureApiKeyMock(...args),
   exchangeNonceWithRetry: (...args: unknown[]) => exchangeNonceWithRetryMock(...args),
@@ -38,7 +40,7 @@ vi.mock('../../src/api.js', () => ({
   passkeyLoginComplete: vi.fn(),
   passkeyRegisterBegin: vi.fn(),
   passkeyRegisterComplete: vi.fn(),
-  passwordLogin: vi.fn(),
+  passwordLogin: (...args: unknown[]) => passwordLoginMock(...args),
   passwordChange: vi.fn(),
   passwordRegister: vi.fn(),
 }));
@@ -116,5 +118,118 @@ describe('LoginPage native auth nonce exchange', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'login.passkey_signin' }));
 
     expect(await screen.findByText('login.nonce_exchange_failed')).toBeDefined();
+  });
+});
+
+describe('LoginPage password login: remember-password', () => {
+  // jsdom's `window.location` is locked down; we can't redefine `reload`
+  // directly. Replace the entire `location` object via vi.stubGlobal for
+  // the duration of the suite — that bypasses the descriptor problem.
+  beforeEach(() => {
+    vi.clearAllMocks();
+    nativeState.value = false; // exercise the web (non-native) branch
+    localStorage.clear();
+    const fakeLocation: Partial<Location> = {
+      ...window.location,
+      reload: vi.fn(),
+      assign: vi.fn(),
+      replace: vi.fn(),
+      href: window.location.href,
+    };
+    vi.stubGlobal('location', fakeLocation);
+  });
+
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+    vi.unstubAllGlobals();
+  });
+
+  function openPasswordMode() {
+    render(<LoginPage serverUrl="https://app.im.codes" onLogin={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: 'login.password_signin' }));
+  }
+
+  it('defaults the remember-password checkbox to checked when no preference exists', () => {
+    openPasswordMode();
+    const cb = screen.getByLabelText('login.remember_password') as HTMLInputElement;
+    expect(cb.checked).toBe(true);
+  });
+
+  it('honors a previously stored "off" preference', () => {
+    localStorage.setItem('rcc_login_remember', '0');
+    openPasswordMode();
+    const cb = screen.getByLabelText('login.remember_password') as HTMLInputElement;
+    expect(cb.checked).toBe(false);
+  });
+
+  it('hydrates username and password from localStorage when remember is on', () => {
+    localStorage.setItem('rcc_login_remember', '1');
+    localStorage.setItem('rcc_login_username', 'alice');
+    localStorage.setItem('rcc_login_password', 'pw1');
+    openPasswordMode();
+    const username = screen.getByPlaceholderText('login.username_placeholder') as HTMLInputElement;
+    const password = screen.getByPlaceholderText('login.password_placeholder') as HTMLInputElement;
+    expect(username.value).toBe('alice');
+    expect(password.value).toBe('pw1');
+  });
+
+  it('does NOT hydrate credentials when remember was previously turned off', () => {
+    localStorage.setItem('rcc_login_remember', '0');
+    localStorage.setItem('rcc_login_username', 'alice');
+    localStorage.setItem('rcc_login_password', 'pw1');
+    openPasswordMode();
+    const username = screen.getByPlaceholderText('login.username_placeholder') as HTMLInputElement;
+    const password = screen.getByPlaceholderText('login.password_placeholder') as HTMLInputElement;
+    expect(username.value).toBe('');
+    expect(password.value).toBe('');
+  });
+
+  it('persists username + password to localStorage on successful login when checkbox is checked', async () => {
+    passwordLoginMock.mockResolvedValue({});
+
+    openPasswordMode();
+    const username = screen.getByPlaceholderText('login.username_placeholder') as HTMLInputElement;
+    const password = screen.getByPlaceholderText('login.password_placeholder') as HTMLInputElement;
+    fireEvent.input(username, { target: { value: 'bob' } });
+    fireEvent.input(password, { target: { value: 'secret' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+
+    await waitFor(() => {
+      expect(localStorage.getItem('rcc_login_remember')).toBe('1');
+      expect(localStorage.getItem('rcc_login_username')).toBe('bob');
+      expect(localStorage.getItem('rcc_login_password')).toBe('secret');
+    });
+  });
+
+  it('immediately wipes saved credentials when the user unchecks the box', () => {
+    localStorage.setItem('rcc_login_remember', '1');
+    localStorage.setItem('rcc_login_username', 'alice');
+    localStorage.setItem('rcc_login_password', 'pw1');
+    openPasswordMode();
+    const cb = screen.getByLabelText('login.remember_password') as HTMLInputElement;
+    fireEvent.click(cb);
+    expect(localStorage.getItem('rcc_login_remember')).toBe('0');
+    expect(localStorage.getItem('rcc_login_username')).toBeNull();
+    expect(localStorage.getItem('rcc_login_password')).toBeNull();
+  });
+
+  it('does NOT save the password to localStorage on successful login when checkbox is unchecked', async () => {
+    localStorage.setItem('rcc_login_remember', '0');
+    passwordLoginMock.mockResolvedValue({});
+
+    openPasswordMode();
+    const username = screen.getByPlaceholderText('login.username_placeholder') as HTMLInputElement;
+    const password = screen.getByPlaceholderText('login.password_placeholder') as HTMLInputElement;
+    fireEvent.input(username, { target: { value: 'carol' } });
+    fireEvent.input(password, { target: { value: 'pw9' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+
+    await waitFor(() => {
+      expect(passwordLoginMock).toHaveBeenCalled();
+    });
+    expect(localStorage.getItem('rcc_login_remember')).toBe('0');
+    expect(localStorage.getItem('rcc_login_username')).toBeNull();
+    expect(localStorage.getItem('rcc_login_password')).toBeNull();
   });
 });

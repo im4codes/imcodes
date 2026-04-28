@@ -422,6 +422,7 @@
     "username_placeholder": "用户名",
     "password_placeholder": "密码",
     "signin": "登录",
+    "remember_password": "在此设备上记住密码",
     "invalid_credentials": "用户名或密码错误",
     "account_pending": "您的账号正在等待管理员审批，请联系管理员。",
     "account_disabled": "您的账号已被禁用，请联系管理员。",

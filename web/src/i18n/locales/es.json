@@ -421,6 +421,7 @@
     "username_placeholder": "Nombre de usuario",
     "password_placeholder": "Contraseña",
     "signin": "Iniciar sesión",
+    "remember_password": "Recordar contraseña en este dispositivo",
     "invalid_credentials": "Nombre de usuario o contraseña incorrectos",
     "account_pending": "Tu cuenta está pendiente de aprobación del administrador. Por favor, contacta al administrador.",
     "account_disabled": "Tu cuenta ha sido deshabilitada. Por favor, contacta al administrador.",

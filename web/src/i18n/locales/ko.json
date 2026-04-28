@@ -421,6 +421,7 @@
     "username_placeholder": "사용자 이름",
     "password_placeholder": "비밀번호",
     "signin": "로그인",
+    "remember_password": "이 기기에 비밀번호 기억",
     "invalid_credentials": "사용자 이름 또는 비밀번호가 올바르지 않습니다",
     "account_pending": "계정이 관리자 승인 대기 중입니다. 관리자에게 문의해 주세요.",
     "account_disabled": "계정이 비활성화되었습니다. 관리자에게 문의해 주세요.",

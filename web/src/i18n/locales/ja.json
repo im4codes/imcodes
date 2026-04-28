@@ -421,6 +421,7 @@
     "username_placeholder": "ユーザー名",
     "password_placeholder": "パスワード",
     "signin": "サインイン",
+    "remember_password": "このデバイスでパスワードを記憶する",
     "invalid_credentials": "ユーザー名またはパスワードが正しくありません",
     "account_pending": "アカウントは管理者の承認待ちです。管理者にお問い合わせください。",
     "account_disabled": "アカウントが無効化されています。管理者にお問い合わせください。",

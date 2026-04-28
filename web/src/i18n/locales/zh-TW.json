@@ -422,6 +422,7 @@
     "username_placeholder": "使用者名稱",
     "password_placeholder": "密碼",
     "signin": "登入",
+    "remember_password": "在此裝置上記住密碼",
     "invalid_credentials": "使用者名稱或密碼錯誤",
     "account_pending": "您的帳號正在等待管理員審核，請聯繫管理員。",
     "account_disabled": "您的帳號已被停用，請聯繫管理員。",
