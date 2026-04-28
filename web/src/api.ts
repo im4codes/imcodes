@@ -959,6 +959,10 @@ const userPrefChannel = typeof BroadcastChannel !== 'undefined'
   ? new BroadcastChannel('imcodes-user-pref-sync')
   : null;
 
+export interface UserPrefChangedMeta {
+  source: 'local' | 'broadcast';
+}
+
 function emitUserPrefChanged(key: string, value: unknown): void {
   try {
     window.dispatchEvent(new CustomEvent(USER_PREF_CHANGED_EVENT, {
@@ -970,16 +974,16 @@ function emitUserPrefChanged(key: string, value: unknown): void {
   } catch { /* ignore */ }
 }
 
-export function onUserPrefChanged(cb: (key: string, value: unknown) => void): () => void {
+export function onUserPrefChanged(cb: (key: string, value: unknown, meta: UserPrefChangedMeta) => void): () => void {
   const handleWindowEvent = (event: Event) => {
     const detail = (event as CustomEvent<{ key?: unknown; value?: unknown }>).detail;
     if (!detail || typeof detail.key !== 'string') return;
-    cb(detail.key, detail.value);
+    cb(detail.key, detail.value, { source: 'local' });
   };
   const handleChannelEvent = (event: MessageEvent<unknown>) => {
     const data = event.data as { key?: unknown; value?: unknown } | null;
     if (!data || typeof data.key !== 'string') return;
-    cb(data.key, data.value);
+    cb(data.key, data.value, { source: 'broadcast' });
   };
   try { window.addEventListener(USER_PREF_CHANGED_EVENT, handleWindowEvent as EventListener); } catch { /* */ }
   try { userPrefChannel?.addEventListener('message', handleChannelEvent); } catch { /* */ }

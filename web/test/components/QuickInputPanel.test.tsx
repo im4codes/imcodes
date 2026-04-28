@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/preact';
+import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/preact';
 import { useState } from 'preact/hooks';
 
 const apiFetchMock = vi.fn();
@@ -41,7 +41,7 @@ vi.mock('../../src/api.js', () => ({
   apiFetch: (...args: unknown[]) => apiFetchMock(...args),
 }));
 
-import { QuickInputPanel, useQuickData, type QuickData } from '../../src/components/QuickInputPanel.js';
+import { QuickInputPanel, useQuickData, __resetQuickDataForTests, type QuickData } from '../../src/components/QuickInputPanel.js';
 
 describe('QuickInputPanel history scope', () => {
   const defaultWidth = window.innerWidth;
@@ -482,7 +482,7 @@ describe('useQuickData persistence guard', () => {
   });
 
   afterEach(() => {
-    vi.runOnlyPendingTimers();
+    __resetQuickDataForTests();
     vi.useRealTimers();
     cleanup();
   });
@@ -492,11 +492,167 @@ describe('useQuickData persistence guard', () => {
     return (
       <div>
         <div data-testid="loaded">{String(quick.loaded)}</div>
+        <div data-testid="history">{quick.data.history.join(',')}</div>
+        <div data-testid="session-history">{(quick.data.sessionHistory.deck_proj_brain ?? []).join(',')}</div>
         <div data-testid="commands">{quick.data.commands.join(',')}</div>
+        <div data-testid="phrases">{quick.data.phrases.join(',')}</div>
         <button onClick={() => quick.addCommand('/custom')}>add-command</button>
+        <button onClick={() => quick.addPhrase('continue')}>add-phrase</button>
+        <button onClick={() => quick.recordHistory('local history', 'deck_proj_brain')}>record-history</button>
+        <button onClick={() => quick.removeCommand('/missing')}>remove-missing-command</button>
+        <button onClick={() => quick.removePhrase('missing')}>remove-missing-phrase</button>
       </div>
     );
   }
+
+  it('shares one GET across multiple hook consumers', async () => {
+    apiFetchMock.mockResolvedValueOnce({ data: { history: [], sessionHistory: {}, commands: ['/server'], phrases: [] } });
+    render(<><Harness /><Harness /></>);
+    await waitFor(() => expect(screen.getAllByTestId('loaded').every((el) => el.textContent === 'true')).toBe(true));
+    expect(apiFetchMock).toHaveBeenCalledTimes(1);
+    expect(screen.getAllByTestId('commands')[0].textContent).toBe('/server');
+  });
+
+  it('merges pre-hydration local mutations with server hydration', async () => {
+    let resolveGet!: (value: unknown) => void;
+    apiFetchMock.mockReturnValueOnce(new Promise((resolve) => { resolveGet = resolve; }));
+    render(<Harness />);
+    fireEvent.click(screen.getByText('add-command'));
+    fireEvent.click(screen.getByText('record-history'));
+    await act(async () => {
+      resolveGet({
+        data: {
+          history: ['server history'],
+          sessionHistory: { deck_proj_brain: ['server session history'] },
+          commands: ['/server'],
+          phrases: [],
+        },
+      });
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(screen.getByTestId('commands').textContent).toContain('/server'));
+    expect(screen.getByTestId('commands').textContent).toContain('/custom');
+    expect(screen.getByTestId('history').textContent).toContain('local history');
+    expect(screen.getByTestId('history').textContent).toContain('server history');
+    expect(screen.getByTestId('session-history').textContent).toContain('local history');
+    expect(screen.getByTestId('session-history').textContent).toContain('server session history');
+  });
+
+  it('normalizes partial quick-data responses to empty defaults', async () => {
+    apiFetchMock.mockResolvedValueOnce({ data: { commands: ['/server'] } });
+    render(<Harness />);
+    await waitFor(() => expect(screen.getByTestId('loaded').textContent).toBe('true'));
+    expect(screen.getByTestId('commands').textContent).toBe('/server');
+    expect(screen.getByTestId('history').textContent).toBe('');
+    expect(screen.getByTestId('session-history').textContent).toBe('');
+    expect(screen.getByTestId('phrases').textContent).toBe('');
+  });
+
+  it('installs one visibility listener and performs one warm refresh for multiple consumers', async () => {
+    const addSpy = vi.spyOn(document, 'addEventListener');
+    let resolveRefresh!: (value: unknown) => void;
+    apiFetchMock
+      .mockResolvedValueOnce({ data: { history: [], sessionHistory: {}, commands: ['/old'], phrases: [] } })
+      .mockReturnValueOnce(new Promise((resolve) => { resolveRefresh = resolve; }));
+
+    render(<><Harness /><Harness /></>);
+    await waitFor(() => expect(screen.getAllByTestId('commands')[0].textContent).toBe('/old'));
+    expect(addSpy.mock.calls.filter((call) => call[0] === 'visibilitychange')).toHaveLength(1);
+
+    Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect(screen.getAllByTestId('commands')[0].textContent).toBe('/old');
+    expect(apiFetchMock).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      resolveRefresh({ data: { history: [], sessionHistory: {}, commands: ['/new'], phrases: [] } });
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(screen.getAllByTestId('commands')[0].textContent).toBe('/new'));
+    addSpy.mockRestore();
+  });
+
+  it('does not fetch on visibility restore when no quick-data consumers are subscribed', async () => {
+    apiFetchMock.mockResolvedValueOnce({ data: { history: [], sessionHistory: {}, commands: ['/old'], phrases: [] } });
+    const view = render(<Harness />);
+    await waitFor(() => expect(screen.getByTestId('commands').textContent).toBe('/old'));
+    view.unmount();
+    apiFetchMock.mockClear();
+
+    Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    expect(apiFetchMock).not.toHaveBeenCalled();
+  });
+
+  it('shares mutations across hook consumers', async () => {
+    apiFetchMock.mockResolvedValueOnce({ data: { history: [], sessionHistory: {}, commands: [], phrases: [] } });
+    render(<><Harness /><Harness /></>);
+    await waitFor(() => expect(screen.getAllByTestId('loaded').every((el) => el.textContent === 'true')).toBe(true));
+
+    fireEvent.click(screen.getAllByText('add-command')[0]);
+    fireEvent.click(screen.getAllByText('add-phrase')[0]);
+
+    await waitFor(() => expect(screen.getAllByTestId('commands').every((el) => el.textContent === '/custom')).toBe(true));
+    expect(screen.getAllByTestId('phrases').every((el) => el.textContent === 'continue')).toBe(true);
+  });
+
+  it('persists an added phrase after hydration through one debounced PUT', async () => {
+    apiFetchMock.mockResolvedValueOnce({ data: { history: [], sessionHistory: {}, commands: [], phrases: [] } });
+    apiFetchMock.mockResolvedValueOnce({ ok: true });
+
+    render(<Harness />);
+
+    await waitFor(() => expect(screen.getByTestId('loaded').textContent).toBe('true'));
+    fireEvent.click(screen.getByText('add-phrase'));
+    await waitFor(() => expect(screen.getByTestId('phrases').textContent).toBe('continue'));
+    vi.advanceTimersByTime(2000);
+    await waitFor(() => expect(apiFetchMock).toHaveBeenCalledTimes(2));
+
+    expect(apiFetchMock).toHaveBeenNthCalledWith(2, '/api/quick-data', {
+      method: 'PUT',
+      body: JSON.stringify({
+        data: {
+          history: [],
+          sessionHistory: {},
+          commands: [],
+          phrases: ['continue'],
+        },
+      }),
+    });
+  });
+
+  it('does not schedule a PUT for no-op mutations', async () => {
+    apiFetchMock.mockResolvedValueOnce({ data: { history: [], sessionHistory: {}, commands: ['/custom'], phrases: [] } });
+    render(<Harness />);
+    await waitFor(() => expect(screen.getByTestId('commands').textContent).toBe('/custom'));
+
+    fireEvent.click(screen.getByText('add-command'));
+    fireEvent.click(screen.getByText('remove-missing-command'));
+    fireEvent.click(screen.getByText('remove-missing-phrase'));
+    vi.advanceTimersByTime(2000);
+    await Promise.resolve();
+
+    expect(apiFetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('clears debounced saves and singleton cache in the quick-data reset helper', async () => {
+    apiFetchMock
+      .mockResolvedValueOnce({ data: { history: [], sessionHistory: {}, commands: [], phrases: [] } })
+      .mockResolvedValueOnce({ data: { history: [], sessionHistory: {}, commands: ['/after-reset'], phrases: [] } });
+    const view = render(<Harness />);
+    await waitFor(() => expect(screen.getByTestId('loaded').textContent).toBe('true'));
+    fireEvent.click(screen.getByText('add-command'));
+    __resetQuickDataForTests();
+    vi.advanceTimersByTime(2000);
+    await Promise.resolve();
+    expect(apiFetchMock).toHaveBeenCalledTimes(1);
+
+    view.unmount();
+    render(<Harness />);
+    await waitFor(() => expect(screen.getByTestId('commands').textContent).toBe('/after-reset'));
+    expect(apiFetchMock).toHaveBeenCalledTimes(2);
+  });
 
   it('does not PUT quick-data after the initial GET fails', async () => {
     apiFetchMock.mockRejectedValueOnce(new Error('network down'));

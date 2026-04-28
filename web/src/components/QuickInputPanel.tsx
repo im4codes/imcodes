@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useMemo } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import { apiFetch } from '../api.js';
+import { createSharedResource } from '../stores/shared-resource.js';
 import { FileBrowser } from './file-browser-lazy.js';
 import type { WsClient } from '../ws-client.js';
 import type { JSX, RefObject } from 'preact';
@@ -81,10 +82,68 @@ export function getAccountHistory(data: QuickData): string[] {
 // ── Hook ──────────────────────────────────────────────────────────────────
 
 let _debounceTimer: ReturnType<typeof setTimeout> | null = null;
+let _hasHydratedFromServer = false;
+let _mutatedBeforeHydration = false;
+let _visibilityInstalled = false;
+let _visibilityHandler: (() => void) | null = null;
+
+function normalizeStringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+}
+
+export function normalizeQuickData(raw: unknown): QuickData {
+  const data = raw && typeof raw === 'object' ? raw as Partial<QuickData> : {};
+  const sessionHistory: Record<string, string[]> = {};
+  if (data.sessionHistory && typeof data.sessionHistory === 'object') {
+    for (const [session, entries] of Object.entries(data.sessionHistory)) {
+      sessionHistory[session] = normalizeStringList(entries).slice(0, SESSION_HISTORY_MAX);
+    }
+  }
+  return {
+    history: normalizeStringList(data.history).slice(0, GLOBAL_HISTORY_MAX),
+    sessionHistory,
+    commands: normalizeStringList(data.commands),
+    phrases: normalizeStringList(data.phrases),
+  };
+}
+
+function mergeLocalFirst(local: string[], server: string[], max: number): string[] {
+  const merged: string[] = [];
+  const seen = new Set<string>();
+  for (const item of [...local, ...server]) {
+    if (seen.has(item)) continue;
+    seen.add(item);
+    merged.push(item);
+    if (merged.length >= max) break;
+  }
+  return merged;
+}
+
+function unionServerLocal(server: string[], local: string[]): string[] {
+  const merged: string[] = [];
+  const seen = new Set<string>();
+  for (const item of [...server, ...local]) {
+    if (seen.has(item)) continue;
+    seen.add(item);
+    merged.push(item);
+  }
+  return merged;
+}
+
+function mergeQuickDataForHydration(server: QuickData, local: QuickData): QuickData {
+  const sessionHistory: Record<string, string[]> = { ...server.sessionHistory };
+  for (const session of new Set([...Object.keys(server.sessionHistory), ...Object.keys(local.sessionHistory)])) {
+    sessionHistory[session] = mergeLocalFirst(local.sessionHistory[session] ?? [], server.sessionHistory[session] ?? [], SESSION_HISTORY_MAX);
+  }
+  return {
+    history: mergeLocalFirst(local.history, server.history, GLOBAL_HISTORY_MAX),
+    sessionHistory,
+    commands: unionServerLocal(server.commands, local.commands),
+    phrases: unionServerLocal(server.phrases, local.phrases),
+  };
+}
 
 function scheduleSave(data: QuickData, canPersist: boolean): void {
-  // Never replace server state with a local empty snapshot before we've
-  // successfully hydrated quick-data at least once in this tab.
   if (!canPersist) return;
   if (_debounceTimer) clearTimeout(_debounceTimer);
   _debounceTimer = setTimeout(() => {
@@ -92,6 +151,45 @@ function scheduleSave(data: QuickData, canPersist: boolean): void {
       console.error('[quick-data] save failed:', err);
     });
   }, 2000);
+}
+
+let quickDataResource = createSharedResource<QuickData>({
+  fetcher: async () => {
+    try {
+      const res = await apiFetch<{ data: QuickData }>('/api/quick-data');
+      const server = normalizeQuickData(res.data);
+      _hasHydratedFromServer = true;
+      if (_mutatedBeforeHydration) {
+        _mutatedBeforeHydration = false;
+        const merged = mergeQuickDataForHydration(server, normalizeQuickData(quickDataResource.peek().value ?? EMPTY_QUICK_DATA));
+        quickDataResource.mutate(merged);
+        return merged;
+      }
+      return server;
+    } catch {
+      return EMPTY_QUICK_DATA;
+    }
+  },
+});
+
+function installQuickDataVisibilityListener(): void {
+  if (_visibilityInstalled || typeof document === 'undefined') return;
+  _visibilityHandler = () => {
+    if (document.visibilityState === 'visible' && quickDataResource.hasSubscribers()) {
+      quickDataResource.invalidate();
+    }
+  };
+  document.addEventListener('visibilitychange', _visibilityHandler);
+  _visibilityInstalled = true;
+}
+
+function updateQuickData(updater: (prev: QuickData) => QuickData): void {
+  const prev = normalizeQuickData(quickDataResource.peek().value ?? EMPTY_QUICK_DATA);
+  const next = updater(prev);
+  if (next === prev) return;
+  if (!_hasHydratedFromServer) _mutatedBeforeHydration = true;
+  quickDataResource.set(next);
+  scheduleSave(next, _hasHydratedFromServer);
 }
 
 export interface UseQuickDataResult {
@@ -109,102 +207,63 @@ export interface UseQuickDataResult {
 }
 
 export function useQuickData(): UseQuickDataResult {
-  const [data, setData] = useState<QuickData>(EMPTY_QUICK_DATA);
-  const [loaded, setLoaded] = useState(false);
-  const [hasHydratedFromServer, setHasHydratedFromServer] = useState(false);
-
-  useEffect(() => {
-    const fetchData = () => {
-      apiFetch<{ data: QuickData }>('/api/quick-data').then((res) => {
-        const d = res.data;
-        if (!d.sessionHistory) d.sessionHistory = {};
-        setData(d);
-        setHasHydratedFromServer(true);
-        setLoaded(true);
-      }).catch(() => { setLoaded(true); });
-    };
-    fetchData();
-    // Re-fetch when app resumes from background (mobile) or tab becomes visible
-    const onVisibility = () => { if (document.visibilityState === 'visible') fetchData(); };
-    document.addEventListener('visibilitychange', onVisibility);
-    return () => document.removeEventListener('visibilitychange', onVisibility);
-  }, []);
+  installQuickDataVisibilityListener();
+  const snapshot = quickDataResource.use();
+  const data = normalizeQuickData(snapshot.value ?? EMPTY_QUICK_DATA);
 
   const recordHistory = (text: string, sessionName?: string) => {
-    setData((prev) => {
-      const next = recordHistoryEntry(prev, text, sessionName);
-      scheduleSave(next, hasHydratedFromServer);
-      return next;
-    });
+    updateQuickData((prev) => recordHistoryEntry(prev, text, sessionName));
   };
 
   const addCommand = (cmd: string) => {
     const trimmed = cmd.trim();
     if (!trimmed) return;
-    setData((prev) => {
-      if (prev.commands.includes(trimmed)) return prev;
-      const next = { ...prev, commands: [...prev.commands, trimmed] };
-      scheduleSave(next, hasHydratedFromServer);
-      return next;
-    });
+    updateQuickData((prev) => prev.commands.includes(trimmed) ? prev : { ...prev, commands: [...prev.commands, trimmed] });
   };
 
   const addPhrase = (phrase: string) => {
     const trimmed = phrase.trim();
     if (!trimmed) return;
-    setData((prev) => {
-      if (prev.phrases.includes(trimmed)) return prev;
-      const next = { ...prev, phrases: [...prev.phrases, trimmed] };
-      scheduleSave(next, hasHydratedFromServer);
-      return next;
-    });
+    updateQuickData((prev) => prev.phrases.includes(trimmed) ? prev : { ...prev, phrases: [...prev.phrases, trimmed] });
   };
 
   const removeCommand = (cmd: string) => {
-    setData((prev) => {
-      const next = { ...prev, commands: prev.commands.filter((c) => c !== cmd) };
-      scheduleSave(next, hasHydratedFromServer);
-      return next;
-    });
+    updateQuickData((prev) => prev.commands.includes(cmd) ? { ...prev, commands: prev.commands.filter((c) => c !== cmd) } : prev);
   };
   const removePhrase = (phrase: string) => {
-    setData((prev) => {
-      const next = { ...prev, phrases: prev.phrases.filter((p) => p !== phrase) };
-      scheduleSave(next, hasHydratedFromServer);
-      return next;
-    });
+    updateQuickData((prev) => prev.phrases.includes(phrase) ? { ...prev, phrases: prev.phrases.filter((p) => p !== phrase) } : prev);
   };
   const removeHistory = (text: string) => {
-    setData((prev) => {
-      const next = { ...prev, history: prev.history.filter((h) => h !== text) };
-      scheduleSave(next, hasHydratedFromServer);
-      return next;
-    });
+    updateQuickData((prev) => prev.history.includes(text) ? { ...prev, history: prev.history.filter((h) => h !== text) } : prev);
   };
   const removeSessionHistory = (sessionName: string, text: string) => {
-    setData((prev) => {
+    updateQuickData((prev) => {
       const sh = prev.sessionHistory[sessionName] ?? [];
-      const next = { ...prev, sessionHistory: { ...prev.sessionHistory, [sessionName]: sh.filter((h) => h !== text) } };
-      scheduleSave(next, hasHydratedFromServer);
-      return next;
+      if (!sh.includes(text)) return prev;
+      return { ...prev, sessionHistory: { ...prev.sessionHistory, [sessionName]: sh.filter((h) => h !== text) } };
     });
   };
   const clearHistory = () => {
-    setData((prev) => {
-      const next = { ...prev, history: [] };
-      scheduleSave(next, hasHydratedFromServer);
-      return next;
-    });
+    updateQuickData((prev) => prev.history.length === 0 ? prev : { ...prev, history: [] });
   };
   const clearSessionHistory = (sessionName: string) => {
-    setData((prev) => {
-      const next = { ...prev, sessionHistory: { ...prev.sessionHistory, [sessionName]: [] } };
-      scheduleSave(next, hasHydratedFromServer);
-      return next;
-    });
+    updateQuickData((prev) => (prev.sessionHistory[sessionName] ?? []).length === 0 ? prev : { ...prev, sessionHistory: { ...prev.sessionHistory, [sessionName]: [] } });
   };
 
-  return { data, loaded, recordHistory, addCommand, addPhrase, removeCommand, removePhrase, removeHistory, removeSessionHistory, clearHistory, clearSessionHistory };
+  return { data, loaded: snapshot.loaded, recordHistory, addCommand, addPhrase, removeCommand, removePhrase, removeHistory, removeSessionHistory, clearHistory, clearSessionHistory };
+}
+
+export function __resetQuickDataForTests(): void {
+  if (_debounceTimer) clearTimeout(_debounceTimer);
+  _debounceTimer = null;
+  _hasHydratedFromServer = false;
+  _mutatedBeforeHydration = false;
+  if (_visibilityHandler && typeof document !== 'undefined') {
+    document.removeEventListener('visibilitychange', _visibilityHandler);
+  }
+  _visibilityHandler = null;
+  _visibilityInstalled = false;
+  quickDataResource.disposeForTests();
 }
 
 // ── Panel component ───────────────────────────────────────────────────────

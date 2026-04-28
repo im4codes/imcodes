@@ -162,7 +162,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
 
   const commitRename = () => {
     if (!renaming) return;
-    const trimmed = renameVal.trim();
+    const trimmed = (renameRef.current?.value ?? renameVal).trim();
     onRenameSession?.(renaming, trimmed || null);
     setRenaming(null);
   };
@@ -260,6 +260,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
               <input
                 ref={renameRef}
                 class="tab-rename-input"
+                autoFocus
                 value={renameVal}
                 onInput={(e) => setRenameVal((e.target as HTMLInputElement).value)}
                 onKeyDown={(e) => {
@@ -267,7 +268,9 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
                   if (e.key === 'Enter') { e.preventDefault(); commitRename(); }
                   if (e.key === 'Escape') setRenaming(null);
                 }}
+                onBlurCapture={commitRename}
                 onBlur={commitRename}
+                onFocusOut={commitRename}
               />
             ) : (
               <button

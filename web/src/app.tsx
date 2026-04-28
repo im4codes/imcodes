@@ -53,13 +53,21 @@ import { getSessionRuntimeType } from '@shared/agent-types.js';
 import { mergeSessionListEntry, type IncomingSessionListEntry } from './session-list-merge.js';
 import { resolveSessionInfoRuntimeType } from './runtime-type.js';
 import { useSyncedPreference } from './hooks/useSyncedPreference.js';
+import { parseString, usePref } from './hooks/usePref.js';
+import { PREF_KEY_DEFAULT_SHELL, PREF_KEY_P2P_SESSION_CONFIG_LEGACY, p2pSessionConfigPrefKey } from './constants/prefs.js';
+import {
+  p2pSubSessionParentSignature,
+  parseP2pSavedConfig,
+  resolveP2pRootSession,
+  serializeP2pSavedConfig,
+} from './preferences/p2p-config-pref.js';
 import { resolveInitialServerId, resolveInitialSessionName, writeHashState } from './hooks/useHashState.js';
 import { useSubSessions } from './hooks/useSubSessions.js';
 import { useProviderStatus } from './hooks/useProviderStatus.js';
 import { DEFAULT_NEW_USER_GUIDE_PREF, shouldMarkNewUserGuidePending, shouldShowNewUserGuidePrompt, type NewUserGuidePref } from './onboarding.js';
 // useSwipeBack now handled inside FloatingPanel for discussion/repo pages
 import { WsClient } from './ws-client.js';
-import { configure as configureApi, apiFetch, onAuthExpired, getUserPref, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns } from './api.js';
+import { configure as configureApi, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
 import { getAuthKey, clearAuthKey } from './biometric-auth.js';
 import { initPushNotifications, resetPushBadge } from './push-notifications.js';
@@ -1123,6 +1131,27 @@ export function App() {
     activeSession,
   );
 
+  const defaultShellPref = usePref<string>(PREF_KEY_DEFAULT_SHELL, { parse: parseString });
+  const subSessionParentSignature = useMemo(
+    () => p2pSubSessionParentSignature(subSessions),
+    [subSessions],
+  );
+  const activeRootSession = useMemo(() => {
+    return resolveP2pRootSession(activeSession, subSessions);
+  // Depend on the session→parent projection, not the full subSessions array
+  // reference, so unrelated sub-session metadata churn does not change the
+  // preference subscription key.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSession, subSessionParentSignature]);
+  const p2pConfigPref = usePref(
+    activeRootSession ? p2pSessionConfigPrefKey(activeRootSession) : null,
+    {
+      legacyKey: PREF_KEY_P2P_SESSION_CONFIG_LEGACY,
+      parse: parseP2pSavedConfig,
+      serialize: serializeP2pSavedConfig,
+    },
+  );
+
   // ── Unread counts (sidebar session tree badges) ────────────────────────────
   const sessionNames = useMemo(() => sessions.map((s) => s.name), [sessions]);
   const unreadCounts = useUnreadCounts(sessionNames, activeSession, wsRef.current, selectedServerId);
@@ -1136,36 +1165,23 @@ export function App() {
     const prev = prevActiveSessionRef.current;
     if (!activeSession || activeSession === prev) return;
     if (!connected || loadedServerId !== selectedServerId) return;
+    if (!defaultShellPref.loaded) return;
     // Conditions met — mark this session as handled
     prevActiveSessionRef.current = activeSession;
     if (visibleSubSessions.length > 0) return;
-    void getUserPref('default_shell').then((saved) => {
-      const shell = (typeof saved === 'string' && saved) ? saved : '/bin/bash';
-      void createSubSession('shell', shell);
-    });
-  }, [activeSession, connected, loadedServerId, selectedServerId, visibleSubSessions.length, createSubSession]);
+    const shell = defaultShellPref.value || '/bin/bash';
+    void createSubSession('shell', shell);
+  }, [activeSession, connected, loadedServerId, selectedServerId, visibleSubSessions.length, createSubSession, defaultShellPref.loaded, defaultShellPref.value]);
 
   // Load P2P config — determine which sessions are enabled for P2P tagging
   useEffect(() => {
-    // Resolve root session: if active is a sub-session, find its parent
-    const activeSub = subSessions.find((s) => s.sessionName === activeSession);
-    const root = activeSub?.parentSession || activeSession || '';
-    if (!root) { setP2pSessionNames(new Set()); return; }
-    const configKey = `p2p_session_config:${root}`;
-    void getUserPref(configKey).then((raw) => {
-      if (!raw || typeof raw !== 'string') { setP2pSessionNames(new Set()); return; }
-      try {
-        const cfg = JSON.parse(raw) as { sessions?: Record<string, { enabled?: boolean; mode?: string }> };
-        const names = new Set<string>();
-        if (cfg.sessions) {
-          for (const [name, entry] of Object.entries(cfg.sessions)) {
-            if (entry.enabled && entry.mode !== 'skip') names.add(name);
-          }
-        }
-        setP2pSessionNames(names);
-      } catch { setP2pSessionNames(new Set()); }
-    });
-  }, [activeSession, subSessions]);
+    if (!activeRootSession || !p2pConfigPref.value?.sessions) { setP2pSessionNames(new Set()); return; }
+    const names = new Set<string>();
+    for (const [name, entry] of Object.entries(p2pConfigPref.value.sessions)) {
+      if (entry.enabled && entry.mode !== 'skip') names.add(name);
+    }
+    setP2pSessionNames(names);
+  }, [activeRootSession, p2pConfigPref.value]);
 
   const diffApplyersRef = useRef<Map<string, (diff: TerminalDiff) => void>>(new Map());
   const historyApplyersRef = useRef<Map<string, (content: string) => void>>(new Map());

@@ -6,7 +6,8 @@ import { useTranslation } from 'react-i18next';
 import type { WsClient } from '../ws-client.js';
 import type { RemoteSession } from '../hooks/useProviderStatus.js';
 import { FileBrowser } from './file-browser-lazy.js';
-import { getUserPref, saveUserPref } from '../api.js';
+import { parseString, usePref } from '../hooks/usePref.js';
+import { PREF_KEY_DEFAULT_SHELL } from '../constants/prefs.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
 import { getSessionAgentGroups, getSessionAgentLabel, SESSION_AGENT_GROUP_LABEL_KEYS } from './session-agent-options.js';
 import { QwenCodingPlanHint } from './QwenCodingPlanHint.js';
@@ -116,11 +117,10 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   const agentGroups = getSessionAgentGroups('sub-session');
 
   // Load saved shell preference from server
+  const defaultShellPref = usePref<string>(PREF_KEY_DEFAULT_SHELL, { parse: parseString });
   useEffect(() => {
-    void getUserPref('default_shell').then((saved) => {
-      if (typeof saved === 'string' && saved) setShellBin(saved);
-    }).catch(() => {});
-  }, []);
+    if (defaultShellPref.value) setShellBin(defaultShellPref.value);
+  }, [defaultShellPref.value]);
 
   // Request shell detection from daemon
   useEffect(() => {
@@ -215,7 +215,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     }
     const selectedShell = type === 'shell' ? (shellBin || undefined) : undefined;
     if (type === 'shell' && selectedShell) {
-      void saveUserPref('default_shell', selectedShell).catch(() => {});
+      void defaultShellPref.save(selectedShell).catch(() => {});
     }
     const extra: Record<string, unknown> = {};
     if (desc) extra.description = desc;

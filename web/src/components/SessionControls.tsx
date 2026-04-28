@@ -14,8 +14,12 @@ import { VoiceOverlay } from './VoiceOverlay.js';
 import { AtPicker } from './AtPicker.js';
 import { P2pConfigPanel } from './P2pConfigPanel.js';
 import { useP2pCustomCombos } from './p2p-combos.js';
-import { uploadFile, getUserPref, saveUserPref, onUserPrefChanged, sendSessionViaHttp } from '../api.js';
-import { fetchSupervisorDefaults, patchSession, patchSubSession } from '../api.js';
+import { parseBooleanish, usePref } from '../hooks/usePref.js';
+import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
+import { PREF_KEY_P2P_COMBO_CONFIRM_SKIP, PREF_KEY_P2P_SESSION_CONFIG_LEGACY, p2pSessionConfigPrefKey } from '../constants/prefs.js';
+import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p-config-pref.js';
+import { uploadFile, sendSessionViaHttp } from '../api.js';
+import { patchSession, patchSubSession } from '../api.js';
 import { isRunningSessionState } from '../thinking-utils.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { MSG_COMMAND_FAILED } from '@shared/ack-protocol.js';
@@ -200,7 +204,6 @@ type P2pMode = string; // 'solo' | single modes | combo pipelines like 'brainsto
 const MODEL_STORAGE_KEY = 'imcodes-model';
 const CODEX_MODEL_STORAGE_KEY = 'imcodes-codex-model';
 const QWEN_MODEL_STORAGE_KEY = 'imcodes-qwen-model';
-const P2P_COMBO_CONFIRM_SKIP_PREF_KEY = 'p2p_combo_direct_send_skip_confirm';
 const CODEX_MODELS: CodexModelChoice[] = [...CODEX_MODEL_IDS];
 const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
 const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
@@ -731,6 +734,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     && isTransport
     && isSupportedSupervisionTargetSessionType(activeSession.agentType)
   );
+  const supervisorDefaultsPref = useSupervisorDefaults(canQuickControlSupervision);
   const isCodex = activeSession?.agentType === 'codex' || activeSession?.agentType === 'codex-sdk';
   const isQwen = activeSession?.agentType === 'qwen';
   const isCopilot = activeSession?.agentType === 'copilot-sdk';
@@ -851,13 +855,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     [allCombos],
   );
 
-  // P2P config loading moved after rootSession declaration below
-
+  const comboSkipPref = usePref<boolean>(PREF_KEY_P2P_COMBO_CONFIRM_SKIP, { parse: parseBooleanish });
   useEffect(() => {
-    void getUserPref(P2P_COMBO_CONFIRM_SKIP_PREF_KEY).then((raw) => {
-      if (raw === true || raw === 'true') setSkipComboSendConfirm(true);
-    });
-  }, []);
+    if (comboSkipPref.value === true) setSkipComboSendConfirm(true);
+  }, [comboSkipPref.value]);
 
   useEffect(() => {
     onQuickOpenChange?.(quickOpen);
@@ -1112,7 +1113,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       }
       nextSnapshot = { ...supervisionSnapshot, mode: nextMode };
     } else {
-      const defaults = await fetchSupervisorDefaults();
+      const defaults = supervisorDefaultsPref.value ?? (supervisorDefaultsPref.loaded ? null : await supervisorDefaultsPref.reload());
       if (!defaults) {
         setAutoOpen(false);
         onSettings?.();
@@ -1152,6 +1153,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     serverId,
     showSendWarning,
     supervisionSnapshot,
+    supervisorDefaultsPref.loaded,
+    supervisorDefaultsPref.reload,
+    supervisorDefaultsPref.value,
     t,
   ]);
 
@@ -1378,7 +1382,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [p2pSavedConfig]);
 
   // P2P config is per main-session (sub-sessions follow parent), stored on server for cross-device sync
-  const p2pConfigKey = rootSession ? `p2p_session_config:${rootSession}` : null;
+  const p2pConfigKey = rootSession ? p2pSessionConfigPrefKey(rootSession) : null;
+  const p2pSavedConfigPref = usePref<P2pSavedConfig>(p2pConfigKey, {
+    legacyKey: PREF_KEY_P2P_SESSION_CONFIG_LEGACY,
+    parse: parseP2pSavedConfig,
+    serialize: serializeP2pSavedConfig,
+  });
   const lastDaemonP2pSyncRef = useRef<string>('');
   const pendingP2pConfigSavesRef = useRef<Map<string, PendingP2pConfigSave>>(new Map());
   const resolvePendingP2pConfigSave = useCallback((requestId: string, result: P2pConfigPersistResult) => {
@@ -1423,40 +1432,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       }
     });
   }, [resolvePendingP2pConfigSave, ws]);
-  const reloadP2pSavedConfig = useCallback(() => {
-    if (!p2pConfigKey) {
-      setP2pSavedConfig(null);
-      return;
-    }
-    const apply = (raw: unknown) => {
-      if (raw && typeof raw === 'string') {
-        try { setP2pSavedConfig(JSON.parse(raw) as P2pSavedConfig); } catch { setP2pSavedConfig(null); }
-      } else {
-        setP2pSavedConfig(null);
-      }
-    };
-    void getUserPref(p2pConfigKey).then((raw) => {
-      if (raw) { apply(raw); return; }
-      void getUserPref('p2p_session_config').then((legacyRaw) => {
-        if (legacyRaw && typeof legacyRaw === 'string') {
-          void saveUserPref(p2pConfigKey, legacyRaw).catch(() => {});
-        }
-        apply(legacyRaw);
-      });
-    });
-  }, [p2pConfigKey]);
   useEffect(() => {
-    reloadP2pSavedConfig();
-  }, [reloadP2pSavedConfig]);
-
-  useEffect(() => {
-    if (!p2pConfigKey) return;
-    return onUserPrefChanged((key) => {
-      if (key === p2pConfigKey || key === 'p2p_session_config') {
-        reloadP2pSavedConfig();
-      }
-    });
-  }, [p2pConfigKey, reloadP2pSavedConfig]);
+    setP2pSavedConfig(p2pSavedConfigPref.value);
+  }, [p2pSavedConfigPref.value]);
 
   useEffect(() => {
     if (!ws || !rootSession || !p2pSavedConfig) return;
@@ -1890,8 +1868,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const maybePersistComboSendSkip = useCallback(() => {
     if (!rememberComboSendChoice) return;
     setSkipComboSendConfirm(true);
-    void saveUserPref(P2P_COMBO_CONFIRM_SKIP_PREF_KEY, true).catch(() => {});
-  }, [rememberComboSendChoice]);
+    void comboSkipPref.save(true).catch(() => {});
+  }, [comboSkipPref, rememberComboSendChoice]);
 
   const getSendValidationError = useCallback((payload: PendingSendPayload): string | null => {
     const text = payload.text.trim();

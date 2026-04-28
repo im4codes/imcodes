@@ -2,7 +2,8 @@ import { useState, useEffect, useMemo } from "preact/hooks";
 import { useTranslation } from "react-i18next";
 import type { WsClient } from "../ws-client.js";
 import { FileBrowser } from "./file-browser-lazy.js";
-import { getUserPref, saveUserPref } from "../api.js";
+import { parseString, usePref } from "../hooks/usePref.js";
+import { PREF_KEY_DEFAULT_SHELL } from "../constants/prefs.js";
 import { sanitizeProjectName } from "@shared/sanitize-project-name.js";
 import {
   getSessionAgentGroups,
@@ -34,7 +35,6 @@ import { CC_PRESET_MSG } from "@shared/cc-presets.js";
 import type { CcPreset } from "@shared/cc-presets.js";
 import { GEMINI_MODEL_IDS, mergeModelSuggestions } from "../../../src/shared/models/options.js";
 
-const DEFAULT_SHELL_KEY = "default_shell";
 // Fallback suggestions used only when the daemon probe returns an empty list
 // (offline/unauthenticated). The live list comes from the dynamic models hook.
 const CURSOR_HEADLESS_MODEL_FALLBACK = ["auto", "composer-2-fast", "gpt-5.2"] as const;
@@ -162,14 +162,8 @@ export function NewSessionDialog({
   const [ocSelectedSession, setOcSelectedSession] = useState("");
 
   // Load saved shell preference — will be validated against daemon's detected list later
-  const [savedShellPref, setSavedShellPref] = useState<string | null>(null);
-  useEffect(() => {
-    void getUserPref(DEFAULT_SHELL_KEY)
-      .then((saved) => {
-        if (typeof saved === "string" && saved) setSavedShellPref(saved);
-      })
-      .catch(() => {});
-  }, []);
+  const defaultShellPref = usePref<string>(PREF_KEY_DEFAULT_SHELL, { parse: parseString });
+  const savedShellPref = defaultShellPref.value;
 
   useEffect(() => {
     if (!ws) return;
@@ -303,7 +297,7 @@ export function NewSessionDialog({
     setError("");
     setStarting(true);
     if (shellBin)
-      void saveUserPref(DEFAULT_SHELL_KEY, shellBin).catch(() => {});
+      void defaultShellPref.save(shellBin).catch(() => {});
 
     if (agentType === "openclaw") {
       const extra =

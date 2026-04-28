@@ -281,7 +281,7 @@ describe('SessionTabs', () => {
 
     const input = screen.getByRole('textbox') as HTMLInputElement;
     fireEvent.input(input, { target: { value: '' } });
-    fireEvent.blur(input);
+    fireEvent.keyDown(input, { key: 'Enter' });
 
     expect(onRenameSession).toHaveBeenCalledWith('deck_proj_brain', null);
   });

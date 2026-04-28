@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from 'preact/hooks';
+import { useCallback, useMemo } from 'preact/hooks';
 import { COMBO_PRESETS, COMBO_SEPARATOR } from '@shared/p2p-modes.js';
-import { getUserPref, saveUserPref } from '../api.js';
+import { PREF_KEY_P2P_CUSTOM_COMBOS } from '../constants/prefs.js';
+import { parseJsonValue, usePref } from '../hooks/usePref.js';
 
-export const CUSTOM_COMBOS_PREF_KEY = 'p2p_custom_combos';
+export const CUSTOM_COMBOS_PREF_KEY = PREF_KEY_P2P_CUSTOM_COMBOS;
 export const BUILDER_MODES = ['audit', 'review', 'plan', 'brainstorm', 'discuss'] as const;
 export const MAX_CUSTOM_COMBOS = 5;
 
@@ -16,9 +17,6 @@ const MODE_COLORS: Record<string, string> = {
 };
 
 const presetKeys = new Set(COMBO_PRESETS.map((combo) => combo.key));
-const subscribers = new Set<(combos: string[]) => void>();
-let cachedCustomCombos: string[] | null = null;
-let loadPromise: Promise<string[]> | null = null;
 
 export function comboModeColor(key: string): string {
   const last = key.split(COMBO_SEPARATOR).pop()?.trim();
@@ -47,52 +45,20 @@ export function normalizeCustomCombos(raw: unknown): string[] {
   return combos;
 }
 
-function publishCustomCombos(combos: string[]) {
-  cachedCustomCombos = combos;
-  for (const subscriber of subscribers) subscriber(combos);
-}
-
-async function loadCustomCombos(force = false): Promise<string[]> {
-  if (!force && cachedCustomCombos !== null) return cachedCustomCombos;
-  if (!loadPromise) {
-    loadPromise = getUserPref(CUSTOM_COMBOS_PREF_KEY)
-      .then((raw) => {
-        if (typeof raw !== 'string') return [];
-        try {
-          return normalizeCustomCombos(JSON.parse(raw));
-        } catch {
-          return [];
-        }
-      })
-      .catch(() => [])
-      .then((combos) => {
-        cachedCustomCombos = combos;
-        return combos;
-      })
-      .finally(() => {
-        loadPromise = null;
-      });
-  }
-  return loadPromise;
+function parseCustomCombos(raw: unknown): string[] {
+  return parseJsonValue<string[]>(raw, normalizeCustomCombos) ?? [];
 }
 
 export function useP2pCustomCombos() {
-  const [customCombos, setCustomCombos] = useState<string[]>(cachedCustomCombos ?? []);
-
-  useEffect(() => {
-    subscribers.add(setCustomCombos);
-    if (cachedCustomCombos !== null) setCustomCombos(cachedCustomCombos);
-    void loadCustomCombos(true).then((combos) => publishCustomCombos(combos)).catch(() => {});
-    return () => {
-      subscribers.delete(setCustomCombos);
-    };
-  }, []);
+  const customCombosPref = usePref<string[]>(PREF_KEY_P2P_CUSTOM_COMBOS, {
+    parse: parseCustomCombos,
+    serialize: (value) => JSON.stringify(normalizeCustomCombos(value)),
+  });
+  const customCombos = customCombosPref.value ?? [];
 
   const saveCustomCombos = useCallback((combos: string[]) => {
-    const normalized = normalizeCustomCombos(combos);
-    publishCustomCombos(normalized);
-    void saveUserPref(CUSTOM_COMBOS_PREF_KEY, JSON.stringify(normalized)).catch(() => {});
-  }, []);
+    void customCombosPref.save(normalizeCustomCombos(combos)).catch(() => {});
+  }, [customCombosPref]);
 
   const allCombos = useMemo(() => ({
     presets: COMBO_PRESETS,

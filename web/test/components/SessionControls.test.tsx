@@ -167,7 +167,16 @@ const onUserPrefChangedMock = vi.fn((cb: (key: string, value: unknown) => void) 
 });
 vi.mock('../../src/api.js', () => ({
   uploadFile: (...args: unknown[]) => uploadFileMock(...args),
-  getUserPref: (...args: unknown[]) => getUserPrefMock(...args),
+  getUserPref: async (key: string) => {
+    if (key === 'supervision.user_default') {
+      try {
+        return await fetchSupervisorDefaultsMock();
+      } catch {
+        return null;
+      }
+    }
+    return getUserPrefMock(key);
+  },
   saveUserPref: (...args: unknown[]) => saveUserPrefMock(...args),
   fetchSupervisorDefaults: (...args: unknown[]) => fetchSupervisorDefaultsMock(...args),
   patchSession: (...args: unknown[]) => patchSessionMock(...args),
@@ -680,7 +689,7 @@ afterEach(() => {
     expect(comboBtn.title).toBe('combo_requires_participants_hint');
   });
 
-  it('reloads P2P config when the session preference changes externally', async () => {
+  it('applies P2P config preference events without refetching', async () => {
     let prefValue = JSON.stringify({
       sessions: {
         'my-session': { enabled: false, mode: 'audit' },
@@ -709,10 +718,8 @@ afterEach(() => {
       detail: { key: 'p2p_session_config:my-session', value: prefValue },
     }));
     await flushAsync();
-    await waitFor(() => {
-      const currentFetches = getUserPrefMock.mock.calls.filter(([key]) => key === 'p2p_session_config:my-session').length;
-      expect(currentFetches).toBeGreaterThan(initialFetches);
-    });
+    const currentFetches = getUserPrefMock.mock.calls.filter(([key]) => key === 'p2p_session_config:my-session').length;
+    expect(currentFetches).toBe(initialFetches);
   });
 
   it('syncs loaded P2P config into daemon authority on mount', async () => {
