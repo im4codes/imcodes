@@ -93,48 +93,35 @@ describe('ChatView', () => {
     (window as Window & { visualViewport?: typeof visualViewportMock }).visualViewport = originalVisualViewport as any;
   });
 
-  it('shows thinking details by default while the tool/detail preference is undecided', () => {
-    showToolCallsPref.value = null;
+  it('always hides thinking events from the timeline regardless of preference', () => {
+    // Thinking events (both live and finished) are unconditionally hidden —
+    // the agent's running state and memory-context card already give enough
+    // signal that work is happening, and the "Thought for Xs" summary was
+    // pure noise. See ChatView's `assistant.thinking` case (returns null).
+    for (const prefValue of [null, true, false] as const) {
+      showToolCallsPref.value = prefValue;
 
-    const { container } = render(
-      <ChatView
-        events={[
-          {
-            eventId: 'thinking-1',
-            type: 'assistant.thinking',
-            ts: Date.now() - 1000,
-            payload: { text: 'checking files' },
-          },
-        ] as any}
-        loading={false}
-        sessionId="test"
-      />,
-    );
+      const { container, unmount } = render(
+        <ChatView
+          events={[
+            {
+              eventId: 'thinking-1',
+              type: 'assistant.thinking',
+              ts: Date.now() - 1000,
+              payload: { text: 'checking files' },
+            },
+          ] as any}
+          loading={false}
+          sessionId="test"
+        />,
+      );
 
-    expect(container.querySelector('.chat-thinking')).toBeTruthy();
-    expect(container.textContent ?? '').toContain('chat.thinking_running');
-  });
-
-  it('hides thinking details when the tool/detail preference is off', () => {
-    showToolCallsPref.value = false;
-
-    const { container } = render(
-      <ChatView
-        events={[
-          {
-            eventId: 'thinking-1',
-            type: 'assistant.thinking',
-            ts: Date.now() - 1000,
-            payload: { text: 'checking files' },
-          },
-        ] as any}
-        loading={false}
-        sessionId="test"
-      />,
-    );
-
-    expect(container.querySelector('.chat-thinking')).toBeNull();
-    expect(container.textContent ?? '').not.toContain('checking files');
+      expect(container.querySelector('.chat-thinking')).toBeNull();
+      expect(container.textContent ?? '').not.toContain('checking files');
+      expect(container.textContent ?? '').not.toContain('chat.thinking_running');
+      expect(container.textContent ?? '').not.toContain('chat.thinking_done');
+      unmount();
+    }
   });
 
   it('keeps preview mode pinned to the bottom during streaming updates with the same timestamp', async () => {
