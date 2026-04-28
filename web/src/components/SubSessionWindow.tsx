@@ -25,7 +25,6 @@ import { IdleFlashLayer } from './IdleFlashLayer.js';
 import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import { resolveSubSessionRuntimeType } from '../runtime-type.js';
-import { DESKTOP_WINDOW_IDS } from '../window-stack.js';
 
 interface WindowGeometry { x: number; y: number; w: number; h: number }
 
@@ -46,10 +45,6 @@ interface Props {
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
   zIndex: number;
   onFocus: () => void;
-  desktopFileBrowserZIndex?: number;
-  onDesktopFileBrowserOpen?: () => void;
-  onDesktopFileBrowserFocus?: () => void;
-  onDesktopFileBrowserClose?: () => void;
   /** Optional: called to pin this sub-session to the sidebar. Passes current viewMode. */
   onPin?: (viewMode: 'terminal' | 'chat') => void;
   sessions?: SessionInfo[];
@@ -111,7 +106,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, onSettings, onTransportConfigSaved, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, inP2p,
+  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, onSettings, onTransportConfigSaved, zIndex, onFocus, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, inP2p,
 }: Props) {
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
@@ -157,10 +152,6 @@ export function SubSessionWindow({
   // (not the parent main session's). The overlay/panel is rendered locally so
   // it layers above this sub-session window instead of being hidden behind it.
   const [showFileBrowser, setShowFileBrowser] = useState(false);
-  useEffect(() => {
-    if (isMobile || !showFileBrowser) return;
-    return () => onDesktopFileBrowserClose?.();
-  }, [isMobile, onDesktopFileBrowserClose, showFileBrowser]);
 
   const [quotes, setQuotes] = useState<string[]>([]);
   const addQuote = useCallback((text: string) => setQuotes((prev) => [...prev, text]), []);
@@ -476,17 +467,11 @@ export function SubSessionWindow({
               sub-session window header. Each sub-session owns its own
               FileBrowser instance rooted at sub.cwd, so selected paths land
               in THIS sub-session's input (not the parent main session's).
-              Desktop child ordering is delegated to the shared window stack. */}
+              The overlay/panel is rendered at zIndex > this window's zIndex
+              so it isn't hidden behind the window itself. */}
           <button
             class="subsession-minimize-btn"
-            onClick={() => {
-              const nextOpen = !showFileBrowser;
-              setShowFileBrowser(nextOpen);
-              if (!isMobile) {
-                if (nextOpen) onDesktopFileBrowserOpen?.();
-                else onDesktopFileBrowserClose?.();
-              }
-            }}
+            onClick={() => setShowFileBrowser((o) => !o)}
             title={t('picker.files')}
             aria-label={t('picker.files')}
             style={{ position: 'relative' }}
@@ -607,7 +592,8 @@ export function SubSessionWindow({
 
       {/* Per-sub-session file browser. Mobile: full-screen overlay.
           Desktop: floating panel. Rooted at this sub-session's cwd so
-          selected paths land in the sub-session's own input. */}
+          selected paths land in the sub-session's own input. zIndex is
+          pinned to this window's zIndex + 1 so it layers above the window. */}
       {showFileBrowser && ws && (
         isMobile ? (
           <div class="mobile-fb-overlay" style={{ zIndex: zIndex + 1 }}>
@@ -641,13 +627,10 @@ export function SubSessionWindow({
           </div>
         ) : (
           <FloatingPanel
-            id={DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id)}
+            id={`subsession-filebrowser-${sub.id}`}
             title={`📁 ${t('picker.files')}`}
-            onClose={() => {
-              setShowFileBrowser(false);
-            }}
-            zIndex={desktopFileBrowserZIndex ?? zIndex}
-            onFocus={onDesktopFileBrowserFocus}
+            onClose={() => setShowFileBrowser(false)}
+            zIndex={zIndex + 1}
             defaultW={420}
             defaultH={500}
           >

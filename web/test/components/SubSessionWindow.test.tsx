@@ -3,7 +3,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
+import { cleanup, render, waitFor } from '@testing-library/preact';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -16,38 +16,11 @@ vi.mock('../../src/components/TerminalView.js', () => ({
 }));
 
 const chatViewPropsSpy = vi.fn();
-const floatingPanelPropsSpy = vi.fn();
-const fileBrowserPropsSpy = vi.fn();
-const defaultUserAgent = navigator.userAgent;
 
 vi.mock('../../src/components/ChatView.js', () => ({
   ChatView: (props: any) => {
     chatViewPropsSpy(props);
     return null;
-  },
-}));
-
-vi.mock('../../src/components/FloatingPanel.js', () => ({
-  FloatingPanel: (props: any) => {
-    floatingPanelPropsSpy(props);
-    return (
-      <div
-        data-testid={`floating-panel-${props.id}`}
-        data-z-index={props.zIndex}
-        data-title={props.title}
-        onMouseDown={props.onFocus}
-      >
-        <button data-testid={`floating-panel-close-${props.id}`} onClick={props.onClose}>close</button>
-        {props.children}
-      </div>
-    );
-  },
-}));
-
-vi.mock('../../src/components/FileBrowser.js', () => ({
-  FileBrowser: (props: any) => {
-    fileBrowserPropsSpy(props);
-    return <button data-testid="file-browser-close" onClick={props.onClose}>file browser</button>;
   },
 }));
 
@@ -163,7 +136,6 @@ describe('SubSessionWindow metadata wiring', () => {
   beforeEach(() => {
     cleanup();
     vi.clearAllMocks();
-    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: defaultUserAgent });
     timelineEventsMock = [];
     activeToolCallMock = false;
   });
@@ -360,132 +332,6 @@ describe('SubSessionWindow metadata wiring', () => {
       expect(document.querySelector('[data-testid="usage-footer"]')).toBeTruthy();
     });
   });
-
-  it('delegates desktop file browser stack identity and callbacks to the child window', async () => {
-    const sub = makeSubSession({ id: 'sub-42', cwd: '/work/project' });
-    const onDesktopFileBrowserOpen = vi.fn();
-    const onDesktopFileBrowserFocus = vi.fn();
-    const onDesktopFileBrowserClose = vi.fn();
-
-    render(
-      <SubSessionWindow
-        sub={sub}
-        ws={ws}
-        connected={true}
-        active={true}
-        onDiff={vi.fn()}
-        onHistory={vi.fn()}
-        onMinimize={vi.fn()}
-        onClose={vi.fn()}
-        onRestart={vi.fn()}
-        onRename={vi.fn()}
-        zIndex={6000}
-        onFocus={vi.fn()}
-        desktopFileBrowserZIndex={6105}
-        onDesktopFileBrowserOpen={onDesktopFileBrowserOpen}
-        onDesktopFileBrowserFocus={onDesktopFileBrowserFocus}
-        onDesktopFileBrowserClose={onDesktopFileBrowserClose}
-        serverId="srv-1"
-      />,
-    );
-
-    fireEvent.click(screen.getByLabelText('picker.files'));
-
-    await waitFor(() => {
-      expect(floatingPanelPropsSpy).toHaveBeenCalledWith(expect.objectContaining({
-        id: 'subsession-filebrowser:sub-42',
-        zIndex: 6105,
-      }));
-      expect(fileBrowserPropsSpy).toHaveBeenCalledWith(expect.objectContaining({
-        initialPath: '/work/project',
-        changesRootPath: '/work/project',
-      }));
-    });
-
-    expect(onDesktopFileBrowserOpen).toHaveBeenCalled();
-    expect(Number(screen.getByTestId('floating-panel-subsession-filebrowser:sub-42').dataset.zIndex)).toBeGreaterThan(6000);
-
-    fireEvent.mouseDown(screen.getByTestId('floating-panel-subsession-filebrowser:sub-42'));
-    expect(onDesktopFileBrowserFocus).toHaveBeenCalled();
-
-    fireEvent.click(screen.getByTestId('floating-panel-close-subsession-filebrowser:sub-42'));
-    expect(onDesktopFileBrowserClose).toHaveBeenCalledTimes(1);
-  });
-
-  it('does not synthesize desktop child z-index from the parent fallback', async () => {
-    const sub = makeSubSession({ id: 'sub-no-stack', cwd: '/work/project' });
-
-    render(
-      <SubSessionWindow
-        sub={sub}
-        ws={ws}
-        connected={true}
-        active={true}
-        onDiff={vi.fn()}
-        onHistory={vi.fn()}
-        onMinimize={vi.fn()}
-        onClose={vi.fn()}
-        onRestart={vi.fn()}
-        onRename={vi.fn()}
-        zIndex={6000}
-        onFocus={vi.fn()}
-        serverId="srv-1"
-      />,
-    );
-
-    fireEvent.click(screen.getByLabelText('picker.files'));
-
-    await waitFor(() => {
-      expect(floatingPanelPropsSpy).toHaveBeenCalledWith(expect.objectContaining({
-        id: 'subsession-filebrowser:sub-no-stack',
-        zIndex: 6000,
-      }));
-    });
-  });
-
-  it('keeps mobile file browser outside desktop child stack callbacks', async () => {
-    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
-    const sub = makeSubSession({ id: 'sub-mobile', cwd: '/work/mobile' });
-    const onDesktopFileBrowserOpen = vi.fn();
-    const onDesktopFileBrowserFocus = vi.fn();
-    const onDesktopFileBrowserClose = vi.fn();
-
-    render(
-      <SubSessionWindow
-        sub={sub}
-        ws={ws}
-        connected={true}
-        active={true}
-        onDiff={vi.fn()}
-        onHistory={vi.fn()}
-        onMinimize={vi.fn()}
-        onClose={vi.fn()}
-        onRestart={vi.fn()}
-        onRename={vi.fn()}
-        zIndex={6000}
-        onFocus={vi.fn()}
-        desktopFileBrowserZIndex={6105}
-        onDesktopFileBrowserOpen={onDesktopFileBrowserOpen}
-        onDesktopFileBrowserFocus={onDesktopFileBrowserFocus}
-        onDesktopFileBrowserClose={onDesktopFileBrowserClose}
-        serverId="srv-1"
-      />,
-    );
-
-    fireEvent.click(screen.getByLabelText('picker.files'));
-
-    await waitFor(() => {
-      expect(screen.getByTestId('file-browser-close')).toBeTruthy();
-    });
-
-    expect(floatingPanelPropsSpy).not.toHaveBeenCalled();
-    expect(onDesktopFileBrowserOpen).not.toHaveBeenCalled();
-    expect(onDesktopFileBrowserFocus).not.toHaveBeenCalled();
-
-    fireEvent.click(screen.getByTestId('file-browser-close'));
-
-    expect(onDesktopFileBrowserClose).not.toHaveBeenCalled();
-  });
 });
 
 describe('SubSessionWindow terminal subscription raw mode', () => {
@@ -499,7 +345,6 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
   beforeEach(() => {
     cleanup();
     vi.clearAllMocks();
-    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: defaultUserAgent });
     vi.useFakeTimers();
   });
 

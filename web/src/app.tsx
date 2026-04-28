@@ -101,16 +101,6 @@ import { pickReadableSessionDisplay } from '@shared/session-display.js';
 import { updateMainSessionLabel } from './session-label-api.js';
 import { buildDocumentTitle } from './tab-title.js';
 import {
-  createDesktopWindowStack,
-  DESKTOP_WINDOW_IDS,
-  DESKTOP_WINDOW_KINDS,
-  getFrontmostSubSessionId,
-  syncDesktopWindowStack,
-  type DesktopWindowMeta,
-  type DesktopWindowStack,
-  type DesktopWindowStackEntry,
-} from './window-stack.js';
-import {
   getDaemonBadgeState,
   getSelectedServerName,
   hasResolvedActiveSession,
@@ -276,7 +266,6 @@ export function App() {
   const [showDesktopLocalWebPreview, setShowDesktopLocalWebPreview] = useState(false);
   const [localWebPreviewPort, setLocalWebPreviewPort] = useState('');
   const [localWebPreviewPath, setLocalWebPreviewPath] = useState('/');
-  const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   // File browser geometry now managed by FloatingPanel (id="filebrowser")
   // NOTE: top-bar 📁 buttons call setShowMobile/DesktopFileBrowser directly.
   // Sub-sessions now own their own FileBrowser inside SubSessionWindow
@@ -853,49 +842,20 @@ export function App() {
     return {};
   });
 
-  const [desktopWindowStack, setDesktopWindowStack] = useState<DesktopWindowStack>(() => createDesktopWindowStack());
+  // z-index per sub-session window
+  const [subZIndexes, setSubZIndexes] = useState<Map<string, number>>(new Map());
   const [showSubDialog, setShowSubDialog] = useState(false);
   const [settingsTarget, setSettingsTarget] = useState<{ sessionName: string; subId?: string; label: string; description: string; cwd: string; type: string; parentSession?: string | null; transportConfig?: Record<string, unknown> | null } | null>(null);
 
-  const updateDesktopWindowStack = useCallback((mutate: (stack: DesktopWindowStack) => void) => {
-    setDesktopWindowStack((prev) => {
-      const next = createDesktopWindowStack(prev.getOrderForTests());
-      mutate(next);
-      return next;
-    });
-  }, []);
-
-  const ensureDesktopWindow = useCallback((id: string, meta: DesktopWindowMeta, options?: { bringToFront?: boolean }) => {
-    if (isMobile) return;
-    updateDesktopWindowStack((next) => {
-      next.ensureWindow(id, meta);
-      if (options?.bringToFront) next.bringToFront(id);
-    });
-  }, [isMobile, updateDesktopWindowStack]);
-
-  const bringDesktopWindowToFront = useCallback((id: string) => {
-    if (isMobile) return;
-    updateDesktopWindowStack((next) => {
-      next.bringToFront(id);
-    });
-  }, [isMobile, updateDesktopWindowStack]);
-
-  const removeDesktopWindow = useCallback((id: string) => {
-    updateDesktopWindowStack((next) => {
-      next.removeWindow(id);
-    });
-  }, [updateDesktopWindowStack]);
-
-  const openManagedDesktopWindow = useCallback((id: string, meta: DesktopWindowMeta, show: () => void) => {
-    ensureDesktopWindow(id, meta, { bringToFront: true });
-    show();
-  }, [ensureDesktopWindow]);
-
-  // Derive focused (topmost) sub-session from shared desktop stack + open set.
-  const focusedSubId = useMemo(
-    () => getFrontmostSubSessionId(desktopWindowStack, openSubIds),
-    [desktopWindowStack, openSubIds],
-  );
+  // Derive focused (topmost) sub-session from z-indexes + open set
+  const focusedSubId = useMemo(() => {
+    let maxZ = -1;
+    let maxId: string | null = null;
+    for (const [id, z] of subZIndexes) {
+      if (openSubIds.has(id) && z > maxZ) { maxZ = z; maxId = id; }
+    }
+    return maxId;
+  }, [subZIndexes, openSubIds]);
   const flashIdleSession = useCallback((sessionName: string) => {
     setIdleFlashTokens((prev) => {
       const next = new Map(prev);
@@ -1043,123 +1003,16 @@ export function App() {
   const p2pSessionLabels = p2pSessionNames;
 
   const bringSubToFront = useCallback((id: string) => {
-    if (isMobile) return;
-    const sub = subSessionsRef.current.find((candidate) => candidate.id === id);
-    ensureDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id), {
-      kind: DESKTOP_WINDOW_KINDS.subSession,
-      subId: id,
-      serverId: sub?.serverId ?? selectedServerIdRef.current ?? undefined,
-    }, { bringToFront: true });
-  }, [ensureDesktopWindow, isMobile]);
-
-  const registerSubSessionChildFileBrowser = useCallback((subId: string) => {
-    if (isMobile) return;
-    const sub = subSessionsRef.current.find((candidate) => candidate.id === subId);
-    const serverId = sub?.serverId ?? selectedServerIdRef.current ?? undefined;
-    const parentId = DESKTOP_WINDOW_IDS.subSession(subId);
-    const childId = DESKTOP_WINDOW_IDS.subsessionFileBrowser(subId);
-    updateDesktopWindowStack((next) => {
-      next.ensureWindow(parentId, {
-        kind: DESKTOP_WINDOW_KINDS.subSession,
-        subId,
-        serverId,
-      });
-      next.ensureWindow(childId, {
-        kind: DESKTOP_WINDOW_KINDS.subsessionFileBrowser,
-        parentId,
-        subId,
-        serverId,
-      });
-      next.bringToFront(childId);
+    setSubZIndexes((prev) => {
+      const max = prev.size > 0 ? Math.max(...prev.values()) : 6000;
+      const next = new Map(prev);
+      next.set(id, max + 1);
+      return next;
     });
-  }, [isMobile, updateDesktopWindowStack]);
-
-  const focusSubSessionChildFileBrowser = useCallback((subId: string) => {
-    bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.subsessionFileBrowser(subId));
-  }, [bringDesktopWindowToFront]);
-
-  const removeSubSessionChildFileBrowser = useCallback((subId: string) => {
-    removeDesktopWindow(DESKTOP_WINDOW_IDS.subsessionFileBrowser(subId));
-  }, [removeDesktopWindow]);
-
-  const getDesktopWindowZIndex = useCallback((id: string, fallback: number) => {
-    return desktopWindowStack.getZIndex(id) ?? fallback;
-  }, [desktopWindowStack]);
-
-  const openDiscussionsWindow = useCallback((fileId?: string | null) => {
-    setDiscussionInitialId(fileId ?? null);
-    openManagedDesktopWindow(
-      DESKTOP_WINDOW_IDS.discussions,
-      { kind: DESKTOP_WINDOW_KINDS.discussions, serverId: selectedServerId ?? undefined },
-      () => setShowDiscussionsPage(true),
-    );
-  }, [openManagedDesktopWindow, selectedServerId]);
-
-  const openRepoWindow = useCallback(() => {
-    openManagedDesktopWindow(
-      DESKTOP_WINDOW_IDS.repo,
-      { kind: DESKTOP_WINDOW_KINDS.repo, serverId: selectedServerId ?? undefined },
-      () => setShowRepoPage(true),
-    );
-  }, [openManagedDesktopWindow, selectedServerId]);
-
-  const openCronManagerWindow = useCallback(() => {
-    openManagedDesktopWindow(
-      DESKTOP_WINDOW_IDS.cronManager,
-      { kind: DESKTOP_WINDOW_KINDS.cronManager, serverId: selectedServerId ?? undefined },
-      () => setShowCronManager(true),
-    );
-  }, [openManagedDesktopWindow, selectedServerId]);
-
-  const openSharedContextManagementWindow = useCallback(() => {
-    openManagedDesktopWindow(
-      DESKTOP_WINDOW_IDS.sharedContextManagement,
-      { kind: DESKTOP_WINDOW_KINDS.sharedContextManagement, serverId: selectedServerId ?? undefined },
-      () => setShowSharedContextManagement(true),
-    );
-  }, [openManagedDesktopWindow, selectedServerId]);
-
-  const openSharedContextDiagnosticsWindow = useCallback(() => {
-    openManagedDesktopWindow(
-      DESKTOP_WINDOW_IDS.sharedContextDiagnostics,
-      { kind: DESKTOP_WINDOW_KINDS.sharedContextDiagnostics, serverId: selectedServerId ?? undefined },
-      () => setShowSharedContextDiagnostics(true),
-    );
-  }, [openManagedDesktopWindow, selectedServerId]);
-
-  const toggleDesktopFileBrowserWindow = useCallback(() => {
-    if (showDesktopFileBrowser) {
-      setShowDesktopFileBrowser(false);
-      removeDesktopWindow(DESKTOP_WINDOW_IDS.fileBrowser);
-      return;
-    }
-    openManagedDesktopWindow(
-      DESKTOP_WINDOW_IDS.fileBrowser,
-      { kind: DESKTOP_WINDOW_KINDS.fileBrowser, serverId: selectedServerId ?? undefined },
-      () => setShowDesktopFileBrowser(true),
-    );
-  }, [openManagedDesktopWindow, removeDesktopWindow, selectedServerId, showDesktopFileBrowser]);
-
-  const toggleLocalWebPreviewWindow = useCallback(() => {
-    if (showDesktopLocalWebPreview) {
-      setShowDesktopLocalWebPreview(false);
-      if (selectedServerId) removeDesktopWindow(DESKTOP_WINDOW_IDS.localWebPreview(selectedServerId));
-      return;
-    }
-    if (!selectedServerId) {
-      setShowDesktopLocalWebPreview(true);
-      return;
-    }
-    openManagedDesktopWindow(
-      DESKTOP_WINDOW_IDS.localWebPreview(selectedServerId),
-      { kind: DESKTOP_WINDOW_KINDS.localWebPreview, serverId: selectedServerId },
-      () => setShowDesktopLocalWebPreview(true),
-    );
-  }, [openManagedDesktopWindow, removeDesktopWindow, selectedServerId, showDesktopLocalWebPreview]);
+  }, []);
 
   const toggleSubSession = useCallback((id: string) => {
     const mobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
-    const willOpen = !openSubIdsRef.current.has(id);
     setOpenSubIds((prev) => {
       if (mobile) {
         // Exclusive on mobile: close if already open, otherwise open only this one
@@ -1171,9 +1024,8 @@ export function App() {
       else next.add(id);
       return next;
     });
-    if (willOpen) bringSubToFront(id);
-    else removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id));
-  }, [bringSubToFront, removeDesktopWindow]);
+    bringSubToFront(id);
+  }, [bringSubToFront]);
 
   const activeSessionRef = useRef(activeSession);
   activeSessionRef.current = activeSession;
@@ -1423,11 +1275,7 @@ export function App() {
       preview: request.preview ?? cached?.preview,
       preferDiff: request.preferDiff ?? cached?.preferDiff,
     });
-    ensureDesktopWindow(DESKTOP_WINDOW_IDS.filePreview, {
-      kind: DESKTOP_WINDOW_KINDS.filePreview,
-      serverId: selectedServerId ?? undefined,
-    }, { bringToFront: true });
-  }, [ensureDesktopWindow, previewFileCache, selectedServerId]);
+  }, [previewFileCache]);
 
   const handlePreviewStateChange = useCallback((update: FileBrowserPreviewUpdate) => {
     setPreviewFileCache((prev) => {
@@ -1464,30 +1312,14 @@ export function App() {
     setPinnedPanels((prev) => prev.filter((p) => p.id !== panel.id));
     // Reopen source window based on type
     if (panel.type === 'filebrowser' || panel.type === 'repo') {
-      openManagedDesktopWindow(
-        DESKTOP_WINDOW_IDS.fileBrowser,
-        { kind: DESKTOP_WINDOW_KINDS.fileBrowser, serverId: selectedServerId ?? undefined },
-        () => setShowDesktopFileBrowser(true),
-      );
+      setShowDesktopFileBrowser(true);
     } else if (panel.type === 'repopage') {
-      openManagedDesktopWindow(
-        DESKTOP_WINDOW_IDS.repo,
-        { kind: DESKTOP_WINDOW_KINDS.repo, serverId: selectedServerId ?? undefined },
-        () => setShowRepoPage(true),
-      );
+      setShowRepoPage(true);
     } else if (panel.type === 'cronmanager') {
-      openManagedDesktopWindow(
-        DESKTOP_WINDOW_IDS.cronManager,
-        { kind: DESKTOP_WINDOW_KINDS.cronManager, serverId: selectedServerId ?? undefined },
-        () => setShowCronManager(true),
-      );
+      setShowCronManager(true);
     } else if (panel.type === SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE) {
       setSharedContextManagementProps(panel.props);
-      openManagedDesktopWindow(
-        DESKTOP_WINDOW_IDS.sharedContextManagement,
-        { kind: DESKTOP_WINDOW_KINDS.sharedContextManagement, serverId: selectedServerId ?? undefined },
-        () => setShowSharedContextManagement(true),
-      );
+      setShowSharedContextManagement(true);
     } else if (panel.type === SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE) {
       setSharedContextDiagnosticsProps({
         enterpriseId: typeof panel.props?.enterpriseId === 'string' ? panel.props.enterpriseId : undefined,
@@ -1497,24 +1329,11 @@ export function App() {
         language: typeof panel.props?.language === 'string' ? panel.props.language : undefined,
         filePath: typeof panel.props?.filePath === 'string' ? panel.props.filePath : undefined,
       });
-      openManagedDesktopWindow(
-        DESKTOP_WINDOW_IDS.sharedContextDiagnostics,
-        { kind: DESKTOP_WINDOW_KINDS.sharedContextDiagnostics, serverId: selectedServerId ?? undefined },
-        () => setShowSharedContextDiagnostics(true),
-      );
+      setShowSharedContextDiagnostics(true);
     } else if (panel.type === LOCAL_WEB_PREVIEW_PANEL_TYPE) {
       setLocalWebPreviewPort(String(panel.props?.port ?? ''));
       setLocalWebPreviewPath(String(panel.props?.path ?? '/'));
-      const serverId = String(panel.props?.serverId ?? selectedServerId ?? '');
-      if (serverId) {
-        openManagedDesktopWindow(
-          DESKTOP_WINDOW_IDS.localWebPreview(serverId),
-          { kind: DESKTOP_WINDOW_KINDS.localWebPreview, serverId },
-          () => setShowDesktopLocalWebPreview(true),
-        );
-      } else {
-        setShowDesktopLocalWebPreview(true);
-      }
+      setShowDesktopLocalWebPreview(true);
     } else if (panel.type === 'subsession') {
       const sub = subSessions.find((s) => s.sessionName === (panel.props?.sessionName as string));
       if (sub) {
@@ -1522,8 +1341,9 @@ export function App() {
         bringSubToFront(sub.id);
       }
     }
-  }, [bringSubToFront, openManagedDesktopWindow, selectedServerId, setPinnedPanels, subSessions]);
+  }, [setPinnedPanels, subSessions, bringSubToFront]);
 
+  const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   const defaultViewMode: ViewMode = isMobile ? 'chat' : 'terminal';
   // Per-session view mode: Record<sessionName, ViewMode>
   const [viewModes, setViewModes] = useState<Record<string, ViewMode>>(() => {
@@ -2650,12 +2470,12 @@ export function App() {
 
     const discussionHandler = (e: Event) => {
       const { fileId } = (e as CustomEvent).detail ?? {};
-      if (fileId) openDiscussionsWindow(fileId);
+      if (fileId) { setDiscussionInitialId(fileId); setShowDiscussionsPage(true); }
     };
     window.addEventListener('deck:view-discussion', discussionHandler);
 
     return () => { window.removeEventListener('deck:navigate', handler); window.removeEventListener('deck:view-discussion', discussionHandler); };
-  }, [handleSelectServer, navigateToSession, openDiscussionsWindow]);
+  }, [handleSelectServer, navigateToSession]);
 
   const handleBackToDashboard = useCallback(() => {
     autoEntryRunRef.current++;
@@ -2725,105 +2545,6 @@ export function App() {
   }
 
   const activeSessionInfo = sessions.find((s) => s.name === activeSession) ?? null;
-  const desktopManagedWindows = useMemo<DesktopWindowStackEntry[]>(() => {
-    if (isMobile) return [];
-
-    const entries: DesktopWindowStackEntry[] = [];
-    const serverId = selectedServerId ?? undefined;
-    const cronProject = sessions.find((s) => s.name === activeSession)?.project;
-
-    if (showDesktopFileBrowser && activeSessionInfo) {
-      entries.push({
-        id: DESKTOP_WINDOW_IDS.fileBrowser,
-        meta: { kind: DESKTOP_WINDOW_KINDS.fileBrowser, serverId },
-      });
-    }
-    if (showDesktopLocalWebPreview && selectedServerId) {
-      entries.push({
-        id: DESKTOP_WINDOW_IDS.localWebPreview(selectedServerId),
-        meta: { kind: DESKTOP_WINDOW_KINDS.localWebPreview, serverId },
-      });
-    }
-    if (showDiscussionsPage && selectedServerId) {
-      entries.push({
-        id: DESKTOP_WINDOW_IDS.discussions,
-        meta: { kind: DESKTOP_WINDOW_KINDS.discussions, serverId },
-      });
-    }
-    if (showRepoPage && activeSessionInfo?.projectDir) {
-      entries.push({
-        id: DESKTOP_WINDOW_IDS.repo,
-        meta: { kind: DESKTOP_WINDOW_KINDS.repo, serverId },
-      });
-    }
-    if (previewFileRequest) {
-      entries.push({
-        id: DESKTOP_WINDOW_IDS.filePreview,
-        meta: { kind: DESKTOP_WINDOW_KINDS.filePreview, serverId },
-      });
-    }
-    if (showCronManager && selectedServerId && cronProject) {
-      entries.push({
-        id: DESKTOP_WINDOW_IDS.cronManager,
-        meta: { kind: DESKTOP_WINDOW_KINDS.cronManager, serverId },
-      });
-    }
-    if (showSharedContextManagement) {
-      entries.push({
-        id: DESKTOP_WINDOW_IDS.sharedContextManagement,
-        meta: { kind: DESKTOP_WINDOW_KINDS.sharedContextManagement, serverId },
-      });
-    }
-    if (showSharedContextDiagnostics) {
-      entries.push({
-        id: DESKTOP_WINDOW_IDS.sharedContextDiagnostics,
-        meta: { kind: DESKTOP_WINDOW_KINDS.sharedContextDiagnostics, serverId },
-      });
-    }
-
-    const pinnedSubSessionNames = new Set(
-      pinnedPanels
-        .filter((panel) => panel.type === 'subsession')
-        .map((panel) => panel.props?.sessionName)
-        .filter((sessionName): sessionName is string => typeof sessionName === 'string'),
-    );
-    for (const sub of visibleSubSessions) {
-      if (!openSubIds.has(sub.id) || pinnedSubSessionNames.has(sub.sessionName)) continue;
-      entries.push({
-        id: DESKTOP_WINDOW_IDS.subSession(sub.id),
-        meta: {
-          kind: DESKTOP_WINDOW_KINDS.subSession,
-          subId: sub.id,
-          serverId: sub.serverId ?? serverId,
-        },
-      });
-    }
-
-    return entries;
-  }, [
-    activeSession,
-    activeSessionInfo,
-    isMobile,
-    openSubIds,
-    pinnedPanels,
-    previewFileRequest,
-    selectedServerId,
-    sessions,
-    showCronManager,
-    showDesktopFileBrowser,
-    showDesktopLocalWebPreview,
-    showDiscussionsPage,
-    showRepoPage,
-    showSharedContextDiagnostics,
-    showSharedContextManagement,
-    visibleSubSessions,
-  ]);
-
-  useEffect(() => {
-    updateDesktopWindowStack((next) => {
-      syncDesktopWindowStack(next, desktopManagedWindows, { keepChildrenWithActiveParent: !isMobile });
-    });
-  }, [desktopManagedWindows, isMobile, updateDesktopWindowStack]);
 
   useEffect(() => {
     if (typeof document === 'undefined') return;
@@ -2922,10 +2643,10 @@ export function App() {
   useEffect(() => {
     if (!pendingRepoToastSession) return;
     if (activeSession !== pendingRepoToastSession.sessionName) return;
-    openRepoWindow();
+    setShowRepoPage(true);
     setRepoFocusLatestAction(pendingRepoToastSession.focus);
     setPendingRepoToastSession(null);
-  }, [activeSession, openRepoWindow, pendingRepoToastSession]);
+  }, [activeSession, pendingRepoToastSession]);
 
   // Memoized sub-session mappings — avoids creating new arrays on every render,
   // which would defeat memo() on child components (SessionPane, SessionTree, pinned panels).
@@ -3079,10 +2800,7 @@ export function App() {
             onDropPanel={(type, id) => {
               if (type === 'subsession') {
                 const sub = subSessions.find(s => s.id === id);
-                if (sub) pinPanel('subsession', { sessionName: sub.sessionName, label: sub.label, serverId: selectedServerId }, () => {
-                  setOpenSubIds((prev) => { const s = new Set(prev); s.delete(id); return s; });
-                  removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id));
-                });
+                if (sub) pinPanel('subsession', { sessionName: sub.sessionName, label: sub.label, serverId: selectedServerId }, () => setOpenSubIds((prev) => { const s = new Set(prev); s.delete(id); return s; }));
               }
             }}
           >
@@ -3092,7 +2810,7 @@ export function App() {
                 style={{ background: '#334155', color: '#e2e8f0', fontSize: 12 }}
                 onClick={() => {
                   setSharedContextManagementProps((prev) => ({ ...prev, serverId: selectedServerId }));
-                  openSharedContextManagementWindow();
+                  setShowSharedContextManagement(true);
                 }}
               >
                 {trans('sharedContext.management.title')}
@@ -3100,7 +2818,7 @@ export function App() {
               <button
                 class="btn"
                 style={{ background: '#334155', color: '#e2e8f0', fontSize: 12 }}
-                onClick={openSharedContextDiagnosticsWindow}
+                onClick={() => setShowSharedContextDiagnostics(true)}
               >
                 {trans('sharedContext.diagnostics.title')}
               </button>
@@ -3140,7 +2858,7 @@ export function App() {
                 activeRoundHop={d.activeRoundHop}
                 status={d.state}
                 modeKey={d.modeKey}
-                onClick={() => openDiscussionsWindow(d.fileId ?? null)}
+                onClick={() => { setDiscussionInitialId(d.fileId ?? null); setShowDiscussionsPage(true); }}
               />
             ))}
 
@@ -3331,7 +3049,7 @@ export function App() {
                     {gitChangesCount > 0 && <span class="file-badge">{gitChangesCount}</span>}
                   </button>
                 )}
-                <button class="view-toggle" title={trans('localWebPreview.title')} onClick={toggleLocalWebPreviewWindow} style={{ position: 'relative' }}>
+                <button class="view-toggle" title={trans('localWebPreview.title')} onClick={() => setShowDesktopLocalWebPreview((o) => !o)} style={{ position: 'relative' }}>
                   🌐
                 </button>
                 {!isTransportSession && (
@@ -3379,7 +3097,7 @@ export function App() {
                 <button
                   class="view-toggle"
                   title={trans('localWebPreview.title')}
-                  onClick={toggleLocalWebPreviewWindow}
+                  onClick={() => setShowDesktopLocalWebPreview((o) => !o)}
                   style={{ position: 'relative' }}
                 >
                   🌐
@@ -3390,14 +3108,14 @@ export function App() {
             {/* Desktop view mode toggle — mobile uses the one in mobile-server-bar */}
             {!isMobile && resolvedActiveSessionExists && (
               <div class="desktop-view-toggle">
-                <button class="view-toggle" title={trans('picker.files')} onClick={toggleDesktopFileBrowserWindow} style={{ position: 'relative' }}>
+                <button class="view-toggle" title={trans('picker.files')} onClick={() => setShowDesktopFileBrowser(o => !o)} style={{ position: 'relative' }}>
                   📁
                   {gitChangesCount > 0 && <span class="file-badge">{gitChangesCount}</span>}
                 </button>
                 <button
                   class="view-toggle"
                   title={trans('localWebPreview.title')}
-                  onClick={toggleLocalWebPreviewWindow}
+                  onClick={() => setShowDesktopLocalWebPreview((o) => !o)}
                   style={{ position: 'relative' }}
                 >
                   🌐
@@ -3472,23 +3190,7 @@ export function App() {
 
             {/* Desktop floating file browser */}
             {!isMobile && showDesktopFileBrowser && wsRef.current && activeSessionInfo && (
-              <FloatingPanel
-                id={DESKTOP_WINDOW_IDS.fileBrowser}
-                title={`📁 ${trans('picker.files')}`}
-                zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.fileBrowser, 5000)}
-                onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.fileBrowser)}
-                onClose={() => {
-                  setShowDesktopFileBrowser(false);
-                  removeDesktopWindow(DESKTOP_WINDOW_IDS.fileBrowser);
-                }}
-                onPin={() => pinPanel('filebrowser', { sessionName: activeSession, projectDir: activeSessionInfo?.projectDir, serverId: selectedServerId }, () => {
-                  setShowDesktopFileBrowser(false);
-                  removeDesktopWindow(DESKTOP_WINDOW_IDS.fileBrowser);
-                })}
-                pinTooltip={trans('sidebar.pin_to_sidebar')}
-                defaultW={420}
-                defaultH={500}
-              >
+              <FloatingPanel id="filebrowser" title={`📁 ${trans('picker.files')}`} onClose={() => setShowDesktopFileBrowser(false)} onPin={() => pinPanel('filebrowser', { sessionName: activeSession, projectDir: activeSessionInfo?.projectDir, serverId: selectedServerId }, () => setShowDesktopFileBrowser(false))} pinTooltip={trans('sidebar.pin_to_sidebar')} defaultW={420} defaultH={500}>
                 <FileBrowser
                   ws={wsRef.current}
                   serverId={selectedServerId}
@@ -3509,10 +3211,7 @@ export function App() {
                       inputEl.focus();
                     }
                   }}
-                  onClose={() => {
-                    setShowDesktopFileBrowser(false);
-                    removeDesktopWindow(DESKTOP_WINDOW_IDS.fileBrowser);
-                  }}
+                  onClose={() => setShowDesktopFileBrowser(false)}
                 />
               </FloatingPanel>
             )}
@@ -3520,23 +3219,15 @@ export function App() {
             {/* Desktop floating local web preview */}
             {showDesktopLocalWebPreview && selectedServerId && (
               <FloatingPanel
-                id={DESKTOP_WINDOW_IDS.localWebPreview(selectedServerId)}
+                id={`local-web-preview-${selectedServerId}`}
                 title={trans('localWebPreview.title')}
-                zIndex={!isMobile ? getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.localWebPreview(selectedServerId), 5000) : undefined}
-                onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.localWebPreview(selectedServerId))}
-                onClose={() => {
-                  setShowDesktopLocalWebPreview(false);
-                  removeDesktopWindow(DESKTOP_WINDOW_IDS.localWebPreview(selectedServerId));
-                }}
+                onClose={() => setShowDesktopLocalWebPreview(false)}
                 onPin={
                   localWebPreviewPort.trim() && /^\d+$/.test(localWebPreviewPort.trim())
                     ? () => pinPanel(
                         LOCAL_WEB_PREVIEW_PANEL_TYPE,
                         { serverId: selectedServerId, port: localWebPreviewPort.trim(), path: normalizeLocalWebPreviewPath(localWebPreviewPath) },
-                        () => {
-                          setShowDesktopLocalWebPreview(false);
-                          removeDesktopWindow(DESKTOP_WINDOW_IDS.localWebPreview(selectedServerId));
-                        },
+                        () => setShowDesktopLocalWebPreview(false),
                       )
                     : undefined
                 }
@@ -3563,14 +3254,11 @@ export function App() {
                 openIds={openSubIds}
                 idleFlashTokens={idleFlashTokens}
                 onOpen={toggleSubSession}
-                onClose={(id) => {
-                  closeSubSession(id);
-                  removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id));
-                }}
+                onClose={closeSubSession}
                 onRestart={restartSubSession}
                 onNew={() => setShowSubDialog(true)}
-                onViewDiscussions={() => openDiscussionsWindow(null)}
-                onViewDiscussion={(fileId) => openDiscussionsWindow(fileId)}
+                onViewDiscussions={() => { setDiscussionInitialId(null); setShowDiscussionsPage(true); }}
+                onViewDiscussion={(fileId) => { setDiscussionInitialId(fileId); setShowDiscussionsPage(true); }}
                 discussions={discussions.filter((d) => d.state !== 'done')}
                 onStopDiscussion={(id) => {
                   if (id.startsWith('p2p_')) {
@@ -3587,8 +3275,8 @@ export function App() {
                 onDiff={registerDiffApplyer}
                 onHistory={registerHistoryApplyer}
                 serverId={selectedServerId}
-                onViewRepo={openRepoWindow}
-                onViewCron={openCronManagerWindow}
+                onViewRepo={() => setShowRepoPage(true)}
+                onViewCron={() => setShowCronManager(true)}
                 subUsages={subUsages}
                 focusedSubId={focusedSubId}
                 quickData={quickData}
@@ -3623,7 +3311,7 @@ export function App() {
                   class="mobile-sidebar-hdr-btn"
                   onClick={() => {
                     setSharedContextManagementProps((prev) => ({ ...prev, serverId: selectedServerId }));
-                    openSharedContextManagementWindow();
+                    setShowSharedContextManagement(true);
                     closeSidebar();
                   }}
                   title={trans('sharedContext.management.title')}
@@ -3631,7 +3319,7 @@ export function App() {
                 <button
                   class="mobile-sidebar-hdr-btn"
                   onClick={() => {
-                    openSharedContextDiagnosticsWindow();
+                    setShowSharedContextDiagnostics(true);
                     closeSidebar();
                   }}
                   title={trans('sharedContext.diagnostics.title')}
@@ -3707,7 +3395,7 @@ export function App() {
                   activeRoundHop={d.activeRoundHop}
                   status={d.state}
                   modeKey={d.modeKey}
-                  onClick={() => { openDiscussionsWindow(d.fileId ?? null); closeSidebar(); }}
+                  onClick={() => { setDiscussionInitialId(d.fileId ?? null); setShowDiscussionsPage(true); closeSidebar(); }}
                 />
               ))}
               {/* Pinned panels — same as desktop sidebar */}
@@ -3791,27 +3479,11 @@ export function App() {
       )}
 
       {showDiscussionsPage && selectedServerId && (
-        <FloatingPanel
-          id={DESKTOP_WINDOW_IDS.discussions}
-          title={trans('p2p.discussions.title')}
-          zIndex={!isMobile ? getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.discussions, 5000) : undefined}
-          onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.discussions)}
-          onClose={() => {
-            setShowDiscussionsPage(false);
-            setDiscussionInitialId(null);
-            removeDesktopWindow(DESKTOP_WINDOW_IDS.discussions);
-          }}
-          defaultW={800}
-          defaultH={600}
-        >
+        <FloatingPanel id="discussions" title={trans('p2p.discussions.title')} onClose={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }} defaultW={800} defaultH={600}>
           <Suspense fallback={<div style={{ textAlign: 'center', padding: 48, color: '#64748b' }}>Loading...</div>}>
             <DiscussionsPage
               ws={wsRef.current}
-              onBack={() => {
-                setShowDiscussionsPage(false);
-                setDiscussionInitialId(null);
-                removeDesktopWindow(DESKTOP_WINDOW_IDS.discussions);
-              }}
+              onBack={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }}
               initialSelectedId={discussionInitialId}
               liveDiscussions={discussions}
               onStopDiscussion={(id) => {
@@ -3828,27 +3500,8 @@ export function App() {
       )}
 
       {showRepoPage && wsRef.current && activeSessionInfo?.projectDir && (
-        <FloatingPanel
-          id={DESKTOP_WINDOW_IDS.repo}
-          title="Repository"
-          zIndex={!isMobile ? getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.repo, 5000) : undefined}
-          onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.repo)}
-          onClose={() => {
-            setShowRepoPage(false);
-            removeDesktopWindow(DESKTOP_WINDOW_IDS.repo);
-          }}
-          onPin={() => pinPanel('repopage', { sessionName: activeSession, projectDir: activeSessionInfo?.projectDir, serverId: selectedServerId }, () => {
-            setShowRepoPage(false);
-            removeDesktopWindow(DESKTOP_WINDOW_IDS.repo);
-          })}
-          pinTooltip={trans('sidebar.pin_to_sidebar')}
-          defaultW={800}
-          defaultH={600}
-        >
-          <RepoPage ws={wsRef.current} projectDir={activeSessionInfo.projectDir} onBack={() => {
-            setShowRepoPage(false);
-            removeDesktopWindow(DESKTOP_WINDOW_IDS.repo);
-          }} onCiEvent={(run) => {
+        <FloatingPanel id="repo" title="Repository" onClose={() => setShowRepoPage(false)} onPin={() => pinPanel('repopage', { sessionName: activeSession, projectDir: activeSessionInfo?.projectDir, serverId: selectedServerId }, () => setShowRepoPage(false))} pinTooltip={trans('sidebar.pin_to_sidebar')} defaultW={800} defaultH={600}>
+          <RepoPage ws={wsRef.current} projectDir={activeSessionInfo.projectDir} onBack={() => setShowRepoPage(false)} onCiEvent={(run) => {
             const id = Date.now();
             const icon = run.status === 'success' ? '✅' : '❌';
             const failurePath = [run.failedJobName, run.failedStepName].filter(Boolean).join(' → ');
@@ -3872,14 +3525,9 @@ export function App() {
       {/* Floating file preview — one file at a time, opened from pinned file browser */}
       {previewFileRequest && wsRef.current && (
         <FloatingPanel
-          id={DESKTOP_WINDOW_IDS.filePreview}
+          id="file-preview"
           title={previewFileRequest.path.split(/[/\\]/).pop() ?? 'Preview'}
-          zIndex={!isMobile ? getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.filePreview, 5000) : undefined}
-          onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.filePreview)}
-          onClose={() => {
-            setPreviewFileRequest(null);
-            removeDesktopWindow(DESKTOP_WINDOW_IDS.filePreview);
-          }}
+          onClose={() => setPreviewFileRequest(null)}
           defaultW={700}
           defaultH={500}
         >
@@ -3898,10 +3546,7 @@ export function App() {
             hideFooter
             onPreviewStateChange={handlePreviewStateChange}
             onConfirm={() => {}}
-            onClose={() => {
-              setPreviewFileRequest(null);
-              removeDesktopWindow(DESKTOP_WINDOW_IDS.filePreview);
-            }}
+            onClose={() => setPreviewFileRequest(null)}
           />
         </FloatingPanel>
       )}
@@ -3927,18 +3572,10 @@ export function App() {
         const cronProject = sessions.find(s => s.name === activeSession)?.project;
         return cronProject ? (
           <FloatingPanel
-            id={DESKTOP_WINDOW_IDS.cronManager}
+            id="cron"
             title={trans('cron.title')}
-            zIndex={!isMobile ? getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.cronManager, 5000) : undefined}
-            onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.cronManager)}
-            onClose={() => {
-              setShowCronManager(false);
-              removeDesktopWindow(DESKTOP_WINDOW_IDS.cronManager);
-            }}
-            onPin={() => pinPanel('cronmanager', { sessionName: activeSession, projectName: cronProject, serverId: selectedServerId }, () => {
-              setShowCronManager(false);
-              removeDesktopWindow(DESKTOP_WINDOW_IDS.cronManager);
-            })}
+            onClose={() => setShowCronManager(false)}
+            onPin={() => pinPanel('cronmanager', { sessionName: activeSession, projectName: cronProject, serverId: selectedServerId }, () => setShowCronManager(false))}
             pinTooltip={trans('sidebar.pin_to_sidebar')}
             defaultW={700}
             defaultH={550}
@@ -3951,14 +3588,10 @@ export function App() {
               activeSession={activeSession}
               onNavigateSession={(sessionName, quote) => {
                 setShowCronManager(false);
-                removeDesktopWindow(DESKTOP_WINDOW_IDS.cronManager);
                 window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: sessionName, quote } }));
               }}
-              onBack={() => {
-                setShowCronManager(false);
-                removeDesktopWindow(DESKTOP_WINDOW_IDS.cronManager);
-              }}
-              onViewDiscussion={(fileId) => openDiscussionsWindow(fileId)}
+              onBack={() => setShowCronManager(false)}
+              onViewDiscussion={(fileId) => { setDiscussionInitialId(fileId); setShowDiscussionsPage(true); }}
               servers={servers.map(s => ({ id: s.id, name: s.name }))}
             />
           </FloatingPanel>
@@ -3967,21 +3600,13 @@ export function App() {
 
       {showSharedContextManagement && (
         <FloatingPanel
-          id={DESKTOP_WINDOW_IDS.sharedContextManagement}
+          id="shared-context-management"
           title={trans('sharedContext.management.title')}
-          zIndex={!isMobile ? getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.sharedContextManagement, 5000) : undefined}
-          onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.sharedContextManagement)}
-          onClose={() => {
-            setShowSharedContextManagement(false);
-            removeDesktopWindow(DESKTOP_WINDOW_IDS.sharedContextManagement);
-          }}
+          onClose={() => setShowSharedContextManagement(false)}
           onPin={() => pinPanel(
             SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE,
             { ...sharedContextManagementProps, serverId: selectedServerId },
-            () => {
-              setShowSharedContextManagement(false);
-              removeDesktopWindow(DESKTOP_WINDOW_IDS.sharedContextManagement);
-            },
+            () => setShowSharedContextManagement(false),
           )}
           pinTooltip={trans('sidebar.pin_to_sidebar')}
           defaultW={760}
@@ -3998,21 +3623,13 @@ export function App() {
 
       {showSharedContextDiagnostics && (
         <FloatingPanel
-          id={DESKTOP_WINDOW_IDS.sharedContextDiagnostics}
+          id="shared-context-diagnostics"
           title={trans('sharedContext.diagnostics.title')}
-          zIndex={!isMobile ? getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.sharedContextDiagnostics, 5000) : undefined}
-          onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.sharedContextDiagnostics)}
-          onClose={() => {
-            setShowSharedContextDiagnostics(false);
-            removeDesktopWindow(DESKTOP_WINDOW_IDS.sharedContextDiagnostics);
-          }}
+          onClose={() => setShowSharedContextDiagnostics(false)}
           onPin={() => pinPanel(
             SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE,
             { ...sharedContextDiagnosticsProps, serverId: selectedServerId },
-            () => {
-              setShowSharedContextDiagnostics(false);
-              removeDesktopWindow(DESKTOP_WINDOW_IDS.sharedContextDiagnostics);
-            },
+            () => setShowSharedContextDiagnostics(false),
           )}
           pinTooltip={trans('sidebar.pin_to_sidebar')}
           defaultW={760}
@@ -4105,8 +3722,6 @@ export function App() {
       {/* Sub-session windows (floating) — only show if not pinned */}
       {visibleSubSessions.filter((sub) => isMobile || !pinnedPanels.some((p) => p.type === 'subsession' && p.props?.sessionName === sub.sessionName)).map((sub) => {
         const isOpen = openSubIds.has(sub.id);
-        const subWindowId = DESKTOP_WINDOW_IDS.subSession(sub.id);
-        const subFileBrowserWindowId = DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id);
         return (
           <div key={sub.id} style={{ display: isOpen ? 'contents' : 'none' }}>
             <SubSessionWindow
@@ -4117,14 +3732,8 @@ export function App() {
               idleFlashToken={idleFlashTokens.get(sub.sessionName) ?? 0}
               onDiff={registerDiffApplyer}
               onHistory={registerHistoryApplyer}
-              onMinimize={() => {
-                setOpenSubIds((prev) => { const s = new Set(prev); s.delete(sub.id); return s; });
-                removeDesktopWindow(subWindowId);
-              }}
-              onClose={() => {
-                closeSubSession(sub.id);
-                removeDesktopWindow(subWindowId);
-              }}
+              onMinimize={() => setOpenSubIds((prev) => { const s = new Set(prev); s.delete(sub.id); return s; })}
+              onClose={() => closeSubSession(sub.id)}
               onRestart={() => restartSubSession(sub.id)}
               onRename={() => {
                 const label = prompt('Rename sub-session:', sub.label ?? '');
@@ -4132,16 +3741,9 @@ export function App() {
               }}
               onSettings={() => setSettingsTarget({ sessionName: sub.sessionName, subId: sub.id, label: sub.label || '', description: sub.description || '', cwd: sub.cwd || '', type: sub.type, parentSession: sub.parentSession, transportConfig: sub.transportConfig ?? null })}
               onTransportConfigSaved={(transportConfig) => updateSubLocal(sub.id, { transportConfig })}
-              zIndex={!isMobile ? getDesktopWindowZIndex(subWindowId, 6000) : 6000}
+              zIndex={subZIndexes.get(sub.id) ?? 6000}
               onFocus={() => bringSubToFront(sub.id)}
-              onPin={(vm) => pinPanel('subsession', { sessionName: sub.sessionName, viewMode: vm, label: sub.label, serverId: selectedServerId }, () => {
-                setOpenSubIds((prev) => { const s = new Set(prev); s.delete(sub.id); return s; });
-                removeDesktopWindow(subWindowId);
-              })}
-              desktopFileBrowserZIndex={!isMobile ? getDesktopWindowZIndex(subFileBrowserWindowId, 6000) : undefined}
-              onDesktopFileBrowserOpen={() => registerSubSessionChildFileBrowser(sub.id)}
-              onDesktopFileBrowserFocus={() => focusSubSessionChildFileBrowser(sub.id)}
-              onDesktopFileBrowserClose={() => removeSubSessionChildFileBrowser(sub.id)}
+              onPin={(vm) => pinPanel('subsession', { sessionName: sub.sessionName, viewMode: vm, label: sub.label, serverId: selectedServerId }, () => setOpenSubIds((prev) => { const s = new Set(prev); s.delete(sub.id); return s; }))}
               sessions={sessions}
               subSessions={subSessionsSlim}
               serverId={selectedServerId ?? undefined}
@@ -4284,7 +3886,7 @@ export function App() {
                   if (t.sessionName && t.sessionName !== activeSession) {
                     setPendingRepoToastSession({ sessionName: t.sessionName, focus });
                   } else {
-                    openRepoWindow();
+                    setShowRepoPage(true);
                     setRepoFocusLatestAction(focus);
                   }
                 }
