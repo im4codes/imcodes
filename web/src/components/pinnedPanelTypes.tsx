@@ -140,9 +140,7 @@ registerPanelType('filebrowser', {
         serverId={ctx.serverId}
         mode="file-multi"
         layout="panel"
-        defaultTab="changes"
         initialPath={projectDir}
-        changesRootPath={projectDir}
         hideFooter={false}
         onPreviewStateChange={ctx.onPreviewStateChange}
         onPreviewFile={ctx.onPreviewFile}

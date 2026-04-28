@@ -1184,6 +1184,52 @@ describe('FileBrowser', () => {
     ]);
   });
 
+  it('lets a floating auto-preview switch to another file from the left file list', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    (ws.fsReadFile as any).mockImplementation((path: string) => `read-${path.split('/').pop()}`);
+    (ws.fsGitDiff as any).mockImplementation((path: string) => `diff-${path.split('/').pop()}`);
+
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/foo.ts"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      respond([
+        { name: 'foo.ts', isDir: false },
+        { name: 'bar.ts', isDir: false },
+      ], '/home/user');
+      sendMsg({ type: 'fs.read_response', requestId: 'read-foo.ts', path: '/home/user/foo.ts', status: 'ok', content: 'foo content' });
+      sendMsg({ type: 'fs.git_diff_response', requestId: 'diff-foo.ts', path: '/home/user/foo.ts', status: 'ok', diff: '' });
+    });
+
+    await act(async () => {
+      fireEvent.click(await screen.findByText('bar.ts'));
+    });
+
+    expect((ws.fsReadFile as any).mock.calls.map((call: any[]) => call[0])).toEqual([
+      '/home/user/foo.ts',
+      '/home/user/bar.ts',
+    ]);
+
+    await act(async () => {
+      sendMsg({ type: 'fs.read_response', requestId: 'read-bar.ts', path: '/home/user/bar.ts', status: 'ok', content: 'bar content' });
+      sendMsg({ type: 'fs.git_diff_response', requestId: 'diff-bar.ts', path: '/home/user/bar.ts', status: 'ok', diff: '' });
+    });
+
+    expect(screen.getByTestId('mock-file-preview').textContent).toContain('bar content');
+    expect((ws.fsReadFile as any).mock.calls.map((call: any[]) => call[0])).toEqual([
+      '/home/user/foo.ts',
+      '/home/user/bar.ts',
+    ]);
+  });
+
   it('clears stale preview-cycle ownership when the ws instance changes', () => {
     const first = makeWsFactory();
     (first.ws.fsReadFile as any).mockImplementationOnce(() => 'read-first');

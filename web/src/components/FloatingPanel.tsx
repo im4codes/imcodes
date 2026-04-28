@@ -25,16 +25,30 @@ const MIN_W = 360;
 const MIN_H = 280;
 const DRAG_MARGIN = 32;
 
+function clampGeomToViewport(geom: WindowGeometry): WindowGeometry {
+  const w = Math.max(MIN_W, geom.w);
+  const h = Math.max(MIN_H, geom.h);
+  const minX = DRAG_MARGIN - w;
+  const maxX = window.innerWidth - DRAG_MARGIN;
+  const maxY = Math.max(0, window.innerHeight - DRAG_MARGIN);
+  return {
+    x: Math.min(Math.max(geom.x, minX), maxX),
+    y: Math.min(Math.max(geom.y, 0), maxY),
+    w,
+    h,
+  };
+}
+
 function loadGeom(id: string, dw: number, dh: number): WindowGeometry {
   try {
     const raw = localStorage.getItem(`rcc_float_${id}`);
-    if (raw) return JSON.parse(raw) as WindowGeometry;
+    if (raw) return clampGeomToViewport(JSON.parse(raw) as WindowGeometry);
   } catch { /* ignore */ }
-  return {
+  return clampGeomToViewport({
     x: Math.max(0, (window.innerWidth - dw) / 2),
     y: Math.max(0, (window.innerHeight - dh) / 2 - 40),
     w: dw, h: dh,
-  };
+  });
 }
 
 function saveGeom(id: string, geom: WindowGeometry) {
@@ -48,13 +62,18 @@ export function FloatingPanel({ id, title, children, onClose, zIndex = 2000, onF
   geomRef.current = geom;
 
   useEffect(() => { saveGeom(id, geom); }, [id, geom]);
+  useEffect(() => {
+    const onResize = () => setGeom((g) => clampGeomToViewport(g));
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
 
   // ── Drag ─────────────────────────────────────────────────────────────────
   const dragStart = useRef<{ mx: number; my: number; ox: number; oy: number } | null>(null);
 
   const clampPos = useCallback((x: number, y: number, w: number) => ({
     x: Math.min(Math.max(x, DRAG_MARGIN - w), window.innerWidth - DRAG_MARGIN),
-    y: Math.min(Math.max(y, 0), window.innerHeight - DRAG_MARGIN),
+    y: Math.min(Math.max(y, 0), Math.max(0, window.innerHeight - DRAG_MARGIN)),
   }), []);
 
   const startDrag = useCallback((e: MouseEvent) => {
@@ -94,11 +113,21 @@ export function FloatingPanel({ id, title, children, onClose, zIndex = 2000, onF
       const dy = me.clientY - sy;
       setGeom(() => {
         let { x, y, w, h } = { ...startG };
+        const startRight = startG.x + startG.w;
+        const startBottom = startG.y + startG.h;
         if (dir.includes('e')) w = Math.max(MIN_W, startG.w + dx);
         if (dir.includes('s')) h = Math.max(MIN_H, startG.h + dy);
-        if (dir.includes('w')) { w = Math.max(MIN_W, startG.w - dx); x = startG.x + (startG.w - w); }
-        if (dir.includes('n')) { h = Math.max(MIN_H, startG.h - dy); y = startG.y + (startG.h - h); }
-        return { x, y, w, h };
+        if (dir.includes('w')) {
+          const desiredX = startG.x + dx;
+          x = Math.min(desiredX, startRight - MIN_W);
+          w = startRight - x;
+        }
+        if (dir.includes('n')) {
+          const desiredY = startG.y + dy;
+          y = Math.max(0, Math.min(desiredY, startBottom - MIN_H));
+          h = startBottom - y;
+        }
+        return clampGeomToViewport({ x, y, w, h });
       });
     };
     const onUp = () => {
@@ -143,6 +172,7 @@ export function FloatingPanel({ id, title, children, onClose, zIndex = 2000, onF
   const rh = 5; // resize handle size
   return (
     <div
+      data-testid={`floating-panel-${id}`}
       style={{
         position: 'fixed', left: geom.x, top: geom.y, width: geom.w, height: geom.h,
         zIndex, display: 'flex', flexDirection: 'column',
@@ -200,14 +230,19 @@ export function FloatingPanel({ id, title, children, onClose, zIndex = 2000, onF
       </div>
 
       {/* Resize handles */}
-      <div onMouseDown={onResizeMouseDown('se')} style={{ position: 'absolute', right: 0, bottom: 0, width: 16, height: 16, cursor: 'se-resize' }} />
-      <div onMouseDown={onResizeMouseDown('e')} style={{ position: 'absolute', right: 0, top: rh, bottom: rh, width: rh, cursor: 'e-resize' }} />
-      <div onMouseDown={onResizeMouseDown('s')} style={{ position: 'absolute', bottom: 0, left: rh, right: rh, height: rh, cursor: 's-resize' }} />
-      <div onMouseDown={onResizeMouseDown('w')} style={{ position: 'absolute', left: 0, top: rh, bottom: rh, width: rh, cursor: 'w-resize' }} />
-      <div onMouseDown={onResizeMouseDown('n')} style={{ position: 'absolute', top: 0, left: rh, right: rh, height: rh, cursor: 'n-resize' }} />
-      <div onMouseDown={onResizeMouseDown('nw')} style={{ position: 'absolute', left: 0, top: 0, width: 16, height: 16, cursor: 'nw-resize' }} />
-      <div onMouseDown={onResizeMouseDown('ne')} style={{ position: 'absolute', right: 0, top: 0, width: 16, height: 16, cursor: 'ne-resize' }} />
-      <div onMouseDown={onResizeMouseDown('sw')} style={{ position: 'absolute', left: 0, bottom: 0, width: 16, height: 16, cursor: 'sw-resize' }} />
+      <div data-testid="floating-resize-se" onMouseDown={onResizeMouseDown('se')} style={{ position: 'absolute', right: 0, bottom: 0, width: 16, height: 16, cursor: 'se-resize', zIndex: 3 }} />
+      <div data-testid="floating-resize-e" onMouseDown={onResizeMouseDown('e')} style={{ position: 'absolute', right: 0, top: rh, bottom: rh, width: rh, cursor: 'e-resize', zIndex: 3 }} />
+      <div data-testid="floating-resize-s" onMouseDown={onResizeMouseDown('s')} style={{ position: 'absolute', bottom: 0, left: rh, right: rh, height: rh, cursor: 's-resize', zIndex: 3 }} />
+      <div data-testid="floating-resize-w" onMouseDown={onResizeMouseDown('w')} style={{ position: 'absolute', left: 0, top: rh, bottom: rh, width: rh, cursor: 'w-resize', zIndex: 3 }} />
+      <div data-testid="floating-resize-n" onMouseDown={onResizeMouseDown('n')} style={{ position: 'absolute', top: 0, left: rh, right: rh, height: rh, cursor: 'n-resize', zIndex: 3 }} />
+      <div data-testid="floating-resize-nw" onMouseDown={onResizeMouseDown('nw')} style={{ position: 'absolute', left: 0, top: 0, width: 16, height: 16, cursor: 'nw-resize', zIndex: 3 }} />
+      <div data-testid="floating-resize-ne" onMouseDown={onResizeMouseDown('ne')} style={{ position: 'absolute', right: 0, top: 0, width: 16, height: 16, cursor: 'ne-resize', zIndex: 3 }} />
+      <div data-testid="floating-resize-sw" onMouseDown={onResizeMouseDown('sw')} style={{ position: 'absolute', left: 0, bottom: 0, width: 16, height: 16, cursor: 'sw-resize', zIndex: 3 }} />
+      <div
+        data-testid="floating-bottom-drag"
+        onMouseDown={startDrag}
+        style={{ position: 'absolute', left: 24, right: 24, bottom: rh, height: 14, cursor: 'grab', zIndex: 2 }}
+      />
     </div>
   );
 }

@@ -744,7 +744,9 @@ export function FileBrowser({
       onPreviewFile({ path: filePath, preferDiff, preview: { status: 'loading', path: filePath } });
       return;
     }
-    dismissedAutoPreviewPathRef.current = null;
+    dismissedAutoPreviewPathRef.current = autoPreviewPath && filePath !== autoPreviewPath
+      ? autoPreviewPath
+      : null;
     previewTabOverridePathRef.current = null;
     setEditDirty(false);
     setEditContent('');
@@ -766,7 +768,7 @@ export function FileBrowser({
       const diffId = ws.fsGitDiff(filePath);
       pendingGitDiffRef.current.set(diffId, { path: filePath, cycleId });
     }
-  }, [getActivePreviewCycle, hasPendingPreviewWork, onPreviewFile, t, ws]);
+  }, [autoPreviewPath, getActivePreviewCycle, hasPendingPreviewWork, onPreviewFile, t, ws]);
 
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set([startPath]));
 
@@ -887,7 +889,7 @@ export function FileBrowser({
   // Auto-preview file on open (e.g. when clicking a path link in chat)
   useEffect(() => {
     if (!autoPreviewPath) return;
-    if (dismissedAutoPreviewPathRef.current === autoPreviewPath && preview.status === 'idle') return;
+    if (dismissedAutoPreviewPathRef.current === autoPreviewPath) return;
     const currentPreviewPath = preview.status !== 'idle' ? (preview as { path: string }).path : null;
     if (currentPreviewPath === autoPreviewPath && preview.status !== 'idle') {
       if (previewTabOverridePathRef.current !== autoPreviewPath) {
