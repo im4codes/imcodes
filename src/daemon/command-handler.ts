@@ -3940,13 +3940,72 @@ log "[step 2] installing ${pkgSpec}"
 # placeholder dir (the half-extract pathology above), do a one-shot
 # \`npm install\` from inside the global package to repopulate it. Run with
 # --ignore-scripts again for the same reason.
-if ! eval "$NPM_RUN install -g --ignore-scripts ${pkgSpec}" >> "$LOG" 2>&1; then
-  log "[step 2] install FAILED (exit $?) — keeping current daemon running"
+#
+# ── Retry on ETARGET (npm CDN replication race) ────────────────────────
+# Real-world failure mode caught on 116.62.239.78: server publishes a
+# new dev release to npm and broadcasts \`daemon.upgrade { targetVersion }\`
+# almost immediately. npm origin has the version but the regional CDN
+# edge serving this daemon hasn't replicated yet — so the packument
+# response is a 200 missing the new version → npm exits with ETARGET.
+# Pre-fix this killed the upgrade for that release entirely (no retry,
+# next try only when the server broadcasts again). We now retry up to
+# 4 times with 30/60/120s back-off and bust the packument cache between
+# attempts so npm refetches origin instead of serving the stale 200.
+#
+# Non-ETARGET failures are NOT retried — they're typically deterministic
+# (network down, ENOSPC, registry auth issue). Logging the per-attempt
+# tail makes those diagnosable post-hoc without re-reading the giant
+# main log.
+INSTALL_OUT="${scriptDir}/install-attempt.log"
+INSTALL_RC=1
+ATTEMPT=0
+MAX_ATTEMPTS=4
+# Indexed sequentially with $ATTEMPT (1-based), so element 0 is unused.
+RETRY_DELAYS=(0 30 60 120)
+while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
+  ATTEMPT=$((ATTEMPT + 1))
+  log "[step 2] install attempt $ATTEMPT/$MAX_ATTEMPTS"
+  : > "$INSTALL_OUT"
+  # --prefer-online: tell npm to revalidate cached packument metadata
+  # rather than serve potentially-stale entries. Belt & braces with the
+  # cache-clean we do between attempts.
+  eval "$NPM_RUN install -g --ignore-scripts --prefer-online ${pkgSpec}" >> "$INSTALL_OUT" 2>&1
+  INSTALL_RC=$?
+  # Always tee the attempt's output into the main log for forensics.
+  cat "$INSTALL_OUT" >> "$LOG"
+  if [ "$INSTALL_RC" -eq 0 ]; then
+    log "[step 2] install attempt $ATTEMPT succeeded"
+    break
+  fi
+  log "[step 2] install attempt $ATTEMPT failed (exit $INSTALL_RC)"
+  # Detect ETARGET (case-insensitive — npm versions vary slightly).
+  IS_ETARGET=0
+  if grep -qiE 'code ETARGET|No matching version found' "$INSTALL_OUT" 2>/dev/null; then
+    IS_ETARGET=1
+  fi
+  if [ "$IS_ETARGET" -ne 1 ]; then
+    log "[step 2] non-ETARGET failure — not retrying. Tail of npm output:"
+    tail -20 "$INSTALL_OUT" | while IFS= read -r line; do log "[step 2]   $line"; done
+    break
+  fi
+  if [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
+    log "[step 2] ETARGET persisted across $MAX_ATTEMPTS attempts — registry never replicated ${pkgSpec}"
+    break
+  fi
+  DELAY=\${RETRY_DELAYS[$ATTEMPT]}
+  log "[step 2] ETARGET — npm CDN likely hasn't replicated ${pkgSpec} yet; retrying in \${DELAY}s after busting packument cache"
+  # Bust the cached packument so the next attempt forces an origin
+  # round-trip instead of revalidating into the stale cached 200.
+  eval "$NPM_RUN cache clean --force" >> "$LOG" 2>&1 || log "[step 2] cache clean returned non-zero (ignored)"
+  sleep "$DELAY"
+done
+if [ "$INSTALL_RC" -ne 0 ]; then
+  log "[step 2] install FAILED after $ATTEMPT attempts (final exit $INSTALL_RC) — keeping current daemon running"
   log "=== upgrade aborted ==="
   sleep ${CLEANUP_AFTER_SEC} && rm -rf "${scriptDir}" &
   exit 0
 fi
-log "[step 2] install succeeded"
+log "[step 2] install succeeded after $ATTEMPT attempt(s)"
 
 ${buildBashSharpRepair()}
 

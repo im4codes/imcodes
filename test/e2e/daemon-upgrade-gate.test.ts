@@ -35,7 +35,8 @@ const mocks = vi.hoisted(() => {
   const store = new Map<string, Record<string, any>>();
   const runtimes = new Map<string, { getStatus: () => string; sending: boolean; pendingCount: number }>();
   const spawnCalls: Array<{ command: string; args: readonly string[] }> = [];
-  return { store, runtimes, spawnCalls };
+  const writeCalls: Array<{ path: string; data: string }> = [];
+  return { store, runtimes, spawnCalls, writeCalls };
 });
 
 // ── Module mocks ──────────────────────────────────────────────────────────
@@ -90,11 +91,15 @@ vi.mock('node:child_process', async (importOriginal) => {
 // fs writes are no-ops so the upgrade script doesn't pollute the host's
 // temp dir on every test run. existsSync is left alone — the upgrade
 // script branches on whether systemd / launchd / npm.cmd actually exist.
+function captureWriteFileSync(path: any, data: any) {
+  if (typeof path === 'string') mocks.writeCalls.push({ path, data: typeof data === 'string' ? data : data?.toString?.() ?? '' });
+}
+
 vi.mock('fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('fs')>();
   return {
     ...actual,
-    writeFileSync: vi.fn(),
+    writeFileSync: vi.fn(captureWriteFileSync),
     mkdtempSync: vi.fn(() => '/tmp/imcodes-upgrade-gate-test'),
   };
 });
@@ -103,7 +108,7 @@ vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
   return {
     ...actual,
-    writeFileSync: vi.fn(),
+    writeFileSync: vi.fn(captureWriteFileSync),
     mkdtempSync: vi.fn(() => '/tmp/imcodes-upgrade-gate-test'),
   };
 });
@@ -465,5 +470,108 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
 
     expect(getBlockedMessage(serverLink)).toBeUndefined();
     expect(mocks.spawnCalls.length).toBeGreaterThan(0);
+  });
+});
+
+// ── Generated upgrade.sh contract (Linux/macOS) ─────────────────────────
+//
+// Captured production failure on 116.62.239.78 (2026-04-27 23:46): the
+// server published `imcodes@2026.4.1951-dev.1930` to npm and broadcast
+// `daemon.upgrade { targetVersion }` immediately. The daemon's upgrade
+// script ran `npm install -g imcodes@<that version>`, npm hit a regional
+// CDN edge that hadn't replicated yet, returned a packument missing the
+// new version, and exited with ETARGET. The script then logged
+// `install FAILED (exit 0)` (wrong — npm exited 1 but `! cmd` mangled
+// `$?`) and aborted with no retry. One bad broadcast = a missed upgrade
+// for that release until the server broadcasts again.
+//
+// These tests pin the post-fix contract for the bash branch:
+//   1. Real install exit code is captured (no more "(exit 0)" lie).
+//   2. ETARGET retries 4× with 30/60/120s back-off + cache-clean.
+//   3. Non-ETARGET errors fail-fast and tail the npm output into the log.
+//   4. Generated bash is syntactically valid.
+//
+// Skipped on Windows because that branch returns early — see the
+// `if (process.platform === 'win32')` block in handleDaemonUpgrade.
+const skipOnWindows = process.platform === 'win32' ? describe.skip : describe;
+
+skipOnWindows('daemon.upgrade — Linux/macOS upgrade.sh contract', () => {
+  beforeEach(() => {
+    mocks.store.clear();
+    mocks.runtimes.clear();
+    mocks.spawnCalls.length = 0;
+    mocks.writeCalls.length = 0;
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  async function captureUpgradeScript(): Promise<string> {
+    const serverLink = { send: vi.fn() } as { send: ReturnType<typeof vi.fn> };
+    handleWebCommand({ type: 'daemon.upgrade', targetVersion: '99.99.99-test' } as any, serverLink as any);
+    await waitForCondition(
+      () => mocks.writeCalls.some((c) => c.path.endsWith('upgrade.sh')),
+      5000,
+    );
+    const script = mocks.writeCalls.find((c) => c.path.endsWith('upgrade.sh'));
+    if (!script) throw new Error('upgrade.sh was never written');
+    return script.data;
+  }
+
+  it('captures the real install exit code (regression: pre-fix logged "(exit 0)" on every failure)', async () => {
+    const sh = await captureUpgradeScript();
+    // Pre-fix used `if ! eval "$NPM_RUN install ..." ; then log "[step 2] install FAILED (exit $?)"`,
+    // where $? after the `!` inversion is always 0. Post-fix captures
+    // INSTALL_RC=$? on its own line so the logged code is real.
+    expect(sh).toMatch(/INSTALL_RC=\$\?/);
+    expect(sh).not.toMatch(/install FAILED \(exit \$\?\) — keeping current daemon running/);
+  });
+
+  it('retries up to 4 times on ETARGET with packument cache-clean between attempts', async () => {
+    const sh = await captureUpgradeScript();
+    // Loop bounded by MAX_ATTEMPTS=4 with explicit per-attempt back-off.
+    expect(sh).toMatch(/MAX_ATTEMPTS=4/);
+    expect(sh).toMatch(/RETRY_DELAYS=\(0 30 60 120\)/);
+    // ETARGET detection is the trigger; non-ETARGET must NOT retry.
+    expect(sh).toMatch(/grep -qiE 'code ETARGET\|No matching version found'/);
+    // Cache-clean between attempts so npm refetches origin instead of
+    // revalidating into the stale cached 200.
+    expect(sh).toMatch(/cache clean --force/);
+    // --prefer-online forces revalidation on the first attempt too.
+    expect(sh).toMatch(/install -g --ignore-scripts --prefer-online/);
+  });
+
+  it('non-ETARGET failures bail after 1 attempt and tail npm output into the log', async () => {
+    const sh = await captureUpgradeScript();
+    // The non-ETARGET branch must `break` out of the retry loop AND
+    // surface the npm error tail prefixed into upgrade.log so operators
+    // can diagnose without re-reading the giant per-attempt file.
+    expect(sh).toMatch(/non-ETARGET failure — not retrying/);
+    expect(sh).toMatch(/tail -20 "\$INSTALL_OUT"/);
+  });
+
+  it('generated bash is syntactically valid (`bash -n` passes)', async () => {
+    const sh = await captureUpgradeScript();
+    // Use vi.importActual to bypass the fs mock above (which captures
+    // writes into mocks.writeCalls instead of hitting disk) and the
+    // child_process mock (which captures spawn calls). bash -n needs
+    // the real script on disk and a real spawn to validate it.
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = realFs.mkdtempSync(join(tmpdir(), 'imcodes-bashcheck-'));
+    const path = join(dir, 'upgrade.sh');
+    try {
+      realFs.writeFileSync(path, sh);
+      const res = realCp.spawnSync('bash', ['-n', path], { encoding: 'utf8' });
+      if (res.status !== 0) {
+        throw new Error(`bash -n exited ${res.status}\nstderr:\n${res.stderr}`);
+      }
+      expect(res.status).toBe(0);
+    } finally {
+      realFs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
