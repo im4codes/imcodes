@@ -9,6 +9,7 @@ import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM } from '@shared/preview-types.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
 import type { ContextMemoryView, ContextModelConfig } from '@shared/context-types.js';
 import type { SharedContextRuntimeConfigSnapshot } from '@shared/shared-context-runtime-config.js';
+import { isNative } from './native.js';
 import {
   SUPERVISION_USER_DEFAULT_PREF_KEY,
   normalizeSupervisorDefaultConfig,
@@ -32,7 +33,11 @@ let _authTelemetryHeadersPromise: Promise<AuthTelemetryHeaders> | null = null;
 // where apiFetch is called before configureApiKey() in the native init effect.
 try {
   const stored = localStorage.getItem('rcc_api_key');
-  if (stored) _apiKey = stored;
+  if (stored && isNative()) {
+    _apiKey = stored;
+  } else if (stored) {
+    localStorage.removeItem('rcc_api_key');
+  }
 } catch { /* SSR or restricted storage */ }
 
 /** Set a Bearer API key for native app auth (replaces cookie+CSRF). */

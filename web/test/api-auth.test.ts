@@ -69,6 +69,30 @@ describe('auth nonce exchange API', () => {
     expect(headers.get('X-Bundle-Version')).toBe('2026.4.937');
   });
 
+  it('drops a stale browser API key so web login can store cookies', async () => {
+    vi.resetModules();
+    vi.stubGlobal('Capacitor', {
+      getPlatform: () => 'web',
+      isNativePlatform: () => false,
+    });
+    localStorage.setItem('rcc_api_key', 'deck_stale_browser_key');
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }));
+
+    const { passwordLogin, getApiKey } = await import('../src/api.js');
+    await passwordLogin('wyj', 'password');
+
+    expect(getApiKey()).toBeNull();
+    expect(localStorage.getItem('rcc_api_key')).toBeNull();
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const headers = new Headers(init.headers);
+    expect(headers.has('Authorization')).toBe(false);
+    expect(init.credentials).toBe('include');
+  });
+
   it('retries transient failures with exponential backoff', async () => {
     vi.useFakeTimers();
     const fetchMock = vi.mocked(fetch);
