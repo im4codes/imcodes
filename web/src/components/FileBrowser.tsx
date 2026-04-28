@@ -243,6 +243,8 @@ export interface FileBrowserPreviewRequest {
   preferDiff?: boolean;
   preview?: FileBrowserPreviewState;
   sourcePreviewLive?: boolean;
+  /** Project/root directory used to keep the floating preview's Changes tab available. */
+  rootPath?: string;
 }
 
 export interface FileBrowserPreviewUpdate {
@@ -1051,7 +1053,7 @@ export function FileBrowser({
   const previewPath = preview.status !== 'idle' ? (preview as { path: string }).path : null;
 
   const tree = (
-    <div class={`fb-tree${hasInlinePreview ? ' fb-tree-split' : ''}`}>
+    <div class={`fb-tree${layout !== 'panel' && hasInlinePreview ? ' fb-tree-split' : ''}`}>
       {data.map((root) => (
         <FsTreeNode
           key={root.id}

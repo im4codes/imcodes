@@ -141,9 +141,10 @@ registerPanelType('filebrowser', {
         mode="file-multi"
         layout="panel"
         initialPath={projectDir}
+        changesRootPath={projectDir}
         hideFooter={false}
         onPreviewStateChange={ctx.onPreviewStateChange}
-        onPreviewFile={ctx.onPreviewFile}
+        onPreviewFile={ctx.onPreviewFile ? (request) => ctx.onPreviewFile?.({ ...request, rootPath: projectDir }) : undefined}
         onConfirm={(paths) => {
           const inputEl = activeSession && ctx.inputRefsMap?.current
             ? ctx.inputRefsMap.current.get(activeSession)

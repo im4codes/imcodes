@@ -1020,6 +1020,7 @@ describe('FileBrowser', () => {
 
     expect(document.querySelector('.fb-panel-tabs')).not.toBeNull();
     expect(document.querySelector('.fb-changes-section')).toBeNull();
+    expect(document.querySelector('.fb-files-and-changes > .fb-tree')?.classList.contains('fb-tree-split')).toBe(false);
     expect(document.querySelector('.fb-body-with-changes')).toBeNull();
   });
 
@@ -1184,7 +1185,7 @@ describe('FileBrowser', () => {
     ]);
   });
 
-  it('lets a floating auto-preview switch to another file from the left file list', async () => {
+  it('lets a floating auto-preview switch to another file from the left file list while keeping Changes as a tab', async () => {
     const { ws, respond, sendMsg } = makeWsFactory();
     (ws.fsReadFile as any).mockImplementation((path: string) => `read-${path.split('/').pop()}`);
     (ws.fsGitDiff as any).mockImplementation((path: string) => `diff-${path.split('/').pop()}`);
@@ -1195,10 +1196,15 @@ describe('FileBrowser', () => {
         mode="file-single"
         layout="panel"
         initialPath="/home/user"
+        changesRootPath="/home/user"
         autoPreviewPath="/home/user/foo.ts"
         onConfirm={vi.fn()}
       />,
     );
+
+    expect(document.querySelector('.fb-panel-tabs')).not.toBeNull();
+    expect(document.querySelector('.fb-changes-section')).toBeNull();
+    expect(document.querySelector('.fb-files-and-changes > .fb-tree')?.classList.contains('fb-tree-split')).toBe(false);
 
     await act(async () => {
       respond([

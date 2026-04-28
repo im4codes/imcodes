@@ -168,6 +168,16 @@ export interface PinnedPanel {
   props: Record<string, unknown>;
 }
 
+function getFilePreviewInitialPath(request: FileBrowserPreviewRequest): string {
+  if (request.rootPath) return request.rootPath;
+  const slash = request.path.lastIndexOf('/');
+  const backslash = request.path.lastIndexOf('\\');
+  const idx = Math.max(slash, backslash);
+  if (idx > 0) return request.path.slice(0, idx);
+  if (idx === 0) return request.path[0] ?? '~';
+  return '~';
+}
+
 interface AuthState {
   userId: string;
   baseUrl: string;
@@ -1279,15 +1289,22 @@ export function App() {
         },
       };
     });
-    setPreviewFileRequest((prev) => (
-      prev?.path === update.path
-        ? {
-            ...prev,
-            preferDiff: prev.preferDiff ?? update.preferDiff,
-            preview: update.preview,
-          }
-        : prev
-    ));
+    setPreviewFileRequest((prev) => {
+      if (!prev) return prev;
+      if (prev.path === update.path) {
+        return {
+          ...prev,
+          preferDiff: prev.preferDiff ?? update.preferDiff,
+          preview: update.preview,
+        };
+      }
+      return {
+        ...prev,
+        path: update.path,
+        preferDiff: update.preferDiff,
+        preview: update.preview,
+      };
+    });
   }, []);
 
   /** Generic unpin: remove from pinnedPanels + reopen the source floating window. */
@@ -3515,12 +3532,13 @@ export function App() {
           defaultH={500}
         >
           <FileBrowser
-            key={`${previewFileRequest.path}:${previewFileRequest.preferDiff ? 'diff' : 'source'}`}
+            key={previewFileRequest.rootPath ?? getFilePreviewInitialPath(previewFileRequest)}
             ws={wsRef.current}
             serverId={selectedServerId ?? undefined}
             mode="file-single"
             layout="panel"
-            initialPath={previewFileRequest.path.replace(/\/[^/]+$/, '') || '~'}
+            initialPath={getFilePreviewInitialPath(previewFileRequest)}
+            changesRootPath={previewFileRequest.rootPath}
             initialPreview={previewFileRequest.preview ?? previewFileCache[previewFileRequest.path]?.preview}
             autoPreviewPath={previewFileRequest.path}
             autoPreviewPreferDiff={!!previewFileRequest.preferDiff}
