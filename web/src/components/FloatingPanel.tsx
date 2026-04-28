@@ -1,7 +1,8 @@
 /**
  * FloatingPanel — reusable draggable/resizable floating window.
  * Used for RepoPage, DiscussionsPage, and other full-page overlays
- * that should behave like floating windows on desktop.
+ * that should behave like floating windows on desktop. Desktop callers own
+ * stack-derived z-order; the mobile fullscreen branch uses its own layer.
  */
 import { useState, useRef, useCallback, useEffect } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
@@ -24,6 +25,7 @@ interface Props {
 const MIN_W = 360;
 const MIN_H = 280;
 const DRAG_MARGIN = 32;
+const MOBILE_FULLSCREEN_Z_INDEX = 2000;
 
 function clampGeomToViewport(geom: WindowGeometry): WindowGeometry {
   const w = Math.max(MIN_W, geom.w);
@@ -141,7 +143,7 @@ export function FloatingPanel({ id, title, children, onClose, zIndex = 2000, onF
   // Mobile: fullscreen with title bar
   if (isMobile) {
     return (
-      <div style={{ position: 'fixed', inset: 0, zIndex, background: '#0f172a', display: 'flex', flexDirection: 'column' }}>
+      <div style={{ position: 'fixed', inset: 0, zIndex: MOBILE_FULLSCREEN_Z_INDEX, background: '#0f172a', display: 'flex', flexDirection: 'column' }}>
         <div style={{ height: 'env(safe-area-inset-top, 0px)', flexShrink: 0, background: '#0f172a' }} />
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: '#1e293b', borderBottom: '1px solid #334155', flexShrink: 0 }}>
           <span
