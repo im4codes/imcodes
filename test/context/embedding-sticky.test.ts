@@ -35,6 +35,22 @@ vi.mock('@huggingface/transformers', () => ({
   env: { cacheDir: undefined } as { cacheDir: string | undefined },
 }));
 
+// Mock the server-fallback module so the test exercises ONLY the local
+// sticky-disable path. Without this, generateEmbedding's catch block
+// falls through to `tryServerEmbedding`, which on a bound dev machine
+// reads ~/.imcodes/server.json and POSTs to the real bound server —
+// returning a real Float32Array and breaking the "expected null" assertion.
+//
+// We mark the fallback as already-unavailable so generateEmbedding's
+// `if (isServerFallbackUnavailable()) return null` short-circuit fires
+// and we never try a network call.
+vi.mock('../../src/context/embedding-server-fallback.js', () => ({
+  isServerFallbackUnavailable: () => true,
+  tryServerEmbedding: vi.fn(async () => null),
+  getServerFallbackDisableReason: () => 'mocked_off',
+  _resetServerFallbackStateForTests: vi.fn(),
+}));
+
 // embedding.ts is module-scoped state; we need a clean slate per test.
 import {
   _resetEmbeddingStateForTests,
