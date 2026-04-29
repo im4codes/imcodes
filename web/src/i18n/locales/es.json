@@ -110,8 +110,7 @@
     "file_change_no_after": "(sin texto nuevo)",
     "file_change_derived_no_preview": "(sin vista previa)",
     "file_change_coarse_hint": "Hay ruta de archivo, pero no se proporcionó texto diff.",
-    "file_change_renamed_from": "{{oldPath}} → {{newPath}}",
-    "compaction_result_title": "Resultado de compactación"
+    "file_change_renamed_from": "{{oldPath}} → {{newPath}}"
   },
   "session": {
     "restart": "↺ Reiniciar",

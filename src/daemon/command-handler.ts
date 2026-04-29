@@ -66,7 +66,6 @@ import { CC_PRESET_MSG, type CcPreset } from '../../shared/cc-presets.js';
 import { MEMORY_WS } from '../../shared/memory-ws.js';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG, MAX_P2P_PARTICIPANTS } from '../../shared/p2p-config-events.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
-import { COMPACTION_RESULT_EVENT } from '../../shared/compaction-events.js';
 import {
   CLAUDE_SDK_EFFORT_LEVELS,
   CODEX_SDK_EFFORT_LEVELS,
@@ -341,23 +340,15 @@ function supportsTransportClear(agentType: string | undefined): agentType is 'cl
     || agentType === 'qwen';
 }
 
-/**
- * Transport agents that benefit from server-side `/compact` interception.
- * None of the underlying SDKs expose a programmatic compact API (claude-code-sdk
- * only emits compact_boundary events, never accepts a manual trigger), so we
- * synthesize compaction by:
- *   1. Loading the session's transport-history events,
- *   2. Calling `compressWithSdk` (the same memory-compression pipeline used for
- *      shared context), which routes to the user's configured context backend,
- *   3. Restarting a fresh transport conversation (same as `/clear`),
- *   4. Surfacing the summary in chat as a memory-excluded assistant.text.
- *
- * Result: zero token bloat in the agent's context, but the user keeps the
- * compressed history visible in the timeline for reference.
- */
-function supportsTransportCompact(agentType: string | undefined): agentType is 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'openclaw' | 'qwen' {
-  return supportsTransportClear(agentType);
-}
+// Note: an earlier `supportsTransportCompact` helper synthesized `/compact`
+// behaviour daemon-side by replaying transport history, calling the memory
+// compressor, and relaunching a fresh conversation. That was rolled back —
+// transport SDKs (claude-code-sdk and friends) accept the literal `/compact`
+// text and run their own native compaction, which is materially better than
+// a daemon-side fresh relaunch (preserves SDK tool config, system prompts,
+// and resume identity). The daemon's automatic materialization pipeline
+// continues to record raw events into `context_event_archive` regardless,
+// so no provenance is lost when the SDK compacts.
 
 function supportsProcessClear(agentType: string | undefined): agentType is 'claude-code' | 'codex' | 'opencode' {
   return agentType === 'claude-code' || agentType === 'codex' || agentType === 'opencode';
@@ -2104,131 +2095,15 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       }
       return;
     }
-    if (text.trim() === '/compact' && supportsTransportCompact(record?.agentType)) {
-      emitTransportUserMessage(text);
-      // Stream a placeholder "running" assistant turn so the chat shows progress
-      // while compression runs. This is a long-ish round-trip (LLM call) so silent
-      // dead air is a worse UX than a visible spinner with status text.
-      const compactingEventId = `compact:${sessionName}:${effectiveId}`;
-      const emitCompactStatus = (statusText: string, streaming: boolean): void => {
-        timelineEmitter.emit(sessionName, 'assistant.text', {
-          text: statusText,
-          streaming,
-          memoryExcluded: true,
-        }, { source: 'daemon', confidence: 'high', eventId: compactingEventId });
-      };
-      emitCompactStatus('🗜 Compacting conversation…', true);
-      // Fresh conversation must not replay stale queued messages from the prior
-      // offline window — drop anything we had buffered for resend.
-      clearResend(sessionName);
-      try {
-        const { replayTransportHistory } = await import('./transport-history.js');
-        const rawEvents = await replayTransportHistory(sessionName);
-        const compactRunId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-        // Only memory-eligible turns feed the compressor. Tool calls, deltas,
-        // session state pings, and approval requests are noise here — they
-        // bloat the prompt without informing the summary.
-        // Synthesize a minimal ContextTargetRef — the compressor only reads
-        // `eventType` and `content` from each event when serializing the prompt,
-        // so the namespace fields are filler. Reuse the session's persisted
-        // namespace when available so logs are coherent across the codebase.
-        const compactNamespace: import('../../shared/context-types.js').ContextNamespace =
-          record?.contextNamespace
-          ?? { scope: 'personal', projectId: record?.projectName ?? sessionName };
-        const localEvents: import('../../shared/context-types.js').LocalContextEvent[] = rawEvents
-          .filter((e) => {
-            const t = typeof e.type === 'string' ? e.type : '';
-            return t === 'user.message' || t === 'assistant.text';
-          })
-          .map((e, idx) => ({
-            id: `compact-src:${sessionName}:${compactRunId}:${idx}`,
-            target: { namespace: compactNamespace, kind: 'session' as const, sessionName },
-            eventType: String(e.type),
-            content: typeof e.text === 'string' ? e.text : '',
-            createdAt: typeof e._ts === 'number' ? e._ts : Date.now(),
-          }))
-          .filter((e) => e.content && e.content.trim().length > 0);
-
-        if (localEvents.length === 0) {
-          emitCompactStatus('⚠️ Nothing to compact yet — start a turn first.', false);
-          const ackStatus = isLegacy ? 'accepted_legacy' : 'accepted';
-          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: ackStatus });
-          try {
-            serverLink.send({ type: 'command.ack', commandId: effectiveId, status: ackStatus, session: sessionName });
-          } catch { /* */ }
-          return;
-        }
-
-        const { compressWithSdk, computeTargetTokens } = await import('../context/summary-compressor.js');
-        const { countTokens } = await import('../context/tokenizer.js');
-        const { summarizeManualCompaction } = await import('../context/compression-feedback.js');
-        const { loadMemoryConfig } = await import('../context/memory-config.js');
-        const { archiveEventsForMaterialization } = await import('../store/context-store.js');
-        const modelConfig = getContextModelConfig();
-        const memoryConfig = loadMemoryConfig(record?.projectDir ?? process.cwd());
-        const compactStartedAt = Date.now();
-        const inputTokens = countTokens(localEvents.map((event) => event.content ?? '').join('\n'));
-        // Manual `/compact` honors the proportional budget by default. A
-        // positive `manualCompactTargetTokens` in `.imc/memory.yaml` is a
-        // hard override; `0` (the default) routes to `computeTargetTokens`.
-        // (memory-system-1.1-foundations P2 / spec.md:218-223)
-        const manualTargetTokens = memoryConfig.manualCompactTargetTokens > 0
-          ? memoryConfig.manualCompactTargetTokens
-          : computeTargetTokens(inputTokens, 'manual');
-        const result = await compressWithSdk({
-          events: localEvents,
-          modelConfig,
-          mode: 'manual',
-          targetTokens: manualTargetTokens,
-          maxEventChars: memoryConfig.maxEventChars,
-          previousSummaryMaxTokens: memoryConfig.previousSummaryMaxTokens,
-          extraRedactPatterns: memoryConfig.extraRedactPatterns,
-        });
-        const summaryTokens = countTokens(result.summary);
-
-        // Restart the transport runtime fresh — the compressed summary replaces
-        // the verbose history. Same exclusive-relaunch dance as /clear.
-        await runExclusiveSessionRelaunch(sessionName, async () => {
-          await relaunchFreshTransportConversation(record);
-        });
-        clearRecentInjectionHistory(sessionName);
-        await handleGetSessions(serverLink);
-        await syncSubSessionIfNeeded(sessionName, serverLink);
-        // Archive synthetic compact sources only after compression, relaunch,
-        // and post-relaunch sync all succeed. Failed compactions must not leave
-        // uncited compact-src:* rows that bloat the raw archive or imply
-        // provenance for a summary that was never accepted.
-        archiveEventsForMaterialization(localEvents, compactStartedAt);
-
-        const backendNote = result.backend
-          ? ` · ${result.backend}${result.usedBackup ? ' (backup)' : ''}`
-          : '';
-        const compactionPayload = summarizeManualCompaction({
-          eventCount: localEvents.length,
-          inputTokens,
-          summaryTokens,
-          sourceEventIds: localEvents.map((event) => event.id),
-          elapsed: Date.now() - compactStartedAt,
-        });
-        timelineEmitter.emit(sessionName, COMPACTION_RESULT_EVENT, compactionPayload as unknown as Record<string, unknown>, { source: 'daemon', confidence: 'high' });
-        emitCompactStatus(
-          `🗜 Compacted ${localEvents.length} turn${localEvents.length === 1 ? '' : 's'}${backendNote}\n\n${result.summary}`,
-          false,
-        );
-        const compactStatus = isLegacy ? 'accepted_legacy' : 'accepted';
-        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: compactStatus });
-        try {
-          serverLink.send({ type: 'command.ack', commandId: effectiveId, status: compactStatus, session: sessionName });
-        } catch { /* */ }
-      } catch (err) {
-        const errMsg = describeTransportSendError(err);
-        logger.error({ sessionName, err }, 'session.compact (transport) failed');
-        emitCompactStatus(`⚠️ Compact failed: ${errMsg}`, false);
-        timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
-        try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg }); } catch { /* */ }
-      }
-      return;
-    }
+    // `/compact` is intentionally NOT intercepted here. Transport SDKs
+    // (claude-code-sdk, codex-sdk, copilot-sdk, cursor-headless, openclaw,
+    // qwen) accept the literal `/compact` text and run their own native
+    // compaction — preserving SDK tool config, system prompts, and resume
+    // identity. The daemon's automatic materialization pipeline already
+    // archives every memory-eligible event into `context_event_archive`
+    // independently, so daemon-side memory provenance is preserved whether
+    // or not the SDK compacts. Falling through to the default send path
+    // forwards `/compact` to the transport untouched.
     const release = await getMutex(sessionName).acquire();
     try {
       const modelMatch = text.trim().match(/^\/model\s+(\S+)(?:\s+.*)?$/);

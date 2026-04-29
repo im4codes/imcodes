@@ -9,7 +9,6 @@ import { memo } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { TimelineEvent, WsClient, MemoryContextTimelinePayload, MemoryContextTimelineItem } from '../ws-client.js';
 import type { FileChangeBatch, FileChangePatch } from '@shared/file-change.js';
-import { COMPACTION_RESULT_EVENT, type CompactionResultPayload } from '@shared/compaction-events.js';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
 import { FileBrowser } from './file-browser-lazy.js';
 import { FloatingPanel } from './FloatingPanel.js';
@@ -1943,19 +1942,6 @@ const ChatEvent = memo(function ChatEvent({
       // "Thought for Xs" summary). The agent's running state and the memory
       // context card already give enough signal that work is happening.
       return null;
-
-    case COMPACTION_RESULT_EVENT: {
-      const payload = event.payload as unknown as CompactionResultPayload;
-      return (
-        <div class="chat-event chat-system chat-compaction-result">
-          <strong>{t('chat.compaction_result_title')}</strong>
-          <div>{payload.headline}</div>
-          <div>{payload.tokenLine}</div>
-          <div>{payload.provenanceLine}</div>
-          {payload.class && <div>{payload.class}</div>}
-        </div>
-      );
-    }
 
     case 'memory.context':
       return <MemoryContextEvent event={event} />;

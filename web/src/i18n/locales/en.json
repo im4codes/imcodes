@@ -110,8 +110,7 @@
     "file_change_no_after": "(no new text)",
     "file_change_derived_no_preview": "(no preview available)",
     "file_change_coarse_hint": "File path available, but no diff text was provided.",
-    "file_change_renamed_from": "{{oldPath}} → {{newPath}}",
-    "compaction_result_title": "Compaction result"
+    "file_change_renamed_from": "{{oldPath}} → {{newPath}}"
   },
   "session": {
     "restart": "↺ Restart",

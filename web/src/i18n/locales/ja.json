@@ -110,8 +110,7 @@
     "file_change_no_after": "（新しいテキストなし）",
     "file_change_derived_no_preview": "（プレビューなし）",
     "file_change_coarse_hint": "ファイルパスはありますが、diff テキストはありません。",
-    "file_change_renamed_from": "{{oldPath}} → {{newPath}}",
-    "compaction_result_title": "圧縮結果"
+    "file_change_renamed_from": "{{oldPath}} → {{newPath}}"
   },
   "session": {
     "restart": "↺ 再起動",

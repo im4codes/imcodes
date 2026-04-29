@@ -110,8 +110,7 @@
     "file_change_no_after": "(새 텍스트 없음)",
     "file_change_derived_no_preview": "(미리보기 없음)",
     "file_change_coarse_hint": "파일 경로는 있지만 diff 텍스트가 제공되지 않았습니다.",
-    "file_change_renamed_from": "{{oldPath}} → {{newPath}}",
-    "compaction_result_title": "압축 결과"
+    "file_change_renamed_from": "{{oldPath}} → {{newPath}}"
   },
   "session": {
     "restart": "↺ 재시작",

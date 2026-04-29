@@ -110,8 +110,7 @@
     "file_change_no_after": "（无新文本）",
     "file_change_derived_no_preview": "（无可用预览）",
     "file_change_coarse_hint": "仅有文件路径，未提供 diff 文本。",
-    "file_change_renamed_from": "{{oldPath}} → {{newPath}}",
-    "compaction_result_title": "压缩结果"
+    "file_change_renamed_from": "{{oldPath}} → {{newPath}}"
   },
   "session": {
     "restart": "↺ 重启",
