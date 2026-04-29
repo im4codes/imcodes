@@ -67,20 +67,31 @@ process.exit(0);
           `Run \`npm run build\` before \`npm test\`.`,
       );
     }
+    // Windows env vars are case-insensitive but Node's `process.env` on
+    // Windows preserves whichever case the underlying API hands back. If
+    // we simply do `{ ...process.env, npm_execpath: stubNpm }`, the
+    // inherited key (set by the outer `npm test` lifecycle) may exist
+    // under a different casing — both keys then make it into the spawn's
+    // env block and Windows' case-insensitive merge picks the inherited
+    // (real npm) one, NOT our stub. Real-world hit on the GHA Windows
+    // runner: postinstall ran with the toolchain npm-cli.js and the
+    // stub log was never written.
+    //
+    // Fix: strip every case-variant of npm_execpath before injecting the
+    // stub so the child sees exactly one key.
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    for (const k of Object.keys(env)) {
+      if (k.toLowerCase() === 'npm_execpath') delete env[k];
+    }
+    env.npm_execpath = stubNpm;
+    // Enable verbose logging in the postinstall script so any failure
+    // gives us a path-by-path trace (otherwise on Windows CI we have no
+    // way to see which guard fired or whether spawn errored).
+    env.IMCODES_POSTINSTALL_DEBUG = '1';
+
     const result = spawnSync(process.execPath, [POSTINSTALL_JS], {
       cwd,
-      env: {
-        ...process.env,
-        // Route the script's `npm install` through our stub. Per npm's
-        // convention, `npm_execpath` points at the JS entrypoint —
-        // postinstall-sharp-repair sees the `.mjs` extension and re-
-        // invokes Node against it, exactly like real npm.
-        npm_execpath: stubNpm,
-        // Enable verbose logging in the postinstall script so any failure
-        // gives us a path-by-path trace (otherwise on Windows CI we have
-        // no way to see which guard fired or whether spawn errored).
-        IMCODES_POSTINSTALL_DEBUG: '1',
-      },
+      env,
       encoding: 'utf8',
     });
     return {
