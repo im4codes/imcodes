@@ -141,6 +141,13 @@ function runRepair(): boolean {
   } else if (npmExec) {
     cmd = npmExec;
     argv = installArgs;
+    // npm on Windows occasionally exposes npm_execpath as the .cmd / .bat
+    // shim itself rather than the JS entrypoint. Node's spawn will not
+    // launch a .cmd shim without going through the shell, so detect by
+    // extension and route through cmd.exe.
+    if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(npmExec)) {
+      useShell = true;
+    }
   } else {
     cmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
     argv = installArgs;
