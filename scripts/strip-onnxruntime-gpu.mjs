@@ -288,9 +288,11 @@ for (const sharpRoot of [
   console.log(`[strip-onnxruntime-gpu] removed ${rel} (${(bytes / 1024 / 1024).toFixed(1)} MB) — npm will re-resolve at install`);
 }
 
-// 7. Neutralize imcodes's own lifecycle scripts in the to-be-published
-//    package.json so a transitive dep's install hook can't accidentally
-//    invoke `tsc` (or any other dev-only command) and crash the install.
+// 7. Rewrite imcodes's own lifecycle scripts in the to-be-published
+//    package.json:
+//      - EVERY script except `postinstall` becomes a no-op echo.
+//      - `postinstall` is force-set to invoke our bundled sharp self-heal
+//        (`dist/src/util/postinstall-sharp-repair.js`).
 //
 // Real-world failure on big@172.16.253.213 (npm 11.12.1, node v24.15.0,
 // fresh `npm i -g imcodes@dev`):
@@ -306,39 +308,76 @@ for (const sharpRoot of [
 //   4. `npm run build` walks UP looking for the script and finds imcodes's
 //      `"build": "tsc"`. tsc isn't on the install-context PATH so it
 //      exits 127 → the entire `npm i -g imcodes` aborts.
+//   5. Even if (4) is dodged, sharp's transitive deps (detect-libc,
+//      semver, @img/colour) frequently land as empty placeholder dirs
+//      under the same npm-global bug → daemon crashes on first
+//      `@huggingface/transformers` import → semantic search permanently
+//      sticky-disabled until the user knows to run a manual repair.
 //
-// The daemon's auto-upgrade dodges this by passing `--ignore-scripts`,
-// but human users `npm i -g imcodes@dev` and get burned every time.
+// The daemon's auto-upgrade dodges (3-4) with `--ignore-scripts` and
+// runs an inline bash repair for (5). Human `npm i -g imcodes@dev` users
+// get neither protection without this prepack rewrite.
 //
-// Fix: rewrite EVERY lifecycle script in the published package.json to
-// the same no-op shell. Sharp's `|| npm run build` walks up, finds a
-// no-op build, exits 0 → its install hook succeeds → npm install
-// completes. Runtime is unaffected because (a) the published tarball
-// ships pre-built `dist/` so end users never need to compile, and
-// (b) the daemon CLI doesn't invoke any of these scripts at runtime.
+// Two-prong fix:
+//
+//   (a) Neutralize build/dev/test/etc. so sharp's `|| npm run build`
+//       fallback can't hijack tsc. Required because we still need to
+//       allow ANY lifecycle script through (sharp's fallback resolves
+//       upward by name regardless of which lifecycle is currently
+//       executing), so we can't just delete scripts wholesale.
+//
+//   (b) Inject our own `postinstall` that runs the bundled sharp self-
+//       heal AFTER the install completes. This catches case (5) for
+//       human installs the same way the bash repair catches it for the
+//       daemon path. The script is bundled in `dist/`, lives next to
+//       `sharp-repair-script.js`, and reuses SHARP_REQUIRED_DEPS so the
+//       allowlist never drifts.
 //
 // Local dev side-effect: this prepack mutates the working-tree
-// package.json. The accompanying `postpack` hook (added in
-// package.json) runs `git checkout -- package.json` to restore it
-// immediately after `npm pack` completes. If postpack doesn't run for
-// any reason (Ctrl+C, pack errored), restore manually with the same
-// command.
+// package.json. The accompanying `postpack` hook
+// (`scripts/restore-package-json-after-pack.mjs`) runs
+// `git checkout -- package.json` to restore it immediately after `npm
+// pack` completes. If postpack doesn't run (Ctrl+C, pack errored),
+// restore manually with the same command.
 const imcodesPkgPath = join(repoRoot, 'package.json');
 if (existsSync(imcodesPkgPath)) {
   const imcodesPkg = JSON.parse(readFileSync(imcodesPkgPath, 'utf8'));
-  if (imcodesPkg.scripts && Object.keys(imcodesPkg.scripts).length > 0) {
-    const NOOP = 'echo "imcodes: published tarball, lifecycle scripts disabled"';
-    let count = 0;
-    for (const key of Object.keys(imcodesPkg.scripts)) {
-      if (imcodesPkg.scripts[key] !== NOOP) {
-        imcodesPkg.scripts[key] = NOOP;
-        count += 1;
-      }
+  imcodesPkg.scripts = imcodesPkg.scripts ?? {};
+  const NOOP = 'echo "imcodes: published tarball, lifecycle scripts disabled"';
+  // Path is relative to the imcodes package root at install time, which is
+  // also the postinstall script's cwd. Forward slashes work on Windows for
+  // `node` invocation (Node accepts both separators on the CLI).
+  const POSTINSTALL_CMD = 'node dist/src/util/postinstall-sharp-repair.js';
+  let neutralized = 0;
+  for (const key of Object.keys(imcodesPkg.scripts)) {
+    if (key === 'postinstall') continue; // handled below
+    if (imcodesPkg.scripts[key] !== NOOP) {
+      imcodesPkg.scripts[key] = NOOP;
+      neutralized += 1;
     }
-    if (count > 0) {
-      writeFileSync(imcodesPkgPath, JSON.stringify(imcodesPkg, null, 2) + '\n');
-      console.log(`[strip-onnxruntime-gpu] neutralized ${count} lifecycle script(s) in package.json (postpack will restore via git checkout)`);
-    }
+  }
+  // Force-write the published-only postinstall. The source-tree package.json
+  // doesn't define one (we have a `prepare` hook for husky during dev), so
+  // this is purely additive at pack time and gets reverted by postpack.
+  if (imcodesPkg.scripts.postinstall !== POSTINSTALL_CMD) {
+    imcodesPkg.scripts.postinstall = POSTINSTALL_CMD;
+  }
+  writeFileSync(imcodesPkgPath, JSON.stringify(imcodesPkg, null, 2) + '\n');
+  console.log(
+    `[strip-onnxruntime-gpu] neutralized ${neutralized} lifecycle script(s) ` +
+      `and installed sharp-repair postinstall (postpack will restore via git checkout)`,
+  );
+  // Sanity-check: make sure the published tarball will actually contain
+  // the bundled postinstall script. If `dist/src/util/postinstall-sharp-
+  // repair.js` is missing, the postinstall would log "Cannot find module"
+  // and skip the repair — better to fail the pack loudly here.
+  const expectedPostinstallScript = join(repoRoot, 'dist', 'src', 'util', 'postinstall-sharp-repair.js');
+  if (!existsSync(expectedPostinstallScript)) {
+    console.error(
+      `[strip-onnxruntime-gpu] FATAL: ${expectedPostinstallScript} not found. ` +
+        `Did 'npm run build' run before pack? The published postinstall would no-op.`,
+    );
+    process.exit(1);
   }
 }
 
