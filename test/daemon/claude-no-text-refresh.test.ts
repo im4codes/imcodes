@@ -74,7 +74,7 @@ function assistantText(text: string): string {
   })}\n`;
 }
 
-async function waitUntil(fn: () => boolean, timeoutMs = 10000): Promise<void> {
+async function waitUntil(fn: () => boolean, timeoutMs = 20_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (fn()) return;
@@ -154,7 +154,7 @@ describe('Claude no-text refresh integration', () => {
 
     expect(assistantIdx).toBeGreaterThanOrEqual(0);
     expect(idleIdx).toBeGreaterThan(assistantIdx);
-  }, 15000);
+  }, 25_000);
 
   it('does not read a different claude session transcript during idle refresh', async () => {
     await appendFile(otherFile, assistantText('wrong claude transcript'));

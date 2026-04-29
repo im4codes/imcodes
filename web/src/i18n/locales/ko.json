@@ -110,7 +110,8 @@
     "file_change_no_after": "(새 텍스트 없음)",
     "file_change_derived_no_preview": "(미리보기 없음)",
     "file_change_coarse_hint": "파일 경로는 있지만 diff 텍스트가 제공되지 않았습니다.",
-    "file_change_renamed_from": "{{oldPath}} → {{newPath}}"
+    "file_change_renamed_from": "{{oldPath}} → {{newPath}}",
+    "compaction_result_title": "압축 결과"
   },
   "session": {
     "restart": "↺ 재시작",
@@ -1240,7 +1241,8 @@
       "memoryDeleteConfirm": "이 기억을 완전히 삭제할까요? 이 작업은 되돌릴 수 없습니다.",
       "memoryDeleteFailed": "기억을 삭제하지 못했습니다",
       "memoryArchived": "보관됨",
-      "memoryShowArchived": "보관된 항목 표시"
+      "memoryShowArchived": "보관된 항목 표시",
+      "memoryMasterSummary": "마스터 요약"
     },
     "diagnostics": {
       "title": "Diagnostics",

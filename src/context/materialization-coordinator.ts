@@ -10,9 +10,10 @@ import type {
 } from '../../shared/context-types.js';
 import { isMemoryEligibleEvent } from '../../shared/context-types.js';
 import { getContextModelConfig } from './context-model-config.js';
-import { compressWithSdk, type CompressionResult } from './summary-compressor.js';
+import { compressWithSdk, computeTargetTokens, type CompressionResult } from './summary-compressor.js';
 import { isMemoryNoiseSummary, isMemoryNoiseTurn } from '../../shared/memory-noise-patterns.js';
 import {
+  archiveEventsForMaterialization,
   clearDirtyTarget,
   countConsecutiveFailedJobs,
   deleteTentativeProjections,
@@ -21,23 +22,46 @@ import {
   deleteStagedEventsByIds,
   listContextEvents,
   listDirtyTargets,
+  listArchivedEventsForTarget,
+  listPinnedNotes,
   listProcessedProjections,
+  pruneArchiveIfDue,
+  queryProcessedProjections,
   recordContextEvent,
+  countStagedTokens,
   setReplicationState,
   updateContextJob,
   writeProcessedProjection,
 } from '../store/context-store.js';
+import { serializeContextNamespace } from './context-keys.js';
+import { countTokens } from './tokenizer.js';
+import { loadMemoryConfig, type MemoryConfig } from './memory-config.js';
+import { createMemoryConfigResolver, resolveMemoryConfigForNamespace, type MemoryConfigResolver } from './memory-config-resolver.js';
+import { computeFingerprint } from '../../shared/memory-fingerprint.js';
+import { warnOncePerHour } from '../util/rate-limited-warn.js';
+import { incrementCounter } from '../util/metrics.js';
+import { redactSummaryPreservingPinned } from '../util/redact-with-pinned-region.js';
 
 export interface MaterializationThresholds {
+  autoTriggerTokens: number;
+  minEventCount: number;
   idleMs: number;
-  eventCount: number;
   scheduleMs: number;
+  maxBatchTokens: number;
   minIntervalMs: number;
+  /** Legacy count-only trigger kept for older tests/configs. Prefer minEventCount + token/idle/schedule. */
+  eventCount?: number;
 }
 
 export interface MaterializationCoordinatorOptions {
   thresholds?: Partial<MaterializationThresholds>;
   modelConfig?: Partial<ContextModelConfig>;
+  /** Project cwd used to discover .imc/memory.yaml; defaults to process.cwd(). */
+  memoryConfigCwd?: string;
+  /** Explicit memory config override for tests/embedded callers. */
+  memoryConfig?: MemoryConfig;
+  /** Per-target/project resolver; preferred for multi-project daemons. */
+  memoryConfigResolver?: MemoryConfigResolver;
   /** Override the SDK compressor (for testing or environments without SDK access). */
   compressor?: (input: import('./summary-compressor.js').CompressionInput) => Promise<import('./summary-compressor.js').CompressionResult>;
 }
@@ -51,15 +75,11 @@ export interface MaterializationResult {
 }
 
 const DEFAULT_THRESHOLDS: MaterializationThresholds = {
+  autoTriggerTokens: 3000,
+  minEventCount: 5,
   idleMs: 5 * 60_000,
-  // Raised from 5 → 20 to cut compression frequency. With spark-class
-  // models priced per input token, summary-bloat (see PREVIOUS_SUMMARY_MAX_CHARS
-  // in summary-compressor.ts) was making each call expensive; firing on every
-  // 5 assistant turns burned the daily quota inside hours. 20-turn batches
-  // still capture meaningful work units (a typical task ≈ 10–30 turns) while
-  // reducing call count ~4×.
-  eventCount: 20,
   scheduleMs: 15 * 60_000,
+  maxBatchTokens: 10_000,
   minIntervalMs: 10_000,
 };
 
@@ -77,18 +97,28 @@ const MAX_SDK_RETRY_ATTEMPTS = 3;
 export class MaterializationCoordinator {
   readonly thresholds: MaterializationThresholds;
   readonly modelConfig: ContextModelConfig;
+  readonly memoryConfig: MemoryConfig;
+  private readonly resolveMemoryConfig: MemoryConfigResolver;
+  private readonly thresholdOverrides: Partial<MaterializationThresholds>;
   private readonly _compressor: MaterializationCoordinatorOptions['compressor'];
 
   constructor(options?: MaterializationCoordinatorOptions) {
     this._compressor = options?.compressor;
+    this.resolveMemoryConfig = options?.memoryConfigResolver ?? createMemoryConfigResolver({
+      fixedConfig: options?.memoryConfig,
+      fallbackCwd: options?.memoryConfigCwd,
+    });
+    this.memoryConfig = options?.memoryConfig
+      ?? (options?.memoryConfigCwd
+        ? loadMemoryConfig(options.memoryConfigCwd)
+        : resolveMemoryConfigForNamespace({ scope: 'personal', projectId: '__default__' }));
     this.modelConfig = getContextModelConfig(options?.modelConfig);
-    // materializationMinIntervalMs from cloud config overrides the threshold default
-    const configMinInterval = this.modelConfig.materializationMinIntervalMs;
-    this.thresholds = {
-      ...DEFAULT_THRESHOLDS,
-      ...(configMinInterval ? { minIntervalMs: configMinInterval } : {}),
-      ...options?.thresholds,
-    };
+    // materializationMinIntervalMs from cloud config overrides the threshold default.
+    // Project .imc/memory.yaml supplies memory-pipeline defaults underneath
+    // explicit constructor overrides.
+    this.thresholdOverrides = options?.thresholds ?? {};
+    this.thresholds = this.buildThresholds(this.memoryConfig);
+    pruneArchiveIfDue(this.memoryConfig.archiveRetentionDays);
   }
 
   ingestEvent(input: Omit<LocalContextEvent, 'id' | 'createdAt'> & Partial<Pick<LocalContextEvent, 'id' | 'createdAt'>>): {
@@ -118,6 +148,7 @@ export class MaterializationCoordinator {
   }
 
   async materializeTarget(target: ContextTargetRef, trigger: ContextJobTrigger, now = Date.now()): Promise<MaterializationResult> {
+    const memoryConfig = this.configForTarget(target);
     const jobType = target.kind === 'project' ? 'materialize_project' : 'materialize_session';
     const job = enqueueContextJob(target, jobType, trigger, now);
     updateContextJob(job.id, 'running', { attemptIncrement: true, now });
@@ -136,6 +167,7 @@ export class MaterializationCoordinator {
     const hasUsableAssistantTurn = events.some((event) => event.eventType === 'assistant.text' || event.eventType === 'assistant.turn');
 
     if (hadNoiseAssistantTurn && !hasUsableAssistantTurn) {
+      archiveEventsForMaterialization(allEvents, now);
       deleteStagedEventsByIds(sourceEventIds);
       updateContextJob(job.id, 'completed', { now });
       clearDirtyTarget(target);
@@ -146,7 +178,8 @@ export class MaterializationCoordinator {
     }
 
     // Fetch previous summary for iterative update (like Hermes's _previous_summary)
-    const previousProjections = listProcessedProjections(target.namespace, 'recent_summary');
+    const previousProjections = listProcessedProjections(target.namespace, 'recent_summary')
+      .filter((projection) => projection.status !== 'archived' && projection.status !== 'archived_dedup');
     const previousSummary = previousProjections.length > 0 ? previousProjections[0].summary : undefined;
 
     // Compress with SDK (primary → backup). When all SDK attempts fail the
@@ -158,11 +191,19 @@ export class MaterializationCoordinator {
     const compressFn = this._compressor ?? compressWithSdk;
     let compression: CompressionResult;
     try {
+      const pinnedNotes = collectPinnedNotesForNamespace(target.namespace);
       compression = await compressFn({
         events,
         previousSummary,
         modelConfig: this.modelConfig,
-        targetTokens: 500,
+        mode: 'auto',
+        targetTokens: memoryConfig.autoMaterializationTargetTokens > 0
+          ? memoryConfig.autoMaterializationTargetTokens
+          : computeTargetTokens(countTokens(events.map((event) => event.content ?? '').join('\n')), 'auto'),
+        maxEventChars: memoryConfig.maxEventChars,
+        previousSummaryMaxTokens: memoryConfig.previousSummaryMaxTokens,
+        extraRedactPatterns: memoryConfig.extraRedactPatterns,
+        pinnedNotes,
       });
     } catch {
       // Compressor itself threw (not just a provider failure the compressor
@@ -182,6 +223,7 @@ export class MaterializationCoordinator {
     // fallback branch below owns that case; we don't treat it as noise.
     if (compression.fromSdk && isMemoryNoiseSummary(compression.summary)) {
       deleteTentativeProjections(target.namespace, 'recent_summary');
+      archiveEventsForMaterialization(allEvents, now);
       deleteStagedEventsByIds(sourceEventIds);
       updateContextJob(job.id, 'completed', { now });
       clearDirtyTarget(target);
@@ -229,6 +271,8 @@ export class MaterializationCoordinator {
         // don't keep re-triggering for the same data. Job status is
         // 'completed' (not 'materialization_failed') so the next fresh
         // batch starts with a clean failure counter.
+        archiveEventsForMaterialization(allEvents, now);
+        incrementCounter('mem.materialization.retry_exhausted_archived', { source: 'materializeTarget' });
         deleteStagedEventsByIds(sourceEventIds);
         updateContextJob(job.id, 'completed', { now,
           error: `SDK compression abandoned after ${priorFailures} consecutive failures — events discarded, no summary written`,
@@ -300,6 +344,7 @@ export class MaterializationCoordinator {
       lastReplicatedAt: replicationState?.lastReplicatedAt,
       lastError: replicationState?.lastError,
     });
+    archiveEventsForMaterialization(allEvents, now);
     deleteStagedEventsByIds(sourceEventIds);
     updateContextJob(job.id, 'completed', { now });
     clearDirtyTarget(target);
@@ -313,6 +358,7 @@ export class MaterializationCoordinator {
   }
 
   scheduleDueTargets(now = Date.now()): ContextJobRecord[] {
+    pruneArchiveIfDue(this.memoryConfig.archiveRetentionDays, now);
     const queued: ContextJobRecord[] = [];
     for (const target of listDirtyTargets()) {
       const trigger = this.selectTrigger(target, now);
@@ -327,6 +373,31 @@ export class MaterializationCoordinator {
     return listProcessedProjections(namespace);
   }
 
+  async materializeDueMasterSummaries(now = Date.now()): Promise<ProcessedContextProjection[]> {
+    const latestBySession = new Map<string, { sessionName: string; namespace: ContextNamespace; updatedAt: number }>();
+    for (const projection of queryProcessedProjections({ projectionClass: 'recent_summary', includeArchived: true, limit: 1000 })) {
+      const sessionName = typeof projection.content.sessionName === 'string' ? projection.content.sessionName : undefined;
+      if (!sessionName) continue;
+      const key = `${serializeContextNamespace(projection.namespace)}::${sessionName}`;
+      const existing = latestBySession.get(key);
+      if (!existing || projection.updatedAt > existing.updatedAt) {
+        latestBySession.set(key, { sessionName, namespace: projection.namespace, updatedAt: projection.updatedAt });
+      }
+    }
+
+    const due: ProcessedContextProjection[] = [];
+    for (const item of latestBySession.values()) {
+      const itemMemoryConfig = this.resolveMemoryConfig(item.namespace);
+      const idleMs = Math.max(0, itemMemoryConfig.masterIdleHours) * 60 * 60 * 1000;
+      const lastMaster = findLatestMasterSummary(item.sessionName, item.namespace);
+      if (lastMaster && lastMaster.updatedAt >= item.updatedAt) continue;
+      if (idleMs > 0 && now - item.updatedAt < idleMs) continue;
+      const projection = await materializeMasterSummary(item.sessionName, item.namespace, now, itemMemoryConfig);
+      if (projection) due.push(projection);
+    }
+    return due;
+  }
+
   private findDirtyTarget(target: ContextTargetRef): ContextDirtyTarget | undefined {
     return listDirtyTargets(target.namespace).find((entry) =>
       entry.target.kind === target.kind && entry.target.sessionName === target.sessionName,
@@ -334,11 +405,18 @@ export class MaterializationCoordinator {
   }
 
   private selectTrigger(dirtyTarget: ContextDirtyTarget, now: number): ContextJobTrigger | undefined {
+    const thresholds = this.thresholdsForTarget(dirtyTarget.target);
     if (this.isRateLimited(dirtyTarget.target, now)) return undefined;
-    if (dirtyTarget.eventCount >= this.thresholds.eventCount) return 'threshold';
+    const tokenSum = countStagedTokens(dirtyTarget.target);
+    // Force-fire bypasses the event-count floor: this is a memory-safety valve
+    // for runaway single/few-event batches with very large tool outputs.
+    if (tokenSum >= thresholds.maxBatchTokens) return 'threshold';
+    if (thresholds.eventCount !== undefined && dirtyTarget.eventCount >= thresholds.eventCount) return 'threshold';
+    if (dirtyTarget.eventCount < thresholds.minEventCount) return undefined;
+    if (tokenSum >= thresholds.autoTriggerTokens) return 'threshold';
+    if (now - dirtyTarget.newestEventAt >= thresholds.idleMs) return 'idle';
+    if (now - dirtyTarget.oldestEventAt >= thresholds.scheduleMs) return 'schedule';
     if (this.hasProcessedSummary(dirtyTarget.target)) return 'schedule';
-    if (now - dirtyTarget.newestEventAt >= this.thresholds.idleMs) return 'idle';
-    if (now - dirtyTarget.oldestEventAt >= this.thresholds.scheduleMs) return 'schedule';
     return undefined;
   }
 
@@ -347,8 +425,9 @@ export class MaterializationCoordinator {
   }
 
   private isRateLimited(target: ContextTargetRef, now: number): boolean {
+    const thresholds = this.thresholdsForTarget(target);
     const latestSummaryAt = this.getLatestSummaryUpdatedAt(target);
-    return latestSummaryAt !== undefined && now - latestSummaryAt < this.thresholds.minIntervalMs;
+    return latestSummaryAt !== undefined && now - latestSummaryAt < thresholds.minIntervalMs;
   }
 
   private hasProcessedSummary(target: ContextTargetRef): boolean {
@@ -368,6 +447,140 @@ export class MaterializationCoordinator {
     }
     return undefined;
   }
+
+  private configForTarget(target: ContextTargetRef): MemoryConfig {
+    return this.resolveMemoryConfig(target.namespace, target);
+  }
+
+  private thresholdsForTarget(target: ContextTargetRef): MaterializationThresholds {
+    return this.buildThresholds(this.configForTarget(target));
+  }
+
+  private buildThresholds(memoryConfig: MemoryConfig): MaterializationThresholds {
+    const configMinInterval = this.modelConfig.materializationMinIntervalMs;
+    const thresholdOverrides = this.thresholdOverrides;
+    return {
+      ...DEFAULT_THRESHOLDS,
+      autoTriggerTokens: memoryConfig.autoTriggerTokens,
+      minEventCount: memoryConfig.minEventCount,
+      idleMs: memoryConfig.idleMs,
+      scheduleMs: memoryConfig.scheduleMs,
+      maxBatchTokens: memoryConfig.maxBatchTokens,
+      ...(configMinInterval ? { minIntervalMs: configMinInterval } : {}),
+      ...thresholdOverrides,
+      ...(thresholdOverrides.eventCount !== undefined && thresholdOverrides.minEventCount === undefined
+        ? { minEventCount: 1 }
+        : {}),
+    };
+  }
+}
+
+
+function collectPinnedNotesForNamespace(namespace: ContextNamespace): string[] {
+  const namespaceKey = serializeContextNamespace(namespace);
+  const notes: string[] = [];
+  let tokenTotal = 0;
+  for (const note of listPinnedNotes(namespaceKey)) {
+    const noteTokens = countTokens(note.content);
+    if (tokenTotal + noteTokens > 1000) {
+      incrementCounter('mem.pinned_notes_overflow', { namespace: namespaceKey });
+      warnOncePerHour('pinned_notes_overflow', { namespace: namespaceKey });
+      break;
+    }
+    tokenTotal += noteTokens;
+    notes.push(note.content);
+  }
+  return notes;
+}
+
+export async function materializeMasterSummary(sessionName: string, namespace?: ContextNamespace, now = Date.now(), memoryConfig?: MemoryConfig): Promise<ProcessedContextProjection | undefined> {
+  const resolvedNamespace = namespace ?? findNamespaceForSessionSummaries(sessionName);
+  if (!resolvedNamespace) return undefined;
+  const effectiveMemoryConfig = memoryConfig ?? resolveMemoryConfigForNamespace(resolvedNamespace);
+
+  const previousMaster = findLatestMasterSummary(sessionName, resolvedNamespace);
+  const since = previousMaster?.updatedAt ?? 0;
+  const batchSummaries = queryBatchSummariesForMaster(sessionName, resolvedNamespace, since);
+  const target: ContextTargetRef = { namespace: resolvedNamespace, kind: 'session', sessionName };
+  const archiveEvents = listArchivedEventsForTarget(target, since, 200).filter(isHighSignalMasterEvent);
+  if (batchSummaries.length === 0 && archiveEvents.length === 0) return previousMaster;
+
+  const sourceEventIds = mergeMasterSourceIds(previousMaster?.sourceEventIds ?? [], [
+    ...batchSummaries.flatMap((projection) => projection.sourceEventIds),
+    ...archiveEvents.map((event) => event.id),
+  ]);
+  const namespaceKey = serializeContextNamespace(resolvedNamespace);
+  const rawSummary = [
+    '## Master Summary',
+    '',
+    `Session: ${sessionName}`,
+    '',
+    '## Batch Summaries',
+    ...(batchSummaries.length > 0
+      ? batchSummaries.slice(0, 20).map((projection) => `- ${projection.summary.split('\n')[0]}`)
+      : ['- (none since previous master summary)']),
+    '',
+    '## High-Signal Events',
+    ...(archiveEvents.length > 0
+      ? archiveEvents.slice(0, 20).map((event) => `- [${event.eventType}] ${(event.content ?? '').replace(/\s+/g, ' ').slice(0, 240)}`)
+      : ['- (none)']),
+  ].join('\n');
+  const summary = redactSummaryPreservingPinned(rawSummary, effectiveMemoryConfig.extraRedactPatterns);
+  return writeProcessedProjection({
+    id: `master:${computeFingerprint(`${namespaceKey}:${sessionName}`)}`,
+    namespace: resolvedNamespace,
+    class: 'master_summary',
+    sourceEventIds,
+    summary,
+    content: {
+      sessionName,
+      source: 'master_summary',
+      batchSummaryCount: batchSummaries.length,
+      highSignalEventCount: archiveEvents.length,
+      targetTokens: effectiveMemoryConfig.manualCompactTargetTokens > 0
+        ? effectiveMemoryConfig.manualCompactTargetTokens
+        : computeTargetTokens(countTokens(summary), 'manual'),
+    },
+    createdAt: previousMaster?.createdAt ?? now,
+    updatedAt: now,
+  });
+}
+
+function mergeMasterSourceIds(prior: string[], incoming: string[]): string[] {
+  const out = [...prior];
+  for (const id of incoming) if (id && !out.includes(id)) out.push(id);
+  while (out.length > 200) out.splice(10, 1);
+  return out;
+}
+
+function findNamespaceForSessionSummaries(sessionName: string): ContextNamespace | undefined {
+  return queryProcessedProjections({ projectionClass: 'recent_summary', includeArchived: true, limit: 1000 })
+    .find((projection) => projection.content.sessionName === sessionName)?.namespace;
+}
+
+function findLatestMasterSummary(sessionName: string, namespace: ContextNamespace): ProcessedContextProjection | undefined {
+  return listProcessedProjections(namespace, 'master_summary')
+    .filter((projection) => projection.status !== 'archived' && projection.status !== 'archived_dedup')
+    .find((projection) => projection.content.sessionName === sessionName);
+}
+
+function queryBatchSummariesForMaster(sessionName: string, namespace: ContextNamespace, since = 0): ProcessedContextProjection[] {
+  return listProcessedProjections(namespace, 'recent_summary')
+    .filter((projection) => projection.status !== 'archived' && projection.status !== 'archived_dedup')
+    .filter((projection) => projection.content.sessionName === sessionName && projection.updatedAt > since)
+    .sort((a, b) => a.updatedAt - b.updatedAt);
+}
+
+function isHighSignalMasterEvent(event: LocalContextEvent): boolean {
+  if (event.eventType === 'user.message' || event.eventType === 'user.turn') return true;
+  if ((event.eventType === 'assistant.text' || event.eventType === 'assistant.turn') && /^##\s+(User Problem|Resolution|Key Decisions|User-Pinned Notes|Active State|Active Task|Learned Facts|State Snapshot|Critical Context)/m.test(event.content ?? '')) {
+    return true;
+  }
+  if (event.eventType === 'tool.result') {
+    const exitCode = event.metadata?.exitCode;
+    return typeof exitCode === 'number' && exitCode !== 0;
+  }
+  return false;
 }
 
 function buildDurableProjection(

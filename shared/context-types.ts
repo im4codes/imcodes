@@ -207,9 +207,10 @@ export interface ContextJobRecord {
   error?: string;
 }
 
-export type ProcessedContextClass = 'recent_summary' | 'durable_memory_candidate';
+export type ProcessedContextClass = 'recent_summary' | 'durable_memory_candidate' | 'master_summary';
+export type ReplicableProcessedContextClass = Exclude<ProcessedContextClass, 'master_summary'>;
 
-export type ProcessedContextProjectionStatus = 'active' | 'archived';
+export type ProcessedContextProjectionStatus = 'active' | 'archived' | 'archived_dedup';
 
 export interface ProcessedContextProjection {
   id: string;
@@ -268,7 +269,7 @@ export interface ContextMemoryRecordView {
   scope: 'personal' | 'project_shared' | 'workspace_shared' | 'org_shared';
   projectId: string;
   summary: string;
-  projectionClass: 'recent_summary' | 'durable_memory_candidate';
+  projectionClass: ProcessedContextClass;
   sourceEventCount: number;
   updatedAt: number;
   hitCount?: number;
@@ -293,6 +294,6 @@ export interface ContextMemoryView {
 
 export interface ProcessedContextReplicationBody {
   namespace: ContextNamespace;
-  projections: ProcessedContextProjection[];
+  projections: Array<Omit<ProcessedContextProjection, 'class'> & { class: ReplicableProcessedContextClass }>;
 }
 import type { TransportAttachment } from './transport-attachments.js';

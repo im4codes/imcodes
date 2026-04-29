@@ -29,7 +29,7 @@ export const DEFAULT_MEMORY_SCORING_WEIGHTS: MemoryScoringWeights = {
 export const HALF_LIFE_RECENT_SUMMARY = 14;
 export const HALF_LIFE_DURABLE_CANDIDATE = 90;
 
-export type ProjectionClass = 'recent_summary' | 'durable_memory_candidate';
+export type ProjectionClass = 'recent_summary' | 'durable_memory_candidate' | 'master_summary';
 
 export interface MemoryScoringInput {
   /** Cosine similarity or pg_trgm similarity, range [0, 1] */

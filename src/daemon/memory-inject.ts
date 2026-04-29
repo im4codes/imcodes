@@ -17,6 +17,8 @@ import type { MemorySearchResultItem } from '../context/memory-search.js';
 import { selectStartupMemoryItems } from '../context/startup-memory.js';
 import { buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
 import logger from '../util/logger.js';
+import { warnOncePerHour } from '../util/rate-limited-warn.js';
+import { incrementCounter } from '../util/metrics.js';
 
 const GEMINI_TMP_DIR = join(homedir(), '.gemini', 'tmp');
 
@@ -34,7 +36,10 @@ export async function readProjectMemory(cwd: string): Promise<string | null> {
         logger.debug({ cwd, file: name }, 'memory-inject: loaded project context');
         return `# Project context (${name})\n\n${content.trim()}`;
       }
-    } catch { /* file not found or unreadable, try next */ }
+    } catch (error) {
+      incrementCounter('mem.startup.silent_failure', { source: 'project-doc-read' });
+      warnOncePerHour('mem.startup.silent_failure.project-doc-read', { cwd, file: name, error: error instanceof Error ? error.message : String(error) });
+    }
   }
   return null;
 }
@@ -133,7 +138,9 @@ export async function readProcessedMemoryItems(projectName: string): Promise<Mem
   if (!normalizedProjectName) return [];
   try {
     return selectStartupMemoryItems({ scope: 'personal', projectId: normalizedProjectName });
-  } catch {
+  } catch (error) {
+    incrementCounter('mem.startup.silent_failure', { source: 'startup-memory-select' });
+    warnOncePerHour('mem.startup.silent_failure.startup-memory-select', { projectName: normalizedProjectName, error: error instanceof Error ? error.message : String(error) });
     return [];
   }
 }

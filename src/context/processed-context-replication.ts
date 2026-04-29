@@ -3,6 +3,7 @@ import type {
   ContextReplicationState,
   ProcessedContextProjection,
   ProcessedContextReplicationBody,
+  ReplicableProcessedContextClass,
 } from '../../shared/context-types.js';
 import {
   getReplicationState,
@@ -27,6 +28,8 @@ export interface ProcessedContextReplicationResult {
   failures: Array<{ namespace: ContextNamespace; error: string }>;
 }
 
+type ReplicableProcessedProjection = Omit<ProcessedContextProjection, 'class'> & { class: ReplicableProcessedContextClass };
+
 export async function replicatePendingProcessedContext(
   credentials: ProcessedContextReplicationCredentials,
   namespaces?: ContextNamespace[],
@@ -47,8 +50,7 @@ export async function replicatePendingProcessedContext(
     if (state.namespace.scope === 'personal' && !personalSyncEnabled) continue;
     const projections = selectPendingProjections(state.namespace, state.pendingProjectionIds);
     // Cloud only stores processed projections — filter out any raw/staged content
-    const processedProjections = projections.filter((p) =>
-      p.class === 'recent_summary' || p.class === 'durable_memory_candidate');
+    const processedProjections = projections.filter(isReplicableProjection);
     if (processedProjections.length === 0 && projections.length > 0) {
       // All pending projections were non-processed (shouldn't happen, but guard)
       continue;
@@ -135,6 +137,10 @@ function resolveStates(namespaces?: ContextNamespace[]): ContextReplicationState
 function selectPendingProjections(namespace: ContextNamespace, pendingIds: string[]): ProcessedContextProjection[] {
   const wanted = new Set(pendingIds);
   return listProcessedProjections(namespace).filter((projection) => wanted.has(projection.id));
+}
+
+function isReplicableProjection(projection: ProcessedContextProjection): projection is ReplicableProcessedProjection {
+  return projection.class === 'recent_summary' || projection.class === 'durable_memory_candidate';
 }
 
 interface ReplicationAck {

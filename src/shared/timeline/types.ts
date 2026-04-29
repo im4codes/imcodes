@@ -11,6 +11,7 @@ import type {
   ProcessedContextProjectionStatus,
 } from '../../../shared/context-types.js';
 import { TIMELINE_EVENT_FILE_CHANGE } from '../../../shared/file-change.js';
+import { COMPACTION_RESULT_EVENT } from '../../../shared/compaction-events.js';
 
 export type TimelineEventType =
   | 'user.message'
@@ -26,7 +27,8 @@ export type TimelineEventType =
   | 'agent.status'
   | 'usage.update'
   | 'ask.question'
-  | 'memory.context';
+  | 'memory.context'
+  | typeof COMPACTION_RESULT_EVENT;
 
 export const TIMELINE_HISTORY_CONTENT_TYPES = [
   'user.message',
@@ -42,6 +44,7 @@ export const TIMELINE_HISTORY_CONTENT_TYPES = [
   'usage.update',
   'ask.question',
   'memory.context',
+  COMPACTION_RESULT_EVENT,
 ] as const satisfies readonly TimelineEventType[];
 
 export const TIMELINE_HISTORY_STATE_TYPES = [

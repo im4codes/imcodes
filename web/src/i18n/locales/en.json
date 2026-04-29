@@ -110,7 +110,8 @@
     "file_change_no_after": "(no new text)",
     "file_change_derived_no_preview": "(no preview available)",
     "file_change_coarse_hint": "File path available, but no diff text was provided.",
-    "file_change_renamed_from": "{{oldPath}} → {{newPath}}"
+    "file_change_renamed_from": "{{oldPath}} → {{newPath}}",
+    "compaction_result_title": "Compaction result"
   },
   "session": {
     "restart": "↺ Restart",
@@ -1241,7 +1242,8 @@
       "memoryDeleteConfirm": "Delete this memory permanently? This cannot be undone.",
       "memoryDeleteFailed": "Failed to delete memory",
       "memoryArchived": "Archived",
-      "memoryShowArchived": "Show archived"
+      "memoryShowArchived": "Show archived",
+      "memoryMasterSummary": "Master summary"
     },
     "diagnostics": {
       "title": "Diagnostics",

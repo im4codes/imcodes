@@ -66,6 +66,7 @@ import { CC_PRESET_MSG, type CcPreset } from '../../shared/cc-presets.js';
 import { MEMORY_WS } from '../../shared/memory-ws.js';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG, MAX_P2P_PARTICIPANTS } from '../../shared/p2p-config-events.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
+import { COMPACTION_RESULT_EVENT } from '../../shared/compaction-events.js';
 import {
   CLAUDE_SDK_EFFORT_LEVELS,
   CODEX_SDK_EFFORT_LEVELS,
@@ -2123,6 +2124,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       try {
         const { replayTransportHistory } = await import('./transport-history.js');
         const rawEvents = await replayTransportHistory(sessionName);
+        const compactRunId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
         // Only memory-eligible turns feed the compressor. Tool calls, deltas,
         // session state pings, and approval requests are noise here — they
         // bloat the prompt without informing the summary.
@@ -2139,7 +2141,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
             return t === 'user.message' || t === 'assistant.text';
           })
           .map((e, idx) => ({
-            id: `compact-src:${sessionName}:${idx}`,
+            id: `compact-src:${sessionName}:${compactRunId}:${idx}`,
             target: { namespace: compactNamespace, kind: 'session' as const, sessionName },
             eventType: String(e.type),
             content: typeof e.text === 'string' ? e.text : '',
@@ -2157,13 +2159,32 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           return;
         }
 
-        const { compressWithSdk } = await import('../context/summary-compressor.js');
+        const { compressWithSdk, computeTargetTokens } = await import('../context/summary-compressor.js');
+        const { countTokens } = await import('../context/tokenizer.js');
+        const { summarizeManualCompaction } = await import('../context/compression-feedback.js');
+        const { loadMemoryConfig } = await import('../context/memory-config.js');
+        const { archiveEventsForMaterialization } = await import('../store/context-store.js');
         const modelConfig = getContextModelConfig();
+        const memoryConfig = loadMemoryConfig(record?.projectDir ?? process.cwd());
+        const compactStartedAt = Date.now();
+        const inputTokens = countTokens(localEvents.map((event) => event.content ?? '').join('\n'));
+        // Manual `/compact` honors the proportional budget by default. A
+        // positive `manualCompactTargetTokens` in `.imc/memory.yaml` is a
+        // hard override; `0` (the default) routes to `computeTargetTokens`.
+        // (memory-system-1.1-foundations P2 / spec.md:218-223)
+        const manualTargetTokens = memoryConfig.manualCompactTargetTokens > 0
+          ? memoryConfig.manualCompactTargetTokens
+          : computeTargetTokens(inputTokens, 'manual');
         const result = await compressWithSdk({
           events: localEvents,
           modelConfig,
-          targetTokens: 600,
+          mode: 'manual',
+          targetTokens: manualTargetTokens,
+          maxEventChars: memoryConfig.maxEventChars,
+          previousSummaryMaxTokens: memoryConfig.previousSummaryMaxTokens,
+          extraRedactPatterns: memoryConfig.extraRedactPatterns,
         });
+        const summaryTokens = countTokens(result.summary);
 
         // Restart the transport runtime fresh — the compressed summary replaces
         // the verbose history. Same exclusive-relaunch dance as /clear.
@@ -2173,10 +2194,23 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         clearRecentInjectionHistory(sessionName);
         await handleGetSessions(serverLink);
         await syncSubSessionIfNeeded(sessionName, serverLink);
+        // Archive synthetic compact sources only after compression, relaunch,
+        // and post-relaunch sync all succeed. Failed compactions must not leave
+        // uncited compact-src:* rows that bloat the raw archive or imply
+        // provenance for a summary that was never accepted.
+        archiveEventsForMaterialization(localEvents, compactStartedAt);
 
         const backendNote = result.backend
           ? ` · ${result.backend}${result.usedBackup ? ' (backup)' : ''}`
           : '';
+        const compactionPayload = summarizeManualCompaction({
+          eventCount: localEvents.length,
+          inputTokens,
+          summaryTokens,
+          sourceEventIds: localEvents.map((event) => event.id),
+          elapsed: Date.now() - compactStartedAt,
+        });
+        timelineEmitter.emit(sessionName, COMPACTION_RESULT_EVENT, compactionPayload as unknown as Record<string, unknown>, { source: 'daemon', confidence: 'high' });
         emitCompactStatus(
           `🗜 Compacted ${localEvents.length} turn${localEvents.length === 1 ? '' : 's'}${backendNote}\n\n${result.summary}`,
           false,
@@ -5825,7 +5859,7 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
   if (!requestId) return;
   const projectId = typeof cmd.projectId === 'string' ? cmd.projectId.trim() : '';
-  const projectionClass = cmd.projectionClass === 'recent_summary' || cmd.projectionClass === 'durable_memory_candidate'
+  const projectionClass = cmd.projectionClass === 'recent_summary' || cmd.projectionClass === 'durable_memory_candidate' || cmd.projectionClass === 'master_summary'
     ? cmd.projectionClass
     : undefined;
   const query = typeof cmd.query === 'string' ? cmd.query.trim() : '';
@@ -5843,12 +5877,12 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
     scope: 'personal';
     projectId: string;
     summary: string;
-    projectionClass: 'recent_summary' | 'durable_memory_candidate';
+    projectionClass: 'recent_summary' | 'durable_memory_candidate' | 'master_summary';
     sourceEventCount: number;
     updatedAt: number;
     hitCount: number;
     lastUsedAt: number | undefined;
-    status: 'active' | 'archived';
+    status: 'active' | 'archived' | 'archived_dedup';
   }>;
   let matchedRecords: number;
 

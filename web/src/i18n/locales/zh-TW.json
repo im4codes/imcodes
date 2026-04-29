@@ -110,7 +110,8 @@
     "file_change_no_after": "（沒有新文字）",
     "file_change_derived_no_preview": "（沒有可用預覽）",
     "file_change_coarse_hint": "只有檔案路徑，未提供 diff 文字。",
-    "file_change_renamed_from": "{{oldPath}} → {{newPath}}"
+    "file_change_renamed_from": "{{oldPath}} → {{newPath}}",
+    "compaction_result_title": "壓縮結果"
   },
   "session": {
     "restart": "↺ 重新啟動",
@@ -1241,7 +1242,8 @@
       "memoryDeleteConfirm": "確定永久刪除這條記憶嗎？此操作無法復原。",
       "memoryDeleteFailed": "刪除記憶失敗",
       "memoryArchived": "已封存",
-      "memoryShowArchived": "顯示已封存"
+      "memoryShowArchived": "顯示已封存",
+      "memoryMasterSummary": "主摘要"
     },
     "diagnostics": {
       "title": "診斷",

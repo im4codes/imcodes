@@ -110,7 +110,8 @@
     "file_change_no_after": "(sin texto nuevo)",
     "file_change_derived_no_preview": "(sin vista previa)",
     "file_change_coarse_hint": "Hay ruta de archivo, pero no se proporcionó texto diff.",
-    "file_change_renamed_from": "{{oldPath}} → {{newPath}}"
+    "file_change_renamed_from": "{{oldPath}} → {{newPath}}",
+    "compaction_result_title": "Resultado de compactación"
   },
   "session": {
     "restart": "↺ Reiniciar",
@@ -1240,7 +1241,8 @@
       "memoryDeleteConfirm": "¿Eliminar esta memoria de forma permanente? Esta acción no se puede deshacer.",
       "memoryDeleteFailed": "No se pudo eliminar la memoria",
       "memoryArchived": "Archivado",
-      "memoryShowArchived": "Mostrar archivados"
+      "memoryShowArchived": "Mostrar archivados",
+      "memoryMasterSummary": "Resumen maestro"
     },
     "diagnostics": {
       "title": "Diagnostics",

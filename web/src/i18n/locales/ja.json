@@ -110,7 +110,8 @@
     "file_change_no_after": "（新しいテキストなし）",
     "file_change_derived_no_preview": "（プレビューなし）",
     "file_change_coarse_hint": "ファイルパスはありますが、diff テキストはありません。",
-    "file_change_renamed_from": "{{oldPath}} → {{newPath}}"
+    "file_change_renamed_from": "{{oldPath}} → {{newPath}}",
+    "compaction_result_title": "圧縮結果"
   },
   "session": {
     "restart": "↺ 再起動",
@@ -1240,7 +1241,8 @@
       "memoryDeleteConfirm": "この記憶を完全に削除しますか？この操作は元に戻せません。",
       "memoryDeleteFailed": "記憶を削除できませんでした",
       "memoryArchived": "アーカイブ済み",
-      "memoryShowArchived": "アーカイブを表示"
+      "memoryShowArchived": "アーカイブを表示",
+      "memoryMasterSummary": "マスター要約"
     },
     "diagnostics": {
       "title": "Diagnostics",

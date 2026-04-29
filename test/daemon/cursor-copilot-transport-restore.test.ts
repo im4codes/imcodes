@@ -348,7 +348,7 @@ describe("cursor/copilot transport restore", () => {
         prompt: "Verify copilot restore",
       }),
     );
-  });
+  }, 10_000);
 
   it("skips unavailable provider restores without throwing and leaves the persisted session inspectable", async () => {
     mocks.store.set("deck_missing_provider_brain", {

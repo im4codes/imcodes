@@ -110,7 +110,8 @@
     "file_change_no_after": "(нет нового текста)",
     "file_change_derived_no_preview": "(предпросмотр недоступен)",
     "file_change_coarse_hint": "Доступен путь к файлу, но diff не предоставлен.",
-    "file_change_renamed_from": "{{oldPath}} → {{newPath}}"
+    "file_change_renamed_from": "{{oldPath}} → {{newPath}}",
+    "compaction_result_title": "Результат сжатия"
   },
   "session": {
     "restart": "↺ Перезапустить",
@@ -1240,7 +1241,8 @@
       "memoryDeleteConfirm": "Удалить эту память навсегда? Это действие нельзя отменить.",
       "memoryDeleteFailed": "Не удалось удалить память",
       "memoryArchived": "В архиве",
-      "memoryShowArchived": "Показать архивные"
+      "memoryShowArchived": "Показать архивные",
+      "memoryMasterSummary": "Главная сводка"
     },
     "diagnostics": {
       "title": "Diagnostics",

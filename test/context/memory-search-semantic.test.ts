@@ -3,6 +3,7 @@ import type { ContextNamespace, ContextTargetRef } from '../../shared/context-ty
 import { searchLocalMemorySemantic } from '../../src/context/memory-search.js';
 import { MaterializationCoordinator } from '../../src/context/materialization-coordinator.js';
 import { localOnlyCompressor } from '../../src/context/summary-compressor.js';
+import { DEFAULT_MEMORY_CONFIG } from '../../src/context/memory-config.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 import { queryProcessedProjections, recordMemoryHits, writeProcessedProjection } from '../../src/store/context-store.js';
 
@@ -156,5 +157,44 @@ describe('memory-search semantic ranking', () => {
 
     expect(result.items).toHaveLength(2);
     expect(result.items[0]?.summary).toContain('Same enterprise');
+  });
+
+  it('redacts embedding sources with namespace-specific config patterns', async () => {
+    const otherNamespace: ContextNamespace = { scope: 'personal', projectId: 'github.com/acme/other', userId: 'user-1' };
+    writeProcessedProjection({
+      namespace,
+      class: 'recent_summary',
+      sourceEventIds: ['evt-1'],
+      summary: 'Repo memory repo-only-secret',
+      content: {},
+    });
+    writeProcessedProjection({
+      namespace: otherNamespace,
+      class: 'recent_summary',
+      sourceEventIds: ['evt-2'],
+      summary: 'Other memory other-only-secret',
+      content: {},
+    });
+
+    const embeddedTexts: string[] = [];
+    generateEmbeddingMock.mockImplementation(async (text: string) => {
+      embeddedTexts.push(text);
+      return new Float32Array([0.5]);
+    });
+
+    await searchLocalMemorySemantic({
+      query: 'memory recall',
+      limit: 2,
+      memoryConfigResolver: (ns) => ({
+        ...DEFAULT_MEMORY_CONFIG,
+        redactPatterns: [],
+        extraRedactPatterns: ns.projectId.endsWith('/repo') ? [/repo-only-secret/g] : [/other-only-secret/g],
+      }),
+    });
+
+    expect(embeddedTexts).toContain('Repo memory [REDACTED:custom] {}');
+    expect(embeddedTexts).toContain('Other memory [REDACTED:custom] {}');
+    expect(embeddedTexts).not.toContain('Repo memory repo-only-secret {}');
+    expect(embeddedTexts).not.toContain('Other memory other-only-secret {}');
   });
 });

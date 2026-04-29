@@ -5,6 +5,7 @@ import { listProcessedProjections } from '../store/context-store.js';
 import type { TransportContextBootstrap } from '../agent/runtime-context-bootstrap.js';
 import { MaterializationCoordinator, type MaterializationCoordinatorOptions } from './materialization-coordinator.js';
 import { isMemoryNoiseTurn } from '../../shared/memory-noise-patterns.js';
+import { createMemoryConfigResolver, rememberMemoryConfigProjectDir } from './memory-config-resolver.js';
 
 const BOOTSTRAP_CACHE_MS = 30_000;
 
@@ -30,7 +31,17 @@ export class LiveContextIngestion {
   private readonly bootstrapCache = new Map<string, BootstrapCacheEntry>();
 
   constructor(options: LiveContextIngestionOptions) {
-    this.coordinator = new MaterializationCoordinator(options);
+    const memoryConfigResolver = options.memoryConfigResolver ?? (options.memoryConfig ? undefined : createMemoryConfigResolver({
+      projectDirResolver: (_namespace, target) => {
+        const sessionName = target?.kind === 'session' ? target.sessionName : undefined;
+        return sessionName ? options.sessionLookup(sessionName)?.projectDir : undefined;
+      },
+      fallbackCwd: options.memoryConfigCwd,
+    }));
+    this.coordinator = new MaterializationCoordinator({
+      ...options,
+      ...(memoryConfigResolver ? { memoryConfigResolver } : {}),
+    });
     this.sessionLookup = options.sessionLookup;
     this.resolveBootstrap = options.resolveBootstrap;
     this.onError = options.onError;
@@ -52,6 +63,7 @@ export class LiveContextIngestion {
     for (const job of this.coordinator.scheduleDueTargets(now)) {
       await this.coordinator.materializeTarget(job.target, job.trigger, now);
     }
+    await this.coordinator.materializeDueMasterSummaries(now);
   }
 
   async backfillSessionFromEvents(sessionName: string, events: TimelineEvent[]): Promise<void> {
@@ -117,6 +129,7 @@ export class LiveContextIngestion {
       return cached.value;
     }
     const value = await this.resolveBootstrap(session);
+    rememberMemoryConfigProjectDir(value.namespace, session.projectDir);
     this.bootstrapCache.set(session.name, {
       recordUpdatedAt: session.updatedAt,
       expiresAt: Date.now() + BOOTSTRAP_CACHE_MS,

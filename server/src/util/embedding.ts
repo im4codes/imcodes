@@ -15,6 +15,7 @@
  */
 
 import { EMBEDDING_MODEL, embeddingToSql } from '../../../shared/embedding-config.js';
+import { redactSensitiveText } from '../../../shared/redact-secrets.js';
 import logger from './logger.js';
 import { getEmbeddingPool } from './embedding-pool.js';
 import type { Database } from '../db/client.js';
@@ -62,9 +63,18 @@ export async function isEmbeddingAvailable(): Promise<boolean> {
 /**
  * Generate an embedding for a projection summary and store it in shared_context_embeddings.
  * Upserts — safe to call multiple times for the same projection.
+ *
+ * Defense-in-depth redaction: replicated daemon summaries are already redacted at
+ * the producer, but a misbehaving daemon (or a custom-pattern miss) must not be
+ * able to leak secrets into the server's vector store. We re-run the deterministic
+ * baseline redaction here before generating the embedding. Query embeddings are
+ * NOT redacted by design — redacting user query text would degrade retrieval
+ * intent. The security boundary lives on stored projection vectors.
+ * (memory-system-1.1-foundations spec.md:178)
  */
 export async function storeProjectionEmbedding(db: Database, projectionId: string, summary: string): Promise<void> {
-  const embedding = await generateEmbedding(summary);
+  const cleaned = redactSensitiveText(summary);
+  const embedding = await generateEmbedding(cleaned);
   if (!embedding) return;
 
   await db.execute(
