@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, realpathSync, readdirSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -76,6 +76,10 @@ process.exit(0);
         // postinstall-sharp-repair sees the `.mjs` extension and re-
         // invokes Node against it, exactly like real npm.
         npm_execpath: stubNpm,
+        // Enable verbose logging in the postinstall script so any failure
+        // gives us a path-by-path trace (otherwise on Windows CI we have
+        // no way to see which guard fired or whether spawn errored).
+        IMCODES_POSTINSTALL_DEBUG: '1',
       },
       encoding: 'utf8',
     });
@@ -96,6 +100,38 @@ process.exit(0);
   /** Plant an empty placeholder dir (the npm-global bug we self-heal). */
   function plantEmptyPlaceholder(root: string, dep: string) {
     mkdirSync(join(root, 'node_modules', dep), { recursive: true });
+  }
+
+  /** Recursive directory listing for failure diagnostics. Truncated to
+   * 50 entries to keep test output readable. */
+  function listTree(root: string, maxEntries = 50): string {
+    const lines: string[] = [];
+    function walk(dir: string, prefix: string) {
+      if (lines.length >= maxEntries) return;
+      let entries: string[];
+      try {
+        entries = readdirSync(dir);
+      } catch {
+        return;
+      }
+      for (const name of entries) {
+        if (lines.length >= maxEntries) {
+          lines.push(`${prefix}…(truncated)`);
+          return;
+        }
+        const abs = join(dir, name);
+        let isDir = false;
+        try {
+          isDir = statSync(abs).isDirectory();
+        } catch {
+          // ignore
+        }
+        lines.push(`${prefix}${name}${isDir ? '/' : ''}`);
+        if (isDir) walk(abs, prefix + '  ');
+      }
+    }
+    walk(root, '');
+    return lines.join('\n');
   }
 
   it('exits 0 even when no deps are present (must never break npm install)', () => {
@@ -119,11 +155,12 @@ process.exit(0);
     for (const dep of SHARP_REQUIRED_DEPS.slice(1)) plantDep(workdir, dep);
 
     const result = runPostinstall(workdir);
-    expect(result.status).toBe(0);
+    const diag = `\n--- script stdout ---\n${result.stdout}\n--- script stderr ---\n${result.stderr}\n--- workdir contents ---\n${listTree(workdir)}\n`;
+    expect(result.status, diag).toBe(0);
     // Stub recorded one invocation.
-    expect(existsSync(stubNpmLog)).toBe(true);
+    expect(existsSync(stubNpmLog), `npm stub log missing — script bailed before spawn?${diag}`).toBe(true);
     const lines = readFileSync(stubNpmLog, 'utf8').trim().split('\n');
-    expect(lines).toHaveLength(1);
+    expect(lines, diag).toHaveLength(1);
     const { argv, cwd } = JSON.parse(lines[0]);
     expect(argv).toEqual([
       'install',
@@ -146,10 +183,11 @@ process.exit(0);
     plantDep(workdir, 'semver');
 
     const result = runPostinstall(workdir);
-    expect(result.status).toBe(0);
+    const diag = `\n--- script stdout ---\n${result.stdout}\n--- script stderr ---\n${result.stderr}\n--- workdir contents ---\n${listTree(workdir)}\n`;
+    expect(result.status, diag).toBe(0);
     // Empty placeholders should be gone.
-    expect(existsSync(join(workdir, 'node_modules', 'sharp'))).toBe(false);
-    expect(existsSync(join(workdir, 'node_modules', 'detect-libc'))).toBe(false);
+    expect(existsSync(join(workdir, 'node_modules', 'sharp')), diag).toBe(false);
+    expect(existsSync(join(workdir, 'node_modules', 'detect-libc')), diag).toBe(false);
     // The real one is left alone.
     expect(existsSync(join(workdir, 'node_modules', '@img', 'colour', 'package.json'))).toBe(true);
   });

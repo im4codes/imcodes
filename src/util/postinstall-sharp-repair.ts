@@ -62,6 +62,17 @@ import { SHARP_REQUIRED_DEPS } from './sharp-repair-script.js';
 const TAG = '[imcodes:postinstall]';
 
 /**
+ * Optional verbose mode for diagnostics. The bundled tests opt in via
+ * `IMCODES_POSTINSTALL_DEBUG=1`; production npm installs see no extra
+ * output. This is the only way to see what happens inside the spawned
+ * child on the Windows CI runner where stderr is captured by vitest.
+ */
+const DEBUG = process.env.IMCODES_POSTINSTALL_DEBUG === '1';
+function dbg(msg: string): void {
+  if (DEBUG) console.error(`${TAG} dbg: ${msg}`);
+}
+
+/**
  * Run the repair. Returns true if a repair was attempted (regardless of
  * outcome), false if no repair was needed.
  */
@@ -70,6 +81,7 @@ function runRepair(): boolean {
   // so process.cwd() === the imcodes package root. Resolve to absolute
   // for safer logging / spawn semantics.
   const pkgRoot = resolve(process.cwd());
+  dbg(`pkgRoot=${pkgRoot}`);
 
   // Dev-checkout guard: if a `.git` directory lives at or above the
   // package root we're almost certainly running inside the imcodes git
@@ -99,6 +111,7 @@ function runRepair(): boolean {
 
   if (missing.length === 0) {
     // Common case on a clean install — silent so we don't spam npm output.
+    dbg(`all required deps present, skipping`);
     return false;
   }
 
@@ -154,12 +167,19 @@ function runRepair(): boolean {
     // PATH lookup of `npm.cmd` on Windows requires the shell.
     useShell = process.platform === 'win32';
   }
+  dbg(`spawn cmd=${cmd} argv=${JSON.stringify(argv)} useShell=${useShell}`);
+  // In debug mode, capture stdout/stderr so test output shows what npm
+  // (or our stub) emitted; production keeps `inherit` so end users see
+  // npm install progress live.
   const result = spawnSync(cmd, argv, {
     cwd: pkgRoot,
-    stdio: 'inherit',
+    stdio: DEBUG ? ['ignore', 'pipe', 'pipe'] : 'inherit',
     shell: useShell,
     env: { ...process.env },
   });
+  dbg(`spawn finished status=${result.status} signal=${result.signal ?? 'none'} error=${result.error ? String(result.error) : 'none'}`);
+  if (DEBUG && result.stdout != null) dbg(`child stdout: ${result.stdout.toString()}`);
+  if (DEBUG && result.stderr != null) dbg(`child stderr: ${result.stderr.toString()}`);
 
   if (result.status === 0) {
     console.error(`${TAG} sharp repair succeeded`);
@@ -184,7 +204,10 @@ function runRepair(): boolean {
 function isInsideGitWorktree(start: string): boolean {
   let cur = start;
   for (let i = 0; i < 8; i++) {
-    if (existsSync(join(cur, '.git'))) return true;
+    const candidate = join(cur, '.git');
+    const hit = existsSync(candidate);
+    dbg(`git-walk[${i}] check=${candidate} hit=${hit}`);
+    if (hit) return true;
     const parent = resolve(cur, '..');
     if (parent === cur) break;
     cur = parent;
