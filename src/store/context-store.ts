@@ -222,7 +222,23 @@ function ensureDb(): DatabaseSyncInstance {
   tryAlter(db, 'ALTER TABLE context_processed_local ADD COLUMN embedding_source TEXT');
   tryAlter(db, 'ALTER TABLE context_processed_local ADD COLUMN summary_fingerprint TEXT');
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS uq_proj_fp ON context_processed_local(namespace_key, class, summary_fingerprint) WHERE summary_fingerprint IS NOT NULL');
-  setupArchiveFts(db);
+  // FTS5 setup MUST NOT crash daemon startup. `setupArchiveFts` already
+  // detects unavailable FTS5 (e.g. Node 23.11.0's built-in SQLite) and
+  // skips the virtual table + triggers when so. This outer try-catch is
+  // defense-in-depth so any unforeseen exception (driver mismatch, perms,
+  // disk pressure during virtual-table creation) leaves the daemon in a
+  // working state rather than degraded with no server connection.
+  // The chat_search_fts read tool falls back to bounded LIKE in this case.
+  try {
+    setupArchiveFts(db);
+  } catch (error) {
+    incrementCounter('mem.archive_fts.unavailable', { source: 'setupArchiveFts.outer' });
+    warnOncePerHour('mem.archive_fts.unavailable', {
+      reason: 'setupArchiveFts threw at startup; daemon continues without FTS index',
+      error: error instanceof Error ? error.message : String(error),
+    });
+    try { internalSetContextMeta(db, 'fts_tokenizer', 'unavailable'); } catch { /* ignore */ }
+  }
   if (stagedReconciledForPath !== dbPath) {
     reconcileMaterializedStagedEvents(db);
     purgeMemoryNoiseProjections(db);
@@ -408,14 +424,61 @@ function chooseFtsTokenizer(database: DatabaseSyncInstance): 'trigram' | 'unicod
   return preferred;
 }
 
+/**
+ * FTS5 is not always available in the host SQLite build. Some Node.js
+ * builds (notably Node 23.11.0's bundled SQLite at the time of writing)
+ * ship without FTS5 compiled in. We MUST detect that and degrade
+ * gracefully — the virtual table AND the AFTER INSERT/UPDATE/DELETE
+ * triggers all reference `context_event_archive_fts`. If FTS5 is missing
+ * and we install the triggers anyway, every archive write fails with
+ * "no such table" because the trigger body is lazily resolved at fire
+ * time, breaking the entire memory pipeline (`archiveEventsForMaterialization`,
+ * materialization, `/compact` etc).
+ *
+ * Strategy: probe with a throwaway temp FTS5 table. If that succeeds,
+ * install the real virtual table + triggers + backfill. If it fails,
+ * record an 'unavailable' sentinel in context_meta, warn-once, and do
+ * NOT create the virtual table or triggers. `searchArchiveFts` already
+ * falls back to a bounded LIKE scan when the FTS query fails for any
+ * reason — including "no such table" — so read-side tools keep working.
+ */
+function isFtsAvailable(database: DatabaseSyncInstance): boolean {
+  try {
+    database.exec("CREATE VIRTUAL TABLE IF NOT EXISTS __imc_fts_probe USING fts5(content)");
+    database.exec('DROP TABLE IF EXISTS __imc_fts_probe');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function setupArchiveFts(database: DatabaseSyncInstance): void {
+  if (!isFtsAvailable(database)) {
+    internalSetContextMeta(database, 'fts_tokenizer', 'unavailable');
+    incrementCounter('mem.archive_fts.unavailable', { source: 'setupArchiveFts' });
+    warnOncePerHour('mem.archive_fts.unavailable', {
+      reason: 'host SQLite build lacks FTS5; chat_search_fts will use LIKE fallback',
+    });
+    return;
+  }
   const tokenizer = chooseFtsTokenizer(database);
   const tokenizerSql = tokenizer === 'trigram' ? "tokenize='trigram'" : "tokenize='unicode61 remove_diacritics 2'";
   try {
     database.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS context_event_archive_fts USING fts5(content, content='context_event_archive', content_rowid='rowid', ${tokenizerSql})`);
   } catch {
-    database.exec("CREATE VIRTUAL TABLE IF NOT EXISTS context_event_archive_fts USING fts5(content, content='context_event_archive', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2')");
-    internalSetContextMeta(database, 'fts_tokenizer', 'unicode61');
+    try {
+      database.exec("CREATE VIRTUAL TABLE IF NOT EXISTS context_event_archive_fts USING fts5(content, content='context_event_archive', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2')");
+      internalSetContextMeta(database, 'fts_tokenizer', 'unicode61');
+    } catch {
+      // Even the simpler tokenizer failed — treat as unavailable. (The
+      // probe should have caught this; this catch is defense-in-depth.)
+      internalSetContextMeta(database, 'fts_tokenizer', 'unavailable');
+      incrementCounter('mem.archive_fts.unavailable', { source: 'setupArchiveFts.fallback' });
+      warnOncePerHour('mem.archive_fts.unavailable', {
+        reason: 'FTS5 probe passed but virtual table creation failed',
+      });
+      return;
+    }
   }
   database.exec(`
     CREATE TRIGGER IF NOT EXISTS context_event_archive_ai AFTER INSERT ON context_event_archive BEGIN
@@ -817,20 +880,27 @@ export function searchArchiveFts(query: string, limit = 20, filters: ArchiveSear
   const namespacePredicate = namespaceKey ? 'AND a.namespace_key = ?' : '';
   const fetchLimit = filters.userId && !namespaceKey ? Math.min(1000, safeLimit * 10) : safeLimit;
   let rows: Array<Record<string, unknown>> = [];
-  try {
-    rows = database.prepare(`
-      SELECT a.id, a.target_key, a.event_type, a.content, a.created_at
-      FROM context_event_archive_fts f
-      JOIN context_event_archive a ON a.rowid = f.rowid
-      WHERE context_event_archive_fts MATCH ?
-        ${namespacePredicate}
-      ORDER BY rank
-      LIMIT ?
-    `).all(...(namespaceKey ? [trimmed, namespaceKey, fetchLimit] : [trimmed, fetchLimit])) as Array<Record<string, unknown>>;
-  } catch (error) {
-    incrementCounter('mem.archive_fts.match_failure', { source: 'searchArchiveFts' });
-    warnOncePerHour('mem.archive_fts.match_failure', { error: error instanceof Error ? error.message : String(error) });
-    rows = [];
+  // Fast path: skip the FTS attempt entirely when setupArchiveFts recorded
+  // FTS5 as unavailable on this host. Falling straight through to LIKE
+  // avoids spamming `mem.archive_fts.match_failure` on every search call.
+  const ftsTokenizer = internalGetContextMeta(database, 'fts_tokenizer');
+  const ftsAvailable = ftsTokenizer !== 'unavailable';
+  if (ftsAvailable) {
+    try {
+      rows = database.prepare(`
+        SELECT a.id, a.target_key, a.event_type, a.content, a.created_at
+        FROM context_event_archive_fts f
+        JOIN context_event_archive a ON a.rowid = f.rowid
+        WHERE context_event_archive_fts MATCH ?
+          ${namespacePredicate}
+        ORDER BY rank
+        LIMIT ?
+      `).all(...(namespaceKey ? [trimmed, namespaceKey, fetchLimit] : [trimmed, fetchLimit])) as Array<Record<string, unknown>>;
+    } catch (error) {
+      incrementCounter('mem.archive_fts.match_failure', { source: 'searchArchiveFts' });
+      warnOncePerHour('mem.archive_fts.match_failure', { error: error instanceof Error ? error.message : String(error) });
+      rows = [];
+    }
   }
   let results = rowsToArchiveSearchResults(rows, filters, safeLimit);
   // FTS5 trigram does not match short two-codepoint CJK queries reliably.
