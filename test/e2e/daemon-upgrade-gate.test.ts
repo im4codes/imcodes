@@ -363,7 +363,8 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
         {
           name: 'deck_thinking_brain',
           sessionState: 'idle',
-          runtime: {
+          runtimeType: 'transport',
+          transport: {
             status: 'thinking',
             sending: false,
             pendingCount: 0,
