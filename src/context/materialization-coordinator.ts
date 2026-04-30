@@ -444,6 +444,10 @@ export class MaterializationCoordinator {
     // for runaway single/few-event batches with very large tool outputs.
     if (tokenSum >= thresholds.maxBatchTokens) return 'threshold';
     if (thresholds.eventCount !== undefined && dirtyTarget.eventCount >= thresholds.eventCount) return 'threshold';
+    // Retry/recovery batches may be small (for example one assistant turn that
+    // failed while the compressor was down). Once they are old enough, do not
+    // let the min-event floor strand them forever.
+    if (dirtyTarget.lastTrigger && now - dirtyTarget.oldestEventAt >= thresholds.scheduleMs) return 'schedule';
     if (dirtyTarget.eventCount < thresholds.minEventCount) return undefined;
     if (tokenSum >= thresholds.autoTriggerTokens) return 'threshold';
     if (now - dirtyTarget.newestEventAt >= thresholds.idleMs) return 'idle';

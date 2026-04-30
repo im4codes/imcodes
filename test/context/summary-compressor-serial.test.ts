@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -72,10 +72,38 @@ function makeQueryMock(opts: {
 }
 
 describe('summary-compressor — concurrent compressWithSdk calls serialize', () => {
+  const originalCompressionTimeout = process.env.IMCODES_COMPRESSION_TIMEOUT_MS;
+
   beforeEach(async () => {
     queryMock.mockReset();
+    if (originalCompressionTimeout === undefined) delete process.env.IMCODES_COMPRESSION_TIMEOUT_MS;
+    else process.env.IMCODES_COMPRESSION_TIMEOUT_MS = originalCompressionTimeout;
     const { resumeAcceptingCompression } = await import('../../src/context/summary-compressor.js');
     resumeAcceptingCompression();
+  });
+
+  afterEach(() => {
+    if (originalCompressionTimeout === undefined) delete process.env.IMCODES_COMPRESSION_TIMEOUT_MS;
+    else process.env.IMCODES_COMPRESSION_TIMEOUT_MS = originalCompressionTimeout;
+  });
+
+  it('uses an extended configurable compression timeout for slow MiniMax/Qwen-style providers', async () => {
+    const { getCompressionTimeoutMs } = await import('../../src/context/summary-compressor.js');
+
+    delete process.env.IMCODES_COMPRESSION_TIMEOUT_MS;
+    expect(getCompressionTimeoutMs()).toBe(60_000);
+
+    process.env.IMCODES_COMPRESSION_TIMEOUT_MS = '120000';
+    expect(getCompressionTimeoutMs()).toBe(120_000);
+
+    process.env.IMCODES_COMPRESSION_TIMEOUT_MS = '1000';
+    expect(getCompressionTimeoutMs()).toBe(5_000);
+
+    process.env.IMCODES_COMPRESSION_TIMEOUT_MS = '999999999';
+    expect(getCompressionTimeoutMs()).toBe(10 * 60_000);
+
+    process.env.IMCODES_COMPRESSION_TIMEOUT_MS = 'not-a-number';
+    expect(getCompressionTimeoutMs()).toBe(60_000);
   });
 
   it('never runs two SDK query() calls concurrently, even with 3 callers firing at the same tick', async () => {

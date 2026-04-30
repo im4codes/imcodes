@@ -39,6 +39,7 @@ const DEFAULT_LOCAL_PROCESSED_FRESH_MS = 6 * 60 * 60 * 1000;
 let db: DatabaseSyncInstance | null = null;
 let currentDbPath: string | null = null;
 let stagedReconciledForPath: string | null = null;
+let materializationRepairRanForPath: string | null = null;
 let archiveBackfillTimer: ReturnType<typeof setTimeout> | null = null;
 let archiveBackfillScheduledForPath: string | null = null;
 
@@ -54,6 +55,7 @@ export const CONTEXT_META_SENTINELS = [
   'fts_backfilled',
   'fts_tokenizer',
   'migration_archive_backfill_cursor',
+  'last_materialization_repair_at',
 ] as const;
 
 export function tryAlter(database: DatabaseSyncInstance, sql: string): boolean {
@@ -243,6 +245,10 @@ function ensureDb(): DatabaseSyncInstance {
     reconcileMaterializedStagedEvents(db);
     purgeMemoryNoiseProjections(db);
     stagedReconciledForPath = dbPath;
+  }
+  if (materializationRepairRanForPath !== dbPath) {
+    repairMaterializationStateForDb(db, { now: Date.now() });
+    materializationRepairRanForPath = dbPath;
   }
   scheduleArchiveBackfillIfNeeded(db, dbPath);
   return db;
@@ -584,6 +590,148 @@ export function removeMemoryNoiseProjections(): number {
   return purgeMemoryNoiseProjections(ensureDb());
 }
 
+export interface MaterializationRepairOptions {
+  now?: number;
+  /** Running jobs older than this are from a dead daemon/process and are reset. */
+  staleRunningMs?: number;
+  /** Keep this many failed materialization jobs per target/job_type for diagnostics. */
+  failedJobsRetainPerTarget?: number;
+  /** Never retain failed materialization jobs older than this window, except for the newest retained rows. */
+  failedJobRetentionMs?: number;
+}
+
+export interface MaterializationRepairStats {
+  staleRunningReset: number;
+  dirtyPendingRefsCleared: number;
+  pollutedFallbackArchived: number;
+  failedJobsPruned: number;
+}
+
+const DEFAULT_STALE_RUNNING_JOB_MS = 10 * 60_000;
+const DEFAULT_FAILED_JOB_RETAIN_PER_TARGET = 20;
+const DEFAULT_FAILED_JOB_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+function isPollutedFallbackProjection(row: { summary: string; content_json: string }): boolean {
+  const content = parseJson<Record<string, unknown>>(row.content_json, {});
+  const compressionFromSdk = content.compressionFromSdk;
+  const fromSdkFalse = compressionFromSdk === false || compressionFromSdk === 0;
+  const compressionModel = typeof content.compressionModel === 'string' ? content.compressionModel : '';
+  const compressionBackend = typeof content.compressionBackend === 'string' ? content.compressionBackend : '';
+  return row.summary.includes('Structured summary unavailable')
+    || row.summary.includes('--- Updated ---')
+    || (fromSdkFalse && (compressionModel === 'local-fallback' || compressionBackend === 'none'))
+    || isLegacyRawTranscriptProjection(row.summary, content);
+}
+
+const RAW_TRANSCRIPT_PREFIX_RE = /^(assistant\.(?:turn|text|thinking)|user\.(?:turn|message)|tool\.(?:call|result)|system\.(?:event|message)|decision|constraint|preference):\s/m;
+
+function isLegacyRawTranscriptProjection(summary: string, content: Record<string, unknown>): boolean {
+  const trimmed = summary.trimStart();
+  if (!RAW_TRANSCRIPT_PREFIX_RE.test(trimmed)) return false;
+  if (trimmed.startsWith('## ')) return false;
+  const hasCompressionProvenance =
+    Object.prototype.hasOwnProperty.call(content, 'compressionFromSdk')
+    || Object.prototype.hasOwnProperty.call(content, 'compressionBackend')
+    || Object.prototype.hasOwnProperty.call(content, 'compressionModel');
+  if (hasCompressionProvenance) return false;
+  return content.targetKind === 'session' || content.targetKind === 'project';
+}
+
+function repairMaterializationStateForDb(
+  database: DatabaseSyncInstance,
+  options: MaterializationRepairOptions = {},
+): MaterializationRepairStats {
+  const now = options.now ?? Date.now();
+  const staleRunningMs = options.staleRunningMs ?? DEFAULT_STALE_RUNNING_JOB_MS;
+  const failedJobsRetainPerTarget = Math.max(0, options.failedJobsRetainPerTarget ?? DEFAULT_FAILED_JOB_RETAIN_PER_TARGET);
+  const failedJobRetentionMs = Math.max(0, options.failedJobRetentionMs ?? DEFAULT_FAILED_JOB_RETENTION_MS);
+
+  const staleCutoff = now - staleRunningMs;
+  const staleRunningResult = database.prepare(`
+    UPDATE context_jobs
+    SET status = 'materialization_failed',
+        updated_at = ?,
+        error = COALESCE(error, 'stale running materialization job reset on daemon startup/repair')
+    WHERE status = 'running'
+      AND job_type IN ('materialize_session', 'materialize_project')
+      AND updated_at < ?
+  `).run(now, staleCutoff) as { changes?: number };
+
+  const dirtyRows = database.prepare(`
+    SELECT d.target_key, d.pending_job_id, j.status
+    FROM context_dirty_targets d
+    LEFT JOIN context_jobs j ON j.id = d.pending_job_id
+    WHERE d.pending_job_id IS NOT NULL
+  `).all() as Array<{ target_key: string; pending_job_id: string | null; status: string | null }>;
+  let dirtyPendingRefsCleared = 0;
+  const clearDirtyStmt = database.prepare('UPDATE context_dirty_targets SET pending_job_id = NULL WHERE target_key = ?');
+  for (const row of dirtyRows) {
+    if (row.status === 'pending' || row.status === 'running') continue;
+    clearDirtyStmt.run(row.target_key);
+    dirtyPendingRefsCleared += 1;
+  }
+
+  const pollutedRows = database.prepare(`
+    SELECT id, summary, content_json
+    FROM context_processed_local
+    WHERE status = 'active'
+  `).all() as Array<{ id: string; summary: string; content_json: string }>;
+  const pollutedIds = pollutedRows
+    .filter(isPollutedFallbackProjection)
+    .map((row) => row.id);
+  let pollutedFallbackArchived = 0;
+  if (pollutedIds.length > 0) {
+    const placeholders = pollutedIds.map(() => '?').join(', ');
+    const archiveResult = database.prepare(`
+      UPDATE context_processed_local
+      SET status = 'archived'
+      WHERE id IN (${placeholders}) AND status = 'active'
+    `).run(...pollutedIds) as { changes?: number };
+    removeProjectionIdsFromReplicationState(database, pollutedIds);
+    pollutedFallbackArchived = archiveResult.changes ?? 0;
+  }
+
+  const failedRows = database.prepare(`
+    SELECT id, target_key, job_type, updated_at
+    FROM context_jobs
+    WHERE status = 'materialization_failed'
+      AND job_type IN ('materialize_session', 'materialize_project')
+    ORDER BY target_key ASC, job_type ASC, updated_at DESC
+  `).all() as Array<{ id: string; target_key: string; job_type: string; updated_at: number }>;
+  const failedCutoff = now - failedJobRetentionMs;
+  const seenByTarget = new Map<string, number>();
+  const deleteIds: string[] = [];
+  for (const row of failedRows) {
+    const key = `${row.target_key}\u0000${row.job_type}`;
+    const seen = seenByTarget.get(key) ?? 0;
+    seenByTarget.set(key, seen + 1);
+    if (seen < failedJobsRetainPerTarget && row.updated_at >= failedCutoff) continue;
+    deleteIds.push(row.id);
+  }
+  let failedJobsPruned = 0;
+  if (deleteIds.length > 0) {
+    const chunkSize = 500;
+    for (let i = 0; i < deleteIds.length; i += chunkSize) {
+      const chunk = deleteIds.slice(i, i + chunkSize);
+      const placeholders = chunk.map(() => '?').join(', ');
+      const result = database.prepare(`DELETE FROM context_jobs WHERE id IN (${placeholders})`).run(...chunk) as { changes?: number };
+      failedJobsPruned += result.changes ?? 0;
+    }
+  }
+
+  internalSetContextMeta(database, 'last_materialization_repair_at', String(now));
+  return {
+    staleRunningReset: staleRunningResult.changes ?? 0,
+    dirtyPendingRefsCleared,
+    pollutedFallbackArchived,
+    failedJobsPruned,
+  };
+}
+
+export function repairMaterializationState(options: MaterializationRepairOptions = {}): MaterializationRepairStats {
+  return repairMaterializationStateForDb(ensureDb(), options);
+}
+
 export function resetContextStoreForTests(): void {
   if (archiveBackfillTimer) {
     clearTimeout(archiveBackfillTimer);
@@ -594,6 +742,7 @@ export function resetContextStoreForTests(): void {
   db = null;
   currentDbPath = null;
   stagedReconciledForPath = null;
+  materializationRepairRanForPath = null;
 }
 
 

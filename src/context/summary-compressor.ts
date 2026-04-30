@@ -573,13 +573,24 @@ ${serializedEvents}`);
 
 // ── Provider send with completion wait ───────────────────────────────────────
 
-// Tighter than the 60 s we had during single-request debugging. With the
-// serialization gate above the queue is now the budget, not the timeout —
-// a single slow call blocked everything behind it for up to a full minute.
-// 20 s still lets a model with warm context finish a structured summary;
-// genuinely slow/broken calls release the lane 3× faster and the
-// circuit breaker trips sooner, falling back to the local summarizer.
-const COMPRESSION_TIMEOUT_MS = 20_000;
+// MiniMax/Qwen-compatible endpoints can legitimately take longer than the
+// 20s budget when producing a structured summary. Keep the lane bounded, but
+// make the timeout configurable so field recovery can extend it without a code
+// change. The default is deliberately higher than the old 20s value while still
+// finite so a wedged provider cannot pin daemon shutdown/upgrade indefinitely.
+const DEFAULT_COMPRESSION_TIMEOUT_MS = 60_000;
+const MIN_COMPRESSION_TIMEOUT_MS = 5_000;
+const MAX_COMPRESSION_TIMEOUT_MS = 10 * 60_000;
+
+export function getCompressionTimeoutMs(): number {
+  const raw = process.env.IMCODES_COMPRESSION_TIMEOUT_MS;
+  if (!raw || raw.trim() === '') return DEFAULT_COMPRESSION_TIMEOUT_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) return DEFAULT_COMPRESSION_TIMEOUT_MS;
+  if (parsed < MIN_COMPRESSION_TIMEOUT_MS) return MIN_COMPRESSION_TIMEOUT_MS;
+  if (parsed > MAX_COMPRESSION_TIMEOUT_MS) return MAX_COMPRESSION_TIMEOUT_MS;
+  return parsed;
+}
 
 export async function resolveCompressionProviderSessionConfig(
   selection: CompressionBackendSelection,
@@ -598,6 +609,7 @@ async function sendToProvider(selection: CompressionBackendSelection, prompt: st
   // Other backends: use the transport provider's send/onComplete flow.
   const sessionConfig = await resolveCompressionProviderSessionConfig(selection);
   const { provider, sessionId } = await getCompressionProvider(selection.backend, sessionConfig);
+  const compressionTimeoutMs = getCompressionTimeoutMs();
 
   return new Promise<string>((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -609,8 +621,8 @@ async function sendToProvider(selection: CompressionBackendSelection, prompt: st
       // exhausts and the daemon OOM-crashes, taking every active session
       // with it. Best-effort: don't await — the rejection must fire promptly.
       void shutdownCompressionProvider().catch(() => { /* best-effort */ });
-      reject(new Error(`Compression timed out after ${COMPRESSION_TIMEOUT_MS}ms`));
-    }, COMPRESSION_TIMEOUT_MS);
+      reject(new Error(`Compression timed out after ${compressionTimeoutMs}ms`));
+    }, compressionTimeoutMs);
 
     const offComplete = provider.onComplete((sid: string, message: AgentMessage) => {
       if (sid !== sessionId) return;
@@ -643,11 +655,12 @@ async function sendViaSdkQuery(prompt: string): Promise<string> {
   const abortController = new AbortController();
   let timedOut = false;
   let stream: (AsyncIterable<unknown> & { close?: () => void }) | undefined;
+  const compressionTimeoutMs = getCompressionTimeoutMs();
   const timer = setTimeout(() => {
     timedOut = true;
     abortController.abort();
     try { stream?.close?.(); } catch { /* best-effort SDK cleanup */ }
-  }, COMPRESSION_TIMEOUT_MS);
+  }, compressionTimeoutMs);
   const savedClaudeCode = process.env.CLAUDECODE;
   delete process.env.CLAUDECODE;
   try {
@@ -675,12 +688,12 @@ async function sendViaSdkQuery(prompt: string): Promise<string> {
         }
       }
     }
-    if (timedOut) throw new Error(`Compression timed out after ${COMPRESSION_TIMEOUT_MS}ms`);
+    if (timedOut) throw new Error(`Compression timed out after ${compressionTimeoutMs}ms`);
     if (!result.trim()) throw new Error('SDK returned empty response');
     return result.trim();
   } catch (err) {
     if (timedOut || abortController.signal.aborted) {
-      throw new Error(`Compression timed out after ${COMPRESSION_TIMEOUT_MS}ms`);
+      throw new Error(`Compression timed out after ${compressionTimeoutMs}ms`);
     }
     throw err;
   } finally {
