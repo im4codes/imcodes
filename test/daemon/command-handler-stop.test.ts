@@ -220,7 +220,8 @@ describe('handleWebCommand shutdown failure paths', () => {
         {
           name: 'deck_proj_brain',
           sessionState: 'running',
-          runtime: {
+          runtimeType: 'transport',
+          transport: {
             status: 'thinking',
             sending: true,
             pendingCount: 0,
