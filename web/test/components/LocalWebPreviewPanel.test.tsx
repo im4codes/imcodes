@@ -41,8 +41,16 @@ vi.mock('react-i18next', () => ({
 
 import { LocalWebPreviewPanel } from '../../src/components/LocalWebPreviewPanel.js';
 
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  // Preact schedules passive hook cleanup through a requestAnimationFrame +
+  // timeout pair.  If the jsdom environment tears down before that scheduler
+  // drains, the timer can fire after globals such as cancelAnimationFrame have
+  // been removed and Vitest reports an unhandled error even though assertions
+  // passed.  Drain the pending scheduler while the environment is still alive.
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 40));
+  });
   vi.clearAllMocks();
 });
 

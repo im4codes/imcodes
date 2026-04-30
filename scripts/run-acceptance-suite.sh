@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-openspec validate memory-system-1.1-foundations
+if [ -d openspec/changes/memory-system-1.1-foundations ]; then
+  openspec validate memory-system-1.1-foundations
+else
+  openspec validate daemon-memory-pipeline --type spec
+fi
 
 npm run build
 npx tsc --noEmit

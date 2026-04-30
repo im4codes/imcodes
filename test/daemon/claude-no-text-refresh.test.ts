@@ -100,10 +100,10 @@ describe('Claude no-text refresh integration', () => {
     await mkdir(workDir, { recursive: true });
     projectDir = claudeProjectDir(workDir);
     await mkdir(projectDir, { recursive: true });
-    ccSessionId = '11111111-1111-1111-1111-111111111111';
+    ccSessionId = randomUUID();
     sessionName = `deck_test_${randomUUID().slice(0, 8)}`;
     trackedFile = join(projectDir, `${ccSessionId}.jsonl`);
-    otherFile = join(projectDir, '22222222-2222-2222-2222-222222222222.jsonl');
+    otherFile = join(projectDir, `${randomUUID()}.jsonl`);
     await writeFile(trackedFile, '');
     await writeFile(otherFile, '');
 
