@@ -1,7 +1,7 @@
 import { describe, expect, it, beforeEach } from 'vitest';
 import { __testing__, resetFailureTracking, getCircuitBreakerStats } from '../../src/context/summary-compressor.js';
 
-const { canCall, recordSuccess, recordFailure } = __testing__;
+const { canCall, recordSuccess, recordFailure, classifyCompressionError } = __testing__;
 
 describe('Circuit breaker state machine', () => {
   beforeEach(() => {
@@ -144,6 +144,14 @@ describe('Circuit breaker state machine', () => {
     expect(stats['claude-code-sdk']?.state).toBe('open');
     expect(stats['codex-sdk']?.state).toBe('closed');
     expect(stats['codex-sdk']?.consecutiveFailures).toBe(1);
+  });
+
+
+
+  it('treats quota and rate-limit errors as permanent compression failures', () => {
+    expect(classifyCompressionError(new Error('429 rate limit exceeded')).retryable).toBe(false);
+    expect(classifyCompressionError(new Error('insufficient_quota: billing credits exhausted')).retryable).toBe(false);
+    expect(classifyCompressionError(new Error('ETIMEDOUT socket hang up')).retryable).toBe(true);
   });
 
   it('resetFailureTracking clears all state', () => {

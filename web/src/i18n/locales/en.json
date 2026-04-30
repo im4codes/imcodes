@@ -1241,7 +1241,8 @@
       "memoryDeleteConfirm": "Delete this memory permanently? This cannot be undone.",
       "memoryDeleteFailed": "Failed to delete memory",
       "memoryArchived": "Archived",
-      "memoryShowArchived": "Show archived"
+      "memoryShowArchived": "Show archived",
+      "memoryMasterSummary": "Master summary"
     },
     "diagnostics": {
       "title": "Diagnostics",

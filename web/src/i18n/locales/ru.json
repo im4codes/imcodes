@@ -1240,7 +1240,8 @@
       "memoryDeleteConfirm": "Удалить эту память навсегда? Это действие нельзя отменить.",
       "memoryDeleteFailed": "Не удалось удалить память",
       "memoryArchived": "В архиве",
-      "memoryShowArchived": "Показать архивные"
+      "memoryShowArchived": "Показать архивные",
+      "memoryMasterSummary": "Главная сводка"
     },
     "diagnostics": {
       "title": "Diagnostics",

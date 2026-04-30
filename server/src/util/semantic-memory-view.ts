@@ -5,11 +5,11 @@ import { embeddingToSql, generateEmbedding } from './embedding.js';
 import { isMemoryNoiseSummary } from '../../../shared/memory-noise-patterns.js';
 
 type MemoryScope = 'personal' | 'enterprise';
-type ProjectionClassFilter = 'recent_summary' | 'durable_memory_candidate';
+type ProjectionClassFilter = 'recent_summary' | 'durable_memory_candidate' | 'master_summary';
 type ProjectionScope = 'personal' | 'project_shared' | 'workspace_shared' | 'org_shared';
-type ProjectionStatus = 'active' | 'archived';
+type ProjectionStatus = 'active' | 'archived' | 'archived_dedup';
 
-interface SemanticMemoryViewInput {
+export interface SemanticMemoryViewInput {
   db: Database;
   userId: string;
   scope: MemoryScope;
@@ -53,7 +53,7 @@ function parseSourceEventCount(sourceEventIds: string | string[]): number {
   }
 }
 
-function buildScopedWhereClause(input: SemanticMemoryViewInput, includeAliases = false): { clause: string; params: unknown[] } {
+export function buildScopedWhereClause(input: SemanticMemoryViewInput, includeAliases = false): { clause: string; params: unknown[] } {
   const params: unknown[] = [];
   const p = (value: unknown): string => {
     params.push(value);

@@ -1240,7 +1240,8 @@
       "memoryDeleteConfirm": "¿Eliminar esta memoria de forma permanente? Esta acción no se puede deshacer.",
       "memoryDeleteFailed": "No se pudo eliminar la memoria",
       "memoryArchived": "Archivado",
-      "memoryShowArchived": "Mostrar archivados"
+      "memoryShowArchived": "Mostrar archivados",
+      "memoryMasterSummary": "Resumen maestro"
     },
     "diagnostics": {
       "title": "Diagnostics",

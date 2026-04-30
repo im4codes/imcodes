@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ContextNamespace } from '../../shared/context-types.js';
 import type { TimelineEvent } from '../../src/daemon/timeline-event.js';
-import { LiveContextIngestion } from '../../src/context/live-context-ingestion.js';
+import {
+  closeLiveContextMaterializationAdmission,
+  LiveContextIngestion,
+  reopenLiveContextMaterializationAdmission,
+} from '../../src/context/live-context-ingestion.js';
 import { localOnlyCompressor } from '../../src/context/summary-compressor.js';
 import { getProcessedProjectionStats, queryProcessedProjections } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
@@ -23,10 +27,12 @@ describe('LiveContextIngestion', () => {
   };
 
   beforeEach(async () => {
+    reopenLiveContextMaterializationAdmission();
     tempDir = await createIsolatedSharedContextDb('live-context-ingestion');
   });
 
   afterEach(async () => {
+    reopenLiveContextMaterializationAdmission();
     await cleanupIsolatedSharedContextDb(tempDir);
   });
 
@@ -84,6 +90,26 @@ describe('LiveContextIngestion', () => {
     expect(summary?.summary).toContain('**User:** Need the final answer only');
     expect(summary?.summary).toContain('**Assistant:** final answer');
     expect(summary?.summary).not.toContain('partial');
+  });
+
+  it('keeps raw events staged but skips materialization while admission is closed', async () => {
+    const ingestion = new LiveContextIngestion({ compressor: localOnlyCompressor,
+      thresholds: { eventCount: 1, idleMs: 1, scheduleMs: 1 },
+      sessionLookup: () => session,
+      resolveBootstrap: async () => ({ namespace, diagnostics: ['test'] }),
+    });
+
+    closeLiveContextMaterializationAdmission('shutdown');
+    await ingestion.handleTimelineEvent(makeEvent('user.message', 100, { text: 'preserve raw user event' }));
+    await ingestion.handleTimelineEvent(makeEvent('assistant.text', 110, { text: 'preserve raw assistant event' }));
+    await ingestion.handleTimelineEvent(makeEvent('session.state', 120, { state: 'idle' }));
+    await ingestion.flushDueTargets(130);
+
+    expect(getProcessedProjectionStats({ scope: 'personal', projectId: namespace.projectId })).toMatchObject({
+      totalRecords: 0,
+      stagedEventCount: 2,
+      dirtyTargetCount: 1,
+    });
   });
 
 

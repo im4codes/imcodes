@@ -3,6 +3,8 @@ import type { ContextNamespace, ContextTargetRef } from '../../shared/context-ty
 import { MaterializationCoordinator } from '../../src/context/materialization-coordinator.js';
 import { localOnlyCompressor } from '../../src/context/summary-compressor.js';
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
+import { DEFAULT_MEMORY_CONFIG } from '../../src/context/memory-config.js';
+import { redactSensitiveText } from '../../src/util/redact-secrets.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 
 describe('MaterializationCoordinator config integration', () => {
@@ -124,5 +126,54 @@ describe('MaterializationCoordinator config integration', () => {
 
     // After 20s cooldown — allowed
     expect(coordinator.canMaterializeTarget(target, 20_200)).toBe(true);
+  });
+
+  it('resolves memory config per namespace during automatic materialization', async () => {
+    const otherNamespace: ContextNamespace = { scope: 'personal', projectId: 'github.com/acme/other', userId: 'user-1' };
+    const seen: Array<{ projectId: string; redacted: string; maxEventChars: number | undefined }> = [];
+    const coordinator = new MaterializationCoordinator({
+      memoryConfigResolver: (ns) => ({
+        ...DEFAULT_MEMORY_CONFIG,
+        maxEventChars: ns.projectId.endsWith('/repo') ? 111 : 222,
+        redactPatterns: [],
+        extraRedactPatterns: ns.projectId.endsWith('/repo') ? [/repo-only-secret/g] : [/other-only-secret/g],
+      }),
+      compressor: async (input) => {
+        const redacted = redactSensitiveText('repo-only-secret other-only-secret', input.extraRedactPatterns);
+        seen.push({
+          projectId: input.events[0]?.target.namespace.projectId ?? 'unknown',
+          redacted,
+          maxEventChars: input.maxEventChars,
+        });
+        return {
+          summary: redacted,
+          model: 'test',
+          backend: 'test',
+          usedBackup: false,
+          fromSdk: true,
+        };
+      },
+      thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
+    });
+
+    const otherTarget: ContextTargetRef = { namespace: otherNamespace, kind: 'session', sessionName: 'deck_other_brain' };
+    coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'repo turn', createdAt: 100 });
+    coordinator.ingestEvent({ target: otherTarget, eventType: 'user.turn', content: 'other turn', createdAt: 200 });
+
+    await coordinator.materializeTarget(target, 'manual', 300);
+    await coordinator.materializeTarget(otherTarget, 'manual', 400);
+
+    expect(seen).toEqual([
+      {
+        projectId: namespace.projectId,
+        redacted: '[REDACTED:custom] other-only-secret',
+        maxEventChars: 111,
+      },
+      {
+        projectId: otherNamespace.projectId,
+        redacted: 'repo-only-secret [REDACTED:custom]',
+        maxEventChars: 222,
+      },
+    ]);
   });
 });

@@ -359,6 +359,18 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
       type: DAEMON_MSG.UPGRADE_BLOCKED,
       reason: 'transport_busy',
       activeSessionNames: ['deck_thinking_brain'],
+      blockedSessions: [
+        {
+          name: 'deck_thinking_brain',
+          sessionState: 'idle',
+          runtime: {
+            status: 'thinking',
+            sending: false,
+            pendingCount: 0,
+            blockReason: 'status_thinking',
+          },
+        },
+      ],
     });
     expect(mocks.spawnCalls).toEqual([]);
   });

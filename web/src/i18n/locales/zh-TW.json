@@ -1241,7 +1241,8 @@
       "memoryDeleteConfirm": "確定永久刪除這條記憶嗎？此操作無法復原。",
       "memoryDeleteFailed": "刪除記憶失敗",
       "memoryArchived": "已封存",
-      "memoryShowArchived": "顯示已封存"
+      "memoryShowArchived": "顯示已封存",
+      "memoryMasterSummary": "主摘要"
     },
     "diagnostics": {
       "title": "診斷",

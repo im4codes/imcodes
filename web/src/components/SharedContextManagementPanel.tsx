@@ -965,11 +965,11 @@ function shouldCollapseMemoryContent(text: string): boolean {
 
 function getMemoryRecordClassLabel(
   t: (key: string) => string,
-  projectionClass: 'recent_summary' | 'durable_memory_candidate',
+  projectionClass: 'recent_summary' | 'durable_memory_candidate' | 'master_summary',
 ): string {
-  return projectionClass === 'recent_summary'
-    ? t('sharedContext.management.memoryRecentSummary')
-    : t('sharedContext.management.memoryDurableCandidate');
+  if (projectionClass === 'recent_summary') return t('sharedContext.management.memoryRecentSummary');
+  if (projectionClass === 'master_summary') return t('sharedContext.management.memoryMasterSummary');
+  return t('sharedContext.management.memoryDurableCandidate');
 }
 
 export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId, serverId, ws, onEnterpriseChange }: Props) {
@@ -1064,9 +1064,10 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     const onArchive = opts?.onArchive;
     const onRestore = opts?.onRestore;
     const onDelete = opts?.onDelete;
-    const visibleRecords = showArchived ? view.records : view.records.filter((r) => r.status !== 'archived');
+    const visibleRecords = showArchived ? view.records : view.records.filter((r) => (r.status ?? 'active') === 'active');
     const recentRecords = visibleRecords.filter((record) => record.projectionClass === 'recent_summary');
     const durableRecords = visibleRecords.filter((record) => record.projectionClass === 'durable_memory_candidate');
+    const masterRecords = visibleRecords.filter((record) => record.projectionClass === 'master_summary');
     const sections = [
       {
         key: 'recent' as const,
@@ -1080,10 +1081,16 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         description: t('sharedContext.management.memoryDurableDescription'),
         records: durableRecords,
       },
+      {
+        key: 'master' as const,
+        title: t('sharedContext.management.memoryMasterSummary'),
+        description: undefined,
+        records: masterRecords,
+      },
     ].filter((section) => section.records.length > 0) satisfies Array<{
-      key: 'recent' | 'durable';
+      key: 'recent' | 'durable' | 'master';
       title: string;
-      description: string;
+      description?: string;
       records: typeof visibleRecords;
     }>;
 
@@ -1098,7 +1105,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
             <SectionHeading title={section.title} description={section.description} />
             <div style={resourceListStyle}>
               {section.records.map((record) => {
-                const isArchived = record.status === 'archived';
+                const isArchived = (record.status ?? 'active') !== 'active';
                 return (
                   <div key={record.id} style={{ ...resourceCardStyle, ...(isArchived ? { opacity: 0.6 } : {}) }}>
                     {/* Compact meta: inline chips */}

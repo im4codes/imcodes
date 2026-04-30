@@ -48,6 +48,9 @@ import { repoCache } from '../repo/cache.js';
 import { closeSingleSession, collectProjectCloseTargets, type CloseFailure, type CloseTreeResult } from './session-close.js';
 import { cleanupKnownTestTerminalSessions } from './startup-test-session-cleanup.js';
 import { clearResend, drainResend, enqueueResend, getResendCount, getResendEntries } from '../daemon/transport-resend-queue.js';
+import { materializeMasterSummary } from '../context/materialization-coordinator.js';
+import { serializeContextNamespace } from '../context/context-keys.js';
+import { registerMasterCompaction } from '../daemon/master-compaction-registry.js';
 
 /** Start JSONL watcher for a CC session — uses specific file if ccSessionId known, else directory scan. */
 function startCCWatcher(sessionName: string, projectDir: string, ccSessionId?: string): void {
@@ -119,6 +122,13 @@ let _onSessionEvent: SessionEventCallback | null = null;
 
 export function setSessionEventCallback(cb: SessionEventCallback): void {
   _onSessionEvent = cb;
+}
+
+export function shouldMaterializeMasterOnSessionStop(record: Pick<SessionRecord, 'name' | 'role' | 'parentSession' | 'contextNamespace'>): boolean {
+  return !record.name.startsWith('deck_sub_')
+    && record.role === 'brain'
+    && !record.parentSession
+    && !!record.contextNamespace;
 }
 
 function emitSessionEvent(event: 'started' | 'stopped' | 'error', session: string, state: string): void {
@@ -232,6 +242,20 @@ export async function stopProject(
         if (record.name.startsWith('deck_sub_')) {
           timelineEmitter.emit(record.name, 'session.state', { state: 'stopped' });
           return;
+        }
+        if (shouldMaterializeMasterOnSessionStop(record)) {
+          const registration = registerMasterCompaction(
+            () => materializeMasterSummary(record.name, record.contextNamespace),
+            {
+              sessionName: record.name,
+              ...(record.contextNamespace ? { namespaceKey: serializeContextNamespace(record.contextNamespace) } : {}),
+            },
+          );
+          if (!registration.skipped) {
+            registration.promise.catch((err) => {
+                logger.warn({ err, session: record.name }, 'master summary materialization failed on session stop');
+            });
+          }
         }
         emitSessionEvent('stopped', record.name, 'stopped');
       },

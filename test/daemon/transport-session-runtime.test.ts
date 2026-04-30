@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
 import { RUNTIME_TYPES } from '../../src/agent/session-runtime.js';
 import type { TransportProvider, ProviderError, SessionConfig } from '../../src/agent/transport-provider.js';
@@ -84,6 +84,7 @@ function makeSearchResult(items: MemorySearchResultItem[]): MemorySearchResult {
 }
 
 const defaultConfig: SessionConfig = { sessionKey: 'deck_test_brain' };
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const flushDispatch = async () => {
   await Promise.resolve();
   await Promise.resolve();
@@ -104,6 +105,10 @@ describe('TransportSessionRuntime', () => {
     mock = makeMockProvider();
     runtime = new TransportSessionRuntime(mock.provider, 'deck_test_brain');
     await runtime.initialize(defaultConfig);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
   });
 
   it('type is transport', () => {
@@ -798,6 +803,94 @@ describe('TransportSessionRuntime', () => {
       }),
       expect.anything(),
     );
+  });
+
+  it('bounds live context bootstrap so a hung resolver cannot block transport dispatch', async () => {
+    vi.stubEnv('IMCODES_TRANSPORT_CONTEXT_BUDGET_MS', '50');
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
+    await r.initialize({
+      ...defaultConfig,
+      contextNamespace: { scope: 'personal', projectId: 'repo-1' },
+      contextLocalProcessedFreshness: 'fresh',
+    });
+    r.setContextBootstrapResolver(() => new Promise(() => {}));
+    timelineEmitterEmitMock.mockClear();
+
+    r.send('/status', 'client-bootstrap-hang');
+    await sleep(80);
+    await flushDispatch();
+
+    expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      userMessage: '/status',
+      authority: expect.objectContaining({
+        namespace: { scope: 'personal', projectId: 'repo-1' },
+      }),
+    }));
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+      'deck_test_brain',
+      'memory.context',
+      expect.objectContaining({
+        relatedToEventId: 'transport-user:client-bootstrap-hang',
+        status: 'skipped_control_message',
+      }),
+      expect.anything(),
+    );
+  });
+
+  it('bounds semantic memory recall so a hung embedding/search path still sends the turn', async () => {
+    vi.stubEnv('IMCODES_TRANSPORT_CONTEXT_BUDGET_MS', '50');
+    searchLocalMemorySemanticMock.mockReturnValue(new Promise(() => {}));
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
+    await r.initialize({
+      ...defaultConfig,
+      contextNamespace: { scope: 'personal', projectId: 'repo-1' },
+      contextLocalProcessedFreshness: 'fresh',
+    });
+    timelineEmitterEmitMock.mockClear();
+
+    r.send('Please recall recent transport memory around recall timeout handling', 'client-recall-hang');
+    await sleep(80);
+    await flushDispatch();
+
+    expect(searchLocalMemorySemanticMock).toHaveBeenCalled();
+    expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.not.objectContaining({
+      memoryRecall: expect.anything(),
+    }));
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+      'deck_test_brain',
+      'memory.context',
+      expect.objectContaining({
+        relatedToEventId: 'transport-user:client-recall-hang',
+        status: 'failed',
+        items: [],
+      }),
+      expect.anything(),
+    );
+  });
+
+  it('clears sending and marks the runtime errored when provider send-start never settles', async () => {
+    vi.stubEnv('IMCODES_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS', '50');
+    const localMock = makeMockProvider();
+    (localMock.provider.send as ReturnType<typeof vi.fn>).mockReturnValue(new Promise(() => {}));
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
+    await r.initialize({
+      ...defaultConfig,
+      contextNamespace: { scope: 'personal', projectId: 'repo-1' },
+      contextLocalProcessedFreshness: 'fresh',
+    });
+
+    r.send('/status', 'client-provider-hang');
+    await sleep(80);
+    await flushDispatch();
+
+    expect(localMock.provider.send).toHaveBeenCalledTimes(1);
+    expect(r.getStatus()).toBe('error');
+    expect(r.sending).toBe(false);
+    expect(r.activeDispatchEntries).toEqual([
+      { clientMessageId: 'client-provider-hang', text: '/status' },
+    ]);
   });
 
   it('emits a template-prompt skip status before transport recall lookup', async () => {

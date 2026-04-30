@@ -1240,7 +1240,8 @@
       "memoryDeleteConfirm": "이 기억을 완전히 삭제할까요? 이 작업은 되돌릴 수 없습니다.",
       "memoryDeleteFailed": "기억을 삭제하지 못했습니다",
       "memoryArchived": "보관됨",
-      "memoryShowArchived": "보관된 항목 표시"
+      "memoryShowArchived": "보관된 항목 표시",
+      "memoryMasterSummary": "마스터 요약"
     },
     "diagnostics": {
       "title": "Diagnostics",

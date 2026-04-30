@@ -1241,7 +1241,8 @@
       "memoryDeleteConfirm": "确定永久删除这条记忆吗？此操作不可撤销。",
       "memoryDeleteFailed": "删除记忆失败",
       "memoryArchived": "已归档",
-      "memoryShowArchived": "显示已归档"
+      "memoryShowArchived": "显示已归档",
+      "memoryMasterSummary": "主摘要"
     },
     "diagnostics": {
       "title": "诊断",
