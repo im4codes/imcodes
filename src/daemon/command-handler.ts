@@ -3656,28 +3656,24 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
     return;
   }
 
-  const activeTransportSessions = getActiveTransportSessionsBlockingDaemonUpgrade();
-  if (activeTransportSessions.length > 0) {
-    // Include per-session blocking reason — runtime.getStatus() can disagree
-    // with session.state (e.g. status='error' while session.state='idle'),
-    // and operators need to see the runtime-level reason to debug stuck
-    // upgrades. Pre-fix we only logged session.state which made the warning
-    // useless ("idle, idle" but still blocking).
-    const blockReasons = activeTransportSessions.map((session) => ({
-      name: session.name,
-      sessionState: session.state,
-      runtime: getTransportSessionUpgradeBlockReason(session.name),
-    }));
+  // Cover BOTH transport-runtime sessions (claude-code-sdk, codex-sdk,
+  // copilot-sdk, cursor-headless, openclaw, qwen) and process-runtime
+  // sessions (claude-code, codex, opencode, gemini, shell). Pre-fix this
+  // gate only checked transport runtimes, so a `claude-code` CLI in tmux
+  // mid-turn would silently get killed by self-upgrade restart, throwing
+  // away the in-flight generation.
+  const activeSessions = getActiveSessionsBlockingDaemonUpgrade();
+  if (activeSessions.length > 0) {
     logger.warn({
       targetVersion,
-      blockedSessions: blockReasons,
-    }, 'daemon.upgrade: blocked because transport sessions have active turns');
+      blockedSessions: activeSessions,
+    }, 'daemon.upgrade: blocked because sessions have active turns');
     try {
       serverLink?.send({
         type: DAEMON_MSG.UPGRADE_BLOCKED,
-        reason: 'transport_busy',
-        activeSessionNames: activeTransportSessions.map((session) => session.name),
-        blockedSessions: blockReasons,
+        reason: activeSessions.every((reason) => reason.runtimeType === 'transport') ? 'transport_busy' : 'session_busy',
+        activeSessionNames: activeSessions.map((reason) => reason.name),
+        blockedSessions: activeSessions,
       });
     } catch { /* ignore */ }
     return;
@@ -4487,11 +4483,69 @@ export function getTransportSessionUpgradeBlockReason(sessionName: string): Tran
   return null;
 }
 
+/** Process-agent session.state values that represent a genuine in-flight turn.
+ *  `'running'` is set by tmux/ConPTY drivers when the underlying CLI agent
+ *  (claude-code, codex, opencode, gemini) has emitted activity that the
+ *  driver classifies as "agent generating" — a self-upgrade restart in that
+ *  window kills the agent's child process mid-turn and discards its work. */
+const PROCESS_IN_PROGRESS_STATES: ReadonlySet<string> = new Set(['running']);
+
+/** Per-session reason a daemon upgrade is currently blocked. Covers both
+ *  transport-runtime sessions (claude-code-sdk, codex-sdk, qwen, …) and
+ *  process-runtime sessions (claude-code, codex, opencode, gemini, shell)
+ *  so the upgrade does not restart the daemon mid-turn for either kind. */
+export interface SessionUpgradeBlockReason {
+  name: string;
+  runtimeType: 'transport' | 'process';
+  sessionState: string;
+  /** Populated only for transport sessions; null for process sessions. */
+  transport: TransportUpgradeBlockReason | null;
+}
+
+export function getActiveSessionsBlockingDaemonUpgrade(sessions = listSessions()): SessionUpgradeBlockReason[] {
+  const reasons: SessionUpgradeBlockReason[] = [];
+  for (const session of sessions) {
+    if (session.runtimeType === 'transport') {
+      const transport = getTransportSessionUpgradeBlockReason(session.name);
+      if (transport) {
+        reasons.push({
+          name: session.name,
+          runtimeType: 'transport',
+          sessionState: session.state,
+          transport,
+        });
+      }
+      continue;
+    }
+    // Process agent (tmux / ConPTY CLI). The transport-runtime block reason
+    // helper is irrelevant here because there is no transport runtime to
+    // probe; the only signal we have is `session.state === 'running'`,
+    // which the driver flips when the CLI is mid-generation.
+    if (PROCESS_IN_PROGRESS_STATES.has(session.state)) {
+      reasons.push({
+        name: session.name,
+        runtimeType: 'process',
+        sessionState: session.state,
+        transport: null,
+      });
+    }
+  }
+  return reasons;
+}
+
+/**
+ * Backward-compat wrapper. Retained because external callers (tests,
+ * possibly third-party scripts) import the older transport-only helper
+ * by name. New code should use `getActiveSessionsBlockingDaemonUpgrade`,
+ * which covers both transport and process agents.
+ */
 export function getActiveTransportSessionsBlockingDaemonUpgrade(sessions = listSessions()) {
-  return sessions.filter((session) => {
-    if (session.runtimeType !== 'transport') return false;
-    return getTransportSessionUpgradeBlockReason(session.name) !== null;
-  });
+  const blockedNames = new Set(
+    getActiveSessionsBlockingDaemonUpgrade(sessions)
+      .filter((reason) => reason.runtimeType === 'transport')
+      .map((reason) => reason.name),
+  );
+  return sessions.filter((session) => blockedNames.has(session.name));
 }
 
 async function handleFileSearch(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
