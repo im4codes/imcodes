@@ -6,6 +6,12 @@ MAX_ATTEMPTS="${CI_NPM_CI_MAX_ATTEMPTS:-3}"
 
 cd "$WORKDIR"
 
+# imcodes uses CPU embeddings. onnxruntime-node's default postinstall may try to
+# download large CUDA provider archives from GitHub; transient 502s there can
+# fail otherwise unrelated CI jobs before tests even start. Keep CI installs
+# CPU-only unless a caller explicitly opts into a different setting.
+export npm_config_onnxruntime_node_install_cuda="${npm_config_onnxruntime_node_install_cuda:-skip}"
+
 attempt=1
 while true; do
   echo "npm ci attempt ${attempt}/${MAX_ATTEMPTS} in ${WORKDIR}"
