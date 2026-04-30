@@ -9,6 +9,22 @@ import { createMemoryConfigResolver, rememberMemoryConfigProjectDir } from './me
 
 const BOOTSTRAP_CACHE_MS = 30_000;
 
+export type LiveContextMaterializationAdmissionReason = 'shutdown' | 'upgrade-pending' | 'test-reset';
+
+let materializationAdmissionClosedReason: LiveContextMaterializationAdmissionReason | null = null;
+
+export function closeLiveContextMaterializationAdmission(reason: LiveContextMaterializationAdmissionReason): void {
+  materializationAdmissionClosedReason = reason;
+}
+
+export function reopenLiveContextMaterializationAdmission(): void {
+  materializationAdmissionClosedReason = null;
+}
+
+export function isLiveContextMaterializationAdmissionOpen(): boolean {
+  return materializationAdmissionClosedReason === null;
+}
+
 export interface LiveContextIngestionOptions extends MaterializationCoordinatorOptions {
   sessionLookup: (sessionName: string) => SessionRecord | undefined;
   resolveBootstrap: (record: SessionRecord) => Promise<TransportContextBootstrap>;
@@ -60,6 +76,7 @@ export class LiveContextIngestion {
   }
 
   async flushDueTargets(now = Date.now()): Promise<void> {
+    if (!isLiveContextMaterializationAdmissionOpen()) return;
     for (const job of this.coordinator.scheduleDueTargets(now)) {
       await this.coordinator.materializeTarget(job.target, job.trigger, now);
     }
@@ -89,7 +106,7 @@ export class LiveContextIngestion {
       });
     }
     if (staged > 0) {
-      if (this.coordinator.canMaterializeTarget(target, lastTs)) {
+      if (isLiveContextMaterializationAdmissionOpen() && this.coordinator.canMaterializeTarget(target, lastTs)) {
         await this.coordinator.materializeTarget(target, 'recovery', lastTs);
       }
     }
@@ -103,7 +120,10 @@ export class LiveContextIngestion {
 
     if (event.type === 'session.state') {
       const state = typeof event.payload.state === 'string' ? event.payload.state : '';
-      if (state === 'idle' && this.hasDirtyTarget(target) && this.coordinator.canMaterializeTarget(target, event.ts)) {
+      if (state === 'idle'
+        && isLiveContextMaterializationAdmissionOpen()
+        && this.hasDirtyTarget(target)
+        && this.coordinator.canMaterializeTarget(target, event.ts)) {
         await this.coordinator.materializeTarget(target, 'idle', event.ts);
       }
       return;
@@ -118,7 +138,9 @@ export class LiveContextIngestion {
       metadata: mapped.metadata,
       createdAt: event.ts,
     });
-    if (result.trigger === 'threshold' && this.coordinator.canMaterializeTarget(target, event.ts)) {
+    if (result.trigger === 'threshold'
+      && isLiveContextMaterializationAdmissionOpen()
+      && this.coordinator.canMaterializeTarget(target, event.ts)) {
       await this.coordinator.materializeTarget(target, 'threshold', event.ts);
     }
   }

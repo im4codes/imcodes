@@ -216,6 +216,18 @@ describe('handleWebCommand shutdown failure paths', () => {
       type: 'daemon.upgrade_blocked',
       reason: 'transport_busy',
       activeSessionNames: ['deck_proj_brain'],
+      blockedSessions: [
+        {
+          name: 'deck_proj_brain',
+          sessionState: 'running',
+          runtime: {
+            status: 'thinking',
+            sending: true,
+            pendingCount: 0,
+            blockReason: 'status_thinking',
+          },
+        },
+      ],
     });
   });
 

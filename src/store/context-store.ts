@@ -452,49 +452,68 @@ function isFtsAvailable(database: DatabaseSyncInstance): boolean {
   }
 }
 
+
+function disableArchiveFts(database: DatabaseSyncInstance, source: string, reason: string, error?: unknown): void {
+  for (const ddl of [
+    'DROP TRIGGER IF EXISTS context_event_archive_ai',
+    'DROP TRIGGER IF EXISTS context_event_archive_ad',
+    'DROP TRIGGER IF EXISTS context_event_archive_au',
+    'DROP TABLE IF EXISTS context_event_archive_fts',
+  ]) {
+    try { database.exec(ddl); } catch { /* best-effort cleanup */ }
+  }
+  internalSetContextMeta(database, 'fts_tokenizer', 'unavailable');
+  incrementCounter('mem.archive_fts.unavailable', { source });
+  warnOncePerHour('mem.archive_fts.unavailable', {
+    reason,
+    ...(error ? { error: error instanceof Error ? error.message : String(error) } : {}),
+  });
+}
+
 function setupArchiveFts(database: DatabaseSyncInstance): void {
   if (!isFtsAvailable(database)) {
-    internalSetContextMeta(database, 'fts_tokenizer', 'unavailable');
-    incrementCounter('mem.archive_fts.unavailable', { source: 'setupArchiveFts' });
-    warnOncePerHour('mem.archive_fts.unavailable', {
-      reason: 'host SQLite build lacks FTS5; chat_search_fts will use LIKE fallback',
-    });
+    disableArchiveFts(database, 'setupArchiveFts', 'host SQLite build lacks FTS5; chat_search_fts will use LIKE fallback');
     return;
   }
   const tokenizer = chooseFtsTokenizer(database);
   const tokenizerSql = tokenizer === 'trigram' ? "tokenize='trigram'" : "tokenize='unicode61 remove_diacritics 2'";
   try {
     database.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS context_event_archive_fts USING fts5(content, content='context_event_archive', content_rowid='rowid', ${tokenizerSql})`);
-  } catch {
+  } catch (error) {
     try {
       database.exec("CREATE VIRTUAL TABLE IF NOT EXISTS context_event_archive_fts USING fts5(content, content='context_event_archive', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2')");
       internalSetContextMeta(database, 'fts_tokenizer', 'unicode61');
-    } catch {
+    } catch (fallbackError) {
       // Even the simpler tokenizer failed — treat as unavailable. (The
       // probe should have caught this; this catch is defense-in-depth.)
-      internalSetContextMeta(database, 'fts_tokenizer', 'unavailable');
-      incrementCounter('mem.archive_fts.unavailable', { source: 'setupArchiveFts.fallback' });
-      warnOncePerHour('mem.archive_fts.unavailable', {
-        reason: 'FTS5 probe passed but virtual table creation failed',
-      });
+      disableArchiveFts(database, 'setupArchiveFts.fallback', 'FTS5 probe passed but virtual table creation failed', fallbackError ?? error);
       return;
     }
   }
-  database.exec(`
-    CREATE TRIGGER IF NOT EXISTS context_event_archive_ai AFTER INSERT ON context_event_archive BEGIN
-      INSERT INTO context_event_archive_fts(rowid, content) VALUES (new.rowid, new.content);
-    END;
-    CREATE TRIGGER IF NOT EXISTS context_event_archive_ad AFTER DELETE ON context_event_archive BEGIN
-      INSERT INTO context_event_archive_fts(context_event_archive_fts, rowid, content) VALUES('delete', old.rowid, old.content);
-    END;
-    CREATE TRIGGER IF NOT EXISTS context_event_archive_au AFTER UPDATE ON context_event_archive BEGIN
-      INSERT INTO context_event_archive_fts(context_event_archive_fts, rowid, content) VALUES('delete', old.rowid, old.content);
-      INSERT INTO context_event_archive_fts(rowid, content) VALUES (new.rowid, new.content);
-    END;
-  `);
+  try {
+    database.exec(`
+      CREATE TRIGGER IF NOT EXISTS context_event_archive_ai AFTER INSERT ON context_event_archive BEGIN
+        INSERT INTO context_event_archive_fts(rowid, content) VALUES (new.rowid, new.content);
+      END;
+      CREATE TRIGGER IF NOT EXISTS context_event_archive_ad AFTER DELETE ON context_event_archive BEGIN
+        INSERT INTO context_event_archive_fts(context_event_archive_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+      END;
+      CREATE TRIGGER IF NOT EXISTS context_event_archive_au AFTER UPDATE ON context_event_archive BEGIN
+        INSERT INTO context_event_archive_fts(context_event_archive_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+        INSERT INTO context_event_archive_fts(rowid, content) VALUES (new.rowid, new.content);
+      END;
+    `);
+  } catch (error) {
+    disableArchiveFts(database, 'setupArchiveFts.triggers', 'FTS5 trigger creation failed; using LIKE fallback', error);
+    return;
+  }
   if (internalGetContextMeta(database, 'fts_backfilled') !== '1') {
-    database.exec("INSERT INTO context_event_archive_fts(context_event_archive_fts) VALUES('rebuild')");
-    internalSetContextMeta(database, 'fts_backfilled', '1');
+    try {
+      database.exec("INSERT INTO context_event_archive_fts(context_event_archive_fts) VALUES('rebuild')");
+      internalSetContextMeta(database, 'fts_backfilled', '1');
+    } catch (error) {
+      disableArchiveFts(database, 'setupArchiveFts.rebuild', 'FTS5 rebuild failed; cleaned up partial FTS objects and will use LIKE fallback', error);
+    }
   }
 }
 
@@ -881,7 +900,7 @@ export function searchArchiveFts(query: string, limit = 20, filters: ArchiveSear
   const fetchLimit = filters.userId && !namespaceKey ? Math.min(1000, safeLimit * 10) : safeLimit;
   let rows: Array<Record<string, unknown>> = [];
   // Fast path: skip the FTS attempt entirely when setupArchiveFts recorded
-  // FTS5 as unavailable on this host. Falling straight through to LIKE
+  // FTS5 as unavailable on this host. Falling straight through to literal substring search
   // avoids spamming `mem.archive_fts.match_failure` on every search call.
   const ftsTokenizer = internalGetContextMeta(database, 'fts_tokenizer');
   const ftsAvailable = ftsTokenizer !== 'unavailable';
@@ -904,7 +923,7 @@ export function searchArchiveFts(query: string, limit = 20, filters: ArchiveSear
   }
   let results = rowsToArchiveSearchResults(rows, filters, safeLimit);
   // FTS5 trigram does not match short two-codepoint CJK queries reliably.
-  // Keep FTS as the primary index path, then fall back to bounded LIKE so
+  // Keep FTS as the primary index path, then fall back to bounded literal substring search so
   // read-side tools still return honest CJK hits on all SQLite builds. This
   // path also safely contains malformed FTS5 syntax (for example unmatched quotes).
   if (results.length === 0) {
@@ -912,11 +931,11 @@ export function searchArchiveFts(query: string, limit = 20, filters: ArchiveSear
     rows = database.prepare(`
       SELECT id, target_key, event_type, content, created_at
       FROM context_event_archive
-      WHERE content LIKE ?
+      WHERE instr(content, ?) > 0
         ${likeNamespacePredicate}
       ORDER BY created_at DESC
       LIMIT ?
-    `).all(...(namespaceKey ? [`%${trimmed}%`, namespaceKey, fetchLimit] : [`%${trimmed}%`, fetchLimit])) as Array<Record<string, unknown>>;
+    `).all(...(namespaceKey ? [trimmed, namespaceKey, fetchLimit] : [trimmed, fetchLimit])) as Array<Record<string, unknown>>;
     results = rowsToArchiveSearchResults(rows, filters, safeLimit);
   }
   return results;

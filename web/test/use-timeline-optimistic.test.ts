@@ -5,7 +5,7 @@
  *   addOptimisticUserMessage → spinner
  *   command.ack error         → red "!" (markOptimisticFailed)
  *   echoed user.message       → cleanup (matches by commandId first, text second)
- *   optimistic timeout (60s)  → auto-fail
+ *   optimistic timeout (90s)  → auto-fail
  *   removeOptimisticMessage   → explicit cleanup (retry path)
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -565,6 +565,36 @@ describe('useTimeline optimistic send flow', () => {
     expect(ref.current!.events).toHaveLength(1);
     expect(ref.current!.events[0].eventId).toBe('real-timeout-recovered');
     expect(ref.current!.events[0].payload.failed).toBeFalsy();
+  });
+
+  it('marks ack_timeout as failed after a short HTTP backfill grace when no echo arrives', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_timeout_grace_miss' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('never confirmed', 'cmd-timeout-grace-miss');
+    });
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'command.failed',
+        commandId: 'cmd-timeout-grace-miss',
+        session: 'deck_opt_timeout_grace_miss',
+        reason: 'ack_timeout',
+        retryable: true,
+      } as unknown as ServerMessage);
+    });
+
+    expect(ref.current!.events[0].payload.pending).toBe(true);
+    act(() => {
+      vi.advanceTimersByTime(1_600);
+    });
+
+    expect(ref.current!.events[0].payload.pending).toBe(false);
+    expect(ref.current!.events[0].payload.failed).toBe(true);
+    expect(ref.current!.events[0].payload.failureReason).toEqual(expect.any(String));
   });
 
   it('settles a pending send when later assistant progress proves the session is processing it', () => {

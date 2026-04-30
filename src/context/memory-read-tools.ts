@@ -141,8 +141,10 @@ export function memoryGetSources(projectionId: string, caller: MemoryToolCaller)
   const projection = getProcessedProjectionById(projectionId);
   if (!projection) return { projectionId, sourceEventCount: 0, sources: [] };
   if (!canAccessNamespace(projection.namespace, checkedCaller)) {
-    const sourceEventCount = projection.sourceEventIds.length;
-    return { projectionId, sourceEventCount, note: 'sources are private to the originating user' };
+    // Fail closed and keep the response isomorphic with a missing projection.
+    // Returning source counts here leaked whether another namespace had a
+    // projection for a guessed id and how many raw events backed it.
+    return { projectionId, sourceEventCount: 0, sources: [] };
   }
   const sources = listProjectionSources(projectionId).map((source) => {
     const event = canReturnEvent(source.event, checkedCaller) ? source.event : undefined;

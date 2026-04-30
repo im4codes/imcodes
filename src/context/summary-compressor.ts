@@ -26,6 +26,8 @@ import { countTokens } from './tokenizer.js';
 import { compressToolEvent } from './tool-compressors.js';
 import { redactSensitiveText } from '../util/redact-secrets.js';
 import { ensurePinnedNotesSection, redactSummaryPreservingPinned } from '../util/redact-with-pinned-region.js';
+import { incrementCounter } from '../util/metrics.js';
+import { warnOncePerHour } from '../util/rate-limited-warn.js';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -49,6 +51,18 @@ export interface CompressionResult {
   backend: string;
   usedBackup: boolean;
   fromSdk: boolean;
+}
+
+export type CompressionAdmissionReason = 'shutdown' | 'upgrade-pending' | 'test-reset';
+
+export class CompressionAdmissionClosedError extends Error {
+  readonly reason: CompressionAdmissionReason;
+
+  constructor(reason: CompressionAdmissionReason) {
+    super(`Compression admission is closed: ${reason}`);
+    this.name = 'CompressionAdmissionClosedError';
+    this.reason = reason;
+  }
 }
 
 // ── Circuit breaker — per-backend state machine ──────────────────────────────
@@ -141,14 +155,39 @@ const RETRY_BASE_DELAY_MS = 1000;
 const RETRY_MAX_DELAY_MS = 8000;
 
 /** Classify error as retryable (transient) or permanent. */
-function isRetryableError(err: unknown): boolean {
+interface CompressionErrorClassification {
+  retryable: boolean;
+  code: 'auth' | 'model' | 'session' | 'quota' | 'timeout' | 'empty_response' | 'transient';
+}
+
+function classifyCompressionError(err: unknown): CompressionErrorClassification {
   const msg = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
-  // Permanent errors — don't retry
-  if (msg.includes('invalid api key') || msg.includes('401') || msg.includes('unauthorized')) return false;
-  if (msg.includes('model not found') || msg.includes('not supported')) return false;
-  if (msg.includes('invalid session')) return false;
-  // Everything else (network, timeout, 5xx, empty response) is retryable
-  return true;
+  // Permanent errors — don't retry. Retrying these used to hold the global
+  // compression lane for minutes and made daemon upgrades look stuck.
+  if (msg.includes('invalid api key') || msg.includes('401') || msg.includes('unauthorized')) return { retryable: false, code: 'auth' };
+  if (msg.includes('model not found') || msg.includes('not supported')) return { retryable: false, code: 'model' };
+  if (msg.includes('invalid session')) return { retryable: false, code: 'session' };
+  if (
+    msg.includes('quota')
+    || msg.includes('rate limit')
+    || msg.includes('ratelimit')
+    || msg.includes('429')
+    || msg.includes('usage limit')
+    || msg.includes('insufficient_quota')
+    || msg.includes('billing')
+    || msg.includes('credit')
+  ) {
+    return { retryable: false, code: 'quota' };
+  }
+  if (msg.includes('timed out') || msg.includes('timeout')) return { retryable: true, code: 'timeout' };
+  if (msg.includes('empty response')) return { retryable: true, code: 'empty_response' };
+  // Everything else (network, 5xx, transient provider failure) is retryable.
+  return { retryable: true, code: 'transient' };
+}
+
+/** Classify error as retryable (transient) or permanent. */
+function isRetryableError(err: unknown): boolean {
+  return classifyCompressionError(err).retryable;
 }
 
 async function sleep(ms: number): Promise<void> {
@@ -199,6 +238,7 @@ export const __testing__ = {
   canCall,
   recordSuccess,
   recordFailure,
+  classifyCompressionError,
 };
 
 // ── Compression provider (shared with the global registry singleton) ─────────
@@ -334,15 +374,73 @@ export async function localOnlyCompressor(input: CompressionInput): Promise<Comp
 // fire-and-forget from their perspective — they just observe natural
 // backpressure when the queue is busy.
 let compressionChain: Promise<void> = Promise.resolve();
+let activeCompressionCount = 0;
+let queuedCompressionCount = 0;
+let acceptingCompression = true;
+let compressionAdmissionClosedReason: CompressionAdmissionReason | null = null;
+
+export interface CompressionQueueState {
+  active: boolean;
+  activeCount: number;
+  queued: number;
+  idle: boolean;
+}
+
+export function getCompressionQueueState(): CompressionQueueState {
+  return {
+    active: activeCompressionCount > 0,
+    activeCount: activeCompressionCount,
+    queued: queuedCompressionCount,
+    idle: activeCompressionCount === 0 && queuedCompressionCount === 0,
+  };
+}
+
+export function stopAcceptingCompression(reason: CompressionAdmissionReason = 'shutdown'): void {
+  acceptingCompression = false;
+  compressionAdmissionClosedReason = reason;
+  logger.debug({ reason, state: getCompressionQueueState() }, 'compression admission closed');
+}
+
+export function resumeAcceptingCompression(): void {
+  acceptingCompression = true;
+  compressionAdmissionClosedReason = null;
+  logger.debug('compression admission opened');
+}
+
+export function isAcceptingCompression(): boolean {
+  return acceptingCompression;
+}
+
+export async function awaitCompressionIdle(timeoutMs: number): Promise<{ idle: boolean; state: CompressionQueueState }> {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  while (true) {
+    const state = getCompressionQueueState();
+    if (state.idle) return { idle: true, state };
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return { idle: false, state };
+    const observedChain = compressionChain;
+    await Promise.race([
+      observedChain.then(() => undefined, () => undefined),
+      sleep(Math.min(remaining, 100)),
+    ]);
+  }
+}
 
 function enqueueExclusive<T>(job: () => Promise<T>): Promise<T> {
   const prev = compressionChain;
   let release!: () => void;
+  queuedCompressionCount += 1;
   compressionChain = new Promise<void>((r) => { release = r; });
-  return prev.catch(() => {}).then(async () => {
+  return prev.catch((err) => {
+    incrementCounter('mem.compression.queue_prior_failure', { source: 'enqueueExclusive' });
+    warnOncePerHour('mem.compression.queue_prior_failure', { error: err instanceof Error ? err.message : String(err) });
+  }).then(async () => {
+    queuedCompressionCount = Math.max(0, queuedCompressionCount - 1);
+    activeCompressionCount += 1;
     try {
       return await job();
     } finally {
+      activeCompressionCount = Math.max(0, activeCompressionCount - 1);
       release();
     }
   });
@@ -351,6 +449,11 @@ function enqueueExclusive<T>(job: () => Promise<T>): Promise<T> {
 // ── Main entry point ─────────────────────────────────────────────────────────
 
 export async function compressWithSdk(input: CompressionInput): Promise<CompressionResult> {
+  if (!acceptingCompression) {
+    const reason = compressionAdmissionClosedReason ?? 'shutdown';
+    incrementCounter('mem.compression.admission_closed', { reason });
+    throw new CompressionAdmissionClosedError(reason);
+  }
   return enqueueExclusive(() => compressWithSdkInner(input));
 }
 
@@ -537,19 +640,29 @@ async function sendToProvider(selection: CompressionBackendSelection, prompt: st
  */
 async function sendViaSdkQuery(prompt: string): Promise<string> {
   const { query } = await import('@anthropic-ai/claude-agent-sdk');
+  const abortController = new AbortController();
+  let timedOut = false;
+  let stream: (AsyncIterable<unknown> & { close?: () => void }) | undefined;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    abortController.abort();
+    try { stream?.close?.(); } catch { /* best-effort SDK cleanup */ }
+  }, COMPRESSION_TIMEOUT_MS);
   const savedClaudeCode = process.env.CLAUDECODE;
   delete process.env.CLAUDECODE;
   try {
     let result = '';
     const pathToClaudeCodeExecutable = resolveClaudeCodePathForSdk();
-    for await (const msg of query({
+    stream = query({
       prompt: COMPRESSOR_SYSTEM_PROMPT + '\n\n' + prompt,
       options: {
         maxTurns: 1,
         pathToClaudeCodeExecutable,
+        abortController,
       },
-    })) {
-      if (msg.type === 'assistant') {
+    }) as AsyncIterable<unknown> & { close?: () => void };
+    for await (const msg of stream) {
+      if (typeof msg === 'object' && msg && 'type' in msg && msg.type === 'assistant') {
         const content = (msg as { message?: { content?: unknown } }).message?.content;
         if (Array.isArray(content)) {
           for (const block of content) {
@@ -562,9 +675,17 @@ async function sendViaSdkQuery(prompt: string): Promise<string> {
         }
       }
     }
+    if (timedOut) throw new Error(`Compression timed out after ${COMPRESSION_TIMEOUT_MS}ms`);
     if (!result.trim()) throw new Error('SDK returned empty response');
     return result.trim();
+  } catch (err) {
+    if (timedOut || abortController.signal.aborted) {
+      throw new Error(`Compression timed out after ${COMPRESSION_TIMEOUT_MS}ms`);
+    }
+    throw err;
   } finally {
+    clearTimeout(timer);
+    try { stream?.close?.(); } catch { /* best-effort SDK cleanup */ }
     if (savedClaudeCode !== undefined) process.env.CLAUDECODE = savedClaudeCode;
   }
 }

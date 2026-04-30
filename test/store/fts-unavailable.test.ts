@@ -92,6 +92,29 @@ describe('FTS5 unavailable host (regression: Node 23.11.0 SQLite without FTS5)',
     expect(getCounter('mem.archive_fts.match_failure', { source: 'searchArchiveFts' })).toBe(0);
   });
 
+
+
+  it('fallback search treats percent and underscore as literal query characters', () => {
+    setContextMeta('fts_tokenizer', 'unavailable');
+    const literal = recordContextEvent({
+      id: 'evt-like-literal',
+      target,
+      eventType: 'assistant.text',
+      content: 'literal wildcard tokens 100%_done are searchable',
+      createdAt: 100,
+    });
+    const broad = recordContextEvent({
+      id: 'evt-like-broad',
+      target,
+      eventType: 'assistant.text',
+      content: 'this row should not match a literal percent underscore query',
+      createdAt: 101,
+    });
+    archiveEventsForMaterialization([literal, broad], 200);
+
+    expect(searchArchiveFts('100%_done', 10, { namespace, userId: namespace.userId }).map((r) => r.id)).toEqual(['evt-like-literal']);
+  });
+
   it('blank query still returns [] under the unavailable sentinel', () => {
     setContextMeta('fts_tokenizer', 'unavailable');
     expect(searchArchiveFts('   ', 10, { namespace, userId: namespace.userId })).toEqual([]);

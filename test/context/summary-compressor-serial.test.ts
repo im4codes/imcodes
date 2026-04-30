@@ -72,8 +72,10 @@ function makeQueryMock(opts: {
 }
 
 describe('summary-compressor — concurrent compressWithSdk calls serialize', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     queryMock.mockReset();
+    const { resumeAcceptingCompression } = await import('../../src/context/summary-compressor.js');
+    resumeAcceptingCompression();
   });
 
   it('never runs two SDK query() calls concurrently, even with 3 callers firing at the same tick', async () => {
@@ -159,6 +161,7 @@ describe('summary-compressor — concurrent compressWithSdk calls serialize', ()
     );
   });
 
+
   it('passes a resolved Claude path into direct SDK compression on Windows', async () => {
     const origPlatform = process.platform;
     const origPath = process.env.PATH;
@@ -182,6 +185,7 @@ describe('summary-compressor — concurrent compressWithSdk calls serialize', ()
     process.env.PATHEXT = '.com;.exe;.bat;.cmd';
 
     queryMock.mockImplementation(async function* (arg: { options?: Record<string, unknown> }) {
+      expect(arg.options?.abortController).toBeInstanceOf(AbortController);
       expect(String(arg.options?.pathToClaudeCodeExecutable ?? '').replace(/\\/g, '/'))
         .toContain('node_modules/@anthropic-ai/claude-code/bin/claude.js');
       yield {
@@ -204,5 +208,61 @@ describe('summary-compressor — concurrent compressWithSdk calls serialize', ()
       if (origPathExt === undefined) delete process.env.PATHEXT; else process.env.PATHEXT = origPathExt;
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
+  });
+
+  it('rejects new compression work after admission is closed without entering the queue', async () => {
+    const {
+      compressWithSdk,
+      getCompressionQueueState,
+      stopAcceptingCompression,
+      CompressionAdmissionClosedError,
+    } = await import('../../src/context/summary-compressor.js');
+    stopAcceptingCompression('shutdown');
+
+    await expect(compressWithSdk(makeInput('closed'))).rejects.toBeInstanceOf(CompressionAdmissionClosedError);
+    expect(queryMock).not.toHaveBeenCalled();
+    expect(getCompressionQueueState()).toMatchObject({ activeCount: 0, queued: 0, idle: true });
+  });
+
+  it('awaitCompressionIdle reports the fresh queue state instead of a stale chain tail', async () => {
+    let releaseFirst!: () => void;
+    let releaseSecond!: () => void;
+    let firstStarted!: () => void;
+    let secondStarted!: () => void;
+    const firstStartedPromise = new Promise<void>((resolve) => { firstStarted = resolve; });
+    const secondStartedPromise = new Promise<void>((resolve) => { secondStarted = resolve; });
+    let call = 0;
+    queryMock.mockImplementation(async function* () {
+      call += 1;
+      const current = call;
+      if (current === 1) {
+        firstStarted();
+        await new Promise<void>((resolve) => { releaseFirst = resolve; });
+      } else {
+        secondStarted();
+        await new Promise<void>((resolve) => { releaseSecond = resolve; });
+      }
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: `SUMMARY ${current}` }] } };
+    });
+
+    const { awaitCompressionIdle, compressWithSdk } = await import('../../src/context/summary-compressor.js');
+    const first = compressWithSdk(makeInput('first'));
+    await firstStartedPromise;
+    const wait = awaitCompressionIdle(100);
+    const second = compressWithSdk(makeInput('second'));
+    releaseFirst();
+    await secondStartedPromise;
+
+    await expect(wait).resolves.toMatchObject({
+      idle: false,
+      state: expect.objectContaining({ idle: false }),
+    });
+
+    releaseSecond();
+    await Promise.all([first, second]);
+    await expect(awaitCompressionIdle(100)).resolves.toMatchObject({
+      idle: true,
+      state: expect.objectContaining({ idle: true }),
+    });
   });
 });

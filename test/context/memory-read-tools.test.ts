@@ -93,7 +93,7 @@ describe('memory read tools', () => {
     expect(sources.partial).toBe(false);
   });
 
-  it('uses direct projection lookup for cross-namespace source counts beyond recency caps', () => {
+  it('does not leak cross-namespace projection source counts beyond recency caps', () => {
     const projection = writeProcessedProjection({
       namespace: bobRepo,
       class: 'recent_summary',
@@ -116,8 +116,13 @@ describe('memory read tools', () => {
     const response = memoryGetSources(projection.id, { userId: 'bob', namespace: bobOtherRepo });
     expect(response).toEqual({
       projectionId: projection.id,
-      sourceEventCount: 3,
-      note: 'sources are private to the originating user',
+      sourceEventCount: 0,
+      sources: [],
+    });
+    const missing = memoryGetSources('missing-projection-id', { userId: 'bob', namespace: bobOtherRepo });
+    expect({ sourceEventCount: response.sourceEventCount, sources: response.sources }).toEqual({
+      sourceEventCount: missing.sourceEventCount,
+      sources: missing.sources,
     });
   });
 

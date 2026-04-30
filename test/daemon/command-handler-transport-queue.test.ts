@@ -1,7 +1,10 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID } from '../../shared/ack-protocol.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
+import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
+import type { TransportProvider } from '../../src/agent/transport-provider.js';
+import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 
 const {
   getSessionMock,
@@ -20,6 +23,9 @@ const {
   applySnapshotUpdateMock,
   updateQueuedTaskIntentMock,
   removeQueuedTaskIntentMock,
+  getQwenRuntimeConfigMock,
+  searchLocalMemoryMock,
+  searchLocalMemorySemanticMock,
 } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
   upsertSessionMock: vi.fn(),
@@ -37,6 +43,9 @@ const {
   applySnapshotUpdateMock: vi.fn(),
   updateQueuedTaskIntentMock: vi.fn(),
   removeQueuedTaskIntentMock: vi.fn(),
+  getQwenRuntimeConfigMock: vi.fn().mockResolvedValue({}),
+  searchLocalMemoryMock: vi.fn(),
+  searchLocalMemorySemanticMock: vi.fn(),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -137,6 +146,15 @@ vi.mock('../../src/daemon/provider-sessions.js', () => ({
   listProviderSessions: vi.fn(() => []),
 }));
 
+vi.mock('../../src/agent/qwen-runtime-config.js', () => ({
+  getQwenRuntimeConfig: getQwenRuntimeConfigMock,
+}));
+
+vi.mock('../../src/context/memory-search.js', () => ({
+  searchLocalMemory: searchLocalMemoryMock,
+  searchLocalMemorySemantic: searchLocalMemorySemanticMock,
+}));
+
 vi.mock('../../src/util/logger.js', () => ({
   default: {
     info: vi.fn(),
@@ -173,6 +191,72 @@ vi.mock('../../src/daemon/supervision-automation.js', () => ({
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
 
 const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+function makeRuntimeProvider(sendImpl: ReturnType<typeof vi.fn>): TransportProvider {
+  let deltaCb: ((sid: string, d: MessageDelta) => void) | null = null;
+  let completeCb: ((sid: string, m: AgentMessage) => void) | null = null;
+  let errorCb: ((sid: string, e: { code: string; message: string; recoverable: boolean }) => void) | null = null;
+  return {
+    id: 'mock-sdk',
+    connectionMode: 'persistent',
+    sessionOwnership: 'provider',
+    capabilities: {
+      streaming: true,
+      toolCalling: false,
+      approval: false,
+      sessionRestore: false,
+      multiTurn: true,
+      attachments: false,
+      contextSupport: 'full-normalized-context-injection',
+    },
+    connect: vi.fn(),
+    disconnect: vi.fn(),
+    createSession: vi.fn().mockResolvedValue('sess-1'),
+    endSession: vi.fn(),
+    send: sendImpl,
+    cancel: vi.fn(),
+    onDelta: (cb: (sid: string, d: MessageDelta) => void) => {
+      deltaCb = cb;
+      return () => { deltaCb = null; };
+    },
+    onComplete: (cb: (sid: string, m: AgentMessage) => void) => {
+      completeCb = cb;
+      return () => { completeCb = null; };
+    },
+    onError: (cb: (sid: string, e: { code: string; message: string; recoverable: boolean }) => void) => {
+      errorCb = cb;
+      return () => { errorCb = null; };
+    },
+    onApprovalRequest: vi.fn(),
+    respondApproval: vi.fn().mockResolvedValue(undefined),
+    // Keep callbacks referenced so TypeScript doesn't collapse the closure in
+    // tests; this provider is only used for send-start/recall timing.
+    __testCallbacks: { deltaCb, completeCb, errorCb },
+  } as unknown as TransportProvider;
+}
+
+function emptyMemorySearchResult() {
+  return {
+    items: [],
+    stats: {
+      totalRecords: 0,
+      matchedRecords: 0,
+      recentSummaryCount: 0,
+      durableCandidateCount: 0,
+      projectCount: 0,
+      stagedEventCount: 0,
+      dirtyTargetCount: 0,
+      pendingJobCount: 0,
+    },
+  };
+}
+
+function firstInvocationOrder(matcher: (call: unknown[]) => boolean): number {
+  const index = emitMock.mock.calls.findIndex((call) => matcher(call));
+  if (index < 0) return Number.POSITIVE_INFINITY;
+  return emitMock.mock.invocationCallOrder[index] ?? Number.POSITIVE_INFINITY;
+}
 
 describe('handleWebCommand transport queue behavior', () => {
   const serverLink = {
@@ -185,6 +269,9 @@ describe('handleWebCommand transport queue behavior', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     supervisionDecideMock.mockResolvedValue({ decision: 'complete', reason: 'ok', confidence: 0.9 });
+    getQwenRuntimeConfigMock.mockResolvedValue({});
+    searchLocalMemoryMock.mockResolvedValue(emptyMemorySearchResult());
+    searchLocalMemorySemanticMock.mockResolvedValue(emptyMemorySearchResult());
     getSessionMock.mockReturnValue({
       name: 'deck_transport_brain',
       projectName: 'transport',
@@ -193,6 +280,10 @@ describe('handleWebCommand transport queue behavior', () => {
       runtimeType: 'transport',
       state: 'running',
     });
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
   });
 
   it('emits queued session.state for queued transport sends without adding a timeline row', async () => {
@@ -473,6 +564,58 @@ describe('handleWebCommand transport queue behavior', () => {
     );
   });
 
+  it('keeps /stop on the priority lane while a transport model switch holds the send lock', async () => {
+    let resolveRuntimeConfig: ((value: unknown) => void) | null = null;
+    getQwenRuntimeConfigMock.mockReturnValueOnce(new Promise((resolve) => {
+      resolveRuntimeConfig = resolve;
+    }));
+    const setAgentId = vi.fn();
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'qwen',
+      runtimeType: 'transport',
+      state: 'running',
+      qwenAvailableModels: ['qwen-plus', 'qwen-max'],
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      setAgentId,
+      cancel,
+      send: vi.fn(() => 'sent'),
+      pendingCount: 0,
+      pendingMessages: [],
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/model qwen-max',
+      commandId: 'cmd-stop-priority-model',
+    }, serverLink as any);
+    await flushAsync();
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/stop',
+      commandId: 'cmd-stop-priority',
+    }, serverLink as any);
+
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {
+      commandId: 'cmd-stop-priority',
+      status: 'accepted',
+    });
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(setAgentId).not.toHaveBeenCalled();
+
+    resolveRuntimeConfig?.({ availableModels: ['qwen-plus', 'qwen-max'] });
+    await flushAsync();
+    await flushAsync();
+  });
+
   it('emits a user.message immediately for dispatched transport sends', async () => {
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: 'route-transport',
@@ -493,6 +636,198 @@ describe('handleWebCommand transport queue behavior', () => {
       'deck_transport_brain',
       'session.state',
       expect.objectContaining({ state: 'queued' }),
+      expect.anything(),
+    );
+  });
+
+  it('emits ordinary send ack synchronously before the first async delivery boundary', async () => {
+    const transportSend = vi.fn(() => 'sent');
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send: transportSend,
+      pendingCount: 0,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'ack at daemon receipt, then deliver later',
+      commandId: 'cmd-receipt-first',
+    }, serverLink as any);
+
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {
+      commandId: 'cmd-receipt-first',
+      status: 'accepted',
+    });
+    expect(transportSend).not.toHaveBeenCalled();
+
+    await flushAsync();
+
+    expect(transportSend).toHaveBeenCalledWith('ack at daemon receipt, then deliver later', 'cmd-receipt-first');
+    const ackOrder = firstInvocationOrder((call) =>
+      call[0] === 'deck_transport_brain'
+      && call[1] === 'command.ack'
+      && (call[2] as Record<string, unknown>)?.commandId === 'cmd-receipt-first',
+    );
+    expect(ackOrder).toBeLessThan(transportSend.mock.invocationCallOrder[0]);
+  });
+
+  it('acks ordinary transport sends before waiting on a prior control command lock', async () => {
+    let resolveRuntimeConfig: ((value: unknown) => void) | null = null;
+    getQwenRuntimeConfigMock.mockReturnValueOnce(new Promise((resolve) => {
+      resolveRuntimeConfig = resolve;
+    }));
+    const transportSend = vi.fn(() => 'sent');
+    const setAgentId = vi.fn();
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'qwen',
+      runtimeType: 'transport',
+      state: 'running',
+      qwenAvailableModels: ['qwen-plus', 'qwen-max'],
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      setAgentId,
+      send: transportSend,
+      pendingCount: 0,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/model qwen-max',
+      commandId: 'cmd-model-hold',
+    }, serverLink as any);
+    await flushAsync();
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'normal while model switch is probing',
+      commandId: 'cmd-normal-during-lock',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {
+      commandId: 'cmd-normal-during-lock',
+      status: 'accepted',
+    });
+    expect(transportSend).not.toHaveBeenCalledWith('normal while model switch is probing', 'cmd-normal-during-lock');
+
+    resolveRuntimeConfig?.({
+      availableModels: ['qwen-plus', 'qwen-max'],
+    });
+    await flushAsync();
+    await flushAsync();
+    await flushAsync();
+
+    expect(setAgentId).toHaveBeenCalledWith('qwen-max');
+    expect(transportSend).toHaveBeenCalledWith('normal while model switch is probing', 'cmd-normal-during-lock');
+  });
+
+  it('acks ordinary transport sends before provider send-start settles', async () => {
+    vi.stubEnv('IMCODES_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS', '30');
+    const providerSend = vi.fn(() => new Promise(() => {}));
+    const runtime = new TransportSessionRuntime(makeRuntimeProvider(providerSend), 'deck_transport_brain');
+    await runtime.initialize({
+      sessionKey: 'deck_transport_brain',
+      contextNamespace: { scope: 'personal', projectId: 'transport' },
+      contextLocalProcessedFreshness: 'fresh',
+    });
+    getTransportRuntimeMock.mockReturnValue(runtime);
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'ordinary provider send-start should not hold ack',
+      commandId: 'cmd-provider-start-hang',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {
+      commandId: 'cmd-provider-start-hang',
+      status: 'accepted',
+    });
+    expect(providerSend).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      userMessage: 'ordinary provider send-start should not hold ack',
+    }));
+    const ackOrder = firstInvocationOrder((call) =>
+      call[0] === 'deck_transport_brain'
+      && call[1] === 'command.ack'
+      && (call[2] as Record<string, unknown>)?.commandId === 'cmd-provider-start-hang',
+    );
+    expect(ackOrder).toBeLessThan(providerSend.mock.invocationCallOrder[0]);
+  });
+
+  it('acks before bootstrap/recall finish and still sends the SDK turn without recall after failures', async () => {
+    vi.stubEnv('IMCODES_TRANSPORT_CONTEXT_BUDGET_MS', '30');
+    searchLocalMemorySemanticMock.mockRejectedValueOnce(new Error('recall failed'));
+    const providerSend = vi.fn().mockResolvedValue(undefined);
+    const runtime = new TransportSessionRuntime(makeRuntimeProvider(providerSend), 'deck_transport_brain');
+    await runtime.initialize({
+      sessionKey: 'deck_transport_brain',
+      contextNamespace: { scope: 'personal', projectId: 'transport' },
+      contextLocalProcessedFreshness: 'fresh',
+    });
+    runtime.setContextBootstrapResolver(() => new Promise(() => {}));
+    getTransportRuntimeMock.mockReturnValue(runtime);
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'ordinary recall failure should still reach sdk',
+      commandId: 'cmd-bootstrap-recall-fail',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {
+      commandId: 'cmd-bootstrap-recall-fail',
+      status: 'accepted',
+    });
+    expect(providerSend).not.toHaveBeenCalled();
+
+    await sleep(80);
+    await flushAsync();
+
+    expect(searchLocalMemorySemanticMock).toHaveBeenCalled();
+    expect(providerSend).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      userMessage: 'ordinary recall failure should still reach sdk',
+      assembledMessage: 'ordinary recall failure should still reach sdk',
+    }));
+    expect(providerSend.mock.calls[0][1]).not.toHaveProperty('memoryRecall');
+    const ackOrder = firstInvocationOrder((call) =>
+      call[0] === 'deck_transport_brain'
+      && call[1] === 'command.ack'
+      && (call[2] as Record<string, unknown>)?.commandId === 'cmd-bootstrap-recall-fail',
+    );
+    expect(ackOrder).toBeLessThan(providerSend.mock.invocationCallOrder[0]);
+  });
+
+  it('forwards /compact unchanged to the transport SDK without daemon-side compaction events', async () => {
+    const transportSend = vi.fn(() => 'sent');
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send: transportSend,
+      pendingCount: 0,
+    });
+
+    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: '/compact', commandId: 'cmd-compact' }, serverLink as any);
+    await flushAsync();
+
+    expect(transportSend).toHaveBeenCalledWith('/compact', 'cmd-compact');
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'user.message',
+      { text: '/compact', allowDuplicate: true, commandId: 'cmd-compact', clientMessageId: 'cmd-compact' },
+      expect.objectContaining({ eventId: 'transport-user:cmd-compact' }),
+    );
+    expect(emitMock).not.toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'compaction.result',
+      expect.anything(),
       expect.anything(),
     );
   });
@@ -934,7 +1269,7 @@ describe('handleWebCommand transport queue behavior', () => {
     clearAllResend();
   });
 
-  it('waits for an in-flight settings restart before sending the first transport message', async () => {
+  it('acks an in-flight settings restart send before waiting to deliver the first transport message', async () => {
     let restartResolved = false;
     let resolveRestart: (() => void) | null = null;
     relaunchSessionWithSettingsMock.mockImplementation(
@@ -963,7 +1298,7 @@ describe('handleWebCommand transport queue behavior', () => {
 
     await flushAsync();
     expect(transportSend).not.toHaveBeenCalled();
-    expect(emitMock).not.toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-after-restart', status: 'accepted' });
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-after-restart', status: 'accepted' });
 
     resolveRestart?.();
     await flushAsync();
@@ -1352,6 +1687,52 @@ describe('handleWebCommand transport queue behavior', () => {
       requestId: 'approval-1',
       approved: true,
     }));
+  });
+
+  it('keeps transport approval feedback on the priority lane while a send control lock is held', async () => {
+    let resolveRuntimeConfig: ((value: unknown) => void) | null = null;
+    getQwenRuntimeConfigMock.mockReturnValueOnce(new Promise((resolve) => {
+      resolveRuntimeConfig = resolve;
+    }));
+    const setAgentId = vi.fn();
+    const respondApproval = vi.fn().mockResolvedValue(undefined);
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'qwen',
+      runtimeType: 'transport',
+      state: 'running',
+      qwenAvailableModels: ['qwen-plus', 'qwen-max'],
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      setAgentId,
+      respondApproval,
+      pendingCount: 0,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/model qwen-max',
+      commandId: 'cmd-feedback-priority-model',
+    }, serverLink as any);
+    await flushAsync();
+
+    handleWebCommand({
+      type: TRANSPORT_MSG.APPROVAL_RESPONSE,
+      sessionId: 'deck_transport_brain',
+      requestId: 'approval-priority',
+      approved: false,
+    }, serverLink as any);
+
+    expect(respondApproval).toHaveBeenCalledWith('approval-priority', false);
+    expect(setAgentId).not.toHaveBeenCalled();
+
+    resolveRuntimeConfig?.({ availableModels: ['qwen-plus', 'qwen-max'] });
+    await flushAsync();
+    await flushAsync();
   });
 
   it('switches model for copilot-sdk transport sessions via /model', async () => {

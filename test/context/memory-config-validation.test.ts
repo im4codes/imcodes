@@ -41,6 +41,24 @@ describe('memory config domain validation (P1)', () => {
     expect(getCounter('mem.config.invalid_value', { field: 'archiveRetentionDays' })).toBe(1);
   });
 
+
+
+  it('rejects decimal integer fields and falls back to defaults', async () => {
+    const dir = await tempProject();
+    dirs.push(dir);
+    await writeYaml(dir, `archiveRetentionDays: 0.5
+minEventCount: 2.5
+autoMaterializationTargetTokens: 10.5
+`);
+    const cfg = loadMemoryConfig(dir);
+    expect(cfg.archiveRetentionDays).toBe(DEFAULT_MEMORY_CONFIG.archiveRetentionDays);
+    expect(cfg.minEventCount).toBe(DEFAULT_MEMORY_CONFIG.minEventCount);
+    expect(cfg.autoMaterializationTargetTokens).toBe(DEFAULT_MEMORY_CONFIG.autoMaterializationTargetTokens);
+    expect(getCounter('mem.config.invalid_value', { field: 'archiveRetentionDays' })).toBe(1);
+    expect(getCounter('mem.config.invalid_value', { field: 'minEventCount' })).toBe(1);
+    expect(getCounter('mem.config.invalid_value', { field: 'autoMaterializationTargetTokens' })).toBe(1);
+  });
+
   it('preserves the -1 disable sentinel', async () => {
     const dir = await tempProject();
     dirs.push(dir);

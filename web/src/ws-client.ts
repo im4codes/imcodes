@@ -28,6 +28,17 @@ import type {
 
 export type MessageHandler = (msg: ServerMessage) => void;
 
+export interface TransportUpgradeBlockedSession {
+  name: string;
+  sessionState?: string;
+  runtime?: {
+    status: string;
+    sending: boolean;
+    pendingCount: number;
+    blockReason?: string;
+  } | null;
+}
+
 export type ServerMessage =
   | { type: 'terminal.diff'; diff: TerminalDiff }
   | { type: 'terminal.history'; sessionName: string; content: string }
@@ -43,7 +54,7 @@ export type ServerMessage =
   | { type: typeof DAEMON_MSG.RECONNECTED }
   | { type: typeof DAEMON_MSG.DISCONNECTED }
   | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'p2p_active'; activeRunIds?: string[] }
-  | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'transport_busy'; activeSessionNames?: string[] }
+  | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'transport_busy'; activeSessionNames?: string[]; blockedSessions?: TransportUpgradeBlockedSession[] }
   | { type: 'daemon.error'; kind: 'uncaughtException' | 'unhandledRejection' | 'warning'; message: string; stack?: string; ts: number }
   | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; project: string; role: string; agentType: string; agentVersion?: string; state: string; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; qwenModel?: string; requestedModel?: string; activeModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; copilotAvailableModels?: string[]; cursorAvailableModels?: string[]; codexAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; permissionLabel?: string; quotaLabel?: string; quotaUsageLabel?: string; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace']; contextNamespaceDiagnostics?: string[]; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextRetryExhausted?: boolean; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride; transportConfig?: Record<string, unknown> | null; transportPendingMessages?: string[]; transportPendingMessageEntries?: Array<{ clientMessageId: string; text: string }> }> }
   | { type: 'outbound'; platform: string; channelId: string; content: string }

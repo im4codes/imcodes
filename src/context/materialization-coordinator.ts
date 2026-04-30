@@ -10,7 +10,7 @@ import type {
 } from '../../shared/context-types.js';
 import { isMemoryEligibleEvent } from '../../shared/context-types.js';
 import { getContextModelConfig } from './context-model-config.js';
-import { compressWithSdk, computeTargetTokens, type CompressionResult } from './summary-compressor.js';
+import { CompressionAdmissionClosedError, compressWithSdk, computeTargetTokens, type CompressionResult } from './summary-compressor.js';
 import { isMemoryNoiseSummary, isMemoryNoiseTurn } from '../../shared/memory-noise-patterns.js';
 import {
   archiveEventsForMaterialization,
@@ -64,6 +64,8 @@ export interface MaterializationCoordinatorOptions {
   memoryConfigResolver?: MemoryConfigResolver;
   /** Override the SDK compressor (for testing or environments without SDK access). */
   compressor?: (input: import('./summary-compressor.js').CompressionInput) => Promise<import('./summary-compressor.js').CompressionResult>;
+  /** Override archive writes for failure-injection tests. */
+  archiveEventsForMaterialization?: typeof archiveEventsForMaterialization;
 }
 
 export interface MaterializationResult {
@@ -101,9 +103,11 @@ export class MaterializationCoordinator {
   private readonly resolveMemoryConfig: MemoryConfigResolver;
   private readonly thresholdOverrides: Partial<MaterializationThresholds>;
   private readonly _compressor: MaterializationCoordinatorOptions['compressor'];
+  private readonly _archiveEventsForMaterialization: typeof archiveEventsForMaterialization;
 
   constructor(options?: MaterializationCoordinatorOptions) {
     this._compressor = options?.compressor;
+    this._archiveEventsForMaterialization = options?.archiveEventsForMaterialization ?? archiveEventsForMaterialization;
     this.resolveMemoryConfig = options?.memoryConfigResolver ?? createMemoryConfigResolver({
       fixedConfig: options?.memoryConfig,
       fallbackCwd: options?.memoryConfigCwd,
@@ -167,7 +171,7 @@ export class MaterializationCoordinator {
     const hasUsableAssistantTurn = events.some((event) => event.eventType === 'assistant.text' || event.eventType === 'assistant.turn');
 
     if (hadNoiseAssistantTurn && !hasUsableAssistantTurn) {
-      archiveEventsForMaterialization(allEvents, now);
+      this._archiveEventsForMaterialization(allEvents, now);
       deleteStagedEventsByIds(sourceEventIds);
       updateContextJob(job.id, 'completed', { now });
       clearDirtyTarget(target);
@@ -205,7 +209,16 @@ export class MaterializationCoordinator {
         extraRedactPatterns: memoryConfig.extraRedactPatterns,
         pinnedNotes,
       });
-    } catch {
+    } catch (error) {
+      if (error instanceof CompressionAdmissionClosedError) {
+        updateContextJob(job.id, 'materialization_failed', { now,
+          error: `compression_admission_closed: ${error.reason} — kept raw events for retry`,
+        });
+        incrementCounter('mem.materialization.compression_admission_closed', { reason: error.reason });
+        return {
+          replicationQueued: false,
+        };
+      }
       // Compressor itself threw (not just a provider failure the compressor
       // swallowed into a local-fallback result). Treat as fromSdk: false and
       // let the abandonment/retry logic below decide what to do.
@@ -223,7 +236,7 @@ export class MaterializationCoordinator {
     // fallback branch below owns that case; we don't treat it as noise.
     if (compression.fromSdk && isMemoryNoiseSummary(compression.summary)) {
       deleteTentativeProjections(target.namespace, 'recent_summary');
-      archiveEventsForMaterialization(allEvents, now);
+      this._archiveEventsForMaterialization(allEvents, now);
       deleteStagedEventsByIds(sourceEventIds);
       updateContextJob(job.id, 'completed', { now });
       clearDirtyTarget(target);
@@ -271,7 +284,7 @@ export class MaterializationCoordinator {
         // don't keep re-triggering for the same data. Job status is
         // 'completed' (not 'materialization_failed') so the next fresh
         // batch starts with a clean failure counter.
-        archiveEventsForMaterialization(allEvents, now);
+        this._archiveEventsForMaterialization(allEvents, now);
         incrementCounter('mem.materialization.retry_exhausted_archived', { source: 'materializeTarget' });
         deleteStagedEventsByIds(sourceEventIds);
         updateContextJob(job.id, 'completed', { now,
@@ -302,6 +315,20 @@ export class MaterializationCoordinator {
       deleteTentativeProjections(target.namespace, 'recent_summary');
     }
 
+    try {
+      this._archiveEventsForMaterialization(allEvents, now);
+    } catch (error) {
+      updateContextJob(job.id, 'materialization_failed', { now,
+        error: `archive_failed: ${error instanceof Error ? error.message : String(error)}`,
+      });
+      incrementCounter('mem.materialization.archive_failed', { source: 'materializeTarget' });
+      warnOncePerHour('mem.materialization.archive_failed', { error: error instanceof Error ? error.message : String(error) });
+      return {
+        replicationQueued: false,
+        compression,
+      };
+    }
+
     const summaryProjection = writeProcessedProjection({
       namespace: target.namespace,
       class: 'recent_summary',
@@ -325,13 +352,19 @@ export class MaterializationCoordinator {
       createdAt: now,
       updatedAt: now,
     });
-    const durableProjection = buildDurableProjection(
-      target.namespace,
-      events,
-      compression.summary,
-      sourceEventIds,
-      now,
-    );
+    let durableProjection: ProcessedContextProjection | undefined;
+    try {
+      durableProjection = buildDurableProjection(
+        target.namespace,
+        events,
+        compression.summary,
+        sourceEventIds,
+        now,
+      );
+    } catch (error) {
+      incrementCounter('mem.materialization.durable_projection_failed', { source: 'materializeTarget' });
+      warnOncePerHour('mem.materialization.durable_projection_failed', { error: error instanceof Error ? error.message : String(error) });
+    }
 
     const replicationState = getReplicationState(target.namespace);
     const pendingProjectionIds = [
@@ -344,7 +377,6 @@ export class MaterializationCoordinator {
       lastReplicatedAt: replicationState?.lastReplicatedAt,
       lastError: replicationState?.lastError,
     });
-    archiveEventsForMaterialization(allEvents, now);
     deleteStagedEventsByIds(sourceEventIds);
     updateContextJob(job.id, 'completed', { now });
     clearDirtyTarget(target);

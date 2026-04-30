@@ -88,6 +88,9 @@ import {
   SHARED_CONTEXT_RUNTIME_CONFIG_MSG,
 } from '../../shared/shared-context-runtime-config.js';
 import { getContextModelConfig } from '../context/context-model-config.js';
+import { getCompressionQueueState, resumeAcceptingCompression, stopAcceptingCompression } from '../context/summary-compressor.js';
+import { closeLiveContextMaterializationAdmission, reopenLiveContextMaterializationAdmission } from '../context/live-context-ingestion.js';
+import { getInflightMasterCompactionCount, resumeAcceptingMasterCompactions, stopAcceptingMasterCompactions } from './master-compaction-registry.js';
 import { detectRepo } from '../repo/detector.js';
 import { GitOriginRepositoryIdentityService } from '../agent/repository-identity-service.js';
 import {
@@ -1540,8 +1543,6 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     return;
   }
 
-  await waitForPendingSessionRelaunch(sessionName);
-
   // Fallback: legacy clients that don't send commandId get a server-generated one
   const isLegacy = !commandId;
   const effectiveId = commandId ?? crypto.randomUUID();
@@ -1575,11 +1576,100 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
 
 // ── P2P routing: structured WS fields (new) or inline @@tokens (legacy) ──
   const clientP2pSessionConfig = (cmd as any).p2pSessionConfig as P2pSessionConfig | undefined;
+  let receiptAcked = false;
+  const emitAcceptedReceiptAck = (): void => {
+    if (receiptAcked) return;
+    const status = isLegacy ? 'accepted_legacy' : 'accepted';
+    emitCommandAck(sessionName, effectiveId, status, undefined, serverLink);
+    receiptAcked = true;
+  };
+  const emitTransportUserMessage = (payloadText: string, extra?: Record<string, unknown>, eventId?: string) => {
+    // Always thread the client commandId through so the web UI can reconcile
+    // its optimistic "sending" bubble deterministically. Callers that set
+    // `clientMessageId` in `extra` keep their override (legacy path).
+    const base: Record<string, unknown> = {
+      text: payloadText,
+      allowDuplicate: true,
+      commandId: effectiveId,
+    };
+    timelineEmitter.emit(
+      sessionName,
+      'user.message',
+      { ...base, ...(extra ?? {}) },
+      eventId ? { source: 'daemon', confidence: 'high', eventId } : undefined,
+    );
+  };
+  const trimmedText = text.trim();
   const wantsStructuredP2pRouting = Boolean(
     clientP2pSessionConfig ||
     (cmd as any).p2pMode ||
+    directTargetSession ||
     (Array.isArray((cmd as any).p2pAtTargets) && (cmd as any).p2pAtTargets.length > 0),
   );
+  const wantsLegacyP2pRouting = text.includes('@@discuss(')
+    || text.includes('@@all(')
+    || text.includes('@@p2p-config(');
+  const isDaemonHandledControlSend = trimmedText === '/stop'
+    || trimmedText === '/clear'
+    || /^\/model\s+\S+/.test(trimmedText)
+    || /^\/(?:thinking|effort)\s+\S+/.test(trimmedText);
+  // For ordinary user turns, command.ack is a daemon-receipt acknowledgement:
+  // once the daemon owns the commandId, the browser should stop waiting on the
+  // websocket round trip. This intentionally happens before the first async
+  // boundary in handleSend: no P2P preference reads, no pending relaunch wait,
+  // no per-session send lock, no live context bootstrap, no semantic recall, no
+  // embedding, and no provider send-start may delay it. Follow-up delivery,
+  // reconnect/restart, memory, and SDK failures surface through later timeline
+  // or session-state events. `/compact` is intentionally NOT a daemon-handled
+  // control and is acked here before being forwarded unchanged to the SDK.
+  if (!wantsStructuredP2pRouting && !wantsLegacyP2pRouting && !isDaemonHandledControlSend) {
+    emitAcceptedReceiptAck();
+  }
+
+  if (trimmedText === '/stop') {
+    const stopRuntime = getTransportRuntime(sessionName);
+    const stopRecord = getSession(sessionName);
+    const isTransportStop = !!stopRuntime
+      || stopRecord?.runtimeType === 'transport'
+      || (typeof stopRecord?.agentType === 'string' && isTransportAgent(stopRecord.agentType));
+    if (isTransportStop) {
+      emitTransportUserMessage(text);
+      // `/stop` is a priority control lane: receipt ack and queue clearing
+      // happen before any P2P config read, pending relaunch wait, transport
+      // mutex, context bootstrap, recall, or provider cancel await. The
+      // cancel itself runs in the background; failures surface as timeline
+      // state, not as a delayed command ack.
+      clearResend(sessionName);
+      emitAcceptedReceiptAck();
+      if (!stopRuntime) {
+        timelineEmitter.emit(sessionName, 'session.state', {
+          state: 'idle',
+          pendingCount: 0,
+          pendingMessages: [],
+          pendingMessageEntries: [],
+        }, { source: 'daemon', confidence: 'high' });
+        return;
+      }
+      void (async () => {
+        try {
+          supervisionAutomation.cancelSession(sessionName);
+          await stopRuntime.cancel();
+          // Mark session for fresh start so daemon restart doesn't resume the
+          // stuck conversation.
+          if (stopRecord?.agentType === 'qwen') {
+            upsertSession({ ...stopRecord, qwenFreshOnResume: true, updatedAt: Date.now() });
+          }
+        } catch (err) {
+          const errMsg = describeTransportSendError(err);
+          logger.error({ sessionName, err }, 'session.stop (transport) failed');
+          timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Stop failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
+        }
+      })();
+      return;
+    }
+  }
+
   const p2pSessionConfig = wantsStructuredP2pRouting
     ? await resolveStructuredP2pSessionConfig(sessionName, clientP2pSessionConfig)
     : undefined;
@@ -1601,11 +1691,16 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       Array.isArray(inlineAtTargets) &&
       inlineAtTargets.length > 0 &&
       inlineAtTargets.every((t) => t && typeof t.session === 'string' && t.session !== '__all__');
+    const hasDirectNamedTarget = typeof directTargetSession === 'string'
+      && directTargetSession.length > 0
+      && directTargetSession !== '__all__';
 
-    if (hasNamedAtTargets) {
-      // @ picker — explicit per-message targets. Only apply the cap.
-      if (inlineAtTargets!.length > MAX_P2P_PARTICIPANTS) {
-        logger.warn({ sessionName, count: inlineAtTargets!.length }, 'P2P start blocked: too many @ targets');
+    if (hasNamedAtTargets || hasDirectNamedTarget) {
+      // @ picker / legacy directTargetSession — explicit per-message targets.
+      // Only apply the cap; these do not need a saved dropdown config.
+      const explicitTargetCount = hasNamedAtTargets ? inlineAtTargets!.length : 1;
+      if (explicitTargetCount > MAX_P2P_PARTICIPANTS) {
+        logger.warn({ sessionName, count: explicitTargetCount }, 'P2P start blocked: too many explicit targets');
         sendP2pTargetError(
           serverLink,
           sessionName,
@@ -1863,6 +1958,8 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     return;
   }
 
+  await waitForPendingSessionRelaunch(sessionName);
+
   // Transport sessions — route directly to the provider runtime, bypassing tmux.
   const transportRuntime = getTransportRuntime(sessionName);
   const record = (await import('../store/session-store.js')).getSession(sessionName);
@@ -1874,22 +1971,6 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     && isEligibleSupervisionTaskText(text);
   const attachments: TransportAttachment[] = [];
   const transportUserEventId = (clientMessageId: string) => `transport-user:${clientMessageId}`;
-  const emitTransportUserMessage = (payloadText: string, extra?: Record<string, unknown>, eventId?: string) => {
-    // Always thread the client commandId through so the web UI can reconcile
-    // its optimistic "sending" bubble deterministically. Callers that set
-    // `clientMessageId` in `extra` keep their override (legacy path).
-    const base: Record<string, unknown> = {
-      text: payloadText,
-      allowDuplicate: true,
-      commandId: effectiveId,
-    };
-    timelineEmitter.emit(
-      sessionName,
-      'user.message',
-      { ...base, ...(extra ?? {}) },
-      eventId ? { source: 'daemon', confidence: 'high', eventId } : undefined,
-    );
-  };
   const isTransportSession = record?.runtimeType === 'transport'
     || (typeof record?.agentType === 'string' && isTransportAgent(record.agentType));
   if (!transportRuntime && isTransportSession) {
@@ -1933,9 +2014,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       },
       { source: 'daemon', confidence: 'high' },
     );
-    const status = isLegacy ? 'accepted_legacy' : 'accepted';
-    timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
-    emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status });
+    emitAcceptedReceiptAck();
     // Best-effort resume for sessions that failed to launch or whose runtime
     // vanished outside the provider reconnect path. The resend queue drains on
     // successful relaunch, so the queued user message still delivers.
@@ -1994,9 +2073,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       },
       { source: 'daemon', confidence: 'high' },
     );
-    const status = isLegacy ? 'accepted_legacy' : 'accepted';
-    timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
-    emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status });
+    emitAcceptedReceiptAck();
     // Best-effort resume. Failure is logged but doesn't change the ack —
     // the next user send will re-enter this branch and try again, or a
     // manual /restart path can recover.
@@ -2019,50 +2096,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     return;
   }
   if (transportRuntime) {
-    if (text.trim() === '/stop') {
-      emitTransportUserMessage(text);
-      // Explicit stop discards any queued resend work — the user asked for a halt.
-      clearResend(sessionName);
-
-      // ── CRITICAL UX: ack the stop BEFORE awaiting the SDK cancel ───────────
-      // The SDK's cancel() does an HTTP abort + cleanup which can take seconds
-      // (especially when the provider is waiting for an in-flight request to
-      // tear down). Push notifications fire from the SDK's own onComplete
-      // callback independently and arrive within ~one round-trip; if we
-      // awaited cancel() first, the WS ack would lag the push by the full
-      // SDK shutdown time, leaving the browser's stop button spinning while
-      // the phone already buzzed.
-      //
-      // The user pressed stop. The daemon received it. That's all the ack
-      // confirms — the actual cancel runs in the background and surfaces
-      // failure as an inline session error if needed.
-      const stopStatus = isLegacy ? 'accepted_legacy' : 'accepted';
-      timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: stopStatus });
-      try {
-        serverLink.send({ type: 'command.ack', commandId: effectiveId, status: stopStatus, session: sessionName });
-      } catch { /* */ }
-
-      // Background cancel — fire-and-forget. Errors surface as inline timeline
-      // events so the user sees them without the spinner having ever waited.
-      void (async () => {
-        try {
-          supervisionAutomation.cancelSession(sessionName);
-          await transportRuntime.cancel();
-          // Mark session for fresh start so daemon restart doesn't resume the
-          // stuck conversation
-          if (record?.agentType === 'qwen') {
-            upsertSession({ ...record, qwenFreshOnResume: true, updatedAt: Date.now() });
-          }
-        } catch (err) {
-          const errMsg = describeTransportSendError(err);
-          logger.error({ sessionName, err }, 'session.stop (transport) failed');
-          timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Stop failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
-          timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
-        }
-      })();
-      return;
-    }
-    if (text.trim() === '/clear' && supportsTransportClear(record?.agentType)) {
+    if (trimmedText === '/clear' && supportsTransportClear(record?.agentType)) {
       emitTransportUserMessage(text);
       // Fresh conversation must not replay stale queued messages from the prior
       // offline window — drop anything we had buffered for resend.
@@ -2106,8 +2140,8 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     // forwards `/compact` to the transport untouched.
     const release = await getMutex(sessionName).acquire();
     try {
-      const modelMatch = text.trim().match(/^\/model\s+(\S+)(?:\s+.*)?$/);
-      const effortMatch = text.trim().match(/^\/(?:thinking|effort)\s+(\S+)\s*$/);
+      const modelMatch = trimmedText.match(/^\/model\s+(\S+)(?:\s+.*)?$/);
+      const effortMatch = trimmedText.match(/^\/(?:thinking|effort)\s+(\S+)\s*$/);
       if (record?.agentType === 'qwen' && modelMatch) {
         const nextModel = modelMatch[1];
           const runtimeConfig = await getQwenRuntimeConfig(true).catch(() => null);
@@ -2355,15 +2389,15 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       if (record?.qwenFreshOnResume) {
         upsertSession({ ...record, qwenFreshOnResume: undefined, updatedAt: Date.now() });
       }
-      const status = isLegacy ? 'accepted_legacy' : 'accepted';
-      timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
-      emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status });
+      emitAcceptedReceiptAck();
     } catch (err) {
       const errMsg = describeTransportSendError(err);
       logger.error({ sessionName, err }, 'session.send (transport) failed');
       timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Send failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
       timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
-      emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
+      if (!receiptAcked) {
+        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
+      }
     } finally {
       release();
     }
@@ -2426,6 +2460,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       originalText: text,
       commandId: effectiveId,
       isLegacy,
+      ackAlreadySent: receiptAcked,
       serverLink,
     });
   } catch (err) {
@@ -2474,6 +2509,7 @@ async function sendProcessSessionMessage(
     originalText?: string;
     commandId?: string;
     isLegacy?: boolean;
+    ackAlreadySent?: boolean;
     serverLink?: Pick<ServerLink, 'send'>;
   },
 ): Promise<void> {
@@ -2486,7 +2522,7 @@ async function sendProcessSessionMessage(
   if (attachments.length > 0) payload.attachments = attachments;
   if (options?.commandId) payload.commandId = options.commandId;
   const userEvent = timelineEmitter.emit(sessionName, 'user.message', payload);
-  if (options?.commandId) {
+  if (options?.commandId && !options.ackAlreadySent) {
     const status = options.isLegacy ? 'accepted_legacy' : 'accepted';
     emitCommandAck(sessionName, options.commandId, status, undefined, options.serverLink);
   }
@@ -3594,6 +3630,32 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
     return;
   }
 
+  const activeMasterCompactions = getInflightMasterCompactionCount();
+  if (activeMasterCompactions > 0) {
+    logger.warn({ targetVersion, activeMasterCompactions }, 'daemon.upgrade: blocked because master compaction is active');
+    try {
+      serverLink?.send({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: 'master_compaction_active',
+        activeMasterCompactions,
+      });
+    } catch { /* ignore */ }
+    return;
+  }
+
+  const compressionState = getCompressionQueueState();
+  if (!compressionState.idle) {
+    logger.warn({ targetVersion, compressionState }, 'daemon.upgrade: blocked because memory compression is active');
+    try {
+      serverLink?.send({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: 'compression_active',
+        compressionState,
+      });
+    } catch { /* ignore */ }
+    return;
+  }
+
   const activeTransportSessions = getActiveTransportSessionsBlockingDaemonUpgrade();
   if (activeTransportSessions.length > 0) {
     // Include per-session blocking reason — runtime.getStatus() can disagree
@@ -3615,6 +3677,7 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
         type: DAEMON_MSG.UPGRADE_BLOCKED,
         reason: 'transport_busy',
         activeSessionNames: activeTransportSessions.map((session) => session.name),
+        blockedSessions: blockReasons,
       });
     } catch { /* ignore */ }
     return;
@@ -3669,6 +3732,47 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
       logger.warn({ err: e }, 'daemon.upgrade: registry probe failed, proceeding without pre-flight');
     }
   }
+
+  let upgradeScriptSpawned = false;
+  const releaseUpgradeMemoryFreeze = (() => {
+    closeLiveContextMaterializationAdmission('upgrade-pending');
+    stopAcceptingCompression('upgrade-pending');
+    stopAcceptingMasterCompactions('upgrade-pending');
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      resumeAcceptingMasterCompactions();
+      resumeAcceptingCompression();
+      reopenLiveContextMaterializationAdmission();
+    };
+  })();
+
+  try {
+    const postFreezeMasterCompactions = getInflightMasterCompactionCount();
+    if (postFreezeMasterCompactions > 0) {
+      logger.warn({ targetVersion, activeMasterCompactions: postFreezeMasterCompactions }, 'daemon.upgrade: blocked because master compaction became active after freeze');
+      try {
+        serverLink?.send({
+          type: DAEMON_MSG.UPGRADE_BLOCKED,
+          reason: 'master_compaction_active',
+          activeMasterCompactions: postFreezeMasterCompactions,
+        });
+      } catch { /* ignore */ }
+      return;
+    }
+    const postFreezeCompressionState = getCompressionQueueState();
+    if (!postFreezeCompressionState.idle) {
+      logger.warn({ targetVersion, compressionState: postFreezeCompressionState }, 'daemon.upgrade: blocked because memory compression became active after freeze');
+      try {
+        serverLink?.send({
+          type: DAEMON_MSG.UPGRADE_BLOCKED,
+          reason: 'compression_active',
+          compressionState: postFreezeCompressionState,
+        });
+      } catch { /* ignore */ }
+      return;
+    }
 
   logger.info('daemon.upgrade: preparing upgrade script');
 
@@ -3739,6 +3843,7 @@ launchctl load -w "${plist}"`;
     child.unref();
 
     logger.info({ log: logFile }, 'daemon.upgrade: Windows upgrade script spawned');
+    upgradeScriptSpawned = true;
     return;
   } else {
     logger.warn('daemon.upgrade: unsupported platform, cannot restart service');
@@ -4281,6 +4386,12 @@ sleep ${CLEANUP_AFTER_SEC} && rm -rf "${scriptDir}" &
   child.unref();
 
   logger.info({ log: logFile }, 'daemon.upgrade: upgrade script spawned, will restart in ~3 s');
+  upgradeScriptSpawned = true;
+  } finally {
+    if (!upgradeScriptSpawned) {
+      releaseUpgradeMemoryFreeze();
+    }
+  }
 }
 
 // ── File system browser ────────────────────────────────────────────────────
@@ -4354,6 +4465,7 @@ export interface TransportUpgradeBlockReason {
   status: string;
   sending: boolean;
   pendingCount: number;
+  blockReason: 'status_thinking' | 'status_streaming' | 'sending' | 'pending';
 }
 
 export function getTransportSessionUpgradeBlockReason(sessionName: string): TransportUpgradeBlockReason | null {
@@ -4362,8 +4474,17 @@ export function getTransportSessionUpgradeBlockReason(sessionName: string): Tran
   const status = runtime.getStatus();
   const sending = !!runtime.sending;
   const pendingCount = runtime.pendingCount ?? 0;
-  if (!TRANSPORT_IN_PROGRESS_STATUSES.has(status) && !sending && pendingCount === 0) return null;
-  return { status, sending, pendingCount };
+  if (TRANSPORT_IN_PROGRESS_STATUSES.has(status)) {
+    return {
+      status,
+      sending,
+      pendingCount,
+      blockReason: status === 'streaming' ? 'status_streaming' : 'status_thinking',
+    };
+  }
+  if (sending) return { status, sending, pendingCount, blockReason: 'sending' };
+  if (pendingCount > 0) return { status, sending, pendingCount, blockReason: 'pending' };
+  return null;
 }
 
 export function getActiveTransportSessionsBlockingDaemonUpgrade(sessions = listSessions()) {

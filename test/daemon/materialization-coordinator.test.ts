@@ -3,7 +3,7 @@ import type { ContextNamespace, ContextTargetRef } from '../../shared/context-ty
 import { MaterializationCoordinator } from '../../src/context/materialization-coordinator.js';
 import { localOnlyCompressor } from '../../src/context/summary-compressor.js';
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
-import { getArchivedEvent, getReplicationState, listContextEvents } from '../../src/store/context-store.js';
+import { getArchivedEvent, getReplicationState, listContextEvents, queryProcessedProjections } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 
 describe('MaterializationCoordinator', () => {
@@ -274,6 +274,36 @@ describe('MaterializationCoordinator', () => {
     expect(getArchivedEvent('evt-retry-user')?.content).toBe('please remember this outage batch');
     expect(getArchivedEvent('evt-retry-assistant')?.content).toBe('working on the durable archive path');
     expect(listContextEvents(target)).toEqual([]);
+  });
+
+  it('does not commit projections when archiving fails after SDK compression succeeds', async () => {
+    const coordinator = new MaterializationCoordinator({
+      compressor: async () => ({
+        summary: '## User Problem\nArchive failure coverage\n\n## Resolution\nDo not commit projections before archive.',
+        model: 'test-model',
+        backend: 'test-backend',
+        usedBackup: false,
+        fromSdk: true,
+      }),
+      archiveEventsForMaterialization: () => {
+        throw new Error('simulated archive failure');
+      },
+      thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
+    });
+
+    coordinator.ingestEvent({ id: 'evt-archive-fail-user', target, eventType: 'user.turn', content: 'keep this retryable', createdAt: 100 });
+    coordinator.ingestEvent({ id: 'evt-archive-fail-assistant', target, eventType: 'assistant.text', content: 'summary would have succeeded', createdAt: 120 });
+
+    const result = await coordinator.materializeTarget(target, 'manual', 500);
+
+    expect(result.summaryProjection).toBeUndefined();
+    expect(result.durableProjection).toBeUndefined();
+    expect(getReplicationState(namespace)?.pendingProjectionIds ?? []).toEqual([]);
+    expect(queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId, limit: 10 })).toEqual([]);
+    expect(listContextEvents(target).map((event) => event.id).sort()).toEqual([
+      'evt-archive-fail-assistant',
+      'evt-archive-fail-user',
+    ]);
   });
 
   it('pairs final assistant.text output with the user request in structured summaries', async () => {

@@ -328,7 +328,12 @@ export class GeminiSdkProvider implements TransportProvider {
     state.lastStatusSignature = null;
 
     const payload = normalizeProviderPayload(payloadOrMessage, attachments, extraSystemPrompt);
-    await this.startTurn(sessionId, state, payload);
+    // TransportProvider.send is a send-start contract: the runtime owns the
+    // in-flight turn state and waits for onDelta/onComplete/onError callbacks.
+    // ACP `prompt()` is long-lived and resolves only when the turn finishes, so
+    // awaiting it here would make generic send-start watchdogs look like total
+    // turn timeouts for normal long-running Gemini work.
+    void this.startTurn(sessionId, state, payload);
   }
 
   async cancel(sessionId: string): Promise<void> {

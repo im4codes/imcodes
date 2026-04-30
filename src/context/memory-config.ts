@@ -83,7 +83,7 @@ function clampPositive(raw: unknown, fallback: number, min = 1, field?: string):
     if (field) reportInvalid(field, raw, fallback);
     return fallback;
   }
-  if (raw < min) {
+  if (!Number.isInteger(raw) || raw < min) {
     if (field) reportInvalid(field, raw, fallback);
     return fallback;
   }
@@ -97,7 +97,7 @@ function clampNonNegative(raw: unknown, fallback: number, min = 0, field?: strin
     if (field) reportInvalid(field, raw, fallback);
     return fallback;
   }
-  if (raw < min) {
+  if (!Number.isInteger(raw) || raw < min) {
     if (field) reportInvalid(field, raw, fallback);
     return fallback;
   }
@@ -115,7 +115,7 @@ function clampPositiveOrSentinel(raw: unknown, fallback: number, sentinel: numbe
     return fallback;
   }
   if (raw === sentinel) return sentinel;
-  if (raw < min) {
+  if (!Number.isInteger(raw) || raw < min) {
     if (field) reportInvalid(field, raw, fallback);
     return fallback;
   }

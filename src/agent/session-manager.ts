@@ -49,6 +49,8 @@ import { closeSingleSession, collectProjectCloseTargets, type CloseFailure, type
 import { cleanupKnownTestTerminalSessions } from './startup-test-session-cleanup.js';
 import { clearResend, drainResend, enqueueResend, getResendCount, getResendEntries } from '../daemon/transport-resend-queue.js';
 import { materializeMasterSummary } from '../context/materialization-coordinator.js';
+import { serializeContextNamespace } from '../context/context-keys.js';
+import { registerMasterCompaction } from '../daemon/master-compaction-registry.js';
 
 /** Start JSONL watcher for a CC session — uses specific file if ccSessionId known, else directory scan. */
 function startCCWatcher(sessionName: string, projectDir: string, ccSessionId?: string): void {
@@ -242,9 +244,18 @@ export async function stopProject(
           return;
         }
         if (shouldMaterializeMasterOnSessionStop(record)) {
-          void materializeMasterSummary(record.name, record.contextNamespace).catch((err) =>
-            logger.warn({ err, session: record.name }, 'master summary materialization failed on session stop'),
+          const registration = registerMasterCompaction(
+            () => materializeMasterSummary(record.name, record.contextNamespace),
+            {
+              sessionName: record.name,
+              ...(record.contextNamespace ? { namespaceKey: serializeContextNamespace(record.contextNamespace) } : {}),
+            },
           );
+          if (!registration.skipped) {
+            registration.promise.catch((err) => {
+                logger.warn({ err, session: record.name }, 'master summary materialization failed on session stop');
+            });
+          }
         }
         emitSessionEvent('stopped', record.name, 'stopped');
       },

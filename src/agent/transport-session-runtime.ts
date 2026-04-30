@@ -36,11 +36,84 @@ import { resolveRuntimeAuthoredContext } from '../context/shared-context-runtime
 import { buildTransportStartupMemory, type TransportContextBootstrap } from './runtime-context-bootstrap.js';
 import { recordMemoryHits } from '../store/context-store.js';
 import logger from '../util/logger.js';
+import { incrementCounter } from '../util/metrics.js';
 
 export interface PendingTransportMessage {
   clientMessageId: string;
   text: string;
   attachments?: TransportAttachment[];
+}
+
+const DEFAULT_TRANSPORT_CONTEXT_BUDGET_MS = 2_500;
+const DEFAULT_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS = 60_000;
+const MIN_TRANSPORT_CONTEXT_BUDGET_MS = 50;
+const MAX_TRANSPORT_CONTEXT_BUDGET_MS = 30_000;
+const MIN_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS = 50;
+const MAX_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS = 10 * 60_000;
+
+type TimeoutOutcome<T> =
+  | { timedOut: false; value: T }
+  | { timedOut: true };
+
+function readBoundedTimeoutMs(
+  envName: string,
+  fallbackMs: number,
+  minMs: number,
+  maxMs: number,
+  options?: { allowZero?: boolean },
+): number {
+  const raw = process.env[envName];
+  if (raw === undefined || raw.trim() === '') return fallbackMs;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) return fallbackMs;
+  if (options?.allowZero && parsed === 0) return 0;
+  if (parsed < minMs) return minMs;
+  if (parsed > maxMs) return maxMs;
+  return parsed;
+}
+
+export function getTransportContextBudgetMs(): number {
+  return readBoundedTimeoutMs(
+    'IMCODES_TRANSPORT_CONTEXT_BUDGET_MS',
+    DEFAULT_TRANSPORT_CONTEXT_BUDGET_MS,
+    MIN_TRANSPORT_CONTEXT_BUDGET_MS,
+    MAX_TRANSPORT_CONTEXT_BUDGET_MS,
+    { allowZero: false },
+  );
+}
+
+export function getTransportProviderSendTimeoutMs(): number {
+  return readBoundedTimeoutMs(
+    'IMCODES_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS',
+    DEFAULT_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS,
+    MIN_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS,
+    MAX_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS,
+    { allowZero: true },
+  );
+}
+
+function withTimeoutOutcome<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+): Promise<TimeoutOutcome<T>> {
+  if (!timeoutMs || timeoutMs <= 0 || !Number.isFinite(timeoutMs)) {
+    return promise.then((value) => ({ timedOut: false, value }));
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return new Promise<TimeoutOutcome<T>>((resolve, reject) => {
+    timer = setTimeout(() => resolve({ timedOut: true }), timeoutMs);
+    timer.unref?.();
+    promise.then(
+      (value) => {
+        if (timer) clearTimeout(timer);
+        resolve({ timedOut: false, value });
+      },
+      (err) => {
+        if (timer) clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
 }
 
 /**
@@ -231,7 +304,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       authoredContextLanguage: config.contextAuthoredContextLanguage,
       authoredContextFilePath: config.contextAuthoredContextFilePath,
     });
-    await this.refreshContextBootstrap();
+    await this.refreshContextBootstrap({ phase: 'initialize' });
 
     if (!alreadyInjected) {
       // Fresh conversation — reset the gate so the next turn will build and
@@ -368,73 +441,74 @@ export class TransportSessionRuntime implements SessionRuntime {
     void promise.catch(() => {}); // prevent unhandled rejection
     this._activeTurn = { promise, resolve, reject };
 
-    void this.refreshContextBootstrap()
-      .then(async () => {
-        const authority = resolveTransportDispatchAuthority(this.provider, {
-          namespace: this._contextNamespace,
-          remoteProcessedFreshness: this._contextRemoteProcessedFreshness,
-          localProcessedFreshness: this._contextLocalProcessedFreshness,
-          retryExhausted: this._contextRetryExhausted,
-          sharedPolicyOverride: this._contextSharedPolicyOverride,
-        }).authority;
-        const startupMemory = this._startupMemory ?? (
-          !this._startupMemoryInjected && authority.authoritySource === 'processed_local' && this._contextNamespace
-            ? buildTransportStartupMemory(this._contextNamespace)
-            : null
-        );
-        const memoryRecallResult = await this.buildTransportMessageRecallResult(message, authority.authoritySource);
-        const memoryRecall = memoryRecallResult.artifact;
-        const dispatchResult = await dispatchSharedContextSend(this.provider, this._providerSessionId!, {
-          userMessage: message,
-          description: this._description,
-          systemPrompt: this._systemPrompt,
-          attachments,
-          namespace: this._contextNamespace,
-          namespaceDiagnostics: this._contextNamespaceDiagnostics,
-          remoteProcessedFreshness: this._contextRemoteProcessedFreshness,
-          localProcessedFreshness: this._contextLocalProcessedFreshness,
-          retryExhausted: this._contextRetryExhausted,
-          sharedPolicyOverride: this._contextSharedPolicyOverride,
-          authoredContextRepository: this.resolveAuthoredContextRepository(),
-          authoredContextLanguage: this._contextAuthoredContextLanguage,
-          authoredContextFilePath: this._contextAuthoredContextFilePath,
-          ...(startupMemory ? { startupMemory } : {}),
-          ...(memoryRecall ? { memoryRecall } : {}),
-        }, {
-          resolveAuthoredContext: (input) => {
-            if (!input.namespace) return Promise.resolve([]);
-            return resolveRuntimeAuthoredContext(input.namespace, {
-              language: input.authoredContextLanguage,
-              filePath: input.authoredContextFilePath,
-            });
-          },
-        });
-        if (dispatchResult.payload?.memoryRecall) {
-          const hitIds = dispatchResult.payload.memoryRecall.items.map((item) => item.id);
-          if (hitIds.length > 0) {
-            try { recordMemoryHits(hitIds); } catch { /* non-fatal */ }
-          }
-          this.emitMemoryContextEvent(dispatchResult.payload.memoryRecall, clientMessageId);
-        } else if (memoryRecallResult.statusPayload) {
-          this.emitMemoryContextStatusEvent(memoryRecallResult.statusPayload, clientMessageId);
+    void (async () => {
+      await this.refreshContextBootstrap({ phase: 'dispatch' });
+      const authority = resolveTransportDispatchAuthority(this.provider, {
+        namespace: this._contextNamespace,
+        remoteProcessedFreshness: this._contextRemoteProcessedFreshness,
+        localProcessedFreshness: this._contextLocalProcessedFreshness,
+        retryExhausted: this._contextRetryExhausted,
+        sharedPolicyOverride: this._contextSharedPolicyOverride,
+      }).authority;
+      const startupMemory = this._startupMemory ?? (
+        !this._startupMemoryInjected && authority.authoritySource === 'processed_local' && this._contextNamespace
+          ? buildTransportStartupMemory(this._contextNamespace)
+          : null
+      );
+      const memoryRecallResult = await this.buildTransportMessageRecallResultWithinBudget(message, authority.authoritySource);
+      const memoryRecall = memoryRecallResult.artifact;
+      const dispatchResult = await dispatchSharedContextSend(this.provider, this._providerSessionId!, {
+        userMessage: message,
+        description: this._description,
+        systemPrompt: this._systemPrompt,
+        attachments,
+        namespace: this._contextNamespace,
+        namespaceDiagnostics: this._contextNamespaceDiagnostics,
+        remoteProcessedFreshness: this._contextRemoteProcessedFreshness,
+        localProcessedFreshness: this._contextLocalProcessedFreshness,
+        retryExhausted: this._contextRetryExhausted,
+        sharedPolicyOverride: this._contextSharedPolicyOverride,
+        authoredContextRepository: this.resolveAuthoredContextRepository(),
+        authoredContextLanguage: this._contextAuthoredContextLanguage,
+        authoredContextFilePath: this._contextAuthoredContextFilePath,
+        ...(startupMemory ? { startupMemory } : {}),
+        ...(memoryRecall ? { memoryRecall } : {}),
+      }, {
+        resolveAuthoredContext: (input) => {
+          if (!input.namespace) return Promise.resolve([]);
+          return resolveRuntimeAuthoredContext(input.namespace, {
+            language: input.authoredContextLanguage,
+            filePath: input.authoredContextFilePath,
+          });
+        },
+        sendTimeoutMs: getTransportProviderSendTimeoutMs(),
+      });
+      if (dispatchResult.payload?.memoryRecall) {
+        const hitIds = dispatchResult.payload.memoryRecall.items.map((item) => item.id);
+        if (hitIds.length > 0) {
+          try { recordMemoryHits(hitIds); } catch { /* non-fatal */ }
         }
-        if (!this._startupMemoryInjected && dispatchResult.payload?.startupMemory) {
-          this._startupMemoryInjected = true;
-          // Emit the "Historical context · injected" timeline card at the
-          // same commit boundary as the persisted flag. Doing this here
-          // (instead of eagerly in `initialize`) guarantees restart-before-
-          // first-message never leaks an unbacked card — the card appears
-          // exactly once, for the turn that actually carried the preamble.
-          this.emitStartupMemoryContext(this._startupMemory);
-          this._startupMemory = null;
-          // Notify session-manager so the flag is persisted to SessionRecord.
-          // Invoked synchronously — the callback just schedules an upsert and
-          // returns, so there's no ordering risk with the rest of this turn.
-          try { this._onStartupMemoryInjected?.(); } catch (err) {
-            logger.warn({ err, sessionKey: this.sessionKey }, 'onStartupMemoryInjected callback failed');
-          }
+        this.emitMemoryContextEvent(dispatchResult.payload.memoryRecall, clientMessageId);
+      } else if (memoryRecallResult.statusPayload) {
+        this.emitMemoryContextStatusEvent(memoryRecallResult.statusPayload, clientMessageId);
+      }
+      if (!this._startupMemoryInjected && dispatchResult.payload?.startupMemory) {
+        this._startupMemoryInjected = true;
+        // Emit the "Historical context · injected" timeline card at the
+        // same commit boundary as the persisted flag. Doing this here
+        // (instead of eagerly in `initialize`) guarantees restart-before-
+        // first-message never leaks an unbacked card — the card appears
+        // exactly once, for the turn that actually carried the preamble.
+        this.emitStartupMemoryContext(this._startupMemory);
+        this._startupMemory = null;
+        // Notify session-manager so the flag is persisted to SessionRecord.
+        // Invoked synchronously — the callback just schedules an upsert and
+        // returns, so there's no ordering risk with the rest of this turn.
+        try { this._onStartupMemoryInjected?.(); } catch (err) {
+          logger.warn({ err, sessionKey: this.sessionKey }, 'onStartupMemoryInjected callback failed');
         }
-      })
+      }
+    })()
       .catch((err) => {
         // Only handle if the provider didn't already fire onError callback.
         // Shared-context dispatch denial is surfaced here as a send failure
@@ -482,10 +556,41 @@ export class TransportSessionRuntime implements SessionRuntime {
     return true;
   }
 
-  private async refreshContextBootstrap(): Promise<void> {
-    if (!this._contextBootstrapResolver) return;
-    const bootstrap = await this._contextBootstrapResolver();
-    this.applyContextBootstrap(bootstrap);
+  private async refreshContextBootstrap(options?: {
+    phase?: 'initialize' | 'dispatch';
+    timeoutMs?: number;
+  }): Promise<'applied' | 'skipped' | 'timeout' | 'failed'> {
+    if (!this._contextBootstrapResolver) return 'skipped';
+    const phase = options?.phase ?? 'dispatch';
+    const timeoutMs = options?.timeoutMs ?? getTransportContextBudgetMs();
+    let bootstrapPromise: Promise<TransportContextBootstrap>;
+    try {
+      bootstrapPromise = Promise.resolve(this._contextBootstrapResolver());
+    } catch (err) {
+      incrementCounter('transport.context.bootstrap_failed', { phase });
+      logger.warn({ err, sessionKey: this.sessionKey, phase }, 'transport context bootstrap failed before dispatch; continuing with existing context');
+      return 'failed';
+    }
+
+    try {
+      const outcome = await withTimeoutOutcome(bootstrapPromise, timeoutMs);
+      if (outcome.timedOut) {
+        incrementCounter('transport.context.bootstrap_timeout', { phase });
+        logger.warn({
+          sessionKey: this.sessionKey,
+          provider: this.provider.id,
+          phase,
+          timeoutMs,
+        }, 'transport context bootstrap timed out; continuing with existing context');
+        return 'timeout';
+      }
+      this.applyContextBootstrap(outcome.value);
+      return 'applied';
+    } catch (err) {
+      incrementCounter('transport.context.bootstrap_failed', { phase });
+      logger.warn({ err, sessionKey: this.sessionKey, phase }, 'transport context bootstrap failed; continuing with existing context');
+      return 'failed';
+    }
   }
 
   private applyContextBootstrap(
@@ -515,9 +620,57 @@ export class TransportSessionRuntime implements SessionRuntime {
     });
   }
 
+  private async buildTransportMessageRecallResultWithinBudget(
+    message: string,
+    authoritySource: ContextAuthorityDecision['authoritySource'],
+  ): Promise<{
+    artifact: TransportMemoryRecallArtifact | null;
+    statusPayload?: Omit<MemoryContextTimelinePayload, 'relatedToEventId'>;
+  }> {
+    const timeoutMs = getTransportContextBudgetMs();
+    let cancelled = false;
+    const trimmed = message.trim();
+    const query = trimmed.slice(0, 200);
+    const recallPromise = this.buildTransportMessageRecallResult(message, authoritySource, {
+      isCancelled: () => cancelled,
+    });
+    try {
+      const outcome = await withTimeoutOutcome(recallPromise, timeoutMs);
+      if (!outcome.timedOut) return outcome.value;
+      cancelled = true;
+      incrementCounter('transport.context.memory_recall_timeout', { provider: this.provider.id });
+      logger.warn({
+        sessionKey: this.sessionKey,
+        provider: this.provider.id,
+        timeoutMs,
+      }, 'transport message recall timed out; dispatching without recall');
+      return {
+        artifact: null,
+        statusPayload: buildMemoryContextStatusPayload(query, 'failed', 'message', {
+          runtimeFamily: 'transport',
+          authoritySource,
+          sourceKind: 'local_processed',
+        }),
+      };
+    } catch (err) {
+      cancelled = true;
+      incrementCounter('transport.context.memory_recall_failed', { provider: this.provider.id });
+      logger.warn({ err, sessionKey: this.sessionKey }, 'transport message recall failed before status payload; continuing without recall');
+      return {
+        artifact: null,
+        statusPayload: buildMemoryContextStatusPayload(query, 'failed', 'message', {
+          runtimeFamily: 'transport',
+          authoritySource,
+          sourceKind: 'local_processed',
+        }),
+      };
+    }
+  }
+
   private async buildTransportMessageRecallResult(
     message: string,
     authoritySource: ContextAuthorityDecision['authoritySource'],
+    options?: { isCancelled?: () => boolean },
   ): Promise<{
     artifact: TransportMemoryRecallArtifact | null;
     statusPayload?: Omit<MemoryContextTimelinePayload, 'relatedToEventId'>;
@@ -585,6 +738,10 @@ export class TransportSessionRuntime implements SessionRuntime {
         repo: this._contextNamespace?.projectId ?? this.resolveAuthoredContextRepository(),
         limit: 10,
       });
+      if (options?.isCancelled?.()) {
+        logger.debug({ sessionKey: this.sessionKey, query }, 'transport message recall result ignored after timeout');
+        return { artifact: null };
+      }
       // 1) Template-origin legacy summaries never surface through recall.
       const processed = result.items
         .filter((item): item is MemorySearchResultItem => item.type === 'processed')
@@ -620,6 +777,10 @@ export class TransportSessionRuntime implements SessionRuntime {
                 matchedCount: processed.length,
               }),
         };
+      }
+      if (options?.isCancelled?.()) {
+        logger.debug({ sessionKey: this.sessionKey, query }, 'transport message recall injection ignored after timeout');
+        return { artifact: null };
       }
       // 4) Record injection into the per-session ring buffer.
       recordRecentInjection(this.sessionKey, items.map((it) => it.id));

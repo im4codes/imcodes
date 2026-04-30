@@ -10,14 +10,18 @@ import {
 
 /** Map an AckFailureReason to a localized message suitable for failureReason payload. */
 function localizedAckFailureReason(reason: AckFailureReason): string {
+  const withFallback = (key: string, fallback: string): string => {
+    const value = i18next.t(key, fallback);
+    return typeof value === 'string' && value.trim() ? value : fallback;
+  };
   // Keys live under `chat.sendFailedReason.*` in every locale JSON.
   switch (reason) {
     case 'daemon_offline':
-      return i18next.t('chat.sendFailedReason.daemonOffline', 'Connection lost');
+      return withFallback('chat.sendFailedReason.daemonOffline', 'Connection lost');
     case 'ack_timeout':
-      return i18next.t('chat.sendFailedReason.ackTimeout', 'No response');
+      return withFallback('chat.sendFailedReason.ackTimeout', 'No response');
     case 'daemon_error':
-      return i18next.t('chat.sendFailedReason.daemonError', 'Server error');
+      return withFallback('chat.sendFailedReason.daemonError', 'Server error');
   }
 }
 /**
@@ -180,6 +184,11 @@ const MAX_PERSISTED_SNAPSHOT_EVENTS = 50;
 // complete before the optimistic timeout marks the bubble as a generic
 // "timeout" failure (which would skip the retry path's specific reason).
 const OPTIMISTIC_TIMEOUT_MS = 90_000;
+// Server-side ack reliability already retried the daemon for ~48s before
+// emitting ack_timeout. Give one short visible HTTP backfill chance to recover
+// a persisted echo, then fail the optimistic bubble so the user has a retry
+// exit instead of waiting for the generic 90s optimistic timer.
+const ACK_TIMEOUT_BACKFILL_GRACE_MS = 1_500;
 
 /**
  * Per-attempt backoff for client-side auto-retry of failed sends. The user's
@@ -1910,7 +1919,7 @@ export function useTimeline(
 
       // ── command.ack: reconcile the optimistic send bubble. Error/conflict
       //    flips it to the failed "!" state so the user can retry; success-ish
-      //    acks just cancel the 30s failure timeout — the real user.message
+      //    acks just cancel the 90s failure timeout — the real user.message
       //    event is still the authoritative "agent saw it" signal and will
       //    remove the bubble on arrival. ──
       if (msg.type === 'command.ack') {
@@ -1948,9 +1957,16 @@ export function useTimeline(
         if (reasonStr === 'ack_timeout') {
           // ack_timeout means the server already retried 5x with the daemon
           // connected — further client retries won't help, but the message
-          // MAY have actually landed and the ack got lost. Let the HTTP
-          // backfill recover the echo from the daemon's persisted store.
+          // MAY have actually landed and the ack got lost. Fire one short
+          // HTTP backfill grace window to recover a persisted echo; if it
+          // does not arrive, mark the bubble failed/ retryable instead of
+          // leaving the user staring at a long-running pending spinner.
           fireHttpBackfillRef.current(0, { phase: 'refresh', visible: true });
+          clearOptimisticTimer(commandId);
+          const timer = setTimeout(() => {
+            markOptimisticFailed(commandId, localizedAckFailureReason('ack_timeout'));
+          }, ACK_TIMEOUT_BACKFILL_GRACE_MS);
+          optimisticTimersRef.current.set(commandId, timer);
           return;
         }
         // daemon_offline / daemon_error → WS retry chain → HTTP fallback → fail.
