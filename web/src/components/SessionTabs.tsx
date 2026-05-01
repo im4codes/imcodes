@@ -50,6 +50,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
   const [renameVal, setRenameVal] = useState('');
   const menuRef = useRef<HTMLDivElement>(null);
   const renameRef = useRef<HTMLInputElement>(null);
+  const tabBarRef = useRef<HTMLDivElement>(null);
 
   // Persisted order & pinned state via server-synced preferences.
   // Default to legacy localStorage values so existing users don't lose their arrangement.
@@ -115,6 +116,19 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
     if (renaming) setTimeout(() => renameRef.current?.select(), 0);
   }, [renaming]);
 
+  useEffect(() => {
+    if (!activeSession) return;
+    const frame = requestAnimationFrame(() => {
+      const activeTab = tabBarRef.current?.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]');
+      activeTab?.scrollIntoView?.({
+        block: 'nearest',
+        inline: 'center',
+        behavior: 'instant' as ScrollBehavior,
+      });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [activeSession, orderedSessions]);
+
   // External rename trigger (from ⋯ menu in SessionControls)
   useEffect(() => {
     if (!renameRequest) return;
@@ -148,7 +162,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
 
   const commitRename = () => {
     if (!renaming) return;
-    const trimmed = renameVal.trim();
+    const trimmed = (renameRef.current?.value ?? renameVal).trim();
     onRenameSession?.(renaming, trimmed || null);
     setRenaming(null);
   };
@@ -215,7 +229,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
   const menuY = ctx ? Math.min(ctx.y, window.innerHeight - 200) : 0;
 
   return (
-    <div class="tab-bar" role="tablist">
+    <div ref={tabBarRef} class="tab-bar" role="tablist">
       {sessions.length === 0 && sessionsLoaded && (
         <span class="tab-empty">No active sessions</span>
       )}
@@ -246,6 +260,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
               <input
                 ref={renameRef}
                 class="tab-rename-input"
+                autoFocus
                 value={renameVal}
                 onInput={(e) => setRenameVal((e.target as HTMLInputElement).value)}
                 onKeyDown={(e) => {
@@ -253,7 +268,9 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
                   if (e.key === 'Enter') { e.preventDefault(); commitRename(); }
                   if (e.key === 'Escape') setRenaming(null);
                 }}
+                onBlurCapture={commitRename}
                 onBlur={commitRename}
+                onFocusOut={commitRename}
               />
             ) : (
               <button

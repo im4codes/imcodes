@@ -6,10 +6,12 @@ import { useTranslation } from 'react-i18next';
 import type { WsClient } from '../ws-client.js';
 import type { RemoteSession } from '../hooks/useProviderStatus.js';
 import { FileBrowser } from './file-browser-lazy.js';
-import { getUserPref, saveUserPref } from '../api.js';
-import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '@shared/effort-levels.js';
+import { parseString, usePref } from '../hooks/usePref.js';
+import { PREF_KEY_DEFAULT_SHELL } from '../constants/prefs.js';
+import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
 import { getSessionAgentGroups, getSessionAgentLabel, SESSION_AGENT_GROUP_LABEL_KEYS } from './session-agent-options.js';
 import { QwenCodingPlanHint } from './QwenCodingPlanHint.js';
+import { useTransportModels, supportsDynamicTransportModels } from '../hooks/useTransportModels.js';
 import {
   buildCcPresetFromDraft,
   createCcPresetDraftFromPreset,
@@ -18,9 +20,11 @@ import {
   type CcPresetDraft,
 } from './cc-preset-form.js';
 import { CC_PRESET_MSG, type CcPreset } from '@shared/cc-presets.js';
+import { GEMINI_MODEL_IDS, mergeModelSuggestions } from '../../../src/shared/models/options.js';
 
 const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
 const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
+const GEMINI_SDK_MODEL_SUGGESTIONS = [...GEMINI_MODEL_IDS] as const;
 
 interface Props {
   ws: WsClient | null;
@@ -113,11 +117,10 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   const agentGroups = getSessionAgentGroups('sub-session');
 
   // Load saved shell preference from server
+  const defaultShellPref = usePref<string>(PREF_KEY_DEFAULT_SHELL, { parse: parseString });
   useEffect(() => {
-    void getUserPref('default_shell').then((saved) => {
-      if (typeof saved === 'string' && saved) setShellBin(saved);
-    }).catch(() => {});
-  }, []);
+    if (defaultShellPref.value) setShellBin(defaultShellPref.value);
+  }, [defaultShellPref.value]);
 
   // Request shell detection from daemon
   useEffect(() => {
@@ -173,14 +176,24 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   useEffect(() => {
     if (type !== 'qwen') return;
     const fallbackModel = selectedCcPreset?.defaultModel ?? selectedCcPreset?.env.ANTHROPIC_MODEL ?? '';
-    if (qwenPresetModels.length === 0) {
-      if (!requestedModel && fallbackModel) setRequestedModel(fallbackModel);
-      return;
-    }
-    if (!requestedModel || !qwenPresetModels.includes(requestedModel)) {
-      setRequestedModel(qwenPresetModels.includes(fallbackModel) ? fallbackModel : qwenPresetModels[0]);
-    }
-  }, [type, qwenPresetModels, requestedModel, selectedCcPreset]);
+    setRequestedModel((current) => {
+      if (qwenPresetModels.length === 0) {
+        return current || fallbackModel;
+      }
+      if (
+        fallbackModel
+        && current === selectedCcPreset?.env.ANTHROPIC_MODEL
+        && current !== fallbackModel
+        && qwenPresetModels.includes(fallbackModel)
+      ) {
+        return fallbackModel;
+      }
+      if (!current || !qwenPresetModels.includes(current)) {
+        return qwenPresetModels.includes(fallbackModel) ? fallbackModel : qwenPresetModels[0];
+      }
+      return current;
+    });
+  }, [type, qwenPresetModels, selectedCcPreset]);
 
   const handleStart = () => {
     const desc = description.trim() || undefined;
@@ -202,13 +215,13 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     }
     const selectedShell = type === 'shell' ? (shellBin || undefined) : undefined;
     if (type === 'shell' && selectedShell) {
-      void saveUserPref('default_shell', selectedShell).catch(() => {});
+      void defaultShellPref.save(selectedShell).catch(() => {});
     }
     const extra: Record<string, unknown> = {};
     if (desc) extra.description = desc;
     if (ccPreset && (type === 'claude-code' || type === 'qwen')) extra.ccPreset = ccPreset;
     if (ccInitPrompt.trim() && type === 'claude-code') extra.ccInitPrompt = ccInitPrompt.trim();
-    if ((type === 'copilot-sdk' || type === 'cursor-headless' || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
+    if ((type === 'copilot-sdk' || type === 'cursor-headless' || type === 'gemini-sdk' || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
     if (type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'qwen') extra.thinking = thinking;
     onStart(type, selectedShell, cwd || undefined, label || undefined, Object.keys(extra).length > 0 ? extra : undefined);
   };
@@ -225,14 +238,24 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
             ? OPENCLAW_THINKING_LEVELS
             : [];
   const supportsCcPreset = type === 'claude-code' || type === 'qwen';
-  const supportsModelSelection = type === 'copilot-sdk' || type === 'cursor-headless' || (type === 'qwen' && !!selectedCcPreset);
-  const modelSuggestions = type === 'copilot-sdk'
-    ? [...COPILOT_SDK_MODEL_SUGGESTIONS]
-    : type === 'cursor-headless'
-      ? [...CURSOR_HEADLESS_MODEL_SUGGESTIONS]
-      : type === 'qwen'
-        ? (qwenPresetModels.length > 0 ? qwenPresetModels : (selectedCcPreset?.defaultModel ? [selectedCcPreset.defaultModel] : []))
-        : [];
+  const dynamicModelsAgentType = supportsDynamicTransportModels(type) ? type : null;
+  const transportModels = useTransportModels(ws, dynamicModelsAgentType);
+  const supportsModelSelection = type === 'copilot-sdk' || type === 'cursor-headless' || type === 'gemini-sdk' || (type === 'qwen' && !!selectedCcPreset);
+  const modelSuggestions = useMemo(() => (
+    transportModels.models.length > 0
+      ? (type === 'gemini-sdk'
+        ? mergeModelSuggestions(GEMINI_SDK_MODEL_SUGGESTIONS, transportModels.models.map((model) => model.id))
+        : transportModels.models.map((model) => model.id))
+      : type === 'copilot-sdk'
+        ? [...COPILOT_SDK_MODEL_SUGGESTIONS]
+        : type === 'cursor-headless'
+          ? [...CURSOR_HEADLESS_MODEL_SUGGESTIONS]
+          : type === 'qwen'
+            ? (qwenPresetModels.length > 0 ? qwenPresetModels : (selectedCcPreset?.defaultModel ? [selectedCcPreset.defaultModel] : []))
+            : type === 'gemini-sdk'
+              ? [...GEMINI_SDK_MODEL_SUGGESTIONS]
+              : []
+  ), [transportModels.models, type, qwenPresetModels, selectedCcPreset]);
 
   return (
     <div class="dialog-overlay">
@@ -534,7 +557,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                 style={{ width: '100%' }}
               >
                 {thinkingLevels.map((level) => (
-                  <option key={level} value={level}>{level}</option>
+                  <option key={level} value={level}>{formatEffortLevel(level)}</option>
                 ))}
               </select>
             </div>

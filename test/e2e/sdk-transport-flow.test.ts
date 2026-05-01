@@ -293,7 +293,7 @@ vi.mock('../../src/agent/provider-quota.js', () => ({ getQwenOAuthQuotaUsageLabe
 vi.mock('../../src/agent/codex-runtime-config.js', () => ({
   getCodexRuntimeConfig: vi.fn(async () => ({
     planLabel: 'Pro',
-    quotaLabel: expect.stringContaining('5h 11%'),
+    quotaLabel: '5h 11% 2h03m 4/6 14:40',
   })),
 }));
 vi.mock('../../src/agent/brain-dispatcher.js', () => ({ BrainDispatcher: vi.fn().mockImplementation(() => ({ start: vi.fn(), stop: vi.fn() })) }));

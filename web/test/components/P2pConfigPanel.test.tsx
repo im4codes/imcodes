@@ -74,6 +74,15 @@ async function flush() {
   }
 }
 
+const callsForPrefKey = (key: string) => getUserPrefMock.mock.calls.filter((call) => call[0] === key);
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
 describe('P2pConfigPanel', () => {
   beforeEach(() => {
     getUserPrefMock.mockResolvedValue(null);
@@ -104,6 +113,25 @@ describe('P2pConfigPanel', () => {
     // shell and script sessions should not appear
     expect(screen.queryByText('w1')).toBeNull();
     expect(screen.queryByText('w2')).toBeNull();
+  });
+
+  it('shows loading UI until a cold P2P preference load resolves', async () => {
+    const primary = deferred<unknown | null>();
+    getUserPrefMock.mockImplementation((key: string) => {
+      if (key === 'p2p_session_config:deck_proj_brain') return primary.promise;
+      return Promise.resolve(null);
+    });
+
+    renderPanel();
+    expect(screen.getByText('…')).toBeDefined();
+    expect(screen.queryByText('brain')).toBeNull();
+
+    await act(async () => {
+      primary.resolve(null);
+      await primary.promise;
+    });
+    await flush();
+    expect(screen.getByText('brain')).toBeDefined();
   });
 
   it('excludes shell type from subSessions', async () => {
@@ -193,18 +221,21 @@ describe('P2pConfigPanel', () => {
     expect(typeof cfg.rounds).toBe('number');
   });
 
-  it('calls onSave with updated mode after changing a select', async () => {
+  it('preserves loaded session modes when saving', async () => {
     const onSave = vi.fn();
     const onClose = vi.fn();
 
+    getUserPrefMock.mockImplementation(async (key: string) => {
+      if (key === 'p2p_session_config:deck_proj_brain') {
+        return JSON.stringify({ sessions: { deck_proj_brain: { enabled: true, mode: 'audit' } }, rounds: 3 });
+      }
+      return null;
+    });
     renderPanel({ onSave, onClose });
     await flush();
 
-    // Change mode for first session (deck_proj_brain)
     const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
     expect(selects.length).toBeGreaterThan(0);
-
-    fireEvent.change(selects[0], { target: { value: 'review' } });
 
     const saveBtn = screen.getByText('settings_save');
     await act(async () => {
@@ -213,9 +244,7 @@ describe('P2pConfigPanel', () => {
     await flush();
 
     const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
-    // The first eligible session mode should be 'review'
-    const firstKey = Object.keys(cfg.sessions)[0];
-    expect(cfg.sessions[firstKey].mode).toBe('review');
+    expect(cfg.sessions.deck_proj_brain).toMatchObject({ enabled: true, mode: 'audit' });
   }, 15_000);
 
   it('calls onClose when the close button (✕) is clicked', async () => {
@@ -599,5 +628,102 @@ describe('P2pConfigPanel', () => {
     fireEvent.click(screen.getAllByText('×')[0]);
 
     expect(saveUserPrefMock).toHaveBeenCalledWith('p2p_custom_combos', JSON.stringify([]));
+  });
+
+  it('shares one P2P config GET across concurrent panel consumers', async () => {
+    const savedConfig: P2pSavedConfig = { sessions: {}, rounds: 2 };
+    getUserPrefMock.mockImplementation(async (key: string) => {
+      if (key === 'p2p_session_config:deck_proj_brain') return JSON.stringify(savedConfig);
+      return null;
+    });
+
+    renderPanel();
+    renderPanel();
+    await flush();
+
+    expect(callsForPrefKey('p2p_session_config:deck_proj_brain')).toHaveLength(1);
+  });
+
+  it('uses the warm P2P config cache when reopening the panel for the same root', async () => {
+    const savedConfig: P2pSavedConfig = { sessions: {}, rounds: 2 };
+    getUserPrefMock.mockImplementation(async (key: string) => {
+      if (key === 'p2p_session_config:deck_proj_brain') return JSON.stringify(savedConfig);
+      return null;
+    });
+
+    const first = renderPanel();
+    await flush();
+    first.unmount();
+    renderPanel();
+    await flush();
+
+    expect(callsForPrefKey('p2p_session_config:deck_proj_brain')).toHaveLength(1);
+  });
+
+  it('applies primary P2P preference events without refetching', async () => {
+    getUserPrefMock.mockImplementation(async (key: string) => {
+      if (key === 'p2p_session_config:deck_proj_brain') {
+        return JSON.stringify({ sessions: { deck_proj_brain: { enabled: false, mode: 'audit' } }, rounds: 1 });
+      }
+      return null;
+    });
+
+    renderPanel();
+    await flush();
+    getUserPrefMock.mockClear();
+
+    window.dispatchEvent(new CustomEvent('imcodes:user-pref-changed', {
+      detail: {
+        key: 'p2p_session_config:deck_proj_brain',
+        value: JSON.stringify({ sessions: { deck_proj_brain: { enabled: true, mode: 'audit' } }, rounds: 1 }),
+      },
+    }));
+    await flush();
+
+    expect(callsForPrefKey('p2p_session_config:deck_proj_brain')).toHaveLength(0);
+    expect((screen.getAllByRole('checkbox')[0] as HTMLInputElement).checked).toBe(true);
+  });
+
+  it('migrates legacy P2P config into the scoped primary key once', async () => {
+    const legacyConfig: P2pSavedConfig = { sessions: {}, rounds: 5 };
+    getUserPrefMock.mockImplementation(async (key: string) => {
+      if (key === 'p2p_session_config') return JSON.stringify(legacyConfig);
+      return null;
+    });
+
+    renderPanel();
+    await flush();
+
+    expect(callsForPrefKey('p2p_session_config:deck_proj_brain')).toHaveLength(1);
+    expect(callsForPrefKey('p2p_session_config')).toHaveLength(1);
+    expect(saveUserPrefMock).toHaveBeenCalledWith('p2p_session_config:deck_proj_brain', JSON.stringify(legacyConfig));
+  });
+
+  it('does not let late P2P cache updates overwrite in-progress local edits', async () => {
+    getUserPrefMock.mockImplementation(async (key: string) => {
+      if (key === 'p2p_session_config:deck_proj_brain') {
+        return JSON.stringify({ sessions: {}, rounds: 1 });
+      }
+      return null;
+    });
+    const onSave = vi.fn();
+
+    renderPanel({ onSave });
+    await flush();
+
+    fireEvent.click(screen.getAllByRole('button').find((button) => button.textContent === '5')!);
+    window.dispatchEvent(new CustomEvent('imcodes:user-pref-changed', {
+      detail: {
+        key: 'p2p_session_config:deck_proj_brain',
+        value: JSON.stringify({ sessions: {}, rounds: 2 }),
+      },
+    }));
+    await flush();
+    await act(async () => {
+      fireEvent.click(screen.getByText('settings_save'));
+    });
+    await flush();
+
+    expect(onSave.mock.calls[0][0].rounds).toBe(5);
   });
 });

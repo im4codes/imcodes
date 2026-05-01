@@ -32,6 +32,11 @@ export const ACK_FAILURE_DAEMON_OFFLINE: AckFailureReason = 'daemon_offline';
 export const ACK_FAILURE_ACK_TIMEOUT: AckFailureReason = 'ack_timeout';
 export const ACK_FAILURE_DAEMON_ERROR: AckFailureReason = 'daemon_error';
 
+// ── command.ack error strings ───────────────────────────────────────────────
+
+/** The daemon has already accepted or rejected this client-generated command id. */
+export const COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID = 'duplicate_command_id' as const;
+
 // ── Message payload shapes ──────────────────────────────────────────────────
 
 export interface CommandFailedMessage {
@@ -52,11 +57,27 @@ export interface DaemonOfflineMessage {
 
 // ── Timing constants ────────────────────────────────────────────────────────
 
-/** How long the server waits after daemon WS close before declaring offline. */
-export const RECONNECT_GRACE_MS = 3_000;
+/** How long the server waits after daemon WS close before declaring offline.
+ *  Sized to cover real-world reconnect scenarios:
+ *  - WiFi roaming / DHCP renewal: 3-8s
+ *  - 4G/5G handoff: 2-5s
+ *  - Server pod restart: 3-10s
+ *  Previously 3s caused fast-fails on every transient blip even though the
+ *  daemon would have come back fine. 10s gives the daemon a realistic window
+ *  to reconnect before we surface failure to the user. */
+export const RECONNECT_GRACE_MS = 10_000;
 
-/** Per-command ack wait budget once the command has been dispatched to daemon. */
-export const ACK_TIMEOUT_MS = 5_000;
+/** Per-command ack wait budget once the command has been dispatched to daemon.
+ *  Higher than 5s to absorb cellular RTT spikes and CPU-stalled daemons during
+ *  process spawn (Claude Code agent boot can take 2-3s on cold cache). */
+export const ACK_TIMEOUT_MS = 8_000;
+
+/** Number of daemon redispatches before surfacing ack_timeout to the browser.
+ *  Total budget = ACK_TIMEOUT_MS * (RETRY_LIMIT + 1) = 8 * 6 = 48s, well within
+ *  the client's optimistic timeout window. Higher retry count is critical when
+ *  the daemon is briefly busy (file-system IO, agent spawn) and the first ack
+ *  is delayed but not lost. */
+export const ACK_TIMEOUT_RETRY_LIMIT = 5;
 
 /** TTL for the server-side `seenCommandAcks` LRU that dedups replayed acks. */
 export const ACK_DEDUP_TTL_MS = 5 * 60_000;

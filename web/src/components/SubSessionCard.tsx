@@ -10,6 +10,7 @@ import { resolveContextWindow } from '../model-context.js';
 import { shortModelLabel } from '../model-label.js';
 import { TerminalView } from './TerminalView.js';
 import { useTimeline } from '../hooks/useTimeline.js';
+import { sendSessionViaHttp } from '../api.js';
 import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff } from '../types.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
@@ -31,6 +32,7 @@ const TYPE_ICON: Record<string, string> = {
   'openclaw': '☁️',
   'qwen': '千',
   'gemini': '♊',
+  'gemini-sdk': '♊',
   'shell': '🐚',
   'script': '🔄',
 };
@@ -85,13 +87,14 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   // (message goes straight to the timeline with a spinner, reconciled by the
   // daemon echo).
   const timeline = isShell
-    ? { events: [], refreshing: false, addOptimisticUserMessage: undefined, removeOptimisticMessage: undefined }
+    ? { events: [], refreshing: false, addOptimisticUserMessage: undefined, retryOptimisticMessage: undefined }
     : useTimeline(sub.sessionName, ws, serverId, {
       isActiveSession: !!isFocused,
     });
   const { events, refreshing } = timeline;
   const addOptimisticUserMessage = 'addOptimisticUserMessage' in timeline ? timeline.addOptimisticUserMessage : undefined;
-  const removeOptimisticMessage = 'removeOptimisticMessage' in timeline ? timeline.removeOptimisticMessage : undefined;
+  const markOptimisticFailed = 'markOptimisticFailed' in timeline ? timeline.markOptimisticFailed : undefined;
+  const retryOptimisticMessage = 'retryOptimisticMessage' in timeline ? timeline.retryOptimisticMessage : undefined;
   const termScrollRef = useRef<(() => void) | null>(null);
   const chatScrollRef = useRef<(() => void) | null>(null);
   const cardInputRef = useRef<HTMLInputElement>(null);
@@ -104,6 +107,21 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   const [quickPanelOpen, setQuickPanelOpen] = useState(false);
   const [overlayOpen, setOverlayOpen] = useState(false);
 
+  // Shell/script cards render a live xterm preview. Keep them in raw mode so
+  // command output is delivered immediately instead of waiting for passive
+  // terminal snapshots; cleanup downgrades back to passive because App owns the
+  // global sub-session subscription.
+  useEffect(() => {
+    if (!isShell || !ws || !connected) return;
+    if (typeof ws.holdTerminalRaw === 'function') {
+      return ws.holdTerminalRaw(sub.sessionName);
+    }
+    try { ws.subscribeTerminal(sub.sessionName, true); } catch { /* ignore */ }
+    return () => {
+      try { ws.subscribeTerminal(sub.sessionName, false); } catch { /* ignore */ }
+    };
+  }, [connected, isShell, sub.sessionName, ws]);
+
   // ── Retry failed send ─────────────────────────────────────────────────────
   // Same contract as SessionPane / SubSessionWindow. Shell/script sub-sessions
   // don't expose the optimistic helpers (no chat timeline), so the handler
@@ -111,7 +129,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   const eventsRef = useRef(events);
   eventsRef.current = events;
   const handleResendFailed = useCallback((commandId: string, text: string) => {
-    if (!ws || !connected || !addOptimisticUserMessage || !removeOptimisticMessage) return;
+    if (!ws || !connected || !retryOptimisticMessage) return;
     const failedEvent = eventsRef.current.find(
       (e) => e.type === 'user.message'
         && e.payload.failed === true
@@ -123,22 +141,23 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     const attachmentsFromFailure = failedEvent && Array.isArray(failedEvent.payload.attachments)
       ? (failedEvent.payload.attachments as Array<Record<string, unknown>>)
       : undefined;
-    removeOptimisticMessage(commandId);
     const newCommandId = globalThis.crypto?.randomUUID?.()
       ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    ws.sendSessionCommand('send', {
-      sessionName: sub.sessionName,
-      text,
-      ...(resendExtra ?? {}),
-      commandId: newCommandId,
-    });
-    if (!isTransportRuntime(sub)) {
-      addOptimisticUserMessage(text, newCommandId, {
-        ...(attachmentsFromFailure ? { attachments: attachmentsFromFailure } : {}),
-        ...(resendExtra ? { resendExtra } : {}),
+    try {
+      ws.sendSessionCommand('send', {
+        sessionName: sub.sessionName,
+        text,
+        ...(resendExtra ?? {}),
+        commandId: newCommandId,
       });
+    } catch {
+      return;
     }
-  }, [addOptimisticUserMessage, connected, removeOptimisticMessage, sub.sessionName, ws]);
+    retryOptimisticMessage(commandId, newCommandId, text, {
+      ...(attachmentsFromFailure ? { attachments: attachmentsFromFailure } : {}),
+      ...(resendExtra ? { resendExtra } : {}),
+    });
+  }, [connected, retryOptimisticMessage, sub.sessionName, ws]);
 
   // Build a SessionInfo for SessionControls compact mode
   const sessionInfo = useMemo<SessionInfo>(() => ({
@@ -176,11 +195,35 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   }, [ws, connected, sub.sessionName, forceFollowLatest]);
 
   const handleTransportStop = useCallback(() => {
-    if (!ws || !connected || sub.state === 'stopped' || sub.state === 'stopping') return;
-    try {
-      ws.sendSessionCommand('send', { sessionName: sub.sessionName, text: '/stop' });
-    } catch { /* ignore */ }
-  }, [ws, connected, sub.sessionName, sub.state]);
+    // Stop is highest-priority — must fire even when the WS is briefly in
+    // probe-state (`_connected = false` during the post-resume ping/pong
+    // window). Previous behavior gated on `connected` AND swallowed any
+    // throw silently, so a stop tap landing during a visibility/focus
+    // tick disappeared. Now: skip the probe gate, try urgent WS first,
+    // fall back to HTTP on throw, surface only if both fail. The state
+    // gate (already-stopped / stopping) stays — those are valid no-ops.
+    if (sub.state === 'stopped' || sub.state === 'stopping') return;
+    const payload = { sessionName: sub.sessionName, text: '/stop' };
+    let wsThrown: unknown = null;
+    if (ws) {
+      try {
+        ws.sendSessionCommandUrgent('send', payload);
+        return;
+      } catch (err) {
+        wsThrown = err;
+      }
+    }
+    if (serverId) {
+      void sendSessionViaHttp(serverId, payload).catch((httpErr) => {
+        // eslint-disable-next-line no-console
+        console.warn('handleTransportStop: WS + HTTP both failed', { wsThrown, httpErr });
+      });
+      return;
+    }
+    // No WS, no serverId → nowhere to send. Surface so it's not invisible.
+    // eslint-disable-next-line no-console
+    console.warn('handleTransportStop: no transport available', { wsThrown });
+  }, [ws, sub.sessionName, sub.state, serverId]);
 
   const busy = useMemo(() => isVisuallyBusy(sub.state, !!getActiveThinkingTs(events)), [events, sub.state]);
   // Preview cards always follow the latest content.
@@ -297,12 +340,14 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
 
       {/* Preview — scrollable, auto-scrolls to bottom on new content */}
       <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-        <div class="subcard-preview" ref={previewRef}>
+        <div class={`subcard-preview${isShell ? ' subcard-preview-terminal' : ''}`} ref={previewRef}>
           {isShell ? (
             <TerminalView
               sessionName={sub.sessionName}
               ws={ws}
               connected={connected}
+              preview
+              mobileInput
               onDiff={(apply) => onDiff(sub.sessionName, apply)}
               onHistory={(apply) => onHistory(sub.sessionName, apply)}
               onScrollBottomFn={(fn) => { termScrollRef.current = fn; }}
@@ -379,6 +424,9 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
                     ...(meta?.attachments ? { attachments: meta.attachments } : {}),
                     ...(meta?.extra ? { resendExtra: meta.extra } : {}),
                   });
+                  if (meta?.commandId && meta.localFailure) {
+                    markOptimisticFailed?.(meta.commandId, meta.localFailure);
+                  }
                   scrollToBottom();
                 }}
               />

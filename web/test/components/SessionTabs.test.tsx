@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, fireEvent, cleanup } from '@testing-library/preact';
+import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/preact';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -93,6 +93,36 @@ describe('SessionTabs', () => {
     const buttons = screen.getAllByRole('tab');
     expect(buttons[0].getAttribute('aria-selected')).toBe('true');
     expect(buttons[1].getAttribute('aria-selected')).toBe('false');
+  });
+
+  it('scrolls the active tab into view when activeSession changes', async () => {
+    const scrollIntoView = vi.fn();
+    const previous = HTMLElement.prototype.scrollIntoView;
+    HTMLElement.prototype.scrollIntoView = scrollIntoView;
+    try {
+      const sessions = makeSessions([{ name: 'session_w1' }, { name: 'session_w2' }, { name: 'session_w3' }]);
+      const view = render(
+        <SessionTabs sessions={sessions} activeSession="session_w1" onSelect={vi.fn()} sessionsLoaded={true} {...defaultProps} />,
+      );
+
+      await waitFor(() => {
+        expect(scrollIntoView).toHaveBeenCalled();
+      });
+      scrollIntoView.mockClear();
+
+      view.rerender(
+        <SessionTabs sessions={sessions} activeSession="session_w3" onSelect={vi.fn()} sessionsLoaded={true} {...defaultProps} />,
+      );
+
+      await waitFor(() => {
+        expect(scrollIntoView).toHaveBeenCalledWith(expect.objectContaining({
+          block: 'nearest',
+          inline: 'center',
+        }));
+      });
+    } finally {
+      HTMLElement.prototype.scrollIntoView = previous;
+    }
   });
 
   it('calls onSelect with the session name when a tab is clicked', () => {
@@ -251,7 +281,7 @@ describe('SessionTabs', () => {
 
     const input = screen.getByRole('textbox') as HTMLInputElement;
     fireEvent.input(input, { target: { value: '' } });
-    fireEvent.blur(input);
+    fireEvent.keyDown(input, { key: 'Enter' });
 
     expect(onRenameSession).toHaveBeenCalledWith('deck_proj_brain', null);
   });

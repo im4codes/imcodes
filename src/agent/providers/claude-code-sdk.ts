@@ -9,6 +9,7 @@ import type {
   ProviderCapabilities,
   ProviderConfig,
   ProviderError,
+  ProviderModelList,
   SessionConfig,
   SessionInfoUpdate,
   ProviderStatusUpdate,
@@ -124,6 +125,21 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     });
     this.config = config;
     logger.info({ provider: this.id, resolved: resolved.executable }, 'Claude Code SDK provider connected');
+  }
+
+  async listModels(_force?: boolean): Promise<ProviderModelList> {
+    const { getClaudeSdkAvailableModels } = await import('../sdk-runtime-config.js');
+    const { getClaudeSdkRuntimeConfig } = await import('../sdk-runtime-config.js');
+    const [models, cfg] = await Promise.all([
+      Promise.resolve(getClaudeSdkAvailableModels()),
+      getClaudeSdkRuntimeConfig(false),
+    ]);
+    return {
+      models: models.map((id) => ({ id })),
+      defaultModel: models[0],
+      isAuthenticated: true,
+      ...(cfg.planLabel ? {} : {}), // planLabel lives in session-info, not model list
+    };
   }
 
   async disconnect(): Promise<void> {

@@ -14,6 +14,7 @@ import { updateSessionState, getSession, upsertSession } from '../store/session-
 import { resolveContextWindow } from '../util/model-context.js';
 import { registerWatcherControl, unregisterWatcherControl, refreshSessionWatcher, type WatcherControl } from './watcher-controls.js';
 import { TIMELINE_EVENT_FILE_CHANGE } from '../../shared/file-change.js';
+import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 import { normalizeGeminiFileChange } from './file-change-normalizer.js';
 
 const GEMINI_TMP_DIR = join(homedir(), '.gemini', 'tmp');
@@ -511,7 +512,7 @@ async function terminalThinkingCheck(sessionName: string, state: WatcherState): 
  * Unified state transition — all idle/running changes MUST go through here.
  * Prevents flicker by deduplicating and enforcing bidirectional locks.
  */
-function transitionState(sessionName: string, state: WatcherState, next: 'running' | 'idle', force = false): void {
+function transitionState(sessionName: string, state: WatcherState, next: 'running' | 'idle', force = false, suppressPush = false): void {
   if (state.currentState === next) return; // already in this state
   if (watchers.has(sessionName) && next === 'idle' && state.currentState === 'running' && !state.turnHadAssistantText && !state.noTextRetrackAttempted) {
     state.noTextRetrackAttempted = true;
@@ -532,7 +533,10 @@ function transitionState(sessionName: string, state: WatcherState, next: 'runnin
   if (next === 'idle') state.lastIdleEmitTs = Date.now();
   if (next === 'running') state.lastRunningEmitTs = Date.now();
   logger.debug({ sessionName, state: next, activeFile: state.activeFile, seenCount: state.seenCount }, 'gemini-watcher: state transition');
-  timelineEmitter.emit(sessionName, 'session.state', { state: next });
+  timelineEmitter.emit(sessionName, 'session.state', {
+    state: next,
+    ...(suppressPush ? { [TIMELINE_SUPPRESS_PUSH_FIELD]: true } : {}),
+  });
   updateSessionState(sessionName, next);
 }
 
@@ -807,7 +811,7 @@ export async function startWatching(sessionName: string, sessionUuid: string): P
       const lastMsg = conv.messages[conv.messages.length - 1];
       state._lastMsgLen = typeof lastMsg?.content === 'string' ? lastMsg.content.length : -1;
       if (state.lastConversationStatus === 'idle') {
-        transitionState(sessionName, state, 'idle');
+        transitionState(sessionName, state, 'idle', false, true);
       }
     }
   }

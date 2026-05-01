@@ -25,6 +25,7 @@ import { IdleFlashLayer } from './IdleFlashLayer.js';
 import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import { resolveSubSessionRuntimeType } from '../runtime-type.js';
+import { DESKTOP_WINDOW_IDS } from '../window-stack.js';
 
 interface WindowGeometry { x: number; y: number; w: number; h: number }
 
@@ -45,6 +46,20 @@ interface Props {
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
   zIndex: number;
   onFocus: () => void;
+  /**
+   * Owner-child stack integration for the delegated desktop file-browser
+   * window owned by this sub-session. When supplied (desktop only), the
+   * child file-browser sources its z-index from the shared stack and
+   * notifies open/focus/close transitions so banded ordering keeps the
+   * child above its owner while a newer unrelated peer can still sit
+   * above the entire owner-child group.
+   *
+   * Mobile renders an inline overlay and ignores these props.
+   */
+  desktopFileBrowserZIndex?: number;
+  onDesktopFileBrowserOpen?: () => void;
+  onDesktopFileBrowserFocus?: () => void;
+  onDesktopFileBrowserClose?: () => void;
   /** Optional: called to pin this sub-session to the sidebar. Passes current viewMode. */
   onPin?: (viewMode: 'terminal' | 'chat') => void;
   sessions?: SessionInfo[];
@@ -106,7 +121,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, onSettings, onTransportConfigSaved, zIndex, onFocus, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, inP2p,
+  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, onSettings, onTransportConfigSaved, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, inP2p,
 }: Props) {
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
@@ -128,7 +143,8 @@ export function SubSessionWindow({
     refreshing,
     historyStatus: timelineHistoryStatus,
     addOptimisticUserMessage,
-    removeOptimisticMessage,
+    markOptimisticFailed,
+    retryOptimisticMessage,
   } = useTimeline(sub.sessionName, ws, serverId, {
     isActiveSession: active,
   });
@@ -152,15 +168,26 @@ export function SubSessionWindow({
   // it layers above this sub-session window instead of being hidden behind it.
   const [showFileBrowser, setShowFileBrowser] = useState(false);
 
+  // Sync the desktop child file-browser open/close into the shared window
+  // stack via the parent-supplied callbacks. Mobile is a no-op (it renders
+  // an inline overlay, not a managed floating window).
+  useEffect(() => {
+    if (isMobile) return;
+    if (showFileBrowser) {
+      onDesktopFileBrowserOpen?.();
+    } else {
+      onDesktopFileBrowserClose?.();
+    }
+  }, [showFileBrowser, isMobile, onDesktopFileBrowserOpen, onDesktopFileBrowserClose]);
+
   const [quotes, setQuotes] = useState<string[]>([]);
   const addQuote = useCallback((text: string) => setQuotes((prev) => [...prev, text]), []);
   const removeQuote = useCallback((i: number) => setQuotes((prev) => prev.filter((_, j) => j !== i)), []);
 
   // ── Retry failed send ─────────────────────────────────────────────────────
   // Mirrors the main-session SessionPane handler so optimistic-UX behavior is
-  // uniform: locate the failed bubble in the timeline cache, clear it, dispatch
-  // a fresh session.send with a new commandId, and re-inject an optimistic
-  // "sending" bubble immediately.
+  // uniform: locate the failed bubble in the timeline cache, dispatch a fresh
+  // session.send with a new commandId, and update the existing bubble in place.
   const eventsRef = useRef(events);
   eventsRef.current = events;
   const handleResendFailed = useCallback((commandId: string, text: string) => {
@@ -176,22 +203,23 @@ export function SubSessionWindow({
     const attachmentsFromFailure = failedEvent && Array.isArray(failedEvent.payload.attachments)
       ? (failedEvent.payload.attachments as Array<Record<string, unknown>>)
       : undefined;
-    removeOptimisticMessage(commandId);
     const newCommandId = globalThis.crypto?.randomUUID?.()
       ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    ws.sendSessionCommand('send', {
-      sessionName: sub.sessionName,
-      text,
-      ...(resendExtra ?? {}),
-      commandId: newCommandId,
-    });
-    if (effectiveRuntimeType !== 'transport') {
-      addOptimisticUserMessage(text, newCommandId, {
-        ...(attachmentsFromFailure ? { attachments: attachmentsFromFailure } : {}),
-        ...(resendExtra ? { resendExtra } : {}),
+    try {
+      ws.sendSessionCommand('send', {
+        sessionName: sub.sessionName,
+        text,
+        ...(resendExtra ?? {}),
+        commandId: newCommandId,
       });
+    } catch {
+      return;
     }
-  }, [addOptimisticUserMessage, connected, removeOptimisticMessage, sub.sessionName, ws]);
+    retryOptimisticMessage(commandId, newCommandId, text, {
+      ...(attachmentsFromFailure ? { attachments: attachmentsFromFailure } : {}),
+      ...(resendExtra ? { resendExtra } : {}),
+    });
+  }, [connected, retryOptimisticMessage, sub.sessionName, ws]);
 
   const thinkingNow = useNowTicker(!!activeThinkingTs && active);
   const isShell = sub.type === 'shell' || sub.type === 'script';
@@ -236,6 +264,7 @@ export function SubSessionWindow({
     qwenModel: sub.qwenModel ?? undefined,
     qwenAuthType: sub.qwenAuthType ?? undefined,
     qwenAvailableModels: sub.qwenAvailableModels ?? undefined,
+    codexAvailableModels: sub.codexAvailableModels ?? undefined,
     modelDisplay: sub.modelDisplay ?? undefined,
     planLabel: sub.planLabel ?? undefined,
     quotaLabel: sub.quotaLabel ?? undefined,
@@ -503,6 +532,7 @@ export function SubSessionWindow({
             events={events}
             loading={false}
             refreshing={refreshing}
+            historyStatus={historyStatus}
             sessionId={sub.sessionName}
             onScrollBottomFn={onChatScrollBottomFn}
             ws={ws}
@@ -516,7 +546,7 @@ export function SubSessionWindow({
       </div>
 
       {/* Usage footer — shared component */}
-      {(lastUsage || historyStatus.phase !== 'idle' || activeThinkingTs || activeToolCall || statusText || liveSessionState === 'running' || liveSessionState === 'idle' || sessionInfo?.planLabel || sessionInfo?.quotaLabel || sessionInfo?.quotaUsageLabel || sessionInfo?.quotaMeta) && (
+      {(lastUsage || activeThinkingTs || activeToolCall || statusText || liveSessionState === 'running' || liveSessionState === 'idle' || sessionInfo?.planLabel || sessionInfo?.quotaLabel || sessionInfo?.quotaUsageLabel || sessionInfo?.quotaMeta) && (
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sub.sessionName}
@@ -532,7 +562,6 @@ export function SubSessionWindow({
           statusText={statusText}
           activeToolCall={activeToolCall}
           now={thinkingNow}
-          historyStatus={historyStatus}
         />
       )}
 
@@ -564,6 +593,9 @@ export function SubSessionWindow({
             ...(meta?.attachments ? { attachments: meta.attachments } : {}),
             ...(meta?.extra ? { resendExtra: meta.extra } : {}),
           });
+          if (meta?.commandId && meta.localFailure) {
+            markOptimisticFailed(meta.commandId, meta.localFailure);
+          }
           scrollToBottom();
         }}
         onSubRestart={onRestart}
@@ -586,9 +618,11 @@ export function SubSessionWindow({
       />
 
       {/* Per-sub-session file browser. Mobile: full-screen overlay.
-          Desktop: floating panel. Rooted at this sub-session's cwd so
-          selected paths land in the sub-session's own input. zIndex is
-          pinned to this window's zIndex + 1 so it layers above the window. */}
+          Desktop: floating panel layered via the shared desktop window stack
+          using parent-child banded ordering — `desktopFileBrowserZIndex` is
+          supplied by the parent and is always above this sub-session's
+          `zIndex` within the band, while a newer unrelated peer can still
+          sit above the entire owner-child group. */}
       {showFileBrowser && ws && (
         isMobile ? (
           <div class="mobile-fb-overlay" style={{ zIndex: zIndex + 1 }}>
@@ -622,10 +656,11 @@ export function SubSessionWindow({
           </div>
         ) : (
           <FloatingPanel
-            id={`subsession-filebrowser-${sub.id}`}
+            id={DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id)}
             title={`📁 ${t('picker.files')}`}
             onClose={() => setShowFileBrowser(false)}
-            zIndex={zIndex + 1}
+            zIndex={desktopFileBrowserZIndex ?? zIndex + 1}
+            onFocus={onDesktopFileBrowserFocus}
             defaultW={420}
             defaultH={500}
           >

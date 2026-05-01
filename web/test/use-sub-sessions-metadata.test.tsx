@@ -210,6 +210,138 @@ describe('sub-session metadata via subsession.sync', () => {
     expect(captured[0].effort).toBe('high');
   });
 
+  it('preserves codex-sdk quota metadata when a later sync carries null quota fields', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'cxsdk_quota_stable',
+      sessionName: 'deck_sub_cxsdk_quota_stable',
+      sessionType: 'codex-sdk',
+      state: 'running',
+      codexAvailableModels: ['gpt-5.5'],
+      planLabel: 'Pro',
+      quotaLabel: '5h 11% 2h03m 4/6 14:40',
+      quotaMeta: {
+        primary: { usedPercent: 11, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+      },
+    }));
+
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'cxsdk_quota_stable',
+      codexAvailableModels: null,
+      planLabel: null,
+      quotaLabel: null,
+      quotaUsageLabel: null,
+      quotaMeta: null,
+    }));
+
+    expect(captured[0].codexAvailableModels).toEqual(['gpt-5.5']);
+    expect(captured[0].planLabel).toBe('Pro');
+    expect(captured[0].quotaLabel).toBe('5h 11% 2h03m 4/6 14:40');
+    expect(captured[0].quotaMeta?.primary?.usedPercent).toBe(11);
+  });
+
+  it('preserves codex-sdk quota metadata when API reload omits daemon-only display fields', async () => {
+    const staleApiSub = {
+      id: 'cxsdk_api_reload',
+      serverId: 'srv1',
+      type: 'codex-sdk',
+      runtimeType: 'transport' as const,
+      providerId: 'codex-sdk',
+      providerSessionId: null,
+      shellBin: null,
+      cwd: '/tmp/proj',
+      ccSessionId: null,
+      geminiSessionId: null,
+      parentSession: 'deck_app_brain',
+      label: 'Codex Worker',
+      description: null,
+      ccPresetId: null,
+      requestedModel: null,
+      activeModel: null,
+      qwenModel: null,
+      qwenAuthType: null,
+      qwenAvailableModels: null,
+      modelDisplay: null,
+      planLabel: null,
+      quotaLabel: null,
+      quotaUsageLabel: null,
+      quotaMeta: null,
+      effort: null,
+      transportConfig: null,
+      closedAt: null,
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    vi.mocked(listSubSessions)
+      .mockResolvedValueOnce([staleApiSub])
+      .mockResolvedValueOnce([staleApiSub]);
+
+    const { ws, send } = createMockWs();
+    const view = render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(captured).toHaveLength(1));
+
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'cxsdk_api_reload',
+      state: 'running',
+      modelDisplay: 'gpt-5.5',
+      planLabel: 'Pro',
+      quotaLabel: '5h 12% 2h01m 4/6 14:40',
+      quotaMeta: {
+        primary: { usedPercent: 12, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+      },
+    }));
+    expect(captured[0].planLabel).toBe('Pro');
+    expect(captured[0].quotaLabel).toContain('5h 12%');
+
+    view.rerender(<Harness ws={ws} connected={false} />);
+    view.rerender(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(listSubSessions).toHaveBeenCalledTimes(2));
+
+    expect(captured[0].state).toBe('running');
+    expect(captured[0].modelDisplay).toBe('gpt-5.5');
+    expect(captured[0].planLabel).toBe('Pro');
+    expect(captured[0].quotaLabel).toBe('5h 12% 2h01m 4/6 14:40');
+    expect(captured[0].quotaMeta?.primary?.usedPercent).toBe(12);
+  });
+
+  it('clears non-codex quota metadata when a later sync carries null quota fields', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'qwen_quota_clear',
+      sessionName: 'deck_sub_qwen_quota_clear',
+      sessionType: 'qwen',
+      state: 'running',
+      planLabel: 'Free',
+      quotaLabel: '1,000/day',
+      quotaUsageLabel: 'today 5/1000',
+      quotaMeta: {
+        primary: { usedPercent: 5, windowDurationMins: 1440, resetsAt: 1_800_000_000 },
+      },
+    }));
+
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'qwen_quota_clear',
+      quotaLabel: null,
+      quotaUsageLabel: null,
+      quotaMeta: null,
+    }));
+
+    expect(captured[0].quotaLabel).toBeNull();
+    expect(captured[0].quotaUsageLabel).toBeNull();
+    expect(captured[0].quotaMeta).toBeNull();
+  });
+
   it('partial sync keeps existing values', async () => {
     const { ws, send } = createMockWs();
     render(<Harness ws={ws} connected={true} />);

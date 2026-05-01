@@ -113,6 +113,7 @@ export function SessionPane({
   onPendingPrefillApplied,
 }: SessionPaneProps) {
   const sessionName = session.name;
+  const hasChatTimeline = session.agentType !== 'shell' && session.agentType !== 'script';
 
   // ── Timeline ────────────────────────────────────────────────────────────────
   const {
@@ -123,10 +124,12 @@ export function SessionPane({
     loadingOlder: timelineLoadingOlder,
     hasOlderHistory: timelineHasOlderHistory,
     addOptimisticUserMessage,
-    removeOptimisticMessage,
+    markOptimisticFailed,
+    retryOptimisticMessage,
     loadOlderEvents,
   } = useTimeline(sessionName, ws, serverId, {
     isActiveSession: isActive,
+    disableHistory: !hasChatTimeline,
   });
   const historyStatus = timelineHistoryStatus ?? IDLE_HISTORY_STATUS;
 
@@ -141,9 +144,8 @@ export function SessionPane({
 
   // ── Retry failed send ─────────────────────────────────────────────────────
   // Reads the failed optimistic bubble from the timeline cache (it stores the
-  // original text + extras), clears it, and dispatches a fresh session.send
-  // with a new commandId. The new optimistic bubble is added immediately so
-  // the user sees the "sending" state without a round-trip to SessionControls.
+  // original text + extras), dispatches a fresh session.send with a new
+  // commandId, and updates the existing bubble in place.
   const timelineEventsRef = useRef(timelineEvents);
   timelineEventsRef.current = timelineEvents;
   const handleResendFailed = useCallback((commandId: string, text: string) => {
@@ -159,21 +161,23 @@ export function SessionPane({
     const attachmentsFromFailure = failedEvent && Array.isArray(failedEvent.payload.attachments)
       ? (failedEvent.payload.attachments as Array<Record<string, unknown>>)
       : undefined;
-    // Remove the old failed bubble first so we don't end up with two copies.
-    removeOptimisticMessage(commandId);
     const newCommandId = globalThis.crypto?.randomUUID?.()
       ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    ws.sendSessionCommand('send', {
-      sessionName,
-      text,
-      ...(resendExtra ?? {}),
-      commandId: newCommandId,
-    });
-    addOptimisticUserMessage(text, newCommandId, {
+    try {
+      ws.sendSessionCommand('send', {
+        sessionName,
+        text,
+        ...(resendExtra ?? {}),
+        commandId: newCommandId,
+      });
+    } catch {
+      return;
+    }
+    retryOptimisticMessage(commandId, newCommandId, text, {
       ...(attachmentsFromFailure ? { attachments: attachmentsFromFailure } : {}),
       ...(resendExtra ? { resendExtra } : {}),
     });
-  }, [addOptimisticUserMessage, connected, removeOptimisticMessage, sessionName, ws]);
+  }, [connected, retryOptimisticMessage, sessionName, ws]);
 
   // ── Usage & thinking state ──────────────────────────────────────────────────
   const lastUsage = useMemo(() => extractLatestUsage(timelineEvents), [timelineEvents]);
@@ -200,9 +204,13 @@ export function SessionPane({
     () => getTailSessionState(timelineEvents) ?? session.state ?? null,
     [timelineEvents, session.state],
   );
-  const shouldShowFooter = !!(
+  // shell / script sessions have no agent state, no token usage, no quota —
+  // suppress the footer entirely so they don't see misleading "Agent
+  // working..." text when raw bytes flow (idle detection fires session.state
+  // 'running' on any pipe-pane output, not just real agent activity).
+  const isAgentlessSession = session.agentType === 'shell' || session.agentType === 'script';
+  const shouldShowFooter = !isAgentlessSession && !!(
     lastUsage
-    || historyStatus.phase !== 'idle'
     || activeThinkingTs
     || activeToolCall
     || statusText
@@ -297,6 +305,7 @@ export function SessionPane({
           events={timelineEvents}
           loading={timelineLoading}
           refreshing={timelineRefreshing}
+          historyStatus={historyStatus}
           loadingOlder={timelineLoadingOlder}
           hasOlderHistory={timelineHasOlderHistory}
           onLoadOlder={loadOlderEvents}
@@ -329,7 +338,6 @@ export function SessionPane({
           statusText={statusText}
           activeToolCall={activeToolCall}
           now={thinkingNow}
-          historyStatus={historyStatus}
         />
       )}
 
@@ -361,10 +369,14 @@ export function SessionPane({
               || (extras.p2pSessionConfig != null && typeof extras.p2pSessionConfig === 'object')
             );
             if (isP2pSend) return;
+            if (!hasChatTimeline) return;
             addOptimisticUserMessage(text, meta?.commandId, {
               ...(meta?.attachments ? { attachments: meta.attachments } : {}),
               ...(meta?.extra ? { resendExtra: meta.extra } : {}),
             });
+            if (meta?.commandId && meta.localFailure) {
+              markOptimisticFailed(meta.commandId, meta.localFailure);
+            }
             scrollToBottom();
           }}
           onStopProject={onStopProject}

@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/preact';
+import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/preact';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -23,13 +23,22 @@ vi.mock('../../src/components/FileBrowser.js', () => ({
 
 import { NewSessionDialog } from '../../src/components/NewSessionDialog.js';
 
-const makeWs = () => ({
-  sendSessionCommand: vi.fn(),
-  send: vi.fn(),
-  connected: true,
-  onMessage: vi.fn().mockReturnValue(() => {}),
-  subSessionDetectShells: vi.fn(),
-});
+const makeWs = () => {
+  const handlers = new Set<(msg: unknown) => void>();
+  return {
+    sendSessionCommand: vi.fn(),
+    send: vi.fn(),
+    connected: true,
+    onMessage: vi.fn((handler: (msg: unknown) => void) => {
+      handlers.add(handler);
+      return () => handlers.delete(handler);
+    }),
+    emit: (msg: unknown) => {
+      handlers.forEach((handler) => handler(msg));
+    },
+    subSessionDetectShells: vi.fn(),
+  };
+};
 
 describe('NewSessionDialog', () => {
   afterEach(() => {
@@ -62,15 +71,16 @@ describe('NewSessionDialog', () => {
     const optgroups = Array.from(select.querySelectorAll('optgroup'));
     expect(optgroups.map((group) => group.label)).toEqual(['SDK', 'CLI']);
     const options = Array.from(select.options).map((o) => o.value);
-    expect(options.slice(0, 6)).toEqual([
+    expect(options.slice(0, 7)).toEqual([
       'claude-code-sdk',
       'codex-sdk',
       'copilot-sdk',
       'cursor-headless',
+      'gemini-sdk',
       'qwen',
       'openclaw',
     ]);
-    expect(options.slice(6)).toEqual([
+    expect(options.slice(7)).toEqual([
       'claude-code',
       'codex',
       'opencode',
@@ -340,18 +350,8 @@ describe('NewSessionDialog', () => {
     });
   });
 
-  it('applies discovered preset models and uses the updated default model for qwen', async () => {
+  it('uses the updated preset default model for qwen', async () => {
     const ws = makeWs();
-    let onMessage: ((msg: unknown) => void) | undefined;
-    ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
-      onMessage = handler;
-      handler({
-        type: 'cc.presets.list_response',
-        presets: [],
-      });
-      return () => {};
-    });
-
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
     const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
@@ -360,7 +360,7 @@ describe('NewSessionDialog', () => {
     fireEvent.input(screen.getByPlaceholderText('e.g. MiniMax'), { target: { value: 'MiniMax' } });
     fireEvent.input(screen.getByPlaceholderText('your-api-key'), { target: { value: 'secret' } });
     fireEvent.click(screen.getByRole('button', { name: /discover models/i }));
-    onMessage?.({
+    act(() => ws.emit({
       type: 'cc.presets.discover_models_response',
       ok: true,
       presetName: 'MiniMax',
@@ -374,10 +374,11 @@ describe('NewSessionDialog', () => {
         defaultModel: 'MiniMax-Text-01',
         availableModels: [{ id: 'MiniMax-M2.7' }, { id: 'MiniMax-Text-01' }],
       },
-    });
+    }));
 
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
     fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
+    await waitFor(() => expect(screen.getByDisplayValue('MiniMax-Text-01')).toBeDefined());
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
 
     await waitFor(() => {
@@ -416,7 +417,9 @@ describe('NewSessionDialog', () => {
     fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
     const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
     fireEvent.input(agentTypeSelect, { target: { value: 'copilot-sdk' } });
-    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'gpt-5.4-mini' } });
+    await waitFor(() => expect(screen.getAllByRole('combobox').length).toBeGreaterThanOrEqual(3));
+    const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
+    fireEvent.input(selects[2], { target: { value: 'gpt-5.4-mini' } });
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
@@ -434,12 +437,54 @@ describe('NewSessionDialog', () => {
     fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
     const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
     fireEvent.input(agentTypeSelect, { target: { value: 'cursor-headless' } });
-    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'gpt-5.2' } });
+    await waitFor(() => expect(screen.getAllByRole('combobox').length).toBeGreaterThanOrEqual(2));
+    const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
+    fireEvent.input(selects[1], { target: { value: 'gpt-5.2' } });
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
       agentType: 'cursor-headless',
       requestedModel: 'gpt-5.2',
+    }));
+  });
+
+  it('keeps auto in gemini-sdk options when dynamic models are discovered', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
+    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    agentTypeSelect.value = 'gemini-sdk';
+    fireEvent.input(agentTypeSelect, { target: { value: 'gemini-sdk' } });
+
+    await waitFor(() => {
+      expect(ws.send.mock.calls.some((call) => (
+        call[0]?.type === 'transport.list_models' && call[0]?.agentType === 'gemini-sdk'
+      ))).toBe(true);
+    });
+    const request = ws.send.mock.calls.find((call) => (
+      call[0]?.type === 'transport.list_models' && call[0]?.agentType === 'gemini-sdk'
+    ))?.[0];
+    expect(request).toMatchObject({ type: 'transport.list_models', agentType: 'gemini-sdk' });
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: 'gemini-sdk',
+      requestId: request?.requestId,
+      models: [
+        { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro' },
+        { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' },
+      ],
+    }));
+
+    await waitFor(() => expect(screen.getByRole('option', { name: 'auto' })).toBeDefined());
+    const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
+    fireEvent.input(selects[1], { target: { value: 'auto' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'gemini-sdk',
+      requestedModel: 'auto',
     }));
   });
 });

@@ -113,12 +113,17 @@ describe('watchdog .cmd file (Windows cmd.exe parser regression)', () => {
       //   - Replace the loop tail with `exit /b 0` so cmd.exe terminates
       const original = readFileSync(watchdogPath, 'utf8');
       const safe = original
-        // Neutralise the upgrade-lock check entirely
-        .replace(/if exist "[^"]*upgrade\.lock" \([\s\S]*?\)\r?\n/m, 'rem upgrade-lock check disabled in test\r\n')
+        // Neutralise the upgrade-lock check (now a single `if exist ... goto wait_lock`)
+        .replace(/if exist "[^"]*upgrade\.lock" goto wait_lock\r?\n/m, 'rem upgrade-lock check disabled in test\r\n')
+        // Belt-and-suspenders: also kill the wait_lock + wait_loop blocks
+        // in case the upgrade lock-check regex above didn't match
+        .replace(/:wait_lock[\s\S]*?goto loop\r?\n/m, '')
         // Replace either of the two possible launch forms with a marker
         .replace(/^call .*$/m, 'echo WATCHDOG_OK')
-        // Strip the loop tail so the script terminates
-        .replace(/timeout \/t 5 \/nobreak >nul[\r\n]+goto loop/m, 'exit /b 0');
+        // Strip the loop tail so the script terminates.  `ping`-based sleep
+        // replaces the old `timeout /t 5 /nobreak` (timeout fails under
+        // wscript → see windows-launch-artifacts.test.ts regression test).
+        .replace(/ping -n 6 127\.0\.0\.1 >nul 2>&1\r?\ngoto loop/m, 'exit /b 0');
       const safePath = join(dir, 'safe-watchdog.cmd');
       writeFileSync(safePath, safe);
 

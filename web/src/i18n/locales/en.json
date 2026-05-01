@@ -43,6 +43,17 @@
     "tool_fold_collapse": "collapse",
     "tool_group_more": "··· {{count}} more",
     "tool_group_collapse": "▲ collapse",
+    "tool_calls_toggle_show": "Show tools and thinking",
+    "tool_calls_toggle_hide": "Hide tools and thinking",
+    "tool_calls_toggle_undecided": "Choose how to view AI activity",
+    "tool_calls_choose_prompt": "Pick view ↓",
+    "tool_chooser_title": "How should AI activity show?",
+    "tool_chooser_subtitle": "Tool calls, file changes, and reasoning add detail but can feel busy.",
+    "tool_chooser_simple_label": "Simple",
+    "tool_chooser_simple_hint": "Just the AI's replies",
+    "tool_chooser_developer_label": "Developer",
+    "tool_chooser_developer_hint": "Show tools, files, reasoning",
+    "tool_chooser_footnote": "Change anytime via the wrench icon.",
     "new_folder": "New folder",
     "new_folder_name": "Folder name",
     "create": "Create",
@@ -141,7 +152,8 @@
       "claude_code_cli": "Claude Code CLI",
       "codex_cli": "Codex CLI",
       "copilot_sdk": "Copilot",
-      "cursor_headless": "Cursor"
+      "cursor_headless": "Cursor",
+      "gemini_sdk": "Gemini SDK"
     },
     "agentGroup": {
       "transport_sdk": "SDK",
@@ -318,9 +330,10 @@
     "timeout": "Request timed out",
     "timeout_detail": "Could not read directory. This may be caused by slow or unavailable network drives.",
     "preview_loading": "Loading…",
-    "preview_too_large": "File too large to preview (> 5 MB)",
+    "preview_too_large": "File too large to preview (> 100 MB)",
     "preview_error": "Preview unavailable",
     "preview_binary": "Binary file — preview unavailable",
+    "preview_video_unsupported": "Your browser cannot play this video format.",
     "mkdir_failed": "Failed to create folder",
     "view_diff": "Diff",
     "view_source": "Source",
@@ -409,6 +422,7 @@
     "username_placeholder": "Username",
     "password_placeholder": "Password",
     "signin": "Sign In",
+    "remember_password": "Remember password on this device",
     "invalid_credentials": "Invalid username or password",
     "account_pending": "Your account is pending admin approval. Please contact the administrator.",
     "account_disabled": "Your account has been disabled. Please contact the administrator.",
@@ -1227,7 +1241,8 @@
       "memoryDeleteConfirm": "Delete this memory permanently? This cannot be undone.",
       "memoryDeleteFailed": "Failed to delete memory",
       "memoryArchived": "Archived",
-      "memoryShowArchived": "Show archived"
+      "memoryShowArchived": "Show archived",
+      "memoryMasterSummary": "Master summary"
     },
     "diagnostics": {
       "title": "Diagnostics",
@@ -1245,5 +1260,13 @@
       "snapshotTitle": "Persisted snapshot",
       "snapshotBindings": "Snapshot bindings"
     }
+  },
+  "embedding": {
+    "status_unknown": "Embedding status unknown (older daemon or disconnected)",
+    "status_ready": "Embedding ready — semantic search runs locally",
+    "status_loading": "Embedding model loading…",
+    "status_fallback": "Embedding: local pipeline unavailable, using server fallback",
+    "status_unavailable": "Embedding unavailable — semantic search disabled on this daemon",
+    "status_idle": "Embedding idle (not yet used this session)"
   }
 }

@@ -11,7 +11,7 @@ import { terminalStreamer, type StreamSubscriber } from './terminal-streamer.js'
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { timelineStore } from './timeline-store.js';
-import type { MemoryContextTimelinePayload } from '../shared/timeline/types.js';
+import { TIMELINE_HISTORY_CONTENT_TYPES, TIMELINE_HISTORY_STATE_TYPES, type MemoryContextTimelinePayload } from '../shared/timeline/types.js';
 import { emitSessionInlineError } from './session-error.js';
 import { enqueueResend, getResendEntries, clearResend } from './transport-resend-queue.js';
 import {
@@ -25,7 +25,7 @@ import {
 } from './subsession-manager.js';
 import logger from '../util/logger.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
-import { MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
+import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID, MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
 import { homedir } from 'os';
 import { readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, stat as fsStat, writeFile as fsWriteFile } from 'node:fs/promises';
 import * as nodePath from 'node:path';
@@ -45,6 +45,7 @@ import { copyFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { ensureImcDir, imcSubDir } from '../util/imc-dir.js';
 import { buildWindowsCleanupScript, buildWindowsCleanupVbs, buildWindowsUpgradeBatch, buildWindowsUpgradeVbs } from '../util/windows-upgrade-script.js';
+import { buildBashSharpRepair } from '../util/sharp-repair-script.js';
 import { UPGRADE_LOCK_FILE, encodeVbsAsUtf16, encodeCmdAsUtf8Bom } from '../util/windows-launch-artifacts.js';
 import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
 import { sanitizeProjectName } from '../../shared/sanitize-project-name.js';
@@ -58,11 +59,12 @@ import {
 import { CODEX_MODEL_IDS, normalizeClaudeCodeModelId } from '../shared/models/options.js';
 import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from '../agent/sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
+import { mergeCodexDisplayMetadata } from '../agent/codex-display.js';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import { CC_PRESET_MSG, type CcPreset } from '../../shared/cc-presets.js';
 import { MEMORY_WS } from '../../shared/memory-ws.js';
-import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG } from '../../shared/p2p-config-events.js';
+import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG, MAX_P2P_PARTICIPANTS } from '../../shared/p2p-config-events.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import {
   CLAUDE_SDK_EFFORT_LEVELS,
@@ -86,6 +88,9 @@ import {
   SHARED_CONTEXT_RUNTIME_CONFIG_MSG,
 } from '../../shared/shared-context-runtime-config.js';
 import { getContextModelConfig } from '../context/context-model-config.js';
+import { getCompressionQueueState, resumeAcceptingCompression, stopAcceptingCompression } from '../context/summary-compressor.js';
+import { closeLiveContextMaterializationAdmission, reopenLiveContextMaterializationAdmission } from '../context/live-context-ingestion.js';
+import { getInflightMasterCompactionCount, resumeAcceptingMasterCompactions, stopAcceptingMasterCompactions } from './master-compaction-registry.js';
 import { detectRepo } from '../repo/detector.js';
 import { GitOriginRepositoryIdentityService } from '../agent/repository-identity-service.js';
 import {
@@ -179,7 +184,7 @@ async function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord
 
   // Compute transport display metadata fresh — matches session-list.ts hydration logic.
   // The session store may have stale or missing metadata during early launch/update windows.
-  const freshDisplay: Partial<Pick<SessionRecord, 'modelDisplay' | 'planLabel' | 'quotaLabel' | 'quotaUsageLabel' | 'quotaMeta'>> = r?.agentType === 'qwen'
+  const freshDisplay: Partial<Pick<SessionRecord, 'modelDisplay' | 'codexAvailableModels' | 'planLabel' | 'quotaLabel' | 'quotaUsageLabel' | 'quotaMeta'>> = r?.agentType === 'qwen'
     ? getQwenDisplayMetadata({
         model: r?.qwenModel,
         authType: r?.qwenAuthType,
@@ -188,8 +193,8 @@ async function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord
       })
     : r?.agentType === 'claude-code-sdk'
       ? await getClaudeSdkRuntimeConfig().catch(() => ({}))
-      : r?.agentType === 'codex-sdk'
-        ? await getCodexRuntimeConfig().catch(() => ({}))
+      : (r?.agentType === 'codex' || r?.agentType === 'codex-sdk')
+        ? mergeCodexDisplayMetadata(await getCodexRuntimeConfig().catch(() => ({})), r)
     : {};
 
   return {
@@ -229,6 +234,7 @@ async function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord
     qwenAuthType: r?.qwenAuthType ?? null,
     qwenAuthLimit: r?.qwenAuthLimit ?? null,
     qwenAvailableModels: r?.qwenAvailableModels ?? null,
+    codexAvailableModels: freshDisplay.codexAvailableModels ?? r?.codexAvailableModels ?? null,
     modelDisplay: freshDisplay.modelDisplay ?? r?.modelDisplay ?? null,
     planLabel: freshDisplay.planLabel ?? r?.planLabel ?? null,
     quotaLabel: freshDisplay.quotaLabel ?? r?.quotaLabel ?? null,
@@ -337,23 +343,15 @@ function supportsTransportClear(agentType: string | undefined): agentType is 'cl
     || agentType === 'qwen';
 }
 
-/**
- * Transport agents that benefit from server-side `/compact` interception.
- * None of the underlying SDKs expose a programmatic compact API (claude-code-sdk
- * only emits compact_boundary events, never accepts a manual trigger), so we
- * synthesize compaction by:
- *   1. Loading the session's transport-history events,
- *   2. Calling `compressWithSdk` (the same memory-compression pipeline used for
- *      shared context), which routes to the user's configured context backend,
- *   3. Restarting a fresh transport conversation (same as `/clear`),
- *   4. Surfacing the summary in chat as a memory-excluded assistant.text.
- *
- * Result: zero token bloat in the agent's context, but the user keeps the
- * compressed history visible in the timeline for reference.
- */
-function supportsTransportCompact(agentType: string | undefined): agentType is 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'openclaw' | 'qwen' {
-  return supportsTransportClear(agentType);
-}
+// Note: an earlier `supportsTransportCompact` helper synthesized `/compact`
+// behaviour daemon-side by replaying transport history, calling the memory
+// compressor, and relaunching a fresh conversation. That was rolled back —
+// transport SDKs (claude-code-sdk and friends) accept the literal `/compact`
+// text and run their own native compaction, which is materially better than
+// a daemon-side fresh relaunch (preserves SDK tool config, system prompts,
+// and resume identity). The daemon's automatic materialization pipeline
+// continues to record raw events into `context_event_archive` regardless,
+// so no provenance is lost when the SDK compacts.
 
 function supportsProcessClear(agentType: string | undefined): agentType is 'claude-code' | 'codex' | 'opencode' {
   return agentType === 'claude-code' || agentType === 'codex' || agentType === 'opencode';
@@ -641,29 +639,21 @@ function expandAllTargets(initiatorName: string, mode: string, excludeSameType =
     if (!inDomain) continue;
 
     if (sessionConfig) {
+      // Strict allowlist semantics: a saved P2P config is an INCLUSION list.
+      // ONLY sessions with `enabled: true` and a non-`skip` mode are eligible.
+      // Missing entries are EXCLUDED.
+      //
+      // Earlier "missing = include" semantics caused every new sub-session
+      // (created after the user's last save) to silently join the run, so
+      // selecting 3 members produced "all members" once any new sub-session
+      // was spawned. The Gate 1 / Gate 2 / cap=5 checks at command-handler
+      // entry now reject the empty-config case explicitly with a clear error
+      // (`NO_SAVED_CONFIG` / `NO_ENABLED_PARTICIPANTS`), so the strict
+      // allowlist never silently fails — it always either runs the picked
+      // set or surfaces a visible error.
       const entry = sessionConfig[s.name];
-      // Semantics: a saved P2P config is an EXCLUSION list plus a mode
-      // override table. Entries with `enabled: false` or `mode: 'skip'`
-      // are explicit opt-outs. MISSING entries default to INCLUDED,
-      // using `mode` (the dropdown / combo override) as their mode.
-      //
-      // Previous semantics ("missing = excluded") was too strict:
-      // whenever the user's saved config grew stale (sub-session names
-      // change on restart, new sessions join the project, etc.) every
-      // active session got filtered out → daemon emitted
-      // `P2P: config filtered all eligible structured-routing targets`
-      // → `command.ack error` with `no_configured_targets`. Combined
-      // with the web intercepting the optimistic bubble for P2P sends
-      // (so `markOptimisticFailed` becomes a no-op), the user
-      // experiences a silent failure where "P2P just doesn't start"
-      // with no visible error.
-      //
-      // Entries for CONFIGURED sessions still win — if a user opted a
-      // session out, it stays out. This change only rescues the stale-
-      // config case by treating never-configured sessions as "no
-      // preference expressed → include by default".
-      if (entry && (entry.enabled === false || entry.mode === 'skip')) continue;
-      const effectiveMode = (entry && mode === P2P_CONFIG_MODE) ? entry.mode : mode;
+      if (!entry || entry.enabled !== true || entry.mode === 'skip') continue;
+      const effectiveMode = (mode === P2P_CONFIG_MODE) ? entry.mode : mode;
       targets.push({ session: s.name, mode: effectiveMode });
     } else {
       targets.push({ session: s.name, mode });
@@ -1279,7 +1269,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       try { serverLink.send({ type: 'session.error', project, message }); } catch { /* ignore */ }
       return;
     }
-    if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless') {
+    if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'gemini-sdk') {
       logger.info({ project, agentType }, 'SDK fresh session.start removing stale main-session store record');
       removeSession(`deck_${project}_brain`);
     }
@@ -1289,7 +1279,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       brainType: agentType as ProjectConfig['brainType'],
       workerTypes: [],
       label,
-      fresh: agentType === 'claude-code-sdk' || agentType === 'codex-sdk',
+      fresh: agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'gemini-sdk',
       extraEnv,
       ccPreset: ccPresetName,
       effort,
@@ -1330,6 +1320,22 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         projectName: project,
         role: 'brain',
         agentType: agentType as 'copilot-sdk' | 'cursor-headless',
+        projectDir: dir,
+        fresh: true,
+        ...(requestedModel ? { requestedModel } : {}),
+        label,
+        effort,
+      });
+    } else if (agentType === 'gemini-sdk') {
+      // Gemini SDK shares the codex-sdk shape: fresh launch, optional requested
+      // model, no ccPreset, no resume id (ACP issues a fresh sessionId on the
+      // first turn and persists it via ~/.gemini/tmp/<project>/chats/).
+      logger.info({ project }, 'SDK fresh session.start launching new Gemini SDK main session');
+      await launchTransportSession({
+        name: `deck_${project}_brain`,
+        projectName: project,
+        role: 'brain',
+        agentType: 'gemini-sdk',
         projectDir: dir,
         fresh: true,
         ...(requestedModel ? { requestedModel } : {}),
@@ -1537,8 +1543,6 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     return;
   }
 
-  await waitForPendingSessionRelaunch(sessionName);
-
   // Fallback: legacy clients that don't send commandId get a server-generated one
   const isLegacy = !commandId;
   const effectiveId = commandId ?? crypto.randomUUID();
@@ -1546,24 +1550,206 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     logger.warn({ sessionName, effectiveId }, 'session.send: missing commandId — using server-generated fallback');
   }
 
-  // Dedup: silently ignore duplicate commandIds
+  // Dedup: reject duplicate commandIds explicitly so the browser/server does
+  // not wait for an ack timeout after the daemon has already seen this send.
   const dedup = getDedup(sessionName);
   if (dedup.has(effectiveId)) {
-    logger.debug({ sessionName, effectiveId }, 'session.send: duplicate commandId, ignored');
+    if ((cmd as any).__bridgeRetry === true) {
+      logger.debug({ sessionName, effectiveId }, 'session.send: bridge retry for commandId already owned by daemon, ignored');
+      return;
+    }
+    logger.debug({ sessionName, effectiveId }, 'session.send: duplicate commandId, rejected');
+    timelineEmitter.emit(sessionName, 'command.ack', {
+      commandId: effectiveId,
+      status: 'error',
+      error: COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID,
+    });
+    emitCommandAckReliable(serverLink, {
+      commandId: effectiveId,
+      sessionName,
+      status: 'error',
+      error: COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID,
+    });
     return;
   }
   dedup.add(effectiveId);
 
 // ── P2P routing: structured WS fields (new) or inline @@tokens (legacy) ──
   const clientP2pSessionConfig = (cmd as any).p2pSessionConfig as P2pSessionConfig | undefined;
+  let receiptAcked = false;
+  const emitAcceptedReceiptAck = (): void => {
+    if (receiptAcked) return;
+    const status = isLegacy ? 'accepted_legacy' : 'accepted';
+    emitCommandAck(sessionName, effectiveId, status, undefined, serverLink);
+    receiptAcked = true;
+  };
+  const emitTransportUserMessage = (payloadText: string, extra?: Record<string, unknown>, eventId?: string) => {
+    // Always thread the client commandId through so the web UI can reconcile
+    // its optimistic "sending" bubble deterministically. Callers that set
+    // `clientMessageId` in `extra` keep their override (legacy path).
+    const base: Record<string, unknown> = {
+      text: payloadText,
+      allowDuplicate: true,
+      commandId: effectiveId,
+    };
+    timelineEmitter.emit(
+      sessionName,
+      'user.message',
+      { ...base, ...(extra ?? {}) },
+      eventId ? { source: 'daemon', confidence: 'high', eventId } : undefined,
+    );
+  };
+  const trimmedText = text.trim();
   const wantsStructuredP2pRouting = Boolean(
     clientP2pSessionConfig ||
     (cmd as any).p2pMode ||
+    directTargetSession ||
     (Array.isArray((cmd as any).p2pAtTargets) && (cmd as any).p2pAtTargets.length > 0),
   );
+  const wantsLegacyP2pRouting = text.includes('@@discuss(')
+    || text.includes('@@all(')
+    || text.includes('@@p2p-config(');
+  const isDaemonHandledControlSend = trimmedText === '/stop'
+    || trimmedText === '/clear'
+    || /^\/model\s+\S+/.test(trimmedText)
+    || /^\/(?:thinking|effort)\s+\S+/.test(trimmedText);
+  // For ordinary user turns, command.ack is a daemon-receipt acknowledgement:
+  // once the daemon owns the commandId, the browser should stop waiting on the
+  // websocket round trip. This intentionally happens before the first async
+  // boundary in handleSend: no P2P preference reads, no pending relaunch wait,
+  // no per-session send lock, no live context bootstrap, no semantic recall, no
+  // embedding, and no provider send-start may delay it. Follow-up delivery,
+  // reconnect/restart, memory, and SDK failures surface through later timeline
+  // or session-state events. `/compact` is intentionally NOT a daemon-handled
+  // control and is acked here before being forwarded unchanged to the SDK.
+  if (!wantsStructuredP2pRouting && !wantsLegacyP2pRouting && !isDaemonHandledControlSend) {
+    emitAcceptedReceiptAck();
+  }
+
+  if (trimmedText === '/stop') {
+    const stopRuntime = getTransportRuntime(sessionName);
+    const stopRecord = getSession(sessionName);
+    const isTransportStop = !!stopRuntime
+      || stopRecord?.runtimeType === 'transport'
+      || (typeof stopRecord?.agentType === 'string' && isTransportAgent(stopRecord.agentType));
+    if (isTransportStop) {
+      emitTransportUserMessage(text);
+      // `/stop` is a priority control lane: receipt ack and queue clearing
+      // happen before any P2P config read, pending relaunch wait, transport
+      // mutex, context bootstrap, recall, or provider cancel await. The
+      // cancel itself runs in the background; failures surface as timeline
+      // state, not as a delayed command ack.
+      clearResend(sessionName);
+      emitAcceptedReceiptAck();
+      if (!stopRuntime) {
+        timelineEmitter.emit(sessionName, 'session.state', {
+          state: 'idle',
+          pendingCount: 0,
+          pendingMessages: [],
+          pendingMessageEntries: [],
+        }, { source: 'daemon', confidence: 'high' });
+        return;
+      }
+      void (async () => {
+        try {
+          supervisionAutomation.cancelSession(sessionName);
+          await stopRuntime.cancel();
+          // Mark session for fresh start so daemon restart doesn't resume the
+          // stuck conversation.
+          if (stopRecord?.agentType === 'qwen') {
+            upsertSession({ ...stopRecord, qwenFreshOnResume: true, updatedAt: Date.now() });
+          }
+        } catch (err) {
+          const errMsg = describeTransportSendError(err);
+          logger.error({ sessionName, err }, 'session.stop (transport) failed');
+          timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Stop failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
+        }
+      })();
+      return;
+    }
+  }
+
   const p2pSessionConfig = wantsStructuredP2pRouting
     ? await resolveStructuredP2pSessionConfig(sessionName, clientP2pSessionConfig)
     : undefined;
+
+  // ── P2P start gates (mandatory) ──
+  // GATE 1: every structured P2P start must have a saved config (either sent
+  //         from client or persisted on disk).
+  // GATE 2: that config must contain at least one participant explicitly
+  //         enabled with a non-skip mode — "no specific selected members → reject".
+  // CAP:    no more than MAX_P2P_PARTICIPANTS (=5) enabled members.
+  // Targeted, structured routing via the @ picker (`p2pAtTargets` with named
+  // sessions, no '__all__' token) is exempt from gates 1+2 because the user
+  // has explicitly named the targets in the message itself; the cap still
+  // applies. The gates' purpose is to prevent the dropdown / `__all__` paths
+  // from defaulting to "every active session" when saved config is missing.
+  if (wantsStructuredP2pRouting) {
+    const inlineAtTargets = (cmd as any).p2pAtTargets as Array<{ session: string; mode: string }> | undefined;
+    const hasNamedAtTargets =
+      Array.isArray(inlineAtTargets) &&
+      inlineAtTargets.length > 0 &&
+      inlineAtTargets.every((t) => t && typeof t.session === 'string' && t.session !== '__all__');
+    const hasDirectNamedTarget = typeof directTargetSession === 'string'
+      && directTargetSession.length > 0
+      && directTargetSession !== '__all__';
+
+    if (hasNamedAtTargets || hasDirectNamedTarget) {
+      // @ picker / legacy directTargetSession — explicit per-message targets.
+      // Only apply the cap; these do not need a saved dropdown config.
+      const explicitTargetCount = hasNamedAtTargets ? inlineAtTargets!.length : 1;
+      if (explicitTargetCount > MAX_P2P_PARTICIPANTS) {
+        logger.warn({ sessionName, count: explicitTargetCount }, 'P2P start blocked: too many explicit targets');
+        sendP2pTargetError(
+          serverLink,
+          sessionName,
+          effectiveId,
+          P2P_CONFIG_ERROR.TOO_MANY_PARTICIPANTS,
+          `P2P participants exceed the limit of ${MAX_P2P_PARTICIPANTS}`,
+        );
+        return;
+      }
+    } else {
+      // Dropdown / __all__ / config-mode path — must have saved config selecting members.
+      if (!p2pSessionConfig || typeof p2pSessionConfig !== 'object') {
+        logger.warn({ sessionName }, 'P2P start blocked: no saved P2P config');
+        sendP2pTargetError(
+          serverLink,
+          sessionName,
+          effectiveId,
+          P2P_CONFIG_ERROR.NO_SAVED_CONFIG,
+          'P2P requires a saved configuration before starting. Open the P2P settings panel and select members.',
+        );
+        return;
+      }
+      const enabledNames = Object.entries(p2pSessionConfig)
+        .filter(([, entry]) => entry && entry.enabled === true && entry.mode !== 'skip')
+        .map(([name]) => name);
+      if (enabledNames.length === 0) {
+        logger.warn({ sessionName }, 'P2P start blocked: saved config has no enabled members');
+        sendP2pTargetError(
+          serverLink,
+          sessionName,
+          effectiveId,
+          P2P_CONFIG_ERROR.NO_ENABLED_PARTICIPANTS,
+          'No P2P participants selected. Open settings and enable at least one member.',
+        );
+        return;
+      }
+      if (enabledNames.length > MAX_P2P_PARTICIPANTS) {
+        logger.warn({ sessionName, count: enabledNames.length }, 'P2P start blocked: too many enabled members');
+        sendP2pTargetError(
+          serverLink,
+          sessionName,
+          effectiveId,
+          P2P_CONFIG_ERROR.TOO_MANY_PARTICIPANTS,
+          `P2P participants exceed the limit of ${MAX_P2P_PARTICIPANTS}. Reduce selection in the settings panel.`,
+        );
+        return;
+      }
+    }
+  }
   let p2pRounds = (cmd as any).p2pRounds as number | undefined;
   let p2pExtraPrompt = (cmd as any).p2pExtraPrompt as string | undefined;
   const p2pLocale = (cmd as any).p2pLocale as string | undefined;
@@ -1772,6 +1958,8 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     return;
   }
 
+  await waitForPendingSessionRelaunch(sessionName);
+
   // Transport sessions — route directly to the provider runtime, bypassing tmux.
   const transportRuntime = getTransportRuntime(sessionName);
   const record = (await import('../store/session-store.js')).getSession(sessionName);
@@ -1783,23 +1971,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     && isEligibleSupervisionTaskText(text);
   const attachments: TransportAttachment[] = [];
   const transportUserEventId = (clientMessageId: string) => `transport-user:${clientMessageId}`;
-  const emitTransportUserMessage = (payloadText: string, extra?: Record<string, unknown>, eventId?: string) => {
-    // Always thread the client commandId through so the web UI can reconcile
-    // its optimistic "sending" bubble deterministically. Callers that set
-    // `clientMessageId` in `extra` keep their override (legacy path).
-    const base: Record<string, unknown> = {
-      text: payloadText,
-      allowDuplicate: true,
-      commandId: effectiveId,
-    };
-    timelineEmitter.emit(
-      sessionName,
-      'user.message',
-      { ...base, ...(extra ?? {}) },
-      eventId ? { source: 'daemon', confidence: 'high', eventId } : undefined,
-    );
-  };
-  if (!transportRuntime && record?.runtimeType === 'transport') {
+  const isTransportSession = record?.runtimeType === 'transport'
+    || (typeof record?.agentType === 'string' && isTransportAgent(record.agentType));
+  if (!transportRuntime && isTransportSession) {
     // No runtime — provider is still (re)connecting. Queue the message for
     // automatic redelivery once `restoreTransportSessions()` rebuilds the
     // runtime instead of dropping it on the floor.
@@ -1840,9 +2014,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       },
       { source: 'daemon', confidence: 'high' },
     );
-    const status = isLegacy ? 'accepted_legacy' : 'accepted';
-    timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
-    emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status });
+    emitAcceptedReceiptAck();
     // Best-effort resume for sessions that failed to launch or whose runtime
     // vanished outside the provider reconnect path. The resend queue drains on
     // successful relaunch, so the queued user message still delivers.
@@ -1901,9 +2073,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       },
       { source: 'daemon', confidence: 'high' },
     );
-    const status = isLegacy ? 'accepted_legacy' : 'accepted';
-    timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
-    emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status });
+    emitAcceptedReceiptAck();
     // Best-effort resume. Failure is logged but doesn't change the ack —
     // the next user send will re-enter this branch and try again, or a
     // manual /restart path can recover.
@@ -1926,32 +2096,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     return;
   }
   if (transportRuntime) {
-    if (text.trim() === '/stop') {
-      emitTransportUserMessage(text);
-      // Explicit stop discards any queued resend work — the user asked for a halt.
-      clearResend(sessionName);
-      try {
-        supervisionAutomation.cancelSession(sessionName);
-        await transportRuntime.cancel();
-        // Mark session for fresh start so daemon restart doesn't resume the stuck conversation
-        if (record?.agentType === 'qwen') {
-          upsertSession({ ...record, qwenFreshOnResume: true, updatedAt: Date.now() });
-        }
-        const stopStatus = isLegacy ? 'accepted_legacy' : 'accepted';
-        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: stopStatus });
-        try {
-          serverLink.send({ type: 'command.ack', commandId: effectiveId, status: stopStatus, session: sessionName });
-        } catch { /* */ }
-      } catch (err) {
-        const errMsg = describeTransportSendError(err);
-        logger.error({ sessionName, err }, 'session.stop (transport) failed');
-        timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Stop failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
-        try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg }); } catch { /* */ }
-      }
-      return;
-    }
-    if (text.trim() === '/clear' && supportsTransportClear(record?.agentType)) {
+    if (trimmedText === '/clear' && supportsTransportClear(record?.agentType)) {
       emitTransportUserMessage(text);
       // Fresh conversation must not replay stale queued messages from the prior
       // offline window — drop anything we had buffered for resend.
@@ -1984,102 +2129,19 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       }
       return;
     }
-    if (text.trim() === '/compact' && supportsTransportCompact(record?.agentType)) {
-      emitTransportUserMessage(text);
-      // Stream a placeholder "running" assistant turn so the chat shows progress
-      // while compression runs. This is a long-ish round-trip (LLM call) so silent
-      // dead air is a worse UX than a visible spinner with status text.
-      const compactingEventId = `compact:${sessionName}:${effectiveId}`;
-      const emitCompactStatus = (statusText: string, streaming: boolean): void => {
-        timelineEmitter.emit(sessionName, 'assistant.text', {
-          text: statusText,
-          streaming,
-          memoryExcluded: true,
-        }, { source: 'daemon', confidence: 'high', eventId: compactingEventId });
-      };
-      emitCompactStatus('🗜 Compacting conversation…', true);
-      // Fresh conversation must not replay stale queued messages from the prior
-      // offline window — drop anything we had buffered for resend.
-      clearResend(sessionName);
-      try {
-        const { replayTransportHistory } = await import('./transport-history.js');
-        const rawEvents = await replayTransportHistory(sessionName);
-        // Only memory-eligible turns feed the compressor. Tool calls, deltas,
-        // session state pings, and approval requests are noise here — they
-        // bloat the prompt without informing the summary.
-        // Synthesize a minimal ContextTargetRef — the compressor only reads
-        // `eventType` and `content` from each event when serializing the prompt,
-        // so the namespace fields are filler. Reuse the session's persisted
-        // namespace when available so logs are coherent across the codebase.
-        const compactNamespace: import('../../shared/context-types.js').ContextNamespace =
-          record?.contextNamespace
-          ?? { scope: 'personal', projectId: record?.projectName ?? sessionName };
-        const localEvents: import('../../shared/context-types.js').LocalContextEvent[] = rawEvents
-          .filter((e) => {
-            const t = typeof e.type === 'string' ? e.type : '';
-            return t === 'user.message' || t === 'assistant.text';
-          })
-          .map((e, idx) => ({
-            id: `compact-src:${sessionName}:${idx}`,
-            target: { namespace: compactNamespace, kind: 'session' as const, sessionName },
-            eventType: String(e.type),
-            content: typeof e.text === 'string' ? e.text : '',
-            createdAt: typeof e._ts === 'number' ? e._ts : Date.now(),
-          }))
-          .filter((e) => e.content && e.content.trim().length > 0);
-
-        if (localEvents.length === 0) {
-          emitCompactStatus('⚠️ Nothing to compact yet — start a turn first.', false);
-          const ackStatus = isLegacy ? 'accepted_legacy' : 'accepted';
-          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: ackStatus });
-          try {
-            serverLink.send({ type: 'command.ack', commandId: effectiveId, status: ackStatus, session: sessionName });
-          } catch { /* */ }
-          return;
-        }
-
-        const { compressWithSdk } = await import('../context/summary-compressor.js');
-        const modelConfig = getContextModelConfig();
-        const result = await compressWithSdk({
-          events: localEvents,
-          modelConfig,
-          targetTokens: 600,
-        });
-
-        // Restart the transport runtime fresh — the compressed summary replaces
-        // the verbose history. Same exclusive-relaunch dance as /clear.
-        await runExclusiveSessionRelaunch(sessionName, async () => {
-          await relaunchFreshTransportConversation(record);
-        });
-        clearRecentInjectionHistory(sessionName);
-        await handleGetSessions(serverLink);
-        await syncSubSessionIfNeeded(sessionName, serverLink);
-
-        const backendNote = result.backend
-          ? ` · ${result.backend}${result.usedBackup ? ' (backup)' : ''}`
-          : '';
-        emitCompactStatus(
-          `🗜 Compacted ${localEvents.length} turn${localEvents.length === 1 ? '' : 's'}${backendNote}\n\n${result.summary}`,
-          false,
-        );
-        const compactStatus = isLegacy ? 'accepted_legacy' : 'accepted';
-        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: compactStatus });
-        try {
-          serverLink.send({ type: 'command.ack', commandId: effectiveId, status: compactStatus, session: sessionName });
-        } catch { /* */ }
-      } catch (err) {
-        const errMsg = describeTransportSendError(err);
-        logger.error({ sessionName, err }, 'session.compact (transport) failed');
-        emitCompactStatus(`⚠️ Compact failed: ${errMsg}`, false);
-        timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
-        try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg }); } catch { /* */ }
-      }
-      return;
-    }
+    // `/compact` is intentionally NOT intercepted here. Transport SDKs
+    // (claude-code-sdk, codex-sdk, copilot-sdk, cursor-headless, openclaw,
+    // qwen) accept the literal `/compact` text and run their own native
+    // compaction — preserving SDK tool config, system prompts, and resume
+    // identity. The daemon's automatic materialization pipeline already
+    // archives every memory-eligible event into `context_event_archive`
+    // independently, so daemon-side memory provenance is preserved whether
+    // or not the SDK compacts. Falling through to the default send path
+    // forwards `/compact` to the transport untouched.
     const release = await getMutex(sessionName).acquire();
     try {
-      const modelMatch = text.trim().match(/^\/model\s+(\S+)(?:\s+.*)?$/);
-      const effortMatch = text.trim().match(/^\/(?:thinking|effort)\s+(\S+)\s*$/);
+      const modelMatch = trimmedText.match(/^\/model\s+(\S+)(?:\s+.*)?$/);
+      const effortMatch = trimmedText.match(/^\/(?:thinking|effort)\s+(\S+)\s*$/);
       if (record?.agentType === 'qwen' && modelMatch) {
         const nextModel = modelMatch[1];
           const runtimeConfig = await getQwenRuntimeConfig(true).catch(() => null);
@@ -2186,7 +2248,14 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       }
       if (record?.agentType === 'codex-sdk' && modelMatch) {
         const nextModel = modelMatch[1];
-        if (!CODEX_MODEL_IDS.includes(nextModel as any)) {
+        const sdkRuntime = await getCodexRuntimeConfig(true).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig);
+        const sdkDisplay = mergeCodexDisplayMetadata(sdkRuntime, record);
+        const availableModels = sdkRuntime.availableModels?.length
+          ? sdkRuntime.availableModels
+          : record.codexAvailableModels?.length
+            ? record.codexAvailableModels
+            : [...CODEX_MODEL_IDS];
+        if (!availableModels.includes(nextModel)) {
           emitTransportUserMessage(text);
           timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Unknown Codex model: ${nextModel}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
           timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Codex model: ${nextModel}` });
@@ -2194,15 +2263,13 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           return;
         }
         transportRuntime.setAgentId(nextModel);
-        const sdkDisplay = await getCodexRuntimeConfig(true).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig);
         const nextRecord = {
           ...record,
           requestedModel: nextModel,
           activeModel: nextModel,
           modelDisplay: nextModel,
-          planLabel: sdkDisplay.planLabel,
-          quotaLabel: sdkDisplay.quotaLabel,
-          quotaUsageLabel: sdkDisplay.quotaUsageLabel,
+          ...(availableModels.length ? { codexAvailableModels: availableModels } : {}),
+          ...sdkDisplay,
           updatedAt: Date.now(),
         };
         upsertSession(nextRecord);
@@ -2221,7 +2288,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted', session: sessionName }); } catch {}
         return;
       }
-      if ((record?.agentType === 'copilot-sdk' || record?.agentType === 'cursor-headless') && modelMatch) {
+      if ((record?.agentType === 'copilot-sdk' || record?.agentType === 'cursor-headless' || record?.agentType === 'gemini-sdk') && modelMatch) {
         const nextModel = modelMatch[1];
         transportRuntime.setAgentId(nextModel);
         const nextRecord = {
@@ -2322,15 +2389,15 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       if (record?.qwenFreshOnResume) {
         upsertSession({ ...record, qwenFreshOnResume: undefined, updatedAt: Date.now() });
       }
-      const status = isLegacy ? 'accepted_legacy' : 'accepted';
-      timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
-      emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status });
+      emitAcceptedReceiptAck();
     } catch (err) {
       const errMsg = describeTransportSendError(err);
       logger.error({ sessionName, err }, 'session.send (transport) failed');
       timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Send failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
       timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
-      emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
+      if (!receiptAcked) {
+        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
+      }
     } finally {
       release();
     }
@@ -2393,10 +2460,44 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       originalText: text,
       commandId: effectiveId,
       isLegacy,
+      ackAlreadySent: receiptAcked,
       serverLink,
     });
   } catch (err) {
     logger.error({ sessionName, err }, 'session.send failed');
+  }
+}
+
+/** Emit command.ack to local timeline + outbox + server. Idempotent per commandId. */
+function emitCommandAck(
+  sessionName: string,
+  commandId: string,
+  status: 'accepted' | 'accepted_legacy' | 'error',
+  error: string | undefined,
+  serverLink: Pick<ServerLink, 'send'> | undefined,
+): void {
+  const ackPayload: Record<string, unknown> = { commandId, status };
+  if (error) ackPayload.error = error;
+  timelineEmitter.emit(sessionName, 'command.ack', ackPayload);
+  const outbox = getDefaultAckOutbox();
+  outbox.enqueue({
+    commandId,
+    sessionName,
+    status,
+    error,
+    ts: Date.now(),
+  }).catch((err) => {
+    logger.error({ commandId, err }, 'ackOutbox.enqueue failed');
+  });
+  try {
+    const wireMsg: Record<string, unknown> = { type: MSG_COMMAND_ACK, commandId, status, session: sessionName };
+    if (error) wireMsg.error = error;
+    serverLink?.send(wireMsg);
+    outbox.markAcked(commandId).catch((err) => {
+      logger.warn({ commandId, err }, 'ackOutbox.markAcked failed');
+    });
+  } catch (err) {
+    logger.warn({ commandId, err }, 'command.ack send failed, queued for retry');
   }
 }
 
@@ -2408,9 +2509,27 @@ async function sendProcessSessionMessage(
     originalText?: string;
     commandId?: string;
     isLegacy?: boolean;
+    ackAlreadySent?: boolean;
     serverLink?: Pick<ServerLink, 'send'>;
   },
 ): Promise<void> {
+  // ── Step 1: Confirm receipt to the user IMMEDIATELY ─────────────────────────
+  // This is the daemon-receipt confirmation. It happens BEFORE the mutex,
+  // BEFORE memory recall, BEFORE any tmux work — so the spinner clears in one
+  // WS RTT regardless of how busy the agent or daemon is. The actual delivery
+  // to the agent happens in the background.
+  const payload: Record<string, unknown> = { text: options?.originalText ?? finalText };
+  if (attachments.length > 0) payload.attachments = attachments;
+  if (options?.commandId) payload.commandId = options.commandId;
+  const userEvent = timelineEmitter.emit(sessionName, 'user.message', payload);
+  if (options?.commandId && !options.ackAlreadySent) {
+    const status = options.isLegacy ? 'accepted_legacy' : 'accepted';
+    emitCommandAck(sessionName, options.commandId, status, undefined, options.serverLink);
+  }
+
+  // ── Step 2: Acquire per-session mutex to serialize tmux delivery ────────────
+  // The mutex preserves message ordering when multiple sends queue up. The ack
+  // above is already out — the user no longer waits on this lock.
   const release = await getMutex(sessionName).acquire();
   try {
     const agentType = getSession(sessionName)?.agentType ?? 'unknown';
@@ -2420,18 +2539,37 @@ async function sendProcessSessionMessage(
       sendText = await rewritePathsForSandbox(sessionName, finalText);
     }
 
-    const memoryContext = await prependLocalMemory(sendText, sessionName);
-    sendText = memoryContext.text;
+    // ── Step 3: Memory recall — best-effort, NO deadline ─────────────────────
+    // Recall is purely advisory; it augments the prompt with related past work
+    // when available. A slow or failing recall MUST NOT delay the message —
+    // the user only cares that the agent gets the prompt. If recall succeeds
+    // we prepend; otherwise we send the raw text.
+    let memoryContext: Awaited<ReturnType<typeof prependLocalMemory>> = { text: sendText };
+    try {
+      memoryContext = await prependLocalMemory(sendText, sessionName);
+      sendText = memoryContext.text;
+    } catch (recallErr) {
+      logger.warn({ sessionName, err: recallErr }, 'memory recall failed — sending without memory injection');
+      // Fall through with the original sendText. Agent still gets the message;
+      // user just doesn't get the related-past-work block.
+    }
 
-    await sendShellAwareCommand(sessionName, sendText, agentType);
-    const payload: Record<string, unknown> = { text: options?.originalText ?? finalText };
-    if (attachments.length > 0) payload.attachments = attachments;
-    // Thread the client commandId through to the user.message event so the
-    // web UI can reconcile its optimistic "sending" bubble deterministically
-    // instead of falling back to text-based matching (which fails when the
-    // agent echoes a normalized or memory-prepended version of the prompt).
-    if (options?.commandId) payload.commandId = options.commandId;
-    const userEvent = timelineEmitter.emit(sessionName, 'user.message', payload);
+    // ── Step 4: Deliver to tmux. Failures here surface as inline errors ──────
+    try {
+      await sendShellAwareCommand(sessionName, sendText, agentType);
+    } catch (sendErr) {
+      const errMsg = sendErr instanceof Error ? sendErr.message : String(sendErr);
+      logger.error({ sessionName, err: sendErr }, 'sendShellAwareCommand failed after ack');
+      try {
+        emitSessionInlineError(sessionName, `Failed to deliver message to agent: ${errMsg}`);
+      } catch { /* best-effort */ }
+      throw sendErr;
+    }
+
+    // ── Step 5: Post-delivery — emit memory.context + record hits ────────────
+    // Order matters — memory.context comes AFTER user.message and AFTER
+    // successful agent delivery so a failed send doesn't pollute recall
+    // analytics.
     if (memoryContext.timelinePayload && userEvent) {
       timelineEmitter.emit(sessionName, 'memory.context', {
         ...memoryContext.timelinePayload,
@@ -2441,62 +2579,15 @@ async function sendProcessSessionMessage(
         try { recordMemoryHits(memoryContext.hitIds); } catch { /* non-fatal */ }
       }
     }
-    if (options?.commandId) {
-      const status = options.isLegacy ? 'accepted_legacy' : 'accepted';
-      timelineEmitter.emit(sessionName, 'command.ack', { commandId: options.commandId, status });
-      const outbox = getDefaultAckOutbox();
-      // Enqueue BEFORE the network send so a thrown send() doesn't lose the ack.
-      // In-memory update is synchronous; disk persistence is fire-and-forget to
-      // avoid holding the per-session mutex on file I/O.
-      outbox.enqueue({
-        commandId: options.commandId,
-        sessionName,
-        status,
-        ts: Date.now(),
-      }).catch((err) => {
-        logger.error({ commandId: options.commandId, err }, 'ackOutbox.enqueue failed');
-      });
-      try {
-        options.serverLink?.send({ type: MSG_COMMAND_ACK, commandId: options.commandId, status, session: sessionName });
-        // Delivery accepted by the transport; server LRU dedup handles any later
-        // outbox replay. Tombstone locally so we don't retransmit on reconnect.
-        outbox.markAcked(options.commandId).catch((err) => {
-          logger.warn({ commandId: options.commandId, err }, 'ackOutbox.markAcked failed');
-        });
-      } catch (err) {
-        // Do NOT silently swallow — the entry stays in the outbox (fire-and-forget
-        // disk write is already in flight) and will be flushed on the next
-        // successful server-link auth.
-        logger.warn({ commandId: options.commandId, err }, 'command.ack send failed, queued for retry');
-      }
-    }
+
     if (agentType === 'opencode') {
       const { scheduleCatchup } = await import('./opencode-watcher.js');
       scheduleCatchup(sessionName);
     }
   } catch (err) {
-    if (options?.commandId) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      timelineEmitter.emit(sessionName, 'command.ack', { commandId: options.commandId, status: 'error', error: errMsg });
-      const outbox = getDefaultAckOutbox();
-      outbox.enqueue({
-        commandId: options.commandId,
-        sessionName,
-        status: 'error',
-        error: errMsg,
-        ts: Date.now(),
-      }).catch((enqueueErr) => {
-        logger.error({ commandId: options.commandId, err: enqueueErr }, 'ackOutbox.enqueue (error ack) failed');
-      });
-      try {
-        options.serverLink?.send({ type: MSG_COMMAND_ACK, commandId: options.commandId, status: 'error', session: sessionName, error: errMsg });
-        outbox.markAcked(options.commandId).catch((mErr) => {
-          logger.warn({ commandId: options.commandId, err: mErr }, 'ackOutbox.markAcked (error ack) failed');
-        });
-      } catch (sendErr) {
-        logger.warn({ commandId: options.commandId, err: sendErr }, 'command.ack (error) send failed, queued for retry');
-      }
-    }
+    // The ack is already out (status: accepted). Surface failures as inline
+    // session errors via the path above; we do NOT downgrade the ack to error
+    // because the user has already been told their message was received.
     throw err;
   } finally {
     release();
@@ -2912,22 +3003,31 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
   let readMs = 0;
   let synthesizeMs = 0;
 
-  // Read generously from disk — session.state events are excluded from the limit budget
-  // so we need to read more to ensure enough substantive events.
+  // Query content by type instead of over-reading and filtering in JS. SQLite
+  // has (session_id, type, ts) indexes; using them keeps the common path near
+  // O(requested rows) instead of decoding thousands of unrelated state events.
   // Do NOT filter by epoch — history should include events across daemon restarts.
-  const readLimit = Math.min(limit * 6, 10000);
   const tRead0 = Date.now();
-  const events = await timelineStore.readPreferred(sessionName, { limit: readLimit, afterTs, beforeTs });
+  const substantive = await timelineStore.readByTypesPreferred(
+    sessionName,
+    [...TIMELINE_HISTORY_CONTENT_TYPES],
+    { limit, afterTs, beforeTs },
+  );
+  let stateEvents: typeof substantive = [];
+  if (substantive.length > 0) {
+    const cutoffTs = substantive[0]!.ts;
+    const stateAfterTs = afterTs === undefined ? cutoffTs - 1 : Math.max(afterTs, cutoffTs - 1);
+    stateEvents = await timelineStore.readByTypesPreferred(
+      sessionName,
+      [...TIMELINE_HISTORY_STATE_TYPES],
+      { limit: Math.max(limit * 2, 100), afterTs: stateAfterTs, beforeTs },
+    );
+  }
+  const events = [...substantive, ...stateEvents].sort((a, b) => a.ts - b.ts);
   readMs = Date.now() - tRead0;
 
   // Content-aware limit: session.state events don't count toward the budget.
   // This prevents idle↔running oscillation storms from crowding out user.message events.
-  const substantive: typeof events = [];
-  const stateEvents: typeof events = [];
-  for (const ev of events) {
-    if (ev.type === 'session.state') stateEvents.push(ev);
-    else substantive.push(ev);
-  }
   // Trim substantive to the requested limit
   const trimmedSubstantive = substantive.length > limit ? substantive.slice(substantive.length - limit) : substantive;
   // Interleave state events that fall within the trimmed time range
@@ -3441,6 +3541,62 @@ async function handleDiscussionStop(cmd: Record<string, unknown>): Promise<void>
   );
 }
 
+/** Compare two imcodes daemon version strings.
+ *
+ * Returns -1 / 0 / 1 like Array.sort comparators (a<b / equal / a>b).
+ *
+ * Format we accept: `<num>.<num>.<num>[-<pre>...]` — calver-style with optional
+ * dot-separated pre-release suffix. e.g.
+ *   `2026.4.1873`              (release)
+ *   `2026.4.1924-dev.1906`     (pre-release)
+ *
+ * Rules:
+ *  - Compare the dot-separated release segments numerically, left-to-right.
+ *  - If release segments tie, a version WITHOUT a pre-release suffix is
+ *    *greater* than one WITH (standard semver convention; pre is a step
+ *    *toward* the next release).
+ *  - If both have pre-release suffixes, compare those segment-wise; numeric
+ *    when both numeric, lexicographic otherwise.
+ *
+ * This is permissive about junk (non-numeric segments parse as 0) — we only
+ * use it to gate downgrade-prevention, never for anything strict.
+ */
+function compareDaemonVersions(a: string, b: string): -1 | 0 | 1 {
+  const parse = (v: string): { rel: number[]; pre: string[] | null } => {
+    const dash = v.indexOf('-');
+    const relStr = dash === -1 ? v : v.slice(0, dash);
+    const preStr = dash === -1 ? null : v.slice(dash + 1);
+    return {
+      rel: relStr.split('.').map((n) => Number.parseInt(n, 10) || 0),
+      pre: preStr ? preStr.split('.') : null,
+    };
+  };
+  const A = parse(a);
+  const B = parse(b);
+  const len = Math.max(A.rel.length, B.rel.length);
+  for (let i = 0; i < len; i++) {
+    const da = A.rel[i] ?? 0;
+    const db = B.rel[i] ?? 0;
+    if (da !== db) return da < db ? -1 : 1;
+  }
+  if (A.pre === null && B.pre === null) return 0;
+  if (A.pre === null) return 1; // a stable > b pre
+  if (B.pre === null) return -1;
+  const plen = Math.max(A.pre.length, B.pre.length);
+  for (let i = 0; i < plen; i++) {
+    const pa = A.pre[i] ?? '';
+    const pb = B.pre[i] ?? '';
+    const na = /^\d+$/.test(pa) ? Number.parseInt(pa, 10) : null;
+    const nb = /^\d+$/.test(pb) ? Number.parseInt(pb, 10) : null;
+    if (na !== null && nb !== null) {
+      if (na !== nb) return na < nb ? -1 : 1;
+    } else if (pa !== pb) {
+      return pa < pb ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
 /** daemon.upgrade — install latest via npm then restart service via a detached script.
  *
  * Safety rules:
@@ -3451,6 +3607,10 @@ async function handleDiscussionStop(cmd: Record<string, unknown>): Promise<void>
  *     so the daemon always comes back up (possibly on the old version).
  *  3. A short sleep before the restart gives the current daemon time to finish
  *     sending any in-flight messages.
+ *  4. Never DOWNGRADE: refuse to restart into an older version. The TS-side
+ *     check at top blocks pinned-target downgrades; the bash-side check after
+ *     `npm install` catches the `targetVersion === 'latest'` case where npm
+ *     may resolve to an older release than what's currently installed.
  */
 async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLink): Promise<void> {
   const activeRuns = getActiveP2pRunsBlockingDaemonUpgrade();
@@ -3470,18 +3630,50 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
     return;
   }
 
-  const activeTransportSessions = getActiveTransportSessionsBlockingDaemonUpgrade();
-  if (activeTransportSessions.length > 0) {
-    logger.warn({
-      targetVersion,
-      activeSessionNames: activeTransportSessions.map((session) => session.name),
-      activeSessionStates: activeTransportSessions.map((session) => session.state),
-    }, 'daemon.upgrade: blocked because transport sessions have active turns');
+  const activeMasterCompactions = getInflightMasterCompactionCount();
+  if (activeMasterCompactions > 0) {
+    logger.warn({ targetVersion, activeMasterCompactions }, 'daemon.upgrade: blocked because master compaction is active');
     try {
       serverLink?.send({
         type: DAEMON_MSG.UPGRADE_BLOCKED,
-        reason: 'transport_busy',
-        activeSessionNames: activeTransportSessions.map((session) => session.name),
+        reason: 'master_compaction_active',
+        activeMasterCompactions,
+      });
+    } catch { /* ignore */ }
+    return;
+  }
+
+  const compressionState = getCompressionQueueState();
+  if (!compressionState.idle) {
+    logger.warn({ targetVersion, compressionState }, 'daemon.upgrade: blocked because memory compression is active');
+    try {
+      serverLink?.send({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: 'compression_active',
+        compressionState,
+      });
+    } catch { /* ignore */ }
+    return;
+  }
+
+  // Cover BOTH transport-runtime sessions (claude-code-sdk, codex-sdk,
+  // copilot-sdk, cursor-headless, openclaw, qwen) and process-runtime
+  // sessions (claude-code, codex, opencode, gemini, shell). Pre-fix this
+  // gate only checked transport runtimes, so a `claude-code` CLI in tmux
+  // mid-turn would silently get killed by self-upgrade restart, throwing
+  // away the in-flight generation.
+  const activeSessions = getActiveSessionsBlockingDaemonUpgrade();
+  if (activeSessions.length > 0) {
+    logger.warn({
+      targetVersion,
+      blockedSessions: activeSessions,
+    }, 'daemon.upgrade: blocked because sessions have active turns');
+    try {
+      serverLink?.send({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: activeSessions.every((reason) => reason.runtimeType === 'transport') ? 'transport_busy' : 'session_busy',
+        activeSessionNames: activeSessions.map((reason) => reason.name),
+        blockedSessions: activeSessions,
       });
     } catch { /* ignore */ }
     return;
@@ -3497,6 +3689,86 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
     logger.info({ daemonVersion: DAEMON_VERSION, targetVersion }, 'daemon.upgrade: already at target version, skipping');
     return;
   }
+  // Don't downgrade: if a specific targetVersion is named and our running
+  // daemon is already at or newer than it, skip. Without this, a server that
+  // pushes `latest` (or an older pinned version) can repeatedly clobber a
+  // newer dev/local build the operator has installed.
+  if (targetVersion && targetVersion !== 'latest' && compareDaemonVersions(DAEMON_VERSION, targetVersion) >= 0) {
+    logger.info({ daemonVersion: DAEMON_VERSION, targetVersion },
+      'daemon.upgrade: installed version is at or newer than target, refusing to downgrade');
+    return;
+  }
+  // For untargeted / `latest` upgrades, pre-flight against the npm registry —
+  // if our running version is already at or newer than what the registry
+  // resolves `imcodes@latest` to, skip the whole upgrade. This stops servers
+  // that blindly broadcast `latest` from clobbering a newer dev build's
+  // global install (npm install -g would replace the symlink/dir with the
+  // older registry release even if we then refused to restart, so we have to
+  // catch this BEFORE spawning the install).
+  if (!targetVersion || targetVersion === 'latest') {
+    try {
+      const res = await fetch('https://registry.npmjs.org/imcodes/latest', {
+        headers: { accept: 'application/json' },
+        // 5 s — registry should be fast; if it's not we'd rather skip the
+        // probe and fall through than block the daemon for long.
+        signal: AbortSignal.timeout(5000),
+      });
+      if (res.ok) {
+        const json = await res.json() as { version?: string };
+        const registryLatest = typeof json.version === 'string' ? json.version : null;
+        if (registryLatest && compareDaemonVersions(DAEMON_VERSION, registryLatest) >= 0) {
+          logger.info({ daemonVersion: DAEMON_VERSION, registryLatest },
+            'daemon.upgrade: registry "latest" is not newer than current, refusing to downgrade');
+          return;
+        }
+      } else {
+        logger.warn({ status: res.status }, 'daemon.upgrade: registry probe returned non-2xx, proceeding without pre-flight');
+      }
+    } catch (e) {
+      logger.warn({ err: e }, 'daemon.upgrade: registry probe failed, proceeding without pre-flight');
+    }
+  }
+
+  let upgradeScriptSpawned = false;
+  const releaseUpgradeMemoryFreeze = (() => {
+    closeLiveContextMaterializationAdmission('upgrade-pending');
+    stopAcceptingCompression('upgrade-pending');
+    stopAcceptingMasterCompactions('upgrade-pending');
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      resumeAcceptingMasterCompactions();
+      resumeAcceptingCompression();
+      reopenLiveContextMaterializationAdmission();
+    };
+  })();
+
+  try {
+    const postFreezeMasterCompactions = getInflightMasterCompactionCount();
+    if (postFreezeMasterCompactions > 0) {
+      logger.warn({ targetVersion, activeMasterCompactions: postFreezeMasterCompactions }, 'daemon.upgrade: blocked because master compaction became active after freeze');
+      try {
+        serverLink?.send({
+          type: DAEMON_MSG.UPGRADE_BLOCKED,
+          reason: 'master_compaction_active',
+          activeMasterCompactions: postFreezeMasterCompactions,
+        });
+      } catch { /* ignore */ }
+      return;
+    }
+    const postFreezeCompressionState = getCompressionQueueState();
+    if (!postFreezeCompressionState.idle) {
+      logger.warn({ targetVersion, compressionState: postFreezeCompressionState }, 'daemon.upgrade: blocked because memory compression became active after freeze');
+      try {
+        serverLink?.send({
+          type: DAEMON_MSG.UPGRADE_BLOCKED,
+          reason: 'compression_active',
+          compressionState: postFreezeCompressionState,
+        });
+      } catch { /* ignore */ }
+      return;
+    }
 
   logger.info('daemon.upgrade: preparing upgrade script');
 
@@ -3567,60 +3839,537 @@ launchctl load -w "${plist}"`;
     child.unref();
 
     logger.info({ log: logFile }, 'daemon.upgrade: Windows upgrade script spawned');
+    upgradeScriptSpawned = true;
     return;
   } else {
     logger.warn('daemon.upgrade: unsupported platform, cannot restart service');
     return;
   }
 
-  // Resolve full npm path — bare `npm` may not work in detached shells (nvm not loaded)
-  const npmBin = join(dirname(process.execPath), 'npm');
-  const npmCmd = existsSync(npmBin) ? npmBin : 'npm';
+  // Resolve absolute paths to `node` and `npm-cli.js` and bake them into the
+  // upgrade script.
+  //
+  // Why this matters on Linux/macOS:
+  //   - `npm` itself is `#!/usr/bin/env node`, which fails when the upgrade
+  //     script runs in a non-interactive shell that doesn't have node on PATH
+  //     (very common with nvm/fnm/volta — their PATH setup lives in
+  //     ~/.bashrc which has the standard `case $- in *i*) ;; *) return;;`
+  //     guard, so non-interactive shells exit before nvm.sh is sourced).
+  //   - Calling `node` via absolute path AND invoking npm-cli.js directly
+  //     bypasses the shebang lookup entirely.
+  //   - We also export node's bin dir to PATH so anything *npm* spawns
+  //     (post-install scripts, node-gyp, the freshly-installed `imcodes`
+  //     binary itself for the version check) can also find node.
+  //
+  // Layout coverage (all of these put npm-cli.js at the same relative path):
+  //   - nvm:    ~/.nvm/versions/node/<ver>/{bin/node, lib/node_modules/npm/bin/npm-cli.js}
+  //   - fnm:    ~/.local/share/fnm/node-versions/<ver>/installation/{bin/node, lib/...}
+  //   - volta:  ~/.volta/tools/image/node/<ver>/{bin/node, lib/...}
+  //   - tarball/system: /usr/{bin/node, lib/node_modules/npm/bin/npm-cli.js}
+  //   - homebrew (macOS): /opt/homebrew/Cellar/node/<ver>/{bin/node, lib/...}
+  //   - snap:   /snap/node/current/{bin/node, lib/node_modules/...}
+  // If none of the candidates exist (extremely unusual), fall back to bare
+  // `npm` and rely on PATH — same behavior as before.
+  const nodeBin = process.execPath;
+  const nodeDir = dirname(nodeBin);
+  // Discovery happens INSIDE the bash script at runtime (see the
+  // `discover npm-cli.js` block in the script body). The bash script
+  // tries multiple strategies in order, with the most reliable first:
+  //   1. `npm prefix -g` → derive `<prefix>/lib/node_modules/npm/bin/npm-cli.js`
+  //   2. realpath of `<nodeDir>/npm` (handles symlink-based installs)
+  //   3. relative candidates for nvm/fnm/volta/system/homebrew/snap layouts
+  //   4. Fallback to bare `npm` and let the shebang chain handle it
+  // Doing it in the script (vs hardcoded TS-side resolution) means the
+  // discovery runs in the actual environment of the upgrade — different
+  // user, different npm install method, no problem. Path baked at TS
+  // gen-time would lock in the daemon process's view of npm, which can
+  // diverge from the user-side installation (e.g. user upgraded node
+  // mid-session).
 
   const pkgSpec = targetVersion ? `imcodes@${targetVersion}` : 'imcodes@latest';
   const targetVer = targetVersion ?? 'latest';
+  const currentVer = DAEMON_VERSION;
+  const oldDaemonPid = process.pid;
+  // 24 h cleanup so a failed upgrade leaves debuggable artifacts on disk
+  // instead of evaporating in 60 s. Operators running into a stuck daemon
+  // can grep `find /tmp -name 'imcodes-upgrade-*' -mmin -1440` after the
+  // fact. Successful upgrades still clean up via the same timer; the only
+  // observable change is debugability.
+  const CLEANUP_AFTER_SEC = 24 * 60 * 60;
   const script = `#!/bin/bash
-LOG="${logFile}"
-echo "=== imcodes upgrade started at $(date) ===" >> "$LOG"
+# imcodes daemon-upgrade script. Generated by daemon.upgrade.
+# Runs detached, outlives the parent daemon process.
+# Logs every step to "$LOG" — keep the file for 24 h after exit so a
+# stuck or failed restart can be diagnosed post-hoc.
 
-# Give the running daemon a moment to finish sending its response
+LOG="${logFile}"
+log() { echo "[$(date '+%Y-%m-%dT%H:%M:%S%z')] $*" >> "$LOG"; }
+
+log "=== imcodes upgrade started ==="
+log "[step 0] daemon PID at gen time: ${oldDaemonPid}"
+log "[step 0] node bin: ${nodeBin}"
+log "[step 0] target: ${pkgSpec} (current daemon version: ${currentVer})"
+
+# ── Single-flight guard ─────────────────────────────────────────────────
+#
+# npm global installs are NOT atomic: a failed or concurrent
+# \`npm install -g imcodes@...\` can remove/replace the global package while a
+# second upgrade has already installed a good copy.  Keep the old daemon
+# serving while the install runs, but allow only ONE upgrade script to touch
+# the global install / service restart path at a time.
+UPGRADE_LOCK_DIR="$HOME/.imcodes/upgrade.lock.d"
+UPGRADE_LOCK_PID="$UPGRADE_LOCK_DIR/pid"
+UPGRADE_LOCK_STARTED="$UPGRADE_LOCK_DIR/started"
+UPGRADE_LOCK_STALE_AFTER_SEC=1800
+UPGRADE_LOCK_HELD=0
+
+lock_age_seconds() {
+  local started now
+  started=$(cat "$UPGRADE_LOCK_STARTED" 2>/dev/null || true)
+  now=$(date +%s)
+  case "$started" in
+    ''|*[!0-9]*)
+      # If a prior process crashed between mkdir and writing the started
+      # file, fall back to the lock directory's mtime so it can still expire.
+      started=$(stat -c %Y "$UPGRADE_LOCK_DIR" 2>/dev/null || stat -f %m "$UPGRADE_LOCK_DIR" 2>/dev/null || echo "$now")
+      case "$started" in
+        ''|*[!0-9]*) echo 0 ;;
+        *) echo $((now - started)) ;;
+      esac
+      ;;
+    *) echo $((now - started)) ;;
+  esac
+}
+
+acquire_upgrade_lock() {
+  mkdir -p "$HOME/.imcodes" 2>/dev/null || true
+  while true; do
+    if mkdir "$UPGRADE_LOCK_DIR" 2>/dev/null; then
+      echo "$$" > "$UPGRADE_LOCK_PID" 2>/dev/null || true
+      date +%s > "$UPGRADE_LOCK_STARTED" 2>/dev/null || true
+      UPGRADE_LOCK_HELD=1
+      log "[step 0.5] acquired upgrade lock: $UPGRADE_LOCK_DIR"
+      return 0
+    fi
+
+    LOCK_OWNER=$(cat "$UPGRADE_LOCK_PID" 2>/dev/null || true)
+    LOCK_AGE=$(lock_age_seconds)
+    if [ -n "$LOCK_OWNER" ] && kill -0 "$LOCK_OWNER" 2>/dev/null; then
+      log "[step 0.5] another upgrade is already running (pid $LOCK_OWNER, age \${LOCK_AGE}s) — exiting without touching npm/service"
+      return 1
+    fi
+    if [ -z "$LOCK_OWNER" ] && [ "$LOCK_AGE" -lt "$UPGRADE_LOCK_STALE_AFTER_SEC" ]; then
+      log "[step 0.5] upgrade lock exists without owner (age \${LOCK_AGE}s) — treating as active, exiting"
+      return 1
+    fi
+
+    STALE_LOCK="\${UPGRADE_LOCK_DIR}.stale.$$"
+    log "[step 0.5] removing stale upgrade lock (owner: \${LOCK_OWNER:-unknown}, age \${LOCK_AGE}s)"
+    if mv "$UPGRADE_LOCK_DIR" "$STALE_LOCK" 2>/dev/null; then
+      rm -rf "$STALE_LOCK"
+      # Loop back and acquire with mkdir; if another process won the race,
+      # mkdir will fail and we'll re-check the new owner.
+      continue
+    fi
+
+    log "[step 0.5] lost race while clearing stale upgrade lock — exiting"
+    return 1
+  done
+}
+
+release_upgrade_lock() {
+  if [ "$UPGRADE_LOCK_HELD" = "1" ]; then
+    OWNER=$(cat "$UPGRADE_LOCK_PID" 2>/dev/null || true)
+    if [ "$OWNER" = "$$" ]; then
+      rm -rf "$UPGRADE_LOCK_DIR"
+      log "[step 0.5] released upgrade lock"
+    else
+      log "[step 0.5] not releasing upgrade lock; owner changed to \${OWNER:-unknown}"
+    fi
+  fi
+}
+
+if ! acquire_upgrade_lock; then
+  log "=== upgrade skipped: another upgrade is in progress ==="
+  sleep ${CLEANUP_AFTER_SEC} && rm -rf "${scriptDir}" &
+  exit 0
+fi
+trap release_upgrade_lock EXIT
+
+# Make node visible to everything we spawn (npm post-install scripts,
+# node-gyp, the freshly-installed imcodes --version probe, etc).
+# Critical on nvm/fnm/volta where node lives outside system PATH.
+export PATH="${nodeDir}:$PATH"
+log "[step 0] PATH=$PATH"
+
+# Discover npm-cli.js dynamically — works for any node install method
+# (Homebrew, nvm, fnm, volta, system pkg, snap, plain tarball, custom).
+# Strategy ordering: most reliable first, fall through on failure.
+NODE="${nodeBin}"
+NPM_CLI=""
+
+# Strategy 1: ask npm itself where it's installed. The shebang in
+# <nodeDir>/npm will find node (we just exported PATH), so this works
+# regardless of how the user installed node.
+if [ -z "$NPM_CLI" ]; then
+  NPM_PREFIX=$(npm prefix -g 2>>"$LOG")
+  if [ -n "$NPM_PREFIX" ] && [ -f "$NPM_PREFIX/lib/node_modules/npm/bin/npm-cli.js" ]; then
+    NPM_CLI="$NPM_PREFIX/lib/node_modules/npm/bin/npm-cli.js"
+    log "[step 0] npm-cli.js via npm prefix -g: $NPM_CLI"
+  fi
+fi
+
+# Strategy 2: realpath the npm sibling next to node. Handles symlink-
+# based installs (Homebrew, nvm, fnm — even when their layouts diverge).
+if [ -z "$NPM_CLI" ] && [ -e "${nodeDir}/npm" ]; then
+  RESOLVED=$(readlink -f "${nodeDir}/npm" 2>/dev/null || readlink "${nodeDir}/npm" 2>/dev/null)
+  case "$RESOLVED" in
+    *npm-cli.js)
+      if [ -f "$RESOLVED" ]; then
+        NPM_CLI="$RESOLVED"
+        log "[step 0] npm-cli.js via realpath \\\${nodeDir}/npm: $NPM_CLI"
+      fi
+      ;;
+  esac
+fi
+
+# Strategy 3: probe known relative-from-nodeDir layouts.
+if [ -z "$NPM_CLI" ]; then
+  for CANDIDATE in \
+    "${nodeDir}/../lib/node_modules/npm/bin/npm-cli.js" \
+    "${nodeDir}/../../../lib/node_modules/npm/bin/npm-cli.js" \
+    "${nodeDir}/node_modules/npm/bin/npm-cli.js" \
+  ; do
+    if [ -f "$CANDIDATE" ]; then
+      NPM_CLI="$CANDIDATE"
+      log "[step 0] npm-cli.js via candidate probe: $NPM_CLI"
+      break
+    fi
+  done
+fi
+
+# Strategy 4: fall back to bare \`npm\` on PATH (PATH already includes nodeDir).
+# The shebang chain still works because node is on PATH from our export.
+if [ -z "$NPM_CLI" ]; then
+  log "[step 0] npm-cli.js NOT located via any strategy — using bare 'npm' from PATH"
+  NPM_RUN='npm'
+else
+  NPM_RUN="\\"$NODE\\" \\"$NPM_CLI\\""
+fi
+log "[step 0] npm runner: $NPM_RUN"
+
+# Give the running daemon a moment to finish in-flight responses.
 sleep 3
 
-# Remove npm link if present — it shadows npm install and prevents real upgrades
-GLOBAL_PKG=$(${npmCmd} root -g 2>/dev/null)/imcodes
+log "[step 1] discover global package root"
+GLOBAL_ROOT=$(eval "$NPM_RUN root -g" 2>>"$LOG")
+log "[step 1] global root: $GLOBAL_ROOT"
+GLOBAL_PKG="$GLOBAL_ROOT/imcodes"
+
+# Remove existing npm link if any — it shadows install and prevents real upgrade.
 if [ -L "$GLOBAL_PKG" ]; then
-  echo "Removing npm link ($GLOBAL_PKG -> $(readlink "$GLOBAL_PKG"))..." >> "$LOG"
-  ${npmCmd} uninstall -g imcodes >> "$LOG" 2>&1 || true
+  log "[step 1] removing pre-existing npm link: $GLOBAL_PKG -> $(readlink "$GLOBAL_PKG")"
+  eval "$NPM_RUN uninstall -g imcodes" >> "$LOG" 2>&1 || log "[step 1] uninstall returned non-zero (ignored)"
 fi
 
-# Attempt npm install — only restart if install succeeds
-echo "Installing ${pkgSpec}..." >> "$LOG"
-if ! "${npmCmd}" install -g ${pkgSpec} >> "$LOG" 2>&1; then
-  echo "Install FAILED (exit $?). Keeping current daemon running." >> "$LOG"
-  echo "=== upgrade aborted at $(date) ===" >> "$LOG"
-  sleep 60 && rm -rf "${scriptDir}" &
+log "[step 2] installing ${pkgSpec}"
+# --ignore-scripts: \`scripts/strip-onnxruntime-gpu.mjs\` strips
+# \`node_modules/sharp/\` from the published tarball so npm re-resolves it on
+# the user's actual platform (otherwise the Linux-built bundle ships a
+# Linux-only sharp wrapper that can't load on macOS/Windows). When npm
+# re-resolves sharp during a global install, sharp's \`install\` hook
+# (\`node install/check.js || npm run build\`) fails with MODULE_NOT_FOUND
+# in a way we couldn't reproduce in nested project installs — npm seems
+# to half-extract sharp under \`<global>/imcodes/node_modules/sharp/\` (the
+# install/ directory ends up missing) and then runs the hook anyway. The
+# fallback \`npm run build\` then walks UP into imcodes's package.json,
+# tries to run imcodes's \`tsc\` build, and exits 127 because tsc isn't on
+# the global PATH. Net effect: every auto-upgrade since the strip-sharp
+# change has been failing with exit 127 and operators were getting
+# \`Cannot find module .../sharp/install/check.js\` in upgrade.log.
+#
+# Skipping install scripts is safe here because (a) sharp 0.34's runtime
+# binary is the prebuilt \`@img/sharp-<platform>-<arch>\` package (which
+# npm STILL fetches and unpacks because it's a regular optionalDependency
+# of sharp — no install script involvement), and (b) the only thing
+# install/check.js does is dlopen-test that prebuilt; if it fails
+# check.js falls back to compiling from source (npm run build), which
+# we never want on a user machine anyway.
+#
+# After the install we probe \`sharp/package.json\`. If npm left an empty
+# placeholder dir (the half-extract pathology above), do a one-shot
+# \`npm install\` from inside the global package to repopulate it. Run with
+# --ignore-scripts again for the same reason.
+#
+# ── Retry on ETARGET (npm CDN replication race) ────────────────────────
+# Real-world failure mode caught on 116.62.239.78: server publishes a
+# new dev release to npm and broadcasts \`daemon.upgrade { targetVersion }\`
+# almost immediately. npm origin has the version but the regional CDN
+# edge serving this daemon hasn't replicated yet — so the packument
+# response is a 200 missing the new version → npm exits with ETARGET.
+# Pre-fix this killed the upgrade for that release entirely (no retry,
+# next try only when the server broadcasts again). We now retry up to
+# 4 times with 60/180/300s back-off (1m / 3m / 5m — the last gap is wide
+# enough to outlast a slow regional CDN: 2m wasn't enough on a real
+# replication-lagged edge node) and bust the packument cache between
+# attempts so npm refetches origin instead of serving the stale 200.
+# Total time-to-give-up: ~9 minutes from the first attempt.
+#
+# Non-ETARGET failures are NOT retried — they're typically deterministic
+# (network down, ENOSPC, registry auth issue). Logging the per-attempt
+# tail makes those diagnosable post-hoc without re-reading the giant
+# main log.
+INSTALL_OUT="${scriptDir}/install-attempt.log"
+INSTALL_RC=1
+ATTEMPT=0
+MAX_ATTEMPTS=4
+# Indexed sequentially with $ATTEMPT (1-based), so element 0 is unused.
+# 60s / 180s / 300s — see the comment block above for sizing rationale.
+RETRY_DELAYS=(0 60 180 300)
+while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
+  ATTEMPT=$((ATTEMPT + 1))
+  log "[step 2] install attempt $ATTEMPT/$MAX_ATTEMPTS"
+  : > "$INSTALL_OUT"
+  # --prefer-online: tell npm to revalidate cached packument metadata
+  # rather than serve potentially-stale entries. Belt & braces with the
+  # cache-clean we do between attempts.
+  eval "$NPM_RUN install -g --ignore-scripts --prefer-online ${pkgSpec}" >> "$INSTALL_OUT" 2>&1
+  INSTALL_RC=$?
+  # Always tee the attempt's output into the main log for forensics.
+  cat "$INSTALL_OUT" >> "$LOG"
+  if [ "$INSTALL_RC" -eq 0 ]; then
+    log "[step 2] install attempt $ATTEMPT succeeded"
+    break
+  fi
+  log "[step 2] install attempt $ATTEMPT failed (exit $INSTALL_RC)"
+  # Detect ETARGET (case-insensitive — npm versions vary slightly).
+  IS_ETARGET=0
+  if grep -qiE 'code ETARGET|No matching version found' "$INSTALL_OUT" 2>/dev/null; then
+    IS_ETARGET=1
+  fi
+  if [ "$IS_ETARGET" -ne 1 ]; then
+    log "[step 2] non-ETARGET failure — not retrying. Tail of npm output:"
+    tail -20 "$INSTALL_OUT" | while IFS= read -r line; do log "[step 2]   $line"; done
+    break
+  fi
+  if [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
+    log "[step 2] ETARGET persisted across $MAX_ATTEMPTS attempts — registry never replicated ${pkgSpec}"
+    break
+  fi
+  DELAY=\${RETRY_DELAYS[$ATTEMPT]}
+  log "[step 2] ETARGET — npm CDN likely hasn't replicated ${pkgSpec} yet; retrying in \${DELAY}s after busting packument cache"
+  # Bust the cached packument so the next attempt forces an origin
+  # round-trip instead of revalidating into the stale cached 200.
+  eval "$NPM_RUN cache clean --force" >> "$LOG" 2>&1 || log "[step 2] cache clean returned non-zero (ignored)"
+  sleep "$DELAY"
+done
+if [ "$INSTALL_RC" -ne 0 ]; then
+  log "[step 2] install FAILED after $ATTEMPT attempts (final exit $INSTALL_RC) — keeping current daemon running"
+  log "=== upgrade aborted ==="
+  sleep ${CLEANUP_AFTER_SEC} && rm -rf "${scriptDir}" &
   exit 0
 fi
-echo "Install succeeded." >> "$LOG"
+log "[step 2] install succeeded after $ATTEMPT attempt(s)"
 
-# Verify installed version matches target (skip for "latest")
-INSTALLED_VER=$(imcodes --version 2>/dev/null || echo "unknown")
-echo "Installed version: $INSTALLED_VER, target: ${targetVer}" >> "$LOG"
+${buildBashSharpRepair()}
+
+# Read installed version directly from package.json — bypasses the
+# freshly-installed imcodes shebang (which can fail under the same
+# PATH issues that motivated this whole bypass).
+GLOBAL_ROOT=$(eval "$NPM_RUN root -g" 2>/dev/null)
+INSTALLED_VER=$("$NODE" -e "try{process.stdout.write(require('$GLOBAL_ROOT/imcodes/package.json').version)}catch(e){process.exit(1)}" 2>/dev/null || echo "unknown")
+log "[step 3] installed version: $INSTALLED_VER, target: ${targetVer}"
 if [ "${targetVer}" != "latest" ] && [ "$INSTALLED_VER" != "${targetVer}" ]; then
-  echo "Version mismatch after install — keeping current daemon running." >> "$LOG"
-  echo "=== upgrade aborted at $(date) ===" >> "$LOG"
-  sleep 60 && rm -rf "${scriptDir}" &
+  log "[step 3] version mismatch — keeping current daemon running"
+  log "=== upgrade aborted ==="
+  sleep ${CLEANUP_AFTER_SEC} && rm -rf "${scriptDir}" &
   exit 0
 fi
 
-# Install succeeded and version verified — restart the service
-echo "Restarting service..." >> "$LOG"
-${restartCmd} >> "$LOG" 2>&1 || echo "Restart command failed (exit $?)" >> "$LOG"
+# Downgrade guard — refuse to restart if installed < current daemon.
+# Catches: server broadcasts \`latest\` but npm's "latest" dist-tag
+# resolves to an older release than the operator's local dev build.
+CURRENT_VER="${currentVer}"
+"$NODE" -e "
+  const a = process.argv[1], b = process.argv[2];
+  const parse = v => { const i = v.indexOf('-'); return { rel: (i<0?v:v.slice(0,i)).split('.').map(n => parseInt(n,10)||0), pre: i<0 ? null : v.slice(i+1).split('.') }; };
+  const A = parse(a), B = parse(b);
+  const len = Math.max(A.rel.length, B.rel.length);
+  for (let i = 0; i < len; i++) { const da = A.rel[i]||0, db = B.rel[i]||0; if (da !== db) process.exit(da < db ? 1 : 2); }
+  if (A.pre === null && B.pre === null) process.exit(0);
+  if (A.pre === null) process.exit(2);
+  if (B.pre === null) process.exit(1);
+  const plen = Math.max(A.pre.length, B.pre.length);
+  for (let i = 0; i < plen; i++) {
+    const pa = A.pre[i]||'', pb = B.pre[i]||'';
+    const na = /^\\d+\$/.test(pa) ? parseInt(pa,10) : null;
+    const nb = /^\\d+\$/.test(pb) ? parseInt(pb,10) : null;
+    if (na !== null && nb !== null) { if (na !== nb) process.exit(na < nb ? 1 : 2); }
+    else if (pa !== pb) process.exit(pa < pb ? 1 : 2);
+  }
+  process.exit(0);
+" "$INSTALLED_VER" "$CURRENT_VER"
+CMP=$?
+# Exit codes: 0=equal, 1=installed<current (downgrade), 2=installed>current (upgrade)
+if [ "$CMP" = "1" ]; then
+  log "[step 3] installed $INSTALLED_VER is OLDER than current $CURRENT_VER — refusing to downgrade"
+  log "=== upgrade aborted ==="
+  sleep ${CLEANUP_AFTER_SEC} && rm -rf "${scriptDir}" &
+  exit 0
+fi
+if [ "$CMP" = "0" ]; then
+  log "[step 3] installed $INSTALLED_VER matches current — no restart needed"
+  log "=== upgrade complete (no-op) ==="
+  sleep ${CLEANUP_AFTER_SEC} && rm -rf "${scriptDir}" &
+  exit 0
+fi
+log "[step 3] version comparator: installed > current → restart"
 
-echo "=== upgrade script done at $(date) ===" >> "$LOG"
+# ── Step 3.5: Regenerate launch chain with the new binary's paths ──────
+#
+# Why this exists: on Linux the systemd unit at
+# ~/.config/systemd/user/imcodes.service hard-codes ExecStart with the
+# absolute path to \`node\` and the imcodes entry script as they existed at
+# \`imcodes bind\` time. Any of these scenarios leaves it pointing at a
+# bin that no longer exists / no longer resolves correctly:
+#
+#   * user switches node via nvm/fnm/volta — \`/.../node/v22.x.x/bin/imcodes\`
+#     still resolves but a fresh \`npm i -g\` populated the new version's
+#     prefix instead, so the old absolute path is stale.
+#   * \`npm uninstall -g imcodes\` followed by reinstall under a different
+#     prefix (homebrew vs nvm vs system) leaves the symlink dangling.
+#   * any reorg of node versions where the bin sits at a new absolute path.
+#
+# Real-world hit: 116.62.239.78 daemon stuck on dev.1922 because the
+# unit's ExecStart pointed at /home/k/.nvm/versions/node/v22.22.2/bin/imcodes
+# from a prior install — \`systemctl restart imcodes\` succeeds in the
+# upgrade script's eyes but the spawned process crashes "Cannot find
+# module '/home/k/.../bin/imcodes'" (988 recorded crashes in daemon.log
+# before one of them finally caught a working state by lucky races).
+#
+# Windows already does the equivalent (Step 5 "Regenerate daemon launch
+# chain" in windows-upgrade-script.ts).  This mirrors that behavior for
+# Linux + macOS so a successful npm install is always followed by a
+# launch-chain pointing at the freshly-installed binary.
+#
+# Safe-by-design: we only touch ExecStart on Linux and ProgramArguments
+# on macOS. Other Environment= / Restart= / KillMode= settings the user
+# may have customised are preserved verbatim. If the unit / plist file
+# doesn't exist, we skip silently — the user may run via \`imcodes start\`
+# directly or have a non-standard launcher, neither of which we should
+# clobber.
+log "[step 3.5] regenerating launch chain"
+NEW_IMCODES_SCRIPT="$GLOBAL_ROOT/imcodes/dist/src/index.js"
+if [ ! -f "$NEW_IMCODES_SCRIPT" ]; then
+  log "[step 3.5] $NEW_IMCODES_SCRIPT not found — skipping (will rely on existing launch chain)"
+elif [ "$(uname)" = "Linux" ]; then
+  SVC="$HOME/.config/systemd/user/imcodes.service"
+  if [ -f "$SVC" ]; then
+    NEW_EXEC="ExecStart=$NODE $NEW_IMCODES_SCRIPT start --foreground"
+    OLD_EXEC=$(grep -m1 '^ExecStart=' "$SVC" || echo '(none)')
+    if [ "$OLD_EXEC" = "$NEW_EXEC" ]; then
+      log "[step 3.5] systemd ExecStart already current"
+    else
+      log "[step 3.5] rewriting ExecStart"
+      log "[step 3.5]   from: $OLD_EXEC"
+      log "[step 3.5]   to:   $NEW_EXEC"
+      # Use awk for portability — sed -i's in-place behavior differs
+      # between BSD (mac) and GNU (linux), and quoting the replacement
+      # gets thorny with paths that may contain '/'. awk on a temp
+      # file is unambiguous on every Unix.
+      if awk -v new="$NEW_EXEC" '
+        BEGIN { done = 0 }
+        /^ExecStart=/ { if (!done) { print new; done = 1; next } }
+        { print }
+      ' "$SVC" > "$SVC.new" && mv "$SVC.new" "$SVC"; then
+        systemctl --user daemon-reload >> "$LOG" 2>&1 && log "[step 3.5] systemd daemon-reload OK" || log "[step 3.5] systemd daemon-reload FAILED (non-fatal)"
+      else
+        log "[step 3.5] awk rewrite FAILED — keeping old unit (non-fatal)"
+        rm -f "$SVC.new"
+      fi
+    fi
+  else
+    log "[step 3.5] $SVC absent — nothing to rewrite"
+  fi
+elif [ "$(uname)" = "Darwin" ]; then
+  PLIST="$HOME/Library/LaunchAgents/imcodes.daemon.plist"
+  if [ -f "$PLIST" ]; then
+    if command -v plutil >/dev/null 2>&1; then
+      log "[step 3.5] rewriting plist ProgramArguments"
+      if plutil -replace ProgramArguments -json "[\\"$NODE\\",\\"$NEW_IMCODES_SCRIPT\\",\\"start\\",\\"--foreground\\"]" "$PLIST" >> "$LOG" 2>&1; then
+        log "[step 3.5] plutil rewrite OK"
+      else
+        log "[step 3.5] plutil rewrite FAILED (non-fatal)"
+      fi
+    else
+      log "[step 3.5] plutil not available — skipping plist regen"
+    fi
+  else
+    log "[step 3.5] $PLIST absent — nothing to rewrite"
+  fi
+fi
 
-# Self-cleanup after 60 s
-sleep 60 && rm -rf "${scriptDir}" &
+log "[step 4] running restart command"
+# Wrap restartCmd in a subshell so its multi-line content captures all
+# stdout/stderr to LOG. The previous template-literal interpolation
+# attached >>$LOG to only the LAST line of restartCmd, swallowing
+# everything before launchctl load (silent unload failures, kill exit
+# codes, etc).
+{
+${restartCmd}
+} >> "$LOG" 2>&1
+RC=$?
+log "[step 4] restart command exit code: $RC"
+
+# Verify the old daemon process is actually gone — surfacing platform-
+# specific restart failures (launchctl unload silently no-op'd, systemd
+# returned 0 without restarting, etc).
+sleep 2
+if kill -0 ${oldDaemonPid} 2>/dev/null; then
+  log "[step 4] WARN: old daemon PID ${oldDaemonPid} still alive after restart command"
+else
+  log "[step 4] old daemon PID ${oldDaemonPid} terminated as expected"
+fi
+
+# ── Step 5: Health check — verify a NEW daemon is actually running ─────
+#
+# Why: a successful step 4 (e.g. "systemctl --user restart imcodes" returns 0
+# when the unit transitions to "activating") doesn't guarantee the new
+# daemon survives. systemd returns success once the spawned process forks,
+# but if its ExecStart fails (e.g. node crashes immediately on a stale
+# module path that survived step 3.5), Restart=always immediately re-spawns
+# it, and the failure repeats invisibly. The new daemon's PID is recorded
+# in ~/.imcodes/daemon.pid AFTER successful startup, so we can use the pid
+# file as a positive-liveness signal: read it 5–15 s after restart and
+# kill -0 it.
+#
+# If the daemon failed to come up after restart, we surface the symptom in
+# upgrade.log loudly so operators see "daemon NOT running after restart"
+# instead of a silent dead service.
+log "[step 5] post-restart health check"
+sleep 5
+HEALTH_PID=""
+for i in 1 2 3; do
+  if [ -f "$HOME/.imcodes/daemon.pid" ]; then
+    HEALTH_PID=$(cat "$HOME/.imcodes/daemon.pid" 2>/dev/null || true)
+    if [ -n "$HEALTH_PID" ] && kill -0 "$HEALTH_PID" 2>/dev/null && [ "$HEALTH_PID" != "${oldDaemonPid}" ]; then
+      log "[step 5] new daemon healthy: PID $HEALTH_PID (after \${i}x check)"
+      break
+    fi
+  fi
+  HEALTH_PID=""
+  sleep 3
+done
+if [ -z "$HEALTH_PID" ]; then
+  log "[step 5] WARN: no live new daemon after 14s — service unit may have a stale path or the new binary crashes on startup"
+  log "[step 5] WARN: check 'systemctl --user status imcodes' (linux) or 'log show --predicate \"subsystem == \\\"imcodes\\\"\"' (macos)"
+  log "[step 5] WARN: if path-stale, manually fix ExecStart in $HOME/.config/systemd/user/imcodes.service then 'systemctl --user daemon-reload && systemctl --user restart imcodes'"
+fi
+
+log "=== upgrade script done ==="
+
+# Self-cleanup after 24 h so failures stay debuggable.
+sleep ${CLEANUP_AFTER_SEC} && rm -rf "${scriptDir}" &
 `;
 
   writeFileSync(scriptPath, script, { mode: 0o755 });
@@ -3633,6 +4382,12 @@ sleep 60 && rm -rf "${scriptDir}" &
   child.unref();
 
   logger.info({ log: logFile }, 'daemon.upgrade: upgrade script spawned, will restart in ~3 s');
+  upgradeScriptSpawned = true;
+  } finally {
+    if (!upgradeScriptSpawned) {
+      releaseUpgradeMemoryFreeze();
+    }
+  }
 }
 
 // ── File system browser ────────────────────────────────────────────────────
@@ -3691,13 +4446,106 @@ export function getActiveP2pRunsBlockingDaemonUpgrade(runs = listP2pRuns()) {
   return runs.filter((run) => !P2P_TERMINAL_RUN_STATUSES.has(run.status));
 }
 
+/** Transport-runtime statuses that represent a genuine in-flight turn the
+ *  user is waiting on. `'error'` is intentionally NOT in this set — an
+ *  errored runtime is *stuck*, not active, and forever-blocking daemon
+ *  upgrades on it leaves the user no way out short of `imcodes service
+ *  restart` (which is exactly what the upgrade wants to do anyway). */
+const TRANSPORT_IN_PROGRESS_STATUSES: ReadonlySet<string> = new Set(['thinking', 'streaming']);
+
+/** Snapshot of why a transport session is currently blocking daemon upgrade.
+ *  Embedded in the upgrade-blocked log so future "why didn't it upgrade"
+ *  investigations can see the actual failing condition instead of guessing
+ *  whether session.state ('idle') or runtime.getStatus() ('error') is to blame. */
+export interface TransportUpgradeBlockReason {
+  status: string;
+  sending: boolean;
+  pendingCount: number;
+  blockReason: 'status_thinking' | 'status_streaming' | 'sending' | 'pending';
+}
+
+export function getTransportSessionUpgradeBlockReason(sessionName: string): TransportUpgradeBlockReason | null {
+  const runtime = getTransportRuntime(sessionName);
+  if (!runtime) return null;
+  const status = runtime.getStatus();
+  const sending = !!runtime.sending;
+  const pendingCount = runtime.pendingCount ?? 0;
+  if (TRANSPORT_IN_PROGRESS_STATUSES.has(status)) {
+    return {
+      status,
+      sending,
+      pendingCount,
+      blockReason: status === 'streaming' ? 'status_streaming' : 'status_thinking',
+    };
+  }
+  if (sending) return { status, sending, pendingCount, blockReason: 'sending' };
+  if (pendingCount > 0) return { status, sending, pendingCount, blockReason: 'pending' };
+  return null;
+}
+
+/** Process-agent session.state values that represent a genuine in-flight turn.
+ *  `'running'` is set by tmux/ConPTY drivers when the underlying CLI agent
+ *  (claude-code, codex, opencode, gemini) has emitted activity that the
+ *  driver classifies as "agent generating" — a self-upgrade restart in that
+ *  window kills the agent's child process mid-turn and discards its work. */
+const PROCESS_IN_PROGRESS_STATES: ReadonlySet<string> = new Set(['running']);
+
+/** Per-session reason a daemon upgrade is currently blocked. Covers both
+ *  transport-runtime sessions (claude-code-sdk, codex-sdk, qwen, …) and
+ *  process-runtime sessions (claude-code, codex, opencode, gemini, shell)
+ *  so the upgrade does not restart the daemon mid-turn for either kind. */
+export interface SessionUpgradeBlockReason {
+  name: string;
+  runtimeType: 'transport' | 'process';
+  sessionState: string;
+  /** Populated only for transport sessions; null for process sessions. */
+  transport: TransportUpgradeBlockReason | null;
+}
+
+export function getActiveSessionsBlockingDaemonUpgrade(sessions = listSessions()): SessionUpgradeBlockReason[] {
+  const reasons: SessionUpgradeBlockReason[] = [];
+  for (const session of sessions) {
+    if (session.runtimeType === 'transport') {
+      const transport = getTransportSessionUpgradeBlockReason(session.name);
+      if (transport) {
+        reasons.push({
+          name: session.name,
+          runtimeType: 'transport',
+          sessionState: session.state,
+          transport,
+        });
+      }
+      continue;
+    }
+    // Process agent (tmux / ConPTY CLI). The transport-runtime block reason
+    // helper is irrelevant here because there is no transport runtime to
+    // probe; the only signal we have is `session.state === 'running'`,
+    // which the driver flips when the CLI is mid-generation.
+    if (PROCESS_IN_PROGRESS_STATES.has(session.state)) {
+      reasons.push({
+        name: session.name,
+        runtimeType: 'process',
+        sessionState: session.state,
+        transport: null,
+      });
+    }
+  }
+  return reasons;
+}
+
+/**
+ * Backward-compat wrapper. Retained because external callers (tests,
+ * possibly third-party scripts) import the older transport-only helper
+ * by name. New code should use `getActiveSessionsBlockingDaemonUpgrade`,
+ * which covers both transport and process agents.
+ */
 export function getActiveTransportSessionsBlockingDaemonUpgrade(sessions = listSessions()) {
-  return sessions.filter((session) => {
-    if (session.runtimeType !== 'transport') return false;
-    const runtime = getTransportRuntime(session.name);
-    if (!runtime) return false;
-    return runtime.getStatus() !== 'idle' || runtime.sending || runtime.pendingCount > 0;
-  });
+  const blockedNames = new Set(
+    getActiveSessionsBlockingDaemonUpgrade(sessions)
+      .filter((reason) => reason.runtimeType === 'transport')
+      .map((reason) => reason.name),
+  );
+  return sessions.filter((session) => blockedNames.has(session.name));
 }
 
 async function handleFileSearch(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
@@ -3927,7 +4775,21 @@ async function handleFsListInner(resolved: string, rawPath: string, requestId: s
   try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: snapshot.resolvedPath, status: 'ok', entries: snapshot.entries }); } catch { /* ignore */ }
 }
 
-const FS_READ_SIZE_LIMIT = 5 * 1024 * 1024; // 5 MB
+const FS_READ_SIZE_LIMIT = 100 * 1024 * 1024; // 100 MB
+
+// Video files are not transferred over WS — the browser fetches them via the
+// HTTP download endpoint and plays them with <video>. We just need to detect
+// the MIME and check the size against this limit.
+const VIDEO_MIME: Record<string, string> = {
+  mp4: 'video/mp4',
+  m4v: 'video/mp4',
+  mov: 'video/quicktime',
+  webm: 'video/webm',
+  ogv: 'video/ogg',
+  ogg: 'video/ogg',
+  mkv: 'video/x-matroska',
+  avi: 'video/x-msvideo',
+};
 
 interface FsReadSnapshot {
   path: string;
@@ -4031,7 +4893,6 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
     const stats = await fsStat(real);
     const fileSignature = `${stats.mtimeMs}:${stats.size}`;
 
-    // Image files: send as base64 with a higher size limit (5 MB)
     const ext = nodePath.extname(real).toLowerCase().slice(1);
     const IMAGE_MIME: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', ico: 'image/x-icon', bmp: 'image/bmp', svg: 'image/svg+xml' };
     // Office documents: send as base64 for frontend preview (PDF.js, docx-preview, xlsx)
@@ -4040,8 +4901,12 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
       docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
       xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     };
-    const mimeType = IMAGE_MIME[ext] ?? OFFICE_MIME[ext];
-    const sizeLimit = mimeType ? 5 * 1024 * 1024 : FS_READ_SIZE_LIMIT;
+    const videoMime = VIDEO_MIME[ext];
+    const mimeType = IMAGE_MIME[ext] ?? OFFICE_MIME[ext] ?? videoMime;
+    // Unified preview size cap (100 MB). Video, image, office, and text all
+    // share the same ceiling — videos are streamed via HTTP rather than the
+    // base64-over-WS path, so the cap is enforced for sanity, not transport.
+    const sizeLimit = FS_READ_SIZE_LIMIT;
 
     // Always generate a download handle so the file can be downloaded even if preview fails
     const fileName = nodePath.basename(real);
@@ -4049,6 +4914,28 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
 
     if (stats.size > sizeLimit) {
       try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: 'file_too_large', previewReason: 'too_large', downloadId: handle.id }); } catch { /* ignore */ }
+      return;
+    }
+
+    // Video files: skip WS content transfer entirely. The browser fetches
+    // the file via the HTTP download endpoint using the downloadId handle
+    // and plays it with <video>. Sending 100 MB as base64 over WS would
+    // be wasteful and break streaming/seek behavior.
+    if (videoMime) {
+      try {
+        serverLink.send({
+          type: 'fs.read_response',
+          requestId,
+          path: rawPath,
+          resolvedPath: real,
+          status: 'ok',
+          mimeType: videoMime,
+          previewMode: 'stream',
+          size: stats.size,
+          downloadId: handle.id,
+          mtime: stats.mtimeMs,
+        });
+      } catch { /* ignore */ }
       return;
     }
 
@@ -4828,28 +5715,21 @@ async function handleTransportListModels(
     } catch { /* not connected */ }
   };
   try {
-    if (agentType === 'cursor-headless') {
-      const { getCursorRuntimeConfig } = await import('../agent/cursor-runtime-config.js');
-      const cfg = await getCursorRuntimeConfig(force);
-      reply({
-        models: cfg.availableModels.map((id) => ({ id })),
-        ...(cfg.defaultModel ? { defaultModel: cfg.defaultModel } : {}),
-        isAuthenticated: cfg.isAuthenticated,
-      });
-      return;
+    const { getProvider, ensureProviderConnected } = await import('../agent/provider-registry.js');
+    let provider = getProvider(agentType);
+
+    // Auto-connect local providers if missing, so we can probe for models
+    if (!provider && (agentType === 'gemini-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless')) {
+      try {
+        provider = await ensureProviderConnected(agentType, {});
+      } catch (err) {
+        logger.debug({ provider: agentType, err }, 'Auto-connect for model listing failed');
+      }
     }
-    if (agentType === 'copilot-sdk') {
-      const { getCopilotRuntimeConfig } = await import('../agent/copilot-runtime-config.js');
-      const cfg = await getCopilotRuntimeConfig(force);
-      reply({
-        models: cfg.models.map((m) => ({
-          id: m.id,
-          ...(m.name ? { name: m.name } : {}),
-          ...(m.supportsReasoningEffort ? { supportsReasoningEffort: true } : {}),
-        })),
-        isAuthenticated: cfg.isAuthenticated,
-        ...(cfg.probeError ? { error: cfg.probeError } : {}),
-      });
+
+    if (provider && typeof provider.listModels === 'function') {
+      const result = await provider.listModels(force);
+      reply(result);
       return;
     }
     reply({ models: [], error: `Unsupported agentType: ${agentType || '(missing)'}` });
@@ -5029,7 +5909,7 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
   if (!requestId) return;
   const projectId = typeof cmd.projectId === 'string' ? cmd.projectId.trim() : '';
-  const projectionClass = cmd.projectionClass === 'recent_summary' || cmd.projectionClass === 'durable_memory_candidate'
+  const projectionClass = cmd.projectionClass === 'recent_summary' || cmd.projectionClass === 'durable_memory_candidate' || cmd.projectionClass === 'master_summary'
     ? cmd.projectionClass
     : undefined;
   const query = typeof cmd.query === 'string' ? cmd.query.trim() : '';
@@ -5047,12 +5927,12 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
     scope: 'personal';
     projectId: string;
     summary: string;
-    projectionClass: 'recent_summary' | 'durable_memory_candidate';
+    projectionClass: 'recent_summary' | 'durable_memory_candidate' | 'master_summary';
     sourceEventCount: number;
     updatedAt: number;
     hitCount: number;
     lastUsedAt: number | undefined;
-    status: 'active' | 'archived';
+    status: 'active' | 'archived' | 'archived_dedup';
   }>;
   let matchedRecords: number;
 

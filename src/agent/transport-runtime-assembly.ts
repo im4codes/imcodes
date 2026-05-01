@@ -5,6 +5,7 @@ import { evaluateContextAuthority } from './context-authority.js';
 import { buildContextDiagnostics } from './context-diagnostics.js';
 import { getSharedContextCutoverFlags, type SharedContextCutoverFlags } from '../context/shared-context-flags.js';
 import type { ProviderError } from './transport-provider.js';
+import { incrementCounter } from '../util/metrics.js';
 import type {
   CompiledAgentContextArtifact,
   ContextNamespace,
@@ -47,6 +48,12 @@ export interface DispatchSharedContextSendOptions {
   flags?: SharedContextCutoverFlags;
   onShadowDiagnostics?: (diagnostics: string[]) => void;
   resolveAuthoredContext?: (input: TransportRuntimeAssemblyInput) => Promise<RuntimeAuthoredContextBinding[]>;
+  /**
+   * Upper bound for the provider send-start RPC. This guards app-server/RPC
+   * providers that can remain connected while never answering the start-turn
+   * request. A value <= 0 disables the watchdog.
+   */
+  sendTimeoutMs?: number;
 }
 
 export interface DispatchSharedContextSendResult {
@@ -88,13 +95,52 @@ export function dispatchSharedContextSend(
       options?.onShadowDiagnostics?.(payload.diagnostics);
     }
     if (!flags.runtimeSend) {
-      await provider.send(sessionId, input.userMessage);
+      await sendProviderWithTimeout(provider, sessionId, input.userMessage, options?.sendTimeoutMs);
       return { disposition: 'legacy-sent', payload };
     }
     enforceDispatchAuthority(payload);
-    await provider.send(sessionId, payload);
+    await sendProviderWithTimeout(provider, sessionId, payload, options?.sendTimeoutMs);
     return { disposition: 'sent', payload };
   });
+}
+
+async function sendProviderWithTimeout(
+  provider: TransportProvider,
+  sessionId: string,
+  payload: string | ProviderContextPayload,
+  timeoutMs: number | undefined,
+): Promise<void> {
+  const sendPromise = provider.send(sessionId, payload);
+  if (!timeoutMs || timeoutMs <= 0 || !Number.isFinite(timeoutMs)) {
+    await sendPromise;
+    return;
+  }
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      sendPromise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          const providerError: ProviderError = {
+            code: 'TRANSPORT_TURN_TIMEOUT',
+            message: `Provider ${provider.id} did not accept the transport turn within ${Math.round(timeoutMs)}ms`,
+            recoverable: false,
+            details: { providerId: provider.id, sessionId, timeoutMs: Math.round(timeoutMs) },
+          };
+          reject(providerError);
+        }, timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } catch (err) {
+    if (typeof err === 'object' && err && 'code' in err && (err as ProviderError).code === 'TRANSPORT_TURN_TIMEOUT') {
+      incrementCounter('transport.provider_send.timeout', { provider: provider.id });
+    }
+    throw err;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 export function buildProviderContextPayload(

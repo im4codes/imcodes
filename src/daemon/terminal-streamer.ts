@@ -91,6 +91,15 @@ interface PipeState {
   stream: Readable;
   cleanup: () => Promise<void>;
   retryCount: number;
+  /** tmux paneId the pipe-pane was attached to. Used by `subscribe()` to
+   *  detect "session was killed and re-created with the same name behind
+   *  our back" — a real-production scenario when session-manager rebuilds
+   *  a session under the same name with a fresh pane, AND a test-isolation
+   *  scenario when a test's afterEach kills the tmux session and the next
+   *  beforeEach recreates it before the previous pipe's cat subprocess saw
+   *  EOF. In both cases the recorded paneId is stale; reusing the pipe
+   *  reads from a dead pipe-pane and bytes silently never arrive. */
+  paneId?: string;
 }
 
 // ── TerminalStreamer ───────────────────────────────────────────────────────────
@@ -110,6 +119,25 @@ export class TerminalStreamer {
    *  `cat` is then orphaned. Observed a ~5% orphan rate (10 of 215 pipe
    *  starts) on a leaking production daemon before this guard. */
   private pipeStartLocks = new Set<string>();
+
+  /** Grace period before tearing down a pipe whose subscriber count
+   *  dropped to zero. Without it, any browser-side subscriber churn
+   *  (component remount, transient WS hiccup, route flip) immediately
+   *  stops the pipe-pane stream — and the next subscribe restarts it.
+   *  On a dock with N visible sub-sessions a single re-render storm
+   *  produces N×2 pipe restart events in a few hundred ms; the user
+   *  sees the terminal "freeze for several seconds" while every pipe
+   *  spins back up + re-snapshots. The grace timer keeps the pipe
+   *  alive across the gap so a re-attaching subscriber attaches to the
+   *  SAME live pipe — no restart, no snapshot, no perceived freeze.
+   *
+   *  30s is comfortably longer than any plausible browser-side
+   *  unsubscribe→resubscribe round-trip while still being short
+   *  enough that a genuinely-departed user releases tmux capture-pane
+   *  / FIFO resources promptly.
+   */
+  private pipeStopGraceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private static readonly PIPE_STOP_GRACE_MS = 30_000;
 
   // Idle detection
   private lastRawAt = new Map<string, number>();
@@ -133,11 +161,40 @@ export class TerminalStreamer {
       return () => { /* no-op */ };
     }
 
+    // Cancel any pending teardown — a new subscriber arrived during the
+    // grace window, the existing pipe is still alive, no need to stop +
+    // restart. This is the path that turns a re-mount churn into a
+    // zero-cost no-op for the user.
+    const pendingStop = this.pipeStopGraceTimers.get(sessionName);
+    if (pendingStop) {
+      clearTimeout(pendingStop);
+      this.pipeStopGraceTimers.delete(sessionName);
+      logger.debug({ sessionName }, 'pipe-stop grace cancelled — new subscriber attached');
+    }
+
     if (!this.subscribers.has(sessionName)) {
       this.subscribers.set(sessionName, new Map());
     }
     const subs = this.subscribers.get(sessionName)!;
-    const hasPipe = this.pipes.has(sessionName);
+    // Probe pipe health — `handlePipeClose` runs ASYNCHRONOUSLY when the cat
+    // subprocess sees EOF (tmux pane killed, pipe-pane dropped). If a
+    // subscribe arrives in the race window AFTER the pane died but BEFORE
+    // handlePipeClose fired (or for an idempotent restart-after-rename
+    // scenario where the pane was replaced under the same session name),
+    // `pipes.has(sessionName)` is still true but the underlying stream is
+    // destroyed. Treating that as a live pipe results in bootstrap reading
+    // from a dead cat → "no bytes ever arrive" symptom. Force a fresh
+    // start in that case.
+    const existingPipe = this.pipes.get(sessionName);
+    const pipeStale = existingPipe !== undefined
+      && (existingPipe.stream.destroyed || existingPipe.stream.readableEnded);
+    if (pipeStale) {
+      this.pipes.delete(sessionName);
+      try { existingPipe.stream.destroy(); } catch { /* ignore */ }
+      void existingPipe.cleanup().catch(() => { /* best-effort */ });
+      logger.debug({ sessionName }, 'subscribe: stale pipe detected, forcing fresh start');
+    }
+    const hasPipe = !pipeStale && this.pipes.has(sessionName);
 
     const subState: SubscriberState = {
       // If pipe already running, buffer raw bytes until snapshot delivered
@@ -159,6 +216,47 @@ export class TerminalStreamer {
     subState: SubscriberState,
     hasPipe: boolean,
   ): Promise<void> {
+    // Stale-pipe check (production + test): if we believed `hasPipe` was
+    // true based on the synchronous map check in subscribe(), verify the
+    // recorded paneId still matches tmux's current paneId for this
+    // session. Mismatch means the pane was destroyed and re-created
+    // under the same session name (real prod cases: session-manager
+    // restart, container respawn; test case: afterEach kills tmux,
+    // beforeEach recreates with same name). The old pipe-pane attaches
+    // to the dead pane and silently delivers no bytes — bootstrap would
+    // sit forever with snapshotPending=true. Force a fresh restart so
+    // the new subscriber gets a working pipe.
+    if (hasPipe && BACKEND !== 'conpty' && BACKEND !== 'wezterm') {
+      const existingPipe = this.pipes.get(sessionName);
+      const recordedPaneId = existingPipe?.paneId;
+      // Use sync getSession first (fast, no tmux call) and fall back to
+      // async tmux probe only when session-store doesn't know.
+      let currentPaneId = getSession(sessionName)?.paneId;
+      if (!currentPaneId) {
+        const fetched = getPaneId(sessionName);
+        currentPaneId = fetched != null ? await fetched.catch(() => undefined) : undefined;
+      }
+      if (recordedPaneId && currentPaneId && recordedPaneId !== currentPaneId) {
+        logger.info({ sessionName, recordedPaneId, currentPaneId }, 'subscribe: pane changed under us, restarting pipe');
+        if (existingPipe) {
+          this.pipes.delete(sessionName);
+          try { existingPipe.stream.destroy(); } catch { /* ignore */ }
+          void existingPipe.cleanup().catch(() => { /* best-effort */ });
+          try { await stopPipePaneStream(sessionName); } catch { /* best-effort */ }
+        }
+        // Drop snapshotPending — we'll get a fresh snapshot through the
+        // startPipe path below with the new pipe.
+        subState.snapshotPending = false;
+        // Drain any buffered raw bytes from the stale pipe — they're
+        // garbage from the dead pane, would corrupt the new screen state.
+        subState.rawBuffer = [];
+        subState.rawBufferBytes = 0;
+        // Treat as fresh subscriber — bootstrap will fall through to the
+        // `if (!hasPipe)` branch at the end of this function.
+        hasPipe = false;
+      }
+    }
+
     // 1. Take snapshot
     try {
       const size = await this.getSize(sessionName);
@@ -234,6 +332,27 @@ export class TerminalStreamer {
     subs.delete(subscriber);
 
     if (subs.size === 0) {
+      this.scheduleGracedStop(sessionName);
+    }
+  }
+
+  /**
+   * Schedule a graced pipe teardown when the subscriber count for a session
+   * dropped to zero. If a new subscriber attaches within the grace window
+   * (`subscribe()` cancels the timer), the existing pipe stays alive and the
+   * re-attach is a no-op — no pipe-pane stop+start, no snapshot, no
+   * perceptible "freeze". Used by both `unsubscribe()` (the user path) and
+   * `removeSubscriber()` (the internal overflow / error path).
+   */
+  private scheduleGracedStop(sessionName: string): void {
+    const existingTimer = this.pipeStopGraceTimers.get(sessionName);
+    if (existingTimer) clearTimeout(existingTimer);
+    const timer = setTimeout(() => {
+      this.pipeStopGraceTimers.delete(sessionName);
+      // Re-check: a subscriber may have attached during the grace window
+      // (and not yet left). Only tear down if subs are still 0.
+      const currentSubs = this.subscribers.get(sessionName);
+      if (!currentSubs || currentSubs.size > 0) return;
       this.subscribers.delete(sessionName);
       void this.stopPipe(sessionName);
       this.clearIdleTimer(sessionName);
@@ -242,7 +361,9 @@ export class TerminalStreamer {
       this.sizeCache.delete(sessionName);
       this.frameSeqs.delete(sessionName);
       resetParser(sessionName);
-    }
+    }, TerminalStreamer.PIPE_STOP_GRACE_MS);
+    this.pipeStopGraceTimers.set(sessionName, timer);
+    logger.debug({ sessionName, graceMs: TerminalStreamer.PIPE_STOP_GRACE_MS }, 'pipe-stop scheduled with grace');
   }
 
   /** Request an on-demand snapshot for all subscribers of a session. */
@@ -310,7 +431,17 @@ export class TerminalStreamer {
 
   /** Called by session-manager when a session restarts with a new pane. */
   async rebindSession(sessionName: string): Promise<void> {
-    if (!this.subscribers.has(sessionName)) return;
+    // Cancel any pending graced stop — rebind is an explicit "reattach
+    // pipe to fresh pane" signal that supersedes a passive teardown. If
+    // the grace fired AFTER rebind completed, it'd tear down the
+    // newly-started pipe.
+    const pendingStop = this.pipeStopGraceTimers.get(sessionName);
+    if (pendingStop) {
+      clearTimeout(pendingStop);
+      this.pipeStopGraceTimers.delete(sessionName);
+    }
+    const subs = this.subscribers.get(sessionName);
+    if (!subs || subs.size === 0) return;
     // Transport sessions don't have a pane to rebind — skip rather than
     // trigger the "paneId not available" error on every relaunch.
     if (isTransportSessionName(sessionName)) return;
@@ -326,9 +457,11 @@ export class TerminalStreamer {
       this.clearIdleTimer(sessionName);
     }
     for (const timer of this.retryTimers.values()) clearTimeout(timer);
+    for (const timer of this.pipeStopGraceTimers.values()) clearTimeout(timer);
     this.subscribers.clear();
     this.pipes.clear();
     this.retryTimers.clear();
+    this.pipeStopGraceTimers.clear();
     this.lastRawAt.clear();
     this.idleTimers.clear();
     this.idleState.clear();
@@ -394,7 +527,7 @@ export class TerminalStreamer {
     try {
       const { stream, cleanup } = await startPipePaneStream(sessionName, paneId ?? '');
 
-      const pipeState: PipeState = { stream, cleanup, retryCount };
+      const pipeState: PipeState = { stream, cleanup, retryCount, paneId };
       this.pipes.set(sessionName, pipeState);
 
       stream.on('data', (chunk: unknown) => {
@@ -582,11 +715,11 @@ export class TerminalStreamer {
     if (!subs) return;
     subs.delete(sub);
     if (subs.size === 0) {
-      this.subscribers.delete(sessionName);
-      void this.stopPipe(sessionName);
-      this.clearIdleTimer(sessionName);
-      this.lastRawAt.delete(sessionName);
-      this.idleState.delete(sessionName);
+      // Same grace path as unsubscribe — a fresh subscriber may attach
+      // immediately after an overflow / error removal (the client sees
+      // `terminal.stream_reset` and resubscribes). Without grace we'd
+      // re-restart the pipe; with grace we keep it alive across the gap.
+      this.scheduleGracedStop(sessionName);
     }
   }
 
@@ -596,6 +729,13 @@ export class TerminalStreamer {
     this.emitSessionStreamError(sessionName, err.message);
     for (const [sub] of subs) {
       try { sub.onError?.(err); } catch { /* ignore */ }
+    }
+    // Fundamentally broken — cancel any pending graced stop and tear down
+    // immediately. There's nothing recoverable to keep alive.
+    const pendingStop = this.pipeStopGraceTimers.get(sessionName);
+    if (pendingStop) {
+      clearTimeout(pendingStop);
+      this.pipeStopGraceTimers.delete(sessionName);
     }
     this.subscribers.delete(sessionName);
     void this.stopPipe(sessionName);

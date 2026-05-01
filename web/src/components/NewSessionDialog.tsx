@@ -2,7 +2,8 @@ import { useState, useEffect, useMemo } from "preact/hooks";
 import { useTranslation } from "react-i18next";
 import type { WsClient } from "../ws-client.js";
 import { FileBrowser } from "./file-browser-lazy.js";
-import { getUserPref, saveUserPref } from "../api.js";
+import { parseString, usePref } from "../hooks/usePref.js";
+import { PREF_KEY_DEFAULT_SHELL } from "../constants/prefs.js";
 import { sanitizeProjectName } from "@shared/sanitize-project-name.js";
 import {
   getSessionAgentGroups,
@@ -15,6 +16,7 @@ import {
   COPILOT_SDK_EFFORT_LEVELS,
   OPENCLAW_THINKING_LEVELS,
   QWEN_EFFORT_LEVELS,
+  formatEffortLevel,
   type TransportEffortLevel,
 } from "@shared/effort-levels.js";
 import {
@@ -31,12 +33,13 @@ import {
 } from "./cc-preset-form.js";
 import { CC_PRESET_MSG } from "@shared/cc-presets.js";
 import type { CcPreset } from "@shared/cc-presets.js";
+import { GEMINI_MODEL_IDS, mergeModelSuggestions } from "../../../src/shared/models/options.js";
 
-const DEFAULT_SHELL_KEY = "default_shell";
 // Fallback suggestions used only when the daemon probe returns an empty list
 // (offline/unauthenticated). The live list comes from the dynamic models hook.
 const CURSOR_HEADLESS_MODEL_FALLBACK = ["auto", "composer-2-fast", "gpt-5.2"] as const;
-const COPILOT_SDK_MODEL_FALLBACK = ["gpt-5", "claude-sonnet-4.5"] as const;
+const COPILOT_SDK_MODEL_FALLBACK = ["gpt-5.4", "gpt-5.4-mini"] as const;
+const GEMINI_SDK_MODEL_FALLBACK = [...GEMINI_MODEL_IDS];
 
 interface Props {
   ws: WsClient | null;
@@ -54,6 +57,7 @@ type AgentType =
   | "cursor-headless"
   | "opencode"
   | "gemini"
+  | "gemini-sdk"
   | "openclaw"
   | "qwen";
 type OpenClawMode = "new" | "bind";
@@ -158,14 +162,8 @@ export function NewSessionDialog({
   const [ocSelectedSession, setOcSelectedSession] = useState("");
 
   // Load saved shell preference — will be validated against daemon's detected list later
-  const [savedShellPref, setSavedShellPref] = useState<string | null>(null);
-  useEffect(() => {
-    void getUserPref(DEFAULT_SHELL_KEY)
-      .then((saved) => {
-        if (typeof saved === "string" && saved) setSavedShellPref(saved);
-      })
-      .catch(() => {});
-  }, []);
+  const defaultShellPref = usePref<string>(PREF_KEY_DEFAULT_SHELL, { parse: parseString });
+  const savedShellPref = defaultShellPref.value;
 
   useEffect(() => {
     if (!ws) return;
@@ -299,7 +297,7 @@ export function NewSessionDialog({
     setError("");
     setStarting(true);
     if (shellBin)
-      void saveUserPref(DEFAULT_SHELL_KEY, shellBin).catch(() => {});
+      void defaultShellPref.save(shellBin).catch(() => {});
 
     if (agentType === "openclaw") {
       const extra =
@@ -324,8 +322,10 @@ export function NewSessionDialog({
       if (ccInitPrompt.trim() && agentType === "claude-code")
         extra.ccInitPrompt = ccInitPrompt.trim();
       if (
-        (agentType === "copilot-sdk"
+        (agentType === "claude-code-sdk"
+          || agentType === "copilot-sdk"
           || agentType === "cursor-headless"
+          || agentType === "gemini-sdk"
           || agentType === "qwen") &&
         requestedModel.trim()
       ) {
@@ -366,8 +366,10 @@ export function NewSessionDialog({
               : [];
   const supportsCcPreset = agentType === "claude-code" || agentType === "qwen";
   const supportsModelSelection =
-    agentType === "copilot-sdk"
+    agentType === "claude-code-sdk"
+    || agentType === "copilot-sdk"
     || agentType === "cursor-headless"
+    || agentType === "gemini-sdk"
     || (agentType === "qwen" && !!selectedCcPreset);
   const dynamicModelsAgentType = supportsDynamicTransportModels(agentType)
     ? agentType
@@ -375,7 +377,10 @@ export function NewSessionDialog({
   const transportModels = useTransportModels(ws, dynamicModelsAgentType);
   const modelSuggestions = useMemo(() => {
     if (transportModels.models.length > 0) {
-      return transportModels.models.map((m) => m.id);
+      const dynamicModelIds = transportModels.models.map((m) => m.id);
+      return agentType === "gemini-sdk"
+        ? mergeModelSuggestions(GEMINI_SDK_MODEL_FALLBACK, dynamicModelIds)
+        : dynamicModelIds;
     }
     if (agentType === "qwen") {
       return qwenPresetModels.length > 0
@@ -384,6 +389,7 @@ export function NewSessionDialog({
     }
     if (agentType === "copilot-sdk") return [...COPILOT_SDK_MODEL_FALLBACK];
     if (agentType === "cursor-headless") return [...CURSOR_HEADLESS_MODEL_FALLBACK];
+    if (agentType === "gemini-sdk") return [...GEMINI_SDK_MODEL_FALLBACK];
     return [] as string[];
   }, [transportModels.models, agentType, qwenPresetModels, selectedCcPreset]);
 
@@ -395,16 +401,24 @@ export function NewSessionDialog({
     if (agentType !== "qwen") return;
     const fallbackModel =
       selectedCcPreset?.defaultModel ?? selectedCcPreset?.env.ANTHROPIC_MODEL ?? "";
-    if (modelSuggestions.length === 0) {
-      if (!requestedModel && fallbackModel) setRequestedModel(fallbackModel);
-      return;
-    }
-    if (!requestedModel || !modelSuggestions.includes(requestedModel)) {
-      setRequestedModel(
-        modelSuggestions.includes(fallbackModel) ? fallbackModel : modelSuggestions[0],
-      );
-    }
-  }, [agentType, modelSuggestions, requestedModel, selectedCcPreset]);
+    setRequestedModel((current) => {
+      if (modelSuggestions.length === 0) {
+        return current || fallbackModel;
+      }
+      if (
+        fallbackModel
+        && current === selectedCcPreset?.env.ANTHROPIC_MODEL
+        && current !== fallbackModel
+        && modelSuggestions.includes(fallbackModel)
+      ) {
+        return fallbackModel;
+      }
+      if (!current || !modelSuggestions.includes(current)) {
+        return modelSuggestions.includes(fallbackModel) ? fallbackModel : modelSuggestions[0];
+      }
+      return current;
+    });
+  }, [agentType, modelSuggestions, selectedCcPreset]);
 
   const handleKey = (e: KeyboardEvent) => {
     if (e.key === "Enter" && !starting) handleStart();
@@ -570,7 +584,7 @@ export function NewSessionDialog({
             >
               {thinkingLevels.map((level) => (
                 <option key={level} value={level}>
-                  {level}
+                  {formatEffortLevel(level)}
                 </option>
               ))}
             </select>
@@ -580,14 +594,27 @@ export function NewSessionDialog({
         {supportsModelSelection && (
           <div class="form-group">
             <label>{t("session.supervision.model")}</label>
-            {agentType === "qwen" && modelSuggestions.length > 0 ? (
+            {modelSuggestions.length > 0 ? (
               <select
                 value={requestedModel}
                 disabled={starting}
                 onInput={(e) =>
                   setRequestedModel((e.target as HTMLSelectElement).value)
                 }
+                style={{
+                  width: "100%",
+                  background: "#0f172a",
+                  border: "1px solid #334155",
+                  color: "#e2e8f0",
+                  borderRadius: 4,
+                  padding: "8px 12px",
+                  fontSize: 13,
+                  appearance: "auto",
+                }}
               >
+                {!requestedModel && (
+                  <option value="">{t("new_session.default_model")}</option>
+                )}
                 {modelSuggestions.map((model) => (
                   <option key={model} value={model}>
                     {model}

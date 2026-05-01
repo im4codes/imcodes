@@ -1022,11 +1022,7 @@ describe('SupervisionBroker', () => {
       });
 
       expect(result.decision).toBe('ask_human');
-      // Existing broker catch path surfaces this as PROVIDER_NOT_CONNECTED
-      // when the error has no supervisionUnavailableReason attached — that's
-      // the correct fail-closed behaviour; the key assertion is that decide()
-      // does NOT silently claim success.
-      expect(result.unavailableReason).toBeDefined();
+      expect(result.unavailableReason).toBe(SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR);
     });
   });
 });

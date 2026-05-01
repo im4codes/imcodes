@@ -30,6 +30,7 @@ import {
   ACK_FAILURE_DAEMON_ERROR,
   RECONNECT_GRACE_MS,
   ACK_TIMEOUT_MS,
+  ACK_TIMEOUT_RETRY_LIMIT,
   ACK_DEDUP_TTL_MS,
   INFLIGHT_GC_TTL_MS,
   type AckFailureReason,
@@ -55,13 +56,44 @@ import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDisc
 import logger from '../util/logger.js';
 import { pickReadableSessionDisplay } from '../../../shared/session-display.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
+import { PUSH_TIMELINE_EVENT_MAX_AGE_MS, TIMELINE_SUPPRESS_PUSH_FIELD } from '../../../shared/push-notifications.js';
 
 const AUTH_TIMEOUT_MS = 5000;
 const MAX_QUEUE_SIZE = 100;
 const MAX_BROWSER_PAYLOAD = 65536; // 64KB (subsession.rebuild_all can include many sessions)
-const BROWSER_RATE_LIMIT = 120;   // messages (desktop with pinned panels sends 30+ on init)
+// Desktop with pinned panels + many sessions can fire 60+ subscribe/repo/repo
+// detect / fs.git_status / chat.subscribe / ping messages on initial connect.
+// A reconnect within 10s doubles that. 120 was right at the cliff edge and
+// caused user-typed `session.send` messages to be dropped (and surfaced as
+// instant `command.failed`) when the limiter consumed all tokens during init.
+// 300 gives 3x headroom for normal init bursts without making abuse easier:
+// real abuse patterns send orders-of-magnitude more.
+const BROWSER_RATE_LIMIT = 300;
 const BROWSER_RATE_WINDOW = 10_000; // 10s
-const QUEUE_MAX_BYTES = 1024 * 1024; // 1MB per (session, browser) — increased from 512KB to reduce stream_reset cascades
+/**
+ * Master switch for the per-browser rate limiter.
+ *
+ * Why this exists as a flag rather than a deletion: the browser-side burst
+ * problem isn't fixed yet (a reconnect or multi-panel desktop tab still
+ * fires 60+ messages within the first ~2 s, and a reconnect within the
+ * 10 s window doubles that). Turning the limiter off avoids the worst
+ * symptom — `session.send` getting dropped → instant `command.failed` →
+ * UI bubble flips to failed within milliseconds — which surfaces in
+ * production as the wall-of-`rate_limited`-errors users have been seeing.
+ *
+ * The proper fix is reducing the burst itself (coalescing fs.git_status /
+ * repo.detect, debouncing terminal.subscribe replays, etc.) rather than
+ * raising the limit further. Until that lands, leave this OFF. To turn
+ * the limiter back on, flip the flag — no other changes required.
+ */
+const BROWSER_RATE_LIMIT_ENABLED = false;
+// 4MB per (session, browser). Heavy output (build logs, large `cat`, log tail)
+// can burst tens of KB per frame; at 1MB the queue overflowed within a few
+// frames during heavy output and triggered stream_reset cascades, which the
+// browser then de-rated to "几秒一次更新". 4MB gives ~1s of breathing room
+// at typical egress rates without holding meaningful memory (a single ws
+// per session, queue is reset on overflow anyway).
+const QUEUE_MAX_BYTES = 4 * 1024 * 1024;
 
 /**
  * Safe ws.send: checks readyState, wraps in try/catch.
@@ -243,6 +275,7 @@ interface InflightCommand {
   rawPayload: string;          // the original session.send JSON as received from browser
   state: InflightState;
   sentAt: number;              // when the inflight was created (dispatch or buffer)
+  dispatchAttempts: number;    // daemon sends attempted by the bridge
   timeoutTimer: ReturnType<typeof setTimeout> | null;
 }
 
@@ -547,6 +580,10 @@ export class WsBridge {
           }
           // session.state idle from timeline (covers all agent types: CC, codex, gemini)
           if (event?.type === 'session.state' && (event.payload as Record<string, unknown>)?.state === 'idle') {
+            const payload = event.payload as Record<string, unknown>;
+            const eventTs = typeof event.ts === 'number' ? event.ts : undefined;
+            if (payload[TIMELINE_SUPPRESS_PUSH_FIELD] === true) return;
+            if (eventTs && Date.now() - eventTs > PUSH_TIMELINE_EVENT_MAX_AGE_MS) return;
             this.dispatchEventPush(db, env, {
               type: 'session.idle',
               session: event.sessionId ?? '',
@@ -640,8 +677,11 @@ export class WsBridge {
         return;
       }
 
-      // Browser rate limit — drop with error response so frontend can handle it
-      {
+      // Browser rate limit — drop with error response so frontend can handle it.
+      // Gated by BROWSER_RATE_LIMIT_ENABLED. See the constant's docs above for
+      // why it's currently off; the entire block is preserved (and inert) so
+      // re-enabling is a one-line flip with no semantic risk.
+      if (BROWSER_RATE_LIMIT_ENABLED) {
         const browserId = this.getBrowserId(ws);
         if (!this.browserRateLimiter.check(browserId, BROWSER_RATE_LIMIT, BROWSER_RATE_WINDOW)) {
           logger.warn({ serverId: this.serverId, type: msg.type }, 'Browser rate limit exceeded — dropped');
@@ -974,12 +1014,24 @@ export class WsBridge {
         logger.warn({ serverId: this.serverId }, 'timeline.event missing sessionId — discarded');
         return;
       }
+      if (rawEvent.type === 'user.message') {
+        const payload = rawEvent.payload as Record<string, unknown> | undefined;
+        const commandId = typeof payload?.commandId === 'string'
+          ? payload.commandId
+          : typeof payload?.clientMessageId === 'string'
+            ? payload.clientMessageId
+            : '';
+        if (commandId) this.clearInflightOnAuthoritativeEcho(commandId);
+      }
       this.ingestRecentTextFromTimelineEvent(rawEvent);
       if (this.db) {
         void upsertSessionTextTailCacheEvent(this.db, this.serverId, rawEvent)
           .catch((err) => logger.warn({ err, serverId: this.serverId, sessionId }, 'Failed to update session_text_tail_cache'));
       }
-      this.sendToSessionSubscribers(sessionId, JSON.stringify(msg));
+      // Bypass TerminalForwardQueue: timeline events are control-plane and
+      // must never queue behind PTY data. Critical for cancel/stop UX —
+      // session.state(idle) used to arrive seconds after the push notification.
+      this.sendJsonToSessionSubscribers(sessionId, JSON.stringify(msg));
       return;
     }
 
@@ -1011,7 +1063,8 @@ export class WsBridge {
         logger.warn({ serverId: this.serverId, type }, 'timeline message missing sessionName — discarded');
         return;
       }
-      this.sendToSessionSubscribers(sessionName, JSON.stringify(msg));
+      // Control-plane: bypass the PTY queue (see sendJsonToSessionSubscribers).
+      this.sendJsonToSessionSubscribers(sessionName, JSON.stringify(msg));
       return;
     }
 
@@ -1026,14 +1079,16 @@ export class WsBridge {
       if (commandId) {
         // Dedup replayed acks from daemon outbox flush (sticky-pod keeps this
         // LRU authoritative within a pod lifetime).
-        if (this.seenCommandAcks.has(commandId)) {
+        if (this.seenCommandAcks.has(commandId) && !this.inflightCommands.has(commandId)) {
           logger.debug({ serverId: this.serverId, commandId }, 'command.ack dedup — dropping replay');
           return;
         }
         this.seenCommandAcks.set(commandId, Date.now());
         this.clearInflightOnAck(commandId);
       }
-      this.sendToSessionSubscribers(sessionName, JSON.stringify(msg));
+      // Control-plane: bypass the PTY queue. command.ack drives the UI
+      // optimistic-bubble state — must never head-of-line block.
+      this.sendJsonToSessionSubscribers(sessionName, JSON.stringify(msg));
       return;
     }
 
@@ -1049,7 +1104,8 @@ export class WsBridge {
         logger.warn({ serverId: this.serverId }, 'subsession.response missing sessionName — discarded');
         return;
       }
-      this.sendToSessionSubscribers(sessionName, JSON.stringify(msg));
+      // Control-plane: bypass the PTY queue.
+      this.sendJsonToSessionSubscribers(sessionName, JSON.stringify(msg));
       return;
     }
 
@@ -1060,7 +1116,11 @@ export class WsBridge {
         logger.warn({ serverId: this.serverId, type }, 'session notification missing session — discarded');
         return;
       }
-      this.sendToSessionSubscribers(sessionName, JSON.stringify(msg));
+      // Control-plane: bypass the PTY queue. session.idle is the WS twin
+      // of the cancel/stop push notification — must arrive without queueing
+      // behind PTY frames so the browser spinner clears in lockstep with
+      // the push.
+      this.sendJsonToSessionSubscribers(sessionName, JSON.stringify(msg));
       return;
     }
 
@@ -1445,6 +1505,58 @@ export class WsBridge {
     }
   }
 
+  /**
+   * Direct JSON delivery to session subscribers — bypasses the per-(session, ws)
+   * TerminalForwardQueue used for backpressure on heavy PTY output AND fans
+   * out across BOTH terminal-mode and transport-mode subscriptions.
+   *
+   * Why this exists:
+   *
+   * 1. Control-plane messages (command.ack, session.state, session.idle,
+   *    timeline.event with assistant.text/user.message, etc.) are tiny but
+   *    latency-critical. When PTY frames are queued (e.g. agent was streaming
+   *    a long response right before a cancel), the old path queued cancel JSON
+   *    behind hundreds of KB of PTY data — the push notification (out-of-band
+   *    APNs/FCM) arrived seconds before the WS confirmation, leaving the
+   *    browser spinner hanging. Direct `safeSend` jumps the queue.
+   *
+   * 2. Session subscriptions live in TWO maps: `browserSubscriptions` (filled
+   *    by `terminal.subscribe`, used by process/tmux agents) and
+   *    `transportSubscriptions` (filled by `chat.subscribe`, used by SDK
+   *    agents like qwen / openclaw / codex-sdk / cursor-headless). Transport
+   *    agents have no tmux pane so the web client never issues
+   *    `terminal.subscribe` for them — meaning the browser appears in
+   *    `transportSubscriptions` only.
+   *
+   *    Before this fan-out, control-plane messages routed via
+   *    `browserSubscriptions` alone NEVER REACHED transport-only browsers.
+   *    Result: the user pressed stop on a Codex-SDK / Qwen session, the SDK
+   *    cancel completed, the push notification fired (proving the daemon
+   *    saw idle), but the browser's chat record never received the matching
+   *    session.idle / command.ack / session.state events — they were silently
+   *    dropped on the floor. The chat list spinner stayed on indefinitely.
+   *
+   *    Fanning out to BOTH maps fixes that. Same WS may live in both maps
+   *    simultaneously (a process session that the user also has chat-mode
+   *    subscriptions to); we dedup per-WS so the same JSON is never sent
+   *    twice.
+   */
+  private sendJsonToSessionSubscribers(sessionName: string, json: string): void {
+    const sent = new Set<WebSocket>();
+    for (const [ws, sessions] of this.browserSubscriptions) {
+      if (!sessions.has(sessionName)) continue;
+      if (sent.has(ws)) continue;
+      sent.add(ws);
+      safeSend(ws, json);
+    }
+    for (const [ws, sessions] of this.transportSubscriptions) {
+      if (!sessions.has(sessionName)) continue;
+      if (sent.has(ws)) continue;
+      sent.add(ws);
+      safeSend(ws, json);
+    }
+  }
+
   private sendToRawSessionSubscribers(sessionName: string, data: string | Buffer): void {
     for (const [ws, sessions] of this.browserSubscriptions) {
       if (sessions.get(sessionName) !== true) continue;
@@ -1469,16 +1581,37 @@ export class WsBridge {
 
     const sent = safeSend(ws, resetMsg, (err) => {
       if (err) {
-        // Send failed (socket CLOSING/CLOSED or threw) — force close
+        // Browser actually disconnected (socket CLOSING/CLOSED). Real cleanup
+        // — drop the subscription and force close.
+        this.removeBrowserSessionSubscription(ws, sessionName);
         try { ws.close(1011, 'backpressure_notify_failed'); } catch { /* ignore */ }
       }
     });
 
-    // Always remove subscription regardless of send success
-    this.removeBrowserSessionSubscription(ws, sessionName);
-
     if (!sent) {
       logger.warn({ serverId: this.serverId, sessionName }, 'Backpressure reset failed to send — socket closed');
+      return;
+    }
+
+    // Reset the per-(session, ws) queue to a fresh accounting state instead
+    // of unsubscribing. Prior behavior unsubscribed on every overflow which
+    // created a churn cycle on heavy shell output:
+    //   heavy stdout → 1MB queue → overflow → server unsubscribes → daemon
+    //   stops pipe-pane → client receives stream_reset → client retries
+    //   subscribe → daemon restarts pipe → flood begins again → overflow.
+    // Each cycle the client's `resetState` count climbs; once it crosses
+    // the cooldown threshold the terminal sits frozen for 5s, and if the
+    // session keeps producing output the cooldown re-engages indefinitely
+    // — which is exactly the "shell terminal 断流, 刷新才能恢复" symptom.
+    //
+    // By keeping the subscription alive we let the client treat the reset
+    // as a discontinuity (request a snapshot, redraw) without forcing a
+    // full re-subscribe roundtrip. The fresh queue gives us a clean budget
+    // for subsequent sends; orphaned in-flight callbacks from the old
+    // queue still decrement only their own (now-unreachable) counter.
+    const sessionQueues = this.terminalQueues.get(sessionName);
+    if (sessionQueues?.has(ws)) {
+      sessionQueues.set(ws, new TerminalForwardQueue());
     }
   }
 
@@ -1664,10 +1797,9 @@ export class WsBridge {
     raw: string,
   ): void {
     // Guard: if we already have an inflight for this commandId, the browser is
-    // retrying / double-sending. The daemon-side user.message 5s dedup will
-    // absorb duplicates, but we still skip creating a second inflight entry.
+    // retrying / double-sending. Keep the existing inflight and wait for its
+    // ack/timeout instead of forwarding another copy to the daemon.
     if (this.inflightCommands.has(commandId)) {
-      this.sendToDaemon(raw);
       return;
     }
 
@@ -1679,17 +1811,29 @@ export class WsBridge {
         rawPayload: raw,
         state: 'dispatched',
         sentAt: Date.now(),
+        dispatchAttempts: 0,
         timeoutTimer: null,
       };
-      entry.timeoutTimer = setTimeout(() => this.onAckTimeout(commandId), ACK_TIMEOUT_MS);
       this.inflightCommands.set(commandId, entry);
-      this.sendToDaemon(raw);
+      this.dispatchInflightToDaemon(entry, false);
       this.startAckHousekeepingIfNeeded();
       return;
     }
 
-    if (this.graceTimer) {
-      // Transient outage — buffer for replay when the daemon reconnects.
+    // Buffer if either:
+    //   (a) we are inside the post-disconnect grace window (`graceTimer` set)
+    //   (b) a daemon WS is open but the auth handshake hasn't completed yet
+    //       (`daemonWs` exists, `authenticated` is still false). Without (b),
+    //       sends arriving during the brief auth window after a grace-expired
+    //       reconnect were INSTANT-FAILED with reason=daemon_offline even
+    //       though the daemon is literally about to come back. This was the
+    //       "发消息瞬间失败, 连点 retry n 次才成功" symptom: each click only
+    //       had a chance to land in the lucky few-ms window after auth
+    //       completed but before the user's eyes registered the green badge.
+    //       The buffered entries are replayed by `replayInflightToDaemon()`
+    //       when the auth `replayInflightToDaemon` call fires (line ~516).
+    const daemonHandshakeInProgress = !!this.daemonWs && !this.authenticated;
+    if (this.graceTimer || daemonHandshakeInProgress) {
       const entry: InflightCommand = {
         commandId,
         sessionName,
@@ -1697,6 +1841,7 @@ export class WsBridge {
         rawPayload: raw,
         state: 'buffered',
         sentAt: Date.now(),
+        dispatchAttempts: 0,
         timeoutTimer: null,
       };
       this.inflightCommands.set(commandId, entry);
@@ -1704,7 +1849,7 @@ export class WsBridge {
       return;
     }
 
-    // Fully offline (grace already expired): fail fast.
+    // Fully offline (no daemon WS, no grace window): fail fast.
     this.emitCommandFailed(ws, commandId, sessionName, ACK_FAILURE_DAEMON_OFFLINE);
   }
 
@@ -1714,16 +1859,34 @@ export class WsBridge {
     for (const entry of ordered) {
       if (entry.state === 'acked') continue;
       try {
-        this.sendToDaemon(entry.rawPayload);
-        if (entry.state === 'buffered') {
-          entry.state = 'dispatched';
-        }
-        // Arm (or re-arm) ack timeout from "now" — daemon's perspective.
-        if (entry.timeoutTimer) clearTimeout(entry.timeoutTimer);
-        entry.timeoutTimer = setTimeout(() => this.onAckTimeout(entry.commandId), ACK_TIMEOUT_MS);
+        this.dispatchInflightToDaemon(entry, entry.dispatchAttempts > 0);
       } catch (err) {
         logger.warn({ commandId: entry.commandId, err }, 'replayInflightToDaemon failed for entry');
       }
+    }
+  }
+
+  private dispatchInflightToDaemon(entry: InflightCommand, markBridgeRetry: boolean): void {
+    const rawPayload = markBridgeRetry
+      ? this.withBridgeRetryMarker(entry.rawPayload, entry.dispatchAttempts + 1)
+      : entry.rawPayload;
+    this.sendToDaemon(rawPayload);
+    entry.dispatchAttempts += 1;
+    entry.state = 'dispatched';
+    if (entry.timeoutTimer) clearTimeout(entry.timeoutTimer);
+    entry.timeoutTimer = setTimeout(() => this.onAckTimeout(entry.commandId), ACK_TIMEOUT_MS);
+  }
+
+  private withBridgeRetryMarker(rawPayload: string, retryAttempt: number): string {
+    try {
+      const msg = JSON.parse(rawPayload) as Record<string, unknown>;
+      return JSON.stringify({
+        ...msg,
+        __bridgeRetry: true,
+        __bridgeRetryAttempt: retryAttempt,
+      });
+    } catch {
+      return rawPayload;
     }
   }
 
@@ -1745,6 +1908,28 @@ export class WsBridge {
     const entry = this.inflightCommands.get(commandId);
     if (!entry) return;
     if (entry.state === 'acked') return;
+    if (this.isDaemonConnected() && entry.dispatchAttempts <= ACK_TIMEOUT_RETRY_LIMIT) {
+      logger.warn(
+        {
+          serverId: this.serverId,
+          commandId,
+          sessionName: entry.sessionName,
+          dispatchAttempts: entry.dispatchAttempts,
+          retryLimit: ACK_TIMEOUT_RETRY_LIMIT,
+        },
+        'command.ack timeout — retrying session.send',
+      );
+      this.dispatchInflightToDaemon(entry, true);
+      return;
+    }
+    if (!this.isDaemonConnected() && this.graceTimer) {
+      entry.state = 'buffered';
+      if (entry.timeoutTimer) {
+        clearTimeout(entry.timeoutTimer);
+        entry.timeoutTimer = null;
+      }
+      return;
+    }
     logger.warn({ serverId: this.serverId, commandId, sessionName: entry.sessionName }, 'command.ack timeout');
     this.emitCommandFailed(entry.browser, commandId, entry.sessionName, ACK_FAILURE_ACK_TIMEOUT);
     this.removeInflight(commandId);
@@ -1761,6 +1946,13 @@ export class WsBridge {
     }
     // Leave the entry around briefly for housekeeping GC so duplicate acks
     // still hit dedup via `seenCommandAcks`.
+    this.removeInflight(commandId);
+  }
+
+  /** A user.message carrying the client command id means the daemon accepted it. */
+  private clearInflightOnAuthoritativeEcho(commandId: string): void {
+    const entry = this.inflightCommands.get(commandId);
+    if (!entry) return;
     this.removeInflight(commandId);
   }
 

@@ -117,6 +117,82 @@ body {
 .shortcut-btn:disabled { opacity: 0.4; cursor: default; }
 .shortcut-btn-wide { padding-left: 14px; padding-right: 14px; }
 .shortcut-btn-icon { width: 28px; min-width: 28px; padding: 4px 0; display: inline-flex; align-items: center; justify-content: center; }
+/* Tool-call toggle wrench (UsageFooter). Three visual states correspond to
+ * the show_tool_calls preference:
+ *   - off  → grey border, dim icon (default tool-row hidden state)
+ *   - on   → green border, full-color icon (developer view active)
+ *   - undecided → grey border with a pulsing green ring (drawing the user's
+ *                 eye to make the first-run choice). */
+.shortcut-btn-tools { font-size: 13px; line-height: 1; opacity: 0.6; filter: grayscale(0.5); border-color: #475569; }
+.shortcut-btn-tools:hover:not(:disabled) { opacity: 1; filter: none; border-color: #64748b; color: #cbd5e1; background: #1a2538; }
+.shortcut-btn-tools.is-on { background: #052e1a; border-color: #22c55e; color: #86efac; opacity: 1; filter: none; box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.35); }
+.shortcut-btn-tools.is-on:hover:not(:disabled) { background: #0a3d24; border-color: #4ade80; color: #bbf7d0; }
+.shortcut-btn-tools.is-undecided { animation: shortcut-btn-tools-pulse 2.4s ease-in-out infinite; }
+@keyframes shortcut-btn-tools-pulse {
+  0%, 100% { opacity: 0.6; box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+  50%      { opacity: 1;   box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.25); }
+}
+/* Wrapper lets us anchor the undecided-state bubble above the button. */
+.shortcut-btn-tools-wrapper { position: relative; display: inline-flex; align-items: center; }
+/* Speech bubble that prompts the user to make the first-run choice. Sits
+ * above the wrench, with a tail pointing down to the button. Removed from
+ * the DOM the moment the show_tool_calls preference is set. */
+.shortcut-btn-tools-bubble {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 5px 9px;
+  background: #14532d;
+  border: 1px solid #22c55e;
+  border-radius: 6px;
+  color: #bbf7d0;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.2;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(34, 197, 94, 0.25);
+  animation: shortcut-btn-tools-bubble-bob 2.4s ease-in-out infinite;
+  z-index: 5;
+}
+.shortcut-btn-tools-bubble::after {
+  content: '';
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  border: 5px solid transparent;
+  border-top-color: #22c55e;
+  filter: drop-shadow(0 1px 0 #14532d);
+}
+.shortcut-btn-tools-bubble::before {
+  content: '';
+  position: absolute;
+  top: calc(100% - 1px);
+  left: 50%;
+  transform: translateX(-50%);
+  border: 4px solid transparent;
+  border-top-color: #14532d;
+  z-index: 1;
+}
+@keyframes shortcut-btn-tools-bubble-bob {
+  0%, 100% { transform: translateX(-50%) translateY(0); }
+  50%      { transform: translateX(-50%) translateY(-2px); }
+}
+
+/* First-time tool-call view chooser shown above the chat timeline. */
+.chat-tool-chooser { margin: 12px 16px; padding: 14px 16px; background: linear-gradient(180deg, #0f1d33 0%, #0d1729 100%); border: 1px solid #1e3a5f; border-radius: 8px; color: #cbd5e1; }
+.chat-tool-chooser-title { font-size: 13px; font-weight: 600; color: #e2e8f0; margin-bottom: 2px; }
+.chat-tool-chooser-subtitle { font-size: 11px; color: #94a3b8; margin-bottom: 12px; }
+.chat-tool-chooser-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+.chat-tool-chooser-btn { flex: 1 1 180px; min-width: 160px; display: grid; grid-template-columns: auto 1fr; grid-template-rows: auto auto; column-gap: 10px; align-items: center; padding: 10px 12px; background: #0b1729; border: 1px solid #334155; border-radius: 6px; color: #cbd5e1; cursor: pointer; transition: all 0.12s; text-align: left; font-family: inherit; }
+.chat-tool-chooser-btn:hover { background: #142845; border-color: #3b82f6; color: #e2e8f0; }
+.chat-tool-chooser-btn-icon { grid-row: 1 / span 2; font-size: 22px; line-height: 1; }
+.chat-tool-chooser-btn-label { font-size: 12px; font-weight: 600; color: #e2e8f0; }
+.chat-tool-chooser-btn-hint { font-size: 11px; color: #94a3b8; }
+.chat-tool-chooser-btn-developer:hover { border-color: #60a5fa; }
+.chat-tool-chooser-footnote { font-size: 10px; color: #64748b; margin-top: 10px; }
 .shortcut-btn-auto { display: inline-flex; align-items: center; gap: 5px; padding-left: 8px; padding-right: 8px; font-weight: 600; }
 .shortcut-btn-auto-dot { width: 6px; height: 6px; border-radius: 999px; flex-shrink: 0; }
 .shortcut-btn-auto-label { letter-spacing: 0.01em; }
@@ -257,6 +333,25 @@ body {
 .controls-queued-item-text {
   flex: 1;
   min-width: 0;
+}
+.controls-queued-item-status {
+  width: 8px;
+  height: 8px;
+  margin-top: 4px;
+  border-radius: 999px;
+  flex-shrink: 0;
+  background: #fbbf24;
+}
+.controls-queued-item-status-sending {
+  background: #38bdf8;
+  animation: queued-status-pulse 1s ease-in-out infinite;
+}
+.controls-queued-item-status-failed {
+  background: #fb7185;
+}
+@keyframes queued-status-pulse {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 1; }
 }
 .controls-queued-item-actions {
   display: inline-flex;
@@ -715,8 +810,11 @@ body {
 .chat-pinned-last-sent:focus-visible { outline: 2px solid #3b82f6; outline-offset: 1px; }
 .chat-pinned-last-sent-label { font-size: 10px; font-weight: 600; color: #93c5fd; letter-spacing: 0.05em; text-transform: uppercase; }
 .chat-pinned-last-sent-text { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; line-clamp: 2; overflow: hidden; text-overflow: ellipsis; word-break: break-word; white-space: pre-wrap; }
-.chat-pinned-last-sent.chat-pinned-expanded .chat-pinned-last-sent-text { display: block; -webkit-line-clamp: unset; line-clamp: unset; max-height: 40vh; overflow-y: auto; }
-.chat-view { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 8px 12px; display: flex; flex-direction: column; gap: 2px; scrollbar-width: thin; scrollbar-color: #6366f1 #1e293b; }
+/* Expanded state still caps at 3 lines — the toggle reveals one extra
+   line of context, never the full message. Tap-again jumps to the
+   message in chat history for the full content. */
+.chat-pinned-last-sent.chat-pinned-expanded .chat-pinned-last-sent-text { -webkit-line-clamp: 3; line-clamp: 3; }
+.chat-view { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 8px 12px; display: flex; flex-direction: column; gap: 2px; scrollbar-width: thin; scrollbar-color: #6366f1 #1e293b; overflow-anchor: none; }
 .chat-view-preview { justify-content: flex-end; }
 .chat-view::-webkit-scrollbar { width: 5px; }
 .chat-view::-webkit-scrollbar-track { background: #1e293b; border-radius: 3px; }
@@ -754,7 +852,13 @@ body {
 .chat-code-block { background: #1a1a2e; border-radius: 8px; margin: 8px 0; overflow: hidden; }
 .chat-code-block pre { margin: 0; padding: 12px; overflow-x: auto; -webkit-overflow-scrolling: touch; font-size: 13px; line-height: 1.4; }
 .chat-code-block code { font-family: 'Cascadia Code', 'Fira Code', 'SF Mono', monospace; color: #e2e8f0; }
+.chat-code-header { display: flex; align-items: center; justify-content: space-between; background: #2a2a4a; }
+.chat-code-header .chat-code-lang { background: transparent; padding: 4px 12px; }
 .chat-code-lang { background: #2a2a4a; color: #94a3b8; font-size: 11px; padding: 4px 12px; font-family: sans-serif; }
+.chat-code-copy-btn { display: inline-flex; align-items: center; justify-content: center; background: transparent; color: #94a3b8; border: none; padding: 4px 10px; cursor: pointer; line-height: 0; transition: color 0.15s; -webkit-tap-highlight-color: transparent; }
+.chat-code-copy-btn:hover { color: #e2e8f0; }
+.chat-code-copy-btn.is-copied { color: #34d399; }
+.chat-code-copy-btn svg { display: block; }
 .chat-inline-code { background: #1e293b; color: #93c5fd; padding: 1px 5px; border-radius: 3px; font-family: 'Cascadia Code', 'Fira Code', 'SF Mono', monospace; font-size: 0.9em; }
 .chat-tool { color: #94a3b8; font-size: 14px; line-height: 1.6; min-height: 28px; padding: 6px 10px; background: #1e293b; border-radius: 6px; border-left: 3px solid #3b82f6; overflow: visible; white-space: normal; word-break: break-all; flex-shrink: 0; }
 .chat-tool-icon { margin-right: 6px; font-weight: bold; color: #60a5fa; font-size: 14px; }
@@ -843,7 +947,15 @@ body {
 .chat-mode { display: inline-block; background: #1e1338; color: #a78bfa; padding: 2px 8px; border-radius: 4px; font-size: 11px; }
 .chat-system { text-align: center; color: #475569; font-size: 11px; padding: 4px 0; }
 .chat-loading { text-align: center; color: #475569; padding: 24px; }
-.chat-refreshing { position: absolute; top: 8px; right: 10px; z-index: 4; width: 18px; height: 18px; border-radius: 999px; background: rgba(15, 23, 42, 0.88); border: 1px solid #334155; display: flex; align-items: center; justify-content: center; pointer-events: none; }
+.chat-history-overlay { position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%); z-index: 4; min-height: 24px; max-width: min(92%, 560px); border-radius: 999px; background: rgba(15, 23, 42, 0.82); border: 1px solid rgba(51, 65, 85, 0.82); box-shadow: 0 8px 24px rgba(2, 6, 23, 0.28); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 5px 9px; pointer-events: none; color: #94a3b8; }
+.chat-history-overlay:not(.has-steps) { width: 24px; height: 24px; padding: 0; }
+.chat-history-overlay-label { font-size: 10px; color: #cbd5e1; white-space: nowrap; flex-shrink: 0; }
+.chat-history-overlay-steps { display: flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; }
+.chat-history-step { display: inline-flex; align-items: center; gap: 3px; min-width: 0; font-size: 10px; line-height: 1.2; color: #64748b; white-space: nowrap; }
+.chat-history-step-icon { display: inline-block; width: 10px; text-align: center; color: inherit; opacity: 0.9; }
+.chat-history-step.running { color: #60a5fa; }
+.chat-history-step.pending { color: #94a3b8; }
+.chat-history-step.done { color: #34d399; }
 .chat-refreshing-spinner { width: 10px; height: 10px; border: 1.5px solid #475569; border-top-color: #60a5fa; border-radius: 50%; animation: chat-spinner-rotate 0.8s linear infinite; }
 .chat-thinking-bar { color: #94a3b8; font-size: 12px; padding: 6px 16px; background: #1e293b; border-top: 1px solid #334155; flex-shrink: 0; }
 .chat-thinking-dots { animation: thinking-pulse 1.2s ease-in-out infinite; letter-spacing: 2px; }
@@ -950,6 +1062,8 @@ body {
 .subcard-ctx-cache { position: absolute; left: 0; top: 0; height: 100%; background: #818cf8; border-radius: 2px; }
 
 .subcard-preview { flex: 1; overflow-y: auto; overflow-x: hidden; }
+.subcard-preview-terminal { display: flex; min-height: 0; }
+.subcard-preview-terminal .terminal-wrap { width: 100%; height: 100%; min-height: 0; }
 .subcard-scroll-bottom { position: absolute; bottom: 6px; right: 10px; width: 26px; height: 26px; border-radius: 50%; background: #334155; border: 1px solid #475569; color: #e2e8f0; font-size: 14px; cursor: pointer; display: flex; align-items: center; justify-content: center; z-index: 5; opacity: 0.8; transition: opacity 0.15s; line-height: 1; padding: 0; }
 .subcard-scroll-bottom:hover { opacity: 1; background: #3b82f6; border-color: #3b82f6; }
 .subcard-resize-handle { position: absolute; top: 0; right: -8px; width: 20px; height: 100%; cursor: ew-resize; background: transparent; z-index: 10; transition: background 0.15s; touch-action: none; }
@@ -1024,14 +1138,6 @@ body {
 /* Usage footer — between chat/terminal and input controls */
 .session-usage-footer { flex-shrink: 0; padding: 4px 10px 3px; background: #0f1117; border-top: 1px solid #1e293b; }
 .session-ctx-bar { position: relative; width: 100%; height: 5px; background: #1e293b; border-radius: 3px; overflow: hidden; margin-bottom: 3px; }
-.session-history-progress { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; min-width: 0; }
-.session-history-progress-label { font-size: 9px; color: #64748b; white-space: nowrap; flex-shrink: 0; }
-.session-history-progress-steps { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; min-width: 0; }
-.session-history-step { display: inline-flex; align-items: center; gap: 3px; font-size: 9px; line-height: 1.2; color: #64748b; white-space: nowrap; }
-.session-history-step-icon { display: inline-block; width: 10px; text-align: center; color: inherit; opacity: 0.9; }
-.session-history-step.running { color: #60a5fa; }
-.session-history-step.pending { color: #94a3b8; }
-.session-history-step.done { color: #34d399; }
 .session-usage-codex-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 4px; align-items: center; }
 .session-usage-codex-quota { display: flex; flex-direction: column; align-items: flex-end; gap: 1px; margin-bottom: 2px; }
 .session-usage-codex-line { color: #64748b; font-size: 9px; line-height: 1.2; text-align: right; }
@@ -1971,6 +2077,8 @@ body {
 .fb-icon-spin { display: inline-block; animation: spin 0.8s linear infinite; }
 .fb-preview-image { display: flex; align-items: center; justify-content: center; padding: 16px; overflow: auto; background: #0a0f1a; min-height: 0; flex: 1; }
 .fb-preview-image img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 4px; background: repeating-conic-gradient(#1e293b 0% 25%, #0f172a 0% 50%) 0 0 / 16px 16px; cursor: zoom-in; }
+.fb-preview-video { display: flex; align-items: center; justify-content: center; padding: 16px; overflow: hidden; background: #0a0f1a; min-height: 0; flex: 1; }
+.fb-preview-video video { max-width: 100%; max-height: 100%; width: 100%; border-radius: 4px; background: #000; outline: none; }
 .fb-lightbox { position: fixed; inset: 0; z-index: 9999; background: rgba(0,0,0,0.85); display: flex; align-items: center; justify-content: center; cursor: zoom-out; }
 .fb-lightbox img { max-width: 92vw; max-height: 92vh; object-fit: contain; border-radius: 6px; cursor: default; }
 .fb-lightbox-close { position: absolute; top: 16px; right: 16px; background: rgba(255,255,255,0.15); border: none; color: #fff; font-size: 20px; width: 36px; height: 36px; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; }

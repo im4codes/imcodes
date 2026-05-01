@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 /**
  * Content fingerprinting for processed memory projections.
  *
@@ -50,4 +51,10 @@ export function fingerprintProjection(args: {
   // fixed enum, summary is user-facing text), so this is unambiguous without
   // needing a real hash function that would pull in crypto on hot paths.
   return `${args.namespaceKey}\u0000${args.projectionClass}\u0000${normalized}`;
+}
+
+
+/** Return a stable SHA-256 hex fingerprint for already-normalized memory text. */
+export function computeFingerprint(normalizedSummary: string): string {
+  return createHash('sha256').update(normalizedSummary, 'utf8').digest('hex');
 }

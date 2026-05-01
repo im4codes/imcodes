@@ -1,9 +1,10 @@
 /**
  * SessionSettingsDialog — edit label, description, cwd for main or sub sessions.
  */
-import { useEffect, useMemo, useState } from 'preact/hooks';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import { fetchSupervisorDefaults, patchSession, patchSubSession, saveSupervisorDefaults } from '../api.js';
+import { patchSession, patchSubSession } from '../api.js';
+import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
 import type { WsClient } from '../ws-client.js';
 import { SESSION_AGENT_TYPES, TRANSPORT_SESSION_AGENT_TYPES, type SessionAgentType } from '@shared/agent-types.js';
 import type { SharedContextRuntimeBackend } from '@shared/context-types.js';
@@ -94,6 +95,13 @@ type SupervisionRuntimeDraft = Pick<
   SupervisionDraft,
   'backend' | 'model' | 'preset' | 'timeoutMs' | 'promptVersion' | 'customInstructions' | 'maxAutoContinueStreak' | 'maxAutoContinueTotal'
 >;
+
+type CcPresetSummary = {
+  name: string;
+  env?: Record<string, string>;
+  availableModels?: Array<{ id: string; name?: string }>;
+  defaultModel?: string;
+};
 
 function timeoutMsToUiSeconds(timeoutMs: number | undefined): number {
   const safeMs = typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0
@@ -268,16 +276,53 @@ function SupervisionIntroCard({ t }: { t: (key: string, params?: Record<string, 
  * picks a preset, instead of showing a stale Qwen default alongside.
  */
 function getPresetPinnedModel(
-  presets: Array<{ name: string; env?: Record<string, string> }>,
+  presets: readonly CcPresetSummary[],
   presetName: string | undefined,
 ): string | undefined {
   if (!presetName) return undefined;
   const target = presetName.trim().toLowerCase();
   if (!target) return undefined;
   const match = presets.find((p) => p.name.trim().toLowerCase() === target);
-  const model = match?.env?.ANTHROPIC_MODEL ?? match?.env?.OPENAI_MODEL;
-  const trimmed = typeof model === 'string' ? model.trim() : '';
+  if (!match) return undefined;
+  // Prefer the discovered defaultModel (set by cc.presets.discover_models);
+  // fall back to the env-pinned model used by the daemon at launch.
+  const discovered = typeof match.defaultModel === 'string' ? match.defaultModel.trim() : '';
+  if (discovered) return discovered;
+  const envModel = match.env?.ANTHROPIC_MODEL ?? match.env?.OPENAI_MODEL;
+  const trimmed = typeof envModel === 'string' ? envModel.trim() : '';
   return trimmed || undefined;
+}
+
+function getPresetModelOptions(
+  presets: readonly CcPresetSummary[],
+  presetName: string | undefined,
+): string[] {
+  if (!presetName) return [];
+  const target = presetName.trim().toLowerCase();
+  if (!target) return [];
+  const match = presets.find((p) => p.name.trim().toLowerCase() === target);
+  if (!match) return [];
+  const options: string[] = [];
+  const add = (value: string | undefined) => {
+    const trimmed = value?.trim();
+    if (trimmed && !options.includes(trimmed)) options.push(trimmed);
+  };
+  add(match.defaultModel);
+  add(match.env?.ANTHROPIC_MODEL);
+  add(match.env?.OPENAI_MODEL);
+  for (const model of match.availableModels ?? []) add(model.id);
+  return options;
+}
+
+function resolvePresetModel(
+  presets: readonly CcPresetSummary[],
+  presetName: string | undefined,
+  currentModel: string | undefined,
+): string | undefined {
+  const options = getPresetModelOptions(presets, presetName);
+  if (options.length === 0) return undefined;
+  const current = currentModel?.trim();
+  return current && options.includes(current) ? current : options[0];
 }
 
 /**
@@ -299,7 +344,7 @@ function SupervisionPresetPicker({
 }: {
   t: (key: string, params?: Record<string, unknown>) => string;
   saving: boolean;
-  presets: Array<{ name: string; env?: Record<string, string> }>;
+  presets: readonly CcPresetSummary[];
   value: string;
   onChange: (next: string | undefined) => void;
   noneLabel: string;
@@ -381,6 +426,13 @@ function SupervisionRuntimeFields({
   onModelChange: (model: string) => void;
   onTimeoutChange: (seconds: number) => void;
 }) {
+  const handleBackendSelect = (e: Event): void => {
+    onBackendChange((e.target as HTMLSelectElement).value);
+  };
+  const handleModelSelect = (e: Event): void => {
+    onModelChange((e.target as HTMLSelectElement).value);
+  };
+
   return (
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 12 }}>
       <div>
@@ -388,7 +440,8 @@ function SupervisionRuntimeFields({
         <select
           class="input"
           value={backend}
-          onChange={(e) => onBackendChange((e.target as HTMLSelectElement).value)}
+          onInput={handleBackendSelect}
+          onChange={handleBackendSelect}
           style={{ width: '100%' }}
           disabled={saving}
         >
@@ -414,7 +467,8 @@ function SupervisionRuntimeFields({
           <select
             class="input"
             value={model}
-            onChange={(e) => onModelChange((e.target as HTMLSelectElement).value)}
+            onInput={handleModelSelect}
+            onChange={handleModelSelect}
             style={{ width: '100%' }}
             disabled={saving || !backend}
           >
@@ -480,10 +534,11 @@ export function SessionSettingsDialog({
   const [supervision, setSupervision] = useState<SupervisionDraft>(initialSupervision);
   const [supervisorDefaults, setSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
   const [initialSupervisorDefaults, setInitialSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
+  const supervisorDefaultsDirtyRef = useRef(false);
   // Qwen presets (env bundles) fetched from the daemon via the same
   // `cc.presets.list` WS channel the Shared Context panel uses. Stays empty
   // when `ws` is not provided — the picker hides itself in that case.
-  const [ccPresets, setCcPresets] = useState<Array<{ name: string; env?: Record<string, string> }>>([]);
+  const [ccPresets, setCcPresets] = useState<CcPresetSummary[]>([]);
 
   useEffect(() => {
     setLabel(initLabel);
@@ -496,6 +551,7 @@ export function SessionSettingsDialog({
   const hasSupervision = supervision.mode !== 'off';
   const isSupportedTransport = TRANSPORT_SESSION_AGENT_TYPES.includes(agentType as typeof TRANSPORT_SESSION_AGENT_TYPES[number]);
   const isAuditMode = supervision.mode === 'supervised_audit';
+  const supervisorDefaultsPref = useSupervisorDefaults(isSupportedTransport);
 
   // Subscribe to `cc.presets.list_response` for as long as the dialog is
   // mounted with a valid `ws`. We fire the list request once on mount and
@@ -503,7 +559,7 @@ export function SessionSettingsDialog({
   useEffect(() => {
     if (!ws) return;
     const unsub = ws.onMessage((msg) => {
-      const m = msg as { type?: string; presets?: Array<{ name: string; env?: Record<string, string> }> };
+      const m = msg as { type?: string; presets?: CcPresetSummary[] };
       if (m.type === 'cc.presets.list_response') {
         setCcPresets(m.presets ?? []);
       }
@@ -513,40 +569,74 @@ export function SessionSettingsDialog({
   }, [ws]);
 
   useEffect(() => {
+    if (ccPresets.length === 0) return;
+    if (supervisorDefaultsDirtyRef.current) return;
+    setSupervisorDefaults((prev) => {
+      const backend = normalizeBackendValue(String(prev.backend ?? ''));
+      if (!backend || !doesSharedContextBackendSupportPresets(backend) || !prev.preset) return prev;
+      const resolvedModel = resolvePresetModel(ccPresets, prev.preset, prev.model);
+      if (!resolvedModel || prev.model === resolvedModel) return prev;
+      return { ...prev, model: resolvedModel };
+    });
+    setSupervision((prev) => {
+      const backend = normalizeBackendValue(String(prev.backend ?? ''));
+      if (!backend || !doesSharedContextBackendSupportPresets(backend) || !prev.preset) return prev;
+      const resolvedModel = resolvePresetModel(ccPresets, prev.preset, prev.model);
+      if (!resolvedModel || prev.model === resolvedModel) return prev;
+      return { ...prev, model: resolvedModel };
+    });
+  }, [
+    ccPresets,
+    supervisorDefaults.backend,
+    supervisorDefaults.model,
+    supervisorDefaults.preset,
+    supervision.backend,
+    supervision.model,
+    supervision.preset,
+  ]);
+
+  useEffect(() => {
     if (!isSupportedTransport) return;
-    let cancelled = false;
-    void fetchSupervisorDefaults()
-      .then((defaults) => {
-        if (cancelled) return;
-        const resolvedDefaults = normalizeSupervisorDefaultConfig(defaults);
-        setSupervisorDefaults(resolvedDefaults);
-        setInitialSupervisorDefaults(resolvedDefaults);
-        if (hasPersistedSupervision) return;
-        setSupervision((prev) => {
-          if (prev.backend || prev.model) return prev;
-          return {
-            ...prev,
-            backend: resolvedDefaults.backend,
-            model: resolvedDefaults.model,
-            // Seed preset from defaults when the backend supports it. If the
-            // backend doesn't support presets the normalizer already stripped
-            // it, so copying is safe either way.
-            preset: resolvedDefaults.preset,
-            timeoutMs: resolvedDefaults.timeoutMs,
-            promptVersion: resolvedDefaults.promptVersion,
-            maxAutoContinueStreak: prev.maxAutoContinueStreak ?? resolvedDefaults.maxAutoContinueStreak ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
-            maxAutoContinueTotal: prev.maxAutoContinueTotal ?? resolvedDefaults.maxAutoContinueTotal ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
-            maxParseRetries: prev.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
-            maxAuditLoops: prev.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS,
-            taskRunPromptVersion: prev.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION,
-          };
-        });
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, [hasPersistedSupervision, isSupportedTransport, sessionName, subSessionId]);
+    if (!supervisorDefaultsPref.loaded) return;
+    const resolvedDefaults = normalizeSupervisorDefaultConfig(supervisorDefaultsPref.value);
+    setInitialSupervisorDefaults(resolvedDefaults);
+    if (!supervisorDefaultsDirtyRef.current) {
+      setSupervisorDefaults(resolvedDefaults);
+    }
+    if (hasPersistedSupervision) return;
+    setSupervision((prev) => {
+      if (prev.backend || prev.model) return prev;
+      const shouldSeedAutoContinueStreak = prev.maxAutoContinueStreak == null
+        || prev.maxAutoContinueStreak === DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK;
+      const shouldSeedAutoContinueTotal = prev.maxAutoContinueTotal == null
+        || prev.maxAutoContinueTotal === DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL;
+      return {
+        ...prev,
+        backend: resolvedDefaults.backend,
+        model: resolvedDefaults.model,
+        // Seed preset from defaults when the backend supports it. If the
+        // backend doesn't support presets the normalizer already stripped
+        // it, so copying is safe either way.
+        preset: resolvedDefaults.preset,
+        timeoutMs: resolvedDefaults.timeoutMs,
+        promptVersion: resolvedDefaults.promptVersion,
+        maxAutoContinueStreak: shouldSeedAutoContinueStreak
+          ? resolvedDefaults.maxAutoContinueStreak
+          : prev.maxAutoContinueStreak,
+        maxAutoContinueTotal: shouldSeedAutoContinueTotal
+          ? resolvedDefaults.maxAutoContinueTotal
+          : prev.maxAutoContinueTotal,
+        maxParseRetries: prev.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
+        maxAuditLoops: prev.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS,
+        taskRunPromptVersion: prev.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION,
+      };
+    });
+  }, [hasPersistedSupervision, isSupportedTransport, supervisorDefaultsPref.loaded, supervisorDefaultsPref.value]);
+
+  const updateSupervisorDefaultsFromUser = (updater: (prev: SupervisionRuntimeDraft) => SupervisionRuntimeDraft): void => {
+    supervisorDefaultsDirtyRef.current = true;
+    setSupervisorDefaults(updater);
+  };
 
   const supervisionBackend = normalizeBackendValue(String(supervision.backend ?? ''));
   const supervisionModel = typeof supervision.model === 'string' ? supervision.model : '';
@@ -561,13 +651,25 @@ export function SessionSettingsDialog({
   const supervisionAuditMode = supervision.auditMode;
   const supervisionAuditLoops = supervision.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS;
   const taskRunPromptVersion = supervision.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION;
-  const modelOptions = supervisionBackend ? getSupervisionModelOptions(supervisionBackend) : [];
+  const supervisionPresetEntry = ccPresets.find((p) => p.name === (typeof supervision.preset === 'string' ? supervision.preset.trim() : ''));
+  const supervisionPresetModelOptions = getPresetModelOptions(ccPresets, supervision.preset);
+  const modelOptions = supervisionBackend
+    ? (supervisionPresetEntry && supervisionPresetModelOptions.length > 0
+        ? supervisionPresetModelOptions
+        : getSupervisionModelOptions(supervisionBackend))
+    : [];
   const supervisorDefaultsBackend = normalizeBackendValue(String(supervisorDefaults.backend ?? ''));
   const supervisorDefaultsModel = typeof supervisorDefaults.model === 'string' ? supervisorDefaults.model : '';
   const supervisorDefaultsTimeout = supervisorDefaults.timeoutMs ?? DEFAULT_SUPERVISION_TIMEOUT_MS;
   const supervisorDefaultsTimeoutSeconds = timeoutMsToUiSeconds(supervisorDefaultsTimeout);
   const supervisorDefaultsPromptVersion = supervisorDefaults.promptVersion ?? SUPERVISION_PROMPT_VERSION;
-  const supervisorDefaultsModelOptions = supervisorDefaultsBackend ? getSupervisionModelOptions(supervisorDefaultsBackend) : [];
+  const supervisorDefaultsPresetEntry = ccPresets.find((p) => p.name === (typeof supervisorDefaults.preset === 'string' ? supervisorDefaults.preset.trim() : ''));
+  const supervisorDefaultsPresetModelOptions = getPresetModelOptions(ccPresets, supervisorDefaults.preset);
+  const supervisorDefaultsModelOptions = supervisorDefaultsBackend
+    ? (supervisorDefaultsPresetEntry && supervisorDefaultsPresetModelOptions.length > 0
+        ? supervisorDefaultsPresetModelOptions
+        : getSupervisionModelOptions(supervisorDefaultsBackend))
+    : [];
   const supervisorDefaultsCustomInstructions = typeof supervisorDefaults.customInstructions === 'string' ? supervisorDefaults.customInstructions : '';
   const supervisorDefaultsAutoContinueStreak = supervisorDefaults.maxAutoContinueStreak ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK;
   const supervisorDefaultsAutoContinueTotal = supervisorDefaults.maxAutoContinueTotal ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL;
@@ -695,8 +797,8 @@ export function SessionSettingsDialog({
           timeoutMs: prev.timeoutMs ?? DEFAULT_SUPERVISION_TIMEOUT_MS,
           promptVersion: prev.promptVersion ?? SUPERVISION_PROMPT_VERSION,
           customInstructions: prev.customInstructions,
-          maxAutoContinueStreak: prev.maxAutoContinueStreak ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
-          maxAutoContinueTotal: prev.maxAutoContinueTotal ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
+          maxAutoContinueStreak: prev.maxAutoContinueStreak ?? supervisorDefaultsAutoContinueStreak,
+          maxAutoContinueTotal: prev.maxAutoContinueTotal ?? supervisorDefaultsAutoContinueTotal,
           maxParseRetries: prev.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
           auditMode: prev.auditMode,
           maxAuditLoops: prev.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS,
@@ -711,8 +813,12 @@ export function SessionSettingsDialog({
           timeoutMs: prev.timeoutMs ?? DEFAULT_SUPERVISION_TIMEOUT_MS,
           promptVersion: prev.promptVersion ?? SUPERVISION_PROMPT_VERSION,
           customInstructions: prev.customInstructions,
-          maxAutoContinueStreak: prev.maxAutoContinueStreak ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
-          maxAutoContinueTotal: prev.maxAutoContinueTotal ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
+          maxAutoContinueStreak: prev.maxAutoContinueStreak == null || prev.maxAutoContinueStreak === DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK
+            ? supervisorDefaultsAutoContinueStreak
+            : prev.maxAutoContinueStreak,
+          maxAutoContinueTotal: prev.maxAutoContinueTotal == null || prev.maxAutoContinueTotal === DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL
+            ? supervisorDefaultsAutoContinueTotal
+            : prev.maxAutoContinueTotal,
           maxParseRetries: prev.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
           auditMode: prev.auditMode,
           maxAuditLoops: prev.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS,
@@ -726,8 +832,12 @@ export function SessionSettingsDialog({
         timeoutMs: prev.timeoutMs ?? DEFAULT_SUPERVISION_TIMEOUT_MS,
         promptVersion: prev.promptVersion ?? SUPERVISION_PROMPT_VERSION,
         customInstructions: prev.customInstructions,
-        maxAutoContinueStreak: prev.maxAutoContinueStreak ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
-        maxAutoContinueTotal: prev.maxAutoContinueTotal ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
+        maxAutoContinueStreak: prev.maxAutoContinueStreak == null || prev.maxAutoContinueStreak === DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK
+          ? supervisorDefaultsAutoContinueStreak
+          : prev.maxAutoContinueStreak,
+        maxAutoContinueTotal: prev.maxAutoContinueTotal == null || prev.maxAutoContinueTotal === DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL
+          ? supervisorDefaultsAutoContinueTotal
+          : prev.maxAutoContinueTotal,
         maxParseRetries: prev.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
         taskRunPromptVersion: prev.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION,
       };
@@ -760,7 +870,7 @@ export function SessionSettingsDialog({
     setError('');
     try {
       if (hasGlobalDefaultsChanges) {
-        await saveSupervisorDefaults({
+        await supervisorDefaultsPref.save({
           backend: supervisorDefaultsBackend || undefined,
           model: supervisorDefaultsModel.trim(),
           timeoutMs: supervisorDefaultsTimeout,
@@ -824,6 +934,12 @@ export function SessionSettingsDialog({
   };
 
   const supervisionModeLabel = labelForMode(t, supervision.mode);
+  const handleSessionModeSelect = (e: Event): void => {
+    handleModeChange((e.target as HTMLSelectElement).value as SupervisionMode);
+  };
+  const handleSessionAuditModeSelect = (e: Event): void => {
+    setSupervision((prev) => ({ ...prev, auditMode: (e.target as HTMLSelectElement).value as SupervisionAuditMode }));
+  };
   const globalDefaultsValid = useMemo(() => {
     if (!isSupportedTransport) return true;
     if (!supervisorDefaultsBackend) return false;
@@ -856,11 +972,11 @@ export function SessionSettingsDialog({
           timeoutSeconds={supervisorDefaultsTimeoutSeconds}
           modelOptions={supervisorDefaultsModelOptions}
           onBackendChange={(nextBackend) => {
-            setSupervisorDefaults((prev) => ({ ...prev, ...updateRuntimeDraft(prev, nextBackend) }));
+            updateSupervisorDefaultsFromUser((prev) => ({ ...prev, ...updateRuntimeDraft(prev, nextBackend) }));
           }}
-              onModelChange={(model) => setSupervisorDefaults((prev) => ({ ...prev, model }))}
-              onTimeoutChange={(seconds) => setSupervisorDefaults((prev) => ({ ...prev, timeoutMs: timeoutUiSecondsToMs(seconds) }))}
-            />
+          onModelChange={(model) => updateSupervisorDefaultsFromUser((prev) => ({ ...prev, model }))}
+          onTimeoutChange={(seconds) => updateSupervisorDefaultsFromUser((prev) => ({ ...prev, timeoutMs: timeoutUiSecondsToMs(seconds) }))}
+        />
 
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 12 }}>
           <div>
@@ -872,7 +988,7 @@ export function SessionSettingsDialog({
               value={String(supervisorDefaultsAutoContinueStreak)}
               onInput={(e) => {
                 const value = Number.parseInt((e.target as HTMLInputElement).value, 10);
-                setSupervisorDefaults((prev) => ({ ...prev, maxAutoContinueStreak: Number.isFinite(value) && value >= 0 ? value : DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK }));
+                updateSupervisorDefaultsFromUser((prev) => ({ ...prev, maxAutoContinueStreak: Number.isFinite(value) && value >= 0 ? value : DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK }));
               }}
               style={{ width: '100%' }}
               disabled={saving}
@@ -888,7 +1004,7 @@ export function SessionSettingsDialog({
               value={String(supervisorDefaultsAutoContinueTotal)}
               onInput={(e) => {
                 const value = Number.parseInt((e.target as HTMLInputElement).value, 10);
-                setSupervisorDefaults((prev) => ({ ...prev, maxAutoContinueTotal: Number.isFinite(value) && value >= 0 ? value : DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL }));
+                updateSupervisorDefaultsFromUser((prev) => ({ ...prev, maxAutoContinueTotal: Number.isFinite(value) && value >= 0 ? value : DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL }));
               }}
               style={{ width: '100%' }}
               disabled={saving}
@@ -903,7 +1019,7 @@ export function SessionSettingsDialog({
             saving={saving}
             presets={ccPresets}
             value={supervisorDefaultsPreset}
-            onChange={(next) => setSupervisorDefaults((prev) => {
+            onChange={(next) => updateSupervisorDefaultsFromUser((prev) => {
               // When a preset is chosen, pin the model to the preset's own
               // ANTHROPIC_MODEL so the picker doesn't keep a stale Qwen default
               // visible while the daemon is actually routing through MiniMax /
@@ -925,7 +1041,7 @@ export function SessionSettingsDialog({
           <textarea
             class="input"
             value={supervisorDefaultsCustomInstructions}
-            onInput={(e) => setSupervisorDefaults((prev) => ({ ...prev, customInstructions: (e.target as HTMLTextAreaElement).value }))}
+            onInput={(e) => updateSupervisorDefaultsFromUser((prev) => ({ ...prev, customInstructions: (e.target as HTMLTextAreaElement).value }))}
             rows={3}
             style={{ width: '100%', resize: 'vertical' }}
             disabled={saving}
@@ -968,7 +1084,8 @@ export function SessionSettingsDialog({
           <select
             class="input"
             value={supervision.mode}
-            onChange={(e) => handleModeChange((e.target as HTMLSelectElement).value as SupervisionMode)}
+            onInput={handleSessionModeSelect}
+            onChange={handleSessionModeSelect}
             style={{ width: '100%' }}
             disabled={saving}
           >
@@ -1110,7 +1227,8 @@ export function SessionSettingsDialog({
                   <select
                     class="input"
                     value={supervisionAuditMode ?? ''}
-                    onChange={(e) => setSupervision((prev) => ({ ...prev, auditMode: (e.target as HTMLSelectElement).value as SupervisionAuditMode }))}
+                    onInput={handleSessionAuditModeSelect}
+                    onChange={handleSessionAuditModeSelect}
                     style={{ width: '100%' }}
                     disabled={saving}
                   >

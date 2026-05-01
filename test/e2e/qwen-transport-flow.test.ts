@@ -15,6 +15,7 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
+import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID } from '../../shared/ack-protocol.js';
 
 const SESSION = `deck_qwene2e_${Math.random().toString(36).slice(2, 8)}_brain`;
 
@@ -619,6 +620,29 @@ describe('qwen transport flow e2e', () => {
         entry.clientMessageId === 'cmd-qwen-queued' && entry.text === 'queued second'),
     );
     expect(queuedState).toBeTruthy();
+    const queuedUserBeforeDrain = mocks.emitted.find((e) =>
+      e.session === SESSION
+      && e.type === 'user.message'
+      && e.payload.clientMessageId === 'cmd-qwen-queued'
+    );
+    expect(queuedUserBeforeDrain).toBeUndefined();
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: 'command.ack',
+      commandId: 'cmd-qwen-queued',
+      status: 'accepted',
+      session: SESSION,
+    });
+    const queuedServerAcks = serverLink.send.mock.calls.filter(([msg]: [Record<string, unknown>]) =>
+      msg.type === 'command.ack' && msg.commandId === 'cmd-qwen-queued',
+    );
+    expect(queuedServerAcks).toHaveLength(1);
+    const queuedTimelineAck = mocks.emitted.find((e) =>
+      e.session === SESSION
+      && e.type === 'command.ack'
+      && e.payload.commandId === 'cmd-qwen-queued'
+      && e.payload.status === 'accepted'
+    );
+    expect(queuedTimelineAck).toBeDefined();
 
     handleWebCommand({ type: 'get_sessions' }, serverLink);
     await flushAsync();
@@ -641,15 +665,37 @@ describe('qwen transport flow e2e', () => {
     const stored = mocks.store.get(SESSION);
     const providerSessionId = typeof stored?.providerSessionId === 'string' ? stored.providerSessionId : '';
     expect(providerSessionId).toBeTruthy();
+    const drainStartIndex = mocks.emitted.length;
     provider?.flushPending(providerSessionId);
     await flushAsync();
 
-    const drainedUser = mocks.emitted.find((e) =>
+    const drainedEvents = mocks.emitted.slice(drainStartIndex);
+    const drainedUsers = drainedEvents.filter((e) =>
       e.session === SESSION
       && e.type === 'user.message'
       && e.payload.clientMessageId === 'cmd-qwen-queued'
     );
-    expect(drainedUser?.payload.text).toBe('queued second');
+    expect(drainedUsers).toHaveLength(1);
+    expect(drainedUsers[0]?.payload.text).toBe('queued second');
+    const allQueuedUsers = mocks.emitted.filter((e) =>
+      e.session === SESSION
+      && e.type === 'user.message'
+      && e.payload.clientMessageId === 'cmd-qwen-queued'
+    );
+    expect(allQueuedUsers).toHaveLength(1);
+    const queuedAssistantFinal = drainedEvents.find((e) =>
+      e.session === SESSION
+      && e.type === 'assistant.text'
+      && e.payload.streaming === false
+      && e.payload.text === 'Qwen: queued second'
+    );
+    expect(queuedAssistantFinal).toBeDefined();
+    const queuedStateAfterDrain = drainedEvents.find((e) =>
+      e.session === SESSION
+      && e.type === 'session.state'
+      && e.payload.state === 'queued'
+    );
+    expect(queuedStateAfterDrain).toBeUndefined();
 
 
     const idleStateEvents = mocks.emitted.filter((e) =>
@@ -661,6 +707,172 @@ describe('qwen transport flow e2e', () => {
     for (const event of idleStateEvents) {
       expect(Object.prototype.hasOwnProperty.call(event.payload, 'pendingMessages')).toBe(true);
     }
+  });
+
+  it('edits and deletes daemon queued transport messages before drain dispatches only the final queue state', async () => {
+    await launchSession({
+      name: SESSION,
+      projectName: 'qwene2e',
+      role: 'brain',
+      agentType: 'qwen',
+      projectDir: '/tmp/qwen-e2e',
+    });
+
+    const serverLink = { send: vi.fn(), daemonVersion: 'test' } as any;
+    handleWebCommand({
+      type: 'session.send',
+      session: SESSION,
+      text: 'slow first',
+      commandId: 'cmd-qwen-edit-slow',
+    }, serverLink);
+    await flushAsync();
+
+    handleWebCommand({
+      type: 'session.send',
+      session: SESSION,
+      text: 'queued original',
+      commandId: 'cmd-qwen-editable',
+    }, serverLink);
+    await flushAsync();
+    handleWebCommand({
+      type: 'session.send',
+      session: SESSION,
+      text: 'queued removed',
+      commandId: 'cmd-qwen-removed',
+    }, serverLink);
+    await flushAsync();
+
+    handleWebCommand({
+      type: 'session.edit_queued_message',
+      sessionName: SESSION,
+      clientMessageId: 'cmd-qwen-editable',
+      text: 'queued edited',
+      commandId: 'cmd-qwen-edit-control',
+    }, serverLink);
+    await flushAsync();
+    handleWebCommand({
+      type: 'session.undo_queued_message',
+      sessionName: SESSION,
+      clientMessageId: 'cmd-qwen-removed',
+      commandId: 'cmd-qwen-undo-control',
+    }, serverLink);
+    await flushAsync();
+
+    handleWebCommand({ type: 'get_sessions' }, serverLink);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session_list',
+      sessions: expect.arrayContaining([
+        expect.objectContaining({
+          name: SESSION,
+          transportPendingMessages: ['queued edited'],
+          transportPendingMessageEntries: [
+            { clientMessageId: 'cmd-qwen-editable', text: 'queued edited' },
+          ],
+        }),
+      ]),
+    }));
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: 'command.ack',
+      commandId: 'cmd-qwen-edit-control',
+      status: 'accepted',
+      session: SESSION,
+    });
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: 'command.ack',
+      commandId: 'cmd-qwen-undo-control',
+      status: 'accepted',
+      session: SESSION,
+    });
+
+    const provider = (await import('../../src/agent/provider-registry.js')).getProvider('qwen') as InstanceType<typeof mocks.MockQwenProvider> | undefined;
+    const providerSessionId = String(mocks.store.get(SESSION)?.providerSessionId ?? '');
+    const drainStartIndex = mocks.emitted.length;
+    provider?.flushPending(providerSessionId);
+    await flushAsync();
+
+    const drainedEvents = mocks.emitted.slice(drainStartIndex);
+    expect(drainedEvents.filter((e) =>
+      e.session === SESSION
+      && e.type === 'user.message'
+      && e.payload.clientMessageId === 'cmd-qwen-editable'
+      && e.payload.text === 'queued edited',
+    )).toHaveLength(1);
+    expect(mocks.emitted.find((e) =>
+      e.session === SESSION
+      && e.type === 'user.message'
+      && e.payload.clientMessageId === 'cmd-qwen-removed',
+    )).toBeUndefined();
+    expect(mocks.emitted.find((e) =>
+      e.session === SESSION
+      && e.type === 'user.message'
+      && e.payload.text === 'queued original',
+    )).toBeUndefined();
+    expect(drainedEvents.find((e) =>
+      e.session === SESSION
+      && e.type === 'assistant.text'
+      && e.payload.streaming === false
+      && e.payload.text === 'Qwen: queued edited',
+    )).toBeDefined();
+  });
+
+  it('rejects duplicate transport commandId without dispatching a second provider turn', async () => {
+    await launchSession({
+      name: SESSION,
+      projectName: 'qwene2e',
+      role: 'brain',
+      agentType: 'qwen',
+      projectDir: '/tmp/qwen-e2e',
+    });
+
+    const serverLink = { send: vi.fn(), daemonVersion: 'test' } as any;
+    handleWebCommand({
+      type: 'session.send',
+      session: SESSION,
+      text: 'dedupe once',
+      commandId: 'cmd-qwen-dup',
+    }, serverLink);
+    await flushAsync();
+    handleWebCommand({
+      type: 'session.send',
+      session: SESSION,
+      text: 'dedupe twice',
+      commandId: 'cmd-qwen-dup',
+    }, serverLink);
+    await flushAsync();
+
+    const userMessages = mocks.emitted.filter((e) =>
+      e.session === SESSION
+      && e.type === 'user.message'
+      && e.payload.clientMessageId === 'cmd-qwen-dup',
+    );
+    expect(userMessages).toHaveLength(1);
+    expect(userMessages[0]?.payload.text).toBe('dedupe once');
+
+    const duplicateTimelineAck = mocks.emitted.find((e) =>
+      e.session === SESSION
+      && e.type === 'command.ack'
+      && e.payload.commandId === 'cmd-qwen-dup'
+      && e.payload.status === 'error'
+      && e.payload.error === COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID,
+    );
+    expect(duplicateTimelineAck).toBeDefined();
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: 'command.ack',
+      commandId: 'cmd-qwen-dup',
+      status: 'error',
+      session: SESSION,
+      error: COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID,
+    });
+
+    const assistantFinals = mocks.emitted.filter((e) =>
+      e.session === SESSION
+      && e.type === 'assistant.text'
+      && e.payload.streaming === false
+      && String(e.payload.text).includes('dedupe'),
+    );
+    expect(assistantFinals.map((e) => e.payload.text)).toEqual(['Qwen: dedupe once']);
   });
 
 });

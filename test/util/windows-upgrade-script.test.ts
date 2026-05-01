@@ -18,9 +18,22 @@ describe('buildWindowsCleanupScript', () => {
     const script = buildWindowsCleanupScript('C:\\Temp\\imcodes-upgrade-123');
     expect(script).toContain('@echo off');
     expect(script).toContain('chcp 65001 >nul 2>&1');
-    expect(script).toContain('timeout /t 120 /nobreak >nul');
+    // ping-based sleep — `timeout` fails under wscript-spawned cmd
+    // because there's no console for stdin.  See the regression test
+    // below for the full story.
+    expect(script).toContain('ping -n 121 127.0.0.1 >nul 2>&1');
     expect(script).toContain('for %%I in ("%~dp0.") do set "SCRIPT_DIR=%%~fI"');
     expect(script).toContain('rmdir /s /q "%SCRIPT_DIR%"');
+  });
+
+  it('NEVER uses `timeout /t` (regression: fails when launched via wscript)', () => {
+    // `timeout /t N /nobreak` requires a real console for stdin.  When
+    // run under a wscript-spawned cmd there is no console, so timeout
+    // aborts with exit code 1 immediately and the cleanup runs without
+    // its 120 s grace period — deleting the temp dir while diagnostic
+    // logs are still being written there.
+    const script = buildWindowsCleanupScript('C:\\Temp\\imcodes-upgrade-123');
+    expect(script).not.toMatch(/timeout \/t \d+/);
   });
 });
 
@@ -116,7 +129,7 @@ describe('buildWindowsUpgradeBatch', () => {
   it('runs npm install BEFORE killing the old daemon or stale watchdogs', () => {
     // CRITICAL: npm install must happen while the old daemon is still alive.
     // That way, if install fails, the old daemon is unaffected.
-    const installIdx = batch.indexOf(`call "${INPUT.npmCmd}" install -g ${INPUT.pkgSpec}`);
+    const installIdx = batch.indexOf(`call "${INPUT.npmCmd}" install -g --ignore-scripts ${INPUT.pkgSpec}`);
     const killWatchdogIdx = batch.indexOf('taskkill /f /t /pid !STALE_WD!');
     const killDaemonIdx = batch.indexOf('taskkill /f /pid !OLD_DAEMON_PID!');
     expect(installIdx).toBeGreaterThan(-1);
@@ -153,7 +166,67 @@ describe('buildWindowsUpgradeBatch', () => {
     expect(doneIdx).toBeGreaterThan(-1);
     const afterDone = batch.slice(doneIdx);
     expect(afterDone).toContain('if exist "%UPGRADE_LOCK%"');
-    expect(afterDone).toContain('del "%UPGRADE_LOCK%"');
+    expect(afterDone).toMatch(/del [^\r\n]*"%UPGRADE_LOCK%"/);
+  });
+
+  it('final safety-net falls back to PowerShell Remove-Item if del silently fails', () => {
+    // Real-world incident on 2026-04-27: `del "%UPGRADE_LOCK%" >nul 2>&1`
+    // returned 0 but the file persisted (suspected sharing violation /
+    // transient AV scan / weird ACL inheritance).  The watchdog spun
+    // forever logging "Upgrade in progress, waiting...".  Belt-and-
+    // suspenders: if del fails, retry with PowerShell Remove-Item.
+    const doneIdx = batch.indexOf(':done');
+    const afterDone = batch.slice(doneIdx);
+    expect(afterDone).toContain('Remove-Item -Force');
+    expect(afterDone).toContain('-LiteralPath');
+    // And log a WARNING if even that fails so the symptom is diagnosable
+    // from the upgrade log instead of being silent.
+    expect(afterDone).toMatch(/WARNING:.*upgrade\.lock still present/i);
+  });
+
+  it('NEVER uses `timeout /t` (regression: fails when launched via wscript)', () => {
+    // `timeout /t N /nobreak` requires a real console for stdin (it polls
+    // keypresses to detect interrupt).  When this batch is launched via
+    // wscript → cmd, the spawned cmd has NO console attached, so timeout
+    // aborts immediately with "Input redirection is not supported,
+    // exiting the process immediately."  No actual sleep happens, which
+    // breaks the post-install settle delay, the post-kill settle delay,
+    // and the health-check grace period.  Use ping instead.
+    expect(batch).not.toMatch(/timeout \/t \d+/);
+    // At least one ping-based sleep should be present
+    expect(batch).toMatch(/ping -n \d+ 127\.0\.0\.1 >nul 2>&1/);
+  });
+
+  it('passes --ignore-scripts to global install (sharp install hook crashes during global install)', () => {
+    // strip-onnxruntime-gpu.mjs strips node_modules/sharp/ from the
+    // published tarball, forcing npm to re-resolve sharp at install
+    // time per platform.  When npm does that during a global install,
+    // sharp's install hook (`node install/check.js || npm run build`)
+    // fails with MODULE_NOT_FOUND on install/check.js, then falls back
+    // to `npm run build` which walks UP into imcodes's package.json
+    // and runs imcodes's `tsc` build (not on global PATH) — exit 127.
+    // --ignore-scripts skips the hook entirely; sharp's runtime binary
+    // (@img/sharp-<platform>-<arch>) is fetched as a regular optional
+    // dependency with no install script, so semantic search still works.
+    expect(batch).toContain('--ignore-scripts');
+    // Specifically on the global install line.
+    expect(batch).toMatch(/install -g --ignore-scripts/);
+  });
+
+  it('runs sharp repair if global install left an empty placeholder dir', () => {
+    // npm 10.x exhibits an empty-dir bug under `npm i -g <tarball>` where
+    // a stripped bundled dep (sharp) gets a placeholder created at
+    // <global>/imcodes/node_modules/sharp/ but nothing extracted into it.
+    // Detect via missing package.json and re-run install scoped to the
+    // imcodes package — this works because nested install doesn't trigger
+    // the same edge case.
+    expect(batch).toContain('node_modules\\sharp\\package.json');
+    expect(batch).toMatch(/sharp.*missing.*repairing/i);
+    expect(batch).toContain('install --no-save --ignore-scripts sharp@0.34.5');
+    // Repair only runs on the success path (don't waste time on aborted installs).
+    const installFailIdx = batch.indexOf('Install FAILED');
+    const repairIdx = batch.indexOf('install --no-save --ignore-scripts sharp');
+    expect(repairIdx).toBeGreaterThan(installFailIdx);
   });
 
   it('uses BOTH PowerShell and wmic so it works on every Windows version', () => {
@@ -173,19 +246,60 @@ describe('buildWindowsUpgradeBatch', () => {
 
   // ── npm install ──
 
-  it('raises NODE_OPTIONS heap limit before npm install while preserving existing flags', () => {
-    const nodeOptionsIdx = batch.indexOf('set "NODE_OPTIONS=%NODE_OPTIONS% --max-old-space-size=16384"');
-    const fallbackIdx = batch.indexOf('set "NODE_OPTIONS=--max-old-space-size=16384"');
-    const installIdx = batch.indexOf(`call "${INPUT.npmCmd}" install -g ${INPUT.pkgSpec}`);
-    expect(nodeOptionsIdx).toBeGreaterThan(-1);
-    expect(fallbackIdx).toBeGreaterThan(-1);
-    expect(nodeOptionsIdx).toBeLessThan(installIdx);
-    expect(fallbackIdx).toBeLessThan(installIdx);
-    expect(batch).toContain('echo Using NODE_OPTIONS=%NODE_OPTIONS% >> "%LOG_FILE%"');
+  it('overwrites (not appends) NODE_OPTIONS before npm install to avoid per-upgrade accumulation', () => {
+    // Bug history: the script used to do
+    //   set "NODE_OPTIONS=%NODE_OPTIONS% --max-old-space-size=16384"
+    // which appends one copy per upgrade.  Because the new daemon spawned
+    // by the script inherits this modified env, the next upgrade starts
+    // with a NODE_OPTIONS already containing the flag, appends another,
+    // and so on.  After ~38 upgrades we observed npm install crashing with
+    // "MemoryChunk allocation failed during deserialization" because V8
+    // tried to reserve a 16 GB heap on a tight VAS budget.
+    //
+    // Fix: save daemon's original value, OVERWRITE with a fresh single
+    // flag, and restore the original immediately after npm install so
+    // any spawned process (success-path watchdog OR abort-path relaunch)
+    // never inherits our temporary flag.
+    const saveIdx = batch.indexOf('set "ORIG_NODE_OPTIONS=%NODE_OPTIONS%"');
+    const setFreshIdx = batch.indexOf('set "NODE_OPTIONS=--max-old-space-size=4096"');
+    const installIdx = batch.indexOf(`call "${INPUT.npmCmd}" install -g --ignore-scripts ${INPUT.pkgSpec}`);
+    const restoreIdx = batch.indexOf('set "NODE_OPTIONS=%ORIG_NODE_OPTIONS%"');
+    expect(saveIdx).toBeGreaterThan(-1);
+    expect(setFreshIdx).toBeGreaterThan(-1);
+    expect(restoreIdx).toBeGreaterThan(-1);
+    expect(saveIdx).toBeLessThan(setFreshIdx);
+    expect(setFreshIdx).toBeLessThan(installIdx);
+    // Restore must happen RIGHT AFTER install, before any abort branch
+    // that could re-spawn the daemon launcher.
+    expect(installIdx).toBeLessThan(restoreIdx);
+    // No appending form should remain — that was the bug.
+    expect(batch).not.toContain('%NODE_OPTIONS% --max-old-space-size');
+    // 16 GB heap was overkill for npm install and contributed to the OOM
+    // on tight-RAM systems; we use 4 GB now.
+    expect(batch).not.toContain('--max-old-space-size=16384');
+  });
+
+  it('restores NODE_OPTIONS before any post-install branch that may relaunch the daemon', () => {
+    // Every branch that calls `wscript "%VBS_LAUNCHER%"` (whether on
+    // install failure, version mismatch, or success-path step 6) MUST
+    // run AFTER NODE_OPTIONS is restored to its original value.
+    const restoreIdx = batch.indexOf('set "NODE_OPTIONS=%ORIG_NODE_OPTIONS%"');
+    expect(restoreIdx).toBeGreaterThan(-1);
+    let searchFrom = 0;
+    let found = 0;
+    while (true) {
+      const idx = batch.indexOf('wscript "%VBS_LAUNCHER%"', searchFrom);
+      if (idx === -1) break;
+      expect(idx).toBeGreaterThan(restoreIdx);
+      searchFrom = idx + 1;
+      found += 1;
+    }
+    // Sanity: at least one daemon-relaunch path must exist.
+    expect(found).toBeGreaterThan(0);
   });
 
   it('installs with quoted npm path', () => {
-    expect(batch).toContain(`call "${INPUT.npmCmd}" install -g ${INPUT.pkgSpec}`);
+    expect(batch).toContain(`call "${INPUT.npmCmd}" install -g --ignore-scripts ${INPUT.pkgSpec}`);
   });
 
   // ── Version verification ──

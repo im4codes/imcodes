@@ -3,7 +3,7 @@ import type { ContextNamespace, ContextTargetRef } from '../../shared/context-ty
 import { MaterializationCoordinator } from '../../src/context/materialization-coordinator.js';
 import { localOnlyCompressor } from '../../src/context/summary-compressor.js';
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
-import { getReplicationState } from '../../src/store/context-store.js';
+import { getArchivedEvent, getReplicationState, listContextEvents, queryProcessedProjections } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 
 describe('MaterializationCoordinator', () => {
@@ -234,14 +234,76 @@ describe('MaterializationCoordinator', () => {
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
     });
 
-    coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'continue the run', createdAt: 100 });
-    coordinator.ingestEvent({ target, eventType: 'assistant.text', content: '[API Error: Connection error. (cause: fetch failed)]', createdAt: 120 });
+    coordinator.ingestEvent({ id: 'evt-api-noise-user', target, eventType: 'user.turn', content: 'continue the run', createdAt: 100 });
+    coordinator.ingestEvent({ id: 'evt-api-noise-assistant', target, eventType: 'assistant.text', content: '[API Error: Connection error. (cause: fetch failed)]', createdAt: 120 });
 
     const result = await coordinator.materializeTarget(target, 'manual', 500);
 
     expect(result.filteredOut).toBe(true);
     expect(result.summaryProjection).toBeUndefined();
     expect(getReplicationState(namespace)?.pendingProjectionIds ?? []).toEqual([]);
+    expect(getArchivedEvent('evt-api-noise-user')?.content).toBe('continue the run');
+    expect(getArchivedEvent('evt-api-noise-assistant')?.content).toContain('[API Error');
+    expect(listContextEvents(target)).toEqual([]);
+  });
+
+  it('archives staged events before deleting them when SDK retry budget is exhausted', async () => {
+    const coordinator = new MaterializationCoordinator({
+      compressor: async () => ({
+        summary: '',
+        model: 'local-fallback',
+        backend: 'none',
+        usedBackup: false,
+        fromSdk: false,
+      }),
+      thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
+    });
+
+    coordinator.ingestEvent({ id: 'evt-retry-user', target, eventType: 'user.turn', content: 'please remember this outage batch', createdAt: 100 });
+    coordinator.ingestEvent({ id: 'evt-retry-assistant', target, eventType: 'assistant.text', content: 'working on the durable archive path', createdAt: 120 });
+
+    for (let i = 0; i < 3; i++) {
+      const result = await coordinator.materializeTarget(target, 'manual', 500 + i);
+      expect(result.filteredOut).toBeUndefined();
+      expect(listContextEvents(target).map((event) => event.id).sort()).toEqual(['evt-retry-assistant', 'evt-retry-user']);
+    }
+
+    const exhausted = await coordinator.materializeTarget(target, 'manual', 600);
+    expect(exhausted.filteredOut).toBe(true);
+    expect(exhausted.summaryProjection).toBeUndefined();
+    expect(getArchivedEvent('evt-retry-user')?.content).toBe('please remember this outage batch');
+    expect(getArchivedEvent('evt-retry-assistant')?.content).toBe('working on the durable archive path');
+    expect(listContextEvents(target)).toEqual([]);
+  });
+
+  it('does not commit projections when archiving fails after SDK compression succeeds', async () => {
+    const coordinator = new MaterializationCoordinator({
+      compressor: async () => ({
+        summary: '## User Problem\nArchive failure coverage\n\n## Resolution\nDo not commit projections before archive.',
+        model: 'test-model',
+        backend: 'test-backend',
+        usedBackup: false,
+        fromSdk: true,
+      }),
+      archiveEventsForMaterialization: () => {
+        throw new Error('simulated archive failure');
+      },
+      thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
+    });
+
+    coordinator.ingestEvent({ id: 'evt-archive-fail-user', target, eventType: 'user.turn', content: 'keep this retryable', createdAt: 100 });
+    coordinator.ingestEvent({ id: 'evt-archive-fail-assistant', target, eventType: 'assistant.text', content: 'summary would have succeeded', createdAt: 120 });
+
+    const result = await coordinator.materializeTarget(target, 'manual', 500);
+
+    expect(result.summaryProjection).toBeUndefined();
+    expect(result.durableProjection).toBeUndefined();
+    expect(getReplicationState(namespace)?.pendingProjectionIds ?? []).toEqual([]);
+    expect(queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId, limit: 10 })).toEqual([]);
+    expect(listContextEvents(target).map((event) => event.id).sort()).toEqual([
+      'evt-archive-fail-assistant',
+      'evt-archive-fail-user',
+    ]);
   });
 
   it('pairs final assistant.text output with the user request in structured summaries', async () => {
@@ -256,6 +318,41 @@ describe('MaterializationCoordinator', () => {
 
     expect(result.summaryProjection.summary).toContain('**User:** fix the flaky build');
     expect(result.summaryProjection.summary).toContain('**Assistant:** updated the import and reran the build');
+  });
+
+
+  it('uses composite token-density triggers with count floor and force-fire ceiling', async () => {
+    const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
+      thresholds: { autoTriggerTokens: 50, minEventCount: 3, maxBatchTokens: 200, idleMs: 10_000, scheduleMs: 20_000, minIntervalMs: 0 },
+    });
+
+    const jumbo = coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'x '.repeat(80), createdAt: 100 });
+    expect(jumbo.queuedJob).toBeUndefined();
+
+    coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'short one', createdAt: 110 });
+    const third = coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'short two', createdAt: 120 });
+    expect(third.trigger).toBe('threshold');
+
+    await coordinator.materializeTarget(target, 'threshold', 130);
+    const force = coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'y '.repeat(300), createdAt: 200 });
+    expect(force.trigger).toBe('threshold');
+  });
+
+  it('loads token trigger thresholds from .imc/memory.yaml when no explicit override is provided', async () => {
+    const { mkdir, writeFile } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    await mkdir(join(tempDir, '.imc'), { recursive: true });
+    // Note: idleMs/scheduleMs floor is 1000 in the validator (memory-config P1).
+    // Use values above the floor; the assertion still proves yaml overrides flow.
+    await writeFile(join(tempDir, '.imc', 'memory.yaml'), 'autoTriggerTokens: 42\nminEventCount: 2\nidleMs: 1111\nscheduleMs: 2222\nmaxBatchTokens: 333\n', 'utf8');
+    const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor, memoryConfigCwd: tempDir });
+    expect(coordinator.thresholds).toMatchObject({
+      autoTriggerTokens: 42,
+      minEventCount: 2,
+      idleMs: 1111,
+      scheduleMs: 2222,
+      maxBatchTokens: 333,
+    });
   });
 
   it('creates durable memory automatically from structured summary key decisions even without explicit durable events', async () => {

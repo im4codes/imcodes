@@ -7,7 +7,9 @@ import { useEffect } from 'preact/hooks';
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
 
 const chatScrollBottomSpy = vi.fn();
+const chatViewPropsSpy = vi.fn();
 const terminalScrollBottomSpy = vi.fn();
+const terminalViewPropsSpy = vi.fn();
 let timelineEvents = [{ type: 'assistant.text', payload: { text: 'hello' } }];
 
 vi.mock('react-i18next', () => ({
@@ -17,7 +19,9 @@ vi.mock('react-i18next', () => ({
 }));
 
 vi.mock('../../src/components/ChatView.js', () => ({
-  ChatView: ({ onScrollBottomFn }: any) => {
+  ChatView: (props: any) => {
+    chatViewPropsSpy(props);
+    const { onScrollBottomFn } = props;
     useEffect(() => {
       onScrollBottomFn?.(chatScrollBottomSpy);
     }, [onScrollBottomFn]);
@@ -26,7 +30,9 @@ vi.mock('../../src/components/ChatView.js', () => ({
 }));
 
 vi.mock('../../src/components/TerminalView.js', () => ({
-  TerminalView: ({ onScrollBottomFn }: any) => {
+  TerminalView: (props: any) => {
+    terminalViewPropsSpy(props);
+    const { onScrollBottomFn } = props;
     useEffect(() => {
       onScrollBottomFn?.(terminalScrollBottomSpy);
     }, [onScrollBottomFn]);
@@ -35,7 +41,8 @@ vi.mock('../../src/components/TerminalView.js', () => ({
 }));
 
 const addOptimisticUserMessageSpy = vi.fn();
-const removeOptimisticMessageSpy = vi.fn();
+const markOptimisticFailedSpy = vi.fn();
+const retryOptimisticMessageSpy = vi.fn();
 
 vi.mock('../../src/hooks/useTimeline.js', () => ({
   useTimeline: () => ({
@@ -45,7 +52,8 @@ vi.mock('../../src/hooks/useTimeline.js', () => ({
     // real wiring. Shell sub-sessions deliberately skip useTimeline and the
     // card falls back to no-op; that path is covered by its own test.
     addOptimisticUserMessage: addOptimisticUserMessageSpy,
-    removeOptimisticMessage: removeOptimisticMessageSpy,
+    markOptimisticFailed: markOptimisticFailedSpy,
+    retryOptimisticMessage: retryOptimisticMessageSpy,
   }),
 }));
 
@@ -267,8 +275,39 @@ describe('SubSessionCard', () => {
     });
   });
 
-  it('renders the stop button in transport fallback input mode and sends /stop', async () => {
-    const ws = { sendSessionCommand: vi.fn() } as any;
+  it('keeps shell cards in raw terminal preview mode', async () => {
+    const releaseRaw = vi.fn();
+    const ws = { holdTerminalRaw: vi.fn(() => releaseRaw), subscribeTerminal: vi.fn() } as any;
+    const view = render(
+      <SubSessionCard
+        sub={makeSubSession({ type: 'shell', shellBin: '/bin/bash' })}
+        ws={ws}
+        connected={true}
+        isOpen={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(ws.holdTerminalRaw).toHaveBeenCalledWith('deck_sub_sub-card-1');
+    });
+
+    const props = terminalViewPropsSpy.mock.calls.at(-1)?.[0];
+    expect(props.preview).toBe(true);
+    expect(props.mobileInput).toBe(true);
+    expect(ws.subscribeTerminal).not.toHaveBeenCalled();
+
+    view.unmount();
+    expect(releaseRaw).toHaveBeenCalledOnce();
+  });
+
+  it('renders the stop button in transport fallback input mode and sends /stop via the urgent path', async () => {
+    // Stop is highest-priority — it must use sendSessionCommandUrgent so a
+    // visibility/focus probe-flip (`_connected = false`) can't silently
+    // drop the click. See ws-client.ts sendUrgent for the full rationale.
+    const ws = { sendSessionCommand: vi.fn(), sendSessionCommandUrgent: vi.fn() } as any;
     const { container } = render(
       <SubSessionCard
         sub={makeSubSession({ runtimeType: 'transport', state: 'running' } as any)}
@@ -286,8 +325,10 @@ describe('SubSessionCard', () => {
     fireEvent.click(stop!);
 
     await waitFor(() => {
-      expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', { sessionName: 'deck_sub_sub-card-1', text: '/stop' });
+      expect(ws.sendSessionCommandUrgent).toHaveBeenCalledWith('send', { sessionName: 'deck_sub_sub-card-1', text: '/stop' });
     });
+    // Regular sendSessionCommand should NOT have been used for stop.
+    expect(ws.sendSessionCommand).not.toHaveBeenCalledWith('send', expect.objectContaining({ text: '/stop' }));
   });
 
   it('renders the stop button when the card uses compact SessionControls', async () => {
@@ -416,5 +457,51 @@ describe('SubSessionCard', () => {
       attachments: [{ kind: 'file', name: 'notes.md' }],
       resendExtra: { mode: 'quick' },
     });
+  });
+
+  it('keeps a new optimistic bubble visible when retrying a failed transport card send', () => {
+    timelineEvents = [{
+      eventId: 'failed-send',
+      type: 'user.message',
+      payload: {
+        text: 'retry from card',
+        failed: true,
+        commandId: 'old-card-cmd',
+        _resendExtra: { mode: 'quick' },
+        attachments: [{ kind: 'file', name: 'notes.md' }],
+      },
+    }];
+    const ws = { sendSessionCommand: vi.fn() } as any;
+
+    render(
+      <SubSessionCard
+        sub={makeSubSession({ runtimeType: 'transport' as any, type: 'claude-code-sdk' } as any)}
+        ws={ws}
+        connected={true}
+        isOpen={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        quickData={{ data: [], recordHistory: vi.fn() } as any}
+      />,
+    );
+
+    const props = chatViewPropsSpy.mock.calls.at(-1)?.[0] as { onResendFailed?: (commandId: string, text: string) => void };
+    props.onResendFailed?.('old-card-cmd', 'retry from card');
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+      sessionName: 'deck_sub_sub-card-1',
+      text: 'retry from card',
+      mode: 'quick',
+    }));
+    expect(retryOptimisticMessageSpy).toHaveBeenCalledWith(
+      'old-card-cmd',
+      expect.any(String),
+      'retry from card',
+      {
+        attachments: [{ kind: 'file', name: 'notes.md' }],
+        resendExtra: { mode: 'quick' },
+      },
+    );
   });
 });

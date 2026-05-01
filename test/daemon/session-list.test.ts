@@ -1,7 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { getTransportRuntimeMock } = vi.hoisted(() => ({
+const { getTransportRuntimeMock, getCodexRuntimeConfigMock } = vi.hoisted(() => ({
   getTransportRuntimeMock: vi.fn(() => undefined),
+  getCodexRuntimeConfigMock: vi.fn(async () => ({
+    planLabel: 'Pro',
+    quotaLabel: '5h 11% 2h03m 4/6 14:40 · 7d 50% 1d04h 4/8 15:48',
+    quotaMeta: {
+      primary: { usedPercent: 11, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+    },
+    availableModels: ['gpt-5.5', 'gpt-5.4-mini'],
+  })),
 }));
 
 vi.mock('../../src/agent/qwen-runtime-config.js', () => ({
@@ -17,10 +25,7 @@ vi.mock('../../src/agent/provider-quota.js', () => ({
 }));
 
 vi.mock('../../src/agent/codex-runtime-config.js', () => ({
-  getCodexRuntimeConfig: vi.fn(async () => ({
-    planLabel: 'Pro',
-    quotaLabel: expect.stringContaining('5h 11%'),
-  })),
+  getCodexRuntimeConfig: getCodexRuntimeConfigMock,
 }));
 
 vi.mock('../../src/agent/session-manager.js', () => ({
@@ -32,6 +37,15 @@ describe('buildSessionList', () => {
     vi.resetModules();
     getTransportRuntimeMock.mockReset();
     getTransportRuntimeMock.mockReturnValue(undefined);
+    getCodexRuntimeConfigMock.mockReset();
+    getCodexRuntimeConfigMock.mockResolvedValue({
+      planLabel: 'Pro',
+      quotaLabel: '5h 11% 2h03m 4/6 14:40 · 7d 50% 1d04h 4/8 15:48',
+      quotaMeta: {
+        primary: { usedPercent: 11, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+      },
+      availableModels: ['gpt-5.5', 'gpt-5.4-mini'],
+    });
     const store = await import('../../src/store/session-store.js');
     for (const s of store.listSessions()) store.removeSession(s.name);
   });
@@ -89,7 +103,50 @@ describe('buildSessionList', () => {
     expect(sessions[0]).toMatchObject({
       planLabel: 'Pro',
       quotaLabel: expect.stringContaining('5h 11%'),
+      quotaMeta: expect.objectContaining({
+        primary: expect.objectContaining({ usedPercent: 11 }),
+      }),
+      codexAvailableModels: ['gpt-5.5', 'gpt-5.4-mini'],
     });
+  });
+
+  it('preserves stored codex quota metadata when runtime quota probing is temporarily empty', async () => {
+    getCodexRuntimeConfigMock.mockResolvedValue({
+      availableModels: ['gpt-5.5'],
+    });
+    const store = await import('../../src/store/session-store.js');
+    store.upsertSession({
+      name: 'deck_codex_stable_brain',
+      projectName: 'demo',
+      role: 'brain',
+      agentType: 'codex',
+      runtimeType: 'process',
+      state: 'running',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      projectDir: '/tmp/demo',
+      planLabel: 'Pro',
+      quotaLabel: '5h 22% 1h10m 4/6 14:40 · 7d 44% 1d04h 4/8 15:48',
+      quotaMeta: {
+        primary: { usedPercent: 22, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+      },
+      codexAvailableModels: ['gpt-5.4'],
+    });
+
+    const { buildSessionList } = await import('../../src/daemon/session-list.js');
+    const sessions = await buildSessionList();
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]).toMatchObject({
+      planLabel: 'Pro',
+      quotaLabel: '5h 22% 1h10m 4/6 14:40 · 7d 44% 1d04h 4/8 15:48',
+      quotaMeta: expect.objectContaining({
+        primary: expect.objectContaining({ usedPercent: 22 }),
+      }),
+      codexAvailableModels: ['gpt-5.5'],
+    });
+    expect(store.getSession('deck_codex_stable_brain')?.quotaLabel).toBe('5h 22% 1h10m 4/6 14:40 · 7d 44% 1d04h 4/8 15:48');
   });
 
   it('derives transport session state from the live runtime instead of stale persisted store state', async () => {

@@ -1020,6 +1020,7 @@ describe('FileBrowser', () => {
 
     expect(document.querySelector('.fb-panel-tabs')).not.toBeNull();
     expect(document.querySelector('.fb-changes-section')).toBeNull();
+    expect(document.querySelector('.fb-files-and-changes > .fb-tree')?.classList.contains('fb-tree-split')).toBe(false);
     expect(document.querySelector('.fb-body-with-changes')).toBeNull();
   });
 
@@ -1184,6 +1185,64 @@ describe('FileBrowser', () => {
     ]);
   });
 
+  it('lets a floating auto-preview switch to another file from the left file list while keeping Changes as a tab', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    const onPreviewStateChange = vi.fn();
+    (ws.fsReadFile as any).mockImplementation((path: string) => `read-${path.split('/').pop()}`);
+    (ws.fsGitDiff as any).mockImplementation((path: string) => `diff-${path.split('/').pop()}`);
+
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        changesRootPath="/home/user"
+        autoPreviewPath="/home/user/foo.ts"
+        onPreviewStateChange={onPreviewStateChange}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect(document.querySelector('.fb-panel-tabs')).not.toBeNull();
+    expect(document.querySelector('.fb-changes-section')).toBeNull();
+    expect(document.querySelector('.fb-files-and-changes > .fb-tree')?.classList.contains('fb-tree-split')).toBe(false);
+
+    await act(async () => {
+      respond([
+        { name: 'foo.ts', isDir: false },
+        { name: 'bar.ts', isDir: false },
+      ], '/home/user');
+      sendMsg({ type: 'fs.read_response', requestId: 'read-foo.ts', path: '/home/user/foo.ts', status: 'ok', content: 'foo content' });
+      sendMsg({ type: 'fs.git_diff_response', requestId: 'diff-foo.ts', path: '/home/user/foo.ts', status: 'ok', diff: '' });
+    });
+
+    await act(async () => {
+      fireEvent.click(await screen.findByText('bar.ts'));
+    });
+
+    expect((ws.fsReadFile as any).mock.calls.map((call: any[]) => call[0])).toEqual([
+      '/home/user/foo.ts',
+      '/home/user/bar.ts',
+    ]);
+    expect(onPreviewStateChange.mock.calls.at(-1)?.[0]).toMatchObject({
+      path: '/home/user/bar.ts',
+      preferDiff: false,
+      preview: { status: 'loading', path: '/home/user/bar.ts' },
+    });
+
+    await act(async () => {
+      sendMsg({ type: 'fs.read_response', requestId: 'read-bar.ts', path: '/home/user/bar.ts', status: 'ok', content: 'bar content' });
+      sendMsg({ type: 'fs.git_diff_response', requestId: 'diff-bar.ts', path: '/home/user/bar.ts', status: 'ok', diff: '' });
+    });
+
+    expect(screen.getByTestId('mock-file-preview').textContent).toContain('bar content');
+    expect((ws.fsReadFile as any).mock.calls.map((call: any[]) => call[0])).toEqual([
+      '/home/user/foo.ts',
+      '/home/user/bar.ts',
+    ]);
+  });
+
   it('clears stale preview-cycle ownership when the ws instance changes', () => {
     const first = makeWsFactory();
     (first.ws.fsReadFile as any).mockImplementationOnce(() => 'read-first');
@@ -1245,7 +1304,6 @@ describe('FileBrowser', () => {
         layout="panel"
         initialPath="/home/user"
         autoPreviewPath="/home/user/foo.ts"
-        onPreviewStateChange={onPreviewStateChange}
         onConfirm={vi.fn()}
       />,
     );

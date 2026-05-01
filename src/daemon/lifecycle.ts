@@ -32,11 +32,12 @@ import { replicatePendingProcessedContext } from '../context/processed-context-r
 import { configureSharedContextRuntime } from '../context/shared-context-runtime.js';
 import { fetchBackendSharedContextRuntimeConfig } from '../context/backend-runtime-config.js';
 import { setContextModelRuntimeConfig } from '../context/context-model-config.js';
-import { LiveContextIngestion } from '../context/live-context-ingestion.js';
+import { closeLiveContextMaterializationAdmission, LiveContextIngestion } from '../context/live-context-ingestion.js';
 import { resolveTransportContextBootstrap } from '../agent/runtime-context-bootstrap.js';
 import { pruneLocalMemory } from '../context/memory-pruning.js';
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 import { isTransportAgent } from '../agent/detect.js';
+import { DAEMON_VERSION } from '../util/version.js';
 
 /** Get the last assistant.text from a session's timeline (for push notification context). */
 async function getLastAssistantText(sessionName: string): Promise<string | undefined> {
@@ -318,7 +319,11 @@ export function releaseInstanceLock(server: net.Server, sockPath?: string): void
 
 /** Startup sequence: config → store → memory → sessions → server link */
 export async function startup(): Promise<DaemonContext> {
-  logger.info('Daemon starting');
+  logger.info({
+    version: DAEMON_VERSION,
+    buildSha: process.env.IMCODES_BUILD_SHA ?? process.env.GIT_COMMIT ?? process.env.SOURCE_VERSION ?? 'unknown',
+    changeId: 'memory-system-1.1-foundations',
+  }, 'Daemon starting');
   lockServer = await acquireInstanceLock();
   writePidFile();
 
@@ -504,12 +509,14 @@ export async function startup(): Promise<DaemonContext> {
             qwenModel: session.qwenModel ?? null,
             qwenAuthType: session.qwenAuthType ?? null,
             qwenAvailableModels: session.qwenAvailableModels ?? null,
+            codexAvailableModels: session.codexAvailableModels ?? null,
             requestedModel: session.requestedModel ?? null,
             activeModel: session.activeModel ?? session.modelDisplay ?? null,
             modelDisplay: session.modelDisplay ?? null,
             planLabel: session.planLabel ?? null,
             quotaLabel: session.quotaLabel ?? null,
             quotaUsageLabel: session.quotaUsageLabel ?? null,
+            quotaMeta: session.quotaMeta ?? null,
             effort: session.effort ?? null,
             transportConfig: session.transportConfig ?? null,
           });
@@ -802,7 +809,7 @@ async function autoReconnectProviders(): Promise<void> {
     const { connectProvider, ensureProviderConnected } = await import('../agent/provider-registry.js');
     const { restoreTransportSessions } = await import('../agent/session-manager.js');
 
-    for (const providerId of ['qwen', 'claude-code-sdk', 'codex-sdk', 'cursor-headless', 'copilot-sdk'] as const) {
+    for (const providerId of ['qwen', 'gemini-sdk', 'claude-code-sdk', 'codex-sdk', 'cursor-headless', 'copilot-sdk'] as const) {
       if (!listSessions().some((s) => s.runtimeType === 'transport' && s.providerId === providerId)) continue;
       try {
         await ensureProviderConnected(providerId, {});
@@ -862,6 +869,33 @@ export async function shutdown(exitCode = 0): Promise<void> {
         }
       }
     } catch { /* conpty not available */ }
+  }
+
+  try {
+    const { stopAcceptingMasterCompactions, drainMasterCompactions } = await import('./master-compaction-registry.js');
+    const { awaitCompressionIdle, stopAcceptingCompression } = await import('../context/summary-compressor.js');
+    if (contextMaterializationTimer) {
+      clearInterval(contextMaterializationTimer);
+      contextMaterializationTimer = null;
+    }
+    closeLiveContextMaterializationAdmission('shutdown');
+    stopAcceptingCompression('shutdown');
+    stopAcceptingMasterCompactions('shutdown');
+    const masterDrain = await drainMasterCompactions(5_000);
+    if (masterDrain.registeredDuringDrain > 0) {
+      logger.error(masterDrain, 'Daemon shutdown observed master compactions registered during drain');
+    }
+    if (masterDrain.remainingFromSnapshot > 0) {
+      logger.warn(masterDrain, 'Daemon shutdown continuing with master compactions still in flight');
+    } else if (masterDrain.drained > 0) {
+      logger.info(masterDrain, 'Daemon shutdown drained master compactions');
+    }
+    const compressionDrain = await awaitCompressionIdle(5_000);
+    if (!compressionDrain.state.idle) {
+      logger.warn(compressionDrain.state, 'Daemon shutdown continuing with compression queue still active');
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Daemon shutdown memory drain failed');
   }
 
   try {

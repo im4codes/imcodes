@@ -143,9 +143,10 @@ vi.mock('../../src/repo/cache.js', () => ({ repoCache: { invalidate: vi.fn() } }
 vi.mock('../../src/agent/brain-dispatcher.js', () => ({ BrainDispatcher: vi.fn().mockImplementation(() => ({ start: vi.fn(), stop: vi.fn() })) }));
 
 import { connectProvider, disconnectAll } from '../../src/agent/provider-registry.js';
-import { getTransportRuntime, launchTransportSession, relaunchSessionWithSettings, restoreTransportSessions, setSessionEventCallback } from '../../src/agent/session-manager.js';
+import { getTransportRuntime, launchTransportSession, relaunchSessionWithSettings, restoreTransportSessions, setSessionEventCallback, setSessionPersistCallback } from '../../src/agent/session-manager.js';
 import { newSession } from '../../src/agent/tmux.js';
 import { getResendCount } from '../../src/daemon/transport-resend-queue.js';
+import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 
 const flush = async () => {
   for (let i = 0; i < 4; i++) await new Promise((resolve) => setTimeout(resolve, 0));
@@ -159,7 +160,9 @@ describe('sdk transport session restore', () => {
     mocks.claudeRuns.length = 0;
     mocks.codexRuns.length = 0;
     mocks.claudeFailures.clear();
+    timelineEmitterEmitMock.mockClear();
     setSessionEventCallback(() => {});
+    setSessionPersistCallback(async () => {});
   });
 
   beforeEach(async () => {
@@ -254,6 +257,54 @@ describe('sdk transport session restore', () => {
     expect(mocks.store.get('deck_sdk_cx_brain')?.effort).toBe('medium');
     expect(mocks.store.get('deck_sdk_cx_brain')?.contextNamespace).toEqual({ scope: 'personal', projectId: 'sdk-cx-restore' });
     expect(mocks.store.get('deck_sdk_cx_brain')?.contextNamespaceDiagnostics).toEqual(['namespace:explicit']);
+  });
+
+  it('publishes idle after restoring a transport session from stale persisted running state', async () => {
+    const persistedRecords: Array<Record<string, any> | null> = [];
+    setSessionPersistCallback(async (record) => {
+      persistedRecords.push(record);
+    });
+    mocks.store.set('deck_sub_sdk_stale_running', {
+      name: 'deck_sub_sdk_stale_running',
+      projectName: 'deck_sub_sdk_stale_running',
+      role: 'w1',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-stale-running',
+      parentSession: 'deck_parent_brain',
+      state: 'running',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-stale-running',
+      codexSessionId: 'codex-thread-stale-running',
+      requestedModel: 'gpt-5.5',
+      activeModel: 'gpt-5.5',
+    });
+
+    await connectProvider('codex-sdk', {});
+    await restoreTransportSessions('codex-sdk');
+
+    expect(getTransportRuntime('deck_sub_sdk_stale_running')?.getStatus()).toBe('idle');
+    expect(mocks.store.get('deck_sub_sdk_stale_running')?.state).toBe('idle');
+    expect(persistedRecords.at(-1)).toMatchObject({
+      name: 'deck_sub_sdk_stale_running',
+      state: 'idle',
+    });
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+      'deck_sub_sdk_stale_running',
+      'session.state',
+      expect.objectContaining({
+        state: 'idle',
+        [TIMELINE_SUPPRESS_PUSH_FIELD]: true,
+        pendingCount: 0,
+        pendingMessages: [],
+        pendingMessageEntries: [],
+      }),
+      { source: 'daemon', confidence: 'high' },
+    );
   });
 
   it('emits started idle when launching a new transport session', async () => {

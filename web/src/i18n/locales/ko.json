@@ -43,6 +43,17 @@
     "tool_fold_collapse": "접기",
     "tool_group_more": "··· {{count}}개 더",
     "tool_group_collapse": "▲ 접기",
+    "tool_calls_toggle_show": "도구와 생각 표시",
+    "tool_calls_toggle_hide": "도구와 생각 숨기기",
+    "tool_calls_toggle_undecided": "AI 활동 표시 방식 선택",
+    "tool_calls_choose_prompt": "보기 선택 ↓",
+    "tool_chooser_title": "AI 활동을 어떻게 표시할까요?",
+    "tool_chooser_subtitle": "도구 호출, 파일 변경, 사고 과정은 상세하지만 화면이 복잡해집니다.",
+    "tool_chooser_simple_label": "간단",
+    "tool_chooser_simple_hint": "AI 응답만",
+    "tool_chooser_developer_label": "개발자",
+    "tool_chooser_developer_hint": "도구·파일·사고 표시",
+    "tool_chooser_footnote": "렌치 아이콘으로 언제든 변경할 수 있습니다.",
     "new_folder": "새 폴더",
     "new_folder_name": "폴더 이름",
     "create": "만들기",
@@ -141,7 +152,8 @@
       "claude_code_cli": "Claude Code CLI",
       "codex_cli": "Codex CLI",
       "copilot_sdk": "Copilot",
-      "cursor_headless": "Cursor"
+      "cursor_headless": "Cursor",
+      "gemini_sdk": "Gemini SDK"
     },
     "agentGroup": {
       "transport_sdk": "SDK",
@@ -318,9 +330,10 @@
     "timeout": "요청 시간 초과",
     "timeout_detail": "디렉토리를 읽을 수 없습니다. 느리거나 사용할 수 없는 네트워크 드라이브가 원인일 수 있습니다.",
     "preview_loading": "로딩 중…",
-    "preview_too_large": "파일이 너무 커서 미리볼 수 없습니다 (> 5 MB)",
+    "preview_too_large": "파일이 너무 커서 미리볼 수 없습니다 (> 100 MB)",
     "preview_error": "미리보기 불가",
     "preview_binary": "바이너리 파일 — 미리보기 불가",
+    "preview_video_unsupported": "브라우저가 이 동영상 형식을 재생할 수 없습니다.",
     "mkdir_failed": "폴더를 만들 수 없습니다",
     "view_diff": "차이",
     "view_source": "소스",
@@ -408,6 +421,7 @@
     "username_placeholder": "사용자 이름",
     "password_placeholder": "비밀번호",
     "signin": "로그인",
+    "remember_password": "이 기기에 비밀번호 기억",
     "invalid_credentials": "사용자 이름 또는 비밀번호가 올바르지 않습니다",
     "account_pending": "계정이 관리자 승인 대기 중입니다. 관리자에게 문의해 주세요.",
     "account_disabled": "계정이 비활성화되었습니다. 관리자에게 문의해 주세요.",
@@ -1226,7 +1240,8 @@
       "memoryDeleteConfirm": "이 기억을 완전히 삭제할까요? 이 작업은 되돌릴 수 없습니다.",
       "memoryDeleteFailed": "기억을 삭제하지 못했습니다",
       "memoryArchived": "보관됨",
-      "memoryShowArchived": "보관된 항목 표시"
+      "memoryShowArchived": "보관된 항목 표시",
+      "memoryMasterSummary": "마스터 요약"
     },
     "diagnostics": {
       "title": "Diagnostics",
@@ -1244,5 +1259,13 @@
       "snapshotTitle": "Persisted snapshot",
       "snapshotBindings": "Snapshot bindings"
     }
+  },
+  "embedding": {
+    "status_unknown": "임베딩 상태 알 수 없음 (구버전 데몬이거나 연결 끊김)",
+    "status_ready": "임베딩 준비 완료 — 시맨틱 검색이 로컬에서 실행됨",
+    "status_loading": "임베딩 모델 로딩 중…",
+    "status_fallback": "임베딩: 로컬 파이프라인 사용 불가, 서버 폴백 사용 중",
+    "status_unavailable": "임베딩 사용 불가 — 이 데몬에서 시맨틱 검색이 비활성화됨",
+    "status_idle": "임베딩 대기 중 (이번 세션에서 아직 사용되지 않음)"
   }
 }

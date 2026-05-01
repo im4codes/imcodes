@@ -28,6 +28,17 @@ import type {
 
 export type MessageHandler = (msg: ServerMessage) => void;
 
+export interface TransportUpgradeBlockedSession {
+  name: string;
+  sessionState?: string;
+  runtime?: {
+    status: string;
+    sending: boolean;
+    pendingCount: number;
+    blockReason?: string;
+  } | null;
+}
+
 export type ServerMessage =
   | { type: 'terminal.diff'; diff: TerminalDiff }
   | { type: 'terminal.history'; sessionName: string; content: string }
@@ -43,9 +54,9 @@ export type ServerMessage =
   | { type: typeof DAEMON_MSG.RECONNECTED }
   | { type: typeof DAEMON_MSG.DISCONNECTED }
   | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'p2p_active'; activeRunIds?: string[] }
-  | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'transport_busy'; activeSessionNames?: string[] }
+  | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'transport_busy'; activeSessionNames?: string[]; blockedSessions?: TransportUpgradeBlockedSession[] }
   | { type: 'daemon.error'; kind: 'uncaughtException' | 'unhandledRejection' | 'warning'; message: string; stack?: string; ts: number }
-  | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; project: string; role: string; agentType: string; agentVersion?: string; state: string; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; qwenModel?: string; requestedModel?: string; activeModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; copilotAvailableModels?: string[]; cursorAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; permissionLabel?: string; quotaLabel?: string; quotaUsageLabel?: string; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace']; contextNamespaceDiagnostics?: string[]; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextRetryExhausted?: boolean; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride; transportConfig?: Record<string, unknown> | null; transportPendingMessages?: string[]; transportPendingMessageEntries?: Array<{ clientMessageId: string; text: string }> }> }
+  | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; project: string; role: string; agentType: string; agentVersion?: string; state: string; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; qwenModel?: string; requestedModel?: string; activeModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; copilotAvailableModels?: string[]; cursorAvailableModels?: string[]; codexAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; permissionLabel?: string; quotaLabel?: string; quotaUsageLabel?: string; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace']; contextNamespaceDiagnostics?: string[]; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextRetryExhausted?: boolean; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride; transportConfig?: Record<string, unknown> | null; transportPendingMessages?: string[]; transportPendingMessageEntries?: Array<{ clientMessageId: string; text: string }> }> }
   | { type: 'outbound'; platform: string; channelId: string; content: string }
   | { type: 'timeline.event'; event: TimelineEvent }
   | { type: 'timeline.replay'; sessionName: string; requestId?: string; events: TimelineEvent[]; truncated: boolean; epoch: number }
@@ -71,8 +82,8 @@ export type ServerMessage =
   | { type: 'p2p.run_update'; run: any }
   | { type: typeof P2P_CONFIG_MSG.SAVE_RESPONSE; requestId: string; scopeSession: string; ok: boolean; error?: string }
   | { type: 'p2p.conflict'; existingRunId: string; initiatorSession: string; commandId: string }
-  | { type: 'subsession.created'; id: string; sessionName: string; sessionType: string; cwd?: string; label?: string; parentSession?: string; state?: string; runtimeType?: 'process' | 'transport' | null; providerId?: string | null; providerSessionId?: string | null; requestedModel?: string | null; activeModel?: string | null; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace'] | null; contextNamespaceDiagnostics?: string[] | null; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextRetryExhausted?: boolean | null; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride | null; transportConfig?: Record<string, unknown> | null; qwenModel?: string | null; qwenAuthType?: string | null; qwenAvailableModels?: string[] | null; modelDisplay?: string | null; planLabel?: string | null; permissionLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null }
-  | { type: 'subsession.sync'; id: string; sessionName?: string; state?: string; cwd?: string; label?: string; requestedModel?: string | null; activeModel?: string | null; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace'] | null; contextNamespaceDiagnostics?: string[] | null; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextRetryExhausted?: boolean | null; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride | null; transportConfig?: Record<string, unknown> | null; qwenModel?: string | null; modelDisplay?: string | null; planLabel?: string | null; permissionLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null }
+  | { type: 'subsession.created'; id: string; sessionName: string; sessionType: string; cwd?: string; label?: string; parentSession?: string; state?: string; runtimeType?: 'process' | 'transport' | null; providerId?: string | null; providerSessionId?: string | null; requestedModel?: string | null; activeModel?: string | null; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace'] | null; contextNamespaceDiagnostics?: string[] | null; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextRetryExhausted?: boolean | null; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride | null; transportConfig?: Record<string, unknown> | null; qwenModel?: string | null; qwenAuthType?: string | null; qwenAvailableModels?: string[] | null; codexAvailableModels?: string[] | null; modelDisplay?: string | null; planLabel?: string | null; permissionLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null }
+  | { type: 'subsession.sync'; id: string; sessionName?: string; state?: string; cwd?: string; label?: string; requestedModel?: string | null; activeModel?: string | null; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace'] | null; contextNamespaceDiagnostics?: string[] | null; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextRetryExhausted?: boolean | null; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride | null; transportConfig?: Record<string, unknown> | null; qwenModel?: string | null; codexAvailableModels?: string[] | null; modelDisplay?: string | null; planLabel?: string | null; permissionLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null }
   | { type: 'subsession.removed'; id: string; sessionName: string }
   | { type: 'p2p.run_started'; runId: string; session: string }
   | { type: 'p2p.cancel_response'; runId: string; ok: boolean }
@@ -134,9 +145,30 @@ const RECONNECT_MAX_MS = 30000;
 const HEARTBEAT_MS = 10000; // lowered from 25s for faster dead-connection detection
 /** If no pong arrives within this window after a ping, assume the socket is a
  *  half-open zombie (iOS/Android commonly leave the TCP open after aggressive
- *  background eviction) and force a fresh reconnect. 2× heartbeat gives one
- *  interval of slack for genuinely slow networks before we tear it down. */
-const PONG_TIMEOUT_MS = HEARTBEAT_MS * 2;
+ *  background eviction) and force a fresh reconnect.
+ *
+ *  Sized to absorb mobile/cellular jitter — 2s was too aggressive and produced
+ *  false-positive forced reconnects (and a flurry of resubscribe traffic) on
+ *  every momentary RTT spike. With `PONG_MISSES_BEFORE_RECONNECT = 2`, total
+ *  detection time is still bounded at ~10s (one missed window + one confirming
+ *  ping + miss). Truly dead sockets are caught well before any TCP-level
+ *  timeout, but live-but-jittery sockets are no longer torn down. */
+// Bumped 5s → 8s. Cellular handoff and CPU-busy daemons regularly took 5–7s
+// to ack a ping; the old 5s window forced spurious reconnects (with the full
+// resubscribe replay), surfacing as "终端订阅一会就断了". With
+// `PONG_MISSES_BEFORE_RECONNECT = 2` the worst-case detection window is
+// ~16s of true silence — still well within the user's tolerance for noticing
+// a dead tab.
+const PONG_TIMEOUT_MS = 8_000;
+const RESUME_PROBE_TIMEOUT_MS = 8_000;
+const PONG_MISSES_BEFORE_RECONNECT = 2;
+/** If we received a pong within this window, treat the socket as already
+ *  proven alive and skip the resume probe. This eliminates UI churn (and the
+ *  brief "disconnected" flash) when the user rapidly switches tabs / focuses
+ *  windows in quick succession — the ping/pong heartbeat already covers
+ *  liveness during normal use; foreground probes only need to fire after a
+ *  genuine sleep/background gap. */
+const PROBE_FRESHNESS_MS = 5_000;
 
 export class WsClient {
   private ws: WebSocket | null = null;
@@ -151,25 +183,42 @@ export class WsClient {
   private _destroyed = false;
   private _pingLatency: number | null = null;
   private _pingSentAt: number | null = null;
+  /** Wall-clock time of the last received pong. Used by `probeConnection` to
+   *  skip a resume probe when a recent heartbeat already proved liveness. */
+  private _lastPongAt = 0;
   private _pongTimer: ReturnType<typeof setTimeout> | null = null;
+  private _resumeProbeTimer: ReturnType<typeof setTimeout> | null = null;
+  private _visibilityListener: (() => void) | null = null;
+  private _missedHeartbeatPongs = 0;
+  private _resumeProbeMisses = 0;
   private _onLatency: ((ms: number) => void) | null = null;
 
   /** Per-session callbacks for raw PTY binary frames. Supports multiple subscribers per session. */
   private _terminalRawHandlers = new Map<string, Set<(data: Uint8Array) => void>>();
 
-  /** Desired terminal subscription mode per session. Replayed on browser reconnect. */
+  /** Effective terminal subscription mode per session. Replayed on browser reconnect. */
   private terminalSubscriptions = new Map<string, boolean>();
+  /** Base terminal mode requested by ordinary subscribeTerminal callers. */
+  private terminalBaseSubscriptions = new Map<string, boolean>();
+  /** Raw-mode holds used by embedded live terminal surfaces that must not be downgraded by passive subscriptions. */
+  private terminalRawHolds = new Map<string, number>();
 
   /** Desired transport-chat subscriptions per session. Replayed on browser reconnect. */
   private transportSubscriptions = new Set<string>();
 
-  /** Per-session stream reset recovery state. */
+  /** Per-session stream reset recovery state.
+   *  - lastSnapshotAt: rate-limits snapshot requests to avoid hammering the
+   *    server during reset bursts (one outstanding snapshot every
+   *    SNAPSHOT_REQUEST_MIN_INTERVAL_MS).
+   *  - pendingSnapshot: a deferred snapshot timer when we're rate-limited;
+   *    guarantees the terminal will eventually catch up even if every reset
+   *    fell within the rate-limit window.
+   *  No cooldown / no retry budget — overflow recovery is now driven entirely
+   *  by re-snapshotting (which the server-side queue-reset path supports).
+   *  The terminal can never be permanently frozen by a burst of resets. */
   private resetState = new Map<string, {
-    count: number;
-    windowStart: number;
-    retryCount: number;
-    inCooldown: boolean;
-    retryTimer: ReturnType<typeof setTimeout> | null;
+    lastSnapshotAt: number;
+    pendingSnapshot: ReturnType<typeof setTimeout> | null;
   }>();
 
   constructor(baseUrl: string, serverId: string) {
@@ -228,6 +277,35 @@ export class WsClient {
   }
 
   send(msg: object): void {
+    if (!this._connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error('WebSocket not connected');
+    }
+    const json = JSON.stringify(msg);
+    if (json.length > 60_000) {
+      throw new Error('Message too large');
+    }
+    this.ws.send(json);
+  }
+
+  /**
+   * Bypass the probe-state gate (`_connected`) for urgent commands like
+   * `/stop`. Probe state is a heuristic — `readyState === OPEN` is the
+   * OS-level truth. Backgrounded tabs can resume with readyState=OPEN
+   * while the path is actually dead, which is why probeConnection() flips
+   * `_connected = false` until a fresh ping/pong confirms the path. But
+   * for STOP we want maximum chance of delivery: try the OS-open socket
+   * (likely still works on most resumes), and let the caller fall back to
+   * HTTP on throw. The previous "stop has highest priority" guarantee
+   * regressed when probeConnection() was added (a604c085) because every
+   * focus/visibility tick briefly marks the socket disconnected, and the
+   * normal `send()` refuses during that window — so a stop tap landing
+   * in that window was silently dropped (caught by `try { ... } catch
+   * { /* ignore *​/ }` in SubSessionCard).
+   *
+   * Throws if there's no socket at all or readyState isn't OPEN — those
+   * are real-deadness conditions where HTTP fallback IS necessary.
+   */
+  sendUrgent(msg: object): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       throw new Error('WebSocket not connected');
     }
@@ -238,21 +316,106 @@ export class WsClient {
     this.ws.send(json);
   }
 
+  /**
+   * Urgent variant of `sendSessionCommand` for stop / interrupt / cancel —
+   * bypasses the probe-state gate so a focus/visibility tick can't silently
+   * swallow it. Caller should still wrap in try/catch and HTTP-fallback
+   * on throw.
+   */
+  sendSessionCommandUrgent(command: 'stop' | 'send' | 'restart', payload: object = {}): void {
+    this.sendUrgent({ type: `session.${command}`, ...payload });
+  }
+
+  /**
+   * Actively verify a foregrounded browser socket before allowing new sends.
+   * Backgrounded tabs can resume with readyState=OPEN while the path to the
+   * server is dead; a short ping/pong probe catches that without refreshing
+   * healthy sockets.
+   *
+   * Stability guards (in order):
+   *   1. If a recent pong (within `PROBE_FRESHNESS_MS`) already proved the
+   *      socket is alive, skip the probe entirely — no disconnected flash,
+   *      no extra ping. Rapid visibility/focus toggles do not churn the UI.
+   *   2. If a probe is already in flight (`_resumeProbeTimer` armed), don't
+   *      restart it; the in-flight probe will resolve on its own.
+   *   3. Otherwise mark the socket unverified, dispatch `disconnected` so
+   *      `send()` callers can't push into a possibly-dead pipe, and ping.
+   */
+  probeConnection(timeoutMs = RESUME_PROBE_TIMEOUT_MS): void {
+    if (this._destroyed) return;
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.reconnectNow(false);
+      return;
+    }
+
+    // Recent pong → socket is provably alive; nothing to do.
+    if (this._connected && this._lastPongAt > 0 && Date.now() - this._lastPongAt < PROBE_FRESHNESS_MS) {
+      return;
+    }
+
+    // Already probing — let the existing watchdog resolve. Avoids stacking
+    // multiple pings/timers when visibility/focus/pageshow all fire.
+    if (this._resumeProbeTimer) return;
+
+    const wasConnected = this._connected;
+    this._connected = false;
+    if (wasConnected) {
+      this.dispatch({ type: 'session.event', event: 'disconnected', session: '', state: 'disconnected' });
+    }
+
+    this.clearPongWatchdog();
+    this._resumeProbeMisses = 0;
+    this.sendResumeProbePing(timeoutMs);
+  }
+
   onMessage(handler: MessageHandler): () => void {
     this.handlers.add(handler);
     return () => this.handlers.delete(handler);
   }
 
   subscribeTerminal(sessionName: string, raw: boolean): void {
-    this.terminalSubscriptions.set(sessionName, raw);
-    if (!this._connected) return;
-    this.send({ type: 'terminal.subscribe', session: sessionName, raw });
+    this.terminalBaseSubscriptions.set(sessionName, raw);
+    this.syncTerminalSubscription(sessionName);
   }
 
   unsubscribeTerminal(sessionName: string): void {
+    this.terminalBaseSubscriptions.delete(sessionName);
+    if ((this.terminalRawHolds.get(sessionName) ?? 0) > 0) {
+      this.syncTerminalSubscription(sessionName);
+      return;
+    }
     this.terminalSubscriptions.delete(sessionName);
     if (!this._connected) return;
     this.send({ type: 'terminal.unsubscribe', session: sessionName });
+  }
+
+  holdTerminalRaw(sessionName: string): () => void {
+    this.terminalRawHolds.set(sessionName, (this.terminalRawHolds.get(sessionName) ?? 0) + 1);
+    this.syncTerminalSubscription(sessionName);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const next = Math.max(0, (this.terminalRawHolds.get(sessionName) ?? 0) - 1);
+      if (next === 0) this.terminalRawHolds.delete(sessionName);
+      else this.terminalRawHolds.set(sessionName, next);
+      this.syncTerminalSubscription(sessionName);
+    };
+  }
+
+  private syncTerminalSubscription(sessionName: string): void {
+    const hasBase = this.terminalBaseSubscriptions.has(sessionName);
+    const raw = (this.terminalBaseSubscriptions.get(sessionName) ?? false)
+      || (this.terminalRawHolds.get(sessionName) ?? 0) > 0;
+    if (!hasBase && !raw) {
+      this.terminalSubscriptions.delete(sessionName);
+      if (!this._connected) return;
+      this.send({ type: 'terminal.unsubscribe', session: sessionName });
+      return;
+    }
+    this.terminalSubscriptions.set(sessionName, raw);
+    if (!this._connected) return;
+    this.send({ type: 'terminal.subscribe', session: sessionName, raw });
   }
 
   /** Subscribe to transport chat events for a session (history replay + live approval/tool updates). */
@@ -559,6 +722,13 @@ export class WsClient {
       this._connected = true;
       this.reconnectAttempt = 0;
       this.startHeartbeat();
+      // Reset per-session stream-reset bookkeeping on reconnect. Stale pending
+      // snapshot timers from the old socket are cleared so they don't fire
+      // after we've already re-issued subscribes here.
+      for (const state of this.resetState.values()) {
+        if (state.pendingSnapshot) clearTimeout(state.pendingSnapshot);
+      }
+      this.resetState.clear();
       for (const [session, raw] of this.terminalSubscriptions) {
         try {
           this.send({ type: 'terminal.subscribe', session, raw });
@@ -587,6 +757,9 @@ export class WsClient {
       try {
         const msg = JSON.parse(ev.data as string) as ServerMessage;
         if (msg.type === 'pong') {
+          this._missedHeartbeatPongs = 0;
+          this._resumeProbeMisses = 0;
+          this._lastPongAt = Date.now();
           if (this._pingSentAt !== null) {
             this._pingLatency = Date.now() - this._pingSentAt;
             this._pingSentAt = null;
@@ -596,6 +769,14 @@ export class WsClient {
           if (this._pongTimer) {
             clearTimeout(this._pongTimer);
             this._pongTimer = null;
+          }
+          if (this._resumeProbeTimer) {
+            clearTimeout(this._resumeProbeTimer);
+            this._resumeProbeTimer = null;
+            if (!this._connected) {
+              this._connected = true;
+              this.dispatch({ type: 'session.event', event: 'connected', session: '', state: 'connected' });
+            }
           }
           return;
         }
@@ -642,67 +823,71 @@ export class WsClient {
     this._terminalRawHandlers.get(sessionName)?.forEach((h) => h(ptyData));
   }
 
-  /** Called when data arrives for a session — confirms stream is healthy, resets retry budget. */
-  private confirmStreamRecovery(session: string): void {
-    const state = this.resetState.get(session);
-    if (state && state.retryCount > 0) {
-      state.retryCount = 0;
-    }
+  /** Called when data arrives for a session — confirms stream is healthy. */
+  private confirmStreamRecovery(_session: string): void {
+    // No-op in the rate-limit-only design. The server keeps the subscription
+    // alive across overflow (queue is reset, not unsubscribed), so a healthy
+    // data flow naturally proves recovery without any client-side state.
   }
 
   /**
-   * Handle terminal.stream_reset: schedule resubscribe with exponential backoff.
-   * Cooldown: 3+ resets within 60s → 30s pause before retrying.
+   * Handle terminal.stream_reset: ALWAYS recover by requesting a fresh
+   * snapshot, never freeze the terminal.
+   *
+   * Design (replaces the old retry-with-cooldown path):
+   *   - Server keeps the subscription alive across overflow — it just sends
+   *     stream_reset + clears its per-(session, ws) queue. So all the client
+   *     needs to do on every reset is request a snapshot to re-sync the
+   *     visible screen.
+   *   - To avoid hammering the server when overflows cascade (a single heavy
+   *     output burst can fire many resets in flight), snapshot requests are
+   *     rate-limited to one per SNAPSHOT_REQUEST_MIN_INTERVAL_MS. Resets
+   *     arriving within the window schedule a deferred snapshot at the end of
+   *     the window, so the terminal is GUARANTEED to recover even after a
+   *     burst.
+   *   - No cooldown that blanks the screen for 5s. No exponential backoff.
+   *   - No "max retries" that leaves the terminal frozen. The previous design
+   *     could enter a permanently-stuck state ("终端卡住不更新, 刷新后恢复");
+   *     this design cannot.
    */
   private handleStreamReset(session: string): void {
+    if (!this._connected) return;
+    const SNAPSHOT_REQUEST_MIN_INTERVAL_MS = 500;
     const now = Date.now();
     let state = this.resetState.get(session);
     if (!state) {
-      state = { count: 0, windowStart: now, retryCount: 0, inCooldown: false, retryTimer: null };
+      state = { lastSnapshotAt: 0, pendingSnapshot: null };
       this.resetState.set(session, state);
     }
 
-    // Reset count window every 60s
-    if (now - state.windowStart > 60_000) {
-      state.count = 0;
-      state.windowStart = now;
-    }
-    state.count++;
-
-    // Cooldown: ≥5 resets in 60s → 5s pause (relaxed from 3/30s to reduce perceived freezes)
-    if (state.count >= 5 && !state.inCooldown) {
-      state.inCooldown = true;
-      setTimeout(() => {
-        const s = this.resetState.get(session);
-        if (s === state) {
-          s.inCooldown = false;
-          s.retryCount = 0;
-        }
-      }, 5_000);
-      return; // Don't resubscribe during cooldown
-    }
-
-    if (state.inCooldown) return;
-
-    if (state.retryCount >= 5) {
-      // Max retries — let handler show user-facing prompt (already dispatched)
+    const sinceLast = now - state.lastSnapshotAt;
+    if (sinceLast >= SNAPSHOT_REQUEST_MIN_INTERVAL_MS) {
+      // Window open — fire snapshot now.
+      state.lastSnapshotAt = now;
+      try {
+        this.send({ type: 'terminal.snapshot_request', sessionName: session });
+      } catch {
+        // ws not open right now; the next reset (or the reconnect resubscribe
+        // replay) will recover.
+      }
       return;
     }
 
-    const delays = [1000, 2000, 4000, 8000, 16000];
-    const delay = delays[Math.min(state.retryCount, delays.length - 1)];
-    state.retryCount++;
-
-    if (state.retryTimer) clearTimeout(state.retryTimer);
-    state.retryTimer = setTimeout(() => {
+    // Inside the rate-limit window — defer one snapshot to the end of the
+    // window. If a deferred snapshot is already scheduled, leave it alone:
+    // multiple resets in the same window collapse into a single snapshot.
+    if (state.pendingSnapshot) return;
+    const remaining = SNAPSHOT_REQUEST_MIN_INTERVAL_MS - sinceLast;
+    state.pendingSnapshot = setTimeout(() => {
       const s = this.resetState.get(session);
-      if (s) s.retryTimer = null;
-      // retryCount is NOT reset here — only reset when data actually flows
-      // (confirmStreamRecovery called from handleRawFrame on first received frame)
-      if (!this._destroyed && this._connected) {
-        this.subscribeTerminal(session, true);
-      }
-    }, delay);
+      if (!s) return;
+      s.pendingSnapshot = null;
+      if (this._destroyed || !this._connected) return;
+      s.lastSnapshotAt = Date.now();
+      try {
+        this.send({ type: 'terminal.snapshot_request', sessionName: session });
+      } catch { /* covered by next reset / reconnect */ }
+    }, remaining);
   }
 
   private scheduleReconnect(): void {
@@ -724,10 +909,14 @@ export class WsClient {
 
     if (force && this.ws) {
       const staleSocket = this.ws;
+      const wasConnected = this._connected;
       this.ws = null;
       this._connected = false;
       this._connecting = false;
       this.clearTimers();
+      if (wasConnected) {
+        this.dispatch({ type: 'session.event', event: 'disconnected', session: '', state: 'disconnected' });
+      }
       try { staleSocket.close(4001, 'client refresh'); } catch { /* ignore */ }
     }
 
@@ -742,6 +931,13 @@ export class WsClient {
     // still "connected" indefinitely while no new events ever arrive — which
     // is exactly the "回前台后消息不同步" symptom users reported.
     const armPing = () => {
+      if (this.isDocumentHidden()) {
+        this.clearPongWatchdog();
+        this._missedHeartbeatPongs = 0;
+        this._pingSentAt = null;
+        return;
+      }
+      if (this._pongTimer) return;
       try {
         this._pingSentAt = Date.now();
         this.send({ type: 'ping' });
@@ -750,20 +946,22 @@ export class WsClient {
         // handler + scheduleReconnect take over.
         return;
       }
-      // Only arm a fresh watchdog if none is pending. A still-pending
-      // watchdog means the previous ping hasn't been ponged yet; resetting
-      // it here would just keep delaying detection forever on a dead
-      // socket. The pong handler is the only thing that clears it.
-      if (!this._pongTimer) {
-        this._pongTimer = setTimeout(() => {
-          this._pongTimer = null;
-          if (this._destroyed) return;
+      this._pongTimer = setTimeout(() => {
+        this._pongTimer = null;
+        if (this._destroyed) return;
+        this._missedHeartbeatPongs += 1;
+        if (this._missedHeartbeatPongs >= PONG_MISSES_BEFORE_RECONNECT) {
           // Socket is half-open. Force a fresh connection so subscriptions
           // and optimistic bubbles get re-synced via the reconnect path.
           this.reconnectNow(true);
-        }, PONG_TIMEOUT_MS);
-      }
+          return;
+        }
+        // One missed pong can be normal under short browser stalls. Confirm
+        // with a second immediate ping before tearing down the socket.
+        armPing();
+      }, PONG_TIMEOUT_MS);
     };
+    this.installVisibilityListener();
     armPing(); // send first ping immediately for initial latency
     this.heartbeatTimer = setInterval(armPing, HEARTBEAT_MS);
   }
@@ -771,11 +969,69 @@ export class WsClient {
   private clearTimers(): void {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
-    if (this._pongTimer) clearTimeout(this._pongTimer);
+    this.clearPongWatchdog();
+    if (this._resumeProbeTimer) clearTimeout(this._resumeProbeTimer);
+    if (this._visibilityListener && typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this._visibilityListener);
+    }
     this.reconnectTimer = null;
     this.heartbeatTimer = null;
-    this._pongTimer = null;
+    this._visibilityListener = null;
+    this._resumeProbeTimer = null;
     this._pingSentAt = null;
+    this._missedHeartbeatPongs = 0;
+    this._resumeProbeMisses = 0;
+  }
+
+  private isDocumentHidden(): boolean {
+    return typeof document !== 'undefined' && document.visibilityState === 'hidden';
+  }
+
+  private clearPongWatchdog(): void {
+    if (!this._pongTimer) return;
+    clearTimeout(this._pongTimer);
+    this._pongTimer = null;
+  }
+
+  private installVisibilityListener(): void {
+    if (this._visibilityListener || typeof document === 'undefined') return;
+    this._visibilityListener = () => {
+      if (!this.isDocumentHidden()) return;
+      // Desktop browsers aggressively throttle background timers. A ping sent
+      // just before tab hiding can have its pong callback delayed past the
+      // foreground 2s watchdog, causing false reconnect loops and subscription
+      // churn. Foreground resume still runs probeConnection() immediately,
+      // but now also requires two missed pongs before reconnecting.
+      this.clearPongWatchdog();
+      this._missedHeartbeatPongs = 0;
+      this._pingSentAt = null;
+    };
+    document.addEventListener('visibilitychange', this._visibilityListener);
+  }
+
+  private sendResumeProbePing(timeoutMs: number): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.reconnectNow(false);
+      return;
+    }
+    try {
+      this._pingSentAt = Date.now();
+      this.ws.send(JSON.stringify({ type: 'ping' }));
+    } catch {
+      this.reconnectNow(true);
+      return;
+    }
+
+    this._resumeProbeTimer = setTimeout(() => {
+      this._resumeProbeTimer = null;
+      if (this._destroyed) return;
+      this._resumeProbeMisses += 1;
+      if (this._resumeProbeMisses >= PONG_MISSES_BEFORE_RECONNECT) {
+        this.reconnectNow(true);
+        return;
+      }
+      this.sendResumeProbePing(timeoutMs);
+    }, timeoutMs);
   }
 
   private dispatch(msg: ServerMessage): void {

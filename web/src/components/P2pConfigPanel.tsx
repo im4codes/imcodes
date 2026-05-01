@@ -2,13 +2,16 @@
  * P2pConfigPanel — modal settings panel for P2P config mode.
  * Lets the user configure per-session participation and modes, plus round count.
  */
-import { useState, useEffect, useMemo } from 'preact/hooks';
+import { useState, useEffect, useMemo, useRef } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import { getUserPref, saveUserPref, onUserPrefChanged } from '../api.js';
+import { usePref } from '../hooks/usePref.js';
+import { PREF_KEY_P2P_SESSION_CONFIG_LEGACY, p2pSessionConfigPrefKey } from '../constants/prefs.js';
+import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p-config-pref.js';
 import { P2pComboManager } from './P2pComboManager.js';
 import { useP2pCustomCombos } from './p2p-combos.js';
 import type { P2pSavedConfig, P2pSessionConfig } from '@shared/p2p-modes.js';
 import { BUILT_IN_ADVANCED_PRESETS } from '@shared/p2p-advanced.js';
+import { MAX_P2P_PARTICIPANTS } from '@shared/p2p-config-events.js';
 import type {
   P2pAdvancedPresetKey,
   P2pAdvancedRound,
@@ -288,11 +291,16 @@ export function P2pConfigPanel({
   const [contextReducerMode, setContextReducerMode] = useState<P2pContextReducerMode | ''>('');
   const [contextReducerSession, setContextReducerSession] = useState('');
   const [contextReducerTemplate, setContextReducerTemplate] = useState('');
-  const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saveWarning, setSaveWarning] = useState<string | null>(null);
   const showAdvancedWorkflowSettings = false;
+  const formDirtyRef = useRef(false);
+  const seededConfigKeyRef = useRef<string | null>(null);
+
+  const markFormDirty = () => {
+    formDirtyRef.current = true;
+  };
 
   const enabledSdkParticipants = useMemo(
     () => allEligible.filter((entry) => entry.flavor === 'sdk').filter((entry) => {
@@ -303,55 +311,32 @@ export function P2pConfigPanel({
   );
 
   // Config key uses the main session (sub-sessions follow parent config)
-  const configKey = scopeSession ? `p2p_session_config:${scopeSession}` : null;
-  const reloadConfig = useMemo(() => {
-    return () => {
-      if (!configKey) { setLoading(false); return; }
-      setLoading(true);
-      const apply = (raw: unknown) => {
-        if (raw && typeof raw === 'string') {
-          try {
-            const parsed: P2pSavedConfig = JSON.parse(raw);
-            setSessionCfg(parsed.sessions ?? {});
-            setRounds(parsed.rounds ?? 3);
-            setHopTimeoutMinutes(parsed.hopTimeoutMinutes ?? 8);
-            setExtraPrompt(parsed.extraPrompt ?? '');
-            setAdvancedPresetKey(parsed.advancedPresetKey ?? '');
-            setAdvancedRounds(parsed.advancedRounds);
-            setAdvancedRunTimeoutMinutes(parsed.advancedRunTimeoutMinutes ?? 30);
-            setContextReducerMode(parsed.contextReducer?.mode ?? '');
-            setContextReducerSession(parsed.contextReducer?.sessionName ?? '');
-            setContextReducerTemplate(parsed.contextReducer?.templateSession ?? '');
-            setAdvancedExpanded(Boolean(parsed.advancedPresetKey || parsed.contextReducer || parsed.advancedRunTimeoutMinutes != null));
-          } catch { /* start fresh */ }
-        }
-        setLoading(false);
-      };
-      void getUserPref(configKey).then((raw) => {
-        if (raw) { apply(raw); return; }
-        void getUserPref('p2p_session_config').then((legacyRaw) => {
-          if (legacyRaw && typeof legacyRaw === 'string') {
-            void saveUserPref(configKey, legacyRaw).catch(() => {});
-          }
-          apply(legacyRaw);
-        });
-      });
-    };
-  }, [configKey]);
-
+  const configKey = scopeSession ? p2pSessionConfigPrefKey(scopeSession) : null;
+  const p2pConfigPref = usePref<P2pSavedConfig>(configKey, {
+    legacyKey: PREF_KEY_P2P_SESSION_CONFIG_LEGACY,
+    parse: parseP2pSavedConfig,
+    serialize: serializeP2pSavedConfig,
+  });
+  const loading = Boolean(configKey && !p2pConfigPref.loaded);
   // Load saved config — per-session key with legacy global fallback
   useEffect(() => {
-    reloadConfig();
-  }, [reloadConfig]);
-
-  useEffect(() => {
-    if (!configKey) return;
-    return onUserPrefChanged((key) => {
-      if (key === configKey || key === 'p2p_session_config') {
-        reloadConfig();
-      }
-    });
-  }, [configKey, reloadConfig]);
+    const parsed = p2pConfigPref.value;
+    if (!parsed) return;
+    if (formDirtyRef.current && seededConfigKeyRef.current === configKey) return;
+    seededConfigKeyRef.current = configKey;
+    formDirtyRef.current = false;
+    setSessionCfg(parsed.sessions ?? {});
+    setRounds(parsed.rounds ?? 3);
+    setHopTimeoutMinutes(parsed.hopTimeoutMinutes ?? 8);
+    setExtraPrompt(parsed.extraPrompt ?? '');
+    setAdvancedPresetKey(parsed.advancedPresetKey ?? '');
+    setAdvancedRounds(parsed.advancedRounds);
+    setAdvancedRunTimeoutMinutes(parsed.advancedRunTimeoutMinutes ?? 30);
+    setContextReducerMode(parsed.contextReducer?.mode ?? '');
+    setContextReducerSession(parsed.contextReducer?.sessionName ?? '');
+    setContextReducerTemplate(parsed.contextReducer?.templateSession ?? '');
+    setAdvancedExpanded(Boolean(parsed.advancedPresetKey || parsed.contextReducer || parsed.advancedRunTimeoutMinutes != null));
+  }, [configKey, p2pConfigPref.value]);
 
   useEffect(() => {
     if (contextReducerMode === 'reuse_existing_session') {
@@ -377,13 +362,31 @@ export function P2pConfigPanel({
   }, []);
 
   const toggleEnabled = (key: string) => {
+    markFormDirty();
     setSessionCfg((prev) => {
       const cur = prev[key] ?? { enabled: false, mode: 'audit' };
-      return { ...prev, [key]: { ...cur, enabled: !cur.enabled } };
+      const willEnable = !cur.enabled;
+      if (willEnable) {
+        // Enforce hard cap at toggle time so the UI never lets a user select more than MAX_P2P_PARTICIPANTS.
+        const currentlyEnabledCount = Object.entries(prev).filter(
+          ([k, e]) => k !== key && e?.enabled === true && e.mode !== 'skip',
+        ).length;
+        if (currentlyEnabledCount >= MAX_P2P_PARTICIPANTS) {
+          setSaveError(
+            t('p2p.settings_max_participants', 'P2P is limited to {{max}} participants. Disable one before enabling another.', {
+              max: MAX_P2P_PARTICIPANTS,
+            }),
+          );
+          return prev;
+        }
+        setSaveError(null);
+      }
+      return { ...prev, [key]: { ...cur, enabled: willEnable } };
     });
   };
 
   const setMode = (key: string, mode: string) => {
+    markFormDirty();
     setSessionCfg((prev) => {
       const cur = prev[key] ?? { enabled: false, mode: 'audit' };
       return { ...prev, [key]: { ...cur, mode } };
@@ -399,6 +402,20 @@ export function P2pConfigPanel({
     const merged: P2pSessionConfig = {};
     for (const e of allEligible) {
       merged[e.key] = sessionCfg[e.key] ?? { enabled: false, mode: 'audit' };
+    }
+    // Enforce cap at save time too (defense-in-depth: stale configs loaded
+    // from disk may already exceed the cap; the daemon also enforces this
+    // gate, but we surface the error here for immediate UX feedback).
+    const enabledCount = Object.values(merged).filter((entry) => entry.enabled === true && entry.mode !== 'skip').length;
+    if (enabledCount > MAX_P2P_PARTICIPANTS) {
+      setSaveError(
+        t('p2p.settings_max_participants', 'P2P is limited to {{max}} participants. Disable {{over}} before saving.', {
+          max: MAX_P2P_PARTICIPANTS,
+          over: enabledCount - MAX_P2P_PARTICIPANTS,
+        }),
+      );
+      setSaving(false);
+      return;
     }
     let contextReducer: P2pContextReducerConfig | undefined;
     if (advancedPresetKey && contextReducerMode === 'reuse_existing_session' && contextReducerSession) {
@@ -421,12 +438,14 @@ export function P2pConfigPanel({
       contextReducer,
     };
     try {
-      if (configKey) await saveUserPref(configKey, JSON.stringify(cfg));
+      if (configKey) await p2pConfigPref.save(cfg);
       let daemonPersistResult: { ok: boolean; error?: string } | undefined;
       if (scopeSession && onPersistDaemonConfig) {
         daemonPersistResult = await onPersistDaemonConfig(scopeSession, cfg);
       }
       onSave(cfg);
+      formDirtyRef.current = false;
+      seededConfigKeyRef.current = configKey;
       if (daemonPersistResult && !daemonPersistResult.ok) {
         setSaveWarning(t('p2p.settings_save_warning', 'Saved to your account, but the local daemon copy failed to update. Retry or reconnect the daemon.'));
         setSaving(false);
@@ -443,6 +462,7 @@ export function P2pConfigPanel({
 
   const getEntry = (key: string) => sessionCfg[key] ?? { enabled: false, mode: 'audit' };
   const handleAdvancedPresetChange = (value: string) => {
+    markFormDirty();
     const nextPreset = value as P2pAdvancedPresetKey | '';
     setAdvancedPresetKey(nextPreset);
     if (!nextPreset) {
@@ -457,6 +477,7 @@ export function P2pConfigPanel({
   };
 
   const updateAdvancedRound = (roundId: string, updater: (round: P2pAdvancedRound) => P2pAdvancedRound) => {
+    markFormDirty();
     setAdvancedRounds((prev) => {
       if (!prev) return prev;
       return prev.map((round) => (round.id === roundId ? updater(round) : round));
@@ -576,7 +597,10 @@ export function P2pConfigPanel({
                           key={r}
                           type="button"
                           style={roundsBtnStyle(rounds === r)}
-                          onClick={() => setRounds(r)}
+                          onClick={() => {
+                            markFormDirty();
+                            setRounds(r);
+                          }}
                         >
                           {r}
                         </button>
@@ -597,7 +621,10 @@ export function P2pConfigPanel({
                         value={hopTimeoutMinutes}
                         onInput={(e) => {
                           const v = parseInt((e.target as HTMLInputElement).value, 10);
-                          if (v >= 1 && v <= 10) setHopTimeoutMinutes(v);
+                          if (v >= 1 && v <= 10) {
+                            markFormDirty();
+                            setHopTimeoutMinutes(v);
+                          }
                         }}
                         style={{
                           width: 72,
@@ -623,7 +650,10 @@ export function P2pConfigPanel({
                   <div style={{ ...sectionLabelStyle, marginTop: 0 }}>{t('p2p.settings_extra_prompt')}</div>
                   <textarea
                     value={extraPrompt}
-                    onInput={(e) => setExtraPrompt((e.target as HTMLTextAreaElement).value)}
+                    onInput={(e) => {
+                      markFormDirty();
+                      setExtraPrompt((e.target as HTMLTextAreaElement).value);
+                    }}
                     placeholder={t('p2p.settings_extra_prompt_hint')}
                     rows={3}
                     style={{
@@ -690,7 +720,10 @@ export function P2pConfigPanel({
                                 value={advancedRunTimeoutMinutes}
                                 onInput={(event) => {
                                   const next = parseInt((event.target as HTMLInputElement).value, 10);
-                                  if (Number.isFinite(next) && next >= 1 && next <= 240) setAdvancedRunTimeoutMinutes(next);
+                                  if (Number.isFinite(next) && next >= 1 && next <= 240) {
+                                    markFormDirty();
+                                    setAdvancedRunTimeoutMinutes(next);
+                                  }
                                 }}
                                 style={{ ...fieldInputStyle, width: 88, textAlign: 'center' }}
                                 aria-label={t('p2p.settings_advanced_run_timeout', 'Whole-run timeout')}
@@ -703,7 +736,10 @@ export function P2pConfigPanel({
                             <span>{t('p2p.settings_context_reducer_mode', 'Reducer mode')}</span>
                             <select
                               value={contextReducerMode}
-                              onChange={(event) => setContextReducerMode((event.target as HTMLSelectElement).value as P2pContextReducerMode | '')}
+                              onChange={(event) => {
+                                markFormDirty();
+                                setContextReducerMode((event.target as HTMLSelectElement).value as P2pContextReducerMode | '');
+                              }}
                               style={fieldInputStyle}
                               aria-label={t('p2p.settings_context_reducer_mode', 'Reducer mode')}
                             >
@@ -718,7 +754,10 @@ export function P2pConfigPanel({
                               <span>{t('p2p.settings_context_reducer_session', 'Reducer participant')}</span>
                               <select
                                 value={contextReducerSession}
-                                onChange={(event) => setContextReducerSession((event.target as HTMLSelectElement).value)}
+                                onChange={(event) => {
+                                  markFormDirty();
+                                  setContextReducerSession((event.target as HTMLSelectElement).value);
+                                }}
                                 style={fieldInputStyle}
                                 aria-label={t('p2p.settings_context_reducer_session', 'Reducer participant')}
                               >
@@ -735,7 +774,10 @@ export function P2pConfigPanel({
                               <span>{t('p2p.settings_context_reducer_template', 'Template participant')}</span>
                               <select
                                 value={contextReducerTemplate}
-                                onChange={(event) => setContextReducerTemplate((event.target as HTMLSelectElement).value)}
+                                onChange={(event) => {
+                                  markFormDirty();
+                                  setContextReducerTemplate((event.target as HTMLSelectElement).value);
+                                }}
                                 style={fieldInputStyle}
                                 aria-label={t('p2p.settings_context_reducer_template', 'Template participant')}
                               >

@@ -6,6 +6,7 @@ import type {
   ProviderCapabilities,
   ProviderConfig,
   ProviderError,
+  ProviderModelList,
   SessionConfig,
   SessionInfoUpdate,
   ProviderStatusUpdate,
@@ -537,6 +538,24 @@ export class CopilotSdkProvider implements TransportProvider {
     if (this.getSessionState(sessionId)) return true;
     const sessions = await this.listSessions();
     return sessions.some((session) => session.key === sessionId);
+  }
+
+  async listModels(force?: boolean): Promise<ProviderModelList> {
+    try {
+      const { getCopilotRuntimeConfig } = await import('../copilot-runtime-config.js');
+      const cfg = await getCopilotRuntimeConfig(force ?? false);
+      return {
+        models: cfg.models.map((m) => ({
+          id: m.id,
+          ...(m.name ? { name: m.name } : {}),
+          ...(m.supportsReasoningEffort ? { supportsReasoningEffort: true } : {}),
+        })),
+        isAuthenticated: cfg.isAuthenticated,
+        ...(cfg.probeError ? { error: cfg.probeError } : {}),
+      };
+    } catch (err) {
+      return { models: [], error: err instanceof Error ? err.message : String(err) };
+    }
   }
 
   async listSessions(): Promise<RemoteSessionInfo[]> {

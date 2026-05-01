@@ -9,6 +9,7 @@ import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM } from '@shared/preview-types.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
 import type { ContextMemoryView, ContextModelConfig } from '@shared/context-types.js';
 import type { SharedContextRuntimeConfigSnapshot } from '@shared/shared-context-runtime-config.js';
+import { isNative } from './native.js';
 import {
   SUPERVISION_USER_DEFAULT_PREF_KEY,
   normalizeSupervisorDefaultConfig,
@@ -32,7 +33,11 @@ let _authTelemetryHeadersPromise: Promise<AuthTelemetryHeaders> | null = null;
 // where apiFetch is called before configureApiKey() in the native init effect.
 try {
   const stored = localStorage.getItem('rcc_api_key');
-  if (stored) _apiKey = stored;
+  if (stored && isNative()) {
+    _apiKey = stored;
+  } else if (stored) {
+    localStorage.removeItem('rcc_api_key');
+  }
 } catch { /* SSR or restricted storage */ }
 
 /** Set a Bearer API key for native app auth (replaces cookie+CSRF). */
@@ -459,6 +464,16 @@ export async function apiFetch<T = unknown>(
   return res.json() as Promise<T>;
 }
 
+export async function sendSessionViaHttp(
+  serverId: string,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  await apiFetch(`/api/server/${encodeURIComponent(serverId)}/session/send`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
 function isRetryableNonceExchangeError(error: unknown): boolean {
   if (error instanceof ApiError) {
     if (error.code === 'invalid_or_expired_nonce') return false;
@@ -577,6 +592,7 @@ export interface SubSessionData {
   qwenModel?: string | null;
   qwenAuthType?: string | null;
   qwenAvailableModels?: string[] | null;
+  codexAvailableModels?: string[] | null;
   requestedModel?: string | null;
   activeModel?: string | null;
   modelDisplay?: string | null;
@@ -759,6 +775,7 @@ export async function fetchTimelineHistoryHttp(
   if (typeof opts.afterTs === 'number' && Number.isFinite(opts.afterTs)) params.set('afterTs', String(opts.afterTs));
   if (typeof opts.beforeTs === 'number' && Number.isFinite(opts.beforeTs)) params.set('beforeTs', String(opts.beforeTs));
   if (typeof opts.limit === 'number' && Number.isFinite(opts.limit)) params.set('limit', String(opts.limit));
+  const timeout = createTimeoutSignal(2_500);
   try {
     const result = await apiFetch<{
       sessionName: string;
@@ -768,6 +785,7 @@ export async function fetchTimelineHistoryHttp(
       nextCursor: number | null;
     }>(`/api/server/${encodeURIComponent(serverId)}/timeline/history/full?${params.toString()}`, {
       method: 'GET',
+      signal: timeout.signal,
     });
     return {
       events: Array.isArray(result.events) ? result.events : [],
@@ -781,6 +799,8 @@ export async function fetchTimelineHistoryHttp(
     // 503 daemon_offline / 504 timeout / network errors are transient — caller
     // should fall back to the WS path. Returning null lets the caller decide.
     return null;
+  } finally {
+    timeout.clear?.();
   }
 }
 
@@ -944,6 +964,10 @@ const userPrefChannel = typeof BroadcastChannel !== 'undefined'
   ? new BroadcastChannel('imcodes-user-pref-sync')
   : null;
 
+export interface UserPrefChangedMeta {
+  source: 'local' | 'broadcast';
+}
+
 function emitUserPrefChanged(key: string, value: unknown): void {
   try {
     window.dispatchEvent(new CustomEvent(USER_PREF_CHANGED_EVENT, {
@@ -955,16 +979,16 @@ function emitUserPrefChanged(key: string, value: unknown): void {
   } catch { /* ignore */ }
 }
 
-export function onUserPrefChanged(cb: (key: string, value: unknown) => void): () => void {
+export function onUserPrefChanged(cb: (key: string, value: unknown, meta: UserPrefChangedMeta) => void): () => void {
   const handleWindowEvent = (event: Event) => {
     const detail = (event as CustomEvent<{ key?: unknown; value?: unknown }>).detail;
     if (!detail || typeof detail.key !== 'string') return;
-    cb(detail.key, detail.value);
+    cb(detail.key, detail.value, { source: 'local' });
   };
   const handleChannelEvent = (event: MessageEvent<unknown>) => {
     const data = event.data as { key?: unknown; value?: unknown } | null;
     if (!data || typeof data.key !== 'string') return;
-    cb(data.key, data.value);
+    cb(data.key, data.value, { source: 'broadcast' });
   };
   try { window.addEventListener(USER_PREF_CHANGED_EVENT, handleWindowEvent as EventListener); } catch { /* */ }
   try { userPrefChannel?.addEventListener('message', handleChannelEvent); } catch { /* */ }

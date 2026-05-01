@@ -18,6 +18,9 @@ import { P2pProgressCard } from './P2pProgressCard.js';
 import type { P2pProgressDiscussion } from './P2pProgressCard.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
 import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
+import { EmbeddingStatusIcon } from './EmbeddingStatusIcon.js';
+import type { EmbeddingStatus } from '@shared/embedding-status.js';
+import { formatDaemonVersionShort } from '../util/format-version.js';
 
 interface DaemonStats {
   daemonVersion?: string | null;
@@ -28,6 +31,7 @@ interface DaemonStats {
   load5: number;
   load15: number;
   uptime: number;
+  embedding?: EmbeddingStatus | null;
 }
 
 type DiscussionSummary = P2pProgressDiscussion & {
@@ -322,7 +326,20 @@ export function SubSessionBar({ subSessions, openIds, idleFlashTokens, onOpen, o
     if (!ws) return;
     return ws.onMessage((msg) => {
       if (msg.type === 'daemon.stats') {
-        setStats({ daemonVersion: msg.daemonVersion, cpu: msg.cpu, memUsed: msg.memUsed, memTotal: msg.memTotal, load1: msg.load1, load5: msg.load5, load15: msg.load15, uptime: msg.uptime });
+        setStats({
+          daemonVersion: msg.daemonVersion,
+          cpu: msg.cpu,
+          memUsed: msg.memUsed,
+          memTotal: msg.memTotal,
+          load1: msg.load1,
+          load5: msg.load5,
+          load15: msg.load15,
+          uptime: msg.uptime,
+          // Older daemons don't ship `embedding`; preserve null so the
+          // icon falls through to its "unknown" rendering instead of
+          // showing a misleading "ready".
+          embedding: (msg as { embedding?: EmbeddingStatus | null }).embedding ?? null,
+        });
       }
     });
   }, [ws]);
@@ -377,7 +394,9 @@ export function SubSessionBar({ subSessions, openIds, idleFlashTokens, onOpen, o
               <span class="daemon-stats-inline" title={`${stats.daemonVersion ? `Daemon ${stats.daemonVersion} | ` : ''}Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}`}>
                 {stats.daemonVersion && (
                   <>
-                    <span style={{ color: '#94a3b8' }}>v{stats.daemonVersion}</span>
+                    {/* Display the short form (strips trailing -dev.NNN counter); the
+                        full version stays available in the title tooltip above. */}
+                    <span style={{ color: '#94a3b8' }}>v{formatDaemonVersionShort(stats.daemonVersion)}</span>
                     <span style={{ color: '#94a3b8' }}> · </span>
                   </>
                 )}
@@ -392,6 +411,8 @@ export function SubSessionBar({ subSessions, openIds, idleFlashTokens, onOpen, o
                 <span style={{ color: '#a78bfa' }}>
                   Load {stats.load1}
                 </span>
+                <span style={{ color: '#94a3b8' }}> · </span>
+                <EmbeddingStatusIcon status={stats.embedding} />
                 <span style={{ color: '#94a3b8' }}> · </span>
                 <span style={{ color: '#94a3b8' }}>
                   {formatUptime(stats.uptime)}
@@ -411,12 +432,15 @@ export function SubSessionBar({ subSessions, openIds, idleFlashTokens, onOpen, o
           const ei = { fontSize: '0.65em', verticalAlign: 'middle' } as const;
           return (
             <span class="daemon-stats-inline" title={`${stats.daemonVersion ? `v${stats.daemonVersion} | ` : ''}CPU ${stats.cpu}% | Mem ${memUsed}/${memTotal}${unit} | Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}`} style={{ whiteSpace: 'nowrap', fontSize: 10 }}>
-              {stats.daemonVersion && <span style={{ color: '#94a3b8' }}>v{stats.daemonVersion} </span>}
+              {/* Mobile-narrow stat strip — show short version; full string in title above. */}
+              {stats.daemonVersion && <span style={{ color: '#94a3b8' }}>v{formatDaemonVersionShort(stats.daemonVersion)} </span>}
               <span style={{ color: stats.cpu > 80 ? '#f87171' : stats.cpu > 50 ? '#fbbf24' : '#4ade80' }}><span style={ei}>⚙️</span>{stats.cpu}%</span>
               {' '}
               <span style={{ color: '#60a5fa' }}><span style={ei}>🧠</span>{memUsed}/{memTotal}{unit}</span>
               {' '}
               <span style={{ color: '#a78bfa' }}>≡{Number(stats.load1).toFixed(1)}</span>
+              {' '}
+              <EmbeddingStatusIcon status={stats.embedding} compact />
             </span>
           );
         })()}

@@ -6,19 +6,68 @@
  * Lazy-loaded on first call — subsequent calls reuse the pipeline.
  */
 
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+
 import { EMBEDDING_MODEL, EMBEDDING_DTYPE, EMBEDDING_DIM } from '../../shared/embedding-config.js';
 import logger from '../util/logger.js';
+import { isServerFallbackUnavailable, tryServerEmbedding } from './embedding-server-fallback.js';
 
 // Re-export shared constants for backward compatibility with existing imports
 export { EMBEDDING_DIM, cosineSimilarity } from '../../shared/embedding-config.js';
 
+/**
+ * Resolve where transformers.js should cache the downloaded embedding model.
+ *
+ * Why this isn't just "leave it to transformers' default": transformers.js
+ * defaults to `<package-install-dir>/.cache` (i.e. inside
+ * `node_modules/@huggingface/transformers/.cache`). For ANY system-level
+ * imcodes install — `npm i -g` on Linux landing in `/usr/lib/node_modules/`,
+ * Homebrew installs under `/opt/homebrew/lib/node_modules/`, Docker images
+ * with the package owned by root, etc. — a non-root daemon process cannot
+ * write into that path and crashes the model load with EACCES on first use.
+ * Real-world hit on 172.16.253.212 (2026-04-27): every embedding attempt
+ * logged `EACCES: permission denied, mkdir
+ * '/usr/lib/node_modules/imcodes/node_modules/@huggingface/transformers/.cache'`
+ * and semantic memory recall was permanently disabled for the process.
+ *
+ * Defaulting to `~/.imcodes/embedding-cache/` makes the cache always live
+ * somewhere the daemon owns. Users / ops can still override via
+ * `IMCODES_EMBEDDING_CACHE_DIR` for shared caches, ramdisk, NFS, etc.
+ */
 function resolveEmbeddingCacheDir(): string {
-  return process.env.IMCODES_EMBEDDING_CACHE_DIR?.trim() || '';
+  const fromEnv = process.env.IMCODES_EMBEDDING_CACHE_DIR?.trim();
+  if (fromEnv) return fromEnv;
+  return join(homedir(), '.imcodes', 'embedding-cache');
 }
 
 // Lazy-loaded pipeline singleton
 let pipelineInstance: any = null;
 let loadingPromise: Promise<any> | null = null;
+/** Sticky flag set when semantic search is permanently unavailable for this
+ *  process. Two failure modes set it:
+ *
+ *    1. `ERR_MODULE_NOT_FOUND` — `@huggingface/transformers` (an optional
+ *       dep) wasn't installed, e.g. the user's npm install skipped its
+ *       onnxruntime-node postinstall under restrictive networks.
+ *
+ *    2. `ERR_DLOPEN_FAILED` — `onnxruntime-node`'s native binary cannot be
+ *       loaded. On Windows this typically means either:
+ *         - The CPU is missing AVX-512 / AVX-VNNI required by the prebuilt
+ *           onnxruntime.dll. We pin to onnxruntime-node@1.20.1 in the
+ *           package.json overrides specifically because 1.21+ Windows
+ *           prebuilds were compiled with /arch:AVX512, breaking every
+ *           Broadwell-EP and earlier x86 CPU. If even 1.20.1 fails, the CPU
+ *           is older than Haswell (no AVX2) — semantic search is genuinely
+ *           unsupported.
+ *         - DirectML.dll has been removed and System32's copy is
+ *           ABI-incompatible with the bundled onnxruntime.dll.
+ *
+ *  Both modes are deterministic: re-trying the import on every call burns
+ *  CPU and re-emits the same warning forever. Stickying the flag means we
+ *  log once and then quietly return null on subsequent calls. */
+let unavailable = false;
+let unavailableReason: string | null = null;
 
 // ── Float32 ⇄ Buffer helpers ────────────────────────────────────────────────
 // Used by the persistent embedding store in context-store.ts to stash the
@@ -44,8 +93,17 @@ export function decodeEmbedding(buf: Buffer | Uint8Array | null | undefined): Fl
   return out;
 }
 
+/** Sticky failure codes — these are deterministic per-machine, so retrying
+ *  burns CPU without ever recovering. See the unavailableReason doc above. */
+const STICKY_FAILURE_CODES: ReadonlySet<string> = new Set([
+  'ERR_MODULE_NOT_FOUND',
+  'MODULE_NOT_FOUND',
+  'ERR_DLOPEN_FAILED',
+]);
+
 async function getPipeline(): Promise<any> {
   if (pipelineInstance) return pipelineInstance;
+  if (unavailable) throw new Error(`embedding model unavailable (${unavailableReason ?? 'unknown'})`);
   if (loadingPromise) return loadingPromise;
 
   loadingPromise = (async () => {
@@ -62,7 +120,37 @@ async function getPipeline(): Promise<any> {
       return p;
     } catch (err) {
       loadingPromise = null;
-      logger.warn({ err }, 'Failed to load embedding model — semantic search disabled');
+      const code = (err as { code?: string } | null)?.code;
+      // Deterministic failures get the sticky treatment so we don't re-try
+      // (and re-warn) on every embedding call for the rest of the process.
+      // Transient failures (network, OOM during model download) keep the
+      // retry path so a blip doesn't permanently kill semantic search.
+      if (code && STICKY_FAILURE_CODES.has(code)) {
+        unavailable = true;
+        unavailableReason = code;
+        if (code === 'ERR_DLOPEN_FAILED') {
+          // Almost always: onnxruntime.dll's prebuilt binary uses AVX-512 /
+          // AVX-VNNI instructions this CPU doesn't have (true on every x86
+          // CPU older than Skylake-X server / Ice Lake desktop), or the
+          // bundled DirectML.dll was stripped and System32's copy is ABI-
+          // incompatible. Print actionable detail; users with old hardware
+          // need to know "your CPU is too old for the bundled binary"
+          // rather than seeing a cryptic stack trace.
+          logger.warn(
+            { code, message: (err as { message?: string }).message },
+            'onnxruntime native binding failed to load (DLL init error). '
+              + 'Likely cause: CPU lacks AVX2 / AVX-512, or bundled DirectML.dll is missing. '
+              + 'Semantic memory recall disabled for this process.',
+          );
+        } else {
+          logger.warn(
+            { code },
+            '@huggingface/transformers not installed — semantic search disabled (install the optional dep to enable)',
+          );
+        }
+      } else {
+        logger.warn({ err }, 'Failed to load embedding model — will retry on next call');
+      }
       throw err;
     }
   })();
@@ -70,9 +158,59 @@ async function getPipeline(): Promise<any> {
   return loadingPromise;
 }
 
+/** Test-only: reset the sticky-disable state so each test starts fresh. */
+export function _resetEmbeddingStateForTests(): void {
+  pipelineInstance = null;
+  loadingPromise = null;
+  unavailable = false;
+  unavailableReason = null;
+}
+
+/** Returns the sticky-failure reason (e.g. 'ERR_DLOPEN_FAILED') if embedding
+ *  has been permanently disabled this process, else null. Useful for
+ *  surfacing actionable diagnostics in memory-recall code paths so the UI
+ *  can degrade gracefully instead of silently returning empty results. */
+export function getEmbeddingUnavailableReason(): string | null {
+  return unavailable ? unavailableReason : null;
+}
+
+/**
+ * High-level embedding status for telemetry / UI display.
+ * See `shared/embedding-status.ts` for the wire-format type definition
+ * and `state` semantics.
+ *
+ * No side effects — never triggers a load, never makes a network call.
+ * Safe to call on every heartbeat.
+ */
+export type { EmbeddingStatus } from '../../shared/embedding-status.js';
+
+export function getEmbeddingStatus(): import('../../shared/embedding-status.js').EmbeddingStatus {
+  if (pipelineInstance) return { state: 'ready', reason: null };
+  if (loadingPromise) return { state: 'loading', reason: null };
+  if (!unavailable) return { state: 'idle', reason: null };
+
+  // Local has sticky-failed. Decide between `fallback` and `unavailable`
+  // by peeking at the server-fallback module's sticky flag. The accessor
+  // never triggers a network call or credential read — it only reads a
+  // module-level boolean.
+  if (isServerFallbackUnavailable()) {
+    return { state: 'unavailable', reason: unavailableReason };
+  }
+  return { state: 'fallback', reason: unavailableReason };
+}
+
 /**
  * Generate a normalized embedding vector for a text string.
- * Returns a Float32Array of EMBEDDING_DIM dimensions, or null if model unavailable.
+ *
+ * Resolution order:
+ *   1. Local pipeline via `@huggingface/transformers` (fast path, ~5 ms).
+ *   2. Server fallback via `POST /api/embedding` if the daemon is bound
+ *      and the local pipeline is permanently unavailable (sharp empty
+ *      placeholders, onnxruntime DLOPEN failure on old CPUs, etc.).
+ *
+ * Returns a Float32Array of EMBEDDING_DIM dimensions, or null when both
+ * paths fail. The fallback only fires when the LOCAL pipeline has
+ * sticky-disabled — we never round-trip the network on the happy path.
  */
 export async function generateEmbedding(text: string): Promise<Float32Array | null> {
   try {
@@ -80,6 +218,13 @@ export async function generateEmbedding(text: string): Promise<Float32Array | nu
     const result = await pipe(text, { pooling: 'mean', normalize: true });
     return result.data as Float32Array;
   } catch {
+    // Local failed. If it's sticky-disabled (deterministic per-host),
+    // try the server fallback. Transient local failures fall through to
+    // null without burning a network call.
+    if (unavailable) {
+      if (isServerFallbackUnavailable()) return null;
+      return await tryServerEmbedding(text);
+    }
     return null;
   }
 }
@@ -103,6 +248,24 @@ export async function generateEmbeddings(texts: string[]): Promise<(Float32Array
     }
     return results;
   } catch {
+    // Local pipeline dead. Fall back to server one-at-a-time when the
+    // local failure is deterministic. Server doesn't have a batch endpoint
+    // yet — sequential is fine because the batch path is only hot during
+    // recall and a sticky-disabled local pipeline is rare overall.
+    if (unavailable) {
+      if (isServerFallbackUnavailable()) return texts.map(() => null);
+      const out: (Float32Array | null)[] = [];
+      for (const text of texts) {
+        out.push(await tryServerEmbedding(text));
+        if (isServerFallbackUnavailable()) {
+          // Server became unavailable mid-batch — fill the rest with null
+          // and break, don't keep firing requests at a sticky-disabled server.
+          while (out.length < texts.length) out.push(null);
+          break;
+        }
+      }
+      return out;
+    }
     return texts.map(() => null);
   }
 }

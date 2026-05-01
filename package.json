@@ -1,7 +1,7 @@
 {
   "name": "imcodes",
   "version": "0.1.2",
-  "description": "A chat interface for AI coding agents — control Claude Code, Codex, Gemini CLI, OpenCode from browser and mobile",
+  "description": "A chat interface for AI coding agents \u2014 control Claude Code, Codex, Gemini CLI, OpenCode from browser and mobile",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -21,7 +21,9 @@
   },
   "scripts": {
     "build": "tsc",
-    "postbuild": "node scripts/mark-bin-executable.mjs",
+    "postbuild": "node scripts/copy-worker-bootstraps.mjs && node scripts/mark-bin-executable.mjs",
+    "prepack": "node scripts/strip-onnxruntime-gpu.mjs",
+    "postpack": "node scripts/restore-package-json-after-pack.mjs",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.ts",
     "test": "vitest run",
@@ -35,22 +37,26 @@
     "lint": "eslint src/",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run build && npm run test:unit && npm run test:server && npm run test:web",
-    "prepare": "husky"
+    "prepare": "husky",
+    "bench:memory": "tsx bench/memory-pipeline.bench.ts"
   },
   "dependencies": {
+    "@agentclientprotocol/sdk": "^0.20.0",
     "@anthropic-ai/claude-agent-sdk": "^0.2.92",
+    "@anthropic-ai/tokenizer": "^0.0.4",
     "@github/copilot-sdk": "^0.2.2",
     "@huggingface/transformers": "^4.1.0",
-    "@openai/codex-sdk": "^0.118.0",
+    "@openai/codex-sdk": "^0.125.0",
     "commander": "^12.1.0",
     "croner": "^10.0.1",
     "fzf": "^0.5.2",
     "octokit": "^4.0.2",
     "pino": "^9.5.0",
     "pino-pretty": "^13.1.3",
-    "tsx": "^4.19.0",
+    "sharp": "^0.34.5",
     "ws": "^8.18.0",
-    "yaml": "^2.6.0"
+    "yaml": "^2.6.0",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
@@ -63,14 +69,20 @@
     "husky": "^9.1.7",
     "jsdom": "^28.1.0",
     "lint-staged": "^16.3.4",
+    "tsx": "^4.19.0",
     "typescript": "^5.7.0",
-    "vitest": "^2.1.0",
-    "zod": "^4.3.6"
+    "vitest": "^2.1.0"
   },
   "lint-staged": {
     "**/*": "grep -qvE 'API_KEY|SECRET|PASSWORD|TOKEN|PRIVATE_KEY' || (echo 'Error: Potential sensitive information detected in your commit!' && exit 1)"
   },
   "optionalDependencies": {
     "node-pty": "^1.1.0"
-  }
+  },
+  "overrides": {
+    "onnxruntime-node": "1.20.1"
+  },
+  "bundleDependencies": [
+    "@huggingface/transformers"
+  ]
 }

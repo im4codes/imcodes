@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID } from '../../shared/ack-protocol.js';
 
 const {
   getSessionMock,
@@ -102,5 +103,37 @@ describe('process session /clear handling', () => {
       memoryExcluded: true,
     }, expect.objectContaining({ source: 'daemon' }));
     expect(emitMock).toHaveBeenCalledWith('deck_proj_brain', 'command.ack', { commandId: 'cmd-clear-process', status: 'accepted' });
+  });
+
+  it('rejects a duplicate process-session commandId after it has been accepted', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_proj_brain',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'claude-code',
+      runtimeType: 'process',
+      state: 'idle',
+      projectDir: '/proj',
+      ccSessionId: 'cc-old',
+    });
+
+    handleWebCommand({ type: 'session.send', session: 'deck_proj_brain', text: '/clear', commandId: 'cmd-clear-dup-process' }, serverLink as any);
+    await flushAsync();
+    handleWebCommand({ type: 'session.send', session: 'deck_proj_brain', text: '/clear', commandId: 'cmd-clear-dup-process' }, serverLink as any);
+    await flushAsync();
+
+    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledTimes(1);
+    expect(emitMock).toHaveBeenCalledWith('deck_proj_brain', 'command.ack', {
+      commandId: 'cmd-clear-dup-process',
+      status: 'error',
+      error: COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID,
+    });
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: 'command.ack',
+      commandId: 'cmd-clear-dup-process',
+      status: 'error',
+      session: 'deck_proj_brain',
+      error: COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID,
+    });
   });
 });

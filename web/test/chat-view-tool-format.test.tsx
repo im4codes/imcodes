@@ -30,6 +30,22 @@ vi.mock('../src/components/FileBrowser.js', () => ({
 vi.mock('../src/api.js', () => ({
   downloadAttachment: vi.fn().mockResolvedValue(undefined),
 }));
+// See ChatView.test.tsx — opt this suite into the developer branch of the
+// show_tool_calls preference so tool-row markup is rendered.
+vi.mock('../src/hooks/usePref.js', () => ({
+  parseBooleanish: (raw: unknown) => (raw === true || raw === 'true' ? true : raw === false || raw === 'false' ? false : null),
+  usePref: () => ({
+    value: true,
+    rawValue: true,
+    loaded: true,
+    loading: false,
+    stale: false,
+    error: null,
+    save: async () => undefined,
+    set: () => undefined,
+    reload: async () => true,
+  }),
+}));
 
 import { ChatView } from '../src/components/ChatView.js';
 import type { TimelineEvent } from '../src/ws-client.js';

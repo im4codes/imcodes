@@ -335,7 +335,13 @@ describe('structured P2P routing via WS fields', () => {
     expect(targets).toEqual([{ session: 'deck_proj_w1', mode: 'review' }]);
   });
 
-  it('returns a distinct error when config filtering removes all otherwise-valid targets', async () => {
+  it('rejects with NO_ENABLED_PARTICIPANTS when the saved config has zero enabled members', async () => {
+    // Gate 2 in handleSend rejects structured P2P starts whose resolved
+    // p2pSessionConfig contains no participants enabled with a non-skip
+    // mode. Previously the post-expansion "filtering removed all targets"
+    // path returned NO_CONFIGURED_TARGETS for this case; the new gate is
+    // semantically more accurate (the config exists but selects no one)
+    // and fires earlier.
     getSavedP2pConfigMock.mockResolvedValue({
       sessions: {
         deck_proj_w1: { enabled: false, mode: 'audit' },
@@ -348,7 +354,7 @@ describe('structured P2P routing via WS fields', () => {
       type: 'session.send',
       sessionName: 'deck_proj_brain',
       text: 'review this code',
-      commandId: 'cmd-no-configured-targets',
+      commandId: 'cmd-no-enabled-participants',
       p2pMode: 'review',
       p2pSessionConfig: {
         deck_proj_w1: { enabled: false, mode: 'audit' },
@@ -358,13 +364,13 @@ describe('structured P2P routing via WS fields', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(startP2pRun).not.toHaveBeenCalled();
-    expect(mockServerLink.send).toHaveBeenCalledWith({
+    expect(mockServerLink.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'command.ack',
-      commandId: 'cmd-no-configured-targets',
+      commandId: 'cmd-no-enabled-participants',
       status: 'error',
       session: 'deck_proj_brain',
-      error: P2P_CONFIG_ERROR.NO_CONFIGURED_TARGETS,
-    });
+      error: P2P_CONFIG_ERROR.NO_ENABLED_PARTICIPANTS,
+    }));
   });
 
   it('persists config saves from the web command path into the daemon store', async () => {
@@ -412,6 +418,19 @@ describe('structured P2P routing via WS fields', () => {
   });
 
   it('p2pAtTargets with __all__ expands to all active sessions', async () => {
+    // The __all__ token routes through the dropdown / config-mode path,
+    // which Gate 1 protects with a saved-config requirement. Provide a
+    // saved config that allowlists every other active session so the
+    // expansion still has members to expand to under the new strict
+    // allowlist semantics.
+    getSavedP2pConfigMock.mockResolvedValue({
+      sessions: {
+        deck_proj_w1: { enabled: true, mode: 'audit' },
+        deck_proj_w2: { enabled: true, mode: 'audit' },
+      },
+      rounds: 1,
+    });
+
     handleWebCommand({
       type: 'session.send',
       sessionName: 'deck_proj_brain',
@@ -630,6 +649,16 @@ describe('structured P2P routing via WS fields', () => {
   });
 
   it('p2pMode field expands to all sessions with that mode', async () => {
+    // Same as the __all__ test: the dropdown path requires a saved config
+    // under the new strict allowlist gates, so seed one before sending.
+    getSavedP2pConfigMock.mockResolvedValue({
+      sessions: {
+        deck_proj_w1: { enabled: true, mode: 'brainstorm' },
+        deck_proj_w2: { enabled: true, mode: 'brainstorm' },
+      },
+      rounds: 1,
+    });
+
     handleWebCommand({
       type: 'session.send',
       sessionName: 'deck_proj_brain',

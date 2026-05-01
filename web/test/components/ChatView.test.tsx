@@ -7,6 +7,9 @@ import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { ChatView } from '../../src/components/ChatView.js';
 
 const chatMarkdownRenderSpy = vi.hoisted(() => vi.fn());
+const showToolCallsPref = vi.hoisted(() => ({
+  value: true as boolean | null,
+}));
 
 type ViewportListener = () => void;
 const visualViewportListeners = new Map<string, Set<ViewportListener>>();
@@ -46,6 +49,27 @@ vi.mock('../../src/components/FloatingPanel.js', () => ({
   FloatingPanel: ({ children }: { children?: preact.ComponentChildren }) => <div>{children}</div>,
 }));
 
+// Force the show-tool-calls preference to "developer view" for ChatView's
+// timeline tests. Production default for an undecided pref is also developer
+// view, with a chooser prompt still visible; these tests assert tool-row
+// markup without the extra prompt unless they explicitly change this value.
+// Other usePref features (parse, save, etc.) aren't exercised here, so a
+// minimal stub is enough.
+vi.mock('../../src/hooks/usePref.js', () => ({
+  parseBooleanish: (raw: unknown) => (raw === true || raw === 'true' ? true : raw === false || raw === 'false' ? false : null),
+  usePref: () => ({
+    value: showToolCallsPref.value,
+    rawValue: showToolCallsPref.value,
+    loaded: true,
+    loading: false,
+    stale: false,
+    error: null,
+    save: async () => undefined,
+    set: () => undefined,
+    reload: async () => true,
+  }),
+}));
+
 describe('ChatView', () => {
   const originalVisualViewport = window.visualViewport;
   const clipboardWriteText = vi.fn().mockResolvedValue(undefined);
@@ -59,6 +83,7 @@ describe('ChatView', () => {
   afterEach(() => {
     cleanup();
     chatMarkdownRenderSpy.mockClear();
+    showToolCallsPref.value = true;
     clipboardWriteText.mockClear();
     visualViewportMock.height = 800;
     visualViewportListeners.clear();
@@ -66,6 +91,37 @@ describe('ChatView', () => {
 
   afterAll(() => {
     (window as Window & { visualViewport?: typeof visualViewportMock }).visualViewport = originalVisualViewport as any;
+  });
+
+  it('always hides thinking events from the timeline regardless of preference', () => {
+    // Thinking events (both live and finished) are unconditionally hidden —
+    // the agent's running state and memory-context card already give enough
+    // signal that work is happening, and the "Thought for Xs" summary was
+    // pure noise. See ChatView's `assistant.thinking` case (returns null).
+    for (const prefValue of [null, true, false] as const) {
+      showToolCallsPref.value = prefValue;
+
+      const { container, unmount } = render(
+        <ChatView
+          events={[
+            {
+              eventId: 'thinking-1',
+              type: 'assistant.thinking',
+              ts: Date.now() - 1000,
+              payload: { text: 'checking files' },
+            },
+          ] as any}
+          loading={false}
+          sessionId="test"
+        />,
+      );
+
+      expect(container.querySelector('.chat-thinking')).toBeNull();
+      expect(container.textContent ?? '').not.toContain('checking files');
+      expect(container.textContent ?? '').not.toContain('chat.thinking_running');
+      expect(container.textContent ?? '').not.toContain('chat.thinking_done');
+      unmount();
+    }
   });
 
   it('keeps preview mode pinned to the bottom during streaming updates with the same timestamp', async () => {
@@ -131,9 +187,44 @@ describe('ChatView', () => {
     );
 
     expect(container.querySelector('.chat-refreshing-spinner')).not.toBeNull();
+    expect(container.querySelector('.chat-history-overlay')).not.toBeNull();
   });
 
-  it('forces the main chat view to follow streamed updates with the same timestamp', async () => {
+  it('renders history fetch progress as a bottom overlay instead of footer layout content', () => {
+    const { container } = render(
+      <ChatView
+        events={[] as any}
+        loading={false}
+        historyStatus={{
+          phase: 'bootstrap',
+          steps: {
+            cache: 'done',
+            textTail: 'running',
+            daemon: 'pending',
+            http: 'pending',
+            older: 'skipped',
+          },
+        }}
+        sessionId="deck_sub_preview"
+      />,
+    );
+
+    expect(container.querySelector('.chat-history-overlay')).not.toBeNull();
+    expect(container.querySelector('.chat-history-step.running')).not.toBeNull();
+    expect(container.querySelector('.chat-history-step.pending')).not.toBeNull();
+    expect(container.querySelector('.session-history-progress')).toBeNull();
+  });
+
+  it('does not move the main chat viewport on same-timestamp streamed updates after the user scrolls away from bottom', async () => {
+    // Regression test for the user-reported bug: "为了自动更新不得不牺牲滚屏体验"
+    //
+    // Before the sticky-bottom fix, ChatView's `useLayoutEffect` on `viewItems`
+    // unconditionally called `scrollToBottom()` on every event-shape change,
+    // forcibly snapping the viewport to bottom even when the user had scrolled
+    // up to read earlier history. This test pins the corrected contract: when
+    // the user has actively scrolled away (scroll event dispatched, distance
+    // beyond `disengageThreshold`), in-place streaming updates with the same
+    // timestamp must NOT move `scrollTop`.
     const initialEvents = [
       {
         eventId: 'evt-1',
@@ -160,8 +251,21 @@ describe('ChatView', () => {
       expect(scrollEl.scrollTop).toBe(1200);
     });
 
-    scrollEl.scrollTop = 50;
+    // Simulate user scrolling away from bottom: move scrollTop AND dispatch
+    // a real scroll event so handleScroll fires and disengages auto-follow.
+    // (The programmatic-scroll guard's 200ms watchdog has already expired
+    // by the time waitFor resolves above, so this dispatch is honoured as
+    // a real user scroll.)
+    // Wait past both the 200ms programmatic-scroll watchdog AND the 1200ms
+    // suppressLoadOlder window (which the transientTopJump handler keys on).
+    await new Promise((resolve) => setTimeout(resolve, 1300));
+    // Use scrollTop=1300 — beyond the disengage threshold (distance=300 > 180)
+    // and well past the transientTopJump threshold (scrollTop=1300 > 100), so
+    // handleScroll cleanly disengages auto-follow without triggering the
+    // mobile-keyboard recovery branch.
+    scrollEl.scrollTop = 1300;
     Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, value: 1800 });
+    fireEvent.scroll(scrollEl);
 
     rerender(
       <ChatView
@@ -178,9 +282,241 @@ describe('ChatView', () => {
       />,
     );
 
+    // Give the layout effect a tick to (potentially) fire and confirm it
+    // does NOT yank the viewport to bottom.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(scrollEl.scrollTop).toBe(1300);
+  });
+
+  it('continues following streamed updates in main chat when the user remains near the bottom', async () => {
+    // Negative companion to the test above: prevent the gating fix from
+    // over-correcting and breaking the legitimate sticky-bottom case.
+    const initialEvents = [
+      {
+        eventId: 'evt-1',
+        type: 'assistant.text',
+        ts: 1000,
+        payload: { text: 'hello' },
+      },
+    ] as any;
+
+    const { container, rerender } = render(
+      <ChatView
+        events={initialEvents}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    const scrollEl = container.querySelector('.chat-view') as HTMLDivElement;
+    Object.defineProperty(scrollEl, 'scrollTop', { configurable: true, writable: true, value: 0 });
+    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, value: 1200 });
+    Object.defineProperty(scrollEl, 'clientHeight', { configurable: true, value: 200 });
+
+    await waitFor(() => {
+      expect(scrollEl.scrollTop).toBe(1200);
+    });
+
+    // Remain near bottom — distance from bottom = 30px, well within
+    // reengageThreshold = max(60, 0.10 * 200) = 60.
+    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, value: 1800 });
+    // No scroll event dispatched — user has not moved.
+    rerender(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-1',
+            type: 'assistant.text',
+            ts: 1000,
+            payload: { text: 'hello world streamed' },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
     await waitFor(() => {
       expect(scrollEl.scrollTop).toBe(1800);
     });
+  });
+
+  it('does not move the main chat viewport when a newer-timestamp message arrives while follow is paused', async () => {
+    // Pins the fallback `lastVisibleTs` effect path. If only the layout
+    // effect were gated, the timestamp-driven effect could still snap.
+    const initialEvents = [
+      {
+        eventId: 'evt-1',
+        type: 'assistant.text',
+        ts: 1000,
+        payload: { text: 'first' },
+      },
+    ] as any;
+
+    const { container, rerender } = render(
+      <ChatView
+        events={initialEvents}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    const scrollEl = container.querySelector('.chat-view') as HTMLDivElement;
+    Object.defineProperty(scrollEl, 'scrollTop', { configurable: true, writable: true, value: 0 });
+    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, value: 1200 });
+    Object.defineProperty(scrollEl, 'clientHeight', { configurable: true, value: 200 });
+
+    await waitFor(() => {
+      expect(scrollEl.scrollTop).toBe(1200);
+    });
+
+    // Wait past the 200ms watchdog and 1200ms suppressLoadOlder window.
+    await new Promise((resolve) => setTimeout(resolve, 1300));
+    // Grow scrollHeight FIRST, then move scrollTop and dispatch — so
+    // handleScroll computes distance against the new layout.
+    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, value: 1800 });
+    scrollEl.scrollTop = 1300;
+    fireEvent.scroll(scrollEl);
+
+    rerender(
+      <ChatView
+        events={[
+          { eventId: 'evt-1', type: 'assistant.text', ts: 1000, payload: { text: 'first' } },
+          { eventId: 'evt-2', type: 'assistant.text', ts: 2000, payload: { text: 'second (newer ts)' } },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    // Wait for the rAF inside the lastVisibleTs effect to fire.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(scrollEl.scrollTop).toBe(1300);
+  });
+
+  it('does not auto-resume after idle time while the user remains scrolled away', async () => {
+    // Pins the removal of the 60-s SCROLL_IDLE_RESUME_MS interval.
+    // Pre-fix, after 60 s of inactivity ChatView would snap to bottom.
+    // Post-fix the user controls the scroll position.
+    vi.useFakeTimers();
+    try {
+      const initialEvents = [
+        { eventId: 'evt-1', type: 'assistant.text', ts: 1000, payload: { text: 'hi' } },
+      ] as any;
+
+      const { container } = render(
+        <ChatView events={initialEvents} loading={false} sessionId="deck_main_brain" />,
+      );
+
+      const scrollEl = container.querySelector('.chat-view') as HTMLDivElement;
+      Object.defineProperty(scrollEl, 'scrollTop', { configurable: true, writable: true, value: 0 });
+      Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, value: 1200 });
+      Object.defineProperty(scrollEl, 'clientHeight', { configurable: true, value: 200 });
+
+      // Pause follow. Advance past both the 200 ms programmatic-scroll
+      // watchdog and the 1200 ms suppressLoadOlder window before simulating
+      // a real user scroll-up.
+      vi.advanceTimersByTime(1300);
+      Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, value: 1800 });
+      // Use scrollTop=1300 — beyond the disengage threshold and well above
+      // the transientTopJump 100 px floor.
+      scrollEl.scrollTop = 1300;
+      fireEvent.scroll(scrollEl);
+
+      // Advance past the old 60 s threshold + the old 10 s polling interval.
+      vi.advanceTimersByTime(75_000);
+
+      expect(scrollEl.scrollTop).toBe(1300);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('shows a new-message count on the floating jump button while follow is paused', async () => {
+    const initialEvents = [
+      { eventId: 'evt-1', type: 'assistant.text', ts: 1000, payload: { text: 'one' } },
+    ] as any;
+
+    const { container, rerender } = render(
+      <ChatView events={initialEvents} loading={false} sessionId="deck_main_brain" />,
+    );
+
+    const scrollEl = container.querySelector('.chat-view') as HTMLDivElement;
+    Object.defineProperty(scrollEl, 'scrollTop', { configurable: true, writable: true, value: 0 });
+    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, value: 1200 });
+    Object.defineProperty(scrollEl, 'clientHeight', { configurable: true, value: 200 });
+
+    await waitFor(() => {
+      expect(scrollEl.scrollTop).toBe(1200);
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 1300));
+    // Grow scrollHeight first, then disengage with a real scroll event.
+    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, value: 1800 });
+    scrollEl.scrollTop = 1300;
+    fireEvent.scroll(scrollEl);
+
+    rerender(
+      <ChatView
+        events={[
+          { eventId: 'evt-1', type: 'assistant.text', ts: 1000, payload: { text: 'one' } },
+          { eventId: 'evt-2', type: 'assistant.text', ts: 2000, payload: { text: 'two' } },
+          { eventId: 'evt-3', type: 'assistant.text', ts: 3000, payload: { text: 'three' } },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    await waitFor(() => {
+      const btn = container.querySelector('.chat-scroll-btn') as HTMLButtonElement;
+      expect(btn).toBeTruthy();
+      // Either the layout effect (viewItems) or the timestamp effect bumps the
+      // counter on each new event. We don't pin the exact number because both
+      // effects can fire — what matters is the button reports a count > 0.
+      expect(btn.textContent ?? '').toMatch(/^↓\s+\d+/);
+    });
+  });
+
+  it('does not render queued session.state events in the chat timeline', async () => {
+    const { queryByText } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'queued-state',
+            type: 'session.state',
+            sessionId: 'deck_q',
+            ts: 1000,
+            epoch: 1,
+            seq: 1,
+            source: 'daemon',
+            confidence: 'high',
+            payload: {
+              state: 'queued',
+              pendingMessageEntries: [{ clientMessageId: 'cmd-q', text: 'queued text' }],
+            },
+          },
+          {
+            eventId: 'assistant-after',
+            type: 'assistant.text',
+            sessionId: 'deck_q',
+            ts: 1001,
+            epoch: 1,
+            seq: 2,
+            source: 'daemon',
+            confidence: 'high',
+            payload: { text: 'visible assistant text' },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_q"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(queryByText('visible assistant text')).toBeDefined();
+    });
+    expect(queryByText('queued')).toBeNull();
   });
 
 

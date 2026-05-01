@@ -6,6 +6,9 @@
  * without the standard methods which makes `localStorage.clear()` throw.
  */
 
+import { afterEach } from 'vitest';
+import { resetWebSharedCachesForTests } from './reset-shared-caches.js';
+
 function ensureStorage(name: 'localStorage' | 'sessionStorage'): void {
   const existing = globalThis[name];
   if (existing && typeof existing.clear === 'function' && typeof existing.setItem === 'function') {
@@ -31,3 +34,20 @@ function ensureStorage(name: 'localStorage' | 'sessionStorage'): void {
 
 ensureStorage('localStorage');
 ensureStorage('sessionStorage');
+
+if (typeof globalThis.requestAnimationFrame !== 'function') {
+  Object.defineProperty(globalThis, 'requestAnimationFrame', {
+    value: (cb: FrameRequestCallback) => setTimeout(() => cb(Date.now()), 0),
+    configurable: true,
+  });
+}
+if (typeof globalThis.cancelAnimationFrame !== 'function') {
+  Object.defineProperty(globalThis, 'cancelAnimationFrame', {
+    value: (id: number) => clearTimeout(id),
+    configurable: true,
+  });
+}
+
+afterEach(async () => {
+  await resetWebSharedCachesForTests();
+});

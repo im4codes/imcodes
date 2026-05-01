@@ -15,8 +15,17 @@ vi.mock('../../src/components/TerminalView.js', () => ({
   TerminalView: () => null,
 }));
 
+vi.mock('../../src/components/FileBrowser.js', () => ({
+  FileBrowser: () => <div data-testid="file-browser-stub" />,
+}));
+
+const chatViewPropsSpy = vi.fn();
+
 vi.mock('../../src/components/ChatView.js', () => ({
-  ChatView: () => null,
+  ChatView: (props: any) => {
+    chatViewPropsSpy(props);
+    return null;
+  },
 }));
 
 const sessionControlsSpy = vi.fn((props: any) => (
@@ -54,7 +63,8 @@ vi.mock('../../src/thinking-utils.js', () => ({
 }));
 
 const addOptimisticUserMessageSpy = vi.fn();
-const removeOptimisticMessageSpy = vi.fn();
+const markOptimisticFailedSpy = vi.fn();
+const retryOptimisticMessageSpy = vi.fn();
 
 vi.mock('../../src/hooks/useTimeline.js', () => ({
   useTimeline: () => ({
@@ -64,7 +74,8 @@ vi.mock('../../src/hooks/useTimeline.js', () => ({
     // blow up when a test triggers user interaction. Real behavior is
     // covered by the useTimeline unit tests.
     addOptimisticUserMessage: addOptimisticUserMessageSpy,
-    removeOptimisticMessage: removeOptimisticMessageSpy,
+    markOptimisticFailed: markOptimisticFailedSpy,
+    retryOptimisticMessage: retryOptimisticMessageSpy,
   }),
 }));
 
@@ -784,19 +795,28 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     });
   });
 
-  it('wires onResendFailed into ChatView so retry works from sub-session bubbles', async () => {
+  it('keeps a new optimistic bubble visible when retrying a failed transport window send', async () => {
     // Also a regression: the failed optimistic bubble in a sub-session had no
     // retry button because onResendFailed was never threaded through to
-    // ChatView. We now pass a handler; verify it's present and callable.
-    const ChatViewModule = await import('../../src/components/ChatView.js');
-    const chatViewSpy = vi.fn((_props: any) => null);
-    (ChatViewModule as unknown as { ChatView: typeof chatViewSpy }).ChatView = chatViewSpy;
-
+    // ChatView. Transport retries must also create a fresh local bubble instead
+    // of removing the failed bubble and leaving the user with no visible state.
+    timelineEventsMock = [{
+      eventId: 'failed-window-send',
+      type: 'user.message',
+      payload: {
+        text: 'retry from window',
+        failed: true,
+        commandId: 'old-window-cmd',
+        _resendExtra: { mode: 'quick' },
+        attachments: [{ kind: 'file', name: 'notes.md' }],
+      },
+    }];
     const sub = makeSubSession({ type: 'claude-code-sdk', runtimeType: 'transport' as any } as any);
+    const retryWs = { ...ws, sendSessionCommand: vi.fn() } as any;
     render(
       <SubSessionWindow
         sub={sub}
-        ws={ws}
+        ws={retryWs}
         connected={true}
         active={true}
         onDiff={vi.fn()}
@@ -810,12 +830,133 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
       />,
     );
 
-    // ChatView may not render directly because of the initial view mode. In
-    // that case, skip — the assertion above (`onSend` wiring) already covers
-    // the core regression. When ChatView does render we expect a function.
-    const chatCall = chatViewSpy.mock.calls.at(-1)?.[0] as { onResendFailed?: unknown } | undefined;
-    if (chatCall) {
-      expect(typeof chatCall.onResendFailed).toBe('function');
-    }
+    const chatCall = chatViewPropsSpy.mock.calls.at(-1)?.[0] as { onResendFailed?: (commandId: string, text: string) => void };
+    expect(typeof chatCall.onResendFailed).toBe('function');
+
+    chatCall.onResendFailed?.('old-window-cmd', 'retry from window');
+
+    expect(retryWs.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+      sessionName: sub.sessionName,
+      text: 'retry from window',
+      mode: 'quick',
+    }));
+    expect(retryOptimisticMessageSpy).toHaveBeenCalledWith(
+      'old-window-cmd',
+      expect.any(String),
+      'retry from window',
+      {
+        attachments: [{ kind: 'file', name: 'notes.md' }],
+        resendExtra: { mode: 'quick' },
+      },
+    );
+  });
+});
+
+describe('SubSessionWindow desktop file-browser stack integration', () => {
+  const ws = {
+    subscribeTerminal: vi.fn(),
+    unsubscribeTerminal: vi.fn(),
+    sendSnapshotRequest: vi.fn(),
+    sendResize: vi.fn(),
+  } as any;
+
+  beforeEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+    timelineEventsMock = [];
+    activeToolCallMock = false;
+  });
+
+  it('uses desktopFileBrowserZIndex for the floating child file-browser when supplied', async () => {
+    const sub = makeSubSession({ type: 'claude-code-sdk', runtimeType: 'transport' as any } as any);
+    const { container, rerender } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={5010}
+        desktopFileBrowserZIndex={5777}
+        onDesktopFileBrowserOpen={vi.fn()}
+        onDesktopFileBrowserClose={vi.fn()}
+        onDesktopFileBrowserFocus={vi.fn()}
+        onFocus={vi.fn()}
+      />,
+    );
+    // Click the file-browser toggle button (📁 in the header) to open it.
+    const toggle = container.querySelector('button[title="picker.files"]') as HTMLButtonElement | null;
+    expect(toggle).toBeTruthy();
+    toggle!.click();
+    await waitFor(() => {
+      const fbPanel = document.querySelector(`[data-testid="floating-panel-subsession-filebrowser:${sub.id}"]`) as HTMLElement | null;
+      expect(fbPanel).toBeTruthy();
+      expect(fbPanel?.style.zIndex).toBe('5777');
+    });
+    // Re-render with no override → fallback to zIndex+1 path.
+    rerender(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={5010}
+        onFocus={vi.fn()}
+      />,
+    );
+  });
+
+  it('fires onDesktopFileBrowserOpen on open and onDesktopFileBrowserClose on close (desktop only)', async () => {
+    const onOpen = vi.fn();
+    const onClose = vi.fn();
+    const onFocus = vi.fn();
+    const sub = makeSubSession({ type: 'claude-code-sdk', runtimeType: 'transport' as any } as any);
+    const { container } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={5010}
+        onFocus={vi.fn()}
+        onDesktopFileBrowserOpen={onOpen}
+        onDesktopFileBrowserClose={onClose}
+        onDesktopFileBrowserFocus={onFocus}
+      />,
+    );
+    // The mount-time effect should fire onClose once (showFileBrowser starts false).
+    await waitFor(() => {
+      expect(onClose).toHaveBeenCalled();
+    });
+    onClose.mockClear();
+    onOpen.mockClear();
+
+    const toggle = container.querySelector('button[title="picker.files"]') as HTMLButtonElement | null;
+    toggle!.click();
+    await waitFor(() => {
+      expect(onOpen).toHaveBeenCalled();
+    });
+
+    toggle!.click(); // close again
+    await waitFor(() => {
+      expect(onClose).toHaveBeenCalled();
+    });
   });
 });

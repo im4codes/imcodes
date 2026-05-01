@@ -2,8 +2,13 @@
  * @vitest-environment jsdom
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, screen, cleanup } from '@testing-library/preact';
+import { render, screen, cleanup, fireEvent } from '@testing-library/preact';
 import { h } from 'preact';
+
+const toolPref = vi.hoisted(() => ({
+  value: true as boolean | null,
+  save: vi.fn(async (_value: boolean) => undefined),
+}));
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -27,13 +32,55 @@ vi.mock('../src/cost-tracker.js', () => ({
   formatCost: (n: number) => `$${n.toFixed(2)}`,
 }));
 
+vi.mock('../src/hooks/usePref.js', () => ({
+  parseBooleanish: (raw: unknown) => (raw === true || raw === 'true' ? true : raw === false || raw === 'false' ? false : null),
+  usePref: () => ({
+    value: toolPref.value,
+    rawValue: toolPref.value,
+    loaded: true,
+    loading: false,
+    stale: false,
+    error: null,
+    save: toolPref.save,
+    set: () => undefined,
+    reload: async () => toolPref.value,
+  }),
+}));
+
 import { UsageFooter } from '../src/components/UsageFooter.js';
 
 afterEach(() => {
   cleanup();
+  toolPref.value = true;
+  toolPref.save.mockClear();
 });
 
 describe('UsageFooter', () => {
+  it('defaults the tools/thinking toggle on while undecided and first click turns it off', () => {
+    toolPref.value = null;
+
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 0,
+          cacheTokens: 0,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
+        sessionName="deck_test_brain"
+      />,
+    );
+
+    expect(container.querySelector('.shortcut-btn-tools-bubble')).toBeTruthy();
+    const button = container.querySelector('.shortcut-btn-tools') as HTMLButtonElement | null;
+    expect(button).toBeTruthy();
+    expect(button?.className).toContain('is-on');
+
+    fireEvent.click(button!);
+
+    expect(toolPref.save).toHaveBeenCalledWith(false);
+  });
+
   it('prioritizes active thinking over stale idle state and renders running states inline', () => {
     const { container, rerender } = render(
       <UsageFooter
@@ -242,35 +289,50 @@ describe('UsageFooter', () => {
     expect(screen.getByText(/7d 34% 1d02h/)).toBeDefined();
   });
 
-  it('renders history fetch steps beneath the ctx bar while history is loading', () => {
+  // ── Shell / script sessions are not "agents" ────────────────────────────────
+  //
+  // Regression: shell + script terminals fired session.state(running) on any
+  // raw bytes (idle detection runs without a structured watcher), and the
+  // footer used `sessionState === 'running'` as the only check to render
+  // "Agent working..." That wording was wrong for a plain shell — running
+  // `top` or `tail -f` should not look like an AI is busy. Suppress the
+  // live-status UI entirely for these session types.
+
+  it('does NOT show "Agent working..." for shell sessions even when sessionState=running', () => {
     const { container } = render(
       <UsageFooter
-        usage={{
-          inputTokens: 2000,
-          cacheTokens: 1000,
-          contextWindow: 1_000_000,
-          model: 'coder-model',
-        }}
-        sessionName="deck_test_brain"
-        historyStatus={{
-          phase: 'bootstrap',
-          steps: {
-            cache: 'done',
-            textTail: 'running',
-            daemon: 'pending',
-            http: 'pending',
-            older: 'skipped',
-          },
-        }}
+        usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
+        sessionName="deck_shell_brain"
+        sessionState="running"
+        agentType="shell"
       />,
     );
+    expect(container.querySelector('.session-live-status-inline')).toBeNull();
+    expect(container.textContent ?? '').not.toContain('Agent working');
+  });
 
-    expect(screen.getByText('session.history_loading_label')).toBeDefined();
-    expect(screen.getByText('session.history_step_cache')).toBeDefined();
-    expect(screen.getByText('session.history_step_text_tail')).toBeDefined();
-    expect(screen.getByText('session.history_step_daemon')).toBeDefined();
-    expect(container.querySelector('.session-history-progress')).toBeTruthy();
-    expect(container.querySelector('.session-history-step.running')).toBeTruthy();
-    expect(container.querySelector('.session-history-step.pending')).toBeTruthy();
+  it('does NOT show "Agent working..." for script sessions even when sessionState=running', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
+        sessionName="deck_script_brain"
+        sessionState="running"
+        agentType="script"
+      />,
+    );
+    expect(container.querySelector('.session-live-status-inline')).toBeNull();
+    expect(container.textContent ?? '').not.toContain('Agent working');
+  });
+
+  it('does NOT show idle agent text for shell sessions', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
+        sessionName="deck_shell_brain"
+        sessionState="idle"
+        agentType="shell"
+      />,
+    );
+    expect(container.textContent ?? '').not.toContain('Agent idle');
   });
 });

@@ -43,6 +43,17 @@
     "tool_fold_collapse": "折りたたむ",
     "tool_group_more": "··· あと {{count}} 件",
     "tool_group_collapse": "▲ 折りたたむ",
+    "tool_calls_toggle_show": "ツールと思考を表示",
+    "tool_calls_toggle_hide": "ツールと思考を非表示",
+    "tool_calls_toggle_undecided": "AI の動作の表示方法を選択",
+    "tool_calls_choose_prompt": "表示を選択 ↓",
+    "tool_chooser_title": "AI の動作をどう表示しますか？",
+    "tool_chooser_subtitle": "ツール呼び出し・ファイル変更・推論は詳細ですが画面が混み合います。",
+    "tool_chooser_simple_label": "シンプル",
+    "tool_chooser_simple_hint": "AI の返答のみ",
+    "tool_chooser_developer_label": "開発者",
+    "tool_chooser_developer_hint": "ツール・ファイル・推論を表示",
+    "tool_chooser_footnote": "レンチアイコンからいつでも切り替え可能。",
     "new_folder": "新しいフォルダ",
     "new_folder_name": "フォルダ名",
     "create": "作成",
@@ -141,7 +152,8 @@
       "claude_code_cli": "Claude Code CLI",
       "codex_cli": "Codex CLI",
       "copilot_sdk": "Copilot",
-      "cursor_headless": "Cursor"
+      "cursor_headless": "Cursor",
+      "gemini_sdk": "Gemini SDK"
     },
     "agentGroup": {
       "transport_sdk": "SDK",
@@ -318,9 +330,10 @@
     "timeout": "リクエストがタイムアウトしました",
     "timeout_detail": "ディレクトリを読み取れませんでした。ネットワークドライブの遅延や利用不可が原因の可能性があります。",
     "preview_loading": "読み込み中…",
-    "preview_too_large": "ファイルが大きすぎてプレビューできません（> 5 MB）",
+    "preview_too_large": "ファイルが大きすぎてプレビューできません（> 100 MB）",
     "preview_error": "プレビュー不可",
     "preview_binary": "バイナリファイル — プレビュー不可",
+    "preview_video_unsupported": "お使いのブラウザはこの動画形式を再生できません。",
     "mkdir_failed": "フォルダを作成できませんでした",
     "view_diff": "差分",
     "view_source": "ソース",
@@ -408,6 +421,7 @@
     "username_placeholder": "ユーザー名",
     "password_placeholder": "パスワード",
     "signin": "サインイン",
+    "remember_password": "このデバイスでパスワードを記憶する",
     "invalid_credentials": "ユーザー名またはパスワードが正しくありません",
     "account_pending": "アカウントは管理者の承認待ちです。管理者にお問い合わせください。",
     "account_disabled": "アカウントが無効化されています。管理者にお問い合わせください。",
@@ -1226,7 +1240,8 @@
       "memoryDeleteConfirm": "この記憶を完全に削除しますか？この操作は元に戻せません。",
       "memoryDeleteFailed": "記憶を削除できませんでした",
       "memoryArchived": "アーカイブ済み",
-      "memoryShowArchived": "アーカイブを表示"
+      "memoryShowArchived": "アーカイブを表示",
+      "memoryMasterSummary": "マスター要約"
     },
     "diagnostics": {
       "title": "Diagnostics",
@@ -1244,5 +1259,13 @@
       "snapshotTitle": "Persisted snapshot",
       "snapshotBindings": "Snapshot bindings"
     }
+  },
+  "embedding": {
+    "status_unknown": "エンベディング状態不明（古いデーモンまたは切断中）",
+    "status_ready": "エンベディング準備完了 — セマンティック検索はローカルで実行",
+    "status_loading": "エンベディングモデルを読み込み中…",
+    "status_fallback": "エンベディング: ローカルパイプライン利用不可、サーバーフォールバックを使用中",
+    "status_unavailable": "エンベディング利用不可 — このデーモンでセマンティック検索は無効",
+    "status_idle": "エンベディング待機中（本セッションでは未使用）"
   }
 }

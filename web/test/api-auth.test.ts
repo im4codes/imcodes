@@ -69,6 +69,30 @@ describe('auth nonce exchange API', () => {
     expect(headers.get('X-Bundle-Version')).toBe('2026.4.937');
   });
 
+  it('drops a stale browser API key so web login can store cookies', async () => {
+    vi.resetModules();
+    vi.stubGlobal('Capacitor', {
+      getPlatform: () => 'web',
+      isNativePlatform: () => false,
+    });
+    localStorage.setItem('rcc_api_key', 'deck_stale_browser_key');
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }));
+
+    const { passwordLogin, getApiKey } = await import('../src/api.js');
+    await passwordLogin('wyj', 'password');
+
+    expect(getApiKey()).toBeNull();
+    expect(localStorage.getItem('rcc_api_key')).toBeNull();
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const headers = new Headers(init.headers);
+    expect(headers.has('Authorization')).toBe(false);
+    expect(init.credentials).toBe('include');
+  });
+
   it('retries transient failures with exponential backoff', async () => {
     vi.useFakeTimers();
     const fetchMock = vi.mocked(fetch);
@@ -125,6 +149,40 @@ describe('auth nonce exchange API', () => {
     await promise;
     expect(timeoutSpy).toHaveBeenCalledWith(10_000);
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect((init.signal as AbortSignal).aborted).toBe(true);
+    vi.useRealTimers();
+  });
+
+  it('bounds timeline history HTTP backfill with a short abort timeout', async () => {
+    vi.useFakeTimers();
+    const timeoutSpy = vi.spyOn(AbortSignal, 'timeout').mockImplementation((timeoutMs: number) => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 0);
+      return controller.signal;
+    });
+
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockImplementation((_url, init) => new Promise((_, reject) => {
+      const signal = init?.signal as AbortSignal | undefined;
+      if (!signal) {
+        reject(new Error('missing signal'));
+        return;
+      }
+      if (signal.aborted) {
+        reject(new DOMException('The operation was aborted', 'AbortError'));
+        return;
+      }
+      signal.addEventListener('abort', () => reject(new DOMException('The operation was aborted', 'AbortError')), { once: true });
+    }));
+
+    const { fetchTimelineHistoryHttp } = await import('../src/api.js');
+    const promise = fetchTimelineHistoryHttp('srv-1', 'deck_proj_brain', { limit: 300 });
+
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(promise).resolves.toBeNull();
+    expect(timeoutSpy).toHaveBeenCalledWith(2_500);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toContain('/api/server/srv-1/timeline/history/full?');
     expect((init.signal as AbortSignal).aborted).toBe(true);
     vi.useRealTimers();
   });

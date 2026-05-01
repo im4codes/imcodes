@@ -13,13 +13,17 @@ import { parseUnifiedDiff } from '@shared/unified-diff.js';
 import { FileBrowser } from './file-browser-lazy.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
-import { useNowTicker } from '../hooks/useNowTicker.js';
+import { usePref, parseBooleanish } from '../hooks/usePref.js';
+import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
+import type { TimelineHistoryStatus, TimelineHistoryStepKey } from '../hooks/useTimeline.js';
 
 interface Props {
   events: TimelineEvent[];
   loading: boolean;
   /** True while gap-filling new events after a cache hit */
   refreshing?: boolean;
+  /** Visible history-fetch progress shown as a non-layout overlay. */
+  historyStatus?: TimelineHistoryStatus | null;
   /** True while loading older events via backward pagination */
   loadingOlder?: boolean;
   /** False when no more history is available */
@@ -316,12 +320,44 @@ function ToolDetailSection({
  *  - Merge consecutive tool.call + tool.result pairs into compact single lines
  *  - Deduplicate consecutive session.state events with same state (keep last)
  */
-function buildViewItems(events: TimelineEvent[]): ViewItem[] {
+/**
+ * Event types that the show_tool_calls preference governs.
+ *
+ * When the preference is off (Simple view), the chat shows only natural-
+ * language turn content — `user.message`, `assistant.text`, plus errors and
+ * `ask.question` events that require user response. Everything in this set
+ * is debug/work-in-progress detail that a non-dev user does not want to
+ * see by default:
+ *
+ *   - `tool.call` / `tool.result` — every Bash/Read/etc. invocation the
+ *     agent makes (also implicitly hides the `tool-group` collapse UI).
+ *   - `file.change`              — the file-diff cards rendered for
+ *                                  apply_patch / file_change events.
+ *   - `memory.context`           — "Related history" recall results that
+ *                                  appear above user messages; useful for
+ *                                  agent introspection, noisy in casual
+ *                                  chat.
+ *   - `assistant.thinking`       — reasoning/progress details. The wrench
+ *                                  defaults ON for undecided users, and a
+ *                                  click turns these details off.
+ */
+const TOOL_LIKE_EVENT_TYPES = new Set<string>([
+  'tool.call',
+  'tool.result',
+  'file.change',
+  'memory.context',
+  'assistant.thinking',
+]);
+
+function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewItem[] {
   // Filter out transient/noisy event types that don't belong in the chat log:
   // - agent.status, usage.update: stats, not chat content
   // - mode.state: shown elsewhere (tabs/header)
   // - command.ack, terminal.snapshot: internal plumbing
-  // - session.state running/idle: live status belongs in footer/header, not chat history
+  // - session.state running/idle/queued: live status belongs in footer/header/queue UI, not chat history
+  // - TOOL_LIKE_EVENT_TYPES: optional developer details — hidden only when
+  //   the user has explicitly turned the wrench preference off. Undecided
+  //   users default to ON and see the first-run prompt.
   const visible = events.filter(
     (e) =>
       !e.hidden &&
@@ -330,8 +366,8 @@ function buildViewItems(events: TimelineEvent[]): ViewItem[] {
       e.type !== 'mode.state' &&
       e.type !== 'command.ack' &&
       e.type !== 'terminal.snapshot' &&
-      !(e.type === 'session.state' && (e.payload.state === 'running' || e.payload.state === 'idle')) &&
-      e.type !== 'assistant.thinking',
+      !(e.type === 'session.state' && (e.payload.state === 'running' || e.payload.state === 'idle' || e.payload.state === 'queued')) &&
+      (showToolCalls || !TOOL_LIKE_EVENT_TYPES.has(e.type)),
   );
 
   // Pre-pass: merge tool.call+tool.result pairs, dedup session.state,
@@ -568,7 +604,7 @@ function findScrollParent(start: HTMLElement): HTMLElement {
   return start;
 }
 
-export function ChatView({ events, loading, refreshing = false, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir, serverId, onQuote, agentType: _agentType, onResendFailed }: Props) {
+export function ChatView({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir, serverId, onQuote, agentType: _agentType, onResendFailed }: Props) {
   const { t } = useTranslation();
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -587,6 +623,24 @@ export function ChatView({ events, loading, refreshing = false, loadingOlder, ha
   const [showScrollBtn, setShowScrollBtn] = useState(false);
   const lastScrollTopRef = useRef(0);
   const suppressLoadOlderUntilRef = useRef(0);
+  // ── Programmatic-scroll guard ────────────────────────────────────────────
+  // `scrollToBottom` writes `el.scrollTop` directly, which fires a synthetic
+  // `scroll` event. Without disambiguation, `handleScroll` sees that synthetic
+  // event and recomputes `autoScrollRef.current = atBottom`, which usually
+  // happens to be true and is harmless — but during in-flight user scrolling
+  // the synthetic event can race against the user's real scroll, causing the
+  // follow state to flip in ways the user did not request. The guard ignores
+  // exactly ONE synthetic scroll event after a programmatic write, with a
+  // 200 ms watchdog so a missed/throttled event never swallows real input.
+  const programmaticIgnoreCountRef = useRef(0);
+  const programmaticIgnoreUntilRef = useRef(0);
+  // ── New-message counter while paused ──────────────────────────────────────
+  // When the user has scrolled up and follow is paused, the floating "↓"
+  // button surfaces an unread count so the paused state stays observable.
+  // Resets to 0 on re-engagement (manual click, scroll back near bottom,
+  // session switch).
+  const newSinceUnfollowRef = useRef(0);
+  const [newSinceUnfollow, setNewSinceUnfollow] = useState(0);
 
   // ── Pinned last-sent user message (appears only when scrolled off top) ──
   // When the user scrolls back through a long chat we want them to see what
@@ -713,25 +767,74 @@ export function ChatView({ events, loading, refreshing = false, loadingOlder, ha
   const urlClickHandler = !preview ? handleUrlClick : undefined;
   const downloadHandler = serverId && ws ? handleDownload : undefined;
 
-  const viewItems = useMemo(() => buildViewItems(events), [events]);
+  // Tool-call/detail visibility preference (shared cache via usePref). Tri-state:
+  //   value === true  → developer view, show tool/file/thinking rows
+  //   value === false → simple chat, hide them
+  //   value === null  → undecided (first run); show by default and surface a
+  //                     one-time chooser banner above the timeline if the
+  //                     user has actually generated developer-detail events.
+  const showToolCallsPref = usePref<boolean>(PREF_KEY_SHOW_TOOL_CALLS, { parse: parseBooleanish });
+  const showToolCalls = showToolCallsPref.value !== false;
+  const showToolCallsUndecided = showToolCallsPref.loaded && showToolCallsPref.value === null;
+  // Only show the chooser banner when the user has events the toggle would
+  // actually affect. If the timeline has no tool/file/memory rows, the
+  // choice is hypothetical and the prompt would be confusing. Mirrors the
+  // exact set the show_tool_calls preference governs in `buildViewItems`.
+  const hasToolEvents = useMemo(
+    () => events.some((e) => TOOL_LIKE_EVENT_TYPES.has(e.type)),
+    [events],
+  );
+  const showFirstTimeChooser = showToolCallsUndecided && hasToolEvents && !preview;
+  const handleChooserPickDeveloper = useCallback(() => {
+    void showToolCallsPref.save(true);
+  }, [showToolCallsPref]);
+  const handleChooserPickSimple = useCallback(() => {
+    void showToolCallsPref.save(false);
+  }, [showToolCallsPref]);
 
-  const scrollToBottom = () => {
+  const viewItems = useMemo(() => buildViewItems(events, showToolCalls), [events, showToolCalls]);
+
+  const markProgrammaticScroll = () => {
+    // Bounded one-shot: skip exactly one upcoming synthetic scroll event.
+    programmaticIgnoreCountRef.current = 1;
+    // Watchdog: if the synthetic event is throttled or never fires, release
+    // the guard after 200ms so legitimate user input never gets swallowed.
+    programmaticIgnoreUntilRef.current = Date.now() + 200;
+  };
+
+  // Pure motion + optional policy. Default `engageFollow=true` preserves the
+  // public contract used by `onScrollBottomFn` parents (SessionPane,
+  // SubSessionWindow), which intentionally call this after the user sends a
+  // message and expect "force jump + re-engage".
+  const scrollToBottom = (engageFollow: boolean = true) => {
     const el = scrollRef.current;
     if (!el) return;
-    autoScrollRef.current = true;
+    if (engageFollow) {
+      autoScrollRef.current = true;
+      newSinceUnfollowRef.current = 0;
+      setNewSinceUnfollow(0);
+    }
     suppressLoadOlder();
+    markProgrammaticScroll();
     el.scrollTop = el.scrollHeight;
     lastScrollTopRef.current = el.scrollTop;
   };
+
+  // (No `followIfEngaged` helper: the two callsites that need it are also
+  // preview-aware, and inlining `if (preview || autoScrollRef.current)`
+  // there reads more clearly than threading preview-awareness through a
+  // helper that would otherwise have to capture the prop.)
 
   // On session change, reset scroll position to bottom
   useEffect(() => {
     autoScrollRef.current = true;
     hasInitialScrolledRef.current = false;
+    newSinceUnfollowRef.current = 0;
+    setNewSinceUnfollow(0);
     setShowScrollBtn(false);
     // Force scroll to bottom on tab switch — the auto-scroll effect may not fire
     // if no new events arrived while this tab was inactive.
-    requestAnimationFrame(() => scrollToBottom());
+    requestAnimationFrame(() => scrollToBottom(true));
   }, [sessionId]);
 
   // On mobile: when keyboard opens, viewport shrinks and scrollTop can reset to 0.
@@ -868,15 +971,33 @@ export function ChatView({ events, loading, refreshing = false, loadingOlder, ha
     if (preview) return;
     if (!hasInitialScrolledRef.current && lastVisibleTs > 0) {
       hasInitialScrolledRef.current = true;
-      scrollToBottom();
+      // Use the non-engaging variant. autoScrollRef is initialised to true,
+      // so on the genuine first mount this still scrolls. On rerenders that
+      // happen while the user has scrolled away (autoScrollRef=false), the
+      // session-change effect's reset of hasInitialScrolledRef can cause
+      // this branch to re-fire when lastVisibleTs next advances; in that
+      // window we MUST NOT engage follow because the user did not request
+      // it. The session-change effect itself already schedules an explicit
+      // force-jump rAF so the genuine session-switch case still re-engages.
+      if (autoScrollRef.current) scrollToBottom(false);
     }
   }, [lastVisibleTs]);
 
-  // Any visible content update should force-follow to the latest message.
+  // Any visible content update should follow IFF the user is currently
+  // engaged with auto-follow. Preview mode keeps its existing "always follow"
+  // contract because it is a tiny live monitor, not a reading surface.
   // Skip while prepending older history so anchor restoration can preserve position.
   useLayoutEffect(() => {
     if (loadingOlder || scrollAnchorRef.current) return;
-    scrollToBottom();
+    const shouldFollow = preview || autoScrollRef.current;
+    if (!shouldFollow) {
+      // User is reading older content; do not yank the viewport. Surface the
+      // arrival via the unread counter on the "↓" affordance.
+      newSinceUnfollowRef.current += 1;
+      setNewSinceUnfollow(newSinceUnfollowRef.current);
+      return;
+    }
+    scrollToBottom(false);
   }, [preview, viewItems, loading, loadingOlder]);
 
   // Restore scroll position after Load Older prepends events
@@ -897,12 +1018,22 @@ export function ChatView({ events, loading, refreshing = false, loadingOlder, ha
     prevVisibleTsRef.current = lastVisibleTs;
     if (!changed && !preview) return;
     requestAnimationFrame(() => {
-      scrollToBottom();
+      // Re-check inside the rAF callback so a state flip during the frame
+      // window (e.g. a user scroll-up that lands between schedule and fire)
+      // is honoured. Preview always follows by design.
+      if (preview || autoScrollRef.current) scrollToBottom(false);
     });
   }, [lastVisibleTs, preview]);
 
   const lastScrollActivityRef = useRef(Date.now());
-  const SCROLL_IDLE_RESUME_MS = 60_000;
+  // (Previously SCROLL_IDLE_RESUME_MS = 60_000 drove a setInterval that
+  // unilaterally re-engaged auto-follow + snapped to bottom 60s after the
+  // last scroll activity. That interval has been removed because it was
+  // exactly the "auto-update fights scroll experience" complaint that
+  // motivated this fix. Re-engagement now happens only via explicit user
+  // intent: scrolling back near the bottom (`reengageThreshold`), clicking
+  // the "↓" button, pressing the End key, switching sessions, or sending a
+  // new message.)
 
   // Scroll auto-trigger for Load Older
   const lastLoadOlderAtRef = useRef(0);
@@ -913,6 +1044,20 @@ export function ChatView({ events, loading, refreshing = false, loadingOlder, ha
   const handleScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
+    // Programmatic-scroll guard: if a recent `scrollToBottom(...)` call
+    // marked an upcoming synthetic event AND the resulting scrollTop is
+    // actually at the bottom (i.e. our write succeeded), swallow exactly
+    // one event. Position-aware so iOS layout shifts that reset scrollTop
+    // to 0 still reach the transient-top-jump recovery branch below.
+    if (
+      programmaticIgnoreCountRef.current > 0
+      && Date.now() < programmaticIgnoreUntilRef.current
+      && el.scrollHeight - el.scrollTop - el.clientHeight < 50
+    ) {
+      programmaticIgnoreCountRef.current -= 1;
+      return;
+    }
+    programmaticIgnoreCountRef.current = 0;
     const scrollTop = el.scrollTop;
     const scrollHeight = el.scrollHeight;
     const clientHeight = el.clientHeight;
@@ -923,14 +1068,28 @@ export function ChatView({ events, loading, refreshing = false, loadingOlder, ha
       && Date.now() < suppressLoadOlderUntilRef.current;
     if (transientTopJump) {
       setShowScrollBtn(false);
-      requestAnimationFrame(() => scrollToBottom());
+      requestAnimationFrame(() => scrollToBottom(true));
       return;
     }
-    // Use generous threshold — 150px from bottom still counts as "at bottom"
-    const atBottom = scrollHeight - scrollTop - clientHeight < 150;
-    autoScrollRef.current = atBottom;
-    setShowScrollBtn(!atBottom);
-    if (!atBottom) lastScrollActivityRef.current = Date.now();
+    // Adaptive + hysteresis thresholds. Avoid flicker around the boundary
+    // (one threshold flapping during streaming layout) and avoid mobile
+    // over-engagement (a flat 150 px swallows ~42 % of a 360 px landscape
+    // viewport but only 14 % of a 1080 px desktop pane).
+    const distance = scrollHeight - scrollTop - clientHeight;
+    const disengageThreshold = Math.max(180, Math.round(0.25 * clientHeight));
+    const reengageThreshold = Math.max(60, Math.round(0.10 * clientHeight));
+    if (wasAutoFollowing && distance > disengageThreshold) {
+      autoScrollRef.current = false;
+      // Reset count so it starts fresh from this pause
+      newSinceUnfollowRef.current = 0;
+      setNewSinceUnfollow(0);
+    } else if (!wasAutoFollowing && distance < reengageThreshold) {
+      autoScrollRef.current = true;
+      newSinceUnfollowRef.current = 0;
+      setNewSinceUnfollow(0);
+    }
+    setShowScrollBtn(!autoScrollRef.current);
+    if (!autoScrollRef.current) lastScrollActivityRef.current = Date.now();
     lastScrollTopRef.current = scrollTop;
     // Auto-trigger load older when scrolled near top
     if (scrollTop < 100 && onLoadOlder && hasOlderHistory && !loadingOlder && !loading) {
@@ -943,18 +1102,8 @@ export function ChatView({ events, loading, refreshing = false, loadingOlder, ha
     }
   };
 
-  // Resume auto-scroll after 1 min of scroll inactivity
-  useEffect(() => {
-    if (!showScrollBtn || preview) return;
-    const timer = setInterval(() => {
-      if (!autoScrollRef.current && Date.now() - lastScrollActivityRef.current >= SCROLL_IDLE_RESUME_MS) {
-        autoScrollRef.current = true;
-        setShowScrollBtn(false);
-        scrollToBottom();
-      }
-    }, 10_000);
-    return () => clearInterval(timer);
-  }, [showScrollBtn, preview]);
+  // (Removed: the 60-s idle-resume timer. See the comment near
+  // `lastScrollActivityRef` above for rationale.)
 
   // Keep the active chat pinned to bottom when layout changes reduce available height
   // (for example, when the sub-session bar appears after tab switch).
@@ -1090,6 +1239,27 @@ export function ChatView({ events, loading, refreshing = false, loadingOlder, ha
   }, [isTouchDevice, preview, openCtxMenu]);
 
   const canShowFilePanel = !preview && !!ws;
+  const historySteps = useMemo(() => {
+    if (!historyStatus || historyStatus.phase === 'idle') return [];
+    const order: TimelineHistoryStepKey[] = ['cache', 'textTail', 'daemon', 'http', 'older'];
+    return order
+      .map((key) => ({ key, state: historyStatus.steps[key] }))
+      .filter((step) => step.state !== 'skipped')
+      .map((step) => ({
+        ...step,
+        label: step.key === 'cache'
+          ? t('session.history_step_cache')
+          : step.key === 'textTail'
+            ? t('session.history_step_text_tail')
+            : step.key === 'daemon'
+              ? t('session.history_step_daemon')
+              : step.key === 'http'
+                ? t('session.history_step_http')
+                : t('session.history_step_older'),
+      }));
+  }, [historyStatus, t]);
+  const showHistoryProgress = !preview && historySteps.some((step) => step.state === 'pending' || step.state === 'running');
+  const showRefreshOverlay = !preview && (showHistoryProgress || refreshing);
 
   return (
     <div class={`chat-view-wrap${canShowFilePanel && showFilePanel ? ' chat-split' : ''}`}>
@@ -1103,13 +1273,28 @@ export function ChatView({ events, loading, refreshing = false, loadingOlder, ha
         </button>
       )}
       <div class="chat-main">
-        {!preview && refreshing && (
+        {showRefreshOverlay && (
           <div
-            class="chat-refreshing"
+            class={`chat-history-overlay${showHistoryProgress ? ' has-steps' : ''}`}
             aria-label={t('chat.refreshing_history', 'Updating history')}
             title={t('chat.refreshing_history', 'Updating history')}
           >
             <span class="chat-refreshing-spinner" aria-hidden="true" />
+            {showHistoryProgress && (
+              <>
+                <span class="chat-history-overlay-label">{t('session.history_loading_label')}</span>
+                <span class="chat-history-overlay-steps">
+                  {historySteps.map((step) => (
+                    <span key={step.key} class={`chat-history-step ${step.state}`}>
+                      <span class="chat-history-step-icon" aria-hidden="true">
+                        {step.state === 'done' ? '✓' : step.state === 'running' ? '…' : '○'}
+                      </span>
+                      {step.label}
+                    </span>
+                  ))}
+                </span>
+              </>
+            )}
           </div>
         )}
         {pinnedAboveViewport && lastSentUserMessage && (
@@ -1126,7 +1311,17 @@ export function ChatView({ events, loading, refreshing = false, loadingOlder, ha
               const root = scrollRef.current;
               if (!root) return;
               const target = findEventElement(root, lastSentUserMessage.eventId);
-              if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+              if (target) {
+                // Respect the OS reduced-motion preference — smooth scrolling
+                // is a vestibular-trigger axis for some users.
+                const reducedMotion = typeof window !== 'undefined'
+                  && window.matchMedia
+                  && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+                target.scrollIntoView({
+                  behavior: reducedMotion ? 'auto' : 'smooth',
+                  block: 'center',
+                });
+              }
             }}
           >
             <span class="chat-pinned-last-sent-label">{t('chat.pinned_last_sent_label', 'Last sent')}</span>
@@ -1134,6 +1329,16 @@ export function ChatView({ events, loading, refreshing = false, loadingOlder, ha
           </div>
         )}
         <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} onScroll={preview ? undefined : handleScroll}
+          // Keyboard parity for the floating "↓" button: End force-engages
+          // follow and jumps to bottom. tabIndex={-1} keeps it scriptable
+          // without inserting it into the natural tab order.
+          tabIndex={preview ? undefined : -1}
+          onKeyDown={preview ? undefined : (e: KeyboardEvent) => {
+            if (e.key === 'End') {
+              e.preventDefault();
+              scrollToBottom(true);
+            }
+          }}
           onContextMenu={!preview && !isTouchDevice ? handleContextMenu : undefined}
           onClick={(highlightEl || ctxMenu) ? () => {
             // Ignore synthetic click from long-press release (within 400ms of menu opening)
@@ -1149,6 +1354,42 @@ export function ChatView({ events, loading, refreshing = false, loadingOlder, ha
               {sessionState ? t('chat.session_state', { state: sessionState }) : t('chat.no_events')}
             </div>
           ) : null}
+          {/* First-time tool-call view chooser. Renders only when the user
+           *  has never picked AND the current timeline has tool events to
+           *  toggle. Picking either button writes the show_tool_calls
+           *  preference and removes the banner from every subscribed view
+           *  (same-tab fan-out via SharedResource). */}
+          {showFirstTimeChooser && (
+            <div
+              class="chat-tool-chooser"
+              role="region"
+              aria-label={t('chat.tool_chooser_title')}
+            >
+              <div class="chat-tool-chooser-title">{t('chat.tool_chooser_title')}</div>
+              <div class="chat-tool-chooser-subtitle">{t('chat.tool_chooser_subtitle')}</div>
+              <div class="chat-tool-chooser-actions">
+                <button
+                  type="button"
+                  class="chat-tool-chooser-btn chat-tool-chooser-btn-simple"
+                  onClick={handleChooserPickSimple}
+                >
+                  <span class="chat-tool-chooser-btn-icon" aria-hidden="true">💬</span>
+                  <span class="chat-tool-chooser-btn-label">{t('chat.tool_chooser_simple_label')}</span>
+                  <span class="chat-tool-chooser-btn-hint">{t('chat.tool_chooser_simple_hint')}</span>
+                </button>
+                <button
+                  type="button"
+                  class="chat-tool-chooser-btn chat-tool-chooser-btn-developer"
+                  onClick={handleChooserPickDeveloper}
+                >
+                  <span class="chat-tool-chooser-btn-icon" aria-hidden="true">🛠</span>
+                  <span class="chat-tool-chooser-btn-label">{t('chat.tool_chooser_developer_label')}</span>
+                  <span class="chat-tool-chooser-btn-hint">{t('chat.tool_chooser_developer_hint')}</span>
+                </button>
+              </div>
+              <div class="chat-tool-chooser-footnote">{t('chat.tool_chooser_footnote')}</div>
+            </div>
+          )}
           {!loading && !preview && onLoadOlder && viewItems.length > 0 && hasOlderHistory && (
             <div style={{ textAlign: 'center', padding: '8px 0' }}>
               <button
@@ -1165,9 +1406,7 @@ export function ChatView({ events, loading, refreshing = false, loadingOlder, ha
               </button>
             </div>
           )}
-          {!loading && viewItems.map((item, idx) => {
-            const nextItem = viewItems[idx + 1];
-            const nextTs = nextItem?.ts ?? nextItem?.event?.ts;
+          {!loading && viewItems.map((item) => {
             if (item.type === 'assistant-block') {
               return (
                 <AssistantBlock
@@ -1186,11 +1425,11 @@ export function ChatView({ events, loading, refreshing = false, loadingOlder, ha
             }
             const linkedEvents = item.linkedEvents ?? [];
             if (linkedEvents.length === 0) {
-              return <ChatEvent key={item.key} event={item.event!} nextTs={nextTs} onPathClick={pathClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />;
+              return <ChatEvent key={item.key} event={item.event!} onPathClick={pathClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />;
             }
             return (
               <div key={item.key} class="chat-linked-event-group">
-                <ChatEvent event={item.event!} nextTs={nextTs} onPathClick={pathClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />
+                <ChatEvent event={item.event!} onPathClick={pathClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />
                 {linkedEvents.map((linkedEvent) => (
                   <ChatEvent
                     key={linkedEvent.eventId}
@@ -1211,12 +1450,16 @@ export function ChatView({ events, loading, refreshing = false, loadingOlder, ha
           <button
             class="chat-scroll-btn"
             onClick={() => {
-              autoScrollRef.current = true;
               setShowScrollBtn(false);
-              scrollToBottom();
+              scrollToBottom(true);
             }}
+            aria-label={
+              newSinceUnfollow > 0
+                ? `Jump to bottom (${newSinceUnfollow} new)`
+                : 'Jump to bottom'
+            }
           >
-            ↓
+            ↓{newSinceUnfollow > 0 ? ` ${newSinceUnfollow}` : ''}
           </button>
         )}
         {selMenu && !preview && (
@@ -1528,7 +1771,6 @@ function AttachmentDownloadButton({ att, serverId, onPathClick }: { att: { id: s
 
 const ChatEvent = memo(function ChatEvent({
   event,
-  nextTs,
   onPathClick,
   onFileChangeOpen,
   onDownload,
@@ -1537,7 +1779,6 @@ const ChatEvent = memo(function ChatEvent({
   showTime,
 }: {
   event: TimelineEvent;
-  nextTs?: number;
   onPathClick?: (p: string) => void;
   onFileChangeOpen?: (path: string, preferDiff?: boolean) => void;
   onDownload?: (path: string) => void;
@@ -1696,7 +1937,11 @@ const ChatEvent = memo(function ChatEvent({
     }
 
     case 'assistant.thinking':
-      return <ThinkingEvent event={event} endTs={nextTs} />;
+      // Per user preference: thinking events are hidden entirely from the
+      // timeline (both the live "thinking…" indicator and the finished
+      // "Thought for Xs" summary). The agent's running state and the memory
+      // context card already give enough signal that work is happening.
+      return null;
 
     case 'memory.context':
       return <MemoryContextEvent event={event} />;
@@ -1974,37 +2219,6 @@ function CoarseFilePatch({ patch }: { patch: FileChangePatch }) {
     </div>
   );
 }
-
-function ActiveThinkingLabel({ startTs }: { startTs: number }) {
-  const { t } = useTranslation();
-  const now = useNowTicker(true);
-  const sec = Math.max(0, Math.round((now - startTs) / 1000));
-  return <>{t('chat.thinking_running', { sec })}</>;
-}
-
-const ThinkingEvent = memo(function ThinkingEvent({ event, endTs }: { event: TimelineEvent; endTs?: number }) {
-  const { t } = useTranslation();
-  const [expanded, setExpanded] = useState(false);
-  const isActive = endTs === undefined;
-
-  const text = String(event.payload.text ?? '');
-  const preview = text.length > 100 ? text.slice(0, 100) + '…' : text;
-  const hasText = text.length > 0;
-
-  return (
-    <div class={`chat-event chat-thinking${isActive ? ' thinking-active' : ''}`}>
-      <button class={`chat-thinking-toggle${hasText ? '' : ' no-text'}`} onClick={hasText ? () => setExpanded(!expanded) : undefined}>
-        <span class={`chat-thinking-dot${isActive ? '' : ' done'}`}>{isActive ? '◌' : '~'}</span>
-        <span class="chat-thinking-label">
-          {isActive
-            ? <ActiveThinkingLabel startTs={event.ts ?? Date.now()} />
-            : t('chat.thinking_done', { sec: Math.max(0, Math.round((endTs - (event.ts ?? endTs)) / 1000)) })}
-        </span>
-        {hasText && <span class="chat-thinking-text">{expanded ? text : preview}</span>}
-      </button>
-    </div>
-  );
-});
 
 const MemoryContextEvent = memo(function MemoryContextEvent({ event }: { event: TimelineEvent }) {
   const { t } = useTranslation();

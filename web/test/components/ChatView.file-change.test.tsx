@@ -58,6 +58,22 @@ vi.mock('../../src/components/FloatingPanel.js', () => ({
 vi.mock('../../src/components/ChatMarkdown.js', () => ({
   ChatMarkdown: ({ text }: { text: string }) => <div>{text}</div>,
 }));
+// See ChatView.test.tsx for the rationale — opt this suite into the
+// "developer" branch of the show_tool_calls preference.
+vi.mock('../../src/hooks/usePref.js', () => ({
+  parseBooleanish: (raw: unknown) => (raw === true || raw === 'true' ? true : raw === false || raw === 'false' ? false : null),
+  usePref: () => ({
+    value: true,
+    rawValue: true,
+    loaded: true,
+    loading: false,
+    stale: false,
+    error: null,
+    save: async () => undefined,
+    set: () => undefined,
+    reload: async () => true,
+  }),
+}));
 
 import { ChatView } from '../../src/components/ChatView.js';
 

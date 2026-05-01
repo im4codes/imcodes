@@ -8,6 +8,7 @@ import {
   MSG_DAEMON_OFFLINE,
   RECONNECT_GRACE_MS,
   ACK_TIMEOUT_MS,
+  ACK_TIMEOUT_RETRY_LIMIT,
 } from '../../shared/ack-protocol.js';
 
 class MockWs extends EventEmitter {
@@ -119,6 +120,32 @@ describe('WsBridge — command ack reliability', () => {
     expect(bridge._getInflightCountForTest()).toBe(1);
   });
 
+  it('does not forward an in-flight duplicate commandId to the daemon', async () => {
+    const bridge = WsBridge.get(serverId);
+    const daemonWs = await connectAndAuthenticateDaemon(bridge, serverId);
+    const browser = addBrowserSubscriber(bridge, 'deck_test_brain');
+
+    browser.emit('message', Buffer.from(JSON.stringify({
+      type: 'session.send',
+      sessionName: 'deck_test_brain',
+      text: 'hi',
+      commandId: 'C1-INFLIGHT-DUP',
+    })));
+    browser.emit('message', Buffer.from(JSON.stringify({
+      type: 'session.send',
+      sessionName: 'deck_test_brain',
+      text: 'hi again',
+      commandId: 'C1-INFLIGHT-DUP',
+    })));
+    await flushAsync();
+
+    const forwarded = daemonWs.sentByType('session.send')
+      .filter((msg) => msg.commandId === 'C1-INFLIGHT-DUP');
+    expect(forwarded).toHaveLength(1);
+    expect(forwarded[0].text).toBe('hi');
+    expect(bridge._getInflightCountForTest()).toBe(1);
+  });
+
   it('clears inflight and dedups replayed ack via seenCommandAcks', async () => {
     const bridge = WsBridge.get(serverId);
     const daemonWs = await connectAndAuthenticateDaemon(bridge, serverId);
@@ -220,10 +247,10 @@ describe('WsBridge — command ack reliability', () => {
     expect(bridge._getInflightCountForTest()).toBe(0);
   });
 
-  it('ack timeout fires command.failed ack_timeout when daemon stays silent', async () => {
+  it('ack timeout retries session.send before command.failed ack_timeout when daemon stays silent', async () => {
     vi.useFakeTimers();
     const bridge = WsBridge.get(serverId);
-    await connectAndAuthenticateDaemon(bridge, serverId);
+    const daemonWs = await connectAndAuthenticateDaemon(bridge, serverId);
     const browser = addBrowserSubscriber(bridge, 'deck_test_brain');
 
     browser.emit('message', Buffer.from(JSON.stringify({
@@ -234,6 +261,16 @@ describe('WsBridge — command ack reliability', () => {
     })));
     await flushAsync();
 
+    for (let attempt = 1; attempt <= ACK_TIMEOUT_RETRY_LIMIT; attempt++) {
+      vi.advanceTimersByTime(ACK_TIMEOUT_MS + 100);
+      await flushAsync();
+      const forwarded = daemonWs.sentByType('session.send').filter((msg) => msg.commandId === 'C4');
+      expect(forwarded).toHaveLength(attempt + 1);
+      expect(forwarded[attempt].__bridgeRetry).toBe(true);
+      expect(forwarded[attempt].__bridgeRetryAttempt).toBe(attempt + 1);
+      expect(browser.sentByType(MSG_COMMAND_FAILED)).toHaveLength(0);
+    }
+
     vi.advanceTimersByTime(ACK_TIMEOUT_MS + 100);
     await flushAsync();
 
@@ -241,6 +278,52 @@ describe('WsBridge — command ack reliability', () => {
     expect(failed.length).toBe(1);
     expect(failed[0].commandId).toBe('C4');
     expect(failed[0].reason).toBe('ack_timeout');
+  });
+
+  it('authoritative user.message echo clears ack timeout even if command.ack is late', async () => {
+    vi.useFakeTimers();
+    const bridge = WsBridge.get(serverId);
+    const daemonWs = await connectAndAuthenticateDaemon(bridge, serverId);
+    const browser = addBrowserSubscriber(bridge, 'deck_test_brain');
+
+    browser.emit('message', Buffer.from(JSON.stringify({
+      type: 'session.send',
+      sessionName: 'deck_test_brain',
+      text: 'hi',
+      commandId: 'C4-echo',
+    })));
+    await flushAsync();
+    expect(bridge._getInflightCountForTest()).toBe(1);
+
+    daemonWs.emit('message', Buffer.from(JSON.stringify({
+      type: 'timeline.event',
+      event: {
+        eventId: 'evt-user-c4-echo',
+        sessionId: 'deck_test_brain',
+        type: 'user.message',
+        ts: Date.now(),
+        seq: 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        payload: { text: 'hi', commandId: 'C4-echo' },
+      },
+    })));
+    await flushAsync();
+    expect(bridge._getInflightCountForTest()).toBe(0);
+
+    vi.advanceTimersByTime(ACK_TIMEOUT_MS + 100);
+    await flushAsync();
+    expect(browser.sentByType(MSG_COMMAND_FAILED)).toHaveLength(0);
+
+    daemonWs.emit('message', Buffer.from(JSON.stringify({
+      type: MSG_COMMAND_ACK,
+      commandId: 'C4-echo',
+      status: 'accepted',
+      session: 'deck_test_brain',
+    })));
+    await flushAsync();
+    expect(bridge._hasSeenAckForTest('C4-echo')).toBe(true);
   });
 
   it('send while daemon is fully offline (past grace) fails immediately', async () => {
@@ -268,6 +351,63 @@ describe('WsBridge — command ack reliability', () => {
     const failed = browser.sentByType(MSG_COMMAND_FAILED);
     expect(failed.some((m) => m.commandId === 'C5' && m.reason === 'daemon_offline')).toBe(true);
     expect(bridge._getInflightCountForTest()).toBe(0);
+  });
+
+  it('after grace expiry: buffers sends arriving during the daemon auth handshake (no fast-fail)', async () => {
+    // Repro for "发消息瞬间失败, 连点 retry n 次才成功":
+    //   1. daemon disconnects, RECONNECT_GRACE_MS expires → daemon_offline announced
+    //   2. daemon reconnects (WS open) but auth handshake hasn't completed yet
+    //   3. user sends a message in this brief window
+    //   Previously: handleOutboundSessionSend saw isDaemonConnected()=false
+    //   AND graceTimer=null (cleared on grace expiry) → instant command.failed
+    //   Now: the handshake-in-progress branch buffers the message and
+    //   replays it via replayInflightToDaemon() once auth completes.
+    vi.useFakeTimers();
+    const bridge = WsBridge.get(serverId);
+    const daemonWs = await connectAndAuthenticateDaemon(bridge, serverId);
+    const browser = addBrowserSubscriber(bridge, 'deck_test_brain');
+
+    daemonWs.close();
+    await flushAsync();
+    vi.advanceTimersByTime(RECONNECT_GRACE_MS + 100);
+    await flushAsync();
+    vi.useRealTimers();
+
+    expect(bridge._isDaemonOfflineAnnouncedForTest()).toBe(true);
+
+    // Daemon WS reopens but auth message has NOT been sent yet
+    const daemonWs2 = new MockWs();
+    bridge.handleDaemonConnection(daemonWs2 as never, makeDb('valid-hash') as never, {} as never);
+    await flushAsync();
+
+    // Browser sends in the auth-handshake window
+    browser.emit('message', Buffer.from(JSON.stringify({
+      type: 'session.send',
+      sessionName: 'deck_test_brain',
+      text: 'hi during handshake',
+      commandId: 'C-HANDSHAKE',
+    })));
+    await flushAsync();
+
+    // Should NOT have been instant-failed
+    const failedDuringHandshake = browser.sentByType(MSG_COMMAND_FAILED)
+      .filter((m) => m.commandId === 'C-HANDSHAKE');
+    expect(failedDuringHandshake).toHaveLength(0);
+    expect(bridge._getInflightCountForTest()).toBe(1);
+
+    // Should NOT have been forwarded to the daemon yet (still buffered)
+    const beforeAuth = daemonWs2.sentByType('session.send')
+      .filter((m) => m.commandId === 'C-HANDSHAKE');
+    expect(beforeAuth).toHaveLength(0);
+
+    // Now complete auth handshake — the buffered message should replay
+    daemonWs2.emit('message', Buffer.from(JSON.stringify({ type: 'auth', serverId, token: 't' })));
+    await flushAsync();
+
+    const afterAuth = daemonWs2.sentByType('session.send')
+      .filter((m) => m.commandId === 'C-HANDSHAKE');
+    expect(afterAuth).toHaveLength(1);
+    expect(afterAuth[0].text).toBe('hi during handshake');
   });
 
   it('daemon.online broadcast fires on first auth and on reconnect', async () => {

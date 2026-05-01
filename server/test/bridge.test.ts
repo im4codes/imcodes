@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { WsBridge } from '../src/ws/bridge.js';
 import * as dbQueries from '../src/db/queries.js';
+import { PUSH_TIMELINE_EVENT_MAX_AGE_MS, TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 
 // ── Mock WebSocket ─────────────────────────────────────────────────────────────
 
@@ -320,19 +321,33 @@ describe('WsBridge', () => {
       expect(daemonWs.sent).toHaveLength(0);
     });
 
-    it('drops with error after rate limit exceeded', async () => {
+    it('forwards every message when BROWSER_RATE_LIMIT_ENABLED is off (current default)', async () => {
+      // The browser-side rate limiter is currently DISABLED by feature flag
+      // (BROWSER_RATE_LIMIT_ENABLED in server/src/ws/bridge.ts). Reasoning is
+      // documented at the constant: a desktop tab with pinned panels +
+      // multi-session reconnects fires 60–300 messages within ~2 s, blowing
+      // through the 300 / 10s window during normal init bursts. Dropped
+      // `session.send` messages then surface as instant `command.failed`,
+      // turning the optimistic bubble red within milliseconds — the wall-of-
+      // `rate_limited` symptom. Until the burst is reduced at source
+      // (coalescing fs.git_status / repo.detect, debouncing subscribe
+      // replays), the limiter stays off.
+      //
+      // This test asserts the disabled behaviour: 1000 messages all forward
+      // and no `rate_limited` error is ever emitted. Flip the flag back on
+      // and revert this test (see git log) when the burst-source fix lands.
       const { daemonWs, browserWs } = await setupBridge();
-      for (let i = 0; i < 120; i++) {
+      for (let i = 0; i < 1000; i++) {
         browserWs.emit('message', JSON.stringify({ type: 'get_sessions' }));
       }
-      const countBefore = daemonWs.sent.length;
-      browserWs.emit('message', JSON.stringify({ type: 'get_sessions' }));
-      // Message not forwarded to daemon
-      expect(daemonWs.sent.length).toBe(countBefore);
-      // Error sent back to browser
-      const lastBrowserMsg = JSON.parse(browserWs.sent[browserWs.sent.length - 1] as string);
-      expect(lastBrowserMsg.type).toBe('error');
-      expect(lastBrowserMsg.code).toBe('rate_limited');
+      // Every message reaches the daemon (the bridge serialises `get_sessions`
+      // into `daemon.get_sessions` so length matches input count).
+      expect(daemonWs.sent.length).toBeGreaterThanOrEqual(1000);
+      // No browser ever received a `rate_limited` error.
+      const rateLimitedHits = browserWs.sent
+        .map((s) => { try { return JSON.parse(s as string); } catch { return null; } })
+        .filter((m) => m && m.type === 'error' && m.code === 'rate_limited');
+      expect(rateLimitedHits).toHaveLength(0);
     });
   });
 
@@ -605,6 +620,129 @@ describe('WsBridge', () => {
       // All 600 frames should have been forwarded as binary
       const binaryFrames = browserWs.sent.filter((s) => Buffer.isBuffer(s));
       expect(binaryFrames).toHaveLength(600);
+    });
+  });
+
+  // ── Backpressure overflow keeps subscription alive ────────────────────────
+  //
+  // Regression: previously `handleQueueOverflow` called
+  // `removeBrowserSessionSubscription` on every overflow. Heavy shell output
+  // (or a slow browser socket) created a churn cycle:
+  //   stdout flood → 1MB queue → overflow → server unsubscribes → daemon
+  //   stops pipe-pane → client receives stream_reset → re-subscribes → daemon
+  //   restarts pipe → flood begins again → overflow again …
+  // Each cycle the client's `resetState` count climbed; once cooldown engaged
+  // the terminal sat frozen until the user manually refreshed. The fix keeps
+  // the subscription alive across overflow and only resets the per-(session,
+  // ws) queue's accounting state. Tests below lock in that behavior.
+
+  describe('backpressure overflow keeps subscription alive (no churn)', () => {
+    /**
+     * Simulate a slow / blocked browser socket: ws.send NEVER fires its
+     * delivery callback, so `bufferedBytes` accumulates monotonically until
+     * QUEUE_MAX_BYTES is exceeded. This is the realistic shape of a browser
+     * that's stalled (tab backgrounded on mobile, transient backpressure on
+     * the underlying TCP, etc.).
+     */
+    class StallingMockWs extends MockWs {
+      override send(data: string | Buffer, _opts?: unknown, _callback?: (err?: Error) => void): void {
+        if (this.closed) return;
+        // Record the send but DO NOT invoke the callback — bufferedBytes
+        // never gets reclaimed, eventually triggering overflow.
+        this.sent.push(data);
+      }
+    }
+
+    it('on overflow: sends terminal.stream_reset to browser but does NOT send terminal.unsubscribe to daemon', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+
+      const browserWs = new StallingMockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sessOverflow' }));
+      await flushAsync();
+      // Drain the initial subscribe forwarded to the daemon so we can assert
+      // on what arrives AFTER overflow.
+      daemonWs.sent.length = 0;
+
+      // Push >4 MB of binary frame data (well past 4 MB QUEUE_MAX_BYTES).
+      // Because StallingMockWs never calls the send callback, bufferedBytes
+      // monotonically climbs until overflow fires.
+      const chunk = Buffer.alloc(64 * 1024, 0x42); // 64 KB per frame
+      const frame = packFrame('sessOverflow', chunk);
+      for (let i = 0; i < 80; i++) {
+        daemonWs.emit('message', frame, true);
+      }
+      await flushAsync();
+
+      // Browser must have received exactly one stream_reset (overflow signal).
+      const resets = browserWs.sentStrings
+        .map((s) => { try { return JSON.parse(s) as Record<string, unknown>; } catch { return null; } })
+        .filter((m): m is Record<string, unknown> => m?.type === 'terminal.stream_reset' && m.session === 'sessOverflow');
+      expect(resets.length).toBeGreaterThanOrEqual(1);
+      expect(resets[0]?.reason).toBe('backpressure');
+
+      // Daemon must NOT have received terminal.unsubscribe — subscription
+      // stays alive across the overflow event.
+      const unsubs = daemonWs.sentStrings
+        .map((s) => { try { return JSON.parse(s) as Record<string, unknown>; } catch { return null; } })
+        .filter((m): m is Record<string, unknown> => m?.type === 'terminal.unsubscribe' && m.session === 'sessOverflow');
+      expect(unsubs).toHaveLength(0);
+
+      // The bridge's internal subscription bookkeeping still has this
+      // session at refs.totalRefs >= 1 (browser is still considered a
+      // subscriber). Verifying through behavior: send a small frame from
+      // the daemon and confirm a fresh queue forwards it without another
+      // overflow event firing.
+      const followupBrowser = new MockWs();
+      bridge.handleBrowserConnection(followupBrowser as never, 'test-user', makeDb('valid-hash'));
+      followupBrowser.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sessOverflow' }));
+      await flushAsync();
+
+      const smallFrame = packFrame('sessOverflow', Buffer.alloc(64, 0x43));
+      daemonWs.emit('message', smallFrame, true);
+      await flushAsync();
+      const followupBinary = followupBrowser.sent.filter((s) => Buffer.isBuffer(s));
+      expect(followupBinary.length).toBeGreaterThanOrEqual(1);
+
+      // Bridge ref-count for the session is still >= 1 (the stalled browser
+      // remained subscribed; followupBrowser added a second ref). No
+      // terminal.unsubscribe sent at any point in this scenario.
+      const allUnsubsAfter = daemonWs.sentStrings
+        .map((s) => { try { return JSON.parse(s) as Record<string, unknown>; } catch { return null; } })
+        .filter((m): m is Record<string, unknown> => m?.type === 'terminal.unsubscribe' && m.session === 'sessOverflow');
+      expect(allUnsubsAfter).toHaveLength(0);
+    });
+
+    it('post-overflow: a fresh queue accepts new sends to the same browser', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+
+      // Use a non-stalling browser this time. Force overflow by sending a
+      // single >4 MB frame in one shot (the queue checks size before
+      // dispatching to ws.send, so this directly exceeds QUEUE_MAX_BYTES).
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sessFreshQueue' }));
+      await flushAsync();
+      browserWs.sent.length = 0;
+
+      const huge = Buffer.alloc(4 * 1024 * 1024 + 100, 0x44); // > 4 MB
+      const hugeFrame = packFrame('sessFreshQueue', huge);
+      daemonWs.emit('message', hugeFrame, true);
+      await flushAsync();
+
+      const resets = browserWs.sentStrings.filter((s) => s.includes('"terminal.stream_reset"'));
+      expect(resets.length).toBeGreaterThanOrEqual(1);
+
+      // After overflow: subsequent normal-sized frame should still flow.
+      // (Queue was reset, subscription is intact.)
+      const normalFrame = packFrame('sessFreshQueue', Buffer.alloc(64, 0x45));
+      daemonWs.emit('message', normalFrame, true);
+      await flushAsync();
+
+      const binarySent = browserWs.sent.filter((s) => Buffer.isBuffer(s));
+      // The huge frame was DROPPED at overflow detection (never sent), but
+      // the normal-sized one MUST flow because subscription is still alive.
+      expect(binarySent.length).toBeGreaterThanOrEqual(1);
     });
   });
 
@@ -1771,6 +1909,44 @@ describe('WsBridge', () => {
       const payload = vi.mocked(dispatchPush).mock.calls.at(-1)?.[0];
       expect(payload?.title).toBe('my-server · Worker Timeline · codex');
       expect(payload?.title).not.toContain('deck_sub_timeline-worker');
+    });
+
+    it('does not push stale timeline idle events replayed on daemon restart', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          sessionId: 'deck_cd_brain',
+          eventId: 'evt-stale-idle',
+          ts: Date.now() - PUSH_TIMELINE_EVENT_MAX_AGE_MS - 1_000,
+          type: 'session.state',
+          payload: { state: 'idle' },
+        },
+      }));
+      await flushAsync();
+
+      expect(dispatchPush).not.toHaveBeenCalled();
+    });
+
+    it('does not push timeline idle events explicitly marked as restore-only', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          sessionId: 'deck_cd_brain',
+          eventId: 'evt-restore-idle',
+          ts: Date.now(),
+          type: 'session.state',
+          payload: { state: 'idle', [TIMELINE_SUPPRESS_PUSH_FIELD]: true },
+        },
+      }));
+      await flushAsync();
+
+      expect(dispatchPush).not.toHaveBeenCalled();
     });
 
     it('uses lastText as push body for session.idle', async () => {

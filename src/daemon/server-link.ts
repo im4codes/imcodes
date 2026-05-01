@@ -5,16 +5,42 @@ import { DAEMON_VERSION } from '../util/version.js';
 import { setTransportRelaySend } from './transport-relay.js';
 import { setProviderRegistryServerLink } from '../agent/provider-registry.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
+import { getEmbeddingStatus } from '../context/embedding.js';
+import type { EmbeddingStatus } from '../../shared/embedding-status.js';
+
+interface SystemStats {
+  cpu: number;
+  memUsed: number;
+  memTotal: number;
+  load1: number;
+  load5: number;
+  load15: number;
+  uptime: number;
+  /** Embedding pipeline + server-fallback liveness for status-bar display.
+   *  Carried in every heartbeat / daemon.stats so the UI tooltip never
+   *  goes stale across reconnects. See `getEmbeddingStatus` for state
+   *  semantics. */
+  embedding: EmbeddingStatus;
+}
 
 /** Collect lightweight system stats for daemon.stats messages. */
-function collectSystemStats(): { cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number } {
+function collectSystemStats(): SystemStats {
   const memTotal = os.totalmem();
   const memFree = os.freemem();
   const [load1, load5, load15] = os.loadavg();
   // CPU usage: approximate from load average vs CPU count
   const cpuCount = os.cpus().length;
   const cpu = Math.min(100, Math.round((load1 / cpuCount) * 100));
-  return { cpu, memUsed: memTotal - memFree, memTotal, load1: +load1.toFixed(2), load5: +load5.toFixed(2), load15: +load15.toFixed(2), uptime: os.uptime() };
+  return {
+    cpu,
+    memUsed: memTotal - memFree,
+    memTotal,
+    load1: +load1.toFixed(2),
+    load5: +load5.toFixed(2),
+    load15: +load15.toFixed(2),
+    uptime: os.uptime(),
+    embedding: getEmbeddingStatus(),
+  };
 }
 
 const HEARTBEAT_MS = 5_000;

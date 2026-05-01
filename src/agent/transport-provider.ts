@@ -375,6 +375,35 @@ export interface TransportProvider {
    * Only call when capabilities.sessionRestore is true.
    */
   listSessions?(): Promise<RemoteSessionInfo[]>;
+
+  /**
+   * Return the list of models available for this provider.
+   *
+   * Providers that support a model picker MUST implement this method.
+   * The result is used by `transport.list_models` → web model-picker.
+   * Implementations should cache results (≥ 30s TTL) to avoid hammering
+   * the underlying SDK on every UI open.
+   *
+   * @param force  When true, bypass any internal cache and re-probe.
+   */
+  listModels?(force?: boolean): Promise<ProviderModelList>;
+}
+
+/** A single model entry returned by listModels(). */
+export interface ProviderModelInfo {
+  id: string;
+  name?: string;
+  supportsReasoningEffort?: boolean;
+}
+
+/** Shape returned by TransportProvider.listModels(). */
+export interface ProviderModelList {
+  models: ProviderModelInfo[];
+  defaultModel?: string;
+  /** True when the provider is authenticated and returned real model data. */
+  isAuthenticated?: boolean;
+  /** Human-readable probe error — shown in the picker when models is empty. */
+  error?: string;
 }
 
 export function normalizeProviderPayload(

@@ -36,6 +36,8 @@ import { sessionMgmtRoutes } from './routes/session-mgmt.js';
 import { subSessionRoutes } from './routes/sub-sessions.js';
 import { discussionRoutes } from './routes/discussions.js';
 import { preferencesRoutes } from './routes/preferences.js';
+import { embeddingRoutes } from './routes/embedding.js';
+import { shutdownEmbeddingPool } from './util/embedding-pool.js';
 import { fileTransferRoutes } from './routes/file-transfer.js';
 import { passkeyRoutes } from './routes/passkey-auth.js';
 import { localWebPreviewRoutes } from './routes/local-web-preview.js';
@@ -169,6 +171,7 @@ export function buildApp(env: Env) {
   app.route('/api/server', subSessionRoutes);
   app.route('/api/server', discussionRoutes);
   app.route('/api/preferences', preferencesRoutes);
+  app.route('/api/embedding', embeddingRoutes);
   app.route('/api/auth/passkey', passkeyRoutes);
   app.route('/api/admin', adminRoutes);
 
@@ -592,6 +595,20 @@ async function main() {
   });
 
   setupWebSocketUpgrade(httpServer as unknown as import('node:http').Server, env);
+
+  // Graceful shutdown — terminate the embedding worker so it doesn't keep
+  // the process alive after SIGTERM (k8s rolling restart, docker stop, etc).
+  const shutdown = async (signal: string) => {
+    logger.info({ signal }, 'Shutting down — closing embedding pool');
+    try {
+      await shutdownEmbeddingPool();
+    } catch (err) {
+      logger.warn({ err }, 'Embedding pool shutdown failed (non-fatal)');
+    }
+    process.exit(0);
+  };
+  process.once('SIGTERM', () => void shutdown('SIGTERM'));
+  process.once('SIGINT', () => void shutdown('SIGINT'));
 }
 
 // Only start the server when run directly (not when imported by tests)

@@ -43,6 +43,17 @@
     "tool_fold_collapse": "收起",
     "tool_group_more": "··· 还有 {{count}} 条",
     "tool_group_collapse": "▲ 收起",
+    "tool_calls_toggle_show": "显示工具和思考",
+    "tool_calls_toggle_hide": "隐藏工具和思考",
+    "tool_calls_toggle_undecided": "选择 AI 活动显示方式",
+    "tool_calls_choose_prompt": "选择视图 ↓",
+    "tool_chooser_title": "AI 活动如何显示？",
+    "tool_chooser_subtitle": "工具调用、文件改动和思考过程信息更全，但视图会更密。",
+    "tool_chooser_simple_label": "简洁",
+    "tool_chooser_simple_hint": "只显示 AI 回复",
+    "tool_chooser_developer_label": "开发",
+    "tool_chooser_developer_hint": "显示工具、文件、思考",
+    "tool_chooser_footnote": "随时点扳手图标切换。",
     "new_folder": "新建文件夹",
     "new_folder_name": "文件夹名称",
     "create": "创建",
@@ -141,7 +152,8 @@
       "claude_code_cli": "Claude Code CLI",
       "codex_cli": "Codex CLI",
       "copilot_sdk": "Copilot",
-      "cursor_headless": "Cursor"
+      "cursor_headless": "Cursor",
+      "gemini_sdk": "Gemini SDK"
     },
     "agentGroup": {
       "transport_sdk": "SDK",
@@ -318,9 +330,10 @@
     "timeout": "请求超时",
     "timeout_detail": "无法读取目录。可能是由网络驱动器缓慢或不可用引起的。",
     "preview_loading": "加载中…",
-    "preview_too_large": "文件过大，无法预览（> 5 MB）",
+    "preview_too_large": "文件过大，无法预览（> 100 MB）",
     "preview_error": "预览不可用",
     "preview_binary": "二进制文件 — 无法预览",
+    "preview_video_unsupported": "您的浏览器不支持此视频格式。",
     "mkdir_failed": "创建文件夹失败",
     "view_diff": "差异",
     "view_source": "源码",
@@ -409,6 +422,7 @@
     "username_placeholder": "用户名",
     "password_placeholder": "密码",
     "signin": "登录",
+    "remember_password": "在此设备上记住密码",
     "invalid_credentials": "用户名或密码错误",
     "account_pending": "您的账号正在等待管理员审批，请联系管理员。",
     "account_disabled": "您的账号已被禁用，请联系管理员。",
@@ -1227,7 +1241,8 @@
       "memoryDeleteConfirm": "确定永久删除这条记忆吗？此操作不可撤销。",
       "memoryDeleteFailed": "删除记忆失败",
       "memoryArchived": "已归档",
-      "memoryShowArchived": "显示已归档"
+      "memoryShowArchived": "显示已归档",
+      "memoryMasterSummary": "主摘要"
     },
     "diagnostics": {
       "title": "诊断",
@@ -1245,5 +1260,13 @@
       "snapshotTitle": "持久化快照",
       "snapshotBindings": "快照绑定数"
     }
+  },
+  "embedding": {
+    "status_unknown": "向量嵌入状态未知（旧版守护进程或连接已断开）",
+    "status_ready": "向量嵌入就绪 — 语义搜索使用本地模型",
+    "status_loading": "正在加载向量嵌入模型…",
+    "status_fallback": "向量嵌入：本地不可用，已切换到服务器回退",
+    "status_unavailable": "向量嵌入不可用 — 该守护进程的语义搜索已禁用",
+    "status_idle": "向量嵌入空闲（本次会话尚未使用）"
   }
 }

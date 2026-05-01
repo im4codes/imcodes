@@ -268,7 +268,13 @@ const flush = async () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 };
 
-describe("cursor/copilot transport restore", () => {
+// Pin a 10s timeout for this suite. The cursor-headless restore case spawns
+// a fake child process and walks resume-id continuity — under default vitest
+// `testTimeout: 5000` and a busy daemon project run, the case routinely takes
+// 4-5s and intermittently flakes at the 5s limit. CLAUDE.md and
+// `openspec/changes/memory-system-1.1-foundations/tasks.md` already note this
+// as a "pre-existing timeout"; pinning it here removes the foot-gun.
+describe("cursor/copilot transport restore", { timeout: 10_000 }, () => {
   beforeEach(() => {
     mocks.store.clear();
     mocks.cursorSpawns.length = 0;
@@ -348,7 +354,7 @@ describe("cursor/copilot transport restore", () => {
         prompt: "Verify copilot restore",
       }),
     );
-  });
+  }, 10_000);
 
   it("skips unavailable provider restores without throwing and leaves the persisted session inspectable", async () => {
     mocks.store.set("deck_missing_provider_brain", {

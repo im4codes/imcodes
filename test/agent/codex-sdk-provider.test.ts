@@ -105,6 +105,39 @@ vi.mock('../../src/util/logger.js', () => ({
   default: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
+// Mock the codex runtime config so tests can pretend specific models are
+// (or aren't) in codex's built-in catalog. The `prompts` map mirrors what
+// would live in `~/.codex/models_cache.json` — keys are model slugs, values
+// are the full per-model `base_instructions`. Tests can override with
+// codexRuntimeConfigMock.set([...]) to simulate "this model isn't in the
+// local cache" (which forces the FALLBACK_BASE_INSTRUCTIONS path).
+const codexRuntimeConfigMock = vi.hoisted(() => {
+  const buildPrompts = (catalog: string[]) =>
+    new Map(catalog.map((id) => [id.toLowerCase(), `[catalog-prompt:${id}]`] as const));
+  return {
+    catalog: ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.2'],
+    prompts: buildPrompts(['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.2']),
+    set(catalog: string[]) {
+      this.catalog = catalog;
+      this.prompts = buildPrompts(catalog);
+    },
+    reset() {
+      this.catalog = ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex', 'gpt-5.2'];
+      this.prompts = buildPrompts(this.catalog);
+    },
+  };
+});
+vi.mock('../../src/agent/codex-runtime-config.js', () => ({
+  getCodexRuntimeConfig: vi.fn(async () => ({
+    availableModels: codexRuntimeConfigMock.catalog,
+    models: codexRuntimeConfigMock.catalog.map((id) => ({ id })),
+  })),
+  getCodexBaseInstructions: vi.fn(async (model: string | undefined) => {
+    if (!model) return undefined;
+    return codexRuntimeConfigMock.prompts.get(model.trim().toLowerCase());
+  }),
+}));
+
 import { CodexSdkProvider } from '../../src/agent/providers/codex-sdk.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 
@@ -189,6 +222,14 @@ describe('CodexSdkProvider', () => {
     ]);
     expect(threadStartReq?.params?.sandbox).toBe('danger-full-access');
     expect(threadStartReq?.params?.approvalPolicy).toBe('never');
+    // No model selected → no per-model prompt available in
+    // `~/.codex/models_cache.json` lookup → we send the short
+    // provider-neutral FALLBACK so codex CLI's `session_startup_prewarm`
+    // doesn't hand the OpenAI Responses API an empty `instructions` field
+    // (which it now rejects with 400). Per-model override behavior is
+    // exercised by the dedicated baseInstructions tests below.
+    expect(typeof threadStartReq?.params?.baseInstructions).toBe('string');
+    expect((threadStartReq?.params?.baseInstructions as string).length).toBeGreaterThan(20);
     expect(turnStartReq?.params?.sandboxPolicy).toEqual({ type: 'dangerFullAccess' });
     expect(turnStartReq?.params?.approvalPolicy).toBe('never');
     expect(deltas).toEqual(['O', 'OK']);
@@ -205,6 +246,137 @@ describe('CodexSdkProvider', () => {
     const child = childProcessMock.children[0];
     const resumeReq = child.requests.find((req) => req.method === 'thread/resume');
     expect(resumeReq?.params?.threadId).toBe('thread-existing');
+  });
+
+  // ── baseInstructions sourcing ──────────────────────────────────────────
+  // We always send a non-empty `baseInstructions` (codex CLI 0.125's
+  // session_startup_prewarm otherwise hands the Responses API an empty
+  // `instructions`, which it rejects with `Instructions are required`).
+  //
+  // Source priority:
+  //   1. `~/.codex/models_cache.json` per-model `base_instructions` (full
+  //      12–22 KB codex prompt — no quality regression for catalog models)
+  //   2. Short provider-neutral FALLBACK_BASE_INSTRUCTIONS (for unknown /
+  //      third-party models like minimax via `wire_api = "responses"`)
+
+  it('forwards codex-cached base_instructions on thread/start for catalog model (gpt-5.4)', async () => {
+    codexRuntimeConfigMock.set(['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini']);
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-cat', cwd: '/tmp/project', agentId: 'gpt-5.4' });
+    await provider.send('route-cat', 'hello');
+    const child = childProcessMock.children[0];
+    const threadStartReq = child.requests.find((req) => req.method === 'thread/start');
+    expect(threadStartReq?.params?.model).toBe('gpt-5.4');
+    // Catalog hit → mock returns sentinel `[catalog-prompt:gpt-5.4]`. In
+    // production this would be the real 14 KB codex base_instructions.
+    expect(threadStartReq?.params?.baseInstructions).toBe('[catalog-prompt:gpt-5.4]');
+    codexRuntimeConfigMock.reset();
+  });
+
+  it('sends fallback baseInstructions on thread/start when model is NOT in codex catalog (custom provider)', async () => {
+    codexRuntimeConfigMock.set(['gpt-5.5', 'gpt-5.4']);
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-mini', cwd: '/tmp/project', agentId: 'codex-MiniMax-M2.5' });
+    await provider.send('route-mini', 'hello');
+    const child = childProcessMock.children[0];
+    const threadStartReq = child.requests.find((req) => req.method === 'thread/start');
+    expect(threadStartReq?.params?.model).toBe('codex-MiniMax-M2.5');
+    const sent = threadStartReq?.params?.baseInstructions as string;
+    expect(typeof sent).toBe('string');
+    expect(sent.length).toBeGreaterThan(20);
+    // Not the catalog sentinel — fallback path was taken.
+    expect(sent).not.toMatch(/^\[catalog-prompt:/);
+    codexRuntimeConfigMock.reset();
+  });
+
+  it('sends fallback baseInstructions on thread/resume for non-catalog model (heals previously-broken threads)', async () => {
+    codexRuntimeConfigMock.set(['gpt-5.5']);
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({
+      sessionKey: 'route-resume-mini',
+      cwd: '/tmp/project',
+      resumeId: 'thread-stored',
+      agentId: 'codex-MiniMax-M2.5',
+    });
+    await provider.send('route-resume-mini', 'hello');
+    const child = childProcessMock.children[0];
+    const resumeReq = child.requests.find((req) => req.method === 'thread/resume');
+    expect(resumeReq?.params?.threadId).toBe('thread-stored');
+    const sent = resumeReq?.params?.baseInstructions as string;
+    expect(typeof sent).toBe('string');
+    expect(sent.length).toBeGreaterThan(20);
+    expect(sent).not.toMatch(/^\[catalog-prompt:/);
+    codexRuntimeConfigMock.reset();
+  });
+
+  it('forwards codex-cached base_instructions on thread/resume for catalog model', async () => {
+    codexRuntimeConfigMock.set(['gpt-5.5', 'gpt-5.4']);
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({
+      sessionKey: 'route-resume-cat',
+      cwd: '/tmp/project',
+      resumeId: 'thread-cat',
+      agentId: 'gpt-5.4',
+    });
+    await provider.send('route-resume-cat', 'hello');
+    const child = childProcessMock.children[0];
+    const resumeReq = child.requests.find((req) => req.method === 'thread/resume');
+    expect(resumeReq?.params?.baseInstructions).toBe('[catalog-prompt:gpt-5.4]');
+    codexRuntimeConfigMock.reset();
+  });
+
+  it('lists codex models across paginated model/list responses', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+
+    const resultPromise = provider.readModelList();
+    const child = childProcessMock.children[0];
+    const firstRequest = child.requests.find((req) => req.method === 'model/list');
+    expect(firstRequest?.params).toMatchObject({ includeHidden: false, limit: 100 });
+
+    child.emits({
+      id: firstRequest?.id,
+      result: {
+        data: [
+          {
+            id: 'mod-1',
+            model: 'gpt-5.5',
+            displayName: 'GPT-5.5',
+            supportedReasoningEfforts: ['low', 'high'],
+            isDefault: true,
+          },
+        ],
+        nextCursor: 'cursor-2',
+      },
+    });
+    await flush();
+
+    const secondRequest = child.requests.filter((req) => req.method === 'model/list')[1];
+    expect(secondRequest?.params).toMatchObject({ cursor: 'cursor-2', includeHidden: false, limit: 100 });
+    child.emits({
+      id: secondRequest?.id,
+      result: {
+        data: [
+          {
+            id: 'mod-2',
+            model: 'gpt-5.4-mini',
+            displayName: 'GPT-5.4 Mini',
+            supportedReasoningEfforts: [],
+            isDefault: false,
+          },
+        ],
+        nextCursor: null,
+      },
+    });
+
+    await expect(resultPromise).resolves.toEqual([
+      { id: 'gpt-5.5', name: 'GPT-5.5', supportsReasoningEffort: true, isDefault: true },
+      { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini' },
+    ]);
   });
 
   it('maps normalized payloads into a message-side codex context block', async () => {

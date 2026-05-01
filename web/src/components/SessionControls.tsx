@@ -14,10 +14,15 @@ import { VoiceOverlay } from './VoiceOverlay.js';
 import { AtPicker } from './AtPicker.js';
 import { P2pConfigPanel } from './P2pConfigPanel.js';
 import { useP2pCustomCombos } from './p2p-combos.js';
-import { uploadFile, getUserPref, saveUserPref, onUserPrefChanged } from '../api.js';
-import { fetchSupervisorDefaults, patchSession, patchSubSession } from '../api.js';
+import { parseBooleanish, usePref } from '../hooks/usePref.js';
+import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
+import { PREF_KEY_P2P_COMBO_CONFIRM_SKIP, PREF_KEY_P2P_SESSION_CONFIG_LEGACY, p2pSessionConfigPrefKey } from '../constants/prefs.js';
+import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p-config-pref.js';
+import { uploadFile, sendSessionViaHttp } from '../api.js';
+import { patchSession, patchSubSession } from '../api.js';
 import { isRunningSessionState } from '../thinking-utils.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
+import { MSG_COMMAND_FAILED } from '@shared/ack-protocol.js';
 import { isLegacyTransportPendingMessageId, normalizeTransportPendingEntries } from '../transport-queue.js';
 import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 import {
@@ -31,8 +36,8 @@ import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import type { P2pSavedConfig } from '@shared/p2p-modes.js';
 import { getQwenAuthTier, QWEN_AUTH_TIERS } from '@shared/qwen-auth.js';
 import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/qwen-models.js';
-import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, normalizeClaudeCodeModelId } from '../../../src/shared/models/options.js';
-import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '@shared/effort-levels.js';
+import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions, normalizeClaudeCodeModelId } from '../../../src/shared/models/options.js';
+import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
 import { useTransportModels, supportsDynamicTransportModels } from '../hooks/useTransportModels.js';
 import {
   buildTransportConfigWithSupervision,
@@ -82,6 +87,7 @@ interface Props {
       commandId: string;
       attachments?: Array<Record<string, unknown>>;
       extra?: Record<string, unknown>;
+      localFailure?: string;
     },
   ) => void;
   /** Sub-session overrides — when set, menu actions use these instead of main session commands. */
@@ -118,6 +124,36 @@ interface Props {
 }
 
 const MAX_UPLOAD_SIZE_MB = Math.round(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE / (1024 * 1024));
+const TRANSPORT_QUEUE_HIDDEN_KEY_PREFIX = 'imcodes:transport-queue-hidden:';
+type LocalQueuedTransportEntry = {
+  clientMessageId: string;
+  text: string;
+  status?: 'sending' | 'queued' | 'failed';
+};
+
+function transportQueueHiddenStorageKey(serverId: string | undefined, sessionName: string): string {
+  const serverPart = encodeURIComponent(serverId || 'local');
+  const sessionPart = encodeURIComponent(sessionName);
+  return `${TRANSPORT_QUEUE_HIDDEN_KEY_PREFIX}${serverPart}:${sessionPart}`;
+}
+
+function readTransportQueueHidden(serverId: string | undefined, sessionName: string | undefined): boolean {
+  if (!sessionName) return false;
+  try {
+    return window.localStorage.getItem(transportQueueHiddenStorageKey(serverId, sessionName)) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function writeTransportQueueHidden(storageKey: string | null, hidden: boolean): void {
+  if (!storageKey) return;
+  try {
+    window.localStorage.setItem(storageKey, hidden ? '1' : '0');
+  } catch {
+    // localStorage may be unavailable in privacy modes; keep in-memory state.
+  }
+}
 
 type MenuAction = 'restart' | 'new' | 'stop';
 type ModelChoice = 'opus[1M]' | 'sonnet' | 'haiku';
@@ -135,6 +171,10 @@ function buildComposerDraftScope(activeSession: SessionInfo | null, subSessionId
 function buildPastedTextFileName(now = new Date()): string {
   const compact = now.toISOString().replace(/[:.]/g, '-');
   return `pasted-text-${compact}.txt`;
+}
+
+function normalizeQueuedText(text: string): string {
+  return text.replace(/\s+/g, ' ').trim();
 }
 
 function parseStoredComposerAttachments(raw: string | null): ComposerAttachment[] {
@@ -157,17 +197,17 @@ function parseStoredComposerAttachments(raw: string | null): ComposerAttachment[
     return [];
   }
 }
-type CodexModelChoice = 'gpt-5.4' | 'gpt-5.4-mini' | 'gpt-5.2';
+type CodexModelChoice = string;
 type QwenModelChoice = string;
 type P2pMode = string; // 'solo' | single modes | combo pipelines like 'brainstorm>discuss>plan' | typeof P2P_CONFIG_MODE
 
 const MODEL_STORAGE_KEY = 'imcodes-model';
 const CODEX_MODEL_STORAGE_KEY = 'imcodes-codex-model';
 const QWEN_MODEL_STORAGE_KEY = 'imcodes-qwen-model';
-const P2P_COMBO_CONFIRM_SKIP_PREF_KEY = 'p2p_combo_direct_send_skip_confirm';
-const CODEX_MODELS: CodexModelChoice[] = [...CODEX_MODEL_IDS] as CodexModelChoice[];
+const CODEX_MODELS: CodexModelChoice[] = [...CODEX_MODEL_IDS];
 const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
 const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
+const GEMINI_SDK_MODEL_SUGGESTIONS = [...GEMINI_MODEL_IDS] as const;
 const P2P_BASE_MODES = ['solo', 'audit', 'review', 'plan', 'brainstorm', 'discuss', P2P_CONFIG_MODE] as const;
 const P2P_MODE_I18N: Record<string, string> = { solo: 'p2p.mode_solo', audit: 'p2p.mode_audit', review: 'p2p.mode_review', plan: 'p2p.mode_plan', brainstorm: 'p2p.mode_brainstorm', discuss: 'p2p.mode_discuss', [P2P_CONFIG_MODE]: 'p2p.mode_config' };
 const P2P_SINGLE_COLORS: Record<string, string> = { solo: '#dbe7f5', audit: '#f59e0b', review: '#3b82f6', plan: '#06b6d4', brainstorm: '#a78bfa', discuss: '#22c55e', [P2P_CONFIG_MODE]: '#94a3b8' };
@@ -337,7 +377,7 @@ function loadModel(): ModelChoice | null {
 function loadCodexModel(): CodexModelChoice | null {
   try {
     const v = localStorage.getItem(CODEX_MODEL_STORAGE_KEY);
-    if (CODEX_MODELS.includes(v as CodexModelChoice)) return v as CodexModelChoice;
+    if (v?.trim()) return v;
   } catch { /* ignore */ }
   return null;
 }
@@ -407,7 +447,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking: _activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved }: Props) {
   const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -441,9 +481,20 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModel);
   const [qwenModel, setQwenModel] = useState<QwenModelChoice | null>(loadQwenModel);
   const [editingQueuedMessageId, setEditingQueuedMessageId] = useState<string | null>(null);
-  const [queuedHintExpanded, setQueuedHintExpanded] = useState(false);
-  const toggleQueuedHintExpanded = useCallback(() => setQueuedHintExpanded((v) => !v), []);
-  const [optimisticQueuedEntries, setOptimisticQueuedEntries] = useState<Array<{ clientMessageId: string; text: string }> | null>(null);
+  const queuedHiddenStorageKey = useMemo(() => (
+    activeSession?.name ? transportQueueHiddenStorageKey(serverId, activeSession.name) : null
+  ), [activeSession?.name, serverId]);
+  const [queuedHintExpanded, setQueuedHintExpanded] = useState(() => (
+    !readTransportQueueHidden(serverId, activeSession?.name)
+  ));
+  const toggleQueuedHintExpanded = useCallback(() => {
+    setQueuedHintExpanded((expanded) => {
+      const nextExpanded = !expanded;
+      writeTransportQueueHidden(queuedHiddenStorageKey, !nextExpanded);
+      return nextExpanded;
+    });
+  }, [queuedHiddenStorageKey]);
+  const [optimisticQueuedEntries, setOptimisticQueuedEntries] = useState<LocalQueuedTransportEntry[] | null>(null);
   const [mobileComposerMultiline, setMobileComposerMultiline] = useState(false);
   const [mobileComposerExpanded, setMobileComposerExpanded] = useState(false);
   const [confirm, setConfirm] = useState<MenuAction | null>(null);
@@ -468,6 +519,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const showRunningSweep = !compact && isRunningSessionState(activeSession?.state);
   const effectiveRuntimeType = activeSession ? resolveSessionInfoRuntimeType(activeSession) : undefined;
+  const transportSendShouldQueue = effectiveRuntimeType === 'transport'
+    && !!activeSession
+    && (isRunningSessionState(activeSession.state) || activeThinking);
   const incomingQueuedTransportEntries = effectiveRuntimeType === 'transport'
     ? normalizeTransportPendingEntries(
         activeSession?.transportPendingMessageEntries,
@@ -475,7 +529,17 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         activeSession?.name ?? '',
       )
     : [];
-  const queuedTransportEntries = optimisticQueuedEntries ?? incomingQueuedTransportEntries;
+  const queuedTransportEntries = useMemo<LocalQueuedTransportEntry[]>(() => {
+    if (optimisticQueuedEntries === null) return incomingQueuedTransportEntries;
+    if (optimisticQueuedEntries.length === 0) return [];
+    if (incomingQueuedTransportEntries.length === 0) return optimisticQueuedEntries;
+    const byId = new Map<string, LocalQueuedTransportEntry>();
+    for (const entry of incomingQueuedTransportEntries) byId.set(entry.clientMessageId, { ...entry, status: 'queued' });
+    for (const entry of optimisticQueuedEntries) {
+      byId.set(entry.clientMessageId, entry);
+    }
+    return [...byId.values()];
+  }, [incomingQueuedTransportEntries, optimisticQueuedEntries]);
   const queuedTransportMessages = queuedTransportEntries.map((entry) => entry.text);
   const queuedTransportLatestMessage = queuedTransportMessages[queuedTransportMessages.length - 1] ?? '';
   const editingQueuedEntry = editingQueuedMessageId
@@ -485,6 +549,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const isEditableQueuedEntry = useCallback((entry: { clientMessageId: string }) => (
     !!activeSession && !isLegacyTransportPendingMessageId(entry.clientMessageId, activeSession.name)
   ), [activeSession]);
+  const isLocalQueuedEntry = useCallback((entry: { clientMessageId: string }) => (
+    !!optimisticQueuedEntries?.some((item) => item.clientMessageId === entry.clientMessageId)
+    && !incomingQueuedTransportEntries.some((item) => item.clientMessageId === entry.clientMessageId)
+  ), [incomingQueuedTransportEntries, optimisticQueuedEntries]);
   // Internal ref for contenteditable — also written to the external inputRef
   const divRef = useRef<HTMLDivElement>(null);
   // History navigation state
@@ -633,8 +701,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       if (model !== normalizedClaudeModel) setModel(normalizedClaudeModel);
     }
     // Codex models
-    if (detectedModel.startsWith('gpt-') && CODEX_MODELS.includes(detectedModel as CodexModelChoice)) {
-      if (codexModel !== detectedModel) setCodexModel(detectedModel as CodexModelChoice);
+    if (detectedModel.startsWith('gpt-')) {
+      if (codexModel !== detectedModel) setCodexModel(detectedModel);
     }
     if (activeSession?.agentType === 'qwen' && detectedModel) {
       if (qwenModel !== detectedModel) setQwenModel(detectedModel as QwenModelChoice);
@@ -666,28 +734,32 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     && isTransport
     && isSupportedSupervisionTargetSessionType(activeSession.agentType)
   );
+  const supervisorDefaultsPref = useSupervisorDefaults(canQuickControlSupervision);
   const isCodex = activeSession?.agentType === 'codex' || activeSession?.agentType === 'codex-sdk';
   const isQwen = activeSession?.agentType === 'qwen';
   const isCopilot = activeSession?.agentType === 'copilot-sdk';
   const isCursorHeadless = activeSession?.agentType === 'cursor-headless';
-  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless;
+  const isGeminiSdk = activeSession?.agentType === 'gemini-sdk';
+  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless || isGeminiSdk;
   // Source-of-truth priority for the model picker:
   //   1. `useTransportModels` — live daemon probe via `transport.list_models`
   //      WS round-trip. Works uniformly for main sessions AND sub-sessions
   //      (sub-session SessionInfo records aren't hydrated with
-  //      copilot/cursorAvailableModels, so we can't rely on activeSession).
-  //   2. `activeSession?.{copilot,cursor}AvailableModels` — the cached
+  //      provider-specific availableModels, so we can't rely on activeSession).
+  //   2. `activeSession?.{copilot,cursor}AvailableModels` — cached
   //      hydration set by `buildSessionList()` for main sessions (first
   //      paint before the WS probe reply arrives).
-  //   3. Hardcoded suggestion constants — offline/no-probe fallback so the
-  //      picker never renders empty.
+  //   3. Provider-specific fallback constants where available.
   const dynamicModelsAgentType = supportsDynamicTransportModels(activeSession?.agentType)
     ? activeSession!.agentType
     : null;
   const dynamicTransportModels = useTransportModels(ws, dynamicModelsAgentType);
   const genericTransportModelSuggestions: readonly string[] = useMemo(() => {
     if (dynamicTransportModels.models.length > 0) {
-      return dynamicTransportModels.models.map((m) => m.id);
+      const dynamicModelIds = dynamicTransportModels.models.map((m) => m.id);
+      return isGeminiSdk
+        ? mergeModelSuggestions(GEMINI_SDK_MODEL_SUGGESTIONS, dynamicModelIds)
+        : dynamicModelIds;
     }
     if (isCopilot) {
       const probed = activeSession?.copilotAvailableModels;
@@ -699,13 +771,29 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       if (probed && probed.length > 0) return probed;
       return CURSOR_HEADLESS_MODEL_SUGGESTIONS;
     }
+    if (isGeminiSdk) {
+      return GEMINI_SDK_MODEL_SUGGESTIONS;
+    }
     return [];
   }, [
     dynamicTransportModels.models,
     isCopilot,
     isCursorHeadless,
+    isGeminiSdk,
     activeSession?.copilotAvailableModels,
     activeSession?.cursorAvailableModels,
+  ]);
+  const codexModelSuggestions: readonly string[] = useMemo(() => {
+    if (activeSession?.agentType !== 'codex-sdk') return CODEX_MODELS;
+    if (dynamicTransportModels.models.length > 0) {
+      return dynamicTransportModels.models.map((m) => m.id);
+    }
+    if (activeSession?.codexAvailableModels?.length) return activeSession.codexAvailableModels;
+    return CODEX_MODELS;
+  }, [
+    activeSession?.agentType,
+    activeSession?.codexAvailableModels,
+    dynamicTransportModels.models,
   ]);
   const genericTransportModel = activeSession?.activeModel
     ?? activeSession?.requestedModel
@@ -767,13 +855,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     [allCombos],
   );
 
-  // P2P config loading moved after rootSession declaration below
-
+  const comboSkipPref = usePref<boolean>(PREF_KEY_P2P_COMBO_CONFIRM_SKIP, { parse: parseBooleanish });
   useEffect(() => {
-    void getUserPref(P2P_COMBO_CONFIRM_SKIP_PREF_KEY).then((raw) => {
-      if (raw === true || raw === 'true') setSkipComboSendConfirm(true);
-    });
-  }, []);
+    if (comboSkipPref.value === true) setSkipComboSendConfirm(true);
+  }, [comboSkipPref.value]);
 
   useEffect(() => {
     onQuickOpenChange?.(quickOpen);
@@ -799,6 +884,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return () => onOverlayOpenChange?.(false);
   }, [mobileFileBrowserOpen, onOverlayOpenChange, overlayOpen]);
 
+  useEffect(() => {
+    setQueuedHintExpanded(!readTransportQueueHidden(serverId, activeSession?.name));
+  }, [activeSession?.name, serverId]);
 
   useEffect(() => {
     if (!editingQueuedMessageId) return;
@@ -812,17 +900,113 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     [incomingQueuedTransportEntries],
   );
   const lastIncomingQueuedTransportEntriesKeyRef = useRef(incomingQueuedTransportEntriesKey);
+  const lastIncomingQueuedTransportEntriesCountRef = useRef(incomingQueuedTransportEntries.length);
+  const lastIncomingQueuedTransportEntryIdsRef = useRef(new Set(incomingQueuedTransportEntries.map((entry) => entry.clientMessageId)));
   useEffect(() => {
     if (effectiveRuntimeType !== 'transport') {
       setOptimisticQueuedEntries(null);
       lastIncomingQueuedTransportEntriesKeyRef.current = incomingQueuedTransportEntriesKey;
+      lastIncomingQueuedTransportEntriesCountRef.current = incomingQueuedTransportEntries.length;
+      lastIncomingQueuedTransportEntryIdsRef.current = new Set(incomingQueuedTransportEntries.map((entry) => entry.clientMessageId));
       return;
     }
-    if (lastIncomingQueuedTransportEntriesKeyRef.current !== incomingQueuedTransportEntriesKey) {
-      setOptimisticQueuedEntries(null);
+    const previousIds = lastIncomingQueuedTransportEntryIdsRef.current;
+    const previousCount = lastIncomingQueuedTransportEntriesCountRef.current;
+    const incomingChanged = lastIncomingQueuedTransportEntriesKeyRef.current !== incomingQueuedTransportEntriesKey;
+    if (incomingChanged && incomingQueuedTransportEntries.length > 0) {
+      const incomingIds = new Set(incomingQueuedTransportEntries.map((entry) => entry.clientMessageId));
+      setOptimisticQueuedEntries((prev) => {
+        if (!prev) return null;
+        const remaining = prev.filter((entry) => !incomingIds.has(entry.clientMessageId));
+        return remaining.length > 0 ? remaining : null;
+      });
+    } else if (incomingChanged && previousCount > 0 && incomingQueuedTransportEntries.length === 0) {
+      setOptimisticQueuedEntries((prev) => {
+        if (!prev) return null;
+        const remaining = prev.filter((entry) => !previousIds.has(entry.clientMessageId));
+        return remaining.length > 0 ? remaining : null;
+      });
     }
     lastIncomingQueuedTransportEntriesKeyRef.current = incomingQueuedTransportEntriesKey;
-  }, [activeSession?.name, effectiveRuntimeType, incomingQueuedTransportEntriesKey]);
+    lastIncomingQueuedTransportEntriesCountRef.current = incomingQueuedTransportEntries.length;
+    lastIncomingQueuedTransportEntryIdsRef.current = new Set(incomingQueuedTransportEntries.map((entry) => entry.clientMessageId));
+  }, [activeSession?.name, effectiveRuntimeType, incomingQueuedTransportEntries.length, incomingQueuedTransportEntriesKey]);
+
+  useEffect(() => {
+    if (!ws || !activeSession) return;
+    return ws.onMessage((msg: ServerMessage) => {
+      const removeLocalQueuedEntry = (commandId: string, text?: string) => {
+        if (!commandId && !text) return;
+        const normalizedText = typeof text === 'string' ? normalizeQueuedText(text) : '';
+        setOptimisticQueuedEntries((prev) => {
+          if (!prev) return prev;
+          const next = prev.filter((entry) => {
+            if (commandId && entry.clientMessageId === commandId) return false;
+            if (!commandId && normalizedText && normalizeQueuedText(entry.text) === normalizedText) return false;
+            return true;
+          });
+          return next.length > 0 ? next : null;
+        });
+      };
+      const markLocalQueuedEntry = (commandId: string, status: LocalQueuedTransportEntry['status']) => {
+        if (!commandId) return;
+        setOptimisticQueuedEntries((prev) => {
+          if (!prev) return prev;
+          let changed = false;
+          const next = prev.map((entry) => {
+            if (entry.clientMessageId !== commandId || entry.status === status) return entry;
+            changed = true;
+            return { ...entry, status };
+          });
+          return changed ? next : prev;
+        });
+      };
+
+      if (msg.type === 'command.ack') {
+        if (msg.session && msg.session !== activeSession.name) return;
+        if (msg.status === 'error' || msg.status === 'conflict') {
+          markLocalQueuedEntry(msg.commandId, 'failed');
+        } else {
+          markLocalQueuedEntry(msg.commandId, 'queued');
+        }
+        return;
+      }
+      if (msg.type === MSG_COMMAND_FAILED) {
+        if (msg.session && msg.session !== activeSession.name) return;
+        markLocalQueuedEntry(msg.commandId, 'failed');
+        return;
+      }
+      if (msg.type !== 'timeline.event') return;
+      const event = msg.event;
+      if (event.sessionId !== activeSession.name) return;
+      if (event.type === 'user.message') {
+        const commandId = typeof event.payload.commandId === 'string'
+          ? event.payload.commandId
+          : typeof event.payload.clientMessageId === 'string'
+            ? event.payload.clientMessageId
+            : '';
+        removeLocalQueuedEntry(commandId, typeof event.payload.text === 'string' ? event.payload.text : undefined);
+      } else if (event.type === 'session.state') {
+        const hasPendingSnapshot = Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessageEntries')
+          || Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessages');
+        const queuedEntries = normalizeTransportPendingEntries(
+          event.payload.pendingMessageEntries,
+          event.payload.pendingMessages,
+          activeSession.name,
+        );
+        if (queuedEntries.length === 0) {
+          if (hasPendingSnapshot) setOptimisticQueuedEntries(null);
+          return;
+        }
+        const queuedIds = new Set(queuedEntries.map((entry) => entry.clientMessageId));
+        setOptimisticQueuedEntries((prev) => {
+          if (!prev) return prev;
+          const next = prev.filter((entry) => !queuedIds.has(entry.clientMessageId));
+          return next.length > 0 ? next : null;
+        });
+      }
+    });
+  }, [activeSession, ws]);
 
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
@@ -929,7 +1113,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       }
       nextSnapshot = { ...supervisionSnapshot, mode: nextMode };
     } else {
-      const defaults = await fetchSupervisorDefaults();
+      const defaults = supervisorDefaultsPref.value ?? (supervisorDefaultsPref.loaded ? null : await supervisorDefaultsPref.reload());
       if (!defaults) {
         setAutoOpen(false);
         onSettings?.();
@@ -969,6 +1153,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     serverId,
     showSendWarning,
     supervisionSnapshot,
+    supervisorDefaultsPref.loaded,
+    supervisorDefaultsPref.reload,
+    supervisorDefaultsPref.value,
     t,
   ]);
 
@@ -1195,7 +1382,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [p2pSavedConfig]);
 
   // P2P config is per main-session (sub-sessions follow parent), stored on server for cross-device sync
-  const p2pConfigKey = rootSession ? `p2p_session_config:${rootSession}` : null;
+  const p2pConfigKey = rootSession ? p2pSessionConfigPrefKey(rootSession) : null;
+  const p2pSavedConfigPref = usePref<P2pSavedConfig>(p2pConfigKey, {
+    legacyKey: PREF_KEY_P2P_SESSION_CONFIG_LEGACY,
+    parse: parseP2pSavedConfig,
+    serialize: serializeP2pSavedConfig,
+  });
   const lastDaemonP2pSyncRef = useRef<string>('');
   const pendingP2pConfigSavesRef = useRef<Map<string, PendingP2pConfigSave>>(new Map());
   const resolvePendingP2pConfigSave = useCallback((requestId: string, result: P2pConfigPersistResult) => {
@@ -1240,40 +1432,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       }
     });
   }, [resolvePendingP2pConfigSave, ws]);
-  const reloadP2pSavedConfig = useCallback(() => {
-    if (!p2pConfigKey) {
-      setP2pSavedConfig(null);
-      return;
-    }
-    const apply = (raw: unknown) => {
-      if (raw && typeof raw === 'string') {
-        try { setP2pSavedConfig(JSON.parse(raw) as P2pSavedConfig); } catch { setP2pSavedConfig(null); }
-      } else {
-        setP2pSavedConfig(null);
-      }
-    };
-    void getUserPref(p2pConfigKey).then((raw) => {
-      if (raw) { apply(raw); return; }
-      void getUserPref('p2p_session_config').then((legacyRaw) => {
-        if (legacyRaw && typeof legacyRaw === 'string') {
-          void saveUserPref(p2pConfigKey, legacyRaw).catch(() => {});
-        }
-        apply(legacyRaw);
-      });
-    });
-  }, [p2pConfigKey]);
   useEffect(() => {
-    reloadP2pSavedConfig();
-  }, [reloadP2pSavedConfig]);
-
-  useEffect(() => {
-    if (!p2pConfigKey) return;
-    return onUserPrefChanged((key) => {
-      if (key === p2pConfigKey || key === 'p2p_session_config') {
-        reloadP2pSavedConfig();
-      }
-    });
-  }, [p2pConfigKey, reloadP2pSavedConfig]);
+    setP2pSavedConfig(p2pSavedConfigPref.value);
+  }, [p2pSavedConfigPref.value]);
 
   useEffect(() => {
     if (!ws || !rootSession || !p2pSavedConfig) return;
@@ -1415,7 +1576,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       (!!normalizedOptions.modeOverride && isComboMode(normalizedOptions.modeOverride)) ||
       (!!syntheticModeOverride && isComboMode(syntheticModeOverride))
     );
-    if (((!text && attachments.length === 0) && !allowEmptyCombo) || !ws || !activeSession) return null;
+    if (((!text && attachments.length === 0) && !allowEmptyCombo) || !activeSession) return null;
 
     // Build P2P routing as structured WS fields — keep text clean for display.
     const extra: Record<string, unknown> = {};
@@ -1480,13 +1641,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       text = text ? `${refs} ${text}` : refs;
     }
     return { text, extra };
-  }, [activeSession, applySavedP2pConfigSelection, attachments, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, sessions, subSessions, ws]);
+  }, [activeSession, applySavedP2pConfigSelection, attachments, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, sessions, subSessions]);
 
   const buildModeOnlySendPayload = useCallback((rawText: string, modeOverride?: string): PendingSendPayload | null => {
     const text = rawText.trim();
     const effectiveMode = modeOverride ?? p2pMode;
     const allowEmptyCombo = !!modeOverride && isComboMode(modeOverride);
-    if ((!text && !allowEmptyCombo) || !ws || !activeSession) return null;
+    if ((!text && !allowEmptyCombo) || !activeSession) return null;
 
     const extra: Record<string, unknown> = {};
     const manual = extractManualP2pTargets(text, buildManualP2pCandidates(sessions, subSessions));
@@ -1505,22 +1666,45 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     }
 
     return { text: cleanText, extra };
-  }, [activeSession, applySavedP2pConfigSelection, i18n?.language, p2pExcludeSameType, p2pMode, p2pSavedConfig, sessions, subSessions, ws]);
+  }, [activeSession, applySavedP2pConfigSelection, i18n?.language, p2pExcludeSameType, p2pMode, p2pSavedConfig, sessions, subSessions]);
 
-  // Returns the commandId on success (so the caller can drive optimistic UI
-  // reconciliation via command.ack / the echoed user.message) or null when the
-  // preconditions (ws, session) aren't satisfied.
-  const sendSessionMessage = useCallback((text: string, extra: Record<string, unknown> = {}): string | null => {
-    if (!ws || !activeSession) return null;
-    const commandId = globalThis.crypto?.randomUUID?.() ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    ws.sendSessionCommand('send', {
+  const makeCommandId = useCallback(() => (
+    globalThis.crypto?.randomUUID?.() ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`
+  ), []);
+
+  const sendSessionMessage = useCallback((text: string, extra: Record<string, unknown> = {}, commandId = makeCommandId()): string | null => {
+    if (!activeSession) return null;
+    const payload = {
       sessionName: activeSession.name,
       text,
       ...extra,
       commandId,
-    });
+    };
+    // `/stop` is highest-priority — bypass the WS probe-state gate so a
+    // focus/visibility tick (probeConnection sets `_connected = false`
+    // for ~50-200 ms while pinging) doesn't drop it. Regular messages
+    // still go through the gated path: a probe-detected dead socket
+    // shouldn't accept a new message that would silently disappear,
+    // but the user's STOP intent must be honored on a best-effort basis.
+    const isStop = text === '/stop';
+    if (!ws) {
+      if (!serverId) return null;
+      void sendSessionViaHttp(serverId, payload).catch((fallbackErr) => {
+        console.warn('session.send HTTP fallback failed', fallbackErr);
+      });
+      return commandId;
+    }
+    try {
+      if (isStop) ws.sendSessionCommandUrgent('send', payload);
+      else ws.sendSessionCommand('send', payload);
+    } catch (err) {
+      if (!serverId) throw err;
+      void sendSessionViaHttp(serverId, payload).catch((fallbackErr) => {
+        console.warn('session.send HTTP fallback failed', fallbackErr);
+      });
+    }
     return commandId;
-  }, [activeSession, ws]);
+  }, [activeSession, makeCommandId, serverId, ws]);
 
   const sendQueuedMessageMutation = useCallback((type: 'session.edit_queued_message' | 'session.undo_queued_message', payload: Record<string, unknown>) => {
     if (!ws || !activeSession) return false;
@@ -1536,6 +1720,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const finalizeSend = useCallback((payload: PendingSendPayload, options?: { clearComposer?: boolean }) => {
     if (!activeSession) return;
+    const isP2pSend = (
+      Array.isArray(payload.extra.p2pAtTargets) && payload.extra.p2pAtTargets.length > 0
+      || (typeof payload.extra.p2pMode === 'string' && payload.extra.p2pMode.length > 0)
+      || (payload.extra.p2pSessionConfig != null && typeof payload.extra.p2pSessionConfig === 'object')
+    );
     if (editingQueuedMessageId && effectiveRuntimeType === 'transport') {
       try {
         if (!sendQueuedMessageMutation('session.edit_queued_message', {
@@ -1575,12 +1764,23 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       return;
     }
     quickData.recordHistory(payload.text, activeSession.name);
-    let commandId: string | null = null;
+    const commandId = makeCommandId();
+    let localFailure: string | undefined;
     try {
-      commandId = sendSessionMessage(payload.text, payload.extra);
-      if (!commandId) return;
-    } catch {
-      return;
+      if (!sendSessionMessage(payload.text, payload.extra, commandId)) return;
+    } catch (err) {
+      localFailure = err instanceof Error ? err.message : String(err || 'Send failed');
+    }
+    const shouldShowAsQueued = effectiveRuntimeType === 'transport'
+      && transportSendShouldQueue
+      && !isP2pSend
+      && !payload.text.trim().startsWith('/');
+    if (shouldShowAsQueued) {
+      setOptimisticQueuedEntries((prev) => {
+        const source = prev ?? incomingQueuedTransportEntries;
+        if (source.some((entry) => entry.clientMessageId === commandId)) return source;
+        return [...source, { clientMessageId: commandId, text: payload.text, status: localFailure ? 'failed' : 'sending' }];
+      });
     }
     // Snapshot attachments before clearComposer wipes them so the optimistic
     // bubble surfaces the same badges the confirmed message will.
@@ -1589,13 +1789,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           id: a.path,
           daemonPath: a.path,
           originalName: a.name,
-        }))
+      }))
       : undefined;
-    onSend?.(activeSession.name, payload.text, {
-      commandId,
-      ...(attachmentSnapshot ? { attachments: attachmentSnapshot } : {}),
-      ...(payload.extra && Object.keys(payload.extra).length > 0 ? { extra: payload.extra } : {}),
-    });
+    if (!shouldShowAsQueued) {
+      onSend?.(activeSession.name, payload.text, {
+        commandId,
+        ...(attachmentSnapshot ? { attachments: attachmentSnapshot } : {}),
+        ...(payload.extra && Object.keys(payload.extra).length > 0 ? { extra: payload.extra } : {}),
+        ...(localFailure ? { localFailure } : {}),
+      });
+    }
     if (options?.clearComposer) {
       pendingAtTargetsRef.current = [];
       pendingConfigOverrideRef.current = null;
@@ -1614,7 +1817,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       if (draftKey) sessionStorage.removeItem(draftKey);
       if (attachmentDraftKey) sessionStorage.removeItem(attachmentDraftKey);
     }
-  }, [activeSession, attachmentDraftKey, draftKey, editingQueuedMessageId, onRemoveQuote, onSend, quickData, quotes, sendQueuedMessageMutation, sendSessionMessage]);
+  }, [activeSession, attachmentDraftKey, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, makeCommandId, onRemoveQuote, onSend, quickData, quotes, sendQueuedMessageMutation, sendSessionMessage, transportSendShouldQueue]);
 
   const handleQueuedMessageEdit = useCallback((entry: { clientMessageId: string; text: string }) => {
     if (!isEditableQueuedEntry(entry)) return;
@@ -1635,6 +1838,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       const source = prev ?? incomingQueuedTransportEntries;
       return source.filter((item) => item.clientMessageId !== entry.clientMessageId);
     });
+    if (isLocalQueuedEntry(entry)) return;
     try {
       sendQueuedMessageMutation('session.undo_queued_message', {
         clientMessageId: entry.clientMessageId,
@@ -1642,13 +1846,30 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     } catch {
       /* ignore */
     }
-  }, [editingQueuedMessageId, incomingQueuedTransportEntries, isEditableQueuedEntry, sendQueuedMessageMutation]);
+  }, [editingQueuedMessageId, incomingQueuedTransportEntries, isEditableQueuedEntry, isLocalQueuedEntry, sendQueuedMessageMutation]);
+
+  const handleQueuedMessageRetry = useCallback((entry: LocalQueuedTransportEntry) => {
+    if (entry.status !== 'failed') return;
+    let commandId: string | null = null;
+    try {
+      commandId = sendSessionMessage(entry.text);
+    } catch {
+      commandId = null;
+    }
+    if (!commandId) return;
+    setOptimisticQueuedEntries((prev) => {
+      const source = prev ?? [];
+      const next = source.filter((item) => item.clientMessageId !== entry.clientMessageId);
+      next.push({ clientMessageId: commandId, text: entry.text, status: 'sending' });
+      return next;
+    });
+  }, [sendSessionMessage]);
 
   const maybePersistComboSendSkip = useCallback(() => {
     if (!rememberComboSendChoice) return;
     setSkipComboSendConfirm(true);
-    void saveUserPref(P2P_COMBO_CONFIRM_SKIP_PREF_KEY, true).catch(() => {});
-  }, [rememberComboSendChoice]);
+    void comboSkipPref.save(true).catch(() => {});
+  }, [comboSkipPref, rememberComboSendChoice]);
 
   const getSendValidationError = useCallback((payload: PendingSendPayload): string | null => {
     const text = payload.text.trim();
@@ -2374,7 +2595,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             </button>
             {modelOpen && (
               <div class="menu-dropdown">
-                {CODEX_MODELS.map((m) => (
+                {codexModelSuggestions.map((m) => (
                   <button
                     key={m}
                     class={`menu-item ${codexModel === m ? 'menu-item-active' : ''}`}
@@ -2461,7 +2682,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                     class={`menu-item ${currentThinking === level ? 'menu-item-active' : ''}`}
                     onClick={() => handleThinkingSelect(level)}
                   >
-                    {currentThinking === level ? '● ' : '○ '}{level}
+                    {currentThinking === level ? '● ' : '○ '}{formatEffortLevel(level)}
                   </button>
                 ))}
               </div>
@@ -3033,11 +3254,34 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               {queuedTransportEntries.map((entry) => (
                 <div class="controls-queued-item" key={entry.clientMessageId}>
                   <span class="controls-queued-item-text">{entry.text}</span>
-                  {isEditableQueuedEntry(entry) && (
+                  <span
+                    class={`controls-queued-item-status controls-queued-item-status-${entry.status ?? 'queued'}`}
+                    aria-label={
+                      entry.status === 'failed'
+                        ? t('chat.sendFailedLabel', 'Send failed')
+                        : entry.status === 'sending'
+                          ? t('chat.sendingLabel', 'Sending')
+                          : t('session.transport_send_queued')
+                    }
+                    title={
+                      entry.status === 'failed'
+                        ? t('chat.sendFailedLabel', 'Send failed')
+                        : entry.status === 'sending'
+                          ? t('chat.sendingLabel', 'Sending')
+                          : t('session.transport_send_queued')
+                    }
+                  />
+                  {(isEditableQueuedEntry(entry) || entry.status === 'failed') && (
                     <span class="controls-queued-item-actions">
-                      <button type="button" class="controls-queued-action" onClick={() => handleQueuedMessageEdit(entry)}>
-                        {t('settings.edit')}
-                      </button>
+                      {entry.status === 'failed' ? (
+                        <button type="button" class="controls-queued-action" onClick={() => handleQueuedMessageRetry(entry)}>
+                          {t('chat.retrySend', 'Retry')}
+                        </button>
+                      ) : (
+                        <button type="button" class="controls-queued-action" onClick={() => handleQueuedMessageEdit(entry)}>
+                          {t('settings.edit')}
+                        </button>
+                      )}
                       <button type="button" class="controls-queued-action controls-queued-action-danger" onClick={() => handleQueuedMessageDelete(entry)}>
                         {t('common.delete')}
                       </button>

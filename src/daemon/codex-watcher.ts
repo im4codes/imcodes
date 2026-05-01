@@ -16,6 +16,7 @@ import { buildMemoryContextTimelinePayload } from './memory-context-timeline.js'
 import { updateSessionState } from '../store/session-store.js';
 import { resolveContextWindow } from '../util/model-context.js';
 import { registerWatcherControl, unregisterWatcherControl, type WatcherControl } from './watcher-controls.js';
+import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 
 // ── Codex SQLite helpers ────────────────────────────────────────────────────────
 
@@ -169,6 +170,7 @@ function normalizePath(p: string): string {
 
 const finalAnswerBuffers = new Map<string, { text: string; timer: ReturnType<typeof setTimeout> }>();
 const sessionStates = new Map<string, 'running' | 'idle'>();
+const historyReplaySessions = new Set<string>();
 const FINAL_ANSWER_DEBOUNCE_MS = 600;
 
 function flushFinalAnswer(sessionName: string): void {
@@ -191,7 +193,10 @@ function emitSessionState(sessionName: string, state: 'running' | 'idle'): void 
       watcher.noTextRetrackAttempted = false;
     }
   }
-  timelineEmitter.emit(sessionName, 'session.state', { state }, { source: 'daemon', confidence: 'high' });
+  timelineEmitter.emit(sessionName, 'session.state', {
+    state,
+    ...(historyReplaySessions.has(sessionName) ? { [TIMELINE_SUPPRESS_PUSH_FIELD]: true } : {}),
+  }, { source: 'daemon', confidence: 'high' });
   updateSessionState(sessionName, state);
 }
 
@@ -321,10 +326,15 @@ async function emitRecentHistory(sessionName: string, filePath: string, model?: 
     const lines = chunk.split('\n');
     const startIdx = size > readSize ? 1 : 0;
 
-    for (let i = startIdx; i < lines.length; i++) {
-      const line = lines[i];
-      if (!line.trim()) continue;
-      parseLine(sessionName, line, model); // Simplified for this restoration fix
+    historyReplaySessions.add(sessionName);
+    try {
+      for (let i = startIdx; i < lines.length; i++) {
+        const line = lines[i];
+        if (!line.trim()) continue;
+        parseLine(sessionName, line, model); // Simplified for this restoration fix
+      }
+    } finally {
+      historyReplaySessions.delete(sessionName);
     }
   } catch {} finally { if (fh) await fh.close().catch(() => {}); }
 }
@@ -343,6 +353,12 @@ interface WatcherState {
   _lastRotationCheck?: number;
   turnHadAssistantText?: boolean;
   noTextRetrackAttempted?: boolean;
+  /**
+   * Slow stat-probe kept alive by `startWatchingById` when the rollout
+   * file doesn't materialise in the initial 30s fast window. Cleared by
+   * `stopWatching()` or when the probe finds and activates the file.
+   */
+  pendingProbeTimer?: ReturnType<typeof setInterval>;
 }
 
 const watchers = new Map<string, WatcherState>();
@@ -546,26 +562,74 @@ export async function startWatchingById(sessionName: string, uuid: string, model
   const control = watcherControl(sessionName);
   registerWatcherControl(sessionName, control);
 
-  for (let i = 0; i < 60 && !state.stopped; i++) {
+  // Helper: one pass over the recent-session dirs looking for a file whose
+  // name contains the target uuid. Returns true when activation succeeds.
+  const tryActivate = async (): Promise<boolean> => {
     for (const dir of recentSessionDirs()) {
       try {
         const entries = await readdir(dir);
-        const match = entries.find(e => e.includes(uuid));
-        if (match) {
-          const found = join(dir, match);
-          state.activeFile = found; state.workDir = dir;
-          state.projectDir = (await readCwd(found)) ?? state.projectDir;
-          claimedFiles.set(found, sessionName);
-          await emitRecentHistory(sessionName, found, model);
-          try { state.fileOffset = (await stat(found)).size; } catch { state.fileOffset = 0; }
-          startPoll(sessionName, state);
-          void watchDir(sessionName, state, dir);
-          return control;
+        const match = entries.find((e) => e.includes(uuid));
+        if (!match) continue;
+        const found = join(dir, match);
+        state.activeFile = found;
+        state.workDir = dir;
+        state.projectDir = (await readCwd(found)) ?? state.projectDir;
+        claimedFiles.set(found, sessionName);
+        await emitRecentHistory(sessionName, found, model);
+        try {
+          state.fileOffset = (await stat(found)).size;
+        } catch {
+          state.fileOffset = 0;
         }
+        startPoll(sessionName, state);
+        void watchDir(sessionName, state, dir);
+        return true;
       } catch {}
     }
-    await new Promise(r => setTimeout(r, 500));
+    return false;
+  };
+
+  // Fast attempt: 60 × 500ms = 30s total, matching Codex's typical
+  // file-materialisation latency when the user is already active.
+  for (let i = 0; i < 60 && !state.stopped; i++) {
+    if (await tryActivate()) return control;
+    await new Promise((r) => setTimeout(r, 500));
   }
+
+  // File didn't appear in the fast window. Previously this function returned
+  // here, leaving the `WatcherState` orphaned in the map with no timer and
+  // no activeFile — so when Codex finally wrote the rollout, nothing tailed
+  // it and the sub-session showed user input with no assistant reply in the
+  // chat UI. Fall through to a slow probe (every 10s) that keeps trying
+  // until the file appears or the session is explicitly stopped.
+  if (!state.stopped) {
+    logger.info(
+      { sessionName, uuid },
+      'codex-watcher: rollout file not found after fast poll, switching to slow probe (kept alive)',
+    );
+    const started = Date.now();
+    const slowProbe = setInterval(async () => {
+      if (state.stopped) {
+        clearInterval(slowProbe);
+        state.pendingProbeTimer = undefined;
+        return;
+      }
+      try {
+        if (await tryActivate()) {
+          clearInterval(slowProbe);
+          state.pendingProbeTimer = undefined;
+          logger.info(
+            { sessionName, uuid, waitedMs: Date.now() - started },
+            'codex-watcher: rollout file appeared after slow probe, activated',
+          );
+        }
+      } catch (err) {
+        logger.debug({ sessionName, uuid, err }, 'codex-watcher: slow-probe tryActivate threw');
+      }
+    }, 10_000);
+    state.pendingProbeTimer = slowProbe;
+  }
+
   return control;
 }
 
@@ -581,6 +645,10 @@ export function stopWatching(sessionName: string): void {
   if (!state) return;
   state.stopped = true; state.abort.abort();
   if (state.pollTimer) clearInterval(state.pollTimer);
+  // Clear any pre-activation slow-probe left behind by `startWatchingById`
+  // that was still waiting on a missing rollout file. Without this, the
+  // probe keeps hitting readdir() forever after the session is gone.
+  if (state.pendingProbeTimer) clearInterval(state.pendingProbeTimer);
   watchers.delete(sessionName);
   unregisterWatcherControl(sessionName);
   sessionStates.delete(sessionName);

@@ -1,3 +1,5 @@
+import { buildBatchSharpRepair } from './sharp-repair-script.js';
+
 export interface WindowsUpgradeScriptInput {
   logFile: string;
   scriptDir: string;
@@ -18,7 +20,10 @@ export function buildWindowsCleanupScript(scriptDir: string): string {
   return `@echo off\r
 chcp 65001 >nul 2>&1\r
 setlocal\r
-timeout /t 120 /nobreak >nul\r
+rem ping-based sleep: works when launched via wscript (no console for stdin),\r
+rem unlike "timeout /t N /nobreak" which aborts with "Input redirection is\r
+rem not supported" and returns immediately.  -n 121 ≈ 120 s wait.\r
+ping -n 121 127.0.0.1 >nul 2>&1\r
 for %%I in ("%~dp0.") do set "SCRIPT_DIR=%%~fI"\r
 rmdir /s /q "%SCRIPT_DIR%"\r
 `;
@@ -79,7 +84,8 @@ set "VBS_LAUNCHER=%USERPROFILE%\\.imcodes\\daemon-launcher.vbs"\r
 set "UPGRADE_LOCK=%USERPROFILE%\\.imcodes\\upgrade.lock"\r
 set "PIDFILE=%USERPROFILE%\\.imcodes\\daemon.pid"\r
 echo === imcodes upgrade started at %date% %time% === >> "%LOG_FILE%"\r
-timeout /t 2 /nobreak > nul\r
+rem ping-based sleep: timeout fails under wscript (no stdin console)\r
+ping -n 3 127.0.0.1 >nul 2>&1\r
 \r
 rem ── Step 1: Create upgrade lock — watchdog will pause (daemon keeps running) ──\r
 echo upgrade > "%UPGRADE_LOCK%"\r
@@ -92,12 +98,22 @@ if exist "%PIDFILE%" (\r
   echo Old daemon PID: !OLD_DAEMON_PID! (will be killed only after install succeeds) >> "%LOG_FILE%"\r
 )\r
 \r
-if defined NODE_OPTIONS (\r
-  set "NODE_OPTIONS=%NODE_OPTIONS% --max-old-space-size=16384"\r
-) else (\r
-  set "NODE_OPTIONS=--max-old-space-size=16384"\r
-)\r
-echo Using NODE_OPTIONS=%NODE_OPTIONS% >> "%LOG_FILE%"\r
+rem Save the daemon's original NODE_OPTIONS so we can restore it BEFORE\r
+rem any branch that re-spawns the daemon launcher (success path or abort\r
+rem paths).  Otherwise our --max-old-space-size flag accumulates one copy\r
+rem per upgrade cycle in the new daemon's env (the spawned launcher\r
+rem inherits our setlocal env), and after N upgrades NODE_OPTIONS contains\r
+rem N copies of the flag.  V8 then tries to reserve a heap matching the\r
+rem LAST occurrence (e.g. 16 GB), and on RAM/VAS-tight systems npm install\r
+rem crashes with\r
+rem   "Fatal JavaScript out of memory: MemoryChunk allocation failed during\r
+rem    deserialization".\r
+rem We also drop the heap from 16 GB to 4 GB: npm install rarely needs\r
+rem more than ~1-2 GB, and 16 GB virtual reservation can fail the OS\r
+rem commit check while the OLD daemon is still resident.\r
+set "ORIG_NODE_OPTIONS=%NODE_OPTIONS%"\r
+set "NODE_OPTIONS=--max-old-space-size=4096"\r
+echo Using NODE_OPTIONS=%NODE_OPTIONS% (orig: %ORIG_NODE_OPTIONS%) >> "%LOG_FILE%"\r
 \r
 rem ── Step 2: Run npm install WHILE OLD DAEMON IS STILL ALIVE ──────────────\r
 rem On Windows, node's .js modules aren't locked by the running daemon\r
@@ -105,8 +121,26 @@ rem (node reads them into memory at load time), so npm CAN overwrite them\r
 rem safely while the old daemon keeps serving requests.  This is the key\r
 rem to guaranteeing the old daemon survives install failures.\r
 echo Installing ${pkgSpec}... >> "%LOG_FILE%"\r
-call "${npmCmd}" install -g ${pkgSpec} >> "%LOG_FILE%" 2>&1\r
+rem --ignore-scripts: see the matching block in command-handler.ts\r
+rem (handleDaemonUpgrade, "Sharp repair") for the full story.  TL;DR:\r
+rem strip-onnxruntime-gpu.mjs removes node_modules/sharp/ from the\r
+rem published tarball so npm re-resolves it per platform.  When npm does\r
+rem that during a global install, sharp's install hook can fail with\r
+rem MODULE_NOT_FOUND on install/check.js (npm appears to half-extract\r
+rem sharp), then fall back to npm-run-build which walks UP into\r
+rem imcodes's package.json and tries tsc.  exit 127.  Skipping install\r
+rem scripts is safe — the runtime sharp binary is the prebuilt\r
+rem @img/sharp-win32-x64 / @img/sharp-win32-arm64 package, which npm\r
+rem still fetches as a regular optionalDependency (no install script).\r
+call "${npmCmd}" install -g --ignore-scripts ${pkgSpec} >> "%LOG_FILE%" 2>&1\r
 set "INSTALL_EXIT=%errorlevel%"\r
+\r
+rem Restore the daemon's original NODE_OPTIONS NOW (right after npm install)\r
+rem so EVERY subsequent path — abort branches that wscript-relaunch the\r
+rem daemon, plus the success branch that spawns the new watchdog — runs\r
+rem with the daemon's original env.  Otherwise our temporary heap flag\r
+rem leaks into the new daemon and accumulates one copy per upgrade.\r
+set "NODE_OPTIONS=%ORIG_NODE_OPTIONS%"\r
 if %INSTALL_EXIT% neq 0 (\r
   echo Install FAILED with exit code %INSTALL_EXIT% — old daemon untouched. >> "%LOG_FILE%"\r
   echo === upgrade aborted at %date% %time% === >> "%LOG_FILE%"\r
@@ -118,6 +152,8 @@ if %INSTALL_EXIT% neq 0 (\r
   wscript "%CLEANUP_VBS%" >nul 2>&1\r
   goto :done\r
 )\r
+\r
+${buildBatchSharpRepair({ npmCmd })}\r
 \r
 rem ── Step 3: Verify the install (shim exists, version matches) ──────────\r
 set "NPM_PREFIX="\r
@@ -185,7 +221,7 @@ if defined OLD_DAEMON_PID if not "!OLD_DAEMON_PID!"=="" (\r
   echo Stopping old daemon PID !OLD_DAEMON_PID!... >> "%LOG_FILE%"\r
   taskkill /f /pid !OLD_DAEMON_PID! >nul 2>&1\r
 )\r
-timeout /t 2 /nobreak >nul\r
+ping -n 3 127.0.0.1 >nul 2>&1\r
 \r
 rem ── Step 5: Regenerate launch chain with the new binary's paths ────────\r
 echo Regenerating daemon launch chain... >> "%LOG_FILE%"\r
@@ -198,7 +234,10 @@ rem ── Step 6: Start new watchdog ──────────────
 rem The new watchdog (generated by repair-watchdog) checks the lock file.\r
 rem It will loop/wait while the lock exists, then start the daemon once\r
 rem we delete it below.\r
-echo Starting new watchdog via VBS... >> "%LOG_FILE%"\r
+rem NODE_OPTIONS was restored to the daemon's original value right after\r
+rem npm install, so the new daemon inherits a clean env (no accumulated\r
+rem --max-old-space-size flags).\r
+echo Starting new watchdog via VBS (NODE_OPTIONS=%NODE_OPTIONS%)... >> "%LOG_FILE%"\r
 if exist "%VBS_LAUNCHER%" (\r
   wscript "%VBS_LAUNCHER%"\r
 ) else (\r
@@ -210,7 +249,7 @@ echo Removing upgrade lock... >> "%LOG_FILE%"\r
 del "%UPGRADE_LOCK%" >nul 2>&1\r
 \r
 rem ── Step 8: Health-check the new daemon ────────────────────────────────\r
-timeout /t 10 /nobreak >nul\r
+ping -n 11 127.0.0.1 >nul 2>&1\r
 if exist "%PIDFILE%" (\r
   set /p DAEMON_PID=<"%PIDFILE%"\r
   tasklist /fi "PID eq !DAEMON_PID!" /nh 2^>nul | find "!DAEMON_PID!" >nul\r
@@ -228,9 +267,20 @@ rem ── Final safety net: make absolutely sure the lock is removed ───�
 rem If any of the above paths ended without deleting the lock (shouldn't\r
 rem happen, but defend in depth), remove it here so the watchdog can\r
 rem resume serving.  This protects against batch script crashes too.\r
+rem\r
+rem We try del first, then PowerShell Remove-Item as fallback — observed\r
+rem in the wild that del can silently fail (sharing violation, transient\r
+rem AV scan, weird ACL inheritance) even when the file is owned by us.\r
 if exist "%UPGRADE_LOCK%" (\r
   echo Final safety: removing lingering upgrade.lock >> "%LOG_FILE%"\r
-  del "%UPGRADE_LOCK%" >nul 2>&1\r
+  del /f /q "%UPGRADE_LOCK%" >nul 2>&1\r
+)\r
+if exist "%UPGRADE_LOCK%" (\r
+  echo del failed; falling back to PowerShell Remove-Item >> "%LOG_FILE%"\r
+  powershell -NoProfile -NonInteractive -Command "Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath \"%UPGRADE_LOCK%\"" >nul 2>&1\r
+)\r
+if exist "%UPGRADE_LOCK%" (\r
+  echo WARNING: upgrade.lock still present after both deletion attempts — watchdog will spin >> "%LOG_FILE%"\r
 )\r
 echo === upgrade done at %date% %time% === >> "%LOG_FILE%"\r
 `;

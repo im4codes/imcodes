@@ -43,6 +43,17 @@
     "tool_fold_collapse": "свернуть",
     "tool_group_more": "··· ещё {{count}}",
     "tool_group_collapse": "▲ свернуть",
+    "tool_calls_toggle_show": "Показывать инструменты и рассуждения",
+    "tool_calls_toggle_hide": "Скрывать инструменты и рассуждения",
+    "tool_calls_toggle_undecided": "Выберите, как показывать активность ИИ",
+    "tool_calls_choose_prompt": "Выберите вид ↓",
+    "tool_chooser_title": "Как показывать активность ИИ?",
+    "tool_chooser_subtitle": "Вызовы инструментов, изменения файлов и рассуждения дают больше деталей, но загромождают вид.",
+    "tool_chooser_simple_label": "Просто",
+    "tool_chooser_simple_hint": "Только ответы ИИ",
+    "tool_chooser_developer_label": "Разработчик",
+    "tool_chooser_developer_hint": "Инструменты, файлы, рассуждения",
+    "tool_chooser_footnote": "Переключайте в любой момент по значку гаечного ключа.",
     "new_folder": "Новая папка",
     "new_folder_name": "Имя папки",
     "create": "Создать",
@@ -141,7 +152,8 @@
       "claude_code_cli": "Claude Code CLI",
       "codex_cli": "Codex CLI",
       "copilot_sdk": "Copilot",
-      "cursor_headless": "Cursor"
+      "cursor_headless": "Cursor",
+      "gemini_sdk": "Gemini SDK"
     },
     "agentGroup": {
       "transport_sdk": "SDK",
@@ -318,9 +330,10 @@
     "timeout": "Превышено время ожидания",
     "timeout_detail": "Не удалось прочитать каталог. Возможно, это вызвано медленными или недоступными сетевыми дисками.",
     "preview_loading": "Загрузка…",
-    "preview_too_large": "Файл слишком большой для предпросмотра (> 5 МБ)",
+    "preview_too_large": "Файл слишком большой для предпросмотра (> 100 МБ)",
     "preview_error": "Предпросмотр недоступен",
     "preview_binary": "Двоичный файл — предпросмотр недоступен",
+    "preview_video_unsupported": "Ваш браузер не поддерживает этот видеоформат.",
     "mkdir_failed": "Не удалось создать папку",
     "view_diff": "Diff",
     "view_source": "Источник",
@@ -408,6 +421,7 @@
     "username_placeholder": "Имя пользователя",
     "password_placeholder": "Пароль",
     "signin": "Войти",
+    "remember_password": "Запомнить пароль на этом устройстве",
     "invalid_credentials": "Неверное имя пользователя или пароль",
     "account_pending": "Ваш аккаунт ожидает одобрения администратором. Пожалуйста, свяжитесь с администратором.",
     "account_disabled": "Ваш аккаунт отключён. Пожалуйста, свяжитесь с администратором.",
@@ -1226,7 +1240,8 @@
       "memoryDeleteConfirm": "Удалить эту память навсегда? Это действие нельзя отменить.",
       "memoryDeleteFailed": "Не удалось удалить память",
       "memoryArchived": "В архиве",
-      "memoryShowArchived": "Показать архивные"
+      "memoryShowArchived": "Показать архивные",
+      "memoryMasterSummary": "Главная сводка"
     },
     "diagnostics": {
       "title": "Diagnostics",
@@ -1244,5 +1259,13 @@
       "snapshotTitle": "Persisted snapshot",
       "snapshotBindings": "Snapshot bindings"
     }
+  },
+  "embedding": {
+    "status_unknown": "Статус эмбеддинга неизвестен (устаревший демон или нет соединения)",
+    "status_ready": "Эмбеддинг готов — семантический поиск выполняется локально",
+    "status_loading": "Загрузка модели эмбеддинга…",
+    "status_fallback": "Эмбеддинг: локальный пайплайн недоступен, используется резервный сервер",
+    "status_unavailable": "Эмбеддинг недоступен — семантический поиск отключён на этом демоне",
+    "status_idle": "Эмбеддинг бездействует (не использовался в этой сессии)"
   }
 }

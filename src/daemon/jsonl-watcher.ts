@@ -23,8 +23,15 @@ import logger from '../util/logger.js';
 import { resolveContextWindow } from '../util/model-context.js';
 import { getSessionContextWindow } from './cc-presets.js';
 import { registerWatcherControl, unregisterWatcherControl, type WatcherControl } from './watcher-controls.js';
-import { TIMELINE_EVENT_FILE_CHANGE, type FileChangeBatch } from '../../shared/file-change.js';
-import { normalizeClaudeFileChange } from './file-change-normalizer.js';
+import {
+  createParseContext,
+  forgetSession as forgetSessionInCtx,
+  parseLines as parseLinesInCtx,
+  type EmitInstruction,
+  type ParseContext,
+  type ParseLineInput,
+} from './jsonl-parse-core.js';
+import { jsonlParsePool, isJsonlWorkerEnabled } from './jsonl-parse-pool.js';
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
 
@@ -145,417 +152,26 @@ async function findLatestJsonl(dir: string): Promise<string | null> {
 }
 
 // ── JSONL parsing ─────────────────────────────────────────────────────────────
+//
+// The heavy parsing (JSON.parse + regex + block interpretation) lives in the
+// pure `jsonl-parse-core` module so it can run either on the main thread or
+// in the `jsonl-parse-worker` thread without diverging. The watcher itself
+// only owns I/O and event dispatch.
+//
+// Strategy:
+//   - Default: drained batches are parsed synchronously on main using
+//     `mainParseCtx`. Code path identical to pre-worker behaviour.
+//   - Opt-in `IM4CODES_JSONL_WORKER=1`: drained batches ship to the worker
+//     pool; crash / timeout automatically falls back to the main-thread
+//     context (same pure parser). Intended for deployments that observe
+//     main-loop pressure from heavy Claude JSONL streams.
+//
+// `emitRecentHistory` (one-shot at session start) always runs on main using a
+// throwaway context, because (a) it's infrequent and (b) we want to filter
+// `usage.update` events and emit the snapshot at the end instead.
 
-interface ContentBlock {
-  type: string;
-  id?: string;
-  text?: string;
-  thinking?: string;
-  name?: string;
-  input?: Record<string, unknown>;
-  content?: unknown;
-  is_error?: boolean;
-  tool_use_id?: string;
-  toolUseResult?: Record<string, unknown>;
-}
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
-}
-
-function extractToolInput(name: string, input?: Record<string, unknown>): string {
-  if (!input) return '';
-  if (name === 'Grep') {
-    const pattern = input.pattern ?? input.query ?? input.text;
-    const path = input.path ?? input.file_path ?? input.filePath;
-    if (pattern && path) return `${String(pattern).split('\n')[0]} in ${String(path).split('\n')[0]}`;
-  }
-  const val = input.command
-    ?? input.path
-    ?? input.file_path
-    ?? input.pattern
-    ?? input.description
-    ?? input.query
-    ?? input.objective
-    ?? input.text
-    ?? '';
-  const text = String(val);
-  return text.split('\n')[0] ?? '';
-}
-
-interface PendingClaudeToolCall {
-  id: string;
-  name: string;
-  input?: Record<string, unknown>;
-  ts?: number;
-}
-
-const pendingClaudeToolCalls = new Map<string, Map<string, PendingClaudeToolCall>>();
-
-function getPendingClaudeTools(sessionName: string): Map<string, PendingClaudeToolCall> {
-  let pending = pendingClaudeToolCalls.get(sessionName);
-  if (!pending) {
-    pending = new Map();
-    pendingClaudeToolCalls.set(sessionName, pending);
-  }
-  return pending;
-}
-
-function rememberClaudeToolCall(sessionName: string, pending: PendingClaudeToolCall): void {
-  getPendingClaudeTools(sessionName).set(pending.id, pending);
-}
-
-function takeClaudeToolCall(sessionName: string, toolUseId?: string): PendingClaudeToolCall | undefined {
-  if (!toolUseId) return undefined;
-  const pending = pendingClaudeToolCalls.get(sessionName);
-  if (!pending) return undefined;
-  const tool = pending.get(toolUseId);
-  if (tool) pending.delete(toolUseId);
-  if (pending.size === 0) pendingClaudeToolCalls.delete(sessionName);
-  return tool;
-}
-
-function emitClaudeFileChange(
-  sessionName: string,
-  batch: FileChangeBatch,
-  eventId: string,
-  ts?: number,
-): void {
-  timelineEmitter.emit(sessionName, TIMELINE_EVENT_FILE_CHANGE, { batch }, {
-    source: 'daemon',
-    confidence: 'high',
-    eventId,
-    ...(ts ? { ts } : {}),
-  });
-}
-
-function buildClaudeToolEventId(sessionName: string, toolUseId: string, phase: 'call' | 'result'): string {
-  return `cc-tool:${sessionName}:${toolUseId}:${phase}`;
-}
-
-function isClaudeFileChangeTool(name?: string): boolean {
-  return name === 'Edit' || name === 'MultiEdit' || name === 'Write' || name === 'NotebookEdit';
-}
-
-/** Patterns for system-injected messages that should not display as user messages. */
-const SYSTEM_INJECT_RE = /<task-notification|<system-reminder|<command-name>|<command-message>|<local-command-|<bash-input>|<bash-stdout>|<bash-stderr>/;
-
-function emitUserStringContent(
-  sessionName: string,
-  text: string,
-  stableId?: (suffix: string) => string,
-  ts?: number,
-): void {
-  if (!text.trim()) return;
-  // System-injected messages: don't show as user message, emit working signal instead
-  if (SYSTEM_INJECT_RE.test(text)) {
-    timelineEmitter.emit(sessionName, 'agent.status', {
-      status: 'processing',
-      label: 'Processing system event...',
-    }, { source: 'daemon', confidence: 'high' });
-    return;
-  }
-  timelineEmitter.emit(sessionName, 'user.message', {
-    text,
-  }, { source: 'daemon', confidence: 'high', ...(stableId ? { eventId: stableId('um') } : {}), ...(ts ? { ts } : {}) });
-}
-
-function emitAssistantStringContent(
-  sessionName: string,
-  text: string,
-  stableId?: (suffix: string) => string,
-  ts?: number,
-): void {
-  if (!text.trim()) return;
-  timelineEmitter.emit(sessionName, 'assistant.text', {
-    text,
-    streaming: false,
-  }, { source: 'daemon', confidence: 'high', ...(stableId ? { eventId: stableId('at') } : {}), ...(ts ? { ts } : {}) });
-}
-
-function emitClaudeToolCallBlock(
-  sessionName: string,
-  block: ContentBlock,
-  stableId?: (suffix: string) => string,
-  ts?: number,
-): void {
-  if (!block.name) return;
-  if (block.name === 'AskUserQuestion') {
-    const inp = block.input as Record<string, unknown> | undefined;
-    timelineEmitter.emit(sessionName, 'ask.question', {
-      toolUseId: block.id,
-      questions: inp?.['questions'] ?? [],
-    }, { source: 'daemon', confidence: 'high', ...(stableId ? { eventId: stableId('aq') } : {}), ...(ts ? { ts } : {}) });
-    return;
-  }
-
-  const input = block.input as Record<string, unknown> | undefined;
-  const toolUseId = block.id;
-  const isDeferredFileTool = isClaudeFileChangeTool(block.name) && !!toolUseId;
-
-  if (toolUseId) {
-    rememberClaudeToolCall(sessionName, {
-      id: toolUseId,
-      name: block.name,
-      input,
-      ...(ts ? { ts } : {}),
-    });
-  }
-
-  if (isDeferredFileTool) return;
-
-  const callEventId = toolUseId ? buildClaudeToolEventId(sessionName, toolUseId, 'call') : (stableId ? stableId('tc') : undefined);
-  const summaryInput = extractToolInput(block.name, input);
-  timelineEmitter.emit(sessionName, 'tool.call', {
-    tool: block.name,
-    ...(summaryInput ? { input: summaryInput } : (input ? { input } : {})),
-  }, {
-    source: 'daemon',
-    confidence: 'high',
-    ...(callEventId ? { eventId: callEventId } : {}),
-    ...(ts ? { ts } : {}),
-  });
-}
-
-function emitClaudeToolResultBlock(
-  sessionName: string,
-  block: ContentBlock,
-  stableId?: (suffix: string) => string,
-  ts?: number,
-): void {
-  const toolUseId = block.tool_use_id;
-  const pending = takeClaudeToolCall(sessionName, toolUseId);
-  const toolUseResult = asRecord(block.toolUseResult);
-  const contentResult = asRecord(block.content);
-  const normalized = pending
-    && !block.is_error
-    ? normalizeClaudeFileChange({
-      toolName: pending.name,
-      toolCallId: pending.id,
-      input: pending.input,
-      toolResult: toolUseResult ?? contentResult ?? undefined,
-    })
-    : null;
-
-  if (pending && isClaudeFileChangeTool(pending.name)) {
-    const summaryInput = extractToolInput(pending.name, pending.input);
-    timelineEmitter.emit(sessionName, 'tool.call', {
-      tool: pending.name,
-      ...(summaryInput ? { input: summaryInput } : (pending.input ? { input: pending.input } : {})),
-    }, {
-      source: 'daemon',
-      confidence: 'high',
-      eventId: buildClaudeToolEventId(sessionName, pending.id, 'call'),
-      ...(pending.ts ? { ts: pending.ts } : {}),
-      ...(normalized ? { hidden: true } : {}),
-    });
-  }
-
-  if (normalized && pending) {
-    timelineEmitter.emit(sessionName, 'tool.result', {
-      ...(block.is_error ? { error: String(block.content ?? 'error') } : {}),
-      ...(toolUseResult?.content ? { output: toolUseResult.content } : {}),
-    }, {
-      source: 'daemon',
-      confidence: 'high',
-      eventId: buildClaudeToolEventId(sessionName, pending.id, 'result'),
-      ...(ts ? { ts } : {}),
-      hidden: true,
-    });
-    emitClaudeFileChange(sessionName, normalized, `cc-file-change:${sessionName}:${pending.id}`, ts);
-    return;
-  }
-
-  const error = block.is_error ? String(block.content ?? 'error') : undefined;
-  const output = !error ? extractToolResultOutput(block) : undefined;
-  timelineEmitter.emit(sessionName, 'tool.result', {
-    ...(error ? { error } : {}),
-    ...(output ? { output } : {}),
-  }, {
-    source: 'daemon',
-    confidence: 'high',
-    ...(toolUseId ? { eventId: buildClaudeToolEventId(sessionName, toolUseId, 'result') } : stableId ? { eventId: stableId('tr') } : {}),
-    ...(ts ? { ts } : {}),
-  });
-}
-
-/**
- * Parse one JSONL line and emit timeline events.
- * - assistant: emit assistant.text, assistant.thinking, tool.call
- * - user: emit user.message, tool.result
- *
- * lineByteOffset: byte offset of this line in the file — used to generate stable
- * eventIds so the same line always produces the same ID regardless of whether it
- * arrives via real-time streaming or history replay.
- */
-function parseLine(sessionName: string, line: string, lineByteOffset?: number): void {
-  if (!line.trim()) return;
-
-  let raw: Record<string, unknown>;
-  try {
-    raw = JSON.parse(line) as Record<string, unknown>;
-  } catch {
-    return;
-  }
-
-  // Extract original event timestamp from JSONL (CC writes ISO timestamp on each entry).
-  const lineTs = raw['timestamp'] ? new Date(raw['timestamp'] as string).getTime() : undefined;
-  const ts = lineTs && isFinite(lineTs) ? lineTs : undefined;
-
-  // Stable ID generator: same line always gets same eventId across restarts.
-  let blockIdx = 0;
-  const stableId = lineByteOffset !== undefined
-    ? (suffix: string) => `cc:${sessionName}:${lineByteOffset}:${suffix}:${blockIdx++}`
-    : undefined;
-
-  // Progress events — transient status for status bar display (no message.content)
-  if (raw['type'] === 'progress') {
-    const data = raw['data'] as Record<string, unknown> | undefined;
-    if (!data) return;
-    const progressType = String(data['type'] ?? '');
-    switch (progressType) {
-      case 'bash_progress': {
-        const elapsed = data['elapsedTimeSeconds'] as number | undefined;
-        timelineEmitter.emit(sessionName, 'agent.status', {
-          status: 'bash_running',
-          label: `Bash running${elapsed ? ` (${Math.round(elapsed)}s)` : ''}...`,
-        }, { source: 'daemon', confidence: 'high' });
-        break;
-      }
-      case 'agent_progress': {
-        const raw = data['message'];
-        let msg = 'working';
-        if (typeof raw === 'string') {
-          msg = raw;
-        } else if (raw && typeof raw === 'object') {
-          const role = (raw as Record<string, unknown>).type ?? (raw as Record<string, unknown>).role ?? '';
-          msg = String(role) || 'working';
-        }
-        timelineEmitter.emit(sessionName, 'agent.status', {
-          status: 'agent_working',
-          label: `Sub-agent: ${msg}`,
-        }, { source: 'daemon', confidence: 'high' });
-        break;
-      }
-      case 'mcp_progress': {
-        const toolName = String(data['toolName'] ?? 'tool');
-        const server = String(data['serverName'] ?? '');
-        const mStatus = String(data['status'] ?? 'started');
-        if (mStatus === 'started') {
-          timelineEmitter.emit(sessionName, 'agent.status', {
-            status: 'mcp_running',
-            label: `MCP: ${server ? server + '/' : ''}${toolName}...`,
-          }, { source: 'daemon', confidence: 'high' });
-        }
-        break;
-      }
-      case 'waiting_for_task': {
-        const desc = String(data['taskDescription'] ?? 'task');
-        timelineEmitter.emit(sessionName, 'agent.status', {
-          status: 'waiting',
-          label: `Waiting: ${desc}`,
-        }, { source: 'daemon', confidence: 'high' });
-        break;
-      }
-    }
-    return;
-  }
-
-  // Result events — end-of-turn summary with total cost
-  if (raw['type'] === 'result') {
-    const costUsd = raw['total_cost_usd'] as number | undefined;
-    if (typeof costUsd === 'number' && costUsd > 0) {
-      timelineEmitter.emit(sessionName, 'usage.update', { costUsd },
-        { source: 'daemon', confidence: 'high' });
-    }
-    return;
-  }
-
-  // System events — compact_boundary etc. (no message.content)
-  if (raw['type'] === 'system') {
-    const subtype = String(raw['subtype'] ?? '');
-    if (subtype === 'compact_boundary') {
-      timelineEmitter.emit(sessionName, 'agent.status', {
-        status: 'compacting',
-        label: 'Compacting conversation...',
-      }, { source: 'daemon', confidence: 'high' });
-    }
-    return;
-  }
-
-  const msg = raw['message'] as Record<string, unknown> | undefined;
-  if (!msg) return;
-  const content = msg['content'];
-
-  if (raw['type'] === 'assistant') {
-    if (typeof content === 'string') {
-      emitAssistantStringContent(sessionName, content, stableId, ts);
-      return;
-    }
-    if (!Array.isArray(content)) return;
-    for (const block of content as ContentBlock[]) {
-      if (block.type === 'text' && block.text) {
-        timelineEmitter.emit(sessionName, 'assistant.text', {
-          text: block.text,
-          streaming: false,
-        }, { source: 'daemon', confidence: 'high', ...(stableId ? { eventId: stableId('at') } : {}), ...(ts ? { ts } : {}) });
-      } else if (block.type === 'thinking') {
-        timelineEmitter.emit(sessionName, 'assistant.thinking', {
-          text: block.thinking,
-        }, { source: 'daemon', confidence: 'high', ...(stableId ? { eventId: stableId('th') } : {}), ...(ts ? { ts } : {}) });
-      } else if (block.type === 'tool_use' && block.name) {
-        emitClaudeToolCallBlock(sessionName, block, stableId, ts);
-      } else if (block.type === 'tool_result') {
-        emitClaudeToolResultBlock(sessionName, block, stableId, ts);
-      }
-    }
-    // Emit token usage + model for context bar (transient, no stable ID needed)
-    const usage = msg['usage'] as { input_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } | undefined;
-    const model = msg['model'] as string | undefined;
-    if (usage && typeof usage.input_tokens === 'number') {
-      const presetCtx = watchers.get(sessionName)?.ccSessionId ? getSessionContextWindow(watchers.get(sessionName)!.ccSessionId!) : undefined;
-      timelineEmitter.emit(sessionName, 'usage.update', {
-        inputTokens: usage.input_tokens + (usage.cache_creation_input_tokens ?? 0),
-        cacheTokens: usage.cache_read_input_tokens ?? 0,
-        contextWindow: resolveContextWindow(presetCtx, model),
-        ...(model ? { model } : {}),
-      }, { source: 'daemon', confidence: 'high' });
-    }
-    return;
-  }
-
-  if (raw['type'] === 'user') {
-    if (typeof content === 'string') {
-      emitUserStringContent(sessionName, content, stableId, ts);
-      return;
-    }
-    if (!Array.isArray(content)) return;
-    for (const block of content as ContentBlock[]) {
-      if (block.type === 'text' && block.text?.trim()) {
-        emitUserStringContent(sessionName, block.text, stableId, ts);
-      } else if (block.type === 'tool_result') {
-        emitClaudeToolResultBlock(sessionName, block, stableId, ts);
-      }
-    }
-  }
-}
-
-/** Extract a truncated summary of tool result content for display. */
-function extractToolResultOutput(block: ContentBlock): string | undefined {
-  const raw = block.content;
-  if (!raw) return undefined;
-  let text: string;
-  if (typeof raw === 'string') {
-    text = raw;
-  } else if (Array.isArray(raw)) {
-    text = (raw as Array<{ text?: string }>).map((b) => b.text ?? '').join('\n');
-  } else {
-    return undefined;
-  }
-  text = text.trim();
-  if (!text) return undefined;
-  return text.length > 200 ? text.slice(0, 197) + '...' : text;
-}
+/** Main-thread fallback state (only used when worker disabled or failed). */
+const mainParseCtx: ParseContext = createParseContext();
 
 // ── Per-session watcher state ─────────────────────────────────────────────────
 
@@ -574,6 +190,14 @@ interface WatcherState {
   status: WatcherStatus;
   /** CC session UUID — used to look up preset contextWindow for usage events. */
   ccSessionId?: string;
+  /**
+   * Waiting-for-file state. When `startWatchingFile` can't find the target
+   * JSONL within its 120s fast-poll, it leaves a slow `setInterval` probe
+   * running so that as soon as the user's first turn materialises the file,
+   * the watcher activates. `stopWatching()` clears this timer.
+   */
+  pendingFilePath?: string;
+  pendingProbeTimer?: ReturnType<typeof setInterval>;
 }
 
 const watchers = new Map<string, WatcherState>();
@@ -695,10 +319,11 @@ export async function emitRecentHistory(sessionName: string, filePath: string): 
       }
     }
 
-    // Collect all parseable events first, then take the LAST N — not first N.
-    // This ensures the most recent history is always returned, not the oldest
-    // within the 256KB tail chunk.
-    interface HistoryEntry { lineBytePos: number; raw: Record<string, unknown>; }
+    // Collect all parseable history entries with their raw line strings so
+    // we can replay them through the shared parse core. Only the LAST N are
+    // replayed — we want the most recent history, not the oldest within the
+    // 256KB tail chunk.
+    interface HistoryEntry { lineBytePos: number; rawLine: string; }
     const allEntries: HistoryEntry[] = [];
 
     let bytePos = size - readSize;
@@ -718,57 +343,27 @@ export async function emitRecentHistory(sessionName: string, filePath: string): 
       const msg = raw['message'] as Record<string, unknown> | undefined;
       const content = msg?.['content'];
       if (!(Array.isArray(content) || typeof content === 'string')) continue;
-      allEntries.push({ lineBytePos, raw });
+      allEntries.push({ lineBytePos, rawLine: line });
     }
 
-    // Take last HISTORY_LINES entries
+    // Take last HISTORY_LINES entries and replay them through the shared parse
+    // core. A scratch ParseContext keeps history's tool-call correlation state
+    // isolated from the live watcher — no leakage into subsequent drains.
     const recentEntries = allEntries.slice(-HISTORY_LINES);
-
-    for (const { lineBytePos, raw } of recentEntries) {
-      let blockIdx = 0;
-      const stableId = (suffix: string) => `cc:${sessionName}:${lineBytePos}:${suffix}:${blockIdx++}`;
-
-      // Extract original timestamp from JSONL entry (same as parseLine)
-      const lineTs = raw['timestamp'] ? new Date(raw['timestamp'] as string).getTime() : undefined;
-      const ts = lineTs && isFinite(lineTs) ? lineTs : undefined;
-
-      if (raw['type'] === 'assistant') {
-        const msg = raw['message'] as Record<string, unknown> | undefined;
-        const content = msg?.['content'] as ContentBlock[] | string;
-        if (typeof content === 'string') {
-          emitAssistantStringContent(sessionName, content, stableId, ts);
-          continue;
-        }
-        for (const block of content) {
-          if (block.type === 'text' && block.text) {
-            timelineEmitter.emit(sessionName, 'assistant.text', {
-              text: block.text, streaming: false,
-            }, { source: 'daemon', confidence: 'high', eventId: stableId('at'), ...(ts ? { ts } : {}) });
-          } else if (block.type === 'thinking') {
-            timelineEmitter.emit(sessionName, 'assistant.thinking', {
-              text: block.thinking,
-            }, { source: 'daemon', confidence: 'high', eventId: stableId('th'), ...(ts ? { ts } : {}) });
-          } else if (block.type === 'tool_use' && block.name) {
-            emitClaudeToolCallBlock(sessionName, block, stableId, ts);
-          } else if (block.type === 'tool_result') {
-            emitClaudeToolResultBlock(sessionName, block, stableId, ts);
-          }
-        }
-      } else if (raw['type'] === 'user') {
-        const msg = raw['message'] as Record<string, unknown> | undefined;
-        const content = msg?.['content'] as ContentBlock[] | string;
-        if (typeof content === 'string') {
-          emitUserStringContent(sessionName, content, stableId, ts);
-          continue;
-        }
-        for (const block of content) {
-          if (block.type === 'text' && block.text?.trim()) {
-            emitUserStringContent(sessionName, block.text, stableId, ts);
-          } else if (block.type === 'tool_result') {
-            emitClaudeToolResultBlock(sessionName, block, stableId, ts);
-          }
-        }
-      }
+    const historyCtx = createParseContext();
+    const presetContextWindow = watchers.get(sessionName)?.ccSessionId
+      ? getSessionContextWindow(watchers.get(sessionName)!.ccSessionId!)
+      : undefined;
+    const { emits } = parseLinesInCtx(historyCtx, {
+      sessionName,
+      items: recentEntries.map((e) => ({ line: e.rawLine, lineByteOffset: e.lineBytePos })),
+      ...(presetContextWindow !== undefined ? { presetContextWindow } : {}),
+    });
+    // History handles the usage snapshot separately below — drop per-line
+    // usage events so we don't spam the context bar during replay.
+    for (const em of emits) {
+      if (em.type === 'usage.update') continue;
+      timelineEmitter.emit(em.sessionName, em.type, em.payload, em.metadata);
     }
 
     // Emit the most recent usage snapshot so the context bar populates on load
@@ -860,11 +455,18 @@ export function stopWatching(sessionName: string): void {
   state.status = 'stopped';
   state.abort.abort();
   if (state.pollTimer) clearInterval(state.pollTimer);
+  // Clear the slow stat-probe that waits for a delayed JSONL file in the
+  // pre-activation path. Left running, it would keep hitting `stat()` on
+  // a path whose session has been torn down.
+  if (state.pendingProbeTimer) clearInterval(state.pendingProbeTimer);
   watchers.delete(sessionName);
   unregisterWatcherControl(sessionName);
   releaseFiles(sessionName);
   releaseOwnership(sessionName);
-  pendingClaudeToolCalls.delete(sessionName);
+  // Drop per-session pending tool-call state in both the main-thread fallback
+  // context and the worker (best-effort; worker call is async and unawaited).
+  forgetSessionInCtx(mainParseCtx, sessionName);
+  void jsonlParsePool.forgetSession(sessionName);
 }
 
 /**
@@ -889,7 +491,9 @@ export async function startWatchingFile(sessionName: string, filePath: string, c
   const control = watcherControl(sessionName);
   registerWatcherControl(sessionName, control);
 
-  // Poll until the specific file appears (up to 120s — CC needs first conversation).
+  // Fast-poll the specific file for up to 120s (~1s interval). Matches the
+  // common case where the file materialises within a minute or two of the
+  // user starting the session.
   let appeared = false;
   for (let i = 0; i < 120 && !state.stopped; i++) {
     try {
@@ -900,10 +504,57 @@ export async function startWatchingFile(sessionName: string, filePath: string, c
       await new Promise((r) => setTimeout(r, 1000));
     }
   }
-  if (!appeared || state.stopped) {
-    // Timeout or stopped — clean up to avoid phantom watcher
-    logger.warn({ sessionName, filePath }, 'jsonl-watcher: file never appeared, cleaning up phantom watcher');
-    state.stopped = true;
+
+  // If the file STILL isn't there after 120s, DO NOT clean up. CC only
+  // creates the per-session JSONL on the first user turn, which can easily
+  // be more than two minutes after the sub-session was restored from the
+  // daemon's session store. The previous "clean up phantom watcher" branch
+  // left the session permanently unwatched: Claude's assistant replies
+  // landed on disk afterwards but nothing emitted them, so the chat UI
+  // showed user messages with no response bubble.
+  //
+  // Instead, keep the watcher alive and switch to a slow stat-probe every
+  // 10s. Activation happens as soon as the file appears (or the session is
+  // stopped). The slow probe costs ~1 stat() per 10s — negligible.
+  if (!appeared && !state.stopped) {
+    logger.info(
+      { sessionName, filePath },
+      'jsonl-watcher: file not yet created after 120s fast-poll, switching to slow probe (kept alive)',
+    );
+    const started = Date.now();
+    state.pendingFilePath = filePath;
+    const slowProbe = setInterval(async () => {
+      if (state.stopped) {
+        clearInterval(slowProbe);
+        return;
+      }
+      try {
+        await stat(filePath);
+      } catch {
+        return;
+      }
+      clearInterval(slowProbe);
+      if (state.stopped) return;
+      logger.info(
+        { sessionName, filePath, waitedMs: Date.now() - started },
+        'jsonl-watcher: file appeared after slow probe, activating',
+      );
+      try {
+        await activateFile(sessionName, state, filePath);
+        state.status = 'active';
+        startDrainPoll(sessionName, state);
+        void watchFile(sessionName, state, filePath);
+      } catch (err) {
+        logger.warn({ sessionName, filePath, err }, 'jsonl-watcher: failed to activate file after slow probe');
+      }
+    }, 10_000);
+    // Hand the timer to watcher state so stopWatching() can clear it.
+    state.pendingProbeTimer = slowProbe;
+    return control;
+  }
+
+  if (state.stopped) {
+    // Session was explicitly stopped while we were waiting — clean exit.
     state.status = 'stopped';
     watchers.delete(sessionName);
     releaseFiles(sessionName);
@@ -912,13 +563,27 @@ export async function startWatchingFile(sessionName: string, filePath: string, c
 
   await activateFile(sessionName, state, filePath);
   state.status = 'active';
+  startDrainPoll(sessionName, state);
+  void watchFile(sessionName, state, filePath);
+  return control;
+}
 
-  // Poll drains new lines every 2s; rotation scan every 10s as fallback (fs.watch is primary).
+/**
+ * Start the standard drain + rotation-check poll loop for an active watcher.
+ * Runs every 2s: drain new lines from the active file, and every 5th tick
+ * (10s) scan the project dir for a newer JSONL that CC rotated into on
+ * context overflow. fs.watch is the primary rotation trigger — this poll
+ * is a fallback for platforms where fs.watch events are unreliable.
+ *
+ * Extracted so the slow-probe path in `startWatchingFile` can reuse the
+ * identical startup sequence once the file finally appears, instead of
+ * duplicating the body.
+ */
+function startDrainPoll(sessionName: string, state: WatcherState): void {
+  if (state.pollTimer) return; // already running
   let pollCount = 0;
   state.pollTimer = setInterval(async () => {
     await drainNewLines(sessionName, state);
-
-    // Fallback rotation scan every 10s (5 ticks × 2s) in case fs.watch misses events.
     pollCount++;
     if (pollCount % 5 === 0 && state.activeFile) {
       try {
@@ -932,8 +597,6 @@ export async function startWatchingFile(sessionName: string, filePath: string, c
       } catch { /* ignore */ }
     }
   }, 2000);
-  void watchFile(sessionName, state, filePath);
-  return control;
 }
 
 async function watchFile(sessionName: string, state: WatcherState, filePath: string): Promise<void> {
@@ -1129,10 +792,36 @@ async function drainNewLines(sessionName: string, state: WatcherState): Promise<
     const prevPendingByteLen = Buffer.byteLength(fullChunk.slice(0, fullChunk.length - chunk.length), 'utf8');
     let lineByteOffset = chunkStartOffset - prevPendingByteLen;
 
+    // Batch complete lines and route to worker (if enabled) or parse on main.
+    const items: ParseLineInput[] = [];
     for (const line of lines) {
       if (state.stopped) break;
-      parseLine(sessionName, line, lineByteOffset);
+      items.push({ line, lineByteOffset });
       lineByteOffset += Buffer.byteLength(line, 'utf8') + 1; // +1 for \n
+    }
+    if (items.length === 0) return;
+
+    const presetContextWindow = state.ccSessionId
+      ? getSessionContextWindow(state.ccSessionId)
+      : undefined;
+    const request = {
+      sessionName,
+      items,
+      ...(state.ccSessionId ? { ccSessionId: state.ccSessionId } : {}),
+      ...(presetContextWindow !== undefined ? { presetContextWindow } : {}),
+    };
+
+    let emits: EmitInstruction[] | null = null;
+    if (isJsonlWorkerEnabled() && jsonlParsePool.isAvailable()) {
+      const result = await jsonlParsePool.parseLines(request);
+      if (result) emits = result.emits;
+    }
+    if (!emits) {
+      // Main-thread fallback: either worker disabled, unavailable, or returned null.
+      emits = parseLinesInCtx(mainParseCtx, request).emits;
+    }
+    for (const em of emits) {
+      timelineEmitter.emit(em.sessionName, em.type, em.payload, em.metadata);
     }
   } catch (err) {
     if (!state.stopped) {

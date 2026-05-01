@@ -1,7 +1,7 @@
 /**
  * @vitest-environment jsdom
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen } from '@testing-library/preact';
 
@@ -48,6 +48,10 @@ import type { TerminalDiff } from '../../src/types.js';
 describe('TerminalView', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it('renders a container div with terminal-container class', () => {
@@ -199,5 +203,57 @@ describe('TerminalView', () => {
     });
 
     expect(mockWrite).not.toHaveBeenCalled();
+  });
+
+  it('batches raw PTY writes while rendering a preview terminal', async () => {
+    vi.useFakeTimers();
+    const { Terminal } = await import('xterm');
+    const mockWrite = vi.fn((_data: Uint8Array, cb?: () => void) => cb?.());
+    const mockScrollToBottom = vi.fn();
+    (Terminal as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      open: vi.fn(),
+      write: mockWrite,
+      reset: vi.fn(),
+      loadAddon: vi.fn(),
+      dispose: vi.fn(),
+      options: {},
+      attachCustomKeyEventHandler: vi.fn(),
+      hasSelection: vi.fn().mockReturnValue(false),
+      getSelection: vi.fn().mockReturnValue(''),
+      onData: vi.fn(),
+      onResize: vi.fn(),
+      onScroll: vi.fn(),
+      focus: vi.fn(),
+      scrollToBottom: mockScrollToBottom,
+      buffer: { active: { baseY: 0, viewportY: 0 } },
+      cols: 80,
+      rows: 24,
+    }));
+
+    let rawHandler: ((data: Uint8Array) => void) | undefined;
+    const ws = {
+      onTerminalRaw: vi.fn((_session: string, handler: (data: Uint8Array) => void) => {
+        rawHandler = handler;
+        return vi.fn();
+      }),
+      onMessage: vi.fn(() => vi.fn()),
+    };
+
+    render(
+      <TerminalView sessionName="preview-raw" ws={ws as any} preview />,
+    );
+
+    expect(rawHandler).toBeDefined();
+    rawHandler!(new Uint8Array([65]));
+    rawHandler!(new Uint8Array([66]));
+
+    expect(mockWrite).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(31);
+    expect(mockWrite).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+
+    expect(mockWrite).toHaveBeenCalledOnce();
+    expect(Array.from(mockWrite.mock.calls[0][0] as Uint8Array)).toEqual([65, 66]);
+    expect(mockScrollToBottom).toHaveBeenCalledOnce();
   });
 });

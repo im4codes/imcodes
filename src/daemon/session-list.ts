@@ -6,6 +6,7 @@ import { getQwenDisplayMetadata } from '../agent/provider-display.js';
 import { getQwenOAuthQuotaUsageLabel } from '../agent/provider-quota.js';
 import { getClaudeSdkRuntimeConfig } from '../agent/sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
+import { mergeCodexDisplayMetadata } from '../agent/codex-display.js';
 import { getCopilotRuntimeConfig } from '../agent/copilot-runtime-config.js';
 import { getCursorRuntimeConfig } from '../agent/cursor-runtime-config.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
@@ -31,6 +32,7 @@ export interface SessionListItem extends SessionContextBootstrapState {
   qwenAvailableModels?: string[];
   copilotAvailableModels?: string[];
   cursorAvailableModels?: string[];
+  codexAvailableModels?: string[];
   modelDisplay?: string;
   planLabel?: string;
   permissionLabel?: string;
@@ -80,6 +82,7 @@ function baseItem(s: SessionRecord): SessionListItem {
     qwenAvailableModels: s.qwenAvailableModels,
     copilotAvailableModels: s.copilotAvailableModels,
     cursorAvailableModels: s.cursorAvailableModels,
+    codexAvailableModels: s.codexAvailableModels,
     modelDisplay: s.modelDisplay ?? s.activeModel,
     planLabel: s.planLabel,
     permissionLabel: s.permissionLabel,
@@ -176,14 +179,12 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
     }
     if (s.agentType === 'codex' || s.agentType === 'codex-sdk') {
       const hydrated: Partial<SessionRecord> = {
-        planLabel: codexRuntime?.planLabel,
+        ...mergeCodexDisplayMetadata(codexRuntime, s),
         permissionLabel: getPermissionLabel(s.agentType),
-        quotaLabel: codexRuntime?.quotaLabel,
-        quotaUsageLabel: codexRuntime?.quotaUsageLabel,
-        quotaMeta: codexRuntime?.quotaMeta,
       };
       if (
         hydrated.planLabel !== s.planLabel
+        || !arraysEqual(hydrated.codexAvailableModels, s.codexAvailableModels)
         || hydrated.permissionLabel !== s.permissionLabel
         || hydrated.quotaLabel !== s.quotaLabel
         || hydrated.quotaUsageLabel != s.quotaUsageLabel

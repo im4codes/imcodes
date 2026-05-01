@@ -59,6 +59,12 @@ describe('writeWatchdogCmd', () => {
   beforeEach(async () => {
     for (const k of Object.keys(written)) delete written[k];
     await resetExistsSyncMock();
+    // Tests below assume a default-prefix layout under
+    // `C:\Users\X\AppData\Roaming\npm`. Stub APPDATA so the
+    // npmGlobalBin === `%APPDATA%\npm` detection picks the env-var form.
+    // Tests that intentionally exercise the custom-prefix branch override
+    // this with vi.stubEnv inside the test body.
+    vi.stubEnv('APPDATA', 'C:\\Users\\X\\AppData\\Roaming');
   });
 
   it('generates watchdog with upgrade lock check', async () => {
@@ -159,7 +165,7 @@ describe('writeWatchdogCmd', () => {
     expect(cmd).toContain('index.js');
   });
 
-  it('watchdog is an infinite loop with 5s retry', async () => {
+  it('watchdog is an infinite loop with ping-based 5s retry', async () => {
     const paths = {
       nodeExe: 'node.exe',
       imcodesScript: 'C:\\npm\\node_modules\\imcodes\\dist\\src\\index.js',
@@ -173,7 +179,57 @@ describe('writeWatchdogCmd', () => {
 
     expect(cmd).toContain(':loop');
     expect(cmd).toContain('goto loop');
-    expect(cmd).toContain('timeout /t 5');
+    // ping -n 6 127.0.0.1 ≈ 5 second wait — works in console-less wscript
+    // child processes where `timeout` aborts immediately.
+    expect(cmd).toContain('ping -n 6 127.0.0.1 >nul 2>&1');
+  });
+
+  it('NEVER uses `timeout /t` for sleep (regression: timeout fails under wscript)', async () => {
+    // `timeout /t N /nobreak` requires a real console for stdin (it polls
+    // keypresses to detect interrupt).  When the watchdog is launched via
+    // wscript → WshShell.Run, the spawned cmd has NO console attached, so
+    // `timeout` aborts immediately with "Input redirection is not
+    // supported, exiting the process immediately." — meaning no actual
+    // sleep happens.  Result: the watchdog spin-loops at full CPU and
+    // logs thousands of "waiting..." lines per minute.  Use ping instead.
+    const paths = {
+      nodeExe: 'node.exe',
+      imcodesScript: 'C:\\npm\\node_modules\\imcodes\\dist\\src\\index.js',
+      watchdogPath: 'out.cmd',
+      vbsPath: 'out.vbs',
+      logPath: 'out.log',
+    };
+    await writeWatchdogCmd(paths);
+    const cmd = written[paths.watchdogPath];
+    expect(cmd).not.toMatch(/timeout \/t \d+/);
+  });
+
+  it('lock-wait state logs only ONCE on entry/exit, not every poll', async () => {
+    // Regression: an earlier implementation logged "Upgrade in progress,
+    // waiting..." inside a 5-second poll loop, which combined with the
+    // `timeout`-fails-under-wscript bug filled the watchdog log with 25k+
+    // lines in 12 minutes during a stuck-lock incident.  The new shape
+    // uses two labels (`:wait_lock` for entry, `:wait_loop` for the poll
+    // body) so the entry message logs once, then we poll silently every
+    // 30 seconds, and log once more when the lock clears.
+    const paths = {
+      nodeExe: 'node.exe',
+      imcodesScript: 'C:\\npm\\node_modules\\imcodes\\dist\\src\\index.js',
+      watchdogPath: 'out.cmd',
+      vbsPath: 'out.vbs',
+      logPath: 'out.log',
+    };
+    await writeWatchdogCmd(paths);
+    const cmd = written[paths.watchdogPath];
+    expect(cmd).toContain(':wait_lock');
+    expect(cmd).toContain(':wait_loop');
+    // 30 s poll during lock-wait (vs 5 s after a clean daemon exit)
+    expect(cmd).toContain('ping -n 31 127.0.0.1 >nul 2>&1');
+    // Exactly one "waiting..." entry message (not inside the poll loop)
+    const waitingHits = (cmd.match(/Upgrade in progress, waiting/g) ?? []).length;
+    expect(waitingHits).toBe(1);
+    // And exactly one "cleared" exit message
+    expect(cmd).toContain('Upgrade lock cleared, resuming');
   });
 });
 
@@ -303,11 +359,13 @@ describe('writeWatchdogCmd encoding (regression: cmd.exe BOM bug)', () => {
     expect(firstLine).toBe('@echo off');
   });
 
-  it('survives non-ASCII usernames by using %APPDATA% / %USERPROFILE% expansion', async () => {
+  it('survives non-ASCII usernames by using %APPDATA% / %USERPROFILE% expansion (default prefix)', async () => {
     // The fix for non-ASCII paths is NOT to encode the bytes correctly —
-    // it's to never bake the path into the file at all.  cmd.exe expands
-    // env vars at runtime via the OS native wide-char API, so the actual
-    // username encoding doesn't matter.
+    // it's to never bake the path into the file at all when the install
+    // is at the default prefix.  cmd.exe expands env vars at runtime via
+    // the OS native wide-char API, so the actual username encoding
+    // doesn't matter.
+    vi.stubEnv('APPDATA', 'C:\\Users\\用户测试\\AppData\\Roaming');
     const paths = {
       nodeExe: 'C:\\Program Files\\nodejs\\node.exe',
       // Path with Chinese chars only matters for the SHIM detection probe.
@@ -324,6 +382,50 @@ describe('writeWatchdogCmd encoding (regression: cmd.exe BOM bug)', () => {
     expect(cmd).not.toContain('用户测试');
     expect(cmd).toContain('%APPDATA%\\npm\\imcodes.cmd');
     expect(cmd).toContain('%USERPROFILE%\\.imcodes\\watchdog.log');
+  });
+
+  it('uses ABSOLUTE shim path when npm prefix differs from %APPDATA%\\npm (nvm/fnm/custom)', async () => {
+    // Regression: a previous implementation hardcoded `%APPDATA%\\npm\\imcodes.cmd`
+    // for the launch line. When the user's npm prefix was elsewhere (nvm,
+    // fnm, volta, system nodejs install, or any custom `npm config set
+    // prefix`), the watchdog launched a stale shim left over from a prior
+    // default-prefix install — bypassing the upgrade. Symptom: user runs
+    // upgrade, npm install reports success, daemon "restart" still serves
+    // the old version because it ran the wrong shim.
+    vi.stubEnv('APPDATA', 'C:\\Users\\X\\AppData\\Roaming');
+    const customPrefix = 'C:\\nvm-versions\\v20.11.0';
+    const paths = {
+      nodeExe: `${customPrefix}\\node.exe`,
+      imcodesScript: `${customPrefix}\\node_modules\\imcodes\\dist\\src\\index.js`,
+      watchdogPath: 'C:\\Users\\X\\.imcodes\\daemon-watchdog.cmd',
+      vbsPath: 'C:\\Users\\X\\.imcodes\\daemon-launcher.vbs',
+      logPath: 'C:\\Users\\X\\.imcodes\\watchdog.log',
+    };
+    await writeWatchdogCmd(paths);
+    const cmd = written[paths.watchdogPath];
+
+    // Watchdog must launch the shim that matches THIS install location,
+    // not the default-prefix shim (which may not exist or be stale).
+    expect(cmd).toContain(`call "${customPrefix}\\imcodes.cmd" start --foreground`);
+    expect(cmd).not.toContain('%APPDATA%\\npm\\imcodes.cmd');
+  });
+
+  it('uses ABSOLUTE shim path when APPDATA env var is unset', async () => {
+    // Defensive: if for some reason APPDATA isn't in the daemon's env
+    // (extremely unusual on Windows but possible under stripped-down
+    // service environments), fall back to the absolute path so the
+    // upgrade can't silently route through a non-existent default prefix.
+    vi.stubEnv('APPDATA', '');
+    const paths = {
+      nodeExe: 'C:\\node\\node.exe',
+      imcodesScript: 'C:\\Users\\X\\AppData\\Roaming\\npm\\node_modules\\imcodes\\dist\\src\\index.js',
+      watchdogPath: 'C:\\Users\\X\\.imcodes\\daemon-watchdog.cmd',
+      vbsPath: 'C:\\Users\\X\\.imcodes\\daemon-launcher.vbs',
+      logPath: 'C:\\Users\\X\\.imcodes\\watchdog.log',
+    };
+    await writeWatchdogCmd(paths);
+    const cmd = written[paths.watchdogPath];
+    expect(cmd).toContain('call "C:\\Users\\X\\AppData\\Roaming\\npm\\imcodes.cmd" start --foreground');
   });
 
   it('every line is plain ASCII (no embedded user paths)', async () => {

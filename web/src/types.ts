@@ -48,6 +48,7 @@ export interface SessionInfo {
   qwenAvailableModels?: string[];
   copilotAvailableModels?: string[];
   cursorAvailableModels?: string[];
+  codexAvailableModels?: string[];
   modelDisplay?: string;
   planLabel?: string;
   permissionLabel?: string;

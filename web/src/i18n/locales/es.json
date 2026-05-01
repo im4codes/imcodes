@@ -43,6 +43,17 @@
     "tool_fold_collapse": "colapsar",
     "tool_group_more": "··· {{count}} más",
     "tool_group_collapse": "▲ colapsar",
+    "tool_calls_toggle_show": "Mostrar herramientas y razonamiento",
+    "tool_calls_toggle_hide": "Ocultar herramientas y razonamiento",
+    "tool_calls_toggle_undecided": "Elige cómo ver la actividad de la IA",
+    "tool_calls_choose_prompt": "Elige vista ↓",
+    "tool_chooser_title": "¿Cómo mostrar la actividad de la IA?",
+    "tool_chooser_subtitle": "Las llamadas a herramientas, cambios de archivos y razonamiento aportan detalle pero pueden saturar.",
+    "tool_chooser_simple_label": "Sencillo",
+    "tool_chooser_simple_hint": "Solo las respuestas de la IA",
+    "tool_chooser_developer_label": "Desarrollador",
+    "tool_chooser_developer_hint": "Mostrar herramientas, archivos, razonamiento",
+    "tool_chooser_footnote": "Cámbialo en cualquier momento con el icono de la llave.",
     "new_folder": "Nueva carpeta",
     "new_folder_name": "Nombre de carpeta",
     "create": "Crear",
@@ -141,7 +152,8 @@
       "claude_code_cli": "Claude Code CLI",
       "codex_cli": "Codex CLI",
       "copilot_sdk": "Copilot",
-      "cursor_headless": "Cursor"
+      "cursor_headless": "Cursor",
+      "gemini_sdk": "Gemini SDK"
     },
     "agentGroup": {
       "transport_sdk": "SDK",
@@ -318,9 +330,10 @@
     "timeout": "Tiempo de espera agotado",
     "timeout_detail": "No se pudo leer el directorio. Puede ser causado por unidades de red lentas o no disponibles.",
     "preview_loading": "Cargando…",
-    "preview_too_large": "Archivo demasiado grande para previsualizar (> 5 MB)",
+    "preview_too_large": "Archivo demasiado grande para previsualizar (> 100 MB)",
     "preview_error": "Vista previa no disponible",
     "preview_binary": "Archivo binario — vista previa no disponible",
+    "preview_video_unsupported": "Tu navegador no puede reproducir este formato de vídeo.",
     "mkdir_failed": "No se pudo crear la carpeta",
     "view_diff": "Diff",
     "view_source": "Fuente",
@@ -408,6 +421,7 @@
     "username_placeholder": "Nombre de usuario",
     "password_placeholder": "Contraseña",
     "signin": "Iniciar sesión",
+    "remember_password": "Recordar contraseña en este dispositivo",
     "invalid_credentials": "Nombre de usuario o contraseña incorrectos",
     "account_pending": "Tu cuenta está pendiente de aprobación del administrador. Por favor, contacta al administrador.",
     "account_disabled": "Tu cuenta ha sido deshabilitada. Por favor, contacta al administrador.",
@@ -1226,7 +1240,8 @@
       "memoryDeleteConfirm": "¿Eliminar esta memoria de forma permanente? Esta acción no se puede deshacer.",
       "memoryDeleteFailed": "No se pudo eliminar la memoria",
       "memoryArchived": "Archivado",
-      "memoryShowArchived": "Mostrar archivados"
+      "memoryShowArchived": "Mostrar archivados",
+      "memoryMasterSummary": "Resumen maestro"
     },
     "diagnostics": {
       "title": "Diagnostics",
@@ -1244,5 +1259,13 @@
       "snapshotTitle": "Persisted snapshot",
       "snapshotBindings": "Snapshot bindings"
     }
+  },
+  "embedding": {
+    "status_unknown": "Estado de embedding desconocido (daemon antiguo o desconectado)",
+    "status_ready": "Embedding listo — la búsqueda semántica se ejecuta localmente",
+    "status_loading": "Cargando modelo de embedding…",
+    "status_fallback": "Embedding: pipeline local no disponible, usando respaldo del servidor",
+    "status_unavailable": "Embedding no disponible — búsqueda semántica deshabilitada en este daemon",
+    "status_idle": "Embedding inactivo (no se ha usado en esta sesión)"
   }
 }

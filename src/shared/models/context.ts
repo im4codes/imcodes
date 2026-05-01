@@ -1,4 +1,5 @@
 export const OPENAI_CONTEXT_WINDOWS = {
+  GPT_55: 922_000,
   GPT_54: 1_000_000,
   GPT_5_FAMILY: 400_000,
   GPT_41_FAMILY: 1_000_000,
@@ -7,7 +8,8 @@ export const OPENAI_CONTEXT_WINDOWS = {
 export const CLAUDE_CONTEXT_WINDOWS = {
   OPUS_1M_ALIAS: 1_000_000,
   OPUS_4_FAMILY: 1_000_000,
-  CLAUDE_4_FAMILY: 200_000,
+  SONNET_4_FAMILY: 1_000_000,
+  HAIKU_4_FAMILY: 200_000,
   CLAUDE_3_FAMILY: 200_000,
 } as const;
 
@@ -28,6 +30,7 @@ export function inferContextWindow(model?: string | null): number | undefined {
   const m = model?.toLowerCase().trim();
   if (!m) return undefined;
 
+  if (/^gpt-5\.5(?:$|[-_.])/.test(m)) return OPENAI_CONTEXT_WINDOWS.GPT_55;
   if (/^gpt-5\.4(?:$|[-_.])/.test(m)) return OPENAI_CONTEXT_WINDOWS.GPT_54;
 
   if (
@@ -41,8 +44,10 @@ export function inferContextWindow(model?: string | null): number | undefined {
 
   if (m == 'opus[1m]') return CLAUDE_CONTEXT_WINDOWS.OPUS_1M_ALIAS;
   if (/^claude-opus-4(?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.OPUS_4_FAMILY;
-  if (m == 'sonnet' || m == 'haiku') return CLAUDE_CONTEXT_WINDOWS.CLAUDE_4_FAMILY;
-  if (/^claude-(?:sonnet|haiku)-4(?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.CLAUDE_4_FAMILY;
+  if (m == 'sonnet') return CLAUDE_CONTEXT_WINDOWS.SONNET_4_FAMILY;
+  if (/^claude-sonnet-4(?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.SONNET_4_FAMILY;
+  if (m == 'haiku') return CLAUDE_CONTEXT_WINDOWS.HAIKU_4_FAMILY;
+  if (/^claude-haiku-4(?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.HAIKU_4_FAMILY;
   if (/^claude-3(?:[.-]|$)/.test(m)) return CLAUDE_CONTEXT_WINDOWS.CLAUDE_3_FAMILY;
 
   if (/^coder-model$/.test(m)) return QWEN_CONTEXT_WINDOWS.CODER_MODEL;

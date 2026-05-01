@@ -24,7 +24,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
           cache: 'npm'
-      - run: npm ci
+      - run: ./scripts/ci-npm-ci.sh .
       - run: npm run lint
 
   # ── Typecheck (daemon + server) ───────────────────────────────────────────
@@ -38,7 +38,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
           cache: 'npm'
-      - run: npm ci
+      - run: ./scripts/ci-npm-ci.sh .
       - name: Install server deps
         run: ./scripts/ci-npm-ci.sh server
       - name: Daemon
@@ -74,7 +74,7 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: 'npm'
-      - run: npm ci
+      - run: ./scripts/ci-npm-ci.sh .
       - run: npm run build
       - run: npm run test:unit
 
@@ -87,7 +87,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
           cache: 'npm'
-      - run: npm ci
+      - run: ./scripts/ci-npm-ci.sh .
       - name: Cache embedding model
         uses: actions/cache@v4
         with:
@@ -114,7 +114,7 @@ jobs:
         run: brew install tmux
       - name: Prime tmux server
         run: tmux new-session -d -s init && tmux kill-session -t init
-      - run: npm ci
+      - run: ./scripts/ci-npm-ci.sh .
       - run: npm run build
       - run: npm run test:unit
 
@@ -129,10 +129,10 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
           cache: 'npm'
-      - run: npm ci
+      - run: bash ./scripts/ci-npm-ci.sh .
       - run: npm run build
       - name: Run Windows-specific unit tests
-        run: npx vitest run test/agent/wezterm.test.ts test/daemon/hook-send.test.ts test/daemon/env-injection.test.ts test/cli/send.test.ts test/util/windows-daemon.test.ts test/util/windows-upgrade-script.test.ts test/util/windows-launch-artifacts.test.ts test/util/windows-launch-artifacts.cmd-parse.test.ts test/util/windows-stale-watchdog-cleanup.test.ts
+        run: npx vitest run test/agent/wezterm.test.ts test/daemon/hook-send.test.ts test/daemon/env-injection.test.ts test/cli/send.test.ts test/util/windows-daemon.test.ts test/util/windows-upgrade-script.test.ts test/util/windows-launch-artifacts.test.ts test/util/windows-launch-artifacts.cmd-parse.test.ts test/util/windows-stale-watchdog-cleanup.test.ts test/util/postinstall-sharp-repair.test.ts
         env:
           IMCODES_MUX: wezterm
 
@@ -145,7 +145,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
           cache: 'npm'
-      - run: npm ci
+      - run: bash ./scripts/ci-npm-ci.sh .
       - run: npm run build
       - name: Run Windows ConPTY / startup regression tests
         run: npx vitest run test/agent/conpty.test.ts test/agent/drivers/drivers.test.ts test/util/windows-daemon.test.ts test/util/windows-upgrade-script.test.ts test/util/windows-launch-artifacts.test.ts test/util/windows-launch-artifacts.cmd-parse.test.ts test/util/windows-stale-watchdog-cleanup.test.ts
@@ -160,7 +160,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
           cache: 'npm'
-      - run: npm ci
+      - run: ./scripts/ci-npm-ci.sh .
       - run: ./scripts/ci-npm-ci.sh web
       - run: cd web && npx vitest run --config vitest.unit.config.ts
 
@@ -173,7 +173,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
           cache: 'npm'
-      - run: npm ci
+      - run: ./scripts/ci-npm-ci.sh .
       - run: ./scripts/ci-npm-ci.sh web
       - run: cd web && npx vitest run --config vitest.components.config.ts
 
@@ -192,7 +192,7 @@ jobs:
           node-version: ${{ env.NODE_VERSION_SERVER }}
           cache: 'npm'
           cache-dependency-path: package-lock.json
-      - run: npm ci
+      - run: ./scripts/ci-npm-ci.sh .
       - run: ./scripts/ci-npm-ci.sh server
       - run: npm run test:server
       - name: Run server-native tests (auth-flow, proxy-addr — require server/node_modules)
@@ -241,7 +241,7 @@ jobs:
         run: sudo apt-get install -y tmux
       - name: Prime tmux server (ensures socket dir exists)
         run: tmux new-session -d -s init && tmux kill-session -t init
-      - run: npm ci
+      - run: ./scripts/ci-npm-ci.sh .
       - name: Install web deps (active timeline refresh e2e wrapper invokes web vitest)
         run: ./scripts/ci-npm-ci.sh web
       - name: Run pipe-pane e2e tests
@@ -261,7 +261,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
           cache: 'npm'
-      - run: npm ci
+      - run: ./scripts/ci-npm-ci.sh .
       - name: Install & authenticate glab (optional — tests skip if unavailable)
         continue-on-error: true
         run: |
@@ -295,7 +295,7 @@ jobs:
         run: sudo apt-get install -y tmux
       - name: Prime tmux server
         run: tmux new-session -d -s init && tmux kill-session -t init
-      - run: npm ci
+      - run: ./scripts/ci-npm-ci.sh .
       - name: Install web deps (needed for tsx component tests)
         run: ./scripts/ci-npm-ci.sh web
       - name: Install server deps (needed for server route tests)
@@ -338,7 +338,7 @@ jobs:
             sed -i '/^always-auth=/d' "$NPM_CONFIG_USERCONFIG"
           fi
       - run: npm install -g npm@11.11.1
-      - run: npm ci
+      - run: ./scripts/ci-npm-ci.sh .
       - name: Install web deps
         run: ./scripts/ci-npm-ci.sh web
       - name: Install server deps
@@ -533,7 +533,7 @@ jobs:
           yes | sdkmanager --licenses
           sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools"
 
-      - run: npm ci
+      - run: ./scripts/ci-npm-ci.sh .
 
       - run: npm ci
         working-directory: web

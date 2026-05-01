@@ -13,6 +13,8 @@ import type {
 import { computeRelevanceScore, type ProjectionClass } from '../../shared/memory-scoring.js';
 import { normalizeSummaryForFingerprint } from '../../shared/memory-fingerprint.js';
 import { getContextModelConfig } from './context-model-config.js';
+import { redactSensitiveText } from '../util/redact-secrets.js';
+import { resolveMemoryConfigForNamespace, type MemoryConfigResolver } from './memory-config-resolver.js';
 import {
   listContextEvents,
   listDirtyTargets,
@@ -48,6 +50,10 @@ export interface MemorySearchQuery {
   includeArchived?: boolean;
   /** Result offset for pagination. */
   offset?: number;
+  /** Optional project/namespace-aware config resolver for embedding-source redaction. */
+  memoryConfigResolver?: MemoryConfigResolver;
+  /** Explicit fallback cwd for legacy/local callers without a namespace registration. */
+  memoryConfigCwd?: string;
 }
 
 export type MemorySearchFormat = 'json' | 'document' | 'table';
@@ -203,8 +209,12 @@ export async function searchLocalMemorySemantic(query: MemorySearchQuery): Promi
       ? getProjectionEmbeddings(processedIds)
       : new Map<string, ReturnType<typeof getProjectionEmbeddings> extends Map<string, infer V> ? V : never>();
 
-    const itemEmbedText = (item: MemorySearchResultItem): string =>
-      `${item.summary} ${item.content ?? ''}`.slice(0, 500);
+    const itemEmbedText = (item: MemorySearchResultItem): string => {
+      const namespace = itemNamespace(item);
+      const config = query.memoryConfigResolver?.(namespace)
+        ?? resolveMemoryConfigForNamespace(namespace, { fallbackCwd: query.memoryConfigCwd });
+      return redactSensitiveText(`${item.summary} ${item.content ?? ''}`, config.extraRedactPatterns).slice(0, 500);
+    };
 
     // Score each candidate by cosine similarity
     const scored: Array<{ item: MemorySearchResultItem; score: number }> = [];
@@ -446,6 +456,16 @@ function eventToItem(event: LocalContextEvent): MemorySearchResultItem {
     eventType: event.eventType,
     summary: event.content ?? event.eventType,
     createdAt: event.createdAt,
+  };
+}
+
+function itemNamespace(item: MemorySearchResultItem): ContextNamespace {
+  return {
+    scope: item.scope as ContextNamespace['scope'],
+    projectId: item.projectId,
+    userId: item.userId,
+    workspaceId: item.workspaceId,
+    enterpriseId: item.enterpriseId,
   };
 }
 

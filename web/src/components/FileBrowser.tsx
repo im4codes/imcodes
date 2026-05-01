@@ -19,7 +19,7 @@ import { parseUnifiedDiff } from '@shared/unified-diff.js';
 import { FileEditor, FileEditorContent } from './file-editor-lazy.js';
 const FilePreviewPane = lazy(() => import('./FilePreviewPane.js'));
 const OfficePreview = lazy(() => import('./OfficePreview.js'));
-import { downloadAttachment } from '../api.js';
+import { downloadAttachment, getApiBaseUrl } from '../api.js';
 import {
   getSharedChangesKey,
   subscribeSharedChanges,
@@ -235,6 +235,7 @@ export type FileBrowserPreviewState =
   | { status: 'ok'; path: string; content: string; diff?: string; diffHtml?: string; downloadId?: string }
   | { status: 'image'; path: string; dataUrl: string; downloadId?: string }
   | { status: 'office'; path: string; data: string; mimeType: string; downloadId?: string }
+  | { status: 'video'; path: string; streamUrl: string; mimeType: string; downloadId?: string }
   | { status: 'error'; path: string; error: string; downloadId?: string };
 
 export interface FileBrowserPreviewRequest {
@@ -242,6 +243,8 @@ export interface FileBrowserPreviewRequest {
   preferDiff?: boolean;
   preview?: FileBrowserPreviewState;
   sourcePreviewLive?: boolean;
+  /** Project/root directory used to keep the floating preview's Changes tab available. */
+  rootPath?: string;
 }
 
 export interface FileBrowserPreviewUpdate {
@@ -281,6 +284,32 @@ const OFFICE_EXTENSIONS: Record<string, string> = {
 function getOfficeType(path: string): string | null {
   const ext = path.match(/\.[a-zA-Z0-9]+$/i)?.[0]?.toLowerCase();
   return ext ? (OFFICE_EXTENSIONS[ext] ?? null) : null;
+}
+
+/** File extensions playable in the browser <video> element. Mirrored from
+ *  VIDEO_MIME in src/daemon/command-handler.ts — keep these in sync. */
+const VIDEO_EXTENSIONS: Record<string, string> = {
+  '.mp4': 'video/mp4',
+  '.m4v': 'video/mp4',
+  '.mov': 'video/quicktime',
+  '.webm': 'video/webm',
+  '.ogv': 'video/ogg',
+  '.ogg': 'video/ogg',
+  '.mkv': 'video/x-matroska',
+  '.avi': 'video/x-msvideo',
+};
+
+function getVideoType(path: string): string | null {
+  const ext = path.match(/\.[a-zA-Z0-9]+$/i)?.[0]?.toLowerCase();
+  return ext ? (VIDEO_EXTENSIONS[ext] ?? null) : null;
+}
+
+/** Build the HTTP URL the <video> element fetches from. Cookies authenticate
+ *  the request on desktop browsers; native (iOS) callers must use a token URL
+ *  instead — handled separately when we mint the stream URL. */
+function buildVideoStreamUrl(serverId: string, downloadId: string): string {
+  const baseUrl = getApiBaseUrl();
+  return `${baseUrl}/api/server/${serverId}/uploads/${encodeURIComponent(downloadId)}/download`;
 }
 
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -585,6 +614,23 @@ export function FileBrowser({
           return;
         }
 
+        // Video preview — daemon signals stream-mode (no inline content) and
+        // we let <video> fetch the bytes via the HTTP download endpoint.
+        // This avoids dragging a full 100 MB base64 payload through the
+        // WebSocket and preserves browser-native streaming/seeking.
+        const videoType = getVideoType(filePath);
+        if (
+          videoType
+          && (msg as { previewMode?: string }).previewMode === 'stream'
+          && dlId
+          && serverId
+        ) {
+          const mimeType = (msg.mimeType as string | undefined) ?? videoType;
+          const streamUrl = buildVideoStreamUrl(serverId, dlId);
+          setPreview({ status: 'video', path: filePath, streamUrl, mimeType, downloadId: dlId });
+          return;
+        }
+
         // Office document preview (PDF, DOCX, XLSX) — check before image
         const officeType = getOfficeType(filePath);
         if (officeType && msg.encoding === 'base64') {
@@ -700,7 +746,9 @@ export function FileBrowser({
       onPreviewFile({ path: filePath, preferDiff, preview: { status: 'loading', path: filePath } });
       return;
     }
-    dismissedAutoPreviewPathRef.current = null;
+    dismissedAutoPreviewPathRef.current = autoPreviewPath && filePath !== autoPreviewPath
+      ? autoPreviewPath
+      : null;
     previewTabOverridePathRef.current = null;
     setEditDirty(false);
     setEditContent('');
@@ -714,6 +762,7 @@ export function FileBrowser({
     const loadingPreview: FileBrowserPreviewState = { status: 'loading', path: filePath };
     setPreview(loadingPreview);
     setShowDiff(preferDiff);
+    onPreviewStateChange?.({ path: filePath, preferDiff, preview: loadingPreview });
     if (!hasPendingPreviewWork('read', filePath, cycleId)) {
       const requestId = ws.fsReadFile(filePath);
       pendingReadRef.current.set(requestId, { path: filePath, cycleId });
@@ -722,7 +771,7 @@ export function FileBrowser({
       const diffId = ws.fsGitDiff(filePath);
       pendingGitDiffRef.current.set(diffId, { path: filePath, cycleId });
     }
-  }, [getActivePreviewCycle, hasPendingPreviewWork, onPreviewFile, t, ws]);
+  }, [autoPreviewPath, getActivePreviewCycle, hasPendingPreviewWork, onPreviewFile, onPreviewStateChange, t, ws]);
 
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set([startPath]));
 
@@ -843,7 +892,7 @@ export function FileBrowser({
   // Auto-preview file on open (e.g. when clicking a path link in chat)
   useEffect(() => {
     if (!autoPreviewPath) return;
-    if (dismissedAutoPreviewPathRef.current === autoPreviewPath && preview.status === 'idle') return;
+    if (dismissedAutoPreviewPathRef.current === autoPreviewPath) return;
     const currentPreviewPath = preview.status !== 'idle' ? (preview as { path: string }).path : null;
     if (currentPreviewPath === autoPreviewPath && preview.status !== 'idle') {
       if (previewTabOverridePathRef.current !== autoPreviewPath) {
@@ -1005,7 +1054,7 @@ export function FileBrowser({
   const previewPath = preview.status !== 'idle' ? (preview as { path: string }).path : null;
 
   const tree = (
-    <div class={`fb-tree${hasInlinePreview ? ' fb-tree-split' : ''}`}>
+    <div class={`fb-tree${layout !== 'panel' && hasInlinePreview ? ' fb-tree-split' : ''}`}>
       {data.map((root) => (
         <FsTreeNode
           key={root.id}
@@ -1080,7 +1129,7 @@ export function FileBrowser({
             {showDiff ? t('file_browser.view_source') : t('file_browser.view_diff')}
           </button>
         )}
-        {(preview.status === 'ok' || preview.status === 'image' || preview.status === 'office' || preview.status === 'error') && serverId && preview.downloadId && (
+        {(preview.status === 'ok' || preview.status === 'image' || preview.status === 'office' || preview.status === 'video' || preview.status === 'error') && serverId && preview.downloadId && (
           <button
             class="fb-diff-toggle"
             title={downloadError || t('upload.download_file')}
@@ -1188,6 +1237,21 @@ export function FileBrowser({
           <Suspense fallback={<div class="fb-preview-loading"><div class="fb-loading-spinner" /></div>}>
             <OfficePreview data={preview.data} mimeType={preview.mimeType} path={preview.path} />
           </Suspense>
+        )}
+        {preview.status === 'video' && (
+          <div class="fb-preview-video">
+            <video
+              key={preview.streamUrl}
+              src={preview.streamUrl}
+              controls
+              preload="metadata"
+              playsInline
+              style={{ maxWidth: '100%', maxHeight: '100%', width: '100%', background: '#000' }}
+            >
+              <source src={preview.streamUrl} type={preview.mimeType} />
+              {t('file_browser.preview_video_unsupported')}
+            </video>
+          </div>
         )}
         {preview.status === 'ok' && isEditing && (
           <Suspense fallback={null}>

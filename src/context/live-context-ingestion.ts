@@ -5,8 +5,25 @@ import { listProcessedProjections } from '../store/context-store.js';
 import type { TransportContextBootstrap } from '../agent/runtime-context-bootstrap.js';
 import { MaterializationCoordinator, type MaterializationCoordinatorOptions } from './materialization-coordinator.js';
 import { isMemoryNoiseTurn } from '../../shared/memory-noise-patterns.js';
+import { createMemoryConfigResolver, rememberMemoryConfigProjectDir } from './memory-config-resolver.js';
 
 const BOOTSTRAP_CACHE_MS = 30_000;
+
+export type LiveContextMaterializationAdmissionReason = 'shutdown' | 'upgrade-pending' | 'test-reset';
+
+let materializationAdmissionClosedReason: LiveContextMaterializationAdmissionReason | null = null;
+
+export function closeLiveContextMaterializationAdmission(reason: LiveContextMaterializationAdmissionReason): void {
+  materializationAdmissionClosedReason = reason;
+}
+
+export function reopenLiveContextMaterializationAdmission(): void {
+  materializationAdmissionClosedReason = null;
+}
+
+export function isLiveContextMaterializationAdmissionOpen(): boolean {
+  return materializationAdmissionClosedReason === null;
+}
 
 export interface LiveContextIngestionOptions extends MaterializationCoordinatorOptions {
   sessionLookup: (sessionName: string) => SessionRecord | undefined;
@@ -30,7 +47,17 @@ export class LiveContextIngestion {
   private readonly bootstrapCache = new Map<string, BootstrapCacheEntry>();
 
   constructor(options: LiveContextIngestionOptions) {
-    this.coordinator = new MaterializationCoordinator(options);
+    const memoryConfigResolver = options.memoryConfigResolver ?? (options.memoryConfig ? undefined : createMemoryConfigResolver({
+      projectDirResolver: (_namespace, target) => {
+        const sessionName = target?.kind === 'session' ? target.sessionName : undefined;
+        return sessionName ? options.sessionLookup(sessionName)?.projectDir : undefined;
+      },
+      fallbackCwd: options.memoryConfigCwd,
+    }));
+    this.coordinator = new MaterializationCoordinator({
+      ...options,
+      ...(memoryConfigResolver ? { memoryConfigResolver } : {}),
+    });
     this.sessionLookup = options.sessionLookup;
     this.resolveBootstrap = options.resolveBootstrap;
     this.onError = options.onError;
@@ -49,9 +76,11 @@ export class LiveContextIngestion {
   }
 
   async flushDueTargets(now = Date.now()): Promise<void> {
+    if (!isLiveContextMaterializationAdmissionOpen()) return;
     for (const job of this.coordinator.scheduleDueTargets(now)) {
       await this.coordinator.materializeTarget(job.target, job.trigger, now);
     }
+    await this.coordinator.materializeDueMasterSummaries(now);
   }
 
   async backfillSessionFromEvents(sessionName: string, events: TimelineEvent[]): Promise<void> {
@@ -77,7 +106,7 @@ export class LiveContextIngestion {
       });
     }
     if (staged > 0) {
-      if (this.coordinator.canMaterializeTarget(target, lastTs)) {
+      if (isLiveContextMaterializationAdmissionOpen() && this.coordinator.canMaterializeTarget(target, lastTs)) {
         await this.coordinator.materializeTarget(target, 'recovery', lastTs);
       }
     }
@@ -91,7 +120,10 @@ export class LiveContextIngestion {
 
     if (event.type === 'session.state') {
       const state = typeof event.payload.state === 'string' ? event.payload.state : '';
-      if (state === 'idle' && this.hasDirtyTarget(target) && this.coordinator.canMaterializeTarget(target, event.ts)) {
+      if (state === 'idle'
+        && isLiveContextMaterializationAdmissionOpen()
+        && this.hasDirtyTarget(target)
+        && this.coordinator.canMaterializeTarget(target, event.ts)) {
         await this.coordinator.materializeTarget(target, 'idle', event.ts);
       }
       return;
@@ -106,7 +138,9 @@ export class LiveContextIngestion {
       metadata: mapped.metadata,
       createdAt: event.ts,
     });
-    if (result.trigger === 'threshold' && this.coordinator.canMaterializeTarget(target, event.ts)) {
+    if (result.trigger === 'threshold'
+      && isLiveContextMaterializationAdmissionOpen()
+      && this.coordinator.canMaterializeTarget(target, event.ts)) {
       await this.coordinator.materializeTarget(target, 'threshold', event.ts);
     }
   }
@@ -117,6 +151,7 @@ export class LiveContextIngestion {
       return cached.value;
     }
     const value = await this.resolveBootstrap(session);
+    rememberMemoryConfigProjectDir(value.namespace, session.projectDir);
     this.bootstrapCache.set(session.name, {
       recordUpdatedAt: session.updatedAt,
       expiresAt: Date.now() + BOOTSTRAP_CACHE_MS,

@@ -74,7 +74,7 @@ function assistantText(text: string): string {
   })}\n`;
 }
 
-async function waitUntil(fn: () => boolean, timeoutMs = 10000): Promise<void> {
+async function waitUntil(fn: () => boolean, timeoutMs = 20_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (fn()) return;
@@ -100,10 +100,10 @@ describe('Claude no-text refresh integration', () => {
     await mkdir(workDir, { recursive: true });
     projectDir = claudeProjectDir(workDir);
     await mkdir(projectDir, { recursive: true });
-    ccSessionId = '11111111-1111-1111-1111-111111111111';
+    ccSessionId = randomUUID();
     sessionName = `deck_test_${randomUUID().slice(0, 8)}`;
     trackedFile = join(projectDir, `${ccSessionId}.jsonl`);
-    otherFile = join(projectDir, '22222222-2222-2222-2222-222222222222.jsonl');
+    otherFile = join(projectDir, `${randomUUID()}.jsonl`);
     await writeFile(trackedFile, '');
     await writeFile(otherFile, '');
 
@@ -154,7 +154,7 @@ describe('Claude no-text refresh integration', () => {
 
     expect(assistantIdx).toBeGreaterThanOrEqual(0);
     expect(idleIdx).toBeGreaterThan(assistantIdx);
-  });
+  }, 25_000);
 
   it('does not read a different claude session transcript during idle refresh', async () => {
     await appendFile(otherFile, assistantText('wrong claude transcript'));

@@ -6,6 +6,8 @@ import {
   hasResolvedActiveSession,
   hasSelectedServer,
   isServerOnline,
+  pickAutoEntryServer,
+  pickMostRecentMainSession,
   shouldResetSelectedServer,
   shouldShowInitialConnectingGate,
 } from '../src/server-selection.js';
@@ -85,6 +87,38 @@ describe('hasResolvedActiveSession', () => {
       { name: 'deck_proj_brain' },
       { name: 'deck_proj_w1' },
     ])).toBe(true);
+  });
+});
+
+describe('pickMostRecentMainSession', () => {
+  it('chooses the main session with the latest preview timestamp', () => {
+    expect(pickMostRecentMainSession([
+      { serverId: 'srv-1', sessionName: 'deck_old_brain', previewUpdatedAt: 10 },
+      { serverId: 'srv-2', sessionName: 'deck_new_brain', previewUpdatedAt: 30 },
+      { serverId: 'srv-1', sessionName: 'deck_sub_child', previewUpdatedAt: 50, isSubSession: true },
+    ])).toEqual({ serverId: 'srv-2', sessionName: 'deck_new_brain' });
+  });
+
+  it('returns null when only sub-sessions are present', () => {
+    expect(pickMostRecentMainSession([
+      { serverId: 'srv-1', sessionName: 'deck_sub_child', previewUpdatedAt: 50, isSubSession: true },
+    ])).toBeNull();
+  });
+});
+
+describe('pickAutoEntryServer', () => {
+  it('prefers a saved server that still exists', () => {
+    expect(pickAutoEntryServer([
+      { id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: Date.now(), createdAt: 1 },
+      { id: 'srv-2', name: 'Server Two', status: 'online', lastHeartbeatAt: Date.now(), createdAt: 2 },
+    ], 'srv-1')).toEqual({ serverId: 'srv-1', sessionName: null });
+  });
+
+  it('falls back to online newest server', () => {
+    expect(pickAutoEntryServer([
+      { id: 'srv-off', name: 'Offline', status: 'offline', lastHeartbeatAt: Date.now(), createdAt: 100 },
+      { id: 'srv-on', name: 'Online', status: 'online', lastHeartbeatAt: Date.now(), createdAt: 1 },
+    ], null)).toEqual({ serverId: 'srv-on', sessionName: null });
   });
 });
 

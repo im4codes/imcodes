@@ -8,6 +8,7 @@ import type {
   ProviderCapabilities,
   ProviderConfig,
   ProviderError,
+  ProviderModelList,
   SessionConfig,
   SessionInfoUpdate,
   ProviderStatusUpdate,
@@ -25,9 +26,58 @@ import type { TransportAttachment } from '../../../shared/transport-attachments.
 import logger from '../../util/logger.js';
 import { CODEX_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
+import { getCodexBaseInstructions } from '../codex-runtime-config.js';
 
 const CODEX_BIN = 'codex';
 const CANCEL_INTERRUPT_TIMEOUT_MS = 1_500;
+
+/**
+ * Provider-neutral fallback `baseInstructions` used when codex's own
+ * `~/.codex/models_cache.json` does not have a matching `base_instructions`
+ * for the active model — e.g. `codex-MiniMax-M2.5` routed via
+ * `[model_providers.minimax]` with `wire_api = "responses"`.
+ *
+ * Background: codex forwards `baseInstructions` as the OpenAI Responses API
+ * `instructions` field. Starting with codex-cli 0.125 + the April 2026
+ * Responses API protocol change, an empty/missing `instructions` is
+ * rejected with:
+ *
+ *   {"type":"error","status":400,"error":{"type":"invalid_request_error",
+ *     "message":"Instructions are required"}}
+ *
+ * For catalog models (gpt-5.x), we lift the full per-model prompt straight
+ * out of `~/.codex/models_cache.json` so there is no quality regression.
+ * For non-catalog / custom-provider models we send this short fallback so
+ * the upstream request is at least well-formed. The user's per-turn
+ * `systemText` is still prepended into `turn/start` input.
+ */
+const FALLBACK_BASE_INSTRUCTIONS =
+  'You are Codex, an AI coding assistant integrated into IM.codes. ' +
+  'Follow the user\'s instructions precisely. ' +
+  'Use available tools to inspect, edit, and run code as needed.';
+
+/**
+ * Resolve the `baseInstructions` to send with `thread/start` /
+ * `thread/resume`. Always returns a non-empty string — codex-cli 0.125's
+ * `session_startup_prewarm` will otherwise hand the upstream Responses API
+ * an empty `instructions` field, which OpenAI now rejects with 400.
+ *
+ * Resolution order:
+ *   1. `~/.codex/models_cache.json` → per-model `base_instructions`
+ *      (preserves codex's full 12–22 KB per-model prompt, no regression)
+ *   2. `FALLBACK_BASE_INSTRUCTIONS` (provider-neutral, short)
+ */
+async function resolveBaseInstructionsOverride(model: string | undefined): Promise<string> {
+  if (model) {
+    try {
+      const cached = await getCodexBaseInstructions(model);
+      if (cached && cached.length > 0) return cached;
+    } catch {
+      // Fall through to fallback.
+    }
+  }
+  return FALLBACK_BASE_INSTRUCTIONS;
+}
 
 type JsonRpcResponse = {
   id?: number;
@@ -41,6 +91,13 @@ type PendingRequest = {
   resolve: (value: any) => void;
   reject: (error: Error) => void;
 };
+
+export interface CodexDiscoveredModel {
+  id: string;
+  name?: string;
+  supportsReasoningEffort?: boolean;
+  isDefault?: boolean;
+}
 
 interface CodexSdkSessionState {
   routeId: string;
@@ -473,10 +530,25 @@ export class CodexSdkProvider implements TransportProvider {
 
   private async ensureThreadLoaded(sessionId: string, state: CodexSdkSessionState): Promise<void> {
     if (state.threadId && state.loaded) return;
+
+    // Always send `baseInstructions`. Catalog models get codex's full
+    // per-model prompt (lifted from `~/.codex/models_cache.json`); unknown
+    // models fall back to a short provider-neutral default. Either way, the
+    // Responses API never sees an empty `instructions` field, which it now
+    // rejects with `{"type":"invalid_request_error","message":"Instructions
+    // are required"}`.
+    const baseInstructions = await resolveBaseInstructionsOverride(state.model);
+
     if (state.threadId) {
+      // Resume must carry the same `baseInstructions`: previously-broken
+      // threads were persisted with empty base_instructions, and codex's
+      // resolution priority (override > stored history > model default)
+      // means supplying it on resume is the only way to repair them
+      // mid-flight.
       const result = await this.request('thread/resume', {
         threadId: state.threadId,
         ...(state.model ? { model: state.model } : {}),
+        baseInstructions,
       });
       const resumedId = result?.thread?.id ?? state.threadId;
       state.threadId = resumedId;
@@ -492,6 +564,7 @@ export class CodexSdkProvider implements TransportProvider {
       sandbox: 'danger-full-access',
       personality: 'none',
       ...(state.model ? { model: state.model } : {}),
+      baseInstructions,
     });
     const threadId = result?.thread?.id;
     if (!threadId) {
@@ -701,6 +774,68 @@ export class CodexSdkProvider implements TransportProvider {
         return payload && typeof payload === 'object' ? payload as Record<string, unknown> : undefined;
       }
       return undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async listModels(force?: boolean): Promise<ProviderModelList> {
+    try {
+      const { getCodexRuntimeConfig } = await import('../codex-runtime-config.js');
+      const cfg = await getCodexRuntimeConfig(force ?? false);
+      return {
+        models: (cfg.models ?? []).map((m) => ({
+          id: m.id,
+          ...(m.name ? { name: m.name } : {}),
+          ...(m.supportsReasoningEffort ? { supportsReasoningEffort: true } : {}),
+        })),
+        ...(cfg.defaultModel ? { defaultModel: cfg.defaultModel } : {}),
+        ...(typeof cfg.isAuthenticated === 'boolean' ? { isAuthenticated: cfg.isAuthenticated } : {}),
+        ...(cfg.probeError ? { error: cfg.probeError } : {}),
+      };
+    } catch (err) {
+      return { models: [], error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  async readModelList(): Promise<CodexDiscoveredModel[] | undefined> {
+    if (!this.child || !this.child.stdin.writable) return undefined;
+    try {
+      const discovered: CodexDiscoveredModel[] = [];
+      const seen = new Set<string>();
+      let cursor: string | null = null;
+      do {
+        const result = await this.request('model/list', {
+          includeHidden: false,
+          limit: 100,
+          ...(cursor ? { cursor } : {}),
+        });
+        const data = Array.isArray(result?.data) ? result.data : [];
+        for (const entry of data) {
+          if (!entry || typeof entry !== 'object') continue;
+          const modelId = typeof entry.model === 'string' && entry.model.trim()
+            ? entry.model.trim()
+            : typeof entry.id === 'string' && entry.id.trim()
+              ? entry.id.trim()
+              : '';
+          if (!modelId || seen.has(modelId)) continue;
+          seen.add(modelId);
+          discovered.push({
+            id: modelId,
+            ...(typeof entry.displayName === 'string' && entry.displayName.trim()
+              ? { name: entry.displayName.trim() }
+              : {}),
+            ...(Array.isArray(entry.supportedReasoningEfforts) && entry.supportedReasoningEfforts.length > 0
+              ? { supportsReasoningEffort: true }
+              : {}),
+            ...(entry.isDefault === true ? { isDefault: true } : {}),
+          });
+        }
+        cursor = typeof result?.nextCursor === 'string' && result.nextCursor.trim()
+          ? result.nextCursor.trim()
+          : null;
+      } while (cursor);
+      return discovered;
     } catch {
       return undefined;
     }

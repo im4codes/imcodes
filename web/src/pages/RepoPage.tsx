@@ -135,6 +135,11 @@ function classifyError(msg: string): ErrorKind {
   return 'generic';
 }
 
+function isTransientWsSendError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err || '');
+  return message.includes('WebSocket not connected');
+}
+
 // ── Component ────────────────────────────────────────────────────────────────
 
 export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props) {
@@ -183,10 +188,14 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
   const [focusedActionTargetKey, setFocusedActionTargetKey] = useState<string | null>(null);
   const [focusedActionTargetReplayClass, setFocusedActionTargetReplayClass] = useState<'repo-action-focus-a' | 'repo-action-focus-b'>('repo-action-focus-a');
   const contextRef = useRef<RepoContext | null>(null);
+  const tabsRef = useRef(tabs);
 
   useEffect(() => {
     contextRef.current = context;
   }, [context]);
+  useEffect(() => {
+    tabsRef.current = tabs;
+  }, [tabs]);
 
   // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -256,6 +265,17 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
     try {
       rid = ws.repoDetect(projectDir);
     } catch (err) {
+      const nextRetry = detectRetryCountRef.current + 1;
+      if (isTransientWsSendError(err) && nextRetry <= MAX_SILENT_RETRIES) {
+        detectRetryCountRef.current = nextRetry;
+        if (detectRetryTimerRef.current) clearTimeout(detectRetryTimerRef.current);
+        detectRetryTimerRef.current = setTimeout(() => doDetect({ preserveUi: true }), RETRY_DELAY_MS);
+        if (!currentContext) {
+          setDetectLoading(true);
+          setDetectError(null);
+        }
+        return;
+      }
       if (!currentContext) {
         setDetectError(`Send failed: ${err instanceof Error ? err.message : String(err)}`);
         setDetectLoading(false);
@@ -273,9 +293,13 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
         pendingRef.current.delete(rid);
         const nextRetry = detectRetryCountRef.current + 1;
         detectRetryCountRef.current = nextRetry;
-        if (currentContext && nextRetry <= MAX_SILENT_RETRIES) {
+        if (nextRetry <= MAX_SILENT_RETRIES) {
           if (detectRetryTimerRef.current) clearTimeout(detectRetryTimerRef.current);
           detectRetryTimerRef.current = setTimeout(() => doDetect({ preserveUi: true }), RETRY_DELAY_MS);
+          if (!currentContext) {
+            setDetectLoading(true);
+            setDetectError(null);
+          }
           return;
         }
         if (!currentContext) {
@@ -340,22 +364,52 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
       updateTab(key, { loading: true });
     }
     let rid: string;
-    switch (key) {
-      case 'issues':
-        rid = ws.repoListIssues(projectDir, { page, ...(force ? { force: true } : {}) });
-        break;
-      case 'prs':
-        rid = ws.repoListPRs(projectDir, { page, ...(force ? { force: true } : {}) });
-        break;
-      case 'branches':
-        rid = ws.repoListBranches(projectDir);
-        break;
-      case 'commits':
-        rid = ws.repoListCommits(projectDir, { page });
-        break;
-      case 'actions':
-        rid = ws.repoListActions(projectDir, { page, ...(force ? { force: true } : {}) });
-        break;
+    try {
+      switch (key) {
+        case 'issues':
+          rid = ws.repoListIssues(projectDir, { page, ...(force ? { force: true } : {}) });
+          break;
+        case 'prs':
+          rid = ws.repoListPRs(projectDir, { page, ...(force ? { force: true } : {}) });
+          break;
+        case 'branches':
+          rid = ws.repoListBranches(projectDir);
+          break;
+        case 'commits':
+          rid = ws.repoListCommits(projectDir, { page });
+          break;
+        case 'actions':
+          rid = ws.repoListActions(projectDir, { page, ...(force ? { force: true } : {}) });
+          break;
+      }
+    } catch (err) {
+      const existingTab = tabsRef.current[key];
+      const hasExistingData = existingTab.fetched;
+      const nextRetry = (tabRetryCountRef.current.get(key) ?? 0) + 1;
+      if (isTransientWsSendError(err) && nextRetry <= MAX_SILENT_RETRIES) {
+        tabRetryCountRef.current.set(key, nextRetry);
+        const existingTimer = tabRetryTimersRef.current.get(key);
+        if (existingTimer) clearTimeout(existingTimer);
+        tabRetryTimersRef.current.set(key, setTimeout(() => {
+          tabRetryTimersRef.current.delete(key);
+          fetchTab(key, page, force, { preserveUi: hasExistingData || preserveUi });
+        }, RETRY_DELAY_MS));
+        updateTab(key, {
+          loading: !hasExistingData,
+          refreshing: false,
+          error: null,
+        });
+        return;
+      }
+      tabRetryCountRef.current.delete(key);
+      const message = err instanceof Error ? err.message : String(err || 'Send failed');
+      updateTab(key, {
+        loading: false,
+        refreshing: false,
+        error: hasExistingData ? null : `Send failed: ${message}`,
+        fetched: hasExistingData,
+      });
+      return;
     }
     pendingRef.current.add(rid);
     tabReqRef.current.set(rid, { key, page, force });
@@ -393,6 +447,16 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
         detailReqRef.current.clear();
         tabReqRef.current.clear();
         detectReqRef.current = null;
+        if (detectTimeoutRef.current) clearTimeout(detectTimeoutRef.current);
+        if (detectRetryTimerRef.current) clearTimeout(detectRetryTimerRef.current);
+        detectRetryTimerRef.current = null;
+        detectRetryCountRef.current = 0;
+        for (const timer of tabRetryTimersRef.current.values()) clearTimeout(timer);
+        tabRetryTimersRef.current.clear();
+        tabRetryCountRef.current.clear();
+        for (const timer of detailRetryTimersRef.current.values()) clearTimeout(timer);
+        detailRetryTimersRef.current.clear();
+        detailRetryCountRef.current.clear();
         latestActionDetailRef.current = null;
         pendingCiFailureRef.current.clear();
         deliveredCiEventRef.current.clear();

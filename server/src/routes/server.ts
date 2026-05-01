@@ -112,6 +112,59 @@ function matchesMemoryQuery(summary: string, content: unknown, query: string): b
   return `${summary}\n${JSON.stringify(content ?? {})}`.toLowerCase().includes(normalized);
 }
 
+type MemoryStatsRow = {
+  total_records?: number | null;
+  recent_summary_count?: number | null;
+  durable_candidate_count?: number | null;
+  project_count?: number | null;
+};
+
+type MemoryRecordRow = {
+  id: string;
+  scope: 'personal' | 'project_shared' | 'workspace_shared' | 'org_shared';
+  project_id: string;
+  projection_class: 'recent_summary' | 'durable_memory_candidate';
+  source_event_ids_json: string | string[];
+  summary: string;
+  updated_at: number;
+  hit_count?: number | null;
+  last_used_at?: number | null;
+  status?: 'active' | 'archived' | null;
+};
+
+function buildMemoryStatsView(
+  row: MemoryStatsRow | null | undefined,
+  matchedRecords: number,
+): ContextMemoryStatsView {
+  return {
+    totalRecords: row?.total_records ?? 0,
+    matchedRecords,
+    recentSummaryCount: row?.recent_summary_count ?? 0,
+    durableCandidateCount: row?.durable_candidate_count ?? 0,
+    projectCount: row?.project_count ?? 0,
+    stagedEventCount: 0,
+    dirtyTargetCount: 0,
+    pendingJobCount: 0,
+  };
+}
+
+function mapMemoryRecordRows(rows: MemoryRecordRow[]): ContextMemoryRecordView[] {
+  return rows.map((row) => ({
+    id: row.id,
+    scope: row.scope,
+    projectId: row.project_id,
+    summary: row.summary,
+    projectionClass: row.projection_class,
+    sourceEventCount: Array.isArray(row.source_event_ids_json)
+      ? row.source_event_ids_json.length
+      : JSON.parse(row.source_event_ids_json || '[]').length,
+    updatedAt: row.updated_at,
+    hitCount: row.hit_count ?? 0,
+    lastUsedAt: row.last_used_at ?? undefined,
+    status: row.status ?? 'active',
+  }));
+}
+
 function buildRemoteMemoryResponse(
   rows: Array<{
     id: string;
@@ -138,30 +191,13 @@ function buildRemoteMemoryResponse(
   ));
   const projectIds = new Set(cleanRows.map((row) => row.project_id));
   return {
-    stats: {
-      totalRecords: cleanRows.length,
-      matchedRecords: filtered.length,
-      recentSummaryCount: cleanRows.filter((row) => row.projection_class === 'recent_summary').length,
-      durableCandidateCount: cleanRows.filter((row) => row.projection_class === 'durable_memory_candidate').length,
-      projectCount: projectIds.size,
-      stagedEventCount: 0,
-      dirtyTargetCount: 0,
-      pendingJobCount: 0,
-    },
-    records: filtered.slice(0, limit).map((row) => ({
-      id: row.id,
-      scope: row.scope,
-      projectId: row.project_id,
-      summary: row.summary,
-      projectionClass: row.projection_class,
-      sourceEventCount: Array.isArray(row.source_event_ids_json)
-        ? row.source_event_ids_json.length
-        : JSON.parse(row.source_event_ids_json || '[]').length,
-      updatedAt: row.updated_at,
-      hitCount: row.hit_count ?? 0,
-      lastUsedAt: row.last_used_at ?? undefined,
-      status: row.status ?? 'active',
-    })),
+    stats: buildMemoryStatsView({
+      total_records: cleanRows.length,
+      recent_summary_count: cleanRows.filter((row) => row.projection_class === 'recent_summary').length,
+      durable_candidate_count: cleanRows.filter((row) => row.projection_class === 'durable_memory_candidate').length,
+      project_count: projectIds.size,
+    }, filtered.length),
+    records: mapMemoryRecordRows(filtered.slice(0, limit)),
   };
 }
 
@@ -585,6 +621,36 @@ serverRoutes.get('/:id/shared-context/personal-memory', requireAuth(), async (c)
       scoringWeights: runtimeConfig.memoryScoringWeights,
     });
     if (semanticView) return c.json(semanticView);
+  }
+
+  if (!query) {
+    const stats = await c.env.DB.queryOne<MemoryStatsRow>(
+      `SELECT COUNT(*)::int AS total_records,
+              COUNT(*) FILTER (WHERE projection_class = 'recent_summary')::int AS recent_summary_count,
+              COUNT(*) FILTER (WHERE projection_class = 'durable_memory_candidate')::int AS durable_candidate_count,
+              COUNT(DISTINCT project_id)::int AS project_count
+       FROM shared_context_projections
+       WHERE user_id = $1
+         AND scope = 'personal'
+         ${projectId ? 'AND project_id = $2' : ''}
+         ${projectionClass ? `AND projection_class = $${projectId ? 3 : 2}` : ''}`,
+      [userId, ...(projectId ? [projectId] : []), ...(projectionClass ? [projectionClass] : [])],
+    );
+    const rows = await c.env.DB.query<MemoryRecordRow>(
+      `SELECT id, scope, project_id, projection_class, source_event_ids_json, summary, updated_at, hit_count, last_used_at, status
+       FROM shared_context_projections
+       WHERE user_id = $1
+         AND scope = 'personal'
+         ${projectId ? 'AND project_id = $2' : ''}
+         ${projectionClass ? `AND projection_class = $${projectId ? 3 : 2}` : ''}
+       ORDER BY updated_at DESC
+       LIMIT $${projectId ? (projectionClass ? 4 : 3) : (projectionClass ? 3 : 2)}`,
+      [userId, ...(projectId ? [projectId] : []), ...(projectionClass ? [projectionClass] : []), limit],
+    );
+    return c.json({
+      stats: buildMemoryStatsView(stats, stats?.total_records ?? 0),
+      records: mapMemoryRecordRows(rows.filter((row) => !isMemoryNoiseSummary(row.summary))),
+    });
   }
 
   const rows = await c.env.DB.query<{

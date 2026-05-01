@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
+import { DAEMON_MSG } from '@shared/daemon-events.js';
 import type { WsClient } from '../ws-client.js';
 
 export interface TransportModelInfo {
@@ -16,12 +17,12 @@ export interface TransportModelState {
 }
 
 /** Agent types that support dynamic model discovery via `transport.list_models`. */
-export type TransportAgentTypeWithModels = 'copilot-sdk' | 'cursor-headless';
+export type TransportAgentTypeWithModels = 'claude-code-sdk' | 'copilot-sdk' | 'cursor-headless' | 'codex-sdk' | 'gemini-sdk';
 
 export function supportsDynamicTransportModels(
   agentType: string | undefined | null,
 ): agentType is TransportAgentTypeWithModels {
-  return agentType === 'copilot-sdk' || agentType === 'cursor-headless';
+  return agentType === 'claude-code-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'codex-sdk' || agentType === 'gemini-sdk';
 }
 
 /** Fetch and cache the list of available models for a transport agent type.
@@ -36,10 +37,11 @@ export function useTransportModels(
 ): TransportModelState & { refresh: () => void } {
   const [state, setState] = useState<TransportModelState>({ models: [], loading: false });
   const pendingRequestId = useRef<string | null>(null);
+  const wsConnected = !!ws?.connected;
 
   const fetchModels = useCallback(
     (force: boolean) => {
-      if (!ws || !supportsDynamicTransportModels(agentType)) {
+      if (!ws || !wsConnected || !supportsDynamicTransportModels(agentType)) {
         setState({ models: [], loading: false });
         return;
       }
@@ -61,7 +63,7 @@ export function useTransportModels(
         });
       }
     },
-    [ws, agentType],
+    [ws, wsConnected, agentType],
   );
 
   useEffect(() => {
@@ -74,6 +76,10 @@ export function useTransportModels(
 
     const unsub = ws.onMessage((msg) => {
       const raw = msg as unknown as Record<string, unknown>;
+      if (raw.type === DAEMON_MSG.RECONNECTED) {
+        fetchModels(false);
+        return;
+      }
       if (raw.type !== 'transport.models_response') return;
       const replyAgent = raw.agentType;
       if (replyAgent !== agentType) return;
@@ -95,9 +101,9 @@ export function useTransportModels(
       });
     });
 
-    fetchModels(false);
+    if (wsConnected) fetchModels(false);
     return unsub;
-  }, [ws, agentType, fetchModels]);
+  }, [ws, wsConnected, agentType, fetchModels]);
 
   return {
     ...state,

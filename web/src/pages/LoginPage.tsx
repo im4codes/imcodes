@@ -21,18 +21,64 @@ interface Props {
   onChangeServer?: () => void;
 }
 
+// localStorage keys for the optional "remember password" feature on the
+// password login form. Cleartext storage is opt-in via the checkbox; the
+// default is checked so this is effectively persistent unless the user
+// explicitly unchecks it.
+const REMEMBER_KEY = 'rcc_login_remember';
+const REMEMBER_USERNAME_KEY = 'rcc_login_username';
+const REMEMBER_PASSWORD_KEY = 'rcc_login_password';
+
+function readRememberPreference(): boolean {
+  try {
+    const raw = localStorage.getItem(REMEMBER_KEY);
+    if (raw === '0') return false;
+    return true; // default checked when unset
+  } catch { return true; }
+}
+
+function readRememberedCredentials(): { username: string; password: string } {
+  try {
+    return {
+      username: localStorage.getItem(REMEMBER_USERNAME_KEY) ?? '',
+      password: localStorage.getItem(REMEMBER_PASSWORD_KEY) ?? '',
+    };
+  } catch { return { username: '', password: '' }; }
+}
+
+function persistRememberedCredentials(remember: boolean, username: string, password: string) {
+  try {
+    localStorage.setItem(REMEMBER_KEY, remember ? '1' : '0');
+    if (remember) {
+      localStorage.setItem(REMEMBER_USERNAME_KEY, username);
+      localStorage.setItem(REMEMBER_PASSWORD_KEY, password);
+    } else {
+      localStorage.removeItem(REMEMBER_USERNAME_KEY);
+      localStorage.removeItem(REMEMBER_PASSWORD_KEY);
+    }
+  } catch { /* ignore quota / disabled storage */ }
+}
+
 export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }: Props) {
   const { t } = useTranslation();
   const [mode, setMode] = useState<'buttons' | 'register' | 'password' | 'password_register' | 'change_password'>('buttons');
   const [displayName, setDisplayName] = useState('');
   const [deviceName, setDeviceName] = useState('');
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
+  // Hydrate username + password from localStorage when the user previously
+  // ticked "remember password". If they didn't, both keys are absent and we
+  // start with empty strings.
+  const initialRemembered = (() => {
+    if (!readRememberPreference()) return { username: '', password: '' };
+    return readRememberedCredentials();
+  })();
+  const [username, setUsername] = useState(initialRemembered.username);
+  const [password, setPassword] = useState(initialRemembered.password);
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [passkeySupported, setPasskeySupported] = useState(false);
+  const [rememberPassword, setRememberPassword] = useState(readRememberPreference);
 
   useEffect(() => {
     // Native apps always support passkey (WebAuthn runs in Custom Tab / ASWebAuthSession, not WebView).
@@ -152,6 +198,12 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
     try {
       const native = isNative();
       const res = await passwordLogin(username.trim(), password, native);
+      // On any success path (including forced password change) we persist the
+      // remember preference so flipping it OFF clears the storage even if the
+      // user never re-types their password. Always pass the credentials that
+      // just succeeded — `password` is still the original (pre-change) value
+      // when `passwordMustChange` is true; the change flow re-saves below.
+      persistRememberedCredentials(rememberPassword, username.trim(), password);
       if (native && res.apiKey && res.userId && res.keyId) {
         const { configureApiKey } = await import('../api.js');
         const { storeAuthKey } = await import('../biometric-auth.js');
@@ -252,6 +304,9 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
     setError(null);
     try {
       await passwordChange(password, newPassword);
+      // The persisted password is now stale — refresh storage with the new
+      // value (or wipe it if the user has unticked remember in the meantime).
+      persistRememberedCredentials(rememberPassword, username.trim(), newPassword);
       if (isNative() && serverUrl) {
         // API key was already stored during login — just proceed
         const { getAuthKey } = await import('../biometric-auth.js');
@@ -360,13 +415,39 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
             />
             <input
               class="input"
-              style={{ width: '100%', marginBottom: 16, boxSizing: 'border-box' }}
+              style={{ width: '100%', marginBottom: 10, boxSizing: 'border-box' }}
               type="password"
               placeholder={t('login.password_placeholder')}
               value={password}
               onInput={(e) => setPassword((e.target as HTMLInputElement).value)}
               onKeyDown={(e) => e.key === 'Enter' && handlePasswordLogin()}
             />
+            <label
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+                marginBottom: 16,
+                color: '#94a3b8',
+                fontSize: 13,
+                cursor: 'pointer',
+                userSelect: 'none',
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={rememberPassword}
+                onChange={(e) => {
+                  const next = (e.target as HTMLInputElement).checked;
+                  setRememberPassword(next);
+                  // Persist the toggle immediately so unchecking wipes saved
+                  // creds even if the user never completes a login attempt.
+                  persistRememberedCredentials(next, username.trim(), password);
+                }}
+                style={{ cursor: 'pointer' }}
+              />
+              {t('login.remember_password')}
+            </label>
             <button
               class="btn btn-primary"
               style={{ width: '100%', marginBottom: 10 }}

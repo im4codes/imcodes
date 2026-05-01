@@ -2,14 +2,15 @@
  * UsageFooter — shared context bar + usage stats + cost display.
  * Used by both main session (app.tsx) and SubSessionWindow.
  */
-import { useEffect, useMemo, useState } from 'preact/hooks';
+import { useEffect, useMemo, useState, useCallback } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { resolveContextWindow } from '../model-context.js';
 import { shortModelLabel } from '../model-label.js';
 import { getSessionCost, getWeeklyCost, getMonthlyCost, formatCost } from '../cost-tracker.js';
 import type { UsageData } from '../usage-data.js';
 import { formatProviderQuotaLabel, type ProviderQuotaMeta } from '@shared/provider-quota.js';
-import type { TimelineHistoryStatus, TimelineHistoryStepKey } from '../hooks/useTimeline.js';
+import { usePref, parseBooleanish } from '../hooks/usePref.js';
+import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 
 interface Props {
   usage: UsageData;
@@ -31,8 +32,6 @@ interface Props {
   activeToolCall?: boolean;
   /** Current timestamp for thinking timer (updated every second). */
   now?: number;
-  /** Visible history-fetch progress beneath the ctx bar while waiting for history. */
-  historyStatus?: TimelineHistoryStatus | null;
 }
 
 const fmt = (n: number) =>
@@ -40,11 +39,40 @@ const fmt = (n: number) =>
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
-export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, now, historyStatus }: Props) {
+export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, now }: Props) {
   const { t } = useTranslation();
   const isCodexFamily = agentType === 'codex' || agentType === 'codex-sdk';
-  const hasActiveLiveWork = !!activeToolCall || !!activeThinkingTs;
-  const showLiveStatus = sessionState === 'running' || sessionState === 'idle' || hasActiveLiveWork;
+  // Wrench pill: tri-state toggle for "show developer details in chat timeline".
+  // Sourced from usePref → SharedResource, so this UsageFooter and ChatView
+  // share one GET / one listener / one cache entry per tab.
+  //   value === null  → undecided (first run; defaults ON, pill shows prompt)
+  //   value === true  → developer view (pill highlighted, details visible)
+  //   value === false → simple chat (pill dim, details hidden)
+  const showToolCallsPref = usePref<boolean>(PREF_KEY_SHOW_TOOL_CALLS, { parse: parseBooleanish });
+  const showToolCallsValue = showToolCallsPref.value;
+  const showToolCallsLoaded = showToolCallsPref.loaded;
+  const showToolCallsActive = showToolCallsValue !== false;
+  const showToolCallsUndecided = showToolCallsLoaded && showToolCallsValue === null;
+  const handleShowToolCallsToggle = useCallback(() => {
+    // Tri-state click cycle:
+    //   undecided → false (Simple; default is already Developer)
+    //   true      → false (Simple)
+    //   false     → true (Developer)
+    // Once decided, the pill is a plain on/off toggle. The first click from
+    // an undecided state closes the developer details the user is already
+    // seeing by default.
+    const next = showToolCallsValue === false ? true : false;
+    void showToolCallsPref.save(next);
+  }, [showToolCallsPref, showToolCallsValue]);
+  // shell / script sessions are NOT agents — they're plain terminals. The
+  // daemon emits `session.state(running)` whenever raw bytes flow (idle
+  // detection runs even without a structured watcher), which previously
+  // surfaced as "Agent working..." in the footer. That wording is wrong
+  // for a shell prompt and confusing for users running `top`, tailing logs,
+  // etc. Skip the live-work UI entirely for these session types.
+  const isAgentless = agentType === 'shell' || agentType === 'script';
+  const hasActiveLiveWork = !isAgentless && (!!activeToolCall || !!activeThinkingTs);
+  const showLiveStatus = !isAgentless && (sessionState === 'running' || sessionState === 'idle' || hasActiveLiveWork);
   const [quotaNow, setQuotaNow] = useState(() => Date.now());
 
   const displayModel = modelOverride ?? usage.model;
@@ -101,14 +129,17 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   const monthlyCost = sessionCost > 0 ? getMonthlyCost() : 0;
   const modelLabel = shortModelLabel(displayModel);
   const inlineQuotaText = displayQuotaLabel;
-  const liveStatusMode = hasActiveLiveWork
-    ? (activeToolCall ? 'tool' : 'thinking')
-    : sessionState === 'running'
-      ? 'running'
-      : sessionState === 'idle'
-        ? (statusText ? (/^(?:supervised|auto):/i.test(statusText) ? 'result' : 'waiting') : 'idle')
-        : null;
+  const liveStatusMode = isAgentless
+    ? null
+    : hasActiveLiveWork
+      ? (activeToolCall ? 'tool' : 'thinking')
+      : sessionState === 'running'
+        ? 'running'
+        : sessionState === 'idle'
+          ? (statusText ? (/^(?:supervised|auto):/i.test(statusText) ? 'result' : 'waiting') : 'idle')
+          : null;
   const liveStatusText = useMemo(() => {
+    if (isAgentless) return null;
     if (hasActiveLiveWork || sessionState === 'running') {
       if (activeToolCall) return statusText || 'Tool running...';
       if (activeThinkingTs) return t('chat.thinking_running', { sec: Math.max(0, Math.round(((now ?? Date.now()) - activeThinkingTs) / 1000)) });
@@ -117,53 +148,17 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     if (sessionState === 'idle' && statusText) return statusText;
     if (sessionState === 'idle') return 'Agent idle — waiting for input';
     return null;
-  }, [activeThinkingTs, activeToolCall, hasActiveLiveWork, now, sessionState, statusText, t]);
+  }, [activeThinkingTs, activeToolCall, hasActiveLiveWork, isAgentless, now, sessionState, statusText, t]);
   const showInlineStatusText = liveStatusMode === 'running' || liveStatusMode === 'thinking' || liveStatusMode === 'tool' || liveStatusMode === 'waiting' || liveStatusMode === 'result';
   const codexQuotaLines = (agentType === 'codex' || agentType === 'codex-sdk')
     ? (displayQuotaLabel ?? '').split(' · ').filter(Boolean)
     : [];
-  const historySteps = useMemo(() => {
-    if (!historyStatus || historyStatus.phase === 'idle') return [];
-    const order: TimelineHistoryStepKey[] = ['cache', 'textTail', 'daemon', 'http', 'older'];
-    return order
-      .map((key) => ({ key, state: historyStatus.steps[key] }))
-      .filter((step) => step.state !== 'skipped')
-      .map((step) => ({
-        ...step,
-        label: step.key === 'cache'
-          ? t('session.history_step_cache')
-          : step.key === 'textTail'
-            ? t('session.history_step_text_tail')
-            : step.key === 'daemon'
-              ? t('session.history_step_daemon')
-              : step.key === 'http'
-                ? t('session.history_step_http')
-                : t('session.history_step_older'),
-      }));
-  }, [historyStatus, t]);
-  const showHistoryProgress = historySteps.some((step) => step.state === 'pending' || step.state === 'running');
-
   return (
     <div class="session-usage-footer" title={tip} data-agent-type={agentType ?? undefined}>
       {total > 0 && (
         <div class="session-ctx-bar">
           <div class="session-ctx-cache" style={{ width: `${cachePct}%` }} />
           <div class="session-ctx-input" style={{ width: `${newPct}%`, left: `${cachePct}%` }} />
-        </div>
-      )}
-      {showHistoryProgress && (
-        <div class="session-history-progress" aria-live="polite">
-          <span class="session-history-progress-label">{t('session.history_loading_label')}</span>
-          <span class="session-history-progress-steps">
-            {historySteps.map((step) => (
-              <span key={step.key} class={`session-history-step ${step.state}`}>
-                <span class="session-history-step-icon" aria-hidden="true">
-                  {step.state === 'done' ? '✓' : step.state === 'running' ? '…' : '○'}
-                </span>
-                {step.label}
-              </span>
-            ))}
-          </span>
         </div>
       )}
       {codexQuotaLines.length > 0 && (
@@ -187,6 +182,43 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
           </span>
         )}
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+          <span class="shortcut-btn-tools-wrapper">
+            {/* Undecided-state bubble. Points the user at the wrench so the
+             *  first-run choice surface is obvious even before they scroll
+             *  the chat (where the larger chooser banner lives). The bubble
+             *  unmounts automatically the moment `showToolCallsUndecided`
+             *  flips false — picking either banner button or clicking the
+             *  wrench saves the pref, which clears the undecided state. */}
+            {showToolCallsUndecided && (
+              <span
+                class="shortcut-btn-tools-bubble"
+                role="status"
+                aria-live="polite"
+              >
+                {t('chat.tool_calls_choose_prompt')}
+              </span>
+            )}
+            <button
+              type="button"
+              class={`shortcut-btn shortcut-btn-icon shortcut-btn-tools${showToolCallsActive ? ' is-on' : ''}${showToolCallsUndecided ? ' is-undecided' : ''}`}
+              title={
+                showToolCallsActive
+                  ? t('chat.tool_calls_toggle_hide')
+                  : showToolCallsUndecided
+                    ? t('chat.tool_calls_toggle_undecided')
+                    : t('chat.tool_calls_toggle_show')
+              }
+              aria-label={
+                showToolCallsActive
+                  ? t('chat.tool_calls_toggle_hide')
+                  : t('chat.tool_calls_toggle_show')
+              }
+              aria-pressed={showToolCallsActive}
+              onClick={handleShowToolCallsToggle}
+            >
+              🛠
+            </button>
+          </span>
           {modelLabel && <span class="session-usage-model">{modelLabel}</span>}
           {total > 0 && <span class="session-usage-tokens">{fmt(total)} / {fmt(ctx)} ({pctStr}%)</span>}
           {inlineQuotaText && codexQuotaLines.length === 0 && <span class="session-usage-tokens">{inlineQuotaText}</span>}

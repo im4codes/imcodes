@@ -27,7 +27,7 @@ const pendingStreamUpdates = new Map<string, {
   pendingText: string | null;
   timer: ReturnType<typeof setTimeout> | null;
 }>();
-const STREAM_UPDATE_INTERVAL_MS = 80;
+const STREAM_UPDATE_INTERVAL_MS = 40;
 const pendingFileLikeTools = new Map<string, ToolCallEvent>();
 const completedFileLikeTools = new Set<string>();
 const MAX_TRACKED_FILE_TOOLS = 512;
