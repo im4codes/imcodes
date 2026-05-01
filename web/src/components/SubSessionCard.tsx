@@ -20,6 +20,7 @@ import type { SessionInfo } from '../types.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
 import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 import { isTransportRuntime, resolveSubSessionRuntimeType } from '../runtime-type.js';
+import { USAGE_CONTEXT_WINDOW_SOURCES, type UsageContextWindowSource } from '@shared/usage-context-window.js';
 
 const TYPE_ICON: Record<string, string> = {
   'claude-code': '⚡',
@@ -248,7 +249,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   const lastUsage = useMemo(() => {
     for (let i = events.length - 1; i >= 0; i--) {
       if (events[i].type === 'usage.update' && events[i].payload.inputTokens) {
-        return events[i].payload as { inputTokens: number; cacheTokens: number; contextWindow: number; model?: string };
+        return events[i].payload as { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string };
       }
     }
     return null;
@@ -317,7 +318,12 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
         {modelLabel && <span class="subcard-model">{modelLabel}</span>}
         {sub.ccPresetId && <span class="subcard-custom-api" title={`Custom API: ${sub.ccPresetId}`}>◉</span>}
         {lastUsage && (() => {
-          const ctx = resolveContextWindow(lastUsage.contextWindow, detectedModel ?? lastUsage.model);
+          const ctx = resolveContextWindow(
+            lastUsage.contextWindow,
+            detectedModel ?? lastUsage.model,
+            1_000_000,
+            { preferExplicit: lastUsage.contextWindowSource === USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER },
+          );
           const total = lastUsage.inputTokens + lastUsage.cacheTokens;
           const totalPct = Math.min(100, total / ctx * 100);
           const cachePct = Math.min(totalPct, lastUsage.cacheTokens / ctx * 100);

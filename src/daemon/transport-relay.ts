@@ -17,6 +17,7 @@ import { getSession } from '../store/session-store.js';
 import { getCachedPresetContextWindow } from './cc-presets.js';
 import { TIMELINE_EVENT_FILE_CHANGE } from '../../shared/file-change.js';
 import { normalizeCodexSdkFileChange, normalizeQwenFileChange } from './file-change-normalizer.js';
+import { USAGE_CONTEXT_WINDOW_SOURCES } from '../../shared/usage-context-window.js';
 
 let sendToServer: ((msg: Record<string, unknown>) => void) | null = null;
 const inFlightMessages = new Map<string, { messageId: string; eventId: string; text: string }>();
@@ -72,6 +73,10 @@ function normalizeUsageUpdatePayload(
     output_tokens?: number;
     cache_read_input_tokens?: number;
     cache_creation_input_tokens?: number;
+    /** Codex app-server native cache field; normalize to cacheTokens. */
+    cached_input_tokens?: number;
+    /** Provider-reported context window, e.g. Codex app-server tokenUsage.modelContextWindow. */
+    model_context_window?: number;
   } | undefined,
   model: string | undefined,
 ): Record<string, unknown> | null {
@@ -82,11 +87,20 @@ function normalizeUsageUpdatePayload(
   const inputTokens = typeof usage?.input_tokens === 'number'
     ? usage.input_tokens + (usage.cache_creation_input_tokens ?? 0)
     : undefined;
+  const cacheTokens = typeof usage?.cache_read_input_tokens === 'number'
+    ? usage.cache_read_input_tokens
+    : typeof usage?.cached_input_tokens === 'number'
+      ? usage.cached_input_tokens
+      : undefined;
+  const explicitContextWindow = typeof usage?.model_context_window === 'number' && Number.isFinite(usage.model_context_window) && usage.model_context_window > 0
+    ? usage.model_context_window
+    : undefined;
   const payload: Record<string, unknown> = {
     ...(typeof inputTokens === 'number' ? { inputTokens } : {}),
-    ...(typeof usage?.cache_read_input_tokens === 'number' ? { cacheTokens: usage.cache_read_input_tokens } : {}),
+    ...(typeof cacheTokens === 'number' ? { cacheTokens } : {}),
     ...(model ? { model } : {}),
-    contextWindow: resolveContextWindow(presetCtx, model),
+    contextWindow: explicitContextWindow ?? resolveContextWindow(presetCtx, model),
+    ...(explicitContextWindow !== undefined ? { contextWindowSource: USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER } : {}),
   };
   return payload;
 }
@@ -198,6 +212,8 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       output_tokens?: number;
       cache_read_input_tokens?: number;
       cache_creation_input_tokens?: number;
+      cached_input_tokens?: number;
+      model_context_window?: number;
     } | undefined;
     const model = typeof message.metadata?.model === 'string' ? message.metadata.model : undefined;
     const usagePayload = normalizeUsageUpdatePayload(sessionName, usage, model);

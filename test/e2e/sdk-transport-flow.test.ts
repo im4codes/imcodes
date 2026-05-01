@@ -94,7 +94,7 @@ vi.mock('node:child_process', async (importOriginal) => {
             stdout.write(JSON.stringify({ method: 'item/started', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', item: { id: 'msg-codex-e2e', type: 'agentMessage', text: '' } } }) + '\n');
             stdout.write(JSON.stringify({ method: 'item/agentMessage/delta', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', itemId: 'msg-codex-e2e', delta: 'Codex' } }) + '\n');
             stdout.write(JSON.stringify({ method: 'item/agentMessage/delta', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', itemId: 'msg-codex-e2e', delta: ': hello' } }) + '\n');
-            stdout.write(JSON.stringify({ method: 'thread/tokenUsage/updated', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', tokenUsage: { last: { inputTokens: 7, cachedInputTokens: 2, outputTokens: 4 }, total: { inputTokens: 7, cachedInputTokens: 2, outputTokens: 4, totalTokens: 13, reasoningOutputTokens: 0 }, modelContextWindow: 1000000 } } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'thread/tokenUsage/updated', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', tokenUsage: { last: { inputTokens: 7, cachedInputTokens: 2, outputTokens: 4 }, total: { inputTokens: 70, cachedInputTokens: 20, outputTokens: 4, totalTokens: 94, reasoningOutputTokens: 0 }, modelContextWindow: 1000000 } } }) + '\n');
             stdout.write(JSON.stringify({ method: 'item/completed', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', item: { id: 'msg-codex-e2e', type: 'agentMessage', text: 'Codex: hello' } } }) + '\n');
             stdout.write(JSON.stringify({ method: 'turn/completed', params: { threadId: 'thread-codex-e2e', turn: { id: 'turn-codex-e2e', status: 'completed', error: null } } }) + '\n');
           }
@@ -1355,7 +1355,11 @@ describe('sdk transport flow e2e', () => {
     expect(streaming[0]?.opts?.eventId).toBe(`transport:${SESSION_CX}:msg-codex-e2e`);
     expect(final?.payload.text).toBe('Codex: hello');
     expect(final?.opts?.eventId).toBe(`transport:${SESSION_CX}:msg-codex-e2e`);
-    expect(usage?.payload.inputTokens).toBe(7);
+    expect(usage?.payload.inputTokens).toBe(50);
+    expect(usage?.payload.cacheTokens).toBe(20);
+    expect(Number(usage?.payload.inputTokens) + Number(usage?.payload.cacheTokens)).toBe(70);
+    expect(usage?.payload.contextWindow).toBe(1000000);
+    expect(usage?.payload.contextWindowSource).toBe('provider');
     expect(toolCall?.payload.tool).toBe('Bash');
     expect(toolResult?.payload.output).toBe('hi\n');
     expect(ack?.payload.status).toBe('accepted');

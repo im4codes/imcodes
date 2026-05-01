@@ -8,6 +8,9 @@ const {
   searchLocalMemorySemanticMock,
   recordMemoryHitsMock,
   detectRepoMock,
+  getProcessedProjectionStatsMock,
+  queryProcessedProjectionsMock,
+  queryPendingContextEventsMock,
 } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
   getTransportRuntimeMock: vi.fn(),
@@ -16,6 +19,9 @@ const {
   searchLocalMemorySemanticMock: vi.fn(),
   recordMemoryHitsMock: vi.fn(),
   detectRepoMock: vi.fn(),
+  getProcessedProjectionStatsMock: vi.fn(),
+  queryProcessedProjectionsMock: vi.fn(),
+  queryPendingContextEventsMock: vi.fn(),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -27,19 +33,15 @@ vi.mock('../../src/store/session-store.js', () => ({
 
 
 vi.mock('../../src/store/context-store.js', () => ({
-  getProcessedProjectionStats: vi.fn(() => ({
-    totalRecords: 0,
-    matchedRecords: 0,
-    recentSummaryCount: 0,
-    durableCandidateCount: 0,
-    projectCount: 0,
-    stagedEventCount: 0,
-    dirtyTargetCount: 0,
-    pendingJobCount: 0,
-  })),
-  queryPendingContextEvents: vi.fn(() => []),
-  queryProcessedProjections: vi.fn(() => []),
+  deleteContextObservation: vi.fn(),
+  ensureContextNamespace: vi.fn(),
+  getProcessedProjectionStats: getProcessedProjectionStatsMock,
+  listContextObservations: vi.fn(() => []),
+  promoteContextObservation: vi.fn(),
+  queryPendingContextEvents: queryPendingContextEventsMock,
+  queryProcessedProjections: queryProcessedProjectionsMock,
   recordMemoryHits: recordMemoryHitsMock,
+  writeContextObservation: vi.fn(),
 }));
 
 vi.mock('../../src/agent/session-manager.js', () => ({
@@ -163,6 +165,9 @@ vi.mock('../../src/repo/detector.js', () => ({
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 import { resetAllRecentInjectionHistories } from '../../src/context/recent-injection-history.js';
+import { MEMORY_WS } from '../../shared/memory-ws.js';
+import { MEMORY_MANAGEMENT_CONTEXT_FIELD } from '../../shared/memory-management-context.js';
+import { MEMORY_MANAGEMENT_ERROR_CODES } from '../../shared/memory-management.js';
 
 const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
@@ -178,6 +183,18 @@ describe('handleWebCommand memory context timeline', () => {
     vi.clearAllMocks();
     resetAllRecentInjectionHistories();
     setContextModelRuntimeConfig(null);
+    getProcessedProjectionStatsMock.mockReturnValue({
+      totalRecords: 0,
+      matchedRecords: 0,
+      recentSummaryCount: 0,
+      durableCandidateCount: 0,
+      projectCount: 0,
+      stagedEventCount: 0,
+      dirtyTargetCount: 0,
+      pendingJobCount: 0,
+    });
+    queryProcessedProjectionsMock.mockReturnValue([]);
+    queryPendingContextEventsMock.mockReturnValue([]);
     getSessionMock.mockReturnValue({
       name: 'deck_process_brain',
       projectName: 'codedeck',
@@ -225,6 +242,186 @@ describe('handleWebCommand memory context timeline', () => {
     detectRepoMock.mockResolvedValue({
       info: { remoteUrl: 'git@github.com:imcodes/codedeck.git' },
     });
+  });
+
+  it('fails closed for personal memory management queries without injected management context', async () => {
+    handleWebCommand({
+      type: MEMORY_WS.PERSONAL_QUERY,
+      requestId: 'personal-no-context',
+      projectId: 'github.com/acme/repo',
+    }, serverLink as any);
+
+    await flushAsync();
+
+    expect(getProcessedProjectionStatsMock).not.toHaveBeenCalled();
+    expect(queryProcessedProjectionsMock).not.toHaveBeenCalled();
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: MEMORY_WS.PERSONAL_RESPONSE,
+      requestId: 'personal-no-context',
+      records: [],
+      pendingRecords: [],
+      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.MANAGEMENT_REQUEST_UNROUTED,
+      stats: expect.objectContaining({
+        totalRecords: 0,
+        matchedRecords: 0,
+        pendingJobCount: 0,
+      }),
+    }));
+  });
+
+  it('filters personal memory management list, stats, and pending records by derived user id', async () => {
+    getProcessedProjectionStatsMock.mockReturnValue({
+      totalRecords: 1,
+      matchedRecords: 1,
+      recentSummaryCount: 1,
+      durableCandidateCount: 0,
+      projectCount: 1,
+      stagedEventCount: 1,
+      dirtyTargetCount: 1,
+      pendingJobCount: 1,
+    });
+    queryProcessedProjectionsMock.mockReturnValue([{
+      id: 'bob-proj',
+      namespace: { scope: 'personal', projectId: 'github.com/acme/repo', userId: 'user-bob' },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-bob'],
+      summary: 'Bob private project memory',
+      content: {},
+      createdAt: 100,
+      updatedAt: 200,
+      hitCount: 2,
+      lastUsedAt: 150,
+      status: 'active',
+    }]);
+    queryPendingContextEventsMock.mockReturnValue([{
+      id: 'pending-bob',
+      projectId: 'github.com/acme/repo',
+      eventType: 'user.turn',
+      content: 'pending private event',
+      createdAt: 123,
+    }]);
+
+    handleWebCommand({
+      type: MEMORY_WS.PERSONAL_QUERY,
+      requestId: 'personal-list',
+      projectId: 'github.com/acme/repo',
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: {
+        actorId: 'user-bob',
+        userId: 'user-bob',
+        role: 'user',
+        source: 'server_bridge',
+        requestId: 'personal-list',
+        boundProjects: [{ canonicalRepoId: 'github.com/acme/repo' }],
+      },
+    }, serverLink as any);
+
+    await flushAsync();
+
+    expect(getProcessedProjectionStatsMock).toHaveBeenCalledWith(expect.objectContaining({
+      scope: 'personal',
+      userId: 'user-bob',
+      projectId: 'github.com/acme/repo',
+    }));
+    expect(queryProcessedProjectionsMock).toHaveBeenCalledWith(expect.objectContaining({
+      scope: 'personal',
+      userId: 'user-bob',
+      projectId: 'github.com/acme/repo',
+      limit: 20,
+    }));
+    expect(queryPendingContextEventsMock).toHaveBeenCalledWith(expect.objectContaining({
+      scope: 'personal',
+      userId: 'user-bob',
+      projectId: 'github.com/acme/repo',
+      limit: 20,
+    }));
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: MEMORY_WS.PERSONAL_RESPONSE,
+      requestId: 'personal-list',
+      records: [expect.objectContaining({ id: 'bob-proj', summary: 'Bob private project memory' })],
+      pendingRecords: [expect.objectContaining({ id: 'pending-bob' })],
+    }));
+  });
+
+  it('passes derived owner and personal scope into semantic personal memory management queries', async () => {
+    searchLocalMemorySemanticMock.mockResolvedValueOnce({
+      items: [
+        {
+          id: 'bob-personal',
+          type: 'processed',
+          scope: 'personal',
+          userId: 'user-bob',
+          projectId: 'github.com/acme/repo',
+          summary: 'Bob matching memory',
+          projectionClass: 'recent_summary',
+          createdAt: 1,
+          updatedAt: 2,
+        },
+        {
+          id: 'alice-personal',
+          type: 'processed',
+          scope: 'personal',
+          userId: 'user-alice',
+          projectId: 'github.com/acme/repo',
+          summary: 'Alice must not leak',
+          projectionClass: 'recent_summary',
+          createdAt: 1,
+          updatedAt: 2,
+        },
+        {
+          id: 'bob-shared',
+          type: 'processed',
+          scope: 'project_shared',
+          userId: 'user-bob',
+          projectId: 'github.com/acme/repo',
+          summary: 'Shared must not appear in personal response',
+          projectionClass: 'recent_summary',
+          createdAt: 1,
+          updatedAt: 2,
+        },
+      ],
+      stats: {
+        totalRecords: 3,
+        matchedRecords: 3,
+        recentSummaryCount: 3,
+        durableCandidateCount: 0,
+        projectCount: 1,
+        stagedEventCount: 0,
+        dirtyTargetCount: 0,
+        pendingJobCount: 0,
+      },
+    });
+
+    handleWebCommand({
+      type: MEMORY_WS.PERSONAL_QUERY,
+      requestId: 'personal-search',
+      canonicalRepoId: 'github.com/acme/repo',
+      query: 'matching',
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: {
+        actorId: 'user-bob',
+        userId: 'user-bob',
+        role: 'user',
+        source: 'server_bridge',
+        requestId: 'personal-search',
+        boundProjects: [{ canonicalRepoId: 'github.com/acme/repo' }],
+      },
+    }, serverLink as any);
+
+    await flushAsync();
+
+    expect(searchLocalMemorySemanticMock).toHaveBeenCalledWith(expect.objectContaining({
+      query: 'matching',
+      scope: 'personal',
+      userId: 'user-bob',
+      repo: 'github.com/acme/repo',
+      limit: 20,
+    }));
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: MEMORY_WS.PERSONAL_RESPONSE,
+      requestId: 'personal-search',
+      records: [expect.objectContaining({ id: 'bob-personal', summary: 'Bob matching memory' })],
+    }));
+    const response = serverLink.send.mock.calls.find((call) => call[0]?.type === MEMORY_WS.PERSONAL_RESPONSE)?.[0] as { records?: unknown[] } | undefined;
+    expect(response?.records).toHaveLength(1);
   });
 
   it('emits a linked memory.context event for injected related history', async () => {

@@ -351,7 +351,7 @@ describe("cursor/copilot transport restore", { timeout: 10_000 }, () => {
     expect(mocks.copilotRuns).toContainEqual(
       expect.objectContaining({
         sessionId: "copilot-session-restore",
-        prompt: "Verify copilot restore",
+        prompt: expect.stringContaining("Verify copilot restore"),
       }),
     );
   }, 10_000);

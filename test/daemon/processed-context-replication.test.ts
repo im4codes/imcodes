@@ -29,6 +29,7 @@ describe('processed-context replication', () => {
     const projection = writeProcessedProjection({
       namespace,
       class: 'recent_summary',
+      origin: 'chat_compacted',
       sourceEventIds: ['evt-1'],
       summary: 'summary',
       content: { trigger: 'idle' },
@@ -42,6 +43,7 @@ describe('processed-context replication', () => {
 
     const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body));
+      expect(body.projections[0].origin).toBe('chat_compacted');
       return { ok: true, json: async () => ({ ok: true, projectionCount: body.projections.length }), text: async () => '' };
     });
     vi.stubGlobal('fetch', fetchMock);
@@ -78,6 +80,7 @@ describe('processed-context replication', () => {
     const projection = writeProcessedProjection({
       namespace,
       class: 'durable_memory_candidate',
+      origin: 'agent_learned',
       sourceEventIds: ['evt-2'],
       summary: 'decision',
       content: { kind: 'decision' },
@@ -116,6 +119,7 @@ describe('processed-context replication', () => {
     const projection = writeProcessedProjection({
       namespace: personalNamespace,
       class: 'recent_summary',
+      origin: 'chat_compacted',
       sourceEventIds: ['evt-1'],
       summary: 'personal summary',
       content: { note: 'only replicate when enabled' },

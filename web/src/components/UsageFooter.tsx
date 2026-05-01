@@ -9,6 +9,7 @@ import { shortModelLabel } from '../model-label.js';
 import { getSessionCost, getWeeklyCost, getMonthlyCost, formatCost } from '../cost-tracker.js';
 import type { UsageData } from '../usage-data.js';
 import { formatProviderQuotaLabel, type ProviderQuotaMeta } from '@shared/provider-quota.js';
+import { USAGE_CONTEXT_WINDOW_SOURCES } from '@shared/usage-context-window.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
 import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 
@@ -107,7 +108,12 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   }, [planLabel, t]);
 
   const { ctx, total, cachePct, newPct, pctStr, tip } = useMemo(() => {
-    const ctx = resolveContextWindow(usage.contextWindow, displayModel);
+    const ctx = resolveContextWindow(
+      usage.contextWindow,
+      displayModel,
+      1_000_000,
+      { preferExplicit: usage.contextWindowSource === USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER },
+    );
     const total = usage.inputTokens + usage.cacheTokens;
     const totalPct = Math.min(100, total / ctx * 100);
     const cachePct = Math.min(totalPct, usage.cacheTokens / ctx * 100);
@@ -122,7 +128,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
       quotaUsageLabel ? t('session.provider_quota_usage_title', { value: quotaUsageLabel }) : '',
     ].filter(Boolean).join('\n');
     return { ctx, total, totalPct, cachePct, newPct, pctStr, tip };
-  }, [usage.inputTokens, usage.cacheTokens, usage.contextWindow, displayModel, displayPlanLabel, displayQuotaLabel, quotaUsageLabel, t]);
+  }, [usage.inputTokens, usage.cacheTokens, usage.contextWindow, usage.contextWindowSource, displayModel, displayPlanLabel, displayQuotaLabel, quotaUsageLabel, t]);
 
   const sessionCost = showCost ? getSessionCost(sessionName) : 0;
   const weeklyCost = sessionCost > 0 ? getWeeklyCost() : 0;

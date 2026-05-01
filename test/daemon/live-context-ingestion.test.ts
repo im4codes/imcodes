@@ -1,14 +1,25 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ContextNamespace } from '../../shared/context-types.js';
 import type { TimelineEvent } from '../../src/daemon/timeline-event.js';
+import type { MaterializationSkillReviewJob } from '../../src/context/materialization-coordinator.js';
 import {
   closeLiveContextMaterializationAdmission,
   LiveContextIngestion,
   reopenLiveContextMaterializationAdmission,
 } from '../../src/context/live-context-ingestion.js';
-import { localOnlyCompressor } from '../../src/context/summary-compressor.js';
+import { localOnlyCompressor, type CompressionInput, type CompressionResult } from '../../src/context/summary-compressor.js';
 import { getProcessedProjectionStats, queryProcessedProjections } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
+
+async function successfulCompressor(input: CompressionInput): Promise<CompressionResult> {
+  return {
+    summary: `Compressed ${input.events.length} events after tool work.`,
+    model: 'test-model',
+    backend: 'test',
+    usedBackup: false,
+    fromSdk: true,
+  };
+}
 
 describe('LiveContextIngestion', () => {
   let tempDir: string;
@@ -189,6 +200,88 @@ describe('LiveContextIngestion', () => {
     expect(summary?.summary).toContain('**Assistant:** Use the final patch');
     expect(summary?.summary).not.toContain('grep');
     expect(summary?.summary).not.toContain('intermediate output');
+  });
+
+  it('uses completed tool results as threshold evidence for post-response skill auto-creation without storing tool output', async () => {
+    const enqueued: MaterializationSkillReviewJob[] = [];
+    const ingestion = new LiveContextIngestion({
+      compressor: successfulCompressor,
+      thresholds: { eventCount: 99, idleMs: 60_000, scheduleMs: 60_000, minIntervalMs: 0 },
+      sessionLookup: () => session,
+      resolveBootstrap: async () => ({ namespace, diagnostics: ['test'] }),
+      skillReviewScheduler: {
+        featureEnabled: true,
+        getState: () => ({
+          pendingKeys: new Set(),
+          lastRunByScope: new Map(),
+          dailyCountByScope: new Map(),
+        }),
+        policy: { toolIterationThreshold: 2, minIntervalMs: 0 },
+        enqueue: (job) => { enqueued.push(job); },
+      },
+    });
+
+    await ingestion.handleTimelineEvent(makeEvent('user.message', 100, { text: 'Use tools once' }));
+    await ingestion.handleTimelineEvent(makeEvent('tool.result', 110, { output: 'do not store this output' }));
+    await ingestion.handleTimelineEvent(makeEvent('assistant.text', 120, { text: 'First answer', streaming: false }));
+    await ingestion.handleTimelineEvent(makeEvent('session.state', 130, { state: 'idle' }));
+    expect(enqueued).toEqual([]);
+
+    await ingestion.handleTimelineEvent(makeEvent('user.message', 200, { text: 'Use tools again' }));
+    await ingestion.handleTimelineEvent(makeEvent('tool.result', 210, { output: 'also not stored' }));
+    await ingestion.handleTimelineEvent(makeEvent('assistant.text', 220, { text: 'Second answer', streaming: false }));
+    await ingestion.handleTimelineEvent(makeEvent('session.state', 230, { state: 'idle' }));
+    expect(enqueued).toEqual([]);
+
+    await ingestion.handleTimelineEvent(makeEvent('user.message', 300, { text: 'Use enough tools in one turn' }));
+    await ingestion.handleTimelineEvent(makeEvent('tool.result', 310, { output: 'third hidden output' }));
+    await ingestion.handleTimelineEvent(makeEvent('tool.result', 320, { output: 'fourth hidden output' }));
+    await ingestion.handleTimelineEvent(makeEvent('assistant.text', 330, { text: 'Third answer', streaming: false }));
+    await ingestion.handleTimelineEvent(makeEvent('session.state', 340, { state: 'idle' }));
+
+    expect(enqueued).toHaveLength(1);
+    expect(enqueued[0]?.trigger).toBe('tool_iteration_count');
+    const summaries = queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId, limit: 10 });
+    expect(summaries.map((entry) => entry.summary).join('\n')).not.toContain('do not store this output');
+    expect(summaries.map((entry) => entry.summary).join('\n')).not.toContain('also not stored');
+  });
+
+  it('filters hidden and failed tool results from skill-review tool-iteration evidence', async () => {
+    const enqueued: MaterializationSkillReviewJob[] = [];
+    const ingestion = new LiveContextIngestion({
+      compressor: successfulCompressor,
+      thresholds: { eventCount: 99, idleMs: 60_000, scheduleMs: 60_000, minIntervalMs: 0 },
+      sessionLookup: () => session,
+      resolveBootstrap: async () => ({ namespace, diagnostics: ['test'] }),
+      skillReviewScheduler: {
+        featureEnabled: true,
+        getState: () => ({
+          pendingKeys: new Set(),
+          lastRunByScope: new Map(),
+          dailyCountByScope: new Map(),
+        }),
+        policy: { toolIterationThreshold: 1, minIntervalMs: 0 },
+        enqueue: (job) => { enqueued.push(job); },
+      },
+    });
+
+    await ingestion.handleTimelineEvent(makeEvent('user.message', 300, { text: 'Hidden tools should not learn' }));
+    await ingestion.handleTimelineEvent({ ...makeEvent('tool.result', 310, { output: 'hidden raw edit' }), hidden: true });
+    await ingestion.handleTimelineEvent(makeEvent('assistant.text', 320, { text: 'First answer', streaming: false }));
+    await ingestion.handleTimelineEvent(makeEvent('session.state', 330, { state: 'idle' }));
+    expect(enqueued).toEqual([]);
+
+    await ingestion.handleTimelineEvent(makeEvent('user.message', 400, { text: 'Failed tools should not learn' }));
+    await ingestion.handleTimelineEvent(makeEvent('tool.result', 410, { error: 'tool failed' }));
+    await ingestion.handleTimelineEvent(makeEvent('assistant.text', 420, { text: 'Second answer', streaming: false }));
+    await ingestion.handleTimelineEvent(makeEvent('session.state', 430, { state: 'idle' }));
+    expect(enqueued).toEqual([]);
+
+    await ingestion.handleTimelineEvent(makeEvent('user.message', 500, { text: 'Visible completed tool can learn' }));
+    await ingestion.handleTimelineEvent(makeEvent('tool.result', 510, { output: 'ok' }));
+    await ingestion.handleTimelineEvent(makeEvent('assistant.text', 520, { text: 'Third answer', streaming: false }));
+    await ingestion.handleTimelineEvent(makeEvent('session.state', 530, { state: 'idle' }));
+    expect(enqueued).toHaveLength(1);
   });
 
   it('backfills recent timeline history for sessions that have no existing context activity', async () => {

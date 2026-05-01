@@ -21,6 +21,7 @@ import { timelineEmitter } from './timeline-emitter.js';
 import { getSession, upsertSession, listSessions } from '../store/session-store.js';
 import type { SessionRecord } from '../store/session-store.js';
 import { refreshSessionWatcher } from './watcher-controls.js';
+import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
 
 export const DEFAULT_HOOK_PORT = 51913;
 const PORT_FILE = path.join(os.homedir(), '.imcodes', 'hook-port');
@@ -128,21 +129,59 @@ export type ResolveResult = {
   available: string[];
 }
 
+function resolveSenderRecord(from: string, allSessions: SessionRecord[]): SessionRecord | null | 'ambiguous' {
+  if (from === IMCODES_EXTERNAL_CLI_SENDER) return null;
+
+  const byName = getSession(from);
+  if (byName) return byName;
+
+  const byLabel = allSessions.filter((s) => s.state !== 'stopped' && s.label && s.label.toLowerCase() === from.toLowerCase());
+  if (byLabel.length === 1) return byLabel[0];
+  if (byLabel.length > 1) return 'ambiguous';
+  return null;
+}
+
 /**
  * Resolve a target session name from the `to` field.
- * Priority: label (case-insensitive) → session name → agent type.
- * Scope: siblings of `from` session (same parentSession or same project).
+ *
+ * Managed-session sender:
+ * - Priority: label (case-insensitive) → session name → agent type.
+ * - Scope: siblings of `from` session (same parentSession or same project).
+ *
+ * External CLI sender:
+ * - There is no trustworthy sender scope, so only an exact non-stopped session
+ *   name is accepted. This preserves shell-originated callback commands such as
+ *   `imcodes send --no-reply "deck_proj_brain" ...` without enabling global
+ *   label/type/broadcast fan-out.
  */
 export function resolveTarget(from: string, to: string): ResolveResult {
-  const fromRecord = getSession(from);
+  const allSessions = listSessions();
+  const fromRecord = resolveSenderRecord(from, allSessions);
+
+  if (fromRecord === 'ambiguous') {
+    return {
+      ok: false,
+      error: `sender session label "${from}" is ambiguous; set IMCODES_SESSION to the exact session name`,
+      available: allSessions.filter((s) => s.state !== 'stopped').map((s) => s.name),
+    };
+  }
+
   if (!fromRecord) {
-    return { ok: false, error: 'sender session not found', available: [] };
+    const activeSessions = allSessions.filter((s) => s.state !== 'stopped');
+    const byExactName = activeSessions.filter((s) => s.name === to);
+    if (byExactName.length === 1) {
+      return { ok: true, targets: [byExactName[0]] };
+    }
+    return {
+      ok: false,
+      error: 'sender session not found; exact active session name required when sending from outside a managed session',
+      available: activeSessions.map((s) => s.name),
+    };
   }
 
   // Determine siblings: sessions sharing the same parent or project (exclude stopped)
-  const allSessions = listSessions();
   const siblings = allSessions.filter((s) => {
-    if (s.name === from) return false; // exclude self
+    if (s.name === fromRecord.name) return false; // exclude self
     if (s.state === 'stopped') return false; // exclude stopped sessions
     // Sub-sessions: match by parentSession
     if (fromRecord.parentSession) {

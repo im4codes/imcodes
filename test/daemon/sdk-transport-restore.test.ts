@@ -210,6 +210,11 @@ describe('sdk transport session restore', () => {
     expect(mocks.claudeRuns[0].options.resume).toBe('cc-session-restore');
     expect(mocks.claudeRuns[0].options.model).toBe('sonnet');
     expect(mocks.claudeRuns[0].options.effort).toBe('high');
+    expect(mocks.claudeRuns[0].options.env).toMatchObject({
+      IMCODES_SESSION: 'deck_sdk_cc_brain',
+      IMCODES_SESSION_LABEL: 'deck_sdk_cc_brain',
+    });
+    expect(String(mocks.claudeRuns[0].options.appendSystemPrompt ?? '')).toContain('Exact session name: deck_sdk_cc_brain');
     expect(mocks.store.get('deck_sdk_cc_brain')?.state).toBe('idle');
     expect(mocks.store.get('deck_sdk_cc_brain')?.modelDisplay).toBe('claude-sonnet-4-6');
     expect(mocks.store.get('deck_sdk_cc_brain')?.requestedModel).toBe('sonnet');
@@ -318,6 +323,7 @@ describe('sdk transport session restore', () => {
       role: 'brain',
       agentType: 'claude-code-sdk',
       projectDir: '/tmp/sdk-new',
+      label: 'CC1',
       requestedModel: 'sonnet',
       effort: 'high',
       transportConfig: {
@@ -332,6 +338,16 @@ describe('sdk transport session restore', () => {
     expect(mocks.store.get('deck_sdk_new_brain')?.contextNamespace).toEqual({ scope: 'personal', projectId: 'sdk-launch-visible' });
     expect(mocks.store.get('deck_sdk_new_brain')?.contextNamespaceDiagnostics).toEqual(['namespace:explicit']);
     expect(onSessionEvent).toHaveBeenCalledWith('started', 'deck_sdk_new_brain', 'idle');
+
+    const runtime = getTransportRuntime('deck_sdk_new_brain');
+    expect(runtime).toBeDefined();
+    runtime!.send('verify sdk env identity');
+    await flush();
+    expect(mocks.claudeRuns.at(-1)?.options.env).toMatchObject({
+      IMCODES_SESSION: 'deck_sdk_new_brain',
+      IMCODES_SESSION_LABEL: 'CC1',
+    });
+    expect(String(mocks.claudeRuns.at(-1)?.options.appendSystemPrompt ?? '')).toContain('Display label: CC1');
   });
 
   it('auto-restarts an errored transport runtime and replays the failed turn', async () => {

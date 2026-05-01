@@ -1,12 +1,16 @@
 import type { ContextMemoryView } from '../../../shared/context-types.js';
 import { computeRelevanceScore, type MemoryScoringWeights, type ProjectionClass } from '../../../shared/memory-scoring.js';
+import {
+  REPLICABLE_SHARED_PROJECTION_SCOPES,
+  type SharedContextProjectionScope,
+} from '../../../shared/memory-scope.js';
 import type { Database } from '../db/client.js';
 import { embeddingToSql, generateEmbedding } from './embedding.js';
 import { isMemoryNoiseSummary } from '../../../shared/memory-noise-patterns.js';
 
 type MemoryScope = 'personal' | 'enterprise';
 type ProjectionClassFilter = 'recent_summary' | 'durable_memory_candidate' | 'master_summary';
-type ProjectionScope = 'personal' | 'project_shared' | 'workspace_shared' | 'org_shared';
+type ProjectionScope = SharedContextProjectionScope;
 type ProjectionStatus = 'active' | 'archived' | 'archived_dedup';
 
 export interface SemanticMemoryViewInput {
@@ -70,7 +74,8 @@ export function buildScopedWhereClause(input: SemanticMemoryViewInput, includeAl
     conditions.push(`${alias}user_id = ${p(input.userId)}`);
   } else {
     if (!input.enterpriseId) throw new Error('enterpriseId is required for enterprise semantic memory search');
-    conditions.push(`${alias}scope IN ('project_shared', 'workspace_shared', 'org_shared')`);
+    const sharedScopePlaceholders = REPLICABLE_SHARED_PROJECTION_SCOPES.map((scope) => p(scope)).join(', ');
+    conditions.push(`${alias}scope IN (${sharedScopePlaceholders})`);
     conditions.push(`${alias}enterprise_id = ${p(input.enterpriseId)}`);
   }
 

@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { selectStartupMemoryItems } from '../../src/context/startup-memory.js';
+import {
+  STARTUP_BOOTSTRAP_SOURCES,
+  STARTUP_MEMORY_STAGES,
+  buildStartupBootstrapSelection,
+  selectStartupMemoryByPolicy,
+  selectStartupMemoryItems,
+} from '../../src/context/startup-memory.js';
 import { writeProcessedProjection } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 
@@ -94,6 +100,88 @@ describe('startup memory selection', () => {
     expect(items.slice(1).map((item) => item.summary)).toEqual([
       'Recent summary for other work',
       'Recent summary for the same source events',
+    ]);
+  });
+
+  it('uses named collect/prioritize/quota/trim/dedup/render stages for bounded startup policy', () => {
+    const report = selectStartupMemoryByPolicy([
+      { id: 'recent-1', source: 'recent', text: 'drop first under pressure', estimatedTokens: 6, updatedAt: 30 },
+      { id: 'durable-1', source: 'durable', text: 'keep durable', estimatedTokens: 4, updatedAt: 10 },
+      { id: 'pinned-1', source: 'pinned', text: 'keep pinned verbatim', estimatedTokens: 4, updatedAt: 1 },
+      { id: 'durable-dup', source: 'durable', text: 'KEEP DURABLE', estimatedTokens: 4, updatedAt: 20 },
+      { id: 'project-doc', source: 'project_docs', text: 'keep docs', estimatedTokens: 2, updatedAt: 5 },
+    ], {
+      totalTokens: 10,
+      pinnedTokens: 10,
+      durableTokens: 10,
+      recentTokens: 10,
+      projectDocsTokens: 10,
+      skillTokens: 10,
+    });
+
+    expect(report.stages).toEqual(STARTUP_MEMORY_STAGES);
+    expect(report.bootstrapSources).toEqual(STARTUP_BOOTSTRAP_SOURCES);
+    expect(report.selected.map((item) => item.id)).toEqual(['pinned-1', 'durable-dup', 'project-doc']);
+    expect(report.usedTokens).toBe(10);
+    expect(report.dropped).toEqual([
+      { id: 'durable-1', source: 'durable', reason: 'duplicate' },
+      { id: 'recent-1', source: 'recent', reason: 'total_budget' },
+    ]);
+  });
+
+  it('unifies startup memory, preferences, project/user context, and skills through the same named-stage bootstrap', () => {
+    const report = buildStartupBootstrapSelection({
+      recent: [{ id: 'recent', text: 'recent turn', estimatedTokens: 2 }],
+      durable: [{ id: 'durable', text: 'durable fact', estimatedTokens: 2 }],
+      projectContext: [{ id: 'project-doc', text: 'project convention', estimatedTokens: 2 }],
+      userContext: [{ id: 'user-context', text: 'user context', estimatedTokens: 2 }],
+      preferences: [{ id: 'pref', text: 'Use pnpm', estimatedTokens: 2 }],
+      skills: [{ id: 'skill', text: 'Test first', estimatedTokens: 2 }],
+    }, {
+      totalTokens: 20,
+      pinnedTokens: 20,
+      durableTokens: 20,
+      recentTokens: 20,
+      projectDocsTokens: 20,
+      skillTokens: 20,
+    });
+
+    expect(report.stages).toEqual(STARTUP_MEMORY_STAGES);
+    expect(report.bootstrapSources).toEqual([
+      'startup_memory',
+      'preferences',
+      'project_context',
+      'user_context',
+      'skills',
+    ]);
+    expect(report.selected.map((item) => `${item.source}:${item.id}`)).toEqual([
+      'skill:skill',
+      'preference:pref',
+      'user_context:user-context',
+      'durable:durable',
+      'project_docs:project-doc',
+      'recent:recent',
+    ]);
+  });
+
+  it('omits a failing or over-budget source without changing ordinary startup compatibility', () => {
+    const report = selectStartupMemoryByPolicy([
+      { id: 'durable-1', source: 'durable', text: 'durable', estimatedTokens: 3 },
+      { id: 'recent-too-large', source: 'recent', text: 'recent', estimatedTokens: 20 },
+      { id: 'skill-too-large', source: 'skill', text: 'skill', estimatedTokens: 20 },
+    ], {
+      totalTokens: 20,
+      durableTokens: 10,
+      recentTokens: 5,
+      skillTokens: 5,
+      pinnedTokens: 10,
+      projectDocsTokens: 10,
+    });
+
+    expect(report.selected.map((item) => item.id)).toEqual(['durable-1']);
+    expect(report.dropped).toEqual([
+      { id: 'skill-too-large', source: 'skill', reason: 'source_quota' },
+      { id: 'recent-too-large', source: 'recent', reason: 'source_quota' },
     ]);
   });
 });

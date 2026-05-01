@@ -5,6 +5,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/pr
 import { useState } from 'preact/hooks';
 import { act } from 'preact/test-utils';
 import { MEMORY_WS } from '@shared/memory-ws.js';
+import { MEMORY_FEATURE_FLAGS_BY_NAME } from '@shared/feature-flags.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('react-i18next', () => ({
@@ -665,15 +666,15 @@ describe('SharedContextManagementPanel', () => {
 
   it('loads local, cloud, and enterprise memory views and saves personal sync settings', async () => {
     const sent: Array<Record<string, unknown>> = [];
-    let messageHandler: ((message: unknown) => void) | null = null;
+    const messageHandlers = new Set<(message: unknown) => void>();
     const ws = {
       send(message: Record<string, unknown>) {
         sent.push(message);
       },
       onMessage(handler: (message: unknown) => void) {
-        messageHandler = handler;
+        messageHandlers.add(handler);
         return () => {
-          if (messageHandler === handler) messageHandler = null;
+          messageHandlers.delete(handler);
         };
       },
     };
@@ -693,7 +694,7 @@ describe('SharedContextManagementPanel', () => {
     expect(queryCommand).toBeDefined();
 
     await act(async () => {
-      messageHandler?.({
+      for (const handler of messageHandlers) handler({
         type: MEMORY_WS.PERSONAL_RESPONSE,
         requestId: queryCommand?.requestId,
         stats: {
@@ -784,15 +785,15 @@ describe('SharedContextManagementPanel', () => {
 
   it('deletes local, cloud, and enterprise memory records', async () => {
     const sent: Array<Record<string, unknown>> = [];
-    let messageHandler: ((message: unknown) => void) | null = null;
+    const messageHandlers = new Set<(message: unknown) => void>();
     const ws = {
       send(message: Record<string, unknown>) {
         sent.push(message);
       },
       onMessage(handler: (message: unknown) => void) {
-        messageHandler = handler;
+        messageHandlers.add(handler);
         return () => {
-          if (messageHandler === handler) messageHandler = null;
+          messageHandlers.delete(handler);
         };
       },
     };
@@ -808,7 +809,7 @@ describe('SharedContextManagementPanel', () => {
     expect(localQuery).toBeDefined();
 
     await act(async () => {
-      messageHandler?.({
+      for (const handler of messageHandlers) handler({
         type: MEMORY_WS.PERSONAL_RESPONSE,
         requestId: localQuery?.requestId,
         stats: {
@@ -843,7 +844,7 @@ describe('SharedContextManagementPanel', () => {
     const deleteCommand = sent.find((message) => message.type === MEMORY_WS.DELETE);
     expect(deleteCommand).toMatchObject({ id: 'local-personal-1' });
     await act(async () => {
-      messageHandler?.({ type: MEMORY_WS.DELETE_RESPONSE, requestId: deleteCommand?.requestId, success: true });
+      for (const handler of messageHandlers) handler({ type: MEMORY_WS.DELETE_RESPONSE, requestId: deleteCommand?.requestId, success: true });
     });
 
     await act(async () => {
@@ -864,5 +865,215 @@ describe('SharedContextManagementPanel', () => {
     });
     await waitFor(() => expect(deleteEnterpriseSharedMemoryMock).toHaveBeenCalledWith('team-1', 'shared-1'));
   });
+
+
+  it('exposes post-1.1 preference, skill, markdown, and observation management controls', async () => {
+    const sent: Array<Record<string, unknown>> = [];
+    const messageHandlers = new Set<(message: unknown) => void>();
+    const ws = {
+      send(message: Record<string, unknown>) {
+        sent.push(message);
+      },
+      onMessage(handler: (message: unknown) => void) {
+        messageHandlers.add(handler);
+        return () => {
+          messageHandlers.delete(handler);
+        };
+      },
+    };
+
+    render(<SharedContextManagementPanel serverId="srv-1" ws={ws as never} />);
+    await flush();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.memory'));
+    });
+
+    await waitFor(() => expect(sent.some((message) => message.type === MEMORY_WS.PREF_QUERY)).toBe(true));
+    expect(sent.some((message) => message.type === MEMORY_WS.FEATURES_QUERY)).toBe(true);
+    expect(sent.some((message) => message.type === MEMORY_WS.SKILL_QUERY)).toBe(true);
+    expect(sent.some((message) => message.type === MEMORY_WS.OBSERVATION_QUERY)).toBe(true);
+    const latestRequestId = (type: string) => [...sent].reverse().find((message) => message.type === type)?.requestId as string | undefined;
+    const latestCommand = (type: string) => [...sent].reverse().find((message) => message.type === type) as Record<string, unknown> | undefined;
+    await act(async () => {
+      fireEvent.input(screen.getByPlaceholderText('sharedContext.management.memoryPreferenceTextPlaceholder'), {
+        target: { value: 'Prefer ignored stale response.' },
+      });
+    });
+    expect(screen.getByText('sharedContext.management.memoryPreferenceSave')).toHaveProperty('disabled', true);
+    await act(async () => {
+      for (const handler of messageHandlers) handler({
+        type: MEMORY_WS.PREF_RESPONSE,
+        requestId: 'stale-or-other-tab',
+        featureEnabled: true,
+        records: [{
+          id: 'pref-stale',
+          userId: 'daemon-local',
+          text: 'Stale response should not render.',
+          fingerprint: 'fp-stale',
+          origin: 'user_note',
+          state: 'active',
+          createdAt: 1700000000000,
+          updatedAt: 1700000000000,
+        }],
+      });
+    });
+    expect(screen.queryByText('Stale response should not render.')).toBeNull();
+
+    await act(async () => {
+      for (const handler of messageHandlers) handler({
+        type: MEMORY_WS.FEATURES_RESPONSE,
+        requestId: latestRequestId(MEMORY_WS.FEATURES_QUERY),
+        records: [
+          { flag: MEMORY_FEATURE_FLAGS_BY_NAME.preferences, enabled: true, disabledBehavior: 'Preferences enabled.' },
+          { flag: MEMORY_FEATURE_FLAGS_BY_NAME.mdIngest, enabled: true, disabledBehavior: 'MD ingest enabled.' },
+          { flag: MEMORY_FEATURE_FLAGS_BY_NAME.skills, enabled: true, disabledBehavior: 'Skills enabled.' },
+          { flag: MEMORY_FEATURE_FLAGS_BY_NAME.skillAutoCreation, enabled: true, disabledBehavior: 'Skill review enabled.' },
+          { flag: MEMORY_FEATURE_FLAGS_BY_NAME.observationStore, enabled: true, disabledBehavior: 'Observation store enabled.' },
+          { flag: MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry, enabled: true, disabledBehavior: 'Namespace registry enabled.' },
+        ],
+      });
+      for (const handler of messageHandlers) handler({
+        type: MEMORY_WS.PREF_RESPONSE,
+        requestId: latestRequestId(MEMORY_WS.PREF_QUERY),
+        featureEnabled: true,
+        records: [{
+          id: 'pref-1',
+          userId: 'daemon-local',
+          text: 'Always prefer tests.',
+          fingerprint: 'fp-pref',
+          origin: 'user_note',
+          state: 'active',
+          createdAt: 1700000000000,
+          updatedAt: 1700000000000,
+        }],
+      });
+      for (const handler of messageHandlers) handler({
+        type: MEMORY_WS.SKILL_RESPONSE,
+        requestId: latestRequestId(MEMORY_WS.SKILL_QUERY),
+        featureEnabled: true,
+        entries: [{
+          key: 'typescript/test-runner',
+          layer: 'user_default',
+          name: 'Test Runner',
+          category: 'typescript',
+          description: 'Run focused tests.',
+          displayPath: '~/.imcodes/skills/typescript/test-runner.md',
+          uri: 'skill://user_default/typescript%2Ftest-runner',
+          fingerprint: 'fp-skill',
+          updatedAt: 1700000001000,
+        }],
+      });
+      for (const handler of messageHandlers) handler({
+        type: MEMORY_WS.OBSERVATION_RESPONSE,
+        requestId: latestRequestId(MEMORY_WS.OBSERVATION_QUERY),
+        featureEnabled: true,
+        records: [{
+          id: 'obs-1',
+          scope: 'personal',
+          class: 'decision',
+          origin: 'chat_compacted',
+          state: 'active',
+          text: 'Use registry hints for skills.',
+          fingerprint: 'fp-obs',
+          namespaceId: 'ns-1',
+          updatedAt: 1700000002000,
+          createdAt: 1700000002000,
+        }],
+      });
+    });
+
+    expect(await screen.findByText('Always prefer tests.')).toBeDefined();
+    expect(await screen.findByText('Test Runner')).toBeDefined();
+    expect(await screen.findByText('Use registry hints for skills.')).toBeDefined();
+    expect(await screen.findByText('sharedContext.management.memoryFeatureStatusTitle')).toBeDefined();
+    expect(screen.getByLabelText(`${MEMORY_FEATURE_FLAGS_BY_NAME.preferences}: sharedContext.management.memoryFeatureEnabled`)).toBeDefined();
+
+    expect(screen.getByPlaceholderText('sharedContext.management.memoryPreferenceTextPlaceholder')).toBeDefined();
+    expect(screen.getByText('sharedContext.management.memoryPreferenceSave')).toBeDefined();
+
+    await act(async () => {
+      fireEvent.input(screen.getAllByPlaceholderText('sharedContext.management.memoryProjectPlaceholder')[0], {
+        target: { value: 'github.com/acme/repo' },
+      });
+      fireEvent.input(screen.getAllByPlaceholderText('sharedContext.management.memoryProjectDirPlaceholder')[0], {
+        target: { value: '/work/repo' },
+      });
+      fireEvent.click(screen.getByText('sharedContext.management.memoryPreferenceSave'));
+    });
+    const prefCreate = latestCommand(MEMORY_WS.PREF_CREATE);
+    expect(prefCreate).toMatchObject({
+      type: MEMORY_WS.PREF_CREATE,
+      text: 'Prefer ignored stale response.',
+    });
+    expect(prefCreate).not.toHaveProperty('userId');
+    expect(prefCreate).not.toHaveProperty('actorId');
+    expect(prefCreate).not.toHaveProperty('role');
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.memorySkillRebuildRegistry'));
+      fireEvent.click(screen.getByText('sharedContext.management.memorySkillPreview'));
+    });
+    const rebuildCommand = latestCommand(MEMORY_WS.SKILL_REBUILD);
+    expect(rebuildCommand).toMatchObject({
+      type: MEMORY_WS.SKILL_REBUILD,
+      projectDir: '/work/repo',
+      canonicalRepoId: 'github.com/acme/repo',
+    });
+    const readCommand = latestCommand(MEMORY_WS.SKILL_READ);
+    expect(readCommand).toMatchObject({
+      type: MEMORY_WS.SKILL_READ,
+      key: 'typescript/test-runner',
+      layer: 'user_default',
+      projectDir: '/work/repo',
+      canonicalRepoId: 'github.com/acme/repo',
+    });
+
+    await act(async () => {
+      for (const handler of messageHandlers) handler({
+        type: MEMORY_WS.SKILL_READ_RESPONSE,
+        requestId: readCommand?.requestId,
+        success: true,
+        key: 'typescript/test-runner',
+        layer: 'user_default',
+        content: '# Test Runner\nUse pnpm test.',
+      });
+    });
+    expect(await screen.findByText(/Use pnpm test/)).toBeDefined();
+
+    expect(screen.getAllByPlaceholderText('sharedContext.management.memoryProjectDirPlaceholder').length).toBeGreaterThan(0);
+    expect(screen.getByText('sharedContext.management.memoryMdIngestRun')).toBeDefined();
+
+    await act(async () => {
+      fireEvent.input(screen.getAllByPlaceholderText('sharedContext.management.memoryProjectDirPlaceholder')[1], {
+        target: { value: '/work/repo' },
+      });
+      fireEvent.input(screen.getAllByPlaceholderText('sharedContext.management.memoryProjectPlaceholder')[1], {
+        target: { value: 'github.com/acme/repo' },
+      });
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.memoryMdIngestRun'));
+      fireEvent.click(screen.getByText('sharedContext.management.memoryObservationPromote'));
+    });
+    const mdIngestCommand = latestCommand(MEMORY_WS.MD_INGEST_RUN);
+    expect(mdIngestCommand).toMatchObject({
+      type: MEMORY_WS.MD_INGEST_RUN,
+      projectDir: '/work/repo',
+      canonicalRepoId: 'github.com/acme/repo',
+      scope: 'personal',
+    });
+    expect(mdIngestCommand).not.toHaveProperty('projectId');
+    const promoteCommand = latestCommand(MEMORY_WS.OBSERVATION_PROMOTE);
+    expect(promoteCommand).toMatchObject({
+      type: MEMORY_WS.OBSERVATION_PROMOTE,
+      id: 'obs-1',
+      projectDir: '/work/repo',
+      canonicalRepoId: 'github.com/acme/repo',
+      expectedFromScope: 'personal',
+      toScope: 'project_shared',
+    });
+  });
+
 
 });

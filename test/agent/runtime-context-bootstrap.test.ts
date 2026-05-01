@@ -1,4 +1,9 @@
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { MEMORY_FEATURE_FLAGS_BY_NAME, memoryFeatureFlagEnvKey } from '../../shared/feature-flags.js';
+import { SKILL_REGISTRY_FILE_NAME, SKILL_REGISTRY_SCHEMA_VERSION, makeSkillUri } from '../../shared/skill-registry-types.js';
 import { configureSharedContextRuntime } from '../../src/context/shared-context-runtime.js';
 import { writeProcessedProjection } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
@@ -17,11 +22,13 @@ import { buildTransportStartupMemory, resolveTransportContextBootstrap } from '.
 
 describe('resolveTransportContextBootstrap', () => {
   let tempDir: string;
+  let tempProjectDir: string | undefined;
 
   beforeEach(() => {
     detectRepoMock.mockReset();
     configureSharedContextRuntime(null);
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
   });
 
   beforeEach(async () => {
@@ -30,6 +37,8 @@ describe('resolveTransportContextBootstrap', () => {
 
   afterEach(async () => {
     await cleanupIsolatedSharedContextDb(tempDir);
+    if (tempProjectDir) await rm(tempProjectDir, { recursive: true, force: true });
+    tempProjectDir = undefined;
   });
 
   it('uses canonical git-origin identity from projectDir when no explicit namespace is configured', async () => {
@@ -78,6 +87,54 @@ describe('resolveTransportContextBootstrap', () => {
       localProcessedFreshness: 'missing',
     });
     expect(detectRepoMock).not.toHaveBeenCalled();
+  });
+
+  it('accepts explicit user_private namespace through the shared scope registry', async () => {
+    const result = await resolveTransportContextBootstrap({
+      projectDir: '/tmp/project',
+      transportConfig: {
+        sharedContextNamespace: {
+          scope: 'user_private',
+          projectId: 'github.com/acme/repo',
+          userId: 'user-1',
+        },
+      },
+    });
+
+    expect(result).toEqual({
+      namespace: {
+        scope: 'user_private',
+        projectId: 'github.com/acme/repo',
+        userId: 'user-1',
+      },
+      diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'missing',
+    });
+    expect(detectRepoMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects unknown explicit namespace scopes and falls back to repo resolution', async () => {
+    detectRepoMock.mockResolvedValue({
+      info: {
+        remoteUrl: 'git@github.com:acme/repo.git',
+      },
+    });
+
+    const result = await resolveTransportContextBootstrap({
+      projectDir: '/tmp/project',
+      transportConfig: {
+        sharedContextNamespace: {
+          scope: 'rogue_scope',
+          projectId: 'github.com/rogue/repo',
+        },
+      },
+    });
+
+    expect(result.namespace).toEqual({
+      scope: 'personal',
+      projectId: 'github.com/acme/repo',
+    });
+    expect(result.diagnostics).toEqual(['namespace:git-origin']);
   });
 
   it('falls back deterministically when no repo remote is available', async () => {
@@ -426,6 +483,54 @@ describe('resolveTransportContextBootstrap', () => {
     ]);
     expect(startup?.injectedText).toContain('[important] Important architecture memory');
     expect(startup?.injectedText).toContain('[recent] Recent startup memory');
+  });
+
+  it('buildTransportStartupMemory renders registry skill references without reading skill markdown bodies', async () => {
+    vi.stubEnv(memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry), 'true');
+    vi.stubEnv(memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.observationStore), 'true');
+    vi.stubEnv(memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.skills), 'true');
+    tempProjectDir = await mkdtemp(join(tmpdir(), 'runtime-skill-project-'));
+    const skillDir = join(tempProjectDir, '.imc', 'skills', 'testing');
+    await mkdir(skillDir, { recursive: true });
+    const missingSkillPath = join(skillDir, 'test-first.md');
+    await writeFile(join(tempProjectDir, '.imc', 'skills', SKILL_REGISTRY_FILE_NAME), JSON.stringify({
+      schemaVersion: SKILL_REGISTRY_SCHEMA_VERSION,
+      generatedAt: 1000,
+      entries: [{
+        schemaVersion: SKILL_REGISTRY_SCHEMA_VERSION,
+        key: 'testing/test-first',
+        layer: 'project_escape_hatch',
+        metadata: {
+          schemaVersion: 1,
+          name: 'test-first',
+          category: 'testing',
+          description: 'Run tests before handoff.',
+        },
+        path: missingSkillPath,
+        displayPath: '.imc/skills/testing/test-first.md',
+        uri: makeSkillUri('project_escape_hatch', 'testing/test-first'),
+        fingerprint: 'registry-fingerprint',
+        updatedAt: 1000,
+      }],
+    }, null, 2));
+
+    const startup = buildTransportStartupMemory({
+      scope: 'personal',
+      projectId: 'github.com/acme/repo',
+    }, { projectDir: tempProjectDir });
+
+    expect(startup?.items).toEqual([
+      expect.objectContaining({
+        id: 'skill:project_escape_hatch:testing/test-first',
+        scope: 'personal',
+      }),
+    ]);
+    expect(startup?.injectedText).toContain('# Available skills (read on demand)');
+    expect(startup?.injectedText).toContain('<startup-skills-index advisory="true">');
+    expect(startup?.injectedText).toContain('path: .imc/skills/testing/test-first.md');
+    expect(startup?.injectedText).toContain('This is a registry hint only');
+    expect(startup?.injectedText).not.toContain('<<<imcodes-skill v1>>>');
+    expect(startup?.injectedText).not.toContain('Run tests before final handoff.');
   });
 
   it('buildTransportStartupMemory filters by full namespace instead of project id only', () => {

@@ -15,6 +15,7 @@ describe('detectSenderSession', () => {
     vi.resetModules();
     // Clear all relevant env vars before each test
     delete process.env.IMCODES_SESSION;
+    delete process.env.IMCODES_SESSION_LABEL;
     delete process.env.WEZTERM_PANE;
     delete process.env.TMUX_PANE;
     const mod = await import('../../src/util/detect-session.js');
@@ -23,6 +24,7 @@ describe('detectSenderSession', () => {
 
   afterEach(() => {
     delete process.env.IMCODES_SESSION;
+    delete process.env.IMCODES_SESSION_LABEL;
     delete process.env.WEZTERM_PANE;
     delete process.env.TMUX_PANE;
     vi.restoreAllMocks();
@@ -39,6 +41,19 @@ describe('detectSenderSession', () => {
     process.env.TMUX_PANE = '%42';
     const result = await detectSenderSession();
     expect(result).toBe('deck_proj_w1');
+  });
+
+  it('prefers IMCODES_SESSION over IMCODES_SESSION_LABEL', async () => {
+    process.env.IMCODES_SESSION = 'deck_proj_w1';
+    process.env.IMCODES_SESSION_LABEL = 'CC1';
+    const result = await detectSenderSession();
+    expect(result).toBe('deck_proj_w1');
+  });
+
+  it('falls back to IMCODES_SESSION_LABEL for SDK/transport tool environments', async () => {
+    process.env.IMCODES_SESSION_LABEL = 'CC1';
+    const result = await detectSenderSession();
+    expect(result).toBe('CC1');
   });
 
   it('throws for WEZTERM_PANE (not yet implemented)', async () => {
@@ -100,6 +115,7 @@ describe('appendAgentSendDocs', () => {
   it('includes $IMCODES_SESSION reference', () => {
     const result = appendAgentSendDocs(null);
     expect(result).toContain('$IMCODES_SESSION');
+    expect(result).toContain('$IMCODES_SESSION_LABEL');
   });
 });
 

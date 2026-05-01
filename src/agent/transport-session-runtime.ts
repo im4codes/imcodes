@@ -40,7 +40,10 @@ import { incrementCounter } from '../util/metrics.js';
 
 export interface PendingTransportMessage {
   clientMessageId: string;
+  /** User-visible task text, without daemon-rendered memory/context preambles. */
   text: string;
+  /** Provider-visible per-turn context rendered through the shared context preamble path. */
+  messagePreamble?: string;
   attachments?: TransportAttachment[];
 }
 
@@ -152,6 +155,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _contextSharedPolicyOverride: SharedScopePolicyOverride | undefined;
   private _contextAuthoredContextLanguage: string | undefined;
   private _contextAuthoredContextFilePath: string | undefined;
+  private _projectDir: string | undefined;
   private _startupMemory: TransportMemoryRecallArtifact | null = null;
   private _startupMemoryTimelineEmitted = false;
   private _startupMemoryInjected = false;
@@ -292,6 +296,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._providerSessionId = await this.provider.createSession(config);
     this._description = config.description;
     this._systemPrompt = config.systemPrompt;
+    this._projectDir = config.cwd;
     this._agentId = config.agentId;
     this._effort = config.effort;
     this.applyContextBootstrap({
@@ -329,7 +334,12 @@ export class TransportSessionRuntime implements SessionRuntime {
    *
    * Returns 'sent' if dispatched immediately, 'queued' if enqueued.
    */
-  send(message: string, clientMessageId?: string, attachments?: TransportAttachment[]): 'sent' | 'queued' {
+  send(
+    message: string,
+    clientMessageId?: string,
+    attachments?: TransportAttachment[],
+    messagePreamble?: string,
+  ): 'sent' | 'queued' {
     if (!this._providerSessionId) {
       throw new Error('TransportSessionRuntime not initialized — call initialize() first');
     }
@@ -337,6 +347,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     const entry: PendingTransportMessage = {
       clientMessageId: clientMessageId ?? randomUUID(),
       text: message,
+      ...(messagePreamble?.trim() ? { messagePreamble: messagePreamble.trim() } : {}),
       ...(attachments?.length ? { attachments } : {}),
     };
 
@@ -355,6 +366,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     const entry = this._pendingMessages.find((item) => item.clientMessageId === clientMessageId);
     if (!entry) return false;
     entry.text = nextText;
+    entry.messagePreamble = undefined;
     return true;
   }
 
@@ -452,13 +464,14 @@ export class TransportSessionRuntime implements SessionRuntime {
       }).authority;
       const startupMemory = this._startupMemory ?? (
         !this._startupMemoryInjected && authority.authoritySource === 'processed_local' && this._contextNamespace
-          ? buildTransportStartupMemory(this._contextNamespace)
+          ? buildTransportStartupMemory(this._contextNamespace, { projectDir: this._projectDir })
           : null
       );
       const memoryRecallResult = await this.buildTransportMessageRecallResultWithinBudget(message, authority.authoritySource);
       const memoryRecall = memoryRecallResult.artifact;
       const dispatchResult = await dispatchSharedContextSend(this.provider, this._providerSessionId!, {
         userMessage: message,
+        messagePreamble: this.mergeMessagePreambles(dispatchedEntries),
         description: this._description,
         systemPrompt: this._systemPrompt,
         attachments,
@@ -554,6 +567,19 @@ export class TransportSessionRuntime implements SessionRuntime {
       messages,
     );
     return true;
+  }
+
+  private mergeMessagePreambles(entries: PendingTransportMessage[] | undefined): string | undefined {
+    if (!entries || entries.length === 0) return undefined;
+    const seen = new Set<string>();
+    const parts: string[] = [];
+    for (const entry of entries) {
+      const preamble = entry.messagePreamble?.trim();
+      if (!preamble || seen.has(preamble)) continue;
+      seen.add(preamble);
+      parts.push(preamble);
+    }
+    return parts.join('\n\n') || undefined;
   }
 
   private async refreshContextBootstrap(options?: {

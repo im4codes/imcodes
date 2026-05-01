@@ -21,6 +21,7 @@ import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 import { EmbeddingStatusIcon } from './EmbeddingStatusIcon.js';
 import type { EmbeddingStatus } from '@shared/embedding-status.js';
 import { formatDaemonVersionShort } from '../util/format-version.js';
+import { USAGE_CONTEXT_WINDOW_SOURCES, type UsageContextWindowSource } from '@shared/usage-context-window.js';
 
 interface DaemonStats {
   daemonVersion?: string | null;
@@ -44,7 +45,7 @@ interface CollapsedSubSessionButtonProps {
   sub: SubSession;
   isOpen: boolean;
   idleFlashToken: number;
-  usage?: { inputTokens: number; cacheTokens: number; contextWindow: number; model?: string };
+  usage?: { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string };
   inP2p: boolean;
   onOpen: (id: string) => void;
   t: (key: string, vars?: Record<string, unknown>) => string;
@@ -71,7 +72,7 @@ interface Props {
   onHistory: (sessionName: string, apply: (c: string) => void) => void;
   serverId?: string;
   /** Per-sub-session usage data (ctx tokens, model) collected from timeline events. */
-  subUsages?: Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; model?: string }>;
+  subUsages?: Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string }>;
   /** ID of the currently focused (topmost) sub-session window. */
   focusedSubId?: string | null;
   /** Quick data for compact SessionControls in cards. */
@@ -119,7 +120,12 @@ function CollapsedSubSessionButton({ sub, isOpen, idleFlashToken, usage, inP2p, 
   const model = usage ? shortModelLabel(usage.model) : null;
   let ctxPct = 0;
   if (usage) {
-    const ctx = resolveContextWindow(usage.contextWindow, usage.model);
+    const ctx = resolveContextWindow(
+      usage.contextWindow,
+      usage.model,
+      1_000_000,
+      { preferExplicit: usage.contextWindowSource === USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER },
+    );
     ctxPct = Math.min(100, (usage.inputTokens + usage.cacheTokens) / ctx * 100);
   }
 

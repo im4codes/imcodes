@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ContextNamespace, ContextTargetRef } from '../../shared/context-types.js';
-import { searchLocalMemory, formatSearchResults } from '../../src/context/memory-search.js';
+import { searchLocalMemory, searchLocalMemoryAuthorized, formatSearchResults } from '../../src/context/memory-search.js';
 import { MaterializationCoordinator } from '../../src/context/materialization-coordinator.js';
 import { localOnlyCompressor } from '../../src/context/summary-compressor.js';
 import { writeProcessedProjection } from '../../src/store/context-store.js';
@@ -78,6 +78,130 @@ describe('memory-search', () => {
     expect(personalResult.items[0]?.summary).toContain('Personal');
     expect(sharedResult.items).toHaveLength(1);
     expect(sharedResult.items[0]?.summary).toContain('Shared');
+  });
+
+  it('filters by scope, owner, and repo without requiring an exact namespace object', () => {
+    writeProcessedProjection({
+      namespace: { scope: 'personal', projectId: 'github.com/acme/repo', userId: 'user-1' },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-personal'],
+      summary: 'User one personal memory',
+      content: {},
+      updatedAt: 400,
+    });
+    writeProcessedProjection({
+      namespace: { scope: 'personal', projectId: 'github.com/acme/repo', userId: 'user-2' },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-other-user'],
+      summary: 'Other user personal memory',
+      content: {},
+      updatedAt: 300,
+    });
+    writeProcessedProjection({
+      namespace: { scope: 'user_private', projectId: 'github.com/acme/repo', userId: 'user-1' },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-user-private'],
+      summary: 'User one owner private memory',
+      content: {},
+      updatedAt: 200,
+    });
+    writeProcessedProjection({
+      namespace: { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1', workspaceId: 'ws-1' },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-shared'],
+      summary: 'Shared project memory',
+      content: {},
+      updatedAt: 100,
+    });
+
+    const result = searchLocalMemory({
+      scope: 'personal',
+      userId: 'user-1',
+      repo: 'github.com/acme/repo',
+    });
+
+    expect(result.items.map((item) => item.summary)).toEqual(['User one personal memory']);
+    expect(result.stats.matchedRecords).toBe(1);
+  });
+
+
+  it('management-authorized search excludes other users personal rows before stats and pagination', () => {
+    writeProcessedProjection({
+      namespace: { scope: 'personal', projectId: 'github.com/acme/repo', userId: 'user-1' },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-user-1'],
+      summary: 'User one private memory',
+      content: { text: 'secret for user one' },
+      updatedAt: 300,
+    });
+    writeProcessedProjection({
+      namespace: { scope: 'personal', projectId: 'github.com/acme/repo', userId: 'user-2' },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-user-2'],
+      summary: 'User two private memory',
+      content: { text: 'secret for user two' },
+      updatedAt: 200,
+    });
+    writeProcessedProjection({
+      namespace: { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1', workspaceId: 'ws-1' },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-shared'],
+      summary: 'Shared project memory',
+      content: { text: 'visible to project' },
+      updatedAt: 100,
+    });
+
+    const result = searchLocalMemoryAuthorized({
+      authorizedNamespaces: [
+        { scope: 'personal', projectId: 'github.com/acme/repo', userId: 'user-1' },
+        { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1', workspaceId: 'ws-1' },
+      ],
+      limit: 10,
+    });
+
+    expect(result.items.map((item) => item.summary)).toEqual([
+      'User one private memory',
+      'Shared project memory',
+    ]);
+    expect(result.items.some((item) => item.userId === 'user-2')).toBe(false);
+    expect(result.stats.matchedRecords).toBe(2);
+    expect(result.stats.recentSummaryCount).toBe(2);
+  });
+
+  it('management-authorized search paginates after authorization', () => {
+    writeProcessedProjection({
+      namespace: { scope: 'personal', projectId: 'github.com/acme/repo', userId: 'user-2' },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-other'],
+      summary: 'Other user newest private memory',
+      content: {},
+      updatedAt: 400,
+    });
+    writeProcessedProjection({
+      namespace: { scope: 'personal', projectId: 'github.com/acme/repo', userId: 'user-1' },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-own-a'],
+      summary: 'Own first memory',
+      content: {},
+      updatedAt: 300,
+    });
+    writeProcessedProjection({
+      namespace: { scope: 'personal', projectId: 'github.com/acme/repo', userId: 'user-1' },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-own-b'],
+      summary: 'Own second memory',
+      content: {},
+      updatedAt: 200,
+    });
+
+    const result = searchLocalMemoryAuthorized({
+      authorizedNamespaces: [{ scope: 'personal', projectId: 'github.com/acme/repo', userId: 'user-1' }],
+      limit: 1,
+      offset: 1,
+    });
+
+    expect(result.items.map((item) => item.summary)).toEqual(['Own second memory']);
+    expect(result.stats.matchedRecords).toBe(2);
   });
 
   it('includes raw events when includeRaw is set', async () => {

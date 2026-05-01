@@ -161,9 +161,16 @@ function makeMockDb() {
         const document = documents.get(version.document_id);
         return document ? ({ document_id: version.document_id, enterprise_id: document.enterprise_id } as T) : null;
       }
-      if (s.includes('select enterprise_id from shared_context_document_bindings where id = $1')) {
+      if (
+        s.includes('select enterprise_id from shared_context_document_bindings where id = $1')
+        || s.includes('select enterprise_id, workspace_id, enrollment_id from shared_context_document_bindings where id = $1')
+      ) {
         const binding = bindings.get(params[0] as string);
-        return binding ? ({ enterprise_id: binding.enterprise_id } as T) : null;
+        return binding ? ({
+          enterprise_id: binding.enterprise_id,
+          workspace_id: binding.workspace_id,
+          enrollment_id: binding.enrollment_id,
+        } as T) : null;
       }
       if (s.includes('select role from team_members where team_id = $1 and user_id = $2 and role in')) {
         const member = teamMembers.get(params[0] as string)?.get(params[1] as string);
@@ -464,6 +471,7 @@ describe('shared-agent-context server control plane', () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    process.env.IMCODES_MEM_FEATURE_ORG_SHARED_AUTHORED_STANDARDS = 'true';
     mockDb = makeMockDb();
     app = await buildTestApp(makeEnv(mockDb.db));
   });
@@ -741,6 +749,59 @@ describe('shared-agent-context server control plane', () => {
 
     const res = await app.request(...req(`/api/shared-context/enterprises/team-1/runtime-authored-context?workspaceId=${workspace.id}&enrollmentId=${enrollment.id}`, 'GET', undefined, 'user-member'));
     expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ enterpriseId: 'team-1', bindings: [] });
+  });
+
+  it('gates org-wide authored standards behind the explicit feature flag without affecting workspace bindings', async () => {
+    process.env.IMCODES_MEM_FEATURE_ORG_SHARED_AUTHORED_STANDARDS = 'false';
+
+    const docRes = await app.request(...req('/api/shared-context/enterprises/team-1/documents', 'POST', {
+      kind: 'coding_standard',
+      title: 'Enterprise rules',
+    }, 'user-owner'));
+    const document = await docRes.json() as { id: string };
+    const versionRes = await app.request(...req(`/api/shared-context/documents/${document.id}/versions`, 'POST', {
+      contentMd: 'Org-wide rule',
+    }, 'user-owner'));
+    const version = await versionRes.json() as { id: string };
+    await app.request(...req(`/api/shared-context/document-versions/${version.id}/activate`, 'POST', {}, 'user-owner'));
+
+    let res = await app.request(...req('/api/shared-context/enterprises/team-1/document-bindings', 'POST', {
+      documentId: document.id,
+      versionId: version.id,
+      mode: 'required',
+    }, 'user-owner'));
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ ok: false, result: null, citation: null, error: 'not_found' });
+
+    process.env.IMCODES_MEM_FEATURE_ORG_SHARED_AUTHORED_STANDARDS = 'true';
+    res = await app.request(...req('/api/shared-context/enterprises/team-1/document-bindings', 'POST', {
+      documentId: document.id,
+      versionId: version.id,
+      mode: 'required',
+      applicabilityRepoId: 'github.com/acme/repo',
+    }, 'user-owner'));
+    expect(res.status).toBe(201);
+    const binding = await res.json() as { id: string; workspaceId: string | null; enrollmentId: string | null };
+    expect(binding.workspaceId).toBeNull();
+    expect(binding.enrollmentId).toBeNull();
+
+    res = await app.request(...req('/api/shared-context/enterprises/team-1/runtime-authored-context?canonicalRepoId=github.com/acme/repo', 'GET', undefined, 'user-member'));
+    expect(await res.json()).toEqual({
+      enterpriseId: 'team-1',
+      bindings: [
+        expect.objectContaining({
+          bindingId: binding.id,
+          documentVersionId: version.id,
+          scope: 'org_shared',
+          mode: 'required',
+          content: 'Org-wide rule',
+        }),
+      ],
+    });
+
+    process.env.IMCODES_MEM_FEATURE_ORG_SHARED_AUTHORED_STANDARDS = 'false';
+    res = await app.request(...req('/api/shared-context/enterprises/team-1/runtime-authored-context?canonicalRepoId=github.com/acme/repo', 'GET', undefined, 'user-member'));
     expect(await res.json()).toEqual({ enterpriseId: 'team-1', bindings: [] });
   });
 

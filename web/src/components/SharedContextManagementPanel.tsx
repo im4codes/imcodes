@@ -6,6 +6,16 @@ import type { ContextMemoryView, SharedContextRuntimeBackend } from '@shared/con
 import { QWEN_MODEL_IDS } from '@shared/qwen-models.js';
 import { MEMORY_WS } from '@shared/memory-ws.js';
 import {
+  type MemoryFeatureAdminRecord,
+  type MemoryManagementErrorCode,
+  type MemoryObservationAdminRecord,
+  type MemoryPreferenceAdminRecord,
+  type MemorySkillAdminRecord,
+} from '@shared/memory-management.js';
+import { MEMORY_FEATURE_FLAGS_BY_NAME, type MemoryFeatureFlag } from '@shared/feature-flags.js';
+import { AUTHORED_CONTEXT_SCOPES, MEMORY_SCOPES, type AuthoredContextScope, type MemoryScope } from '@shared/memory-scope.js';
+import { OBSERVATION_CLASSES, type ObservationClass } from '@shared/memory-observation.js';
+import {
   DEFAULT_MEMORY_RECALL_MIN_SCORE,
   DEFAULT_MEMORY_SCORING_WEIGHTS,
   DEFAULT_PRIMARY_CONTEXT_BACKEND,
@@ -652,6 +662,20 @@ type ManagementTab = 'enterprise' | 'members' | 'projects' | 'knowledge' | 'proc
 type MemoryTopTab = 'personal' | 'enterprise-memory';
 type MemoryPersonalSubTab = 'unprocessed' | 'processed' | 'cloud';
 type MemoryEnterpriseSubTab = 'shared-memory' | 'authored-context';
+type MemoryObservationClassFilter = '' | ObservationClass;
+const MD_INGEST_UI_SCOPES = ['personal', 'project_shared'] as const satisfies readonly MemoryScope[];
+type MemoryAdminRequestSurface =
+  | 'features'
+  | 'preferences'
+  | 'skills'
+  | 'observations'
+  | 'prefCreate'
+  | 'prefDelete'
+  | 'skillRebuild'
+  | 'skillRead'
+  | 'skillDelete'
+  | 'mdIngest'
+  | 'observationPromote';
 
 interface Props {
   enterpriseId?: string;
@@ -665,7 +689,7 @@ interface TabDef {
   label: string;
 }
 
-type SharedScopeValue = 'project_shared' | 'workspace_shared' | 'org_shared';
+type SharedScopeValue = AuthoredContextScope;
 
 function InfoCard(props: { title: string; children: ComponentChildren }) {
   return (
@@ -755,6 +779,139 @@ function MetaCard({ label, value }: { label: string; value: ComponentChildren })
     </div>
   );
 }
+
+// ── Memory admin (post-1.1) visuals ──────────────────────────────────────────
+// Tighter grid for the feature flag status row — each cell shows a colored
+// status dot, the flag name, and an enabled/disabled/unknown label. Keeps the
+// flag name visible (used as `MetaCard` label before) without the redundant
+// uppercase header treatment.
+const featureFlagGridStyle = {
+  display: 'grid',
+  gridTemplateColumns: SC_IS_MOBILE ? 'repeat(2, minmax(0, 1fr))' : 'repeat(auto-fit, minmax(180px, 1fr))',
+  gap: SC_IS_MOBILE ? DT.space.xs : DT.space.sm,
+} as const;
+
+function featureFlagCardStyle(enabled: boolean | null) {
+  const accentBorder = enabled === true
+    ? 'rgba(52,211,153,0.32)'
+    : enabled === false
+      ? 'rgba(248,113,113,0.28)'
+      : DT.border.subtle;
+  const tintBg = enabled === true
+    ? 'linear-gradient(180deg, rgba(52,211,153,0.06), rgba(52,211,153,0.02))'
+    : enabled === false
+      ? 'linear-gradient(180deg, rgba(248,113,113,0.05), rgba(248,113,113,0.015))'
+      : DT.bg.input;
+  return {
+    borderRadius: DT.radius.md,
+    border: `1px solid ${accentBorder}`,
+    background: tintBg,
+    padding: SC_IS_MOBILE ? `${DT.space.xs}px ${DT.space.sm}px` : `${DT.space.sm}px ${DT.space.md}px`,
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: 4,
+    minWidth: 0,
+    overflow: 'hidden' as const,
+    transition: 'border-color 0.15s, background 0.15s',
+  };
+}
+
+function featureFlagDotStyle(enabled: boolean | null) {
+  const color = enabled === true
+    ? DT.text.success
+    : enabled === false
+      ? DT.text.error
+      : DT.text.muted;
+  return {
+    width: 8,
+    height: 8,
+    borderRadius: '50%' as const,
+    background: color,
+    boxShadow: enabled === true ? `0 0 6px ${color}` : 'none',
+    flexShrink: 0,
+  };
+}
+
+function featureFlagStatusTextStyle(enabled: boolean | null) {
+  const color = enabled === true
+    ? DT.text.success
+    : enabled === false
+      ? DT.text.error
+      : DT.text.muted;
+  return {
+    color,
+    fontSize: 10,
+    fontWeight: 600,
+    textTransform: 'uppercase' as const,
+    letterSpacing: '0.06em',
+  };
+}
+
+function FeatureFlagCard({ flag, enabled, statusText }: { flag: string; enabled: boolean | null; statusText: string }) {
+  const label = `${flag}: ${statusText}`;
+  return (
+    <div style={featureFlagCardStyle(enabled)} title={flag} aria-label={label}>
+      <span style={{ display: 'flex', alignItems: 'center', gap: 6, color: DT.text.primary, fontSize: SC_IS_MOBILE ? 11 : 12, fontWeight: 600, overflow: 'hidden' }}>
+        <span style={featureFlagDotStyle(enabled)} />
+        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: 'ui-monospace, Menlo, monospace', fontSize: SC_IS_MOBILE ? 10 : 11 }}>{flag}</span>
+      </span>
+      <span style={featureFlagStatusTextStyle(enabled)}>{statusText}</span>
+    </div>
+  );
+}
+
+// Sub-card for each post-1.1 admin tool (preferences, skills, MD ingest,
+// observations). When the feature is disabled the card gets a muted red
+// accent on its left border so the user can spot the gated state at a glance,
+// in addition to the existing helper-text notice. `enabled === null` means we
+// haven't received a `features.query` response yet — keep the neutral look.
+function adminSubCardStyle(enabled: boolean | null) {
+  const leftAccent = enabled === false
+    ? `3px solid rgba(248,113,113,0.45)`
+    : enabled === true
+      ? `3px solid rgba(52,211,153,0.4)`
+      : `3px solid ${DT.border.subtle}`;
+  return {
+    ...resourceCardStyle,
+    borderLeft: leftAccent,
+    paddingLeft: SC_IS_MOBILE ? DT.space.md : DT.space.lg,
+  };
+}
+
+// Small inline status pill for a sub-card heading. Mirrors `pillStyle` but
+// colored by feature state.
+function featurePillStyle(enabled: boolean | null) {
+  if (enabled === true) {
+    return {
+      ...pillStyle,
+      background: 'rgba(52,211,153,0.12)',
+      border: `1px solid rgba(52,211,153,0.3)`,
+      color: DT.text.success,
+    };
+  }
+  if (enabled === false) {
+    return {
+      ...pillStyle,
+      background: 'rgba(248,113,113,0.10)',
+      border: `1px solid rgba(248,113,113,0.3)`,
+      color: DT.text.error,
+    };
+  }
+  return {
+    ...pillStyle,
+    color: DT.text.muted,
+  };
+}
+
+// Form row for admin tools: same as `rowStyle` but a touch tighter and with
+// inputs that don't sprawl on wide screens.
+const adminFormRowStyle = {
+  display: 'flex',
+  gap: DT.space.sm,
+  flexWrap: 'wrap' as const,
+  alignItems: 'center',
+  padding: SC_IS_MOBILE ? 0 : `${DT.space.xs}px 0`,
+} as const;
 
 interface ProcessingPresetEntry {
   name: string;
@@ -977,6 +1134,19 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const onEnterpriseChangeRef = useRef(onEnterpriseChange);
   onEnterpriseChangeRef.current = onEnterpriseChange;
   const personalMemoryRequestIdRef = useRef<string | null>(null);
+  const memoryAdminRequestIdsRef = useRef<Record<MemoryAdminRequestSurface, string | null>>({
+    features: null,
+    preferences: null,
+    skills: null,
+    observations: null,
+    prefCreate: null,
+    prefDelete: null,
+    skillRebuild: null,
+    skillRead: null,
+    skillDelete: null,
+    mdIngest: null,
+    observationPromote: null,
+  });
 
   const [teams, setTeams] = useState<TeamSummary[]>([]);
   const [enterpriseId, setEnterpriseId] = useState(initialEnterpriseId ?? '');
@@ -1037,6 +1207,49 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [memoryEnterpriseSubTab, setMemoryEnterpriseSubTab] = useState<MemoryEnterpriseSubTab>('shared-memory');
   const [showArchived, setShowArchived] = useState(false);
   const [deletingMemoryIds, setDeletingMemoryIds] = useState<Set<string>>(new Set());
+  const [memoryFeatureRecords, setMemoryFeatureRecords] = useState<MemoryFeatureAdminRecord[]>([]);
+  const [preferenceRecords, setPreferenceRecords] = useState<MemoryPreferenceAdminRecord[]>([]);
+  const [preferenceFeatureEnabled, setPreferenceFeatureEnabled] = useState<boolean | null>(null);
+  const preferenceUserId = 'server-derived';
+  const [preferenceText, setPreferenceText] = useState('');
+  const [skillEntries, setSkillEntries] = useState<MemorySkillAdminRecord[]>([]);
+  const [skillsFeatureEnabled, setSkillsFeatureEnabled] = useState<boolean | null>(null);
+  const [skillPreview, setSkillPreview] = useState<{ key: string; layer: string; content: string } | null>(null);
+  const [memoryAdminProjectDir, setMemoryAdminProjectDir] = useState('');
+  const [mdIngestProjectDir, setMdIngestProjectDir] = useState('');
+  const [mdIngestCanonicalRepoId, setMdIngestCanonicalRepoId] = useState('');
+  const [mdIngestScope, setMdIngestScope] = useState<MemoryScope>('personal');
+  const [mdIngestFeatureEnabled, setMdIngestFeatureEnabled] = useState<boolean | null>(null);
+  const [mdIngestResult, setMdIngestResult] = useState<{ filesChecked: number; observationsWritten: number } | null>(null);
+  const [observationRecords, setObservationRecords] = useState<MemoryObservationAdminRecord[]>([]);
+  const [observationStoreFeatureEnabled, setObservationStoreFeatureEnabled] = useState<boolean | null>(null);
+  const [observationScope, setObservationScope] = useState<'' | MemoryScope>('');
+  const [observationClass, setObservationClass] = useState<MemoryObservationClassFilter>('');
+  const [promotionTargetScope, setPromotionTargetScope] = useState<MemoryScope>('project_shared');
+  const [promotionReason, setPromotionReason] = useState('');
+  const memoryFeatureRecordByFlag = useMemo(() => new Map<MemoryFeatureFlag, MemoryFeatureAdminRecord>(
+    memoryFeatureRecords.map((record) => [record.flag, record]),
+  ), [memoryFeatureRecords]);
+  const memoryFeatureEnabled = useCallback((flag: MemoryFeatureFlag, fallback: boolean | null = null): boolean | null => (
+    memoryFeatureRecordByFlag.get(flag)?.enabled ?? fallback
+  ), [memoryFeatureRecordByFlag]);
+  const memoryFeatureStatusText = useCallback((enabled: boolean | null): string => (
+    enabled === null
+      ? t('sharedContext.management.memoryFeatureUnknown')
+      : t(enabled ? 'sharedContext.management.memoryFeatureEnabled' : 'sharedContext.management.memoryFeatureDisabled')
+  ), [t]);
+  const memoryAdminErrorMessage = useCallback((errorCode?: MemoryManagementErrorCode, fallback?: string): string => {
+    if (errorCode) return t(`sharedContext.management.error.${errorCode}`);
+    return fallback ?? t('sharedContext.management.memoryAdminActionFailed');
+  }, [t]);
+  const markMemoryAdminRequest = useCallback((surface: MemoryAdminRequestSurface): string => {
+    const requestId = crypto.randomUUID();
+    memoryAdminRequestIdsRef.current[surface] = requestId;
+    return requestId;
+  }, []);
+  const isCurrentMemoryAdminResponse = useCallback((surface: MemoryAdminRequestSurface, requestId?: string): boolean => (
+    !!requestId && memoryAdminRequestIdsRef.current[surface] === requestId
+  ), []);
 
   useEffect(() => {
     if (!ws) return;
@@ -1170,6 +1383,8 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                         id={record.id}
                         text={record.summary}
                         expanded={expandedMemoryRecordIds.has(record.id)}
+                        expandLabel={t('sharedContext.management.memoryExpand')}
+                        collapseLabel={t('sharedContext.management.memoryCollapse')}
                         onToggle={() => {
                           setExpandedMemoryRecordIds((current) => {
                             const next = new Set(current);
@@ -1440,6 +1655,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         ws.send({
           type: MEMORY_WS.PERSONAL_QUERY,
           requestId,
+          canonicalRepoId: memoryProjectId.trim() || undefined,
           ...queryInput,
           includeArchived: showArchived,
         });
@@ -1466,32 +1682,148 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     }
   }, [enterpriseId, memoryProjectId, memoryProjectionClass, memoryQuery, serverId, ws, showArchived]);
 
+  const loadMemoryAdminViews = useCallback(() => {
+    if (!ws) return;
+    const projectDir = memoryAdminProjectDir.trim() || undefined;
+    const canonicalRepoId = memoryProjectId.trim() || undefined;
+    ws.send({ type: MEMORY_WS.FEATURES_QUERY, requestId: markMemoryAdminRequest('features') });
+    ws.send({ type: MEMORY_WS.PREF_QUERY, requestId: markMemoryAdminRequest('preferences') });
+    ws.send({ type: MEMORY_WS.SKILL_QUERY, requestId: markMemoryAdminRequest('skills'), projectDir, canonicalRepoId });
+    ws.send({
+      type: MEMORY_WS.OBSERVATION_QUERY,
+      requestId: markMemoryAdminRequest('observations'),
+      projectDir,
+      canonicalRepoId,
+      scope: observationScope || undefined,
+      class: observationClass || undefined,
+      limit: 50,
+    });
+  }, [markMemoryAdminRequest, memoryAdminProjectDir, memoryProjectId, observationClass, observationScope, ws]);
+
+  useEffect(() => {
+    if (!ws) return;
+    return ws.onMessage((msg) => {
+      if (msg.type === MEMORY_WS.FEATURES_RESPONSE) {
+        if (!isCurrentMemoryAdminResponse('features', msg.requestId)) return;
+        const records = msg.records ?? [];
+        setMemoryFeatureRecords(records);
+        setPreferenceFeatureEnabled(records.find((record) => record.flag === MEMORY_FEATURE_FLAGS_BY_NAME.preferences)?.enabled ?? null);
+        setSkillsFeatureEnabled(records.find((record) => record.flag === MEMORY_FEATURE_FLAGS_BY_NAME.skills)?.enabled ?? null);
+        setMdIngestFeatureEnabled(records.find((record) => record.flag === MEMORY_FEATURE_FLAGS_BY_NAME.mdIngest)?.enabled ?? null);
+        setObservationStoreFeatureEnabled(records.find((record) => record.flag === MEMORY_FEATURE_FLAGS_BY_NAME.observationStore)?.enabled ?? null);
+        return;
+      }
+      if (msg.type === MEMORY_WS.PREF_RESPONSE) {
+        if (!isCurrentMemoryAdminResponse('preferences', msg.requestId)) return;
+        setPreferenceRecords(msg.records ?? []);
+        if (msg.featureEnabled !== undefined) setPreferenceFeatureEnabled(msg.featureEnabled);
+        return;
+      }
+      if (msg.type === MEMORY_WS.SKILL_RESPONSE) {
+        if (!isCurrentMemoryAdminResponse('skills', msg.requestId)) return;
+        setSkillEntries(msg.entries ?? []);
+        if (msg.featureEnabled !== undefined) setSkillsFeatureEnabled(msg.featureEnabled);
+        return;
+      }
+      if (msg.type === MEMORY_WS.OBSERVATION_RESPONSE) {
+        if (!isCurrentMemoryAdminResponse('observations', msg.requestId)) return;
+        setObservationRecords(msg.records ?? []);
+        if (msg.featureEnabled !== undefined) setObservationStoreFeatureEnabled(msg.featureEnabled);
+        return;
+      }
+      if (msg.type === MEMORY_WS.PREF_CREATE_RESPONSE) {
+        if (!isCurrentMemoryAdminResponse('prefCreate', msg.requestId)) return;
+        if (msg.success) {
+          setPreferenceText('');
+          setNotice(t('sharedContext.notice.memoryPreferenceSaved'));
+          loadMemoryAdminViews();
+        } else setError(memoryAdminErrorMessage(msg.errorCode, msg.error));
+        return;
+      }
+      if (msg.type === MEMORY_WS.PREF_DELETE_RESPONSE) {
+        if (!isCurrentMemoryAdminResponse('prefDelete', msg.requestId)) return;
+        if (msg.success) {
+          setNotice(t('sharedContext.notice.memoryPreferenceDeleted'));
+          loadMemoryAdminViews();
+        } else setError(memoryAdminErrorMessage(msg.errorCode, msg.error));
+        return;
+      }
+      if (msg.type === MEMORY_WS.SKILL_REBUILD_RESPONSE) {
+        if (!isCurrentMemoryAdminResponse('skillRebuild', msg.requestId)) return;
+        if (msg.success) {
+          setNotice(t('sharedContext.notice.memorySkillRegistryRebuilt'));
+          loadMemoryAdminViews();
+        } else setError(memoryAdminErrorMessage(msg.errorCode, msg.error));
+        return;
+      }
+      if (msg.type === MEMORY_WS.SKILL_READ_RESPONSE) {
+        if (!isCurrentMemoryAdminResponse('skillRead', msg.requestId)) return;
+        if (msg.success && msg.key && msg.layer) {
+          setSkillPreview({ key: msg.key, layer: msg.layer, content: msg.content ?? '' });
+        } else setError(memoryAdminErrorMessage(msg.errorCode, msg.error));
+        return;
+      }
+      if (msg.type === MEMORY_WS.SKILL_DELETE_RESPONSE) {
+        if (!isCurrentMemoryAdminResponse('skillDelete', msg.requestId)) return;
+        if (msg.success) {
+          setSkillPreview(null);
+          setNotice(t('sharedContext.notice.memorySkillDeleted'));
+          loadMemoryAdminViews();
+        } else setError(memoryAdminErrorMessage(msg.errorCode, msg.error));
+        return;
+      }
+      if (msg.type === MEMORY_WS.MD_INGEST_RUN_RESPONSE) {
+        if (!isCurrentMemoryAdminResponse('mdIngest', msg.requestId)) return;
+        if (msg.featureEnabled !== undefined) setMdIngestFeatureEnabled(msg.featureEnabled);
+        if (msg.success) {
+          setMdIngestResult({ filesChecked: msg.filesChecked ?? 0, observationsWritten: msg.observationsWritten ?? 0 });
+          setNotice(t('sharedContext.notice.memoryMdIngestCompleted'));
+          void loadMemoryViews();
+          loadMemoryAdminViews();
+        } else setError(memoryAdminErrorMessage(msg.errorCode, msg.error));
+        return;
+      }
+      if (msg.type === MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE) {
+        if (!isCurrentMemoryAdminResponse('observationPromote', msg.requestId)) return;
+        if (msg.success) {
+          setNotice(t('sharedContext.notice.memoryObservationPromoted'));
+          loadMemoryAdminViews();
+        } else setError(memoryAdminErrorMessage(msg.errorCode, msg.error));
+      }
+    });
+  }, [isCurrentMemoryAdminResponse, loadMemoryAdminViews, loadMemoryViews, memoryAdminErrorMessage, t, ws]);
+
   useEffect(() => {
     if (activeTab !== 'memory') return;
     void loadMemoryViews();
   }, [activeTab, loadMemoryViews]);
 
+  useEffect(() => {
+    if (activeTab !== 'memory') return;
+    loadMemoryAdminViews();
+  }, [activeTab, loadMemoryAdminViews]);
+
   const handleMemoryArchive = useCallback((id: string) => {
     if (!ws) return;
     const requestId = crypto.randomUUID();
-    ws.send({ type: MEMORY_WS.ARCHIVE, requestId, id });
+    ws.send({ type: MEMORY_WS.ARCHIVE, requestId, id, canonicalRepoId: memoryProjectId.trim() || undefined });
     const unsub = ws.onMessage((msg) => {
       if (msg.type !== MEMORY_WS.ARCHIVE_RESPONSE || msg.requestId !== requestId) return;
       unsub();
       if (msg.success) void loadMemoryViews();
     });
-  }, [ws, loadMemoryViews]);
+  }, [ws, loadMemoryViews, memoryProjectId]);
 
   const handleMemoryRestore = useCallback((id: string) => {
     if (!ws) return;
     const requestId = crypto.randomUUID();
-    ws.send({ type: MEMORY_WS.RESTORE, requestId, id });
+    ws.send({ type: MEMORY_WS.RESTORE, requestId, id, canonicalRepoId: memoryProjectId.trim() || undefined });
     const unsub = ws.onMessage((msg) => {
       if (msg.type !== MEMORY_WS.RESTORE_RESPONSE || msg.requestId !== requestId) return;
       unsub();
       if (msg.success) void loadMemoryViews();
     });
-  }, [ws, loadMemoryViews]);
+  }, [ws, loadMemoryViews, memoryProjectId]);
 
 
   const confirmMemoryDelete = useCallback((recordId: string) => {
@@ -1512,7 +1844,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const handleLocalMemoryDelete = useCallback((id: string) => {
     if (!ws || !confirmMemoryDelete(id)) return;
     const requestId = crypto.randomUUID();
-    ws.send({ type: MEMORY_WS.DELETE, requestId, id });
+    ws.send({ type: MEMORY_WS.DELETE, requestId, id, canonicalRepoId: memoryProjectId.trim() || undefined });
     const unsub = ws.onMessage((msg) => {
       if (msg.type !== MEMORY_WS.DELETE_RESPONSE || msg.requestId !== requestId) return;
       unsub();
@@ -1520,7 +1852,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       if (msg.success) void loadMemoryViews();
       else setError(msg.error || t('sharedContext.management.memoryDeleteFailed'));
     });
-  }, [confirmMemoryDelete, finishMemoryDelete, loadMemoryViews, t, ws]);
+  }, [confirmMemoryDelete, finishMemoryDelete, loadMemoryViews, memoryProjectId, t, ws]);
 
   const handleCloudMemoryDelete = useCallback(async (id: string) => {
     if (!confirmMemoryDelete(id)) return;
@@ -1865,9 +2197,9 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
               <input value={canonicalRepoId} onInput={(e) => setCanonicalRepoId((e.currentTarget as HTMLInputElement).value)} placeholder={t('sharedContext.management.canonicalRepoId')} style={inputStyle} />
               <input value={displayName} onInput={(e) => setDisplayName((e.currentTarget as HTMLInputElement).value)} placeholder={t('sharedContext.management.displayName')} style={inputStyle} />
               <select value={scope} onChange={(e) => setScope((e.currentTarget as HTMLSelectElement).value as SharedScopeValue)} style={inputStyle}>
-                <option value="project_shared">{t('sharedContext.management.scopeProjectLabel')}</option>
-                <option value="workspace_shared">{t('sharedContext.management.scopeWorkspaceLabel')}</option>
-                <option value="org_shared">{t('sharedContext.management.scopeEnterpriseLabel')}</option>
+                {AUTHORED_CONTEXT_SCOPES.map((scopeValue) => (
+                  <option key={scopeValue} value={scopeValue}>{scopePresentation[scopeValue].label}</option>
+                ))}
               </select>
               <select value={selectedWorkspaceId} onChange={(e) => setSelectedWorkspaceId((e.currentTarget as HTMLSelectElement).value)} style={inputStyle}>
                 <option value="">{t('sharedContext.management.noWorkspace')}</option>
@@ -2585,6 +2917,384 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
             <div style={memoryProcessedNoteStyle}>{t('sharedContext.management.memoryProcessedNote')}</div>
           </div>
 
+          <div style={sectionStyle}>
+            <SectionHeading
+              title={t('sharedContext.management.memoryPost11AdminTitle')}
+              description={t('sharedContext.management.memoryPost11AdminDescription')}
+              action={<button style={subtleButtonStyle} onClick={() => loadMemoryAdminViews()} disabled={!ws}>{t('sharedContext.refresh')}</button>}
+            />
+            {!ws ? <div style={helperTextStyle}>{t('sharedContext.management.memoryAdminDaemonRequired')}</div> : null}
+            <div style={resourceCardStyle}>
+              <SectionHeading
+                title={t('sharedContext.management.memoryFeatureStatusTitle')}
+                description={t('sharedContext.management.memoryFeatureStatusDescription')}
+              />
+              <div style={featureFlagGridStyle}>
+                {[
+                  MEMORY_FEATURE_FLAGS_BY_NAME.preferences,
+                  MEMORY_FEATURE_FLAGS_BY_NAME.mdIngest,
+                  MEMORY_FEATURE_FLAGS_BY_NAME.skills,
+                  MEMORY_FEATURE_FLAGS_BY_NAME.skillAutoCreation,
+                  MEMORY_FEATURE_FLAGS_BY_NAME.observationStore,
+                  MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry,
+                ].map((flag) => {
+                  const enabled = memoryFeatureEnabled(flag);
+                  const statusText = memoryFeatureStatusText(enabled);
+                  return (
+                    <FeatureFlagCard key={flag} flag={flag} enabled={enabled} statusText={statusText} />
+                  );
+                })}
+              </div>
+            </div>
+            <div style={cardGridStyle}>
+              <div style={adminSubCardStyle(preferenceFeatureEnabled)}>
+                <SectionHeading
+                  title={t('sharedContext.management.memoryPreferencesTitle')}
+                  description={t('sharedContext.management.memoryPreferencesDescription')}
+                  action={<span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                    <span
+                      style={featurePillStyle(preferenceFeatureEnabled)}
+                      title={`${memoryFeatureStatusText(preferenceFeatureEnabled)} · ${preferenceRecords.length}`}
+                      aria-label={`${memoryFeatureStatusText(preferenceFeatureEnabled)} · ${preferenceRecords.length}`}
+                    >
+                      <span style={featureFlagDotStyle(preferenceFeatureEnabled)} />
+                      {preferenceRecords.length}
+                    </span>
+                  </span>}
+                />
+                {preferenceFeatureEnabled === false ? (
+                  <div style={helperTextStyle}>{t('sharedContext.management.memoryFeatureDisabledNotice')}</div>
+                ) : null}
+                <div style={adminFormRowStyle}>
+                  <input
+                    value={preferenceUserId}
+                    readOnly
+                    disabled
+                    placeholder={t('sharedContext.management.memoryPreferenceUserPlaceholder')}
+                    style={inputStyle}
+                  />
+                  <input
+                    value={preferenceText}
+                    onInput={(e) => setPreferenceText((e.currentTarget as HTMLInputElement).value)}
+                    placeholder={t('sharedContext.management.memoryPreferenceTextPlaceholder')}
+                    style={inputStyle}
+                  />
+                  <button
+                    type="button"
+                    style={buttonStyle}
+                    disabled={!ws || preferenceFeatureEnabled !== true || !preferenceText.trim()}
+                    onClick={() => ws?.send({
+                      type: MEMORY_WS.PREF_CREATE,
+                      requestId: markMemoryAdminRequest('prefCreate'),
+                      text: preferenceText.trim(),
+                    })}
+                  >
+                    {t('sharedContext.management.memoryPreferenceSave')}
+                  </button>
+                </div>
+                <div style={resourceListStyle}>
+                  {preferenceRecords.length > 0 ? preferenceRecords.map((record) => (
+                    <div key={record.id} style={resourceCardStyle}>
+                      <div style={metaGridStyle}>
+                        <MetaCard label={t('sharedContext.management.memoryPreferenceUser')} value={record.userId} />
+                        <MetaCard label={t('sharedContext.management.memoryRecordUpdated')} value={new Date(record.updatedAt).toLocaleString()} />
+                        <MetaCard label={t('sharedContext.management.memoryRecordStatus')} value={record.state} />
+                      </div>
+                      <MemoryRecordContent
+                        id={`pref-${record.id}`}
+                        text={record.text}
+                        expanded={expandedMemoryRecordIds.has(`pref-${record.id}`)}
+                        expandLabel={t('sharedContext.management.memoryExpand')}
+                        collapseLabel={t('sharedContext.management.memoryCollapse')}
+                        onToggle={() => {
+                          setExpandedMemoryRecordIds((current) => {
+                            const next = new Set(current);
+                            const key = `pref-${record.id}`;
+                            if (next.has(key)) next.delete(key);
+                            else next.add(key);
+                            return next;
+                          });
+                        }}
+                      />
+                      <div style={rowStyle}>
+                        <button
+                          type="button"
+                          style={deleteButtonStyle}
+                          disabled={preferenceFeatureEnabled !== true}
+                          onClick={() => {
+                            const confirmed = globalThis.confirm?.(t('sharedContext.management.memoryPreferenceDeleteConfirm')) ?? true;
+                            if (!confirmed) return;
+                            ws?.send({ type: MEMORY_WS.PREF_DELETE, requestId: markMemoryAdminRequest('prefDelete'), id: record.id });
+                          }}
+                        >
+                          {t('sharedContext.management.memoryDelete')}
+                        </button>
+                      </div>
+                    </div>
+                  )) : <div style={helperTextStyle}>{t('sharedContext.management.memoryPreferencesEmpty')}</div>}
+                </div>
+              </div>
+
+              <div style={adminSubCardStyle(skillsFeatureEnabled)}>
+                <SectionHeading
+                  title={t('sharedContext.management.memorySkillsTitle')}
+                  description={t('sharedContext.management.memorySkillsDescription')}
+                  action={<span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                    <span
+                      style={featurePillStyle(skillsFeatureEnabled)}
+                      title={`${memoryFeatureStatusText(skillsFeatureEnabled)} · ${skillEntries.length}`}
+                      aria-label={`${memoryFeatureStatusText(skillsFeatureEnabled)} · ${skillEntries.length}`}
+                    >
+                      <span style={featureFlagDotStyle(skillsFeatureEnabled)} />
+                      {skillEntries.length}
+                    </span>
+                  </span>}
+                />
+                {skillsFeatureEnabled === false ? (
+                  <div style={helperTextStyle}>{t('sharedContext.management.memoryFeatureDisabledNotice')}</div>
+                ) : null}
+                <div style={adminFormRowStyle}>
+                  <input
+                    value={memoryAdminProjectDir}
+                    onInput={(e) => setMemoryAdminProjectDir((e.currentTarget as HTMLInputElement).value)}
+                    placeholder={t('sharedContext.management.memoryProjectDirPlaceholder')}
+                    style={inputStyle}
+                  />
+                  <button type="button" style={subtleButtonStyle} disabled={!ws} onClick={() => loadMemoryAdminViews()}>
+                    {t('sharedContext.refresh')}
+                  </button>
+                  <button
+                    type="button"
+                    style={buttonStyle}
+                    disabled={!ws || skillsFeatureEnabled !== true}
+                    onClick={() => ws?.send({
+                      type: MEMORY_WS.SKILL_REBUILD,
+                      requestId: markMemoryAdminRequest('skillRebuild'),
+                      projectDir: memoryAdminProjectDir.trim() || undefined,
+                      canonicalRepoId: memoryProjectId.trim() || undefined,
+                    })}
+                  >
+                    {t('sharedContext.management.memorySkillRebuildRegistry')}
+                  </button>
+                </div>
+                <div style={resourceListStyle}>
+                  {skillEntries.length > 0 ? skillEntries.map((entry) => (
+                    <div key={`${entry.layer}:${entry.key}:${entry.displayPath}`} style={resourceCardStyle}>
+                      <div style={metaGridStyle}>
+                        <MetaCard label={t('sharedContext.management.memorySkillName')} value={entry.name} />
+                        <MetaCard label={t('sharedContext.management.memorySkillLayer')} value={entry.layer} />
+                        <MetaCard label={t('sharedContext.management.memorySkillPath')} value={entry.displayPath} />
+                        <MetaCard label={t('sharedContext.management.memoryRecordUpdated')} value={new Date(entry.updatedAt).toLocaleString()} />
+                      </div>
+                      {entry.description ? <div style={helperTextStyle}>{entry.description}</div> : null}
+                      <div style={rowStyle}>
+                        <button
+                          type="button"
+                          style={subtleButtonStyle}
+                          disabled={skillsFeatureEnabled !== true}
+                          onClick={() => ws?.send({
+                            type: MEMORY_WS.SKILL_READ,
+                            requestId: markMemoryAdminRequest('skillRead'),
+                            key: entry.key,
+                            layer: entry.layer,
+                            projectDir: memoryAdminProjectDir.trim() || undefined,
+                            canonicalRepoId: memoryProjectId.trim() || undefined,
+                          })}
+                        >
+                          {t('sharedContext.management.memorySkillPreview')}
+                        </button>
+                        <button
+                          type="button"
+                          style={deleteButtonStyle}
+                          disabled={skillsFeatureEnabled !== true}
+                          onClick={() => {
+                            const confirmed = globalThis.confirm?.(t('sharedContext.management.memorySkillDeleteConfirm')) ?? true;
+                            if (!confirmed) return;
+                            ws?.send({
+                              type: MEMORY_WS.SKILL_DELETE,
+                              requestId: markMemoryAdminRequest('skillDelete'),
+                              key: entry.key,
+                              layer: entry.layer,
+                              projectDir: memoryAdminProjectDir.trim() || undefined,
+                              canonicalRepoId: memoryProjectId.trim() || undefined,
+                            });
+                          }}
+                        >
+                          {t('sharedContext.management.memoryDelete')}
+                        </button>
+                      </div>
+                    </div>
+                  )) : <div style={helperTextStyle}>{t('sharedContext.management.memorySkillsEmpty')}</div>}
+                </div>
+                {skillPreview ? (
+                  <div style={resourceCardStyle}>
+                    <SectionHeading
+                      title={t('sharedContext.management.memorySkillPreviewTitle')}
+                      description={`${skillPreview.layer}:${skillPreview.key}`}
+                      action={<button type="button" style={archiveRestoreButtonStyle} onClick={() => setSkillPreview(null)}>{t('sharedContext.management.memoryCollapse')}</button>}
+                    />
+                    <pre style={{ ...memoryContentExpandedStyle, whiteSpace: 'pre-wrap', fontFamily: 'ui-monospace, Menlo, monospace' }}>{skillPreview.content}</pre>
+                  </div>
+                ) : null}
+              </div>
+            </div>
+
+            <div style={cardGridStyle}>
+              <div style={adminSubCardStyle(mdIngestFeatureEnabled)}>
+                <SectionHeading
+                  title={t('sharedContext.management.memoryMdIngestTitle')}
+                  description={t('sharedContext.management.memoryMdIngestDescription')}
+                  action={<span
+                    style={featurePillStyle(mdIngestFeatureEnabled)}
+                    title={memoryFeatureStatusText(mdIngestFeatureEnabled)}
+                    aria-label={memoryFeatureStatusText(mdIngestFeatureEnabled)}
+                  >
+                    <span style={featureFlagDotStyle(mdIngestFeatureEnabled)} />
+                    {memoryFeatureStatusText(mdIngestFeatureEnabled)}
+                  </span>}
+                />
+                {mdIngestFeatureEnabled === false ? (
+                  <div style={helperTextStyle}>{t('sharedContext.management.memoryFeatureDisabledNotice')}</div>
+                ) : null}
+                <div style={adminFormRowStyle}>
+                  <input
+                    value={mdIngestProjectDir}
+                    onInput={(e) => setMdIngestProjectDir((e.currentTarget as HTMLInputElement).value)}
+                    placeholder={t('sharedContext.management.memoryProjectDirPlaceholder')}
+                    style={inputStyle}
+                  />
+                  <input
+                    value={mdIngestCanonicalRepoId}
+                    onInput={(e) => setMdIngestCanonicalRepoId((e.currentTarget as HTMLInputElement).value)}
+                    placeholder={t('sharedContext.management.memoryProjectPlaceholder')}
+                    style={inputStyle}
+                  />
+                  <select value={mdIngestScope} onChange={(e) => setMdIngestScope((e.currentTarget as HTMLSelectElement).value as MemoryScope)} style={inputStyle}>
+                    {MD_INGEST_UI_SCOPES.map((scopeValue) => (
+                      <option key={scopeValue} value={scopeValue}>{t(`sharedContext.management.memoryScope.${scopeValue}`)}</option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    style={buttonStyle}
+                    disabled={!ws || mdIngestFeatureEnabled !== true || !mdIngestProjectDir.trim() || !mdIngestCanonicalRepoId.trim() || (mdIngestScope !== 'personal' && mdIngestScope !== 'project_shared')}
+                    onClick={() => ws?.send({
+                      type: MEMORY_WS.MD_INGEST_RUN,
+                      requestId: markMemoryAdminRequest('mdIngest'),
+                      projectDir: mdIngestProjectDir.trim(),
+                      canonicalRepoId: mdIngestCanonicalRepoId.trim(),
+                      scope: mdIngestScope,
+                    })}
+                  >
+                    {t('sharedContext.management.memoryMdIngestRun')}
+                  </button>
+                </div>
+                {mdIngestResult ? (
+                  <div style={metaGridStyle}>
+                    <MetaCard label={t('sharedContext.management.memoryMdFilesChecked')} value={mdIngestResult.filesChecked} />
+                    <MetaCard label={t('sharedContext.management.memoryMdObservationsWritten')} value={mdIngestResult.observationsWritten} />
+                  </div>
+                ) : <div style={helperTextStyle}>{t('sharedContext.management.memoryMdIngestEmpty')}</div>}
+              </div>
+
+              <div style={adminSubCardStyle(observationStoreFeatureEnabled)}>
+                <SectionHeading
+                  title={t('sharedContext.management.memoryObservationsTitle')}
+                  description={t('sharedContext.management.memoryObservationsDescription')}
+                  action={<span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                    <span
+                      style={featurePillStyle(observationStoreFeatureEnabled)}
+                      title={`${memoryFeatureStatusText(observationStoreFeatureEnabled)} · ${observationRecords.length}`}
+                      aria-label={`${memoryFeatureStatusText(observationStoreFeatureEnabled)} · ${observationRecords.length}`}
+                    >
+                      <span style={featureFlagDotStyle(observationStoreFeatureEnabled)} />
+                      {observationRecords.length}
+                    </span>
+                  </span>}
+                />
+                {observationStoreFeatureEnabled === false ? (
+                  <div style={helperTextStyle}>{t('sharedContext.management.memoryFeatureDisabledNotice')}</div>
+                ) : null}
+                <div style={adminFormRowStyle}>
+                  <select value={observationScope} onChange={(e) => setObservationScope((e.currentTarget as HTMLSelectElement).value as '' | MemoryScope)} style={inputStyle}>
+                    <option value="">{t('sharedContext.management.memoryAllScopes')}</option>
+                    {MEMORY_SCOPES.map((scopeValue) => (
+                      <option key={scopeValue} value={scopeValue}>{t(`sharedContext.management.memoryScope.${scopeValue}`)}</option>
+                    ))}
+                  </select>
+                  <select value={observationClass} onChange={(e) => setObservationClass((e.currentTarget as HTMLSelectElement).value as MemoryObservationClassFilter)} style={inputStyle}>
+                    <option value="">{t('sharedContext.management.memoryAllClasses')}</option>
+                    {OBSERVATION_CLASSES.map((classValue) => (
+                      <option key={classValue} value={classValue}>{t(`sharedContext.management.memoryObservationClass.${classValue}`)}</option>
+                    ))}
+                  </select>
+                  <select value={promotionTargetScope} onChange={(e) => setPromotionTargetScope((e.currentTarget as HTMLSelectElement).value as MemoryScope)} style={inputStyle}>
+                    {MEMORY_SCOPES.map((scopeValue) => (
+                      <option key={scopeValue} value={scopeValue}>{t(`sharedContext.management.memoryScope.${scopeValue}`)}</option>
+                    ))}
+                  </select>
+                  <input
+                    value={promotionReason}
+                    onInput={(e) => setPromotionReason((e.currentTarget as HTMLInputElement).value)}
+                    placeholder={t('sharedContext.management.memoryPromotionReasonPlaceholder')}
+                    style={inputStyle}
+                  />
+                  <button type="button" style={subtleButtonStyle} disabled={!ws} onClick={() => loadMemoryAdminViews()}>
+                    {t('sharedContext.refresh')}
+                  </button>
+                </div>
+                <div style={resourceListStyle}>
+                  {observationRecords.length > 0 ? observationRecords.map((record) => (
+                    <div key={record.id} style={resourceCardStyle}>
+                      <div style={metaGridStyle}>
+                        <MetaCard label={t('sharedContext.management.memoryRecordClass')} value={t(`sharedContext.management.memoryObservationClass.${record.class}`)} />
+                        <MetaCard label={t('sharedContext.management.memoryRecordStatus')} value={record.state} />
+                        <MetaCard label={t('sharedContext.management.memoryScopeLabel')} value={t(`sharedContext.management.memoryScope.${record.scope}`)} />
+                        <MetaCard label={t('sharedContext.management.memoryRecordUpdated')} value={new Date(record.updatedAt).toLocaleString()} />
+                      </div>
+                      <MemoryRecordContent
+                        id={`observation-${record.id}`}
+                        text={record.text}
+                        expanded={expandedMemoryRecordIds.has(`observation-${record.id}`)}
+                        expandLabel={t('sharedContext.management.memoryExpand')}
+                        collapseLabel={t('sharedContext.management.memoryCollapse')}
+                        onToggle={() => {
+                          setExpandedMemoryRecordIds((current) => {
+                            const next = new Set(current);
+                            const key = `observation-${record.id}`;
+                            if (next.has(key)) next.delete(key);
+                            else next.add(key);
+                            return next;
+                          });
+                        }}
+                      />
+                      <div style={rowStyle}>
+                        <button
+                          type="button"
+                          style={subtleButtonStyle}
+                          disabled={observationStoreFeatureEnabled !== true}
+                          onClick={() => ws?.send({
+                            type: MEMORY_WS.OBSERVATION_PROMOTE,
+                            requestId: markMemoryAdminRequest('observationPromote'),
+                            id: record.id,
+                            projectDir: memoryAdminProjectDir.trim() || undefined,
+                            canonicalRepoId: memoryProjectId.trim() || undefined,
+                            expectedFromScope: record.scope,
+                            toScope: promotionTargetScope,
+                            reason: promotionReason.trim() || undefined,
+                          })}
+                        >
+                          {t('sharedContext.management.memoryObservationPromote')}
+                        </button>
+                      </div>
+                    </div>
+                  )) : <div style={helperTextStyle}>{t('sharedContext.management.memoryObservationsEmpty')}</div>}
+                </div>
+              </div>
+            </div>
+          </div>
+
+
           <div style={{ ...sectionStyle, gap: 12 }}>
             {/* Top level: Personal | Enterprise */}
             <div style={tabBarStyle}>
@@ -2695,6 +3405,8 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                           id={`pending-${record.id}`}
                           text={record.content || '—'}
                           expanded={expandedMemoryRecordIds.has(`pending-${record.id}`)}
+                          expandLabel={t('sharedContext.management.memoryExpand')}
+                          collapseLabel={t('sharedContext.management.memoryCollapse')}
                           onToggle={() => {
                             setExpandedMemoryRecordIds((current) => {
                               const next = new Set(current);
@@ -2772,7 +3484,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   );
 }
 
-function CornerFold({ expanded, onClick }: { expanded: boolean; onClick: (e: Event) => void }) {
+function CornerFold({ expanded, onClick, expandLabel, collapseLabel }: { expanded: boolean; onClick: (e: Event) => void; expandLabel: string; collapseLabel: string }) {
   const size = 22;
   return (
     <button
@@ -2791,7 +3503,7 @@ function CornerFold({ expanded, onClick }: { expanded: boolean; onClick: (e: Eve
         cursor: 'pointer',
         overflow: 'hidden',
       }}
-      title={expanded ? 'Collapse' : 'Expand'}
+      title={expanded ? collapseLabel : expandLabel}
     >
       <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} style={{ display: 'block' }}>
         {/* Corner dashed lines */}
@@ -2823,11 +3535,15 @@ function MemoryRecordContent({
   text,
   expanded,
   onToggle,
+  expandLabel,
+  collapseLabel,
 }: {
   id: string;
   text: string;
   expanded: boolean;
   onToggle: () => void;
+  expandLabel: string;
+  collapseLabel: string;
 }) {
   const collapsible = shouldCollapseMemoryContent(text);
   const showExpanded = expanded || !collapsible;
@@ -2843,7 +3559,12 @@ function MemoryRecordContent({
         <ChatMarkdown text={text} />
       </div>
       {collapsible ? (
-        <CornerFold expanded={expanded} onClick={(e) => { e.stopPropagation(); onToggle(); }} />
+        <CornerFold
+          expanded={expanded}
+          expandLabel={expandLabel}
+          collapseLabel={collapseLabel}
+          onClick={(e) => { e.stopPropagation(); onToggle(); }}
+        />
       ) : null}
     </div>
   );

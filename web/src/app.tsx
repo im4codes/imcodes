@@ -16,6 +16,7 @@ import {
 } from './components/file-browser-lazy.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { RECONNECT_GRACE_MS } from '@shared/ack-protocol.js';
+import type { UsageContextWindowSource } from '@shared/usage-context-window.js';
 import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate } from './p2p-run-mapping.js';
 import { useTranslation } from 'react-i18next';
 import { ErrorBoundary } from './components/ErrorBoundary.js';
@@ -785,7 +786,7 @@ export function App() {
   const [idleFlashTokens, setIdleFlashTokens] = useState<Map<string, number>>(() => new Map());
   const [toasts, setToasts] = useState<Array<{ id: number; sessionName: string; project: string; kind: 'idle' | 'notification'; title?: string; message?: string; openRepoLatest?: boolean; failedJobName?: string; failedStepName?: string }>>([]);
   const [detectedModels, setDetectedModels] = useState<Map<string, string>>(new Map());
-  const [subUsages, setSubUsages] = useState<Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; model?: string }>>(new Map());
+  const [subUsages, setSubUsages] = useState<Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string }>>(new Map());
   const quickData = useQuickData();
   const lastImcodesActivityRef = useRef(Date.now());
   const resubscribeTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
@@ -1856,7 +1857,7 @@ export function App() {
           if (event.sessionId.startsWith('deck_sub_') && event.payload.inputTokens) {
             setSubUsages((prev) => {
               const next = new Map(prev);
-              next.set(event.sessionId, event.payload as { inputTokens: number; cacheTokens: number; contextWindow: number; model?: string });
+              next.set(event.sessionId, event.payload as { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string });
               return next;
             });
           }

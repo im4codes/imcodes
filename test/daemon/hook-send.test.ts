@@ -54,6 +54,7 @@ vi.mock('../../src/daemon/watcher-controls.js', () => ({
 
 import { startHookServer, clearQueues, getQueue, resolveTarget } from '../../src/daemon/hook-server.js';
 import { detectStatus } from '../../src/agent/detect.js';
+import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -264,8 +265,56 @@ describe('Hook server /send endpoint', () => {
       if (result.ok) expect(result.targets.length).toBe(2); // w1 and w2 (brain excluded)
     });
 
-    it('returns error when sender not found in store', () => {
+    it('resolves a unique sender label for SDK/transport sessions before applying sibling target scope', () => {
+      const sdk = makeSession({ name: 'deck_proj_sdk', role: 'w4', agentType: 'claude-code-sdk', label: 'CC1', runtimeType: 'transport' });
       getSessionMock.mockReturnValue(null);
+      listSessionsMock.mockReturnValue([brain, w1, w2, sdk]);
+
+      const result = resolveTarget('CC1', 'Reviewer');
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.targets[0].name).toBe('deck_proj_w2');
+    });
+
+    it('rejects ambiguous sender labels instead of guessing the SDK caller', () => {
+      const sdk1 = makeSession({ name: 'deck_proj_sdk1', role: 'w4', agentType: 'claude-code-sdk', label: 'CC1', runtimeType: 'transport' });
+      const sdk2 = makeSession({ name: 'deck_proj_sdk2', role: 'w5', agentType: 'claude-code-sdk', label: 'CC1', runtimeType: 'transport' });
+      getSessionMock.mockReturnValue(null);
+      listSessionsMock.mockReturnValue([brain, w1, sdk1, sdk2]);
+
+      const result = resolveTarget('CC1', 'Coder');
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error).toContain('ambiguous');
+    });
+
+    it('allows external CLI senders to resolve an exact active session name globally', () => {
+      getSessionMock.mockReturnValue(null);
+      listSessionsMock.mockReturnValue([brain, w1, w2]);
+
+      const result = resolveTarget(IMCODES_EXTERNAL_CLI_SENDER, 'deck_proj_w2');
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.targets[0].name).toBe('deck_proj_w2');
+    });
+
+    it('does not allow external CLI senders to resolve labels, agent types, broadcast, or stopped sessions', () => {
+      const stopped = makeSession({ name: 'deck_proj_stopped', role: 'w4', agentType: 'codex', state: 'stopped', label: 'Stopped' });
+      getSessionMock.mockReturnValue(null);
+      listSessionsMock.mockReturnValue([brain, w1, w2, stopped]);
+
+      for (const target of ['coder', 'codex', '--all', '*', 'deck_proj_stopped']) {
+        const result = resolveTarget(IMCODES_EXTERNAL_CLI_SENDER, target);
+        expect(result.ok).toBe(false);
+        if (!result.ok) {
+          expect(result.error).toContain('sender session not found');
+          expect(result.available).toContain('deck_proj_brain');
+          expect(result.available).not.toContain('deck_proj_stopped');
+        }
+      }
+    });
+
+    it('returns error when sender not found in store and target is not an exact active session name', () => {
+      getSessionMock.mockReturnValue(null);
+      listSessionsMock.mockReturnValue([brain, w1]);
+
       const result = resolveTarget('nonexistent', 'target');
       expect(result.ok).toBe(false);
       if (!result.ok) expect(result.error).toContain('sender session not found');
@@ -288,6 +337,22 @@ describe('Hook server /send endpoint', () => {
   // ── Successful delivery ──────────────────────────────────────────────────
 
   describe('Successful delivery', () => {
+    it('delivers shell-originated callback sends when the target is an exact active session name', async () => {
+      const brain = makeSession({ name: 'deck_proj_brain', role: 'brain', agentType: 'claude-code' });
+      const w1 = makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'codex' });
+
+      getSessionMock.mockReturnValue(null);
+      listSessionsMock.mockReturnValue([brain, w1]);
+
+      const res = await postSend(port, { from: IMCODES_EXTERNAL_CLI_SENDER, to: 'deck_proj_brain', message: 'Task: UI polish\nResult: done' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.ok).toBe(true);
+      expect(res.body.delivered).toBe(true);
+      expect(res.body.target).toBe('deck_proj_brain');
+      expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith('deck_proj_brain', 'Task: UI polish\nResult: done');
+    });
+
     it('REGRESSION GUARD: CLI /send to process sessions must route through session.send recall pipeline and this test must not be deleted', async () => {
       const brain = makeSession({ name: 'deck_proj_brain', role: 'brain', agentType: 'claude-code' });
       const w1 = makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'codex' });

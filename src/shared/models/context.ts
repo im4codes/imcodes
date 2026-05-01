@@ -63,6 +63,28 @@ export function inferContextWindow(model?: string | null): number | undefined {
   return undefined;
 }
 
-export function resolveContextWindow(explicit: number | undefined, model?: string | null, fallback = 1_000_000): number {
-  return inferContextWindow(model) ?? explicit ?? fallback;
+export interface ResolveContextWindowOptions {
+  /**
+   * Some providers report the actual live window for the current turn/session.
+   * Prefer that value over model-family inference when the event explicitly
+   * marks the context window as provider-sourced. Keep the historical default
+   * of model inference first for older watcher events whose explicit value may
+   * be a stale preset/fallback.
+   */
+  preferExplicit?: boolean;
+}
+
+function validExplicitContextWindow(value: number | undefined): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+export function resolveContextWindow(
+  explicit: number | undefined,
+  model?: string | null,
+  fallback = 1_000_000,
+  options: ResolveContextWindowOptions = {},
+): number {
+  const safeExplicit = validExplicitContextWindow(explicit);
+  if (options.preferExplicit && safeExplicit !== undefined) return safeExplicit;
+  return inferContextWindow(model) ?? safeExplicit ?? fallback;
 }

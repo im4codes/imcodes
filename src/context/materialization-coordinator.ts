@@ -33,7 +33,7 @@ import {
   updateContextJob,
   writeProcessedProjection,
 } from '../store/context-store.js';
-import { serializeContextNamespace } from './context-keys.js';
+import { serializeContextNamespace, serializeContextTarget } from './context-keys.js';
 import { countTokens } from './tokenizer.js';
 import { loadMemoryConfig, type MemoryConfig } from './memory-config.js';
 import { createMemoryConfigResolver, resolveMemoryConfigForNamespace, type MemoryConfigResolver } from './memory-config-resolver.js';
@@ -41,6 +41,17 @@ import { computeFingerprint } from '../../shared/memory-fingerprint.js';
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { incrementCounter } from '../util/metrics.js';
 import { redactSummaryPreservingPinned } from '../util/redact-with-pinned-region.js';
+import {
+  decideSkillReviewSchedule,
+  type SkillReviewSchedulerPolicy,
+  type SkillReviewState,
+} from '../../shared/skill-review-scheduler.js';
+import type { SkillReviewTrigger } from '../../shared/skill-review-triggers.js';
+import {
+  MEMORY_FEATURE_FLAGS_BY_NAME,
+  memoryFeatureFlagEnvKey,
+  resolveMemoryFeatureFlagValue,
+} from '../../shared/feature-flags.js';
 
 export interface MaterializationThresholds {
   autoTriggerTokens: number;
@@ -66,6 +77,15 @@ export interface MaterializationCoordinatorOptions {
   compressor?: (input: import('./summary-compressor.js').CompressionInput) => Promise<import('./summary-compressor.js').CompressionResult>;
   /** Override archive writes for failure-injection tests. */
   archiveEventsForMaterialization?: typeof archiveEventsForMaterialization;
+  /**
+   * Optional post-response skill review scheduler. The coordinator invokes it
+   * only after SDK-backed materialization has completed, so auto-creation stays
+   * on the existing isolated background path and never enters the send ack or
+   * provider-delivery foreground paths.
+   */
+  skillReviewScheduler?: MaterializationSkillReviewScheduler;
+  /** Gate self-learning durable extraction/classification; defaults to the shared feature flag (default off). */
+  selfLearningEnabled?: boolean | (() => boolean);
 }
 
 export interface MaterializationResult {
@@ -74,6 +94,31 @@ export interface MaterializationResult {
   replicationQueued: boolean;
   compression?: CompressionResult;
   filteredOut?: boolean;
+}
+
+export interface MaterializationSkillReviewJob {
+  idempotencyKey: string;
+  scopeKey: string;
+  responseId: string;
+  trigger: SkillReviewTrigger;
+  target: ContextTargetRef;
+  projectionId: string;
+  sourceEventIds: readonly string[];
+  nextAttemptAt: number;
+  maxAttempts: number;
+  createdAt: number;
+}
+
+interface SkillReviewTriggerEvidence {
+  toolIterationCount: number;
+}
+
+export interface MaterializationSkillReviewScheduler {
+  featureEnabled: boolean | (() => boolean);
+  getState: (scopeKey: string) => SkillReviewState;
+  enqueue: (job: MaterializationSkillReviewJob) => void | Promise<void>;
+  policy?: Partial<SkillReviewSchedulerPolicy>;
+  isShuttingDown?: () => boolean;
 }
 
 const DEFAULT_THRESHOLDS: MaterializationThresholds = {
@@ -95,6 +140,7 @@ const DEFAULT_THRESHOLDS: MaterializationThresholds = {
  * producing the nested "--- Updated ---" chains observed in the field).
  */
 const MAX_SDK_RETRY_ATTEMPTS = 3;
+const MAX_SKILL_REVIEW_EVIDENCE_TARGETS = 256;
 
 export class MaterializationCoordinator {
   readonly thresholds: MaterializationThresholds;
@@ -104,10 +150,15 @@ export class MaterializationCoordinator {
   private readonly thresholdOverrides: Partial<MaterializationThresholds>;
   private readonly _compressor: MaterializationCoordinatorOptions['compressor'];
   private readonly _archiveEventsForMaterialization: typeof archiveEventsForMaterialization;
+  private readonly _skillReviewScheduler?: MaterializationSkillReviewScheduler;
+  private readonly _selfLearningEnabled?: boolean | (() => boolean);
+  private readonly skillReviewEvidenceByTarget = new Map<string, SkillReviewTriggerEvidence>();
 
   constructor(options?: MaterializationCoordinatorOptions) {
     this._compressor = options?.compressor;
     this._archiveEventsForMaterialization = options?.archiveEventsForMaterialization ?? archiveEventsForMaterialization;
+    this._skillReviewScheduler = options?.skillReviewScheduler;
+    this._selfLearningEnabled = options?.selfLearningEnabled;
     this.resolveMemoryConfig = options?.memoryConfigResolver ?? createMemoryConfigResolver({
       fixedConfig: options?.memoryConfig,
       fallbackCwd: options?.memoryConfigCwd,
@@ -149,6 +200,27 @@ export class MaterializationCoordinator {
 
   listDirtyTargets(namespace?: ContextNamespace): ContextDirtyTarget[] {
     return listDirtyTargets(namespace);
+  }
+
+  recordSkillReviewToolIteration(target: ContextTargetRef, count = 1): void {
+    const safeCount = Math.max(0, Math.floor(count));
+    if (safeCount <= 0) return;
+    const targetKey = serializeContextTarget(target);
+    const current = this.skillReviewEvidenceByTarget.get(targetKey)?.toolIterationCount ?? 0;
+    if (!this.skillReviewEvidenceByTarget.has(targetKey) && this.skillReviewEvidenceByTarget.size >= MAX_SKILL_REVIEW_EVIDENCE_TARGETS) {
+      const oldestKey = this.skillReviewEvidenceByTarget.keys().next().value as string | undefined;
+      if (oldestKey) {
+        this.skillReviewEvidenceByTarget.delete(oldestKey);
+        incrementCounter('mem.skill.evidence_evicted', { reason: 'lru_limit' });
+      }
+    }
+    this.skillReviewEvidenceByTarget.set(targetKey, {
+      toolIterationCount: Math.min(1_000_000, current + safeCount),
+    });
+  }
+
+  recordFilteredSkillReviewToolIteration(reason: 'hidden' | 'error'): void {
+    incrementCounter('mem.skill.evidence_filtered', { reason });
   }
 
   async materializeTarget(target: ContextTargetRef, trigger: ContextJobTrigger, now = Date.now()): Promise<MaterializationResult> {
@@ -332,6 +404,7 @@ export class MaterializationCoordinator {
     const summaryProjection = writeProcessedProjection({
       namespace: target.namespace,
       class: 'recent_summary',
+      origin: 'chat_compacted',
       sourceEventIds,
       summary: compression.summary,
       content: {
@@ -353,17 +426,19 @@ export class MaterializationCoordinator {
       updatedAt: now,
     });
     let durableProjection: ProcessedContextProjection | undefined;
-    try {
-      durableProjection = buildDurableProjection(
-        target.namespace,
-        events,
-        compression.summary,
-        sourceEventIds,
-        now,
-      );
-    } catch (error) {
-      incrementCounter('mem.materialization.durable_projection_failed', { source: 'materializeTarget' });
-      warnOncePerHour('mem.materialization.durable_projection_failed', { error: error instanceof Error ? error.message : String(error) });
+    if (this.isSelfLearningEnabled()) {
+      try {
+        durableProjection = buildDurableProjection(
+          target.namespace,
+          events,
+          compression.summary,
+          sourceEventIds,
+          now,
+        );
+      } catch (error) {
+        incrementCounter('mem.materialization.durable_projection_failed', { source: 'materializeTarget' });
+        warnOncePerHour('mem.materialization.durable_projection_failed', { error: error instanceof Error ? error.message : String(error) });
+      }
     }
 
     const replicationState = getReplicationState(target.namespace);
@@ -380,6 +455,12 @@ export class MaterializationCoordinator {
     deleteStagedEventsByIds(sourceEventIds);
     updateContextJob(job.id, 'completed', { now });
     clearDirtyTarget(target);
+    this.schedulePostResponseSkillReview({
+      target,
+      projectionId: summaryProjection.id,
+      sourceEventIds,
+      now,
+    });
 
     return {
       summaryProjection,
@@ -436,6 +517,76 @@ export class MaterializationCoordinator {
     );
   }
 
+  private schedulePostResponseSkillReview(input: {
+    target: ContextTargetRef;
+    projectionId: string;
+    sourceEventIds: readonly string[];
+    now: number;
+  }): void {
+    const scheduler = this._skillReviewScheduler;
+    if (!scheduler) return;
+    try {
+      const featureEnabled = typeof scheduler.featureEnabled === 'function'
+        ? scheduler.featureEnabled()
+        : scheduler.featureEnabled;
+      const scopeKey = serializeContextNamespace(input.target.namespace);
+      const targetKey = serializeContextTarget(input.target);
+      const triggerEvidence = this.skillReviewEvidenceByTarget.get(targetKey) ?? { toolIterationCount: 0 };
+      const responseId = [...input.sourceEventIds].reverse().find((id) => id.trim().length > 0)
+        ?? input.projectionId;
+      const decision = decideSkillReviewSchedule({
+        featureEnabled,
+        delivered: true,
+        phase: 'post_response_background',
+        trigger: 'tool_iteration_count',
+        scopeKey,
+        responseId,
+        now: input.now,
+        state: scheduler.getState(scopeKey),
+        policy: scheduler.policy,
+        shuttingDown: scheduler.isShuttingDown?.() ?? false,
+        triggerEvidence,
+      });
+      this.skillReviewEvidenceByTarget.delete(targetKey);
+      if (decision.action === 'skip') {
+        if (decision.reason === 'coalesced') {
+          incrementCounter('mem.skill.review_deduped', { source: 'materialization' });
+        } else if (decision.reason === 'below_trigger_threshold'
+          || decision.reason === 'invalid_trigger'
+          || decision.reason === 'not_delivered'
+          || decision.reason === 'not_background') {
+          incrementCounter('mem.skill.review_not_eligible', { reason: decision.reason });
+        } else if (decision.reason !== 'disabled' && decision.reason !== 'shutdown') {
+          incrementCounter('mem.skill.review_throttled', { reason: decision.reason });
+        }
+        return;
+      }
+      const job: MaterializationSkillReviewJob = {
+        idempotencyKey: decision.idempotencyKey,
+        scopeKey,
+        responseId,
+        trigger: 'tool_iteration_count',
+        target: input.target,
+        projectionId: input.projectionId,
+        sourceEventIds: [...input.sourceEventIds],
+        nextAttemptAt: decision.nextAttemptAt,
+        maxAttempts: decision.maxAttempts,
+        createdAt: input.now,
+      };
+      void Promise.resolve(scheduler.enqueue(job)).catch((error) => {
+        incrementCounter('mem.skill.review_failed', { source: 'materialization_enqueue' });
+        warnOncePerHour('mem.skill.review_failed', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    } catch (error) {
+      incrementCounter('mem.skill.review_failed', { source: 'materialization_schedule' });
+      warnOncePerHour('mem.skill.review_failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   private selectTrigger(dirtyTarget: ContextDirtyTarget, now: number): ContextJobTrigger | undefined {
     const thresholds = this.thresholdsForTarget(dirtyTarget.target);
     if (this.isRateLimited(dirtyTarget.target, now)) return undefined;
@@ -490,6 +641,16 @@ export class MaterializationCoordinator {
 
   private thresholdsForTarget(target: ContextTargetRef): MaterializationThresholds {
     return this.buildThresholds(this.configForTarget(target));
+  }
+
+  private isSelfLearningEnabled(): boolean {
+    if (typeof this._selfLearningEnabled === 'function') return this._selfLearningEnabled();
+    if (typeof this._selfLearningEnabled === 'boolean') return this._selfLearningEnabled;
+    const flag = MEMORY_FEATURE_FLAGS_BY_NAME.selfLearning;
+    const raw = process.env[memoryFeatureFlagEnvKey(flag)];
+    return resolveMemoryFeatureFlagValue(flag, {
+      environmentStartupDefault: raw == null ? undefined : { [flag]: raw === 'true' || raw === '1' },
+    });
   }
 
   private buildThresholds(memoryConfig: MemoryConfig): MaterializationThresholds {
@@ -566,6 +727,7 @@ export async function materializeMasterSummary(sessionName: string, namespace?: 
     id: `master:${computeFingerprint(`${namespaceKey}:${sessionName}`)}`,
     namespace: resolvedNamespace,
     class: 'master_summary',
+    origin: 'chat_compacted',
     sourceEventIds,
     summary,
     content: {
@@ -638,6 +800,7 @@ function buildDurableProjection(
   return writeProcessedProjection({
     namespace,
     class: 'durable_memory_candidate',
+    origin: 'agent_learned',
     sourceEventIds,
     summary: buildDurableSummary(signals),
     content: {

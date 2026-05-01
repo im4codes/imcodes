@@ -1,10 +1,12 @@
 import type { CodexStatusSnapshot } from '@shared/codex-status.js';
+import { isUsageContextWindowSource, type UsageContextWindowSource } from '@shared/usage-context-window.js';
 import type { TimelineEvent } from './ws-client.js';
 
 export interface UsageData {
   inputTokens: number;
   cacheTokens: number;
   contextWindow: number;
+  contextWindowSource?: UsageContextWindowSource;
   model?: string;
   codexStatus?: CodexStatusSnapshot;
 }
@@ -28,6 +30,9 @@ export function extractLatestUsage(events: TimelineEvent[]): UsageData | null {
       usage.inputTokens = payload.inputTokens;
       usage.cacheTokens = typeof payload.cacheTokens === 'number' ? payload.cacheTokens : 0;
       usage.contextWindow = typeof payload.contextWindow === 'number' ? payload.contextWindow : 0;
+      if (isUsageContextWindowSource(payload.contextWindowSource)) {
+        usage.contextWindowSource = payload.contextWindowSource;
+      }
       tokensFound = true;
     }
     if (!modelFound && typeof payload.model === 'string') {

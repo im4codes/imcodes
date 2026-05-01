@@ -19,7 +19,7 @@ function makeEvent(payload: Record<string, unknown>): TimelineEvent {
 describe('extractLatestUsage', () => {
   it('merges token usage and codex status from separate events', () => {
     const usage = extractLatestUsage([
-      makeEvent({ inputTokens: 120, cacheTokens: 30, contextWindow: 200_000, model: 'gpt-5.2-codex' }),
+      makeEvent({ inputTokens: 120, cacheTokens: 30, contextWindow: 200_000, contextWindowSource: 'provider', model: 'gpt-5.2-codex' }),
       makeEvent({ codexStatus: { capturedAt: 1, fiveHourLeftPercent: 43, weeklyLeftPercent: 34 } }),
     ]);
 
@@ -27,6 +27,7 @@ describe('extractLatestUsage', () => {
       inputTokens: 120,
       cacheTokens: 30,
       contextWindow: 200_000,
+      contextWindowSource: 'provider',
       model: 'gpt-5.2-codex',
       codexStatus: {
         fiveHourLeftPercent: 43,

@@ -25,4 +25,8 @@ describe('web model context resolution', () => {
     expect(inferContextWindow('gpt-5.1')).toBe(400_000);
     expect(inferContextWindow('gpt-5.2-codex')).toBe(400_000);
   });
+
+  it('honors provider-sourced explicit context windows when requested', () => {
+    expect(resolveContextWindow(258_400, 'gpt-5.4-mini', 1_000_000, { preferExplicit: true })).toBe(258_400);
+  });
 });

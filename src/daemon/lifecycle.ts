@@ -33,6 +33,7 @@ import { configureSharedContextRuntime } from '../context/shared-context-runtime
 import { fetchBackendSharedContextRuntimeConfig } from '../context/backend-runtime-config.js';
 import { setContextModelRuntimeConfig } from '../context/context-model-config.js';
 import { closeLiveContextMaterializationAdmission, LiveContextIngestion } from '../context/live-context-ingestion.js';
+import { LocalSkillReviewWorker } from '../context/skill-review-worker.js';
 import { resolveTransportContextBootstrap } from '../agent/runtime-context-bootstrap.js';
 import { pruneLocalMemory } from '../context/memory-pruning.js';
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
@@ -425,8 +426,10 @@ export async function startup(): Promise<DaemonContext> {
     }
   })();
 
+  const skillReviewWorker = new LocalSkillReviewWorker();
   const liveContextIngestion = new LiveContextIngestion({
     sessionLookup: getSession,
+    skillReviewScheduler: skillReviewWorker,
     resolveBootstrap: (session) => resolveTransportContextBootstrap({
       projectDir: session.projectDir,
       transportConfig: getSession(session.name)?.transportConfig ?? session.transportConfig ?? {},

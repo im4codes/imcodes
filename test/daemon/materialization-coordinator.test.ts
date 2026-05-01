@@ -102,6 +102,7 @@ describe('MaterializationCoordinator', () => {
   it('materializes structured problem-resolution summaries from eligible events', async () => {
     const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
+      selfLearningEnabled: true,
       modelConfig: {
         primaryContextBackend: 'claude-code-sdk',
         primaryContextModel: 'sonnet',
@@ -257,6 +258,7 @@ describe('MaterializationCoordinator', () => {
         fromSdk: false,
       }),
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
+      selfLearningEnabled: true,
     });
 
     coordinator.ingestEvent({ id: 'evt-retry-user', target, eventType: 'user.turn', content: 'please remember this outage batch', createdAt: 100 });
@@ -379,6 +381,7 @@ describe('MaterializationCoordinator', () => {
         fromSdk: true,
       }),
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
+      selfLearningEnabled: true,
     });
 
     coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'keep startup notes stable', createdAt: 100 });
@@ -399,5 +402,23 @@ describe('MaterializationCoordinator', () => {
         preferences: ['Prefer durable-first startup context'],
       },
     }));
+  });
+
+  it('skips durable agent-learned projection writes when self-learning is disabled', async () => {
+    const coordinator = new MaterializationCoordinator({
+      compressor: localOnlyCompressor,
+      thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
+      selfLearningEnabled: false,
+    });
+
+    coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'remember this decision', createdAt: 100 });
+    coordinator.ingestEvent({ target, eventType: 'decision', content: 'self-learning gate must remain off by default', createdAt: 101 });
+    coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'noted the decision', createdAt: 102 });
+
+    const result = await coordinator.materializeTarget(target, 'manual', 500);
+
+    expect(result.summaryProjection.class).toBe('recent_summary');
+    expect(result.durableProjection).toBeUndefined();
+    expect(queryProcessedProjections({ projectId: namespace.projectId, projectionClass: 'durable_memory_candidate' })).toEqual([]);
   });
 });

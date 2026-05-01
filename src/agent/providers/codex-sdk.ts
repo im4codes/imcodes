@@ -102,22 +102,95 @@ export interface CodexDiscoveredModel {
 interface CodexSdkSessionState {
   routeId: string;
   cwd: string;
+  env?: Record<string, string>;
   model?: string;
   effort?: TransportEffortLevel;
   threadId?: string;
   loaded: boolean;
   runningTurnId?: string;
+  runningCompact: boolean;
   currentMessageId: string | null;
   currentText: string;
   pendingComplete?: AgentMessage;
   cancelled: boolean;
   cancelTimer: ReturnType<typeof setTimeout> | null;
   lastUsage?: {
+    /**
+     * Context-bar usage must represent the thread total, not only the last turn.
+     * Codex app-server emits both `last` and `total`; the UI's ctx meter is a
+     * thread-level indicator, so we normalize from `total` when available and
+     * keep the last-turn fields only for diagnostics.
+     */
     input_tokens: number;
+    cache_read_input_tokens: number;
     cached_input_tokens: number;
     output_tokens: number;
+    total_tokens?: number;
+    reasoning_output_tokens?: number;
+    model_context_window?: number;
+    codex_total_input_tokens?: number;
+    codex_last_input_tokens?: number;
+    codex_last_cached_input_tokens?: number;
+    codex_last_output_tokens?: number;
   };
   lastStatusSignature: string | null;
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
+  return value;
+}
+
+function normalizeCodexTokenUsage(params: Record<string, any>): CodexSdkSessionState['lastUsage'] | undefined {
+  const tokenUsage = params.tokenUsage;
+  if (!tokenUsage || typeof tokenUsage !== 'object') return undefined;
+
+  const total = tokenUsage.total && typeof tokenUsage.total === 'object'
+    ? tokenUsage.total as Record<string, unknown>
+    : undefined;
+  const last = tokenUsage.last && typeof tokenUsage.last === 'object'
+    ? tokenUsage.last as Record<string, unknown>
+    : undefined;
+  if (!total && !last) return undefined;
+
+  const totalInput = finiteNumber(total?.inputTokens);
+  const totalCached = finiteNumber(total?.cachedInputTokens);
+  const totalOutput = finiteNumber(total?.outputTokens);
+  const lastInput = finiteNumber(last?.inputTokens);
+  const lastCached = finiteNumber(last?.cachedInputTokens);
+  const lastOutput = finiteNumber(last?.outputTokens);
+
+  const inputTokens = totalInput ?? lastInput;
+  const cachedTokens = totalCached ?? lastCached;
+  const outputTokens = totalOutput ?? lastOutput;
+  if (inputTokens === undefined && cachedTokens === undefined && outputTokens === undefined) return undefined;
+  const cachedForUi = cachedTokens ?? 0;
+  // Codex/OpenAI-style `inputTokens` includes cached input as a subset
+  // (`totalTokens === inputTokens + outputTokens` in Codex JSONL). The web ctx
+  // bar renders `inputTokens + cacheTokens`, matching Anthropic's split fields.
+  // Therefore expose the uncached remainder as provider-neutral `input_tokens`
+  // and carry the raw Codex total separately for diagnostics.
+  const inputForUi = Math.max(0, (inputTokens ?? 0) - cachedForUi);
+
+  const modelContextWindow = finiteNumber(tokenUsage.modelContextWindow)
+    // Backward-compat with older tests / adapters that briefly placed this
+    // beside `tokenUsage`; generated app-server types now nest it inside.
+    ?? finiteNumber(params.modelContextWindow);
+
+  return {
+    input_tokens: inputForUi,
+    cache_read_input_tokens: cachedForUi,
+    // Keep Codex's native name too for diagnostics and direct provider users.
+    cached_input_tokens: cachedForUi,
+    output_tokens: outputTokens ?? 0,
+    ...(finiteNumber(total?.totalTokens) !== undefined ? { total_tokens: finiteNumber(total?.totalTokens)! } : {}),
+    ...(finiteNumber(total?.reasoningOutputTokens) !== undefined ? { reasoning_output_tokens: finiteNumber(total?.reasoningOutputTokens)! } : {}),
+    ...(modelContextWindow !== undefined && modelContextWindow > 0 ? { model_context_window: modelContextWindow } : {}),
+    ...(inputTokens !== undefined ? { codex_total_input_tokens: inputTokens } : {}),
+    ...(lastInput !== undefined ? { codex_last_input_tokens: lastInput } : {}),
+    ...(lastCached !== undefined ? { codex_last_cached_input_tokens: lastCached } : {}),
+    ...(lastOutput !== undefined ? { codex_last_output_tokens: lastOutput } : {}),
+  };
 }
 
 function toolFromItem(item: Record<string, any>, lifecycle: 'started' | 'completed'): ToolCallEvent | null {
@@ -303,7 +376,7 @@ export class CodexSdkProvider implements TransportProvider {
         execFile(resolved.executable, [...resolved.prependArgs, '--version'], { windowsHide: true }, (err) => (err ? reject(err) : resolve()));
       });
     });
-    await this.startAppServer(binaryPath);
+    await this.startAppServer(binaryPath, config);
     this.config = config;
     logger.info({ provider: this.id, resolved: resolved.executable, prepend: resolved.prependArgs }, 'Codex SDK provider connected via app-server');
   }
@@ -331,11 +404,13 @@ export class CodexSdkProvider implements TransportProvider {
     this.sessions.set(routeId, {
       routeId,
       cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
+      env: { ...(existing?.env ?? {}), ...((config.env as Record<string, string> | undefined) ?? {}) },
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
       effort: config.effort ?? existing?.effort,
       threadId: config.resumeId ?? existing?.threadId,
       loaded: false,
       runningTurnId: undefined,
+      runningCompact: false,
       currentMessageId: null,
       currentText: '',
       pendingComplete: undefined,
@@ -424,7 +499,7 @@ export class CodexSdkProvider implements TransportProvider {
     if (!state) {
       throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Unknown Codex SDK session: ${sessionId}`, false);
     }
-    if (state.runningTurnId) {
+    if (state.runningTurnId || state.runningCompact) {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Codex SDK session is already busy', true);
     }
 
@@ -436,6 +511,10 @@ export class CodexSdkProvider implements TransportProvider {
     state.lastUsage = undefined;
     state.lastStatusSignature = null;
     const payload = normalizeProviderPayload(payloadOrMessage, attachments, extraSystemPrompt);
+    if (this.isCompactCommand(payload)) {
+      await this.startCompact(sessionId, state);
+      return;
+    }
     await this.startTurn(sessionId, state, payload);
   }
 
@@ -460,7 +539,7 @@ export class CodexSdkProvider implements TransportProvider {
     state.cancelTimer.unref?.();
   }
 
-  private async startAppServer(binaryPath: string): Promise<void> {
+  private async startAppServer(binaryPath: string, config: ProviderConfig): Promise<void> {
     await this.disconnect().catch(() => {});
     // Resolve npm .cmd shims into (node.exe, [scriptPath]) so spawn works
     // without shell:true (which has its own quoting issues on Windows).
@@ -468,7 +547,7 @@ export class CodexSdkProvider implements TransportProvider {
     const args = [...resolved.prependArgs, 'app-server'];
     const child = spawn(resolved.executable, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: process.env,
+      env: { ...process.env, ...((config.env as Record<string, string> | undefined) ?? {}) },
       windowsHide: true,
     });
     this.child = child;
@@ -516,6 +595,7 @@ export class CodexSdkProvider implements TransportProvider {
         threadId: state.threadId,
         input: [{ type: 'text', text: inputText }],
         cwd: state.cwd,
+        ...this.sessionEnvironmentParams(state),
         approvalPolicy: 'never',
         sandboxPolicy: { type: 'dangerFullAccess' },
         ...(state.model ? { model: state.model } : {}),
@@ -523,6 +603,33 @@ export class CodexSdkProvider implements TransportProvider {
       });
       state.runningTurnId = result?.turn?.id;
     } catch (err) {
+      state.runningTurnId = undefined;
+      this.emitError(sessionId, this.normalizeError(err));
+    }
+  }
+
+  private isCompactCommand(payload: ProviderContextPayload): boolean {
+    // Codex slash commands are app-client controls, not ordinary model text.
+    // The daemon still forwards `/compact` through the ordinary transport send
+    // path; this provider adapter is the SDK boundary that maps the raw command
+    // to Codex app-server's native compaction RPC. Using `assembledMessage`
+    // here would be wrong because shared-context/preference preambles may wrap
+    // the provider-visible text, while `userMessage` preserves the user's raw
+    // command token.
+    return payload.userMessage.trim() === '/compact';
+  }
+
+  private async startCompact(sessionId: string, state: CodexSdkSessionState): Promise<void> {
+    try {
+      await this.ensureThreadLoaded(sessionId, state);
+      state.runningCompact = true;
+      state.currentText = '';
+      state.currentMessageId = null;
+      await this.request('thread/compact/start', {
+        threadId: state.threadId,
+      });
+    } catch (err) {
+      state.runningCompact = false;
       state.runningTurnId = undefined;
       this.emitError(sessionId, this.normalizeError(err));
     }
@@ -547,6 +654,7 @@ export class CodexSdkProvider implements TransportProvider {
       // mid-flight.
       const result = await this.request('thread/resume', {
         threadId: state.threadId,
+        ...this.sessionEnvironmentParams(state),
         ...(state.model ? { model: state.model } : {}),
         baseInstructions,
       });
@@ -560,6 +668,7 @@ export class CodexSdkProvider implements TransportProvider {
 
     const result = await this.request('thread/start', {
       cwd: state.cwd,
+      ...this.sessionEnvironmentParams(state),
       approvalPolicy: 'never',
       sandbox: 'danger-full-access',
       personality: 'none',
@@ -574,6 +683,10 @@ export class CodexSdkProvider implements TransportProvider {
     state.loaded = true;
     this.threadToSession.set(threadId, sessionId);
     this.emitSessionInfo(sessionId, { resumeId: threadId, ...(state.model ? { model: state.model } : {}) });
+  }
+
+  private sessionEnvironmentParams(state: CodexSdkSessionState): { env?: Record<string, string> } {
+    return state.env && Object.keys(state.env).length > 0 ? { env: state.env } : {};
   }
 
   private handleLine(line: string): void {
@@ -620,13 +733,18 @@ export class CodexSdkProvider implements TransportProvider {
     if (method === 'thread/tokenUsage/updated') {
       const sessionId = this.threadToSession.get(params.threadId);
       const state = sessionId ? this.sessions.get(sessionId) : null;
-      const last = params.tokenUsage?.last;
-      if (!state || !last) return;
-      state.lastUsage = {
-        input_tokens: Number(last.inputTokens ?? 0),
-        cached_input_tokens: Number(last.cachedInputTokens ?? 0),
-        output_tokens: Number(last.outputTokens ?? 0),
-      };
+      if (!state) return;
+      const normalizedUsage = normalizeCodexTokenUsage(params);
+      if (!normalizedUsage) return;
+      state.lastUsage = normalizedUsage;
+      return;
+    }
+
+    if (method === 'thread/compacted') {
+      const sessionId = this.threadToSession.get(params.threadId);
+      const state = sessionId ? this.sessions.get(sessionId) : null;
+      if (!sessionId || !state || !state.runningCompact) return;
+      this.completeCompact(sessionId, state, typeof params.turnId === 'string' ? params.turnId : undefined);
       return;
     }
 
@@ -654,6 +772,16 @@ export class CodexSdkProvider implements TransportProvider {
 
       const item = params.item as Record<string, any> | undefined;
       if (!item) return;
+
+      if (item.type === 'contextCompaction') {
+        state.runningCompact = true;
+        state.runningTurnId = typeof params.turnId === 'string' ? params.turnId : state.runningTurnId;
+        this.emitStatus(sessionId, state, {
+          status: 'thinking',
+          label: 'Compacting context...',
+        });
+        return;
+      }
 
       if (item.type === 'reasoning') {
         this.emitStatus(sessionId, state, {
@@ -699,12 +827,14 @@ export class CodexSdkProvider implements TransportProvider {
       if (status === 'failed') {
         this.clearCancelTimer(state);
         this.clearStatus(sessionId, state);
+        state.runningCompact = false;
         state.runningTurnId = undefined;
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, turn.error?.message ?? 'Codex turn failed', false, turn.error));
         return;
       }
       if (status === 'interrupted') {
         this.clearCancelTimer(state);
+        state.runningCompact = false;
         if (!state.runningTurnId && state.cancelled) {
           state.cancelled = false;
           return;
@@ -712,6 +842,11 @@ export class CodexSdkProvider implements TransportProvider {
         this.clearStatus(sessionId, state);
         state.runningTurnId = undefined;
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
+        return;
+      }
+
+      if (state.runningCompact) {
+        this.completeCompact(sessionId, state, typeof turn.id === 'string' ? turn.id : undefined);
         return;
       }
 
@@ -751,6 +886,31 @@ export class CodexSdkProvider implements TransportProvider {
       this.pendingRequests.set(id, { resolve, reject });
       this.child!.stdin.write(`${payload}\n`);
     });
+  }
+
+  private completeCompact(sessionId: string, state: CodexSdkSessionState, turnId?: string): void {
+    this.clearCancelTimer(state);
+    this.clearStatus(sessionId, state);
+    state.runningCompact = false;
+    state.runningTurnId = undefined;
+    state.currentMessageId = null;
+    state.currentText = '';
+    const completed: AgentMessage = {
+      id: turnId ? `${turnId}:context-compaction` : `${sessionId}:context-compaction:${Date.now()}`,
+      sessionId,
+      kind: 'system',
+      role: 'system',
+      content: 'Codex context compacted.',
+      timestamp: Date.now(),
+      status: 'complete',
+      metadata: {
+        provider: this.id,
+        event: 'thread/compacted',
+        ...(state.threadId ? { resumeId: state.threadId } : {}),
+        ...(turnId ? { turnId } : {}),
+      },
+    };
+    for (const cb of this.completeCallbacks) cb(sessionId, completed);
   }
 
   /**

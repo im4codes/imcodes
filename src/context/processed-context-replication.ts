@@ -136,7 +136,14 @@ function resolveStates(namespaces?: ContextNamespace[]): ContextReplicationState
 
 function selectPendingProjections(namespace: ContextNamespace, pendingIds: string[]): ProcessedContextProjection[] {
   const wanted = new Set(pendingIds);
-  return listProcessedProjections(namespace).filter((projection) => wanted.has(projection.id));
+  return listProcessedProjections(namespace)
+    .filter((projection) => wanted.has(projection.id))
+    .map((projection) => ({
+      ...projection,
+      // Legacy rows created before post-1.1 origin metadata are backfilled at
+      // the replication boundary; new materialization/write paths set origin explicitly.
+      origin: projection.origin ?? 'chat_compacted',
+    }));
 }
 
 function isReplicableProjection(projection: ProcessedContextProjection): projection is ReplicableProcessedProjection {

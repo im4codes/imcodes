@@ -45,4 +45,9 @@ describe('model context inference', () => {
     expect(resolveContextWindow(200_000, 'claude-opus-4-1')).toBe(1_000_000);
     expect(resolveContextWindow(200_000, 'claude-sonnet-4-6')).toBe(1_000_000);
   });
+
+  it('honors provider-sourced explicit context windows when requested', () => {
+    expect(resolveContextWindow(258_400, 'gpt-5.4-mini', 1_000_000, { preferExplicit: true })).toBe(258_400);
+    expect(resolveContextWindow(0, 'gpt-5.4-mini', 1_000_000, { preferExplicit: true })).toBe(1_000_000);
+  });
 });

@@ -17,6 +17,7 @@ import { updateSessionState } from '../store/session-store.js';
 import { resolveContextWindow } from '../util/model-context.js';
 import { registerWatcherControl, unregisterWatcherControl, type WatcherControl } from './watcher-controls.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
+import { USAGE_CONTEXT_WINDOW_SOURCES } from '../../shared/usage-context-window.js';
 
 // ── Codex SQLite helpers ────────────────────────────────────────────────────────
 
@@ -269,13 +270,20 @@ export function parseLine(sessionName: string, line: string, model?: string): vo
   if (!pl) return;
 
   if (pl.type === 'token_count') {
+    const total = pl.info?.total_token_usage;
     const last = pl.info?.last_token_usage;
-    if (last && typeof last.input_tokens === 'number') {
+    const usage = total ?? last;
+    if (usage && typeof usage.input_tokens === 'number') {
+      const cachedInput = typeof usage.cached_input_tokens === 'number' ? usage.cached_input_tokens : 0;
+      const modelContextWindow = typeof pl.info?.model_context_window === 'number' && Number.isFinite(pl.info.model_context_window) && pl.info.model_context_window > 0
+        ? pl.info.model_context_window
+        : undefined;
       timelineEmitter.emit(sessionName, 'usage.update', {
-        inputTokens: last.input_tokens,
-        cacheTokens: last.cached_input_tokens ?? 0,
-        outputTokens: last.output_tokens ?? 0,
-        contextWindow: resolveContextWindow(pl.info.model_context_window, model),
+        inputTokens: Math.max(0, usage.input_tokens - cachedInput),
+        cacheTokens: cachedInput,
+        outputTokens: usage.output_tokens ?? 0,
+        contextWindow: modelContextWindow ?? resolveContextWindow(undefined, model),
+        ...(modelContextWindow !== undefined ? { contextWindowSource: USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER } : {}),
         ...(model ? { model } : {}),
       }, { source: 'daemon', confidence: 'high', ...(ts ? { ts } : {}) });
     }

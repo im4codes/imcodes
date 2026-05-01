@@ -8,6 +8,7 @@ import { COOKIE_SESSION, COOKIE_CSRF, HEADER_CSRF } from '@shared/cookie-names.j
 import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM } from '@shared/preview-types.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
 import type { ContextMemoryView, ContextModelConfig } from '@shared/context-types.js';
+import type { AuthoredContextScope } from '@shared/memory-scope.js';
 import type { SharedContextRuntimeConfigSnapshot } from '@shared/shared-context-runtime-config.js';
 import { isNative } from './native.js';
 import {
@@ -1242,7 +1243,7 @@ export interface SharedProject {
   workspaceId: string | null;
   canonicalRepoId: string;
   displayName: string | null;
-  scope: 'project_shared' | 'workspace_shared' | 'org_shared';
+  scope: AuthoredContextScope;
   status: 'unenrolled' | 'active' | 'pending_removal' | 'removed';
 }
 
@@ -1285,7 +1286,7 @@ export interface RuntimeAuthoredContextBindingView {
   bindingId: string;
   documentVersionId: string;
   mode: 'required' | 'advisory';
-  scope: 'project_shared' | 'workspace_shared' | 'org_shared';
+  scope: AuthoredContextScope;
   repository?: string;
   language?: string;
   pathPattern?: string;
@@ -1400,7 +1401,7 @@ export async function enrollSharedProject(
     canonicalRepoId: string;
     displayName?: string;
     workspaceId?: string | null;
-    scope: 'project_shared' | 'workspace_shared' | 'org_shared';
+    scope: AuthoredContextScope;
   },
 ): Promise<{ id: string }> {
   return apiFetch(`/api/shared-context/enterprises/${encodeURIComponent(enterpriseId)}/projects/enroll`, {

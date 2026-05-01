@@ -298,6 +298,40 @@ describe('transport-relay (timeline-emitter based)', () => {
       });
     });
 
+    it('emits Codex SDK cumulative context usage instead of last-turn usage', () => {
+      const { provider, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireComplete('sess-1', makeMessage({
+        id: 'msg-codex-usage',
+        metadata: {
+          model: 'gpt-5.4-mini',
+          usage: {
+            // CodexSdkProvider normalizes app-server tokenUsage.total into these fields.
+            input_tokens: 105_000,
+            cached_input_tokens: 35_000,
+            cache_read_input_tokens: 35_000,
+            output_tokens: 200,
+            model_context_window: 258_400,
+            codex_total_input_tokens: 140_000,
+            codex_last_input_tokens: 12_000,
+            codex_last_cached_input_tokens: 3_000,
+          },
+        },
+      }));
+
+      const usageCall = emitMock.mock.calls.find(c => c[1] === 'usage.update');
+      expect(usageCall).toBeDefined();
+      expect(usageCall![2]).toMatchObject({
+        inputTokens: 105_000,
+        cacheTokens: 35_000,
+        model: 'gpt-5.4-mini',
+        contextWindow: 258_400,
+        contextWindowSource: 'provider',
+      });
+      expect(Number(usageCall![2].inputTokens) + Number(usageCall![2].cacheTokens)).toBe(140_000);
+    });
+
     it('falls back to message.content when no accumulator exists', () => {
       const { provider, fireComplete } = makeMockProvider();
       wireProviderToRelay(provider);

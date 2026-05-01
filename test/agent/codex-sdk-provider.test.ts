@@ -50,6 +50,9 @@ const childProcessMock = vi.hoisted(() => {
               result: { turn: { id: 'turn-1', status: 'inProgress', items: [], error: null } },
             });
           }
+          if (msg.method === 'thread/compact/start' && typeof msg.id === 'number') {
+            childRecord.emits({ id: msg.id, result: {} });
+          }
           if (msg.method === 'turn/interrupt' && typeof msg.id === 'number') {
             childRecord.emits({ id: msg.id, result: {} });
           }
@@ -159,10 +162,14 @@ describe('CodexSdkProvider', () => {
     const tools: Array<{ name: string; status: string; detail?: unknown }> = [];
     const deltas: string[] = [];
     const completed: string[] = [];
+    const completedMessages: any[] = [];
     const sessionInfo: Array<Record<string, unknown>> = [];
     provider.onToolCall((_, tool) => tools.push({ name: tool.name, status: tool.status, detail: tool.detail }));
     provider.onDelta((_sid, delta) => deltas.push(delta.delta));
-    provider.onComplete((_sid, msg) => completed.push(msg.content));
+    provider.onComplete((_sid, msg) => {
+      completed.push(msg.content);
+      completedMessages.push(msg);
+    });
     provider.onSessionInfo?.((_sid, info) => sessionInfo.push(info as Record<string, unknown>));
 
     await provider.send('route-1', 'hello');
@@ -185,7 +192,15 @@ describe('CodexSdkProvider', () => {
     child.emits({ method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'msg-1', delta: 'K' } });
     child.emits({
       method: 'thread/tokenUsage/updated',
-      params: { threadId: 'thread-1', turnId: 'turn-1', tokenUsage: { last: { inputTokens: 3, cachedInputTokens: 1, outputTokens: 2 }, total: { inputTokens: 3, cachedInputTokens: 1, outputTokens: 2, totalTokens: 6, reasoningOutputTokens: 0 }, modelContextWindow: 258400 } },
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        tokenUsage: {
+          last: { inputTokens: 3, cachedInputTokens: 1, outputTokens: 2 },
+          total: { inputTokens: 30, cachedInputTokens: 20, outputTokens: 5, totalTokens: 55, reasoningOutputTokens: 4 },
+          modelContextWindow: 258400,
+        },
+      },
     });
     child.emits({
       method: 'item/completed',
@@ -234,6 +249,19 @@ describe('CodexSdkProvider', () => {
     expect(turnStartReq?.params?.approvalPolicy).toBe('never');
     expect(deltas).toEqual(['O', 'OK']);
     expect(completed).toEqual(['OK']);
+    expect(completedMessages[0]?.metadata?.usage).toMatchObject({
+      input_tokens: 10,
+      cache_read_input_tokens: 20,
+      cached_input_tokens: 20,
+      output_tokens: 5,
+      total_tokens: 55,
+      reasoning_output_tokens: 4,
+      model_context_window: 258400,
+      codex_total_input_tokens: 30,
+      codex_last_input_tokens: 3,
+      codex_last_cached_input_tokens: 1,
+      codex_last_output_tokens: 2,
+    });
     expect(sessionInfo).toContainEqual({ resumeId: 'thread-1' });
   });
 
@@ -457,6 +485,80 @@ describe('CodexSdkProvider', () => {
         text: 'Context instructions:\nEnterprise standard\n\nHistory block\n\nhello',
       },
     ]);
+  });
+
+  it('maps raw /compact to Codex app-server native compaction instead of a model turn', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-compact', cwd: '/tmp/project' });
+
+    const completed: Array<{ role: string; kind: string; content: string; metadata?: Record<string, unknown> }> = [];
+    provider.onComplete((_sid, msg) => completed.push({
+      role: msg.role,
+      kind: msg.kind,
+      content: msg.content,
+      metadata: msg.metadata,
+    }));
+
+    await provider.send('route-compact', '/compact');
+
+    const child = childProcessMock.children[0];
+    expect(child.requests.some((req) => req.method === 'thread/compact/start')).toBe(true);
+    expect(child.requests.some((req) => req.method === 'turn/start')).toBe(false);
+
+    child.emits({ method: 'thread/compacted', params: { threadId: 'thread-1', turnId: 'compact-turn-1' } });
+    await flush();
+
+    expect(completed).toEqual([
+      expect.objectContaining({
+        role: 'system',
+        kind: 'system',
+        content: 'Codex context compacted.',
+        metadata: expect.objectContaining({
+          provider: 'codex-sdk',
+          event: 'thread/compacted',
+          turnId: 'compact-turn-1',
+        }),
+      }),
+    ]);
+  });
+
+  it('uses the raw userMessage when detecting /compact in normalized payloads', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-compact-context', cwd: '/tmp/project' });
+
+    const payload: ProviderContextPayload = {
+      userMessage: '  /compact  ',
+      assembledMessage: 'Related history\n\n/compact',
+      systemText: 'Injected runtime context',
+      messagePreamble: 'Related history',
+      attachments: undefined,
+      context: {
+        systemText: 'Injected runtime context',
+        messagePreamble: 'Related history',
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'repo' },
+        authoritySource: 'processed_local',
+        freshness: 'fresh',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    };
+
+    await provider.send('route-compact-context', payload);
+
+    const child = childProcessMock.children[0];
+    expect(child.requests.some((req) => req.method === 'thread/compact/start')).toBe(true);
+    expect(child.requests.some((req) => req.method === 'turn/start')).toBe(false);
   });
 
   it('rejects normalized payloads combined with legacy extraSystemPrompt', async () => {
@@ -777,6 +879,33 @@ describe('CodexSdkProvider', () => {
     const child = childProcessMock.children[0];
     const turnStartReq = child.requests.find((req) => req.method === 'turn/start');
     expect(turnStartReq?.params?.effort).toBe('high');
+  });
+
+  it('propagates per-session IM.codes sender identity env through Codex app-server requests', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({
+      sessionKey: 'route-env',
+      cwd: '/tmp/project',
+      env: {
+        IMCODES_SESSION: 'deck_repo_w1',
+        IMCODES_SESSION_LABEL: 'Cx1',
+      },
+    });
+
+    await provider.send('route-env', 'hello');
+    const child = childProcessMock.children[0];
+    const threadStartReq = child.requests.find((req) => req.method === 'thread/start');
+    const turnStartReq = child.requests.find((req) => req.method === 'turn/start');
+
+    expect(threadStartReq?.params?.env).toMatchObject({
+      IMCODES_SESSION: 'deck_repo_w1',
+      IMCODES_SESSION_LABEL: 'Cx1',
+    });
+    expect(turnStartReq?.params?.env).toMatchObject({
+      IMCODES_SESSION: 'deck_repo_w1',
+      IMCODES_SESSION_LABEL: 'Cx1',
+    });
   });
 
   it('emits thinking status from reasoning items and clears it on streamed assistant text', async () => {

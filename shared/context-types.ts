@@ -1,4 +1,10 @@
 import type { MemoryScoringWeights } from './memory-scoring.js';
+import type {
+  AuthoredContextScope,
+  MemoryScope,
+  SharedContextProjectionScope,
+} from './memory-scope.js';
+import type { MemoryOrigin } from './memory-origin.js';
 
 export type CanonicalRepositoryIdentityKind = 'git-origin' | 'local-fallback';
 
@@ -20,14 +26,16 @@ export interface RepositoryAlias {
   createdAt?: number;
 }
 
-export type ContextScope = 'personal' | 'project_shared' | 'workspace_shared' | 'org_shared';
+export type ContextScope = MemoryScope;
 
 export interface ContextNamespace {
   scope: ContextScope;
-  projectId: string;
+  projectId?: string;
   userId?: string;
   workspaceId?: string;
   enterpriseId?: string;
+  localTenant?: string;
+  canonicalRepoId?: string;
 }
 
 export interface SharedScopePolicyOverride {
@@ -56,7 +64,7 @@ export interface RuntimeAuthoredContextBinding {
   bindingId: string;
   documentVersionId: string;
   mode: AuthoredContextBindingMode;
-  scope: Exclude<ContextScope, 'personal'>;
+  scope: AuthoredContextScope;
   repository?: string;
   language?: string;
   pathPattern?: string;
@@ -219,6 +227,8 @@ export interface ProcessedContextProjection {
   sourceEventIds: string[];
   summary: string;
   content: Record<string, unknown>;
+  contentHash?: string;
+  origin?: MemoryOrigin;
   createdAt: number;
   updatedAt: number;
   hitCount?: number;
@@ -266,7 +276,7 @@ export interface ContextMemoryStatsView {
 
 export interface ContextMemoryRecordView {
   id: string;
-  scope: 'personal' | 'project_shared' | 'workspace_shared' | 'org_shared';
+  scope: SharedContextProjectionScope;
   projectId: string;
   summary: string;
   projectionClass: ProcessedContextClass;

@@ -62,6 +62,7 @@ import { execSync } from 'child_process';
 import { homedir } from 'os';
 import { existsSync, realpathSync, readFileSync, writeFileSync } from 'fs';
 import { resolve, join, dirname } from 'path';
+import { IMCODES_EXTERNAL_CLI_SENDER } from '../shared/imcodes-send.js';
 
 import { PROJECT_ROOT } from './util/project-root.js';
 
@@ -429,11 +430,16 @@ program
     const hookPort = readHookPort();
     if (hookPort) {
       try {
-        const from = await detectSenderSession().catch(() => 'cli');
+        const detectedFrom = await detectSenderSession().catch(() => '');
+        const from = detectedFrom || IMCODES_EXTERNAL_CLI_SENDER;
 
         // --reply: append callback instruction so the target knows to reply
         if (opts.reply) {
-          message += `\n\nAfter completing the above task, send your response using: imcodes send --no-reply "${from}" "Task: <brief summary of the request>\nResult: <your response>"`;
+          if (!detectedFrom) {
+            console.error('Error: --reply requires a managed sender session. Set IMCODES_SESSION to the session that should receive the reply, or omit --reply.');
+            process.exit(1);
+          }
+          message += `\n\nAfter completing the above task, send your response using: imcodes send --no-reply "${detectedFrom}" "Task: <brief summary of the request>\nResult: <your response>"`;
         }
 
         if (opts.all) {

@@ -24,7 +24,7 @@ describe('pinned notes store integration', () => {
 
   it('injects pinned notes byte-identically under the User-Pinned Notes heading', async () => {
     const pinned = 'password: required\nhex-looking value: 0123456789abcdef0123456789abcdef01234567\n空白  그대로';
-    addPinnedNote({ namespaceKey: serializeContextNamespace(namespace), content: pinned, id: 'pin-1', now: 100 });
+    addPinnedNote({ namespaceKey: serializeContextNamespace(namespace), content: pinned, origin: 'manual_pin', id: 'pin-1', now: 100 });
 
     const coordinator = new MaterializationCoordinator({
       compressor: localOnlyCompressor,

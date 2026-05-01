@@ -1,3 +1,4 @@
+import { createRequire } from 'node:module';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ContextNamespace, ContextTargetRef } from '../../shared/context-types.js';
 import {
@@ -24,6 +25,9 @@ import {
   writeProcessedProjection,
 } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
+
+const require = createRequire(import.meta.url);
+const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 
 describe('context-store', () => {
   let tempDir: string;
@@ -477,6 +481,130 @@ describe('context-store', () => {
   });
 
   describe('SQLite schema — H.2 migration columns', () => {
+    it('stores namespace filter columns and indexes management query paths', () => {
+      const event = recordContextEvent({ target, eventType: 'user.turn', content: 'pending', createdAt: 10 });
+      const job = enqueueContextJob(target, 'materialize_session', 'threshold', 20);
+      const projection = writeProcessedProjection({
+        namespace,
+        class: 'recent_summary',
+        sourceEventIds: ['source-1'],
+        summary: 'indexed projection',
+        content: {},
+        createdAt: 30,
+        updatedAt: 40,
+      });
+
+      const dbPath = process.env.IMCODES_CONTEXT_DB_PATH;
+      expect(dbPath).toBeTruthy();
+      const sqlite = new DatabaseSync(dbPath!);
+      try {
+        const indexNames = (table: string): string[] =>
+          (sqlite.prepare(`PRAGMA index_list('${table}')`).all() as Array<{ name: string }>).map((row) => String(row.name));
+
+        expect(indexNames('context_processed_local')).toEqual(expect.arrayContaining([
+          'idx_context_processed_local_scope_project',
+          'idx_context_processed_local_scope_owner_project',
+          'idx_context_processed_local_project',
+        ]));
+        expect(indexNames('context_staged_events')).toEqual(expect.arrayContaining([
+          'idx_context_staged_events_scope_project',
+          'idx_context_staged_events_scope_owner_project',
+          'idx_context_staged_events_project_created',
+          'idx_context_staged_events_namespace_created',
+        ]));
+        expect(indexNames('context_dirty_targets')).toEqual(expect.arrayContaining([
+          'idx_context_dirty_targets_scope_project',
+          'idx_context_dirty_targets_scope_owner_project',
+          'idx_context_dirty_targets_project_newest',
+          'idx_context_dirty_targets_namespace_newest',
+        ]));
+        expect(indexNames('context_jobs')).toEqual(expect.arrayContaining([
+          'idx_context_jobs_status_scope_project',
+          'idx_context_jobs_status_scope_owner_project',
+          'idx_context_jobs_status_project_created',
+          'idx_context_jobs_namespace_status_created',
+        ]));
+
+        expect(sqlite.prepare('SELECT scope, user_id, project_id FROM context_processed_local WHERE id = ?').get(projection.id)).toEqual({
+          scope: 'personal',
+          user_id: 'user-1',
+          project_id: 'repo',
+        });
+        expect(sqlite.prepare('SELECT scope, user_id, project_id FROM context_staged_events WHERE id = ?').get(event.id)).toEqual({
+          scope: 'personal',
+          user_id: 'user-1',
+          project_id: 'repo',
+        });
+        expect(sqlite.prepare('SELECT scope, user_id, project_id FROM context_jobs WHERE id = ?').get(job.id)).toEqual({
+          scope: 'personal',
+          user_id: 'user-1',
+          project_id: 'repo',
+        });
+        expect(sqlite.prepare('SELECT scope, user_id, project_id FROM context_dirty_targets WHERE pending_job_id = ?').get(job.id)).toEqual({
+          scope: 'personal',
+          user_id: 'user-1',
+          project_id: 'repo',
+        });
+      } finally {
+        sqlite.close();
+      }
+    });
+
+    it('backfills namespace filter columns for existing local rows', () => {
+      recordContextEvent({ target, eventType: 'user.turn', content: 'legacy pending', createdAt: 10 });
+      const job = enqueueContextJob(target, 'materialize_session', 'threshold', 20);
+      const projection = writeProcessedProjection({
+        namespace,
+        class: 'recent_summary',
+        sourceEventIds: ['legacy-source'],
+        summary: 'legacy indexed projection',
+        content: {},
+        createdAt: 30,
+        updatedAt: 40,
+      });
+
+      const dbPath = process.env.IMCODES_CONTEXT_DB_PATH;
+      expect(dbPath).toBeTruthy();
+      const sqlite = new DatabaseSync(dbPath!);
+      try {
+        sqlite.exec(`
+          UPDATE context_processed_local SET scope = NULL, enterprise_id = NULL, workspace_id = NULL, user_id = NULL, project_id = NULL;
+          UPDATE context_staged_events SET scope = NULL, enterprise_id = NULL, workspace_id = NULL, user_id = NULL, project_id = NULL;
+          UPDATE context_dirty_targets SET scope = NULL, enterprise_id = NULL, workspace_id = NULL, user_id = NULL, project_id = NULL;
+          UPDATE context_jobs SET scope = NULL, enterprise_id = NULL, workspace_id = NULL, user_id = NULL, project_id = NULL;
+        `);
+      } finally {
+        sqlite.close();
+      }
+
+      resetContextStoreForTests();
+
+      expect(getProcessedProjectionStats({ scope: 'personal', userId: 'user-1', projectId: 'repo' })).toMatchObject({
+        totalRecords: 1,
+        stagedEventCount: 1,
+        dirtyTargetCount: 1,
+        pendingJobCount: 1,
+      });
+      expect(queryProcessedProjections({ scope: 'personal', userId: 'user-1', projectId: 'repo' })).toHaveLength(1);
+      expect(queryPendingContextEvents({ scope: 'personal', userId: 'user-1', projectId: 'repo' })).toHaveLength(1);
+
+      const sqliteAfter = new DatabaseSync(dbPath!);
+      try {
+        expect(sqliteAfter.prepare('SELECT scope, user_id, project_id FROM context_processed_local WHERE id = ?').get(projection.id)).toEqual({
+          scope: 'personal',
+          user_id: 'user-1',
+          project_id: 'repo',
+        });
+        expect(sqliteAfter.prepare('SELECT scope, user_id, project_id FROM context_jobs WHERE id = ?').get(job.id)).toEqual({
+          scope: 'personal',
+          user_id: 'user-1',
+          project_id: 'repo',
+        });
+      } finally {
+        sqliteAfter.close();
+      }
+    });
+
     it('context_processed_local has hit_count column with default 0', () => {
       const projection = writeProcessedProjection({
         namespace, class: 'recent_summary',

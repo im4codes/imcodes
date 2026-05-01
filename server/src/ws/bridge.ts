@@ -21,6 +21,16 @@ import { DAEMON_MSG } from '../../../shared/daemon-events.js';
 import { REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
 import { TRANSPORT_RELAY_TYPES, TRANSPORT_MSG } from '../../../shared/transport-events.js';
 import {
+  isMemoryManagementRequestType,
+  isMemoryManagementResponseType,
+} from '../../../shared/memory-ws.js';
+import {
+  MEMORY_MANAGEMENT_CONTEXT_FIELD,
+  type AuthenticatedMemoryManagementContext,
+  type MemoryManagementRole,
+} from '../../../shared/memory-management-context.js';
+import { MEMORY_MANAGEMENT_BRIDGE_ERROR_CODES } from '../../../shared/memory-management.js';
+import {
   MSG_COMMAND_ACK,
   MSG_COMMAND_FAILED,
   MSG_DAEMON_ONLINE,
@@ -54,6 +64,7 @@ import {
 import { LocalWebPreviewRegistry } from '../preview/registry.js';
 import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, getSubSessionById, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent } from '../db/queries.js';
 import logger from '../util/logger.js';
+import { incrementCounter } from '../../../src/util/metrics.js';
 import { pickReadableSessionDisplay } from '../../../shared/session-display.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
 import { PUSH_TIMELINE_EVENT_MAX_AGE_MS, TIMELINE_SUPPRESS_PUSH_FIELD } from '../../../shared/push-notifications.js';
@@ -61,6 +72,7 @@ import { PUSH_TIMELINE_EVENT_MAX_AGE_MS, TIMELINE_SUPPRESS_PUSH_FIELD } from '..
 const AUTH_TIMEOUT_MS = 5000;
 const MAX_QUEUE_SIZE = 100;
 const MAX_BROWSER_PAYLOAD = 65536; // 64KB (subsession.rebuild_all can include many sessions)
+const MAX_PENDING_MEMORY_MANAGEMENT_REQUESTS_PER_SOCKET = 32;
 // Desktop with pinned panels + many sessions can fire 60+ subscribe/repo/repo
 // detect / fs.git_status / chat.subscribe / ping messages on initial connect.
 // A reconnect within 10s doubles that. 120 was right at the cliff edge and
@@ -339,6 +351,9 @@ export class WsBridge {
   /** Per-request timeline.history / timeline.replay pending map — routes responses via requestId unicast. */
   private pendingTimelineRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
 
+  /** Per-request memory management pending map — routes sensitive admin responses via requestId unicast. */
+  private pendingMemoryManagementRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
+
   /** Per-request HTTP timeline/history relay pending map. */
   private pendingHttpTimelineRequests = new Map<string, PendingHttpTimelineRequest>();
   private pendingRecentTextBackfills = new Map<string, Promise<WatchRecentTextRow[]>>();
@@ -422,6 +437,160 @@ export class WsBridge {
 
   static getAll(): Map<string, WsBridge> {
     return WsBridge.instances;
+  }
+
+  private registerMemoryManagementRequest(ws: WebSocket, msg: Record<string, unknown>): string | null {
+    if (!isMemoryManagementRequestType(msg.type)) return null;
+    const userId = this.browserUserIds.get(ws)?.trim();
+    if (!userId) {
+      safeSend(ws, JSON.stringify({
+        type: 'error',
+        code: MEMORY_MANAGEMENT_BRIDGE_ERROR_CODES.UNAUTHENTICATED,
+        message: 'memory management requests require an authenticated browser session',
+        originalType: msg.type,
+      }));
+      return null;
+    }
+    const pendingForSocket = [...this.pendingMemoryManagementRequests.values()].filter((pending) => pending.socket === ws).length;
+    if (pendingForSocket >= MAX_PENDING_MEMORY_MANAGEMENT_REQUESTS_PER_SOCKET) {
+      safeSend(ws, JSON.stringify({
+        type: 'error',
+        code: MEMORY_MANAGEMENT_BRIDGE_ERROR_CODES.TOO_MANY_PENDING_REQUESTS,
+        message: 'too many pending memory management requests',
+        originalType: msg.type,
+      }));
+      return null;
+    }
+    const requestId = typeof msg.requestId === 'string' && msg.requestId.trim()
+      ? msg.requestId.trim()
+      : null;
+    if (!requestId) {
+      safeSend(ws, JSON.stringify({
+        type: 'error',
+        code: MEMORY_MANAGEMENT_BRIDGE_ERROR_CODES.MISSING_REQUEST_ID,
+        message: 'memory management requests require requestId',
+        originalType: msg.type,
+      }));
+      return null;
+    }
+    const existing = this.pendingMemoryManagementRequests.get(requestId);
+    if (existing) {
+      safeSend(ws, JSON.stringify({
+        type: 'error',
+        code: MEMORY_MANAGEMENT_BRIDGE_ERROR_CODES.DUPLICATE_REQUEST_ID,
+        message: 'memory management requestId is already pending',
+        originalType: msg.type,
+        requestId,
+      }));
+      return null;
+    }
+    const timer = setTimeout(() => this.pendingMemoryManagementRequests.delete(requestId), 30_000);
+    this.pendingMemoryManagementRequests.set(requestId, { socket: ws, timer });
+    return requestId;
+  }
+
+  private clearPendingMemoryManagementRequest(requestId: string): WebSocket | undefined {
+    const pending = this.pendingMemoryManagementRequests.get(requestId);
+    if (!pending) return undefined;
+    clearTimeout(pending.timer);
+    this.pendingMemoryManagementRequests.delete(requestId);
+    return pending.socket;
+  }
+
+  private failMemoryManagementForward(ws: WebSocket, msg: Record<string, unknown>, requestId: string, error: unknown): void {
+    this.clearPendingMemoryManagementRequest(requestId);
+    logger.warn({
+      serverId: this.serverId,
+      type: msg.type,
+      requestId,
+      error: error instanceof Error ? error.message : String(error),
+    }, 'memory management context injection failed');
+    safeSend(ws, JSON.stringify({
+      type: 'error',
+      code: MEMORY_MANAGEMENT_BRIDGE_ERROR_CODES.CONTEXT_INJECTION_FAILED,
+      message: 'memory management request could not be authorized',
+      originalType: msg.type,
+      requestId,
+    }));
+  }
+
+  private async resolveMemoryManagementRole(params: {
+    userId: string;
+    canonicalRepoId?: string;
+    workspaceId?: string;
+    orgId?: string;
+  }): Promise<MemoryManagementRole> {
+    if (!this.db) return 'user';
+    const { userId, canonicalRepoId, workspaceId, orgId } = params;
+    try {
+      if (orgId) {
+        const row = await this.db.queryOne<{ role?: string }>(
+          'SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2',
+          [orgId, userId],
+        );
+        if (row?.role === 'owner' || row?.role === 'admin') return 'org_admin';
+        return 'user';
+      }
+      if (workspaceId) {
+        const row = await this.db.queryOne<{ role?: string }>(
+          `SELECT tm.role
+             FROM shared_context_workspaces w
+             JOIN team_members tm ON tm.team_id = w.enterprise_id AND tm.user_id = $2
+            WHERE w.id = $1`,
+          [workspaceId, userId],
+        );
+        if (row?.role === 'owner' || row?.role === 'admin') return 'workspace_admin';
+        return 'user';
+      }
+      if (canonicalRepoId) {
+        const row = await this.db.queryOne<{ role?: string }>(
+          `SELECT tm.role
+             FROM shared_project_enrollments e
+             JOIN team_members tm ON tm.team_id = e.enterprise_id AND tm.user_id = $2
+            WHERE e.canonical_repo_id = $1
+              AND e.status = 'active'
+            ORDER BY CASE tm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END
+            LIMIT 1`,
+          [canonicalRepoId, userId],
+        );
+        if (row?.role === 'owner' || row?.role === 'admin') return 'workspace_admin';
+      }
+    } catch (error) {
+      logger.warn({ err: error, serverId: this.serverId }, 'memory management role derivation failed');
+    }
+    return 'user';
+  }
+
+  private async withMemoryManagementContext(ws: WebSocket, msg: Record<string, unknown>, requestId: string): Promise<Record<string, unknown>> {
+    const userId = this.browserUserIds.get(ws)?.trim();
+    if (!userId) return msg;
+    const canonicalRepoId = typeof msg.canonicalRepoId === 'string' && msg.canonicalRepoId.trim()
+      ? msg.canonicalRepoId.trim()
+      : undefined;
+    const projectDir = typeof msg.projectDir === 'string' && msg.projectDir.trim() ? msg.projectDir.trim() : undefined;
+    const workspaceId = typeof msg.workspaceId === 'string' && msg.workspaceId.trim() ? msg.workspaceId.trim() : undefined;
+    const orgId = typeof msg.orgId === 'string' && msg.orgId.trim()
+      ? msg.orgId.trim()
+      : (typeof msg.enterpriseId === 'string' && msg.enterpriseId.trim() ? msg.enterpriseId.trim() : undefined);
+    const role = await this.resolveMemoryManagementRole({ userId, canonicalRepoId, workspaceId, orgId });
+    const context: AuthenticatedMemoryManagementContext = {
+      actorId: userId,
+      userId,
+      role,
+      serverId: this.serverId,
+      requestId,
+      source: 'server_bridge',
+      boundProjects: projectDir || canonicalRepoId || workspaceId || orgId
+        ? [{ projectDir, canonicalRepoId, workspaceId, orgId }]
+        : [],
+    };
+    const { [MEMORY_MANAGEMENT_CONTEXT_FIELD]: _ignoredContext, managementContext: _ignoredLegacyContext, ...safeMsg } = msg;
+    void _ignoredContext;
+    void _ignoredLegacyContext;
+    return {
+      ...safeMsg,
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: context,
+    };
   }
 
   // ── Daemon connection ──────────────────────────────────────────────────────
@@ -657,7 +826,7 @@ export class WsBridge {
       safeSend(ws, JSON.stringify({ type: TRANSPORT_MSG.SESSIONS_RESPONSE, providerId, sessions }));
     }
 
-    ws.on('message', (data) => {
+    ws.on('message', async (data) => {
       const raw = (data as Buffer).toString();
       if (Buffer.byteLength(raw, 'utf8') > MAX_BROWSER_PAYLOAD) {
         logger.warn({ serverId: this.serverId }, 'Browser message too large — dropped');
@@ -711,6 +880,17 @@ export class WsBridge {
       }
 
       if (typeof msg.type !== 'string') {
+        return;
+      }
+
+      if (isMemoryManagementRequestType(msg.type)) {
+        const requestId = this.registerMemoryManagementRequest(ws, msg);
+        if (!requestId) return;
+        try {
+          this.sendToDaemon(JSON.stringify(await this.withMemoryManagementContext(ws, msg, requestId)));
+        } catch (error) {
+          this.failMemoryManagementForward(ws, msg, requestId, error);
+        }
         return;
       }
 
@@ -868,6 +1048,21 @@ export class WsBridge {
 
     if (type === PREVIEW_MSG.ERROR) {
       this.failPreviewRequest(msg as unknown as PreviewErrorMessage);
+      return;
+    }
+
+    if (isMemoryManagementResponseType(type)) {
+      const requestId = msg.requestId as string | undefined;
+      const pending = requestId ? this.pendingMemoryManagementRequests.get(requestId) : undefined;
+      if (!requestId || !pending) {
+        incrementCounter('mem.bridge.unrouted_response', { type: String(type) });
+        logger.warn({ serverId: this.serverId, type, requestId }, 'memory management response missing pending request — dropped');
+        return;
+      }
+      this.clearPendingMemoryManagementRequest(requestId);
+      if (pending.socket.readyState === WebSocket.OPEN) {
+        pending.socket.send(JSON.stringify(msg));
+      }
       return;
     }
 
@@ -1738,6 +1933,12 @@ export class WsBridge {
       if (pending.socket === ws) {
         clearTimeout(pending.timer);
         this.pendingTimelineRequests.delete(reqId);
+      }
+    }
+    for (const [reqId, pending] of this.pendingMemoryManagementRequests) {
+      if (pending.socket === ws) {
+        clearTimeout(pending.timer);
+        this.pendingMemoryManagementRequests.delete(reqId);
       }
     }
   }

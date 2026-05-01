@@ -4,6 +4,7 @@ import { RUNTIME_TYPES } from '../../src/agent/session-runtime.js';
 import type { TransportProvider, ProviderError, SessionConfig } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { MemorySearchResult, MemorySearchResultItem } from '../../src/context/memory-search.js';
+import { PREFERENCE_CONTEXT_END, PREFERENCE_CONTEXT_START } from '../../shared/preference-ingest.js';
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
@@ -146,6 +147,32 @@ describe('TransportSessionRuntime', () => {
     ]);
     // provider.send called only once (for first message)
     expect(mock.provider.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps queued preference context in messagePreamble without changing user-visible text', async () => {
+    runtime.send('first');
+    await flushDispatch();
+    const preferencePreamble = `${PREFERENCE_CONTEXT_START}\n- Use pnpm\n${PREFERENCE_CONTEXT_END}`;
+    expect(runtime.send('second', 'msg-queued-2', undefined, preferencePreamble)).toBe('queued');
+
+    expect(runtime.pendingMessages).toEqual(['second']);
+    expect(runtime.pendingEntries).toEqual([
+      {
+        clientMessageId: 'msg-queued-2',
+        text: 'second',
+        messagePreamble: preferencePreamble,
+      },
+    ]);
+
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'second',
+      assembledMessage: expect.stringContaining('Use pnpm'),
+      messagePreamble: expect.stringContaining('Use pnpm'),
+    }));
   });
 
   it('tracks the active dispatch payload for restart-based replay', async () => {

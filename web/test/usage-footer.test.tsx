@@ -48,6 +48,7 @@ vi.mock('../src/hooks/usePref.js', () => ({
 }));
 
 import { UsageFooter } from '../src/components/UsageFooter.js';
+import { USAGE_CONTEXT_WINDOW_SOURCES } from '@shared/usage-context-window.js';
 
 afterEach(() => {
   cleanup();
@@ -287,6 +288,23 @@ describe('UsageFooter', () => {
     expect(screen.queryByText('stale quota text')).toBeNull();
     expect(screen.getByText(/5h 43% 2m/)).toBeDefined();
     expect(screen.getByText(/7d 34% 1d02h/)).toBeDefined();
+  });
+
+  it('uses provider-sourced context window before model-family inference', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 100_000,
+          cacheTokens: 0,
+          contextWindow: 258_400,
+          contextWindowSource: USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER,
+          model: 'gpt-5.4-mini',
+        }}
+        sessionName="deck_test_brain"
+      />,
+    );
+
+    expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('Context: 100k / 258k (39%)');
   });
 
   // ── Shell / script sessions are not "agents" ────────────────────────────────
