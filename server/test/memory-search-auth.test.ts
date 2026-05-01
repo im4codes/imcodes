@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 
 describe('memory search authorization source guard', () => {
   it('keeps generic memory search gated from owner-private reads unless user-private sync is enabled', () => {
-    const source = readFileSync('server/src/routes/shared-context.ts', 'utf8');
+    const source = readFileSync(new URL('../src/routes/shared-context.ts', import.meta.url), 'utf8');
     const routeStart = source.indexOf("sharedContextRoutes.post('/memory/search'");
     const routeEnd = source.indexOf('type CitationProjectionRow', routeStart);
     expect(routeStart).toBeGreaterThanOrEqual(0);

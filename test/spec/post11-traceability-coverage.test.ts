@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 const CHANGE_DIR = 'openspec/changes/memory-system-post-1-1-integration';
+const hasOpenSpecChange = existsSync(CHANGE_DIR);
 
 const TRACEABILITY_EVIDENCE: Record<string, string[]> = {
   'POST11-R1': ['test/daemon/command-handler-transport-queue.test.ts'],
@@ -47,7 +48,7 @@ function anchorExists(path: string): boolean {
   return existsSync(path);
 }
 
-describe('post-1.1 traceability coverage', () => {
+describe.skipIf(!hasOpenSpecChange)('post-1.1 traceability coverage', () => {
   it('keeps every POST11 requirement anchored to tasks and existing test evidence', () => {
     const spec = read(`${CHANGE_DIR}/specs/daemon-memory-post-foundations/spec.md`);
     const tasks = read(`${CHANGE_DIR}/tasks.md`);

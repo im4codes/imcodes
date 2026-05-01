@@ -1,10 +1,9 @@
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 describe('post-1.1 memory migration coverage', () => {
-  const migration = readFileSync(join(process.cwd(), 'server/src/db/migrations/044_memory_scope_search_citations_org.sql'), 'utf8').toLowerCase();
-  const hardeningMigration = readFileSync(join(process.cwd(), 'server/src/db/migrations/045_memory_post11_hardening.sql'), 'utf8').toLowerCase();
+  const migration = readFileSync(new URL('../src/db/migrations/044_memory_scope_search_citations_org.sql', import.meta.url), 'utf8').toLowerCase();
+  const hardeningMigration = readFileSync(new URL('../src/db/migrations/045_memory_post11_hardening.sql', import.meta.url), 'utf8').toLowerCase();
 
   it('adds nullable fingerprint/origin parity columns for backfillable shared storage', () => {
     expect(migration).toContain('add column if not exists summary_fingerprint text');
