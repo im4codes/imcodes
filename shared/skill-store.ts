@@ -1,5 +1,4 @@
 import { join } from 'node:path';
-import { parse as parseYaml } from 'yaml';
 import {
   validateBuiltinSkillManifest,
   type BuiltinSkillManifestEntry,
@@ -248,6 +247,60 @@ export function normalizeSkillMetadata(
   };
 }
 
+function parseSkillScalar(value: string): unknown {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return '';
+  if (trimmed === 'true') return true;
+  if (trimmed === 'false') return false;
+  if (trimmed === 'null') return null;
+  if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) return Number(trimmed);
+  const singleQuoted = trimmed.match(/^'(.*)'$/s);
+  if (singleQuoted) return singleQuoted[1]?.replace(/''/g, "'") ?? '';
+  const doubleQuoted = trimmed.match(/^"(.*)"$/s);
+  if (doubleQuoted) {
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return doubleQuoted[1] ?? '';
+    }
+  }
+  return trimmed;
+}
+
+function parseSkillFrontMatter(rawFrontMatter: string): Record<string, unknown> {
+  const root: Record<string, unknown> = {};
+  let currentObject: Record<string, unknown> | null = null;
+
+  for (const rawLine of rawFrontMatter.replace(/\r\n?/g, '\n').split('\n')) {
+    const trimmed = rawLine.trim();
+    if (trimmed.length === 0 || trimmed.startsWith('#')) continue;
+    const topLevel = !/^\s/.test(rawLine);
+    const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*)$/);
+    if (!match) {
+      throw new Error(`Invalid skill front matter: unsupported YAML line "${trimmed}"`);
+    }
+    const key = match[1]!;
+    const value = match[2] ?? '';
+    if (topLevel) {
+      if (value.trim().length === 0) {
+        const nested: Record<string, unknown> = {};
+        root[key] = nested;
+        currentObject = nested;
+        continue;
+      }
+      root[key] = parseSkillScalar(value);
+      currentObject = null;
+      continue;
+    }
+    if (!currentObject) {
+      throw new Error(`Invalid skill front matter: nested key "${key}" has no parent`);
+    }
+    currentObject[key] = parseSkillScalar(value);
+  }
+
+  return root;
+}
+
 export function extractSkillFrontMatter(markdown: string): { frontMatter: Record<string, unknown>; content: string } {
   if (!markdown.startsWith(`${SKILL_FRONT_MATTER_DELIMITER}\n`) && !markdown.startsWith(`${SKILL_FRONT_MATTER_DELIMITER}\r\n`)) {
     return { frontMatter: {}, content: markdown };
@@ -261,8 +314,8 @@ export function extractSkillFrontMatter(markdown: string): { frontMatter: Record
   const rawFrontMatter = markdown.slice(SKILL_FRONT_MATTER_DELIMITER.length + lineEnding.length, closeIndex);
   const afterClose = closeIndex + close.length;
   const contentStart = markdown.startsWith(lineEnding, afterClose) ? afterClose + lineEnding.length : afterClose;
-  const parsed = rawFrontMatter.trim().length === 0 ? {} : parseYaml(rawFrontMatter);
-  return { frontMatter: asRecord(parsed ?? {}, 'front matter'), content: markdown.slice(contentStart) };
+  const parsed = rawFrontMatter.trim().length === 0 ? {} : parseSkillFrontMatter(rawFrontMatter);
+  return { frontMatter: asRecord(parsed, 'front matter'), content: markdown.slice(contentStart) };
 }
 
 export function parseSkillMarkdown(

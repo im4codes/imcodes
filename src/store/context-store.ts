@@ -44,9 +44,9 @@ import {
 } from '../../shared/memory-namespace.js';
 import {
   assertValidObservationInput,
-  computeObservationTextHash,
   isObservationClass,
   isObservationState,
+  normalizeObservationText,
   normalizeObservationSourceIds,
   type ContextObservationInput,
   type ObservationClass,
@@ -583,6 +583,10 @@ function namespaceBindingId(binding: Pick<ContextNamespaceBinding, 'localTenant'
 
 function observationIdFor(namespaceId: string, observationClass: ObservationClass, fingerprint: string, textHash: string): string {
   return computeFingerprint(`ctxobs:v1:${namespaceId}:${observationClass}:${fingerprint}:${textHash}`);
+}
+
+function computeObservationTextHash(text: string): string {
+  return `sha256:${computeFingerprint(normalizeObservationText(text))}`;
 }
 
 function normalizeOptional(value: string | undefined): string | null {

@@ -1,6 +1,5 @@
 import type { MemoryOrigin } from './memory-origin.js';
 import type { MemoryScope } from './memory-scope.js';
-import { createHash } from 'node:crypto';
 
 export const OBSERVATION_CLASSES = [
   'fact',
@@ -121,10 +120,6 @@ export function assertObservationContent(observationClass: ObservationClass, con
 
 export function normalizeObservationText(text: string): string {
   return text.trim().replace(/\s+/g, ' ').toLowerCase();
-}
-
-export function computeObservationTextHash(text: string): string {
-  return `sha256:${createHash('sha256').update(normalizeObservationText(text)).digest('hex')}`;
 }
 
 export function normalizeObservationSourceIds(sourceEventIds: readonly string[] | undefined): string[] {
