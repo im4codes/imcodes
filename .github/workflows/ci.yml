@@ -132,7 +132,11 @@ jobs:
       - run: bash ./scripts/ci-npm-ci.sh .
       - run: npm run build
       - name: Run Windows-specific unit tests
-        run: npx vitest run test/agent/wezterm.test.ts test/daemon/hook-send.test.ts test/daemon/env-injection.test.ts test/cli/send.test.ts test/util/windows-daemon.test.ts test/util/windows-upgrade-script.test.ts test/util/windows-launch-artifacts.test.ts test/util/windows-launch-artifacts.cmd-parse.test.ts test/util/windows-stale-watchdog-cleanup.test.ts test/util/postinstall-sharp-repair.test.ts
+        run: npx vitest run test/agent/wezterm.test.ts test/daemon/hook-send.test.ts test/daemon/env-injection.test.ts test/cli/send.test.ts test/util/windows-daemon.test.ts test/util/windows-upgrade-script.test.ts test/util/windows-launch-artifacts.test.ts test/util/windows-launch-artifacts.cmd-parse.test.ts test/util/postinstall-sharp-repair.test.ts
+        env:
+          IMCODES_MUX: wezterm
+      - name: Run Windows process-cleanup regression tests
+        run: npx vitest run test/util/windows-stale-watchdog-cleanup.test.ts
         env:
           IMCODES_MUX: wezterm
 
@@ -148,7 +152,9 @@ jobs:
       - run: bash ./scripts/ci-npm-ci.sh .
       - run: npm run build
       - name: Run Windows ConPTY / startup regression tests
-        run: npx vitest run test/agent/conpty.test.ts test/agent/drivers/drivers.test.ts test/util/windows-daemon.test.ts test/util/windows-upgrade-script.test.ts test/util/windows-launch-artifacts.test.ts test/util/windows-launch-artifacts.cmd-parse.test.ts test/util/windows-stale-watchdog-cleanup.test.ts
+        run: npx vitest run test/agent/conpty.test.ts test/agent/drivers/drivers.test.ts test/util/windows-daemon.test.ts test/util/windows-upgrade-script.test.ts test/util/windows-launch-artifacts.test.ts test/util/windows-launch-artifacts.cmd-parse.test.ts
+      - name: Run Windows ConPTY process-cleanup regression tests
+        run: npx vitest run test/util/windows-stale-watchdog-cleanup.test.ts
   # ── Web frontend tests ────────────────────────────────────────────────────
 
   web-tests-unit:
