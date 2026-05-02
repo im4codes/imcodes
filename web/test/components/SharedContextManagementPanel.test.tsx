@@ -690,7 +690,7 @@ describe('SharedContextManagementPanel', () => {
     await waitFor(() => expect(getPersonalCloudMemoryMock).toHaveBeenCalledWith(expect.any(Object)));
     await waitFor(() => expect(getEnterpriseSharedMemoryMock).toHaveBeenCalledWith('team-1', expect.any(Object)));
 
-    const queryCommand = sent.find((message) => message.type === MEMORY_WS.PERSONAL_QUERY);
+    const queryCommand = [...sent].reverse().find((message) => message.type === MEMORY_WS.PERSONAL_QUERY);
     expect(queryCommand).toBeDefined();
 
     await act(async () => {
@@ -805,7 +805,7 @@ describe('SharedContextManagementPanel', () => {
       fireEvent.click(screen.getByText('sharedContext.management.tabs.memory'));
     });
 
-    const localQuery = sent.find((message) => message.type === MEMORY_WS.PERSONAL_QUERY);
+    const localQuery = [...sent].reverse().find((message) => message.type === MEMORY_WS.PERSONAL_QUERY);
     expect(localQuery).toBeDefined();
 
     await act(async () => {
@@ -864,6 +864,66 @@ describe('SharedContextManagementPanel', () => {
       fireEvent.click(enterpriseDeleteButtons[0]);
     });
     await waitFor(() => expect(deleteEnterpriseSharedMemoryMock).toHaveBeenCalledWith('team-1', 'shared-1'));
+  });
+
+  it('resolves directory-only memory project options through the daemon before using the canonical id', async () => {
+    const sent: Array<Record<string, unknown>> = [];
+    const messageHandlers = new Set<(message: unknown) => void>();
+    const ws = {
+      send(message: Record<string, unknown>) {
+        sent.push(message);
+      },
+      onMessage(handler: (message: unknown) => void) {
+        messageHandlers.add(handler);
+        return () => {
+          messageHandlers.delete(handler);
+        };
+      },
+    };
+
+    render(
+      <SharedContextManagementPanel
+        serverId="srv-1"
+        ws={ws as never}
+        activeProjectDir="/work/repo"
+        memoryProjectCandidates={[{
+          projectDir: '/work/repo',
+          displayName: 'Repo',
+          source: 'active_session',
+        }]}
+      />,
+    );
+    await flush();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.memory'));
+    });
+
+    await waitFor(() => {
+      expect(sent.some((message) => message.type === MEMORY_WS.PROJECT_RESOLVE && message.projectDir === '/work/repo')).toBe(true);
+    });
+    const resolveCommand = [...sent].reverse().find((message) => message.type === MEMORY_WS.PROJECT_RESOLVE);
+    await act(async () => {
+      for (const handler of messageHandlers) handler({
+        type: MEMORY_WS.PROJECT_RESOLVE_RESPONSE,
+        requestId: resolveCommand?.requestId,
+        success: true,
+        status: 'resolved',
+        projectDir: '/work/repo',
+        canonicalRepoId: 'github.com/acme/repo',
+        displayName: 'acme/repo',
+      });
+    });
+
+    await waitFor(() => {
+      const latestPersonalQuery = [...sent].reverse().find((message) => message.type === MEMORY_WS.PERSONAL_QUERY);
+      expect(latestPersonalQuery).toMatchObject({
+        canonicalRepoId: 'github.com/acme/repo',
+        projectId: 'github.com/acme/repo',
+      });
+    });
+    expect(screen.getAllByText('github.com/acme/repo').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('/work/repo').length).toBeGreaterThan(0);
   });
 
 
@@ -987,7 +1047,7 @@ describe('SharedContextManagementPanel', () => {
     expect(await screen.findByText('Test Runner')).toBeDefined();
     expect(await screen.findByText('Use registry hints for skills.')).toBeDefined();
     expect(await screen.findByText('sharedContext.management.memoryFeatureStatusTitle')).toBeDefined();
-    expect(screen.getByLabelText(`${MEMORY_FEATURE_FLAGS_BY_NAME.preferences}: sharedContext.management.memoryFeatureEnabled`)).toBeDefined();
+    expect(screen.getByLabelText('sharedContext.management.memoryFeatureLabel.preferences: sharedContext.management.memoryFeatureEnabled')).toBeDefined();
 
     expect(screen.getByPlaceholderText('sharedContext.management.memoryPreferenceTextPlaceholder')).toBeDefined();
     expect(screen.getByText('sharedContext.management.memoryPreferenceSave')).toBeDefined();

@@ -141,6 +141,7 @@ import { isObservationClass } from '../../shared/memory-observation.js';
 import { SKILL_MAX_BYTES } from '../../shared/skill-envelope.js';
 import { MD_INGEST_FEATURE_FLAG } from '../../shared/md-ingest.js';
 import { MEMORY_MANAGEMENT_ERROR_CODES, type MemoryManagementErrorCode } from '../../shared/memory-management.js';
+import type { MemoryProjectResolutionStatus } from '../../shared/memory-project-options.js';
 import {
   MEMORY_MANAGEMENT_CONTEXT_FIELD,
   isAuthenticatedMemoryManagementContext,
@@ -1284,6 +1285,9 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
       break;
     case MEMORY_WS.PERSONAL_QUERY:
       void handlePersonalMemoryQuery(cmd, serverLink);
+      break;
+    case MEMORY_WS.PROJECT_RESOLVE:
+      void handleMemoryProjectResolve(cmd, serverLink);
       break;
     case MEMORY_WS.FEATURES_QUERY:
       handleMemoryFeaturesQuery(cmd, serverLink);
@@ -6476,6 +6480,115 @@ function handleMemoryFeaturesQuery(cmd: Record<string, unknown>, serverLink: Ser
       disabledBehavior: getMemoryFeatureFlagDefinition(flag).disabledBehavior,
     })),
   });
+}
+
+async function handleMemoryProjectResolve(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = commandString(cmd, 'requestId') || undefined;
+  const projectDir = commandString(cmd, 'projectDir');
+  const claimedCanonicalRepoId = commandCanonicalRepoId(cmd);
+  const send = (payload: {
+    success: boolean;
+    status: MemoryProjectResolutionStatus;
+    projectDir?: string;
+    canonicalRepoId?: string;
+    displayName?: string;
+    error?: string;
+    errorCode?: MemoryManagementErrorCode;
+  }) => {
+    serverLink.send({
+      type: MEMORY_WS.PROJECT_RESOLVE_RESPONSE,
+      requestId,
+      ...payload,
+    });
+  };
+
+  if (!projectDir) {
+    send({
+      success: false,
+      status: 'invalid_dir',
+      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.MISSING_PROJECT_DIR,
+    });
+    return;
+  }
+
+  const knownProjectDirs = new Set(listSessions()
+    .map((session) => session.projectDir?.trim())
+    .filter((value): value is string => Boolean(value)));
+  if (!knownProjectDirs.has(projectDir)) {
+    send({
+      success: false,
+      status: 'unauthorized',
+      projectDir,
+      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.PROJECT_IDENTITY_MISMATCH,
+    });
+    return;
+  }
+
+  const stat = await fsStat(projectDir).catch(() => null);
+  if (!stat?.isDirectory()) {
+    send({
+      success: false,
+      status: 'invalid_dir',
+      projectDir,
+      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.INVALID_PROJECT_DIR,
+    });
+    return;
+  }
+
+  try {
+    const repo = await detectRepo(projectDir);
+    if (!repo.info?.remoteUrl) {
+      const status: MemoryProjectResolutionStatus = repo.status === 'multiple_remotes'
+        ? 'multiple_remotes'
+        : repo.status === 'no_repo'
+          ? 'no_repo'
+          : repo.status === 'unauthorized'
+            ? 'unauthorized'
+            : 'error';
+      send({
+        success: false,
+        status,
+        projectDir,
+        errorCode: status === 'unauthorized'
+          ? MEMORY_MANAGEMENT_ERROR_CODES.PROJECT_IDENTITY_MISMATCH
+          : MEMORY_MANAGEMENT_ERROR_CODES.MISSING_PROJECT_IDENTITY,
+      });
+      return;
+    }
+
+    const canonical = processRecallRepositoryIdentityService.resolve({
+      cwd: projectDir,
+      originUrl: repo.info.remoteUrl,
+    });
+    if (claimedCanonicalRepoId && claimedCanonicalRepoId !== canonical.key) {
+      send({
+        success: false,
+        status: 'mismatch',
+        projectDir,
+        canonicalRepoId: canonical.key,
+        displayName: `${repo.info.owner}/${repo.info.repo}`,
+        errorCode: MEMORY_MANAGEMENT_ERROR_CODES.PROJECT_IDENTITY_MISMATCH,
+      });
+      return;
+    }
+
+    send({
+      success: true,
+      status: 'resolved',
+      projectDir,
+      canonicalRepoId: canonical.key,
+      displayName: `${repo.info.owner}/${repo.info.repo}`,
+    });
+  } catch (error) {
+    logger.warn({ error, projectDir }, 'memory project resolve failed');
+    send({
+      success: false,
+      status: 'error',
+      projectDir,
+      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 }
 
 async function handleMemoryPreferencesQuery(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {

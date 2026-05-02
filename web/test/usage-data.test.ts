@@ -35,4 +35,19 @@ describe('extractLatestUsage', () => {
       },
     });
   });
+
+  it('skips impossible historical cumulative ctx usage snapshots', () => {
+    const usage = extractLatestUsage([
+      makeEvent({ inputTokens: 120_000, cacheTokens: 30_000, contextWindow: 1_000_000, model: 'gpt-5.5' }),
+      makeEvent({ inputTokens: 23_593_691, cacheTokens: 721_072_000, contextWindow: 258_400, contextWindowSource: 'provider' }),
+      makeEvent({ model: 'gpt-5.5' }),
+    ]);
+
+    expect(usage).toMatchObject({
+      inputTokens: 120_000,
+      cacheTokens: 30_000,
+      contextWindow: 1_000_000,
+      model: 'gpt-5.5',
+    });
+  });
 });

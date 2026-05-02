@@ -116,10 +116,11 @@ interface CodexSdkSessionState {
   cancelTimer: ReturnType<typeof setTimeout> | null;
   lastUsage?: {
     /**
-     * Context-bar usage must represent the thread total, not only the last turn.
-     * Codex app-server emits both `last` and `total`; the UI's ctx meter is a
-     * thread-level indicator, so we normalize from `total` when available and
-     * keep the last-turn fields only for diagnostics.
+     * Context-bar usage must represent the current request/window occupancy.
+     * Codex app-server emits both `last` and `total`; `total` is cumulative
+     * usage for the long-running thread and can grow far beyond the live
+     * context window, so provider-neutral fields normalize from `last` when
+     * available and keep cumulative fields only for diagnostics.
      */
     input_tokens: number;
     cache_read_input_tokens: number;
@@ -160,9 +161,9 @@ function normalizeCodexTokenUsage(params: Record<string, any>): CodexSdkSessionS
   const lastCached = finiteNumber(last?.cachedInputTokens);
   const lastOutput = finiteNumber(last?.outputTokens);
 
-  const inputTokens = totalInput ?? lastInput;
-  const cachedTokens = totalCached ?? lastCached;
-  const outputTokens = totalOutput ?? lastOutput;
+  const inputTokens = lastInput ?? totalInput;
+  const cachedTokens = lastCached ?? totalCached;
+  const outputTokens = lastOutput ?? totalOutput;
   if (inputTokens === undefined && cachedTokens === undefined && outputTokens === undefined) return undefined;
   const cachedForUi = cachedTokens ?? 0;
   // Codex/OpenAI-style `inputTokens` includes cached input as a subset
@@ -186,7 +187,7 @@ function normalizeCodexTokenUsage(params: Record<string, any>): CodexSdkSessionS
     ...(finiteNumber(total?.totalTokens) !== undefined ? { total_tokens: finiteNumber(total?.totalTokens)! } : {}),
     ...(finiteNumber(total?.reasoningOutputTokens) !== undefined ? { reasoning_output_tokens: finiteNumber(total?.reasoningOutputTokens)! } : {}),
     ...(modelContextWindow !== undefined && modelContextWindow > 0 ? { model_context_window: modelContextWindow } : {}),
-    ...(inputTokens !== undefined ? { codex_total_input_tokens: inputTokens } : {}),
+    ...(totalInput !== undefined ? { codex_total_input_tokens: totalInput } : {}),
     ...(lastInput !== undefined ? { codex_last_input_tokens: lastInput } : {}),
     ...(lastCached !== undefined ? { codex_last_cached_input_tokens: lastCached } : {}),
     ...(lastOutput !== undefined ? { codex_last_output_tokens: lastOutput } : {}),

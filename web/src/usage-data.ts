@@ -11,8 +11,27 @@ export interface UsageData {
   codexStatus?: CodexStatusSnapshot;
 }
 
+const IMPOSSIBLE_CONTEXT_USAGE_MULTIPLIER = 50;
+
 function isCodexStatusSnapshot(value: unknown): value is CodexStatusSnapshot {
   return !!value && typeof value === 'object' && 'capturedAt' in value;
+}
+
+export function isPlausibleUsagePayload(payload: Record<string, unknown>): boolean {
+  if (typeof payload.inputTokens !== 'number') return false;
+  const inputTokens = payload.inputTokens;
+  const cacheTokens = typeof payload.cacheTokens === 'number' ? payload.cacheTokens : 0;
+  if (!Number.isFinite(inputTokens) || !Number.isFinite(cacheTokens) || inputTokens < 0 || cacheTokens < 0) {
+    return false;
+  }
+  if (typeof payload.contextWindow !== 'number' || !Number.isFinite(payload.contextWindow) || payload.contextWindow <= 0) {
+    return true;
+  }
+  const total = inputTokens + cacheTokens;
+  // Older Codex/Codex-SDK builds accidentally emitted cumulative billing totals
+  // as live ctx usage. Keep historical timelines readable by skipping values
+  // that are orders of magnitude larger than any possible context window.
+  return total <= payload.contextWindow * IMPOSSIBLE_CONTEXT_USAGE_MULTIPLIER;
 }
 
 export function extractLatestUsage(events: TimelineEvent[]): UsageData | null {
@@ -26,8 +45,8 @@ export function extractLatestUsage(events: TimelineEvent[]): UsageData | null {
     if (event.type !== 'usage.update') continue;
     const payload = event.payload as Record<string, unknown>;
 
-    if (!tokensFound && typeof payload.inputTokens === 'number') {
-      usage.inputTokens = payload.inputTokens;
+    if (!tokensFound && isPlausibleUsagePayload(payload)) {
+      usage.inputTokens = payload.inputTokens as number;
       usage.cacheTokens = typeof payload.cacheTokens === 'number' ? payload.cacheTokens : 0;
       usage.contextWindow = typeof payload.contextWindow === 'number' ? payload.contextWindow : 0;
       if (isUsageContextWindowSource(payload.contextWindowSource)) {

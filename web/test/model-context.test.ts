@@ -29,4 +29,8 @@ describe('web model context resolution', () => {
   it('honors provider-sourced explicit context windows when requested', () => {
     expect(resolveContextWindow(258_400, 'gpt-5.4-mini', 1_000_000, { preferExplicit: true })).toBe(258_400);
   });
+
+  it('rejects known stale provider fallback windows for GPT-5.5', () => {
+    expect(resolveContextWindow(258_400, 'gpt-5.5', 1_000_000, { preferExplicit: true })).toBe(922_000);
+  });
 });

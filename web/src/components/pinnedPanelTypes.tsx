@@ -265,6 +265,15 @@ registerPanelType(SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE, {
       serverId={ctx.serverId}
       ws={ctx.ws}
       onEnterpriseChange={(enterpriseId) => ctx.updatePanelProps?.(panel.id, { ...panel.props, enterpriseId })}
+      activeProjectDir={ctx.activeProjectDir ?? null}
+      memoryProjectCandidates={(ctx.sessions ?? [])
+        .filter((session) => Boolean(session.projectDir))
+        .map((session) => ({
+          projectDir: session.projectDir,
+          displayName: session.label || session.project || session.name,
+          sessionName: session.name,
+          source: session.name === ctx.activeSession ? 'active_session' as const : 'recent_session' as const,
+        }))}
     />
   ),
 });

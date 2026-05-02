@@ -20,7 +20,8 @@ import type { SessionInfo } from '../types.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
 import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 import { isTransportRuntime, resolveSubSessionRuntimeType } from '../runtime-type.js';
-import { USAGE_CONTEXT_WINDOW_SOURCES, type UsageContextWindowSource } from '@shared/usage-context-window.js';
+import { extractLatestUsage } from '../usage-data.js';
+import { USAGE_CONTEXT_WINDOW_SOURCES } from '@shared/usage-context-window.js';
 
 const TYPE_ICON: Record<string, string> = {
   'claude-code': '⚡',
@@ -247,12 +248,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   }, [forceFollowLatest]);
 
   const lastUsage = useMemo(() => {
-    for (let i = events.length - 1; i >= 0; i--) {
-      if (events[i].type === 'usage.update' && events[i].payload.inputTokens) {
-        return events[i].payload as { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string };
-      }
-    }
-    return null;
+    return extractLatestUsage(events);
   }, [events]);
 
   // Model may appear in any usage.update event — not only ones with inputTokens

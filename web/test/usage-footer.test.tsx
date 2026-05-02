@@ -307,6 +307,23 @@ describe('UsageFooter', () => {
     expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('Context: 100k / 258k (39%)');
   });
 
+  it('does not let stale Codex provider fallback shrink GPT-5.5 context window', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 100_000,
+          cacheTokens: 0,
+          contextWindow: 258_400,
+          contextWindowSource: USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER,
+          model: 'gpt-5.5',
+        }}
+        sessionName="deck_test_brain"
+      />,
+    );
+
+    expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('Context: 100k / 922k (11%)');
+  });
+
   // ── Shell / script sessions are not "agents" ────────────────────────────────
   //
   // Regression: shell + script terminals fired session.state(running) on any

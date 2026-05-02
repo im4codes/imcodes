@@ -298,7 +298,7 @@ describe('transport-relay (timeline-emitter based)', () => {
       });
     });
 
-    it('emits Codex SDK cumulative context usage instead of last-turn usage', () => {
+    it('emits Codex SDK current-window context usage instead of cumulative billing usage', () => {
       const { provider, fireComplete } = makeMockProvider();
       wireProviderToRelay(provider);
 
@@ -307,10 +307,11 @@ describe('transport-relay (timeline-emitter based)', () => {
         metadata: {
           model: 'gpt-5.4-mini',
           usage: {
-            // CodexSdkProvider normalizes app-server tokenUsage.total into these fields.
-            input_tokens: 105_000,
-            cached_input_tokens: 35_000,
-            cache_read_input_tokens: 35_000,
+            // CodexSdkProvider normalizes app-server tokenUsage.last into the
+            // provider-neutral fields and keeps tokenUsage.total only as diagnostics.
+            input_tokens: 9_000,
+            cached_input_tokens: 3_000,
+            cache_read_input_tokens: 3_000,
             output_tokens: 200,
             model_context_window: 258_400,
             codex_total_input_tokens: 140_000,
@@ -323,13 +324,41 @@ describe('transport-relay (timeline-emitter based)', () => {
       const usageCall = emitMock.mock.calls.find(c => c[1] === 'usage.update');
       expect(usageCall).toBeDefined();
       expect(usageCall![2]).toMatchObject({
-        inputTokens: 105_000,
-        cacheTokens: 35_000,
+        inputTokens: 9_000,
+        cacheTokens: 3_000,
         model: 'gpt-5.4-mini',
         contextWindow: 258_400,
         contextWindowSource: 'provider',
       });
-      expect(Number(usageCall![2].inputTokens) + Number(usageCall![2].cacheTokens)).toBe(140_000);
+      expect(Number(usageCall![2].inputTokens) + Number(usageCall![2].cacheTokens)).toBe(12_000);
+    });
+
+    it('does not let Codex SDK stale provider fallback shrink GPT-5.5 window', () => {
+      const { provider, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireComplete('sess-1', makeMessage({
+        id: 'msg-codex-gpt55-usage',
+        metadata: {
+          model: 'gpt-5.5',
+          usage: {
+            input_tokens: 9_000,
+            cached_input_tokens: 3_000,
+            cache_read_input_tokens: 3_000,
+            model_context_window: 258_400,
+          },
+        },
+      }));
+
+      const usageCall = emitMock.mock.calls.find(c => c[1] === 'usage.update');
+      expect(usageCall).toBeDefined();
+      expect(usageCall![2]).toMatchObject({
+        inputTokens: 9_000,
+        cacheTokens: 3_000,
+        model: 'gpt-5.5',
+        contextWindow: 922_000,
+      });
+      expect(usageCall![2].contextWindowSource).toBeUndefined();
     });
 
     it('falls back to message.content when no accumulator exists', () => {

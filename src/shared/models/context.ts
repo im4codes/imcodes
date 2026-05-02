@@ -78,6 +78,20 @@ function validExplicitContextWindow(value: number | undefined): number | undefin
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
+function isKnownStaleProviderContextWindow(
+  model: string | null | undefined,
+  explicit: number,
+  inferred: number | undefined,
+): boolean {
+  if (inferred === undefined || explicit >= inferred) return false;
+  const m = model?.toLowerCase().trim();
+  if (!m) return false;
+  // Codex app-server currently reports 258400 for GPT-5.5 sessions even when
+  // the selected IM.codes model is GPT-5.5. That is a transport-side fallback,
+  // not the model context limit that should drive the UI ctx meter.
+  return /^gpt-5\.5(?:$|[-_.])/.test(m);
+}
+
 export function resolveContextWindow(
   explicit: number | undefined,
   model?: string | null,
@@ -85,6 +99,10 @@ export function resolveContextWindow(
   options: ResolveContextWindowOptions = {},
 ): number {
   const safeExplicit = validExplicitContextWindow(explicit);
-  if (options.preferExplicit && safeExplicit !== undefined) return safeExplicit;
-  return inferContextWindow(model) ?? safeExplicit ?? fallback;
+  const inferred = inferContextWindow(model);
+  if (options.preferExplicit && safeExplicit !== undefined) {
+    if (isKnownStaleProviderContextWindow(model, safeExplicit, inferred)) return inferred!;
+    return safeExplicit;
+  }
+  return inferred ?? safeExplicit ?? fallback;
 }

@@ -272,18 +272,31 @@ export function parseLine(sessionName: string, line: string, model?: string): vo
   if (pl.type === 'token_count') {
     const total = pl.info?.total_token_usage;
     const last = pl.info?.last_token_usage;
-    const usage = total ?? last;
+    // `total_token_usage` is cumulative for the Codex thread/session and can
+    // grow far beyond the live prompt window. The UI ctx meter must reflect the
+    // current request/window occupancy, so prefer `last_token_usage` whenever it
+    // is available and keep `total` only as a compatibility fallback.
+    const usage = last ?? total;
     if (usage && typeof usage.input_tokens === 'number') {
       const cachedInput = typeof usage.cached_input_tokens === 'number' ? usage.cached_input_tokens : 0;
       const modelContextWindow = typeof pl.info?.model_context_window === 'number' && Number.isFinite(pl.info.model_context_window) && pl.info.model_context_window > 0
         ? pl.info.model_context_window
         : undefined;
+      const contextWindow = resolveContextWindow(
+        modelContextWindow,
+        model,
+        1_000_000,
+        { preferExplicit: modelContextWindow !== undefined },
+      );
+      const contextWindowSource = modelContextWindow !== undefined && contextWindow === modelContextWindow
+        ? USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER
+        : undefined;
       timelineEmitter.emit(sessionName, 'usage.update', {
         inputTokens: Math.max(0, usage.input_tokens - cachedInput),
         cacheTokens: cachedInput,
         outputTokens: usage.output_tokens ?? 0,
-        contextWindow: modelContextWindow ?? resolveContextWindow(undefined, model),
-        ...(modelContextWindow !== undefined ? { contextWindowSource: USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER } : {}),
+        contextWindow,
+        ...(contextWindowSource ? { contextWindowSource } : {}),
         ...(model ? { model } : {}),
       }, { source: 'daemon', confidence: 'high', ...(ts ? { ts } : {}) });
     }

@@ -12,6 +12,11 @@ import {
   type MemoryPreferenceAdminRecord,
   type MemorySkillAdminRecord,
 } from '@shared/memory-management.js';
+import {
+  deriveMemoryProjectCapabilities,
+  type MemoryProjectOption,
+  type MemoryProjectResolutionStatus,
+} from '@shared/memory-project-options.js';
 import { MEMORY_FEATURE_FLAGS_BY_NAME, type MemoryFeatureFlag } from '@shared/feature-flags.js';
 import { AUTHORED_CONTEXT_SCOPES, MEMORY_SCOPES, type AuthoredContextScope, type MemoryScope } from '@shared/memory-scope.js';
 import { OBSERVATION_CLASSES, type ObservationClass } from '@shared/memory-observation.js';
@@ -662,9 +667,11 @@ type ManagementTab = 'enterprise' | 'members' | 'projects' | 'knowledge' | 'proc
 type MemoryTopTab = 'personal' | 'enterprise-memory';
 type MemoryPersonalSubTab = 'unprocessed' | 'processed' | 'cloud';
 type MemoryEnterpriseSubTab = 'shared-memory' | 'authored-context';
+type MemoryToolTab = 'status' | 'preferences' | 'skills' | 'md-ingest' | 'observations';
 type MemoryObservationClassFilter = '' | ObservationClass;
 const MD_INGEST_UI_SCOPES = ['personal', 'project_shared'] as const satisfies readonly MemoryScope[];
 type MemoryAdminRequestSurface =
+  | 'projectResolve'
   | 'features'
   | 'preferences'
   | 'skills'
@@ -682,6 +689,17 @@ interface Props {
   serverId?: string;
   ws?: WsClient | null;
   onEnterpriseChange?: (enterpriseId: string) => void;
+  memoryProjectCandidates?: MemoryProjectCandidate[];
+  activeProjectDir?: string | null;
+}
+
+export interface MemoryProjectCandidate {
+  projectDir?: string;
+  canonicalRepoId?: string;
+  displayName?: string;
+  sessionName?: string;
+  source?: MemoryProjectOption['source'];
+  lastSeenAt?: number;
 }
 
 interface TabDef {
@@ -847,14 +865,15 @@ function featureFlagStatusTextStyle(enabled: boolean | null) {
   };
 }
 
-function FeatureFlagCard({ flag, enabled, statusText }: { flag: string; enabled: boolean | null; statusText: string }) {
-  const label = `${flag}: ${statusText}`;
+function FeatureFlagCard({ flag, label, enabled, statusText }: { flag: string; label: string; enabled: boolean | null; statusText: string }) {
+  const ariaLabel = `${label}: ${statusText}`;
   return (
-    <div style={featureFlagCardStyle(enabled)} title={flag} aria-label={label}>
+    <div style={featureFlagCardStyle(enabled)} title={flag} aria-label={ariaLabel}>
       <span style={{ display: 'flex', alignItems: 'center', gap: 6, color: DT.text.primary, fontSize: SC_IS_MOBILE ? 11 : 12, fontWeight: 600, overflow: 'hidden' }}>
         <span style={featureFlagDotStyle(enabled)} />
-        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: 'ui-monospace, Menlo, monospace', fontSize: SC_IS_MOBILE ? 10 : 11 }}>{flag}</span>
+        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{label}</span>
       </span>
+      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: DT.text.muted, fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 10 }}>{flag}</span>
       <span style={featureFlagStatusTextStyle(enabled)}>{statusText}</span>
     </div>
   );
@@ -1129,12 +1148,47 @@ function getMemoryRecordClassLabel(
   return t('sharedContext.management.memoryDurableCandidate');
 }
 
-export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId, serverId, ws, onEnterpriseChange }: Props) {
+function memoryProjectOptionId(input: Pick<MemoryProjectOption, 'canonicalRepoId' | 'projectDir' | 'displayName'>): string {
+  return input.canonicalRepoId?.trim()
+    || input.projectDir?.trim()
+    || input.displayName.trim();
+}
+
+function projectDirDisplayName(projectDir: string): string {
+  const trimmed = projectDir.trim().replace(/\/+$/, '');
+  const parts = trimmed.split('/');
+  return parts[parts.length - 1] || trimmed;
+}
+
+function mergeMemoryProjectOption(
+  target: Map<string, MemoryProjectOption>,
+  option: MemoryProjectOption,
+): void {
+  const id = memoryProjectOptionId(option);
+  const existing = target.get(id);
+  if (!existing) {
+    target.set(id, { ...option, id });
+    return;
+  }
+  target.set(id, {
+    ...existing,
+    ...option,
+    id,
+    displayName: option.displayName || existing.displayName,
+    canonicalRepoId: option.canonicalRepoId || existing.canonicalRepoId,
+    projectDir: option.projectDir || existing.projectDir,
+    status: option.status === 'resolved' || existing.status !== 'resolved' ? option.status : existing.status,
+    lastSeenAt: Math.max(existing.lastSeenAt ?? 0, option.lastSeenAt ?? 0) || undefined,
+  });
+}
+
+export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId, serverId, ws, onEnterpriseChange, memoryProjectCandidates = [], activeProjectDir }: Props) {
   const { t } = useTranslation();
   const onEnterpriseChangeRef = useRef(onEnterpriseChange);
   onEnterpriseChangeRef.current = onEnterpriseChange;
   const personalMemoryRequestIdRef = useRef<string | null>(null);
   const memoryAdminRequestIdsRef = useRef<Record<MemoryAdminRequestSurface, string | null>>({
+    projectResolve: null,
     features: null,
     preferences: null,
     skills: null,
@@ -1196,6 +1250,10 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [processingPresets, setProcessingPresets] = useState<Array<{ name: string; env: Record<string, string>; contextWindow?: number; initMessage?: string }>>([]);
   const [memoryLoading, setMemoryLoading] = useState(false);
   const [memoryProjectId, setMemoryProjectId] = useState('');
+  const [selectedMemoryProjectId, setSelectedMemoryProjectId] = useState('');
+  const [memoryProjectSearch, setMemoryProjectSearch] = useState('');
+  const [resolvedMemoryProjects, setResolvedMemoryProjects] = useState<Record<string, MemoryProjectOption>>({});
+  const [resolvingMemoryProjectIds, setResolvingMemoryProjectIds] = useState<Set<string>>(new Set());
   const [memoryQuery, setMemoryQuery] = useState('');
   const [memoryProjectionClass, setMemoryProjectionClass] = useState<'' | 'recent_summary' | 'durable_memory_candidate'>('');
   const [localPersonalMemory, setLocalPersonalMemory] = useState<ContextMemoryView>(EMPTY_MEMORY_VIEW);
@@ -1203,6 +1261,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [sharedMemory, setSharedMemory] = useState<ContextMemoryView>(EMPTY_MEMORY_VIEW);
   const [expandedMemoryRecordIds, setExpandedMemoryRecordIds] = useState<Set<string>>(new Set());
   const [memoryTopTab, setMemoryTopTab] = useState<MemoryTopTab>('personal');
+  const [memoryToolTab, setMemoryToolTab] = useState<MemoryToolTab>('status');
   const [memoryPersonalSubTab, setMemoryPersonalSubTab] = useState<MemoryPersonalSubTab>('processed');
   const [memoryEnterpriseSubTab, setMemoryEnterpriseSubTab] = useState<MemoryEnterpriseSubTab>('shared-memory');
   const [showArchived, setShowArchived] = useState(false);
@@ -1212,7 +1271,9 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [preferenceFeatureEnabled, setPreferenceFeatureEnabled] = useState<boolean | null>(null);
   const preferenceUserId = 'server-derived';
   const [preferenceText, setPreferenceText] = useState('');
+  const [preferenceSearch, setPreferenceSearch] = useState('');
   const [skillEntries, setSkillEntries] = useState<MemorySkillAdminRecord[]>([]);
+  const [skillSearch, setSkillSearch] = useState('');
   const [skillsFeatureEnabled, setSkillsFeatureEnabled] = useState<boolean | null>(null);
   const [skillPreview, setSkillPreview] = useState<{ key: string; layer: string; content: string } | null>(null);
   const [memoryAdminProjectDir, setMemoryAdminProjectDir] = useState('');
@@ -1222,6 +1283,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [mdIngestFeatureEnabled, setMdIngestFeatureEnabled] = useState<boolean | null>(null);
   const [mdIngestResult, setMdIngestResult] = useState<{ filesChecked: number; observationsWritten: number } | null>(null);
   const [observationRecords, setObservationRecords] = useState<MemoryObservationAdminRecord[]>([]);
+  const [observationSearch, setObservationSearch] = useState('');
   const [observationStoreFeatureEnabled, setObservationStoreFeatureEnabled] = useState<boolean | null>(null);
   const [observationScope, setObservationScope] = useState<'' | MemoryScope>('');
   const [observationClass, setObservationClass] = useState<MemoryObservationClassFilter>('');
@@ -1456,6 +1518,169 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     { id: 'authored-context' as const, label: t('sharedContext.management.memoryTabAuthoredContext') },
   ], [t, sharedMemory]);
 
+  const memoryProjectOptions = useMemo<MemoryProjectOption[]>(() => {
+    const options = new Map<string, MemoryProjectOption>();
+
+    for (const candidate of memoryProjectCandidates) {
+      const projectDir = candidate.projectDir?.trim();
+      const candidateCanonicalRepoId = candidate.canonicalRepoId?.trim();
+      if (!projectDir && !candidateCanonicalRepoId) continue;
+      const display = candidate.displayName?.trim()
+        || (projectDir ? projectDirDisplayName(projectDir) : candidateCanonicalRepoId ?? '');
+      mergeMemoryProjectOption(options, {
+        id: candidateCanonicalRepoId || projectDir || display,
+        displayName: display,
+        canonicalRepoId: candidateCanonicalRepoId,
+        projectDir,
+        source: candidate.source ?? (projectDir === activeProjectDir ? 'active_session' : 'recent_session'),
+        status: candidateCanonicalRepoId && projectDir ? 'resolved' : projectDir ? 'needs_resolution' : 'canonical_only',
+        lastSeenAt: candidate.lastSeenAt,
+      });
+    }
+
+    for (const project of projects) {
+      if (project.status !== 'active') continue;
+      const canonicalRepoId = project.canonicalRepoId.trim();
+      if (!canonicalRepoId) continue;
+      mergeMemoryProjectOption(options, {
+        id: canonicalRepoId,
+        displayName: project.displayName?.trim() || canonicalRepoId,
+        canonicalRepoId,
+        source: 'enterprise_enrollment',
+        status: 'canonical_only',
+      });
+    }
+
+    for (const option of Object.values(resolvedMemoryProjects)) {
+      mergeMemoryProjectOption(options, option);
+    }
+
+    return Array.from(options.values()).sort((a, b) => {
+      if (a.projectDir === activeProjectDir) return -1;
+      if (b.projectDir === activeProjectDir) return 1;
+      return (b.lastSeenAt ?? 0) - (a.lastSeenAt ?? 0) || a.displayName.localeCompare(b.displayName);
+    });
+  }, [activeProjectDir, memoryProjectCandidates, projects, resolvedMemoryProjects]);
+
+  const selectedMemoryProject = useMemo(
+    () => memoryProjectOptions.find((option) => option.id === selectedMemoryProjectId) ?? null,
+    [memoryProjectOptions, selectedMemoryProjectId],
+  );
+  const selectedMemoryProjectCapabilities = useMemo(
+    () => deriveMemoryProjectCapabilities(selectedMemoryProject),
+    [selectedMemoryProject],
+  );
+  const selectedCanonicalRepoId = selectedMemoryProject?.canonicalRepoId?.trim() || memoryProjectId.trim() || undefined;
+  const selectedProjectDir = selectedMemoryProject?.projectDir?.trim() || memoryAdminProjectDir.trim() || undefined;
+  const selectedMdProjectDir = selectedMemoryProject?.projectDir?.trim() || mdIngestProjectDir.trim() || undefined;
+  const selectedMdCanonicalRepoId = selectedMemoryProject?.canonicalRepoId?.trim() || mdIngestCanonicalRepoId.trim() || memoryProjectId.trim() || undefined;
+
+  const filteredMemoryProjectOptions = useMemo(() => {
+    const needle = memoryProjectSearch.trim().toLowerCase();
+    if (!needle) return memoryProjectOptions;
+    return memoryProjectOptions.filter((option) => [
+      option.displayName,
+      option.canonicalRepoId,
+      option.projectDir,
+      option.source,
+      option.status,
+    ].some((value) => value?.toLowerCase().includes(needle)));
+  }, [memoryProjectOptions, memoryProjectSearch]);
+
+  const filteredPreferenceRecords = useMemo(() => {
+    const needle = preferenceSearch.trim().toLowerCase();
+    if (!needle) return preferenceRecords;
+    return preferenceRecords.filter((record) => [
+      record.text,
+      record.userId,
+      record.state,
+      record.origin,
+      record.fingerprint,
+    ].some((value) => value?.toLowerCase().includes(needle)));
+  }, [preferenceRecords, preferenceSearch]);
+
+  const filteredSkillEntries = useMemo(() => {
+    const needle = skillSearch.trim().toLowerCase();
+    if (!needle) return skillEntries;
+    return skillEntries.filter((entry) => [
+      entry.name,
+      entry.key,
+      entry.layer,
+      entry.category,
+      entry.description,
+      entry.displayPath,
+      entry.uri,
+    ].some((value) => value?.toLowerCase().includes(needle)));
+  }, [skillEntries, skillSearch]);
+
+  const filteredObservationRecords = useMemo(() => {
+    const needle = observationSearch.trim().toLowerCase();
+    if (!needle) return observationRecords;
+    return observationRecords.filter((record) => [
+      record.text,
+      record.scope,
+      record.class,
+      record.origin,
+      record.state,
+      record.namespaceId,
+      record.fingerprint,
+    ].some((value) => value?.toLowerCase().includes(needle)));
+  }, [observationRecords, observationSearch]);
+
+  useEffect(() => {
+    if (selectedMemoryProjectId && memoryProjectOptions.some((option) => option.id === selectedMemoryProjectId)) return;
+    const preferred = memoryProjectOptions.find((option) => option.projectDir === activeProjectDir)
+      ?? memoryProjectOptions.find((option) => option.status === 'resolved')
+      ?? memoryProjectOptions[0];
+    if (preferred) setSelectedMemoryProjectId(preferred.id);
+  }, [activeProjectDir, memoryProjectOptions, selectedMemoryProjectId]);
+
+  const memoryProjectStatusLabel = useCallback((status: MemoryProjectResolutionStatus): string => (
+    t(`sharedContext.management.memoryProjectStatus.${status}`)
+  ), [t]);
+
+  const memoryProjectSourceLabel = useCallback((source: MemoryProjectOption['source']): string => (
+    t(`sharedContext.management.memoryProjectSource.${source}`)
+  ), [t]);
+
+  const memoryFeatureLabel = useCallback((flag: MemoryFeatureFlag): string => {
+    switch (flag) {
+      case MEMORY_FEATURE_FLAGS_BY_NAME.preferences:
+        return t('sharedContext.management.memoryFeatureLabel.preferences');
+      case MEMORY_FEATURE_FLAGS_BY_NAME.mdIngest:
+        return t('sharedContext.management.memoryFeatureLabel.mdIngest');
+      case MEMORY_FEATURE_FLAGS_BY_NAME.skills:
+        return t('sharedContext.management.memoryFeatureLabel.skills');
+      case MEMORY_FEATURE_FLAGS_BY_NAME.skillAutoCreation:
+        return t('sharedContext.management.memoryFeatureLabel.skillAutoCreation');
+      case MEMORY_FEATURE_FLAGS_BY_NAME.observationStore:
+        return t('sharedContext.management.memoryFeatureLabel.observationStore');
+      case MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry:
+        return t('sharedContext.management.memoryFeatureLabel.namespaceRegistry');
+      default:
+        return flag;
+    }
+  }, [t]);
+
+  const resolveMemoryProject = useCallback((option: MemoryProjectOption) => {
+    if (!ws || !option.projectDir) return;
+    const projectDir = option.projectDir.trim();
+    if (!projectDir || resolvingMemoryProjectIds.has(projectDir)) return;
+    const requestId = markMemoryAdminRequest('projectResolve');
+    setResolvingMemoryProjectIds((current) => new Set(current).add(projectDir));
+    ws.send({
+      type: MEMORY_WS.PROJECT_RESOLVE,
+      requestId,
+      projectDir,
+      canonicalRepoId: option.canonicalRepoId?.trim() || undefined,
+    });
+  }, [markMemoryAdminRequest, resolvingMemoryProjectIds, ws]);
+
+  useEffect(() => {
+    if (!selectedMemoryProject || selectedMemoryProject.status !== 'needs_resolution') return;
+    resolveMemoryProject(selectedMemoryProject);
+  }, [resolveMemoryProject, selectedMemoryProject]);
+
   const refreshEnterpriseData = useCallback(async (nextEnterpriseId = enterpriseId) => {
     if (!nextEnterpriseId) {
       setTeam(null);
@@ -1644,7 +1869,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     setError(null);
     try {
       const queryInput = {
-        projectId: memoryProjectId.trim() || undefined,
+        projectId: selectedCanonicalRepoId,
         projectionClass: memoryProjectionClass || undefined,
         query: memoryQuery.trim() || undefined,
         limit: 25,
@@ -1655,7 +1880,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         ws.send({
           type: MEMORY_WS.PERSONAL_QUERY,
           requestId,
-          canonicalRepoId: memoryProjectId.trim() || undefined,
+          canonicalRepoId: selectedCanonicalRepoId,
           ...queryInput,
           includeArchived: showArchived,
         });
@@ -1667,7 +1892,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
 
       if (enterpriseId) {
         setSharedMemory(normalizeMemoryView(await getEnterpriseSharedMemory(enterpriseId, {
-          canonicalRepoId: memoryProjectId.trim() || undefined,
+          canonicalRepoId: selectedCanonicalRepoId,
           projectionClass: memoryProjectionClass || undefined,
           query: memoryQuery.trim() || undefined,
           limit: 25,
@@ -1680,12 +1905,12 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     } finally {
       setMemoryLoading(false);
     }
-  }, [enterpriseId, memoryProjectId, memoryProjectionClass, memoryQuery, serverId, ws, showArchived]);
+  }, [enterpriseId, memoryProjectionClass, memoryQuery, selectedCanonicalRepoId, ws, showArchived]);
 
   const loadMemoryAdminViews = useCallback(() => {
     if (!ws) return;
-    const projectDir = memoryAdminProjectDir.trim() || undefined;
-    const canonicalRepoId = memoryProjectId.trim() || undefined;
+    const projectDir = selectedProjectDir;
+    const canonicalRepoId = selectedCanonicalRepoId;
     ws.send({ type: MEMORY_WS.FEATURES_QUERY, requestId: markMemoryAdminRequest('features') });
     ws.send({ type: MEMORY_WS.PREF_QUERY, requestId: markMemoryAdminRequest('preferences') });
     ws.send({ type: MEMORY_WS.SKILL_QUERY, requestId: markMemoryAdminRequest('skills'), projectDir, canonicalRepoId });
@@ -1698,11 +1923,59 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       class: observationClass || undefined,
       limit: 50,
     });
-  }, [markMemoryAdminRequest, memoryAdminProjectDir, memoryProjectId, observationClass, observationScope, ws]);
+  }, [markMemoryAdminRequest, observationClass, observationScope, selectedCanonicalRepoId, selectedProjectDir, ws]);
 
   useEffect(() => {
     if (!ws) return;
     return ws.onMessage((msg) => {
+      if (msg.type === MEMORY_WS.PROJECT_RESOLVE_RESPONSE) {
+        const resolveMsg = msg as unknown as {
+          requestId?: string;
+          success: boolean;
+          projectDir?: string;
+          canonicalRepoId?: string;
+          displayName?: string;
+          status?: MemoryProjectResolutionStatus;
+          error?: string;
+          errorCode?: MemoryManagementErrorCode;
+        };
+        if (!isCurrentMemoryAdminResponse('projectResolve', resolveMsg.requestId)) return;
+        const projectDir = resolveMsg.projectDir?.trim();
+        const canonicalRepoId = resolveMsg.canonicalRepoId?.trim();
+        const displayName = resolveMsg.displayName?.trim()
+          || (projectDir ? projectDirDisplayName(projectDir) : canonicalRepoId)
+          || t('sharedContext.management.memoryProjectUnknown');
+        if (projectDir) {
+          setResolvingMemoryProjectIds((current) => {
+            const next = new Set(current);
+            next.delete(projectDir);
+            return next;
+          });
+        }
+        const option: MemoryProjectOption = {
+          id: canonicalRepoId || projectDir || displayName,
+          displayName,
+          canonicalRepoId,
+          projectDir,
+          source: 'resolved_directory',
+          status: resolveMsg.status ?? (resolveMsg.success ? 'resolved' : 'error'),
+          lastSeenAt: Date.now(),
+        };
+        const key = projectDir || canonicalRepoId || option.id;
+        setResolvedMemoryProjects((current) => ({ ...current, [key]: option }));
+        if (resolveMsg.success && canonicalRepoId) {
+          setSelectedMemoryProjectId(memoryProjectOptionId(option));
+          setMemoryProjectId(canonicalRepoId);
+          if (projectDir) {
+            setMemoryAdminProjectDir(projectDir);
+            setMdIngestProjectDir(projectDir);
+          }
+          setMdIngestCanonicalRepoId(canonicalRepoId);
+        } else {
+          setError(memoryAdminErrorMessage(resolveMsg.errorCode, resolveMsg.error));
+        }
+        return;
+      }
       if (msg.type === MEMORY_WS.FEATURES_RESPONSE) {
         if (!isCurrentMemoryAdminResponse('features', msg.requestId)) return;
         const records = msg.records ?? [];
@@ -1806,24 +2079,24 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const handleMemoryArchive = useCallback((id: string) => {
     if (!ws) return;
     const requestId = crypto.randomUUID();
-    ws.send({ type: MEMORY_WS.ARCHIVE, requestId, id, canonicalRepoId: memoryProjectId.trim() || undefined });
+    ws.send({ type: MEMORY_WS.ARCHIVE, requestId, id, canonicalRepoId: selectedCanonicalRepoId });
     const unsub = ws.onMessage((msg) => {
       if (msg.type !== MEMORY_WS.ARCHIVE_RESPONSE || msg.requestId !== requestId) return;
       unsub();
       if (msg.success) void loadMemoryViews();
     });
-  }, [ws, loadMemoryViews, memoryProjectId]);
+  }, [ws, loadMemoryViews, selectedCanonicalRepoId]);
 
   const handleMemoryRestore = useCallback((id: string) => {
     if (!ws) return;
     const requestId = crypto.randomUUID();
-    ws.send({ type: MEMORY_WS.RESTORE, requestId, id, canonicalRepoId: memoryProjectId.trim() || undefined });
+    ws.send({ type: MEMORY_WS.RESTORE, requestId, id, canonicalRepoId: selectedCanonicalRepoId });
     const unsub = ws.onMessage((msg) => {
       if (msg.type !== MEMORY_WS.RESTORE_RESPONSE || msg.requestId !== requestId) return;
       unsub();
       if (msg.success) void loadMemoryViews();
     });
-  }, [ws, loadMemoryViews, memoryProjectId]);
+  }, [ws, loadMemoryViews, selectedCanonicalRepoId]);
 
 
   const confirmMemoryDelete = useCallback((recordId: string) => {
@@ -1844,7 +2117,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const handleLocalMemoryDelete = useCallback((id: string) => {
     if (!ws || !confirmMemoryDelete(id)) return;
     const requestId = crypto.randomUUID();
-    ws.send({ type: MEMORY_WS.DELETE, requestId, id, canonicalRepoId: memoryProjectId.trim() || undefined });
+    ws.send({ type: MEMORY_WS.DELETE, requestId, id, canonicalRepoId: selectedCanonicalRepoId });
     const unsub = ws.onMessage((msg) => {
       if (msg.type !== MEMORY_WS.DELETE_RESPONSE || msg.requestId !== requestId) return;
       unsub();
@@ -1852,7 +2125,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       if (msg.success) void loadMemoryViews();
       else setError(msg.error || t('sharedContext.management.memoryDeleteFailed'));
     });
-  }, [confirmMemoryDelete, finishMemoryDelete, loadMemoryViews, memoryProjectId, t, ws]);
+  }, [confirmMemoryDelete, finishMemoryDelete, loadMemoryViews, selectedCanonicalRepoId, t, ws]);
 
   const handleCloudMemoryDelete = useCallback(async (id: string) => {
     if (!confirmMemoryDelete(id)) return;
@@ -1932,6 +2205,105 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       return nextBackend;
     });
   }, []);
+
+  const renderMemoryProjectPicker = () => (
+    <div style={{ ...resourceCardStyle, gap: DT.space.sm }}>
+      <SectionHeading
+        title={t('sharedContext.management.memoryProjectPickerTitle')}
+        description={t('sharedContext.management.memoryProjectPickerDescription')}
+      />
+      <div style={adminFormRowStyle}>
+        <input
+          value={memoryProjectSearch}
+          onInput={(e) => setMemoryProjectSearch((e.currentTarget as HTMLInputElement).value)}
+          placeholder={t('sharedContext.management.memoryProjectSearchPlaceholder')}
+          aria-label={t('sharedContext.management.memoryProjectSearchPlaceholder')}
+          style={inputStyle}
+        />
+        {selectedMemoryProject ? (
+          <span style={pillStyle}>
+            {t('sharedContext.management.memoryProjectSelected')}: {selectedMemoryProject.displayName}
+          </span>
+        ) : null}
+      </div>
+      <div style={{ ...resourceListStyle, maxHeight: 220, overflowY: 'auto' }}>
+        {filteredMemoryProjectOptions.length > 0 ? filteredMemoryProjectOptions.map((option) => {
+          const active = selectedMemoryProject?.id === option.id;
+          const resolving = Boolean(option.projectDir && resolvingMemoryProjectIds.has(option.projectDir));
+          return (
+            <button
+              key={option.id}
+              type="button"
+              style={{
+                ...resourceCardStyle,
+                textAlign: 'left',
+                cursor: 'pointer',
+                border: active ? `1px solid ${DT.text.accent}` : resourceCardStyle.border,
+                background: active ? 'rgba(37,99,235,0.12)' : resourceCardStyle.background,
+              }}
+              onClick={() => {
+                setSelectedMemoryProjectId(option.id);
+                if (option.canonicalRepoId) setMemoryProjectId(option.canonicalRepoId);
+                if (option.projectDir) {
+                  setMemoryAdminProjectDir(option.projectDir);
+                  setMdIngestProjectDir(option.projectDir);
+                }
+                if (option.canonicalRepoId) setMdIngestCanonicalRepoId(option.canonicalRepoId);
+                if (option.status === 'needs_resolution') resolveMemoryProject(option);
+              }}
+            >
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap' }}>
+                <strong style={{ color: DT.text.primary }}>{option.displayName}</strong>
+                <span style={pillStyle}>{memoryProjectStatusLabel(resolving ? 'needs_resolution' : option.status)}</span>
+              </div>
+              <div style={metaGridStyle}>
+                <MetaCard label={t('sharedContext.management.memoryProjectCanonicalId')} value={option.canonicalRepoId || '—'} />
+                <MetaCard label={t('sharedContext.management.memoryProjectDirectory')} value={option.projectDir || '—'} />
+                <MetaCard label={t('sharedContext.management.memoryProjectSourceLabel')} value={memoryProjectSourceLabel(option.source)} />
+              </div>
+              {option.status === 'needs_resolution' || resolving ? (
+                <div style={helperTextStyle}>{resolving ? t('sharedContext.management.memoryProjectResolving') : t('sharedContext.management.memoryProjectNeedsResolve')}</div>
+              ) : null}
+              {option.status === 'canonical_only' ? (
+                <div style={helperTextStyle}>{t('sharedContext.management.memoryProjectCanonicalOnlyNotice')}</div>
+              ) : null}
+            </button>
+          );
+        }) : (
+          <div style={helperTextStyle}>{t('sharedContext.management.memoryProjectEmpty')}</div>
+        )}
+      </div>
+      <details style={{ color: DT.text.secondary }}>
+        <summary style={{ cursor: 'pointer' }}>{t('sharedContext.management.memoryProjectAdvanced')}</summary>
+        <div style={{ ...adminFormRowStyle, marginTop: DT.space.sm }}>
+          <input
+            value={memoryProjectId}
+            onInput={(e) => {
+              const next = (e.currentTarget as HTMLInputElement).value;
+              setMemoryProjectId(next);
+              setMdIngestCanonicalRepoId(next);
+            }}
+            placeholder={t('sharedContext.management.memoryProjectPlaceholder')}
+            style={inputStyle}
+          />
+          <input
+            value={memoryAdminProjectDir}
+            onInput={(e) => {
+              const next = (e.currentTarget as HTMLInputElement).value;
+              setMemoryAdminProjectDir(next);
+              setMdIngestProjectDir(next);
+            }}
+            placeholder={t('sharedContext.management.memoryProjectDirPlaceholder')}
+            style={inputStyle}
+          />
+        </div>
+        <div style={helperTextStyle}>{t('sharedContext.management.memoryProjectAdvancedDescription')}</div>
+      </details>
+      {selectedMemoryProject && !selectedMemoryProjectCapabilities.canRunLocalTools ? (
+        <div style={memoryProcessedNoteStyle}>{t('sharedContext.management.memoryProjectLocalToolsDisabled')}</div>
+      ) : null}
+    </div>
+  );
 
   return (
     <div style={shellStyle}>
@@ -2890,13 +3262,8 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
               description={t('sharedContext.management.memoryQueryDescription')}
               action={<button style={buttonStyle} onClick={() => void loadMemoryViews()}>{t('sharedContext.refresh')}</button>}
             />
+            {renderMemoryProjectPicker()}
             <div style={rowStyle}>
-              <input
-                value={memoryProjectId}
-                onInput={(e) => setMemoryProjectId((e.currentTarget as HTMLInputElement).value)}
-                placeholder={t('sharedContext.management.memoryProjectPlaceholder')}
-                style={inputStyle}
-              />
               <input
                 value={memoryQuery}
                 onInput={(e) => setMemoryQuery((e.currentTarget as HTMLInputElement).value)}
@@ -2919,12 +3286,30 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
 
           <div style={sectionStyle}>
             <SectionHeading
-              title={t('sharedContext.management.memoryPost11AdminTitle')}
-              description={t('sharedContext.management.memoryPost11AdminDescription')}
+              title={t('sharedContext.management.memoryToolsTitle')}
+              description={t('sharedContext.management.memoryToolsDescription')}
               action={<button style={subtleButtonStyle} onClick={() => loadMemoryAdminViews()} disabled={!ws}>{t('sharedContext.refresh')}</button>}
             />
             {!ws ? <div style={helperTextStyle}>{t('sharedContext.management.memoryAdminDaemonRequired')}</div> : null}
-            <div style={resourceCardStyle}>
+            <div style={tabBarStyle}>
+              {[
+                { id: 'status' as const, label: t('sharedContext.management.memoryToolTabStatus') },
+                { id: 'preferences' as const, label: t('sharedContext.management.memoryToolTabPreferences'), count: preferenceRecords.length },
+                { id: 'skills' as const, label: t('sharedContext.management.memoryToolTabSkills'), count: skillEntries.length },
+                { id: 'md-ingest' as const, label: t('sharedContext.management.memoryToolTabMdIngest') },
+                { id: 'observations' as const, label: t('sharedContext.management.memoryToolTabObservations'), count: observationRecords.length },
+              ].map((tab) => (
+                <button
+                  key={tab.id}
+                  type="button"
+                  style={memoryToolTab === tab.id ? tabActiveStyle : tabStyle}
+                  onClick={() => setMemoryToolTab(tab.id)}
+                >
+                  {tab.label}{tab.count != null ? <span style={tabBadgeStyle}>{tab.count}</span> : null}
+                </button>
+              ))}
+            </div>
+            <div style={{ ...resourceCardStyle, display: memoryToolTab === 'status' ? 'flex' : 'none' }}>
               <SectionHeading
                 title={t('sharedContext.management.memoryFeatureStatusTitle')}
                 description={t('sharedContext.management.memoryFeatureStatusDescription')}
@@ -2941,13 +3326,13 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                   const enabled = memoryFeatureEnabled(flag);
                   const statusText = memoryFeatureStatusText(enabled);
                   return (
-                    <FeatureFlagCard key={flag} flag={flag} enabled={enabled} statusText={statusText} />
+                    <FeatureFlagCard key={flag} flag={flag} label={memoryFeatureLabel(flag)} enabled={enabled} statusText={statusText} />
                   );
                 })}
               </div>
             </div>
-            <div style={cardGridStyle}>
-              <div style={adminSubCardStyle(preferenceFeatureEnabled)}>
+            <div style={{ ...cardGridStyle, display: memoryToolTab === 'preferences' || memoryToolTab === 'skills' ? 'grid' : 'none' }}>
+              <div style={{ ...adminSubCardStyle(preferenceFeatureEnabled), display: memoryToolTab === 'preferences' ? 'flex' : 'none' }}>
                 <SectionHeading
                   title={t('sharedContext.management.memoryPreferencesTitle')}
                   description={t('sharedContext.management.memoryPreferencesDescription')}
@@ -2992,8 +3377,14 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     {t('sharedContext.management.memoryPreferenceSave')}
                   </button>
                 </div>
+                <input
+                  value={preferenceSearch}
+                  onInput={(e) => setPreferenceSearch((e.currentTarget as HTMLInputElement).value)}
+                  placeholder={t('sharedContext.management.memoryPreferenceSearchPlaceholder')}
+                  style={inputStyle}
+                />
                 <div style={resourceListStyle}>
-                  {preferenceRecords.length > 0 ? preferenceRecords.map((record) => (
+                  {filteredPreferenceRecords.length > 0 ? filteredPreferenceRecords.map((record) => (
                     <div key={record.id} style={resourceCardStyle}>
                       <div style={metaGridStyle}>
                         <MetaCard label={t('sharedContext.management.memoryPreferenceUser')} value={record.userId} />
@@ -3035,7 +3426,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 </div>
               </div>
 
-              <div style={adminSubCardStyle(skillsFeatureEnabled)}>
+              <div style={{ ...adminSubCardStyle(skillsFeatureEnabled), display: memoryToolTab === 'skills' ? 'flex' : 'none' }}>
                 <SectionHeading
                   title={t('sharedContext.management.memorySkillsTitle')}
                   description={t('sharedContext.management.memorySkillsDescription')}
@@ -3066,19 +3457,28 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                   <button
                     type="button"
                     style={buttonStyle}
-                    disabled={!ws || skillsFeatureEnabled !== true}
+                    disabled={!ws || skillsFeatureEnabled !== true || !selectedProjectDir || !selectedCanonicalRepoId}
                     onClick={() => ws?.send({
                       type: MEMORY_WS.SKILL_REBUILD,
                       requestId: markMemoryAdminRequest('skillRebuild'),
-                      projectDir: memoryAdminProjectDir.trim() || undefined,
-                      canonicalRepoId: memoryProjectId.trim() || undefined,
+                      projectDir: selectedProjectDir,
+                      canonicalRepoId: selectedCanonicalRepoId,
                     })}
                   >
                     {t('sharedContext.management.memorySkillRebuildRegistry')}
                   </button>
                 </div>
+                <input
+                  value={skillSearch}
+                  onInput={(e) => setSkillSearch((e.currentTarget as HTMLInputElement).value)}
+                  placeholder={t('sharedContext.management.memorySkillSearchPlaceholder')}
+                  style={inputStyle}
+                />
+                {!selectedMemoryProjectCapabilities.canRunLocalTools ? (
+                  <div style={helperTextStyle}>{t('sharedContext.management.memoryProjectLocalToolsDisabled')}</div>
+                ) : null}
                 <div style={resourceListStyle}>
-                  {skillEntries.length > 0 ? skillEntries.map((entry) => (
+                  {filteredSkillEntries.length > 0 ? filteredSkillEntries.map((entry) => (
                     <div key={`${entry.layer}:${entry.key}:${entry.displayPath}`} style={resourceCardStyle}>
                       <div style={metaGridStyle}>
                         <MetaCard label={t('sharedContext.management.memorySkillName')} value={entry.name} />
@@ -3091,14 +3491,14 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                         <button
                           type="button"
                           style={subtleButtonStyle}
-                          disabled={skillsFeatureEnabled !== true}
+                          disabled={skillsFeatureEnabled !== true || !selectedProjectDir || !selectedCanonicalRepoId}
                           onClick={() => ws?.send({
                             type: MEMORY_WS.SKILL_READ,
                             requestId: markMemoryAdminRequest('skillRead'),
                             key: entry.key,
                             layer: entry.layer,
-                            projectDir: memoryAdminProjectDir.trim() || undefined,
-                            canonicalRepoId: memoryProjectId.trim() || undefined,
+                            projectDir: selectedProjectDir,
+                            canonicalRepoId: selectedCanonicalRepoId,
                           })}
                         >
                           {t('sharedContext.management.memorySkillPreview')}
@@ -3106,7 +3506,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                         <button
                           type="button"
                           style={deleteButtonStyle}
-                          disabled={skillsFeatureEnabled !== true}
+                          disabled={skillsFeatureEnabled !== true || !selectedProjectDir || !selectedCanonicalRepoId}
                           onClick={() => {
                             const confirmed = globalThis.confirm?.(t('sharedContext.management.memorySkillDeleteConfirm')) ?? true;
                             if (!confirmed) return;
@@ -3115,8 +3515,8 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                               requestId: markMemoryAdminRequest('skillDelete'),
                               key: entry.key,
                               layer: entry.layer,
-                              projectDir: memoryAdminProjectDir.trim() || undefined,
-                              canonicalRepoId: memoryProjectId.trim() || undefined,
+                              projectDir: selectedProjectDir,
+                              canonicalRepoId: selectedCanonicalRepoId,
                             });
                           }}
                         >
@@ -3139,8 +3539,8 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
               </div>
             </div>
 
-            <div style={cardGridStyle}>
-              <div style={adminSubCardStyle(mdIngestFeatureEnabled)}>
+            <div style={{ ...cardGridStyle, display: memoryToolTab === 'md-ingest' || memoryToolTab === 'observations' ? 'grid' : 'none' }}>
+              <div style={{ ...adminSubCardStyle(mdIngestFeatureEnabled), display: memoryToolTab === 'md-ingest' ? 'flex' : 'none' }}>
                 <SectionHeading
                   title={t('sharedContext.management.memoryMdIngestTitle')}
                   description={t('sharedContext.management.memoryMdIngestDescription')}
@@ -3177,12 +3577,12 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                   <button
                     type="button"
                     style={buttonStyle}
-                    disabled={!ws || mdIngestFeatureEnabled !== true || !mdIngestProjectDir.trim() || !mdIngestCanonicalRepoId.trim() || (mdIngestScope !== 'personal' && mdIngestScope !== 'project_shared')}
+                    disabled={!ws || mdIngestFeatureEnabled !== true || !selectedMdProjectDir || !selectedMdCanonicalRepoId || (mdIngestScope !== 'personal' && mdIngestScope !== 'project_shared')}
                     onClick={() => ws?.send({
                       type: MEMORY_WS.MD_INGEST_RUN,
                       requestId: markMemoryAdminRequest('mdIngest'),
-                      projectDir: mdIngestProjectDir.trim(),
-                      canonicalRepoId: mdIngestCanonicalRepoId.trim(),
+                      projectDir: selectedMdProjectDir,
+                      canonicalRepoId: selectedMdCanonicalRepoId,
                       scope: mdIngestScope,
                     })}
                   >
@@ -3197,7 +3597,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 ) : <div style={helperTextStyle}>{t('sharedContext.management.memoryMdIngestEmpty')}</div>}
               </div>
 
-              <div style={adminSubCardStyle(observationStoreFeatureEnabled)}>
+              <div style={{ ...adminSubCardStyle(observationStoreFeatureEnabled), display: memoryToolTab === 'observations' ? 'flex' : 'none' }}>
                 <SectionHeading
                   title={t('sharedContext.management.memoryObservationsTitle')}
                   description={t('sharedContext.management.memoryObservationsDescription')}
@@ -3243,8 +3643,14 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     {t('sharedContext.refresh')}
                   </button>
                 </div>
+                <input
+                  value={observationSearch}
+                  onInput={(e) => setObservationSearch((e.currentTarget as HTMLInputElement).value)}
+                  placeholder={t('sharedContext.management.memoryObservationSearchPlaceholder')}
+                  style={inputStyle}
+                />
                 <div style={resourceListStyle}>
-                  {observationRecords.length > 0 ? observationRecords.map((record) => (
+                  {filteredObservationRecords.length > 0 ? filteredObservationRecords.map((record) => (
                     <div key={record.id} style={resourceCardStyle}>
                       <div style={metaGridStyle}>
                         <MetaCard label={t('sharedContext.management.memoryRecordClass')} value={t(`sharedContext.management.memoryObservationClass.${record.class}`)} />
@@ -3272,13 +3678,13 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                         <button
                           type="button"
                           style={subtleButtonStyle}
-                          disabled={observationStoreFeatureEnabled !== true}
+                          disabled={observationStoreFeatureEnabled !== true || !selectedProjectDir || !selectedCanonicalRepoId}
                           onClick={() => ws?.send({
                             type: MEMORY_WS.OBSERVATION_PROMOTE,
                             requestId: markMemoryAdminRequest('observationPromote'),
                             id: record.id,
-                            projectDir: memoryAdminProjectDir.trim() || undefined,
-                            canonicalRepoId: memoryProjectId.trim() || undefined,
+                            projectDir: selectedProjectDir,
+                            canonicalRepoId: selectedCanonicalRepoId,
                             expectedFromScope: record.scope,
                             toScope: promotionTargetScope,
                             reason: promotionReason.trim() || undefined,

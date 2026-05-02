@@ -95,12 +95,21 @@ function normalizeUsageUpdatePayload(
   const explicitContextWindow = typeof usage?.model_context_window === 'number' && Number.isFinite(usage.model_context_window) && usage.model_context_window > 0
     ? usage.model_context_window
     : undefined;
+  const contextWindow = resolveContextWindow(
+    explicitContextWindow ?? presetCtx,
+    model,
+    1_000_000,
+    { preferExplicit: explicitContextWindow !== undefined },
+  );
+  const contextWindowSource = explicitContextWindow !== undefined && contextWindow === explicitContextWindow
+    ? USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER
+    : undefined;
   const payload: Record<string, unknown> = {
     ...(typeof inputTokens === 'number' ? { inputTokens } : {}),
     ...(typeof cacheTokens === 'number' ? { cacheTokens } : {}),
     ...(model ? { model } : {}),
-    contextWindow: explicitContextWindow ?? resolveContextWindow(presetCtx, model),
-    ...(explicitContextWindow !== undefined ? { contextWindowSource: USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER } : {}),
+    contextWindow,
+    ...(contextWindowSource ? { contextWindowSource } : {}),
   };
   return payload;
 }

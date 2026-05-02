@@ -250,10 +250,10 @@ describe('CodexSdkProvider', () => {
     expect(deltas).toEqual(['O', 'OK']);
     expect(completed).toEqual(['OK']);
     expect(completedMessages[0]?.metadata?.usage).toMatchObject({
-      input_tokens: 10,
-      cache_read_input_tokens: 20,
-      cached_input_tokens: 20,
-      output_tokens: 5,
+      input_tokens: 2,
+      cache_read_input_tokens: 1,
+      cached_input_tokens: 1,
+      output_tokens: 2,
       total_tokens: 55,
       reasoning_output_tokens: 4,
       model_context_window: 258400,

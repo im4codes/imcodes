@@ -18,6 +18,7 @@ import type {
   MemoryPreferenceAdminRecord,
   MemorySkillAdminRecord,
 } from '@shared/memory-management.js';
+import type { MemoryProjectResolveResponsePayload } from '@shared/memory-project-options.js';
 import {
   MSG_COMMAND_FAILED,
   MSG_DAEMON_ONLINE,
@@ -132,6 +133,7 @@ export type ServerMessage =
   | { type: typeof MEMORY_WS.ARCHIVE_RESPONSE; requestId?: string; success: boolean; error?: string }
   | { type: typeof MEMORY_WS.RESTORE_RESPONSE; requestId?: string; success: boolean; error?: string }
   | { type: typeof MEMORY_WS.DELETE_RESPONSE; requestId?: string; success: boolean; error?: string }
+  | ({ type: typeof MEMORY_WS.PROJECT_RESOLVE_RESPONSE } & MemoryProjectResolveResponsePayload)
   | { type: typeof MEMORY_WS.FEATURES_RESPONSE; requestId?: string; records: MemoryFeatureAdminRecord[] }
   | { type: typeof MEMORY_WS.PREF_RESPONSE; requestId?: string; records: MemoryPreferenceAdminRecord[]; featureEnabled?: boolean }
   | { type: typeof MEMORY_WS.PREF_CREATE_RESPONSE; requestId?: string; success: boolean; id?: string; error?: string; errorCode?: MemoryManagementErrorCode }

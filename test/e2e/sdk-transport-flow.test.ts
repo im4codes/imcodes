@@ -1355,9 +1355,9 @@ describe('sdk transport flow e2e', () => {
     expect(streaming[0]?.opts?.eventId).toBe(`transport:${SESSION_CX}:msg-codex-e2e`);
     expect(final?.payload.text).toBe('Codex: hello');
     expect(final?.opts?.eventId).toBe(`transport:${SESSION_CX}:msg-codex-e2e`);
-    expect(usage?.payload.inputTokens).toBe(50);
-    expect(usage?.payload.cacheTokens).toBe(20);
-    expect(Number(usage?.payload.inputTokens) + Number(usage?.payload.cacheTokens)).toBe(70);
+    expect(usage?.payload.inputTokens).toBe(5);
+    expect(usage?.payload.cacheTokens).toBe(2);
+    expect(Number(usage?.payload.inputTokens) + Number(usage?.payload.cacheTokens)).toBe(7);
     expect(usage?.payload.contextWindow).toBe(1000000);
     expect(usage?.payload.contextWindowSource).toBe('provider');
     expect(toolCall?.payload.tool).toBe('Bash');

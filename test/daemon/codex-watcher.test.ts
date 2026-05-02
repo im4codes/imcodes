@@ -219,7 +219,7 @@ describe('parseLine — ignored line types', () => {
     expect(timelineEmitter.emit).not.toHaveBeenCalled();
   });
 
-  it('emits cumulative token_count usage with provider-sourced context window', () => {
+  it('emits current-window token_count usage with provider-sourced context window', () => {
     parseLine('session-c', tokenCountLine({
       total_token_usage: {
         input_tokens: 140_000,
@@ -241,8 +241,8 @@ describe('parseLine — ignored line types', () => {
       'session-c',
       'usage.update',
       expect.objectContaining({
-        inputTokens: 105_000,
-        cacheTokens: 35_000,
+        inputTokens: 9_000,
+        cacheTokens: 3_000,
         outputTokens: 2,
         contextWindow: 258_400,
         contextWindowSource: 'provider',
@@ -250,6 +250,39 @@ describe('parseLine — ignored line types', () => {
       }),
       expect.objectContaining({ source: 'daemon', confidence: 'high' }),
     );
+  });
+
+  it('does not let Codex stale provider fallback shrink GPT-5.5 window', () => {
+    parseLine('session-c', tokenCountLine({
+      total_token_usage: {
+        input_tokens: 140_000,
+        cached_input_tokens: 35_000,
+        output_tokens: 2,
+        total_tokens: 140_002,
+        reasoning_output_tokens: 0,
+      },
+      last_token_usage: {
+        input_tokens: 12_000,
+        cached_input_tokens: 3_000,
+        output_tokens: 2,
+        total_tokens: 12_002,
+      },
+      model_context_window: 258_400,
+    }), 'gpt-5.5');
+
+    expect(timelineEmitter.emit).toHaveBeenCalledWith(
+      'session-c',
+      'usage.update',
+      expect.objectContaining({
+        inputTokens: 9_000,
+        cacheTokens: 3_000,
+        contextWindow: 922_000,
+        model: 'gpt-5.5',
+      }),
+      expect.objectContaining({ source: 'daemon', confidence: 'high' }),
+    );
+    const payload = vi.mocked(timelineEmitter.emit).mock.calls[0]?.[2] as Record<string, unknown>;
+    expect(payload.contextWindowSource).toBeUndefined();
   });
 
   it('ignores non-tool response_item lines (e.g. assistant message)', () => {

@@ -50,4 +50,9 @@ describe('model context inference', () => {
     expect(resolveContextWindow(258_400, 'gpt-5.4-mini', 1_000_000, { preferExplicit: true })).toBe(258_400);
     expect(resolveContextWindow(0, 'gpt-5.4-mini', 1_000_000, { preferExplicit: true })).toBe(1_000_000);
   });
+
+  it('rejects known stale provider fallback windows for GPT-5.5', () => {
+    expect(resolveContextWindow(258_400, 'gpt-5.5', 1_000_000, { preferExplicit: true })).toBe(922_000);
+    expect(resolveContextWindow(258_400, 'gpt-5.5-pro', 1_000_000, { preferExplicit: true })).toBe(922_000);
+  });
 });

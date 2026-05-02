@@ -43,6 +43,7 @@ import { CronManager } from './pages/CronManager.js';
 import { SharedContextManagementPanel } from './components/SharedContextManagementPanel.js';
 import { ContextDiagnosticsPanel } from './components/ContextDiagnosticsPanel.js';
 import { NewUserGuide, type NewUserGuideStep } from './components/NewUserGuide.js';
+import { isPlausibleUsagePayload } from './usage-data.js';
 import { ServerIconBar } from './components/ServerIconBar.js';
 import { Sidebar, loadSidebarCollapsed, saveSidebarCollapsed } from './components/Sidebar.js';
 import { SessionTree } from './components/SessionTree.js';
@@ -1854,7 +1855,7 @@ export function App() {
             }
           }
           // Track usage data for all sub-sessions (ctx bar in collapsed buttons)
-          if (event.sessionId.startsWith('deck_sub_') && event.payload.inputTokens) {
+          if (event.sessionId.startsWith('deck_sub_') && isPlausibleUsagePayload(event.payload as Record<string, unknown>)) {
             setSubUsages((prev) => {
               const next = new Map(prev);
               next.set(event.sessionId, event.payload as { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string });
@@ -3836,6 +3837,15 @@ export function App() {
             serverId={selectedServerId ?? undefined}
             ws={wsRef.current}
             onEnterpriseChange={(enterpriseId) => setSharedContextManagementProps((prev) => ({ ...prev, enterpriseId, serverId: selectedServerId }))}
+            activeProjectDir={activeSessionInfo?.projectDir ?? null}
+            memoryProjectCandidates={sessions
+              .filter((session) => Boolean(session.projectDir))
+              .map((session) => ({
+                projectDir: session.projectDir,
+                displayName: session.label || session.project || session.name,
+                sessionName: session.name,
+                source: session.name === activeSession ? 'active_session' as const : 'recent_session' as const,
+              }))}
           />
         </FloatingPanel>
       )}
