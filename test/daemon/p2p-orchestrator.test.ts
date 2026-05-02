@@ -278,16 +278,24 @@ describe('P2P orchestrator — parallel rounds', () => {
   });
 
   it('dispatches phase-2 hops in parallel and waits for the barrier before summary', async () => {
-    const events: Array<{ session: string; kind: 'dispatch' | 'idle'; at: number }> = [];
+    const events: Array<{ session: string; kind: 'dispatch' | 'idle'; at: number; seq: number }> = [];
+    const idleSessions = new Set<string>();
+    let eventSeq = 0;
+    const recordEvent = (session: string, kind: 'dispatch' | 'idle') => {
+      events.push({ session, kind, at: Date.now(), seq: ++eventSeq });
+    };
+    detectStatusAsyncMock.mockImplementation(async (session: string) => (idleSessions.has(session) ? 'idle' : 'running'));
 
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
-      events.push({ session, kind: 'dispatch', at: Date.now() });
+      idleSessions.delete(session);
+      recordEvent(session, 'dispatch');
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       const delay = session === 'deck_proj_w2' ? 140 : session === 'deck_proj_w1' ? 40 : 20;
       setTimeout(async () => {
         await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
-        events.push({ session, kind: 'idle', at: Date.now() });
+        idleSessions.add(session);
+        recordEvent(session, 'idle');
         notifySessionIdle(session);
       }, delay);
     });
@@ -316,7 +324,7 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(summaryDispatch).toBeDefined();
     expect(w2Idle).toBeDefined();
     expect(Math.abs((w1Dispatch?.at ?? 0) - (w2Dispatch?.at ?? 0))).toBeLessThan(80);
-    expect((summaryDispatch?.at ?? 0)).toBeGreaterThan((w2Idle?.at ?? 0));
+    expect((summaryDispatch?.seq ?? 0)).toBeGreaterThan((w2Idle?.seq ?? 0));
   });
 
   it('sends the original user request as a follow-up prompt after final summary completes', async () => {
