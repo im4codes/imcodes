@@ -783,6 +783,101 @@ describe('SharedContextManagementPanel', () => {
     })));
   });
 
+  it('keeps memory browsing on all projects by default and explains cloud-only personal memory', async () => {
+    getPersonalCloudMemoryMock.mockResolvedValueOnce({
+      stats: {
+        totalRecords: 16059,
+        matchedRecords: 16059,
+        recentSummaryCount: 0,
+        durableCandidateCount: 16059,
+        projectCount: 12,
+        stagedEventCount: 0,
+        dirtyTargetCount: 0,
+        pendingJobCount: 0,
+      },
+      records: [
+        {
+          id: 'cloud-personal-large',
+          scope: 'personal',
+          projectId: 'github.com/acme/repo',
+          summary: 'Large synced personal memory set',
+          projectionClass: 'durable_memory_candidate',
+          sourceEventCount: 8,
+          updatedAt: 1700000003000,
+        },
+      ],
+      pendingRecords: [],
+    });
+    const sent: Array<Record<string, unknown>> = [];
+    const messageHandlers = new Set<(message: unknown) => void>();
+    const ws = {
+      send(message: Record<string, unknown>) {
+        sent.push(message);
+      },
+      onMessage(handler: (message: unknown) => void) {
+        messageHandlers.add(handler);
+        return () => {
+          messageHandlers.delete(handler);
+        };
+      },
+    };
+
+    render(<SharedContextManagementPanel serverId="srv-1" ws={ws as never} />);
+    await flush();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.memory'));
+    });
+
+    const localQuery = [...sent].reverse().find((message) => message.type === MEMORY_WS.PERSONAL_QUERY);
+    expect(localQuery).toBeDefined();
+    expect(localQuery).not.toHaveProperty('canonicalRepoId');
+    expect(localQuery).not.toHaveProperty('projectId');
+
+    await act(async () => {
+      for (const handler of messageHandlers) handler({
+        type: MEMORY_WS.PERSONAL_RESPONSE,
+        requestId: localQuery?.requestId,
+        stats: {
+          totalRecords: 0,
+          matchedRecords: 0,
+          recentSummaryCount: 0,
+          durableCandidateCount: 0,
+          projectCount: 0,
+          stagedEventCount: 0,
+          dirtyTargetCount: 0,
+          pendingJobCount: 0,
+        },
+        records: [],
+        pendingRecords: [],
+      });
+    });
+
+    expect(await screen.findByText('sharedContext.management.memoryProcessedEmptyWithCloud')).toBeDefined();
+    expect((await screen.findAllByText('16059')).length).toBeGreaterThan(0);
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.memoryViewPersonalCloud'));
+    });
+    expect(await screen.findByText('Large synced personal memory set')).toBeDefined();
+  });
+
+  it('shows actionable daemon and feature-state reasons instead of disabled/unknown-only memory UI', async () => {
+    render(<SharedContextManagementPanel serverId="srv-1" />);
+    await flush();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.memory'));
+    });
+
+    expect((await screen.findAllByText('sharedContext.management.memoryFeatureUnavailable')).length).toBeGreaterThan(0);
+    expect(await screen.findByText('sharedContext.management.memoryLocalStatusUnavailable')).toBeDefined();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.memoryToolTabPreferences'));
+    });
+    expect((await screen.findAllByText('sharedContext.management.memoryToolDisabledNoDaemon')).length).toBeGreaterThan(0);
+  });
+
   it('deletes local, cloud, and enterprise memory records', async () => {
     const sent: Array<Record<string, unknown>> = [];
     const messageHandlers = new Set<(message: unknown) => void>();
@@ -917,6 +1012,21 @@ describe('SharedContextManagementPanel', () => {
 
     await waitFor(() => {
       const latestPersonalQuery = [...sent].reverse().find((message) => message.type === MEMORY_WS.PERSONAL_QUERY);
+      expect(latestPersonalQuery).toBeTruthy();
+      expect(latestPersonalQuery).not.toHaveProperty('canonicalRepoId');
+      expect(latestPersonalQuery).not.toHaveProperty('projectId');
+    });
+
+    await act(async () => {
+      const browseSelect = screen.getByLabelText('sharedContext.management.memoryBrowseProjectFilter') as HTMLSelectElement;
+      fireEvent.input(browseSelect, { target: { value: 'github.com/acme/repo' } });
+    });
+
+    await waitFor(() => {
+      const latestPersonalQuery = [...sent].reverse().find((message) => (
+        message.type === MEMORY_WS.PERSONAL_QUERY
+        && message.canonicalRepoId === 'github.com/acme/repo'
+      ));
       expect(latestPersonalQuery).toMatchObject({
         canonicalRepoId: 'github.com/acme/repo',
         projectId: 'github.com/acme/repo',
@@ -1104,14 +1214,6 @@ describe('SharedContextManagementPanel', () => {
     expect(screen.getAllByPlaceholderText('sharedContext.management.memoryProjectDirPlaceholder').length).toBeGreaterThan(0);
     expect(screen.getByText('sharedContext.management.memoryMdIngestRun')).toBeDefined();
 
-    await act(async () => {
-      fireEvent.input(screen.getAllByPlaceholderText('sharedContext.management.memoryProjectDirPlaceholder')[1], {
-        target: { value: '/work/repo' },
-      });
-      fireEvent.input(screen.getAllByPlaceholderText('sharedContext.management.memoryProjectPlaceholder')[1], {
-        target: { value: 'github.com/acme/repo' },
-      });
-    });
     await act(async () => {
       fireEvent.click(screen.getByText('sharedContext.management.memoryMdIngestRun'));
       fireEvent.click(screen.getByText('sharedContext.management.memoryObservationPromote'));
