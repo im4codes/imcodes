@@ -134,6 +134,12 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   const weeklyCost = sessionCost > 0 ? getWeeklyCost() : 0;
   const monthlyCost = sessionCost > 0 ? getMonthlyCost() : 0;
   const modelLabel = shortModelLabel(displayModel);
+  // Keep the ctx meter visible even before the first non-zero usage event when
+  // the session/model is known. A zero-token session still has useful context
+  // capacity information (e.g. "0 / 922k" for GPT-5.5); hiding it made Codex
+  // SDK sessions look like ctx tracking had disappeared after stale cumulative
+  // usage snapshots were filtered out.
+  const hasContextInfo = total > 0 || (usage.contextWindow ?? 0) > 0 || !!modelLabel;
   const inlineQuotaText = displayQuotaLabel;
   const liveStatusMode = isAgentless
     ? null
@@ -161,7 +167,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     : [];
   return (
     <div class="session-usage-footer" title={tip} data-agent-type={agentType ?? undefined}>
-      {total > 0 && (
+      {hasContextInfo && (
         <div class="session-ctx-bar">
           <div class="session-ctx-cache" style={{ width: `${cachePct}%` }} />
           <div class="session-ctx-input" style={{ width: `${newPct}%`, left: `${cachePct}%` }} />
@@ -226,7 +232,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
             </button>
           </span>
           {modelLabel && <span class="session-usage-model">{modelLabel}</span>}
-          {total > 0 && <span class="session-usage-tokens">{fmt(total)} / {fmt(ctx)} ({pctStr}%)</span>}
+          {hasContextInfo && <span class="session-usage-tokens">{fmt(total)} / {fmt(ctx)} ({pctStr}%)</span>}
           {inlineQuotaText && codexQuotaLines.length === 0 && <span class="session-usage-tokens">{inlineQuotaText}</span>}
           {sessionCost > 0 && (
             <span class="session-usage-cost">

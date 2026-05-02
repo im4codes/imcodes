@@ -328,7 +328,7 @@ export function SessionPane({
           sessionName={sessionName}
           sessionState={liveSessionState}
           agentType={session.agentType}
-          modelOverride={session.modelDisplay ?? (session.agentType === 'qwen' ? session.qwenModel : undefined)}
+          modelOverride={session.modelDisplay ?? (session.agentType === 'qwen' ? session.qwenModel : undefined) ?? detectedModel}
           planLabel={session.planLabel}
           quotaLabel={session.quotaLabel}
           quotaUsageLabel={session.quotaUsageLabel}

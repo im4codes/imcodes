@@ -38,7 +38,14 @@ const sessionControlsSpy = vi.fn((props: any) => (
     data-queued={(props.activeSession?.transportPendingMessages ?? []).join('|')}
   />
 ));
-const usageFooterSpy = vi.fn((props: any) => <div data-testid="usage-footer" data-quota={props.quotaLabel ?? ''} data-state={props.sessionState ?? ''} />);
+const usageFooterSpy = vi.fn((props: any) => (
+  <div
+    data-testid="usage-footer"
+    data-quota={props.quotaLabel ?? ''}
+    data-state={props.sessionState ?? ''}
+    data-model={props.modelOverride ?? ''}
+  />
+));
 let timelineEventsMock: any[] = [];
 let activeToolCallMock = false;
 
@@ -179,6 +186,40 @@ describe('SubSessionWindow metadata wiring', () => {
       expect(controls?.dataset.effort).toBe('high');
       expect(controls?.dataset.quota).toContain('5h 11%');
       expect(footer?.dataset.quota).toContain('5h 11%');
+    });
+  });
+
+  it('passes detected timeline model to the usage footer when session metadata has no modelDisplay', async () => {
+    timelineEventsMock = [
+      { type: 'usage.update', payload: { model: 'gpt-5.5' } },
+    ];
+    const sub = makeSubSession({
+      type: 'codex-sdk',
+      runtimeType: 'transport' as any,
+      state: 'idle',
+      modelDisplay: undefined,
+    } as any);
+
+    render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const footer = document.querySelector('[data-testid="usage-footer"]') as HTMLElement | null;
+      expect(footer?.dataset.model).toBe('gpt-5.5');
     });
   });
 

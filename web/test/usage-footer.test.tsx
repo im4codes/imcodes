@@ -324,6 +324,26 @@ describe('UsageFooter', () => {
     expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('Context: 100k / 922k (11%)');
   });
 
+  it('keeps the ctx meter visible at zero usage when the model is known', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 0,
+          cacheTokens: 0,
+          contextWindow: 0,
+        }}
+        sessionName="deck_test_brain"
+        agentType="codex-sdk"
+        modelOverride="gpt-5.5"
+      />,
+    );
+
+    expect(container.querySelector('.session-ctx-bar')).toBeTruthy();
+    expect(screen.getByText('gpt-5.5')).toBeDefined();
+    expect(screen.getByText('0 / 922k (0.0%)')).toBeDefined();
+    expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('Context: 0 / 922k (0.0%)');
+  });
+
   // ── Shell / script sessions are not "agents" ────────────────────────────────
   //
   // Regression: shell + script terminals fired session.state(running) on any

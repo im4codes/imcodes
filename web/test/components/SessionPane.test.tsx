@@ -67,7 +67,15 @@ vi.mock('../../src/thinking-utils.js', () => ({
 vi.mock('../../src/cost-tracker.js', () => ({ recordCost: vi.fn() }));
 vi.mock('../../src/format-label.js', () => ({ formatLabel: (x: string) => x }));
 vi.mock('../../src/components/UsageFooter.js', () => ({
-  UsageFooter: (props: any) => <div data-testid="usage-footer" data-state={props.sessionState}>{props.quotaLabel ?? props.planLabel ?? 'footer'}</div>,
+  UsageFooter: (props: any) => (
+    <div
+      data-testid="usage-footer"
+      data-state={props.sessionState}
+      data-model={props.modelOverride ?? ''}
+    >
+      {props.quotaLabel ?? props.planLabel ?? 'footer'}
+    </div>
+  ),
 }));
 
 import { SessionPane } from '../../src/components/SessionPane.js';
@@ -115,6 +123,32 @@ describe('SessionPane', () => {
 
     expect(screen.getByTestId('usage-footer')).toBeDefined();
     expect(screen.getByText(/5h 11% 2h03m 4\/6 14:40/)).toBeDefined();
+  });
+
+  it('passes detected model to UsageFooter when session metadata has no modelDisplay', () => {
+    render(
+      <SessionPane
+        serverId="s1"
+        session={{
+          name: 'deck_test_brain',
+          project: 'test',
+          role: 'brain',
+          agentType: 'codex-sdk',
+          state: 'idle',
+          projectDir: '/tmp/test',
+        } as any}
+        sessions={[]}
+        subSessions={[]}
+        ws={null}
+        connected={false}
+        isActive={true}
+        viewMode="chat"
+        quickData={{} as any}
+        detectedModel="gpt-5.5"
+      />,
+    );
+
+    expect(screen.getByTestId('usage-footer').getAttribute('data-model')).toBe('gpt-5.5');
   });
 
   it('adds optimistic user messages for transport sessions', () => {
