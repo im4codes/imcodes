@@ -972,6 +972,54 @@ describe('SharedContextManagementPanel', () => {
     expect((await screen.findAllByText('sharedContext.management.memoryToolDisabledNoDaemon')).length).toBeGreaterThan(0);
   });
 
+  it('renders requested-on dependency-blocked memory features as blocked instead of plain disabled', async () => {
+    const sent: Array<Record<string, unknown>> = [];
+    const messageHandlers = new Set<(message: unknown) => void>();
+    const ws = {
+      send(message: Record<string, unknown>) {
+        sent.push(message);
+      },
+      onMessage(handler: (message: unknown) => void) {
+        messageHandlers.add(handler);
+        return () => {
+          messageHandlers.delete(handler);
+        };
+      },
+    };
+
+    render(<SharedContextManagementPanel serverId="srv-1" ws={ws as never} />);
+    await flush();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.memory'));
+    });
+
+    await waitFor(() => expect(sent.some((message) => message.type === MEMORY_WS.FEATURES_QUERY)).toBe(true));
+    const requestId = [...sent].reverse().find((message) => message.type === MEMORY_WS.FEATURES_QUERY)?.requestId as string | undefined;
+    await act(async () => {
+      for (const handler of messageHandlers) handler({
+        type: MEMORY_WS.FEATURES_RESPONSE,
+        requestId,
+        records: [
+          {
+            flag: MEMORY_FEATURE_FLAGS_BY_NAME.preferences,
+            requested: true,
+            enabled: false,
+            source: 'persisted_config',
+            envKey: 'IMCODES_MEM_FEATURE_PREFERENCES',
+            dependencies: [MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry, MEMORY_FEATURE_FLAGS_BY_NAME.observationStore],
+            dependencyBlocked: [MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry, MEMORY_FEATURE_FLAGS_BY_NAME.observationStore],
+            disabledBehavior: 'Preferences blocked.',
+          },
+        ],
+      });
+    });
+
+    expect(screen.getByLabelText('sharedContext.management.memoryFeatureLabel.preferences: sharedContext.management.memoryFeatureBlocked')).toBeDefined();
+    expect(screen.queryByLabelText('sharedContext.management.memoryFeatureLabel.preferences: sharedContext.management.memoryFeatureDisabled')).toBeNull();
+    expect(screen.getByText('sharedContext.management.memoryFeatureDisableAction')).toBeDefined();
+  });
+
   it('does not render local daemon errors as healthy zero memory stats', async () => {
     const sent: Array<Record<string, unknown>> = [];
     const messageHandlers = new Set<(message: unknown) => void>();

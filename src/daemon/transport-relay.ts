@@ -18,6 +18,7 @@ import { getCachedPresetContextWindow } from './cc-presets.js';
 import { TIMELINE_EVENT_FILE_CHANGE } from '../../shared/file-change.js';
 import { normalizeCodexSdkFileChange, normalizeQwenFileChange } from './file-change-normalizer.js';
 import { USAGE_CONTEXT_WINDOW_SOURCES } from '../../shared/usage-context-window.js';
+import { resolveEffectiveSessionModel } from '../../shared/session-model.js';
 
 let sendToServer: ((msg: Record<string, unknown>) => void) | null = null;
 const inFlightMessages = new Map<string, { messageId: string; eventId: string; text: string }>();
@@ -73,6 +74,7 @@ function normalizeUsageUpdatePayload(
 ): Record<string, unknown> | null {
   if (!usage && !model) return null;
   const session = getSession(sessionName);
+  const effectiveModel = resolveEffectiveSessionModel(session, model);
   const presetCtx = session?.presetContextWindow
     ?? (session?.ccPreset ? getCachedPresetContextWindow(session.ccPreset) : undefined);
   const inputTokens = typeof usage?.input_tokens === 'number'
@@ -88,7 +90,7 @@ function normalizeUsageUpdatePayload(
     : undefined;
   const contextWindow = resolveContextWindow(
     explicitContextWindow ?? presetCtx,
-    model,
+    effectiveModel,
     1_000_000,
     { preferExplicit: explicitContextWindow !== undefined },
   );
@@ -98,7 +100,7 @@ function normalizeUsageUpdatePayload(
   const payload: Record<string, unknown> = {
     ...(typeof inputTokens === 'number' ? { inputTokens } : {}),
     ...(typeof cacheTokens === 'number' ? { cacheTokens } : {}),
-    ...(model ? { model } : {}),
+    ...(effectiveModel ? { model: effectiveModel } : {}),
     contextWindow,
     ...(contextWindowSource ? { contextWindowSource } : {}),
   };

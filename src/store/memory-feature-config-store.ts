@@ -79,12 +79,16 @@ export function getPersistedMemoryFeatureFlagValues(): MemoryFeatureFlagValues {
 }
 
 export function setPersistedMemoryFeatureFlagValue(flag: MemoryFeatureFlag, enabled: boolean): MemoryFeatureFlagValues {
+  return setPersistedMemoryFeatureFlagValues({ [flag]: enabled });
+}
+
+export function setPersistedMemoryFeatureFlagValues(updates: MemoryFeatureFlagValues): MemoryFeatureFlagValues {
   ensureLoaded();
   const nextPayload: MemoryFeatureConfigStorePayload = {
     version: STORE_VERSION,
     flags: {
       ...payload.flags,
-      [flag]: enabled,
+      ...updates,
     },
   };
   persist(nextPayload);

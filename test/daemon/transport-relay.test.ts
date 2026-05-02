@@ -11,6 +11,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // ── Module mocks (must be hoisted before any imports) ───────────────────────
 
+const getSessionMock = vi.hoisted(() => vi.fn());
+
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({
   timelineEmitter: {
     emit: vi.fn(),
@@ -24,6 +26,10 @@ vi.mock('../../src/daemon/transport-history.js', () => ({
 // Mock resolveSessionName to return identity mapping (providerSid === sessionName for tests)
 vi.mock('../../src/agent/session-manager.js', () => ({
   resolveSessionName: (providerSid: string) => providerSid,
+}));
+
+vi.mock('../../src/store/session-store.js', () => ({
+  getSession: getSessionMock,
 }));
 
 // ── Imports after mocks ──────────────────────────────────────────────────────
@@ -119,6 +125,7 @@ describe('transport-relay (timeline-emitter based)', () => {
     appendMock = vi.mocked(appendTransportEvent);
     emitMock.mockClear();
     appendMock.mockClear();
+    getSessionMock.mockReset();
   });
 
   afterEach(() => {
@@ -416,6 +423,83 @@ describe('transport-relay (timeline-emitter based)', () => {
         contextWindow: 922_000,
       });
       expect(usageCall![2].contextWindowSource).toBeUndefined();
+    });
+
+    it('uses the stored session model when Codex SDK usage omits model and ignores stale 258k provider window for GPT-5.5', () => {
+      getSessionMock.mockReturnValue({
+        name: 'sess-1',
+        activeModel: 'gpt-5.5',
+      });
+      const { provider, fireUsage } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireUsage('sess-1', {
+        usage: {
+          input_tokens: 185_000,
+          cached_input_tokens: 5_000,
+          model_context_window: 258_400,
+        },
+      });
+
+      const usageCall = emitMock.mock.calls.find(c => c[1] === 'usage.update');
+      expect(usageCall).toBeDefined();
+      expect(usageCall![2]).toMatchObject({
+        inputTokens: 185_000,
+        cacheTokens: 5_000,
+        model: 'gpt-5.5',
+        contextWindow: 922_000,
+      });
+      expect(usageCall![2].contextWindowSource).toBeUndefined();
+    });
+
+    it('uses the stored session model when usage omits both model and provider context window, avoiding the generic 1M fallback for GPT-5.5', () => {
+      getSessionMock.mockReturnValue({
+        name: 'sess-1',
+        modelDisplay: 'gpt-5.5',
+      });
+      const { provider, fireUsage } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireUsage('sess-1', {
+        usage: {
+          input_tokens: 9_000,
+          cached_input_tokens: 0,
+        },
+      });
+
+      const usageCall = emitMock.mock.calls.find(c => c[1] === 'usage.update');
+      expect(usageCall).toBeDefined();
+      expect(usageCall![2]).toMatchObject({
+        inputTokens: 9_000,
+        cacheTokens: 0,
+        model: 'gpt-5.5',
+        contextWindow: 922_000,
+      });
+    });
+
+    it('uses the same stored session model fallback for non-GPT-5.5 models when usage omits model', () => {
+      getSessionMock.mockReturnValue({
+        name: 'sess-1',
+        activeModel: 'qwen3-coder-next',
+      });
+      const { provider, fireUsage } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireUsage('sess-1', {
+        usage: {
+          input_tokens: 12_000,
+          cached_input_tokens: 2_000,
+        },
+      });
+
+      const usageCall = emitMock.mock.calls.find(c => c[1] === 'usage.update');
+      expect(usageCall).toBeDefined();
+      expect(usageCall![2]).toMatchObject({
+        inputTokens: 12_000,
+        cacheTokens: 2_000,
+        model: 'qwen3-coder-next',
+        contextWindow: 262_144,
+      });
     });
 
     it('falls back to message.content when no accumulator exists', () => {

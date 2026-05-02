@@ -1430,7 +1430,8 @@
       "memoryFeatureEnableAction": "켜기",
       "memoryFeatureDisableAction": "끄기",
       "memoryFeatureToggleSaving": "저장 중…",
-      "memoryFeatureDependencyBlockedHint": "켜기로 요청되었지만 의존 기능이 꺼져 있습니다: {{deps}}. 의존 기능을 먼저 켜세요. {{behavior}}"
+      "memoryFeatureDependencyBlockedHint": "켜기로 요청되었지만 의존 기능이 꺼져 있습니다: {{deps}}. 의존 기능을 먼저 켜세요. {{behavior}}",
+      "memoryFeatureBlocked": "차단됨"
     },
     "diagnostics": {
       "title": "Diagnostics",

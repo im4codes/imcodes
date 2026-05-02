@@ -1430,7 +1430,8 @@
       "memoryFeatureEnableAction": "有効化",
       "memoryFeatureDisableAction": "無効化",
       "memoryFeatureToggleSaving": "保存中…",
-      "memoryFeatureDependencyBlockedHint": "有効化が要求されましたが、依存機能が無効です: {{deps}}。先に依存機能を有効化してください。{{behavior}}"
+      "memoryFeatureDependencyBlockedHint": "有効化が要求されましたが、依存機能が無効です: {{deps}}。先に依存機能を有効化してください。{{behavior}}",
+      "memoryFeatureBlocked": "ブロック中"
     },
     "diagnostics": {
       "title": "Diagnostics",

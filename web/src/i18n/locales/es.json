@@ -1430,7 +1430,8 @@
       "memoryFeatureEnableAction": "Activar",
       "memoryFeatureDisableAction": "Desactivar",
       "memoryFeatureToggleSaving": "Guardando…",
-      "memoryFeatureDependencyBlockedHint": "Solicitado, pero las dependencias siguen desactivadas: {{deps}}. Activa primero las dependencias. {{behavior}}"
+      "memoryFeatureDependencyBlockedHint": "Solicitado, pero las dependencias siguen desactivadas: {{deps}}. Activa primero las dependencias. {{behavior}}",
+      "memoryFeatureBlocked": "Bloqueado"
     },
     "diagnostics": {
       "title": "Diagnostics",

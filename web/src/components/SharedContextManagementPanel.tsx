@@ -812,17 +812,19 @@ const featureFlagGridStyle = {
   gap: SC_IS_MOBILE ? DT.space.xs : DT.space.sm,
 } as const;
 
-function featureFlagCardStyle(enabled: boolean | null) {
-  const accentBorder = enabled === true
-    ? 'rgba(52,211,153,0.32)'
-    : enabled === false
-      ? 'rgba(248,113,113,0.28)'
-      : DT.border.subtle;
-  const tintBg = enabled === true
-    ? 'linear-gradient(180deg, rgba(52,211,153,0.06), rgba(52,211,153,0.02))'
-    : enabled === false
-      ? 'linear-gradient(180deg, rgba(248,113,113,0.05), rgba(248,113,113,0.015))'
-      : DT.bg.input;
+function featureFlagCardStyle(enabled: boolean | null, blocked = false) {
+  let accentBorder: string = DT.border.subtle;
+  let tintBg: string = DT.bg.input;
+  if (blocked) {
+    accentBorder = 'rgba(251,191,36,0.34)';
+    tintBg = 'linear-gradient(180deg, rgba(251,191,36,0.06), rgba(251,191,36,0.02))';
+  } else if (enabled === true) {
+    accentBorder = 'rgba(52,211,153,0.32)';
+    tintBg = 'linear-gradient(180deg, rgba(52,211,153,0.06), rgba(52,211,153,0.02))';
+  } else if (enabled === false) {
+    accentBorder = 'rgba(248,113,113,0.28)';
+    tintBg = 'linear-gradient(180deg, rgba(248,113,113,0.05), rgba(248,113,113,0.015))';
+  }
   return {
     borderRadius: DT.radius.md,
     border: `1px solid ${accentBorder}`,
@@ -837,12 +839,14 @@ function featureFlagCardStyle(enabled: boolean | null) {
   };
 }
 
-function featureFlagDotStyle(enabled: boolean | null) {
-  const color = enabled === true
-    ? DT.text.success
-    : enabled === false
-      ? DT.text.error
-      : DT.text.muted;
+function featureFlagDotStyle(enabled: boolean | null, blocked = false) {
+  const color = blocked
+    ? DT.text.warn
+    : enabled === true
+      ? DT.text.success
+      : enabled === false
+        ? DT.text.error
+        : DT.text.muted;
   return {
     width: 8,
     height: 8,
@@ -853,12 +857,14 @@ function featureFlagDotStyle(enabled: boolean | null) {
   };
 }
 
-function featureFlagStatusTextStyle(enabled: boolean | null) {
-  const color = enabled === true
-    ? DT.text.success
-    : enabled === false
-      ? DT.text.error
-      : DT.text.muted;
+function featureFlagStatusTextStyle(enabled: boolean | null, blocked = false) {
+  const color = blocked
+    ? DT.text.warn
+    : enabled === true
+      ? DT.text.success
+      : enabled === false
+        ? DT.text.error
+        : DT.text.muted;
   return {
     color,
     fontSize: 10,
@@ -874,6 +880,7 @@ function FeatureFlagCard({
   enabled,
   statusText,
   detail,
+  blocked = false,
   actionLabel,
   actionPending = false,
   actionDisabled = false,
@@ -884,6 +891,7 @@ function FeatureFlagCard({
   enabled: boolean | null;
   statusText: string;
   detail?: string;
+  blocked?: boolean;
   actionLabel?: string;
   actionPending?: boolean;
   actionDisabled?: boolean;
@@ -891,13 +899,13 @@ function FeatureFlagCard({
 }) {
   const ariaLabel = `${label}: ${statusText}`;
   return (
-    <div style={featureFlagCardStyle(enabled)} title={flag} aria-label={ariaLabel}>
+    <div style={featureFlagCardStyle(enabled, blocked)} title={flag} aria-label={ariaLabel}>
       <span style={{ display: 'flex', alignItems: 'center', gap: 6, color: DT.text.primary, fontSize: SC_IS_MOBILE ? 11 : 12, fontWeight: 600, overflow: 'hidden' }}>
-        <span style={featureFlagDotStyle(enabled)} />
+        <span style={featureFlagDotStyle(enabled, blocked)} />
         <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{label}</span>
       </span>
       <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: DT.text.muted, fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 10 }}>{flag}</span>
-      <span style={featureFlagStatusTextStyle(enabled)}>{statusText}</span>
+      <span style={featureFlagStatusTextStyle(enabled, blocked)}>{statusText}</span>
       {detail ? <span style={{ ...helperTextStyle, fontSize: 10 }}>{detail}</span> : null}
       {onToggle && actionLabel ? (
         <button
@@ -1377,7 +1385,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     setMdIngestFeatureEnabled(records.find((record) => record.flag === MEMORY_FEATURE_FLAGS_BY_NAME.mdIngest)?.enabled ?? null);
     setObservationStoreFeatureEnabled(records.find((record) => record.flag === MEMORY_FEATURE_FLAGS_BY_NAME.observationStore)?.enabled ?? null);
   }, []);
-  const memoryFeatureDisplay = useCallback((flag: MemoryFeatureFlag): { enabled: boolean | null; statusText: string; detail: string } => {
+  const memoryFeatureDisplay = useCallback((flag: MemoryFeatureFlag): { enabled: boolean | null; statusText: string; detail: string; blocked?: boolean } => {
     const record = memoryFeatureRecordByFlag.get(flag);
     if (!ws) {
       return {
@@ -1424,7 +1432,8 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     if (record.requested && record.dependencyBlocked?.length) {
       return {
         enabled: false,
-        statusText: t('sharedContext.management.memoryFeatureDisabled'),
+        statusText: t('sharedContext.management.memoryFeatureBlocked'),
+        blocked: true,
         detail: t('sharedContext.management.memoryFeatureDependencyBlockedHint', {
           deps: record.dependencyBlocked.join(', '),
           behavior: record.disabledBehavior || '',
@@ -3704,6 +3713,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                       enabled={display.enabled}
                       statusText={display.statusText}
                       detail={display.detail}
+                      blocked={display.blocked === true}
                       actionLabel={pending
                         ? t('sharedContext.management.memoryFeatureToggleSaving')
                         : requested

@@ -26,6 +26,7 @@ import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import { resolveSubSessionRuntimeType } from '../runtime-type.js';
 import { DESKTOP_WINDOW_IDS } from '../window-stack.js';
+import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 
 interface WindowGeometry { x: number; y: number; w: number; h: number }
 
@@ -265,6 +266,8 @@ export function SubSessionWindow({
     qwenAuthType: sub.qwenAuthType ?? undefined,
     qwenAvailableModels: sub.qwenAvailableModels ?? undefined,
     codexAvailableModels: sub.codexAvailableModels ?? undefined,
+    requestedModel: sub.requestedModel ?? undefined,
+    activeModel: sub.activeModel ?? undefined,
     modelDisplay: sub.modelDisplay ?? undefined,
     planLabel: sub.planLabel ?? undefined,
     quotaLabel: sub.quotaLabel ?? undefined,
@@ -552,7 +555,7 @@ export function SubSessionWindow({
           sessionName={sub.sessionName}
           sessionState={liveSessionState}
           agentType={sessionInfo?.agentType}
-          modelOverride={sessionInfo?.modelDisplay ?? (sessionInfo?.agentType === 'qwen' ? sessionInfo?.qwenModel : undefined) ?? detectedModel ?? lastUsage?.model}
+          modelOverride={resolveEffectiveSessionModel(sessionInfo, detectedModel, lastUsage?.model)}
           planLabel={sessionInfo?.planLabel}
           quotaLabel={sessionInfo?.quotaLabel}
           quotaUsageLabel={(sessionInfo?.agentType === 'codex' || sessionInfo?.agentType === 'codex-sdk') ? undefined : sessionInfo?.quotaUsageLabel}

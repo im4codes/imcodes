@@ -21,6 +21,7 @@ import type { SessionInfo, TerminalDiff } from '../types.js';
 import { extractLatestUsage } from '../usage-data.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
+import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 
 type ViewMode = 'terminal' | 'chat';
 
@@ -328,7 +329,7 @@ export function SessionPane({
           sessionName={sessionName}
           sessionState={liveSessionState}
           agentType={session.agentType}
-          modelOverride={session.modelDisplay ?? (session.agentType === 'qwen' ? session.qwenModel : undefined) ?? detectedModel}
+          modelOverride={resolveEffectiveSessionModel(session, detectedModel)}
           planLabel={session.planLabel}
           quotaLabel={session.quotaLabel}
           quotaUsageLabel={session.quotaUsageLabel}

@@ -1431,7 +1431,8 @@
       "memoryFeatureEnableAction": "Enable",
       "memoryFeatureDisableAction": "Disable",
       "memoryFeatureToggleSaving": "Saving…",
-      "memoryFeatureDependencyBlockedHint": "Requested on, but dependencies are still disabled: {{deps}}. Enable the dependencies first. {{behavior}}"
+      "memoryFeatureDependencyBlockedHint": "Requested on, but dependencies are still disabled: {{deps}}. Enable the dependencies first. {{behavior}}",
+      "memoryFeatureBlocked": "Blocked"
     },
     "diagnostics": {
       "title": "Diagnostics",

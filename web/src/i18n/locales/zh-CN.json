@@ -1431,7 +1431,8 @@
       "memoryFeatureEnableAction": "开启",
       "memoryFeatureDisableAction": "关闭",
       "memoryFeatureToggleSaving": "保存中…",
-      "memoryFeatureDependencyBlockedHint": "已请求开启，但依赖仍关闭：{{deps}}。请先开启依赖。{{behavior}}"
+      "memoryFeatureDependencyBlockedHint": "已请求开启，但依赖仍关闭：{{deps}}。请先开启依赖。{{behavior}}",
+      "memoryFeatureBlocked": "依赖阻塞"
     },
     "diagnostics": {
       "title": "诊断",

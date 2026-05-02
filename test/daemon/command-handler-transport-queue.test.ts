@@ -2203,7 +2203,7 @@ describe('handleWebCommand transport queue behavior', () => {
     }));
   });
 
-  it('reports dependency-blocked feature toggles without partially enabling them', async () => {
+  it('cascades dependencies when enabling a daemon memory feature toggle', async () => {
     handleWebCommand({
       type: MEMORY_WS.FEATURES_SET,
       requestId: 'feature-set-dep',
@@ -2219,7 +2219,52 @@ describe('handleWebCommand transport queue behavior', () => {
       success: true,
       flag: MEMORY_FEATURE_FLAGS_BY_NAME.preferences,
       requested: true,
+      enabled: true,
+      records: expect.arrayContaining([
+        expect.objectContaining({
+          flag: MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry,
+          requested: true,
+          enabled: true,
+        }),
+        expect.objectContaining({
+          flag: MEMORY_FEATURE_FLAGS_BY_NAME.observationStore,
+          requested: true,
+          enabled: true,
+        }),
+        expect.objectContaining({
+          flag: MEMORY_FEATURE_FLAGS_BY_NAME.preferences,
+          requested: true,
+          enabled: true,
+          dependencyBlocked: [],
+        }),
+      ]),
+    }));
+  });
+
+  it('reports dependency-blocked requested features when a dependency is disabled later', async () => {
+    handleWebCommand({
+      type: MEMORY_WS.FEATURES_SET,
+      requestId: 'feature-set-pref-on',
+      flag: MEMORY_FEATURE_FLAGS_BY_NAME.preferences,
+      enabled: true,
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: localMemoryManagementContext(),
+    }, serverLink as any);
+    await flushAsync();
+    serverLink.send.mockClear();
+
+    handleWebCommand({
+      type: MEMORY_WS.FEATURES_SET,
+      requestId: 'feature-set-ns-off',
+      flag: MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry,
       enabled: false,
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: localMemoryManagementContext(),
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: MEMORY_WS.FEATURES_SET_RESPONSE,
+      requestId: 'feature-set-ns-off',
+      success: true,
       records: expect.arrayContaining([
         expect.objectContaining({
           flag: MEMORY_FEATURE_FLAGS_BY_NAME.preferences,

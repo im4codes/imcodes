@@ -223,6 +223,42 @@ describe('SubSessionWindow metadata wiring', () => {
     });
   });
 
+  it('passes active/requested transport model to the usage footer before timeline fallback', async () => {
+    timelineEventsMock = [
+      { type: 'usage.update', payload: { inputTokens: 1, cacheTokens: 0, contextWindow: 258_400 } },
+    ];
+    const sub = makeSubSession({
+      type: 'codex-sdk',
+      runtimeType: 'transport' as any,
+      state: 'idle',
+      activeModel: 'gpt-5.5',
+      requestedModel: 'gpt-5.4',
+      modelDisplay: undefined,
+    } as any);
+
+    render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const footer = document.querySelector('[data-testid="usage-footer"]') as HTMLElement | null;
+      expect(footer?.dataset.model).toBe('gpt-5.5');
+    });
+  });
+
   it('passes queued transport messages through to shared session controls for sub-sessions', async () => {
     const sub = makeSubSession({
       type: 'claude-code-sdk',

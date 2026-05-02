@@ -151,6 +151,34 @@ describe('SessionPane', () => {
     expect(screen.getByTestId('usage-footer').getAttribute('data-model')).toBe('gpt-5.5');
   });
 
+  it('passes active/requested transport model to UsageFooter before falling back to display or detected model', () => {
+    render(
+      <SessionPane
+        serverId="s1"
+        session={{
+          name: 'deck_test_brain',
+          project: 'test',
+          role: 'brain',
+          agentType: 'codex-sdk',
+          state: 'idle',
+          projectDir: '/tmp/test',
+          activeModel: 'gpt-5.5',
+          requestedModel: 'gpt-5.4',
+        } as any}
+        sessions={[]}
+        subSessions={[]}
+        ws={null}
+        connected={false}
+        isActive={true}
+        viewMode="chat"
+        quickData={{} as any}
+        detectedModel="gpt-5"
+      />,
+    );
+
+    expect(screen.getByTestId('usage-footer').getAttribute('data-model')).toBe('gpt-5.5');
+  });
+
   it('adds optimistic user messages for transport sessions', () => {
     render(
       <SessionPane

@@ -1430,7 +1430,8 @@
       "memoryFeatureEnableAction": "Включить",
       "memoryFeatureDisableAction": "Отключить",
       "memoryFeatureToggleSaving": "Сохранение…",
-      "memoryFeatureDependencyBlockedHint": "Запрошено включение, но зависимости отключены: {{deps}}. Сначала включите зависимости. {{behavior}}"
+      "memoryFeatureDependencyBlockedHint": "Запрошено включение, но зависимости отключены: {{deps}}. Сначала включите зависимости. {{behavior}}",
+      "memoryFeatureBlocked": "Заблокировано"
     },
     "diagnostics": {
       "title": "Diagnostics",

@@ -158,7 +158,7 @@ import { assertManagedSkillPathSync, ManagedSkillPathError } from '../context/ma
 import {
   getMemoryFeatureConfigStoreDiagnostics,
   getPersistedMemoryFeatureFlagValues,
-  setPersistedMemoryFeatureFlagValue,
+  setPersistedMemoryFeatureFlagValues,
 } from '../store/memory-feature-config-store.js';
 
 const MAX_P2P_FILE_PULL_COUNT = 20;
@@ -6579,6 +6579,15 @@ function buildMemoryFeatureAdminRecords() {
   });
 }
 
+function collectMemoryFeatureWithDependencies(flag: MemoryFeatureFlag, seen = new Set<MemoryFeatureFlag>()): Set<MemoryFeatureFlag> {
+  if (seen.has(flag)) return seen;
+  seen.add(flag);
+  for (const dependency of getMemoryFeatureFlagDefinition(flag).dependencies) {
+    collectMemoryFeatureWithDependencies(dependency, seen);
+  }
+  return seen;
+}
+
 function handleMemoryFeaturesQuery(cmd: Record<string, unknown>, serverLink: ServerLink): void {
   const requestId = commandString(cmd, 'requestId') || undefined;
   serverLink.send({
@@ -6613,7 +6622,10 @@ function handleMemoryFeaturesSet(cmd: Record<string, unknown>, serverLink: Serve
   }
 
   try {
-    setPersistedMemoryFeatureFlagValue(flag, enabled);
+    const updates: MemoryFeatureFlagValues = enabled
+      ? Object.fromEntries([...collectMemoryFeatureWithDependencies(flag)].map((dependency) => [dependency, true])) as MemoryFeatureFlagValues
+      : { [flag]: false };
+    setPersistedMemoryFeatureFlagValues(updates);
     if (flag === MEMORY_FEATURE_FLAGS_BY_NAME.skills || flag === MEMORY_FEATURE_FLAGS_BY_NAME.skillAutoCreation) {
       publishRuntimeMemoryCacheInvalidation({ kind: 'skill_registry' });
     }

@@ -20,6 +20,7 @@ import type { PinnedPanel } from '../app.js';
 import type { PanelRenderContext } from './PinnedPanelRegistry.js';
 import { SharedContextManagementPanel } from './SharedContextManagementPanel.js';
 import { ContextDiagnosticsPanel } from './ContextDiagnosticsPanel.js';
+import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 
 export const LOCAL_WEB_PREVIEW_PANEL_TYPE = 'localwebpreview';
 export const SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE = 'sharedcontext-management';
@@ -57,7 +58,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
 
   const isShell = liveSub.type === 'shell' || liveSub.type === 'script';
   const mode = pinnedViewMode ?? (isShell ? 'terminal' : 'chat');
-  const modelDisplay = liveSub.modelDisplay ?? (liveSub.type === 'qwen' ? liveSub.qwenModel : undefined);
+  const modelDisplay = resolveEffectiveSessionModel(liveSub);
   const compactQuotaText = liveSub.type === 'codex' || liveSub.type === 'codex-sdk'
     ? ''
     : [liveSub.quotaLabel, liveSub.quotaUsageLabel].filter(Boolean).join(' · ');
