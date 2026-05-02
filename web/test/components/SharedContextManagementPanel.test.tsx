@@ -1406,6 +1406,52 @@ describe('SharedContextManagementPanel', () => {
     expect(await screen.findByText('Use registry hints for skills.')).toBeDefined();
     expect(await screen.findByText('sharedContext.management.memoryFeatureStatusTitle')).toBeDefined();
     expect(screen.getByLabelText('sharedContext.management.memoryFeatureLabel.preferences: sharedContext.management.memoryFeatureEnabled')).toBeDefined();
+    expect(screen.getAllByText('sharedContext.management.memoryFeatureDisableAction').length).toBeGreaterThan(0);
+
+    await act(async () => {
+      fireEvent.click(screen.getAllByText('sharedContext.management.memoryFeatureDisableAction')[0]);
+    });
+    const featureSet = latestCommand(MEMORY_WS.FEATURES_SET);
+    expect(featureSet).toMatchObject({
+      type: MEMORY_WS.FEATURES_SET,
+      flag: MEMORY_FEATURE_FLAGS_BY_NAME.preferences,
+      enabled: false,
+    });
+    await act(async () => {
+      for (const handler of messageHandlers) handler({
+        type: MEMORY_WS.FEATURES_SET_RESPONSE,
+        requestId: featureSet?.requestId,
+        success: true,
+        flag: MEMORY_FEATURE_FLAGS_BY_NAME.preferences,
+        requested: false,
+        enabled: false,
+        records: [
+          { flag: MEMORY_FEATURE_FLAGS_BY_NAME.preferences, requested: false, enabled: false, source: 'persisted_config', envKey: 'IMCODES_MEM_FEATURE_PREFERENCES', dependencies: [], dependencyBlocked: [], disabledBehavior: 'Preferences disabled.' },
+          { flag: MEMORY_FEATURE_FLAGS_BY_NAME.mdIngest, requested: true, enabled: true, source: 'persisted_config', envKey: 'IMCODES_MEM_FEATURE_MD_INGEST', dependencies: [], dependencyBlocked: [], disabledBehavior: 'MD ingest enabled.' },
+          { flag: MEMORY_FEATURE_FLAGS_BY_NAME.skills, requested: true, enabled: true, source: 'persisted_config', envKey: 'IMCODES_MEM_FEATURE_SKILLS', dependencies: [], dependencyBlocked: [], disabledBehavior: 'Skills enabled.' },
+          { flag: MEMORY_FEATURE_FLAGS_BY_NAME.skillAutoCreation, requested: true, enabled: true, source: 'persisted_config', envKey: 'IMCODES_MEM_FEATURE_SKILL_AUTO_CREATION', dependencies: [], dependencyBlocked: [], disabledBehavior: 'Skill review enabled.' },
+          { flag: MEMORY_FEATURE_FLAGS_BY_NAME.observationStore, requested: true, enabled: true, source: 'persisted_config', envKey: 'IMCODES_MEM_FEATURE_OBSERVATION_STORE', dependencies: [], dependencyBlocked: [], disabledBehavior: 'Observation store enabled.' },
+          { flag: MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry, requested: true, enabled: true, source: 'persisted_config', envKey: 'IMCODES_MEM_FEATURE_NAMESPACE_REGISTRY', dependencies: [], dependencyBlocked: [], disabledBehavior: 'Namespace registry enabled.' },
+        ],
+      });
+    });
+    expect(await screen.findByText('sharedContext.notice.memoryFeatureDisabled')).toBeDefined();
+    await act(async () => {
+      for (const handler of messageHandlers) handler({
+        type: MEMORY_WS.FEATURES_RESPONSE,
+        requestId: latestRequestId(MEMORY_WS.FEATURES_QUERY),
+        records: [
+          { flag: MEMORY_FEATURE_FLAGS_BY_NAME.preferences, requested: false, enabled: false, source: 'persisted_config', envKey: 'IMCODES_MEM_FEATURE_PREFERENCES', dependencies: [], dependencyBlocked: [], disabledBehavior: 'Preferences disabled.' },
+          { flag: MEMORY_FEATURE_FLAGS_BY_NAME.mdIngest, requested: true, enabled: true, source: 'persisted_config', envKey: 'IMCODES_MEM_FEATURE_MD_INGEST', dependencies: [], dependencyBlocked: [], disabledBehavior: 'MD ingest enabled.' },
+          { flag: MEMORY_FEATURE_FLAGS_BY_NAME.skills, requested: true, enabled: true, source: 'persisted_config', envKey: 'IMCODES_MEM_FEATURE_SKILLS', dependencies: [], dependencyBlocked: [], disabledBehavior: 'Skills enabled.' },
+          { flag: MEMORY_FEATURE_FLAGS_BY_NAME.skillAutoCreation, requested: true, enabled: true, source: 'persisted_config', envKey: 'IMCODES_MEM_FEATURE_SKILL_AUTO_CREATION', dependencies: [], dependencyBlocked: [], disabledBehavior: 'Skill review enabled.' },
+          { flag: MEMORY_FEATURE_FLAGS_BY_NAME.observationStore, requested: true, enabled: true, source: 'persisted_config', envKey: 'IMCODES_MEM_FEATURE_OBSERVATION_STORE', dependencies: [], dependencyBlocked: [], disabledBehavior: 'Observation store enabled.' },
+          { flag: MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry, requested: true, enabled: true, source: 'persisted_config', envKey: 'IMCODES_MEM_FEATURE_NAMESPACE_REGISTRY', dependencies: [], dependencyBlocked: [], disabledBehavior: 'Namespace registry enabled.' },
+        ],
+      });
+    });
+    expect(screen.getByLabelText('sharedContext.management.memoryFeatureLabel.preferences: sharedContext.management.memoryFeatureDisabled')).toBeDefined();
+    expect(screen.getAllByText('sharedContext.management.memoryFeatureEnableAction').length).toBeGreaterThan(0);
 
     expect(screen.getByPlaceholderText('sharedContext.management.memoryPreferenceTextPlaceholder')).toBeDefined();
     expect(screen.getByText('sharedContext.management.memoryPreferenceSave')).toBeDefined();

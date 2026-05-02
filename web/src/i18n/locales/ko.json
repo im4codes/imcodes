@@ -1022,7 +1022,9 @@
       "memorySkillRegistryRebuilt": "Skill registry rebuilt",
       "memorySkillDeleted": "Skill deleted",
       "memoryMdIngestCompleted": "Markdown ingest completed",
-      "memoryObservationPromoted": "Observation promoted"
+      "memoryObservationPromoted": "Observation promoted",
+      "memoryFeatureEnabled": "{{flag}} 활성화됨",
+      "memoryFeatureDisabled": "{{flag}} 비활성화됨"
     },
     "management": {
       "title": "Shared Context",
@@ -1333,7 +1335,9 @@
         "unsupported_md_ingest_scope": "Markdown 수집은 개인 및 프로젝트 공유 범위만 지원합니다.",
         "management_request_unrouted": "관리 응답을 현재 브라우저로 라우팅할 수 없습니다.",
         "registry_file_too_large": "스킬 레지스트리 파일이 너무 커서 로드할 수 없습니다.",
-        "registry_entry_limit_exceeded": "스킬 레지스트리 항목이 너무 많아 전체를 로드할 수 없습니다."
+        "registry_entry_limit_exceeded": "스킬 레지스트리 항목이 너무 많아 전체를 로드할 수 없습니다.",
+        "invalid_feature_flag": "올바른 메모리 기능 플래그를 선택하세요.",
+        "feature_config_write_failed": "메모리 기능 플래그 설정을 저장하지 못했습니다."
       },
       "memoryToolsTitle": "Memory tools",
       "memoryToolsDescription": "Manage preferences, skills, markdown ingest, observations, and daemon memory feature status with the selected project identity.",
@@ -1398,7 +1402,7 @@
       "memoryFeatureErrorDetail": "Feature status could not be loaded.",
       "memoryFeatureUnknownDetail": "The daemon response did not include this feature flag.",
       "memoryFeatureEnabledDetail": "This feature is enabled by the daemon.",
-      "memoryFeatureDisabledHint": "Disabled by daemon config. Enable {{env}} and restart the daemon if you use environment flags. {{behavior}}",
+      "memoryFeatureDisabledHint": "daemon 설정으로 꺼져 있습니다. 여기에서 켜거나 daemon 시작 전에 {{env}}를 설정하세요. {{behavior}}",
       "memoryBrowseProjectFilter": "Memory browse filter",
       "memoryBrowseAllProjects": "All projects (default)",
       "memoryAllProjectsActive": "All projects",
@@ -1420,9 +1424,13 @@
       "memoryLocalStatusNoResponse": "No response from the local daemon; local counts may be stale or unavailable.",
       "memoryLocalStatusError": "Local daemon returned an error while loading personal memory.",
       "memoryToolDisabledNoDaemon": "Connect the local daemon before using this management action.",
-      "memoryToolDisabledFeature": "This feature is disabled. Enable {{env}} in the daemon configuration/environment and restart the daemon if needed.",
+      "memoryToolDisabledFeature": "이 기능은 꺼져 있습니다. Feature flags 상태 탭에서 켜거나 daemon 시작 전에 {{env}}를 설정하세요.",
       "memoryToolDisabledFeatureUnknown": "Feature status is not loaded yet; refresh daemon status first.",
-      "memoryToolDisabledProjectRequired": "Select a resolved project with both canonical ID and local directory before running this local tool."
+      "memoryToolDisabledProjectRequired": "Select a resolved project with both canonical ID and local directory before running this local tool.",
+      "memoryFeatureEnableAction": "켜기",
+      "memoryFeatureDisableAction": "끄기",
+      "memoryFeatureToggleSaving": "저장 중…",
+      "memoryFeatureDependencyBlockedHint": "켜기로 요청되었지만 의존 기능이 꺼져 있습니다: {{deps}}. 의존 기능을 먼저 켜세요. {{behavior}}"
     },
     "diagnostics": {
       "title": "Diagnostics",

@@ -675,6 +675,7 @@ const MD_INGEST_UI_SCOPES = ['personal', 'project_shared'] as const satisfies re
 type MemoryAdminRequestSurface =
   | 'projectResolve'
   | 'features'
+  | 'featureSet'
   | 'preferences'
   | 'skills'
   | 'observations'
@@ -867,7 +868,27 @@ function featureFlagStatusTextStyle(enabled: boolean | null) {
   };
 }
 
-function FeatureFlagCard({ flag, label, enabled, statusText, detail }: { flag: string; label: string; enabled: boolean | null; statusText: string; detail?: string }) {
+function FeatureFlagCard({
+  flag,
+  label,
+  enabled,
+  statusText,
+  detail,
+  actionLabel,
+  actionPending = false,
+  actionDisabled = false,
+  onToggle,
+}: {
+  flag: string;
+  label: string;
+  enabled: boolean | null;
+  statusText: string;
+  detail?: string;
+  actionLabel?: string;
+  actionPending?: boolean;
+  actionDisabled?: boolean;
+  onToggle?: () => void;
+}) {
   const ariaLabel = `${label}: ${statusText}`;
   return (
     <div style={featureFlagCardStyle(enabled)} title={flag} aria-label={ariaLabel}>
@@ -878,6 +899,16 @@ function FeatureFlagCard({ flag, label, enabled, statusText, detail }: { flag: s
       <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: DT.text.muted, fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 10 }}>{flag}</span>
       <span style={featureFlagStatusTextStyle(enabled)}>{statusText}</span>
       {detail ? <span style={{ ...helperTextStyle, fontSize: 10 }}>{detail}</span> : null}
+      {onToggle && actionLabel ? (
+        <button
+          type="button"
+          style={{ ...subtleButtonStyle, padding: '6px 10px', fontSize: 11, width: 'fit-content' }}
+          disabled={actionDisabled || actionPending || enabled === null}
+          onClick={onToggle}
+        >
+          {actionLabel}
+        </button>
+      ) : null}
     </div>
   );
 }
@@ -1231,6 +1262,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const memoryAdminRequestIdsRef = useRef<Record<MemoryAdminRequestSurface, string | null>>({
     projectResolve: null,
     features: null,
+    featureSet: null,
     preferences: null,
     skills: null,
     observations: null,
@@ -1311,6 +1343,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [showArchived, setShowArchived] = useState(false);
   const [deletingMemoryIds, setDeletingMemoryIds] = useState<Set<string>>(new Set());
   const [memoryFeatureRecords, setMemoryFeatureRecords] = useState<MemoryFeatureAdminRecord[]>([]);
+  const [pendingMemoryFeatureFlags, setPendingMemoryFeatureFlags] = useState<Set<MemoryFeatureFlag>>(new Set());
   const [preferenceRecords, setPreferenceRecords] = useState<MemoryPreferenceAdminRecord[]>([]);
   const [preferenceFeatureEnabled, setPreferenceFeatureEnabled] = useState<boolean | null>(null);
   const preferenceUserId = 'server-derived';
@@ -1337,6 +1370,13 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const memoryFeatureRecordByFlag = useMemo(() => new Map<MemoryFeatureFlag, MemoryFeatureAdminRecord>(
     memoryFeatureRecords.map((record) => [record.flag, record]),
   ), [memoryFeatureRecords]);
+  const applyMemoryFeatureRecords = useCallback((records: MemoryFeatureAdminRecord[]) => {
+    setMemoryFeatureRecords(records);
+    setPreferenceFeatureEnabled(records.find((record) => record.flag === MEMORY_FEATURE_FLAGS_BY_NAME.preferences)?.enabled ?? null);
+    setSkillsFeatureEnabled(records.find((record) => record.flag === MEMORY_FEATURE_FLAGS_BY_NAME.skills)?.enabled ?? null);
+    setMdIngestFeatureEnabled(records.find((record) => record.flag === MEMORY_FEATURE_FLAGS_BY_NAME.mdIngest)?.enabled ?? null);
+    setObservationStoreFeatureEnabled(records.find((record) => record.flag === MEMORY_FEATURE_FLAGS_BY_NAME.observationStore)?.enabled ?? null);
+  }, []);
   const memoryFeatureDisplay = useCallback((flag: MemoryFeatureFlag): { enabled: boolean | null; statusText: string; detail: string } => {
     const record = memoryFeatureRecordByFlag.get(flag);
     if (!ws) {
@@ -1381,11 +1421,21 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         detail: record.disabledBehavior || t('sharedContext.management.memoryFeatureEnabledDetail'),
       };
     }
+    if (record.requested && record.dependencyBlocked?.length) {
+      return {
+        enabled: false,
+        statusText: t('sharedContext.management.memoryFeatureDisabled'),
+        detail: t('sharedContext.management.memoryFeatureDependencyBlockedHint', {
+          deps: record.dependencyBlocked.join(', '),
+          behavior: record.disabledBehavior || '',
+        }),
+      };
+    }
     return {
       enabled: false,
       statusText: t('sharedContext.management.memoryFeatureDisabled'),
       detail: t('sharedContext.management.memoryFeatureDisabledHint', {
-        env: memoryFeatureFlagEnvKey(flag),
+        env: record.envKey || memoryFeatureFlagEnvKey(flag),
         behavior: record.disabledBehavior || '',
       }),
     };
@@ -1778,6 +1828,20 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     }
   }, [t]);
 
+  const toggleMemoryFeatureFlag = useCallback((flag: MemoryFeatureFlag) => {
+    if (!ws) return;
+    const record = memoryFeatureRecordByFlag.get(flag);
+    const nextEnabled = !(record?.requested ?? record?.enabled ?? false);
+    const requestId = markMemoryAdminRequest('featureSet');
+    setPendingMemoryFeatureFlags((current) => new Set(current).add(flag));
+    ws.send({
+      type: MEMORY_WS.FEATURES_SET,
+      requestId,
+      flag,
+      enabled: nextEnabled,
+    });
+  }, [markMemoryAdminRequest, memoryFeatureRecordByFlag, ws]);
+
   const resolveMemoryProject = useCallback((option: MemoryProjectOption) => {
     if (!ws || !option.projectDir) return;
     const projectDir = option.projectDir.trim();
@@ -2128,11 +2192,35 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         clearTimeoutRef(memoryFeaturesStatusTimerRef);
         const records = msg.records ?? [];
         setMemoryFeaturesStatus('ready');
-        setMemoryFeatureRecords(records);
-        setPreferenceFeatureEnabled(records.find((record) => record.flag === MEMORY_FEATURE_FLAGS_BY_NAME.preferences)?.enabled ?? null);
-        setSkillsFeatureEnabled(records.find((record) => record.flag === MEMORY_FEATURE_FLAGS_BY_NAME.skills)?.enabled ?? null);
-        setMdIngestFeatureEnabled(records.find((record) => record.flag === MEMORY_FEATURE_FLAGS_BY_NAME.mdIngest)?.enabled ?? null);
-        setObservationStoreFeatureEnabled(records.find((record) => record.flag === MEMORY_FEATURE_FLAGS_BY_NAME.observationStore)?.enabled ?? null);
+        applyMemoryFeatureRecords(records);
+        return;
+      }
+      if (msg.type === MEMORY_WS.FEATURES_SET_RESPONSE) {
+        if (!isCurrentMemoryAdminResponse('featureSet', msg.requestId)) return;
+        const flag = msg.flag as MemoryFeatureFlag | undefined;
+        if (flag) {
+          setPendingMemoryFeatureFlags((current) => {
+            const next = new Set(current);
+            next.delete(flag);
+            return next;
+          });
+        } else {
+          setPendingMemoryFeatureFlags(new Set());
+        }
+        if (msg.success) {
+          const records = msg.records ?? [];
+          if (records.length) applyMemoryFeatureRecords(records);
+          if (flag) {
+            setNotice(t(msg.requested === false
+              ? 'sharedContext.notice.memoryFeatureDisabled'
+              : 'sharedContext.notice.memoryFeatureEnabled', {
+              flag: memoryFeatureLabel(flag),
+            }));
+          }
+          loadMemoryAdminViews();
+        } else {
+          setError(memoryAdminErrorMessage(msg.errorCode, msg.error));
+        }
         return;
       }
       if (msg.type === MEMORY_WS.PREF_RESPONSE) {
@@ -2213,7 +2301,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         } else setError(memoryAdminErrorMessage(msg.errorCode, msg.error));
       }
     });
-  }, [isCurrentMemoryAdminResponse, loadMemoryAdminViews, loadMemoryViews, memoryAdminErrorMessage, t, ws]);
+  }, [applyMemoryFeatureRecords, isCurrentMemoryAdminResponse, loadMemoryAdminViews, loadMemoryViews, memoryAdminErrorMessage, memoryFeatureLabel, t, ws]);
 
   useEffect(() => {
     if (!selectedMemoryProject || selectedMemoryProject.status !== 'needs_resolution') return;
@@ -3605,6 +3693,9 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                   MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry,
                 ].map((flag) => {
                   const display = memoryFeatureDisplay(flag);
+                  const record = memoryFeatureRecordByFlag.get(flag);
+                  const pending = pendingMemoryFeatureFlags.has(flag);
+                  const requested = record?.requested ?? record?.enabled ?? false;
                   return (
                     <FeatureFlagCard
                       key={flag}
@@ -3613,6 +3704,14 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                       enabled={display.enabled}
                       statusText={display.statusText}
                       detail={display.detail}
+                      actionLabel={pending
+                        ? t('sharedContext.management.memoryFeatureToggleSaving')
+                        : requested
+                          ? t('sharedContext.management.memoryFeatureDisableAction')
+                          : t('sharedContext.management.memoryFeatureEnableAction')}
+                      actionPending={pending}
+                      actionDisabled={!ws || memoryFeaturesStatus !== 'ready' || !record || (pendingMemoryFeatureFlags.size > 0 && !pending)}
+                      onToggle={() => toggleMemoryFeatureFlag(flag)}
                     />
                   );
                 })}

@@ -128,12 +128,15 @@ import { normalizeSendOrigin, type SendOrigin } from '../../shared/send-origin.j
 import {
   getMemoryFeatureFlagDefinition,
   computeEffectiveMemoryFeatureFlags,
+  isMemoryFeatureFlag,
   MEMORY_FEATURE_FLAGS,
   MEMORY_FEATURE_FLAGS_BY_NAME,
   memoryFeatureFlagEnvKey,
   resolveMemoryFeatureFlagValue,
+  type FeatureFlagValueSource,
   type MemoryFeatureFlagValues,
   type MemoryFeatureFlag,
+  type MemoryFeatureFlagResolutionLayers,
 } from '../../shared/feature-flags.js';
 import { incrementCounter } from '../util/metrics.js';
 import { computeMemoryFingerprint } from '../../shared/memory-fingerprint.js';
@@ -152,6 +155,11 @@ import {
 import type { ContextMemoryStatsView, ContextNamespace } from '../../shared/context-types.js';
 import { publishRuntimeMemoryCacheInvalidation } from '../context/runtime-memory-cache-bus.js';
 import { assertManagedSkillPathSync, ManagedSkillPathError } from '../context/managed-skill-path.js';
+import {
+  getMemoryFeatureConfigStoreDiagnostics,
+  getPersistedMemoryFeatureFlagValues,
+  setPersistedMemoryFeatureFlagValue,
+} from '../store/memory-feature-config-store.js';
 
 const MAX_P2P_FILE_PULL_COUNT = 20;
 const processRecallRepositoryIdentityService = new GitOriginRepositoryIdentityService();
@@ -171,19 +179,41 @@ function isMemoryFeatureEnabled(flag: MemoryFeatureFlag): boolean {
   return getEffectiveMemoryFeatureFlags()[flag];
 }
 
-function readRequestedMemoryFeatureFlags(): MemoryFeatureFlagValues {
-  const requested: MemoryFeatureFlagValues = {};
+function readMemoryFeatureEnvironmentDefaults(): MemoryFeatureFlagValues {
+  const environmentStartupDefault: MemoryFeatureFlagValues = {};
   for (const flag of MEMORY_FEATURE_FLAGS) {
     const envValue = readBooleanEnv(process.env[memoryFeatureFlagEnvKey(flag)]);
-    requested[flag] = resolveMemoryFeatureFlagValue(flag, {
-      environmentStartupDefault: envValue === undefined ? undefined : { [flag]: envValue },
-    });
+    if (envValue !== undefined) environmentStartupDefault[flag] = envValue;
+  }
+  return environmentStartupDefault;
+}
+
+function readMemoryFeatureResolutionLayers(): MemoryFeatureFlagResolutionLayers {
+  const persistedConfig = getPersistedMemoryFeatureFlagValues();
+  return {
+    persistedConfig,
+    environmentStartupDefault: readMemoryFeatureEnvironmentDefaults(),
+    readFailed: !!getMemoryFeatureConfigStoreDiagnostics().lastLoadIssue,
+  };
+}
+
+function readRequestedMemoryFeatureFlags(layers: MemoryFeatureFlagResolutionLayers = readMemoryFeatureResolutionLayers()): MemoryFeatureFlagValues {
+  const requested: MemoryFeatureFlagValues = {};
+  for (const flag of MEMORY_FEATURE_FLAGS) {
+    requested[flag] = resolveMemoryFeatureFlagValue(flag, layers);
   }
   return requested;
 }
 
 function getEffectiveMemoryFeatureFlags(): Record<MemoryFeatureFlag, boolean> {
   return computeEffectiveMemoryFeatureFlags(readRequestedMemoryFeatureFlags());
+}
+
+function featureFlagValueSource(flag: MemoryFeatureFlag, layers: MemoryFeatureFlagResolutionLayers): FeatureFlagValueSource {
+  if (layers.runtimeConfigOverride?.[flag] !== undefined) return 'runtime_config_override';
+  if (layers.persistedConfig?.[flag] !== undefined) return 'persisted_config';
+  if (layers.environmentStartupDefault?.[flag] !== undefined) return 'environment_startup_default';
+  return 'registry_default';
 }
 
 function isPreferenceFeatureEnabled(): boolean {
@@ -1321,6 +1351,9 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
       break;
     case MEMORY_WS.FEATURES_QUERY:
       handleMemoryFeaturesQuery(cmd, serverLink);
+      break;
+    case MEMORY_WS.FEATURES_SET:
+      handleMemoryFeaturesSet(cmd, serverLink);
       break;
     case MEMORY_WS.PREF_QUERY:
       void handleMemoryPreferencesQuery(cmd, serverLink);
@@ -6525,17 +6558,86 @@ function observationStoreFeatureEnabled(): boolean {
   return isMemoryFeatureEnabled(MEMORY_FEATURE_FLAGS_BY_NAME.observationStore);
 }
 
+function buildMemoryFeatureAdminRecords() {
+  const layers = readMemoryFeatureResolutionLayers();
+  const requested = readRequestedMemoryFeatureFlags(layers);
+  const effective = computeEffectiveMemoryFeatureFlags(requested);
+  return MEMORY_FEATURE_FLAGS.map((flag) => {
+    const definition = getMemoryFeatureFlagDefinition(flag);
+    return {
+      flag,
+      requested: requested[flag] === true,
+      enabled: effective[flag],
+      source: featureFlagValueSource(flag, layers),
+      envKey: memoryFeatureFlagEnvKey(flag),
+      dependencies: definition.dependencies,
+      dependencyBlocked: requested[flag] === true && !effective[flag]
+        ? definition.dependencies.filter((dependency) => !effective[dependency])
+        : [],
+      disabledBehavior: definition.disabledBehavior,
+    };
+  });
+}
+
 function handleMemoryFeaturesQuery(cmd: Record<string, unknown>, serverLink: ServerLink): void {
   const requestId = commandString(cmd, 'requestId') || undefined;
   serverLink.send({
     type: MEMORY_WS.FEATURES_RESPONSE,
     requestId,
-    records: MEMORY_FEATURE_FLAGS.map((flag) => ({
-      flag,
-      enabled: isMemoryFeatureEnabled(flag),
-      disabledBehavior: getMemoryFeatureFlagDefinition(flag).disabledBehavior,
-    })),
+    records: buildMemoryFeatureAdminRecords(),
   });
+}
+
+function handleMemoryFeaturesSet(cmd: Record<string, unknown>, serverLink: ServerLink): void {
+  const requestId = commandString(cmd, 'requestId') || undefined;
+  const flag = commandString(cmd, 'flag');
+  const enabled = cmd.enabled;
+  const ctx = commandManagementContext(cmd);
+  if (!ctx) {
+    serverLink.send({
+      type: MEMORY_WS.FEATURES_SET_RESPONSE,
+      requestId,
+      success: false,
+      ...memoryManagementContextError(),
+    });
+    return;
+  }
+  if (!isMemoryFeatureFlag(flag) || typeof enabled !== 'boolean') {
+    serverLink.send({
+      type: MEMORY_WS.FEATURES_SET_RESPONSE,
+      requestId,
+      success: false,
+      ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.INVALID_FEATURE_FLAG),
+    });
+    return;
+  }
+
+  try {
+    setPersistedMemoryFeatureFlagValue(flag, enabled);
+    if (flag === MEMORY_FEATURE_FLAGS_BY_NAME.skills || flag === MEMORY_FEATURE_FLAGS_BY_NAME.skillAutoCreation) {
+      publishRuntimeMemoryCacheInvalidation({ kind: 'skill_registry' });
+    }
+    const records = buildMemoryFeatureAdminRecords();
+    serverLink.send({
+      type: MEMORY_WS.FEATURES_SET_RESPONSE,
+      requestId,
+      success: true,
+      flag,
+      requested: enabled,
+      enabled: records.find((record) => record.flag === flag)?.enabled ?? false,
+      records,
+    });
+  } catch (err) {
+    logger.warn({ flag, enabled, err }, 'Failed to persist memory feature flag override');
+    serverLink.send({
+      type: MEMORY_WS.FEATURES_SET_RESPONSE,
+      requestId,
+      success: false,
+      flag,
+      requested: enabled,
+      ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.FEATURE_CONFIG_WRITE_FAILED),
+    });
+  }
 }
 
 async function handleMemoryProjectResolve(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {

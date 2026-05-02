@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID } from '../../shared/ack-protocol.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { MEMORY_WS } from '../../shared/memory-ws.js';
@@ -18,6 +21,7 @@ import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
 import type { TransportProvider } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
+import { resetMemoryFeatureConfigStoreForTests } from '../../src/store/memory-feature-config-store.js';
 
 const {
   getSessionMock,
@@ -270,6 +274,15 @@ function enableMdIngestFeature(): void {
   vi.stubEnv(memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.mdIngest), '1');
 }
 
+function localMemoryManagementContext() {
+  return {
+    actorId: 'operator-1',
+    userId: 'operator-1',
+    role: 'user',
+    source: 'local_daemon',
+  };
+}
+
 function makeRuntimeProvider(sendImpl: ReturnType<typeof vi.fn>): TransportProvider {
   let deltaCb: ((sid: string, d: MessageDelta) => void) | null = null;
   let completeCb: ((sid: string, m: AgentMessage) => void) | null = null;
@@ -336,6 +349,7 @@ function firstInvocationOrder(matcher: (call: unknown[]) => boolean): number {
 }
 
 describe('handleWebCommand transport queue behavior', () => {
+  let memoryFeatureConfigTempDir: string | null = null;
   const serverLink = {
     send: vi.fn(),
     sendBinary: vi.fn(),
@@ -345,6 +359,9 @@ describe('handleWebCommand transport queue behavior', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    memoryFeatureConfigTempDir = mkdtempSync(join(tmpdir(), 'imcodes-memory-feature-flags-'));
+    vi.stubEnv('IMCODES_MEMORY_FEATURE_CONFIG_PATH', join(memoryFeatureConfigTempDir, 'feature-flags.json'));
+    resetMemoryFeatureConfigStoreForTests();
     supervisionDecideMock.mockResolvedValue({ decision: 'complete', reason: 'ok', confidence: 0.9 });
     getQwenRuntimeConfigMock.mockResolvedValue({});
     searchLocalMemoryMock.mockResolvedValue(emptyMemorySearchResult());
@@ -361,7 +378,12 @@ describe('handleWebCommand transport queue behavior', () => {
   });
 
   afterEach(() => {
+    resetMemoryFeatureConfigStoreForTests();
     vi.unstubAllEnvs();
+    if (memoryFeatureConfigTempDir) {
+      rmSync(memoryFeatureConfigTempDir, { recursive: true, force: true });
+      memoryFeatureConfigTempDir = null;
+    }
   });
 
   it('emits queued session.state for queued transport sends without adding a timeline row', async () => {
@@ -2131,6 +2153,121 @@ describe('handleWebCommand transport queue behavior', () => {
         expect.objectContaining({ flag: MEMORY_FEATURE_FLAGS_BY_NAME.preferences, enabled: true }),
         expect.objectContaining({ flag: MEMORY_FEATURE_FLAGS_BY_NAME.skills, enabled: false }),
       ]),
+    });
+  });
+
+  it('persists daemon memory feature toggles through shared management messages', async () => {
+    vi.stubEnv(memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry), '0');
+
+    handleWebCommand({
+      type: MEMORY_WS.FEATURES_SET,
+      requestId: 'feature-set-1',
+      flag: MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry,
+      enabled: true,
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: localMemoryManagementContext(),
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: MEMORY_WS.FEATURES_SET_RESPONSE,
+      requestId: 'feature-set-1',
+      success: true,
+      flag: MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry,
+      requested: true,
+      enabled: true,
+      records: expect.arrayContaining([
+        expect.objectContaining({
+          flag: MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry,
+          requested: true,
+          enabled: true,
+          source: 'persisted_config',
+        }),
+      ]),
+    }));
+
+    serverLink.send.mockClear();
+    handleWebCommand({ type: MEMORY_WS.FEATURES_QUERY, requestId: 'features-after-set' }, serverLink as any);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: MEMORY_WS.FEATURES_RESPONSE,
+      requestId: 'features-after-set',
+      records: expect.arrayContaining([
+        expect.objectContaining({
+          flag: MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry,
+          requested: true,
+          enabled: true,
+          source: 'persisted_config',
+        }),
+      ]),
+    }));
+  });
+
+  it('reports dependency-blocked feature toggles without partially enabling them', async () => {
+    handleWebCommand({
+      type: MEMORY_WS.FEATURES_SET,
+      requestId: 'feature-set-dep',
+      flag: MEMORY_FEATURE_FLAGS_BY_NAME.preferences,
+      enabled: true,
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: localMemoryManagementContext(),
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: MEMORY_WS.FEATURES_SET_RESPONSE,
+      requestId: 'feature-set-dep',
+      success: true,
+      flag: MEMORY_FEATURE_FLAGS_BY_NAME.preferences,
+      requested: true,
+      enabled: false,
+      records: expect.arrayContaining([
+        expect.objectContaining({
+          flag: MEMORY_FEATURE_FLAGS_BY_NAME.preferences,
+          requested: true,
+          enabled: false,
+          dependencyBlocked: expect.arrayContaining([
+            MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry,
+            MEMORY_FEATURE_FLAGS_BY_NAME.observationStore,
+          ]),
+        }),
+      ]),
+    }));
+  });
+
+  it('rejects invalid daemon memory feature toggle requests', async () => {
+    handleWebCommand({
+      type: MEMORY_WS.FEATURES_SET,
+      requestId: 'feature-set-invalid',
+      flag: 'mem.feature.not_real',
+      enabled: true,
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: localMemoryManagementContext(),
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: MEMORY_WS.FEATURES_SET_RESPONSE,
+      requestId: 'feature-set-invalid',
+      success: false,
+      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.INVALID_FEATURE_FLAG,
+      error: MEMORY_MANAGEMENT_ERROR_CODES.INVALID_FEATURE_FLAG,
+    });
+  });
+
+  it('rejects daemon memory feature toggles without management context', async () => {
+    handleWebCommand({
+      type: MEMORY_WS.FEATURES_SET,
+      requestId: 'feature-set-no-context',
+      flag: MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry,
+      enabled: true,
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: MEMORY_WS.FEATURES_SET_RESPONSE,
+      requestId: 'feature-set-no-context',
+      success: false,
+      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.MANAGEMENT_REQUEST_UNROUTED,
+      error: MEMORY_MANAGEMENT_ERROR_CODES.MANAGEMENT_REQUEST_UNROUTED,
     });
   });
 

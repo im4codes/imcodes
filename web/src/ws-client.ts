@@ -13,6 +13,7 @@ import { CC_PRESET_MSG, type CcPreset, type CcPresetModelInfo } from '@shared/cc
 import { MEMORY_WS } from '@shared/memory-ws.js';
 import type {
   MemoryFeatureAdminRecord,
+  MemoryFeatureSetResponse,
   MemoryManagementErrorCode,
   MemoryObservationAdminRecord,
   MemoryPreferenceAdminRecord,
@@ -136,6 +137,7 @@ export type ServerMessage =
   | { type: typeof MEMORY_WS.DELETE_RESPONSE; requestId?: string; success: boolean; error?: string }
   | ({ type: typeof MEMORY_WS.PROJECT_RESOLVE_RESPONSE } & MemoryProjectResolveResponsePayload)
   | { type: typeof MEMORY_WS.FEATURES_RESPONSE; requestId?: string; records: MemoryFeatureAdminRecord[] }
+  | ({ type: typeof MEMORY_WS.FEATURES_SET_RESPONSE } & MemoryFeatureSetResponse)
   | { type: typeof MEMORY_WS.PREF_RESPONSE; requestId?: string; records: MemoryPreferenceAdminRecord[]; featureEnabled?: boolean }
   | { type: typeof MEMORY_WS.PREF_CREATE_RESPONSE; requestId?: string; success: boolean; id?: string; error?: string; errorCode?: MemoryManagementErrorCode }
   | { type: typeof MEMORY_WS.PREF_DELETE_RESPONSE; requestId?: string; success: boolean; error?: string; errorCode?: MemoryManagementErrorCode }

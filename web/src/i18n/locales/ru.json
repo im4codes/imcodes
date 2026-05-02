@@ -1022,7 +1022,9 @@
       "memorySkillRegistryRebuilt": "Skill registry rebuilt",
       "memorySkillDeleted": "Skill deleted",
       "memoryMdIngestCompleted": "Markdown ingest completed",
-      "memoryObservationPromoted": "Observation promoted"
+      "memoryObservationPromoted": "Observation promoted",
+      "memoryFeatureEnabled": "{{flag}} включено",
+      "memoryFeatureDisabled": "{{flag}} отключено"
     },
     "management": {
       "title": "Shared Context",
@@ -1333,7 +1335,9 @@
         "unsupported_md_ingest_scope": "Импорт Markdown поддерживает только личную и проектную общую область.",
         "management_request_unrouted": "Ответ управления не удалось направить в этот браузер.",
         "registry_file_too_large": "Файл реестра навыков слишком велик для загрузки.",
-        "registry_entry_limit_exceeded": "В реестре навыков слишком много записей для полной загрузки."
+        "registry_entry_limit_exceeded": "В реестре навыков слишком много записей для полной загрузки.",
+        "invalid_feature_flag": "Выберите допустимый флаг функции памяти.",
+        "feature_config_write_failed": "Не удалось сохранить настройку флага функции памяти."
       },
       "memoryToolsTitle": "Memory tools",
       "memoryToolsDescription": "Manage preferences, skills, markdown ingest, observations, and daemon memory feature status with the selected project identity.",
@@ -1398,7 +1402,7 @@
       "memoryFeatureErrorDetail": "Feature status could not be loaded.",
       "memoryFeatureUnknownDetail": "The daemon response did not include this feature flag.",
       "memoryFeatureEnabledDetail": "This feature is enabled by the daemon.",
-      "memoryFeatureDisabledHint": "Disabled by daemon config. Enable {{env}} and restart the daemon if you use environment flags. {{behavior}}",
+      "memoryFeatureDisabledHint": "Отключено конфигурацией daemon. Нажмите Включить здесь или задайте {{env}} перед запуском daemon. {{behavior}}",
       "memoryBrowseProjectFilter": "Memory browse filter",
       "memoryBrowseAllProjects": "All projects (default)",
       "memoryAllProjectsActive": "All projects",
@@ -1420,9 +1424,13 @@
       "memoryLocalStatusNoResponse": "No response from the local daemon; local counts may be stale or unavailable.",
       "memoryLocalStatusError": "Local daemon returned an error while loading personal memory.",
       "memoryToolDisabledNoDaemon": "Connect the local daemon before using this management action.",
-      "memoryToolDisabledFeature": "This feature is disabled. Enable {{env}} in the daemon configuration/environment and restart the daemon if needed.",
+      "memoryToolDisabledFeature": "Эта функция отключена. Включите её на вкладке состояния Feature flags или задайте {{env}} перед запуском daemon.",
       "memoryToolDisabledFeatureUnknown": "Feature status is not loaded yet; refresh daemon status first.",
-      "memoryToolDisabledProjectRequired": "Select a resolved project with both canonical ID and local directory before running this local tool."
+      "memoryToolDisabledProjectRequired": "Select a resolved project with both canonical ID and local directory before running this local tool.",
+      "memoryFeatureEnableAction": "Включить",
+      "memoryFeatureDisableAction": "Отключить",
+      "memoryFeatureToggleSaving": "Сохранение…",
+      "memoryFeatureDependencyBlockedHint": "Запрошено включение, но зависимости отключены: {{deps}}. Сначала включите зависимости. {{behavior}}"
     },
     "diagnostics": {
       "title": "Diagnostics",

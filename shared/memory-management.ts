@@ -1,4 +1,4 @@
-import type { MemoryFeatureFlag } from './feature-flags.js';
+import type { FeatureFlagValueSource, MemoryFeatureFlag } from './feature-flags.js';
 import type { MemoryScope } from './memory-scope.js';
 import type { ObservationClass, ObservationState } from './memory-observation.js';
 import type { MemoryOrigin } from './memory-origin.js';
@@ -22,6 +22,8 @@ export const MEMORY_MANAGEMENT_ERROR_CODES = {
   OBSERVATION_QUERY_FORBIDDEN: 'observation_query_forbidden',
   UNSUPPORTED_MD_INGEST_SCOPE: 'unsupported_md_ingest_scope',
   MANAGEMENT_REQUEST_UNROUTED: 'management_request_unrouted',
+  INVALID_FEATURE_FLAG: 'invalid_feature_flag',
+  FEATURE_CONFIG_WRITE_FAILED: 'feature_config_write_failed',
   SKILL_PATH_NOT_READABLE: 'skill_path_not_readable',
   SKILL_FILE_TOO_LARGE: 'skill_file_too_large',
   SKILL_NOT_FOUND: 'skill_not_found',
@@ -45,12 +47,28 @@ export type MemoryManagementBridgeErrorCode = (typeof MEMORY_MANAGEMENT_BRIDGE_E
 export interface MemoryFeatureAdminRecord {
   flag: MemoryFeatureFlag;
   enabled: boolean;
+  requested: boolean;
+  source: FeatureFlagValueSource;
+  envKey: string;
+  dependencies: readonly MemoryFeatureFlag[];
+  dependencyBlocked: readonly MemoryFeatureFlag[];
   disabledBehavior: string;
 }
 
 export interface MemoryFeatureAdminResponse {
   requestId?: string;
   records: MemoryFeatureAdminRecord[];
+}
+
+export interface MemoryFeatureSetResponse {
+  requestId?: string;
+  success: boolean;
+  flag?: MemoryFeatureFlag;
+  requested?: boolean;
+  enabled?: boolean;
+  records?: MemoryFeatureAdminRecord[];
+  error?: string;
+  errorCode?: MemoryManagementErrorCode;
 }
 
 export interface MemoryPreferenceAdminRecord {

@@ -1023,7 +1023,9 @@
       "memorySkillRegistryRebuilt": "技能 registry 已重建",
       "memorySkillDeleted": "技能已删除",
       "memoryMdIngestCompleted": "Markdown 导入完成",
-      "memoryObservationPromoted": "Observation 已提升"
+      "memoryObservationPromoted": "Observation 已提升",
+      "memoryFeatureEnabled": "已开启 {{flag}}",
+      "memoryFeatureDisabled": "已关闭 {{flag}}"
     },
     "management": {
       "title": "共享上下文",
@@ -1334,7 +1336,9 @@
         "unsupported_md_ingest_scope": "Markdown 导入仅支持个人和项目共享作用域。",
         "management_request_unrouted": "管理响应无法路由到当前浏览器。",
         "registry_file_too_large": "技能注册表文件过大，无法加载。",
-        "registry_entry_limit_exceeded": "技能注册表条目过多，无法完整加载。"
+        "registry_entry_limit_exceeded": "技能注册表条目过多，无法完整加载。",
+        "invalid_feature_flag": "请选择有效的记忆功能开关。",
+        "feature_config_write_failed": "无法保存记忆功能开关设置。"
       },
       "memoryToolsTitle": "记忆工具",
       "memoryToolsDescription": "基于已选择的项目身份管理偏好、技能、Markdown 导入、观察记录和 daemon 记忆功能状态。",
@@ -1399,7 +1403,7 @@
       "memoryFeatureErrorDetail": "无法加载功能状态。",
       "memoryFeatureUnknownDetail": "daemon 响应里没有包含该功能开关。",
       "memoryFeatureEnabledDetail": "该功能已由 daemon 启用。",
-      "memoryFeatureDisabledHint": "已被 daemon 配置禁用。如果使用环境变量，请启用 {{env}} 并按需重启 daemon。{{behavior}}",
+      "memoryFeatureDisabledHint": "已被 daemon 配置关闭。可在这里点“开启”，或在 daemon 启动前设置 {{env}}。{{behavior}}",
       "memoryBrowseProjectFilter": "记忆浏览过滤器",
       "memoryBrowseAllProjects": "所有项目（默认）",
       "memoryAllProjectsActive": "所有项目",
@@ -1421,9 +1425,13 @@
       "memoryLocalStatusNoResponse": "本地 daemon 无响应；本地计数可能过期或不可用。",
       "memoryLocalStatusError": "加载个人记忆时本地 daemon 返回了错误。",
       "memoryToolDisabledNoDaemon": "请先连接本地 daemon，再使用该管理操作。",
-      "memoryToolDisabledFeature": "该功能已禁用。请在 daemon 配置/环境中启用 {{env}}，必要时重启 daemon。",
+      "memoryToolDisabledFeature": "此功能已关闭。请在“功能开关”状态页开启，或在 daemon 启动前设置 {{env}}。",
       "memoryToolDisabledFeatureUnknown": "功能状态尚未加载；请先刷新 daemon 状态。",
-      "memoryToolDisabledProjectRequired": "运行本地工具前，请选择同时具备 canonical ID 和本地目录的已解析项目。"
+      "memoryToolDisabledProjectRequired": "运行本地工具前，请选择同时具备 canonical ID 和本地目录的已解析项目。",
+      "memoryFeatureEnableAction": "开启",
+      "memoryFeatureDisableAction": "关闭",
+      "memoryFeatureToggleSaving": "保存中…",
+      "memoryFeatureDependencyBlockedHint": "已请求开启，但依赖仍关闭：{{deps}}。请先开启依赖。{{behavior}}"
     },
     "diagnostics": {
       "title": "诊断",
