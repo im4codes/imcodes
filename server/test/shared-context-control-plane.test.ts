@@ -930,6 +930,24 @@ describe('shared-agent-context server control plane', () => {
           status: 'active',
         },
       ],
+      projects: [
+        {
+          projectId: 'github.com/acme/repo-2',
+          displayName: 'github.com/acme/repo-2',
+          totalRecords: 1,
+          recentSummaryCount: 1,
+          durableCandidateCount: 0,
+          updatedAt: 1700000000500,
+        },
+        {
+          projectId: 'github.com/acme/repo',
+          displayName: 'github.com/acme/repo',
+          totalRecords: 1,
+          recentSummaryCount: 1,
+          durableCandidateCount: 0,
+          updatedAt: 1700000000000,
+        },
+      ],
     });
   });
 
@@ -1040,6 +1058,16 @@ describe('shared-agent-context server control plane', () => {
           updatedAt: 1700000000100,
           hitCount: 0,
           status: 'active',
+        },
+      ],
+      projects: [
+        {
+          projectId: 'github.com/acme/repo',
+          displayName: 'github.com/acme/repo',
+          totalRecords: 2,
+          recentSummaryCount: 1,
+          durableCandidateCount: 1,
+          updatedAt: 1700000000100,
         },
       ],
     });
