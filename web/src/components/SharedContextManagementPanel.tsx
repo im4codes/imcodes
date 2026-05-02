@@ -899,7 +899,7 @@ function FeatureFlagCard({
 }) {
   const ariaLabel = `${label}: ${statusText}`;
   return (
-    <div style={featureFlagCardStyle(enabled, blocked)} title={flag} aria-label={ariaLabel}>
+    <div style={featureFlagCardStyle(enabled, blocked)} title={flag} role="group" aria-label={ariaLabel}>
       <span style={{ display: 'flex', alignItems: 'center', gap: 6, color: DT.text.primary, fontSize: SC_IS_MOBILE ? 11 : 12, fontWeight: 600, overflow: 'hidden' }}>
         <span style={featureFlagDotStyle(enabled, blocked)} />
         <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{label}</span>

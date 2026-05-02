@@ -973,6 +973,7 @@ describe('SharedContextManagementPanel', () => {
   });
 
   it('renders requested-on dependency-blocked memory features as blocked instead of plain disabled', async () => {
+    listTeamsMock.mockResolvedValueOnce([]);
     const sent: Array<Record<string, unknown>> = [];
     const messageHandlers = new Set<(message: unknown) => void>();
     const ws = {
@@ -995,7 +996,12 @@ describe('SharedContextManagementPanel', () => {
     });
 
     await waitFor(() => expect(sent.some((message) => message.type === MEMORY_WS.FEATURES_QUERY)).toBe(true));
+    await screen.findByRole('group', {
+      name: 'sharedContext.management.memoryFeatureLabel.preferences: sharedContext.management.memoryFeatureLoading',
+    });
     const requestId = [...sent].reverse().find((message) => message.type === MEMORY_WS.FEATURES_QUERY)?.requestId as string | undefined;
+    expect(requestId).toBeTruthy();
+
     await act(async () => {
       for (const handler of messageHandlers) handler({
         type: MEMORY_WS.FEATURES_RESPONSE,
@@ -1014,9 +1020,14 @@ describe('SharedContextManagementPanel', () => {
         ],
       });
     });
+    await flush();
 
-    expect(screen.getByLabelText('sharedContext.management.memoryFeatureLabel.preferences: sharedContext.management.memoryFeatureBlocked')).toBeDefined();
-    expect(screen.queryByLabelText('sharedContext.management.memoryFeatureLabel.preferences: sharedContext.management.memoryFeatureDisabled')).toBeNull();
+    expect(await screen.findByRole('group', {
+      name: 'sharedContext.management.memoryFeatureLabel.preferences: sharedContext.management.memoryFeatureBlocked',
+    })).toBeDefined();
+    expect(screen.queryByRole('group', {
+      name: 'sharedContext.management.memoryFeatureLabel.preferences: sharedContext.management.memoryFeatureDisabled',
+    })).toBeNull();
     expect(screen.getByText('sharedContext.management.memoryFeatureDisableAction')).toBeDefined();
   });
 
