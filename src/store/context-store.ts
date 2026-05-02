@@ -60,7 +60,7 @@ export type DatabaseSyncInstance = InstanceType<typeof DatabaseSync>;
 
 const DEFAULT_DB_PATH = join(homedir(), '.imcodes', 'shared-agent-context.sqlite');
 const DEFAULT_LOCAL_PROCESSED_FRESH_MS = 6 * 60 * 60 * 1000;
-const LEGACY_DAEMON_LOCAL_USER_ID = 'daemon-local';
+export const LEGACY_DAEMON_LOCAL_USER_ID = 'daemon-local';
 
 let db: DatabaseSyncInstance | null = null;
 let currentDbPath: string | null = null;
@@ -155,28 +155,67 @@ function namespaceFilterColumnValues(namespace: ContextNamespace): [string, stri
 function appendNamespaceFilterSql(
   conditions: string[],
   params: (string | number)[],
-  filters: Pick<ProcessedProjectionQuery, 'scope' | 'enterpriseId' | 'workspaceId' | 'userId' | 'projectId'>,
+  filters: Pick<ProcessedProjectionQuery, 'scope' | 'enterpriseId' | 'workspaceId' | 'userId' | 'projectId' | 'includeLegacyPersonalOwner'>,
 ): void {
-  if (filters.scope) {
+  if (hasFilterValue(filters.scope)) {
     conditions.push('scope = ?');
     params.push(filters.scope);
   }
-  if (filters.enterpriseId) {
+  if (hasFilterValue(filters.enterpriseId)) {
     conditions.push('enterprise_id = ?');
     params.push(filters.enterpriseId);
   }
-  if (filters.workspaceId) {
+  if (hasFilterValue(filters.workspaceId)) {
     conditions.push('workspace_id = ?');
     params.push(filters.workspaceId);
   }
-  if (filters.userId) {
-    conditions.push('user_id = ?');
-    params.push(filters.userId);
+  if (hasFilterValue(filters.userId)) {
+    if (filters.includeLegacyPersonalOwner && (!hasFilterValue(filters.scope) || filters.scope === 'personal')) {
+      conditions.push("(user_id = ? OR user_id IS NULL OR TRIM(user_id) = '' OR user_id = ?)");
+      params.push(filters.userId, LEGACY_DAEMON_LOCAL_USER_ID);
+    } else {
+      conditions.push('user_id = ?');
+      params.push(filters.userId);
+    }
+  } else if (filters.userId !== undefined) {
+    conditions.push("user_id = '__imcodes_empty_user_filter_never_matches__'");
   }
-  if (filters.projectId) {
+  if (hasFilterValue(filters.projectId)) {
     conditions.push('project_id = ?');
     params.push(filters.projectId);
+  } else if (filters.projectId !== undefined) {
+    conditions.push("project_id = '__imcodes_empty_project_filter_never_matches__'");
   }
+}
+
+function hasFilterValue(value: string | undefined): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function isLegacyPersonalOwner(userId: string | undefined): boolean {
+  return !userId?.trim() || userId === LEGACY_DAEMON_LOCAL_USER_ID;
+}
+
+function namespaceMatchesFilters(
+  namespace: ContextNamespace,
+  filters: Pick<ProcessedProjectionQuery, 'scope' | 'enterpriseId' | 'workspaceId' | 'userId' | 'projectId' | 'includeLegacyPersonalOwner'>,
+): boolean {
+  if (hasFilterValue(filters.scope) && namespace.scope !== filters.scope) return false;
+  if (hasFilterValue(filters.enterpriseId) && namespace.enterpriseId !== filters.enterpriseId) return false;
+  if (hasFilterValue(filters.workspaceId) && namespace.workspaceId !== filters.workspaceId) return false;
+  if (filters.userId !== undefined) {
+    if (!hasFilterValue(filters.userId)) return false;
+    if (namespace.userId !== filters.userId) {
+      if (!(filters.includeLegacyPersonalOwner && namespace.scope === 'personal' && isLegacyPersonalOwner(namespace.userId))) {
+        return false;
+      }
+    }
+  }
+  if (filters.projectId !== undefined) {
+    if (!hasFilterValue(filters.projectId)) return false;
+    if (namespace.projectId !== filters.projectId) return false;
+  }
+  return true;
 }
 
 function backfillNamespaceFilterColumnsForTable(
@@ -1822,6 +1861,7 @@ export function queryPendingContextEvents(filters: {
   workspaceId?: string;
   userId?: string;
   projectId?: string;
+  includeLegacyPersonalOwner?: boolean;
   query?: string;
   limit?: number;
 } = {}): ContextPendingEventView[] {
@@ -1852,12 +1892,7 @@ export function queryPendingContextEvents(filters: {
       };
     })
     .filter((row) => {
-      if (filters.scope && row.namespace.scope !== filters.scope) return false;
-      if (filters.enterpriseId && row.namespace.enterpriseId !== filters.enterpriseId) return false;
-      if (filters.workspaceId && row.namespace.workspaceId !== filters.workspaceId) return false;
-      if (filters.userId && row.namespace.userId !== filters.userId) return false;
-      if (filters.projectId && row.namespace.projectId !== filters.projectId) return false;
-      return true;
+      return namespaceMatchesFilters(row.namespace, filters);
     })
     .filter((row) => {
       if (!normalizedQuery) return true;
@@ -2520,6 +2555,13 @@ export interface ProcessedProjectionQuery {
   workspaceId?: string;
   userId?: string;
   projectId?: string;
+  /**
+   * Explicit management/read compatibility for legacy local personal rows that
+   * were written before durable owner ids were available. This widens only
+   * `personal` owner matching to include missing/daemon-local owners; different
+   * real users remain excluded.
+   */
+  includeLegacyPersonalOwner?: boolean;
   projectionClass?: ProcessedContextClass;
   query?: string;
   limit?: number;
@@ -2589,11 +2631,7 @@ export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}
     })
     .filter((projection) => {
       // Namespace + class JS filters — applied regardless of SQL predicate coverage.
-      if (filters.scope && projection.namespace.scope !== filters.scope) return false;
-      if (filters.enterpriseId && projection.namespace.enterpriseId !== filters.enterpriseId) return false;
-      if (filters.workspaceId && projection.namespace.workspaceId !== filters.workspaceId) return false;
-      if (filters.userId && projection.namespace.userId !== filters.userId) return false;
-      if (filters.projectId && projection.namespace.projectId !== filters.projectId) return false;
+      if (!namespaceMatchesFilters(projection.namespace, filters)) return false;
       // Class was already in SQL (when provided); still safe to double-check.
       if (filters.projectionClass && projection.class !== filters.projectionClass) return false;
       if (isMemoryNoiseSummary(projection.summary)) return false;
@@ -2644,11 +2682,7 @@ export function getProcessedProjectionStats(filters: ProcessedProjectionQuery = 
   const projectIds = new Set<string>();
   for (const row of rows) {
     const namespace = parseNamespaceKey(String(row.namespace_key));
-    if (filters.scope && namespace.scope !== filters.scope) continue;
-    if (filters.enterpriseId && namespace.enterpriseId !== filters.enterpriseId) continue;
-    if (filters.workspaceId && namespace.workspaceId !== filters.workspaceId) continue;
-    if (filters.userId && namespace.userId !== filters.userId) continue;
-    if (filters.projectId && namespace.projectId !== filters.projectId) continue;
+    if (!namespaceMatchesFilters(namespace, filters)) continue;
     const status = typeof row.status === 'string' ? row.status : 'active';
     if (!filters.includeArchived && status !== 'active') continue;
     const projectionClass = String(row.class) as ProcessedContextClass;
@@ -2711,11 +2745,7 @@ function getPendingContextStats(filters: ProcessedProjectionQuery): {
 
   for (const row of dirtyRows) {
     const namespace = parseNamespaceKey(String(row.namespace_key));
-    if (filters.scope && namespace.scope !== filters.scope) continue;
-    if (filters.enterpriseId && namespace.enterpriseId !== filters.enterpriseId) continue;
-    if (filters.workspaceId && namespace.workspaceId !== filters.workspaceId) continue;
-    if (filters.userId && namespace.userId !== filters.userId) continue;
-    if (filters.projectId && namespace.projectId !== filters.projectId) continue;
+    if (!namespaceMatchesFilters(namespace, filters)) continue;
     stagedEventCount += Number(row.event_count);
     dirtyTargetCount += 1;
     if (namespace.projectId) projectIds.add(namespace.projectId);
@@ -2723,11 +2753,7 @@ function getPendingContextStats(filters: ProcessedProjectionQuery): {
 
   for (const row of pendingJobRows) {
     const namespace = parseNamespaceKey(String(row.namespace_key));
-    if (filters.scope && namespace.scope !== filters.scope) continue;
-    if (filters.enterpriseId && namespace.enterpriseId !== filters.enterpriseId) continue;
-    if (filters.workspaceId && namespace.workspaceId !== filters.workspaceId) continue;
-    if (filters.userId && namespace.userId !== filters.userId) continue;
-    if (filters.projectId && namespace.projectId !== filters.projectId) continue;
+    if (!namespaceMatchesFilters(namespace, filters)) continue;
     pendingJobCount += 1;
     if (namespace.projectId) projectIds.add(namespace.projectId);
   }

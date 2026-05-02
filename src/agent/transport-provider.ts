@@ -223,6 +223,22 @@ export interface ProviderStatusUpdate {
   label?: string | null;
 }
 
+/** Provider-reported token/context usage update. */
+export interface ProviderUsageUpdate {
+  /** Provider-native usage fields normalized enough for the daemon relay. */
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
+    cached_input_tokens?: number;
+    model_context_window?: number;
+    [key: string]: unknown;
+  };
+  /** Active model for resolving display context-window limits. */
+  model?: string;
+}
+
 // ── TransportProvider interface ─────────────────────────────────────────────
 
 /**
@@ -334,6 +350,14 @@ export interface TransportProvider {
    * Used by SDK-backed providers that can surface phases before a final response arrives.
    */
   onStatus?(cb: (sessionId: string, status: ProviderStatusUpdate) => void): () => void;
+
+  /**
+   * Register a callback for token/context usage updates that can arrive
+   * independently from final assistant messages. Used by transports such as
+   * Codex SDK where tokenUsage notifications may race before or after
+   * item/turn completion.
+   */
+  onUsage?(cb: (sessionId: string, update: ProviderUsageUpdate) => void): () => void;
 
   /**
    * Register a callback for approval requests from the agent.

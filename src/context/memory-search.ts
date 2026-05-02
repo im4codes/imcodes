@@ -20,6 +20,7 @@ import {
   listContextEvents,
   listDirtyTargets,
   queryProcessedProjections,
+  LEGACY_DAEMON_LOCAL_USER_ID,
   getProjectionEmbeddings,
   saveProjectionEmbedding,
 } from '../store/context-store.js';
@@ -39,6 +40,8 @@ export interface MemorySearchQuery {
   repo?: string;
   /** Optional owner/user filter used by authenticated management reads. */
   userId?: string;
+  /** Include legacy local personal rows that have no durable owner id. */
+  includeLegacyPersonalOwner?: boolean;
   /** Filter by projection class. */
   projectionClass?: ProcessedContextClass;
   /** Include raw unprocessed staged events. */
@@ -358,6 +361,7 @@ export function searchLocalMemoryAuthorized(query: AuthorizedMemorySearchQuery):
       workspaceId: namespace.workspaceId,
       userId: namespace.userId,
       projectId: namespace.projectId,
+      includeLegacyPersonalOwner: query.includeLegacyPersonalOwner,
       projectionClass: query.projectionClass,
       query: query.query,
       includeArchived: query.includeArchived,
@@ -455,6 +459,7 @@ function collectProcessedProjections(query: MemorySearchQuery): ProcessedContext
     workspaceId: query.namespace?.workspaceId,
     userId: query.namespace?.userId ?? query.userId,
     projectId: query.namespace?.projectId ?? query.repo,
+    includeLegacyPersonalOwner: query.includeLegacyPersonalOwner,
     projectionClass: query.projectionClass,
     query: query.query,
     includeArchived: query.includeArchived,
@@ -549,12 +554,16 @@ function matchesNamespace(
     if (item.scope !== namespace.scope) return false;
     if ((item.enterpriseId ?? undefined) !== (namespace.enterpriseId ?? undefined)) return false;
     if ((item.workspaceId ?? undefined) !== (namespace.workspaceId ?? undefined)) return false;
-    if ((item.userId ?? undefined) !== (namespace.userId ?? undefined)) return false;
+    if ((item.userId ?? undefined) !== (namespace.userId ?? undefined)) {
+      if (!(query.includeLegacyPersonalOwner && namespace.scope === 'personal' && (!item.userId || item.userId === LEGACY_DAEMON_LOCAL_USER_ID))) return false;
+    }
     return true;
   }
   if (query.scope && item.scope !== query.scope) return false;
   if (query.repo && item.projectId !== query.repo) return false;
-  if (query.userId && item.userId !== query.userId) return false;
+  if (query.userId && item.userId !== query.userId) {
+    if (!(query.includeLegacyPersonalOwner && item.scope === 'personal' && (!item.userId || item.userId === LEGACY_DAEMON_LOCAL_USER_ID))) return false;
+  }
   return true;
 }
 

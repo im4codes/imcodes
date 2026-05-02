@@ -272,10 +272,10 @@ export function parseLine(sessionName: string, line: string, model?: string): vo
   if (pl.type === 'token_count') {
     const total = pl.info?.total_token_usage;
     const last = pl.info?.last_token_usage;
-    // `total_token_usage` is cumulative for the Codex thread/session and can
-    // grow far beyond the live prompt window. The UI ctx meter must reflect the
-    // current request/window occupancy, so prefer `last_token_usage` whenever it
-    // is available and keep `total` only as a compatibility fallback.
+    // Codex CLI reports `last_token_usage` for the current prompt/window and
+    // `total_token_usage` as cumulative billing/thread usage. The UI ctx meter
+    // must match Codex CLI's live window occupancy, so prefer `last`; `total`
+    // is only a compatibility fallback when old payloads omit `last`.
     const usage = last ?? total;
     if (usage && typeof usage.input_tokens === 'number') {
       const cachedInput = typeof usage.cached_input_tokens === 'number' ? usage.cached_input_tokens : 0;

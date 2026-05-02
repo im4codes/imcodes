@@ -9,8 +9,12 @@ const {
   recordMemoryHitsMock,
   detectRepoMock,
   getProcessedProjectionStatsMock,
+  getProcessedProjectionByIdMock,
   queryProcessedProjectionsMock,
   queryPendingContextEventsMock,
+  archiveMemoryMock,
+  restoreArchivedMemoryMock,
+  deleteMemoryMock,
 } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
   getTransportRuntimeMock: vi.fn(),
@@ -20,8 +24,12 @@ const {
   recordMemoryHitsMock: vi.fn(),
   detectRepoMock: vi.fn(),
   getProcessedProjectionStatsMock: vi.fn(),
+  getProcessedProjectionByIdMock: vi.fn(),
   queryProcessedProjectionsMock: vi.fn(),
   queryPendingContextEventsMock: vi.fn(),
+  archiveMemoryMock: vi.fn(),
+  restoreArchivedMemoryMock: vi.fn(),
+  deleteMemoryMock: vi.fn(),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -35,12 +43,17 @@ vi.mock('../../src/store/session-store.js', () => ({
 vi.mock('../../src/store/context-store.js', () => ({
   deleteContextObservation: vi.fn(),
   ensureContextNamespace: vi.fn(),
+  LEGACY_DAEMON_LOCAL_USER_ID: 'daemon-local',
   getProcessedProjectionStats: getProcessedProjectionStatsMock,
+  getProcessedProjectionById: getProcessedProjectionByIdMock,
   listContextObservations: vi.fn(() => []),
   promoteContextObservation: vi.fn(),
   queryPendingContextEvents: queryPendingContextEventsMock,
   queryProcessedProjections: queryProcessedProjectionsMock,
   recordMemoryHits: recordMemoryHitsMock,
+  archiveMemory: archiveMemoryMock,
+  restoreArchivedMemory: restoreArchivedMemoryMock,
+  deleteMemory: deleteMemoryMock,
   writeContextObservation: vi.fn(),
 }));
 
@@ -195,6 +208,10 @@ describe('handleWebCommand memory context timeline', () => {
     });
     queryProcessedProjectionsMock.mockReturnValue([]);
     queryPendingContextEventsMock.mockReturnValue([]);
+    getProcessedProjectionByIdMock.mockReturnValue(undefined);
+    archiveMemoryMock.mockReturnValue(false);
+    restoreArchivedMemoryMock.mockReturnValue(false);
+    deleteMemoryMock.mockReturnValue(false);
     getSessionMock.mockReturnValue({
       name: 'deck_process_brain',
       projectName: 'codedeck',
@@ -339,6 +356,121 @@ describe('handleWebCommand memory context timeline', () => {
       requestId: 'personal-list',
       records: [expect.objectContaining({ id: 'bob-proj', summary: 'Bob private project memory' })],
       pendingRecords: [expect.objectContaining({ id: 'pending-bob' })],
+    }));
+  });
+
+  it('enables explicit legacy local-owner compatibility for personal memory management reads', async () => {
+    handleWebCommand({
+      type: MEMORY_WS.PERSONAL_QUERY,
+      requestId: 'legacy-personal-list',
+      canonicalRepoId: 'github.com/acme/repo',
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: {
+        actorId: 'user-bob',
+        userId: 'user-bob',
+        role: 'user',
+        source: 'server_bridge',
+        requestId: 'legacy-personal-list',
+        boundProjects: [{ canonicalRepoId: 'github.com/acme/repo' }],
+      },
+    }, serverLink as any);
+
+    await flushAsync();
+
+    expect(getProcessedProjectionStatsMock).toHaveBeenCalledWith(expect.objectContaining({
+      scope: 'personal',
+      userId: 'user-bob',
+      projectId: 'github.com/acme/repo',
+      includeLegacyPersonalOwner: true,
+    }));
+    expect(queryProcessedProjectionsMock).toHaveBeenCalledWith(expect.objectContaining({
+      scope: 'personal',
+      userId: 'user-bob',
+      projectId: 'github.com/acme/repo',
+      includeLegacyPersonalOwner: true,
+    }));
+    expect(queryPendingContextEventsMock).toHaveBeenCalledWith(expect.objectContaining({
+      scope: 'personal',
+      userId: 'user-bob',
+      projectId: 'github.com/acme/repo',
+      includeLegacyPersonalOwner: true,
+    }));
+  });
+
+  it('allows management actions on visible legacy personal rows in the bound project', async () => {
+    getProcessedProjectionByIdMock.mockReturnValue({
+      id: 'legacy-proj',
+      namespace: { scope: 'personal', projectId: 'github.com/acme/repo' },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-legacy'],
+      summary: 'Legacy project memory',
+      content: {},
+      createdAt: 1,
+      updatedAt: 2,
+      status: 'active',
+    });
+    archiveMemoryMock.mockReturnValue(true);
+
+    handleWebCommand({
+      type: MEMORY_WS.ARCHIVE,
+      requestId: 'archive-legacy',
+      id: 'legacy-proj',
+      canonicalRepoId: 'github.com/acme/repo',
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: {
+        actorId: 'user-bob',
+        userId: 'user-bob',
+        role: 'user',
+        source: 'server_bridge',
+        requestId: 'archive-legacy',
+        boundProjects: [{ canonicalRepoId: 'github.com/acme/repo' }],
+      },
+    }, serverLink as any);
+
+    await flushAsync();
+
+    expect(archiveMemoryMock).toHaveBeenCalledWith('legacy-proj');
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: MEMORY_WS.ARCHIVE_RESPONSE,
+      requestId: 'archive-legacy',
+      success: true,
+    }));
+  });
+
+  it('rejects management actions on another real user personal rows', async () => {
+    getProcessedProjectionByIdMock.mockReturnValue({
+      id: 'alice-proj',
+      namespace: { scope: 'personal', projectId: 'github.com/acme/repo', userId: 'user-alice' },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-alice'],
+      summary: 'Alice project memory',
+      content: {},
+      createdAt: 1,
+      updatedAt: 2,
+      status: 'active',
+    });
+
+    handleWebCommand({
+      type: MEMORY_WS.DELETE,
+      requestId: 'delete-alice',
+      id: 'alice-proj',
+      canonicalRepoId: 'github.com/acme/repo',
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: {
+        actorId: 'user-bob',
+        userId: 'user-bob',
+        role: 'user',
+        source: 'server_bridge',
+        requestId: 'delete-alice',
+        boundProjects: [{ canonicalRepoId: 'github.com/acme/repo' }],
+      },
+    }, serverLink as any);
+
+    await flushAsync();
+
+    expect(deleteMemoryMock).not.toHaveBeenCalled();
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: MEMORY_WS.DELETE_RESPONSE,
+      requestId: 'delete-alice',
+      success: false,
+      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_QUERY_FORBIDDEN,
     }));
   });
 

@@ -29,6 +29,12 @@ const PREVIEW_RAW_FLUSH_MS = 32;
 const PREVIEW_RAW_MAX_BYTES = 16 * 1024;
 const PREVIEW_DIFF_SUPPRESS_AFTER_RAW_MS = 1000;
 
+function requestFrame(callback: FrameRequestCallback): number | ReturnType<typeof setTimeout> {
+  const raf = globalThis.requestAnimationFrame;
+  if (typeof raf === 'function') return raf.call(globalThis, callback);
+  return setTimeout(() => callback(Date.now()), 0);
+}
+
 function concatChunks(chunks: Uint8Array[], totalBytes: number): Uint8Array {
   if (chunks.length === 1) return chunks[0];
   const combined = new Uint8Array(totalBytes);
@@ -178,13 +184,13 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
         if (el && el.clientWidth > 0 && el.clientHeight > 0) {
           fittingRef.current = true;
           fitAddon.fit();
-          requestAnimationFrame(() => { fittingRef.current = false; });
+          requestFrame(() => { fittingRef.current = false; });
           fitDone = true;
         }
       };
-      requestAnimationFrame(() => {
+      requestFrame(() => {
         doFit();
-        if (!fitDone) requestAnimationFrame(() => { doFit(); });
+        if (!fitDone) requestFrame(() => { doFit(); });
       });
       // Fallback: force a fit after 400ms for slow mobile renders
       fitTimer = setTimeout(() => {
@@ -192,13 +198,13 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
         if (!fitDone) {
           fittingRef.current = true;
           fitAddon.fit();
-          requestAnimationFrame(() => { fittingRef.current = false; });
+          requestFrame(() => { fittingRef.current = false; });
           fitDone = true;
         }
       }, 400);
       // Auto-focus terminal on mount for desktop keyboard input
       if (!isMobile) {
-        requestAnimationFrame(() => term.focus());
+        requestFrame(() => term.focus());
       }
     }
 
@@ -262,7 +268,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
       fittingRef.current = true;
       fitAddon.fit();
       // Use rAF so the reflow onScroll events fire before we clear fittingRef
-      requestAnimationFrame(() => {
+      requestFrame(() => {
         fittingRef.current = false;
         term.scrollToBottom();
         autoFollowRef.current = true;
@@ -287,7 +293,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
       // Snap to bottom immediately after fit (reflow can reset viewportY to 0)
       term.scrollToBottom();
       autoFollowRef.current = true;
-      requestAnimationFrame(() => { fittingRef.current = false; });
+      requestFrame(() => { fittingRef.current = false; });
       // NOTE: do NOT repaint linesRef.current here — xterm reflows on resize natively,
       // and repainting with stale diff buffer clobbers live PTY output (especially on mobile
       // where viewport resizes frequently due to address bar / keyboard show/hide).
@@ -402,7 +408,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
 
     // Always scroll to bottom on new content (fullFrame handles its own scroll internally).
     if (!diff.fullFrame) {
-      requestAnimationFrame(() => term.scrollToBottom());
+      requestFrame(() => term.scrollToBottom());
     }
   }, []);
 

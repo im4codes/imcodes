@@ -196,6 +196,35 @@ function preferenceUserIdForSend(cmd: Record<string, unknown>, record: SessionRe
   return fromNamespace || DAEMON_LOCAL_PREFERENCE_USER_ID;
 }
 
+const processPreferenceContextSignatures = new Map<string, string>();
+
+function normalizePreferenceProviderContextSignature(context: string): string {
+  return context.replace(/\s+/g, ' ').trim();
+}
+
+function prepareProcessPreferenceProviderText(input: {
+  sessionName: string;
+  providerText: string;
+  preferenceContext: string;
+}): string {
+  const context = input.preferenceContext.trim();
+  if (!context) return input.providerText;
+  const trimmedText = input.providerText.trim();
+  if (trimmedText.startsWith('/')) {
+    if (trimmedText === '/compact' || trimmedText === '/clear') {
+      processPreferenceContextSignatures.delete(input.sessionName);
+    }
+    return input.providerText;
+  }
+  const signature = normalizePreferenceProviderContextSignature(context);
+  if (!signature) return input.providerText;
+  if (processPreferenceContextSignatures.get(input.sessionName) === signature) {
+    return input.providerText;
+  }
+  processPreferenceContextSignatures.set(input.sessionName, signature);
+  return prependPreferenceProviderContext(input.providerText, context);
+}
+
 function loadPreferenceProviderContext(input: {
   enabled: boolean;
   userId: string;
@@ -2661,8 +2690,14 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     return;
   }
 
-  // Preserve raw @file references for normal sends.
-  const finalText = prependPreferenceProviderContext(displayText, preferenceMessagePreamble);
+  // Preserve raw @file references for normal sends. Stable preferences are
+  // session context, not per-turn recall: for tmux/process agents inject them
+  // once per provider conversation, and reset the gate on clear/compact.
+  const finalText = prepareProcessPreferenceProviderText({
+    sessionName,
+    providerText: displayText,
+    preferenceContext: preferenceMessagePreamble,
+  });
 
   if (text.trim() === '/clear' && record?.runtimeType !== 'transport' && supportsProcessClear(record?.agentType)) {
     emitTransportUserMessage(text);
@@ -6188,6 +6223,7 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
   const baseStats = getProcessedProjectionStats({
     scope: 'personal',
     userId: ownerUserId,
+    includeLegacyPersonalOwner: true,
     projectId: projectId || undefined,
     projectionClass,
     includeArchived,
@@ -6213,13 +6249,14 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
       query,
       scope: 'personal',
       userId: ownerUserId,
+      includeLegacyPersonalOwner: true,
       repo: projectId || undefined,
       projectionClass,
       limit,
       includeArchived,
     });
     records = semantic.items
-      .filter((item) => item.type === 'processed' && item.scope === 'personal' && item.userId === ownerUserId)
+      .filter((item) => item.type === 'processed' && item.scope === 'personal' && personalOwnerMatchesManagementUser(item.userId, ownerUserId))
       .map((item) => ({
         id: item.id,
         scope: 'personal' as const,
@@ -6237,6 +6274,7 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
     records = queryProcessedProjections({
       scope: 'personal',
       userId: ownerUserId,
+      includeLegacyPersonalOwner: true,
       projectId: projectId || undefined,
       projectionClass,
       limit,
@@ -6263,6 +6301,7 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
   const pendingRecords = queryPendingContextEvents({
     scope: 'personal',
     userId: ownerUserId,
+    includeLegacyPersonalOwner: true,
     projectId: projectId || undefined,
     query: query || undefined,
     limit,
@@ -6350,6 +6389,12 @@ function observationNamespace(namespaceId: string): ContextNamespace | undefined
   return listContextNamespaces().find((namespace) => namespace.id === namespaceId);
 }
 
+function personalOwnerMatchesManagementUser(namespaceUserId: string | undefined, ownerUserId: string): boolean {
+  return namespaceUserId === ownerUserId
+    || !namespaceUserId?.trim()
+    || namespaceUserId === DAEMON_LOCAL_PREFERENCE_USER_ID;
+}
+
 function managementContextCanAccessNamespace(namespace: ContextNamespace | undefined, ctx: AuthenticatedMemoryManagementContext): boolean {
   if (!namespace) return false;
   if (namespace.scope === 'user_private') {
@@ -6357,8 +6402,9 @@ function managementContextCanAccessNamespace(namespace: ContextNamespace | undef
   }
   const boundProjects = ctx.boundProjects ?? [];
   if (namespace.scope === 'personal') {
-    if (!namespace.userId?.trim() || namespace.userId !== ctx.userId) return false;
+    if (!personalOwnerMatchesManagementUser(namespace.userId, ctx.userId)) return false;
     if (namespace.projectId) {
+      if (boundProjects.length === 0) return true;
       return boundProjects.some((project) => project.canonicalRepoId === namespace.projectId);
     }
     return true;

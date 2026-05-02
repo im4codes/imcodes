@@ -199,6 +199,89 @@ describe('context-store', () => {
     ]);
   });
 
+  it('requires explicit legacy personal owner compatibility for owner-filtered management reads', () => {
+    const now = Date.now();
+    writeProcessedProjection({
+      namespace: { scope: 'personal', projectId: 'repo' },
+      class: 'recent_summary',
+      sourceEventIds: ['legacy-proj'],
+      summary: 'Legacy local personal memory',
+      content: {},
+      createdAt: now - 10,
+      updatedAt: now,
+    });
+    writeProcessedProjection({
+      namespace: { scope: 'personal', projectId: 'repo', userId: 'user-2' },
+      class: 'recent_summary',
+      sourceEventIds: ['other-user-proj'],
+      summary: 'Other user personal memory',
+      content: {},
+      createdAt: now - 5,
+      updatedAt: now,
+    });
+    recordContextEvent({
+      target: { namespace: { scope: 'personal', projectId: 'repo' }, kind: 'session', sessionName: 'legacy-session' },
+      eventType: 'user.turn',
+      content: 'Legacy pending local event',
+      createdAt: now,
+    });
+
+    expect(queryProcessedProjections({ scope: 'personal', projectId: 'repo', userId: 'user-1' })).toEqual([]);
+    expect(getProcessedProjectionStats({ scope: 'personal', projectId: 'repo', userId: 'user-1' }).totalRecords).toBe(0);
+    expect(queryPendingContextEvents({ scope: 'personal', projectId: 'repo', userId: 'user-1' })).toEqual([]);
+
+    const compatibleRecords = queryProcessedProjections({
+      scope: 'personal',
+      projectId: 'repo',
+      userId: 'user-1',
+      includeLegacyPersonalOwner: true,
+    });
+    expect(compatibleRecords).toEqual([
+      expect.objectContaining({ summary: 'Legacy local personal memory' }),
+    ]);
+    expect(getProcessedProjectionStats({
+      scope: 'personal',
+      projectId: 'repo',
+      userId: 'user-1',
+      includeLegacyPersonalOwner: true,
+    })).toMatchObject({
+      totalRecords: 1,
+      matchedRecords: 1,
+      projectCount: 1,
+      stagedEventCount: 1,
+    });
+    expect(queryPendingContextEvents({
+      scope: 'personal',
+      projectId: 'repo',
+      userId: 'user-1',
+      includeLegacyPersonalOwner: true,
+    })).toEqual([
+      expect.objectContaining({ content: 'Legacy pending local event' }),
+    ]);
+    expect(queryProcessedProjections({
+      projectId: 'repo',
+      userId: 'user-1',
+      includeLegacyPersonalOwner: true,
+    })).toEqual([
+      expect.objectContaining({ summary: 'Legacy local personal memory' }),
+    ]);
+  });
+
+  it('does not treat an empty owner filter as an all-user memory query', () => {
+    writeProcessedProjection({
+      namespace,
+      class: 'recent_summary',
+      sourceEventIds: ['evt-user'],
+      summary: 'User-owned summary',
+      content: {},
+      createdAt: 1,
+      updatedAt: 2,
+    });
+
+    expect(queryProcessedProjections({ scope: 'personal', userId: '' })).toEqual([]);
+    expect(getProcessedProjectionStats({ scope: 'personal', userId: '' }).totalRecords).toBe(0);
+  });
+
   it('removes staged events once they have been materialized', () => {
     const first = recordContextEvent({ target, eventType: 'user.turn', content: 'question', createdAt: 10 });
     const second = recordContextEvent({ target, eventType: 'assistant.turn', content: 'answer', createdAt: 20 });

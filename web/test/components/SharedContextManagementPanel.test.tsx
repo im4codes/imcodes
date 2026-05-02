@@ -83,6 +83,16 @@ async function flush() {
   });
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 describe('SharedContextManagementPanel', () => {
   beforeEach(() => {
     listTeamsMock.mockResolvedValue([{ id: 'team-1', name: 'Acme', role: 'owner' }]);
@@ -761,7 +771,7 @@ describe('SharedContextManagementPanel', () => {
       fireEvent.click(screen.getByText('sharedContext.management.memoryTabPersonal'));
     });
     await act(async () => {
-      fireEvent.click(screen.getByText('sharedContext.management.memoryTabUnprocessed'));
+      fireEvent.click(screen.getByText('sharedContext.management.memoryTabLocalPending'));
     });
     expect(await screen.findByText('Pending raw local event')).toBeDefined();
     expect(await screen.findByText('sharedContext.management.memoryPendingTitle')).toBeDefined();
@@ -876,6 +886,160 @@ describe('SharedContextManagementPanel', () => {
       fireEvent.click(screen.getByText('sharedContext.management.memoryToolTabPreferences'));
     });
     expect((await screen.findAllByText('sharedContext.management.memoryToolDisabledNoDaemon')).length).toBeGreaterThan(0);
+  });
+
+  it('does not render local daemon errors as healthy zero memory stats', async () => {
+    const sent: Array<Record<string, unknown>> = [];
+    const messageHandlers = new Set<(message: unknown) => void>();
+    const ws = {
+      send(message: Record<string, unknown>) {
+        sent.push(message);
+      },
+      onMessage(handler: (message: unknown) => void) {
+        messageHandlers.add(handler);
+        return () => {
+          messageHandlers.delete(handler);
+        };
+      },
+    };
+
+    render(<SharedContextManagementPanel serverId="srv-1" ws={ws as never} />);
+    await flush();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.memory'));
+    });
+
+    const localQuery = [...sent].reverse().find((message) => message.type === MEMORY_WS.PERSONAL_QUERY);
+    expect(localQuery).toBeDefined();
+
+    await act(async () => {
+      for (const handler of messageHandlers) handler({
+        type: MEMORY_WS.PERSONAL_RESPONSE,
+        requestId: localQuery?.requestId,
+        errorCode: 'management_request_unrouted',
+        error: 'missing management context',
+        stats: {
+          totalRecords: 0,
+          matchedRecords: 0,
+          recentSummaryCount: 0,
+          durableCandidateCount: 0,
+          projectCount: 0,
+          stagedEventCount: 0,
+          dirtyTargetCount: 0,
+          pendingJobCount: 0,
+        },
+        records: [],
+        pendingRecords: [],
+      });
+    });
+
+    expect(await screen.findByText('sharedContext.management.memoryLocalStatusError')).toBeDefined();
+    expect(screen.queryByText('sharedContext.management.memoryStatTotal')).toBeNull();
+    expect(screen.queryByText('sharedContext.management.memoryProcessedEmptyPending')).toBeNull();
+  });
+
+  it('ignores stale cloud memory responses after a newer project filter load starts', async () => {
+    const firstCloud = deferred<Awaited<ReturnType<typeof getPersonalCloudMemoryMock>>>();
+    const secondCloud = deferred<Awaited<ReturnType<typeof getPersonalCloudMemoryMock>>>();
+    getPersonalCloudMemoryMock
+      .mockReturnValueOnce(firstCloud.promise)
+      .mockReturnValueOnce(secondCloud.promise);
+
+    const sent: Array<Record<string, unknown>> = [];
+    const messageHandlers = new Set<(message: unknown) => void>();
+    const ws = {
+      send(message: Record<string, unknown>) {
+        sent.push(message);
+      },
+      onMessage(handler: (message: unknown) => void) {
+        messageHandlers.add(handler);
+        return () => {
+          messageHandlers.delete(handler);
+        };
+      },
+    };
+
+    render(
+      <SharedContextManagementPanel
+        serverId="srv-1"
+        ws={ws as never}
+        activeProjectDir="/work/repo"
+        memoryProjectCandidates={[{
+          projectDir: '/work/repo',
+          displayName: 'Repo',
+          canonicalRepoId: 'github.com/acme/repo',
+          source: 'active_session',
+        }]}
+      />,
+    );
+    await flush();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.memory'));
+    });
+    await act(async () => {
+      const browseSelect = screen.getByLabelText('sharedContext.management.memoryBrowseProjectFilter') as HTMLSelectElement;
+      fireEvent.input(browseSelect, { target: { value: 'github.com/acme/repo' } });
+    });
+
+    await act(async () => {
+      secondCloud.resolve({
+        stats: {
+          totalRecords: 7,
+          matchedRecords: 7,
+          recentSummaryCount: 0,
+          durableCandidateCount: 7,
+          projectCount: 1,
+          stagedEventCount: 0,
+          dirtyTargetCount: 0,
+          pendingJobCount: 0,
+        },
+        records: [{
+          id: 'latest-cloud',
+          scope: 'personal',
+          projectId: 'github.com/acme/repo',
+          summary: 'Latest cloud memory',
+          projectionClass: 'durable_memory_candidate',
+          sourceEventCount: 1,
+          updatedAt: 1700000004000,
+        }],
+        pendingRecords: [],
+      });
+      await secondCloud.promise;
+    });
+
+    await act(async () => {
+      firstCloud.resolve({
+        stats: {
+          totalRecords: 99,
+          matchedRecords: 99,
+          recentSummaryCount: 0,
+          durableCandidateCount: 99,
+          projectCount: 1,
+          stagedEventCount: 0,
+          dirtyTargetCount: 0,
+          pendingJobCount: 0,
+        },
+        records: [{
+          id: 'stale-cloud',
+          scope: 'personal',
+          projectId: 'github.com/old/repo',
+          summary: 'Stale cloud memory',
+          projectionClass: 'durable_memory_candidate',
+          sourceEventCount: 1,
+          updatedAt: 1700000001000,
+        }],
+        pendingRecords: [],
+      });
+      await firstCloud.promise;
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.memoryTabCloud'));
+    });
+    expect(await screen.findByText('Latest cloud memory')).toBeDefined();
+    expect(screen.queryByText('Stale cloud memory')).toBeNull();
   });
 
   it('deletes local, cloud, and enterprise memory records', async () => {

@@ -12,6 +12,7 @@ import type {
   SessionConfig,
   SessionInfoUpdate,
   ProviderStatusUpdate,
+  ProviderUsageUpdate,
   ToolCallEvent,
 } from '../transport-provider.js';
 import {
@@ -30,6 +31,40 @@ import { getCodexBaseInstructions } from '../codex-runtime-config.js';
 
 const CODEX_BIN = 'codex';
 const CANCEL_INTERRUPT_TIMEOUT_MS = 1_500;
+const DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 32_000;
+const MIN_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 4_000;
+const MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 128_000;
+
+function getCodexSdkContextInjectionMaxChars(): number {
+  const raw = process.env.IMCODES_CODEX_SDK_CONTEXT_MAX_CHARS;
+  if (raw === undefined || raw.trim() === '') return DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) return DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS;
+  if (parsed < MIN_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS) return MIN_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS;
+  if (parsed > MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS) return MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS;
+  return parsed;
+}
+
+function capCodexSdkContextInjection(text: string, maxChars = getCodexSdkContextInjectionMaxChars()): string {
+  if (text.length <= maxChars) return text;
+  const marker = `\n\n[IM.codes: injected context truncated from ${text.length} to ${maxChars} chars to prevent SDK auto-compaction.]`;
+  if (maxChars <= marker.length + 16) return text.slice(0, maxChars);
+  return `${text.slice(0, maxChars - marker.length).trimEnd()}${marker}`;
+}
+
+function buildCodexTurnInput(payload: ProviderContextPayload): string {
+  const contextParts: string[] = [];
+  const systemText = payload.systemText?.trim();
+  const messagePreamble = payload.messagePreamble?.trim();
+  if (systemText) contextParts.push(`Context instructions:\n${systemText}`);
+  if (messagePreamble) contextParts.push(messagePreamble);
+  if (contextParts.length === 0) return payload.assembledMessage;
+
+  const contextText = capCodexSdkContextInjection(contextParts.join('\n\n'));
+  const userMessage = messagePreamble ? payload.userMessage : payload.assembledMessage;
+  const trimmedUserMessage = userMessage.trim();
+  return trimmedUserMessage ? `${contextText}\n\n${trimmedUserMessage}` : contextText;
+}
 
 /**
  * Provider-neutral fallback `baseInstructions` used when codex's own
@@ -116,11 +151,11 @@ interface CodexSdkSessionState {
   cancelTimer: ReturnType<typeof setTimeout> | null;
   lastUsage?: {
     /**
-     * Context-bar usage must represent the current request/window occupancy.
-     * Codex app-server emits both `last` and `total`; `total` is cumulative
-     * usage for the long-running thread and can grow far beyond the live
+     * Context-bar usage must represent the current prompt/window occupancy,
+     * not cumulative billing/thread totals. Codex app-server emits both
+     * `last` and `total`; `total` grows across turns and can exceed the model
      * context window, so provider-neutral fields normalize from `last` when
-     * available and keep cumulative fields only for diagnostics.
+     * available and keep cumulative `total` fields only for diagnostics.
      */
     input_tokens: number;
     cache_read_input_tokens: number;
@@ -130,6 +165,8 @@ interface CodexSdkSessionState {
     reasoning_output_tokens?: number;
     model_context_window?: number;
     codex_total_input_tokens?: number;
+    codex_total_cached_input_tokens?: number;
+    codex_total_output_tokens?: number;
     codex_last_input_tokens?: number;
     codex_last_cached_input_tokens?: number;
     codex_last_output_tokens?: number;
@@ -188,6 +225,8 @@ function normalizeCodexTokenUsage(params: Record<string, any>): CodexSdkSessionS
     ...(finiteNumber(total?.reasoningOutputTokens) !== undefined ? { reasoning_output_tokens: finiteNumber(total?.reasoningOutputTokens)! } : {}),
     ...(modelContextWindow !== undefined && modelContextWindow > 0 ? { model_context_window: modelContextWindow } : {}),
     ...(totalInput !== undefined ? { codex_total_input_tokens: totalInput } : {}),
+    ...(totalCached !== undefined ? { codex_total_cached_input_tokens: totalCached } : {}),
+    ...(totalOutput !== undefined ? { codex_total_output_tokens: totalOutput } : {}),
     ...(lastInput !== undefined ? { codex_last_input_tokens: lastInput } : {}),
     ...(lastCached !== undefined ? { codex_last_cached_input_tokens: lastCached } : {}),
     ...(lastOutput !== undefined ? { codex_last_output_tokens: lastOutput } : {}),
@@ -361,6 +400,7 @@ export class CodexSdkProvider implements TransportProvider {
   private toolCallCallbacks: Array<(sessionId: string, tool: ToolCallEvent) => void> = [];
   private sessionInfoCallbacks: Array<(sessionId: string, info: SessionInfoUpdate) => void> = [];
   private statusCallbacks: Array<(sessionId: string, status: ProviderStatusUpdate) => void> = [];
+  private usageCallbacks: Array<(sessionId: string, update: ProviderUsageUpdate) => void> = [];
   private child: ChildProcessWithoutNullStreams | null = null;
   private rl: ReadlineInterface | null = null;
   private nextRequestId = 1;
@@ -479,6 +519,14 @@ export class CodexSdkProvider implements TransportProvider {
     };
   }
 
+  onUsage(cb: (sessionId: string, update: ProviderUsageUpdate) => void): () => void {
+    this.usageCallbacks.push(cb);
+    return () => {
+      const idx = this.usageCallbacks.indexOf(cb);
+      if (idx >= 0) this.usageCallbacks.splice(idx, 1);
+    };
+  }
+
   setSessionAgentId(sessionId: string, agentId: string): void {
     const state = this.sessions.get(sessionId);
     if (!state) return;
@@ -589,9 +637,7 @@ export class CodexSdkProvider implements TransportProvider {
   private async startTurn(sessionId: string, state: CodexSdkSessionState, payload: ProviderContextPayload): Promise<void> {
     try {
       await this.ensureThreadLoaded(sessionId, state);
-      const inputText = payload.systemText
-        ? `Context instructions:\n${payload.systemText}\n\n${payload.assembledMessage}`
-        : payload.assembledMessage;
+      const inputText = buildCodexTurnInput(payload);
       const result = await this.request('turn/start', {
         threadId: state.threadId,
         input: [{ type: 'text', text: inputText }],
@@ -734,10 +780,14 @@ export class CodexSdkProvider implements TransportProvider {
     if (method === 'thread/tokenUsage/updated') {
       const sessionId = this.threadToSession.get(params.threadId);
       const state = sessionId ? this.sessions.get(sessionId) : null;
-      if (!state) return;
+      if (!sessionId || !state) return;
       const normalizedUsage = normalizeCodexTokenUsage(params);
       if (!normalizedUsage) return;
       state.lastUsage = normalizedUsage;
+      for (const cb of this.usageCallbacks) cb(sessionId, {
+        usage: normalizedUsage,
+        ...(state.model ? { model: state.model } : {}),
+      });
       return;
     }
 

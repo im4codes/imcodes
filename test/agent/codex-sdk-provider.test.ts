@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { PassThrough, Writable } from 'node:stream';
 
@@ -154,6 +154,10 @@ describe('CodexSdkProvider', () => {
     childProcessMock.children.length = 0;
   });
 
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it('starts a thread, captures resume id, emits tool calls, streams message deltas, and completes', async () => {
     const provider = new CodexSdkProvider();
     await provider.connect({ binaryPath: 'codex' });
@@ -164,6 +168,7 @@ describe('CodexSdkProvider', () => {
     const completed: string[] = [];
     const completedMessages: any[] = [];
     const sessionInfo: Array<Record<string, unknown>> = [];
+    const usageUpdates: Array<Record<string, unknown>> = [];
     provider.onToolCall((_, tool) => tools.push({ name: tool.name, status: tool.status, detail: tool.detail }));
     provider.onDelta((_sid, delta) => deltas.push(delta.delta));
     provider.onComplete((_sid, msg) => {
@@ -171,6 +176,7 @@ describe('CodexSdkProvider', () => {
       completedMessages.push(msg);
     });
     provider.onSessionInfo?.((_sid, info) => sessionInfo.push(info as Record<string, unknown>));
+    provider.onUsage?.((_sid, usage) => usageUpdates.push(usage as Record<string, unknown>));
 
     await provider.send('route-1', 'hello');
     const child = childProcessMock.children[0];
@@ -258,10 +264,21 @@ describe('CodexSdkProvider', () => {
       reasoning_output_tokens: 4,
       model_context_window: 258400,
       codex_total_input_tokens: 30,
+      codex_total_cached_input_tokens: 20,
+      codex_total_output_tokens: 5,
       codex_last_input_tokens: 3,
       codex_last_cached_input_tokens: 1,
       codex_last_output_tokens: 2,
     });
+    expect(usageUpdates).toEqual([
+      expect.objectContaining({
+        usage: expect.objectContaining({
+          input_tokens: 2,
+          cache_read_input_tokens: 1,
+          cached_input_tokens: 1,
+        }),
+      }),
+    ]);
     expect(sessionInfo).toContainEqual({ resumeId: 'thread-1' });
   });
 
@@ -444,6 +461,51 @@ describe('CodexSdkProvider', () => {
     expect(turnStartReq?.params?.input?.[0]?.text).toBe(
       'Context instructions:\nNormalized system text\n\nRelevant context\n\nship it',
     );
+  });
+
+  it('caps Codex SDK injected context while preserving the user turn text', async () => {
+    vi.stubEnv('IMCODES_CODEX_SDK_CONTEXT_MAX_CHARS', '4000');
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-context-cap', cwd: '/tmp/project' });
+    const userMessage = 'Please preserve this exact user request after context trimming';
+    const systemText = `Enterprise standard ${'s'.repeat(3000)}`;
+    const messagePreamble = `Historical memory ${'m'.repeat(3000)}`;
+
+    await provider.send('route-context-cap', {
+      userMessage,
+      assembledMessage: `${messagePreamble}\n\n${userMessage}`,
+      systemText,
+      messagePreamble,
+      attachments: undefined,
+      context: {
+        systemText,
+        messagePreamble,
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'repo' },
+        authoritySource: 'processed_local',
+        freshness: 'fresh',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    });
+
+    const child = childProcessMock.children[0];
+    const turnStartReq = child.requests.find((req) => req.method === 'turn/start');
+    const inputText = String(turnStartReq?.params?.input?.[0]?.text ?? '');
+    const separator = `\n\n${userMessage}`;
+    const contextText = inputText.slice(0, inputText.indexOf(separator));
+    expect(inputText).toContain(userMessage);
+    expect(contextText.length).toBeLessThanOrEqual(4000);
+    expect(contextText).toContain('injected context truncated');
   });
 
   it('maps normalized system context into the turn input text', async () => {

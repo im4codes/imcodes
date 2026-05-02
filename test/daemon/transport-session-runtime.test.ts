@@ -32,8 +32,17 @@ function makeMockProvider() {
 
   const fireDelta = (sid: string) =>
     deltaCb?.(sid, { messageId: 'msg', type: 'text', delta: 'x', role: 'assistant' });
-  const fireComplete = (sid: string) =>
-    completeCb?.(sid, { id: 'msg-1', sessionId: sid, kind: 'text', role: 'assistant', content: 'done', timestamp: Date.now(), status: 'complete' });
+  const fireComplete = (sid: string, overrides: Partial<AgentMessage> = {}) =>
+    completeCb?.(sid, {
+      id: 'msg-1',
+      sessionId: sid,
+      kind: 'text',
+      role: 'assistant',
+      content: 'done',
+      timestamp: Date.now(),
+      status: 'complete',
+      ...overrides,
+    } as AgentMessage);
   const fireError = (sid: string, err?: ProviderError) =>
     errorCb?.(sid, err ?? { code: 'PROVIDER_ERROR', message: 'err', recoverable: false });
   const fireApproval = (sid: string, req: { id: string; description: string; tool?: string }) =>
@@ -147,6 +156,55 @@ describe('TransportSessionRuntime', () => {
     ]);
     // provider.send called only once (for first message)
     expect(mock.provider.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('injects stable preference context only once per provider conversation', async () => {
+    const preferencePreamble = `${PREFERENCE_CONTEXT_START}\n- Use pnpm\n${PREFERENCE_CONTEXT_END}`;
+
+    runtime.send('first preference-aware turn', 'pref-once-1', undefined, preferencePreamble);
+    await flushDispatch();
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    runtime.send('second preference-aware turn', 'pref-once-2', undefined, preferencePreamble);
+    await flushDispatch();
+
+    const firstPayload = mock.provider.send.mock.calls[0]?.[1] as Record<string, unknown>;
+    const secondPayload = mock.provider.send.mock.calls[1]?.[1] as Record<string, unknown>;
+    expect(firstPayload.messagePreamble).toContain('Use pnpm');
+    expect(String(firstPayload.assembledMessage)).toContain('Use pnpm');
+    expect(secondPayload.messagePreamble).toBeUndefined();
+    expect(secondPayload.assembledMessage).toBe('second preference-aware turn');
+  });
+
+  it('does not attach preference context to control messages and re-injects it after compaction', async () => {
+    const preferencePreamble = `${PREFERENCE_CONTEXT_START}\n- Use pnpm\n${PREFERENCE_CONTEXT_END}`;
+
+    runtime.send('first preference-aware turn', 'pref-compact-1', undefined, preferencePreamble);
+    await flushDispatch();
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    runtime.send('/compact', 'pref-compact-control', undefined, preferencePreamble);
+    await flushDispatch();
+    const compactPayload = mock.provider.send.mock.calls[1]?.[1] as Record<string, unknown>;
+    expect(compactPayload.userMessage).toBe('/compact');
+    expect(compactPayload.messagePreamble).toBeUndefined();
+    expect(compactPayload.assembledMessage).toBe('/compact');
+
+    mock.fireComplete('sess-1', {
+      kind: 'system',
+      role: 'system',
+      content: 'Codex context compacted.',
+      metadata: { provider: 'codex-sdk', event: 'thread/compacted' },
+    });
+    await flushDispatch();
+
+    runtime.send('after compact', 'pref-compact-2', undefined, preferencePreamble);
+    await flushDispatch();
+    const afterCompactPayload = mock.provider.send.mock.calls[2]?.[1] as Record<string, unknown>;
+    expect(afterCompactPayload.messagePreamble).toContain('Use pnpm');
+    expect(String(afterCompactPayload.assembledMessage)).toContain('Use pnpm');
   });
 
   it('keeps queued preference context in messagePreamble without changing user-visible text', async () => {

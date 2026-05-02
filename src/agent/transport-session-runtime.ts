@@ -32,6 +32,7 @@ import {
   clearRecentInjectionHistory,
 } from '../context/recent-injection-history.js';
 import { getContextModelConfig } from '../context/context-model-config.js';
+import { PREFERENCE_CONTEXT_END, PREFERENCE_CONTEXT_START } from '../../shared/preference-ingest.js';
 import { resolveRuntimeAuthoredContext } from '../context/shared-context-runtime.js';
 import { buildTransportStartupMemory, type TransportContextBootstrap } from './runtime-context-bootstrap.js';
 import { recordMemoryHits } from '../store/context-store.js';
@@ -159,6 +160,11 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _startupMemory: TransportMemoryRecallArtifact | null = null;
   private _startupMemoryTimelineEmitted = false;
   private _startupMemoryInjected = false;
+  /** Last provider-visible preference context block injected into this provider conversation.
+   *  Preferences are stable session context, not per-turn recall; repeat injection
+   *  bloats SDK prompt windows and can trigger provider auto-compaction. */
+  private _lastInjectedPreferenceContextSignature: string | null = null;
+  private _preferenceContextInjectionAttempt: { previous: string | null } | null = null;
   private _contextBootstrapResolver: (() => Promise<TransportContextBootstrap>) | undefined;
   private _unsubscribes: Array<() => void> = [];
   private _onStatusChange?: (status: AgentStatus) => void;
@@ -195,6 +201,9 @@ export class TransportSessionRuntime implements SessionRuntime {
       }),
       this.provider.onComplete((sid: string, message: AgentMessage) => {
         if (sid !== this._providerSessionId) return;
+        if (isTransportCompactionCompletion(message)) {
+          this._lastInjectedPreferenceContextSignature = null;
+        }
         this._sending = false;
         this._history.push(message);
         this._activeTurn?.resolve();
@@ -471,7 +480,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       const memoryRecall = memoryRecallResult.artifact;
       const dispatchResult = await dispatchSharedContextSend(this.provider, this._providerSessionId!, {
         userMessage: message,
-        messagePreamble: this.mergeMessagePreambles(dispatchedEntries),
+        messagePreamble: this.mergeMessagePreambles(dispatchedEntries, message),
         description: this._description,
         systemPrompt: this._systemPrompt,
         attachments,
@@ -505,6 +514,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       } else if (memoryRecallResult.statusPayload) {
         this.emitMemoryContextStatusEvent(memoryRecallResult.statusPayload, clientMessageId);
       }
+      this._preferenceContextInjectionAttempt = null;
       if (!this._startupMemoryInjected && dispatchResult.payload?.startupMemory) {
         this._startupMemoryInjected = true;
         // Emit the "Historical context · injected" timeline card at the
@@ -526,6 +536,10 @@ export class TransportSessionRuntime implements SessionRuntime {
         // Only handle if the provider didn't already fire onError callback.
         // Shared-context dispatch denial is surfaced here as a send failure
         // because the outer runtime contract is still send-oriented.
+        if (this._preferenceContextInjectionAttempt) {
+          this._lastInjectedPreferenceContextSignature = this._preferenceContextInjectionAttempt.previous;
+          this._preferenceContextInjectionAttempt = null;
+        }
         if (!this._sending || !this._activeTurn) return;
         this.setStatus('error');
         this._sending = false;
@@ -569,17 +583,43 @@ export class TransportSessionRuntime implements SessionRuntime {
     return true;
   }
 
-  private mergeMessagePreambles(entries: PendingTransportMessage[] | undefined): string | undefined {
+  private mergeMessagePreambles(entries: PendingTransportMessage[] | undefined, userMessage?: string): string | undefined {
     if (!entries || entries.length === 0) return undefined;
     const seen = new Set<string>();
     const parts: string[] = [];
+    const isControlMessage = userMessage?.trim().startsWith('/') === true;
+    if (userMessage?.trim() === '/compact') {
+      // The provider-native compact command must stay raw, and the next real
+      // turn should re-seed stable preferences because the SDK may have
+      // discarded prior context during compaction.
+      this._lastInjectedPreferenceContextSignature = null;
+    }
     for (const entry of entries) {
       const preamble = entry.messagePreamble?.trim();
-      if (!preamble || seen.has(preamble)) continue;
-      seen.add(preamble);
-      parts.push(preamble);
+      if (!preamble) continue;
+      const filtered = this.filterOneShotPreferenceContext(preamble, isControlMessage);
+      if (!filtered || seen.has(filtered)) continue;
+      seen.add(filtered);
+      parts.push(filtered);
     }
     return parts.join('\n\n') || undefined;
+  }
+
+  private filterOneShotPreferenceContext(preamble: string, isControlMessage: boolean): string | undefined {
+    const extracted = extractPreferenceContextBlocks(preamble);
+    if (extracted.blocks.length === 0) return preamble;
+    const signature = normalizePreferenceContextSignature(extracted.blocks);
+    if (isControlMessage) return extracted.withoutBlocks || undefined;
+    if (signature && signature === this._lastInjectedPreferenceContextSignature) {
+      return extracted.withoutBlocks || undefined;
+    }
+    if (signature) {
+      this._preferenceContextInjectionAttempt ??= {
+        previous: this._lastInjectedPreferenceContextSignature,
+      };
+      this._lastInjectedPreferenceContextSignature = signature;
+    }
+    return preamble;
   }
 
   private async refreshContextBootstrap(options?: {
@@ -927,4 +967,43 @@ function toTransportMemoryRecallItem(item: MemorySearchResultItem): TransportMem
     createdAt: item.createdAt,
     ...(typeof item.updatedAt === 'number' ? { updatedAt: item.updatedAt } : {}),
   };
+}
+
+function extractPreferenceContextBlocks(text: string): { blocks: string[]; withoutBlocks: string } {
+  const blocks: string[] = [];
+  const retained: string[] = [];
+  let cursor = 0;
+  while (cursor < text.length) {
+    const start = text.indexOf(PREFERENCE_CONTEXT_START, cursor);
+    if (start < 0) {
+      retained.push(text.slice(cursor));
+      break;
+    }
+    const end = text.indexOf(PREFERENCE_CONTEXT_END, start + PREFERENCE_CONTEXT_START.length);
+    if (end < 0) {
+      retained.push(text.slice(cursor));
+      break;
+    }
+    retained.push(text.slice(cursor, start));
+    const blockEnd = end + PREFERENCE_CONTEXT_END.length;
+    blocks.push(text.slice(start, blockEnd).trim());
+    cursor = blockEnd;
+  }
+  return {
+    blocks,
+    withoutBlocks: retained.join('').replace(/\n{3,}/g, '\n\n').trim(),
+  };
+}
+
+function normalizePreferenceContextSignature(blocks: readonly string[]): string {
+  return blocks.map((block) => block.replace(/\s+/g, ' ').trim()).filter(Boolean).join('\n');
+}
+
+function isTransportCompactionCompletion(message: AgentMessage): boolean {
+  const metadata = message.metadata;
+  return message.kind === 'system'
+    && message.role === 'system'
+    && typeof metadata === 'object'
+    && metadata !== null
+    && (metadata as Record<string, unknown>).event === 'thread/compacted';
 }

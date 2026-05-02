@@ -5,7 +5,7 @@
  * JSONL watchers), so ChatView renders them without any special handling.
  * Also cached to local JSONL for replay on reconnect/restart.
  */
-import type { TransportProvider, ProviderError, ProviderStatusUpdate } from '../agent/transport-provider.js';
+import type { TransportProvider, ProviderError, ProviderStatusUpdate, ProviderUsageUpdate } from '../agent/transport-provider.js';
 import type { MessageDelta, AgentMessage, ToolCallEvent } from '../../shared/agent-message.js';
 import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { resolveSessionName, isEphemeralProviderSid } from '../agent/session-manager.js';
@@ -68,16 +68,7 @@ function clearPendingStreamUpdate(eventId: string): void {
 
 function normalizeUsageUpdatePayload(
   sessionName: string,
-  usage: {
-    input_tokens?: number;
-    output_tokens?: number;
-    cache_read_input_tokens?: number;
-    cache_creation_input_tokens?: number;
-    /** Codex app-server native cache field; normalize to cacheTokens. */
-    cached_input_tokens?: number;
-    /** Provider-reported context window, e.g. Codex app-server tokenUsage.modelContextWindow. */
-    model_context_window?: number;
-  } | undefined,
+  usage: ProviderUsageUpdate['usage'] | undefined,
   model: string | undefined,
 ): Record<string, unknown> | null {
   if (!usage && !model) return null;
@@ -452,6 +443,19 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       status: status.status,
       ...(status.label !== undefined ? { label: status.label } : {}),
     }, { source: 'daemon', confidence: 'high' });
+  });
+
+  provider.onUsage?.((providerSid: string, update: ProviderUsageUpdate) => {
+    const sessionName = resolveSessionName(providerSid);
+    if (!sessionName) {
+      logger.debug({ providerSid }, 'transport-relay: unresolved route for usage — dropped');
+      return;
+    }
+
+    const usagePayload = normalizeUsageUpdatePayload(sessionName, update.usage, update.model);
+    if (usagePayload) {
+      timelineEmitter.emit(sessionName, 'usage.update', usagePayload, { source: 'daemon', confidence: 'high' });
+    }
   });
 
   provider.onApprovalRequest?.((providerSid: string, request) => {

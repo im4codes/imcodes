@@ -49,6 +49,7 @@ type CompleteCb = (sessionId: string, message: AgentMessage) => void;
 type ErrorCb = (sessionId: string, error: { code: string; message: string; recoverable: boolean }) => void;
 type ToolCb = (sessionId: string, tool: ToolCallEvent) => void;
 type StatusCb = (sessionId: string, status: { status: string | null; label?: string | null }) => void;
+type UsageCb = (sessionId: string, update: { usage?: Record<string, unknown>; model?: string }) => void;
 type ApprovalCb = (sessionId: string, request: { id: string; description: string; tool?: string }) => void;
 
 function makeMockProvider() {
@@ -57,6 +58,7 @@ function makeMockProvider() {
   let errorCb: ErrorCb | undefined;
   let toolCb: ToolCb | undefined;
   let statusCb: StatusCb | undefined;
+  let usageCb: UsageCb | undefined;
   let approvalCb: ApprovalCb | undefined;
 
   return {
@@ -66,6 +68,7 @@ function makeMockProvider() {
       onError: (cb: ErrorCb) => { errorCb = cb; return () => { errorCb = undefined; }; },
       onToolCall: (cb: ToolCb) => { toolCb = cb; },
       onStatus: (cb: StatusCb) => { statusCb = cb; return () => { statusCb = undefined; }; },
+      onUsage: (cb: UsageCb) => { usageCb = cb; return () => { usageCb = undefined; }; },
       onApprovalRequest: (cb: ApprovalCb) => { approvalCb = cb; },
     } as unknown as TransportProvider,
     fireDelta: (sid: string, delta: MessageDelta) => deltaCb?.(sid, delta),
@@ -73,6 +76,7 @@ function makeMockProvider() {
     fireError: (sid: string, err: { code: string; message: string; recoverable: boolean }) => errorCb?.(sid, err),
     fireTool: (sid: string, tool: ToolCallEvent) => toolCb?.(sid, tool),
     fireStatus: (sid: string, status: { status: string | null; label?: string | null }) => statusCb?.(sid, status),
+    fireUsage: (sid: string, update: { usage?: Record<string, unknown>; model?: string }) => usageCb?.(sid, update),
     fireApproval: (sid: string, request: { id: string; description: string; tool?: string }) => approvalCb?.(sid, request),
   };
 }
@@ -331,6 +335,31 @@ describe('transport-relay (timeline-emitter based)', () => {
         contextWindowSource: 'provider',
       });
       expect(Number(usageCall![2].inputTokens) + Number(usageCall![2].cacheTokens)).toBe(12_000);
+    });
+
+    it('emits provider usage updates even when they arrive outside message completion', () => {
+      const { provider, fireUsage } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireUsage('sess-1', {
+        model: 'gpt-5.5',
+        usage: {
+          input_tokens: 42_000,
+          cache_read_input_tokens: 8_000,
+          cached_input_tokens: 8_000,
+          model_context_window: 258_400,
+        },
+      });
+
+      const usageCall = emitMock.mock.calls.find(c => c[1] === 'usage.update');
+      expect(usageCall).toBeDefined();
+      expect(usageCall![2]).toMatchObject({
+        inputTokens: 42_000,
+        cacheTokens: 8_000,
+        model: 'gpt-5.5',
+        contextWindow: 922_000,
+      });
+      expect(usageCall![2].contextWindowSource).toBeUndefined();
     });
 
     it('does not let Codex SDK stale provider fallback shrink GPT-5.5 window', () => {
