@@ -215,6 +215,28 @@ function makeMockDb() {
           ] as T[];
         }
       }
+      if (normalized.includes('group by project_id') && normalized.includes("scope = 'personal'")) {
+        return [
+          {
+            project_id: 'github.com/acme/repo',
+            total_records: 1,
+            recent_summary_count: 1,
+            durable_candidate_count: 0,
+            updated_at: 1700000000000,
+          },
+        ] as T[];
+      }
+      if (normalized.includes('group by project_id') && normalized.includes('enterprise_id =')) {
+        return [
+          {
+            project_id: 'github.com/acme/repo',
+            total_records: 1,
+            recent_summary_count: 0,
+            durable_candidate_count: 1,
+            updated_at: 1700000002000,
+          },
+        ] as T[];
+      }
       if (normalized.includes("from shared_context_projections where user_id = $1 and scope = 'personal'")) {
         return [
           {
@@ -767,6 +789,16 @@ describe('shared-context processed remote route', () => {
           status: 'active',
         },
       ],
+      projects: [
+        {
+          projectId: 'github.com/acme/repo',
+          displayName: 'github.com/acme/repo',
+          totalRecords: 1,
+          recentSummaryCount: 1,
+          durableCandidateCount: 0,
+          updatedAt: 1700000000000,
+        },
+      ],
     });
   });
 
@@ -804,6 +836,16 @@ describe('shared-context processed remote route', () => {
           status: 'active',
         },
       ],
+      projects: [
+        {
+          projectId: 'github.com/acme/repo',
+          displayName: 'github.com/acme/repo',
+          totalRecords: 1,
+          recentSummaryCount: 1,
+          durableCandidateCount: 0,
+          updatedAt: 1700000000000,
+        },
+      ],
     });
   });
 
@@ -839,6 +881,16 @@ describe('shared-context processed remote route', () => {
           updatedAt: 1700000000000,
           hitCount: 0,
           status: 'active',
+        },
+      ],
+      projects: [
+        {
+          projectId: 'github.com/acme/repo',
+          displayName: 'github.com/acme/repo',
+          totalRecords: 1,
+          recentSummaryCount: 1,
+          durableCandidateCount: 0,
+          updatedAt: 1700000000000,
         },
       ],
     });
@@ -904,6 +956,16 @@ describe('shared-context processed remote route', () => {
           status: 'active',
         },
       ],
+      projects: [
+        {
+          projectId: 'github.com/acme/repo',
+          displayName: 'github.com/acme/repo',
+          totalRecords: 1,
+          recentSummaryCount: 1,
+          durableCandidateCount: 0,
+          updatedAt: 1700000000000,
+        },
+      ],
     });
   });
 
@@ -942,6 +1004,16 @@ describe('shared-context processed remote route', () => {
           hitCount: 7,
           lastUsedAt: 1700000003000,
           status: 'active',
+        },
+      ],
+      projects: [
+        {
+          projectId: 'github.com/acme/repo',
+          displayName: 'github.com/acme/repo',
+          totalRecords: 1,
+          recentSummaryCount: 0,
+          durableCandidateCount: 1,
+          updatedAt: 1700000002000,
         },
       ],
     });

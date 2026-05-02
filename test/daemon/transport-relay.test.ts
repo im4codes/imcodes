@@ -390,6 +390,34 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(usageCall![2].contextWindowSource).toBeUndefined();
     });
 
+    it('does not let Codex SDK stale provider fallback expand GPT-5.5 window to 1M', () => {
+      const { provider, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireComplete('sess-1', makeMessage({
+        id: 'msg-codex-gpt55-usage-1m',
+        metadata: {
+          model: 'gpt-5.5',
+          usage: {
+            input_tokens: 9_000,
+            cached_input_tokens: 3_000,
+            cache_read_input_tokens: 3_000,
+            model_context_window: 1_000_000,
+          },
+        },
+      }));
+
+      const usageCall = emitMock.mock.calls.find(c => c[1] === 'usage.update');
+      expect(usageCall).toBeDefined();
+      expect(usageCall![2]).toMatchObject({
+        inputTokens: 9_000,
+        cacheTokens: 3_000,
+        model: 'gpt-5.5',
+        contextWindow: 922_000,
+      });
+      expect(usageCall![2].contextWindowSource).toBeUndefined();
+    });
+
     it('falls back to message.content when no accumulator exists', () => {
       const { provider, fireComplete } = makeMockProvider();
       wireProviderToRelay(provider);

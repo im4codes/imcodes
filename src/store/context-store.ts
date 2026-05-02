@@ -14,6 +14,7 @@ import type {
   ContextReplicationState,
   ContextTargetRef,
   ContextPendingEventView,
+  ContextMemoryProjectView,
   LocalContextEvent,
   ProcessedContextProjection,
   ProcessedContextClass,
@@ -2711,6 +2712,83 @@ export function getProcessedProjectionStats(filters: ProcessedProjectionQuery = 
     dirtyTargetCount: pending.dirtyTargetCount,
     pendingJobCount: pending.pendingJobCount,
   };
+}
+
+export function listMemoryProjectSummaries(filters: ProcessedProjectionQuery = {}): ContextMemoryProjectView[] {
+  const database = ensureDb();
+  const conditions: string[] = [];
+  const params: (string | number)[] = [];
+  if (!filters.includeArchived) {
+    conditions.push("status = 'active'");
+  }
+  appendNamespaceFilterSql(conditions, params, filters);
+  if (filters.projectionClass) {
+    conditions.push('class = ?');
+    params.push(filters.projectionClass);
+  }
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const rows = database.prepare(`
+    SELECT namespace_key, project_id, class, summary, updated_at, status
+    FROM context_processed_local
+    ${where}
+  `).all(...params) as Array<Record<string, unknown>>;
+
+  const projects = new Map<string, ContextMemoryProjectView>();
+  for (const row of rows) {
+    const namespace = parseNamespaceKey(String(row.namespace_key));
+    if (!namespaceMatchesFilters(namespace, filters)) continue;
+    const status = typeof row.status === 'string' ? row.status : 'active';
+    if (!filters.includeArchived && status !== 'active') continue;
+    if (isMemoryNoiseSummary(String(row.summary))) continue;
+    const projectId = namespace.projectId || (typeof row.project_id === 'string' ? row.project_id.trim() : '');
+    if (!projectId) continue;
+    const projectionClass = String(row.class) as ProcessedContextClass;
+    const updatedAt = Number(row.updated_at) || undefined;
+    const current = projects.get(projectId) ?? {
+      projectId,
+      displayName: projectId,
+      totalRecords: 0,
+      recentSummaryCount: 0,
+      durableCandidateCount: 0,
+      pendingEventCount: 0,
+      updatedAt,
+    };
+    current.totalRecords += 1;
+    if (projectionClass === 'recent_summary') current.recentSummaryCount += 1;
+    if (projectionClass === 'durable_memory_candidate') current.durableCandidateCount += 1;
+    current.updatedAt = Math.max(current.updatedAt ?? 0, updatedAt ?? 0) || undefined;
+    projects.set(projectId, current);
+  }
+
+  const pendingConditions: string[] = [];
+  const pendingParams: (string | number)[] = [];
+  appendNamespaceFilterSql(pendingConditions, pendingParams, filters);
+  const pendingWhere = pendingConditions.length > 0 ? `WHERE ${pendingConditions.join(' AND ')}` : '';
+  const pendingRows = database.prepare(`
+    SELECT namespace_key
+    FROM context_staged_events
+    ${pendingWhere}
+  `).all(...pendingParams) as Array<Record<string, unknown>>;
+  for (const row of pendingRows) {
+    const namespace = parseNamespaceKey(String(row.namespace_key));
+    if (!namespaceMatchesFilters(namespace, filters)) continue;
+    const projectId = namespace.projectId;
+    if (!projectId) continue;
+    const current = projects.get(projectId) ?? {
+      projectId,
+      displayName: projectId,
+      totalRecords: 0,
+      recentSummaryCount: 0,
+      durableCandidateCount: 0,
+      pendingEventCount: 0,
+    };
+    current.pendingEventCount = (current.pendingEventCount ?? 0) + 1;
+    projects.set(projectId, current);
+  }
+
+  return Array.from(projects.values())
+    .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0) || b.totalRecords - a.totalRecords || a.projectId.localeCompare(b.projectId))
+    .slice(0, 200);
 }
 
 function getPendingContextStats(filters: ProcessedProjectionQuery): {

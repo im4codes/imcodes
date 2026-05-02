@@ -120,6 +120,10 @@ function withTimeoutOutcome<T>(
   });
 }
 
+function isTransportSlashControl(message: string | undefined): boolean {
+  return message?.trim().startsWith('/') === true;
+}
+
 /**
  * Transport session runtime — manages a single conversation with a remote provider.
  *
@@ -464,6 +468,7 @@ export class TransportSessionRuntime implements SessionRuntime {
 
     void (async () => {
       await this.refreshContextBootstrap({ phase: 'dispatch' });
+      const isSlashControl = isTransportSlashControl(message);
       const authority = resolveTransportDispatchAuthority(this.provider, {
         namespace: this._contextNamespace,
         remoteProcessedFreshness: this._contextRemoteProcessedFreshness,
@@ -471,18 +476,27 @@ export class TransportSessionRuntime implements SessionRuntime {
         retryExhausted: this._contextRetryExhausted,
         sharedPolicyOverride: this._contextSharedPolicyOverride,
       }).authority;
-      const startupMemory = this._startupMemory ?? (
+      const startupMemory = isSlashControl ? null : (this._startupMemory ?? (
         !this._startupMemoryInjected && authority.authoritySource === 'processed_local' && this._contextNamespace
           ? buildTransportStartupMemory(this._contextNamespace, { projectDir: this._projectDir })
           : null
-      );
-      const memoryRecallResult = await this.buildTransportMessageRecallResultWithinBudget(message, authority.authoritySource);
+      ));
+      const memoryRecallResult = isSlashControl
+        ? {
+            artifact: null,
+            statusPayload: buildMemoryContextStatusPayload(message.trim().slice(0, 200), 'skipped_control_message', 'message', {
+              runtimeFamily: 'transport',
+              authoritySource: authority.authoritySource,
+              sourceKind: 'local_processed',
+            }),
+          }
+        : await this.buildTransportMessageRecallResultWithinBudget(message, authority.authoritySource);
       const memoryRecall = memoryRecallResult.artifact;
       const dispatchResult = await dispatchSharedContextSend(this.provider, this._providerSessionId!, {
         userMessage: message,
-        messagePreamble: this.mergeMessagePreambles(dispatchedEntries, message),
-        description: this._description,
-        systemPrompt: this._systemPrompt,
+        messagePreamble: isSlashControl ? undefined : this.mergeMessagePreambles(dispatchedEntries, message),
+        description: isSlashControl ? undefined : this._description,
+        systemPrompt: isSlashControl ? undefined : this._systemPrompt,
         attachments,
         namespace: this._contextNamespace,
         namespaceDiagnostics: this._contextNamespaceDiagnostics,
@@ -490,13 +504,14 @@ export class TransportSessionRuntime implements SessionRuntime {
         localProcessedFreshness: this._contextLocalProcessedFreshness,
         retryExhausted: this._contextRetryExhausted,
         sharedPolicyOverride: this._contextSharedPolicyOverride,
-        authoredContextRepository: this.resolveAuthoredContextRepository(),
-        authoredContextLanguage: this._contextAuthoredContextLanguage,
-        authoredContextFilePath: this._contextAuthoredContextFilePath,
+        authoredContextRepository: isSlashControl ? undefined : this.resolveAuthoredContextRepository(),
+        authoredContextLanguage: isSlashControl ? undefined : this._contextAuthoredContextLanguage,
+        authoredContextFilePath: isSlashControl ? undefined : this._contextAuthoredContextFilePath,
         ...(startupMemory ? { startupMemory } : {}),
         ...(memoryRecall ? { memoryRecall } : {}),
       }, {
         resolveAuthoredContext: (input) => {
+          if (isSlashControl) return Promise.resolve([]);
           if (!input.namespace) return Promise.resolve([]);
           return resolveRuntimeAuthoredContext(input.namespace, {
             language: input.authoredContextLanguage,

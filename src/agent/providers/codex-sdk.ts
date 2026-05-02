@@ -31,6 +31,9 @@ import { getCodexBaseInstructions } from '../codex-runtime-config.js';
 
 const CODEX_BIN = 'codex';
 const CANCEL_INTERRUPT_TIMEOUT_MS = 1_500;
+const COMPACT_START_ACCEPT_TIMEOUT_MS = 15_000;
+const COMPACT_NO_SIGNAL_SETTLE_MS = 5_000;
+const COMPACT_HARD_TIMEOUT_MS = 120_000;
 const DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 32_000;
 const MIN_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 4_000;
 const MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 128_000;
@@ -149,6 +152,9 @@ interface CodexSdkSessionState {
   pendingComplete?: AgentMessage;
   cancelled: boolean;
   cancelTimer: ReturnType<typeof setTimeout> | null;
+  compactSettleTimer: ReturnType<typeof setTimeout> | null;
+  compactHardTimer: ReturnType<typeof setTimeout> | null;
+  compactObserved: boolean;
   lastUsage?: {
     /**
      * Context-bar usage must represent the current prompt/window occupancy,
@@ -231,6 +237,49 @@ function normalizeCodexTokenUsage(params: Record<string, any>): CodexSdkSessionS
     ...(lastCached !== undefined ? { codex_last_cached_input_tokens: lastCached } : {}),
     ...(lastOutput !== undefined ? { codex_last_output_tokens: lastOutput } : {}),
   };
+}
+
+function readParamThreadId(params: Record<string, any>): string | undefined {
+  const threadId = params.threadId ?? params.thread_id ?? params.thread?.id ?? params.thread?.threadId ?? params.thread?.thread_id;
+  return typeof threadId === 'string' && threadId.trim() ? threadId : undefined;
+}
+
+function readParamTurnId(params: Record<string, any>): string | undefined {
+  const turnId = params.turnId ?? params.turn_id ?? params.turn?.id ?? params.turn?.turnId ?? params.turn?.turn_id;
+  return typeof turnId === 'string' && turnId.trim() ? turnId : undefined;
+}
+
+function readThreadStatus(params: Record<string, any>): string | undefined {
+  const raw = params.status ?? params.threadStatus ?? params.thread_status ?? params.thread?.status;
+  if (typeof raw === 'string' && raw.trim()) return raw.trim();
+  if (!raw || typeof raw !== 'object') return undefined;
+  const nested = (raw as Record<string, any>).type
+    ?? (raw as Record<string, any>).kind
+    ?? (raw as Record<string, any>).state
+    ?? (raw as Record<string, any>).status;
+  return typeof nested === 'string' && nested.trim() ? nested.trim() : undefined;
+}
+
+function normalizeStatusName(status: string | undefined): string {
+  return (status ?? '').replace(/[_\s-]+/g, '').toLowerCase();
+}
+
+function isThreadActiveStatus(status: string | undefined): boolean {
+  const normalized = normalizeStatusName(status);
+  return normalized === 'active'
+    || normalized === 'running'
+    || normalized === 'busy'
+    || normalized === 'compacting'
+    || normalized === 'inprogress';
+}
+
+function isThreadIdleStatus(status: string | undefined): boolean {
+  const normalized = normalizeStatusName(status);
+  return normalized === 'idle'
+    || normalized === 'ready'
+    || normalized === 'complete'
+    || normalized === 'completed'
+    || normalized === 'notloaded';
 }
 
 function toolFromItem(item: Record<string, any>, lifecycle: 'started' | 'completed'): ToolCallEvent | null {
@@ -426,6 +475,10 @@ export class CodexSdkProvider implements TransportProvider {
     this.rejectPending(new Error('Codex app-server disconnected'));
     this.rl?.close();
     this.rl = null;
+    for (const state of this.sessions.values()) {
+      this.clearCancelTimer(state);
+      this.clearCompactTimers(state);
+    }
     // `child.kill('SIGTERM')` only terminates the node wrapper; the native
     // codex binary it spawned lives on and leaks ~60MB per abandoned pair.
     // Walk the descendant tree and tree-kill instead. Fire-and-forget is
@@ -457,6 +510,9 @@ export class CodexSdkProvider implements TransportProvider {
       pendingComplete: undefined,
       cancelled: false,
       cancelTimer: null,
+      compactSettleTimer: null,
+      compactHardTimer: null,
+      compactObserved: false,
       lastUsage: undefined,
       lastStatusSignature: null,
     });
@@ -468,6 +524,7 @@ export class CodexSdkProvider implements TransportProvider {
     const state = this.sessions.get(sessionId);
     if (!state) return;
     this.clearCancelTimer(state);
+    this.clearCompactTimers(state);
     if (state.threadId && state.loaded) {
       await this.request('thread/unsubscribe', { threadId: state.threadId }).catch(() => {});
       this.threadToSession.delete(state.threadId);
@@ -670,14 +727,34 @@ export class CodexSdkProvider implements TransportProvider {
     try {
       await this.ensureThreadLoaded(sessionId, state);
       state.runningCompact = true;
+      state.compactObserved = false;
       state.currentText = '';
       state.currentMessageId = null;
-      await this.request('thread/compact/start', {
-        threadId: state.threadId,
+      this.emitStatus(sessionId, state, {
+        status: 'thinking',
+        label: 'Compacting context...',
       });
+      this.armCompactHardTimeout(sessionId, state);
+      const result = await this.request('thread/compact/start', {
+        threadId: state.threadId,
+      }, COMPACT_START_ACCEPT_TIMEOUT_MS);
+      // Some Codex app-server builds accept `thread/compact/start` as a
+      // synchronous/no-op request when there is no compactable turn and never
+      // emit `thread/compacted` or a `contextCompaction` item. Do not leave the
+      // IM.codes runtime permanently busy in that accepted-but-silent state;
+      // give the native event stream a short grace window, then settle the UI
+      // as a completed native compact request. If a real compaction item/status
+      // arrives, `compactObserved` cancels this fallback and we wait for the
+      // native completion signal instead.
+      if (state.runningCompact && !state.compactObserved) {
+        this.armCompactNoSignalSettle(sessionId, state, readParamTurnId(result ?? {}));
+      }
     } catch (err) {
+      this.clearCompactTimers(state);
+      this.clearStatus(sessionId, state);
       state.runningCompact = false;
       state.runningTurnId = undefined;
+      state.compactObserved = false;
       this.emitError(sessionId, this.normalizeError(err));
     }
   }
@@ -778,7 +855,8 @@ export class CodexSdkProvider implements TransportProvider {
     }
 
     if (method === 'thread/tokenUsage/updated') {
-      const sessionId = this.threadToSession.get(params.threadId);
+      const threadId = readParamThreadId(params);
+      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
       const normalizedUsage = normalizeCodexTokenUsage(params);
@@ -792,15 +870,38 @@ export class CodexSdkProvider implements TransportProvider {
     }
 
     if (method === 'thread/compacted') {
-      const sessionId = this.threadToSession.get(params.threadId);
+      const threadId = readParamThreadId(params);
+      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state || !state.runningCompact) return;
-      this.completeCompact(sessionId, state, typeof params.turnId === 'string' ? params.turnId : undefined);
+      this.completeCompact(sessionId, state, readParamTurnId(params));
+      return;
+    }
+
+    if (method === 'thread/status/changed') {
+      const threadId = readParamThreadId(params);
+      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
+      const state = sessionId ? this.sessions.get(sessionId) : null;
+      if (!sessionId || !state || !state.runningCompact) return;
+      const status = readThreadStatus(params);
+      if (isThreadActiveStatus(status)) {
+        state.compactObserved = true;
+        this.clearCompactSettleTimer(state);
+        this.emitStatus(sessionId, state, {
+          status: 'thinking',
+          label: 'Compacting context...',
+        });
+        return;
+      }
+      if (isThreadIdleStatus(status)) {
+        this.completeCompact(sessionId, state, readParamTurnId(params));
+      }
       return;
     }
 
     if (method === 'item/agentMessage/delta') {
-      const sessionId = this.threadToSession.get(params.threadId);
+      const threadId = readParamThreadId(params);
+      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
       this.clearStatus(sessionId, state);
@@ -817,7 +918,8 @@ export class CodexSdkProvider implements TransportProvider {
     }
 
     if (method === 'item/started' || method === 'item/completed') {
-      const sessionId = this.threadToSession.get(params.threadId);
+      const threadId = readParamThreadId(params);
+      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
 
@@ -826,7 +928,13 @@ export class CodexSdkProvider implements TransportProvider {
 
       if (item.type === 'contextCompaction') {
         state.runningCompact = true;
-        state.runningTurnId = typeof params.turnId === 'string' ? params.turnId : state.runningTurnId;
+        state.compactObserved = true;
+        this.clearCompactSettleTimer(state);
+        state.runningTurnId = readParamTurnId(params) ?? state.runningTurnId;
+        if (method === 'item/completed') {
+          this.completeCompact(sessionId, state, readParamTurnId(params));
+          return;
+        }
         this.emitStatus(sessionId, state, {
           status: 'thinking',
           label: 'Compacting context...',
@@ -869,7 +977,8 @@ export class CodexSdkProvider implements TransportProvider {
     }
 
     if (method === 'turn/completed') {
-      const sessionId = this.threadToSession.get(params.threadId);
+      const threadId = readParamThreadId(params);
+      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
       const turn = params.turn ?? {};
@@ -877,15 +986,19 @@ export class CodexSdkProvider implements TransportProvider {
 
       if (status === 'failed') {
         this.clearCancelTimer(state);
+        this.clearCompactTimers(state);
         this.clearStatus(sessionId, state);
         state.runningCompact = false;
+        state.compactObserved = false;
         state.runningTurnId = undefined;
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, turn.error?.message ?? 'Codex turn failed', false, turn.error));
         return;
       }
       if (status === 'interrupted') {
         this.clearCancelTimer(state);
+        this.clearCompactTimers(state);
         state.runningCompact = false;
+        state.compactObserved = false;
         if (!state.runningTurnId && state.cancelled) {
           state.cancelled = false;
           return;
@@ -927,23 +1040,42 @@ export class CodexSdkProvider implements TransportProvider {
     }
   }
 
-  private request(method: string, params: Record<string, any>): Promise<any> {
+  private request(method: string, params: Record<string, any>, timeoutMs?: number): Promise<any> {
     if (!this.child?.stdin.writable) {
       return Promise.reject(new Error('Codex app-server stdin is not writable'));
     }
     const id = this.nextRequestId++;
     const payload = JSON.stringify({ id, method, params });
     return new Promise((resolve, reject) => {
-      this.pendingRequests.set(id, { resolve, reject });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      if (timeoutMs && timeoutMs > 0 && Number.isFinite(timeoutMs)) {
+        timer = setTimeout(() => {
+          if (!this.pendingRequests.delete(id)) return;
+          reject(new Error(`Codex app-server request ${method} did not settle within ${Math.round(timeoutMs)}ms`));
+        }, timeoutMs);
+        timer.unref?.();
+      }
+      this.pendingRequests.set(id, {
+        resolve: (value) => {
+          if (timer) clearTimeout(timer);
+          resolve(value);
+        },
+        reject: (error) => {
+          if (timer) clearTimeout(timer);
+          reject(error);
+        },
+      });
       this.child!.stdin.write(`${payload}\n`);
     });
   }
 
   private completeCompact(sessionId: string, state: CodexSdkSessionState, turnId?: string): void {
     this.clearCancelTimer(state);
+    this.clearCompactTimers(state);
     this.clearStatus(sessionId, state);
     state.runningCompact = false;
     state.runningTurnId = undefined;
+    state.compactObserved = false;
     state.currentMessageId = null;
     state.currentText = '';
     const completed: AgentMessage = {
@@ -1107,5 +1239,53 @@ export class CodexSdkProvider implements TransportProvider {
     if (!state.cancelTimer) return;
     clearTimeout(state.cancelTimer);
     state.cancelTimer = null;
+  }
+
+  private armCompactNoSignalSettle(sessionId: string, state: CodexSdkSessionState, turnId?: string): void {
+    this.clearCompactSettleTimer(state);
+    state.compactSettleTimer = setTimeout(() => {
+      if (!this.sessions.has(sessionId)) return;
+      if (!state.runningCompact || state.compactObserved) return;
+      this.completeCompact(sessionId, state, turnId);
+    }, COMPACT_NO_SIGNAL_SETTLE_MS);
+    state.compactSettleTimer.unref?.();
+  }
+
+  private armCompactHardTimeout(sessionId: string, state: CodexSdkSessionState): void {
+    this.clearCompactHardTimer(state);
+    state.compactHardTimer = setTimeout(() => {
+      if (!this.sessions.has(sessionId)) return;
+      if (!state.runningCompact) return;
+      this.clearCompactTimers(state);
+      this.clearStatus(sessionId, state);
+      state.runningCompact = false;
+      state.runningTurnId = undefined;
+      state.compactObserved = false;
+      state.currentMessageId = null;
+      state.currentText = '';
+      this.emitError(sessionId, this.makeError(
+        PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+        `Codex SDK compact did not complete within ${Math.round(COMPACT_HARD_TIMEOUT_MS)}ms`,
+        true,
+      ));
+    }, COMPACT_HARD_TIMEOUT_MS);
+    state.compactHardTimer.unref?.();
+  }
+
+  private clearCompactSettleTimer(state: CodexSdkSessionState): void {
+    if (!state.compactSettleTimer) return;
+    clearTimeout(state.compactSettleTimer);
+    state.compactSettleTimer = null;
+  }
+
+  private clearCompactHardTimer(state: CodexSdkSessionState): void {
+    if (!state.compactHardTimer) return;
+    clearTimeout(state.compactHardTimer);
+    state.compactHardTimer = null;
+  }
+
+  private clearCompactTimers(state: CodexSdkSessionState): void {
+    this.clearCompactSettleTimer(state);
+    this.clearCompactHardTimer(state);
   }
 }

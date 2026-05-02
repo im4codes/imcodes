@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const {
   getSessionMock,
@@ -10,11 +13,13 @@ const {
   detectRepoMock,
   getProcessedProjectionStatsMock,
   getProcessedProjectionByIdMock,
+  listMemoryProjectSummariesMock,
   queryProcessedProjectionsMock,
   queryPendingContextEventsMock,
   archiveMemoryMock,
   restoreArchivedMemoryMock,
   deleteMemoryMock,
+  listSessionsMock,
 } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
   getTransportRuntimeMock: vi.fn(),
@@ -25,15 +30,17 @@ const {
   detectRepoMock: vi.fn(),
   getProcessedProjectionStatsMock: vi.fn(),
   getProcessedProjectionByIdMock: vi.fn(),
+  listMemoryProjectSummariesMock: vi.fn(),
   queryProcessedProjectionsMock: vi.fn(),
   queryPendingContextEventsMock: vi.fn(),
   archiveMemoryMock: vi.fn(),
   restoreArchivedMemoryMock: vi.fn(),
   deleteMemoryMock: vi.fn(),
+  listSessionsMock: vi.fn(() => []),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
-  listSessions: vi.fn(() => []),
+  listSessions: listSessionsMock,
   getSession: getSessionMock,
   upsertSession: vi.fn(),
   removeSession: vi.fn(),
@@ -46,6 +53,7 @@ vi.mock('../../src/store/context-store.js', () => ({
   LEGACY_DAEMON_LOCAL_USER_ID: 'daemon-local',
   getProcessedProjectionStats: getProcessedProjectionStatsMock,
   getProcessedProjectionById: getProcessedProjectionByIdMock,
+  listMemoryProjectSummaries: listMemoryProjectSummariesMock,
   listContextObservations: vi.fn(() => []),
   promoteContextObservation: vi.fn(),
   queryPendingContextEvents: queryPendingContextEventsMock,
@@ -209,9 +217,11 @@ describe('handleWebCommand memory context timeline', () => {
     queryProcessedProjectionsMock.mockReturnValue([]);
     queryPendingContextEventsMock.mockReturnValue([]);
     getProcessedProjectionByIdMock.mockReturnValue(undefined);
+    listMemoryProjectSummariesMock.mockReturnValue([]);
     archiveMemoryMock.mockReturnValue(false);
     restoreArchivedMemoryMock.mockReturnValue(false);
     deleteMemoryMock.mockReturnValue(false);
+    listSessionsMock.mockReturnValue([]);
     getSessionMock.mockReturnValue({
       name: 'deck_process_brain',
       projectName: 'codedeck',
@@ -286,6 +296,44 @@ describe('handleWebCommand memory context timeline', () => {
     }));
   });
 
+  it('authorizes project resolution by realpath so cwd aliases do not leave the selector without a canonical id', async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), 'imcodes-project-resolve-'));
+    const realProjectDir = join(tempDir, 'repo');
+    const aliasProjectDir = join(tempDir, 'repo-link');
+    await mkdir(realProjectDir);
+    await symlink(realProjectDir, aliasProjectDir);
+    listSessionsMock.mockReturnValue([{ name: 'deck_repo_brain', projectDir: aliasProjectDir }]);
+
+    try {
+      handleWebCommand({
+        type: MEMORY_WS.PROJECT_RESOLVE,
+        requestId: 'resolve-realpath',
+        projectDir: realProjectDir,
+        [MEMORY_MANAGEMENT_CONTEXT_FIELD]: {
+          actorId: 'user-bob',
+          userId: 'user-bob',
+          role: 'user',
+          source: 'server_bridge',
+          requestId: 'resolve-realpath',
+          boundProjects: [{ projectDir: realProjectDir }],
+        },
+      }, serverLink as any);
+
+      await vi.waitFor(() => {
+        expect(detectRepoMock).toHaveBeenCalledWith(realProjectDir);
+        expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: MEMORY_WS.PROJECT_RESOLVE_RESPONSE,
+          requestId: 'resolve-realpath',
+          success: true,
+          status: 'resolved',
+          canonicalRepoId: 'github.com/imcodes/codedeck',
+        }));
+      });
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('filters personal memory management list, stats, and pending records by derived user id', async () => {
     getProcessedProjectionStatsMock.mockReturnValue({
       totalRecords: 1,
@@ -316,6 +364,15 @@ describe('handleWebCommand memory context timeline', () => {
       eventType: 'user.turn',
       content: 'pending private event',
       createdAt: 123,
+    }]);
+    listMemoryProjectSummariesMock.mockReturnValue([{
+      projectId: 'github.com/acme/repo',
+      displayName: 'acme/repo',
+      totalRecords: 1,
+      recentSummaryCount: 1,
+      durableCandidateCount: 0,
+      pendingEventCount: 1,
+      updatedAt: 200,
     }]);
 
     handleWebCommand({
@@ -351,11 +408,18 @@ describe('handleWebCommand memory context timeline', () => {
       projectId: 'github.com/acme/repo',
       limit: 20,
     }));
+    expect(listMemoryProjectSummariesMock).toHaveBeenCalledWith(expect.objectContaining({
+      scope: 'personal',
+      userId: 'user-bob',
+      projectId: 'github.com/acme/repo',
+      includeLegacyPersonalOwner: true,
+    }));
     expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
       type: MEMORY_WS.PERSONAL_RESPONSE,
       requestId: 'personal-list',
       records: [expect.objectContaining({ id: 'bob-proj', summary: 'Bob private project memory' })],
       pendingRecords: [expect.objectContaining({ id: 'pending-bob' })],
+      projects: [expect.objectContaining({ projectId: 'github.com/acme/repo' })],
     }));
   });
 

@@ -4,6 +4,8 @@ import { inferContextWindow, resolveContextWindow } from '../src/model-context.j
 describe('web model context resolution', () => {
   it('resolves GPT-5.5 to 922k', () => {
     expect(inferContextWindow('gpt-5.5')).toBe(922_000);
+    expect(inferContextWindow('gpt5.5')).toBe(922_000);
+    expect(inferContextWindow('GPT-5.5 (high)')).toBe(922_000);
     expect(resolveContextWindow(400_000, 'gpt-5.5')).toBe(922_000);
   });
 
@@ -32,5 +34,6 @@ describe('web model context resolution', () => {
 
   it('rejects known stale provider fallback windows for GPT-5.5', () => {
     expect(resolveContextWindow(258_400, 'gpt-5.5', 1_000_000, { preferExplicit: true })).toBe(922_000);
+    expect(resolveContextWindow(1_000_000, 'gpt-5.5', 1_000_000, { preferExplicit: true })).toBe(922_000);
   });
 });

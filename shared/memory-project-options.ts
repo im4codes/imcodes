@@ -17,6 +17,7 @@ export const MEMORY_PROJECT_OPTION_SOURCES = [
   'active_session',
   'recent_session',
   'enterprise_enrollment',
+  'memory_index',
   'resolved_directory',
   'manual_resolved',
 ] as const;

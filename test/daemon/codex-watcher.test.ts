@@ -285,6 +285,39 @@ describe('parseLine — ignored line types', () => {
     expect(payload.contextWindowSource).toBeUndefined();
   });
 
+  it('does not let Codex stale provider fallback expand GPT-5.5 window to 1M', () => {
+    parseLine('session-c', tokenCountLine({
+      total_token_usage: {
+        input_tokens: 140_000,
+        cached_input_tokens: 35_000,
+        output_tokens: 2,
+        total_tokens: 140_002,
+        reasoning_output_tokens: 0,
+      },
+      last_token_usage: {
+        input_tokens: 12_000,
+        cached_input_tokens: 3_000,
+        output_tokens: 2,
+        total_tokens: 12_002,
+      },
+      model_context_window: 1_000_000,
+    }), 'gpt-5.5');
+
+    expect(timelineEmitter.emit).toHaveBeenCalledWith(
+      'session-c',
+      'usage.update',
+      expect.objectContaining({
+        inputTokens: 9_000,
+        cacheTokens: 3_000,
+        contextWindow: 922_000,
+        model: 'gpt-5.5',
+      }),
+      expect.objectContaining({ source: 'daemon', confidence: 'high' }),
+    );
+    const payload = vi.mocked(timelineEmitter.emit).mock.calls[0]?.[2] as Record<string, unknown>;
+    expect(payload.contextWindowSource).toBeUndefined();
+  });
+
   it('ignores non-tool response_item lines (e.g. assistant message)', () => {
     parseLine('session-c', responseItemLine());
     expect(timelineEmitter.emit).not.toHaveBeenCalled();

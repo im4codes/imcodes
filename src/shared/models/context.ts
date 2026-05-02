@@ -25,13 +25,21 @@ export const QWEN_CONTEXT_WINDOWS = {
   KIMI_K25: 262_144,
 } as const;
 
+function isGpt55Model(model: string): boolean {
+  return /^gpt[-_ ]?5\.5(?:$|[-_.\s(])/.test(model);
+}
+
+function isGpt54Model(model: string): boolean {
+  return /^gpt[-_ ]?5\.4(?:$|[-_.\s(])/.test(model);
+}
+
 /** Infer context window from model name when the provider doesn't send one explicitly. */
 export function inferContextWindow(model?: string | null): number | undefined {
   const m = model?.toLowerCase().trim();
   if (!m) return undefined;
 
-  if (/^gpt-5\.5(?:$|[-_.])/.test(m)) return OPENAI_CONTEXT_WINDOWS.GPT_55;
-  if (/^gpt-5\.4(?:$|[-_.])/.test(m)) return OPENAI_CONTEXT_WINDOWS.GPT_54;
+  if (isGpt55Model(m)) return OPENAI_CONTEXT_WINDOWS.GPT_55;
+  if (isGpt54Model(m)) return OPENAI_CONTEXT_WINDOWS.GPT_54;
 
   if (
     /^gpt-5(?:$|[-_.])/.test(m) ||
@@ -83,13 +91,14 @@ function isKnownStaleProviderContextWindow(
   explicit: number,
   inferred: number | undefined,
 ): boolean {
-  if (inferred === undefined || explicit >= inferred) return false;
+  if (inferred === undefined) return false;
   const m = model?.toLowerCase().trim();
   if (!m) return false;
-  // Codex app-server currently reports 258400 for GPT-5.5 sessions even when
-  // the selected IM.codes model is GPT-5.5. That is a transport-side fallback,
-  // not the model context limit that should drive the UI ctx meter.
-  return /^gpt-5\.5(?:$|[-_.])/.test(m);
+  // Codex/app-server can report transport fallback windows for GPT-5.5
+  // sessions (seen as 258400 and 1000000) even when the selected IM.codes
+  // model is GPT-5.5. GPT-5.5's product limit is fixed at 922k for this UI
+  // contract, so any provider-sourced mismatch must not drive the ctx meter.
+  return isGpt55Model(m) && explicit !== inferred;
 }
 
 export function resolveContextWindow(

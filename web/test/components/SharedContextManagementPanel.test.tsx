@@ -871,6 +871,90 @@ describe('SharedContextManagementPanel', () => {
     expect(await screen.findByText('Large synced personal memory set')).toBeDefined();
   });
 
+  it('adds daemon memory project indexes to the browse dropdown without forcing a default project filter', async () => {
+    const sent: Array<Record<string, unknown>> = [];
+    const messageHandlers = new Set<(message: unknown) => void>();
+    const ws = {
+      send(message: Record<string, unknown>) {
+        sent.push(message);
+      },
+      onMessage(handler: (message: unknown) => void) {
+        messageHandlers.add(handler);
+        return () => {
+          messageHandlers.delete(handler);
+        };
+      },
+    };
+
+    render(<SharedContextManagementPanel serverId="srv-1" ws={ws as never} />);
+    await flush();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.memory'));
+    });
+
+    const localQuery = [...sent].reverse().find((message) => message.type === MEMORY_WS.PERSONAL_QUERY);
+    expect(localQuery).toBeDefined();
+    expect(localQuery).not.toHaveProperty('canonicalRepoId');
+    expect(localQuery).not.toHaveProperty('projectId');
+
+    await act(async () => {
+      for (const handler of messageHandlers) handler({
+        type: MEMORY_WS.PERSONAL_RESPONSE,
+        requestId: localQuery?.requestId,
+        stats: {
+          totalRecords: 42,
+          matchedRecords: 42,
+          recentSummaryCount: 20,
+          durableCandidateCount: 22,
+          projectCount: 2,
+          stagedEventCount: 0,
+          dirtyTargetCount: 0,
+          pendingJobCount: 0,
+        },
+        records: [],
+        pendingRecords: [],
+        projects: [
+          {
+            projectId: 'github.com/im4codes/imcodes',
+            displayName: 'im4codes/imcodes',
+            totalRecords: 40,
+            recentSummaryCount: 19,
+            durableCandidateCount: 21,
+            updatedAt: 1700000005000,
+          },
+          {
+            projectId: 'local/201eaffedeeb',
+            totalRecords: 2,
+            recentSummaryCount: 1,
+            durableCandidateCount: 1,
+          },
+        ],
+      });
+    });
+
+    const browseSelect = await screen.findByLabelText('sharedContext.management.memoryBrowseProjectFilter') as HTMLSelectElement;
+    expect(browseSelect.value).toBe('');
+    const optionValues = Array.from(browseSelect.options).map((option) => option.value);
+    expect(optionValues).toContain('github.com/im4codes/imcodes');
+    expect(optionValues).toContain('local/201eaffedeeb');
+
+    await act(async () => {
+      fireEvent.input(browseSelect, { target: { value: 'github.com/im4codes/imcodes' } });
+    });
+
+    await waitFor(() => {
+      const filteredQuery = [...sent].reverse().find((message) => (
+        message.type === MEMORY_WS.PERSONAL_QUERY
+        && message.canonicalRepoId === 'github.com/im4codes/imcodes'
+      ));
+      expect(filteredQuery).toMatchObject({
+        canonicalRepoId: 'github.com/im4codes/imcodes',
+        projectId: 'github.com/im4codes/imcodes',
+      });
+    });
+  });
+
   it('shows actionable daemon and feature-state reasons instead of disabled/unknown-only memory UI', async () => {
     render(<SharedContextManagementPanel serverId="srv-1" />);
     await flush();

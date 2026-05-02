@@ -82,6 +82,7 @@ import {
   ensureContextNamespace,
   getProcessedProjectionStats,
   getProcessedProjectionById,
+  listMemoryProjectSummaries,
   listContextNamespaces,
   listContextObservations,
   queryPendingContextEvents,
@@ -6306,12 +6307,21 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
     query: query || undefined,
     limit,
   });
+  const projects = listMemoryProjectSummaries({
+    scope: 'personal',
+    userId: ownerUserId,
+    includeLegacyPersonalOwner: true,
+    projectId: projectId || undefined,
+    projectionClass,
+    includeArchived,
+  });
   serverLink.send({
     type: MEMORY_WS.PERSONAL_RESPONSE,
     requestId,
     stats,
     records,
     pendingRecords,
+    projects,
   });
 }
 
@@ -6557,10 +6567,18 @@ async function handleMemoryProjectResolve(cmd: Record<string, unknown>, serverLi
     return;
   }
 
-  const knownProjectDirs = new Set(listSessions()
+  const requestedRealpath = await fsRealpath(projectDir).catch(() => undefined);
+  const knownProjectDirs = listSessions()
     .map((session) => session.projectDir?.trim())
-    .filter((value): value is string => Boolean(value)));
-  if (!knownProjectDirs.has(projectDir)) {
+    .filter((value): value is string => Boolean(value));
+  const knownProjectRealpaths = new Set<string>();
+  for (const dir of knownProjectDirs) {
+    const real = await fsRealpath(dir).catch(() => undefined);
+    if (real) knownProjectRealpaths.add(real);
+  }
+  const isKnownProjectDir = knownProjectDirs.includes(projectDir)
+    || Boolean(requestedRealpath && knownProjectRealpaths.has(requestedRealpath));
+  if (!isKnownProjectDir) {
     send({
       success: false,
       status: 'unauthorized',

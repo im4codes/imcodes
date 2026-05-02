@@ -6,7 +6,7 @@ import { logAudit } from '../security/audit.js';
 import { parseRemoteUrl } from '../../../src/repo/detector.js';
 import { parseCanonicalRepositoryKey } from '../../../src/agent/repository-identity-service.js';
 import { classifyTimestampFreshness } from '../../../shared/context-freshness.js';
-import type { ContextMemoryRecordView, ContextMemoryStatsView } from '../../../shared/context-types.js';
+import type { ContextMemoryProjectView, ContextMemoryRecordView, ContextMemoryStatsView, ContextMemoryView } from '../../../shared/context-types.js';
 import { computeRelevanceScore, applyRecallCapRule, type ProjectionClass } from '../../../shared/memory-scoring.js';
 import { normalizeSharedContextRuntimeConfig } from '../../../shared/shared-context-runtime-config.js';
 import { isTemplatePrompt, isTemplateOriginSummary, isImperativeCommand } from '../../../shared/template-prompt-patterns.js';
@@ -191,6 +191,14 @@ type MemoryStatsRow = {
   project_count?: number | null;
 };
 
+type MemoryProjectStatsRow = {
+  project_id: string;
+  total_records?: number | null;
+  recent_summary_count?: number | null;
+  durable_candidate_count?: number | null;
+  updated_at?: number | null;
+};
+
 type MemoryRecordRow = {
   id: string;
   scope: SharedProjectionScope;
@@ -237,6 +245,45 @@ function mapMemoryRecordRows(rows: MemoryRecordRow[]): ContextMemoryRecordView[]
   }));
 }
 
+function mapMemoryProjectRows(rows: MemoryProjectStatsRow[]): ContextMemoryProjectView[] {
+  return rows
+    .filter((row) => row.project_id)
+    .map((row) => ({
+      projectId: row.project_id,
+      displayName: row.project_id,
+      totalRecords: row.total_records ?? 0,
+      recentSummaryCount: row.recent_summary_count ?? 0,
+      durableCandidateCount: row.durable_candidate_count ?? 0,
+      updatedAt: row.updated_at ?? undefined,
+    }));
+}
+
+function buildMemoryProjectsFromRows(rows: Array<Pick<MemoryProjectStatsRow, 'project_id'> & {
+  projection_class: 'recent_summary' | 'durable_memory_candidate';
+  updated_at: number;
+}>): ContextMemoryProjectView[] {
+  const projects = new Map<string, ContextMemoryProjectView>();
+  for (const row of rows) {
+    if (!row.project_id) continue;
+    const current = projects.get(row.project_id) ?? {
+      projectId: row.project_id,
+      displayName: row.project_id,
+      totalRecords: 0,
+      recentSummaryCount: 0,
+      durableCandidateCount: 0,
+      updatedAt: row.updated_at,
+    };
+    current.totalRecords += 1;
+    if (row.projection_class === 'recent_summary') current.recentSummaryCount += 1;
+    if (row.projection_class === 'durable_memory_candidate') current.durableCandidateCount += 1;
+    current.updatedAt = Math.max(current.updatedAt ?? 0, row.updated_at ?? 0) || undefined;
+    projects.set(row.project_id, current);
+  }
+  return Array.from(projects.values())
+    .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0) || b.totalRecords - a.totalRecords || a.projectId.localeCompare(b.projectId))
+    .slice(0, 200);
+}
+
 function buildSharedMemoryResponse(
   rows: Array<{
     id: string;
@@ -253,7 +300,7 @@ function buildSharedMemoryResponse(
   }>,
   query?: string,
   limit = 20,
-): { stats: ContextMemoryStatsView; records: ContextMemoryRecordView[] } {
+): ContextMemoryView {
   const normalizedQuery = query?.trim() ?? '';
   const cleanRows = rows.filter((row) => !isMemoryNoiseSummary(row.summary));
   const filtered = cleanRows.filter((row) => matchesMemoryQuery(
@@ -270,6 +317,7 @@ function buildSharedMemoryResponse(
       project_count: projectIds.size,
     }, filtered.length),
     records: mapMemoryRecordRows(filtered.slice(0, limit)),
+    projects: buildMemoryProjectsFromRows(cleanRows),
   };
 }
 
@@ -329,9 +377,26 @@ sharedContextRoutes.get('/personal-memory', async (c) => {
        LIMIT $${projectId ? (projectionClass ? 4 : 3) : (projectionClass ? 3 : 2)}`,
       [userId, ...(projectId ? [projectId] : []), ...(projectionClass ? [projectionClass] : []), limit],
     );
+    const projectRows = await c.env.DB.query<MemoryProjectStatsRow>(
+      `SELECT project_id,
+              COUNT(*)::int AS total_records,
+              COUNT(*) FILTER (WHERE projection_class = 'recent_summary')::int AS recent_summary_count,
+              COUNT(*) FILTER (WHERE projection_class = 'durable_memory_candidate')::int AS durable_candidate_count,
+              MAX(updated_at) AS updated_at
+       FROM shared_context_projections
+       WHERE user_id = $1
+         AND scope = 'personal'
+         ${projectId ? 'AND project_id = $2' : ''}
+         ${projectionClass ? `AND projection_class = $${projectId ? 3 : 2}` : ''}
+       GROUP BY project_id
+       ORDER BY MAX(updated_at) DESC
+       LIMIT 200`,
+      [userId, ...(projectId ? [projectId] : []), ...(projectionClass ? [projectionClass] : [])],
+    );
     return c.json({
       stats: buildMemoryStatsView(stats, stats?.total_records ?? 0),
       records: mapMemoryRecordRows(rows.filter((row) => !isMemoryNoiseSummary(row.summary))),
+      projects: mapMemoryProjectRows(projectRows),
     });
   }
 
@@ -1172,9 +1237,25 @@ sharedContextRoutes.get('/enterprises/:enterpriseId/memory', async (c) => {
        LIMIT $${canonicalRepoId ? (projectionClass ? 4 : 3) : (projectionClass ? 3 : 2)}`,
       [enterpriseId, ...(canonicalRepoId ? [canonicalRepoId] : []), ...(projectionClass ? [projectionClass] : []), limit],
     );
+    const projectRows = await c.env.DB.query<MemoryProjectStatsRow>(
+      `SELECT project_id,
+              COUNT(*)::int AS total_records,
+              COUNT(*) FILTER (WHERE projection_class = 'recent_summary')::int AS recent_summary_count,
+              COUNT(*) FILTER (WHERE projection_class = 'durable_memory_candidate')::int AS durable_candidate_count,
+              MAX(updated_at) AS updated_at
+       FROM shared_context_projections
+       WHERE enterprise_id = $1
+         ${canonicalRepoId ? 'AND project_id = $2' : ''}
+         ${projectionClass ? `AND projection_class = $${canonicalRepoId ? 3 : 2}` : ''}
+       GROUP BY project_id
+       ORDER BY MAX(updated_at) DESC
+       LIMIT 200`,
+      [enterpriseId, ...(canonicalRepoId ? [canonicalRepoId] : []), ...(projectionClass ? [projectionClass] : [])],
+    );
     return c.json({
       stats: buildMemoryStatsView(stats, stats?.total_records ?? 0),
       records: mapMemoryRecordRows(rows.filter((row) => !isMemoryNoiseSummary(row.summary))),
+      projects: mapMemoryProjectRows(projectRows),
     });
   }
 

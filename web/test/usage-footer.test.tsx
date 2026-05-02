@@ -324,6 +324,23 @@ describe('UsageFooter', () => {
     expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('Context: 100k / 922k (11%)');
   });
 
+  it('does not let stale Codex provider fallback expand GPT-5.5 context window to 1M', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 100_000,
+          cacheTokens: 0,
+          contextWindow: 1_000_000,
+          contextWindowSource: USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER,
+          model: 'gpt-5.5',
+        }}
+        sessionName="deck_test_brain"
+      />,
+    );
+
+    expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('Context: 100k / 922k (11%)');
+  });
+
   it('keeps the ctx meter visible at zero usage when the model is known', () => {
     const { container } = render(
       <UsageFooter

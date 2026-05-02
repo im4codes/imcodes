@@ -127,6 +127,7 @@ export type ServerMessage =
     stats: import('../../shared/context-types.js').ContextMemoryStatsView;
     records: Array<import('../../shared/context-types.js').ContextMemoryRecordView>;
     pendingRecords?: Array<import('../../shared/context-types.js').ContextPendingEventView>;
+    projects?: Array<import('../../shared/context-types.js').ContextMemoryProjectView>;
     error?: string;
     errorCode?: MemoryManagementErrorCode;
   }

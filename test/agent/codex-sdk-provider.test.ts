@@ -585,6 +585,102 @@ describe('CodexSdkProvider', () => {
     ]);
   });
 
+  it('recognizes snake_case thread compact notifications and clears compact busy state', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-compact-snake', cwd: '/tmp/project' });
+
+    const completed: string[] = [];
+    provider.onComplete((_sid, msg) => completed.push(String(msg.metadata?.turnId ?? '')));
+
+    await provider.send('route-compact-snake', '/compact');
+
+    const child = childProcessMock.children[0];
+    child.emits({ method: 'thread/compacted', params: { thread_id: 'thread-1', turn_id: 'compact-turn-snake' } });
+    await flush();
+
+    expect(completed).toEqual(['compact-turn-snake']);
+    await provider.send('route-compact-snake', 'after compact');
+    expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(1);
+  });
+
+  it('completes compact on contextCompaction item completion even without turn/completed', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-compact-item', cwd: '/tmp/project' });
+
+    const statuses: Array<{ status: string | null; label?: string | null }> = [];
+    const completed: string[] = [];
+    provider.onStatus?.((_sid, status) => statuses.push(status));
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+
+    await provider.send('route-compact-item', '/compact');
+
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'compact-turn-item', item: { id: 'compact-item', type: 'contextCompaction' } },
+    });
+    child.emits({
+      method: 'item/completed',
+      params: { threadId: 'thread-1', turnId: 'compact-turn-item', item: { id: 'compact-item', type: 'contextCompaction' } },
+    });
+    await flush();
+
+    expect(statuses).toEqual([
+      { status: 'thinking', label: 'Compacting context...' },
+      { status: null, label: null },
+    ]);
+    expect(completed).toEqual(['Codex context compacted.']);
+    await provider.send('route-compact-item', 'after item compact');
+    expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(1);
+  });
+
+  it('settles accepted compact requests that emit no native completion signal', async () => {
+    vi.useFakeTimers();
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-compact-no-signal', cwd: '/tmp/project' });
+
+    const completed: string[] = [];
+    const errors: string[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+    provider.onError((_sid, err) => errors.push(err.code));
+
+    await provider.send('route-compact-no-signal', '/compact');
+    const child = childProcessMock.children[0];
+    expect(child.requests.some((req) => req.method === 'thread/compact/start')).toBe(true);
+    expect(completed).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(errors).toEqual([]);
+    expect(completed).toEqual(['Codex context compacted.']);
+    await provider.send('route-compact-no-signal', 'after silent compact');
+    expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(1);
+  });
+
+  it('does not settle compact by fallback after an active compact signal arrives', async () => {
+    vi.useFakeTimers();
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-compact-active', cwd: '/tmp/project' });
+
+    const completed: string[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+
+    await provider.send('route-compact-active', '/compact');
+    const child = childProcessMock.children[0];
+    child.emits({ method: 'thread/status/changed', params: { thread_id: 'thread-1', status: { type: 'active' } } });
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(completed).toEqual([]);
+
+    child.emits({ method: 'thread/status/changed', params: { thread_id: 'thread-1', status: 'idle' } });
+    await Promise.resolve();
+    expect(completed).toEqual(['Codex context compacted.']);
+  });
+
   it('uses the raw userMessage when detecting /compact in normalized payloads', async () => {
     const provider = new CodexSdkProvider();
     await provider.connect({ binaryPath: 'codex' });

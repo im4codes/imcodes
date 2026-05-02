@@ -207,6 +207,51 @@ describe('TransportSessionRuntime', () => {
     expect(String(afterCompactPayload.assembledMessage)).toContain('Use pnpm');
   });
 
+  it('keeps slash controls raw for every transport by suppressing startup, recall, authored, and preference context', async () => {
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
+      startupMemory: {
+        reason: 'startup',
+        runtimeFamily: 'transport',
+        authoritySource: 'processed_local',
+        sourceKind: 'local_processed',
+        injectionSurface: 'normalized-payload',
+        items: [makeSearchItem({ id: 'startup-memory', summary: 'Startup memory must not ride with slash controls' })],
+        injectedText: 'Historical context that must not be attached to /compact',
+      } as any,
+    }));
+    await r.initialize({
+      ...defaultConfig,
+      description: 'Session description must not be attached to /compact',
+      systemPrompt: 'Runtime system prompt must not be attached to /compact',
+      contextNamespace: { scope: 'personal', projectId: 'repo-1' },
+      contextLocalProcessedFreshness: 'fresh',
+    });
+    timelineEmitterEmitMock.mockClear();
+    searchLocalMemorySemanticMock.mockClear();
+
+    const preferencePreamble = `${PREFERENCE_CONTEXT_START}\n- Prefer pnpm\n${PREFERENCE_CONTEXT_END}`;
+    r.send('/compact', 'raw-compact-control', undefined, preferencePreamble);
+    await flushDispatch();
+
+    expect(searchLocalMemorySemanticMock).not.toHaveBeenCalled();
+    const compactPayload = localMock.provider.send.mock.calls[0]?.[1] as Record<string, any>;
+    expect(compactPayload.userMessage).toBe('/compact');
+    expect(compactPayload.assembledMessage).toBe('/compact');
+    expect(compactPayload.systemText).toBeUndefined();
+    expect(compactPayload.messagePreamble).toBeUndefined();
+    expect(compactPayload.startupMemory).toBeUndefined();
+    expect(compactPayload.memoryRecall).toBeUndefined();
+    expect(compactPayload.context?.systemText).toBeUndefined();
+    expect(compactPayload.context?.messagePreamble).toBeUndefined();
+    expect(compactPayload.context?.requiredAuthoredContext).toEqual([]);
+    expect(compactPayload.context?.advisoryAuthoredContext).toEqual([]);
+  });
+
   it('keeps queued preference context in messagePreamble without changing user-visible text', async () => {
     runtime.send('first');
     await flushDispatch();

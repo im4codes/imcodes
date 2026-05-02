@@ -2,7 +2,7 @@ import type { ComponentChildren } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { DEFAULT_PRIMARY_CONTEXT_MODEL } from '@shared/context-model-defaults.js';
-import type { ContextMemoryView, SharedContextRuntimeBackend } from '@shared/context-types.js';
+import type { ContextMemoryProjectView, ContextMemoryView, SharedContextRuntimeBackend } from '@shared/context-types.js';
 import { QWEN_MODEL_IDS } from '@shared/qwen-models.js';
 import { MEMORY_WS } from '@shared/memory-ws.js';
 import {
@@ -1119,6 +1119,7 @@ const EMPTY_MEMORY_VIEW: ContextMemoryView = {
   },
   records: [],
   pendingRecords: [],
+  projects: [],
 };
 
 function normalizeMemoryView(view: ContextMemoryView): ContextMemoryView {
@@ -1135,6 +1136,7 @@ function normalizeMemoryView(view: ContextMemoryView): ContextMemoryView {
     },
     records: view.records ?? [],
     pendingRecords: view.pendingRecords ?? [],
+    projects: view.projects ?? [],
   };
 }
 
@@ -1161,6 +1163,27 @@ function projectDirDisplayName(projectDir: string): string {
   const trimmed = projectDir.trim().replace(/\/+$/, '');
   const parts = trimmed.split('/');
   return parts[parts.length - 1] || trimmed;
+}
+
+function memoryProjectDisplayNameFromId(projectId: string): string {
+  const trimmed = projectId.trim();
+  if (!trimmed) return trimmed;
+  const parts = trimmed.split('/');
+  if (parts.length >= 2) return parts.slice(-2).join('/');
+  return trimmed;
+}
+
+function memoryProjectOptionFromMemoryProject(project: ContextMemoryProjectView): MemoryProjectOption | null {
+  const canonicalRepoId = project.projectId.trim();
+  if (!canonicalRepoId) return null;
+  return {
+    id: canonicalRepoId,
+    displayName: project.displayName?.trim() || memoryProjectDisplayNameFromId(canonicalRepoId),
+    canonicalRepoId,
+    source: 'memory_index',
+    status: 'canonical_only',
+    lastSeenAt: project.updatedAt,
+  };
 }
 
 function memoryProjectOptionLabel(option: MemoryProjectOption, missingCanonical: string, missingDirectory: string): string {
@@ -1271,6 +1294,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [selectedMemoryProjectId, setSelectedMemoryProjectId] = useState('');
   const [memoryBrowseProjectId, setMemoryBrowseProjectId] = useState('');
   const [memoryProjectSearch, setMemoryProjectSearch] = useState('');
+  const [memoryIndexedProjects, setMemoryIndexedProjects] = useState<Record<string, MemoryProjectOption>>({});
   const [resolvedMemoryProjects, setResolvedMemoryProjects] = useState<Record<string, MemoryProjectOption>>({});
   const [resolvingMemoryProjectIds, setResolvingMemoryProjectIds] = useState<Set<string>>(new Set());
   const [memoryQuery, setMemoryQuery] = useState('');
@@ -1378,6 +1402,17 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const isCurrentMemoryAdminResponse = useCallback((surface: MemoryAdminRequestSurface, requestId?: string): boolean => (
     !!requestId && memoryAdminRequestIdsRef.current[surface] === requestId
   ), []);
+  const rememberMemoryProjectIndex = useCallback((projects?: readonly ContextMemoryProjectView[]) => {
+    if (!projects?.length) return;
+    setMemoryIndexedProjects((current) => {
+      const next = new Map(Object.values(current).map((option) => [option.id, option] as const));
+      for (const project of projects) {
+        const option = memoryProjectOptionFromMemoryProject(project);
+        if (option) mergeMemoryProjectOption(next, option);
+      }
+      return Object.fromEntries(next);
+    });
+  }, []);
 
   useEffect(() => {
     if (!ws) return;
@@ -1617,6 +1652,10 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       });
     }
 
+    for (const option of Object.values(memoryIndexedProjects)) {
+      mergeMemoryProjectOption(options, option);
+    }
+
     for (const option of Object.values(resolvedMemoryProjects)) {
       mergeMemoryProjectOption(options, option);
     }
@@ -1626,7 +1665,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       if (b.projectDir === activeProjectDir) return 1;
       return (b.lastSeenAt ?? 0) - (a.lastSeenAt ?? 0) || a.displayName.localeCompare(b.displayName);
     });
-  }, [activeProjectDir, memoryProjectCandidates, projects, resolvedMemoryProjects]);
+  }, [activeProjectDir, memoryIndexedProjects, memoryProjectCandidates, projects, resolvedMemoryProjects]);
 
   const selectedMemoryProject = useMemo(
     () => memoryProjectOptions.find((option) => option.id === selectedMemoryProjectId) ?? null,
@@ -1752,11 +1791,6 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       canonicalRepoId: option.canonicalRepoId?.trim() || undefined,
     });
   }, [markMemoryAdminRequest, resolvingMemoryProjectIds, ws]);
-
-  useEffect(() => {
-    if (!selectedMemoryProject || selectedMemoryProject.status !== 'needs_resolution') return;
-    resolveMemoryProject(selectedMemoryProject);
-  }, [resolveMemoryProject, selectedMemoryProject]);
 
   const refreshEnterpriseData = useCallback(async (nextEnterpriseId = enterpriseId) => {
     if (!nextEnterpriseId) {
@@ -1934,14 +1968,16 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       if (msg.type !== MEMORY_WS.PERSONAL_RESPONSE) return;
       if (msg.requestId !== personalMemoryRequestIdRef.current) return;
       clearTimeoutRef(personalMemoryStatusTimerRef);
+      rememberMemoryProjectIndex(msg.projects ?? []);
       setLocalPersonalMemory(normalizeMemoryView({
         stats: msg.stats,
         records: msg.records,
         pendingRecords: msg.pendingRecords ?? [],
+        projects: msg.projects ?? [],
       }));
       setLocalPersonalMemoryStatus(msg.errorCode ? 'error' : 'ready');
     });
-  }, [ws]);
+  }, [rememberMemoryProjectIndex, ws]);
 
   const loadMemoryViews = useCallback(async () => {
     const generation = memoryViewGenerationRef.current + 1;
@@ -1981,6 +2017,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
 
       const cloudView = normalizeMemoryView(await getPersonalCloudMemory(queryInput));
       if (memoryViewGenerationRef.current !== generation) return;
+      rememberMemoryProjectIndex(cloudView.projects ?? []);
       setCloudPersonalMemory(cloudView);
 
       if (enterpriseId) {
@@ -1991,6 +2028,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
           limit: 25,
         }));
         if (memoryViewGenerationRef.current !== generation) return;
+        rememberMemoryProjectIndex(enterpriseView.projects ?? []);
         setSharedMemory(enterpriseView);
       } else {
         if (memoryViewGenerationRef.current !== generation) return;
@@ -2001,7 +2039,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     } finally {
       if (memoryViewGenerationRef.current === generation) setMemoryLoading(false);
     }
-  }, [browseCanonicalRepoId, enterpriseId, memoryProjectionClass, memoryQuery, ws, showArchived]);
+  }, [browseCanonicalRepoId, enterpriseId, memoryProjectionClass, memoryQuery, rememberMemoryProjectIndex, ws, showArchived]);
 
   const loadMemoryAdminViews = useCallback(() => {
     if (!ws) {
@@ -2176,6 +2214,11 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       }
     });
   }, [isCurrentMemoryAdminResponse, loadMemoryAdminViews, loadMemoryViews, memoryAdminErrorMessage, t, ws]);
+
+  useEffect(() => {
+    if (!selectedMemoryProject || selectedMemoryProject.status !== 'needs_resolution') return;
+    resolveMemoryProject(selectedMemoryProject);
+  }, [resolveMemoryProject, selectedMemoryProject]);
 
   useEffect(() => () => {
     clearTimeoutRef(personalMemoryStatusTimerRef);

@@ -274,6 +274,16 @@ export interface ContextMemoryStatsView {
   pendingJobCount: number;
 }
 
+export interface ContextMemoryProjectView {
+  projectId: string;
+  displayName?: string;
+  totalRecords: number;
+  recentSummaryCount: number;
+  durableCandidateCount: number;
+  pendingEventCount?: number;
+  updatedAt?: number;
+}
+
 export interface ContextMemoryRecordView {
   id: string;
   scope: SharedContextProjectionScope;
@@ -300,6 +310,7 @@ export interface ContextMemoryView {
   stats: ContextMemoryStatsView;
   records: ContextMemoryRecordView[];
   pendingRecords?: ContextPendingEventView[];
+  projects?: ContextMemoryProjectView[];
 }
 
 export interface ProcessedContextReplicationBody {
