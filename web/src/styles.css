@@ -970,7 +970,7 @@ body {
 @keyframes thinking-pulse { 0%, 100% { opacity: 0.3; } 50% { opacity: 1; } }
 .chat-bubble-content { white-space: pre-wrap; word-break: break-word; }
 .chat-bubble-time { font-size: 10px; color: #64748b; margin-top: 2px; }
-.chat-sel-menu { position: absolute; transform: translate(-50%, calc(-100% - 8px)); z-index: 20; pointer-events: auto; display: flex; gap: 4px; }
+.chat-sel-menu { position: absolute; z-index: 20; pointer-events: auto; display: flex; flex-wrap: wrap; gap: 4px; max-width: calc(100% - 16px); box-sizing: border-box; }
 /* Mobile: disable native text selection/callout in chat — custom long-press timer handles Copy/Quote. */
 @media (pointer: coarse) { .chat-view { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; } }
 .chat-sel-btn { background: #1e293b; border: 1px solid #475569; color: #e2e8f0; font-size: 13px; padding: 5px 14px; border-radius: 6px; cursor: pointer; font-family: inherit; white-space: nowrap; box-shadow: 0 4px 12px rgba(0,0,0,0.4); transition: background 0.15s; }

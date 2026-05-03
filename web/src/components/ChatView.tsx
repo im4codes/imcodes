@@ -16,6 +16,7 @@ import { ChatMarkdown } from './ChatMarkdown.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
 import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 import type { TimelineHistoryStatus, TimelineHistoryStepKey } from '../hooks/useTimeline.js';
+import { positionChatActionMenu } from '../chat-action-menu-position.js';
 
 interface Props {
   events: TimelineEvent[];
@@ -550,6 +551,8 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
 interface SelectionMenu {
   x: number;
   y: number;
+  anchorClientX: number;
+  anchorClientY: number;
   text: string;
 }
 
@@ -610,12 +613,14 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const bottomRef = useRef<HTMLDivElement>(null);
   const [fileBrowserTarget, setFileBrowserTarget] = useState<FileBrowserTarget | null>(null);
   const [selMenu, setSelMenu] = useState<SelectionMenu | null>(null);
+  const selMenuRef = useRef<HTMLDivElement>(null);
   const [copied, setCopied] = useState(false);
   const [pendingUrl, setPendingUrl] = useState<string | null>(null);
   const [highlightEl, setHighlightEl] = useState<HTMLElement | null>(null);
   const highlightElRef = useRef(highlightEl);
   highlightElRef.current = highlightEl;
-  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; text: string } | null>(null);
+  const [ctxMenu, setCtxMenu] = useState<SelectionMenu | null>(null);
+  const ctxMenuRef = useRef<HTMLDivElement>(null);
   // Timestamp when ctx menu was opened — clicks within 400ms are synthetic (from long-press release)
   const menuOpenedAtRef = useRef(0);
 
@@ -1126,6 +1131,42 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   }, [preview]);
 
   const isTouchDevice = 'ontouchstart' in window;
+  const getActionMenuContainerRect = useCallback(() => {
+    const container = scrollRef.current;
+    if (!container) return null;
+    const mainEl = container.closest('.chat-main') as HTMLElement | null;
+    return (mainEl ?? container).getBoundingClientRect();
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!selMenu || !selMenuRef.current) return;
+    const containerRect = getActionMenuContainerRect();
+    if (!containerRect) return;
+    const menuRect = selMenuRef.current.getBoundingClientRect();
+    const next = positionChatActionMenu(
+      selMenu.anchorClientX,
+      selMenu.anchorClientY,
+      containerRect,
+      { width: menuRect.width, height: menuRect.height },
+    );
+    if (Math.abs(selMenu.x - next.x) < 0.5 && Math.abs(selMenu.y - next.y) < 0.5) return;
+    setSelMenu({ ...selMenu, ...next });
+  }, [getActionMenuContainerRect, selMenu]);
+
+  useLayoutEffect(() => {
+    if (!ctxMenu || !ctxMenuRef.current) return;
+    const containerRect = getActionMenuContainerRect();
+    if (!containerRect) return;
+    const menuRect = ctxMenuRef.current.getBoundingClientRect();
+    const next = positionChatActionMenu(
+      ctxMenu.anchorClientX,
+      ctxMenu.anchorClientY,
+      containerRect,
+      { width: menuRect.width, height: menuRect.height },
+    );
+    if (Math.abs(ctxMenu.x - next.x) < 0.5 && Math.abs(ctxMenu.y - next.y) < 0.5) return;
+    setCtxMenu({ ...ctxMenu, ...next });
+  }, [ctxMenu, getActionMenuContainerRect]);
 
   // Desktop: show selection popup menu when text is selected within the chat view
   useEffect(() => {
@@ -1145,11 +1186,15 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       const text = sel.toString().trim();
       if (!text) { setSelMenu(null); return; }
       const selRect = range.getBoundingClientRect();
-      const wrapEl = container.closest('.chat-view-wrap') as HTMLElement | null;
-      const wrapRect = (wrapEl ?? container).getBoundingClientRect();
+      const mainEl = container.closest('.chat-main') as HTMLElement | null;
+      const mainRect = (mainEl ?? container).getBoundingClientRect();
+      const anchorClientX = selRect.left + selRect.width / 2;
+      const anchorClientY = selRect.top;
+      const position = positionChatActionMenu(anchorClientX, anchorClientY, mainRect);
       setSelMenu({
-        x: selRect.left + selRect.width / 2 - wrapRect.left,
-        y: selRect.top - wrapRect.top,
+        ...position,
+        anchorClientX,
+        anchorClientY,
         text,
       });
       setCopied(false);
@@ -1165,15 +1210,17 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     setHighlightEl(target);
     const text = extractChatEventText(target);
     if (!text) return;
-    const mainEl = scrollRef.current?.closest('.chat-main') as HTMLElement | null;
-    const mainRect = (mainEl ?? scrollRef.current!).getBoundingClientRect();
+    const mainRect = getActionMenuContainerRect();
+    if (!mainRect) return;
+    const position = positionChatActionMenu(clientX, clientY, mainRect);
     menuOpenedAtRef.current = Date.now();
     setCtxMenu({
-      x: Math.max(40, Math.min(clientX - mainRect.left, mainRect.width - 80)),
-      y: Math.max(10, Math.min(clientY - mainRect.top - 40, mainRect.height - 120)),
+      ...position,
+      anchorClientX: clientX,
+      anchorClientY: clientY,
       text,
     });
-  }, []);
+  }, [getActionMenuContainerRect]);
 
   // Desktop: right-click → contextmenu event → custom menu
   const handleContextMenu = useCallback((e: Event) => {
@@ -1464,6 +1511,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
         )}
         {selMenu && !preview && (
           <div
+            ref={selMenuRef}
             class="chat-sel-menu"
             style={{ left: `${selMenu.x}px`, top: `${selMenu.y}px` }}
             onMouseDown={(e) => e.preventDefault()}
@@ -1498,6 +1546,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
         )}
         {ctxMenu && !preview && (
           <div
+            ref={ctxMenuRef}
             class="chat-sel-menu"
             style={{ left: `${ctxMenu.x}px`, top: `${ctxMenu.y}px` }}
             onMouseDown={(e) => e.preventDefault()}
