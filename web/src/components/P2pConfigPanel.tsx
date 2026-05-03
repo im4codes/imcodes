@@ -363,13 +363,19 @@ export function P2pConfigPanel({
 
   const toggleEnabled = (key: string) => {
     markFormDirty();
+    const eligibleKeys = new Set(allEligible.map((entry) => entry.key));
     setSessionCfg((prev) => {
       const cur = prev[key] ?? { enabled: false, mode: 'audit' };
       const willEnable = !cur.enabled;
-      if (willEnable) {
-        // Enforce hard cap at toggle time so the UI never lets a user select more than MAX_P2P_PARTICIPANTS.
+      const willCountAsParticipant = willEnable && cur.mode !== 'skip';
+      if (willCountAsParticipant) {
+        // Enforce hard cap at toggle time so the UI never lets a user select
+        // more than MAX_P2P_PARTICIPANTS. Count only currently eligible
+        // sessions: old saved configs can contain stale/closed/other-scope
+        // entries, and those are pruned on save, so they must not block a
+        // user from selecting the visible in-scope participants.
         const currentlyEnabledCount = Object.entries(prev).filter(
-          ([k, e]) => k !== key && e?.enabled === true && e.mode !== 'skip',
+          ([k, e]) => k !== key && eligibleKeys.has(k) && e?.enabled === true && e.mode !== 'skip',
         ).length;
         if (currentlyEnabledCount >= MAX_P2P_PARTICIPANTS) {
           setSaveError(
@@ -387,8 +393,25 @@ export function P2pConfigPanel({
 
   const setMode = (key: string, mode: string) => {
     markFormDirty();
+    const eligibleKeys = new Set(allEligible.map((entry) => entry.key));
     setSessionCfg((prev) => {
       const cur = prev[key] ?? { enabled: false, mode: 'audit' };
+      const willCountAsParticipant = cur.enabled && mode !== 'skip';
+      const didCountAsParticipant = cur.enabled && cur.mode !== 'skip';
+      if (willCountAsParticipant && !didCountAsParticipant) {
+        const currentlyEnabledCount = Object.entries(prev).filter(
+          ([k, e]) => k !== key && eligibleKeys.has(k) && e?.enabled === true && e.mode !== 'skip',
+        ).length;
+        if (currentlyEnabledCount >= MAX_P2P_PARTICIPANTS) {
+          setSaveError(
+            t('p2p.settings_max_participants', 'P2P is limited to {{max}} participants. Disable one before enabling another.', {
+              max: MAX_P2P_PARTICIPANTS,
+            }),
+          );
+          return prev;
+        }
+      }
+      setSaveError(null);
       return { ...prev, [key]: { ...cur, mode } };
     });
   };

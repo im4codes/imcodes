@@ -31,6 +31,7 @@ vi.mock('../../src/api.js', () => ({
 
 import { P2pConfigPanel } from '../../src/components/P2pConfigPanel.js';
 import type { P2pSavedConfig } from '@shared/p2p-modes.js';
+import { MAX_P2P_PARTICIPANTS } from '@shared/p2p-config-events.js';
 
 const sessions = [
   { name: 'deck_proj_brain', agentType: 'claude-code-sdk', state: 'running' },
@@ -329,6 +330,47 @@ describe('P2pConfigPanel', () => {
     const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
     const firstKey = Object.keys(cfg.sessions)[0];
     expect(cfg.sessions[firstKey].enabled).toBe(true);
+  }, 15_000);
+
+  it('ignores stale saved participants when enforcing the checkbox participant cap', async () => {
+    const onSave = vi.fn();
+    const staleSessions = Object.fromEntries(
+      Array.from({ length: MAX_P2P_PARTICIPANTS - 1 }, (_, index) => [
+        `deck_old_stale_${index}`,
+        { enabled: true, mode: 'audit' },
+      ]),
+    );
+    getUserPrefMock.mockImplementation(async (key: string) => {
+      if (key === 'p2p_session_config:deck_proj_brain') {
+        return JSON.stringify({ sessions: staleSessions, rounds: 3 });
+      }
+      return null;
+    });
+
+    renderPanel({ onSave });
+    await flush();
+
+    const checkboxes = screen.getAllByRole('checkbox') as HTMLInputElement[];
+    expect(checkboxes).toHaveLength(2);
+
+    fireEvent.click(checkboxes[0]);
+    expect(checkboxes[0].checked).toBe(true);
+
+    // Regression: before the cap counted stale saved entries, this second
+    // click was rejected as if five participants were already selected.
+    fireEvent.click(checkboxes[1]);
+    expect(checkboxes[1].checked).toBe(true);
+    expect(screen.queryByText(/P2P is limited/i)).toBeNull();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('settings_save'));
+    });
+    await flush();
+
+    const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
+    expect(Object.keys(cfg.sessions).some((key) => key.startsWith('deck_old_stale_'))).toBe(false);
+    expect(cfg.sessions.deck_proj_brain.enabled).toBe(true);
+    expect(cfg.sessions.deck_sub_abc.enabled).toBe(true);
   }, 15_000);
 
   it('changing rounds updates the config passed to onSave', async () => {
