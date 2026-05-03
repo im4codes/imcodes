@@ -166,14 +166,14 @@ describe('memory-search semantic ranking', () => {
       class: 'recent_summary',
       sourceEventIds: ['evt-1'],
       summary: 'Repo memory repo-only-secret',
-      content: {},
+      content: { ownerUserId: 'user-1', createdByUserId: 'user-1', updatedByUserId: 'user-2' },
     });
     writeProcessedProjection({
       namespace: otherNamespace,
       class: 'recent_summary',
       sourceEventIds: ['evt-2'],
       summary: 'Other memory other-only-secret',
-      content: {},
+      content: { ownerUserId: 'user-1', createdByUserId: 'user-1', updatedByUserId: 'user-2' },
     });
 
     const embeddedTexts: string[] = [];

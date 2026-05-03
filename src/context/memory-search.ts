@@ -11,6 +11,7 @@ import type {
   ProcessedContextProjectionStatus,
   ContextMemoryStatsView,
 } from '../../shared/context-types.js';
+import { projectionSemanticContent } from '../../shared/memory-content-hash.js';
 import { computeRelevanceScore, type ProjectionClass } from '../../shared/memory-scoring.js';
 import { normalizeSummaryForFingerprint } from '../../shared/memory-fingerprint.js';
 import { getContextModelConfig } from './context-model-config.js';
@@ -481,7 +482,10 @@ function collectRawEvents(query: MemorySearchQuery): MemorySearchResultItem[] {
 }
 
 function projectionToItem(projection: ProcessedContextProjection): MemorySearchResultItem {
-  const content = projection.content;
+  const content = projectionSemanticContent(projection.content);
+  const contentRecord = content && typeof content === 'object' && !Array.isArray(content)
+    ? content as Record<string, unknown>
+    : undefined;
   return {
     type: 'processed',
     id: projection.id,
@@ -492,15 +496,15 @@ function projectionToItem(projection: ProcessedContextProjection): MemorySearchR
     userId: projection.namespace.userId,
     projectionClass: projection.class,
     summary: projection.summary,
-    content: typeof content === 'object' ? JSON.stringify(content) : undefined,
+    content: contentRecord ? JSON.stringify(contentRecord) : undefined,
     createdAt: projection.createdAt,
     updatedAt: projection.updatedAt,
     hitCount: projection.hitCount,
     lastUsedAt: projection.lastUsedAt,
     status: projection.status,
-    sourceEventCount: typeof content?.eventCount === 'number' ? content.eventCount : undefined,
+    sourceEventCount: typeof contentRecord?.eventCount === 'number' ? contentRecord.eventCount : undefined,
     sourceEventIds: projection.sourceEventIds,
-    processingModel: typeof content?.primaryContextModel === 'string' ? content.primaryContextModel : undefined,
+    processingModel: typeof contentRecord?.primaryContextModel === 'string' ? contentRecord.primaryContextModel : undefined,
   };
 }
 

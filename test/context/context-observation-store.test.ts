@@ -88,10 +88,10 @@ describe('post-1.1 context namespace and observation store', () => {
       }),
     ]);
     expect(projection.origin).toBe('chat_compacted');
-    expect(projection.content).toEqual(expect.objectContaining({
-      ownerUserId: 'user-1',
-      createdByUserId: 'user-1',
-    }));
+    expect(projection.content).toEqual({
+      text: 'Fixed ack ordering',
+      observationClass: 'bugfix',
+    });
   });
 
   it('keeps legacy personal namespaces without user ids readable while binding observations locally', () => {

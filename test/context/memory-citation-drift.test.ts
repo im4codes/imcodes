@@ -21,7 +21,13 @@ describe('persistent memory citation drift content_hash', () => {
       class: 'recent_summary',
       sourceEventIds: ['evt-1'],
       summary: 'Remember retry policy',
-      content: { z: 2, a: 1 },
+      content: {
+        z: 2,
+        a: 1,
+        ownerUserId: 'user-1',
+        createdByUserId: 'user-1',
+        updatedByUserId: 'user-2',
+      },
       createdAt: 100,
       updatedAt: 100,
     });

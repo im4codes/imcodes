@@ -29,7 +29,7 @@ import { countTokens } from '../context/tokenizer.js';
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { incrementCounter } from '../util/metrics.js';
 import { mergeSourceIds } from './source-id-merge.js';
-import { computeProjectionContentHash } from '../../shared/memory-content-hash.js';
+import { computeProjectionContentHash, projectionSemanticContent } from '../../shared/memory-content-hash.js';
 import {
   isMemoryScope,
   isOwnerPrivateMemoryScope,
@@ -2076,7 +2076,7 @@ export function writeProcessedProjection(input: Omit<ProcessedContextProjection,
   // This avoids a second pass using process.cwd()-derived rules from the wrong
   // project and preserves explicit pinned-note byte identity.
   const summaryForDb = input.summary;
-  const contentForDb = applyImplicitOwnerMetadata(canonicalNamespace, input.content);
+  const contentForDb = input.content;
   const contentJsonForDb = JSON.stringify(contentForDb);
   const contentHashForDb = projectionContentHash(summaryForDb, contentForDb);
   const originForDb = projectionOriginForInput(input);
@@ -2910,7 +2910,7 @@ export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}
       if (filters.projectionClass && projection.class !== filters.projectionClass) return false;
       if (isMemoryNoiseSummary(projection.summary)) return false;
       if (normalizedQuery) {
-        const haystack = `${projection.summary}\n${JSON.stringify(projection.content)}`.toLowerCase();
+        const haystack = `${projection.summary}\n${JSON.stringify(projectionSemanticContent(projection.content))}`.toLowerCase();
         if (!haystack.includes(normalizedQuery)) return false;
       }
       return true;
@@ -2970,7 +2970,7 @@ export function getProcessedProjectionStats(filters: ProcessedProjectionQuery = 
       matchedRecords += 1;
       continue;
     }
-    const haystack = `${String(row.summary)}\n${JSON.stringify(parseJson<Record<string, unknown>>(row.content_json, {}))}`.toLowerCase();
+    const haystack = `${String(row.summary)}\n${JSON.stringify(projectionSemanticContent(parseJson<Record<string, unknown>>(row.content_json, {})))}`.toLowerCase();
     if (haystack.includes(normalizedQuery)) matchedRecords += 1;
   }
   const pending = getPendingContextStats(filters);
