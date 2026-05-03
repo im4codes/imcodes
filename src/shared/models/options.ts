@@ -9,7 +9,7 @@ export function normalizeClaudeCodeModelId(value: string | null | undefined): Cl
   return CLAUDE_CODE_MODEL_IDS.includes(trimmed as ClaudeCodeModelId) ? (trimmed as ClaudeCodeModelId) : undefined;
 }
 
-export const CODEX_MODEL_IDS = ['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex-spark', 'gpt-5.2'] as const;
+export const CODEX_MODEL_IDS = ['gpt-5.4', 'gpt-5.5', 'gpt-5.4-mini', 'gpt-5.3-codex-spark', 'gpt-5.2'] as const;
 export type CodexModelId = typeof CODEX_MODEL_IDS[number];
 
 export const GEMINI_MODEL_IDS = [

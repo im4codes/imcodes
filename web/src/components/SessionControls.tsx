@@ -40,6 +40,7 @@ import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSug
 import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { useTransportModels, supportsDynamicTransportModels } from '../hooks/useTransportModels.js';
+import { loadCodexModelPreference, saveCodexModelPreference } from '../codex-model-preference.js';
 import {
   buildTransportConfigWithSupervision,
   extractSessionSupervisionSnapshot,
@@ -203,7 +204,6 @@ type QwenModelChoice = string;
 type P2pMode = string; // 'solo' | single modes | combo pipelines like 'brainstorm>discuss>plan' | typeof P2P_CONFIG_MODE
 
 const MODEL_STORAGE_KEY = 'imcodes-model';
-const CODEX_MODEL_STORAGE_KEY = 'imcodes-codex-model';
 const QWEN_MODEL_STORAGE_KEY = 'imcodes-qwen-model';
 const CODEX_MODELS: CodexModelChoice[] = [...CODEX_MODEL_IDS];
 const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
@@ -375,14 +375,6 @@ function loadModel(): ModelChoice | null {
   return null;
 }
 
-function loadCodexModel(): CodexModelChoice | null {
-  try {
-    const v = localStorage.getItem(CODEX_MODEL_STORAGE_KEY);
-    if (v?.trim()) return v;
-  } catch { /* ignore */ }
-  return null;
-}
-
 function loadQwenModel(): QwenModelChoice | null {
   try {
     const v = localStorage.getItem(QWEN_MODEL_STORAGE_KEY);
@@ -479,7 +471,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [openSpecExpandedChange, setOpenSpecExpandedChange] = useState<string | null>(null);
   const [openSpecLayoutTick, setOpenSpecLayoutTick] = useState(0);
   const [model, setModel] = useState<ModelChoice | null>(loadModel);
-  const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModel);
+  const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModelPreference);
   const [qwenModel, setQwenModel] = useState<QwenModelChoice | null>(loadQwenModel);
   const [editingQueuedMessageId, setEditingQueuedMessageId] = useState<string | null>(null);
   const queuedHiddenStorageKey = useMemo(() => (
@@ -797,6 +789,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     dynamicTransportModels.models,
   ]);
   const genericTransportModel = resolveEffectiveSessionModel(activeSession, detectedModel) ?? null;
+  const displayedCodexModel = activeSession?.agentType === 'codex-sdk'
+    ? genericTransportModel
+    : (genericTransportModel ?? codexModel);
   const thinkingLevels = useMemo((): readonly TransportEffortLevel[] => (
     activeSession?.agentType === 'claude-code-sdk'
       ? CLAUDE_SDK_EFFORT_LEVELS
@@ -2170,7 +2165,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const handleCodexModelSelect = (m: CodexModelChoice) => {
     if (!ws || !activeSession) return;
     setCodexModel(m);
-    try { localStorage.setItem(CODEX_MODEL_STORAGE_KEY, m); } catch { /* ignore */ }
+    saveCodexModelPreference(m);
     if (activeSession.agentType === 'codex-sdk') {
       sendSessionMessage(`/model ${m}`);
     } else {
@@ -2586,20 +2581,20 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               class="shortcut-btn"
               onClick={() => setModelOpen((o) => !o)}
               disabled={disabled}
-              title={codexModel ? `Model: ${codexModel}` : 'Model: default — tap to select'}
-              style={{ color: codexModel ? '#34d399' : '#6b7280', fontSize: 10 }}
+              title={displayedCodexModel ? `Model: ${displayedCodexModel}` : 'Model: default — tap to select'}
+              style={{ color: displayedCodexModel ? '#34d399' : '#6b7280', fontSize: 10 }}
             >
-              {codexModel ?? 'default'}
+              {displayedCodexModel ?? 'default'}
             </button>
             {modelOpen && (
               <div class="menu-dropdown">
                 {codexModelSuggestions.map((m) => (
                   <button
                     key={m}
-                    class={`menu-item ${codexModel === m ? 'menu-item-active' : ''}`}
+                    class={`menu-item ${displayedCodexModel === m ? 'menu-item-active' : ''}`}
                     onClick={() => handleCodexModelSelect(m)}
                   >
-                    {codexModel === m ? '● ' : '○ '}{m}
+                    {displayedCodexModel === m ? '● ' : '○ '}{m}
                   </button>
                 ))}
               </div>

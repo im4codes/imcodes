@@ -601,18 +601,18 @@ function resolveProcessingModelForBackend(
   return trimmed;
 }
 
-function formatServerScopeValue(serverId?: string): string {
-  if (!serverId) return 'Unbound';
+function formatServerScopeValue(serverId: string | undefined, unboundLabel: string): string {
+  if (!serverId) return unboundLabel;
   if (serverId.length <= 12) return serverId;
   return `${serverId.slice(0, 8)}…${serverId.slice(-4)}`;
 }
 
-function formatRelativeTime(ts: number): string {
+function formatRelativeTime(ts: number, t: (key: string, options?: Record<string, unknown>) => string): string {
   const diff = Date.now() - ts;
-  if (diff < 60_000) return '<1m ago';
-  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
-  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
-  return `${Math.floor(diff / 86_400_000)}d ago`;
+  if (diff < 60_000) return t('sharedContext.management.relativeLessThanOneMinute');
+  if (diff < 3_600_000) return t('sharedContext.management.relativeMinutesAgo', { count: Math.floor(diff / 60_000) });
+  if (diff < 86_400_000) return t('sharedContext.management.relativeHoursAgo', { count: Math.floor(diff / 3_600_000) });
+  return t('sharedContext.management.relativeDaysAgo', { count: Math.floor(diff / 86_400_000) });
 }
 
 const archiveBadgeStyle = {
@@ -904,7 +904,6 @@ function FeatureFlagCard({
         <span style={featureFlagDotStyle(enabled, blocked)} />
         <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{label}</span>
       </span>
-      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: DT.text.muted, fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 10 }}>{flag}</span>
       <span style={featureFlagStatusTextStyle(enabled, blocked)}>{statusText}</span>
       {detail ? <span style={{ ...helperTextStyle, fontSize: 10 }}>{detail}</span> : null}
       {onToggle && actionLabel ? (
@@ -1018,6 +1017,7 @@ function ModelPresetChipSelector({
   onChange: (next: { model: string; preset: string }) => void;
   idPrefix: string;
 }) {
+  const { t } = useTranslation();
   const modelOptions = PROCESSING_MODEL_OPTIONS_BY_BACKEND[backend] ?? [];
   const supportsPresets = doesSharedContextBackendSupportPresets(backend);
   const trimmedModel = model.trim();
@@ -1051,17 +1051,17 @@ function ModelPresetChipSelector({
     <div style={chipGroupStyle}>
       {supportsPresets && presets.length > 0 ? (
         <div style={compactChipRowStyle}>
-          <span style={inlineDimensionLabelStyle}>Preset</span>
+          <span style={inlineDimensionLabelStyle}>{t('sharedContext.management.processingPresetLabel')}</span>
           <button
             key={`${idPrefix}:preset:__none__`}
             type="button"
             aria-label={`${idPrefix}:preset:none`}
             aria-pressed={!trimmedPreset}
-            title="No preset — use the default provider endpoint"
+            title={t('sharedContext.management.processingPresetNoneTitle')}
             style={neutralChipStyle(!trimmedPreset)}
             onClick={() => onChange({ model: trimmedModel, preset: '' })}
           >
-            (none)
+            {t('sharedContext.management.processingPresetNone')}
           </button>
           {presets.map((p) => {
             const active = trimmedPreset === p.name;
@@ -1072,7 +1072,9 @@ function ModelPresetChipSelector({
                 type="button"
                 aria-label={`${idPrefix}:preset:${p.name}`}
                 aria-pressed={active}
-                title={pinned ? `Preset bundle → model: ${pinned}` : `Preset bundle: ${p.name}`}
+                title={pinned
+                  ? t('sharedContext.management.processingPresetBundleModelTitle', { model: pinned })
+                  : t('sharedContext.management.processingPresetBundleTitle', { preset: p.name })}
                 style={presetChipStyle(active)}
                 onClick={() => {
                   // Picking a preset pins its embedded model. User has to
@@ -1090,7 +1092,7 @@ function ModelPresetChipSelector({
         </div>
       ) : null}
       <div style={compactChipRowStyle}>
-        <span style={inlineDimensionLabelStyle}>Model</span>
+        <span style={inlineDimensionLabelStyle}>{t('sharedContext.management.processingModelLabel')}</span>
         {activePreset ? (
           // Preset active — this row is read-only: the endpoint dictates
           // the model. Rendered with the teal "active" style so the user
@@ -1102,10 +1104,10 @@ function ModelPresetChipSelector({
             aria-label={`model:${backend}:${presetPinnedModel || '(preset)'}`}
             aria-pressed={true}
             disabled
-            title="Model is set by the active preset. Clear the preset to pick another."
+            title={t('sharedContext.management.processingModelPresetTitle')}
             style={{ ...modelChipStyle(true), cursor: 'default', opacity: 0.95 }}
           >
-            {presetPinnedModel || '(defined by preset)'}
+            {presetPinnedModel || t('sharedContext.management.processingModelDefinedByPreset')}
           </button>
         ) : (
           modelOptions.map((modelId) => {
@@ -1385,6 +1387,30 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     setMdIngestFeatureEnabled(records.find((record) => record.flag === MEMORY_FEATURE_FLAGS_BY_NAME.mdIngest)?.enabled ?? null);
     setObservationStoreFeatureEnabled(records.find((record) => record.flag === MEMORY_FEATURE_FLAGS_BY_NAME.observationStore)?.enabled ?? null);
   }, []);
+  const memoryFeatureKey = useCallback((flag: MemoryFeatureFlag): string => {
+    switch (flag) {
+      case MEMORY_FEATURE_FLAGS_BY_NAME.preferences:
+        return 'preferences';
+      case MEMORY_FEATURE_FLAGS_BY_NAME.mdIngest:
+        return 'mdIngest';
+      case MEMORY_FEATURE_FLAGS_BY_NAME.skills:
+        return 'skills';
+      case MEMORY_FEATURE_FLAGS_BY_NAME.skillAutoCreation:
+        return 'skillAutoCreation';
+      case MEMORY_FEATURE_FLAGS_BY_NAME.observationStore:
+        return 'observationStore';
+      case MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry:
+        return 'namespaceRegistry';
+      default:
+        return flag;
+    }
+  }, []);
+  const memoryFeatureLabel = useCallback((flag: MemoryFeatureFlag): string => (
+    t(`sharedContext.management.memoryFeatureLabel.${memoryFeatureKey(flag)}`)
+  ), [memoryFeatureKey, t]);
+  const memoryFeatureDisabledBehavior = useCallback((flag: MemoryFeatureFlag): string => (
+    t(`sharedContext.management.memoryFeatureDisabledBehavior.${memoryFeatureKey(flag)}`)
+  ), [memoryFeatureKey, t]);
   const memoryFeatureDisplay = useCallback((flag: MemoryFeatureFlag): { enabled: boolean | null; statusText: string; detail: string; blocked?: boolean } => {
     const record = memoryFeatureRecordByFlag.get(flag);
     if (!ws) {
@@ -1426,7 +1452,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       return {
         enabled: true,
         statusText: t('sharedContext.management.memoryFeatureEnabled'),
-        detail: record.disabledBehavior || t('sharedContext.management.memoryFeatureEnabledDetail'),
+        detail: t('sharedContext.management.memoryFeatureEnabledDetail'),
       };
     }
     if (record.requested && record.dependencyBlocked?.length) {
@@ -1435,8 +1461,8 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         statusText: t('sharedContext.management.memoryFeatureBlocked'),
         blocked: true,
         detail: t('sharedContext.management.memoryFeatureDependencyBlockedHint', {
-          deps: record.dependencyBlocked.join(', '),
-          behavior: record.disabledBehavior || '',
+          deps: record.dependencyBlocked.map(memoryFeatureLabel).join(', '),
+          behavior: memoryFeatureDisabledBehavior(flag),
         }),
       };
     }
@@ -1445,10 +1471,10 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       statusText: t('sharedContext.management.memoryFeatureDisabled'),
       detail: t('sharedContext.management.memoryFeatureDisabledHint', {
         env: record.envKey || memoryFeatureFlagEnvKey(flag),
-        behavior: record.disabledBehavior || '',
+        behavior: memoryFeatureDisabledBehavior(flag),
       }),
     };
-  }, [memoryFeatureRecordByFlag, memoryFeaturesStatus, t, ws]);
+  }, [memoryFeatureDisabledBehavior, memoryFeatureLabel, memoryFeatureRecordByFlag, memoryFeaturesStatus, t, ws]);
   const memoryAdminErrorMessage = useCallback((errorCode?: MemoryManagementErrorCode, fallback?: string): string => {
     if (errorCode) return t(`sharedContext.management.error.${errorCode}`);
     return fallback ?? t('sharedContext.management.memoryAdminActionFailed');
@@ -1562,7 +1588,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
                       <span style={{ color: DT.text.muted, fontSize: 10 }}>
                         {record.lastUsedAt
-                          ? t('sharedContext.management.memoryLastRecalled', { time: formatRelativeTime(record.lastUsedAt) })
+                          ? t('sharedContext.management.memoryLastRecalled', { time: formatRelativeTime(record.lastUsedAt, t) })
                           : t('sharedContext.management.memoryNeverRecalled')}
                       </span>
                       {allowActions || allowDelete ? (
@@ -1817,25 +1843,6 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const memoryProjectSourceLabel = useCallback((source: MemoryProjectOption['source']): string => (
     t(`sharedContext.management.memoryProjectSource.${source}`)
   ), [t]);
-
-  const memoryFeatureLabel = useCallback((flag: MemoryFeatureFlag): string => {
-    switch (flag) {
-      case MEMORY_FEATURE_FLAGS_BY_NAME.preferences:
-        return t('sharedContext.management.memoryFeatureLabel.preferences');
-      case MEMORY_FEATURE_FLAGS_BY_NAME.mdIngest:
-        return t('sharedContext.management.memoryFeatureLabel.mdIngest');
-      case MEMORY_FEATURE_FLAGS_BY_NAME.skills:
-        return t('sharedContext.management.memoryFeatureLabel.skills');
-      case MEMORY_FEATURE_FLAGS_BY_NAME.skillAutoCreation:
-        return t('sharedContext.management.memoryFeatureLabel.skillAutoCreation');
-      case MEMORY_FEATURE_FLAGS_BY_NAME.observationStore:
-        return t('sharedContext.management.memoryFeatureLabel.observationStore');
-      case MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry:
-        return t('sharedContext.management.memoryFeatureLabel.namespaceRegistry');
-      default:
-        return flag;
-    }
-  }, [t]);
 
   const toggleMemoryFeatureFlag = useCallback((flag: MemoryFeatureFlag) => {
     if (!ws) return;
@@ -2719,11 +2726,21 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
           </button>
         </div>
         <div style={statGridStyle}>
-          <StatCard label="Enterprise" value={team?.name ?? 'None'} detail={team ? `Role: ${team.myRole}` : 'Choose or create one'} />
-          <StatCard label="Members" value={team?.members?.length ?? 0} />
-          <StatCard label="Projects" value={projects.length} />
-          <StatCard label="Knowledge Docs" value={documents.length} />
-          <StatCard label="Server" value={formatServerScopeValue(serverId)} detail={serverId ? 'Cloud-synced runtime settings' : 'Select a server to sync processing config'} />
+          <StatCard
+            label={t('sharedContext.management.statEnterprise')}
+            value={team?.name ?? t('sharedContext.management.noneValue')}
+            detail={team
+              ? t('sharedContext.management.statRole', { role: t(`sharedContext.roles.${team.myRole}`) })
+              : t('sharedContext.management.statChooseOrCreateEnterprise')}
+          />
+          <StatCard label={t('sharedContext.management.statMembers')} value={team?.members?.length ?? 0} />
+          <StatCard label={t('sharedContext.management.statProjects')} value={projects.length} />
+          <StatCard label={t('sharedContext.management.statKnowledgeDocs')} value={documents.length} />
+          <StatCard
+            label={t('sharedContext.management.statServer')}
+            value={formatServerScopeValue(serverId, t('sharedContext.management.serverUnbound'))}
+            detail={serverId ? t('sharedContext.management.statCloudSyncedRuntimeSettings') : t('sharedContext.management.statSelectServerToSync')}
+          />
         </div>
       </div>
 
@@ -2757,8 +2774,8 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
               description={t('sharedContext.management.inviteDescription')}
             />
             <InfoCard title={t('sharedContext.management.inviteFlowTitle')}>
-              <div>New invitations create member access only.</div>
-              <div>Admin role changes happen after join, from the member management section.</div>
+              <div>{t('sharedContext.management.inviteFlowLine1')}</div>
+              <div>{t('sharedContext.management.inviteFlowLine2')}</div>
             </InfoCard>
             <div style={rowStyle}>
               <input
@@ -2836,8 +2853,8 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                   <div key={workspace.id} style={resourceCardStyle}>
                     <strong>{workspace.name}</strong>
                     <div style={metaGridStyle}>
-                      <MetaCard label="Workspace ID" value={<code>{workspace.id}</code>} />
-                      <MetaCard label="Projects" value={projects.filter((project) => project.workspaceId === workspace.id).length} />
+                      <MetaCard label={t('sharedContext.management.workspaceId')} value={<code>{workspace.id}</code>} />
+                      <MetaCard label={t('sharedContext.management.projects')} value={projects.filter((project) => project.workspaceId === workspace.id).length} />
                     </div>
                   </div>
                 ))}
@@ -2852,7 +2869,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
           <SectionHeading
             title={t('sharedContext.management.members')}
             description={t('sharedContext.management.memberRolesDescription')}
-            action={<span style={pillStyle}>{team?.members?.length ?? 0} active</span>}
+            action={<span style={pillStyle}>{t('sharedContext.management.activeCount', { count: team?.members?.length ?? 0 })}</span>}
           />
           {team?.members?.length ? (
             <div style={resourceListStyle}>
@@ -2864,8 +2881,8 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                       <span style={helperTextStyle}>{member.username ? `@${member.username}` : member.user_id}</span>
                     </div>
                     <div style={metaGridStyle}>
-                      <MetaCard label="Role" value={member.role} />
-                      <MetaCard label="Joined" value={new Date(member.joined_at).toLocaleString()} />
+                      <MetaCard label={t('sharedContext.management.role')} value={t(`sharedContext.roles.${member.role}`)} />
+                      <MetaCard label={t('sharedContext.management.joined')} value={new Date(member.joined_at).toLocaleString()} />
                     </div>
                     {member.role !== 'owner' && (
                       <div style={rowStyle}>
@@ -2990,10 +3007,10 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                         {scopePresentation[project.scope as SharedScopeValue].label}
                       </span>
                       <div style={metaGridStyle}>
-                        <MetaCard label="Workspace" value={project.workspaceId ? (workspaceNameById.get(project.workspaceId) ?? project.workspaceId) : t('sharedContext.management.noWorkspaceAssigned')} />
-                        <MetaCard label="Status" value={project.status} />
-                        <MetaCard label="Scope" value={scopePresentation[project.scope as SharedScopeValue].label} />
-                        <MetaCard label="Meaning" value={scopePresentation[project.scope as SharedScopeValue].description} />
+                        <MetaCard label={t('sharedContext.management.workspaceLabel')} value={project.workspaceId ? (workspaceNameById.get(project.workspaceId) ?? project.workspaceId) : t('sharedContext.management.noWorkspaceAssigned')} />
+                        <MetaCard label={t('sharedContext.management.statusLabel')} value={project.status} />
+                        <MetaCard label={t('sharedContext.management.scopeLabel')} value={scopePresentation[project.scope as SharedScopeValue].label} />
+                        <MetaCard label={t('sharedContext.management.meaningLabel')} value={scopePresentation[project.scope as SharedScopeValue].description} />
                       </div>
                     </div>
                     <div style={rowStyle}>
@@ -3101,10 +3118,10 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
             />
             <div style={rowStyle}>
               <select value={documentKind} onChange={(e) => setDocumentKind((e.currentTarget as HTMLSelectElement).value as KindOption)} style={inputStyle}>
-                <option value="coding_standard">coding_standard</option>
-                <option value="architecture_guideline">architecture_guideline</option>
-                <option value="repo_playbook">repo_playbook</option>
-                <option value="knowledge_doc">knowledge_doc</option>
+                <option value="coding_standard">{t('sharedContext.management.documentKind.coding_standard')}</option>
+                <option value="architecture_guideline">{t('sharedContext.management.documentKind.architecture_guideline')}</option>
+                <option value="repo_playbook">{t('sharedContext.management.documentKind.repo_playbook')}</option>
+                <option value="knowledge_doc">{t('sharedContext.management.documentKind.knowledge_doc')}</option>
               </select>
               <input value={documentTitle} onInput={(e) => setDocumentTitle((e.currentTarget as HTMLInputElement).value)} placeholder={t('sharedContext.management.documentTitle')} style={inputStyle} />
               <button
@@ -3128,8 +3145,8 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     <span style={helperTextStyle}>{document.kind}</span>
                   </div>
                   <div style={metaGridStyle}>
-                    <MetaCard label="Versions" value={document.versions.length} />
-                    <MetaCard label="Active" value={document.versions.find((version) => version.status === 'active')?.versionNumber ? `v${document.versions.find((version) => version.status === 'active')?.versionNumber}` : 'None'} />
+                    <MetaCard label={t('sharedContext.management.versions')} value={document.versions.length} />
+                    <MetaCard label={t('sharedContext.management.activeVersion')} value={document.versions.find((version) => version.status === 'active')?.versionNumber ? `v${document.versions.find((version) => version.status === 'active')?.versionNumber}` : t('sharedContext.management.noneValue')} />
                   </div>
                   <div style={rowStyle}>
                     {document.versions.map((version) => (
@@ -3225,10 +3242,10 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                   <div key={binding.id} style={resourceCardStyle}>
                     <strong>{binding.mode} · {binding.status}</strong>
                     <div style={metaGridStyle}>
-                      <MetaCard label="Document" value={binding.documentId} />
-                      <MetaCard label="Version" value={binding.versionId} />
-                      <MetaCard label="Language" value={binding.applicabilityLanguage || 'Any'} />
-                      <MetaCard label="Path" value={binding.applicabilityPathPattern || 'Any'} />
+                      <MetaCard label={t('sharedContext.management.documentLabel')} value={binding.documentId} />
+                      <MetaCard label={t('sharedContext.management.versionLabel')} value={binding.versionId} />
+                      <MetaCard label={t('sharedContext.management.language')} value={binding.applicabilityLanguage || t('sharedContext.management.anyValue')} />
+                      <MetaCard label={t('sharedContext.management.pathLabel')} value={binding.applicabilityPathPattern || t('sharedContext.management.anyValue')} />
                     </div>
                   </div>
                 ))}
@@ -3389,7 +3406,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
             <SectionHeading
               title={t('sharedContext.management.personalSyncTitle')}
               description={t('sharedContext.management.personalSyncDescription')}
-              action={serverId ? <span style={pillStyle}>{formatServerScopeValue(serverId)}</span> : undefined}
+              action={serverId ? <span style={pillStyle}>{formatServerScopeValue(serverId, t('sharedContext.management.serverUnbound'))}</span> : undefined}
             />
             {serverId ? (
               <div
@@ -3445,7 +3462,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
             <SectionHeading
               title={t('sharedContext.management.memoryRecallThresholdTitle')}
               description={t('sharedContext.management.memoryRecallThresholdDescription')}
-              action={serverId ? <span style={pillStyle}>{formatServerScopeValue(serverId)}</span> : undefined}
+              action={serverId ? <span style={pillStyle}>{formatServerScopeValue(serverId, t('sharedContext.management.serverUnbound'))}</span> : undefined}
             />
             {serverId ? (
               <>

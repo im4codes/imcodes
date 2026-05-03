@@ -293,7 +293,7 @@ describe('SharedContextManagementPanel', () => {
     await flush();
 
     expect(screen.queryByText('sharedContext.roles.admin')).toBeNull();
-    expect(await screen.findByText(/New invitations create member access only\./)).toBeDefined();
+    expect(await screen.findByText('sharedContext.management.inviteFlowLine1')).toBeDefined();
 
     await act(async () => {
       fireEvent.click(screen.getByText('sharedContext.management.createInvite'));
@@ -1029,6 +1029,8 @@ describe('SharedContextManagementPanel', () => {
       name: 'sharedContext.management.memoryFeatureLabel.preferences: sharedContext.management.memoryFeatureDisabled',
     })).toBeNull();
     expect(screen.getByText('sharedContext.management.memoryFeatureDisableAction')).toBeDefined();
+    expect(screen.queryByText(MEMORY_FEATURE_FLAGS_BY_NAME.preferences)).toBeNull();
+    expect(screen.queryByText('Preferences blocked.')).toBeNull();
   });
 
   it('does not render local daemon errors as healthy zero memory stats', async () => {

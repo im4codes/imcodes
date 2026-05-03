@@ -3500,6 +3500,25 @@ afterEach(() => {
     });
   });
 
+  it('does not show local codex model preference as confirmed for codex-sdk sessions without metadata', () => {
+    localStorage.setItem('imcodes-codex-model', 'gpt-5.5');
+
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({
+          name: 'codex-sdk-session',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: /^default$/i })).toBeDefined();
+    expect(screen.queryByRole('button', { name: /^gpt-5.5$/i })).toBeNull();
+  });
+
   it('prefers dynamically discovered codex-sdk models over the static fallback list', async () => {
     const ws = makeWs();
     render(
@@ -3530,7 +3549,7 @@ afterEach(() => {
       isAuthenticated: true,
     }));
 
-    fireEvent.click(screen.getByRole('button', { name: /^default$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^gpt-5.4$/i }));
     fireEvent.click(screen.getAllByRole('button', { name: /gpt-5.5/i })[0]!);
 
     expectSendPayload(ws, {
@@ -3585,7 +3604,7 @@ afterEach(() => {
       isAuthenticated: true,
     }));
 
-    fireEvent.click(screen.getByRole('button', { name: /^default$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^gpt-5.4$/i }));
     expect(screen.getByRole('button', { name: /gpt-5.5/i })).toBeDefined();
   });
 

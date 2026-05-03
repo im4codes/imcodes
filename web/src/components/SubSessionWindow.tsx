@@ -68,6 +68,7 @@ interface Props {
   serverId?: string;
   pendingPrefillText?: string | null;
   onPendingPrefillApplied?: () => void;
+  detectedModelHint?: string;
   /** Whether this sub-session is participating in an active P2P discussion. */
   inP2p?: boolean;
 }
@@ -122,7 +123,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, onSettings, onTransportConfigSaved, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, inP2p,
+  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, onSettings, onTransportConfigSaved, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, detectedModelHint, inP2p,
 }: Props) {
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
@@ -416,6 +417,7 @@ export function SubSessionWindow({
     }
     return undefined;
   }, [events]);
+  const effectiveDetectedModel = detectedModel ?? detectedModelHint;
 
   const lastCostEvent = useMemo(() => {
     for (let i = events.length - 1; i >= 0; i--) {
@@ -555,7 +557,7 @@ export function SubSessionWindow({
           sessionName={sub.sessionName}
           sessionState={liveSessionState}
           agentType={sessionInfo?.agentType}
-          modelOverride={resolveEffectiveSessionModel(sessionInfo, detectedModel, lastUsage?.model)}
+          modelOverride={resolveEffectiveSessionModel(sessionInfo, effectiveDetectedModel, lastUsage?.model)}
           planLabel={sessionInfo?.planLabel}
           quotaLabel={sessionInfo?.quotaLabel}
           quotaUsageLabel={(sessionInfo?.agentType === 'codex' || sessionInfo?.agentType === 'codex-sdk') ? undefined : sessionInfo?.quotaUsageLabel}
@@ -613,7 +615,7 @@ export function SubSessionWindow({
         sessions={sessions}
         subSessions={subSessions}
         serverId={serverId}
-        detectedModel={detectedModel ?? lastUsage?.model}
+        detectedModel={effectiveDetectedModel ?? lastUsage?.model}
         quotes={quotes}
         onRemoveQuote={removeQuote}
         pendingPrefillText={pendingPrefillText}

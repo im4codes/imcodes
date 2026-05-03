@@ -108,6 +108,7 @@ import {
 import { ingestTimelineEventForCache, requestActiveTimelineRefresh } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
+import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { updateMainSessionLabel } from './session-label-api.js';
 import { buildDocumentTitle } from './tab-title.js';
 import {
@@ -787,6 +788,7 @@ export function App() {
   const [idleFlashTokens, setIdleFlashTokens] = useState<Map<string, number>>(() => new Map());
   const [toasts, setToasts] = useState<Array<{ id: number; sessionName: string; project: string; kind: 'idle' | 'notification'; title?: string; message?: string; openRepoLatest?: boolean; failedJobName?: string; failedStepName?: string }>>([]);
   const [detectedModels, setDetectedModels] = useState<Map<string, string>>(new Map());
+  const detectedModelsRef = useRef<Map<string, string>>(new Map());
   const [subUsages, setSubUsages] = useState<Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string }>>(new Map());
   const quickData = useQuickData();
   const lastImcodesActivityRef = useRef(Date.now());
@@ -1066,6 +1068,21 @@ export function App() {
   // `bringSubToFront` is only invoked from event handlers / effects, not
   // during the initial synchronous render path.
   const subSessionsRef = useRef<readonly SubSession[]>([]);
+
+  const recordDetectedModel = useCallback((sessionName: string, detected: string) => {
+    if (detectedModelsRef.current.get(sessionName) !== detected) {
+      const immediate = new Map(detectedModelsRef.current);
+      immediate.set(sessionName, detected);
+      detectedModelsRef.current = immediate;
+    }
+    setDetectedModels((prev) => {
+      if (prev.get(sessionName) === detected) return prev;
+      const next = new Map(prev);
+      next.set(sessionName, detected);
+      detectedModelsRef.current = next;
+      return next;
+    });
+  }, []);
 
   /**
    * Sub-session bring-to-front. Wraps the shared stack so the rest of the
@@ -1732,12 +1749,7 @@ export function App() {
         const geminiMatch = stripped.match(/\b(gemini[- ]\d[\w.-]*)\b/);
         const detected = claudeModel ?? (gptMatch ? gptMatch[1] : null) ?? (geminiMatch ? geminiMatch[1] : null);
         if (detected) {
-          setDetectedModels((prev) => {
-            if (prev.get(sessionName) === detected) return prev;
-            const next = new Map(prev);
-            next.set(sessionName, detected);
-            return next;
-          });
+          recordDetectedModel(sessionName, detected);
         }
       }
       // Detect model from JSONL usage.update events (authoritative, overrides terminal scan)
@@ -1846,19 +1858,24 @@ export function App() {
             const gemM = modelStr.match(/\b(gemini[- ]\d[\w.-]*)\b/);
             const det = claudeM ?? (gptM ? gptM[1] : null) ?? (gemM ? gemM[1] : null);
             if (det) {
-              setDetectedModels((prev) => {
-                if (prev.get(event.sessionId) === det) return prev;
-                const next = new Map(prev);
-                next.set(event.sessionId, det);
-                return next;
-              });
+              recordDetectedModel(event.sessionId, det);
             }
           }
           // Track usage data for all sub-sessions (ctx bar in collapsed buttons)
           if (event.sessionId.startsWith('deck_sub_') && isPlausibleUsagePayload(event.payload as Record<string, unknown>)) {
+            const payload = event.payload as { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string };
+            const sub = subSessionsRef.current.find((candidate) => candidate.sessionName === event.sessionId);
+            const effectiveModel = resolveEffectiveSessionModel(
+              sub,
+              detectedModelsRef.current.get(event.sessionId),
+              payload.model,
+            );
+            const displayPayload = effectiveModel && payload.model !== effectiveModel
+              ? { ...payload, model: effectiveModel }
+              : payload;
             setSubUsages((prev) => {
               const next = new Map(prev);
-              next.set(event.sessionId, event.payload as { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string });
+              next.set(event.sessionId, displayPayload);
               return next;
             });
           }
@@ -3492,6 +3509,7 @@ export function App() {
                 onViewRepo={() => setShowRepoPage(true)}
                 onViewCron={() => setShowCronManager(true)}
                 subUsages={subUsages}
+                detectedModels={detectedModels}
                 focusedSubId={focusedSubId}
                 quickData={quickData}
                 sessions={sessions}
@@ -3994,6 +4012,7 @@ export function App() {
               sessions={sessions}
               subSessions={subSessionsSlim}
               serverId={selectedServerId ?? undefined}
+              detectedModelHint={detectedModels.get(sub.sessionName)}
               inP2p={p2pSessionLabels.has(sub.sessionName)}
               pendingPrefillText={pendingPrefills[sub.sessionName] ?? null}
               onPendingPrefillApplied={() => setPendingPrefills((prev) => {

@@ -22,6 +22,7 @@ import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 import { isTransportRuntime, resolveSubSessionRuntimeType } from '../runtime-type.js';
 import { extractLatestUsage } from '../usage-data.js';
 import { USAGE_CONTEXT_WINDOW_SOURCES } from '@shared/usage-context-window.js';
+import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 
 const TYPE_ICON: Record<string, string> = {
   'claude-code': '⚡',
@@ -77,6 +78,34 @@ function loadCardW(id: string, fallback: number): number {
     if (v) return Math.max(200, Math.min(1200, parseInt(v)));
   } catch { /* ignore */ }
   return fallback;
+}
+
+function buildCompactSessionInfo(sub: SubSession): SessionInfo {
+  return {
+    name: sub.sessionName,
+    project: sub.sessionName,
+    role: 'w1',
+    agentType: sub.type,
+    state: (sub.state as SessionInfo['state']) ?? 'unknown',
+    label: sub.label ?? null,
+    projectDir: sub.cwd ?? undefined,
+    runtimeType: resolveSubSessionRuntimeType(sub),
+    qwenModel: sub.qwenModel ?? undefined,
+    qwenAuthType: sub.qwenAuthType ?? undefined,
+    qwenAvailableModels: sub.qwenAvailableModels ?? undefined,
+    codexAvailableModels: sub.codexAvailableModels ?? undefined,
+    requestedModel: sub.requestedModel ?? undefined,
+    activeModel: sub.activeModel ?? undefined,
+    modelDisplay: sub.modelDisplay ?? undefined,
+    planLabel: sub.planLabel ?? undefined,
+    quotaLabel: sub.quotaLabel ?? undefined,
+    quotaUsageLabel: sub.quotaUsageLabel ?? undefined,
+    quotaMeta: sub.quotaMeta ?? undefined,
+    effort: sub.effort ?? undefined,
+    transportConfig: sub.transportConfig ?? undefined,
+    transportPendingMessages: sub.transportPendingMessages ?? undefined,
+    transportPendingMessageEntries: sub.transportPendingMessageEntries ?? undefined,
+  };
 }
 
 export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlashToken, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId, onTransportConfigSaved, inP2p }: Props) {
@@ -162,19 +191,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   }, [connected, retryOptimisticMessage, sub.sessionName, ws]);
 
   // Build a SessionInfo for SessionControls compact mode
-  const sessionInfo = useMemo<SessionInfo>(() => ({
-    name: sub.sessionName,
-    project: sub.sessionName,
-    role: 'w1',
-    agentType: sub.type,
-    state: (sub.state as SessionInfo['state']) ?? 'unknown',
-    label: sub.label ?? null,
-    projectDir: sub.cwd ?? undefined,
-    runtimeType: resolveSubSessionRuntimeType(sub),
-    transportConfig: sub.transportConfig ?? undefined,
-    transportPendingMessages: sub.transportPendingMessages ?? undefined,
-    transportPendingMessageEntries: sub.transportPendingMessageEntries ?? undefined,
-  }), [sub.sessionName, sub.type, sub.state, sub.label, sub.cwd, sub.runtimeType, sub.transportConfig, sub.transportPendingMessages, sub.transportPendingMessageEntries]);
+  const sessionInfo = useMemo<SessionInfo>(() => buildCompactSessionInfo(sub), [sub]);
 
   const forceFollowLatest = useCallback(() => {
     if (isShell) termScrollRef.current?.();
@@ -261,7 +278,8 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     return null;
   }, [events]);
 
-  const modelLabel = useMemo(() => shortModelLabel(detectedModel ?? lastUsage?.model), [detectedModel, lastUsage]);
+  const effectiveModel = useMemo(() => resolveEffectiveSessionModel(sub, detectedModel, lastUsage?.model), [sub, detectedModel, lastUsage]);
+  const modelLabel = useMemo(() => shortModelLabel(effectiveModel), [effectiveModel]);
 
   // Per-card width override (persisted in localStorage)
   const [localW, setLocalW] = useState(() => loadCardW(sub.id, cardW));
@@ -316,7 +334,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
         {lastUsage && (() => {
           const ctx = resolveContextWindow(
             lastUsage.contextWindow,
-            detectedModel ?? lastUsage.model,
+            effectiveModel,
             1_000_000,
             { preferExplicit: lastUsage.contextWindowSource === USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER },
           );
@@ -327,7 +345,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
           const fmt = (n: number) => n >= 1000000 ? `${(n / 1000000).toFixed(n % 1000000 === 0 ? 0 : 1)}M` : n >= 1000 ? `${(n / 1000).toFixed(0)}k` : String(n);
           const pctStr = totalPct < 1 ? totalPct.toFixed(1) : totalPct.toFixed(0);
           const tip = [
-            detectedModel ?? lastUsage.model ?? '',
+            effectiveModel ?? '',
             `Context: ${fmt(total)} / ${fmt(ctx)} (${pctStr}%)`,
             `  New: ${fmt(lastUsage.inputTokens)}  Cache: ${fmt(lastUsage.cacheTokens)}`,
           ].filter(Boolean).join('\n');
@@ -403,6 +421,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
                 sessions={sessions}
                 subSessions={subSessions}
                 serverId={serverId}
+                detectedModel={effectiveModel}
                 onTransportConfigSaved={(transportConfig) => onTransportConfigSaved?.(sub.id, transportConfig)}
                 onQuickOpenChange={setQuickPanelOpen}
                 onOverlayOpenChange={setOverlayOpen}

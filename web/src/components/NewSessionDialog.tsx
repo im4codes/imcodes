@@ -33,12 +33,14 @@ import {
 } from "./cc-preset-form.js";
 import { CC_PRESET_MSG } from "@shared/cc-presets.js";
 import type { CcPreset } from "@shared/cc-presets.js";
-import { GEMINI_MODEL_IDS, mergeModelSuggestions } from "../../../src/shared/models/options.js";
+import { CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions } from "../../../src/shared/models/options.js";
+import { loadCodexModelPreference } from "../codex-model-preference.js";
 
 // Fallback suggestions used only when the daemon probe returns an empty list
 // (offline/unauthenticated). The live list comes from the dynamic models hook.
 const CURSOR_HEADLESS_MODEL_FALLBACK = ["auto", "composer-2-fast", "gpt-5.2"] as const;
 const COPILOT_SDK_MODEL_FALLBACK = ["gpt-5.4", "gpt-5.4-mini"] as const;
+const CODEX_SDK_MODEL_FALLBACK = [...CODEX_MODEL_IDS] as const;
 const GEMINI_SDK_MODEL_FALLBACK = [...GEMINI_MODEL_IDS];
 
 interface Props {
@@ -323,6 +325,7 @@ export function NewSessionDialog({
         extra.ccInitPrompt = ccInitPrompt.trim();
       if (
         (agentType === "claude-code-sdk"
+          || agentType === "codex-sdk"
           || agentType === "copilot-sdk"
           || agentType === "cursor-headless"
           || agentType === "gemini-sdk"
@@ -367,6 +370,7 @@ export function NewSessionDialog({
   const supportsCcPreset = agentType === "claude-code" || agentType === "qwen";
   const supportsModelSelection =
     agentType === "claude-code-sdk"
+    || agentType === "codex-sdk"
     || agentType === "copilot-sdk"
     || agentType === "cursor-headless"
     || agentType === "gemini-sdk"
@@ -388,10 +392,25 @@ export function NewSessionDialog({
         : (selectedCcPreset?.defaultModel ? [selectedCcPreset.defaultModel] : []);
     }
     if (agentType === "copilot-sdk") return [...COPILOT_SDK_MODEL_FALLBACK];
+    if (agentType === "codex-sdk") return [...CODEX_SDK_MODEL_FALLBACK];
     if (agentType === "cursor-headless") return [...CURSOR_HEADLESS_MODEL_FALLBACK];
     if (agentType === "gemini-sdk") return [...GEMINI_SDK_MODEL_FALLBACK];
     return [] as string[];
   }, [transportModels.models, agentType, qwenPresetModels, selectedCcPreset]);
+
+  useEffect(() => {
+    if (agentType !== "codex-sdk") return;
+    setRequestedModel((current) => {
+      const trimmed = current.trim();
+      if (trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) return trimmed;
+      const stored = loadCodexModelPreference();
+      if (stored && (modelSuggestions.length === 0 || modelSuggestions.includes(stored))) return stored;
+      if (transportModels.defaultModel && (modelSuggestions.length === 0 || modelSuggestions.includes(transportModels.defaultModel))) {
+        return transportModels.defaultModel;
+      }
+      return trimmed;
+    });
+  }, [agentType, modelSuggestions, transportModels.defaultModel]);
 
   useEffect(() => {
     setThinking("high");

@@ -386,6 +386,49 @@ describe('SubSessionCard', () => {
     });
   });
 
+  it('passes model metadata to compact controls and computes GPT-5.5 ctx from session metadata when usage omits model', async () => {
+    timelineEvents = [{
+      type: 'usage.update',
+      payload: {
+        inputTokens: 100_000,
+        cacheTokens: 0,
+        contextWindow: 258_400,
+        contextWindowSource: 'provider',
+      },
+    }] as any;
+
+    const { container } = render(
+      <SubSessionCard
+        sub={makeSubSession({
+          type: 'codex-sdk',
+          runtimeType: 'transport' as any,
+          activeModel: 'gpt-5.5',
+          requestedModel: 'gpt-5.5',
+          modelDisplay: 'gpt-5.5',
+        } as any)}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        quickData={{} as any}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(sessionControlsSpy).toHaveBeenCalled();
+    });
+
+    const props = sessionControlsSpy.mock.calls.at(-1)?.[0];
+    expect(props.activeSession.activeModel).toBe('gpt-5.5');
+    expect(props.activeSession.requestedModel).toBe('gpt-5.5');
+    expect(props.detectedModel).toBe('gpt-5.5');
+
+    const ctxBar = container.querySelector('.subcard-ctx-bar') as HTMLElement | null;
+    expect(ctxBar?.getAttribute('title')).toContain('Context: 100k / 922k (11%)');
+  });
+
   it('raises the whole card above neighbors while a compact dropdown is open', async () => {
     const { container, getByTestId } = render(
       <SubSessionCard

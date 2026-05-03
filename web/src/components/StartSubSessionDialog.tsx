@@ -20,10 +20,12 @@ import {
   type CcPresetDraft,
 } from './cc-preset-form.js';
 import { CC_PRESET_MSG, type CcPreset } from '@shared/cc-presets.js';
-import { GEMINI_MODEL_IDS, mergeModelSuggestions } from '../../../src/shared/models/options.js';
+import { CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions } from '../../../src/shared/models/options.js';
+import { loadCodexModelPreference } from '../codex-model-preference.js';
 
 const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
 const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
+const CODEX_SDK_MODEL_SUGGESTIONS = [...CODEX_MODEL_IDS] as const;
 const GEMINI_SDK_MODEL_SUGGESTIONS = [...GEMINI_MODEL_IDS] as const;
 
 interface Props {
@@ -221,7 +223,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     if (desc) extra.description = desc;
     if (ccPreset && (type === 'claude-code' || type === 'qwen')) extra.ccPreset = ccPreset;
     if (ccInitPrompt.trim() && type === 'claude-code') extra.ccInitPrompt = ccInitPrompt.trim();
-    if ((type === 'copilot-sdk' || type === 'cursor-headless' || type === 'gemini-sdk' || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
+    if ((type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'gemini-sdk' || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
     if (type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'qwen') extra.thinking = thinking;
     onStart(type, selectedShell, cwd || undefined, label || undefined, Object.keys(extra).length > 0 ? extra : undefined);
   };
@@ -240,12 +242,14 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   const supportsCcPreset = type === 'claude-code' || type === 'qwen';
   const dynamicModelsAgentType = supportsDynamicTransportModels(type) ? type : null;
   const transportModels = useTransportModels(ws, dynamicModelsAgentType);
-  const supportsModelSelection = type === 'copilot-sdk' || type === 'cursor-headless' || type === 'gemini-sdk' || (type === 'qwen' && !!selectedCcPreset);
+  const supportsModelSelection = type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'gemini-sdk' || (type === 'qwen' && !!selectedCcPreset);
   const modelSuggestions = useMemo(() => (
     transportModels.models.length > 0
       ? (type === 'gemini-sdk'
         ? mergeModelSuggestions(GEMINI_SDK_MODEL_SUGGESTIONS, transportModels.models.map((model) => model.id))
         : transportModels.models.map((model) => model.id))
+      : type === 'codex-sdk'
+        ? [...CODEX_SDK_MODEL_SUGGESTIONS]
       : type === 'copilot-sdk'
         ? [...COPILOT_SDK_MODEL_SUGGESTIONS]
         : type === 'cursor-headless'
@@ -256,6 +260,20 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
               ? [...GEMINI_SDK_MODEL_SUGGESTIONS]
               : []
   ), [transportModels.models, type, qwenPresetModels, selectedCcPreset]);
+
+  useEffect(() => {
+    if (type !== 'codex-sdk') return;
+    setRequestedModel((current) => {
+      const trimmed = current.trim();
+      if (trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) return trimmed;
+      const stored = loadCodexModelPreference();
+      if (stored && (modelSuggestions.length === 0 || modelSuggestions.includes(stored))) return stored;
+      if (transportModels.defaultModel && (modelSuggestions.length === 0 || modelSuggestions.includes(transportModels.defaultModel))) {
+        return transportModels.defaultModel;
+      }
+      return trimmed;
+    });
+  }, [type, modelSuggestions, transportModels.defaultModel]);
 
   return (
     <div class="dialog-overlay">

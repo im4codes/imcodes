@@ -22,6 +22,7 @@ import { EmbeddingStatusIcon } from './EmbeddingStatusIcon.js';
 import type { EmbeddingStatus } from '@shared/embedding-status.js';
 import { formatDaemonVersionShort } from '../util/format-version.js';
 import { USAGE_CONTEXT_WINDOW_SOURCES, type UsageContextWindowSource } from '@shared/usage-context-window.js';
+import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 
 interface DaemonStats {
   daemonVersion?: string | null;
@@ -46,6 +47,7 @@ interface CollapsedSubSessionButtonProps {
   isOpen: boolean;
   idleFlashToken: number;
   usage?: { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string };
+  detectedModel?: string;
   inP2p: boolean;
   onOpen: (id: string) => void;
   t: (key: string, vars?: Record<string, unknown>) => string;
@@ -73,6 +75,8 @@ interface Props {
   serverId?: string;
   /** Per-sub-session usage data (ctx tokens, model) collected from timeline events. */
   subUsages?: Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string }>;
+  /** Last model detected from timeline/terminal events, keyed by sessionName. */
+  detectedModels?: Map<string, string>;
   /** ID of the currently focused (topmost) sub-session window. */
   focusedSubId?: string | null;
   /** Quick data for compact SessionControls in cards. */
@@ -112,17 +116,18 @@ function formatUptime(seconds: number): string {
   return d > 0 ? `${d}d ${h}h` : `${h}h`;
 }
 
-function CollapsedSubSessionButton({ sub, isOpen, idleFlashToken, usage, inP2p, onOpen, t }: CollapsedSubSessionButtonProps) {
+function CollapsedSubSessionButton({ sub, isOpen, idleFlashToken, usage, inP2p, onOpen, t, detectedModel }: CollapsedSubSessionButtonProps) {
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
   const abbr = getAgentBadgeLabel(sub.type);
-  const model = usage ? shortModelLabel(usage.model) : null;
+  const effectiveModel = resolveEffectiveSessionModel(sub, detectedModel, usage?.model);
+  const model = effectiveModel ? shortModelLabel(effectiveModel) : null;
   let ctxPct = 0;
   if (usage) {
     const ctx = resolveContextWindow(
       usage.contextWindow,
-      usage.model,
+      effectiveModel,
       1_000_000,
       { preferExplicit: usage.contextWindowSource === USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER },
     );
@@ -153,7 +158,7 @@ function CollapsedSubSessionButton({ sub, isOpen, idleFlashToken, usage, inP2p, 
   );
 }
 
-export function SubSessionBar({ subSessions, openIds, idleFlashTokens, onOpen, onClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, focusedSubId, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
+export function SubSessionBar({ subSessions, openIds, idleFlashTokens, onOpen, onClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, detectedModels, focusedSubId, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
   const { t } = useTranslation();
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
   const [collapsed, setCollapsed] = useState(() => load('rcc_subcard_collapsed', isMobile));
@@ -543,6 +548,7 @@ export function SubSessionBar({ subSessions, openIds, idleFlashTokens, onOpen, o
               isOpen={openIds.has(sub.id)}
               idleFlashToken={idleFlashTokens?.get(sub.sessionName) ?? 0}
               usage={subUsages?.get(`deck_sub_${sub.id}`)}
+              detectedModel={detectedModels?.get(sub.sessionName)}
               inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
               onOpen={onOpen}
               t={t}
