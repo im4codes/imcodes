@@ -40,7 +40,7 @@ import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSug
 import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { useTransportModels, supportsDynamicTransportModels } from '../hooks/useTransportModels.js';
-import { loadCodexModelPreference, saveCodexModelPreference } from '../codex-model-preference.js';
+import { loadCodexModelPreference, loadLegacyCodexModelPreferenceForModelessSession, saveCodexModelPreference } from '../codex-model-preference.js';
 import {
   buildTransportConfigWithSupervision,
   extractSessionSupervisionSnapshot,
@@ -788,7 +788,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     activeSession?.codexAvailableModels,
     dynamicTransportModels.models,
   ]);
-  const genericTransportModel = resolveEffectiveSessionModel(activeSession, detectedModel) ?? null;
+  const legacyCodexModel = loadLegacyCodexModelPreferenceForModelessSession(activeSession, detectedModel);
+  const genericTransportModel = resolveEffectiveSessionModel(activeSession, detectedModel, legacyCodexModel) ?? null;
   const displayedCodexModel = activeSession?.agentType === 'codex-sdk'
     ? genericTransportModel
     : (genericTransportModel ?? codexModel);
@@ -2165,7 +2166,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const handleCodexModelSelect = (m: CodexModelChoice) => {
     if (!ws || !activeSession) return;
     setCodexModel(m);
-    saveCodexModelPreference(m);
+    saveCodexModelPreference(m, activeSession.name);
     if (activeSession.agentType === 'codex-sdk') {
       sendSessionMessage(`/model ${m}`);
     } else {

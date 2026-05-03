@@ -3500,7 +3500,7 @@ afterEach(() => {
     });
   });
 
-  it('does not show local codex model preference as confirmed for codex-sdk sessions without metadata', () => {
+  it('uses saved codex model preference as a legacy fallback for model-less codex-sdk sessions', () => {
     localStorage.setItem('imcodes-codex-model', 'gpt-5.5');
 
     render(
@@ -3515,7 +3515,27 @@ afterEach(() => {
       />,
     );
 
-    expect(screen.getByRole('button', { name: /^default$/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /^gpt-5.5$/i })).toBeDefined();
+    expect(screen.queryByRole('button', { name: /^default$/i })).toBeNull();
+  });
+
+  it('does not let saved codex model preference override confirmed codex-sdk session metadata', () => {
+    localStorage.setItem('imcodes-codex-model', 'gpt-5.5');
+
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({
+          name: 'codex-sdk-session',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+          activeModel: 'gpt-5.4',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: /^gpt-5.4$/i })).toBeDefined();
     expect(screen.queryByRole('button', { name: /^gpt-5.5$/i })).toBeNull();
   });
 

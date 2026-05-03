@@ -91,12 +91,14 @@ function makeSubSession(overrides: Partial<SubSession> = {}): SubSession {
 
 describe('SubSessionCard', () => {
   beforeEach(() => {
+    localStorage.clear();
     vi.clearAllMocks();
     timelineEvents = [{ type: 'assistant.text', payload: { text: 'hello' } }];
   });
 
   afterEach(() => {
     cleanup();
+    localStorage.clear();
   });
 
   it('forces preview scroll to bottom after sending from the card input', async () => {
@@ -384,6 +386,42 @@ describe('SubSessionCard', () => {
       const controls = document.querySelector('[data-testid="session-controls"]') as HTMLElement | null;
       expect(controls?.dataset.queued).toBe('queued send');
     });
+  });
+
+  it('uses saved codex preference as legacy fallback for compact model-less codex-sdk sessions', async () => {
+    localStorage.setItem('imcodes-codex-model:deck_sub_sub-card-1', 'gpt-5.5');
+    timelineEvents = [{
+      type: 'usage.update',
+      payload: {
+        inputTokens: 166_000,
+        cacheTokens: 0,
+        contextWindow: 258_400,
+        contextWindowSource: 'provider',
+      },
+    }] as any;
+
+    const { container } = render(
+      <SubSessionCard
+        sub={makeSubSession({ type: 'codex-sdk', runtimeType: 'transport' as any } as any)}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        quickData={{} as any}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(sessionControlsSpy).toHaveBeenCalled();
+    });
+
+    const props = sessionControlsSpy.mock.calls.at(-1)?.[0];
+    expect(props.detectedModel).toBe('gpt-5.5');
+    const ctxBar = container.querySelector('.subcard-ctx-bar') as HTMLElement | null;
+    expect(ctxBar?.getAttribute('title')).toContain('Context: 166k / 922k (18%)');
+    expect(ctxBar?.getAttribute('title')).not.toContain('/ 258k');
   });
 
   it('passes model metadata to compact controls and computes GPT-5.5 ctx from session metadata when usage omits model', async () => {

@@ -202,6 +202,34 @@ describe('SubSessionBar', () => {
     expect(second.container.querySelector('.subsession-bar')).not.toBeNull();
   });
 
+  it('uses saved codex preference as legacy fallback for collapsed model-less codex-sdk sessions', () => {
+    localStorage.setItem('imcodes-codex-model:deck_sub_sub-1', 'gpt-5.5');
+    const view = render(
+      <SubSessionBar
+        subSessions={[makeSubSession({ type: 'codex-sdk' } as any)]}
+        openIds={new Set()}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        subUsages={new Map([[
+          'deck_sub_sub-1',
+          { inputTokens: 166_000, cacheTokens: 0, contextWindow: 258_400, contextWindowSource: 'provider' },
+        ]]) as any}
+      />,
+    );
+
+    fireEvent.click(view.container.querySelector('.subcard-toolbar-btn') as HTMLButtonElement);
+    const card = view.container.querySelector('.subsession-card') as HTMLButtonElement;
+    expect(card.title).toContain('gpt-5.5');
+    expect(card.title).toContain('ctx 18%');
+    expect(card.title).not.toContain('ctx 64%');
+  });
+
   it('uses sub-session model metadata when collapsed usage omits model but provider window is stale', () => {
     const view = render(
       <SubSessionBar

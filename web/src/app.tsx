@@ -109,6 +109,7 @@ import { ingestTimelineEventForCache, requestActiveTimelineRefresh } from './hoo
 import { getMobileKeyboardState } from './mobile-keyboard.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
+import { loadLegacyCodexModelPreferenceForModelessSession } from './codex-model-preference.js';
 import { updateMainSessionLabel } from './session-label-api.js';
 import { buildDocumentTitle } from './tab-title.js';
 import {
@@ -1865,10 +1866,13 @@ export function App() {
           if (event.sessionId.startsWith('deck_sub_') && isPlausibleUsagePayload(event.payload as Record<string, unknown>)) {
             const payload = event.payload as { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string };
             const sub = subSessionsRef.current.find((candidate) => candidate.sessionName === event.sessionId);
+            const detectedModel = detectedModelsRef.current.get(event.sessionId);
+            const legacyCodexModel = loadLegacyCodexModelPreferenceForModelessSession(sub, detectedModel, payload.model);
             const effectiveModel = resolveEffectiveSessionModel(
               sub,
-              detectedModelsRef.current.get(event.sessionId),
+              detectedModel,
               payload.model,
+              legacyCodexModel,
             );
             const displayPayload = effectiveModel && payload.model !== effectiveModel
               ? { ...payload, model: effectiveModel }

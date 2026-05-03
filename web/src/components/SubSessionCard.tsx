@@ -23,6 +23,7 @@ import { isTransportRuntime, resolveSubSessionRuntimeType } from '../runtime-typ
 import { extractLatestUsage } from '../usage-data.js';
 import { USAGE_CONTEXT_WINDOW_SOURCES } from '@shared/usage-context-window.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
+import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 
 const TYPE_ICON: Record<string, string> = {
   'claude-code': '⚡',
@@ -278,7 +279,8 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     return null;
   }, [events]);
 
-  const effectiveModel = useMemo(() => resolveEffectiveSessionModel(sub, detectedModel, lastUsage?.model), [sub, detectedModel, lastUsage]);
+  const legacyCodexModel = useMemo(() => loadLegacyCodexModelPreferenceForModelessSession(sub, detectedModel, lastUsage?.model), [sub, detectedModel, lastUsage]);
+  const effectiveModel = useMemo(() => resolveEffectiveSessionModel(sub, detectedModel, lastUsage?.model, legacyCodexModel), [sub, detectedModel, lastUsage, legacyCodexModel]);
   const modelLabel = useMemo(() => shortModelLabel(effectiveModel), [effectiveModel]);
 
   // Per-card width override (persisted in localStorage)

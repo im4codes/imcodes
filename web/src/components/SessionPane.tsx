@@ -22,6 +22,7 @@ import { extractLatestUsage } from '../usage-data.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
+import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 
 type ViewMode = 'terminal' | 'chat';
 
@@ -272,6 +273,8 @@ export function SessionPane({
   const terminalVisible = isActive && effectiveViewMode === 'terminal';
   const chatVisible = isActive && effectiveViewMode === 'chat';
   const isShellTerminal = terminalVisible && (session.agentType === 'shell' || session.agentType === 'script');
+  const legacyCodexModel = loadLegacyCodexModelPreferenceForModelessSession(session, detectedModel, lastUsage?.model);
+  const effectiveDetectedModel = detectedModel ?? legacyCodexModel ?? undefined;
 
   useEffect(() => {
     if (!terminalVisible || !connected || !ws) return;
@@ -329,7 +332,7 @@ export function SessionPane({
           sessionName={sessionName}
           sessionState={liveSessionState}
           agentType={session.agentType}
-          modelOverride={resolveEffectiveSessionModel(session, detectedModel)}
+          modelOverride={resolveEffectiveSessionModel(session, effectiveDetectedModel, lastUsage?.model)}
           planLabel={session.planLabel}
           quotaLabel={session.quotaLabel}
           quotaUsageLabel={session.quotaUsageLabel}
@@ -386,7 +389,7 @@ export function SessionPane({
           onTransportConfigSaved={onTransportConfigSaved}
           sessionDisplayName={session.label ? formatLabel(session.label) : (session.project ?? null)}
           quickData={quickData}
-          detectedModel={detectedModel}
+          detectedModel={effectiveDetectedModel}
           hideShortcuts={false}
           activeThinking={!!activeThinkingTs}
           mobileFileBrowserOpen={mobileFileBrowserOpen}

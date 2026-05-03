@@ -27,6 +27,7 @@ import { useNowTicker } from '../hooks/useNowTicker.js';
 import { resolveSubSessionRuntimeType } from '../runtime-type.js';
 import { DESKTOP_WINDOW_IDS } from '../window-stack.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
+import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 
 interface WindowGeometry { x: number; y: number; w: number; h: number }
 
@@ -417,7 +418,8 @@ export function SubSessionWindow({
     }
     return undefined;
   }, [events]);
-  const effectiveDetectedModel = detectedModel ?? detectedModelHint;
+  const legacyCodexModel = loadLegacyCodexModelPreferenceForModelessSession(sub, detectedModel, detectedModelHint, lastUsage?.model);
+  const effectiveDetectedModel = detectedModel ?? detectedModelHint ?? legacyCodexModel ?? undefined;
 
   const lastCostEvent = useMemo(() => {
     for (let i = events.length - 1; i >= 0; i--) {

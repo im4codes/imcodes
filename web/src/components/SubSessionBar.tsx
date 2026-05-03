@@ -23,6 +23,7 @@ import type { EmbeddingStatus } from '@shared/embedding-status.js';
 import { formatDaemonVersionShort } from '../util/format-version.js';
 import { USAGE_CONTEXT_WINDOW_SOURCES, type UsageContextWindowSource } from '@shared/usage-context-window.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
+import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 
 interface DaemonStats {
   daemonVersion?: string | null;
@@ -121,7 +122,8 @@ function CollapsedSubSessionButton({ sub, isOpen, idleFlashToken, usage, inP2p, 
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
   const abbr = getAgentBadgeLabel(sub.type);
-  const effectiveModel = resolveEffectiveSessionModel(sub, detectedModel, usage?.model);
+  const legacyCodexModel = loadLegacyCodexModelPreferenceForModelessSession(sub, detectedModel, usage?.model);
+  const effectiveModel = resolveEffectiveSessionModel(sub, detectedModel, usage?.model, legacyCodexModel);
   const model = effectiveModel ? shortModelLabel(effectiveModel) : null;
   let ctxPct = 0;
   if (usage) {
