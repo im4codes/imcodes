@@ -1,4 +1,9 @@
 export const OPENAI_CONTEXT_WINDOWS = {
+  // OpenAI's API model table lists gpt-5.5 with a 1,050,000-token
+  // total context window and 128,000 max output tokens. The generic UI meter
+  // tracks prompt/input occupancy, so the API-style fallback input budget is
+  // 922k. Codex SDK sessions can have a smaller product/effective live window
+  // and must prefer provider-sourced `model_context_window` when present.
   GPT_55: 922_000,
   GPT_54: 1_000_000,
   GPT_5_FAMILY: 400_000,
@@ -86,21 +91,6 @@ function validExplicitContextWindow(value: number | undefined): number | undefin
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
-function isKnownStaleProviderContextWindow(
-  model: string | null | undefined,
-  explicit: number,
-  inferred: number | undefined,
-): boolean {
-  if (inferred === undefined) return false;
-  const m = model?.toLowerCase().trim();
-  if (!m) return false;
-  // Codex/app-server can report transport fallback windows for GPT-5.5
-  // sessions (seen as 258400 and 1000000) even when the selected IM.codes
-  // model is GPT-5.5. GPT-5.5's product limit is fixed at 922k for this UI
-  // contract, so any provider-sourced mismatch must not drive the ctx meter.
-  return isGpt55Model(m) && explicit !== inferred;
-}
-
 export function resolveContextWindow(
   explicit: number | undefined,
   model?: string | null,
@@ -110,7 +100,6 @@ export function resolveContextWindow(
   const safeExplicit = validExplicitContextWindow(explicit);
   const inferred = inferContextWindow(model);
   if (options.preferExplicit && safeExplicit !== undefined) {
-    if (isKnownStaleProviderContextWindow(model, safeExplicit, inferred)) return inferred!;
     return safeExplicit;
   }
   return inferred ?? safeExplicit ?? fallback;

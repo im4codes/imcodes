@@ -420,8 +420,8 @@ describe('SubSessionCard', () => {
     const props = sessionControlsSpy.mock.calls.at(-1)?.[0];
     expect(props.detectedModel).toBe('gpt-5.5');
     const ctxBar = container.querySelector('.subcard-ctx-bar') as HTMLElement | null;
-    expect(ctxBar?.getAttribute('title')).toContain('Context: 166k / 922k (18%)');
-    expect(ctxBar?.getAttribute('title')).not.toContain('/ 258k');
+    expect(ctxBar?.getAttribute('title')).toContain('Context: 166k / 258k (64%)');
+    expect(ctxBar?.getAttribute('title')).not.toContain('/ 922k');
   });
 
   it('passes model metadata to compact controls and computes GPT-5.5 ctx from session metadata when usage omits model', async () => {
@@ -464,7 +464,7 @@ describe('SubSessionCard', () => {
     expect(props.detectedModel).toBe('gpt-5.5');
 
     const ctxBar = container.querySelector('.subcard-ctx-bar') as HTMLElement | null;
-    expect(ctxBar?.getAttribute('title')).toContain('Context: 100k / 922k (11%)');
+    expect(ctxBar?.getAttribute('title')).toContain('Context: 100k / 258k (39%)');
   });
 
   it('raises the whole card above neighbors while a compact dropdown is open', async () => {

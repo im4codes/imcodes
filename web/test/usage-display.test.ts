@@ -17,7 +17,7 @@ describe('usage display behavior', () => {
     expect(view.pctStr).toBe('32');
   });
 
-  it('uses 922k context for gpt-5.5 even when explicit context is stale', () => {
+  it('uses API input-budget 922k context for gpt-5.5 fallback', () => {
     const view = usageSummary(16_000, 0, 400_000, 'gpt-5.5');
     expect(view.ctx).toBe(922_000);
     expect(view.pctStr).toBe('2');

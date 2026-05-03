@@ -364,12 +364,12 @@ describe('transport-relay (timeline-emitter based)', () => {
         inputTokens: 42_000,
         cacheTokens: 8_000,
         model: 'gpt-5.5',
-        contextWindow: 922_000,
+        contextWindow: 258_400,
+        contextWindowSource: 'provider',
       });
-      expect(usageCall![2].contextWindowSource).toBeUndefined();
     });
 
-    it('does not let Codex SDK stale provider fallback shrink GPT-5.5 window', () => {
+    it('honors Codex SDK provider effective window for GPT-5.5', () => {
       const { provider, fireComplete } = makeMockProvider();
       wireProviderToRelay(provider);
 
@@ -392,12 +392,12 @@ describe('transport-relay (timeline-emitter based)', () => {
         inputTokens: 9_000,
         cacheTokens: 3_000,
         model: 'gpt-5.5',
-        contextWindow: 922_000,
+        contextWindow: 258_400,
+        contextWindowSource: 'provider',
       });
-      expect(usageCall![2].contextWindowSource).toBeUndefined();
     });
 
-    it('does not let Codex SDK stale provider fallback expand GPT-5.5 window to 1M', () => {
+    it('honors Codex SDK provider 1M context window when reported for GPT-5.5', () => {
       const { provider, fireComplete } = makeMockProvider();
       wireProviderToRelay(provider);
 
@@ -420,12 +420,12 @@ describe('transport-relay (timeline-emitter based)', () => {
         inputTokens: 9_000,
         cacheTokens: 3_000,
         model: 'gpt-5.5',
-        contextWindow: 922_000,
+        contextWindow: 1_000_000,
+        contextWindowSource: 'provider',
       });
-      expect(usageCall![2].contextWindowSource).toBeUndefined();
     });
 
-    it('uses the stored session model when Codex SDK usage omits model and ignores stale 258k provider window for GPT-5.5', () => {
+    it('uses the stored session model when Codex SDK usage omits model and honors 258k provider window for GPT-5.5', () => {
       getSessionMock.mockReturnValue({
         name: 'sess-1',
         activeModel: 'gpt-5.5',
@@ -447,12 +447,12 @@ describe('transport-relay (timeline-emitter based)', () => {
         inputTokens: 185_000,
         cacheTokens: 5_000,
         model: 'gpt-5.5',
-        contextWindow: 922_000,
+        contextWindow: 258_400,
+        contextWindowSource: 'provider',
       });
-      expect(usageCall![2].contextWindowSource).toBeUndefined();
     });
 
-    it('uses the stored session model when usage omits both model and provider context window, avoiding the generic 1M fallback for GPT-5.5', () => {
+    it('uses the stored session model when usage omits both model and provider context window, using the API input-budget fallback for GPT-5.5', () => {
       getSessionMock.mockReturnValue({
         name: 'sess-1',
         modelDisplay: 'gpt-5.5',

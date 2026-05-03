@@ -307,7 +307,7 @@ describe('UsageFooter', () => {
     expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('Context: 100k / 258k (39%)');
   });
 
-  it('does not let stale Codex provider fallback shrink GPT-5.5 context window', () => {
+  it('honors Codex provider effective GPT-5.5 context window', () => {
     const { container } = render(
       <UsageFooter
         usage={{
@@ -321,10 +321,10 @@ describe('UsageFooter', () => {
       />,
     );
 
-    expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('Context: 100k / 922k (11%)');
+    expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('Context: 100k / 258k (39%)');
   });
 
-  it('does not let stale Codex provider fallback expand GPT-5.5 context window to 1M', () => {
+  it('honors provider-reported 1M GPT-5.5 context window', () => {
     const { container } = render(
       <UsageFooter
         usage={{
@@ -338,7 +338,7 @@ describe('UsageFooter', () => {
       />,
     );
 
-    expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('Context: 100k / 922k (11%)');
+    expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('Context: 100k / 1M (10%)');
   });
 
   it('keeps the ctx meter visible at zero usage when the model is known', () => {

@@ -252,7 +252,7 @@ describe('parseLine — ignored line types', () => {
     );
   });
 
-  it('does not let Codex stale provider fallback shrink GPT-5.5 window', () => {
+  it('honors Codex provider effective window for GPT-5.5', () => {
     parseLine('session-c', tokenCountLine({
       total_token_usage: {
         input_tokens: 140_000,
@@ -276,16 +276,17 @@ describe('parseLine — ignored line types', () => {
       expect.objectContaining({
         inputTokens: 9_000,
         cacheTokens: 3_000,
-        contextWindow: 922_000,
+        contextWindow: 258_400,
+        contextWindowSource: 'provider',
         model: 'gpt-5.5',
       }),
       expect.objectContaining({ source: 'daemon', confidence: 'high' }),
     );
     const payload = vi.mocked(timelineEmitter.emit).mock.calls[0]?.[2] as Record<string, unknown>;
-    expect(payload.contextWindowSource).toBeUndefined();
+    expect(payload.contextWindowSource).toBe('provider');
   });
 
-  it('does not let Codex stale provider fallback expand GPT-5.5 window to 1M', () => {
+  it('honors Codex provider 1M context window when reported for GPT-5.5', () => {
     parseLine('session-c', tokenCountLine({
       total_token_usage: {
         input_tokens: 140_000,
@@ -309,13 +310,14 @@ describe('parseLine — ignored line types', () => {
       expect.objectContaining({
         inputTokens: 9_000,
         cacheTokens: 3_000,
-        contextWindow: 922_000,
+        contextWindow: 1_000_000,
+        contextWindowSource: 'provider',
         model: 'gpt-5.5',
       }),
       expect.objectContaining({ source: 'daemon', confidence: 'high' }),
     );
     const payload = vi.mocked(timelineEmitter.emit).mock.calls[0]?.[2] as Record<string, unknown>;
-    expect(payload.contextWindowSource).toBeUndefined();
+    expect(payload.contextWindowSource).toBe('provider');
   });
 
   it('ignores non-tool response_item lines (e.g. assistant message)', () => {
