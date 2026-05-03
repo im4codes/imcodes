@@ -27,6 +27,7 @@ import {
 import {
   MEMORY_MANAGEMENT_CONTEXT_FIELD,
   type AuthenticatedMemoryManagementContext,
+  type MemoryManagementBoundProject,
   type MemoryManagementRole,
 } from '../../../shared/memory-management-context.js';
 import { MEMORY_MANAGEMENT_BRIDGE_ERROR_CODES } from '../../../shared/memory-management.js';
@@ -514,37 +515,23 @@ export class WsBridge {
     }));
   }
 
-  private async resolveMemoryManagementRole(params: {
+  private roleFromMembership(role: unknown, elevatedRole: Exclude<MemoryManagementRole, 'user'>): MemoryManagementRole {
+    return role === 'owner' || role === 'admin' ? elevatedRole : 'user';
+  }
+
+  private async resolveMemoryManagementAuthorization(params: {
     userId: string;
     canonicalRepoId?: string;
+    projectDir?: string;
     workspaceId?: string;
     orgId?: string;
-  }): Promise<MemoryManagementRole> {
-    if (!this.db) return 'user';
-    const { userId, canonicalRepoId, workspaceId, orgId } = params;
+  }): Promise<{ role: MemoryManagementRole; boundProjects: MemoryManagementBoundProject[] }> {
+    if (!this.db) return { role: 'user', boundProjects: [] };
+    const { userId, canonicalRepoId, projectDir, workspaceId, orgId } = params;
     try {
-      if (orgId) {
-        const row = await this.db.queryOne<{ role?: string }>(
-          'SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2',
-          [orgId, userId],
-        );
-        if (row?.role === 'owner' || row?.role === 'admin') return 'org_admin';
-        return 'user';
-      }
-      if (workspaceId) {
-        const row = await this.db.queryOne<{ role?: string }>(
-          `SELECT tm.role
-             FROM shared_context_workspaces w
-             JOIN team_members tm ON tm.team_id = w.enterprise_id AND tm.user_id = $2
-            WHERE w.id = $1`,
-          [workspaceId, userId],
-        );
-        if (row?.role === 'owner' || row?.role === 'admin') return 'workspace_admin';
-        return 'user';
-      }
       if (canonicalRepoId) {
-        const row = await this.db.queryOne<{ role?: string }>(
-          `SELECT tm.role
+        const row = await this.db.queryOne<{ role?: string; workspace_id?: string | null; enterprise_id?: string | null }>(
+          `SELECT tm.role, e.workspace_id, e.enterprise_id
              FROM shared_project_enrollments e
              JOIN team_members tm ON tm.team_id = e.enterprise_id AND tm.user_id = $2
             WHERE e.canonical_repo_id = $1
@@ -553,12 +540,56 @@ export class WsBridge {
             LIMIT 1`,
           [canonicalRepoId, userId],
         );
-        if (row?.role === 'owner' || row?.role === 'admin') return 'workspace_admin';
+        if (typeof row?.role === 'string') {
+          return {
+            role: this.roleFromMembership(row.role, 'workspace_admin'),
+            boundProjects: [{
+              projectDir,
+              canonicalRepoId,
+              workspaceId: typeof row.workspace_id === 'string' ? row.workspace_id : undefined,
+              orgId: typeof row.enterprise_id === 'string' ? row.enterprise_id : undefined,
+            }],
+          };
+        }
+        return { role: 'user', boundProjects: [] };
+      }
+
+      if (workspaceId) {
+        const row = await this.db.queryOne<{ role?: string; enterprise_id?: string | null }>(
+          `SELECT tm.role, w.enterprise_id
+             FROM shared_context_workspaces w
+             JOIN team_members tm ON tm.team_id = w.enterprise_id AND tm.user_id = $2
+            WHERE w.id = $1`,
+          [workspaceId, userId],
+        );
+        if (typeof row?.role === 'string') {
+          return {
+            role: this.roleFromMembership(row.role, 'workspace_admin'),
+            boundProjects: [{
+              workspaceId,
+              orgId: typeof row.enterprise_id === 'string' ? row.enterprise_id : undefined,
+            }],
+          };
+        }
+        return { role: 'user', boundProjects: [] };
+      }
+
+      if (orgId) {
+        const row = await this.db.queryOne<{ role?: string }>(
+          'SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2',
+          [orgId, userId],
+        );
+        if (typeof row?.role === 'string') {
+          return {
+            role: this.roleFromMembership(row.role, 'org_admin'),
+            boundProjects: [{ orgId }],
+          };
+        }
       }
     } catch (error) {
-      logger.warn({ err: error, serverId: this.serverId }, 'memory management role derivation failed');
+      logger.warn({ err: error, serverId: this.serverId }, 'memory management authorization derivation failed');
     }
-    return 'user';
+    return { role: 'user', boundProjects: [] };
   }
 
   private async withMemoryManagementContext(ws: WebSocket, msg: Record<string, unknown>, requestId: string): Promise<Record<string, unknown>> {
@@ -572,17 +603,15 @@ export class WsBridge {
     const orgId = typeof msg.orgId === 'string' && msg.orgId.trim()
       ? msg.orgId.trim()
       : (typeof msg.enterpriseId === 'string' && msg.enterpriseId.trim() ? msg.enterpriseId.trim() : undefined);
-    const role = await this.resolveMemoryManagementRole({ userId, canonicalRepoId, workspaceId, orgId });
+    const authorization = await this.resolveMemoryManagementAuthorization({ userId, canonicalRepoId, projectDir, workspaceId, orgId });
     const context: AuthenticatedMemoryManagementContext = {
       actorId: userId,
       userId,
-      role,
+      role: authorization.role,
       serverId: this.serverId,
       requestId,
       source: 'server_bridge',
-      boundProjects: projectDir || canonicalRepoId || workspaceId || orgId
-        ? [{ projectDir, canonicalRepoId, workspaceId, orgId }]
-        : [],
+      boundProjects: authorization.boundProjects,
     };
     const { [MEMORY_MANAGEMENT_CONTEXT_FIELD]: _ignoredContext, managementContext: _ignoredLegacyContext, ...safeMsg } = msg;
     void _ignoredContext;

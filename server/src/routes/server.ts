@@ -201,11 +201,28 @@ type MemoryRecordRow = {
   projection_class: 'recent_summary' | 'durable_memory_candidate';
   source_event_ids_json: string | string[];
   summary: string;
+  content_json?: string | Record<string, unknown> | null;
   updated_at: number;
   hit_count?: number | null;
   last_used_at?: number | null;
   status?: 'active' | 'archived' | null;
 };
+
+function parseRecordContent(raw: string | Record<string, unknown> | null | undefined): Record<string, unknown> {
+  if (!raw) return {};
+  if (typeof raw === 'object' && !Array.isArray(raw)) return raw;
+  if (typeof raw !== 'string') return {};
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
+}
+
+function metadataUserId(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
 
 function buildMemoryStatsView(
   row: MemoryStatsRow | null | undefined,
@@ -224,20 +241,28 @@ function buildMemoryStatsView(
 }
 
 function mapMemoryRecordRows(rows: MemoryRecordRow[]): ContextMemoryRecordView[] {
-  return rows.map((row) => ({
-    id: row.id,
-    scope: row.scope,
-    projectId: row.project_id,
-    summary: row.summary,
-    projectionClass: row.projection_class,
-    sourceEventCount: Array.isArray(row.source_event_ids_json)
-      ? row.source_event_ids_json.length
-      : JSON.parse(row.source_event_ids_json || '[]').length,
-    updatedAt: row.updated_at,
-    hitCount: row.hit_count ?? 0,
-    lastUsedAt: row.last_used_at ?? undefined,
-    status: row.status ?? 'active',
-  }));
+  return rows.map((row) => {
+    const content = parseRecordContent(row.content_json);
+    const ownerUserId = metadataUserId(content.ownerUserId) ?? metadataUserId(content.ownedByUserId) ?? metadataUserId(content.userId);
+    const createdByUserId = metadataUserId(content.createdByUserId) ?? metadataUserId(content.authorUserId) ?? ownerUserId;
+    return {
+      id: row.id,
+      scope: row.scope,
+      projectId: row.project_id,
+      ownerUserId,
+      createdByUserId,
+      updatedByUserId: metadataUserId(content.updatedByUserId) ?? createdByUserId,
+      summary: row.summary,
+      projectionClass: row.projection_class,
+      sourceEventCount: Array.isArray(row.source_event_ids_json)
+        ? row.source_event_ids_json.length
+        : JSON.parse(row.source_event_ids_json || '[]').length,
+      updatedAt: row.updated_at,
+      hitCount: row.hit_count ?? 0,
+      lastUsedAt: row.last_used_at ?? undefined,
+      status: row.status ?? 'active',
+    };
+  });
 }
 
 function mapMemoryProjectRows(rows: MemoryProjectStatsRow[]): ContextMemoryProjectView[] {

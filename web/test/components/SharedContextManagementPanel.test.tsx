@@ -1241,6 +1241,32 @@ describe('SharedContextManagementPanel', () => {
       });
     });
 
+    await screen.findByText('Local personal summary');
+    await act(async () => {
+      fireEvent.click((await screen.findAllByText('sharedContext.management.memoryEdit'))[0]);
+    });
+    const memoryEditField = await screen.findByLabelText('sharedContext.management.memoryEditTextLabel');
+    await act(async () => {
+      fireEvent.input(memoryEditField, {
+        target: { value: 'Edited local personal summary' },
+      });
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.memoryUpdate'));
+      fireEvent.click(screen.getByText('sharedContext.management.memoryPin'));
+    });
+    const updateCommand = sent.find((message) => message.type === MEMORY_WS.UPDATE);
+    expect(updateCommand).toMatchObject({
+      id: 'local-personal-1',
+      text: 'Edited local personal summary',
+      canonicalRepoId: 'github.com/acme/repo',
+    });
+    const pinCommand = sent.find((message) => message.type === MEMORY_WS.PIN);
+    expect(pinCommand).toMatchObject({
+      id: 'local-personal-1',
+      canonicalRepoId: 'github.com/acme/repo',
+    });
+
     const localDeleteButtons = await screen.findAllByText('sharedContext.management.memoryDelete');
     await act(async () => {
       fireEvent.click(localDeleteButtons[0]);
@@ -1513,17 +1539,51 @@ describe('SharedContextManagementPanel', () => {
     });
     expect(screen.getByLabelText('sharedContext.management.memoryFeatureLabel.preferences: sharedContext.management.memoryFeatureDisabled')).toBeDefined();
     expect(screen.getAllByText('sharedContext.management.memoryFeatureEnableAction').length).toBeGreaterThan(0);
+    await act(async () => {
+      for (const handler of messageHandlers) handler({
+        type: MEMORY_WS.FEATURES_RESPONSE,
+        requestId: latestRequestId(MEMORY_WS.FEATURES_QUERY),
+        records: [
+          { flag: MEMORY_FEATURE_FLAGS_BY_NAME.preferences, requested: true, enabled: true, source: 'persisted_config', envKey: 'IMCODES_MEM_FEATURE_PREFERENCES', dependencies: [], dependencyBlocked: [], disabledBehavior: 'Preferences enabled.' },
+          { flag: MEMORY_FEATURE_FLAGS_BY_NAME.mdIngest, requested: true, enabled: true, source: 'persisted_config', envKey: 'IMCODES_MEM_FEATURE_MD_INGEST', dependencies: [], dependencyBlocked: [], disabledBehavior: 'MD ingest enabled.' },
+          { flag: MEMORY_FEATURE_FLAGS_BY_NAME.skills, requested: true, enabled: true, source: 'persisted_config', envKey: 'IMCODES_MEM_FEATURE_SKILLS', dependencies: [], dependencyBlocked: [], disabledBehavior: 'Skills enabled.' },
+          { flag: MEMORY_FEATURE_FLAGS_BY_NAME.skillAutoCreation, requested: true, enabled: true, source: 'persisted_config', envKey: 'IMCODES_MEM_FEATURE_SKILL_AUTO_CREATION', dependencies: [], dependencyBlocked: [], disabledBehavior: 'Skill review enabled.' },
+          { flag: MEMORY_FEATURE_FLAGS_BY_NAME.observationStore, requested: true, enabled: true, source: 'persisted_config', envKey: 'IMCODES_MEM_FEATURE_OBSERVATION_STORE', dependencies: [], dependencyBlocked: [], disabledBehavior: 'Observation store enabled.' },
+          { flag: MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry, requested: true, enabled: true, source: 'persisted_config', envKey: 'IMCODES_MEM_FEATURE_NAMESPACE_REGISTRY', dependencies: [], dependencyBlocked: [], disabledBehavior: 'Namespace registry enabled.' },
+        ],
+      });
+    });
 
     expect(screen.getByPlaceholderText('sharedContext.management.memoryPreferenceTextPlaceholder')).toBeDefined();
     expect(screen.getByText('sharedContext.management.memoryPreferenceSave')).toBeDefined();
 
     await act(async () => {
+      fireEvent.input(screen.getByLabelText('sharedContext.management.memoryToolProjectSelector'), {
+        target: { value: 'github.com/acme/repo' },
+      });
       fireEvent.input(screen.getAllByPlaceholderText('sharedContext.management.memoryProjectPlaceholder')[0], {
         target: { value: 'github.com/acme/repo' },
       });
       fireEvent.input(screen.getAllByPlaceholderText('sharedContext.management.memoryProjectDirPlaceholder')[0], {
         target: { value: '/work/repo' },
       });
+    });
+    await act(async () => {
+      fireEvent.input(screen.getByLabelText('sharedContext.management.memoryManualAddTextLabel'), {
+        target: { value: 'Remember the local test command.' },
+      });
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.memoryManualAddSave'));
+    });
+    const memoryCreate = latestCommand(MEMORY_WS.CREATE);
+    expect(memoryCreate).toMatchObject({
+      type: MEMORY_WS.CREATE,
+      text: 'Remember the local test command.',
+      projectionClass: 'durable_memory_candidate',
+      canonicalRepoId: 'github.com/acme/repo',
+    });
+    await act(async () => {
       fireEvent.click(screen.getByText('sharedContext.management.memoryPreferenceSave'));
     });
     const prefCreate = latestCommand(MEMORY_WS.PREF_CREATE);
@@ -1534,6 +1594,22 @@ describe('SharedContextManagementPanel', () => {
     expect(prefCreate).not.toHaveProperty('userId');
     expect(prefCreate).not.toHaveProperty('actorId');
     expect(prefCreate).not.toHaveProperty('role');
+
+    await act(async () => {
+      fireEvent.click(screen.getAllByText('sharedContext.management.memoryEdit')[0]);
+      fireEvent.input(screen.getByPlaceholderText('sharedContext.management.memoryPreferenceTextPlaceholder'), {
+        target: { value: 'Always prefer focused tests.' },
+      });
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.memoryPreferenceUpdate'));
+    });
+    const prefUpdate = latestCommand(MEMORY_WS.PREF_UPDATE);
+    expect(prefUpdate).toMatchObject({
+      type: MEMORY_WS.PREF_UPDATE,
+      id: 'pref-1',
+      text: 'Always prefer focused tests.',
+    });
 
     await act(async () => {
       fireEvent.click(screen.getByText('sharedContext.management.memorySkillRebuildRegistry'));
@@ -1568,10 +1644,29 @@ describe('SharedContextManagementPanel', () => {
 
     expect(screen.getAllByPlaceholderText('sharedContext.management.memoryProjectDirPlaceholder').length).toBeGreaterThan(0);
     expect(screen.getByText('sharedContext.management.memoryMdIngestRun')).toBeDefined();
+    expect(screen.getByText('sharedContext.management.memoryPromotionHelp')).toBeDefined();
 
     await act(async () => {
       fireEvent.click(screen.getByText('sharedContext.management.memoryMdIngestRun'));
-      fireEvent.click(screen.getByText('sharedContext.management.memoryObservationPromote'));
+      fireEvent.click(screen.getByText('sharedContext.management.memoryToolTabObservations'));
+    });
+    await act(async () => {
+      const editButtons = screen.getAllByText('sharedContext.management.memoryEdit');
+      fireEvent.click(editButtons[editButtons.length - 1]);
+    });
+    const observationEditField = await screen.findByLabelText('sharedContext.management.memoryObservationEditTextLabel');
+    await act(async () => {
+      fireEvent.input(observationEditField, {
+        target: { value: 'Use on-demand registry hints for skills.' },
+      });
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.memoryObservationUpdate'));
+    });
+    await act(async () => {
+      const deleteButtons = screen.getAllByText('sharedContext.management.memoryDelete');
+      fireEvent.click(deleteButtons[deleteButtons.length - 1]);
+      fireEvent.click(screen.getByText('sharedContext.management.memoryObservationPromoteTo'));
     });
     const mdIngestCommand = latestCommand(MEMORY_WS.MD_INGEST_RUN);
     expect(mdIngestCommand).toMatchObject({
@@ -1581,6 +1676,26 @@ describe('SharedContextManagementPanel', () => {
       scope: 'personal',
     });
     expect(mdIngestCommand).not.toHaveProperty('projectId');
+    const observationUpdate = latestCommand(MEMORY_WS.OBSERVATION_UPDATE);
+    expect(observationUpdate).toMatchObject({
+      type: MEMORY_WS.OBSERVATION_UPDATE,
+      id: 'obs-1',
+      expectedFromScope: 'personal',
+      text: 'Use on-demand registry hints for skills.',
+    });
+    const observationDelete = latestCommand(MEMORY_WS.OBSERVATION_DELETE);
+    expect(observationDelete).toMatchObject({
+      type: MEMORY_WS.OBSERVATION_DELETE,
+      id: 'obs-1',
+      expectedFromScope: 'personal',
+    });
+    expect(latestCommand(MEMORY_WS.OBSERVATION_PROMOTE)).toBeUndefined();
+    expect(screen.getByText('sharedContext.management.memoryPromotionConfirmTitle')).toBeDefined();
+    expect(screen.getByText('sharedContext.management.memoryPromotionConfirmBody')).toBeDefined();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.memoryPromotionConfirmAction'));
+    });
     const promoteCommand = latestCommand(MEMORY_WS.OBSERVATION_PROMOTE);
     expect(promoteCommand).toMatchObject({
       type: MEMORY_WS.OBSERVATION_PROMOTE,

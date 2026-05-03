@@ -15,6 +15,23 @@ const REQUIRED_KEYS = [
   'memory.skills.layerDiagnostics',
   'memory.skills.enforced',
   'memory.skills.additive',
+  'sharedContext.notice.memoryCreated',
+  'sharedContext.notice.memoryUpdated',
+  'sharedContext.notice.memoryPinned',
+  'sharedContext.management.memoryManualAddTitle',
+  'sharedContext.management.memoryManualAddSave',
+  'sharedContext.management.memoryPin',
+  'sharedContext.management.memoryUpdate',
+  'sharedContext.management.memoryRecordOwner',
+  'sharedContext.management.memoryRecordCreatedBy',
+  'sharedContext.management.memoryRecordUpdatedBy',
+  'sharedContext.management.memoryPreferenceUpdate',
+  'sharedContext.management.memoryObservationUpdate',
+  'sharedContext.management.memoryObservationDeleteConfirm',
+  'sharedContext.management.error.missing_memory_text',
+  'sharedContext.management.error.memory_not_found',
+  'sharedContext.management.error.missing_observation_text',
+  'sharedContext.management.error.observation_mutation_forbidden',
 ] as const;
 
 function getPath(value: Record<string, unknown>, key: string): unknown {

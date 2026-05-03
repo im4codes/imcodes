@@ -49,6 +49,7 @@ function validateMarkdownIngestNamespace(namespace: ContextNamespace): ContextNa
 export async function runMarkdownMemoryIngest(input: {
   projectDir: string | undefined;
   namespace: ContextNamespace;
+  actorUserId?: string;
   featureEnabled?: boolean;
   now?: number;
 }): Promise<{ filesChecked: number; observationsWritten: number; droppedReason?: 'unsupported_scope' }> {
@@ -91,6 +92,7 @@ export async function runMarkdownMemoryIngest(input: {
             origin: MD_INGEST_ORIGIN,
             fingerprint: section.fingerprint,
             provenanceFingerprint: `${relativePath}:${section.fingerprint}`,
+            ...(input.actorUserId?.trim() ? { createdByUserId: input.actorUserId.trim(), updatedByUserId: input.actorUserId.trim() } : {}),
           },
           origin: MD_INGEST_ORIGIN,
           createdAt: input.now,

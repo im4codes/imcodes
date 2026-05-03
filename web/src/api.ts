@@ -1259,6 +1259,7 @@ export interface SharedDocumentVersion {
   id: string;
   versionNumber: number;
   status: string;
+  createdByUserId?: string;
 }
 
 export interface SharedDocument {
@@ -1266,6 +1267,7 @@ export interface SharedDocument {
   enterpriseId: string;
   kind: 'coding_standard' | 'architecture_guideline' | 'repo_playbook' | 'knowledge_doc';
   title: string;
+  createdByUserId?: string;
   versions: SharedDocumentVersion[];
 }
 
@@ -1280,6 +1282,7 @@ export interface SharedDocumentBinding {
   applicabilityLanguage: string | null;
   applicabilityPathPattern: string | null;
   status: string;
+  createdByUserId?: string;
 }
 
 export interface RuntimeAuthoredContextBindingView {

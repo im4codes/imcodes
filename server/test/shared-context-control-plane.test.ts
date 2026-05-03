@@ -214,11 +214,12 @@ function makeMockDb() {
           status: entry.status,
         })) as T[];
       }
-      if (s.includes('select id, kind, title from shared_context_documents where enterprise_id = $1')) {
+      if (s.includes('from shared_context_documents where enterprise_id = $1') && s.includes('select id, kind, title')) {
         return [...documents.values()].filter((entry) => entry.enterprise_id === params[0]).map((entry) => ({
           id: entry.id,
           kind: entry.kind,
           title: entry.title,
+          created_by: entry.created_by,
         })) as T[];
       }
       if (s.includes('from shared_context_projections where enterprise_id = $1') && s.includes('select id, scope, project_id, projection_class, source_event_ids_json, summary, content_json, updated_at')) {
@@ -245,12 +246,12 @@ function makeMockDb() {
             status: 'active',
           })) as T[];
       }
-      if (s.includes('select id, version_number, status from shared_context_document_versions where document_id = $1')) {
+      if (s.includes('from shared_context_document_versions where document_id = $1') && s.includes('select id, version_number, status')) {
         return [...versions.values()]
           .filter((entry) => entry.document_id === params[0])
-          .map((entry) => ({ id: entry.id, version_number: entry.version_number, status: entry.status })) as T[];
+          .map((entry) => ({ id: entry.id, version_number: entry.version_number, status: entry.status, created_by: entry.created_by })) as T[];
       }
-      if (s.includes('select id, workspace_id, enrollment_id, document_id, version_id, binding_mode, applicability_repo_id, applicability_language, applicability_path_pattern, status from shared_context_document_bindings where enterprise_id = $1')) {
+      if (s.includes('from shared_context_document_bindings where enterprise_id = $1') && s.includes('select id, workspace_id, enrollment_id, document_id, version_id, binding_mode')) {
         return [...bindings.values()].filter((entry) => entry.enterprise_id === params[0]).map((entry) => ({
           id: entry.id,
           workspace_id: entry.workspace_id,
@@ -262,6 +263,7 @@ function makeMockDb() {
           applicability_language: entry.applicability_language,
           applicability_path_pattern: entry.applicability_path_pattern,
           status: entry.status,
+          created_by: entry.created_by,
         })) as T[];
       }
       if (s.includes('from shared_context_document_bindings b join shared_context_document_versions v on v.id = b.version_id where b.enterprise_id = $1 and b.status = \'active\' and v.status = \'active\'')) {

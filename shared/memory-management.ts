@@ -8,7 +8,9 @@ export const MEMORY_MANAGEMENT_ERROR_CODES = {
   ACTION_FAILED: 'action_failed',
   FEATURE_DISABLED: 'feature_disabled',
   MISSING_PREFERENCE_TEXT: 'missing_preference_text',
+  MISSING_MEMORY_TEXT: 'missing_memory_text',
   MISSING_ID: 'missing_id',
+  MEMORY_NOT_FOUND: 'memory_not_found',
   PREFERENCE_NOT_FOUND: 'preference_not_found',
   PREFERENCE_FORBIDDEN_OWNER: 'preference_forbidden_owner',
   MISSING_PROJECT_DIR: 'missing_project_dir',
@@ -24,6 +26,9 @@ export const MEMORY_MANAGEMENT_ERROR_CODES = {
   MANAGEMENT_REQUEST_UNROUTED: 'management_request_unrouted',
   INVALID_FEATURE_FLAG: 'invalid_feature_flag',
   FEATURE_CONFIG_WRITE_FAILED: 'feature_config_write_failed',
+  MISSING_OBSERVATION_TEXT: 'missing_observation_text',
+  OBSERVATION_NOT_FOUND: 'observation_not_found',
+  OBSERVATION_MUTATION_FORBIDDEN: 'observation_mutation_forbidden',
   SKILL_PATH_NOT_READABLE: 'skill_path_not_readable',
   SKILL_FILE_TOO_LARGE: 'skill_file_too_large',
   SKILL_NOT_FOUND: 'skill_not_found',
@@ -74,6 +79,9 @@ export interface MemoryFeatureSetResponse {
 export interface MemoryPreferenceAdminRecord {
   id: string;
   userId: string;
+  ownerUserId?: string;
+  createdByUserId?: string;
+  updatedByUserId?: string;
   text: string;
   fingerprint: string;
   origin: MemoryOrigin;
@@ -115,6 +123,9 @@ export interface MemoryObservationAdminRecord {
   class: ObservationClass;
   origin: MemoryOrigin;
   state: ObservationState;
+  ownerUserId?: string;
+  createdByUserId?: string;
+  updatedByUserId?: string;
   text: string;
   fingerprint: string;
   namespaceId: string;

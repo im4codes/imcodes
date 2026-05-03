@@ -206,11 +206,28 @@ type MemoryRecordRow = {
   projection_class: 'recent_summary' | 'durable_memory_candidate';
   source_event_ids_json: string | string[];
   summary: string;
+  content_json?: string | Record<string, unknown> | null;
   updated_at: number;
   hit_count?: number | null;
   last_used_at?: number | null;
   status?: 'active' | 'archived' | null;
 };
+
+function parseRecordContent(raw: string | Record<string, unknown> | null | undefined): Record<string, unknown> {
+  if (!raw) return {};
+  if (typeof raw === 'object' && !Array.isArray(raw)) return raw;
+  if (typeof raw !== 'string') return {};
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
+}
+
+function metadataUserId(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
 
 function buildMemoryStatsView(
   row: MemoryStatsRow | null | undefined,
@@ -229,20 +246,28 @@ function buildMemoryStatsView(
 }
 
 function mapMemoryRecordRows(rows: MemoryRecordRow[]): ContextMemoryRecordView[] {
-  return rows.map((row) => ({
-    id: row.id,
-    scope: row.scope,
-    projectId: row.project_id,
-    summary: row.summary,
-    projectionClass: row.projection_class,
-    sourceEventCount: Array.isArray(row.source_event_ids_json)
-      ? row.source_event_ids_json.length
-      : JSON.parse(row.source_event_ids_json || '[]').length,
-    updatedAt: row.updated_at,
-    hitCount: row.hit_count ?? 0,
-    lastUsedAt: row.last_used_at ?? undefined,
-    status: row.status ?? 'active',
-  }));
+  return rows.map((row) => {
+    const content = parseRecordContent(row.content_json);
+    const ownerUserId = metadataUserId(content.ownerUserId) ?? metadataUserId(content.ownedByUserId) ?? metadataUserId(content.userId);
+    const createdByUserId = metadataUserId(content.createdByUserId) ?? metadataUserId(content.authorUserId) ?? ownerUserId;
+    return {
+      id: row.id,
+      scope: row.scope,
+      projectId: row.project_id,
+      ownerUserId,
+      createdByUserId,
+      updatedByUserId: metadataUserId(content.updatedByUserId) ?? createdByUserId,
+      summary: row.summary,
+      projectionClass: row.projection_class,
+      sourceEventCount: Array.isArray(row.source_event_ids_json)
+        ? row.source_event_ids_json.length
+        : JSON.parse(row.source_event_ids_json || '[]').length,
+      updatedAt: row.updated_at,
+      hitCount: row.hit_count ?? 0,
+      lastUsedAt: row.last_used_at ?? undefined,
+      status: row.status ?? 'active',
+    };
+  });
 }
 
 function mapMemoryProjectRows(rows: MemoryProjectStatsRow[]): ContextMemoryProjectView[] {
@@ -815,14 +840,14 @@ sharedContextRoutes.get('/enterprises/:enterpriseId/documents', async (c) => {
   const enterpriseId = c.req.param('enterpriseId');
   const auth = await requireEnterpriseRole(c, enterpriseId, 'member');
   if (auth instanceof Response) return auth;
-  const docs = await c.env.DB.query<{ id: string; kind: DocumentKind; title: string }>(
-    'SELECT id, kind, title FROM shared_context_documents WHERE enterprise_id = $1 ORDER BY title ASC',
+  const docs = await c.env.DB.query<{ id: string; kind: DocumentKind; title: string; created_by: string }>(
+    'SELECT id, kind, title, created_by FROM shared_context_documents WHERE enterprise_id = $1 ORDER BY title ASC',
     [enterpriseId],
   );
   const result = [];
   for (const doc of docs) {
-    const versions = await c.env.DB.query<{ id: string; version_number: number; status: string }>(
-      'SELECT id, version_number, status FROM shared_context_document_versions WHERE document_id = $1 ORDER BY version_number DESC',
+    const versions = await c.env.DB.query<{ id: string; version_number: number; status: string; created_by: string }>(
+      'SELECT id, version_number, status, created_by FROM shared_context_document_versions WHERE document_id = $1 ORDER BY version_number DESC',
       [doc.id],
     );
     result.push({
@@ -830,10 +855,12 @@ sharedContextRoutes.get('/enterprises/:enterpriseId/documents', async (c) => {
       enterpriseId,
       kind: doc.kind,
       title: doc.title,
+      createdByUserId: doc.created_by,
       versions: versions.map((version) => ({
         id: version.id,
         versionNumber: version.version_number,
         status: version.status,
+        createdByUserId: version.created_by,
       })),
     });
   }
@@ -855,8 +882,9 @@ sharedContextRoutes.get('/enterprises/:enterpriseId/document-bindings', async (c
     applicability_language: string | null;
     applicability_path_pattern: string | null;
     status: string;
+    created_by: string;
   }>(
-    'SELECT id, workspace_id, enrollment_id, document_id, version_id, binding_mode, applicability_repo_id, applicability_language, applicability_path_pattern, status FROM shared_context_document_bindings WHERE enterprise_id = $1 ORDER BY id ASC',
+    'SELECT id, workspace_id, enrollment_id, document_id, version_id, binding_mode, applicability_repo_id, applicability_language, applicability_path_pattern, status, created_by FROM shared_context_document_bindings WHERE enterprise_id = $1 ORDER BY id ASC',
     [enterpriseId],
   );
   const orgAuthoredEnabled = isMemoryFeatureEnabled(c.env, MEMORY_FEATURES.orgSharedAuthoredStandards);
@@ -884,6 +912,7 @@ sharedContextRoutes.get('/enterprises/:enterpriseId/document-bindings', async (c
       applicabilityLanguage: row.applicability_language,
       applicabilityPathPattern: row.applicability_path_pattern,
       status: row.status,
+      createdByUserId: row.created_by,
     })),
   });
 });

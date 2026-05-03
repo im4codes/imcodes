@@ -2,7 +2,6 @@ import type { MemoryScoringWeights } from './memory-scoring.js';
 import type {
   AuthoredContextScope,
   MemoryScope,
-  SharedContextProjectionScope,
 } from './memory-scope.js';
 import type { MemoryOrigin } from './memory-origin.js';
 
@@ -286,8 +285,11 @@ export interface ContextMemoryProjectView {
 
 export interface ContextMemoryRecordView {
   id: string;
-  scope: SharedContextProjectionScope;
+  scope: MemoryScope;
   projectId: string;
+  ownerUserId?: string;
+  createdByUserId?: string;
+  updatedByUserId?: string;
   summary: string;
   projectionClass: ProcessedContextClass;
   sourceEventCount: number;

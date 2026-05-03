@@ -634,6 +634,22 @@ function normalizeOptional(value: string | undefined): string | null {
   return trimmed ? trimmed : null;
 }
 
+function metadataUserId(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function applyImplicitOwnerMetadata(namespace: ContextNamespace, content: Record<string, unknown>): Record<string, unknown> {
+  if (!isOwnerPrivateMemoryScope(namespace.scope)) return content;
+  const ownerUserId = metadataUserId(namespace.userId);
+  if (!ownerUserId) return content;
+  return {
+    ...content,
+    ownerUserId: metadataUserId(content.ownerUserId) ?? metadataUserId(content.ownedByUserId) ?? ownerUserId,
+    createdByUserId: metadataUserId(content.createdByUserId) ?? metadataUserId(content.authorUserId) ?? ownerUserId,
+    updatedByUserId: metadataUserId(content.updatedByUserId) ?? metadataUserId(content.createdByUserId) ?? metadataUserId(content.authorUserId) ?? ownerUserId,
+  };
+}
+
 function isCanonicalNamespaceInput(input: CanonicalNamespaceInput | ContextNamespace): input is CanonicalNamespaceInput {
   return input.scope === 'user_private'
     || 'canonicalRepoId' in input
@@ -725,15 +741,23 @@ function projectionOriginForInput(input: { origin?: MemoryOrigin; content: Recor
 function upsertContextObservationForDb(database: DatabaseSyncInstance, input: ContextObservationInput): ContextObservationRow {
   assertValidObservationInput(input);
   if (!isMemoryScope(input.scope)) throw new Error(`invalid observation scope: ${String(input.scope)}`);
-  const namespaceScopeRow = database.prepare('SELECT scope FROM context_namespaces WHERE id = ?')
-    .get(input.namespaceId) as { scope: string } | undefined;
+  const namespaceScopeRow = database.prepare('SELECT scope, user_id, project_id, workspace_id, org_id FROM context_namespaces WHERE id = ?')
+    .get(input.namespaceId) as { scope: string; user_id?: string | null; project_id?: string | null; workspace_id?: string | null; org_id?: string | null } | undefined;
   if (!namespaceScopeRow) throw new Error(`namespace not found for observation: ${input.namespaceId}`);
   if (namespaceScopeRow.scope !== input.scope) {
     throw new Error(`observation scope ${input.scope} does not match namespace scope ${namespaceScopeRow.scope}`);
   }
+  const observationNamespace: ContextNamespace = {
+    scope: input.scope,
+    userId: typeof namespaceScopeRow.user_id === 'string' ? namespaceScopeRow.user_id : undefined,
+    projectId: typeof namespaceScopeRow.project_id === 'string' ? namespaceScopeRow.project_id : undefined,
+    workspaceId: typeof namespaceScopeRow.workspace_id === 'string' ? namespaceScopeRow.workspace_id : undefined,
+    enterpriseId: typeof namespaceScopeRow.org_id === 'string' ? namespaceScopeRow.org_id : undefined,
+  };
+  const contentForDb = applyImplicitOwnerMetadata(observationNamespace, input.content);
   const now = input.now ?? Date.now();
   const sourceEventIds = normalizeObservationSourceIds(input.sourceEventIds);
-  const textHash = input.textHash ?? computeObservationTextHash(input.text ?? JSON.stringify(input.content));
+  const textHash = input.textHash ?? computeObservationTextHash(input.text ?? JSON.stringify(contentForDb));
   const id = input.id ?? observationIdFor(input.namespaceId, input.class, input.fingerprint, textHash);
   const prior = database.prepare(`
     SELECT id, source_event_ids_json, created_at, projection_id, state
@@ -766,7 +790,7 @@ function upsertContextObservationForDb(database: DatabaseSyncInstance, input: Co
     input.class,
     input.origin,
     input.fingerprint,
-    JSON.stringify(input.content),
+    JSON.stringify(contentForDb),
     textHash,
     JSON.stringify(mergedSourceIds),
     input.projectionId ?? prior?.projection_id ?? null,
@@ -1562,6 +1586,34 @@ export function addPinnedNote(input: { namespaceKey: string; content: string; or
   return note;
 }
 
+export function upsertPinnedNote(input: { namespaceKey: string; content: string; origin: MemoryOrigin; id?: string; now?: number }): PinnedNote {
+  const database = ensureDb();
+  const now = input.now ?? Date.now();
+  const origin = requireExplicitMemoryOrigin(input.origin, 'pinned note');
+  const id = input.id ?? randomUUID();
+  const content = input.content.trim();
+  if (!content) throw new Error('pinned note content is required');
+  database.prepare(`
+    INSERT INTO context_pinned_notes (id, namespace_key, content, origin, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      namespace_key = excluded.namespace_key,
+      content = excluded.content,
+      origin = excluded.origin,
+      updated_at = excluded.updated_at
+  `).run(id, input.namespaceKey, content, origin, now, now);
+  const row = database.prepare('SELECT * FROM context_pinned_notes WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+  if (!row) throw new Error('failed to upsert pinned note');
+  return {
+    id: String(row.id),
+    namespaceKey: String(row.namespace_key),
+    content: String(row.content),
+    origin: isMemoryOrigin(row.origin) ? row.origin : origin,
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
+  };
+}
+
 export function removePinnedNote(id: string): boolean {
   const database = ensureDb();
   const result = database.prepare('DELETE FROM context_pinned_notes WHERE id = ?').run(id) as { changes?: number };
@@ -2024,8 +2076,9 @@ export function writeProcessedProjection(input: Omit<ProcessedContextProjection,
   // This avoids a second pass using process.cwd()-derived rules from the wrong
   // project and preserves explicit pinned-note byte identity.
   const summaryForDb = input.summary;
-  const contentJsonForDb = JSON.stringify(input.content);
-  const contentHashForDb = projectionContentHash(summaryForDb, input.content);
+  const contentForDb = applyImplicitOwnerMetadata(canonicalNamespace, input.content);
+  const contentJsonForDb = JSON.stringify(contentForDb);
+  const contentHashForDb = projectionContentHash(summaryForDb, contentForDb);
   const originForDb = projectionOriginForInput(input);
 
   // Explicit ids are used by replication/import paths and stable singleton
@@ -2046,7 +2099,7 @@ export function writeProcessedProjection(input: Omit<ProcessedContextProjection,
           class: input.class,
           sourceEventIds,
           summary: summaryForDb,
-          content: parseJson<Record<string, unknown>>(contentJsonForDb, input.content),
+          content: parseJson<Record<string, unknown>>(contentJsonForDb, contentForDb),
           contentHash: contentHashForDb,
           origin: originForDb,
           createdAt: prior?.created_at ?? input.createdAt ?? now,
@@ -2169,7 +2222,7 @@ export function writeProcessedProjection(input: Omit<ProcessedContextProjection,
         projectionClass: input.class,
         sourceEventIds: returnedIds,
         summary: row.summary,
-        content: parseJson<Record<string, unknown>>(row.content_json, input.content),
+        content: parseJson<Record<string, unknown>>(row.content_json, contentForDb),
         createdAt: Number(row.created_at),
         updatedAt: Number(row.updated_at),
         fingerprint,
@@ -2183,7 +2236,7 @@ export function writeProcessedProjection(input: Omit<ProcessedContextProjection,
         origin: returnedOrigin,
         sourceEventIds: returnedIds,
         summary: row.summary,
-        content: parseJson<Record<string, unknown>>(row.content_json, input.content),
+        content: parseJson<Record<string, unknown>>(row.content_json, contentForDb),
         contentHash: typeof row.content_hash === 'string' && row.content_hash ? row.content_hash : contentHashForDb,
         createdAt: Number(row.created_at),
         updatedAt: Number(row.updated_at),
@@ -2251,6 +2304,226 @@ export function listContextObservations(filters: {
     .filter((row) => !filters.scope || row.scope === filters.scope)
     .filter((row) => !filters.class || row.class === filters.class)
     .filter((row) => !filters.projectionId || row.projectionId === filters.projectionId);
+}
+
+export function updateContextObservationText(input: {
+  observationId: string;
+  text: string;
+  fingerprint?: string;
+  observationClass?: ObservationClass;
+  ownerUserId?: string;
+  createdByUserId?: string;
+  updatedByUserId?: string;
+  now?: number;
+}): ContextObservationRow | null {
+  const database = ensureDb();
+  const now = input.now ?? Date.now();
+  const text = input.text.trim();
+  if (!text) throw new Error('observation text is required');
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    const existingRow = database.prepare('SELECT * FROM context_observations WHERE id = ?')
+      .get(input.observationId) as Record<string, unknown> | undefined;
+    if (!existingRow) {
+      database.exec('COMMIT');
+      return null;
+    }
+    const existing = observationRowFromDb(existingRow);
+    const observationClass = input.observationClass ?? existing.class;
+    const content = {
+      ...existing.content,
+      text,
+      ...(input.ownerUserId && typeof existing.content.ownerUserId !== 'string' ? { ownerUserId: input.ownerUserId } : {}),
+      ...(input.createdByUserId && typeof existing.content.createdByUserId !== 'string' ? { createdByUserId: input.createdByUserId } : {}),
+      ...(input.updatedByUserId ? { updatedByUserId: input.updatedByUserId } : {}),
+    };
+    const fingerprint = input.fingerprint ?? existing.fingerprint;
+    const textHash = computeObservationTextHash(text);
+    assertValidObservationInput({
+      namespaceId: existing.namespaceId,
+      scope: existing.scope,
+      class: observationClass,
+      origin: existing.origin,
+      fingerprint,
+      content,
+      text,
+      textHash,
+      sourceEventIds: existing.sourceEventIds,
+      projectionId: existing.projectionId,
+      state: existing.state,
+      confidence: existing.confidence,
+    });
+    const conflict = database.prepare(`
+      SELECT id FROM context_observations
+      WHERE namespace_id = ? AND class = ? AND fingerprint = ? AND text_hash = ? AND id <> ?
+      LIMIT 1
+    `).get(existing.namespaceId, observationClass, fingerprint, textHash, input.observationId) as { id: string } | undefined;
+    if (conflict) throw new Error(`observation update conflicts with existing observation ${conflict.id}`);
+    database.prepare(`
+      UPDATE context_observations
+      SET class = ?, fingerprint = ?, content_json = ?, text_hash = ?, updated_at = ?
+      WHERE id = ?
+    `).run(observationClass, fingerprint, JSON.stringify(content), textHash, now, input.observationId);
+    if (existing.projectionId) {
+      const projection = database.prepare(`
+        SELECT id, namespace_key, class, content_json, summary_fingerprint
+        FROM context_processed_local
+        WHERE id = ?
+      `).get(existing.projectionId) as {
+        id: string;
+        namespace_key: string;
+        class: string;
+        content_json: string;
+        summary_fingerprint: string | null;
+      } | undefined;
+      if (projection) {
+        const projectionContent = parseJson<Record<string, unknown>>(projection.content_json, {});
+        const nextProjectionContent = {
+          ...projectionContent,
+          text,
+          summary: text,
+          ...(input.ownerUserId && typeof projectionContent.ownerUserId !== 'string' ? { ownerUserId: input.ownerUserId } : {}),
+          ...(input.createdByUserId && typeof projectionContent.createdByUserId !== 'string' ? { createdByUserId: input.createdByUserId } : {}),
+          ...(input.updatedByUserId ? { updatedByUserId: input.updatedByUserId } : {}),
+        };
+        const nextSummaryFingerprint = projection.summary_fingerprint ? projectionFingerprint(text) : null;
+        if (nextSummaryFingerprint) {
+          const projectionConflict = database.prepare(`
+            SELECT id FROM context_processed_local
+            WHERE namespace_key = ? AND class = ? AND summary_fingerprint = ? AND id <> ?
+            LIMIT 1
+          `).get(projection.namespace_key, projection.class, nextSummaryFingerprint, projection.id) as { id: string } | undefined;
+          if (projectionConflict) throw new Error(`projection update conflicts with existing projection ${projectionConflict.id}`);
+        }
+        database.prepare(`
+          UPDATE context_processed_local
+          SET summary = ?,
+              content_json = ?,
+              content_hash = ?,
+              updated_at = ?,
+              summary_fingerprint = ?,
+              embedding = NULL,
+              embedding_source = NULL
+          WHERE id = ?
+        `).run(
+          text,
+          JSON.stringify(nextProjectionContent),
+          projectionContentHash(text, nextProjectionContent),
+          now,
+          nextSummaryFingerprint,
+          projection.id,
+        );
+      }
+    }
+    const updatedRow = database.prepare('SELECT * FROM context_observations WHERE id = ?')
+      .get(input.observationId) as Record<string, unknown> | undefined;
+    database.exec('COMMIT');
+    return updatedRow ? observationRowFromDb(updatedRow) : null;
+  } catch (error) {
+    try { database.exec('ROLLBACK'); } catch { /* ignore */ }
+    throw error;
+  }
+}
+
+export function updateProcessedProjectionSummary(input: {
+  projectionId: string;
+  summary: string;
+  ownerUserId?: string;
+  createdByUserId?: string;
+  updatedByUserId?: string;
+  now?: number;
+}): ProcessedContextProjection | null {
+  const database = ensureDb();
+  const now = input.now ?? Date.now();
+  const summary = input.summary.trim();
+  if (!summary) throw new Error('memory summary is required');
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    const existingRow = database.prepare('SELECT * FROM context_processed_local WHERE id = ?')
+      .get(input.projectionId) as Record<string, unknown> | undefined;
+    if (!existingRow) {
+      database.exec('COMMIT');
+      return null;
+    }
+    const projectionClass = String(existingRow.class) as ProcessedContextClass;
+    const namespaceKey = String(existingRow.namespace_key);
+    const priorContent = parseJson<Record<string, unknown>>(existingRow.content_json, {});
+    const nextContent = {
+      ...priorContent,
+      summary,
+      text: summary,
+      manuallyEdited: true,
+      ...(input.ownerUserId && typeof priorContent.ownerUserId !== 'string' ? { ownerUserId: input.ownerUserId } : {}),
+      ...(input.createdByUserId && typeof priorContent.createdByUserId !== 'string' ? { createdByUserId: input.createdByUserId } : {}),
+      ...(input.updatedByUserId ? { updatedByUserId: input.updatedByUserId } : {}),
+    };
+    const nextSummaryFingerprint = typeof existingRow.summary_fingerprint === 'string' && existingRow.summary_fingerprint
+      ? projectionFingerprint(summary)
+      : null;
+    if (nextSummaryFingerprint) {
+      const conflict = database.prepare(`
+        SELECT id FROM context_processed_local
+        WHERE namespace_key = ? AND class = ? AND summary_fingerprint = ? AND id <> ?
+        LIMIT 1
+      `).get(namespaceKey, projectionClass, nextSummaryFingerprint, input.projectionId) as { id: string } | undefined;
+      if (conflict) throw new Error(`projection update conflicts with existing projection ${conflict.id}`);
+    }
+    const nextContentJson = JSON.stringify(nextContent);
+    database.prepare(`
+      UPDATE context_processed_local
+      SET summary = ?,
+          content_json = ?,
+          content_hash = ?,
+          updated_at = ?,
+          summary_fingerprint = ?,
+          embedding = NULL,
+          embedding_source = NULL
+      WHERE id = ?
+    `).run(
+      summary,
+      nextContentJson,
+      projectionContentHash(summary, nextContent),
+      now,
+      nextSummaryFingerprint,
+      input.projectionId,
+    );
+
+    const observationRows = database.prepare('SELECT * FROM context_observations WHERE projection_id = ?')
+      .all(input.projectionId) as Array<Record<string, unknown>>;
+    for (const observationRow of observationRows) {
+      const observation = observationRowFromDb(observationRow);
+      const nextObservationContent = {
+        ...observation.content,
+        summary,
+        text: summary,
+        projectionClass,
+        ...(input.ownerUserId && typeof observation.content.ownerUserId !== 'string' ? { ownerUserId: input.ownerUserId } : {}),
+        ...(input.createdByUserId && typeof observation.content.createdByUserId !== 'string' ? { createdByUserId: input.createdByUserId } : {}),
+        ...(input.updatedByUserId ? { updatedByUserId: input.updatedByUserId } : {}),
+      };
+      const observationFingerprint = projectionFingerprint(summary);
+      const textHash = computeObservationTextHash(summary);
+      const conflict = database.prepare(`
+        SELECT id FROM context_observations
+        WHERE namespace_id = ? AND class = ? AND fingerprint = ? AND text_hash = ? AND id <> ?
+        LIMIT 1
+      `).get(observation.namespaceId, observation.class, observationFingerprint, textHash, observation.id) as { id: string } | undefined;
+      if (conflict) throw new Error(`observation update conflicts with existing observation ${conflict.id}`);
+      database.prepare(`
+        UPDATE context_observations
+        SET fingerprint = ?, content_json = ?, text_hash = ?, updated_at = ?
+        WHERE id = ?
+      `).run(observationFingerprint, JSON.stringify(nextObservationContent), textHash, now, observation.id);
+    }
+
+    const updatedRow = database.prepare('SELECT * FROM context_processed_local WHERE id = ?')
+      .get(input.projectionId) as Record<string, unknown> | undefined;
+    database.exec('COMMIT');
+    return updatedRow ? processedProjectionFromRow(updatedRow) : null;
+  } catch (error) {
+    try { database.exec('ROLLBACK'); } catch { /* ignore */ }
+    throw error;
+  }
 }
 
 export function promoteContextObservation(input: {
@@ -3022,10 +3295,18 @@ export function archiveMemory(id: string): boolean {
  */
 export function deleteMemory(id: string): boolean {
   const database = ensureDb();
-  const result = database.prepare('DELETE FROM context_processed_local WHERE id = ?').run(id);
-  const deleted = ((result as { changes: number }).changes ?? 0) > 0;
-  if (deleted) {
-    removeProjectionIdsFromReplicationState(database, [id]);
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    const result = database.prepare('DELETE FROM context_processed_local WHERE id = ?').run(id);
+    const deleted = ((result as { changes: number }).changes ?? 0) > 0;
+    if (deleted) {
+      database.prepare('DELETE FROM context_observations WHERE projection_id = ?').run(id);
+      removeProjectionIdsFromReplicationState(database, [id]);
+    }
+    database.exec('COMMIT');
+    return deleted;
+  } catch (error) {
+    try { database.exec('ROLLBACK'); } catch { /* ignore */ }
+    throw error;
   }
-  return deleted;
 }

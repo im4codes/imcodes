@@ -4,6 +4,7 @@ import { incrementCounter } from '../util/metrics.js';
 export type RuntimeMemoryCacheInvalidationEvent =
   | { kind: 'preference'; userId: string }
   | { kind: 'observation'; observationId: string; namespace?: ContextNamespace }
+  | { kind: 'projection'; projectionId: string; namespace?: ContextNamespace }
   | { kind: 'md_ingest'; projectDir: string; namespace: ContextNamespace }
   | { kind: 'skill_registry' };
 

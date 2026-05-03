@@ -18,7 +18,7 @@ import {
   type MemoryProjectResolutionStatus,
 } from '@shared/memory-project-options.js';
 import { MEMORY_FEATURE_FLAGS_BY_NAME, memoryFeatureFlagEnvKey, type MemoryFeatureFlag } from '@shared/feature-flags.js';
-import { AUTHORED_CONTEXT_SCOPES, MEMORY_SCOPES, type AuthoredContextScope, type MemoryScope } from '@shared/memory-scope.js';
+import { AUTHORED_CONTEXT_SCOPES, canPromoteMemoryScope, MEMORY_SCOPES, type AuthoredContextScope, type MemoryScope } from '@shared/memory-scope.js';
 import { OBSERVATION_CLASSES, type ObservationClass } from '@shared/memory-observation.js';
 import {
   DEFAULT_MEMORY_RECALL_MIN_SCORE,
@@ -431,6 +431,16 @@ const memoryProcessedNoteStyle = {
   fontSize: 12,
 } as const;
 
+const promotionConfirmStyle = {
+  ...memoryProcessedNoteStyle,
+  border: `1px solid rgba(251,191,36,0.35)`,
+  background: 'rgba(251,191,36,0.08)',
+  color: DT.text.primary,
+  display: 'flex',
+  flexDirection: 'column',
+  gap: DT.space.sm,
+} as const;
+
 const processingGridStyle = {
   display: 'grid',
   gridTemplateColumns: SC_IS_MOBILE ? '1fr' : 'repeat(auto-fit, minmax(300px, 1fr))',
@@ -672,19 +682,31 @@ type MemoryObservationClassFilter = '' | ObservationClass;
 type MemoryResponseStatus = 'idle' | 'loading' | 'ready' | 'unavailable' | 'timeout' | 'error';
 type TimeoutHandle = ReturnType<typeof setTimeout>;
 const MD_INGEST_UI_SCOPES = ['personal', 'project_shared'] as const satisfies readonly MemoryScope[];
+interface PendingObservationPromotion {
+  observationId: string;
+  fromScope: MemoryScope;
+  toScope: MemoryScope;
+  reason?: string;
+}
 type MemoryAdminRequestSurface =
   | 'projectResolve'
   | 'features'
   | 'featureSet'
   | 'preferences'
+  | 'memoryCreate'
+  | 'memoryUpdate'
+  | 'memoryPin'
   | 'skills'
   | 'observations'
   | 'prefCreate'
+  | 'prefUpdate'
   | 'prefDelete'
   | 'skillRebuild'
   | 'skillRead'
   | 'skillDelete'
   | 'mdIngest'
+  | 'observationUpdate'
+  | 'observationDelete'
   | 'observationPromote';
 
 interface Props {
@@ -1274,14 +1296,20 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     features: null,
     featureSet: null,
     preferences: null,
+    memoryCreate: null,
+    memoryUpdate: null,
+    memoryPin: null,
     skills: null,
     observations: null,
     prefCreate: null,
+    prefUpdate: null,
     prefDelete: null,
     skillRebuild: null,
     skillRead: null,
     skillDelete: null,
     mdIngest: null,
+    observationUpdate: null,
+    observationDelete: null,
     observationPromote: null,
   });
 
@@ -1340,6 +1368,10 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [resolvedMemoryProjects, setResolvedMemoryProjects] = useState<Record<string, MemoryProjectOption>>({});
   const [resolvingMemoryProjectIds, setResolvingMemoryProjectIds] = useState<Set<string>>(new Set());
   const [memoryQuery, setMemoryQuery] = useState('');
+  const [manualMemoryText, setManualMemoryText] = useState('');
+  const [manualMemoryProjectionClass, setManualMemoryProjectionClass] = useState<'recent_summary' | 'durable_memory_candidate'>('durable_memory_candidate');
+  const [editingMemoryId, setEditingMemoryId] = useState<string | null>(null);
+  const [editingMemoryText, setEditingMemoryText] = useState('');
   const [memoryProjectionClass, setMemoryProjectionClass] = useState<'' | 'recent_summary' | 'durable_memory_candidate'>('');
   const [localPersonalMemory, setLocalPersonalMemory] = useState<ContextMemoryView>(EMPTY_MEMORY_VIEW);
   const [localPersonalMemoryStatus, setLocalPersonalMemoryStatus] = useState<MemoryResponseStatus>('idle');
@@ -1358,6 +1390,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [preferenceFeatureEnabled, setPreferenceFeatureEnabled] = useState<boolean | null>(null);
   const preferenceUserId = 'server-derived';
   const [preferenceText, setPreferenceText] = useState('');
+  const [editingPreferenceId, setEditingPreferenceId] = useState<string | null>(null);
   const [preferenceSearch, setPreferenceSearch] = useState('');
   const [skillEntries, setSkillEntries] = useState<MemorySkillAdminRecord[]>([]);
   const [skillSearch, setSkillSearch] = useState('');
@@ -1376,6 +1409,9 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [observationClass, setObservationClass] = useState<MemoryObservationClassFilter>('');
   const [promotionTargetScope, setPromotionTargetScope] = useState<MemoryScope>('project_shared');
   const [promotionReason, setPromotionReason] = useState('');
+  const [pendingObservationPromotion, setPendingObservationPromotion] = useState<PendingObservationPromotion | null>(null);
+  const [editingObservationId, setEditingObservationId] = useState<string | null>(null);
+  const [editingObservationText, setEditingObservationText] = useState('');
   const [memoryFeaturesStatus, setMemoryFeaturesStatus] = useState<MemoryResponseStatus>('idle');
   const memoryFeatureRecordByFlag = useMemo(() => new Map<MemoryFeatureFlag, MemoryFeatureAdminRecord>(
     memoryFeatureRecords.map((record) => [record.flag, record]),
@@ -1515,16 +1551,24 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     opts?: {
       allowArchiveRestore?: boolean;
       allowDelete?: boolean;
+      allowEdit?: boolean;
+      allowPin?: boolean;
       onArchive?: (id: string, projectId?: string) => void;
       onRestore?: (id: string, projectId?: string) => void;
       onDelete?: (id: string, projectId?: string) => void;
+      onUpdate?: (id: string, projectId?: string) => void;
+      onPin?: (id: string, projectId?: string) => void;
     },
   ) => {
     const allowActions = opts?.allowArchiveRestore ?? false;
     const allowDelete = opts?.allowDelete ?? false;
+    const allowEdit = opts?.allowEdit ?? false;
+    const allowPin = opts?.allowPin ?? false;
     const onArchive = opts?.onArchive;
     const onRestore = opts?.onRestore;
     const onDelete = opts?.onDelete;
+    const onUpdate = opts?.onUpdate;
+    const onPin = opts?.onPin;
     const visibleRecords = showArchived ? view.records : view.records.filter((r) => (r.status ?? 'active') === 'active');
     const recentRecords = visibleRecords.filter((record) => record.projectionClass === 'recent_summary');
     const durableRecords = visibleRecords.filter((record) => record.projectionClass === 'durable_memory_candidate');
@@ -1574,6 +1618,15 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                       <span style={metaChipStyle} title={record.projectId}>{record.projectId.split('/').pop()}</span>
                       <span style={metaChipStyle}>{getMemoryRecordClassLabel(t, record.projectionClass)}</span>
                       <span style={metaChipStyle}>{record.sourceEventCount} {t('sharedContext.management.memoryRecordSources').toLowerCase()}</span>
+                      {record.ownerUserId ? (
+                        <span style={metaChipStyle}>{t('sharedContext.management.memoryRecordOwner')}: {record.ownerUserId}</span>
+                      ) : null}
+                      {record.createdByUserId && record.createdByUserId !== record.ownerUserId ? (
+                        <span style={metaChipStyle}>{t('sharedContext.management.memoryRecordCreatedBy')}: {record.createdByUserId}</span>
+                      ) : null}
+                      {record.updatedByUserId && record.updatedByUserId !== (record.createdByUserId ?? record.ownerUserId) ? (
+                        <span style={metaChipStyle}>{t('sharedContext.management.memoryRecordUpdatedBy')}: {record.updatedByUserId}</span>
+                      ) : null}
                       {isArchived ? (
                         <span style={archiveBadgeStyle}>{t('sharedContext.management.memoryArchived')}</span>
                       ) : null}
@@ -1591,8 +1644,29 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                           ? t('sharedContext.management.memoryLastRecalled', { time: formatRelativeTime(record.lastUsedAt, t) })
                           : t('sharedContext.management.memoryNeverRecalled')}
                       </span>
-                      {allowActions || allowDelete ? (
+                      {allowActions || allowDelete || allowEdit || allowPin ? (
                         <span style={{ marginLeft: 'auto', display: 'inline-flex', gap: 6, flexWrap: 'wrap' }}>
+                          {allowEdit ? (
+                            <button
+                              type="button"
+                              style={archiveRestoreButtonStyle}
+                              onClick={() => {
+                                setEditingMemoryId(record.id);
+                                setEditingMemoryText(record.summary);
+                              }}
+                            >
+                              {t('sharedContext.management.memoryEdit')}
+                            </button>
+                          ) : null}
+                          {allowPin ? (
+                            <button
+                              type="button"
+                              style={archiveRestoreButtonStyle}
+                              onClick={() => onPin?.(record.id, record.projectId)}
+                            >
+                              {t('sharedContext.management.memoryPin')}
+                            </button>
+                          ) : null}
                           {allowActions ? (
                             isArchived ? (
                               <button
@@ -1643,6 +1717,36 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                         }}
                       />
                     ) : null}
+                    {allowEdit && editingMemoryId === record.id ? (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: DT.space.sm }}>
+                        <textarea
+                          value={editingMemoryText}
+                          onInput={(e) => setEditingMemoryText((e.currentTarget as HTMLTextAreaElement).value)}
+                          aria-label={t('sharedContext.management.memoryEditTextLabel')}
+                          style={{ ...inputStyle, minHeight: 96, resize: 'vertical' }}
+                        />
+                        <div style={rowStyle}>
+                          <button
+                            type="button"
+                            style={buttonStyle}
+                            disabled={!editingMemoryText.trim()}
+                            onClick={() => onUpdate?.(record.id, record.projectId)}
+                          >
+                            {t('sharedContext.management.memoryUpdate')}
+                          </button>
+                          <button
+                            type="button"
+                            style={subtleButtonStyle}
+                            onClick={() => {
+                              setEditingMemoryId(null);
+                              setEditingMemoryText('');
+                            }}
+                          >
+                            {t('sharedContext.management.memoryEditCancel')}
+                          </button>
+                        </div>
+                      </div>
+                    ) : null}
                   </div>
                 );
               })}
@@ -1651,7 +1755,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         ))}
       </div>
     );
-  }, [deletingMemoryIds, expandedMemoryRecordIds, t, showArchived]);
+  }, [deletingMemoryIds, editingMemoryId, editingMemoryText, expandedMemoryRecordIds, t, showArchived]);
 
   const selectedDocument = useMemo(
     () => documents.find((entry) => entry.id === selectedDocumentId) ?? null,
@@ -1767,6 +1871,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const browseCanonicalRepoId = selectedBrowseMemoryProject?.canonicalRepoId?.trim() || undefined;
   const selectedCanonicalRepoId = selectedMemoryProject?.canonicalRepoId?.trim() || memoryProjectId.trim() || undefined;
   const selectedProjectDir = selectedMemoryProject?.projectDir?.trim() || memoryAdminProjectDir.trim() || undefined;
+  const manualMemoryCanonicalRepoId = selectedCanonicalRepoId || browseCanonicalRepoId;
   const selectedMdProjectDir = selectedMemoryProject?.projectDir?.trim() || mdIngestProjectDir.trim() || undefined;
   const selectedMdCanonicalRepoId = selectedMemoryProject?.canonicalRepoId?.trim() || mdIngestCanonicalRepoId.trim() || memoryProjectId.trim() || undefined;
 
@@ -2245,6 +2350,36 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         if (msg.featureEnabled !== undefined) setPreferenceFeatureEnabled(msg.featureEnabled);
         return;
       }
+      if (msg.type === MEMORY_WS.CREATE_RESPONSE) {
+        if (!isCurrentMemoryAdminResponse('memoryCreate', msg.requestId)) return;
+        if (msg.success) {
+          setManualMemoryText('');
+          setNotice(t('sharedContext.notice.memoryCreated'));
+          void loadMemoryViews();
+          loadMemoryAdminViews();
+        } else setError(memoryAdminErrorMessage(msg.errorCode, msg.error));
+        return;
+      }
+      if (msg.type === MEMORY_WS.UPDATE_RESPONSE) {
+        if (!isCurrentMemoryAdminResponse('memoryUpdate', msg.requestId)) return;
+        if (msg.success) {
+          setEditingMemoryId(null);
+          setEditingMemoryText('');
+          setNotice(t('sharedContext.notice.memoryUpdated'));
+          void loadMemoryViews();
+          loadMemoryAdminViews();
+        } else setError(memoryAdminErrorMessage(msg.errorCode, msg.error));
+        return;
+      }
+      if (msg.type === MEMORY_WS.PIN_RESPONSE) {
+        if (!isCurrentMemoryAdminResponse('memoryPin', msg.requestId)) return;
+        if (msg.success) {
+          setNotice(t('sharedContext.notice.memoryPinned'));
+          void loadMemoryViews();
+          loadMemoryAdminViews();
+        } else setError(memoryAdminErrorMessage(msg.errorCode, msg.error));
+        return;
+      }
       if (msg.type === MEMORY_WS.SKILL_RESPONSE) {
         if (!isCurrentMemoryAdminResponse('skills', msg.requestId)) return;
         setSkillEntries(msg.entries ?? []);
@@ -2261,7 +2396,18 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         if (!isCurrentMemoryAdminResponse('prefCreate', msg.requestId)) return;
         if (msg.success) {
           setPreferenceText('');
+          setEditingPreferenceId(null);
           setNotice(t('sharedContext.notice.memoryPreferenceSaved'));
+          loadMemoryAdminViews();
+        } else setError(memoryAdminErrorMessage(msg.errorCode, msg.error));
+        return;
+      }
+      if (msg.type === MEMORY_WS.PREF_UPDATE_RESPONSE) {
+        if (!isCurrentMemoryAdminResponse('prefUpdate', msg.requestId)) return;
+        if (msg.success) {
+          setPreferenceText('');
+          setEditingPreferenceId(null);
+          setNotice(t('sharedContext.notice.memoryPreferenceUpdated'));
           loadMemoryAdminViews();
         } else setError(memoryAdminErrorMessage(msg.errorCode, msg.error));
         return;
@@ -2311,8 +2457,30 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       }
       if (msg.type === MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE) {
         if (!isCurrentMemoryAdminResponse('observationPromote', msg.requestId)) return;
+        setPendingObservationPromotion(null);
         if (msg.success) {
           setNotice(t('sharedContext.notice.memoryObservationPromoted'));
+          loadMemoryAdminViews();
+        } else setError(memoryAdminErrorMessage(msg.errorCode, msg.error));
+        return;
+      }
+      if (msg.type === MEMORY_WS.OBSERVATION_UPDATE_RESPONSE) {
+        if (!isCurrentMemoryAdminResponse('observationUpdate', msg.requestId)) return;
+        if (msg.success) {
+          setEditingObservationId(null);
+          setEditingObservationText('');
+          setNotice(t('sharedContext.notice.memoryObservationUpdated'));
+          loadMemoryAdminViews();
+        } else setError(memoryAdminErrorMessage(msg.errorCode, msg.error));
+        return;
+      }
+      if (msg.type === MEMORY_WS.OBSERVATION_DELETE_RESPONSE) {
+        if (!isCurrentMemoryAdminResponse('observationDelete', msg.requestId)) return;
+        if (msg.success) {
+          setEditingObservationId(null);
+          setEditingObservationText('');
+          setPendingObservationPromotion(null);
+          setNotice(t('sharedContext.notice.memoryObservationDeleted'));
           loadMemoryAdminViews();
         } else setError(memoryAdminErrorMessage(msg.errorCode, msg.error));
       }
@@ -2361,6 +2529,40 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     });
   }, [ws, loadMemoryViews, selectedCanonicalRepoId]);
 
+  const handleManualMemoryCreate = useCallback(() => {
+    const text = manualMemoryText.trim();
+    if (!ws || !text || !manualMemoryCanonicalRepoId) return;
+    ws.send({
+      type: MEMORY_WS.CREATE,
+      requestId: markMemoryAdminRequest('memoryCreate'),
+      text,
+      projectionClass: manualMemoryProjectionClass,
+      canonicalRepoId: manualMemoryCanonicalRepoId,
+    });
+  }, [manualMemoryCanonicalRepoId, manualMemoryProjectionClass, manualMemoryText, markMemoryAdminRequest, ws]);
+
+  const handleLocalMemoryUpdate = useCallback((id: string, recordProjectId?: string) => {
+    const text = editingMemoryText.trim();
+    if (!ws || !text) return;
+    ws.send({
+      type: MEMORY_WS.UPDATE,
+      requestId: markMemoryAdminRequest('memoryUpdate'),
+      id,
+      text,
+      canonicalRepoId: recordProjectId || selectedCanonicalRepoId || browseCanonicalRepoId,
+    });
+  }, [browseCanonicalRepoId, editingMemoryText, markMemoryAdminRequest, selectedCanonicalRepoId, ws]);
+
+  const handleLocalMemoryPin = useCallback((id: string, recordProjectId?: string) => {
+    if (!ws) return;
+    ws.send({
+      type: MEMORY_WS.PIN,
+      requestId: markMemoryAdminRequest('memoryPin'),
+      id,
+      canonicalRepoId: recordProjectId || selectedCanonicalRepoId || browseCanonicalRepoId,
+    });
+  }, [browseCanonicalRepoId, markMemoryAdminRequest, selectedCanonicalRepoId, ws]);
+
 
   const confirmMemoryDelete = useCallback((recordId: string) => {
     const confirmed = globalThis.confirm?.(t('sharedContext.management.memoryDeleteConfirm')) ?? true;
@@ -2380,7 +2582,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const handleLocalMemoryDelete = useCallback((id: string, recordProjectId?: string) => {
     if (!ws || !confirmMemoryDelete(id)) return;
     const requestId = crypto.randomUUID();
-    ws.send({ type: MEMORY_WS.DELETE, requestId, id, canonicalRepoId: recordProjectId || selectedCanonicalRepoId });
+    ws.send({ type: MEMORY_WS.DELETE, requestId, id, canonicalRepoId: recordProjectId || selectedCanonicalRepoId || browseCanonicalRepoId });
     const unsub = ws.onMessage((msg) => {
       if (msg.type !== MEMORY_WS.DELETE_RESPONSE || msg.requestId !== requestId) return;
       unsub();
@@ -2388,7 +2590,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       if (msg.success) void loadMemoryViews();
       else setError(msg.error || t('sharedContext.management.memoryDeleteFailed'));
     });
-  }, [confirmMemoryDelete, finishMemoryDelete, loadMemoryViews, selectedCanonicalRepoId, t, ws]);
+  }, [browseCanonicalRepoId, confirmMemoryDelete, finishMemoryDelete, loadMemoryViews, selectedCanonicalRepoId, t, ws]);
 
   const handleCloudMemoryDelete = useCallback(async (id: string) => {
     if (!confirmMemoryDelete(id)) return;
@@ -2508,6 +2710,11 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const localMemoryUnavailable = localPersonalMemoryStatus === 'unavailable'
     || localPersonalMemoryStatus === 'timeout'
     || localPersonalMemoryStatus === 'error';
+  const manualMemoryDisabledReason = !ws
+    ? t('sharedContext.management.memoryToolDisabledNoDaemon')
+    : !manualMemoryCanonicalRepoId
+      ? t('sharedContext.management.memoryManualAddProjectRequired')
+      : null;
 
   const renderMemoryProjectPicker = () => (
     <div style={{ ...resourceCardStyle, gap: DT.space.sm }}>
@@ -3145,6 +3352,9 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     <span style={helperTextStyle}>{document.kind}</span>
                   </div>
                   <div style={metaGridStyle}>
+                    {document.createdByUserId ? (
+                      <MetaCard label={t('sharedContext.management.memoryRecordCreatedBy')} value={document.createdByUserId} />
+                    ) : null}
                     <MetaCard label={t('sharedContext.management.versions')} value={document.versions.length} />
                     <MetaCard label={t('sharedContext.management.activeVersion')} value={document.versions.find((version) => version.status === 'active')?.versionNumber ? `v${document.versions.find((version) => version.status === 'active')?.versionNumber}` : t('sharedContext.management.noneValue')} />
                   </div>
@@ -3246,6 +3456,9 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                       <MetaCard label={t('sharedContext.management.versionLabel')} value={binding.versionId} />
                       <MetaCard label={t('sharedContext.management.language')} value={binding.applicabilityLanguage || t('sharedContext.management.anyValue')} />
                       <MetaCard label={t('sharedContext.management.pathLabel')} value={binding.applicabilityPathPattern || t('sharedContext.management.anyValue')} />
+                      {binding.createdByUserId ? (
+                        <MetaCard label={t('sharedContext.management.memoryRecordCreatedBy')} value={binding.createdByUserId} />
+                      ) : null}
                     </div>
                   </div>
                 ))}
@@ -3777,20 +3990,41 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     placeholder={t('sharedContext.management.memoryPreferenceTextPlaceholder')}
                     style={inputStyle}
                   />
-                  <button
-                    type="button"
-                    style={buttonStyle}
-                    disabled={!!preferenceDisabledReason || !preferenceText.trim()}
-                    title={preferenceDisabledReason ?? undefined}
-                    onClick={() => ws?.send({
-                      type: MEMORY_WS.PREF_CREATE,
-                      requestId: markMemoryAdminRequest('prefCreate'),
-                      text: preferenceText.trim(),
-                    })}
-                  >
-                    {t('sharedContext.management.memoryPreferenceSave')}
-                  </button>
-                </div>
+	                  <button
+	                    type="button"
+	                    style={buttonStyle}
+	                    disabled={!!preferenceDisabledReason || !preferenceText.trim()}
+	                    title={preferenceDisabledReason ?? undefined}
+	                    onClick={() => ws?.send(editingPreferenceId
+	                      ? {
+	                        type: MEMORY_WS.PREF_UPDATE,
+	                        requestId: markMemoryAdminRequest('prefUpdate'),
+	                        id: editingPreferenceId,
+	                        text: preferenceText.trim(),
+	                      }
+	                      : {
+	                        type: MEMORY_WS.PREF_CREATE,
+	                        requestId: markMemoryAdminRequest('prefCreate'),
+	                        text: preferenceText.trim(),
+	                      })}
+	                  >
+	                    {editingPreferenceId
+	                      ? t('sharedContext.management.memoryPreferenceUpdate')
+	                      : t('sharedContext.management.memoryPreferenceSave')}
+	                  </button>
+	                  {editingPreferenceId ? (
+	                    <button
+	                      type="button"
+	                      style={subtleButtonStyle}
+	                      onClick={() => {
+	                        setEditingPreferenceId(null);
+	                        setPreferenceText('');
+	                      }}
+	                    >
+	                      {t('sharedContext.management.memoryEditCancel')}
+	                    </button>
+	                  ) : null}
+	                </div>
                 <input
                   value={preferenceSearch}
                   onInput={(e) => setPreferenceSearch((e.currentTarget as HTMLInputElement).value)}
@@ -3801,7 +4035,13 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                   {filteredPreferenceRecords.length > 0 ? filteredPreferenceRecords.map((record) => (
                     <div key={record.id} style={resourceCardStyle}>
                       <div style={metaGridStyle}>
-                        <MetaCard label={t('sharedContext.management.memoryPreferenceUser')} value={record.userId} />
+                        <MetaCard label={t('sharedContext.management.memoryPreferenceUser')} value={record.ownerUserId ?? record.userId} />
+                        {record.createdByUserId ? (
+                          <MetaCard label={t('sharedContext.management.memoryRecordCreatedBy')} value={record.createdByUserId} />
+                        ) : null}
+                        {record.updatedByUserId && record.updatedByUserId !== record.createdByUserId ? (
+                          <MetaCard label={t('sharedContext.management.memoryRecordUpdatedBy')} value={record.updatedByUserId} />
+                        ) : null}
                         <MetaCard label={t('sharedContext.management.memoryRecordUpdated')} value={new Date(record.updatedAt).toLocaleString()} />
                         <MetaCard label={t('sharedContext.management.memoryRecordStatus')} value={record.state} />
                       </div>
@@ -3820,11 +4060,23 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                             return next;
                           });
                         }}
-                      />
-                      <div style={rowStyle}>
-                        <button
-                          type="button"
-                          style={deleteButtonStyle}
+	                      />
+	                      <div style={rowStyle}>
+	                        <button
+	                          type="button"
+	                          style={subtleButtonStyle}
+	                          disabled={!!preferenceDisabledReason}
+	                          title={preferenceDisabledReason ?? undefined}
+	                          onClick={() => {
+	                            setEditingPreferenceId(record.id);
+	                            setPreferenceText(record.text);
+	                          }}
+	                        >
+	                          {t('sharedContext.management.memoryEdit')}
+	                        </button>
+	                        <button
+	                          type="button"
+	                          style={deleteButtonStyle}
                           disabled={!!preferenceDisabledReason}
                           title={preferenceDisabledReason ?? undefined}
                           onClick={() => {
@@ -4029,7 +4281,15 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                       <option key={classValue} value={classValue}>{t(`sharedContext.management.memoryObservationClass.${classValue}`)}</option>
                     ))}
                   </select>
-                  <select value={promotionTargetScope} onChange={(e) => setPromotionTargetScope((e.currentTarget as HTMLSelectElement).value as MemoryScope)} style={inputStyle}>
+                  <select
+                    value={promotionTargetScope}
+                    aria-label={t('sharedContext.management.memoryPromotionTargetLabel')}
+                    onChange={(e) => {
+                      setPromotionTargetScope((e.currentTarget as HTMLSelectElement).value as MemoryScope);
+                      setPendingObservationPromotion(null);
+                    }}
+                    style={inputStyle}
+                  >
                     {MEMORY_SCOPES.map((scopeValue) => (
                       <option key={scopeValue} value={scopeValue}>{t(`sharedContext.management.memoryScope.${scopeValue}`)}</option>
                     ))}
@@ -4038,11 +4298,15 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     value={promotionReason}
                     onInput={(e) => setPromotionReason((e.currentTarget as HTMLInputElement).value)}
                     placeholder={t('sharedContext.management.memoryPromotionReasonPlaceholder')}
+                    aria-label={t('sharedContext.management.memoryPromotionReasonLabel')}
                     style={inputStyle}
                   />
                   <button type="button" style={subtleButtonStyle} disabled={!ws} onClick={() => loadMemoryAdminViews()}>
                     {t('sharedContext.refresh')}
                   </button>
+                </div>
+                <div style={memoryProcessedNoteStyle}>
+                  {t('sharedContext.management.memoryPromotionHelp')}
                 </div>
                 <input
                   value={observationSearch}
@@ -4051,17 +4315,43 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                   style={inputStyle}
                 />
                 <div style={resourceListStyle}>
-                  {filteredObservationRecords.length > 0 ? filteredObservationRecords.map((record) => (
+                  {filteredObservationRecords.length > 0 ? filteredObservationRecords.map((record) => {
+                    const fromScopeLabel = t(`sharedContext.management.memoryScope.${record.scope}`);
+                    const toScopeLabel = t(`sharedContext.management.memoryScope.${promotionTargetScope}`);
+                    const canPromoteSelectedScope = canPromoteMemoryScope(record.scope, promotionTargetScope);
+                    const perRecordPromoteDisabledReason = observationPromoteDisabledReason
+                      ?? (!canPromoteSelectedScope
+                        ? t('sharedContext.management.memoryPromotionNotAllowed', { from: fromScopeLabel, to: toScopeLabel })
+                        : null);
+                    const pendingPromotionForRecord = pendingObservationPromotion?.observationId === record.id
+                      ? pendingObservationPromotion
+                      : null;
+                    const pendingFromScopeLabel = pendingPromotionForRecord
+                      ? t(`sharedContext.management.memoryScope.${pendingPromotionForRecord.fromScope}`)
+                      : fromScopeLabel;
+                    const pendingToScopeLabel = pendingPromotionForRecord
+                      ? t(`sharedContext.management.memoryScope.${pendingPromotionForRecord.toScope}`)
+                      : toScopeLabel;
+                    return (
                     <div key={record.id} style={resourceCardStyle}>
                       <div style={metaGridStyle}>
                         <MetaCard label={t('sharedContext.management.memoryRecordClass')} value={t(`sharedContext.management.memoryObservationClass.${record.class}`)} />
                         <MetaCard label={t('sharedContext.management.memoryRecordStatus')} value={record.state} />
                         <MetaCard label={t('sharedContext.management.memoryScopeLabel')} value={t(`sharedContext.management.memoryScope.${record.scope}`)} />
+                        {record.ownerUserId ? (
+                          <MetaCard label={t('sharedContext.management.memoryRecordOwner')} value={record.ownerUserId} />
+                        ) : null}
+                        {record.createdByUserId ? (
+                          <MetaCard label={t('sharedContext.management.memoryRecordCreatedBy')} value={record.createdByUserId} />
+                        ) : null}
+                        {record.updatedByUserId && record.updatedByUserId !== record.createdByUserId ? (
+                          <MetaCard label={t('sharedContext.management.memoryRecordUpdatedBy')} value={record.updatedByUserId} />
+                        ) : null}
                         <MetaCard label={t('sharedContext.management.memoryRecordUpdated')} value={new Date(record.updatedAt).toLocaleString()} />
                       </div>
-                      <MemoryRecordContent
-                        id={`observation-${record.id}`}
-                        text={record.text}
+	                      <MemoryRecordContent
+	                        id={`observation-${record.id}`}
+	                        text={record.text}
                         expanded={expandedMemoryRecordIds.has(`observation-${record.id}`)}
                         expandLabel={t('sharedContext.management.memoryExpand')}
                         collapseLabel={t('sharedContext.management.memoryCollapse')}
@@ -4072,31 +4362,142 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                             if (next.has(key)) next.delete(key);
                             else next.add(key);
                             return next;
-                          });
-                        }}
-                      />
-                      <div style={rowStyle}>
-                        <button
-                          type="button"
-                          style={subtleButtonStyle}
-                          disabled={!!observationPromoteDisabledReason}
-                          title={observationPromoteDisabledReason ?? undefined}
-                          onClick={() => ws?.send({
-                            type: MEMORY_WS.OBSERVATION_PROMOTE,
-                            requestId: markMemoryAdminRequest('observationPromote'),
-                            id: record.id,
-                            projectDir: selectedProjectDir,
-                            canonicalRepoId: selectedCanonicalRepoId,
-                            expectedFromScope: record.scope,
+	                          });
+	                        }}
+	                      />
+	                      {editingObservationId === record.id ? (
+	                        <div style={{ display: 'flex', flexDirection: 'column', gap: DT.space.sm }}>
+	                          <textarea
+	                            value={editingObservationText}
+	                            onInput={(e) => setEditingObservationText((e.currentTarget as HTMLTextAreaElement).value)}
+	                            aria-label={t('sharedContext.management.memoryObservationEditTextLabel')}
+	                            style={{ ...inputStyle, minHeight: 96, resize: 'vertical' }}
+	                          />
+	                          <div style={rowStyle}>
+	                            <button
+	                              type="button"
+	                              style={buttonStyle}
+	                              disabled={!!observationPromoteDisabledReason || !editingObservationText.trim()}
+	                              title={observationPromoteDisabledReason ?? undefined}
+	                              onClick={() => ws?.send({
+	                                type: MEMORY_WS.OBSERVATION_UPDATE,
+	                                requestId: markMemoryAdminRequest('observationUpdate'),
+	                                id: record.id,
+	                                expectedFromScope: record.scope,
+	                                text: editingObservationText.trim(),
+	                              })}
+	                            >
+	                              {t('sharedContext.management.memoryObservationUpdate')}
+	                            </button>
+	                            <button
+	                              type="button"
+	                              style={subtleButtonStyle}
+	                              onClick={() => {
+	                                setEditingObservationId(null);
+	                                setEditingObservationText('');
+	                              }}
+	                            >
+	                              {t('sharedContext.management.memoryEditCancel')}
+	                            </button>
+	                          </div>
+	                        </div>
+	                      ) : null}
+	                      <div style={rowStyle}>
+	                        <button
+	                          type="button"
+	                          style={subtleButtonStyle}
+	                          disabled={!!observationPromoteDisabledReason}
+	                          title={observationPromoteDisabledReason ?? undefined}
+	                          onClick={() => {
+	                            setPendingObservationPromotion(null);
+	                            setEditingObservationId(record.id);
+	                            setEditingObservationText(record.text);
+	                          }}
+	                        >
+	                          {t('sharedContext.management.memoryEdit')}
+	                        </button>
+	                        <button
+	                          type="button"
+	                          style={deleteButtonStyle}
+	                          disabled={!!observationPromoteDisabledReason}
+	                          title={observationPromoteDisabledReason ?? undefined}
+	                          onClick={() => {
+	                            const confirmed = globalThis.confirm?.(t('sharedContext.management.memoryObservationDeleteConfirm')) ?? true;
+	                            if (!confirmed) return;
+	                            ws?.send({
+	                              type: MEMORY_WS.OBSERVATION_DELETE,
+	                              requestId: markMemoryAdminRequest('observationDelete'),
+	                              id: record.id,
+	                              expectedFromScope: record.scope,
+	                            });
+	                          }}
+	                        >
+	                          {t('sharedContext.management.memoryDelete')}
+	                        </button>
+	                        <button
+	                          type="button"
+	                          style={subtleButtonStyle}
+                          disabled={!!perRecordPromoteDisabledReason}
+                          title={perRecordPromoteDisabledReason ?? t('sharedContext.management.memoryObservationPromoteTitle', { from: fromScopeLabel, to: toScopeLabel })}
+                          onClick={() => setPendingObservationPromotion({
+                            observationId: record.id,
+                            fromScope: record.scope,
                             toScope: promotionTargetScope,
                             reason: promotionReason.trim() || undefined,
                           })}
                         >
-                          {t('sharedContext.management.memoryObservationPromote')}
+                          {t('sharedContext.management.memoryObservationPromoteTo', { scope: toScopeLabel })}
                         </button>
                       </div>
+                      {pendingPromotionForRecord ? (
+                        <div
+                          style={promotionConfirmStyle}
+                          role="alertdialog"
+                          aria-label={t('sharedContext.management.memoryPromotionConfirmTitle')}
+                        >
+                          <strong>{t('sharedContext.management.memoryPromotionConfirmTitle')}</strong>
+                          <span>
+                            {t('sharedContext.management.memoryPromotionConfirmBody', {
+                              from: pendingFromScopeLabel,
+                              to: pendingToScopeLabel,
+                            })}
+                          </span>
+                          <span style={helperTextStyle}>
+                            {pendingPromotionForRecord.reason
+                              ? t('sharedContext.management.memoryPromotionReasonPreview', { reason: pendingPromotionForRecord.reason })
+                              : t('sharedContext.management.memoryPromotionNoReason')}
+                          </span>
+                          <div style={rowStyle}>
+                            <button
+                              type="button"
+                              style={subtleButtonStyle}
+                              onClick={() => setPendingObservationPromotion(null)}
+                            >
+                              {t('sharedContext.management.memoryPromotionCancel')}
+                            </button>
+                            <button
+                              type="button"
+                              style={buttonStyle}
+                              disabled={!ws}
+                              onClick={() => ws?.send({
+                                type: MEMORY_WS.OBSERVATION_PROMOTE,
+                                requestId: markMemoryAdminRequest('observationPromote'),
+                                id: pendingPromotionForRecord.observationId,
+                                projectDir: selectedProjectDir,
+                                canonicalRepoId: selectedCanonicalRepoId,
+                                expectedFromScope: pendingPromotionForRecord.fromScope,
+                                toScope: pendingPromotionForRecord.toScope,
+                                reason: pendingPromotionForRecord.reason,
+                              })}
+                            >
+                              {t('sharedContext.management.memoryPromotionConfirmAction')}
+                            </button>
+                          </div>
+                        </div>
+                      ) : null}
                     </div>
-                  )) : <div style={helperTextStyle}>{t('sharedContext.management.memoryObservationsEmpty')}</div>}
+                    );
+                  }) : <div style={helperTextStyle}>{t('sharedContext.management.memoryObservationsEmpty')}</div>}
                 </div>
               </div>
             </div>
@@ -4179,6 +4580,42 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     </button>
                   </div>
                 ) : null}
+                <div style={{ ...resourceCardStyle, gap: DT.space.sm }}>
+                  <SectionHeading
+                    title={t('sharedContext.management.memoryManualAddTitle')}
+                    description={t('sharedContext.management.memoryManualAddDescription')}
+                  />
+                  {manualMemoryDisabledReason ? (
+                    <div style={memoryProcessedNoteStyle}>{manualMemoryDisabledReason}</div>
+                  ) : null}
+                  <div style={adminFormRowStyle}>
+                    <select
+                      value={manualMemoryProjectionClass}
+                      onChange={(e) => setManualMemoryProjectionClass((e.currentTarget as HTMLSelectElement).value as 'recent_summary' | 'durable_memory_candidate')}
+                      aria-label={t('sharedContext.management.memoryManualAddClassLabel')}
+                      style={inputStyle}
+                    >
+                      <option value="durable_memory_candidate">{t('sharedContext.management.memoryDurableCandidate')}</option>
+                      <option value="recent_summary">{t('sharedContext.management.memoryRecentSummary')}</option>
+                    </select>
+                    <textarea
+                      value={manualMemoryText}
+                      onInput={(e) => setManualMemoryText((e.currentTarget as HTMLTextAreaElement).value)}
+                      placeholder={t('sharedContext.management.memoryManualAddPlaceholder')}
+                      aria-label={t('sharedContext.management.memoryManualAddTextLabel')}
+                      style={{ ...inputStyle, minHeight: 76, resize: 'vertical' }}
+                    />
+                    <button
+                      type="button"
+                      style={buttonStyle}
+                      disabled={!!manualMemoryDisabledReason || !manualMemoryText.trim()}
+                      title={manualMemoryDisabledReason ?? undefined}
+                      onClick={handleManualMemoryCreate}
+                    >
+                      {t('sharedContext.management.memoryManualAddSave')}
+                    </button>
+                  </div>
+                </div>
                 <div
                   style={{
                     display: 'flex',
@@ -4195,7 +4632,17 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 {localMemoryUnavailable
                   ? null
                   : localPersonalMemory.records.length > 0
-                  ? renderProcessedMemoryRecords(localPersonalMemory, { allowArchiveRestore: true, allowDelete: true, onArchive: handleMemoryArchive, onRestore: handleMemoryRestore, onDelete: handleLocalMemoryDelete })
+                  ? renderProcessedMemoryRecords(localPersonalMemory, {
+                    allowArchiveRestore: true,
+                    allowDelete: true,
+                    allowEdit: true,
+                    allowPin: true,
+                    onArchive: handleMemoryArchive,
+                    onRestore: handleMemoryRestore,
+                    onDelete: handleLocalMemoryDelete,
+                    onUpdate: handleLocalMemoryUpdate,
+                    onPin: handleLocalMemoryPin,
+                  })
                   : (
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                       <div style={helperTextStyle}>

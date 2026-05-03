@@ -132,14 +132,18 @@ export type ServerMessage =
     error?: string;
     errorCode?: MemoryManagementErrorCode;
   }
-  | { type: typeof MEMORY_WS.ARCHIVE_RESPONSE; requestId?: string; success: boolean; error?: string }
-  | { type: typeof MEMORY_WS.RESTORE_RESPONSE; requestId?: string; success: boolean; error?: string }
-  | { type: typeof MEMORY_WS.DELETE_RESPONSE; requestId?: string; success: boolean; error?: string }
+  | { type: typeof MEMORY_WS.ARCHIVE_RESPONSE; requestId?: string; success: boolean; error?: string; errorCode?: MemoryManagementErrorCode }
+  | { type: typeof MEMORY_WS.RESTORE_RESPONSE; requestId?: string; success: boolean; error?: string; errorCode?: MemoryManagementErrorCode }
+  | { type: typeof MEMORY_WS.CREATE_RESPONSE; requestId?: string; success: boolean; id?: string; error?: string; errorCode?: MemoryManagementErrorCode }
+  | { type: typeof MEMORY_WS.UPDATE_RESPONSE; requestId?: string; success: boolean; id?: string; error?: string; errorCode?: MemoryManagementErrorCode }
+  | { type: typeof MEMORY_WS.PIN_RESPONSE; requestId?: string; success: boolean; id?: string; error?: string; errorCode?: MemoryManagementErrorCode }
+  | { type: typeof MEMORY_WS.DELETE_RESPONSE; requestId?: string; success: boolean; error?: string; errorCode?: MemoryManagementErrorCode }
   | ({ type: typeof MEMORY_WS.PROJECT_RESOLVE_RESPONSE } & MemoryProjectResolveResponsePayload)
   | { type: typeof MEMORY_WS.FEATURES_RESPONSE; requestId?: string; records: MemoryFeatureAdminRecord[] }
   | ({ type: typeof MEMORY_WS.FEATURES_SET_RESPONSE } & MemoryFeatureSetResponse)
   | { type: typeof MEMORY_WS.PREF_RESPONSE; requestId?: string; records: MemoryPreferenceAdminRecord[]; featureEnabled?: boolean }
   | { type: typeof MEMORY_WS.PREF_CREATE_RESPONSE; requestId?: string; success: boolean; id?: string; error?: string; errorCode?: MemoryManagementErrorCode }
+  | { type: typeof MEMORY_WS.PREF_UPDATE_RESPONSE; requestId?: string; success: boolean; id?: string; error?: string; errorCode?: MemoryManagementErrorCode }
   | { type: typeof MEMORY_WS.PREF_DELETE_RESPONSE; requestId?: string; success: boolean; error?: string; errorCode?: MemoryManagementErrorCode }
   | { type: typeof MEMORY_WS.SKILL_RESPONSE; requestId?: string; entries: MemorySkillAdminRecord[]; sourceCounts?: Record<string, number>; featureEnabled?: boolean }
   | { type: typeof MEMORY_WS.SKILL_REBUILD_RESPONSE; requestId?: string; success: boolean; userCount?: number; projectCount?: number; error?: string; errorCode?: MemoryManagementErrorCode }
@@ -147,6 +151,8 @@ export type ServerMessage =
   | { type: typeof MEMORY_WS.SKILL_DELETE_RESPONSE; requestId?: string; success: boolean; error?: string; errorCode?: MemoryManagementErrorCode }
   | { type: typeof MEMORY_WS.MD_INGEST_RUN_RESPONSE; requestId?: string; success: boolean; filesChecked?: number; observationsWritten?: number; error?: string; errorCode?: MemoryManagementErrorCode; featureEnabled?: boolean }
   | { type: typeof MEMORY_WS.OBSERVATION_RESPONSE; requestId?: string; records: MemoryObservationAdminRecord[]; featureEnabled?: boolean }
+  | { type: typeof MEMORY_WS.OBSERVATION_UPDATE_RESPONSE; requestId?: string; success: boolean; id?: string; error?: string; errorCode?: MemoryManagementErrorCode }
+  | { type: typeof MEMORY_WS.OBSERVATION_DELETE_RESPONSE; requestId?: string; success: boolean; error?: string; errorCode?: MemoryManagementErrorCode }
   | { type: typeof MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE; requestId?: string; success: boolean; audit?: Record<string, unknown>; error?: string; errorCode?: MemoryManagementErrorCode };
 
 export type {

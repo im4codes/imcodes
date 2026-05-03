@@ -10,8 +10,12 @@ import {
   listObservationPromotionAudits,
   promoteContextObservation,
   rejectAutomaticObservationPromotion,
+  getProjectionEmbedding,
+  saveProjectionEmbedding,
+  updateContextObservationText,
   writeContextObservation,
   writeProcessedProjection,
+  deleteMemory,
 } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 
@@ -77,9 +81,17 @@ describe('post-1.1 context namespace and observation store', () => {
         projectionId: projection.id,
         sourceEventIds: ['evt-1'],
         state: 'active',
+        content: expect.objectContaining({
+          ownerUserId: 'user-1',
+          createdByUserId: 'user-1',
+        }),
       }),
     ]);
     expect(projection.origin).toBe('chat_compacted');
+    expect(projection.content).toEqual(expect.objectContaining({
+      ownerUserId: 'user-1',
+      createdByUserId: 'user-1',
+    }));
   });
 
   it('keeps legacy personal namespaces without user ids readable while binding observations locally', () => {
@@ -175,6 +187,58 @@ describe('post-1.1 context namespace and observation store', () => {
         sourceEventIds: ['evt-a', 'evt-b'],
       }),
     ]);
+  });
+
+  it('deletes linked observations when deleting a processed memory projection', () => {
+    const projection = writeProcessedProjection({
+      namespace,
+      class: 'durable_memory_candidate',
+      origin: 'user_note',
+      sourceEventIds: ['evt-delete-linked'],
+      summary: 'Delete the linked observation with this memory',
+      content: { text: 'Delete the linked observation with this memory', observationClass: 'note' },
+      createdAt: 100,
+      updatedAt: 110,
+    });
+
+    expect(listContextObservations({ projectionId: projection.id })).toHaveLength(1);
+    expect(deleteMemory(projection.id)).toBe(true);
+    expect(listContextObservations({ projectionId: projection.id })).toHaveLength(0);
+    expect(deleteMemory(projection.id)).toBe(false);
+  });
+
+  it('clears stale projection embeddings when editing a linked observation', () => {
+    const projection = writeProcessedProjection({
+      namespace,
+      class: 'durable_memory_candidate',
+      origin: 'user_note',
+      sourceEventIds: ['evt-edit-linked'],
+      summary: 'Original linked observation text',
+      content: { text: 'Original linked observation text', observationClass: 'note' },
+      createdAt: 100,
+      updatedAt: 110,
+    });
+    const observation = listContextObservations({ projectionId: projection.id })[0];
+    expect(observation).toBeTruthy();
+    saveProjectionEmbedding(projection.id, Buffer.from([1, 2, 3, 4]), projection.summary);
+    expect(getProjectionEmbedding(projection.id)?.embeddingSource).toBe(projection.summary);
+
+    const updated = updateContextObservationText({
+      observationId: observation.id,
+      text: 'Edited linked observation text',
+      fingerprint: 'fp-edited-linked-observation',
+      observationClass: observation.class,
+      now: 200,
+    });
+
+    expect(updated).toMatchObject({
+      id: observation.id,
+      content: expect.objectContaining({ text: 'Edited linked observation text' }),
+    });
+    const embedding = getProjectionEmbedding(projection.id);
+    expect(embedding?.summary).toBe('Edited linked observation text');
+    expect(embedding?.embedding).toBeNull();
+    expect(embedding?.embeddingSource).toBeNull();
   });
 
   it('rejects observations whose scope does not match the namespace scope', () => {

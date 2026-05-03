@@ -186,6 +186,56 @@ describe('WsBridge memory management routing', () => {
     expect((ctx?.boundProjects as Array<Record<string, unknown>> | undefined)?.[0]?.canonicalRepoId).toBeUndefined();
   });
 
+  it('does not forward unverified canonical project hints as authorized bindings', async () => {
+    const db = makeDb(async (sql: string) => {
+      if (sql.includes('token_hash')) return { token_hash: 'valid-hash' };
+      return null;
+    });
+    const { daemon, browserA } = await setup(db);
+    browserA.emit('message', JSON.stringify({
+      type: MEMORY_WS.SEARCH,
+      requestId: 'unauthorized-project',
+      canonicalRepoId: 'github.com/acme/private',
+      projectDir: '/tmp/acme-private',
+      repo: 'github.com/acme/private',
+    }));
+    await flush();
+
+    const forwarded = daemon.sentJson().find((msg) => msg.type === MEMORY_WS.SEARCH) as Record<string, unknown> | undefined;
+    const ctx = forwarded?.[MEMORY_MANAGEMENT_CONTEXT_FIELD] as Record<string, unknown> | undefined;
+    expect(ctx?.role).toBe('user');
+    expect(ctx?.boundProjects).toEqual([]);
+  });
+
+  it('forwards active enrolled canonical projects with server-derived workspace/org bindings', async () => {
+    const db = makeDb(async (sql: string, params?: unknown[]) => {
+      if (sql.includes('token_hash')) return { token_hash: 'valid-hash' };
+      if (sql.includes('shared_project_enrollments') && params?.[0] === 'github.com/acme/repo' && params?.[1] === 'user-a') {
+        return { role: 'member', workspace_id: 'workspace-1', enterprise_id: 'team-1' };
+      }
+      return null;
+    });
+    const { daemon, browserA } = await setup(db);
+    browserA.emit('message', JSON.stringify({
+      type: MEMORY_WS.SEARCH,
+      requestId: 'authorized-project',
+      canonicalRepoId: 'github.com/acme/repo',
+      projectDir: '/work/repo',
+      repo: 'github.com/acme/repo',
+    }));
+    await flush();
+
+    const forwarded = daemon.sentJson().find((msg) => msg.type === MEMORY_WS.SEARCH) as Record<string, unknown> | undefined;
+    const ctx = forwarded?.[MEMORY_MANAGEMENT_CONTEXT_FIELD] as Record<string, unknown> | undefined;
+    expect(ctx?.role).toBe('user');
+    expect(ctx?.boundProjects).toEqual([{
+      canonicalRepoId: 'github.com/acme/repo',
+      projectDir: '/work/repo',
+      workspaceId: 'workspace-1',
+      orgId: 'team-1',
+    }]);
+  });
+
   it('cleans up and single-casts an error if management context construction fails', async () => {
     const { bridge, daemon, browserA, browserB } = await setup();
     vi.spyOn(bridge as unknown as { withMemoryManagementContext: (...args: unknown[]) => Promise<Record<string, unknown>> }, 'withMemoryManagementContext')
