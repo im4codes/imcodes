@@ -226,11 +226,11 @@ describe('SubSessionBar', () => {
     fireEvent.click(view.container.querySelector('.subcard-toolbar-btn') as HTMLButtonElement);
     const card = view.container.querySelector('.subsession-card') as HTMLButtonElement;
     expect(card.title).toContain('gpt-5.5');
-    expect(card.title).toContain('ctx 18%');
-    expect(card.title).not.toContain('ctx 64%');
+    expect(card.title).toContain('ctx 64%');
+    expect(card.title).not.toContain('ctx 18%');
   });
 
-  it('uses sub-session model metadata when collapsed usage omits model but provider window is stale', () => {
+  it('uses sub-session model metadata when collapsed usage omits model but has a provider window', () => {
     const view = render(
       <SubSessionBar
         subSessions={[makeSubSession({ type: 'codex-sdk', activeModel: 'gpt-5.5' } as any)]}
@@ -253,8 +253,8 @@ describe('SubSessionBar', () => {
     fireEvent.click(view.container.querySelector('.subcard-toolbar-btn') as HTMLButtonElement);
     const card = view.container.querySelector('.subsession-card') as HTMLButtonElement;
     expect(card.title).toContain('gpt-5.5');
-    expect(card.title).toContain('ctx 11%');
-    expect(card.title).not.toContain('ctx 39%');
+    expect(card.title).toContain('ctx 39%');
+    expect(card.title).not.toContain('ctx 11%');
   });
 
 });
