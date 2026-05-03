@@ -30,6 +30,7 @@ import { NewSessionDialog } from './components/NewSessionDialog.js';
 import { SubSessionBar } from './components/SubSessionBar.js';
 import { SubSessionWindow } from './components/SubSessionWindow.js';
 import { useSharedGitChanges, requestSharedChanges } from './git-status-store.js';
+import { applyFilePreviewRequestUpdate, updateFilePreviewCache } from './file-preview-state.js';
 import { StartSubSessionDialog } from './components/StartSubSessionDialog.js';
 import { SessionSettingsDialog } from './components/SessionSettingsDialog.js';
 import { StartDiscussionDialog, type DiscussionPrefs, type SubSessionOption } from './components/StartDiscussionDialog.js';
@@ -1499,33 +1500,8 @@ export function App() {
   }, [previewFileCache]);
 
   const handlePreviewStateChange = useCallback((update: FileBrowserPreviewUpdate) => {
-    setPreviewFileCache((prev) => {
-      const existing = prev[update.path];
-      if (existing?.preview === update.preview && existing.preferDiff === update.preferDiff) return prev;
-      return {
-        ...prev,
-        [update.path]: {
-          preferDiff: update.preferDiff,
-          preview: update.preview,
-        },
-      };
-    });
-    setPreviewFileRequest((prev) => {
-      if (!prev) return prev;
-      if (prev.path === update.path) {
-        return {
-          ...prev,
-          preferDiff: prev.preferDiff ?? update.preferDiff,
-          preview: update.preview,
-        };
-      }
-      return {
-        ...prev,
-        path: update.path,
-        preferDiff: update.preferDiff,
-        preview: update.preview,
-      };
-    });
+    setPreviewFileCache((prev) => updateFilePreviewCache(prev, update));
+    setPreviewFileRequest((prev) => applyFilePreviewRequestUpdate(prev, update));
   }, []);
 
   /** Generic unpin: remove from pinnedPanels + reopen the source floating window. */

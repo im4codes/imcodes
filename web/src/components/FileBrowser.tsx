@@ -27,6 +27,7 @@ import {
   __resetSharedChangesForTests,
   type ChangeFile,
 } from '../git-status-store.js';
+import { filePreviewStatesEqual } from '../file-preview-state.js';
 
 const PREF_KEY = 'fb_prefer_editor';
 const WINDOWS_DRIVES_ROOT = '__imcodes_windows_drives__';
@@ -263,15 +264,16 @@ export function mergePreviewState(
   if (!currentPath || !incomingPath || currentPath !== incomingPath) return incoming;
   if (incoming.status === 'loading') return current;
   if (current.status === 'ok' && incoming.status === 'ok') {
-    return {
+    const merged: FileBrowserPreviewState = {
       ...current,
       ...incoming,
       diff: incoming.diff ?? current.diff,
       diffHtml: incoming.diffHtml ?? current.diffHtml,
       downloadId: incoming.downloadId ?? current.downloadId,
     };
+    return filePreviewStatesEqual(current, merged) ? current : merged;
   }
-  return incoming;
+  return filePreviewStatesEqual(current, incoming) ? current : incoming;
 }
 
 /** File extensions that can be previewed with office document libraries. */
