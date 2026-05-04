@@ -218,6 +218,18 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
       wsRef.current?.sendInput(sessionName, data);
     });
 
+    const handlePaste = (ev: ClipboardEvent) => {
+      const el = containerRef.current;
+      if (!el || (el.clientWidth === 0 && el.clientHeight === 0)) return;
+      const text = ev.clipboardData?.getData('text/plain') ?? '';
+      if (!text) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      term.focus();
+      wsRef.current?.sendInput(sessionName, text);
+    };
+    containerRef.current?.addEventListener('paste', handlePaste, { capture: true });
+
     // Sync terminal dimensions to tmux on every resize — but only when visible.
     // When hidden (chat mode), the parent sends a large fallback size (200x50)
     // to keep tmux uncramped. Sending xterm's tiny hidden-container dimensions
@@ -313,6 +325,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
     return () => {
       if (fitTimer) clearTimeout(fitTimer);
       discardPendingRaw();
+      containerRef.current?.removeEventListener('paste', handlePaste, { capture: true });
       window.removeEventListener('focus', onWindowFocus);
       document.removeEventListener('visibilitychange', onVisibilityChange);
       observer.disconnect();
@@ -454,7 +467,10 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
         ref={containerRef}
         class="terminal-container"
         style={{ width: '100%', height: '100%', overflow: 'hidden' }}
-        onClick={isMobile ? undefined : () => { fitRef.current?.fit(); }}
+        onClick={isMobile ? undefined : () => {
+          fitRef.current?.fit();
+          termRef.current?.focus();
+        }}
         onTouchStart={isMobile ? (e) => {
           isTouchingRef.current = true;
           const t = e.touches[0];

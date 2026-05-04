@@ -118,7 +118,7 @@ export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessa
   const doSave = useCallback((forceWrite = false) => {
     setSaveStatus('saving');
     setSaveError(null);
-    const requestId = ws.fsWriteFile(path, currentContent || content, forceWrite ? undefined : originalMtime);
+    const requestId = ws.fsWriteFile(path, currentContent ?? content, forceWrite ? undefined : originalMtime);
     pendingWriteRef.current.set(requestId, path);
     const tid = setTimeout(() => {
       if (pendingWriteRef.current.has(requestId)) {
@@ -209,6 +209,15 @@ export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage,
           onContentChange?.(newContent);
         }
       }),
+      EditorView.domEventHandlers({
+        paste: (event, view) => {
+          const text = event.clipboardData?.getData('text/plain');
+          if (text === undefined) return false;
+          event.preventDefault();
+          view.dispatch(view.state.replaceSelection(text));
+          return true;
+        },
+      }),
       EditorView.theme({
         '&': { height: '100%', fontSize: '12px', fontFamily: "'Menlo', 'Monaco', 'Consolas', monospace" },
         '.cm-scroller': { overflow: 'auto' },
@@ -226,6 +235,7 @@ export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage,
       parent: containerRef.current,
     });
     viewRef.current = view;
+    view.focus();
 
     return () => {
       view.destroy();

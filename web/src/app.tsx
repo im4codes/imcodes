@@ -138,6 +138,16 @@ const nativeCallback = typeof window !== 'undefined'
 
 type ViewMode = TerminalSubscribeViewMode;
 
+function isTextEntryElement(el: HTMLElement | null): boolean {
+  if (!el) return false;
+  const tag = el.tagName;
+  return tag === 'INPUT'
+    || tag === 'TEXTAREA'
+    || tag === 'SELECT'
+    || el.isContentEditable
+    || !!el.closest?.('.cm-editor, .fb-editor-cm');
+}
+
 type SharedContextDiagnosticsWindowState = {
   enterpriseId?: string;
   canonicalRepoId?: string;
@@ -2448,9 +2458,9 @@ export function App() {
       const session = activeSession;
       if (!ws?.connected || !session) return;
       const el = document.activeElement as HTMLElement | null;
-      const tag = el?.tagName ?? '';
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-      if (el?.isContentEditable) return;
+      const target = e.target as HTMLElement | null;
+      if (isTextEntryElement(target) || isTextEntryElement(el)) return;
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') return;
 
       const currentViewMode = viewModesRef.current[session] ?? defaultViewMode;
       if (currentViewMode === 'chat') {
@@ -2500,7 +2510,26 @@ export function App() {
     };
     document.addEventListener('keydown', handler);
     return () => document.removeEventListener('keydown', handler);
-  }, [activeSession, connected]);
+  }, [activeSession, connected, defaultViewMode]);
+
+  useEffect(() => {
+    const handler = (e: ClipboardEvent) => {
+      const ws = wsRef.current;
+      const session = activeSession;
+      if (!ws?.connected || !session) return;
+      const target = e.target as HTMLElement | null;
+      const el = document.activeElement as HTMLElement | null;
+      if (isTextEntryElement(target) || isTextEntryElement(el)) return;
+      const currentViewMode = viewModesRef.current[session] ?? defaultViewMode;
+      if (currentViewMode !== 'terminal') return;
+      const text = e.clipboardData?.getData('text/plain') ?? '';
+      if (!text) return;
+      e.preventDefault();
+      ws.sendInput(session, text);
+    };
+    document.addEventListener('paste', handler);
+    return () => document.removeEventListener('paste', handler);
+  }, [activeSession, connected, defaultViewMode]);
 
   // Ctrl+B (Cmd+B on Mac) — toggle sidebar collapse (desktop only)
   useEffect(() => {

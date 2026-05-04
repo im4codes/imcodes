@@ -9,7 +9,7 @@
  * - Conflict response does NOT auto-force-save (dialog handles it)
  * - "Keep mine" force-writes without expectedMtime → onSaved on ok
  * - "Use disk version" propagates diskMtime via onMtimeUpdate
- * - Empty-string currentContent falls back to original content (|| not ??)
+ * - Empty-string currentContent is preserved when saving an empty file
  * - Timeout timers are cleared on response
  * - Error responses show correct status
  */
@@ -21,13 +21,23 @@ import { render, screen, fireEvent, act, cleanup } from '@testing-library/preact
 
 // Mock CodeMirror to prevent heavy imports in jsdom
 vi.mock('codemirror', () => {
-  const mockView = { state: { doc: { toString: () => '', length: 0 } }, dispatch: vi.fn(), destroy: vi.fn() };
+  const mockView = {
+    state: {
+      doc: { toString: () => '', length: 0 },
+      replaceSelection: vi.fn((text: string) => ({ changes: { from: 0, to: 0, insert: text } })),
+    },
+    dispatch: vi.fn(),
+    destroy: vi.fn(),
+    focus: vi.fn(),
+  };
   class MockEditorView {
     state = mockView.state;
     dispatch = mockView.dispatch;
     destroy = mockView.destroy;
+    focus = mockView.focus;
     constructor(_config: any) {}
     static theme() { return []; }
+    static domEventHandlers() { return []; }
     static updateListener = { of: () => [] };
   }
   return { EditorView: MockEditorView, basicSetup: [] };
@@ -119,7 +129,7 @@ describe('FileEditor', () => {
       );
     });
 
-    it('uses || fallback: empty currentContent falls back to original content', () => {
+    it('preserves empty currentContent so saving can clear a file', () => {
       const ws = makeWs();
       const { onMessage } = makeOnMessage();
       render(
@@ -138,10 +148,9 @@ describe('FileEditor', () => {
 
       fireEvent.click(screen.getByText('fileBrowser.save'));
 
-      // With || (not ??), empty string falls back to "original content"
       expect(ws.fsWriteFile).toHaveBeenCalledWith(
         '/file.txt',
-        'original content',
+        '',
         1000,
       );
     });
