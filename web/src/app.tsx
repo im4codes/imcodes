@@ -2242,19 +2242,28 @@ export function App() {
     // While the probe is waiting for pong, WsClient marks itself disconnected
     // so the first user send cannot disappear into a stale-open socket.
     let lastResumeCheckAt = 0;
-    const handleResume = () => {
+    let lastResumeCheckWasForce = false;
+    let hiddenSinceAt = 0;
+    const handleResume = (forceIfStale = false) => {
       const now = Date.now();
-      if (now - lastResumeCheckAt < 500) return;
+      if (now - lastResumeCheckAt < 500 && (!forceIfStale || lastResumeCheckWasForce)) return;
       lastResumeCheckAt = now;
-      ws.probeConnection();
+      lastResumeCheckWasForce = forceIfStale;
+      ws.resumeConnection(forceIfStale);
       requestActiveTimelineRefresh({ resetCooldowns: true });
     };
     const onVisibility = () => {
-      if (document.visibilityState === 'hidden') return;
-      handleResume();
+      if (document.visibilityState === 'hidden') {
+        hiddenSinceAt = Date.now();
+        return;
+      }
+      const wasLongHidden = hiddenSinceAt > 0 && Date.now() - hiddenSinceAt > 60_000;
+      hiddenSinceAt = 0;
+      handleResume(wasLongHidden);
     };
     document.addEventListener('visibilitychange', onVisibility);
-    window.addEventListener('focus', handleResume);
+    const onFocus = () => handleResume(false);
+    window.addEventListener('focus', onFocus);
     const onPageShow = (ev: PageTransitionEvent) => {
       if (ev.persisted) handleResume();
     };
@@ -2263,7 +2272,7 @@ export function App() {
     let removeAppStateListener: (() => void) | null = null;
     if (isNative()) {
       void import('@capacitor/app')
-        .then(({ App }) => installNativeAppResumeRefresh(true, () => ws.probeConnection(), App))
+        .then(({ App }) => installNativeAppResumeRefresh(true, (force) => ws.resumeConnection(force), App))
         .then((cleanup) => {
           removeAppStateListener = cleanup;
         })
@@ -2272,7 +2281,7 @@ export function App() {
 
     return () => {
       document.removeEventListener('visibilitychange', onVisibility);
-      window.removeEventListener('focus', handleResume);
+      window.removeEventListener('focus', onFocus);
       window.removeEventListener('pageshow', onPageShow);
       removeAppStateListener?.();
       unsub();
