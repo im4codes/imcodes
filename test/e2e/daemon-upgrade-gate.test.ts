@@ -304,7 +304,7 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
     addTransportSession('deck_stuck_codex_brain', { status: 'error' });
 
     const serverLink = { send: vi.fn() } as { send: ReturnType<typeof vi.fn> };
-    handleWebCommand({ type: 'daemon.upgrade' }, serverLink as any);
+    handleWebCommand({ type: 'daemon.upgrade', targetVersion: '99.99.99-test' }, serverLink as any);
     await waitForCondition(() => mocks.spawnCalls.length > 0, 5000).catch(() => {});
 
     expect(getBlockedMessage(serverLink)).toBeUndefined();
@@ -323,7 +323,7 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
     );
 
     const serverLink = { send: vi.fn() } as { send: ReturnType<typeof vi.fn> };
-    handleWebCommand({ type: 'daemon.upgrade' }, serverLink as any);
+    handleWebCommand({ type: 'daemon.upgrade', targetVersion: '99.99.99-test' }, serverLink as any);
     await waitForCondition(() => mocks.spawnCalls.length > 0, 5000).catch(() => {});
 
     expect(getBlockedMessage(serverLink)).toBeUndefined();
@@ -337,7 +337,7 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
     addTransportSession('deck_idle_brain', { status: 'idle' });
 
     const serverLink = { send: vi.fn() } as { send: ReturnType<typeof vi.fn> };
-    handleWebCommand({ type: 'daemon.upgrade' }, serverLink as any);
+    handleWebCommand({ type: 'daemon.upgrade', targetVersion: '99.99.99-test' }, serverLink as any);
     await waitForCondition(() => mocks.spawnCalls.length > 0, 5000).catch(() => {});
 
     expect(getBlockedMessage(serverLink)).toBeUndefined();
@@ -352,7 +352,7 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
     addTransportSession('deck_thinking_brain', { status: 'thinking' });
 
     const serverLink = { send: vi.fn() } as { send: ReturnType<typeof vi.fn> };
-    handleWebCommand({ type: 'daemon.upgrade' }, serverLink as any);
+    handleWebCommand({ type: 'daemon.upgrade', targetVersion: '99.99.99-test' }, serverLink as any);
     await flushAsync();
 
     expect(getBlockedMessage(serverLink)).toMatchObject({
@@ -380,7 +380,7 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
     addTransportSession('deck_streaming_brain', { status: 'streaming' });
 
     const serverLink = { send: vi.fn() } as { send: ReturnType<typeof vi.fn> };
-    handleWebCommand({ type: 'daemon.upgrade' }, serverLink as any);
+    handleWebCommand({ type: 'daemon.upgrade', targetVersion: '99.99.99-test' }, serverLink as any);
     await flushAsync();
 
     expect(getBlockedMessage(serverLink)).toMatchObject({
@@ -397,7 +397,7 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
     addTransportSession('deck_sending_brain', { status: 'idle', sending: true });
 
     const serverLink = { send: vi.fn() } as { send: ReturnType<typeof vi.fn> };
-    handleWebCommand({ type: 'daemon.upgrade' }, serverLink as any);
+    handleWebCommand({ type: 'daemon.upgrade', targetVersion: '99.99.99-test' }, serverLink as any);
     await flushAsync();
 
     expect(getBlockedMessage(serverLink)).toMatchObject({
@@ -413,7 +413,7 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
     addTransportSession('deck_queued_brain', { status: 'idle', pendingCount: 2 });
 
     const serverLink = { send: vi.fn() } as { send: ReturnType<typeof vi.fn> };
-    handleWebCommand({ type: 'daemon.upgrade' }, serverLink as any);
+    handleWebCommand({ type: 'daemon.upgrade', targetVersion: '99.99.99-test' }, serverLink as any);
     await flushAsync();
 
     expect(getBlockedMessage(serverLink)).toMatchObject({
@@ -434,7 +434,7 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
     addTransportSession('deck_stuck_brain', { status: 'error' });
 
     const serverLink = { send: vi.fn() } as { send: ReturnType<typeof vi.fn> };
-    handleWebCommand({ type: 'daemon.upgrade' }, serverLink as any);
+    handleWebCommand({ type: 'daemon.upgrade', targetVersion: '99.99.99-test' }, serverLink as any);
     await flushAsync();
 
     const blocked = getBlockedMessage(serverLink);
@@ -448,7 +448,7 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
 
   it("proceeds with no transport sessions and no P2P runs", async () => {
     const serverLink = { send: vi.fn() } as { send: ReturnType<typeof vi.fn> };
-    handleWebCommand({ type: 'daemon.upgrade' }, serverLink as any);
+    handleWebCommand({ type: 'daemon.upgrade', targetVersion: '99.99.99-test' }, serverLink as any);
     await waitForCondition(() => mocks.spawnCalls.length > 0, 5000).catch(() => {});
 
     expect(getBlockedMessage(serverLink)).toBeUndefined();
@@ -478,7 +478,7 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
     // No runtime registered for this session name.
 
     const serverLink = { send: vi.fn() } as { send: ReturnType<typeof vi.fn> };
-    handleWebCommand({ type: 'daemon.upgrade' }, serverLink as any);
+    handleWebCommand({ type: 'daemon.upgrade', targetVersion: '99.99.99-test' }, serverLink as any);
     await waitForCondition(() => mocks.spawnCalls.length > 0, 5000).catch(() => {});
 
     expect(getBlockedMessage(serverLink)).toBeUndefined();

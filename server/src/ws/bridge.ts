@@ -18,6 +18,7 @@ import type { Env } from '../env.js';
 import { MemoryRateLimiter } from './rate-limiter.js';
 import { sha256Hex } from '../security/crypto.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
+import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
 import { TRANSPORT_RELAY_TYPES, TRANSPORT_MSG } from '../../../shared/transport-events.js';
 import {
@@ -89,6 +90,10 @@ import { incrementCounter } from '../util/metrics.js';
 import { pickReadableSessionDisplay } from '../../../shared/session-display.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
 import { PUSH_TIMELINE_EVENT_MAX_AGE_MS, TIMELINE_SUPPRESS_PUSH_FIELD } from '../../../shared/push-notifications.js';
+import {
+  DAEMON_UPGRADE_DELIVERY_STATUS,
+} from '../../../shared/daemon-upgrade.js';
+import { DaemonUpgradeCoordinator, type DaemonUpgradeSource, type RequestDaemonUpgradeResult } from './daemon-upgrade-coordinator.js';
 
 const AUTH_TIMEOUT_MS = 5000;
 const MAX_QUEUE_SIZE = 100;
@@ -323,7 +328,7 @@ export class WsBridge {
   private daemonWs: WebSocket | null = null;
   private authenticated = false;
   private daemonVersion: string | null = null;
-  private upgradeAttempts = 0;
+  private daemonUpgradeCoordinator = new DaemonUpgradeCoordinator();
   private browserSockets = new Set<WebSocket>();
   private mobileSockets = new Set<WebSocket>();
   private queue: string[] = [];
@@ -884,8 +889,13 @@ export class WsBridge {
             logger.warn({ err, serverId: this.serverId }, 'failed to push global memory feature config on daemon auth');
           }
         }
+        this.daemonUpgradeCoordinator.clearIfTargetVersionMatches(this.daemonVersion);
+        this.flushPendingDaemonUpgrade(ws);
 
-        // Auto-upgrade: on each reconnect, retry up to 3 times with 10-minute intervals.
+        // Auto-upgrade: on reconnect, retry up to 3 times, but never schedule
+        // more than one upgrade command per 15 minutes while the daemon remains
+        // on a mismatched version. This protects npm global install from
+        // reconnect storms and registry propagation windows.
         // Always target the server's exact version so dev↔stable mismatches converge to
         // the same channel in both directions.
         const serverVersion = process.env.APP_VERSION;
@@ -896,20 +906,36 @@ export class WsBridge {
           && this.daemonVersion !== serverVersion,
         );
         if (shouldUpgrade) {
-          this.upgradeAttempts = (this.upgradeAttempts ?? 0) + 1;
-          if (this.upgradeAttempts <= 3) {
-            logger.info({ serverId: this.serverId, daemonVersion: this.daemonVersion, serverVersion, attempt: this.upgradeAttempts }, 'Version mismatch — sending daemon.upgrade');
-            setTimeout(() => {
-              try { ws.send(JSON.stringify({ type: 'daemon.upgrade', targetVersion: serverVersion })); } catch { /* ignore */ }
-            }, 5000);
-            // Schedule retry: if daemon reconnects with the same old version after 10 min, the counter is already incremented.
-            // If daemon doesn't reconnect (upgrade succeeded and restarted), the next auth will have matching version → no upgrade sent.
-          } else {
-            logger.warn({ serverId: this.serverId, daemonVersion: this.daemonVersion, serverVersion, attempts: this.upgradeAttempts }, 'Version mismatch — max upgrade attempts reached, giving up');
+          const result = this.requestDaemonUpgrade({
+            targetVersion: serverVersion,
+            source: 'auto',
+            isStillCurrent: () => this.daemonWs === ws && this.authenticated && this.daemonVersion !== serverVersion,
+          });
+          if (result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.SENT) {
+            logger.info({
+              serverId: this.serverId,
+              daemonVersion: this.daemonVersion,
+              serverVersion,
+              upgradeId: result.upgradeId,
+            }, 'Version mismatch — scheduling daemon.upgrade');
+          } else if (result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.SUPPRESSED) {
+            logger.info({
+              serverId: this.serverId,
+              daemonVersion: this.daemonVersion,
+              serverVersion,
+              nextAttemptAt: result.nextAttemptAt,
+            }, 'Version mismatch — auto daemon.upgrade suppressed by 15-minute interval');
+          } else if (result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.BACKOFF) {
+            logger.warn({
+              serverId: this.serverId,
+              daemonVersion: this.daemonVersion,
+              serverVersion,
+              reason: result.reason,
+            }, 'Version mismatch — auto daemon.upgrade in backoff');
           }
         } else {
-          // Version matches, daemon is newer, or auto-upgrade does not apply — reset retry counter
-          this.upgradeAttempts = 0;
+          // Version matches or auto-upgrade does not apply — reset retry state.
+          this.daemonUpgradeCoordinator.clearIfTargetVersionMatches(this.daemonVersion);
         }
 
         // Replay queued messages, skipping terminal.subscribe/unsubscribe — refs replay below is authoritative
@@ -917,6 +943,14 @@ export class WsBridge {
           try {
             const parsed = JSON.parse(queued) as { type?: string };
             if (parsed.type === 'terminal.subscribe' || parsed.type === 'terminal.unsubscribe') continue;
+            if (parsed.type === DAEMON_COMMAND_TYPES.DAEMON_UPGRADE) {
+              this.requestDaemonUpgrade({
+                targetVersion: (parsed as { targetVersion?: unknown }).targetVersion,
+                source: 'replay',
+                isStillCurrent: () => this.daemonWs === ws && this.authenticated,
+              });
+              continue;
+            }
             ws.send(queued);
           } catch { /* ignore */ }
         }
@@ -1111,6 +1145,17 @@ export class WsBridge {
       }
 
       if (typeof msg.type !== 'string') {
+        return;
+      }
+
+      if (this.isBrowserForbiddenDaemonCommandType(msg.type)) {
+        logger.warn({ serverId: this.serverId, type: msg.type }, 'Browser attempted server-only daemon command — rejected');
+        safeSend(ws, JSON.stringify({
+          type: 'error',
+          code: 'server_only_command',
+          originalType: msg.type,
+          requestId: msg.requestId,
+        }));
         return;
       }
 
@@ -2466,6 +2511,48 @@ export class WsBridge {
     return this.seenCommandAcks.has(commandId);
   }
 
+  requestDaemonUpgrade(input: {
+    targetVersion?: unknown;
+    source?: DaemonUpgradeSource;
+    isStillCurrent?: () => boolean;
+  } = {}): RequestDaemonUpgradeResult {
+    return this.daemonUpgradeCoordinator.request({
+      targetVersion: input.targetVersion,
+      source: input.source ?? 'manual',
+      isDaemonReady: () => this.isDaemonReadyForUpgrade(),
+      isStillCurrent: input.isStillCurrent,
+      send: (message) => this.sendDirectToDaemon(message),
+    });
+  }
+
+  private flushPendingDaemonUpgrade(ws: WebSocket): void {
+    const result = this.daemonUpgradeCoordinator.flushPending({
+      isDaemonReady: () => this.isDaemonReadyForUpgrade(),
+      isStillCurrent: () => this.daemonWs === ws && this.authenticated,
+      send: (message) => this.sendDirectToDaemon(message),
+    });
+    if (result?.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.SENT) {
+      logger.info({
+        serverId: this.serverId,
+        targetVersion: result.targetVersion,
+        upgradeId: result.upgradeId,
+      }, 'Flushed pending daemon.upgrade after daemon auth');
+    }
+  }
+
+  private isDaemonReadyForUpgrade(): boolean {
+    return Boolean(this.daemonWs && this.authenticated);
+  }
+
+  private sendDirectToDaemon(message: Record<string, unknown>): void {
+    if (!this.daemonWs || !this.authenticated) return;
+    try {
+      this.daemonWs.send(JSON.stringify(message));
+    } catch (err) {
+      logger.error({ serverId: this.serverId, err }, 'Failed to send daemon upgrade command');
+    }
+  }
+
   /** Force-close the daemon WebSocket. Use after token rotation to evict the stale connection. */
   kickDaemon(): void {
     if (this.daemonWs) {
@@ -2476,6 +2563,14 @@ export class WsBridge {
   }
 
   sendToDaemon(message: string): void {
+    const parsed = this.parseJsonObject(message);
+    if (parsed?.type === DAEMON_COMMAND_TYPES.DAEMON_UPGRADE) {
+      this.requestDaemonUpgrade({
+        targetVersion: parsed.targetVersion,
+        source: 'manual',
+      });
+      return;
+    }
     if (this.daemonWs && this.authenticated) {
       try {
         this.daemonWs.send(message);
@@ -2487,6 +2582,21 @@ export class WsBridge {
         this.queue.push(message);
       }
     }
+  }
+
+  private parseJsonObject(message: string): Record<string, unknown> | null {
+    try {
+      const parsed = JSON.parse(message) as unknown;
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? parsed as Record<string, unknown>
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private isBrowserForbiddenDaemonCommandType(type: string): boolean {
+    return type === DAEMON_COMMAND_TYPES.SERVER_DELETE || type.startsWith('daemon.');
   }
 
   requestTimelineHistory(params: {

@@ -62,6 +62,7 @@ import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from '../agent/codex-display.js';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import { DAEMON_UPGRADE_TARGET_LATEST, normalizeDaemonUpgradeTargetVersion } from '../../shared/daemon-upgrade.js';
 import { CC_PRESET_MSG, type CcPreset } from '../../shared/cc-presets.js';
 import { MEMORY_WS } from '../../shared/memory-ws.js';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG, MAX_P2P_PARTICIPANTS } from '../../shared/p2p-config-events.js';
@@ -1299,11 +1300,19 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case 'discussion.list':
       handleDiscussionList(serverLink);
       break;
-    case 'server.delete':
+    case DAEMON_COMMAND_TYPES.SERVER_DELETE:
       void handleServerDelete();
       break;
-    case 'daemon.upgrade':
-      void handleDaemonUpgrade(cmd.targetVersion as string | undefined, serverLink);
+    case DAEMON_COMMAND_TYPES.DAEMON_UPGRADE:
+      try {
+        const normalizedTarget = normalizeDaemonUpgradeTargetVersion(cmd.targetVersion);
+        void handleDaemonUpgrade(
+          normalizedTarget === DAEMON_UPGRADE_TARGET_LATEST ? undefined : normalizedTarget,
+          serverLink,
+        );
+      } catch {
+        logger.warn({ targetVersion: cmd.targetVersion }, 'daemon.upgrade rejected invalid targetVersion');
+      }
       break;
     case 'file.search':
       void handleFileSearch(cmd, serverLink);
@@ -3973,6 +3982,7 @@ function compareDaemonVersions(a: string, b: string): -1 | 0 | 1 {
  *     may resolve to an older release than what's currently installed.
  */
 async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLink): Promise<void> {
+  const UPGRADE_MEMORY_FREEZE_TTL_MS = 15 * 60 * 1000;
   const activeRuns = getActiveP2pRunsBlockingDaemonUpgrade();
   if (activeRuns.length > 0) {
     logger.warn({
@@ -4103,6 +4113,13 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
       reopenLiveContextMaterializationAdmission();
     };
   })();
+  const scheduleUpgradeMemoryFreezeRelease = () => {
+    const timer = setTimeout(() => {
+      logger.warn({ targetVersion }, 'daemon.upgrade: releasing memory freeze after watchdog timeout');
+      releaseUpgradeMemoryFreeze();
+    }, UPGRADE_MEMORY_FREEZE_TTL_MS);
+    timer.unref?.();
+  };
 
   try {
     const postFreezeMasterCompactions = getInflightMasterCompactionCount();
@@ -4200,6 +4217,7 @@ launchctl load -w "${plist}"`;
 
     logger.info({ log: logFile }, 'daemon.upgrade: Windows upgrade script spawned');
     upgradeScriptSpawned = true;
+    scheduleUpgradeMemoryFreezeRelease();
     return;
   } else {
     logger.warn('daemon.upgrade: unsupported platform, cannot restart service');
@@ -4743,6 +4761,7 @@ sleep ${CLEANUP_AFTER_SEC} && rm -rf "${scriptDir}" &
 
   logger.info({ log: logFile }, 'daemon.upgrade: upgrade script spawned, will restart in ~3 s');
   upgradeScriptSpawned = true;
+  scheduleUpgradeMemoryFreezeRelease();
   } finally {
     if (!upgradeScriptSpawned) {
       releaseUpgradeMemoryFreeze();

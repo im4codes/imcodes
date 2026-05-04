@@ -197,6 +197,63 @@ describe('WsBridge', () => {
 
       expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.4.905'))).toBe(true);
     });
+
+    it('rate-limits auto daemon.upgrade to at most once every 15 minutes', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.4.905-dev.877';
+
+      const bridge = WsBridge.get(serverId);
+      const firstWs = new MockWs();
+      bridge.handleDaemonConnection(firstWs as never, makeDb('valid-hash'), {} as never);
+
+      firstWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.4.904-dev.100' }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5000);
+      await flushAsync();
+
+      expect(firstWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(1);
+
+      const secondWs = new MockWs();
+      bridge.handleDaemonConnection(secondWs as never, makeDb('valid-hash'), {} as never);
+      secondWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.4.904-dev.100' }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5000);
+      await flushAsync();
+
+      expect(secondWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
+
+      await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
+
+      const thirdWs = new MockWs();
+      bridge.handleDaemonConnection(thirdWs as never, makeDb('valid-hash'), {} as never);
+      thirdWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.4.904-dev.100' }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5000);
+      await flushAsync();
+
+      expect(thirdWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(1);
+    });
+
+    it('does not send a stale scheduled daemon.upgrade after the daemon socket is replaced', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.4.905-dev.877';
+
+      const bridge = WsBridge.get(serverId);
+      const staleWs = new MockWs();
+      bridge.handleDaemonConnection(staleWs as never, makeDb('valid-hash'), {} as never);
+      staleWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.4.904-dev.100' }));
+      await flushAsync();
+
+      const replacementWs = new MockWs();
+      bridge.handleDaemonConnection(replacementWs as never, makeDb('valid-hash'), {} as never);
+      replacementWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.4.904-dev.100' }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5000);
+      await flushAsync();
+
+      expect(staleWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
+      expect(replacementWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
+    });
   });
 
   describe('message relay daemon→browser', () => {
@@ -315,6 +372,24 @@ describe('WsBridge', () => {
       expect(daemonWs.sentStrings.some((s) => s.includes('admin.shutdown'))).toBe(true);
     });
 
+    it('rejects browser raw daemon.upgrade commands', async () => {
+      const { daemonWs, browserWs } = await setupBridge();
+      browserWs.emit('message', JSON.stringify({ type: 'daemon.upgrade', targetVersion: '2026.4.905-dev.877', requestId: 'r1' }));
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.some((s) => s.includes('daemon.upgrade'))).toBe(false);
+      expect(browserWs.sentStrings.some((s) => s.includes('server_only_command') && s.includes('r1'))).toBe(true);
+    });
+
+    it('rejects browser raw server.delete commands', async () => {
+      const { daemonWs, browserWs } = await setupBridge();
+      browserWs.emit('message', JSON.stringify({ type: 'server.delete', requestId: 'r2' }));
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.some((s) => s.includes('server.delete'))).toBe(false);
+      expect(browserWs.sentStrings.some((s) => s.includes('server_only_command') && s.includes('r2'))).toBe(true);
+    });
+
     it('drops oversized payload', async () => {
       const { daemonWs, browserWs } = await setupBridge();
       browserWs.emit('message', JSON.stringify({ type: 'session.send', text: 'x'.repeat(70000) }));
@@ -367,6 +442,35 @@ describe('WsBridge', () => {
       await flushAsync();
 
       expect(daemonWs.sentStrings.some((s) => s.includes('get_sessions'))).toBe(true);
+    });
+
+    it('keeps offline daemon.upgrade out of the ordinary queue and flushes it once on auth', async () => {
+      const bridge = WsBridge.get(serverId);
+
+      bridge.sendToDaemon(JSON.stringify({ type: 'daemon.upgrade', targetVersion: '2026.4.905-dev.877' }));
+      bridge.sendToDaemon(JSON.stringify({ type: 'daemon.upgrade', targetVersion: '2026.4.905-dev.877' }));
+
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const upgradeMessages = daemonWs.sentStrings.filter((s) => s.includes('"type":"daemon.upgrade"'));
+      expect(upgradeMessages).toHaveLength(1);
+      expect(upgradeMessages[0]).toContain('2026.4.905-dev.877');
+    });
+
+    it('drops daemon.upgrade with an invalid targetVersion before it reaches the daemon', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      bridge.sendToDaemon(JSON.stringify({ type: 'daemon.upgrade', targetVersion: '2026.4.905-dev.877;touch /tmp/pwn' }));
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.some((s) => s.includes('daemon.upgrade'))).toBe(false);
     });
   });
 

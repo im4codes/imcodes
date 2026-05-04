@@ -37,6 +37,7 @@ import { deletePersonalMemoryProjection } from '../util/memory-delete.js';
 import { isMemoryNoiseSummary } from '../../../shared/memory-noise-patterns.js';
 import { MEMORY_ORIGINS } from '../../../shared/memory-origin.js';
 import { OBSERVATION_CLASSES } from '../../../shared/memory-observation.js';
+import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import {
   SYNCED_PROJECTION_MEMORY_SCOPES,
   type AuthoredContextScope,
@@ -381,7 +382,7 @@ serverRoutes.delete('/:id', requireAuth(), async (c) => {
 
   // Notify daemon to self-destruct (best-effort — daemon may be offline)
   try {
-    WsBridge.get(serverId).sendToDaemon(JSON.stringify({ type: 'server.delete' }));
+    WsBridge.get(serverId).sendToDaemon(JSON.stringify({ type: DAEMON_COMMAND_TYPES.SERVER_DELETE }));
   } catch { /* daemon may be offline, continue with DB deletion */ }
 
   const deleted = await deleteServer(c.env.DB, serverId, userId);
@@ -395,15 +396,21 @@ serverRoutes.post('/:id/upgrade', requireAuth(), async (c) => {
   const serverId = c.req.param('id') ?? '';
   const dbServers = await getServersByUserId(c.env.DB, userId);
   if (!dbServers.find((s) => s.id === serverId)) return c.json({ error: 'not_found' }, 404);
-  try {
-    WsBridge.get(serverId).sendToDaemon(JSON.stringify({
-      type: 'daemon.upgrade',
-      ...(process.env.APP_VERSION ? { targetVersion: process.env.APP_VERSION } : {}),
-    }));
-    return c.json({ ok: true });
-  } catch {
-    return c.json({ error: 'daemon_offline' }, 503);
+  const result = WsBridge.get(serverId).requestDaemonUpgrade({
+    targetVersion: process.env.APP_VERSION,
+    source: 'manual',
+  });
+  if (!result.ok) {
+    return c.json({ error: result.reason ?? 'upgrade_request_failed', deliveryStatus: result.deliveryStatus }, 400);
   }
+  return c.json({
+    ok: true,
+    upgradeId: result.upgradeId,
+    targetVersion: result.targetVersion,
+    deliveryStatus: result.deliveryStatus,
+    ...(result.nextAttemptAt ? { nextAttemptAt: result.nextAttemptAt } : {}),
+    ...(result.reason ? { reason: result.reason } : {}),
+  });
 });
 
 // POST /api/server/:id/heartbeat — authenticated via Bearer server token
