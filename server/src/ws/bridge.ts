@@ -21,6 +21,7 @@ import { DAEMON_MSG } from '../../../shared/daemon-events.js';
 import { REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
 import { TRANSPORT_RELAY_TYPES, TRANSPORT_MSG } from '../../../shared/transport-events.js';
 import {
+  MEMORY_WS,
   isMemoryManagementRequestType,
   isMemoryManagementResponseType,
 } from '../../../shared/memory-ws.js';
@@ -30,7 +31,26 @@ import {
   type MemoryManagementBoundProject,
   type MemoryManagementRole,
 } from '../../../shared/memory-management-context.js';
-import { MEMORY_MANAGEMENT_BRIDGE_ERROR_CODES } from '../../../shared/memory-management.js';
+import {
+  MEMORY_MANAGEMENT_BRIDGE_ERROR_CODES,
+  MEMORY_MANAGEMENT_ERROR_CODES,
+} from '../../../shared/memory-management.js';
+import {
+  MEMORY_FEATURE_CONFIG_MSG,
+  MEMORY_FEATURE_CONFIG_PREF_KEY,
+  MEMORY_FEATURE_FLAGS,
+  encodeMemoryFeatureFlagValuesJson,
+  getMemoryFeatureFlagDefinition,
+  isMemoryFeatureFlag,
+  memoryFeatureFlagEnvKey,
+  parseMemoryFeatureFlagValuesJson,
+  computeEffectiveMemoryFeatureFlags,
+  resolveMemoryFeatureFlagValue,
+  type FeatureFlagValueSource,
+  type MemoryFeatureFlag,
+  type MemoryFeatureFlagResolutionLayers,
+  type MemoryFeatureFlagValues,
+} from '../../../shared/feature-flags.js';
 import {
   MSG_COMMAND_ACK,
   MSG_COMMAND_FAILED,
@@ -63,7 +83,7 @@ import {
   type PreviewWsOpenedMessage,
 } from '../../../shared/preview-types.js';
 import { LocalWebPreviewRegistry } from '../preview/registry.js';
-import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, getSubSessionById, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent } from '../db/queries.js';
+import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, getSubSessionById, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent, getUserPref, setUserPref } from '../db/queries.js';
 import logger from '../util/logger.js';
 import { incrementCounter } from '../util/metrics.js';
 import { pickReadableSessionDisplay } from '../../../shared/session-display.js';
@@ -515,6 +535,178 @@ export class WsBridge {
     }));
   }
 
+  private readMemoryFeatureEnvironmentDefaults(): MemoryFeatureFlagValues {
+    const environmentStartupDefault: MemoryFeatureFlagValues = {};
+    for (const flag of MEMORY_FEATURE_FLAGS) {
+      const key = memoryFeatureFlagEnvKey(flag);
+      const raw = process.env[key];
+      if (raw != null) environmentStartupDefault[flag] = raw === 'true' || raw === '1';
+    }
+    return environmentStartupDefault;
+  }
+
+  private memoryFeatureLayers(userConfig: MemoryFeatureFlagValues): MemoryFeatureFlagResolutionLayers {
+    return {
+      persistedConfig: userConfig,
+      environmentStartupDefault: this.readMemoryFeatureEnvironmentDefaults(),
+    };
+  }
+
+  private featureFlagValueSource(flag: MemoryFeatureFlag, layers: MemoryFeatureFlagResolutionLayers): FeatureFlagValueSource {
+    if (layers.runtimeConfigOverride?.[flag] !== undefined) return 'runtime_config_override';
+    if (layers.persistedConfig?.[flag] !== undefined) return 'persisted_config';
+    if (layers.environmentStartupDefault?.[flag] !== undefined) return 'environment_startup_default';
+    return 'registry_default';
+  }
+
+  private requestedMemoryFeatureFlags(layers: MemoryFeatureFlagResolutionLayers): MemoryFeatureFlagValues {
+    const requested: MemoryFeatureFlagValues = {};
+    for (const flag of MEMORY_FEATURE_FLAGS) {
+      requested[flag] = resolveMemoryFeatureFlagValue(flag, layers);
+    }
+    return requested;
+  }
+
+  private buildMemoryFeatureAdminRecords(userConfig: MemoryFeatureFlagValues) {
+    const layers = this.memoryFeatureLayers(userConfig);
+    const requested = this.requestedMemoryFeatureFlags(layers);
+    const effective = computeEffectiveMemoryFeatureFlags(requested);
+    return MEMORY_FEATURE_FLAGS.map((flag) => {
+      const definition = getMemoryFeatureFlagDefinition(flag);
+      return {
+        flag,
+        requested: requested[flag] === true,
+        enabled: effective[flag],
+        source: this.featureFlagValueSource(flag, layers),
+        envKey: memoryFeatureFlagEnvKey(flag),
+        dependencies: definition.dependencies,
+        dependencyBlocked: requested[flag] === true && !effective[flag]
+          ? definition.dependencies.filter((dependency) => !effective[dependency])
+          : [],
+        disabledBehavior: definition.disabledBehavior,
+      };
+    });
+  }
+
+  private collectMemoryFeatureWithDependencies(flag: MemoryFeatureFlag, seen = new Set<MemoryFeatureFlag>()): Set<MemoryFeatureFlag> {
+    if (seen.has(flag)) return seen;
+    seen.add(flag);
+    for (const dependency of getMemoryFeatureFlagDefinition(flag).dependencies) {
+      this.collectMemoryFeatureWithDependencies(dependency, seen);
+    }
+    return seen;
+  }
+
+  private async readUserMemoryFeatureFlags(userId: string): Promise<MemoryFeatureFlagValues> {
+    if (!this.db) return {};
+    return parseMemoryFeatureFlagValuesJson(await getUserPref(this.db, userId, MEMORY_FEATURE_CONFIG_PREF_KEY));
+  }
+
+  private async writeUserMemoryFeatureFlags(userId: string, flags: MemoryFeatureFlagValues): Promise<MemoryFeatureFlagValues> {
+    if (!this.db) throw new Error('database_unavailable');
+    const normalized = parseMemoryFeatureFlagValuesJson(encodeMemoryFeatureFlagValuesJson(flags));
+    await setUserPref(this.db, userId, MEMORY_FEATURE_CONFIG_PREF_KEY, encodeMemoryFeatureFlagValuesJson(normalized));
+    return normalized;
+  }
+
+  private sendMemoryFeatureConfigApply(flags: MemoryFeatureFlagValues): void {
+    this.sendToDaemon(JSON.stringify({
+      type: MEMORY_FEATURE_CONFIG_MSG.APPLY,
+      flags,
+    }));
+  }
+
+  private async pushUserMemoryFeatureConfigToOnlineDaemons(userId: string, flags: MemoryFeatureFlagValues): Promise<void> {
+    const entries = [...WsBridge.instances.values()];
+    await Promise.all(entries.map(async (bridge) => {
+      if (!bridge.authenticated || !bridge.daemonWs || !bridge.db) return;
+      const row = await bridge.db.queryOne<{ user_id?: string }>(
+        'SELECT user_id FROM servers WHERE id = $1',
+        [bridge.serverId],
+      ).catch(() => null);
+      if (row?.user_id !== userId) return;
+      try {
+        bridge.sendMemoryFeatureConfigApply(flags);
+      } catch (error) {
+        logger.warn({ err: error, serverId: bridge.serverId }, 'failed to apply global memory feature config to daemon');
+      }
+    }));
+  }
+
+  private async handleMemoryFeaturesQuery(ws: WebSocket, msg: Record<string, unknown>): Promise<boolean> {
+    if (msg.type !== MEMORY_WS.FEATURES_QUERY) return false;
+    const requestId = this.registerMemoryManagementRequest(ws, msg);
+    if (!requestId) return true;
+    const userId = this.browserUserIds.get(ws)?.trim();
+    try {
+      const flags = userId ? await this.readUserMemoryFeatureFlags(userId) : {};
+      this.clearPendingMemoryManagementRequest(requestId);
+      safeSend(ws, JSON.stringify({
+        type: MEMORY_WS.FEATURES_RESPONSE,
+        requestId,
+        records: this.buildMemoryFeatureAdminRecords(flags),
+      }));
+    } catch (error) {
+      this.failMemoryManagementForward(ws, msg, requestId, error);
+    }
+    return true;
+  }
+
+  private async handleMemoryFeaturesSet(ws: WebSocket, msg: Record<string, unknown>): Promise<boolean> {
+    if (msg.type !== MEMORY_WS.FEATURES_SET) return false;
+    const requestId = this.registerMemoryManagementRequest(ws, msg);
+    if (!requestId) return true;
+    const userId = this.browserUserIds.get(ws)?.trim();
+    const flag = typeof msg.flag === 'string' ? msg.flag : undefined;
+    const enabled = msg.enabled;
+    const sendSetResponse = (payload: Record<string, unknown>) => {
+      this.clearPendingMemoryManagementRequest(requestId);
+      safeSend(ws, JSON.stringify({
+        type: MEMORY_WS.FEATURES_SET_RESPONSE,
+        requestId,
+        ...payload,
+      }));
+    };
+    if (!userId) {
+      sendSetResponse({ success: false, error: MEMORY_MANAGEMENT_BRIDGE_ERROR_CODES.UNAUTHENTICATED });
+      return true;
+    }
+    if (!isMemoryFeatureFlag(flag) || typeof enabled !== 'boolean') {
+      sendSetResponse({
+        success: false,
+        error: MEMORY_MANAGEMENT_ERROR_CODES.INVALID_FEATURE_FLAG,
+        errorCode: MEMORY_MANAGEMENT_ERROR_CODES.INVALID_FEATURE_FLAG,
+      });
+      return true;
+    }
+    try {
+      const current = await this.readUserMemoryFeatureFlags(userId);
+      const updates: MemoryFeatureFlagValues = enabled
+        ? Object.fromEntries([...this.collectMemoryFeatureWithDependencies(flag)].map((dependency) => [dependency, true])) as MemoryFeatureFlagValues
+        : { [flag]: false };
+      const next = await this.writeUserMemoryFeatureFlags(userId, { ...current, ...updates });
+      await this.pushUserMemoryFeatureConfigToOnlineDaemons(userId, next);
+      const records = this.buildMemoryFeatureAdminRecords(next);
+      sendSetResponse({
+        success: true,
+        flag,
+        requested: enabled,
+        enabled: records.find((record) => record.flag === flag)?.enabled ?? false,
+        records,
+      });
+    } catch (error) {
+      logger.warn({ err: error, serverId: this.serverId, flag }, 'failed to persist global memory feature config');
+      sendSetResponse({
+        success: false,
+        flag,
+        requested: enabled,
+        error: MEMORY_MANAGEMENT_ERROR_CODES.FEATURE_CONFIG_WRITE_FAILED,
+        errorCode: MEMORY_MANAGEMENT_ERROR_CODES.FEATURE_CONFIG_WRITE_FAILED,
+      });
+    }
+    return true;
+  }
+
   private roleFromMembership(role: unknown, elevatedRole: Exclude<MemoryManagementRole, 'user'>): MemoryManagementRole {
     return role === 'owner' || role === 'admin' ? elevatedRole : 'user';
   }
@@ -663,7 +855,10 @@ export class WsBridge {
         if (this.authTimer) clearTimeout(this.authTimer);
 
         const tokenHash = sha256Hex(msg.token);
-        const server = await db.queryOne<{ token_hash: string }>('SELECT token_hash FROM servers WHERE id = $1', [this.serverId]);
+        const server = await db.queryOne<{ token_hash: string; user_id?: string }>(
+          'SELECT token_hash, user_id FROM servers WHERE id = $1',
+          [this.serverId],
+        );
 
         if (!server || server.token_hash !== tokenHash) {
           logger.warn({ serverId: this.serverId }, 'Daemon auth failed');
@@ -682,6 +877,13 @@ export class WsBridge {
         updateServerHeartbeat(db, this.serverId, this.daemonVersion).catch((err) =>
           logger.error({ err }, 'Failed to update heartbeat on auth'),
         );
+        if (typeof server.user_id === 'string' && server.user_id.trim()) {
+          try {
+            this.sendMemoryFeatureConfigApply(await this.readUserMemoryFeatureFlags(server.user_id));
+          } catch (err) {
+            logger.warn({ err, serverId: this.serverId }, 'failed to push global memory feature config on daemon auth');
+          }
+        }
 
         // Auto-upgrade: on each reconnect, retry up to 3 times with 10-minute intervals.
         // Always target the server's exact version so dev↔stable mismatches converge to
@@ -909,6 +1111,15 @@ export class WsBridge {
       }
 
       if (typeof msg.type !== 'string') {
+        return;
+      }
+
+      if (msg.type === MEMORY_WS.FEATURES_QUERY) {
+        await this.handleMemoryFeaturesQuery(ws, msg);
+        return;
+      }
+      if (msg.type === MEMORY_WS.FEATURES_SET) {
+        await this.handleMemoryFeaturesSet(ws, msg);
         return;
       }
 

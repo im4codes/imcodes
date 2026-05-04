@@ -7,7 +7,7 @@ import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { MEMORY_WS } from '../../shared/memory-ws.js';
 import { MEMORY_MANAGEMENT_CONTEXT_FIELD } from '../../shared/memory-management-context.js';
 import { MEMORY_MANAGEMENT_ERROR_CODES } from '../../shared/memory-management.js';
-import { MEMORY_FEATURE_FLAGS_BY_NAME, memoryFeatureFlagEnvKey } from '../../shared/feature-flags.js';
+import { MEMORY_FEATURE_CONFIG_MSG, MEMORY_FEATURE_FLAGS_BY_NAME, memoryFeatureFlagEnvKey } from '../../shared/feature-flags.js';
 import {
   PREFERENCE_CONTEXT_START,
   PREFERENCE_FEATURE_ENV_KEY,
@@ -2139,7 +2139,7 @@ describe('handleWebCommand transport queue behavior', () => {
     }));
   });
 
-  it('reports daemon memory feature states through shared management messages', async () => {
+  it('reports effective daemon memory feature states including server runtime override and fallback config', async () => {
     enablePreferenceFeature();
     vi.stubEnv(memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.skills), '0');
 
@@ -2156,7 +2156,36 @@ describe('handleWebCommand transport queue behavior', () => {
     });
   });
 
-  it('persists daemon memory feature toggles through shared management messages', async () => {
+  it('applies server-managed global memory feature config ahead of local daemon config', async () => {
+    vi.stubEnv(memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.preferences), '0');
+
+    handleWebCommand({
+      type: MEMORY_FEATURE_CONFIG_MSG.APPLY,
+      flags: {
+        [MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry]: true,
+        [MEMORY_FEATURE_FLAGS_BY_NAME.observationStore]: true,
+        [MEMORY_FEATURE_FLAGS_BY_NAME.preferences]: true,
+      },
+    }, serverLink as any);
+
+    handleWebCommand({ type: MEMORY_WS.FEATURES_QUERY, requestId: 'features-runtime-override' }, serverLink as any);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: MEMORY_WS.FEATURES_RESPONSE,
+      requestId: 'features-runtime-override',
+      records: expect.arrayContaining([
+        expect.objectContaining({
+          flag: MEMORY_FEATURE_FLAGS_BY_NAME.preferences,
+          requested: true,
+          enabled: true,
+          source: 'runtime_config_override',
+        }),
+      ]),
+    }));
+  });
+
+  it('persists local fallback memory feature toggles when a direct daemon request is used', async () => {
     vi.stubEnv(memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry), '0');
 
     handleWebCommand({
@@ -2203,7 +2232,7 @@ describe('handleWebCommand transport queue behavior', () => {
     }));
   });
 
-  it('cascades dependencies when enabling a daemon memory feature toggle', async () => {
+  it('cascades dependencies when enabling a local fallback memory feature toggle', async () => {
     handleWebCommand({
       type: MEMORY_WS.FEATURES_SET,
       requestId: 'feature-set-dep',
@@ -2279,7 +2308,7 @@ describe('handleWebCommand transport queue behavior', () => {
     }));
   });
 
-  it('rejects invalid daemon memory feature toggle requests', async () => {
+  it('rejects invalid local fallback memory feature toggle requests', async () => {
     handleWebCommand({
       type: MEMORY_WS.FEATURES_SET,
       requestId: 'feature-set-invalid',
@@ -2298,7 +2327,7 @@ describe('handleWebCommand transport queue behavior', () => {
     });
   });
 
-  it('rejects daemon memory feature toggles without management context', async () => {
+  it('rejects local fallback memory feature toggles without management context', async () => {
     handleWebCommand({
       type: MEMORY_WS.FEATURES_SET,
       requestId: 'feature-set-no-context',

@@ -45,6 +45,10 @@ import {
 import { computeProjectionContentHash } from '../memory/citation.js';
 import { SUPERVISION_USER_DEFAULT_PREF_KEY } from '../../../shared/supervision-config.js';
 import {
+  MEMORY_FEATURE_CONFIG_PREF_KEY,
+  parseMemoryFeatureFlagValuesJson,
+} from '../../../shared/feature-flags.js';
+import {
   authoredContextScopeForBinding,
   expandSearchRequestScope,
   compareRuntimeAuthoredContextBindings,
@@ -735,9 +739,6 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
 });
 
 serverRoutes.post('/:id/shared-context/owner-private', async (c) => {
-  if (!isMemoryFeatureEnabled(c.env, MEMORY_FEATURES.userPrivateSync)) {
-    return c.json(sameShapeMemoryLookupEnvelope(), 404);
-  }
   const auth = c.req.header('Authorization');
   if (!auth?.startsWith('Bearer ')) return c.json({ error: 'unauthorized' }, 401);
   const tokenHash = sha256Hex(auth.slice(7));
@@ -747,6 +748,12 @@ serverRoutes.post('/:id/shared-context/owner-private', async (c) => {
     [tokenHash, c.req.param('id')],
   );
   if (!serverRow) return c.json({ error: 'unauthorized' }, 401);
+  const featureFlags = parseMemoryFeatureFlagValuesJson(
+    await getUserPref(c.env.DB, serverRow.user_id, MEMORY_FEATURE_CONFIG_PREF_KEY),
+  );
+  if (!isMemoryFeatureEnabled(c.env, MEMORY_FEATURES.userPrivateSync, featureFlags)) {
+    return c.json(sameShapeMemoryLookupEnvelope(), 404);
+  }
 
   const body = await c.req.json().catch(() => null);
   const parsed = ownerPrivateReplicationSchema.safeParse(body);
@@ -799,9 +806,6 @@ serverRoutes.post('/:id/shared-context/owner-private', async (c) => {
 });
 
 serverRoutes.post('/:id/shared-context/owner-private/search', async (c) => {
-  if (!isMemoryFeatureEnabled(c.env, MEMORY_FEATURES.userPrivateSync)) {
-    return c.json(sameShapeSearchEnvelope());
-  }
   const auth = c.req.header('Authorization');
   if (!auth?.startsWith('Bearer ')) return c.json({ error: 'unauthorized' }, 401);
   const tokenHash = sha256Hex(auth.slice(7));
@@ -811,6 +815,12 @@ serverRoutes.post('/:id/shared-context/owner-private/search', async (c) => {
     [tokenHash, c.req.param('id')],
   );
   if (!serverRow) return c.json({ error: 'unauthorized' }, 401);
+  const featureFlags = parseMemoryFeatureFlagValuesJson(
+    await getUserPref(c.env.DB, serverRow.user_id, MEMORY_FEATURE_CONFIG_PREF_KEY),
+  );
+  if (!isMemoryFeatureEnabled(c.env, MEMORY_FEATURES.userPrivateSync, featureFlags)) {
+    return c.json(sameShapeSearchEnvelope());
+  }
 
   const body = await c.req.json().catch(() => null);
   const parsed = ownerPrivateSearchSchema.safeParse(body);
@@ -964,8 +974,8 @@ serverRoutes.post('/:id/shared-context/authored-bindings', async (c) => {
   const token = auth.slice(7);
   const tokenHash = sha256Hex(token);
 
-  const serverRow = await c.env.DB.queryOne<{ id: string; team_id: string | null }>(
-    'SELECT id, team_id FROM servers WHERE token_hash = $1 AND id = $2',
+  const serverRow = await c.env.DB.queryOne<{ id: string; team_id: string | null; user_id: string }>(
+    'SELECT id, team_id, user_id FROM servers WHERE token_hash = $1 AND id = $2',
     [tokenHash, c.req.param('id')],
   );
   if (!serverRow) return c.json({ error: 'unauthorized' }, 401);
@@ -1022,6 +1032,10 @@ serverRoutes.post('/:id/shared-context/authored-bindings', async (c) => {
     [enterpriseId, namespace.workspaceId ?? null, namespace.projectId],
   );
 
+  const featureFlags = parseMemoryFeatureFlagValuesJson(
+    await getUserPref(c.env.DB, serverRow.user_id, MEMORY_FEATURE_CONFIG_PREF_KEY),
+  );
+  const orgAuthoredEnabled = isMemoryFeatureEnabled(c.env, MEMORY_FEATURES.orgSharedAuthoredStandards, featureFlags);
   const bindings: RuntimeAuthoredContextBinding[] = rows
     .map((row) => ({
       bindingId: row.binding_id,
@@ -1037,7 +1051,7 @@ serverRoutes.post('/:id/shared-context/authored-bindings', async (c) => {
       content: row.content_md,
       active: true,
     }))
-    .filter((binding) => binding.scope !== 'org_shared' || isMemoryFeatureEnabled(c.env, MEMORY_FEATURES.orgSharedAuthoredStandards))
+    .filter((binding) => binding.scope !== 'org_shared' || orgAuthoredEnabled)
     .filter((binding) => !binding.repository || binding.repository === namespace.projectId)
     .filter((binding) => !binding.language || binding.language === language)
     .filter((binding) => !binding.pathPattern || (!!filePath && matchesAuthoredContextPathPattern(binding.pathPattern, filePath)))

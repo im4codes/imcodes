@@ -134,10 +134,12 @@ import {
   getMemoryFeatureFlagDefinition,
   computeEffectiveMemoryFeatureFlags,
   isMemoryFeatureFlag,
+  MEMORY_FEATURE_CONFIG_MSG,
   MEMORY_FEATURE_FLAGS,
   MEMORY_FEATURE_FLAGS_BY_NAME,
   memoryFeatureFlagEnvKey,
   resolveMemoryFeatureFlagValue,
+  sanitizeMemoryFeatureFlagValues,
   type FeatureFlagValueSource,
   type MemoryFeatureFlagValues,
   type MemoryFeatureFlag,
@@ -163,7 +165,9 @@ import { assertManagedSkillPathSync, ManagedSkillPathError } from '../context/ma
 import {
   getMemoryFeatureConfigStoreDiagnostics,
   getPersistedMemoryFeatureFlagValues,
+  getRuntimeMemoryFeatureFlagValues,
   setPersistedMemoryFeatureFlagValues,
+  setRuntimeMemoryFeatureFlagValues,
 } from '../store/memory-feature-config-store.js';
 
 const MAX_P2P_FILE_PULL_COUNT = 20;
@@ -196,6 +200,7 @@ function readMemoryFeatureEnvironmentDefaults(): MemoryFeatureFlagValues {
 function readMemoryFeatureResolutionLayers(): MemoryFeatureFlagResolutionLayers {
   const persistedConfig = getPersistedMemoryFeatureFlagValues();
   return {
+    runtimeConfigOverride: getRuntimeMemoryFeatureFlagValues(),
     persistedConfig,
     environmentStartupDefault: readMemoryFeatureEnvironmentDefaults(),
     readFailed: !!getMemoryFeatureConfigStoreDiagnostics().lastLoadIssue,
@@ -1359,6 +1364,9 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
       break;
     case SHARED_CONTEXT_RUNTIME_CONFIG_MSG.APPLY:
       void handleSharedContextRuntimeConfigApply(cmd);
+      break;
+    case MEMORY_FEATURE_CONFIG_MSG.APPLY:
+      handleMemoryFeatureConfigApply(cmd);
       break;
     case MEMORY_WS.PERSONAL_QUERY:
       void handlePersonalMemoryQuery(cmd, serverLink);
@@ -6257,6 +6265,18 @@ async function handleSharedContextRuntimeConfigApply(cmd: Record<string, unknown
   }
 }
 
+function handleMemoryFeatureConfigApply(cmd: Record<string, unknown>): void {
+  const nextFlags = sanitizeMemoryFeatureFlagValues(cmd.flags);
+  const previous = getRuntimeMemoryFeatureFlagValues() ?? {};
+  setRuntimeMemoryFeatureFlagValues(nextFlags);
+  if (
+    previous[MEMORY_FEATURE_FLAGS_BY_NAME.skills] !== nextFlags[MEMORY_FEATURE_FLAGS_BY_NAME.skills]
+    || previous[MEMORY_FEATURE_FLAGS_BY_NAME.skillAutoCreation] !== nextFlags[MEMORY_FEATURE_FLAGS_BY_NAME.skillAutoCreation]
+  ) {
+    publishRuntimeMemoryCacheInvalidation({ kind: 'skill_registry' });
+  }
+}
+
 async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
   if (!requestId) return;
@@ -6718,6 +6738,11 @@ function handleMemoryFeaturesQuery(cmd: Record<string, unknown>, serverLink: Ser
 }
 
 function handleMemoryFeaturesSet(cmd: Record<string, unknown>, serverLink: ServerLink): void {
+  // In normal server-backed operation the bridge consumes FEATURES_SET,
+  // persists the account-level user-global config, and pushes
+  // MEMORY_FEATURE_CONFIG_MSG.APPLY to every online daemon owned by that user.
+  // This direct daemon write path is retained only as a local fallback for
+  // legacy/offline control planes; it is not the primary UI persistence plane.
   const requestId = commandString(cmd, 'requestId') || undefined;
   const flag = commandString(cmd, 'flag');
   const enabled = cmd.enabled;

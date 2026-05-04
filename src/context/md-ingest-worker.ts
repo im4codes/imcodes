@@ -15,6 +15,11 @@ import {
   type MemoryFeatureFlag,
   type MemoryFeatureFlagValues,
 } from '../../shared/feature-flags.js';
+import {
+  getMemoryFeatureConfigStoreDiagnostics,
+  getPersistedMemoryFeatureFlagValues,
+  getRuntimeMemoryFeatureFlagValues,
+} from '../store/memory-feature-config-store.js';
 import { writeProcessedProjection } from '../store/context-store.js';
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { incrementCounter } from '../util/metrics.js';
@@ -31,7 +36,10 @@ function isMdIngestEnabled(): boolean {
     }),
   ) as MemoryFeatureFlagValues;
   return resolveEffectiveMemoryFeatureFlagValue(MD_INGEST_FEATURE_FLAG, {
+    runtimeConfigOverride: getRuntimeMemoryFeatureFlagValues(),
+    persistedConfig: getPersistedMemoryFeatureFlagValues(),
     environmentStartupDefault,
+    readFailed: !!getMemoryFeatureConfigStoreDiagnostics().lastLoadIssue,
   });
 }
 

@@ -52,6 +52,11 @@ import {
   memoryFeatureFlagEnvKey,
   resolveMemoryFeatureFlagValue,
 } from '../../shared/feature-flags.js';
+import {
+  getMemoryFeatureConfigStoreDiagnostics,
+  getPersistedMemoryFeatureFlagValues,
+  getRuntimeMemoryFeatureFlagValues,
+} from '../store/memory-feature-config-store.js';
 
 export interface MaterializationThresholds {
   autoTriggerTokens: number;
@@ -649,7 +654,10 @@ export class MaterializationCoordinator {
     const flag = MEMORY_FEATURE_FLAGS_BY_NAME.selfLearning;
     const raw = process.env[memoryFeatureFlagEnvKey(flag)];
     return resolveMemoryFeatureFlagValue(flag, {
+      runtimeConfigOverride: getRuntimeMemoryFeatureFlagValues(),
+      persistedConfig: getPersistedMemoryFeatureFlagValues(),
       environmentStartupDefault: raw == null ? undefined : { [flag]: raw === 'true' || raw === '1' },
+      readFailed: !!getMemoryFeatureConfigStoreDiagnostics().lastLoadIssue,
     });
   }
 

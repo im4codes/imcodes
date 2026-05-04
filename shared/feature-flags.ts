@@ -25,7 +25,11 @@ export const FEATURE_FLAG_VALUE_PRECEDENCE = [
 ] as const;
 export type FeatureFlagValueSource = (typeof FEATURE_FLAG_VALUE_PRECEDENCE)[number];
 
-export type MemoryFeatureRuntimeSource = 'local_daemon_config' | 'server_config' | 'local_or_server_config';
+export type MemoryFeatureRuntimeSource =
+  | 'user_global_config'
+  | 'local_daemon_config'
+  | 'server_config'
+  | 'local_or_server_config';
 
 export interface MemoryFeatureFlagDefinition {
   flag: MemoryFeatureFlag;
@@ -45,6 +49,12 @@ export interface MemoryFeatureFlagResolutionLayers {
   environmentStartupDefault?: MemoryFeatureFlagValues;
   readFailed?: boolean;
 }
+
+export const MEMORY_FEATURE_CONFIG_PREF_KEY = 'memory.feature_flags.global.v1' as const;
+
+export const MEMORY_FEATURE_CONFIG_MSG = {
+  APPLY: 'memory.features.apply',
+} as const;
 
 const FLAG = {
   scopeRegistryExtensions: 'mem.feature.scope_registry_extensions',
@@ -69,7 +79,7 @@ export const MEMORY_FEATURE_FLAG_REGISTRY = {
   [FLAG.scopeRegistryExtensions]: {
     flag: FLAG.scopeRegistryExtensions,
     defaultValue: false,
-    runtimeSource: 'local_or_server_config',
+    runtimeSource: 'user_global_config',
     dependencies: [],
     requiredPrerequisites: [],
     observedBy: ['daemon', 'server', 'web', 'namespace_registry'],
@@ -78,7 +88,7 @@ export const MEMORY_FEATURE_FLAG_REGISTRY = {
   [FLAG.userPrivateSync]: {
     flag: FLAG.userPrivateSync,
     defaultValue: false,
-    runtimeSource: 'local_or_server_config',
+    runtimeSource: 'user_global_config',
     dependencies: [FLAG.scopeRegistryExtensions, FLAG.namespaceRegistry, FLAG.observationStore],
     requiredPrerequisites: [],
     observedBy: ['daemon_replication_runner', 'server_owner_private_sync', 'startup_selection', 'memory_search'],
@@ -87,7 +97,7 @@ export const MEMORY_FEATURE_FLAG_REGISTRY = {
   [FLAG.selfLearning]: {
     flag: FLAG.selfLearning,
     defaultValue: false,
-    runtimeSource: 'local_daemon_config',
+    runtimeSource: 'user_global_config',
     dependencies: [FLAG.namespaceRegistry, FLAG.observationStore],
     requiredPrerequisites: [],
     observedBy: ['materialization_pipeline', 'compression_pipeline'],
@@ -96,7 +106,7 @@ export const MEMORY_FEATURE_FLAG_REGISTRY = {
   [FLAG.namespaceRegistry]: {
     flag: FLAG.namespaceRegistry,
     defaultValue: false,
-    runtimeSource: 'local_or_server_config',
+    runtimeSource: 'user_global_config',
     dependencies: [],
     requiredPrerequisites: [],
     observedBy: ['daemon_storage', 'server_storage'],
@@ -105,7 +115,7 @@ export const MEMORY_FEATURE_FLAG_REGISTRY = {
   [FLAG.observationStore]: {
     flag: FLAG.observationStore,
     defaultValue: false,
-    runtimeSource: 'local_or_server_config',
+    runtimeSource: 'user_global_config',
     dependencies: [FLAG.namespaceRegistry],
     requiredPrerequisites: [],
     observedBy: ['daemon_storage', 'server_storage', 'materialization', 'preferences', 'skills'],
@@ -114,7 +124,7 @@ export const MEMORY_FEATURE_FLAG_REGISTRY = {
   [FLAG.quickSearch]: {
     flag: FLAG.quickSearch,
     defaultValue: false,
-    runtimeSource: 'server_config',
+    runtimeSource: 'user_global_config',
     dependencies: [FLAG.namespaceRegistry],
     requiredPrerequisites: [],
     observedBy: ['web_search_ui', 'server_search_rpc', 'daemon_search_rpc'],
@@ -123,7 +133,7 @@ export const MEMORY_FEATURE_FLAG_REGISTRY = {
   [FLAG.citation]: {
     flag: FLAG.citation,
     defaultValue: false,
-    runtimeSource: 'server_config',
+    runtimeSource: 'user_global_config',
     dependencies: [FLAG.quickSearch],
     requiredPrerequisites: [],
     observedBy: ['web_composer', 'citation_rpc'],
@@ -132,7 +142,7 @@ export const MEMORY_FEATURE_FLAG_REGISTRY = {
   [FLAG.citeCount]: {
     flag: FLAG.citeCount,
     defaultValue: false,
-    runtimeSource: 'server_config',
+    runtimeSource: 'user_global_config',
     dependencies: [FLAG.citation],
     requiredPrerequisites: [],
     observedBy: ['citation_store', 'search_ranking'],
@@ -141,7 +151,7 @@ export const MEMORY_FEATURE_FLAG_REGISTRY = {
   [FLAG.citeDriftBadge]: {
     flag: FLAG.citeDriftBadge,
     defaultValue: false,
-    runtimeSource: 'server_config',
+    runtimeSource: 'user_global_config',
     dependencies: [FLAG.citation],
     requiredPrerequisites: [],
     observedBy: ['web_citation_renderer'],
@@ -150,7 +160,7 @@ export const MEMORY_FEATURE_FLAG_REGISTRY = {
   [FLAG.mdIngest]: {
     flag: FLAG.mdIngest,
     defaultValue: false,
-    runtimeSource: 'local_daemon_config',
+    runtimeSource: 'user_global_config',
     dependencies: [FLAG.namespaceRegistry, FLAG.observationStore],
     requiredPrerequisites: [],
     observedBy: ['session_bootstrap', 'md_ingest_worker'],
@@ -159,7 +169,7 @@ export const MEMORY_FEATURE_FLAG_REGISTRY = {
   [FLAG.preferences]: {
     flag: FLAG.preferences,
     defaultValue: false,
-    runtimeSource: 'local_daemon_config',
+    runtimeSource: 'user_global_config',
     dependencies: [FLAG.namespaceRegistry, FLAG.observationStore],
     requiredPrerequisites: [],
     observedBy: ['daemon_send_handler', 'preference_store'],
@@ -168,7 +178,7 @@ export const MEMORY_FEATURE_FLAG_REGISTRY = {
   [FLAG.skills]: {
     flag: FLAG.skills,
     defaultValue: false,
-    runtimeSource: 'local_or_server_config',
+    runtimeSource: 'user_global_config',
     dependencies: [FLAG.namespaceRegistry, FLAG.observationStore],
     requiredPrerequisites: [],
     observedBy: ['skill_loader', 'render_policy', 'admin_api'],
@@ -177,7 +187,7 @@ export const MEMORY_FEATURE_FLAG_REGISTRY = {
   [FLAG.skillAutoCreation]: {
     flag: FLAG.skillAutoCreation,
     defaultValue: false,
-    runtimeSource: 'local_daemon_config',
+    runtimeSource: 'user_global_config',
     dependencies: [FLAG.skills, FLAG.selfLearning],
     requiredPrerequisites: [],
     observedBy: ['background_skill_review_worker'],
@@ -186,7 +196,7 @@ export const MEMORY_FEATURE_FLAG_REGISTRY = {
   [FLAG.orgSharedAuthoredStandards]: {
     flag: FLAG.orgSharedAuthoredStandards,
     defaultValue: false,
-    runtimeSource: 'server_config',
+    runtimeSource: 'user_global_config',
     dependencies: [FLAG.scopeRegistryExtensions],
     requiredPrerequisites: ['shared_context_document_migrations', 'shared_context_version_migrations', 'shared_context_binding_migrations'],
     observedBy: ['server_shared_context_routes', 'authored_context_resolver', 'web_diagnostics'],
@@ -198,6 +208,29 @@ const MEMORY_FEATURE_FLAG_SET: ReadonlySet<string> = new Set(MEMORY_FEATURE_FLAG
 
 export function isMemoryFeatureFlag(value: unknown): value is MemoryFeatureFlag {
   return typeof value === 'string' && MEMORY_FEATURE_FLAG_SET.has(value);
+}
+
+export function sanitizeMemoryFeatureFlagValues(raw: unknown): MemoryFeatureFlagValues {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const flags: MemoryFeatureFlagValues = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (!isMemoryFeatureFlag(key)) continue;
+    if (value === true || value === false) flags[key] = value;
+  }
+  return flags;
+}
+
+export function parseMemoryFeatureFlagValuesJson(raw: string | null | undefined): MemoryFeatureFlagValues {
+  if (!raw?.trim()) return {};
+  try {
+    return sanitizeMemoryFeatureFlagValues(JSON.parse(raw));
+  } catch {
+    return {};
+  }
+}
+
+export function encodeMemoryFeatureFlagValuesJson(flags: MemoryFeatureFlagValues): string {
+  return JSON.stringify(sanitizeMemoryFeatureFlagValues(flags));
 }
 
 export function getMemoryFeatureFlagDefinition(flag: MemoryFeatureFlag): MemoryFeatureFlagDefinition {

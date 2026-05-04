@@ -33,6 +33,11 @@ import { incrementCounter } from '../util/metrics.js';
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { getSkillRegistrySnapshot, upsertUserSkillRegistryEntry } from './skill-registry.js';
 import { buildSkillRegistryEntryForWrittenUserSkill } from './skill-registry-builder.js';
+import {
+  getMemoryFeatureConfigStoreDiagnostics,
+  getPersistedMemoryFeatureFlagValues,
+  getRuntimeMemoryFeatureFlagValues,
+} from '../store/memory-feature-config-store.js';
 
 type StoredSkillReviewJob = MaterializationSkillReviewJob & {
   state: SkillReviewJobState;
@@ -54,7 +59,10 @@ function effectiveSkillAutoCreationEnabled(): boolean {
     }),
   ) as Partial<Record<MemoryFeatureFlag, boolean>>;
   return resolveEffectiveMemoryFeatureFlagValue(MEMORY_FEATURE_FLAGS_BY_NAME.skillAutoCreation, {
+    runtimeConfigOverride: getRuntimeMemoryFeatureFlagValues(),
+    persistedConfig: getPersistedMemoryFeatureFlagValues(),
     environmentStartupDefault,
+    readFailed: !!getMemoryFeatureConfigStoreDiagnostics().lastLoadIssue,
   });
 }
 

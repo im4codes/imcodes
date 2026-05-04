@@ -14,6 +14,12 @@ import { isMemoryNoiseSummary } from '../../../shared/memory-noise-patterns.js';
 import { normalizeSummaryForFingerprint } from '../../../shared/memory-fingerprint.js';
 import { isMemoryOrigin, type MemoryOrigin } from '../../../shared/memory-origin.js';
 import { REPLICABLE_SHARED_PROJECTION_SCOPES } from '../../../shared/memory-scope.js';
+import {
+  MEMORY_FEATURE_CONFIG_PREF_KEY,
+  parseMemoryFeatureFlagValuesJson,
+  type MemoryFeatureFlag,
+  type MemoryFeatureFlagValues,
+} from '../../../shared/feature-flags.js';
 import { searchSemanticMemoryView } from '../util/semantic-memory-view.js';
 import { applyRuntimeAuthoredContextBudget } from '../memory/authored-context-runtime.js';
 import { deleteEnterpriseMemoryProjection, deletePersonalMemoryProjection } from '../util/memory-delete.js';
@@ -39,6 +45,7 @@ import {
   consumeCitationCountRateLimit,
   deriveCitationIdempotencyKey,
 } from '../memory/citation.js';
+import { getUserPref } from '../db/queries.js';
 
 type EnterpriseRole = 'owner' | 'admin' | 'member';
 type BindingMode = 'required' | 'advisory';
@@ -48,6 +55,19 @@ type RepositoryAliasReason = 'ssh-https-equivalent' | 'explicit-migration';
 export const sharedContextRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 sharedContextRoutes.use('*', requireAuth());
 type SharedContextRouteContext = Context<{ Bindings: Env; Variables: { userId: string; role: string } }>;
+
+async function getCurrentUserMemoryFeatureFlags(c: SharedContextRouteContext): Promise<MemoryFeatureFlagValues> {
+  const userId = c.get('userId' as never) as string;
+  return parseMemoryFeatureFlagValuesJson(await getUserPref(c.env.DB, userId, MEMORY_FEATURE_CONFIG_PREF_KEY));
+}
+
+function isUserMemoryFeatureEnabled(
+  c: SharedContextRouteContext,
+  feature: MemoryFeatureFlag,
+  flags: MemoryFeatureFlagValues,
+): boolean {
+  return isMemoryFeatureEnabled(c.env, feature, flags);
+}
 
 async function getEnterpriseRole(db: Env['DB'], enterpriseId: string, userId: string): Promise<EnterpriseRole | null> {
   const row = await db.queryOne<{ role: EnterpriseRole }>(
@@ -451,7 +471,8 @@ sharedContextRoutes.get('/personal-memory', async (c) => {
 });
 
 sharedContextRoutes.post('/memory/search', async (c) => {
-  if (!isMemoryFeatureEnabled(c.env, MEMORY_FEATURES.quickSearch)) {
+  const featureFlags = await getCurrentUserMemoryFeatureFlags(c);
+  if (!isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.quickSearch, featureFlags)) {
     return c.json(sameShapeSearchEnvelope());
   }
   const userId = c.get('userId' as never) as string;
@@ -464,7 +485,7 @@ sharedContextRoutes.post('/memory/search', async (c) => {
   const query = body?.query?.trim() ?? '';
   const requestedScope = isSearchRequestScope(body?.scope) ? body.scope : 'all_authorized';
   const limit = Math.max(1, Math.min(50, typeof body?.limit === 'number' ? body.limit : 20));
-  const userPrivateSyncEnabled = isMemoryFeatureEnabled(c.env, MEMORY_FEATURES.userPrivateSync);
+  const userPrivateSyncEnabled = isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.userPrivateSync, featureFlags);
   const scopes = expandSearchRequestScope(requestedScope, { includeOwnerPrivate: userPrivateSyncEnabled });
   if (scopes.length === 0) return c.json(sameShapeSearchEnvelope());
 
@@ -524,7 +545,7 @@ sharedContextRoutes.post('/memory/search', async (c) => {
   }
 
   if (sharedScopes.length > 0) {
-    const citeCountEnabled = isMemoryFeatureEnabled(c.env, MEMORY_FEATURES.citeCount);
+    const citeCountEnabled = isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.citeCount, featureFlags);
     const rows = await c.env.DB.query<SearchProjectionRow>(
       `SELECT p.id, p.scope, p.project_id, p.projection_class, p.summary, p.updated_at, p.origin,
               p.hit_count, COALESCE(cc.cite_count, 0) AS cite_count
@@ -644,8 +665,9 @@ async function getOrRepairProjectionContentHash(
 }
 
 sharedContextRoutes.post('/memory/citations', async (c) => {
-  if (!isMemoryFeatureEnabled(c.env, MEMORY_FEATURES.citation)) return sameShapeNotFound(c);
   const userId = c.get('userId' as never) as string;
+  const featureFlags = await getCurrentUserMemoryFeatureFlags(c);
+  if (!isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.citation, featureFlags)) return sameShapeNotFound(c);
   const body = await readJsonBody<{ projectionId?: string; citingMessageId?: string }>(c);
   const projectionId = body?.projectionId?.trim();
   const citingMessageId = body?.citingMessageId?.trim();
@@ -678,7 +700,7 @@ sharedContextRoutes.post('/memory/citations', async (c) => {
         [idempotencyKey, userId],
       );
   if (!inserted && !existingCitation) return sameShapeNotFound(c);
-  const countAllowed = inserted && isMemoryFeatureEnabled(c.env, MEMORY_FEATURES.citeCount)
+  const countAllowed = inserted && isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.citeCount, featureFlags)
     ? consumeCitationCountRateLimit({ env: c.env, userId, projectionId, now }).allowed
     : false;
   if (countAllowed) {
@@ -692,7 +714,7 @@ sharedContextRoutes.post('/memory/citations', async (c) => {
     );
   }
   const drift = existingCitation ? existingCitation.projection_content_hash !== contentHash : false;
-  const driftVisible = isMemoryFeatureEnabled(c.env, MEMORY_FEATURES.citeDriftBadge);
+  const driftVisible = isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.citeDriftBadge, featureFlags);
 
   return c.json({
     ok: true,
@@ -707,8 +729,9 @@ sharedContextRoutes.post('/memory/citations', async (c) => {
 });
 
 sharedContextRoutes.get('/memory/citations/:citationId', async (c) => {
-  if (!isMemoryFeatureEnabled(c.env, MEMORY_FEATURES.citation)) return sameShapeNotFound(c);
   const userId = c.get('userId' as never) as string;
+  const featureFlags = await getCurrentUserMemoryFeatureFlags(c);
+  if (!isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.citation, featureFlags)) return sameShapeNotFound(c);
   const citationId = c.req.param('citationId');
   const row = await c.env.DB.queryOne<{
     id: string;
@@ -723,7 +746,7 @@ sharedContextRoutes.get('/memory/citations/:citationId', async (c) => {
   const projection = await getAuthorizedCitationProjection(c, row.projection_id, userId);
   if (!projection) return sameShapeNotFound(c);
   const currentHash = await getOrRepairProjectionContentHash(c, projection);
-  const driftVisible = isMemoryFeatureEnabled(c.env, MEMORY_FEATURES.citeDriftBadge);
+  const driftVisible = isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.citeDriftBadge, featureFlags);
   return c.json({
     ok: true,
     citation: {
@@ -887,7 +910,8 @@ sharedContextRoutes.get('/enterprises/:enterpriseId/document-bindings', async (c
     'SELECT id, workspace_id, enrollment_id, document_id, version_id, binding_mode, applicability_repo_id, applicability_language, applicability_path_pattern, status, created_by FROM shared_context_document_bindings WHERE enterprise_id = $1 ORDER BY id ASC',
     [enterpriseId],
   );
-  const orgAuthoredEnabled = isMemoryFeatureEnabled(c.env, MEMORY_FEATURES.orgSharedAuthoredStandards);
+  const featureFlags = await getCurrentUserMemoryFeatureFlags(c);
+  const orgAuthoredEnabled = isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.orgSharedAuthoredStandards, featureFlags);
   const visibleRows = rows.filter((row) => {
     const scope = authoredContextScopeForBinding({
       workspaceId: row.workspace_id,
@@ -945,8 +969,10 @@ sharedContextRoutes.get('/enterprises/:enterpriseId/runtime-authored-context', a
     [enterpriseId],
   );
 
+  const featureFlags = await getCurrentUserMemoryFeatureFlags(c);
+  const orgAuthoredEnabled = isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.orgSharedAuthoredStandards, featureFlags);
   const bindings = rows
-    .filter((row) => row.enrollment_id || row.workspace_id || isMemoryFeatureEnabled(c.env, MEMORY_FEATURES.orgSharedAuthoredStandards))
+    .filter((row) => row.enrollment_id || row.workspace_id || orgAuthoredEnabled)
     .filter((row) => matchesRuntimeAuthoredContextRow(row, {
       canonicalRepoId,
       workspaceId,
@@ -1038,8 +1064,10 @@ sharedContextRoutes.get('/enterprises/:enterpriseId/diagnostics', async (c) => {
     Date.now(),
     getRemoteProcessedFreshMs(),
   );
+  const featureFlags = await getCurrentUserMemoryFeatureFlags(c);
+  const orgAuthoredEnabled = isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.orgSharedAuthoredStandards, featureFlags);
   const matchingBindings = bindings
-    .filter((row) => row.enrollment_id || row.workspace_id || isMemoryFeatureEnabled(c.env, MEMORY_FEATURES.orgSharedAuthoredStandards))
+    .filter((row) => row.enrollment_id || row.workspace_id || orgAuthoredEnabled)
     .filter((row) => matchesRuntimeAuthoredContextRow(row, {
       canonicalRepoId,
       workspaceId,
@@ -1425,7 +1453,8 @@ sharedContextRoutes.post('/enterprises/:enterpriseId/document-bindings', async (
     workspaceId: body.workspaceId,
     enrollmentId: body.enrollmentId,
   });
-  if (bindingScope === 'org_shared' && !isMemoryFeatureEnabled(c.env, MEMORY_FEATURES.orgSharedAuthoredStandards)) {
+  const featureFlags = await getCurrentUserMemoryFeatureFlags(c);
+  if (bindingScope === 'org_shared' && !isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.orgSharedAuthoredStandards, featureFlags)) {
     return sameShapeNotFound(c);
   }
   const bindingId = randomHex(16);
@@ -1463,7 +1492,8 @@ sharedContextRoutes.post('/document-bindings/:bindingId/deactivate', async (c) =
     workspaceId: binding.workspace_id,
     enrollmentId: binding.enrollment_id,
   });
-  if (bindingScope === 'org_shared' && !isMemoryFeatureEnabled(c.env, MEMORY_FEATURES.orgSharedAuthoredStandards)) {
+  const featureFlags = await getCurrentUserMemoryFeatureFlags(c);
+  if (bindingScope === 'org_shared' && !isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.orgSharedAuthoredStandards, featureFlags)) {
     return sameShapeNotFound(c);
   }
   const auth = await requireEnterpriseRole(c, binding.enterprise_id, 'admin');

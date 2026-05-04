@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import {
   isMemoryFeatureFlag,
+  sanitizeMemoryFeatureFlagValues,
   type MemoryFeatureFlag,
   type MemoryFeatureFlagValues,
 } from '../../shared/feature-flags.js';
@@ -20,6 +21,7 @@ interface MemoryFeatureConfigStorePayload {
 let loaded = false;
 let payload: MemoryFeatureConfigStorePayload = { version: STORE_VERSION, flags: {} };
 let lastLoadIssue: string | undefined;
+let runtimeOverride: MemoryFeatureFlagValues | undefined;
 
 function storePath(): string {
   const override = process.env[STORE_PATH_ENV]?.trim();
@@ -78,6 +80,14 @@ export function getPersistedMemoryFeatureFlagValues(): MemoryFeatureFlagValues {
   return { ...payload.flags };
 }
 
+export function getRuntimeMemoryFeatureFlagValues(): MemoryFeatureFlagValues | undefined {
+  return runtimeOverride ? { ...runtimeOverride } : undefined;
+}
+
+export function setRuntimeMemoryFeatureFlagValues(flags: MemoryFeatureFlagValues | null | undefined): void {
+  runtimeOverride = flags ? sanitizeMemoryFeatureFlagValues(flags) : undefined;
+}
+
 export function setPersistedMemoryFeatureFlagValue(flag: MemoryFeatureFlag, enabled: boolean): MemoryFeatureFlagValues {
   return setPersistedMemoryFeatureFlagValues({ [flag]: enabled });
 }
@@ -108,4 +118,5 @@ export function resetMemoryFeatureConfigStoreForTests(): void {
   loaded = false;
   payload = { version: STORE_VERSION, flags: {} };
   lastLoadIssue = undefined;
+  runtimeOverride = undefined;
 }

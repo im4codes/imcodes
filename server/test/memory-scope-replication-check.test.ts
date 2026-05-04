@@ -5,6 +5,10 @@ import type { Env } from '../src/env.js';
 import type { Database } from '../src/db/client.js';
 import { serverRoutes } from '../src/routes/server.js';
 import { computeProjectionContentHash } from '../src/memory/citation.js';
+import {
+  MEMORY_FEATURE_CONFIG_PREF_KEY,
+  MEMORY_FEATURE_FLAGS_BY_NAME,
+} from '../../shared/feature-flags.js';
 
 function makeEnv(db: Database): Env {
   return {
@@ -27,12 +31,16 @@ function normalize(sql: string): string {
   return sql.toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
-function makeMockDb() {
+function makeMockDb(options: { userPrefs?: Record<string, string> } = {}) {
   const executeLog: Array<{ sql: string; params: unknown[] }> = [];
   const tokenHash = sha256Hex('daemon-token');
   const db: Database = {
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []) => {
       const s = normalize(sql);
+      if (s.includes('from user_preferences')) {
+        const value = options.userPrefs?.[`${String(params[0])}:${String(params[1])}`];
+        return value == null ? null : ({ value } as T);
+      }
       if (s.includes('select id, user_id from servers where token_hash = $1 and id = $2')) {
         return params[0] === tokenHash && params[1] === 'srv-1'
           ? ({ id: 'srv-1', user_id: 'owner-1' } as T)
@@ -71,6 +79,31 @@ describe('user_private owner-only server replication', () => {
 
   afterEach(() => {
     delete process.env.IMCODES_MEM_FEATURE_USER_PRIVATE_SYNC;
+  });
+
+  it('lets the user-global online feature config override the daemon env fallback', async () => {
+    const { db, executeLog } = makeMockDb({
+      userPrefs: {
+        [`owner-1:${MEMORY_FEATURE_CONFIG_PREF_KEY}`]: JSON.stringify({
+          [MEMORY_FEATURE_FLAGS_BY_NAME.userPrivateSync]: false,
+        }),
+      },
+    });
+    const app = new Hono<{ Bindings: Env }>();
+    app.route('/api/server', serverRoutes);
+
+    const res = await app.request('/api/server/srv-1/shared-context/owner-private', {
+      method: 'POST',
+      headers: { authorization: 'Bearer daemon-token', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        namespace: { scope: 'user_private', userId: 'owner-1' },
+        records: [{ kind: 'note', origin: 'user_note', fingerprint: 'fp-disabled', text: 'private' }],
+      }),
+    }, makeEnv(db));
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ ok: false, result: null, citation: null, error: 'not_found' });
+    expect(executeLog).toEqual([]);
   });
 
   it('stores user_private records in the dedicated owner table, not shared projections', async () => {

@@ -20,6 +20,11 @@ import type { StartupMemoryCandidate } from './startup-memory.js';
 import { getSkillRegistrySnapshot } from './skill-registry.js';
 import { incrementCounter } from '../util/metrics.js';
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
+import {
+  getMemoryFeatureConfigStoreDiagnostics,
+  getPersistedMemoryFeatureFlagValues,
+  getRuntimeMemoryFeatureFlagValues,
+} from '../store/memory-feature-config-store.js';
 
 const SKILL_STARTUP_SOURCE = 'skill-startup-registry';
 
@@ -39,7 +44,10 @@ function isSkillsFeatureEnabled(): boolean {
     }),
   ) as MemoryFeatureFlagValues;
   return resolveEffectiveMemoryFeatureFlagValue(flag, {
+    runtimeConfigOverride: getRuntimeMemoryFeatureFlagValues(),
+    persistedConfig: getPersistedMemoryFeatureFlagValues(),
     environmentStartupDefault,
+    readFailed: !!getMemoryFeatureConfigStoreDiagnostics().lastLoadIssue,
   });
 }
 

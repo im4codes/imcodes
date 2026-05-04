@@ -3,6 +3,11 @@ import { EventEmitter } from 'node:events';
 import { WsBridge } from '../src/ws/bridge.js';
 import { MEMORY_WS } from '../../shared/memory-ws.js';
 import { MEMORY_MANAGEMENT_CONTEXT_FIELD } from '../../shared/memory-management-context.js';
+import {
+  MEMORY_FEATURE_CONFIG_MSG,
+  MEMORY_FEATURE_CONFIG_PREF_KEY,
+  MEMORY_FEATURE_FLAGS_BY_NAME,
+} from '../../shared/feature-flags.js';
 
 class MockWs extends EventEmitter {
   sent: Array<string | Buffer> = [];
@@ -139,6 +144,107 @@ describe('WsBridge memory management routing', () => {
 
     expect(daemon.sentJson().filter((msg) => msg.requestId === 'dup-1')).toHaveLength(1);
     expect(browserA.sentJson().some((msg) => msg.code === 'duplicate_request_id')).toBe(true);
+  });
+
+  it('serves memory feature state from the user-global online preference store instead of daemon-local state', async () => {
+    const db = makeDb(async (sql: string, params?: unknown[]) => {
+      if (sql.includes('token_hash')) return { token_hash: 'valid-hash', user_id: 'user-a' };
+      if (sql.includes('FROM user_preferences')) {
+        expect(params).toEqual(['user-a', MEMORY_FEATURE_CONFIG_PREF_KEY]);
+        return {
+          value: JSON.stringify({
+            [MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry]: true,
+            [MEMORY_FEATURE_FLAGS_BY_NAME.observationStore]: true,
+            [MEMORY_FEATURE_FLAGS_BY_NAME.preferences]: true,
+          }),
+        };
+      }
+      return null;
+    });
+    const { daemon, browserA } = await setup(db);
+    daemon.sent = [];
+
+    browserA.emit('message', JSON.stringify({ type: MEMORY_WS.FEATURES_QUERY, requestId: 'features-global' }));
+    await flush();
+
+    expect(daemon.sentJson().some((msg) => msg.type === MEMORY_WS.FEATURES_QUERY)).toBe(false);
+    const response = browserA.sentJson().find((msg) => msg.type === MEMORY_WS.FEATURES_RESPONSE && msg.requestId === 'features-global');
+    expect(response).toBeTruthy();
+    const records = response?.records as Array<Record<string, unknown>>;
+    expect(records.find((record) => record.flag === MEMORY_FEATURE_FLAGS_BY_NAME.preferences)).toMatchObject({
+      requested: true,
+      enabled: true,
+      source: 'persisted_config',
+    });
+  });
+
+  it('persists memory feature toggles globally and applies them to every online daemon owned by the user', async () => {
+    const writes: Array<{ userId: string; key: string; value: string }> = [];
+    const db = makeDb(async (sql: string) => {
+      if (sql.includes('token_hash')) return { token_hash: 'valid-hash', user_id: 'user-a' };
+      if (sql.includes('SELECT user_id FROM servers WHERE id = $1')) return { user_id: 'user-a' };
+      if (sql.includes('FROM user_preferences')) return { value: '{}' };
+      return null;
+    });
+    const executeDb = db as unknown as { execute: (sql: string, params?: unknown[]) => Promise<{ changes: number }> };
+    executeDb.execute = async (_sql: string, params?: unknown[]) => {
+      writes.push({ userId: String(params?.[0]), key: String(params?.[1]), value: String(params?.[2]) });
+      return { changes: 1 };
+    };
+    const first = await setup(db);
+    const second = await setup(db);
+    first.daemon.sent = [];
+    second.daemon.sent = [];
+
+    first.browserA.emit('message', JSON.stringify({
+      type: MEMORY_WS.FEATURES_SET,
+      requestId: 'features-set-global',
+      flag: MEMORY_FEATURE_FLAGS_BY_NAME.preferences,
+      enabled: true,
+    }));
+    await flush();
+
+    const featureWrites = writes.filter((write) => write.key === MEMORY_FEATURE_CONFIG_PREF_KEY);
+    expect(featureWrites).toHaveLength(1);
+    const persisted = JSON.parse(featureWrites[0]?.value ?? '{}') as Record<string, unknown>;
+    expect(persisted[MEMORY_FEATURE_FLAGS_BY_NAME.preferences]).toBe(true);
+    expect(persisted[MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry]).toBe(true);
+    expect(persisted[MEMORY_FEATURE_FLAGS_BY_NAME.observationStore]).toBe(true);
+    expect(first.daemon.sentJson().some((msg) => msg.type === MEMORY_WS.FEATURES_SET)).toBe(false);
+    const firstApply = first.daemon.sentJson().find((msg) => msg.type === MEMORY_FEATURE_CONFIG_MSG.APPLY);
+    const secondApply = second.daemon.sentJson().find((msg) => msg.type === MEMORY_FEATURE_CONFIG_MSG.APPLY);
+    expect(firstApply?.flags).toMatchObject({ [MEMORY_FEATURE_FLAGS_BY_NAME.preferences]: true });
+    expect(secondApply?.flags).toMatchObject({ [MEMORY_FEATURE_FLAGS_BY_NAME.preferences]: true });
+    expect(first.browserA.sentJson().find((msg) => msg.type === MEMORY_WS.FEATURES_SET_RESPONSE)).toMatchObject({
+      requestId: 'features-set-global',
+      success: true,
+      flag: MEMORY_FEATURE_FLAGS_BY_NAME.preferences,
+      enabled: true,
+    });
+  });
+
+  it('does not apply a user-global memory feature toggle to daemons owned by other users', async () => {
+    const makeOwnerDb = (ownerUserId: string) => makeDb(async (sql: string) => {
+      if (sql.includes('token_hash')) return { token_hash: 'valid-hash', user_id: ownerUserId };
+      if (sql.includes('SELECT user_id FROM servers WHERE id = $1')) return { user_id: ownerUserId };
+      if (sql.includes('FROM user_preferences')) return { value: '{}' };
+      return null;
+    });
+    const owner = await setup(makeOwnerDb('user-a'));
+    const other = await setup(makeOwnerDb('user-b'));
+    owner.daemon.sent = [];
+    other.daemon.sent = [];
+
+    owner.browserA.emit('message', JSON.stringify({
+      type: MEMORY_WS.FEATURES_SET,
+      requestId: 'features-set-owner-only',
+      flag: MEMORY_FEATURE_FLAGS_BY_NAME.preferences,
+      enabled: true,
+    }));
+    await flush();
+
+    expect(owner.daemon.sentJson().some((msg) => msg.type === MEMORY_FEATURE_CONFIG_MSG.APPLY)).toBe(true);
+    expect(other.daemon.sentJson().some((msg) => msg.type === MEMORY_FEATURE_CONFIG_MSG.APPLY)).toBe(false);
   });
 
   it('enforces the per-socket pending memory management request limit', async () => {

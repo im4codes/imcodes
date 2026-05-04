@@ -14,9 +14,10 @@ import {
   type SharedContextProjectionScope,
 } from '../../../shared/memory-scope.js';
 import {
-  getMemoryFeatureFlagDefinition,
   MEMORY_FEATURE_FLAGS_BY_NAME,
+  resolveMemoryFeatureFlagValue,
   type MemoryFeatureFlag,
+  type MemoryFeatureFlagValues,
 } from '../../../shared/feature-flags.js';
 export type { AuthoredContextScope, MemoryScope, SearchRequestScope } from '../../../shared/memory-scope.js';
 
@@ -83,11 +84,17 @@ function envKeyForFeature(feature: Feature): string {
   return `IMCODES_${feature.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`;
 }
 
-export function isMemoryFeatureEnabled(env: Env | undefined, feature: Feature): boolean {
+export function isMemoryFeatureEnabled(
+  env: Env | undefined,
+  feature: Feature,
+  userConfig?: MemoryFeatureFlagValues,
+): boolean {
   const key = envKeyForFeature(feature);
   const raw = (env as unknown as Record<string, string | undefined> | undefined)?.[key] ?? process.env[key];
-  if (raw != null) return raw === 'true' || raw === '1';
-  return getMemoryFeatureFlagDefinition(feature).defaultValue;
+  return resolveMemoryFeatureFlagValue(feature, {
+    persistedConfig: userConfig,
+    environmentStartupDefault: raw == null ? undefined : { [feature]: raw === 'true' || raw === '1' },
+  });
 }
 
 export async function jsonSameShapeNotFound(
