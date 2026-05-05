@@ -585,6 +585,16 @@ skipOnWindows('daemon.upgrade — Linux/macOS upgrade.sh contract', () => {
     expect(lockIdx).toBeLessThan(restartIdx);
   });
 
+  it('does not leave a raw 24h cleanup sleeper inside the daemon service cgroup on Linux', async () => {
+    const sh = await captureUpgradeScript();
+
+    expect(sh).toContain('schedule_self_cleanup()');
+    expect(sh).toContain('systemd-run --user --unit="$CLEANUP_UNIT"');
+    expect(sh).toContain('skipped background sleeper on Linux to avoid leaking into imcodes.service cgroup');
+    expect(sh).not.toMatch(/sleep 86400 && rm -rf/);
+    expect(sh.match(/schedule_self_cleanup/g)?.length ?? 0).toBeGreaterThanOrEqual(6);
+  });
+
   it('generated bash is syntactically valid (`bash -n` passes)', async () => {
     const sh = await captureUpgradeScript();
     // Use vi.importActual to bypass the fs mock above (which captures
