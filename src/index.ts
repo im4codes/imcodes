@@ -63,6 +63,7 @@ import { homedir } from 'os';
 import { existsSync, realpathSync, readFileSync, writeFileSync } from 'fs';
 import { resolve, join, dirname } from 'path';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../shared/imcodes-send.js';
+import { formatDurationSeconds, readProcessUptimeSeconds, readServiceRestartCount } from './util/daemon-status.js';
 
 import { PROJECT_ROOT } from './util/project-root.js';
 
@@ -289,10 +290,22 @@ program
         if (out && out !== '0') { daemonPid = out; daemonRunning = true; }
       } catch { /* not using systemd */ }
     }
+    const daemonPidNumber = daemonPid ? parseInt(daemonPid, 10) : NaN;
+    const daemonUptimeSeconds = daemonRunning && Number.isSafeInteger(daemonPidNumber)
+      ? readProcessUptimeSeconds(daemonPidNumber)
+      : null;
+    const daemonRestartCount = readServiceRestartCount();
 
     if (opts.json) {
       console.log(JSON.stringify({
-        daemon: { version, running: daemonRunning, pid: daemonPid, server: creds ? { url: creds.workerUrl, serverId: creds.serverId } : null },
+        daemon: {
+          version,
+          running: daemonRunning,
+          pid: daemonPid,
+          uptimeSeconds: daemonUptimeSeconds,
+          restartCount: daemonRestartCount,
+          server: creds ? { url: creds.workerUrl, serverId: creds.serverId } : null,
+        },
         sessions: sessions.map((s) => ({ ...s, tmuxAlive: liveSet.has(s.name) })),
       }, null, 2));
       return;
@@ -300,7 +313,13 @@ program
 
     // Daemon info
     console.log(`\x1b[1mIM.codes Daemon v${version}\x1b[0m`);
-    console.log(`  Status:  ${daemonRunning ? `\x1b[32mrunning\x1b[0m (pid ${daemonPid})` : '\x1b[31mstopped\x1b[0m'}`);
+    const statusDetails = [
+      ...(daemonRunning && daemonPid ? [`pid ${daemonPid}`] : []),
+      ...(daemonUptimeSeconds !== null ? [`uptime ${formatDurationSeconds(daemonUptimeSeconds)}`] : []),
+      ...(daemonRestartCount !== null ? [`restarts ${daemonRestartCount}`] : []),
+    ];
+    const detailSuffix = statusDetails.length > 0 ? ` (${statusDetails.join(', ')})` : '';
+    console.log(`  Status:  ${daemonRunning ? `\x1b[32mrunning\x1b[0m${detailSuffix}` : `\x1b[31mstopped\x1b[0m${detailSuffix}`}`);
     if (creds) {
       console.log(`  Server:  ${creds.workerUrl}`);
       console.log(`  ID:      ${creds.serverId}`);
