@@ -127,6 +127,20 @@ describe('ChatMarkdown', () => {
     expect(writeText).toHaveBeenCalledWith('/home/big/Desktop/拼团经济模型v1.0.docx');
   });
 
+  it('places the code block copy button next to the language title', () => {
+    const { container } = render(
+      <ChatMarkdown text={'```bash\necho hi\n```'} />
+    );
+
+    const titlebar = container.querySelector('.chat-code-titlebar');
+    const lang = titlebar?.querySelector('.chat-code-lang');
+    const copyButton = titlebar?.querySelector('.chat-code-copy-btn');
+
+    expect(titlebar).not.toBeNull();
+    expect(lang?.textContent).toBe('bash');
+    expect(copyButton).not.toBeNull();
+  });
+
   it('renders a download button for local markdown links with file extensions', () => {
     const onDownload = vi.fn();
     const { container } = render(

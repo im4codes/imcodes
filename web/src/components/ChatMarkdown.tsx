@@ -63,25 +63,27 @@ function CodeBlock({
   return (
     <div class="chat-code-block">
       <div class="chat-code-header">
-        <span class="chat-code-lang">{lang || 'text'}</span>
-        <button
-          type="button"
-          class={`chat-code-copy-btn${copied ? ' is-copied' : ''}`}
-          onClick={handleCopy}
-          title={copied ? t('common.copied') : t('common.copy')}
-          aria-label={copied ? t('common.copied') : t('common.copy')}
-        >
-          {copied ? (
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <polyline points="20 6 9 17 4 12" />
-            </svg>
-          ) : (
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <rect x="9" y="9" width="11" height="11" rx="2" ry="2" />
-              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-            </svg>
-          )}
-        </button>
+        <div class="chat-code-titlebar">
+          <span class="chat-code-lang">{lang || 'text'}</span>
+          <button
+            type="button"
+            class={`chat-code-copy-btn${copied ? ' is-copied' : ''}`}
+            onClick={handleCopy}
+            title={copied ? t('common.copied') : t('common.copy')}
+            aria-label={copied ? t('common.copied') : t('common.copy')}
+          >
+            {copied ? (
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+            ) : (
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="9" y="9" width="11" height="11" rx="2" ry="2" />
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+              </svg>
+            )}
+          </button>
+        </div>
       </div>
       <pre><code>{splitPathsAndUrlsInternal(text, onPathClick, onUrlClick, onDownload)}</code></pre>
     </div>
