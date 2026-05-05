@@ -252,6 +252,60 @@ describe('CopilotSdkProvider', () => {
     expect(completions).toEqual(['COPILOT_ATTACHMENT_OK']);
   });
 
+  it('captures input/output/cache token + cost from assistant.usage and emits snake_case metadata.usage', async () => {
+    // Regression: previously only `outputTokens` was captured from the
+    // `assistant.usage` event. The chat header context bar showed "0 / N"
+    // for every copilot turn because input_tokens never reached
+    // transport-relay's normalizeUsageUpdatePayload. The upstream SDK
+    // (copilot-sdk/generated/session-events.d.ts:1554) ships ALL four token
+    // fields plus `cost`; this test pins the full mapping camelCase →
+    // snake_case so the chat bar + context_turn_usage row see real values.
+    const harness = createCopilotHarness();
+    const provider = new CopilotSdkProvider();
+    copilotSdkRuntimeHooks.loadSdk = async () => ({
+      CopilotClient: harness.FakeClient,
+    }) as typeof import('@github/copilot-sdk');
+
+    await provider.connect({ binaryPath: 'copilot' });
+    const routeId = await provider.createSession({ sessionKey: 'route-usage', cwd: '/tmp/project', agentId: 'gpt-5.4' });
+
+    const messages: Array<{ sid: string; metadata: Record<string, unknown> }> = [];
+    provider.onComplete((sid, message) => {
+      if (sid === routeId) messages.push({ sid, metadata: (message.metadata ?? {}) as Record<string, unknown> });
+    });
+
+    await provider.send(routeId, 'Hello');
+    const session = Array.from(harness.sessions.values())[0];
+    expect(session).toBeTruthy();
+
+    session.emit({
+      type: 'assistant.usage',
+      data: {
+        model: 'gpt-5.4',
+        inputTokens: 1500,
+        outputTokens: 320,
+        cacheReadTokens: 800,
+        cacheWriteTokens: 200,
+        cost: 0.045,
+      },
+    });
+    session.emit({
+      type: 'assistant.message',
+      data: { messageId: 'msg-usage', content: 'reply', toolRequests: [] },
+    });
+    session.emit({ type: 'session.idle', data: {} });
+
+    expect(messages).toHaveLength(1);
+    const usage = (messages[0].metadata.usage ?? {}) as Record<string, unknown>;
+    expect(usage).toMatchObject({
+      input_tokens: 1500,
+      output_tokens: 320,
+      cache_read_input_tokens: 800,
+      cache_creation_input_tokens: 200,
+    });
+    expect(messages[0].metadata.costUsd).toBe(0.045);
+  });
+
   it('uses normalized payload attachments instead of the raw legacy attachments argument', async () => {
     const harness = createCopilotHarness();
     const provider = new CopilotSdkProvider();

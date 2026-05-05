@@ -79,7 +79,20 @@ interface CopilotSessionState {
   currentMessageId: string | null;
   currentText: string;
   completionEmittedForCurrentTurn: boolean;
+  /** Per-turn token usage from copilot's `assistant.usage` event. The
+   *  upstream `@github/copilot` SDK ships ALL four fields (verified against
+   *  copilot-sdk/generated/session-events.d.ts:1554-1580) but the previous
+   *  implementation only read `outputTokens`, leaving every copilot turn at
+   *  input_tokens=0/cache=0 in `context_turn_usage`. The chat-header context
+   *  bar showed "0 / N" because transport-relay's normalize step couldn't
+   *  find any input_tokens to display. */
   currentOutputTokens?: number;
+  currentInputTokens?: number;
+  currentCacheReadTokens?: number;
+  currentCacheWriteTokens?: number;
+  /** USD cost from copilot's billing breakdown — surfaced as `costUsd` in
+   *  `usage.update` payload + `context_turn_usage.cost_usd`. */
+  currentCostUsd?: number;
   currentInteractionId?: string;
   busy: boolean;
   backgroundTainted: boolean;
@@ -492,7 +505,7 @@ export class CopilotSdkProvider implements TransportProvider {
     state.currentMessageId = null;
     state.currentText = '';
     state.completionEmittedForCurrentTurn = false;
-    state.currentOutputTokens = undefined;
+    state.currentOutputTokens = undefined; state.currentInputTokens = undefined; state.currentCacheReadTokens = undefined; state.currentCacheWriteTokens = undefined; state.currentCostUsd = undefined;
     state.currentInteractionId = undefined;
     state.backgroundTainted = false;
     state.cancelRequested = false;
@@ -640,8 +653,26 @@ export class CopilotSdkProvider implements TransportProvider {
         return;
       }
       case 'assistant.usage': {
+        // Capture the full token + cost breakdown from copilot's per-API-call
+        // usage event (schema: copilot-sdk/generated/session-events.d.ts:1554).
+        // Multiple usage events can fire per turn (sub-agent calls); we
+        // overwrite rather than accumulate to match the previous behavior of
+        // currentOutputTokens — accumulation would be more accurate but is a
+        // separate change that needs UI/contract review.
+        if (typeof event.data?.inputTokens === 'number') {
+          state.currentInputTokens = event.data.inputTokens;
+        }
         if (typeof event.data?.outputTokens === 'number') {
           state.currentOutputTokens = event.data.outputTokens;
+        }
+        if (typeof event.data?.cacheReadTokens === 'number') {
+          state.currentCacheReadTokens = event.data.cacheReadTokens;
+        }
+        if (typeof event.data?.cacheWriteTokens === 'number') {
+          state.currentCacheWriteTokens = event.data.cacheWriteTokens;
+        }
+        if (typeof event.data?.cost === 'number') {
+          state.currentCostUsd = event.data.cost;
         }
         if (isNonEmptyString(event.data?.interactionId)) {
           state.currentInteractionId = event.data.interactionId;
@@ -697,9 +728,34 @@ export class CopilotSdkProvider implements TransportProvider {
             status: 'complete',
             metadata: {
               ...(state.model ? { model: state.model } : {}),
-              ...(typeof state.currentOutputTokens === 'number'
-                ? { usage: { output_tokens: state.currentOutputTokens } }
+              // Build usage with whichever fields we captured. transport-relay's
+              // normalizeUsageUpdatePayload reads input_tokens / output_tokens /
+              // cache_read_input_tokens / cache_creation_input_tokens (snake_case);
+              // we already collected copilot's camelCase fields and translate
+              // here so the chat header context bar + context_turn_usage row
+              // pick them up like every other provider.
+              ...(typeof state.currentInputTokens === 'number'
+                || typeof state.currentOutputTokens === 'number'
+                || typeof state.currentCacheReadTokens === 'number'
+                || typeof state.currentCacheWriteTokens === 'number'
+                ? {
+                    usage: {
+                      ...(typeof state.currentInputTokens === 'number'
+                        ? { input_tokens: state.currentInputTokens }
+                        : {}),
+                      ...(typeof state.currentOutputTokens === 'number'
+                        ? { output_tokens: state.currentOutputTokens }
+                        : {}),
+                      ...(typeof state.currentCacheReadTokens === 'number'
+                        ? { cache_read_input_tokens: state.currentCacheReadTokens }
+                        : {}),
+                      ...(typeof state.currentCacheWriteTokens === 'number'
+                        ? { cache_creation_input_tokens: state.currentCacheWriteTokens }
+                        : {}),
+                    },
+                  }
                 : {}),
+              ...(typeof state.currentCostUsd === 'number' ? { costUsd: state.currentCostUsd } : {}),
               ...(state.currentInteractionId ? { interactionId: state.currentInteractionId } : {}),
               resumeId: state.sessionId,
             },
@@ -785,7 +841,7 @@ export class CopilotSdkProvider implements TransportProvider {
       state.currentMessageId = null;
       state.currentText = '';
       state.completionEmittedForCurrentTurn = false;
-      state.currentOutputTokens = undefined;
+      state.currentOutputTokens = undefined; state.currentInputTokens = undefined; state.currentCacheReadTokens = undefined; state.currentCacheWriteTokens = undefined; state.currentCostUsd = undefined;
       state.currentInteractionId = undefined;
       state.busy = false;
       state.backgroundTainted = false;
@@ -837,7 +893,7 @@ export class CopilotSdkProvider implements TransportProvider {
     state.currentMessageId = null;
     state.currentText = '';
     state.completionEmittedForCurrentTurn = false;
-    state.currentOutputTokens = undefined;
+    state.currentOutputTokens = undefined; state.currentInputTokens = undefined; state.currentCacheReadTokens = undefined; state.currentCacheWriteTokens = undefined; state.currentCostUsd = undefined;
     state.currentInteractionId = undefined;
     state.busy = false;
     state.backgroundTainted = false;
