@@ -2732,7 +2732,14 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
               setMemoryBrowseProjectId(next);
             }}
             aria-label={t('sharedContext.management.memoryBrowseProjectFilter')}
-            style={inputStyle}
+            // `inputStyle` carries `flex: '1 1 180px'` which is correct in
+            // row-flex parents (180px = WIDTH basis). Here the parent is a
+            // column-flex `<label>`, so the same shorthand resolves on the
+            // VERTICAL axis and the select inflates to ~180+ px tall.
+            // Override flex back to intrinsic height; cross-axis stretch
+            // (default for column-flex children) keeps width filling the
+            // label.
+            style={{ ...inputStyle, flex: '0 0 auto' }}
           >
             <option value="">{t('sharedContext.management.memoryBrowseAllProjects')}</option>
             {memoryProjectOptions.map((option) => (
@@ -2778,7 +2785,9 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
               if (option.status === 'needs_resolution') resolveMemoryProject(option);
             }}
             aria-label={t('sharedContext.management.memoryToolProjectSelector')}
-            style={inputStyle}
+            // See above — column-flex `<label>` parent re-interprets
+            // `inputStyle.flex` as a vertical basis. Reset to intrinsic.
+            style={{ ...inputStyle, flex: '0 0 auto' }}
           >
             <option value="">{t('sharedContext.management.memoryToolProjectNone')}</option>
             {memoryProjectOptions.map((option) => (
