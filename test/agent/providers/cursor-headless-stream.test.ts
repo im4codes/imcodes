@@ -126,6 +126,36 @@ describe('parseCursorStreamLine', () => {
     });
   });
 
+  it('normalizes cursor-agent camelCase usage fields into snake_case', () => {
+    // Real cursor-agent (verified 2026.05.04-08e5280) emits camelCase token
+    // fields:
+    //   {"usage":{"inputTokens":1227,"outputTokens":13,"cacheReadTokens":10624,"cacheWriteTokens":0}}
+    // Transport-relay's `normalizeUsageUpdatePayload` only knows snake_case;
+    // without translation every cursor turn lost ALL token data and the
+    // chat header context bar showed "0 / 1M (0.0%)". This test pins the
+    // translation contract.
+    const parsed = parseCursorStreamLine(JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      session_id: 'cursor-chat-real',
+      result: '`1 + 1 = 2`',
+      usage: {
+        inputTokens: 1227,
+        outputTokens: 13,
+        cacheReadTokens: 10624,
+        cacheWriteTokens: 0,
+      },
+    }));
+    expect(parsed?.kind).toBe('result.success');
+    if (parsed?.kind !== 'result.success') return;
+    expect(parsed.usage).toMatchObject({
+      input_tokens: 1227,
+      output_tokens: 13,
+      cache_read_input_tokens: 10624,
+      cache_creation_input_tokens: 0,
+    });
+  });
+
   it('ignores invalid or irrelevant records', () => {
     expect(parseCursorStreamLine('')).toBeNull();
     expect(parseCursorStreamLine('not-json')).toBeNull();
