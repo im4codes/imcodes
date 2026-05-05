@@ -899,6 +899,19 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // otherwise have to scroll up to re-read it. Below / intersecting cases
   // both leave the pin hidden.
   useEffect(() => {
+    // Preview mode (sub-session card) never renders the pinned banner — it
+    // sits in `.chat-main`'s normal flow as a sibling of `.chat-view`, so its
+    // appearance/disappearance shifts content height by ~60 px. Inside the
+    // small preview card the user's last bubble can be just outside the
+    // viewport top by ≤60 px; banner-shows pushes the bubble down into the
+    // viewport, IO fires `isIntersecting=true`, banner-hides pulls the
+    // bubble back above viewport, IO fires again — infinite oscillation
+    // around ~50–100 px from bottom. Bail in preview so neither the banner
+    // nor the observer can run.
+    if (preview) {
+      setPinnedAboveViewport(false);
+      return;
+    }
     if (!lastSentUserMessage) {
       setPinnedAboveViewport(false);
       return;
@@ -952,7 +965,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     }, { root, threshold: [0, 1] });
     observer.observe(target);
     return () => observer.disconnect();
-  }, [lastSentUserMessage?.eventId]);
+  }, [lastSentUserMessage?.eventId, preview]);
 
   // Auto-scroll only on visible new events — agent.status / assistant.thinking / usage.update
   // events are filtered from the chat view but still part of `events`, so using the raw last ts
@@ -1344,7 +1357,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
             )}
           </div>
         )}
-        {pinnedAboveViewport && lastSentUserMessage && (
+        {!preview && pinnedAboveViewport && lastSentUserMessage && (
           <div
             class={`chat-pinned-last-sent${pinnedExpanded ? ' chat-pinned-expanded' : ''}`}
             role="button"
