@@ -480,6 +480,71 @@ function ensureDb(): DatabaseSyncInstance {
     );
     CREATE INDEX IF NOT EXISTS idx_observation_promotion_audit_observation
       ON observation_promotion_audit(observation_id, created_at);
+
+    -- ── Compression runs — telemetry for memory-compression cost analysis ──
+    --
+    -- One row per call to compressWithSdk(). Persists which model/backend was
+    -- used, how many tokens were spent, and how long it took, so operators can
+    -- query later: "which sessions burn the most input tokens", "is qwen3
+    -- producing materially shorter outputs than claude-sonnet", "how often
+    -- does primary fail-over to backup", etc. Row insert is best-effort —
+    -- a recording failure must never block compression itself.
+    --
+    -- Retention is governed by the same archiveRetentionDays config knob as
+    -- the event archive; -1 keeps forever.
+    CREATE TABLE IF NOT EXISTS context_compression_runs (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      created_at      INTEGER NOT NULL,
+      backend         TEXT    NOT NULL,
+      model           TEXT    NOT NULL,
+      used_backup     INTEGER NOT NULL,
+      from_sdk        INTEGER NOT NULL,
+      namespace_key   TEXT,
+      target_kind     TEXT,
+      session_name    TEXT,
+      trigger         TEXT,
+      mode            TEXT,
+      event_count     INTEGER NOT NULL,
+      input_tokens    INTEGER NOT NULL,
+      output_tokens   INTEGER NOT NULL,
+      target_tokens   INTEGER NOT NULL,
+      duration_ms     INTEGER NOT NULL,
+      outcome         TEXT    NOT NULL,
+      error_code      TEXT,
+      error_message   TEXT,
+      projection_id   TEXT,
+      CHECK (outcome IN ('success', 'fallback', 'admission_closed', 'error', 'noop'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_compression_runs_created
+      ON context_compression_runs(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_compression_runs_backend_created
+      ON context_compression_runs(backend, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_compression_runs_namespace_created
+      ON context_compression_runs(namespace_key, created_at DESC);
+
+    -- Per-turn SDK token usage telemetry. Every time a transport provider
+    -- emits a usage.update timeline event with token data, the emitter writes
+    -- a row here. Inserts are best-effort: a recording failure MUST NOT
+    -- escape the timeline emit hot path. Retention follows the same
+    -- archiveRetentionDays as the event archive.
+    CREATE TABLE IF NOT EXISTS context_turn_usage (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      created_at      INTEGER NOT NULL,
+      session_name    TEXT    NOT NULL,
+      agent_type      TEXT,
+      model           TEXT,
+      input_tokens    INTEGER NOT NULL DEFAULT 0,
+      cache_tokens    INTEGER NOT NULL DEFAULT 0,
+      output_tokens   INTEGER NOT NULL DEFAULT 0,
+      context_window  INTEGER,
+      cost_usd        REAL
+    );
+    CREATE INDEX IF NOT EXISTS idx_turn_usage_created
+      ON context_turn_usage(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_turn_usage_session_created
+      ON context_turn_usage(session_name, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_turn_usage_agent_model_created
+      ON context_turn_usage(agent_type, model, created_at DESC);
   `);
   // Migrate existing DBs — add columns if missing
   tryAlter(db, 'ALTER TABLE context_processed_local ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0');
@@ -1441,6 +1506,319 @@ export function pruneArchiveIfDue(retentionDays: number, now = Date.now()): { de
   const last = lastRaw ? Number(lastRaw) : Number.NaN;
   if (Number.isFinite(last) && now - last < 86_400_000) return { deleted: 0, skipped: true };
   return { ...pruneArchive(retentionDays, now), skipped: false };
+}
+
+// ── Compression-run telemetry ────────────────────────────────────────────────
+//
+// Persisted log of every compressWithSdk() call so operators can later run
+// queries like:
+//
+//   -- which sessions burn the most input tokens
+//   SELECT session_name, sum(input_tokens) AS total
+//   FROM context_compression_runs WHERE created_at > ? GROUP BY session_name
+//   ORDER BY total DESC LIMIT 10;
+//
+//   -- compression ratio per backend
+//   SELECT backend, model, count(*), avg(output_tokens*1.0/input_tokens)
+//   FROM context_compression_runs WHERE input_tokens > 0 GROUP BY backend, model;
+//
+//   -- failover frequency
+//   SELECT backend, used_backup, outcome, count(*)
+//   FROM context_compression_runs GROUP BY backend, used_backup, outcome;
+//
+// Inserts are best-effort: a recording failure MUST NOT break the
+// compression caller. Retention follows the same `archiveRetentionDays`
+// knob as `context_event_archive` (sentinel `last_compression_run_sweep_at`).
+
+export type CompressionRunOutcome = 'success' | 'fallback' | 'admission_closed' | 'error' | 'noop';
+
+export interface CompressionRunRecord {
+  /** Unix ms when the row is inserted (defaults to now). */
+  createdAt?: number;
+  backend: string;
+  model: string;
+  usedBackup: boolean;
+  fromSdk: boolean;
+  /** Optional context — null when the call is a master summary spanning many. */
+  namespaceKey?: string | null;
+  targetKind?: string | null;
+  sessionName?: string | null;
+  trigger?: string | null;
+  /** Compression mode the caller passed to compressWithSdk. */
+  mode?: 'auto' | 'manual' | null;
+  eventCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  targetTokens: number;
+  durationMs: number;
+  outcome: CompressionRunOutcome;
+  /** Classified compression error code when outcome ≠ 'success'. */
+  errorCode?: string | null;
+  /** Truncated last error message (max 500 chars at insert time). */
+  errorMessage?: string | null;
+  /** Linked projection id when the run produced a durable projection. */
+  projectionId?: string | null;
+}
+
+export function recordCompressionRun(input: CompressionRunRecord): void {
+  // Hard-bound the error message so a runaway provider error never bloats
+  // the table. Slice on the insert side as defense-in-depth — the caller
+  // is supposed to slice too, but we don't trust that.
+  const errMsg = input.errorMessage ? input.errorMessage.slice(0, 500) : null;
+  try {
+    const database = ensureDb();
+    database.prepare(`
+      INSERT INTO context_compression_runs (
+        created_at, backend, model, used_backup, from_sdk,
+        namespace_key, target_kind, session_name, trigger, mode,
+        event_count, input_tokens, output_tokens, target_tokens, duration_ms,
+        outcome, error_code, error_message, projection_id
+      ) VALUES (
+        ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?,
+        ?, ?, ?, ?
+      )
+    `).run(
+      input.createdAt ?? Date.now(),
+      input.backend,
+      input.model,
+      input.usedBackup ? 1 : 0,
+      input.fromSdk ? 1 : 0,
+      input.namespaceKey ?? null,
+      input.targetKind ?? null,
+      input.sessionName ?? null,
+      input.trigger ?? null,
+      input.mode ?? null,
+      input.eventCount,
+      input.inputTokens,
+      input.outputTokens,
+      input.targetTokens,
+      input.durationMs,
+      input.outcome,
+      input.errorCode ?? null,
+      errMsg,
+      input.projectionId ?? null,
+    );
+  } catch (err) {
+    // Never break compression because of telemetry — log + counter only.
+    incrementCounter('mem.compression_run.record_failed', {});
+    warnOncePerHour('mem.compression_run.record_failed', {
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+export interface CompressionRunSummary {
+  /** Number of rows scanned (within the optional time window). */
+  total: number;
+  /** Aggregate input/output token sums per backend+model. */
+  byBackendModel: Array<{
+    backend: string;
+    model: string;
+    runs: number;
+    inputTokens: number;
+    outputTokens: number;
+    totalDurationMs: number;
+    successes: number;
+    fallbacks: number;
+    errors: number;
+  }>;
+}
+
+export function summarizeCompressionRuns(input: { since?: number; until?: number } = {}): CompressionRunSummary {
+  const database = ensureDb();
+  const since = input.since ?? 0;
+  const until = input.until ?? Date.now();
+  const totalRow = database.prepare(`
+    SELECT count(*) AS n FROM context_compression_runs
+    WHERE created_at >= ? AND created_at <= ?
+  `).get(since, until) as { n: number };
+  const rows = database.prepare(`
+    SELECT
+      backend,
+      model,
+      count(*)                                                AS runs,
+      coalesce(sum(input_tokens), 0)                          AS input_tokens,
+      coalesce(sum(output_tokens), 0)                         AS output_tokens,
+      coalesce(sum(duration_ms), 0)                           AS total_duration_ms,
+      coalesce(sum(CASE WHEN outcome = 'success'  THEN 1 ELSE 0 END), 0) AS successes,
+      coalesce(sum(CASE WHEN outcome = 'fallback' THEN 1 ELSE 0 END), 0) AS fallbacks,
+      coalesce(sum(CASE WHEN outcome = 'error'    THEN 1 ELSE 0 END), 0) AS errors
+    FROM context_compression_runs
+    WHERE created_at >= ? AND created_at <= ?
+    GROUP BY backend, model
+    ORDER BY input_tokens DESC
+  `).all(since, until) as Array<{
+    backend: string; model: string; runs: number;
+    input_tokens: number; output_tokens: number; total_duration_ms: number;
+    successes: number; fallbacks: number; errors: number;
+  }>;
+  return {
+    total: totalRow?.n ?? 0,
+    byBackendModel: rows.map((r) => ({
+      backend: r.backend,
+      model: r.model,
+      runs: r.runs,
+      inputTokens: r.input_tokens,
+      outputTokens: r.output_tokens,
+      totalDurationMs: r.total_duration_ms,
+      successes: r.successes,
+      fallbacks: r.fallbacks,
+      errors: r.errors,
+    })),
+  };
+}
+
+export function pruneCompressionRuns(retentionDays: number, now = Date.now()): { deleted: number } {
+  if (retentionDays === -1) return { deleted: 0 };
+  if (!Number.isFinite(retentionDays) || retentionDays < 1) {
+    incrementCounter('mem.config.invalid_value', { field: 'archiveRetentionDays' });
+    return { deleted: 0 };
+  }
+  const database = ensureDb();
+  const cutoff = now - retentionDays * 86_400_000;
+  const result = database.prepare(
+    'DELETE FROM context_compression_runs WHERE created_at < ?',
+  ).run(cutoff) as { changes?: number };
+  internalSetContextMeta(database, 'last_compression_run_sweep_at', String(now), now);
+  return { deleted: result.changes ?? 0 };
+}
+
+// ── Per-turn SDK token usage telemetry ───────────────────────────────────────
+//
+// Mirrors `context_compression_runs` but for the user-facing SDK turns
+// (claude-code-sdk, codex-sdk, qwen, gemini-sdk, copilot-sdk, cursor-headless).
+// Hooked from the timeline emitter so every `usage.update` event with token
+// fields lands here too — operators get JSONL history (existing) + structured
+// SQLite analytics (new) without each provider needing its own recording call.
+
+export interface TurnUsageRecord {
+  /** Unix ms when the row is inserted (defaults to now). */
+  createdAt?: number;
+  /** Session name the turn belongs to. */
+  sessionName: string;
+  /** Transport agent type, e.g. 'claude-code-sdk' / 'codex-sdk'. Optional
+   *  because some emitters (e.g. usage.update from `command-handler.ts`
+   *  on model switch) only know `model`. */
+  agentType?: string | null;
+  model?: string | null;
+  inputTokens?: number;
+  cacheTokens?: number;
+  outputTokens?: number;
+  contextWindow?: number | null;
+  costUsd?: number | null;
+}
+
+export function recordTurnUsage(input: TurnUsageRecord): void {
+  // Skip rows that carry no token information at all — pure model-switch
+  // events fire `usage.update` with only `{ model, contextWindow }` and would
+  // pollute the analytics table without being useful for cost stats.
+  const inputTokens = input.inputTokens ?? 0;
+  const cacheTokens = input.cacheTokens ?? 0;
+  const outputTokens = input.outputTokens ?? 0;
+  if (inputTokens === 0 && cacheTokens === 0 && outputTokens === 0 && input.costUsd == null) {
+    return;
+  }
+  try {
+    const database = ensureDb();
+    database.prepare(`
+      INSERT INTO context_turn_usage (
+        created_at, session_name, agent_type, model,
+        input_tokens, cache_tokens, output_tokens, context_window, cost_usd
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      input.createdAt ?? Date.now(),
+      input.sessionName,
+      input.agentType ?? null,
+      input.model ?? null,
+      inputTokens,
+      cacheTokens,
+      outputTokens,
+      input.contextWindow ?? null,
+      input.costUsd ?? null,
+    );
+  } catch (err) {
+    // Never break the timeline emitter — log + counter only.
+    incrementCounter('mem.turn_usage.record_failed', {});
+    warnOncePerHour('mem.turn_usage.record_failed', {
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+export interface TurnUsageSummary {
+  total: number;
+  byAgentModel: Array<{
+    agentType: string | null;
+    model: string | null;
+    turns: number;
+    inputTokens: number;
+    cacheTokens: number;
+    outputTokens: number;
+    costUsd: number | null;
+  }>;
+}
+
+export function summarizeTurnUsage(input: { since?: number; until?: number; sessionName?: string } = {}): TurnUsageSummary {
+  const database = ensureDb();
+  const since = input.since ?? 0;
+  const until = input.until ?? Date.now();
+  const sessionFilter = input.sessionName ? ' AND session_name = ?' : '';
+  const args: (string | number)[] = [since, until];
+  if (input.sessionName) args.push(input.sessionName);
+
+  const totalRow = database.prepare(
+    `SELECT count(*) AS n FROM context_turn_usage
+     WHERE created_at >= ? AND created_at <= ?${sessionFilter}`,
+  ).get(...args) as { n: number } | undefined;
+
+  const rows = database.prepare(
+    `SELECT
+        agent_type,
+        model,
+        count(*)                          AS turns,
+        coalesce(sum(input_tokens), 0)    AS input_tokens,
+        coalesce(sum(cache_tokens), 0)    AS cache_tokens,
+        coalesce(sum(output_tokens), 0)   AS output_tokens,
+        sum(cost_usd)                     AS cost_usd
+      FROM context_turn_usage
+      WHERE created_at >= ? AND created_at <= ?${sessionFilter}
+      GROUP BY agent_type, model
+      ORDER BY input_tokens + output_tokens DESC`,
+  ).all(...args) as Array<{
+    agent_type: string | null; model: string | null; turns: number;
+    input_tokens: number; cache_tokens: number; output_tokens: number;
+    cost_usd: number | null;
+  }>;
+
+  return {
+    total: totalRow?.n ?? 0,
+    byAgentModel: rows.map((r) => ({
+      agentType: r.agent_type,
+      model: r.model,
+      turns: r.turns,
+      inputTokens: r.input_tokens,
+      cacheTokens: r.cache_tokens,
+      outputTokens: r.output_tokens,
+      costUsd: r.cost_usd,
+    })),
+  };
+}
+
+export function pruneTurnUsage(retentionDays: number, now = Date.now()): { deleted: number } {
+  if (retentionDays === -1) return { deleted: 0 };
+  if (!Number.isFinite(retentionDays) || retentionDays < 1) {
+    incrementCounter('mem.config.invalid_value', { field: 'archiveRetentionDays' });
+    return { deleted: 0 };
+  }
+  const database = ensureDb();
+  const cutoff = now - retentionDays * 86_400_000;
+  const result = database.prepare(
+    'DELETE FROM context_turn_usage WHERE created_at < ?',
+  ).run(cutoff) as { changes?: number };
+  internalSetContextMeta(database, 'last_turn_usage_sweep_at', String(now), now);
+  return { deleted: result.changes ?? 0 };
 }
 
 export interface PinnedNote {

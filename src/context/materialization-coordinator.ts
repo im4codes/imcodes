@@ -27,6 +27,7 @@ import {
   listProcessedProjections,
   pruneArchiveIfDue,
   queryProcessedProjections,
+  recordCompressionRun,
   recordContextEvent,
   countStagedTokens,
   setReplicationState,
@@ -41,6 +42,7 @@ import { computeFingerprint } from '../../shared/memory-fingerprint.js';
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { incrementCounter } from '../util/metrics.js';
 import { redactSummaryPreservingPinned } from '../util/redact-with-pinned-region.js';
+import { timelineEmitter } from '../daemon/timeline-emitter.js';
 import {
   decideSkillReviewSchedule,
   type SkillReviewSchedulerPolicy,
@@ -299,13 +301,82 @@ export class MaterializationCoordinator {
       // Compressor itself threw (not just a provider failure the compressor
       // swallowed into a local-fallback result). Treat as fromSdk: false and
       // let the abandonment/retry logic below decide what to do.
+      const errMsg = error instanceof Error ? error.message : String(error);
       compression = {
         summary: '',
         model: 'local-fallback',
         backend: 'none',
         usedBackup: false,
         fromSdk: false,
+        inputTokens: 0,
+        outputTokens: 0,
+        targetTokens: 0,
+        durationMs: 0,
+        errorMessage: errMsg.slice(0, 500),
       };
+    }
+
+    // Persist a row in context_compression_runs so operators can query
+    // model/token costs later. Best-effort — recording failures must never
+    // break compression; recordCompressionRun swallows internally.
+    const outcome: 'success' | 'fallback' | 'error' = compression.fromSdk
+      ? (compression.usedBackup ? 'fallback' : 'success')
+      : (compression.errorCode || compression.errorMessage ? 'error' : 'fallback');
+    try {
+      recordCompressionRun({
+        backend: compression.backend,
+        model: compression.model,
+        usedBackup: compression.usedBackup,
+        fromSdk: compression.fromSdk,
+        namespaceKey: serializeContextNamespace(target.namespace),
+        targetKind: target.kind,
+        sessionName: target.sessionName ?? null,
+        trigger,
+        mode: 'auto',
+        eventCount: events.length,
+        inputTokens: compression.inputTokens ?? 0,
+        outputTokens: compression.outputTokens ?? 0,
+        targetTokens: compression.targetTokens ?? 0,
+        durationMs: compression.durationMs ?? 0,
+        outcome,
+        errorCode: compression.errorCode ?? null,
+        errorMessage: compression.errorMessage ?? null,
+      });
+    } catch {
+      // Telemetry must never escape — recordCompressionRun already swallows
+      // its own errors, but defense-in-depth.
+    }
+
+    // Emit a `memory.compression` timeline event so the user can see in chat
+    // history that a compression just ran (web UI renders it COLLAPSED by
+    // default, click to expand). Persisted to JSONL via the timeline store.
+    // Only emit when we have a session-bound target — namespace-only
+    // (project-level) compactions don't have a chat thread to attach to.
+    if (target.sessionName) {
+      try {
+        timelineEmitter.emit(
+          target.sessionName,
+          'memory.compression',
+          {
+            backend: compression.backend,
+            model: compression.model,
+            usedBackup: compression.usedBackup,
+            fromSdk: compression.fromSdk,
+            trigger,
+            mode: 'auto',
+            eventCount: events.length,
+            inputTokens: compression.inputTokens ?? 0,
+            outputTokens: compression.outputTokens ?? 0,
+            targetTokens: compression.targetTokens ?? 0,
+            durationMs: compression.durationMs ?? 0,
+            outcome,
+            ...(compression.errorCode ? { errorCode: compression.errorCode } : {}),
+          },
+          { source: 'daemon', confidence: 'high' },
+        );
+      } catch {
+        // Timeline emit must never escape compression.
+      }
     }
 
     // Only SDK-produced summaries are ever filtered by `isMemoryNoiseSummary`.

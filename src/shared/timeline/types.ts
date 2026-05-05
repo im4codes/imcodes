@@ -26,7 +26,13 @@ export type TimelineEventType =
   | 'agent.status'
   | 'usage.update'
   | 'ask.question'
-  | 'memory.context';
+  | 'memory.context'
+  // Emitted once per memory-compression call (NOT manual /compact, which is
+  // forwarded to the SDK transport unchanged). Carries the backend+model that
+  // did the compression plus token telemetry. Persisted to JSONL history for
+  // operator queries; the web UI renders this event COLLAPSED by default —
+  // a small one-liner in the chat stream that the user clicks to expand.
+  | 'memory.compression';
 
 export const TIMELINE_HISTORY_CONTENT_TYPES = [
   'user.message',
@@ -42,7 +48,35 @@ export const TIMELINE_HISTORY_CONTENT_TYPES = [
   'usage.update',
   'ask.question',
   'memory.context',
+  'memory.compression',
 ] as const satisfies readonly TimelineEventType[];
+
+/** Payload schema for the `memory.compression` timeline event.
+ *  Pinned here so daemon emit + web render share one source of truth. */
+export interface MemoryCompressionTimelinePayload {
+  backend: string;
+  model: string;
+  /** True when primary backend failed and we fell through to backup. */
+  usedBackup: boolean;
+  /** False ⇒ local-fallback path (no LLM ran); operators usually want to
+   *  filter these out of cost analysis. */
+  fromSdk: boolean;
+  /** Materialization trigger that started the compression. */
+  trigger?: string;
+  /** Compression mode passed to compressWithSdk. */
+  mode?: 'auto' | 'manual';
+  eventCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  targetTokens: number;
+  durationMs: number;
+  /** Outcome category — same enum as the context_compression_runs table. */
+  outcome: 'success' | 'fallback' | 'error' | 'admission_closed' | 'noop';
+  /** When `outcome ≠ 'success'`, the classified compression error code. */
+  errorCode?: string;
+  /** Linked durable projection id when the run produced one. */
+  projectionId?: string;
+}
 
 export const TIMELINE_HISTORY_STATE_TYPES = [
   'session.state',

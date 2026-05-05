@@ -145,6 +145,29 @@ export class TimelineEmitter {
     const isStreamingDelta = isStableUpdate && payload.streaming === true;
     if (!isStreamingDelta) {
       timelineStore.append(event);
+      // Mirror per-turn `usage.update` into SQLite so operators can query
+      // historical token spend without parsing JSONL. Best-effort — failures
+      // never escape (recordTurnUsage swallows internally + extra try/catch).
+      // Final-only: streaming deltas don't reach here.
+      if (type === 'usage.update') {
+        try {
+          // Lazy import keeps this file free of a hard dependency cycle on
+          // context-store at module-graph load time.
+          void import('../store/context-store.js').then((m) => {
+            m.recordTurnUsage({
+              createdAt: ts,
+              sessionName: sessionId,
+              agentType: typeof payload.agentType === 'string' ? payload.agentType : null,
+              model: typeof payload.model === 'string' ? payload.model : null,
+              inputTokens: typeof payload.inputTokens === 'number' ? payload.inputTokens : 0,
+              cacheTokens: typeof payload.cacheTokens === 'number' ? payload.cacheTokens : 0,
+              outputTokens: typeof payload.outputTokens === 'number' ? payload.outputTokens : 0,
+              contextWindow: typeof payload.contextWindow === 'number' ? payload.contextWindow : null,
+              costUsd: typeof payload.costUsd === 'number' ? payload.costUsd : null,
+            });
+          }).catch(() => { /* swallow — telemetry must never escape */ });
+        } catch { /* ignore */ }
+      }
     }
 
     // Notify handlers

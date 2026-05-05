@@ -51,6 +51,22 @@ export interface CompressionResult {
   backend: string;
   usedBackup: boolean;
   fromSdk: boolean;
+  /** Token telemetry — populated for every call so callers can persist a
+   *  run row for later cost / efficiency analysis. `inputTokens` is the
+   *  prompt size (including previous summary + serialized events).
+   *  `outputTokens` is the produced summary size. `targetTokens` is the
+   *  budget that was passed to the LLM. All counted via `countTokens`. */
+  inputTokens: number;
+  outputTokens: number;
+  targetTokens: number;
+  /** Wall-clock duration of the SDK call (or local-fallback path). */
+  durationMs: number;
+  /** Classified error code when `fromSdk: false` and the path was an
+   *  exception (not a "no events" early return). One of the
+   *  `CompressionErrorClassification.code` values. Undefined on success. */
+  errorCode?: 'auth' | 'model' | 'session' | 'quota' | 'timeout' | 'empty_response' | 'agent_missing' | 'transient';
+  /** Truncated last error message when the SDK path failed. */
+  errorMessage?: string;
 }
 
 export type CompressionAdmissionReason = 'shutdown' | 'upgrade-pending' | 'test-reset';
@@ -404,16 +420,21 @@ const COMPRESSOR_SYSTEM_PROMPT = `You are a memory compression engine. Your outp
 export async function localOnlyCompressor(input: CompressionInput): Promise<CompressionResult> {
   // Tests expect local-only compression to behave as if SDK succeeded (fromSdk=true)
   // so the coordinator commits the result instead of entering retry mode.
+  const summary = ensurePinnedNotesSection(
+    buildLocalFallbackSummary(input.events, input.previousSummary),
+    input.pinnedNotes ?? [],
+    input.extraRedactPatterns ?? [],
+  );
   return {
-    summary: ensurePinnedNotesSection(
-      buildLocalFallbackSummary(input.events, input.previousSummary),
-      input.pinnedNotes ?? [],
-      input.extraRedactPatterns ?? [],
-    ),
+    summary,
     model: 'local-only-test',
     backend: 'local',
     usedBackup: false,
     fromSdk: true,
+    inputTokens: 0,
+    outputTokens: countTokens(summary),
+    targetTokens: input.targetTokens ?? 0,
+    durationMs: 0,
   };
 }
 
@@ -552,6 +573,7 @@ function trimPreviousSummary(previousSummary: string | undefined, maxTokens = DE
 
 async function compressWithSdkInner(input: CompressionInput): Promise<CompressionResult> {
   const { events, modelConfig } = input;
+  const startedAt = Date.now();
   const extraRedactPatterns = input.extraRedactPatterns ?? [];
   const previousSummary = trimPreviousSummary(
     input.previousSummary ? redactSummaryPreservingPinned(input.previousSummary, extraRedactPatterns) : undefined,
@@ -559,9 +581,14 @@ async function compressWithSdkInner(input: CompressionInput): Promise<Compressio
   );
 
   if (events.length === 0) {
+    const summary = ensurePinnedNotesSection(previousSummary ?? 'No events to compress.', input.pinnedNotes ?? [], extraRedactPatterns);
     return {
-      summary: ensurePinnedNotesSection(previousSummary ?? 'No events to compress.', input.pinnedNotes ?? [], extraRedactPatterns),
+      summary,
       model: '', backend: '', usedBackup: false, fromSdk: false,
+      inputTokens: 0,
+      outputTokens: countTokens(summary),
+      targetTokens: input.targetTokens ?? 0,
+      durationMs: Date.now() - startedAt,
     };
   }
 
@@ -578,6 +605,10 @@ ${serializedEvents}`);
   });
   const now = Date.now();
 
+  // Track the last error from any tier so we can attach it to the final
+  // local-fallback CompressionResult (callers persist this for analytics).
+  let lastErr: unknown;
+
   // Try primary (gated by circuit breaker)
   if (canCall(modelConfig.primaryContextBackend, now)) {
     try {
@@ -587,11 +618,17 @@ ${serializedEvents}`);
         preset: modelConfig.primaryContextPreset,
       });
       recordSuccess(modelConfig.primaryContextBackend);
+      const summary = ensurePinnedNotesSection(result, input.pinnedNotes ?? [], extraRedactPatterns);
       return {
-        summary: ensurePinnedNotesSection(result, input.pinnedNotes ?? [], extraRedactPatterns), model: modelConfig.primaryContextModel,
-        backend: modelConfig.primaryContextBackend, usedBackup: false, fromSdk: true,
+        summary,
+        model: modelConfig.primaryContextModel,
+        backend: modelConfig.primaryContextBackend,
+        usedBackup: false, fromSdk: true,
+        inputTokens, outputTokens: countTokens(summary),
+        targetTokens, durationMs: Date.now() - startedAt,
       };
     } catch (err) {
+      lastErr = err;
       recordFailure(modelConfig.primaryContextBackend, now);
       await shutdownCompressionProvider();
       logger.warn({ err, backend: modelConfig.primaryContextBackend },
@@ -612,11 +649,17 @@ ${serializedEvents}`);
           preset: modelConfig.backupContextPreset,
         });
         recordSuccess(modelConfig.backupContextBackend);
+        const summary = ensurePinnedNotesSection(result, input.pinnedNotes ?? [], extraRedactPatterns);
         return {
-          summary: ensurePinnedNotesSection(result, input.pinnedNotes ?? [], extraRedactPatterns), model: modelConfig.backupContextModel,
-          backend: modelConfig.backupContextBackend, usedBackup: true, fromSdk: true,
+          summary,
+          model: modelConfig.backupContextModel,
+          backend: modelConfig.backupContextBackend,
+          usedBackup: true, fromSdk: true,
+          inputTokens, outputTokens: countTokens(summary),
+          targetTokens, durationMs: Date.now() - startedAt,
         };
       } catch (err) {
+        lastErr = err;
         recordFailure(modelConfig.backupContextBackend, now);
         await shutdownCompressionProvider();
         logger.warn({ err, backend: modelConfig.backupContextBackend },
@@ -629,9 +672,20 @@ ${serializedEvents}`);
   }
 
   // All SDK attempts failed / circuits open — local fallback
+  const fallbackSummary = ensurePinnedNotesSection(
+    buildLocalFallbackSummary(events, previousSummary),
+    input.pinnedNotes ?? [],
+    extraRedactPatterns,
+  );
+  const errorClassification = lastErr ? classifyCompressionError(lastErr) : undefined;
+  const errorMessage = lastErr instanceof Error ? lastErr.message : (lastErr ? String(lastErr) : undefined);
   return {
-    summary: ensurePinnedNotesSection(buildLocalFallbackSummary(events, previousSummary), input.pinnedNotes ?? [], extraRedactPatterns),
+    summary: fallbackSummary,
     model: 'local-fallback', backend: 'none', usedBackup: false, fromSdk: false,
+    inputTokens, outputTokens: countTokens(fallbackSummary),
+    targetTokens, durationMs: Date.now() - startedAt,
+    errorCode: errorClassification?.code,
+    errorMessage: errorMessage ? errorMessage.slice(0, 500) : undefined,
   };
 }
 
