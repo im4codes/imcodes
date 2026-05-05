@@ -39,4 +39,29 @@ describe('styles.css regression contracts', () => {
     expect(subcardRule).not.toBeNull();
     expect(subcardRule![0]).toMatch(/overflow-y:\s*auto/);
   });
+
+  it('.fb-changes-section must NOT cap height — list must scroll past 10 items', () => {
+    // User reported: file browser changes list silently hides items
+    // beyond ~10 even though the DOM has them. Root cause:
+    // `.fb-changes-section` carried a `max-height: 25%` from the old
+    // layout where it sat alongside the file tree inside
+    // `.fb-files-and-changes`. After commit 6c3c1169 removed that
+    // embedded use, the section is always the sole content of its
+    // container — but the cap remained, clipping the list to 25% of
+    // the pane height (~150–200 px = ~10 items). Because the section
+    // itself is `overflow: hidden`, items past the cap aren't even
+    // scrollable — they're just hidden.
+    //
+    // Fix: drop `max-height` from the base rule so the section fills
+    // its container and `.fb-changes-list { overflow-y: auto }` does
+    // the actual clipping/scrolling.
+    const sectionRule = css.match(/\.fb-changes-section\s*\{[^}]*\}/);
+    expect(sectionRule).not.toBeNull();
+    expect(sectionRule![0]).not.toMatch(/max-height\s*:/);
+    // The list itself MUST stay a scroll container so overflow goes
+    // through native scrolling instead of being silently clipped.
+    const listRule = css.match(/\.fb-changes-list\s*\{[^}]*\}/);
+    expect(listRule).not.toBeNull();
+    expect(listRule![0]).toMatch(/overflow-y:\s*auto/);
+  });
 });

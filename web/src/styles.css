@@ -2041,9 +2041,18 @@ body {
 .fb-files-and-changes.fb-tree-split { flex: 0 0 38%; min-width: 180px; border-right: 1px solid #334155; overflow: hidden; }
 .fb-files-and-changes .fb-tree { flex: 3; overflow-y: auto; min-height: 0; }
 .fb-body-split .fb-files-and-changes { border-right: 1px solid #334155; }
-/* Git changes section */
-.fb-changes-section { border-top: 1px solid #1e293b; flex: 1; max-height: 25%; overflow: hidden; display: flex; flex-direction: column; }
-.fb-body > .fb-changes-section { max-height: none; flex: 1; border-top: none; }
+/* Git changes section.
+   Currently always the sole content of its container — directly under
+   `.fb-body` when no preview is split, inside `.fb-tree.fb-tree-split`
+   when a preview pane is open. The earlier `max-height: 25%` cap was
+   for the old layout where the section sat alongside the file tree
+   inside `.fb-files-and-changes` (embedded use removed in commit
+   6c3c1169). With no sibling to share space with, the cap just clipped
+   the list to ~10 items because `.fb-changes-section` is also
+   `overflow: hidden` — hiding everything past the cap even though
+   `.fb-changes-list` is `overflow-y: auto`. Let the section fill its
+   container so the list scrolls naturally. */
+.fb-changes-section { flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
 .fb-changes-header { display: flex; align-items: center; justify-content: space-between; padding: 5px 10px; background: #0f172a; flex-shrink: 0; }
 .fb-changes-title { font-size: 11px; font-weight: 600; color: #64748b; text-transform: uppercase; letter-spacing: .05em; }
 .fb-changes-refresh { background: none; border: none; color: #64748b; cursor: pointer; font-size: 14px; padding: 0 4px; }
