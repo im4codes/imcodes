@@ -114,20 +114,27 @@ describe('MaterializationCoordinator retry behavior', () => {
     coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'keep trying', createdAt: 100 });
     coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'ok', createdAt: 101 });
 
-    // Attempts 1, 2, 3 — all fail. No projection ever written.
+    // Round-2 audit (0699ea64-3e6 finding android#1): the comparison
+    // `priorFailures >= MAX_SDK_RETRY_ATTEMPTS` used to NOT count the
+    // current failure, so MAX=3 meant "try 4 times". The fix now counts
+    // the current failure, so MAX=3 means "try 3 times" (matching the
+    // constant name + log text "attempt N/3"). This test was pinning
+    // the buggy off-by-one and is updated to lock in the corrected
+    // behavior.
+
+    // Attempts 1, 2 — all fail. Raw events kept; no projection ever written.
     await coordinator.materializeTarget(target, 'manual', 200);
     await coordinator.materializeTarget(target, 'schedule', 300);
-    await coordinator.materializeTarget(target, 'schedule', 400);
 
     expect(listContextEvents(target).length).toBeGreaterThan(0);
     let projections = queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId });
     expect(projections.length).toBe(0);
 
-    // Attempt 4 — budget exhausted: raw events are cleared (prevent unbounded
-    // growth), but STILL no projection is written. The memory store keeps its
-    // pre-existing state (empty in this test) and a "gap" simply exists for
-    // the abandoned batch.
-    await coordinator.materializeTarget(target, 'schedule', 500);
+    // Attempt 3 — budget exhausted on the THIRD failure (was the 4th before
+    // the fix): raw events are cleared (prevent unbounded growth), still
+    // no projection. Memory store keeps its pre-existing state and a
+    // "gap" simply exists for the abandoned batch.
+    await coordinator.materializeTarget(target, 'schedule', 400);
     expect(listContextEvents(target).length).toBe(0);
     projections = queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId });
     expect(projections.length).toBe(0);

@@ -80,6 +80,13 @@ function normalizeUsageUpdatePayload(
   const inputTokens = typeof usage?.input_tokens === 'number'
     ? usage.input_tokens + (usage.cache_creation_input_tokens ?? 0)
     : undefined;
+  // Round-2 audit (0699ea64-3e6 finding A3): `output_tokens` was being silently
+  // dropped here, leaving every transport-SDK turn at output_tokens=0 in
+  // context_turn_usage. Map it through so analytics aren't all-zero for SDK
+  // sessions (codex-sdk, claude-code-sdk via onComplete metadata, cursor, ...).
+  const outputTokens = typeof usage?.output_tokens === 'number' && usage.output_tokens >= 0
+    ? usage.output_tokens
+    : undefined;
   const cacheTokens = typeof usage?.cache_read_input_tokens === 'number'
     ? usage.cache_read_input_tokens
     : typeof usage?.cached_input_tokens === 'number'
@@ -100,6 +107,7 @@ function normalizeUsageUpdatePayload(
   const payload: Record<string, unknown> = {
     ...(typeof inputTokens === 'number' ? { inputTokens } : {}),
     ...(typeof cacheTokens === 'number' ? { cacheTokens } : {}),
+    ...(typeof outputTokens === 'number' ? { outputTokens } : {}),
     ...(effectiveModel ? { model: effectiveModel } : {}),
     contextWindow,
     ...(contextWindowSource ? { contextWindowSource } : {}),
@@ -525,3 +533,8 @@ async function pushProviderSessions(providerId: string): Promise<void> {
     logger.warn({ err, providerId }, 'Failed to push provider sessions on connect');
   }
 }
+
+/** @internal Exported for tests only — see test/daemon/transport-relay-usage-payload.test.ts. */
+export const __testing__ = {
+  normalizeUsageUpdatePayload,
+};

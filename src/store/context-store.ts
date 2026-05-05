@@ -546,6 +546,16 @@ function ensureDb(): DatabaseSyncInstance {
     CREATE INDEX IF NOT EXISTS idx_turn_usage_agent_model_created
       ON context_turn_usage(agent_type, model, created_at DESC);
   `);
+  // Round-2 audit (0699ea64-3e6 finding A1): every daemon restart re-emits
+  // historical `usage.update` events from JSONL replay (gemini-watcher's
+  // deterministic stableId AND jsonl-watcher's final-usage emit). Without a
+  // unique key on event_id, recordTurnUsage inflates SUM(input_tokens) by N×
+  // every restart. Partial index excludes legacy rows (event_id IS NULL) so
+  // the migration is idempotent on existing databases.
+  tryAlter(db, 'ALTER TABLE context_turn_usage ADD COLUMN event_id TEXT');
+  db.exec(
+    'CREATE UNIQUE INDEX IF NOT EXISTS uq_turn_usage_event ON context_turn_usage(session_name, event_id) WHERE event_id IS NOT NULL'
+  );
   // Migrate existing DBs — add columns if missing
   tryAlter(db, 'ALTER TABLE context_processed_local ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0');
   tryAlter(db, 'ALTER TABLE context_processed_local ADD COLUMN last_used_at INTEGER');
@@ -1708,6 +1718,14 @@ export interface TurnUsageRecord {
   outputTokens?: number;
   contextWindow?: number | null;
   costUsd?: number | null;
+  /** Idempotency key. Pass the timeline event's `eventId` to make this row
+   *  unique per `(session_name, event_id)`. Without it, daemon restart +
+   *  JSONL history replay (gemini-watcher's deterministic stableId, the
+   *  jsonl-watcher final-usage emit) inflate SUM(input_tokens) by N× per
+   *  restart. The UNIQUE partial index `uq_turn_usage_event` swallows the
+   *  duplicates via INSERT OR IGNORE; legacy rows with NULL event_id are
+   *  unaffected. */
+  eventId?: string | null;
 }
 
 export function recordTurnUsage(input: TurnUsageRecord): void {
@@ -1723,10 +1741,10 @@ export function recordTurnUsage(input: TurnUsageRecord): void {
   try {
     const database = ensureDb();
     database.prepare(`
-      INSERT INTO context_turn_usage (
+      INSERT OR IGNORE INTO context_turn_usage (
         created_at, session_name, agent_type, model,
-        input_tokens, cache_tokens, output_tokens, context_window, cost_usd
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        input_tokens, cache_tokens, output_tokens, context_window, cost_usd, event_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       input.createdAt ?? Date.now(),
       input.sessionName,
@@ -1737,6 +1755,7 @@ export function recordTurnUsage(input: TurnUsageRecord): void {
       outputTokens,
       input.contextWindow ?? null,
       input.costUsd ?? null,
+      input.eventId ?? null,
     );
   } catch (err) {
     // Never break the timeline emitter — log + counter only.

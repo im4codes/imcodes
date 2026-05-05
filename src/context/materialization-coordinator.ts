@@ -294,6 +294,35 @@ export class MaterializationCoordinator {
           error: `compression_admission_closed: ${error.reason} — kept raw events for retry`,
         });
         incrementCounter('mem.materialization.compression_admission_closed', { reason: error.reason });
+        // Round-2 audit (0699ea64-3e6 finding A2/Commit B): admission_closed
+        // path used to early-return WITHOUT recording in
+        // context_compression_runs, leaving the schema's CHECK enum value
+        // 'admission_closed' as dead schema. Operators querying "how often
+        // does the upgrade-pending freeze block compactions" couldn't
+        // answer it. Now we record an SQLite row so the metric is queryable
+        // — but we explicitly do NOT emit a timeline event (would be chat
+        // noise: "nothing happened, but here's an event saying so").
+        try {
+          recordCompressionRun({
+            backend: 'none',
+            model: '',
+            usedBackup: false,
+            fromSdk: false,
+            namespaceKey: serializeContextNamespace(target.namespace),
+            targetKind: target.kind,
+            sessionName: target.sessionName ?? null,
+            trigger,
+            mode: 'auto',
+            eventCount: events.length,
+            inputTokens: 0,
+            outputTokens: 0,
+            targetTokens: 0,
+            durationMs: 0,
+            outcome: 'admission_closed',
+            errorCode: error.reason,
+            errorMessage: null,
+          });
+        } catch { /* never escape */ }
         return {
           replicationQueued: false,
         };
@@ -319,32 +348,42 @@ export class MaterializationCoordinator {
     // Persist a row in context_compression_runs so operators can query
     // model/token costs later. Best-effort — recording failures must never
     // break compression; recordCompressionRun swallows internally.
+    //
+    // Round-2 audit (0699ea64-3e6 finding A2/Commit B): when events.length===0
+    // the compressor early-returns a fromSdk:false CompressionResult that
+    // used to be recorded as outcome='fallback' (because errorCode is also
+    // unset). That polluted SUM(outcome='fallback') analytics — those rows
+    // weren't real fallbacks, just no-ops. Skip recording + emit entirely
+    // for the no-op case; the path produces no projection and no LLM call,
+    // so there is nothing useful to log for cost analysis.
     const outcome: 'success' | 'fallback' | 'error' = compression.fromSdk
       ? (compression.usedBackup ? 'fallback' : 'success')
       : (compression.errorCode || compression.errorMessage ? 'error' : 'fallback');
-    try {
-      recordCompressionRun({
-        backend: compression.backend,
-        model: compression.model,
-        usedBackup: compression.usedBackup,
-        fromSdk: compression.fromSdk,
-        namespaceKey: serializeContextNamespace(target.namespace),
-        targetKind: target.kind,
-        sessionName: target.sessionName ?? null,
-        trigger,
-        mode: 'auto',
-        eventCount: events.length,
-        inputTokens: compression.inputTokens ?? 0,
-        outputTokens: compression.outputTokens ?? 0,
-        targetTokens: compression.targetTokens ?? 0,
-        durationMs: compression.durationMs ?? 0,
-        outcome,
-        errorCode: compression.errorCode ?? null,
-        errorMessage: compression.errorMessage ?? null,
-      });
-    } catch {
-      // Telemetry must never escape — recordCompressionRun already swallows
-      // its own errors, but defense-in-depth.
+    if (events.length > 0) {
+      try {
+        recordCompressionRun({
+          backend: compression.backend,
+          model: compression.model,
+          usedBackup: compression.usedBackup,
+          fromSdk: compression.fromSdk,
+          namespaceKey: serializeContextNamespace(target.namespace),
+          targetKind: target.kind,
+          sessionName: target.sessionName ?? null,
+          trigger,
+          mode: 'auto',
+          eventCount: events.length,
+          inputTokens: compression.inputTokens ?? 0,
+          outputTokens: compression.outputTokens ?? 0,
+          targetTokens: compression.targetTokens ?? 0,
+          durationMs: compression.durationMs ?? 0,
+          outcome,
+          errorCode: compression.errorCode ?? null,
+          errorMessage: compression.errorMessage ?? null,
+        });
+      } catch {
+        // Telemetry must never escape — recordCompressionRun already swallows
+        // its own errors, but defense-in-depth.
+      }
     }
 
     // Emit a `memory.compression` timeline event so the user can see in chat
@@ -352,7 +391,8 @@ export class MaterializationCoordinator {
     // default, click to expand). Persisted to JSONL via the timeline store.
     // Only emit when we have a session-bound target — namespace-only
     // (project-level) compactions don't have a chat thread to attach to.
-    if (target.sessionName) {
+    // Same events.length>0 guard as the SQLite recording above.
+    if (target.sessionName && events.length > 0) {
       try {
         timelineEmitter.emit(
           target.sessionName,
@@ -421,7 +461,15 @@ export class MaterializationCoordinator {
     const sdkFailed = !compression.fromSdk;
 
     if (sdkFailed) {
-      const retryBudgetExhausted = priorFailures >= MAX_SDK_RETRY_ATTEMPTS;
+      // Round-2 audit (0699ea64-3e6 finding android#1/Commit B):
+      // `priorFailures >= MAX_SDK_RETRY_ATTEMPTS` was off-by-one — the comparison
+      // didn't include the CURRENT failure, so the constant `3` actually meant
+      // "permit 3 prior failures + give up on the 4th". Operators reading
+      // `attempt 3/3` reasonably expected "next failure ends the batch", but
+      // the daemon would still try once more. Counting the current failure
+      // (priorFailures + 1) makes the constant match its name.
+      const totalFailuresIncludingCurrent = priorFailures + 1;
+      const retryBudgetExhausted = totalFailuresIncludingCurrent >= MAX_SDK_RETRY_ATTEMPTS;
       // Any legacy tentative rows from earlier versions of this code get
       // scrubbed here — the new design never writes tentatives, so the only
       // tentative rows that can exist are pre-migration leftovers.
@@ -436,7 +484,7 @@ export class MaterializationCoordinator {
         incrementCounter('mem.materialization.retry_exhausted_archived', { source: 'materializeTarget' });
         deleteStagedEventsByIds(sourceEventIds);
         updateContextJob(job.id, 'completed', { now,
-          error: `SDK compression abandoned after ${priorFailures} consecutive failures — events discarded, no summary written`,
+          error: `SDK compression abandoned after ${totalFailuresIncludingCurrent} consecutive failures — events discarded, no summary written`,
         });
         clearDirtyTarget(target);
         return {
@@ -449,7 +497,7 @@ export class MaterializationCoordinator {
       // Retry path: keep staged events, leave dirty target in place, mark
       // job materialization_failed so the next trigger retries SDK.
       updateContextJob(job.id, 'materialization_failed', { now,
-        error: `SDK compression unavailable (attempt ${priorFailures + 1}/${MAX_SDK_RETRY_ATTEMPTS}) — kept raw events for retry`,
+        error: `SDK compression unavailable (attempt ${totalFailuresIncludingCurrent}/${MAX_SDK_RETRY_ATTEMPTS}) — kept raw events for retry`,
       });
       return {
         replicationQueued: false,

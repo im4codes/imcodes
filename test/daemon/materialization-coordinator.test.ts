@@ -264,7 +264,11 @@ describe('MaterializationCoordinator', () => {
     coordinator.ingestEvent({ id: 'evt-retry-user', target, eventType: 'user.turn', content: 'please remember this outage batch', createdAt: 100 });
     coordinator.ingestEvent({ id: 'evt-retry-assistant', target, eventType: 'assistant.text', content: 'working on the durable archive path', createdAt: 120 });
 
-    for (let i = 0; i < 3; i++) {
+    // Round-2 audit (0699ea64-3e6 finding android#1): retry off-by-one fix
+    // means MAX_SDK_RETRY_ATTEMPTS=3 now truly means "give up on the 3rd
+    // failure" (was "give up on the 4th"). The retry-then-exhaust loop
+    // therefore runs 2 retries (events kept) and exhausts on the 3rd.
+    for (let i = 0; i < 2; i++) {
       const result = await coordinator.materializeTarget(target, 'manual', 500 + i);
       expect(result.filteredOut).toBeUndefined();
       expect(listContextEvents(target).map((event) => event.id).sort()).toEqual(['evt-retry-assistant', 'evt-retry-user']);
