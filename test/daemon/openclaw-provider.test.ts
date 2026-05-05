@@ -122,6 +122,13 @@ describe('OpenClawProvider', () => {
       reasoningEffort: true,
       supportedEffortLevels: ['off', 'minimal', 'low', 'medium', 'high', 'adaptive'],
       contextSupport: 'full-normalized-context-injection',
+      compact: {
+        execution: 'unsupported',
+        verified: true,
+        completion: 'none',
+        cancellation: 'none',
+        reason: 'Verified in this adapter/environment: OpenClaw exposes no compact RPC/command path here, and no local openclaw CLI is installed to test a provider slash command.',
+      },
     });
   });
 
