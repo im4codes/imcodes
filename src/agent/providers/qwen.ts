@@ -29,9 +29,14 @@ import { DEFAULT_TRANSPORT_EFFORT, QWEN_EFFORT_LEVELS, type TransportEffortLevel
 import logger from '../../util/logger.js';
 import { inferContextWindow } from '../../util/model-context.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
+import {
+  SESSION_CONTROL_METADATA_COMMAND_FIELD,
+  isSessionCompactCommandText,
+} from '../../../shared/session-control-commands.js';
 
 const execFileAsync = promisify(execFile);
 const QWEN_BIN = 'qwen';
+const QWEN_COMPACT_SLASH_COMMAND = '/compress' as const;
 const TRANSIENT_RETRY_DELAY_MS = 250;
 const TRANSIENT_RETRY_MAX_ATTEMPTS = 1;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -75,6 +80,23 @@ function extractSyntheticApiError(text: string | undefined): string | undefined 
   if (typeof text !== 'string') return undefined;
   const match = text.trim().match(/^\[API Error:\s*(.+)\]$/i);
   return match?.[1]?.trim() || undefined;
+}
+
+function toQwenCompactPayload(payload: ProviderContextPayload): ProviderContextPayload {
+  const { systemText: _systemText, messagePreamble: _messagePreamble, startupMemory: _startupMemory, memoryRecall: _memoryRecall, ...rest } = payload;
+  const { systemText: _contextSystemText, messagePreamble: _contextMessagePreamble, ...contextRest } = payload.context;
+  return {
+    ...rest,
+    userMessage: QWEN_COMPACT_SLASH_COMMAND,
+    assembledMessage: QWEN_COMPACT_SLASH_COMMAND,
+    context: {
+      ...contextRest,
+      requiredAuthoredContext: [],
+      advisoryAuthoredContext: [],
+      diagnostics: [],
+    },
+    diagnostics: [],
+  };
 }
 
 interface QwenSessionState {
@@ -231,6 +253,14 @@ export class QwenProvider implements TransportProvider {
     reasoningEffort: true,
     supportedEffortLevels: QWEN_EFFORT_LEVELS,
     contextSupport: 'degraded-message-side-context-mapping',
+    compact: {
+      execution: 'slash-command',
+      providerCommand: QWEN_COMPACT_SLASH_COMMAND,
+      verified: true,
+      completion: 'command-result',
+      cancellation: 'provider-cancel',
+      reason: 'Verified with Qwen Code 0.14.5: non-interactive CLI supports /compress, not /compact; adapter translates the IM.codes /compact control command.',
+    },
   };
 
   private config: ProviderConfig | null = null;
@@ -413,14 +443,25 @@ export class QwenProvider implements TransportProvider {
     state.emittedToolSignatures.clear();
     state.lastStatusSignature = null;
     const payload = normalizeProviderPayload(payloadOrMessage, _attachments, extraSystemPrompt);
+    const isCompactControl = isSessionCompactCommandText(payload.userMessage);
+    const providerPayload = isCompactControl ? toQwenCompactPayload(payload) : payload;
+    const compactCompletionMetadata = isCompactControl
+      ? {
+          [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact',
+          event: 'session.history.compress',
+          providerCommand: QWEN_COMPACT_SLASH_COMMAND,
+        }
+      : undefined;
 
     const args = [
-      '-p', payload.assembledMessage,
+      '-p', providerPayload.assembledMessage,
       '--output-format', 'stream-json',
       '--include-partial-messages',
       '--approval-mode', 'yolo',
     ];
-    const effectivePrompt = payload.systemText?.trim() || state.description?.trim();
+    const effectivePrompt = isCompactControl
+      ? undefined
+      : (providerPayload.systemText?.trim() || state.description?.trim());
     if (effectivePrompt) {
       args.push('--append-system-prompt', effectivePrompt);
     }
@@ -459,6 +500,12 @@ export class QwenProvider implements TransportProvider {
     });
     state.child = child;
     this.sessions.set(sessionId, state);
+    if (isCompactControl) {
+      this.emitStatus(sessionId, state, {
+        status: 'compacting',
+        label: 'Compacting conversation...',
+      });
+    }
 
     let completed = false;
     let sawError = false;
@@ -487,6 +534,7 @@ export class QwenProvider implements TransportProvider {
     const emitError = (messageText: string, details?: unknown): void => {
       if (sawError || completed) return;
       sawError = true;
+      this.clearStatus(sessionId, state);
       const errorCode = state.cancelled
         ? PROVIDER_ERROR_CODES.CANCELLED
         : (this.isAuthFailureMessage(messageText) ? PROVIDER_ERROR_CODES.AUTH_FAILED : PROVIDER_ERROR_CODES.PROVIDER_ERROR);
@@ -503,11 +551,12 @@ export class QwenProvider implements TransportProvider {
       state.pendingFinalText = undefined;
       state.pendingFinalMetadata = undefined;
       const finalMessageId = messageId || randomUUID();
+      const isCompactCompletion = metadata?.[SESSION_CONTROL_METADATA_COMMAND_FIELD] === 'compact';
       const msg: AgentMessage = {
         id: finalMessageId,
         sessionId,
-        kind: 'text',
-        role: 'assistant',
+        kind: isCompactCompletion ? 'system' : 'text',
+        role: isCompactCompletion ? 'system' : 'assistant',
         content: text,
         timestamp: Date.now(),
         status: 'complete',
@@ -685,6 +734,7 @@ export class QwenProvider implements TransportProvider {
           state.pendingFinalMetadata = {
             ...(state.model || payload.message?.model ? { model: state.model ?? payload.message?.model } : {}),
             ...(payload.message?.usage ? { usage: sanitizeUsageForDisplay(payload.message.usage, state.model ?? payload.message?.model) } : {}),
+            ...(compactCompletionMetadata ?? {}),
           };
         }
         return;
@@ -739,6 +789,7 @@ export class QwenProvider implements TransportProvider {
             ...(state.pendingFinalMetadata ?? {}),
             ...(state.model ? { model: state.model } : {}),
             ...(!assistantUsage && sanitizedResultUsage ? { usage: sanitizedResultUsage } : {}),
+            ...(compactCompletionMetadata ?? {}),
           };
         }
       }

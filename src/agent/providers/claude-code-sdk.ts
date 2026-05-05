@@ -103,6 +103,14 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     reasoningEffort: true,
     supportedEffortLevels: CLAUDE_SDK_EFFORT_LEVELS,
     contextSupport: 'full-normalized-context-injection',
+    compact: {
+      execution: 'slash-command',
+      providerCommand: '/compact',
+      verified: true,
+      completion: 'status-only',
+      cancellation: 'provider-cancel',
+      reason: 'Verified with Claude Agent SDK 0.2.119 supportedCommands(): compact is a provider slash command, not an active RPC.',
+    },
   };
 
   private config: ProviderConfig | null = null;

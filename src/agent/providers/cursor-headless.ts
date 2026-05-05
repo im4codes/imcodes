@@ -108,6 +108,13 @@ export class CursorHeadlessProvider implements TransportProvider {
     attachments: false,
     reasoningEffort: false,
     contextSupport: 'degraded-message-side-context-mapping',
+    compact: {
+      execution: 'unsupported',
+      verified: true,
+      completion: 'none',
+      cancellation: 'none',
+      reason: 'Verified with cursor-agent 2026.05.05-84a231c: CLI help exposes no compact/compress command or compact API for the headless adapter.',
+    },
   };
 
   private config: ProviderConfig | null = null;

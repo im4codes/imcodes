@@ -95,7 +95,12 @@ function pickString(record: CursorRecord, ...keys: string[]): string | undefined
  * Everything downstream — `transport-relay.normalizeUsageUpdatePayload`,
  * `ProviderUsageUpdate.usage`, the SQLite write path — expects
  * `ProviderUsageUpdate.usage` shape (snake_case `input_tokens` /
- * `output_tokens` / `cache_read_input_tokens` / `cache_creation_input_tokens`).
+ * `output_tokens`). Cursor's cache counters are not provider-window occupancy:
+ * long-running sessions have shown `cacheReadTokens` exceeding the model
+ * context window while the live prompt is small. Preserve those counters under
+ * cursor-specific diagnostic keys instead of mapping them to canonical cache
+ * fields; otherwise the UI context meter reads cumulative/billing cache as
+ * live context and shows impossible values such as 1.3M / 1M.
  *
  * Without translation every cursor turn produced `undefined` token fields:
  * the chat header context bar showed "0 / 1M (0.0%)", and `context_turn_usage`
@@ -115,17 +120,18 @@ function normalizeCursorUsage(raw: CursorRecord | undefined): CursorRecord | und
   const map: Array<[string, string]> = [
     ['inputTokens', 'input_tokens'],
     ['outputTokens', 'output_tokens'],
-    ['cacheReadTokens', 'cache_read_input_tokens'],
-    // cacheWriteTokens semantically maps to "creation" tokens (input tokens
-    // that build the cache) — transport-relay folds these into input_tokens
-    // via `(usage.input_tokens + (usage.cache_creation_input_tokens ?? 0))`.
-    ['cacheWriteTokens', 'cache_creation_input_tokens'],
     ['contextWindow', 'model_context_window'],
   ];
   for (const [from, to] of map) {
     if (typeof raw[from] === 'number' && typeof result[to] !== 'number') {
       result[to] = raw[from];
     }
+  }
+  if (typeof raw.cacheReadTokens === 'number' && typeof result.cursor_cache_read_tokens !== 'number') {
+    result.cursor_cache_read_tokens = raw.cacheReadTokens;
+  }
+  if (typeof raw.cacheWriteTokens === 'number' && typeof result.cursor_cache_write_tokens !== 'number') {
+    result.cursor_cache_write_tokens = raw.cacheWriteTokens;
   }
   return result;
 }

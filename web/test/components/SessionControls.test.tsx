@@ -2126,6 +2126,34 @@ afterEach(() => {
     expect(screen.queryByRole('button', { name: '1 queued' })).toBeNull();
   });
 
+  it('sends /compact without creating an optimistic user bubble', () => {
+    const ws = makeWs();
+    const onSend = vi.fn();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'idle',
+        })}
+        quickData={makeQuickData() as any}
+        onSend={onSend}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = '/compact';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+
+    expectSendPayload(ws, {
+      sessionName: 'qwen-session',
+      text: '/compact',
+    });
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
   it('qwen oauth model dropdown only shows coder-model even if stale model list exists', () => {
     render(<SessionControls
       ws={makeWs() as any}

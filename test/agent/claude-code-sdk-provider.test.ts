@@ -380,6 +380,67 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(run.options.appendSystemPrompt).toBe('Visible description\n\nRuntime note only');
   });
 
+  it('declares /compact as a verified Claude slash command capability', async () => {
+    const provider = new ClaudeCodeSdkProvider();
+
+    expect(provider.capabilities.compact).toEqual(expect.objectContaining({
+      execution: 'slash-command',
+      verified: true,
+      completion: 'status-only',
+      cancellation: 'provider-cancel',
+    }));
+  });
+
+  it('forwards raw /compact to Claude Code SDK as a slash command', async () => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-compact', model: 'claude-sonnet-4-6' },
+      { type: 'system', subtype: 'status', session_id: 'session-compact', status: 'compacting' },
+      { type: 'system', subtype: 'status', session_id: 'session-compact', status: null },
+      { type: 'result', session_id: 'session-compact', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-compact', cwd: '/tmp/project', resumeId: 'session-compact' });
+
+    const statuses: Array<{ status: string | null; label?: string | null }> = [];
+    provider.onStatus?.((_sid, status) => statuses.push(status));
+
+    await provider.send('route-compact', {
+      userMessage: '/compact',
+      assembledMessage: '/compact',
+      systemText: undefined,
+      messagePreamble: undefined,
+      attachments: undefined,
+      context: {
+        systemText: undefined,
+        messagePreamble: undefined,
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        authoritySource: 'none',
+        freshness: 'missing',
+        fallbackAllowed: false,
+        retryScheduled: false,
+        diagnostics: [],
+      },
+      supportClass: 'full-normalized-context-injection',
+      diagnostics: [],
+    });
+    await flush();
+
+    const run = sdkMock.runs.at(-1)!;
+    expect(run.prompt).toBe('/compact');
+    expect(run.options.appendSystemPrompt).toBeUndefined();
+    expect(statuses).toEqual([
+      { status: 'compacting', label: 'Compacting conversation...' },
+      { status: null, label: null },
+    ]);
+  });
+
   it('maps normalized provider payloads without re-assembling prompt state in the caller', async () => {
     sdkMock.setNextMessages([
       { type: 'system', subtype: 'init', session_id: 'session-payload', model: 'claude-sonnet-4-6' },

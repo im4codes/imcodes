@@ -1,6 +1,7 @@
 import type { CodexStatusSnapshot } from '@shared/codex-status.js';
 import { isUsageContextWindowSource, type UsageContextWindowSource } from '@shared/usage-context-window.js';
 import type { TimelineEvent } from './ws-client.js';
+import { resolveContextWindow } from './model-context.js';
 
 export interface UsageData {
   inputTokens: number;
@@ -11,7 +12,7 @@ export interface UsageData {
   codexStatus?: CodexStatusSnapshot;
 }
 
-const IMPOSSIBLE_CONTEXT_USAGE_MULTIPLIER = 50;
+const MAX_CONTEXT_USAGE_OVERRUN_RATIO = 1.05;
 
 function isCodexStatusSnapshot(value: unknown): value is CodexStatusSnapshot {
   return !!value && typeof value === 'object' && 'capturedAt' in value;
@@ -27,11 +28,19 @@ export function isPlausibleUsagePayload(payload: Record<string, unknown>): boole
   if (typeof payload.contextWindow !== 'number' || !Number.isFinite(payload.contextWindow) || payload.contextWindow <= 0) {
     return true;
   }
+  const contextWindow = resolveContextWindow(
+    payload.contextWindow,
+    typeof payload.model === 'string' ? payload.model : undefined,
+    1_000_000,
+    { preferExplicit: payload.contextWindowSource === 'provider' },
+  );
   const total = inputTokens + cacheTokens;
-  // Older Codex/Codex-SDK builds accidentally emitted cumulative billing totals
-  // as live ctx usage. Keep historical timelines readable by skipping values
-  // that are orders of magnitude larger than any possible context window.
-  return total <= payload.contextWindow * IMPOSSIBLE_CONTEXT_USAGE_MULTIPLIER;
+  // Provider context meters describe current prompt/window occupancy, not
+  // cumulative billing totals. A live context snapshot cannot materially exceed
+  // the window; stale Codex/Cursor builds have emitted cumulative totals that
+  // made the UI show impossible values like "1.3M / 1M". Skip those snapshots
+  // and fall back to the latest plausible usage/model event.
+  return total <= contextWindow * MAX_CONTEXT_USAGE_OVERRUN_RATIO;
 }
 
 export function extractLatestUsage(events: TimelineEvent[]): UsageData | null {

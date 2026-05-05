@@ -47,6 +47,7 @@ import { appendTransportEvent } from '../../src/daemon/transport-history.js';
 import type { TransportProvider } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
 import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
+import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
 
 // ── Mock provider factory ────────────────────────────────────────────────────
 
@@ -281,6 +282,21 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(textCall![2].streaming).toBe(false);
       // Uses message.content as authoritative final text
       expect(textCall![2].text).toBe('part1 part2');
+    });
+
+    it('does not render provider compact control completions as assistant text', () => {
+      const { provider, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireComplete('sess-1', makeMessage({
+        id: 'msg-compact',
+        kind: 'system',
+        role: 'system',
+        content: 'Context compressed.',
+        metadata: { [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact' },
+      }));
+
+      expect(emitMock.mock.calls.filter(c => c[1] === 'assistant.text')).toHaveLength(0);
     });
 
     it('emits usage.update using current usage semantics when completion metadata includes model and usage', () => {

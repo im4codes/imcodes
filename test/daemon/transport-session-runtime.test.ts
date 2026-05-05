@@ -5,6 +5,7 @@ import type { TransportProvider, ProviderError, SessionConfig } from '../../src/
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { MemorySearchResult, MemorySearchResultItem } from '../../src/context/memory-search.js';
 import { PREFERENCE_CONTEXT_END, PREFERENCE_CONTEXT_START } from '../../shared/preference-ingest.js';
+import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
@@ -196,7 +197,7 @@ describe('TransportSessionRuntime', () => {
       kind: 'system',
       role: 'system',
       content: 'Codex context compacted.',
-      metadata: { provider: 'codex-sdk', event: 'thread/compacted' },
+      metadata: { provider: 'codex-sdk', [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact' },
     });
     await flushDispatch();
 
@@ -205,6 +206,19 @@ describe('TransportSessionRuntime', () => {
     const afterCompactPayload = mock.provider.send.mock.calls[2]?.[1] as Record<string, unknown>;
     expect(afterCompactPayload.messagePreamble).toContain('Use pnpm');
     expect(String(afterCompactPayload.assembledMessage)).toContain('Use pnpm');
+  });
+
+  it('rejects /compact before dispatch when provider compact capability is unsupported', () => {
+    (mock.provider.capabilities as Record<string, unknown>).compact = {
+      execution: 'unsupported',
+      verified: false,
+      completion: 'none',
+      cancellation: 'none',
+      reason: 'mock provider does not support compact',
+    };
+
+    expect(() => runtime.send('/compact')).toThrow('mock provider does not support compact');
+    expect(mock.provider.send).not.toHaveBeenCalled();
   });
 
   it('keeps slash controls raw for every transport by suppressing startup, recall, authored, and preference context', async () => {

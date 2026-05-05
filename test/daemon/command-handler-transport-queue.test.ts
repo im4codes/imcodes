@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID } from '../../shared/ack-protocol.js';
+import { TRANSPORT_SESSION_AGENT_TYPES } from '../../shared/agent-types.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { MEMORY_WS } from '../../shared/memory-ws.js';
 import { MEMORY_MANAGEMENT_CONTEXT_FIELD } from '../../shared/memory-management-context.js';
@@ -1107,7 +1108,16 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(ackOrder).toBeLessThan(providerSend.mock.invocationCallOrder[0]);
   });
 
-  it('forwards /compact unchanged to the transport SDK without daemon-side compaction events', async () => {
+  it.each([...TRANSPORT_SESSION_AGENT_TYPES])('forwards /compact unchanged for %s without rendering it as a user message', async (agentType) => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType,
+      runtimeType: 'transport',
+      state: 'running',
+    });
+    const commandId = `cmd-compact-${agentType}`;
     const transportSend = vi.fn(() => 'sent');
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: 'route-transport',
@@ -1115,29 +1125,62 @@ describe('handleWebCommand transport queue behavior', () => {
       pendingCount: 0,
     });
 
-    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: '/compact', commandId: 'cmd-compact' }, serverLink as any);
+    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: '/compact', commandId }, serverLink as any);
 
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {
-      commandId: 'cmd-compact',
+      commandId,
       status: 'accepted',
     });
     expect(transportSend).not.toHaveBeenCalled();
 
     await flushAsync();
 
-    expect(transportSend).toHaveBeenCalledWith('/compact', 'cmd-compact');
-    expect(emitMock).toHaveBeenCalledWith(
-      'deck_transport_brain',
-      'user.message',
-      { text: '/compact', allowDuplicate: true, commandId: 'cmd-compact', clientMessageId: 'cmd-compact' },
-      expect.objectContaining({ eventId: 'transport-user:cmd-compact' }),
+    expect(transportSend).toHaveBeenCalledWith('/compact', commandId);
+    const compactUserMessages = emitMock.mock.calls.filter((call) =>
+      call[0] === 'deck_transport_brain'
+      && call[1] === 'user.message'
+      && (call[2] as { text?: string } | undefined)?.text === '/compact',
     );
+    expect(compactUserMessages).toEqual([]);
     expect(emitMock).not.toHaveBeenCalledWith(
       'deck_transport_brain',
       'compaction.result',
       expect.anything(),
       expect.anything(),
     );
+  });
+
+  it('shows a compact-specific visible error when transport runtime rejects /compact synchronously', async () => {
+    const transportSend = vi.fn(() => {
+      throw new Error('provider does not support compact');
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send: transportSend,
+      pendingCount: 0,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/compact',
+      commandId: 'cmd-compact-fail',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(transportSend).toHaveBeenCalledWith('/compact', 'cmd-compact-fail');
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'assistant.text',
+      { text: '⚠️ Compact failed: provider does not support compact', streaming: false, memoryExcluded: true },
+      { source: 'daemon', confidence: 'high' },
+    );
+    const compactUserMessages = emitMock.mock.calls.filter((call) =>
+      call[0] === 'deck_transport_brain'
+      && call[1] === 'user.message'
+      && (call[2] as { text?: string } | undefined)?.text === '/compact',
+    );
+    expect(compactUserMessages).toEqual([]);
   });
 
   it('rejects a duplicate commandId without dispatching it to the transport runtime again', async () => {

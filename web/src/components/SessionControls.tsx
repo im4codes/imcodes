@@ -53,6 +53,7 @@ import {
   type SupervisionMode,
 } from '@shared/supervision-config.js';
 import { FILE_TRANSFER_LIMITS } from '@shared/transport/file-transfer.js';
+import { shouldHideOptimisticUserMessageForSessionControl } from '@shared/session-control-commands.js';
 
 interface Props {
   ws: WsClient | null;
@@ -1800,7 +1801,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           originalName: a.name,
       }))
       : undefined;
-    if (!shouldShowAsQueued) {
+    const suppressOptimisticUserBubble = shouldHideOptimisticUserMessageForSessionControl(payload.text) && !localFailure;
+    if (!shouldShowAsQueued && !suppressOptimisticUserBubble) {
       onSend?.(activeSession.name, payload.text, {
         commandId,
         ...(attachmentSnapshot ? { attachments: attachmentSnapshot } : {}),

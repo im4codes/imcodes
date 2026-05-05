@@ -19,6 +19,7 @@ import { TIMELINE_EVENT_FILE_CHANGE } from '../../shared/file-change.js';
 import { normalizeCodexSdkFileChange, normalizeQwenFileChange } from './file-change-normalizer.js';
 import { USAGE_CONTEXT_WINDOW_SOURCES } from '../../shared/usage-context-window.js';
 import { resolveEffectiveSessionModel } from '../../shared/session-model.js';
+import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
 
 let sendToServer: ((msg: Record<string, unknown>) => void) | null = null;
 const inFlightMessages = new Map<string, { messageId: string; eventId: string; text: string }>();
@@ -33,6 +34,12 @@ const STREAM_UPDATE_INTERVAL_MS = 40;
 const pendingFileLikeTools = new Map<string, ToolCallEvent>();
 const completedFileLikeTools = new Set<string>();
 const MAX_TRACKED_FILE_TOOLS = 512;
+
+function isCompactControlCompletion(message: AgentMessage): boolean {
+  return message.kind === 'system'
+    && message.role === 'system'
+    && message.metadata?.[SESSION_CONTROL_METADATA_COMMAND_FIELD] === 'compact';
+}
 
 function rememberCompletedFileLikeTool(key: string): void {
   completedFileLikeTools.add(key);
@@ -201,6 +208,14 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     const sessionName = resolveSessionName(providerSid);
     if (!sessionName) {
       logger.debug({ providerSid }, 'transport-relay: unresolved route for complete — dropped');
+      return;
+    }
+    if (isCompactControlCompletion(message)) {
+      const tracked = inFlightMessages.get(sessionName);
+      if (tracked) {
+        inFlightMessages.delete(sessionName);
+        clearPendingStreamUpdate(tracked.eventId);
+      }
       return;
     }
     const finalText = message.content;

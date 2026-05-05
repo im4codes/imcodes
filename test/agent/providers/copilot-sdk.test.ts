@@ -3,6 +3,7 @@ import {
   CopilotSdkProvider,
   copilotSdkRuntimeHooks,
 } from '../../../src/agent/providers/copilot-sdk.js';
+import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../../shared/session-control-commands.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 
 vi.mock('../../../src/util/logger.js', () => ({
@@ -18,10 +19,21 @@ type FakeSessionConfig = Record<string, unknown> & {
   onPermissionRequest?: (request: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>;
 };
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 function createCopilotHarness(options?: {
   version?: string;
   protocolVersion?: number;
   authenticated?: boolean;
+  compact?: () => Promise<Record<string, unknown>>;
 }) {
   const sessions = new Map<string, FakeSession>();
   const createdConfigs: FakeSessionConfig[] = [];
@@ -35,6 +47,15 @@ function createCopilotHarness(options?: {
     readonly abort = vi.fn(async () => {});
     readonly setModel = vi.fn(async () => {});
     readonly disconnect = vi.fn(async () => {});
+    readonly rpc = {
+      history: {
+        compact: vi.fn(options?.compact ?? (async () => ({
+          success: true,
+          tokensRemoved: 1234,
+          messagesRemoved: 5,
+        }))),
+      },
+    };
     constructor(readonly sessionId: string) {}
     on(handler: (event: Record<string, unknown>) => void): () => void {
       this.handlers.add(handler);
@@ -168,6 +189,144 @@ describe('CopilotSdkProvider', () => {
     await vi.advanceTimersByTimeAsync(1);
 
     await expect(pending).resolves.toEqual({ kind: 'denied-no-approval-rule-and-could-not-request-from-user' });
+  });
+
+  it('uses Copilot native history.compact for /compact instead of sending it as a prompt', async () => {
+    const harness = createCopilotHarness();
+    const provider = new CopilotSdkProvider();
+    copilotSdkRuntimeHooks.loadSdk = async () => ({
+      CopilotClient: harness.FakeClient,
+    }) as typeof import('@github/copilot-sdk');
+
+    const statuses: Array<Record<string, unknown>> = [];
+    const completions: Array<Record<string, unknown>> = [];
+    provider.onStatus((_, status) => statuses.push(status as Record<string, unknown>));
+    provider.onComplete((_, message) => completions.push(message as Record<string, unknown>));
+    await provider.connect({ binaryPath: 'copilot' });
+    const routeId = await provider.createSession({ sessionKey: 'route-compact', cwd: '/tmp/project' });
+    const session = harness.sessions.get('session-1');
+    expect(session).toBeTruthy();
+
+    await provider.send(routeId, '/compact');
+
+    expect(session?.send).not.toHaveBeenCalled();
+    expect(session?.rpc.history.compact).toHaveBeenCalledOnce();
+    expect(statuses).toEqual([
+      { status: 'compacting', label: 'Compacting conversation...' },
+      { status: null, label: null },
+    ]);
+    expect(completions).toEqual([
+      expect.objectContaining({
+        kind: 'system',
+        role: 'system',
+        content: 'Copilot context compacted.',
+        metadata: expect.objectContaining({
+          provider: 'copilot-sdk',
+          event: 'session.history.compact',
+          [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact',
+          resumeId: 'session-1',
+          tokensRemoved: 1234,
+          messagesRemoved: 5,
+        }),
+      }),
+    ]);
+  });
+
+  it('deduplicates Copilot compaction_complete events against the history.compact RPC result', async () => {
+    const compact = deferred<Record<string, unknown>>();
+    const harness = createCopilotHarness({ compact: () => compact.promise });
+    const provider = new CopilotSdkProvider();
+    copilotSdkRuntimeHooks.loadSdk = async () => ({
+      CopilotClient: harness.FakeClient,
+    }) as typeof import('@github/copilot-sdk');
+
+    const completions: Array<Record<string, unknown>> = [];
+    provider.onComplete((_, message) => completions.push(message as Record<string, unknown>));
+    await provider.connect({ binaryPath: 'copilot' });
+    const routeId = await provider.createSession({ sessionKey: 'route-compact-event', cwd: '/tmp/project' });
+    const session = harness.sessions.get('session-1');
+    expect(session).toBeTruthy();
+
+    const sendPromise = provider.send(routeId, '/compact');
+    await Promise.resolve();
+    session?.emit({
+      type: 'session.compaction_complete',
+      data: {
+        success: true,
+        tokensRemoved: 2000,
+        messagesRemoved: 7,
+        summaryContent: 'summary from sdk event',
+        checkpointPath: '/tmp/checkpoint.json',
+      },
+    });
+    compact.resolve({ success: true, tokensRemoved: 1234, messagesRemoved: 5 });
+    await sendPromise;
+
+    expect(completions).toHaveLength(1);
+    expect(completions[0]).toEqual(expect.objectContaining({
+      kind: 'system',
+      metadata: expect.objectContaining({
+        event: 'session.compaction_complete',
+        [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact',
+        tokensRemoved: 2000,
+        messagesRemoved: 7,
+        summaryContent: 'summary from sdk event',
+        checkpointPath: '/tmp/checkpoint.json',
+      }),
+    }));
+  });
+
+  it('surfaces a visible provider error when Copilot history.compact is unavailable', async () => {
+    const harness = createCopilotHarness();
+    const provider = new CopilotSdkProvider();
+    copilotSdkRuntimeHooks.loadSdk = async () => ({
+      CopilotClient: harness.FakeClient,
+    }) as typeof import('@github/copilot-sdk');
+
+    const errors: string[] = [];
+    provider.onError((_, error) => errors.push(error.message));
+    await provider.connect({ binaryPath: 'copilot' });
+    const routeId = await provider.createSession({ sessionKey: 'route-compact-missing', cwd: '/tmp/project' });
+    const session = harness.sessions.get('session-1');
+    expect(session).toBeTruthy();
+    delete (session!.rpc.history as { compact?: unknown }).compact;
+
+    await expect(provider.send(routeId, '/compact')).rejects.toMatchObject({
+      message: 'Copilot compact failed: SDK history.compact is unavailable',
+    });
+
+    expect(session?.send).not.toHaveBeenCalled();
+    expect(errors).toEqual(['Copilot compact failed: SDK history.compact is unavailable']);
+  });
+
+  it('cancels an in-flight Copilot compact without later emitting success', async () => {
+    const compact = deferred<Record<string, unknown>>();
+    const harness = createCopilotHarness({ compact: () => compact.promise });
+    const provider = new CopilotSdkProvider();
+    copilotSdkRuntimeHooks.loadSdk = async () => ({
+      CopilotClient: harness.FakeClient,
+    }) as typeof import('@github/copilot-sdk');
+
+    const completions: string[] = [];
+    const errors: string[] = [];
+    provider.onComplete((_, message) => completions.push(message.content));
+    provider.onError((_, error) => errors.push(error.message));
+    await provider.connect({ binaryPath: 'copilot' });
+    const routeId = await provider.createSession({ sessionKey: 'route-compact-cancel', cwd: '/tmp/project' });
+    const session = harness.sessions.get('session-1');
+    expect(session).toBeTruthy();
+
+    const sendPromise = provider.send(routeId, '/compact');
+    await Promise.resolve();
+    await provider.cancel(routeId);
+    compact.resolve({ success: true, tokensRemoved: 10, messagesRemoved: 1 });
+    await sendPromise;
+
+    expect(session?.abort).toHaveBeenCalledOnce();
+    expect(errors).toEqual(['Copilot compact cancelled']);
+    expect(completions).toEqual([]);
+    await provider.send(routeId, 'after compact cancel');
+    expect(session?.send).toHaveBeenCalledOnce();
   });
 
   it('rotates poisoned sessions after background-tainted abort and suppresses stale callbacks', async () => {

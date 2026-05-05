@@ -23,6 +23,10 @@ import {
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
+import {
+  SESSION_CONTROL_METADATA_COMMAND_FIELD,
+  isSessionControlCommandText,
+} from '../../../shared/session-control-commands.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 import logger from '../../util/logger.js';
 import { CODEX_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
@@ -438,6 +442,12 @@ export class CodexSdkProvider implements TransportProvider {
     reasoningEffort: true,
     supportedEffortLevels: CODEX_SDK_EFFORT_LEVELS,
     contextSupport: 'degraded-message-side-context-mapping',
+    compact: {
+      execution: 'sdk-rpc',
+      verified: true,
+      completion: 'provider-event',
+      cancellation: 'local-cancel',
+    },
   };
 
   private config: ProviderConfig | null = null;
@@ -626,7 +636,20 @@ export class CodexSdkProvider implements TransportProvider {
 
   async cancel(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
-    if (!state?.threadId || !state.runningTurnId) return;
+    if (!state?.threadId) return;
+    if (state.runningCompact) {
+      state.cancelled = true;
+      const turnId = state.runningTurnId;
+      if (turnId) {
+        void this.request('turn/interrupt', {
+          threadId: state.threadId,
+          turnId,
+        }).catch(() => {});
+      }
+      this.cancelCompactLocally(sessionId, state);
+      return;
+    }
+    if (!state.runningTurnId) return;
     state.cancelled = true;
     const turnId = state.runningTurnId;
     await this.request('turn/interrupt', {
@@ -720,7 +743,7 @@ export class CodexSdkProvider implements TransportProvider {
     // here would be wrong because shared-context/preference preambles may wrap
     // the provider-visible text, while `userMessage` preserves the user's raw
     // command token.
-    return payload.userMessage.trim() === '/compact';
+    return isSessionControlCommandText(payload.userMessage, 'compact');
   }
 
   private async startCompact(sessionId: string, state: CodexSdkSessionState): Promise<void> {
@@ -731,7 +754,7 @@ export class CodexSdkProvider implements TransportProvider {
       state.currentText = '';
       state.currentMessageId = null;
       this.emitStatus(sessionId, state, {
-        status: 'thinking',
+        status: 'compacting',
         label: 'Compacting context...',
       });
       this.armCompactHardTimeout(sessionId, state);
@@ -888,7 +911,7 @@ export class CodexSdkProvider implements TransportProvider {
         state.compactObserved = true;
         this.clearCompactSettleTimer(state);
         this.emitStatus(sessionId, state, {
-          status: 'thinking',
+          status: 'compacting',
           label: 'Compacting context...',
         });
         return;
@@ -936,7 +959,7 @@ export class CodexSdkProvider implements TransportProvider {
           return;
         }
         this.emitStatus(sessionId, state, {
-          status: 'thinking',
+          status: 'compacting',
           label: 'Compacting context...',
         });
         return;
@@ -1089,6 +1112,7 @@ export class CodexSdkProvider implements TransportProvider {
       metadata: {
         provider: this.id,
         event: 'thread/compacted',
+        [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact',
         ...(state.threadId ? { resumeId: state.threadId } : {}),
         ...(turnId ? { turnId } : {}),
       },
@@ -1210,6 +1234,19 @@ export class CodexSdkProvider implements TransportProvider {
 
   private clearStatus(sessionId: string, state: CodexSdkSessionState): void {
     this.emitStatus(sessionId, state, { status: null, label: null });
+  }
+
+  private cancelCompactLocally(sessionId: string, state: CodexSdkSessionState): void {
+    this.clearCancelTimer(state);
+    this.clearCompactTimers(state);
+    this.clearStatus(sessionId, state);
+    state.runningCompact = false;
+    state.runningTurnId = undefined;
+    state.compactObserved = false;
+    state.currentMessageId = null;
+    state.currentText = '';
+    state.pendingComplete = undefined;
+    this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex compact cancelled', true));
   }
 
   private emitError(sessionId: string, error: ProviderError): void {

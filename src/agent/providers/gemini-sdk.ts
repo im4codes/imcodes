@@ -160,6 +160,13 @@ export class GeminiSdkProvider implements TransportProvider {
     attachments: false,
     reasoningEffort: false,
     contextSupport: 'degraded-message-side-context-mapping',
+    compact: {
+      execution: 'unsupported',
+      verified: true,
+      completion: 'none',
+      cancellation: 'none',
+      reason: 'Verified with Gemini CLI 0.39.1: regular CLI registers /compress with /compact and /summarize aliases, but the --acp command registry used by this adapter does not register compress/compact.',
+    },
   };
 
   private config: ProviderConfig | null = null;

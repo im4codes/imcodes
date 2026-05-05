@@ -50,4 +50,31 @@ describe('extractLatestUsage', () => {
       model: 'gpt-5.5',
     });
   });
+
+  it('skips over-window snapshots that look like cumulative provider totals', () => {
+    const usage = extractLatestUsage([
+      makeEvent({ inputTokens: 120_000, cacheTokens: 30_000, contextWindow: 1_000_000, model: 'Auto' }),
+      makeEvent({ inputTokens: 186_606, cacheTokens: 1_080_320, contextWindow: 1_000_000, model: 'Auto' }),
+    ]);
+
+    expect(usage).toMatchObject({
+      inputTokens: 120_000,
+      cacheTokens: 30_000,
+      contextWindow: 1_000_000,
+      model: 'Auto',
+    });
+  });
+
+  it('uses the effective model window before rejecting over-window snapshots', () => {
+    const usage = extractLatestUsage([
+      makeEvent({ inputTokens: 300_000, cacheTokens: 0, contextWindow: 258_400, model: 'gpt-5.5' }),
+    ]);
+
+    expect(usage).toMatchObject({
+      inputTokens: 300_000,
+      cacheTokens: 0,
+      contextWindow: 258_400,
+      model: 'gpt-5.5',
+    });
+  });
 });

@@ -126,14 +126,16 @@ describe('parseCursorStreamLine', () => {
     });
   });
 
-  it('normalizes cursor-agent camelCase usage fields into snake_case', () => {
+  it('normalizes cursor-agent camelCase usage fields without treating cache counters as live context', () => {
     // Real cursor-agent (verified 2026.05.04-08e5280) emits camelCase token
     // fields:
     //   {"usage":{"inputTokens":1227,"outputTokens":13,"cacheReadTokens":10624,"cacheWriteTokens":0}}
-    // Transport-relay's `normalizeUsageUpdatePayload` only knows snake_case;
-    // without translation every cursor turn lost ALL token data and the
-    // chat header context bar showed "0 / 1M (0.0%)". This test pins the
-    // translation contract.
+    // Transport-relay's context meter treats canonical cache_read_input_tokens
+    // as live prompt/window occupancy. Cursor's cacheReadTokens/cacheWriteTokens
+    // are cumulative/billing-style counters in long sessions, so mapping them
+    // into canonical cache fields makes the UI show impossible ctx values
+    // (e.g. 1.3M / 1M). Keep input/output canonical, but preserve cache values
+    // only as cursor-specific diagnostics.
     const parsed = parseCursorStreamLine(JSON.stringify({
       type: 'result',
       subtype: 'success',
@@ -151,9 +153,11 @@ describe('parseCursorStreamLine', () => {
     expect(parsed.usage).toMatchObject({
       input_tokens: 1227,
       output_tokens: 13,
-      cache_read_input_tokens: 10624,
-      cache_creation_input_tokens: 0,
+      cursor_cache_read_tokens: 10624,
+      cursor_cache_write_tokens: 0,
     });
+    expect(parsed.usage).not.toHaveProperty('cache_read_input_tokens');
+    expect(parsed.usage).not.toHaveProperty('cache_creation_input_tokens');
   });
 
   it('ignores invalid or irrelevant records', () => {
@@ -162,4 +166,3 @@ describe('parseCursorStreamLine', () => {
     expect(parseCursorStreamLine(JSON.stringify({ type: 'user', message: { content: [] } }))).toBeNull();
   });
 });
-

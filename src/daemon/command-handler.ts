@@ -160,6 +160,12 @@ import {
   type AuthenticatedMemoryManagementContext,
   type MemoryManagementBoundProject,
 } from '../../shared/memory-management-context.js';
+import {
+  isDaemonHandledSessionControlSend,
+  isSessionControlCommandText,
+  shouldHideTimelineUserMessageForSessionControl,
+  shouldResetProcessPreferenceContextForSessionControl,
+} from '../../shared/session-control-commands.js';
 import type { ContextMemoryStatsView, ContextNamespace } from '../../shared/context-types.js';
 import { publishRuntimeMemoryCacheInvalidation } from '../context/runtime-memory-cache-bus.js';
 import { assertManagedSkillPathSync, ManagedSkillPathError } from '../context/managed-skill-path.js';
@@ -253,7 +259,7 @@ function prepareProcessPreferenceProviderText(input: {
   if (!context) return input.providerText;
   const trimmedText = input.providerText.trim();
   if (trimmedText.startsWith('/')) {
-    if (trimmedText === '/compact' || trimmedText === '/clear') {
+    if (shouldResetProcessPreferenceContextForSessionControl(trimmedText)) {
       processPreferenceContextSignatures.delete(input.sessionName);
     }
     return input.providerText;
@@ -596,15 +602,12 @@ function supportsTransportClear(agentType: string | undefined): agentType is 'cl
     || agentType === 'qwen';
 }
 
-// Note: an earlier `supportsTransportCompact` helper synthesized `/compact`
-// behaviour daemon-side by replaying transport history, calling the memory
-// compressor, and relaunching a fresh conversation. That was rolled back —
-// transport SDKs (claude-code-sdk and friends) accept the literal `/compact`
-// text and run their own native compaction, which is materially better than
-// a daemon-side fresh relaunch (preserves SDK tool config, system prompts,
-// and resume identity). The daemon's automatic materialization pipeline
-// continues to record raw events into `context_event_archive` regardless,
-// so no provenance is lost when the SDK compacts.
+// `/compact` is provider-dispatched, not daemon-synthesized. Provider adapters
+// that expose a compact RPC translate the raw command at the SDK boundary;
+// verified slash-command providers receive the literal command; unsupported
+// providers fail visibly. The daemon's automatic materialization pipeline still
+// records raw events into `context_event_archive`, so provenance is preserved
+// independently of provider-side compaction.
 
 function supportsProcessClear(agentType: string | undefined): agentType is 'claude-code' | 'codex' | 'opencode' {
   return agentType === 'claude-code' || agentType === 'codex' || agentType === 'opencode';
@@ -1931,7 +1934,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     || text.includes('@@all(')
     || text.includes('@@p2p-config(');
   const isDaemonHandledControlSend = trimmedText === '/stop'
-    || trimmedText === '/clear'
+    || isDaemonHandledSessionControlSend(trimmedText)
     || /^\/model\s+\S+/.test(trimmedText)
     || /^\/(?:thinking|effort)\s+\S+/.test(trimmedText);
   // For ordinary user turns, command.ack is a daemon-receipt acknowledgement:
@@ -2452,7 +2455,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     return;
   }
   if (transportRuntime) {
-    if (trimmedText === '/clear' && supportsTransportClear(record?.agentType)) {
+    if (isSessionControlCommandText(trimmedText, 'clear') && supportsTransportClear(record?.agentType)) {
       emitTransportUserMessage(text);
       // Fresh conversation must not replay stale queued messages from the prior
       // offline window — drop anything we had buffered for resend.
@@ -2485,15 +2488,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       }
       return;
     }
-    // `/compact` is intentionally NOT intercepted here. Transport SDKs
-    // (claude-code-sdk, codex-sdk, copilot-sdk, cursor-headless, openclaw,
-    // qwen) accept the literal `/compact` text and run their own native
-    // compaction — preserving SDK tool config, system prompts, and resume
-    // identity. The daemon's automatic materialization pipeline already
-    // archives every memory-eligible event into `context_event_archive`
-    // independently, so daemon-side memory provenance is preserved whether
-    // or not the SDK compacts. Falling through to the default send path
-    // forwards `/compact` to the transport untouched.
+    // `/compact` is intentionally NOT handled as daemon-side compaction here.
+    // The transport runtime/provider capability decides whether it is translated
+    // to an SDK RPC, forwarded as a verified slash command, or rejected visibly.
+    // Falling through preserves the ordinary receipt-ack contract while keeping
+    // provider-specific compact semantics at the SDK boundary.
     const release = await getMutex(sessionName).acquire();
     try {
       const modelMatch = trimmedText.match(/^\/model\s+(\S+)(?:\s+.*)?$/);
@@ -2731,14 +2730,16 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         }
       }
       if (result === 'sent') {
-        emitTransportUserMessage(
-          displayText,
-          {
-            clientMessageId: effectiveId,
-            ...(attachments.length > 0 ? { attachments } : {}),
-          },
-          transportUserEventId(effectiveId),
-        );
+        if (!shouldHideTimelineUserMessageForSessionControl(displayText)) {
+          emitTransportUserMessage(
+            displayText,
+            {
+              clientMessageId: effectiveId,
+              ...(attachments.length > 0 ? { attachments } : {}),
+            },
+            transportUserEventId(effectiveId),
+          );
+        }
       }
       if (result === 'queued') {
         timelineEmitter.emit(sessionName, 'session.state', {
@@ -2756,7 +2757,8 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     } catch (err) {
       const errMsg = describeTransportSendError(err);
       logger.error({ sessionName, err }, 'session.send (transport) failed');
-      timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Send failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+      const failureLabel = isSessionControlCommandText(displayText, 'compact') ? 'Compact failed' : 'Send failed';
+      timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ ${failureLabel}: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
       timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
       if (!receiptAcked) {
         emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
@@ -2776,7 +2778,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     preferenceContext: preferenceMessagePreamble,
   });
 
-  if (text.trim() === '/clear' && record?.runtimeType !== 'transport' && supportsProcessClear(record?.agentType)) {
+  if (isSessionControlCommandText(text, 'clear') && record?.runtimeType !== 'transport' && supportsProcessClear(record?.agentType)) {
     emitTransportUserMessage(text);
     try {
       await runExclusiveSessionRelaunch(sessionName, async () => {

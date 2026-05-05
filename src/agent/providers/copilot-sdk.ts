@@ -22,6 +22,10 @@ import {
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
+import {
+  SESSION_CONTROL_METADATA_COMMAND_FIELD,
+  isSessionControlCommandText,
+} from '../../../shared/session-control-commands.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 import logger from '../../util/logger.js';
 import { resolveBinaryWithWindowsFallbacks } from '../transport-paths.js';
@@ -46,6 +50,11 @@ type CopilotSessionLike = {
   abort(): Promise<void>;
   setModel(model: string, options?: Record<string, unknown>): Promise<void>;
   on(handler: (event: Record<string, any>) => void): () => void;
+  rpc?: {
+    history?: {
+      compact?: () => Promise<CopilotCompactResultLike>;
+    };
+  };
   disconnect?(): Promise<void>;
 };
 
@@ -59,6 +68,19 @@ type CopilotClientLike = {
   listSessions(filter?: Record<string, unknown>): Promise<Array<{ sessionId: string; summary?: string; modifiedTime?: Date | string | number }>>;
   deleteSession(sessionId: string): Promise<void>;
   listModels(): Promise<Array<{ id: string; capabilities?: { supports?: { reasoningEffort?: boolean } } }>>;
+};
+
+type CopilotOperation = 'idle' | 'turn' | 'compact' | 'cancelling';
+
+type CopilotCompactResultLike = {
+  success?: boolean;
+  error?: string;
+  tokensRemoved?: number;
+  messagesRemoved?: number;
+  summaryContent?: string;
+  checkpointNumber?: number;
+  checkpointPath?: string;
+  requestId?: string;
 };
 
 interface PendingApproval {
@@ -95,9 +117,11 @@ interface CopilotSessionState {
   currentCostUsd?: number;
   currentInteractionId?: string;
   busy: boolean;
+  operation: CopilotOperation;
   backgroundTainted: boolean;
   cancelRequested: boolean;
   cancelErrorEmitted: boolean;
+  compactCompletionEmitted: boolean;
   rotationInProgress: boolean;
   generation: number;
   lastStatusSignature: string | null;
@@ -242,6 +266,12 @@ export class CopilotSdkProvider implements TransportProvider {
     reasoningEffort: true,
     supportedEffortLevels: ['low', 'medium', 'high', 'max'],
     contextSupport: 'degraded-message-side-context-mapping',
+    compact: {
+      execution: 'sdk-rpc',
+      verified: true,
+      completion: 'rpc-result-or-provider-event',
+      cancellation: 'provider-cancel',
+    },
   };
 
   private config: ProviderConfig | null = null;
@@ -368,9 +398,11 @@ export class CopilotSdkProvider implements TransportProvider {
       currentOutputTokens: undefined,
       currentInteractionId: undefined,
       busy: false,
+      operation: 'idle',
       backgroundTainted: false,
       cancelRequested: false,
       cancelErrorEmitted: false,
+      compactCompletionEmitted: false,
       rotationInProgress: false,
       generation: 0,
       lastStatusSignature: null,
@@ -500,17 +532,14 @@ export class CopilotSdkProvider implements TransportProvider {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Copilot session is already busy', true);
     }
     const payload = normalizeProviderPayload(payloadOrMessage, attachments, extraSystemPrompt);
+    if (isSessionControlCommandText(payload.userMessage, 'compact')) {
+      await this.compactHistory(state);
+      return;
+    }
     const prompt = [payload.systemText?.trim(), payload.assembledMessage?.trim()].filter(Boolean).join('\n\n');
     const sdkAttachments = toAttachmentPayload(payload.attachments);
-    state.currentMessageId = null;
-    state.currentText = '';
-    state.completionEmittedForCurrentTurn = false;
-    state.currentOutputTokens = undefined; state.currentInputTokens = undefined; state.currentCacheReadTokens = undefined; state.currentCacheWriteTokens = undefined; state.currentCostUsd = undefined;
-    state.currentInteractionId = undefined;
-    state.backgroundTainted = false;
-    state.cancelRequested = false;
-    state.cancelErrorEmitted = false;
-    state.rotationInProgress = false;
+    this.resetTurnState(state);
+    state.operation = 'turn';
     state.busy = true;
     try {
       if (state.model) {
@@ -525,21 +554,137 @@ export class CopilotSdkProvider implements TransportProvider {
       });
     } catch (error) {
       state.busy = false;
+      state.operation = 'idle';
       throw error;
     }
+  }
+
+  private resetTurnState(state: CopilotSessionState): void {
+    state.currentMessageId = null;
+    state.currentText = '';
+    state.completionEmittedForCurrentTurn = false;
+    state.currentOutputTokens = undefined;
+    state.currentInputTokens = undefined;
+    state.currentCacheReadTokens = undefined;
+    state.currentCacheWriteTokens = undefined;
+    state.currentCostUsd = undefined;
+    state.currentInteractionId = undefined;
+    state.backgroundTainted = false;
+    state.cancelRequested = false;
+    state.cancelErrorEmitted = false;
+    state.compactCompletionEmitted = false;
+    state.rotationInProgress = false;
+  }
+
+  private async compactHistory(state: CopilotSessionState): Promise<void> {
+    const history = state.session.rpc?.history;
+    const compact = history?.compact;
+    if (typeof compact !== 'function') {
+      const error = this.makeError(
+        PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+        'Copilot compact failed: SDK history.compact is unavailable',
+        false,
+      );
+      this.emitError(state.routeId, error);
+      throw error;
+    }
+    this.resetTurnState(state);
+    state.busy = true;
+    state.operation = 'compact';
+    this.emitStatus(state.routeId, { status: 'compacting', label: 'Compacting conversation...' });
+    try {
+      const result = await compact.call(history);
+      if (state.operation === 'compact' && !state.cancelRequested) {
+        this.completeCompactOnce(state, 'session.history.compact', result ?? {});
+      }
+      this.finishCompactOperation(state);
+    } catch (error) {
+      const providerError = this.toCompactError(error);
+      this.finishCompactOperation(state);
+      if (state.cancelRequested) return;
+      this.emitError(state.routeId, providerError);
+      throw providerError;
+    }
+  }
+
+  private completeCompactOnce(state: CopilotSessionState, event: string, data: CopilotCompactResultLike): void {
+    if (state.operation !== 'compact' || state.compactCompletionEmitted || state.cancelRequested) return;
+    state.compactCompletionEmitted = true;
+    state.completionEmittedForCurrentTurn = true;
+    if (data?.success === false) {
+      this.emitError(state.routeId, this.makeError(
+        PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+        `Copilot compact failed: ${data.error ?? 'SDK reported no compactable changes'}`,
+        true,
+        data,
+      ));
+      return;
+    }
+    const complete: AgentMessage = {
+      id: `${state.sessionId}:context-compaction:${Date.now()}`,
+      sessionId: state.routeId,
+      kind: 'system',
+      role: 'system',
+      content: 'Copilot context compacted.',
+      timestamp: Date.now(),
+      status: 'complete',
+      metadata: {
+        provider: this.id,
+        event,
+        [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact',
+        resumeId: state.sessionId,
+        ...(typeof data?.tokensRemoved === 'number' ? { tokensRemoved: data.tokensRemoved } : {}),
+        ...(typeof data?.messagesRemoved === 'number' ? { messagesRemoved: data.messagesRemoved } : {}),
+        ...(typeof data?.summaryContent === 'string' ? { summaryContent: data.summaryContent } : {}),
+        ...(typeof data?.checkpointNumber === 'number' ? { checkpointNumber: data.checkpointNumber } : {}),
+        ...(typeof data?.checkpointPath === 'string' ? { checkpointPath: data.checkpointPath } : {}),
+        ...(typeof data?.requestId === 'string' ? { requestId: data.requestId } : {}),
+      },
+    };
+    for (const cb of this.completeCallbacks) cb(state.routeId, complete);
+  }
+
+  private finishCompactOperation(state: CopilotSessionState): void {
+    if (state.operation === 'compact' || state.operation === 'cancelling') {
+      state.operation = 'idle';
+    }
+    state.busy = false;
+    this.emitStatus(state.routeId, { status: null, label: null });
+  }
+
+  private toCompactError(error: unknown): ProviderError {
+    if (this.isProviderError(error)) {
+      return {
+        ...error,
+        message: /^Copilot compact failed:/i.test(error.message)
+          ? error.message
+          : `Copilot compact failed: ${error.message}`,
+      };
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    return this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, `Copilot compact failed: ${message}`, false, error);
   }
 
   async cancel(sessionId: string): Promise<void> {
     const state = this.getSessionState(sessionId);
     if (!state) return;
+    const wasCompact = state.operation === 'compact';
     state.cancelRequested = true;
+    state.operation = 'cancelling';
     try {
       await state.session.abort();
     } finally {
       state.busy = false;
+      state.operation = 'idle';
+      this.emitStatus(state.routeId, { status: null, label: null });
+      if (wasCompact) state.compactCompletionEmitted = true;
       if (!state.cancelErrorEmitted) {
         state.cancelErrorEmitted = true;
-        this.emitError(state.routeId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Copilot turn cancelled', true));
+        this.emitError(state.routeId, this.makeError(
+          PROVIDER_ERROR_CODES.CANCELLED,
+          wasCompact ? 'Copilot compact cancelled' : 'Copilot turn cancelled',
+          true,
+        ));
       }
     }
     if (!state.backgroundTainted) return;
@@ -709,8 +854,25 @@ export class CopilotSdkProvider implements TransportProvider {
         }
         return;
       }
+      case 'session.compaction_start': {
+        if (state.operation === 'compact') {
+          this.emitStatus(routeId, { status: 'compacting', label: 'Compacting conversation...' });
+        }
+        return;
+      }
+      case 'session.compaction_complete': {
+        if (state.operation === 'compact' && !state.cancelRequested) {
+          this.completeCompactOnce(state, 'session.compaction_complete', event.data ?? {});
+          this.finishCompactOperation(state);
+        }
+        return;
+      }
       case 'session.idle': {
+        if (state.operation === 'compact') {
+          return;
+        }
         state.busy = false;
+        state.operation = 'idle';
         if (state.cancelRequested && !state.cancelErrorEmitted) {
           state.cancelErrorEmitted = true;
           this.emitError(routeId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Copilot turn cancelled', true));
@@ -766,6 +928,7 @@ export class CopilotSdkProvider implements TransportProvider {
       }
       case 'session.error': {
         state.busy = false;
+        state.operation = 'idle';
         const error = this.makeError(
           PROVIDER_ERROR_CODES.PROVIDER_ERROR,
           String(event.data?.message ?? 'Copilot session error'),
@@ -844,9 +1007,11 @@ export class CopilotSdkProvider implements TransportProvider {
       state.currentOutputTokens = undefined; state.currentInputTokens = undefined; state.currentCacheReadTokens = undefined; state.currentCacheWriteTokens = undefined; state.currentCostUsd = undefined;
       state.currentInteractionId = undefined;
       state.busy = false;
+      state.operation = 'idle';
       state.backgroundTainted = false;
       state.cancelRequested = false;
       state.cancelErrorEmitted = false;
+      state.compactCompletionEmitted = false;
       this.attachSession(state);
       this.emitSessionInfo(state.routeId, {
         resumeId: state.sessionId,
@@ -896,9 +1061,11 @@ export class CopilotSdkProvider implements TransportProvider {
     state.currentOutputTokens = undefined; state.currentInputTokens = undefined; state.currentCacheReadTokens = undefined; state.currentCacheWriteTokens = undefined; state.currentCostUsd = undefined;
     state.currentInteractionId = undefined;
     state.busy = false;
+    state.operation = 'idle';
     state.backgroundTainted = false;
     state.cancelRequested = false;
     state.cancelErrorEmitted = false;
+    state.compactCompletionEmitted = false;
     state.rotationInProgress = false;
     this.attachSession(state);
     try {

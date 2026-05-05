@@ -6,6 +6,11 @@ import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { TransportProvider, ProviderError, SessionConfig, SessionInfoUpdate } from './transport-provider.js';
 import type { ApprovalRequest } from './transport-provider.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
+import {
+  SESSION_CONTROL_METADATA_COMMAND_FIELD,
+  isSessionCompactCommandText,
+  shouldResetTransportPreferenceContextForSessionControl,
+} from '../../shared/session-control-commands.js';
 import type { TransportAttachment } from '../../shared/transport-attachments.js';
 import {
   SharedContextDispatchError,
@@ -356,6 +361,10 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (!this._providerSessionId) {
       throw new Error('TransportSessionRuntime not initialized — call initialize() first');
     }
+    if (isSessionCompactCommandText(message) && this.provider.capabilities.compact?.execution === 'unsupported') {
+      const reason = this.provider.capabilities.compact.reason?.trim();
+      throw new Error(reason || `${this.provider.id} does not support /compact`);
+    }
 
     const entry: PendingTransportMessage = {
       clientMessageId: clientMessageId ?? randomUUID(),
@@ -465,6 +474,10 @@ export class TransportSessionRuntime implements SessionRuntime {
     });
     void promise.catch(() => {}); // prevent unhandled rejection
     this._activeTurn = { promise, resolve, reject };
+
+    if (shouldResetTransportPreferenceContextForSessionControl(message)) {
+      this._lastInjectedPreferenceContextSignature = null;
+    }
 
     void (async () => {
       await this.refreshContextBootstrap({ phase: 'dispatch' });
@@ -603,9 +616,9 @@ export class TransportSessionRuntime implements SessionRuntime {
     const seen = new Set<string>();
     const parts: string[] = [];
     const isControlMessage = userMessage?.trim().startsWith('/') === true;
-    if (userMessage?.trim() === '/compact') {
-      // The provider-native compact command must stay raw, and the next real
-      // turn should re-seed stable preferences because the SDK may have
+    if (userMessage && shouldResetTransportPreferenceContextForSessionControl(userMessage)) {
+      // The compact control command must stay raw, and the next real turn
+      // should re-seed stable preferences because the provider may have
       // discarded prior context during compaction.
       this._lastInjectedPreferenceContextSignature = null;
     }
@@ -1016,9 +1029,16 @@ function normalizePreferenceContextSignature(blocks: readonly string[]): string 
 
 function isTransportCompactionCompletion(message: AgentMessage): boolean {
   const metadata = message.metadata;
+  const event = typeof metadata === 'object' && metadata !== null
+    ? (metadata as Record<string, unknown>).event
+    : undefined;
   return message.kind === 'system'
     && message.role === 'system'
-    && typeof metadata === 'object'
-    && metadata !== null
-    && (metadata as Record<string, unknown>).event === 'thread/compacted';
+    && (
+      (typeof metadata === 'object'
+        && metadata !== null
+        && (metadata as Record<string, unknown>)[SESSION_CONTROL_METADATA_COMMAND_FIELD] === 'compact')
+      || event === 'thread/compacted'
+      || event === 'session.history.compact'
+    );
 }

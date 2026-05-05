@@ -143,6 +143,7 @@ vi.mock('../../src/agent/codex-runtime-config.js', () => ({
 
 import { CodexSdkProvider } from '../../src/agent/providers/codex-sdk.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
+import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -579,6 +580,7 @@ describe('CodexSdkProvider', () => {
         metadata: expect.objectContaining({
           provider: 'codex-sdk',
           event: 'thread/compacted',
+          [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact',
           turnId: 'compact-turn-1',
         }),
       }),
@@ -628,7 +630,7 @@ describe('CodexSdkProvider', () => {
     await flush();
 
     expect(statuses).toEqual([
-      { status: 'thinking', label: 'Compacting context...' },
+      { status: 'compacting', label: 'Compacting context...' },
       { status: null, label: null },
     ]);
     expect(completed).toEqual(['Codex context compacted.']);
@@ -717,6 +719,36 @@ describe('CodexSdkProvider', () => {
     const child = childProcessMock.children[0];
     expect(child.requests.some((req) => req.method === 'thread/compact/start')).toBe(true);
     expect(child.requests.some((req) => req.method === 'turn/start')).toBe(false);
+  });
+
+  it('cancels an in-flight compact locally so the session can continue', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-compact-cancel', cwd: '/tmp/project' });
+
+    const statuses: Array<{ status: string | null; label?: string | null }> = [];
+    const completed: string[] = [];
+    const errors: string[] = [];
+    provider.onStatus?.((_sid, status) => statuses.push(status));
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+    provider.onError((_sid, err) => errors.push(`${err.code}:${err.message}`));
+
+    await provider.send('route-compact-cancel', '/compact');
+    await provider.cancel('route-compact-cancel');
+
+    expect(errors).toEqual(['CANCELLED:Codex compact cancelled']);
+    expect(statuses).toEqual([
+      { status: 'compacting', label: 'Compacting context...' },
+      { status: null, label: null },
+    ]);
+
+    const child = childProcessMock.children[0];
+    child.emits({ method: 'thread/compacted', params: { threadId: 'thread-1', turnId: 'late-compact' } });
+    await flush();
+    expect(completed).toEqual([]);
+
+    await provider.send('route-compact-cancel', 'after compact cancel');
+    expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(1);
   });
 
   it('rejects normalized payloads combined with legacy extraSystemPrompt', async () => {
