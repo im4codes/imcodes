@@ -95,7 +95,11 @@ describe('SessionTabs', () => {
     expect(buttons[1].getAttribute('aria-selected')).toBe('false');
   });
 
-  it('scrolls the active tab into view when activeSession changes', async () => {
+  it('scrolls the active tab into view by mutating tab-bar scrollLeft only (no scrollIntoView)', async () => {
+    // Regression for "怎么往左偏这么多" (image ce683be95d350b6cda6852eae74bb320.png):
+    // the previous implementation called Element.scrollIntoView({ inline: 'center' })
+    // which walks the entire ancestor scroll chain and dragged the chat layout
+    // sideways on mobile. Now we only mutate this tab-bar's scrollLeft.
     const scrollIntoView = vi.fn();
     const previous = HTMLElement.prototype.scrollIntoView;
     HTMLElement.prototype.scrollIntoView = scrollIntoView;
@@ -105,21 +109,19 @@ describe('SessionTabs', () => {
         <SessionTabs sessions={sessions} activeSession="session_w1" onSelect={vi.fn()} sessionsLoaded={true} {...defaultProps} />,
       );
 
-      await waitFor(() => {
-        expect(scrollIntoView).toHaveBeenCalled();
-      });
-      scrollIntoView.mockClear();
+      // Wait a frame so the requestAnimationFrame inside the effect runs.
+      await new Promise((resolve) => setTimeout(resolve, 50));
 
       view.rerender(
         <SessionTabs sessions={sessions} activeSession="session_w3" onSelect={vi.fn()} sessionsLoaded={true} {...defaultProps} />,
       );
 
-      await waitFor(() => {
-        expect(scrollIntoView).toHaveBeenCalledWith(expect.objectContaining({
-          block: 'nearest',
-          inline: 'center',
-        }));
-      });
+      // Wait again for the rerender's rAF.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      // The new implementation MUST NOT use scrollIntoView (which would scroll
+      // every scrollable ancestor including .chat-main / document body).
+      expect(scrollIntoView).not.toHaveBeenCalled();
     } finally {
       HTMLElement.prototype.scrollIntoView = previous;
     }

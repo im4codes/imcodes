@@ -119,12 +119,24 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
   useEffect(() => {
     if (!activeSession) return;
     const frame = requestAnimationFrame(() => {
-      const activeTab = tabBarRef.current?.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]');
-      activeTab?.scrollIntoView?.({
-        block: 'nearest',
-        inline: 'center',
-        behavior: 'instant' as ScrollBehavior,
-      });
+      const tabBar = tabBarRef.current;
+      const activeTab = tabBar?.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]');
+      if (!tabBar || !activeTab) return;
+      // User report (image: ce683be95d350b6cda6852eae74bb320.png — "怎么往左偏这么多!"):
+      // Element.scrollIntoView() walks the entire ancestor scroll chain and
+      // scrolls EVERY scrollable ancestor — which on mobile included
+      // `.chat-main` / the document, dragging the whole chat layout left.
+      // Roll our own: only mutate this tab-bar's scrollLeft, never anything
+      // outside it.
+      const tabRect = activeTab.getBoundingClientRect();
+      const barRect = tabBar.getBoundingClientRect();
+      const desiredCenter = tabBar.scrollLeft + (tabRect.left - barRect.left)
+        - (barRect.width / 2 - tabRect.width / 2);
+      const maxScroll = Math.max(0, tabBar.scrollWidth - tabBar.clientWidth);
+      const target = Math.max(0, Math.min(desiredCenter, maxScroll));
+      if (Math.abs(target - tabBar.scrollLeft) > 0.5) {
+        tabBar.scrollLeft = target;
+      }
     });
     return () => cancelAnimationFrame(frame);
   }, [activeSession, orderedSessions]);
