@@ -124,6 +124,7 @@ import {
   shouldShowInitialConnectingGate,
 } from './server-selection.js';
 import { installNativeAppResumeRefresh } from './app-resume-refresh.js';
+import { isImeComposingKeyEvent } from './ime-keyboard.js';
 import { markServerLive, markServerOffline, touchServerHeartbeat } from './server-online-state.js';
 import { MSG_DAEMON_ONLINE, MSG_DAEMON_OFFLINE } from '@shared/ack-protocol.js';
 
@@ -2454,6 +2455,7 @@ export function App() {
   // Global keyboard passthrough
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      if (isImeComposingKeyEvent(e)) return;
       const ws = wsRef.current;
       const session = activeSession;
       if (!ws?.connected || !session) return;

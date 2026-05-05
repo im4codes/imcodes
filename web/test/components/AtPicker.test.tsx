@@ -85,6 +85,18 @@ describe('AtPicker', () => {
     expect(screen.getByText('quick_discussion_with_agent')).toBeDefined();
   });
 
+  it('does not handle picker keyboard shortcuts while IME composition is active', () => {
+    renderPicker();
+
+    const filesLabel = screen.getByText('files');
+    const agentsLabel = screen.getByText('agents');
+
+    fireEvent.keyDown(document, { key: 'ArrowDown', isComposing: true, keyCode: 229 });
+
+    expect(filesLabel.closest('div')?.getAttribute('data-hl')).toBe('true');
+    expect(agentsLabel.closest('div')?.getAttribute('data-hl')).toBeNull();
+  });
+
   it('shows only same-domain agents in agents step', () => {
     renderPicker();
 

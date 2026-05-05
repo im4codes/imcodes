@@ -2694,6 +2694,58 @@ afterEach(() => {
     expect(input.textContent).toBe('draft text');
   });
 
+  it('ignores input keyboard shortcuts while IME composition is active', async () => {
+    const ws = makeWs();
+    const quickData = makeQuickData();
+    quickData.data = {
+      history: ['session newest'],
+      sessionHistory: {
+        'my-session': ['session newest'],
+      },
+      commands: [],
+      phrases: [],
+    };
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={quickData as any} />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+
+    input.textContent = '拼';
+    fireEvent.input(input);
+    input.dispatchEvent(new Event('compositionstart', { bubbles: true, cancelable: true }));
+
+    fireEvent.keyDown(input, { key: 'ArrowUp' });
+    expect(input.textContent).toBe('拼');
+
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+
+    input.dispatchEvent(new Event('compositionend', { bubbles: true, cancelable: true }));
+    fireEvent.keyDown(input, { key: 'ArrowUp' });
+    expect(input.textContent).toBe('session newest');
+  });
+
+  it('ignores history navigation when keydown itself is marked composing', () => {
+    const ws = makeWs();
+    const quickData = makeQuickData();
+    quickData.data = {
+      history: ['session newest'],
+      sessionHistory: {
+        'my-session': ['session newest'],
+      },
+      commands: [],
+      phrases: [],
+    };
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={quickData as any} />);
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+
+    input.textContent = 'pin';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'ArrowUp', isComposing: true, keyCode: 229 });
+    expect(input.textContent).toBe('pin');
+  });
+
   it('closes @ picker if user keeps typing without making a selection', () => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
     const input = screen.getByRole('textbox') as HTMLDivElement;

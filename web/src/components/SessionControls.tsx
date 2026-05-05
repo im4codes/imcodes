@@ -20,6 +20,7 @@ import { PREF_KEY_P2P_COMBO_CONFIRM_SKIP, PREF_KEY_P2P_SESSION_CONFIG_LEGACY, p2
 import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p-config-pref.js';
 import { uploadFile, sendSessionViaHttp } from '../api.js';
 import { patchSession, patchSubSession } from '../api.js';
+import { isImeComposingKeyEvent } from '../ime-keyboard.js';
 import { isRunningSessionState } from '../thinking-utils.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { MSG_COMMAND_FAILED } from '@shared/ack-protocol.js';
@@ -551,6 +552,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   // History navigation state
   const histIdxRef = useRef(-1);   // -1 = not navigating; 0 = most recent
   const draftRef = useRef('');      // saved unsent text while navigating
+  const imeComposingRef = useRef(false);
   const attachmentDraftRef = useRef<ComposerAttachment[]>([]);
   // File upload state
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -566,6 +568,19 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   useEffect(() => {
     if (inputRef) (inputRef as { current: HTMLDivElement | null }).current = divRef.current;
   });
+
+  useEffect(() => {
+    const el = divRef.current;
+    if (!el) return;
+    const handleCompositionStart = () => { imeComposingRef.current = true; };
+    const handleCompositionEnd = () => { imeComposingRef.current = false; };
+    el.addEventListener('compositionstart', handleCompositionStart);
+    el.addEventListener('compositionend', handleCompositionEnd);
+    return () => {
+      el.removeEventListener('compositionstart', handleCompositionStart);
+      el.removeEventListener('compositionend', handleCompositionEnd);
+    };
+  }, []);
 
   useEffect(() => {
     if (!pendingPrefillText || !divRef.current) return;
@@ -1954,6 +1969,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [buildModeOnlySendPayload, requestSend]);
 
   const handleKeyDown = (e: KeyboardEvent) => {
+    if (imeComposingRef.current || isImeComposingKeyEvent(e)) return;
+
     if (e.key === 'Escape' && effectiveRuntimeType === 'transport' && isRunningSessionState(activeSession?.state)) {
       e.preventDefault();
       sendSessionMessage('/stop');
