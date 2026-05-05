@@ -150,6 +150,15 @@ describe('tmux shell-injection prevention', () => {
     expect(call!.args).toEqual(['send-keys', '-t', 'deck_test_brain', '-l', '--', text]);
   });
 
+  it('sendRawInput maps application cursor keys used by full-screen TUIs', async () => {
+    await tmux.sendRawInput('deck_test_brain', '\x1bOC');
+    await tmux.sendRawInput('deck_test_brain', '\x1bOD');
+
+    const keyCalls = execFileCalls.filter((c) => c.args[0] === 'send-keys');
+    expect(keyCalls.at(-2)?.args).toEqual(['send-keys', '-t', 'deck_test_brain', 'Right']);
+    expect(keyCalls.at(-1)?.args).toEqual(['send-keys', '-t', 'deck_test_brain', 'Left']);
+  });
+
   it('respawnPane passes command without shell interpretation', async () => {
     const cmd = "bash -c 'echo $(id)'";
     await tmux.respawnPane('deck_test_brain', cmd);
