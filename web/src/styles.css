@@ -815,7 +815,16 @@ body {
    message in chat history for the full content. */
 .chat-pinned-last-sent.chat-pinned-expanded .chat-pinned-last-sent-text { -webkit-line-clamp: 3; line-clamp: 3; }
 .chat-view { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 8px 12px; display: flex; flex-direction: column; gap: 2px; scrollbar-width: thin; scrollbar-color: #6366f1 #1e293b; overflow-anchor: none; }
-.chat-view-preview { justify-content: flex-end; }
+/* In sub-session cards `.subcard-preview` (parent) owns the scrollbar. If
+   `.chat-view` ALSO scrolls (default rule above), every new event triggers
+   two independent scrollTop writes — one from ChatView's preview-mode auto-
+   follow, one from SubSessionCard.forceFollowLatest — and near the bottom
+   they oscillate against each other, producing the "infinite up/down jitter"
+   reported when card height ≈ content height. Force `.chat-view-preview`
+   to stop being a scroll container so the only scroll surface is
+   `.subcard-preview`. `justify-content: flex-end` keeps content pinned to
+   bottom inside the bounded card, just like before. */
+.chat-view-preview { overflow-y: visible; overflow-x: visible; justify-content: flex-end; }
 .chat-view::-webkit-scrollbar { width: 5px; }
 .chat-view::-webkit-scrollbar-track { background: #1e293b; border-radius: 3px; }
 .chat-view::-webkit-scrollbar-thumb { background: linear-gradient(180deg, #3b82f6, #6366f1, #3b82f6); border-radius: 3px; box-shadow: 0 0 8px #6366f1cc; }
