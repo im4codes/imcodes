@@ -157,7 +157,7 @@ const RETRY_MAX_DELAY_MS = 8000;
 /** Classify error as retryable (transient) or permanent. */
 interface CompressionErrorClassification {
   retryable: boolean;
-  code: 'auth' | 'model' | 'session' | 'quota' | 'timeout' | 'empty_response' | 'transient';
+  code: 'auth' | 'model' | 'session' | 'quota' | 'timeout' | 'empty_response' | 'agent_missing' | 'transient';
 }
 
 function classifyCompressionError(err: unknown): CompressionErrorClassification {
@@ -178,6 +178,41 @@ function classifyCompressionError(err: unknown): CompressionErrorClassification 
     || msg.includes('credit')
   ) {
     return { retryable: false, code: 'quota' };
+  }
+  // Permanent: agent CLI binary missing on the host.
+  //
+  // Real-world hit: 213 (big@172.16.253.213) ran imcodes daemon configured with
+  // `claude-code-sdk` as the primary compression backend, but had no `claude`
+  // CLI installed. The Anthropic Claude Agent SDK threw
+  //   "Claude Code native binary not found at claude. Please ensure
+  //    Claude Code is installed via native installer..."
+  // Without classification, this fell through to "transient" and the retry
+  // loop kept the compression lane busy. Each retry was 1-8s × 3 = up to 27s
+  // of wasted active time per call, with the next materialization tick (10s)
+  // queuing another. Net effect: `getCompressionQueueState().idle` was never
+  // true, so the daemon-upgrade gate `if (!compressionState.idle) block` kept
+  // the daemon stuck on an old version that ALSO had a phantom-SIGTERM bug,
+  // producing a 13-second restart loop and a 4-hour outage.
+  //
+  // Patterns covered:
+  //   - `Claude Code native binary not found at claude` (Anthropic SDK raw)
+  //   - `Codex binary not found` / `Cursor binary not found` (imcodes provider
+  //     wrappers — `src/agent/providers/{codex-sdk,cursor-headless}.ts`)
+  //   - `spawn <cmd> ENOENT` (Node.js child_process default)
+  //   - `command not found` (shell-level)
+  //   - PROVIDER_NOT_FOUND error code (imcodes shared error taxonomy)
+  // Permanent means: no retry, immediate circuit-breaker tick, fall through to
+  // backup backend → local fallback. Compression lane releases in <50 ms instead
+  // of holding for tens of seconds.
+  if (
+    msg.includes('native binary not found')
+    || msg.includes('binary not found at')
+    || /\bbinary not found\b/.test(msg)
+    || /\bspawn\s+\S+\s+enoent\b/.test(msg)
+    || msg.includes('command not found')
+    || msg.includes('provider_not_found')
+  ) {
+    return { retryable: false, code: 'agent_missing' };
   }
   if (msg.includes('timed out') || msg.includes('timeout')) return { retryable: true, code: 'timeout' };
   if (msg.includes('empty response')) return { retryable: true, code: 'empty_response' };
@@ -206,7 +241,20 @@ async function sendWithRetry(prompt: string, selection: CompressionBackendSelect
       return await sendToProvider(selection, prompt);
     } catch (err) {
       lastErr = err;
-      if (!isRetryableError(err) || attempt === MAX_RETRIES_PER_BACKEND) {
+      const classification = classifyCompressionError(err);
+      if (!classification.retryable || attempt === MAX_RETRIES_PER_BACKEND) {
+        // Surface "agent CLI missing" loudly + actionably the FIRST time it
+        // happens — operators usually don't notice the per-call warn until
+        // hours later when something else (daemon-upgrade stall, drained
+        // memory recall) makes the missing CLI a visible problem.
+        if (classification.code === 'agent_missing') {
+          warnOncePerHour('mem.compression.agent_missing', {
+            backend: selection.backend,
+            error: err instanceof Error ? err.message : String(err),
+            hint: agentInstallHint(selection.backend),
+          });
+          incrementCounter('mem.compression.agent_missing', { backend: selection.backend });
+        }
         throw err;
       }
       // Tear down and retry with fresh provider
@@ -218,6 +266,22 @@ async function sendWithRetry(prompt: string, selection: CompressionBackendSelect
     }
   }
   throw lastErr;
+}
+
+/** Best-effort install hint per backend so operators have an actionable next step. */
+function agentInstallHint(backend: string): string {
+  switch (backend) {
+    case 'claude-code-sdk':
+      return 'install Claude Code CLI: npm install -g @anthropic-ai/claude-code';
+    case 'codex-sdk':
+      return 'install Codex CLI (see codex.openai.com docs)';
+    case 'qwen':
+      return 'install qwen CLI on PATH';
+    case 'gemini-sdk':
+      return 'install Gemini CLI on PATH';
+    default:
+      return `install the ${backend} CLI on PATH or configure a different primaryContextBackend`;
+  }
 }
 
 export function resetFailureTracking(): void {
