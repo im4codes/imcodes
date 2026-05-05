@@ -1,9 +1,17 @@
 import { describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   formatDurationSeconds,
+  parseWindowsWmicCreationDateEpochMs,
   parsePsElapsedSeconds,
+  readDaemonRestartCount,
+  readDaemonRuntimeStatus,
+  readPersistedDaemonUptimeSeconds,
   readProcessUptimeSeconds,
   readServiceRestartCount,
+  recordDaemonStart,
 } from '../../src/util/daemon-status.js';
 
 describe('daemon status helpers', () => {
@@ -48,6 +56,56 @@ describe('daemon status helpers', () => {
     expect(readProcessUptimeSeconds(123, runner)).toBe(3_723);
   });
 
+  it('uses the ps etime fallback on macOS when etimes is unavailable', () => {
+    const runner = vi.fn((file: string, args: string[]) => {
+      if (args.includes('etimes=')) throw new Error('unsupported');
+      return '2-03:04:05\n';
+    });
+
+    expect(readProcessUptimeSeconds(123, runner, 'darwin')).toBe(183_845);
+  });
+
+  it('reads Windows process uptime from PowerShell CIM output', () => {
+    const runner = vi.fn(() => '789\n');
+
+    expect(readProcessUptimeSeconds(123, runner, 'win32')).toBe(789);
+    expect(runner).toHaveBeenCalledWith(
+      'powershell',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-Command',
+        expect.stringContaining('ProcessId = 123'),
+      ],
+      expect.objectContaining({ windowsHide: true }),
+    );
+  });
+
+  it('falls back to Windows wmic CreationDate when PowerShell is unavailable', () => {
+    const runner = vi.fn((file: string) => {
+      if (file === 'powershell') throw new Error('powershell unavailable');
+      return 'CreationDate=20260505080000.000000+480\r\r\n\r\r\n';
+    });
+    const nowMs = Date.UTC(2026, 4, 5, 0, 10, 0);
+
+    expect(readProcessUptimeSeconds(123, runner, 'win32', nowMs)).toBe(600);
+    expect(runner).toHaveBeenLastCalledWith(
+      'wmic',
+      ['process', 'where', 'ProcessId=123', 'get', 'CreationDate', '/value'],
+      expect.objectContaining({ windowsHide: true }),
+    );
+  });
+
+  it('parses Windows wmic CreationDate with timezone offset', () => {
+    expect(parseWindowsWmicCreationDateEpochMs('CreationDate=20260505080000.123456+480'))
+      .toBe(Date.UTC(2026, 4, 5, 0, 0, 0, 123));
+    expect(parseWindowsWmicCreationDateEpochMs('CreationDate=20260505023000.000000-300'))
+      .toBe(Date.UTC(2026, 4, 5, 7, 30, 0, 0));
+    expect(parseWindowsWmicCreationDateEpochMs('CreationDate=20261305080000.000000+480')).toBeNull();
+  });
+
   it('reads systemd restart count on linux when available', () => {
     const runner = vi.fn(() => '7\n');
 
@@ -62,5 +120,54 @@ describe('daemon status helpers', () => {
   it('omits restart count on non-systemd platforms or command failure', () => {
     expect(readServiceRestartCount('darwin', vi.fn())).toBeNull();
     expect(readServiceRestartCount('linux', vi.fn(() => { throw new Error('missing'); }))).toBeNull();
+  });
+
+  it('records daemon runtime status and increments restart count on a new pid', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-daemon-status-'));
+    try {
+      expect(recordDaemonStart({ pid: 100, nowMs: 1_000, baseDir: dir, version: '1.0.0' })).toMatchObject({
+        pid: 100,
+        startedAt: 1_000,
+        restartCount: 0,
+        version: '1.0.0',
+      });
+      expect(recordDaemonStart({ pid: 100, nowMs: 2_000, baseDir: dir, version: '1.0.0' })?.restartCount).toBe(0);
+      expect(recordDaemonStart({ pid: 101, nowMs: 3_000, baseDir: dir, version: '1.0.1' })?.restartCount).toBe(1);
+      expect(readDaemonRuntimeStatus(dir)).toMatchObject({
+        pid: 101,
+        startedAt: 3_000,
+        restartCount: 1,
+        version: '1.0.1',
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('uses persisted runtime status as restart count and uptime fallback', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-daemon-status-'));
+    try {
+      recordDaemonStart({ pid: 200, nowMs: 10_000, baseDir: dir });
+      recordDaemonStart({ pid: 201, nowMs: 20_000, baseDir: dir });
+
+      expect(readDaemonRestartCount('win32', vi.fn(), dir)).toBe(1);
+      expect(readDaemonRestartCount('darwin', vi.fn(), dir)).toBe(1);
+      expect(readPersistedDaemonUptimeSeconds(201, 25_500, dir)).toBe(5);
+      expect(readPersistedDaemonUptimeSeconds(999, 25_500, dir)).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('prefers systemd restart count over persisted runtime status on linux', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-daemon-status-'));
+    try {
+      recordDaemonStart({ pid: 300, nowMs: 10_000, baseDir: dir });
+      recordDaemonStart({ pid: 301, nowMs: 20_000, baseDir: dir });
+
+      expect(readDaemonRestartCount('linux', vi.fn(() => '7\n'), dir)).toBe(7);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -63,7 +63,7 @@ import { homedir } from 'os';
 import { existsSync, realpathSync, readFileSync, writeFileSync } from 'fs';
 import { resolve, join, dirname } from 'path';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../shared/imcodes-send.js';
-import { formatDurationSeconds, readProcessUptimeSeconds, readServiceRestartCount } from './util/daemon-status.js';
+import { formatDurationSeconds, readDaemonRestartCount, readPersistedDaemonUptimeSeconds, readProcessUptimeSeconds } from './util/daemon-status.js';
 
 import { PROJECT_ROOT } from './util/project-root.js';
 
@@ -292,9 +292,9 @@ program
     }
     const daemonPidNumber = daemonPid ? parseInt(daemonPid, 10) : NaN;
     const daemonUptimeSeconds = daemonRunning && Number.isSafeInteger(daemonPidNumber)
-      ? readProcessUptimeSeconds(daemonPidNumber)
+      ? readProcessUptimeSeconds(daemonPidNumber) ?? readPersistedDaemonUptimeSeconds(daemonPidNumber)
       : null;
-    const daemonRestartCount = readServiceRestartCount();
+    const daemonRestartCount = readDaemonRestartCount();
 
     if (opts.json) {
       console.log(JSON.stringify({

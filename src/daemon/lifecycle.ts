@@ -22,6 +22,7 @@ import { loadConfig, type Config } from '../config.js';
 import { loadCredentials } from '../bind/bind-flow.js';
 import { sendKeys } from '../agent/tmux.js';
 import logger from '../util/logger.js';
+import { recordDaemonStart } from '../util/daemon-status.js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -327,6 +328,7 @@ export async function startup(): Promise<DaemonContext> {
   }, 'Daemon starting');
   lockServer = await acquireInstanceLock();
   writePidFile();
+  recordDaemonStart({ version: DAEMON_VERSION });
 
   const config = await loadConfig();
   logger.info({ config: config.daemon }, 'Config loaded');
