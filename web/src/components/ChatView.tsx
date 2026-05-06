@@ -1632,14 +1632,23 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       )}
       {/* External link confirm dialog */}
       {pendingUrl && (
-        <div class="dialog-overlay" onClick={() => setPendingUrl(null)}>
-          <div class="dialog-box" onClick={(e: Event) => e.stopPropagation()}>
-            <div class="dialog-title">{t('chat.external_link_title')}</div>
-            <p style={{ fontSize: 13, color: '#94a3b8', margin: '8px 0', wordBreak: 'break-all' }}>{pendingUrl}</p>
-            <p style={{ fontSize: 12, color: '#f59e0b', margin: '8px 0' }}>{t('chat.external_link_warning')}</p>
-            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 12 }}>
-              <button class="dialog-btn" onClick={() => setPendingUrl(null)}>{t('chat.external_link_cancel')}</button>
-              <button class="dialog-btn dialog-btn-primary" onClick={() => {
+        <div class="dialog-overlay external-link-overlay" onClick={() => setPendingUrl(null)}>
+          <div
+            class="external-link-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="external-link-dialog-title"
+            onClick={(e: Event) => e.stopPropagation()}
+          >
+            <div class="external-link-heading">
+              <span class="external-link-icon" aria-hidden="true">↗</span>
+              <div class="external-link-title" id="external-link-dialog-title">{t('chat.external_link_title')}</div>
+            </div>
+            <div class="external-link-url" title={pendingUrl}>{pendingUrl}</div>
+            <div class="external-link-warning">{t('chat.external_link_warning')}</div>
+            <div class="external-link-actions">
+              <button class="external-link-btn" onClick={() => setPendingUrl(null)}>{t('chat.external_link_cancel')}</button>
+              <button class="external-link-btn external-link-btn-primary" onClick={() => {
                 window.open(pendingUrl, '_blank', 'noopener,noreferrer');
                 setPendingUrl(null);
               }}>{t('chat.external_link_open')}</button>
