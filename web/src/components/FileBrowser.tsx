@@ -11,7 +11,7 @@ import { DAEMON_MSG } from '@shared/daemon-events.js';
  *   'modal' — rendered as a full-screen overlay dialog
  *   'panel' — rendered inline (no overlay), fits inside a parent container
  */
-import { useState, useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
+import { useState, useRef, useEffect, useCallback, useMemo, useLayoutEffect } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { WsClient, ServerMessage } from '../ws-client.js';
 import { lazy, Suspense } from 'preact/compat';
@@ -326,9 +326,29 @@ function updateNode(nodes: FsNode[], targetId: string, patch: Partial<FsNode>): 
 
 type PendingPreviewRequest = { path: string; cycleId: number };
 type PendingPreviewDiff = PendingPreviewRequest & { diff: string; diffHtml: string };
+type PreviewScrollMode = Exclude<FileBrowserPreviewState['status'], 'idle' | 'ok'> | 'source' | 'diff' | 'edit';
+type PreviewScrollSnapshot = { key: string; scrollTop: number; scrollLeft: number };
 
 function previewCycleKey(path: string, cycleId: number): string {
   return `${cycleId}\0${path}`;
+}
+
+function getPreviewScrollMode(
+  preview: FileBrowserPreviewState,
+  isEditing: boolean,
+  showDiff: boolean,
+  canRenderDiff: boolean,
+): PreviewScrollMode | null {
+  if (preview.status === 'idle') return null;
+  if (preview.status === 'ok') {
+    if (isEditing) return 'edit';
+    return showDiff && canRenderDiff ? 'diff' : 'source';
+  }
+  return preview.status;
+}
+
+function previewScrollKey(path: string, mode: PreviewScrollMode): string {
+  return `${mode}\0${path}`;
 }
 
 /** Backward-compat re-export so the existing FileBrowser test suite keeps
@@ -439,6 +459,8 @@ export function FileBrowser({
   const pendingGitDiffRef = useRef(new Map<string, PendingPreviewRequest>());
   const pendingPreviewDiffRef = useRef(new Map<string, PendingPreviewDiff>());
   const pendingMkdirRef = useRef(new Map<string, { parentPath: string; targetPath: string }>());
+  const previewContentRef = useRef<HTMLDivElement | null>(null);
+  const previewScrollSnapshotRef = useRef<PreviewScrollSnapshot | null>(null);
   const mountedRef = useRef(true);
   const dismissedAutoPreviewPathRef = useRef<string | null>(null);
   const previewTabOverridePathRef = useRef<string | null>(null);
@@ -1110,6 +1132,36 @@ export function FileBrowser({
 
   const hasDiff = preview.status === 'ok' && (!!preview.diff || !!preview.diffHtml);
   const canRenderDiff = preview.status === 'ok' && !!preview.diffHtml;
+  const previewScrollMode = getPreviewScrollMode(preview, isEditing, showDiff, canRenderDiff);
+  const activePreviewScrollKey = previewScrollMode && preview.status !== 'idle'
+    ? previewScrollKey((preview as { path: string }).path, previewScrollMode)
+    : null;
+
+  useEffect(() => {
+    const el = previewContentRef.current;
+    if (!el || !activePreviewScrollKey) return;
+    const saveScroll = () => {
+      previewScrollSnapshotRef.current = {
+        key: activePreviewScrollKey,
+        scrollTop: el.scrollTop,
+        scrollLeft: el.scrollLeft,
+      };
+    };
+    saveScroll();
+    el.addEventListener('scroll', saveScroll, { passive: true });
+    return () => {
+      saveScroll();
+      el.removeEventListener('scroll', saveScroll);
+    };
+  }, [activePreviewScrollKey]);
+
+  useLayoutEffect(() => {
+    const el = previewContentRef.current;
+    const snapshot = previewScrollSnapshotRef.current;
+    if (!el || !activePreviewScrollKey || !snapshot || snapshot.key !== activePreviewScrollKey) return;
+    if (el.scrollTop !== snapshot.scrollTop) el.scrollTop = snapshot.scrollTop;
+    if (el.scrollLeft !== snapshot.scrollLeft) el.scrollLeft = snapshot.scrollLeft;
+  }, [activePreviewScrollKey, preview]);
 
   const previewPane = hasInlinePreview ? (
     <div class="fb-preview">
@@ -1253,7 +1305,7 @@ export function FileBrowser({
         }}>✕</button>
       </div>
       {/* Conflict dialog rendered inside FileEditor */}
-      <div class="fb-preview-content">
+      <div class="fb-preview-content" ref={previewContentRef}>
         {preview.status === 'loading' && (
           <div class="fb-preview-loading">
             <div class="fb-loading-spinner" />

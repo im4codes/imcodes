@@ -1498,6 +1498,48 @@ describe('FileBrowser', () => {
     vi.useRealTimers();
   });
 
+  it('preserves the preview scroll position when auto-refresh updates the current file', async () => {
+    vi.useFakeTimers();
+    const { ws, respond, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/foo.ts"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([{ name: 'foo.ts', isDir: false }], '/home/user'); });
+    await act(async () => {
+      sendMsg({ type: 'fs.read_response', requestId: 'mock-read-id', path: '/home/user/foo.ts', status: 'ok', content: 'const before = 1;' });
+      sendMsg({ type: 'fs.git_diff_response', requestId: 'mock-git-diff-id', path: '/home/user/foo.ts', status: 'ok', diff: '' });
+    });
+
+    const previewContent = document.querySelector('.fb-preview-content') as HTMLDivElement;
+    previewContent.scrollTop = 360;
+    previewContent.scrollLeft = 24;
+    fireEvent.scroll(previewContent);
+
+    await act(async () => {
+      vi.advanceTimersByTime(5_000);
+    });
+
+    previewContent.scrollTop = 0;
+    previewContent.scrollLeft = 0;
+    await act(async () => {
+      sendMsg({ type: 'fs.read_response', requestId: 'mock-read-id', path: '/home/user/foo.ts', status: 'ok', content: 'const after = 2;' });
+      sendMsg({ type: 'fs.git_diff_response', requestId: 'mock-git-diff-id', path: '/home/user/foo.ts', status: 'ok', diff: '' });
+    });
+
+    expect(screen.getByTestId('mock-file-preview').textContent).toContain('const after = 2;');
+    expect(previewContent.scrollTop).toBe(360);
+    expect(previewContent.scrollLeft).toBe(24);
+    vi.useRealTimers();
+  });
+
   it('does not poll local preview state for source instances that delegate to external previews', async () => {
     vi.useFakeTimers();
     const { ws } = makeWsFactory();
