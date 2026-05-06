@@ -2053,6 +2053,8 @@ body {
    `.fb-changes-list` is `overflow-y: auto`. Let the section fill its
    container so the list scrolls naturally. */
 .fb-changes-section { flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
+.fb-tree.fb-changes-tree { display: flex; flex-direction: column; overflow: hidden; padding: 0; }
+.fb-tree.fb-changes-tree > .fb-changes-section { flex: 1; min-height: 0; }
 .fb-changes-header { display: flex; align-items: center; justify-content: space-between; padding: 5px 10px; background: #0f172a; flex-shrink: 0; }
 .fb-changes-title { font-size: 11px; font-weight: 600; color: #64748b; text-transform: uppercase; letter-spacing: .05em; }
 .fb-changes-refresh { background: none; border: none; color: #64748b; cursor: pointer; font-size: 14px; padding: 0 4px; }

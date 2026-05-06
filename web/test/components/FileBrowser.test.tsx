@@ -798,6 +798,97 @@ describe('FileBrowser', () => {
     expect(document.querySelector('.fb-preview-content pre')).toBeNull();
   });
 
+  it('keeps source visible while a Changes-tab diff is still pending', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        changesRootPath="/home/user"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([], '/home/user'); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'ok',
+        files: [{ path: '/home/user/new-file.ts', code: 'A' }],
+      });
+    });
+
+    const changesTab = document.querySelector('.fb-panel-tab:last-child') as HTMLElement;
+    await act(async () => { fireEvent.click(changesTab); });
+
+    const changeItem = document.querySelector('.fb-changes-item') as HTMLElement;
+    await act(async () => { fireEvent.click(changeItem); });
+    await act(async () => {
+      sendMsg({ type: 'fs.read_response', requestId: 'mock-read-id', path: '/home/user/new-file.ts', status: 'ok', content: 'const fresh = true;' });
+    });
+
+    expect(document.querySelector('.fb-diff')).toBeNull();
+    expect(screen.getByTestId('mock-file-preview').textContent).toContain('const fresh = true;');
+  });
+
+  it('preserves a Changes-tab diff that arrives before the file read response', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        changesRootPath="/home/user"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([], '/home/user'); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'ok',
+        files: [{ path: '/home/user/new-file.ts', code: 'A' }],
+      });
+    });
+
+    const changesTab = document.querySelector('.fb-panel-tab:last-child') as HTMLElement;
+    await act(async () => { fireEvent.click(changesTab); });
+
+    const changeItem = document.querySelector('.fb-changes-item') as HTMLElement;
+    await act(async () => { fireEvent.click(changeItem); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_diff_response',
+        requestId: 'mock-git-diff-id',
+        path: '/home/user/new-file.ts',
+        status: 'ok',
+        diff: [
+          'diff --git a/new-file.ts b/new-file.ts',
+          'new file mode 100644',
+          '--- /dev/null',
+          '+++ b/new-file.ts',
+          '@@ -0,0 +1 @@',
+          '+const fresh = true;',
+        ].join('\n'),
+      });
+      sendMsg({ type: 'fs.read_response', requestId: 'mock-read-id', path: '/home/user/new-file.ts', status: 'ok', content: 'const fresh = true;' });
+    });
+
+    expect(document.querySelector('.fb-diff')).not.toBeNull();
+    expect(document.querySelector('.fb-diff')?.textContent).toContain('const fresh = true;');
+    expect(document.querySelector('.fb-preview-content pre')).toBeNull();
+  });
+
   it('falls back to source preview when an untracked file has no diff content', async () => {
     const { ws, respond, sendMsg } = makeWsFactory();
     render(
@@ -836,6 +927,40 @@ describe('FileBrowser', () => {
     expect(document.querySelector('.fb-diff')).toBeNull();
     expect(document.querySelector('.fb-diff-toggle.active')).toBeNull();
     expect(screen.getByTestId('mock-file-preview').textContent).toContain('const fresh = true;');
+  });
+
+  it('uses a dedicated flex scroll container for split Changes view', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        changesRootPath="/home/user"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([], '/home/user'); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'ok',
+        files: [{ path: '/home/user/foo.ts', code: 'M' }],
+      });
+    });
+
+    const changesTab = document.querySelector('.fb-panel-tab:last-child') as HTMLElement;
+    await act(async () => { fireEvent.click(changesTab); });
+    const changeItem = document.querySelector('.fb-changes-item') as HTMLElement;
+    await act(async () => { fireEvent.click(changeItem); });
+
+    expect(document.querySelector('.fb-tree.fb-tree-split.fb-changes-tree')).not.toBeNull();
+    expect(document.querySelector('.fb-tree.fb-changes-tree > .fb-changes-section')).not.toBeNull();
   });
 
   it('passes preferDiff to external previews opened from the Changes tab', async () => {

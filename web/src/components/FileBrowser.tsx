@@ -325,6 +325,11 @@ function updateNode(nodes: FsNode[], targetId: string, patch: Partial<FsNode>): 
 }
 
 type PendingPreviewRequest = { path: string; cycleId: number };
+type PendingPreviewDiff = PendingPreviewRequest & { diff: string; diffHtml: string };
+
+function previewCycleKey(path: string, cycleId: number): string {
+  return `${cycleId}\0${path}`;
+}
 
 /** Backward-compat re-export so the existing FileBrowser test suite keeps
  *  working after the shared-changes cache moved to `git-status-store.ts`. */
@@ -373,6 +378,8 @@ export function FileBrowser({
   const [error, setError] = useState<string | null>(null);
   const [showHidden, setShowHidden] = useState(false);
   const [preview, setPreview] = useState<FileBrowserPreviewState>(() => initialPreview ?? { status: 'idle' });
+  const previewRef = useRef<FileBrowserPreviewState>(preview);
+  useEffect(() => { previewRef.current = preview; }, [preview]);
   const [showDiff, setShowDiff] = useState(() => {
     if (initialPreview?.status === 'ok' && initialPreview.diffHtml && autoPreviewPreferDiff) return true;
     return false;
@@ -430,6 +437,7 @@ export function FileBrowser({
   const pendingReadRef = useRef(new Map<string, PendingPreviewRequest>());
   const pendingGitStatusRef = useRef(new Map<string, string>()); // requestId → dirPath
   const pendingGitDiffRef = useRef(new Map<string, PendingPreviewRequest>());
+  const pendingPreviewDiffRef = useRef(new Map<string, PendingPreviewDiff>());
   const pendingMkdirRef = useRef(new Map<string, { parentPath: string; targetPath: string }>());
   const mountedRef = useRef(true);
   const dismissedAutoPreviewPathRef = useRef<string | null>(null);
@@ -450,6 +458,7 @@ export function FileBrowser({
       pendingReadRef.current.clear();
       pendingGitStatusRef.current.clear();
       pendingGitDiffRef.current.clear();
+      pendingPreviewDiffRef.current.clear();
       pendingMkdirRef.current.clear();
       editorMsgHandlers.current.clear();
       if (pendingChangesTimerRef.current) clearTimeout(pendingChangesTimerRef.current);
@@ -659,11 +668,19 @@ export function FileBrowser({
         }
         setEditContent(content);
 
+        const pendingDiff = pendingPreviewDiffRef.current.get(previewCycleKey(filePath, pending.cycleId));
         setPreview((prev) => {
-          // Merge diff if already fetched
           const existing = prev.status === 'ok' && prev.path === filePath ? prev : null;
-          return { status: 'ok', path: filePath, content, diff: existing?.diff, diffHtml: existing?.diffHtml, downloadId: dlId };
+          return {
+            status: 'ok',
+            path: filePath,
+            content,
+            diff: existing?.diff ?? pendingDiff?.diff,
+            diffHtml: existing?.diffHtml ?? pendingDiff?.diffHtml,
+            downloadId: dlId,
+          };
         });
+        pendingPreviewDiffRef.current.delete(previewCycleKey(filePath, pending.cycleId));
         return;
       }
 
@@ -711,6 +728,18 @@ export function FileBrowser({
           if (!diffHtml && previewTabOverridePathRef.current !== filePath) {
             setShowDiff(false);
           }
+          const diffKey = previewCycleKey(filePath, pending.cycleId);
+          const currentPreview = previewRef.current;
+          if (diffHtml && !(currentPreview.status === 'ok' && currentPreview.path === filePath)) {
+            pendingPreviewDiffRef.current.set(diffKey, {
+              path: filePath,
+              cycleId: pending.cycleId,
+              diff,
+              diffHtml,
+            });
+          } else {
+            pendingPreviewDiffRef.current.delete(diffKey);
+          }
           setPreview((prev) => {
             if (prev.status === 'ok' && prev.path === filePath) {
               return { ...prev, diff, diffHtml };
@@ -756,6 +785,7 @@ export function FileBrowser({
     setEditContent('');
     setOriginalMtime(undefined);
     setIsEditing(() => { try { return localStorage.getItem(PREF_KEY) === '1'; } catch { return false; } });
+    pendingPreviewDiffRef.current.clear();
     const active = getActivePreviewCycle(filePath);
     const cycleId = active && (hasPendingPreviewWork('read', filePath, active.cycleId) || hasPendingPreviewWork('diff', filePath, active.cycleId))
       ? active.cycleId
@@ -838,6 +868,7 @@ export function FileBrowser({
       pendingRef.current.clear();
       pendingReadRef.current.clear();
       pendingGitDiffRef.current.clear();
+      pendingPreviewDiffRef.current.clear();
       activePreviewCycleRef.current = null;
       for (const timer of timersRef.current.values()) clearTimeout(timer);
       timersRef.current.clear();
@@ -914,6 +945,7 @@ export function FileBrowser({
     if (autoPreviewPath) dismissedAutoPreviewPathRef.current = autoPreviewPath;
     previewTabOverridePathRef.current = null;
     activePreviewCycleRef.current = null;
+    pendingPreviewDiffRef.current.clear();
     setIsEditing(false);
     setEditDirty(false);
     setPreview({ status: 'idle' });
@@ -1076,7 +1108,8 @@ export function FileBrowser({
     </div>
   );
 
-  const hasDiff = preview.status === 'ok' && !!preview.diff;
+  const hasDiff = preview.status === 'ok' && (!!preview.diff || !!preview.diffHtml);
+  const canRenderDiff = preview.status === 'ok' && !!preview.diffHtml;
 
   const previewPane = hasInlinePreview ? (
     <div class="fb-preview">
@@ -1277,13 +1310,13 @@ export function FileBrowser({
             />
           </Suspense>
         )}
-        {preview.status === 'ok' && !isEditing && !showDiff && (
+        {preview.status === 'ok' && !isEditing && (!showDiff || !canRenderDiff) && (
           <Suspense fallback={<div class="fb-preview-loading"><div class="fb-loading-spinner" /></div>}>
             <FilePreviewPane content={preview.content} path={preview.path} />
           </Suspense>
         )}
-        {preview.status === 'ok' && !isEditing && showDiff && preview.diffHtml && (
-          <div class="fb-diff" dangerouslySetInnerHTML={{ __html: preview.diffHtml }} />
+        {preview.status === 'ok' && !isEditing && showDiff && canRenderDiff && (
+          <div class="fb-diff" dangerouslySetInnerHTML={{ __html: preview.diffHtml ?? '' }} />
         )}
       </div>
     </div>
@@ -1507,7 +1540,7 @@ export function FileBrowser({
             {tabs}
             {previewPane ? (
               <div class="fb-body fb-body-split">
-                <div class="fb-tree fb-tree-split">{changesSection}</div>
+                <div class="fb-tree fb-tree-split fb-changes-tree">{changesSection}</div>
                 {previewPane}
               </div>
             ) : (
