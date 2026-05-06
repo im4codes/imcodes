@@ -18,7 +18,7 @@ import { parseBooleanish, usePref } from '../hooks/usePref.js';
 import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
 import { PREF_KEY_P2P_COMBO_CONFIRM_SKIP, PREF_KEY_P2P_SESSION_CONFIG_LEGACY, p2pSessionConfigPrefKey } from '../constants/prefs.js';
 import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p-config-pref.js';
-import { uploadFile, sendSessionViaHttp } from '../api.js';
+import { uploadFile, sendSessionViaHttp, cancelSessionViaHttp } from '../api.js';
 import { patchSession, patchSubSession } from '../api.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
 import { isRunningSessionState } from '../thinking-utils.js';
@@ -1682,21 +1682,41 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     globalThis.crypto?.randomUUID?.() ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`
   ), []);
 
+  const cancelActiveTransportTurn = useCallback((commandId = makeCommandId()): string | null => {
+    if (!activeSession) return null;
+    const payload = {
+      sessionName: activeSession.name,
+      commandId,
+    };
+    if (!ws) {
+      if (!serverId) return null;
+      void cancelSessionViaHttp(serverId, payload).catch((fallbackErr) => {
+        console.warn('session.cancel HTTP fallback failed', fallbackErr);
+      });
+      return commandId;
+    }
+    try {
+      ws.sendSessionCommandUrgent('cancel', payload);
+    } catch (err) {
+      if (!serverId) throw err;
+      void cancelSessionViaHttp(serverId, payload).catch((fallbackErr) => {
+        console.warn('session.cancel HTTP fallback failed', fallbackErr);
+      });
+    }
+    return commandId;
+  }, [activeSession, makeCommandId, serverId, ws]);
+
   const sendSessionMessage = useCallback((text: string, extra: Record<string, unknown> = {}, commandId = makeCommandId()): string | null => {
     if (!activeSession) return null;
+    if (effectiveRuntimeType === 'transport' && text.trim() === '/stop') {
+      return cancelActiveTransportTurn(commandId);
+    }
     const payload = {
       sessionName: activeSession.name,
       text,
       ...extra,
       commandId,
     };
-    // `/stop` is highest-priority — bypass the WS probe-state gate so a
-    // focus/visibility tick (probeConnection sets `_connected = false`
-    // for ~50-200 ms while pinging) doesn't drop it. Regular messages
-    // still go through the gated path: a probe-detected dead socket
-    // shouldn't accept a new message that would silently disappear,
-    // but the user's STOP intent must be honored on a best-effort basis.
-    const isStop = text === '/stop';
     if (!ws) {
       if (!serverId) return null;
       void sendSessionViaHttp(serverId, payload).catch((fallbackErr) => {
@@ -1705,8 +1725,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       return commandId;
     }
     try {
-      if (isStop) ws.sendSessionCommandUrgent('send', payload);
-      else ws.sendSessionCommand('send', payload);
+      ws.sendSessionCommand('send', payload);
     } catch (err) {
       if (!serverId) throw err;
       void sendSessionViaHttp(serverId, payload).catch((fallbackErr) => {
@@ -1714,7 +1733,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       });
     }
     return commandId;
-  }, [activeSession, makeCommandId, serverId, ws]);
+  }, [activeSession, cancelActiveTransportTurn, effectiveRuntimeType, makeCommandId, serverId, ws]);
 
   const sendQueuedMessageMutation = useCallback((type: 'session.edit_queued_message' | 'session.undo_queued_message', payload: Record<string, unknown>) => {
     if (!ws || !activeSession) return false;
@@ -1735,6 +1754,29 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       || (typeof payload.extra.p2pMode === 'string' && payload.extra.p2pMode.length > 0)
       || (payload.extra.p2pSessionConfig != null && typeof payload.extra.p2pSessionConfig === 'object')
     );
+    const clearComposerState = () => {
+      pendingAtTargetsRef.current = [];
+      pendingConfigOverrideRef.current = null;
+      if (divRef.current) divRef.current.textContent = '';
+      setHasText(false);
+      setMobileComposerExpanded(false);
+      setMobileComposerMultiline(false);
+      setAttachments([]);
+      if (quotes && quotes.length > 0) {
+        for (let i = quotes.length - 1; i >= 0; i--) onRemoveQuote?.(i);
+      }
+      atSelectionLockRef.current = false;
+      atSelectionSnapshotRef.current = '';
+      histIdxRef.current = -1;
+      draftRef.current = '';
+      if (draftKey) sessionStorage.removeItem(draftKey);
+      if (attachmentDraftKey) sessionStorage.removeItem(attachmentDraftKey);
+    };
+    if (effectiveRuntimeType === 'transport' && !isP2pSend && payload.text.trim() === '/stop') {
+      if (!cancelActiveTransportTurn()) return;
+      if (options?.clearComposer) clearComposerState();
+      return;
+    }
     if (editingQueuedMessageId && effectiveRuntimeType === 'transport') {
       try {
         if (!sendQueuedMessageMutation('session.edit_queued_message', {
@@ -1754,22 +1796,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         ));
       });
       if (options?.clearComposer) {
-        pendingAtTargetsRef.current = [];
-        pendingConfigOverrideRef.current = null;
-        if (divRef.current) divRef.current.textContent = '';
-        setHasText(false);
-        setMobileComposerExpanded(false);
-        setMobileComposerMultiline(false);
-        setAttachments([]);
-        if (quotes && quotes.length > 0) {
-          for (let i = quotes.length - 1; i >= 0; i--) onRemoveQuote?.(i);
-        }
-        atSelectionLockRef.current = false;
-        atSelectionSnapshotRef.current = '';
-        histIdxRef.current = -1;
-        draftRef.current = '';
-        if (draftKey) sessionStorage.removeItem(draftKey);
-        if (attachmentDraftKey) sessionStorage.removeItem(attachmentDraftKey);
+        clearComposerState();
       }
       return;
     }
@@ -1811,24 +1838,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       });
     }
     if (options?.clearComposer) {
-      pendingAtTargetsRef.current = [];
-      pendingConfigOverrideRef.current = null;
-      if (divRef.current) divRef.current.textContent = '';
-      setHasText(false);
-      setMobileComposerExpanded(false);
-      setMobileComposerMultiline(false);
-      setAttachments([]);
-      if (quotes && quotes.length > 0) {
-        for (let i = quotes.length - 1; i >= 0; i--) onRemoveQuote?.(i);
-      }
-      atSelectionLockRef.current = false;
-      atSelectionSnapshotRef.current = '';
-      histIdxRef.current = -1;
-      draftRef.current = '';
-      if (draftKey) sessionStorage.removeItem(draftKey);
-      if (attachmentDraftKey) sessionStorage.removeItem(attachmentDraftKey);
+      clearComposerState();
     }
-  }, [activeSession, attachmentDraftKey, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, makeCommandId, onRemoveQuote, onSend, quickData, quotes, sendQueuedMessageMutation, sendSessionMessage, transportSendShouldQueue]);
+  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, makeCommandId, onRemoveQuote, onSend, quickData, quotes, sendQueuedMessageMutation, sendSessionMessage, transportSendShouldQueue]);
 
   const handleQueuedMessageEdit = useCallback((entry: { clientMessageId: string; text: string }) => {
     if (!isEditableQueuedEntry(entry)) return;
@@ -1975,7 +1987,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
     if (e.key === 'Escape' && effectiveRuntimeType === 'transport' && isRunningSessionState(activeSession?.state)) {
       e.preventDefault();
-      sendSessionMessage('/stop');
+      cancelActiveTransportTurn();
       return;
     }
 
@@ -2294,7 +2306,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               aria-label={t('session.stop_plain')}
               disabled={disabled || activeSession?.state === 'stopped'}
               onClick={() => {
-                sendSessionMessage('/stop');
+                cancelActiveTransportTurn();
               }}
               style={isRunningSessionState(activeSession?.state) ? { color: '#f87171' } : undefined}
             >

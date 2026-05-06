@@ -10,6 +10,7 @@ import {
   ACK_TIMEOUT_MS,
   ACK_TIMEOUT_RETRY_LIMIT,
 } from '../../shared/ack-protocol.js';
+import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 
 class MockWs extends EventEmitter {
   sent: Array<string | Buffer> = [];
@@ -117,6 +118,28 @@ describe('WsBridge — command ack reliability', () => {
     const forwarded = daemonWs.sentByType('session.send');
     expect(forwarded.length).toBe(1);
     expect(forwarded[0].commandId).toBe('C1');
+    expect(bridge._getInflightCountForTest()).toBe(1);
+  });
+
+  it('dispatches session.cancel through the reliable priority command path', async () => {
+    const bridge = WsBridge.get(serverId);
+    const daemonWs = await connectAndAuthenticateDaemon(bridge, serverId);
+    const browser = addBrowserSubscriber(bridge, 'deck_test_brain');
+
+    browser.emit('message', Buffer.from(JSON.stringify({
+      type: DAEMON_COMMAND_TYPES.SESSION_CANCEL,
+      sessionName: 'deck_test_brain',
+      commandId: 'C-CANCEL-1',
+    })));
+    await flushAsync();
+
+    const forwarded = daemonWs.sentByType(DAEMON_COMMAND_TYPES.SESSION_CANCEL);
+    expect(forwarded).toHaveLength(1);
+    expect(forwarded[0]).toEqual({
+      type: DAEMON_COMMAND_TYPES.SESSION_CANCEL,
+      sessionName: 'deck_test_brain',
+      commandId: 'C-CANCEL-1',
+    });
     expect(bridge._getInflightCountForTest()).toBe(1);
   });
 

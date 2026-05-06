@@ -1154,6 +1154,9 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case 'session.restart':
       void handleRestart(cmd, serverLink);
       break;
+    case DAEMON_COMMAND_TYPES.SESSION_CANCEL:
+      void handleSessionCancel(cmd, serverLink);
+      break;
     case DAEMON_COMMAND_TYPES.SESSION_UPDATE_TRANSPORT_CONFIG:
       void handleSessionTransportConfigUpdate(cmd, serverLink);
       break;
@@ -1816,6 +1819,77 @@ async function handleStop(cmd: Record<string, unknown>, serverLink: ServerLink):
   try { serverLink.send({ type: 'session.error', project, message: `Shutdown failed: ${message}` }); } catch { /* ignore */ }
 }
 
+function resolveSessionCommandName(cmd: Record<string, unknown>): string | undefined {
+  return (typeof cmd.sessionName === 'string' && cmd.sessionName)
+    ? cmd.sessionName
+    : (typeof cmd.session === 'string' && cmd.session ? cmd.session : undefined);
+}
+
+function markTransportCancelIdle(sessionName: string, error?: string): void {
+  timelineEmitter.emit(sessionName, 'session.state', {
+    state: 'idle',
+    pendingCount: 0,
+    pendingMessages: [],
+    pendingMessageEntries: [],
+    ...(error ? { error } : {}),
+  }, { source: 'daemon', confidence: 'high' });
+}
+
+function cancelTransportTurnNow(
+  sessionName: string,
+  commandId: string | undefined,
+  serverLink: Pick<ServerLink, 'send'> | undefined,
+): boolean {
+  const stopRuntime = getTransportRuntime(sessionName);
+  const stopRecord = getSession(sessionName);
+  const isTransportStop = !!stopRuntime
+    || stopRecord?.runtimeType === 'transport'
+    || (typeof stopRecord?.agentType === 'string' && isTransportAgent(stopRecord.agentType));
+  if (!isTransportStop) return false;
+
+  clearResend(sessionName);
+  if (commandId) emitCommandAck(sessionName, commandId, 'accepted', undefined, serverLink);
+  markTransportCancelIdle(sessionName);
+
+  if (!stopRuntime) return true;
+
+  void (async () => {
+    try {
+      supervisionAutomation.cancelSession(sessionName);
+      await stopRuntime.cancel();
+      // Mark session for fresh start so daemon restart doesn't resume the
+      // stuck conversation.
+      if (stopRecord?.agentType === 'qwen') {
+        upsertSession({ ...stopRecord, qwenFreshOnResume: true, updatedAt: Date.now() });
+      }
+    } catch (err) {
+      const errMsg = describeTransportSendError(err);
+      logger.error({ sessionName, err }, 'session.cancel (transport) failed');
+      timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Stop failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+      markTransportCancelIdle(sessionName, errMsg);
+    }
+  })();
+
+  return true;
+}
+
+async function handleSessionCancel(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const sessionName = resolveSessionCommandName(cmd);
+  const commandId = typeof cmd.commandId === 'string' && cmd.commandId.trim()
+    ? cmd.commandId.trim()
+    : undefined;
+  if (!sessionName) {
+    logger.warn('session.cancel: missing sessionName');
+    return;
+  }
+
+  if (cancelTransportTurnNow(sessionName, commandId, serverLink)) return;
+
+  const errMsg = 'Transport session unavailable';
+  logger.warn({ sessionName }, 'session.cancel: session is not a transport session');
+  if (commandId) emitCommandAck(sessionName, commandId, 'error', errMsg, serverLink);
+}
+
 /**
  * Send a command to a session, handling `!`-prefixed shell commands:
  * - claude-code: send `!` first (with delayed-Enter), then send the rest of the command
@@ -1951,45 +2025,8 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   }
 
   if (trimmedText === '/stop') {
-    const stopRuntime = getTransportRuntime(sessionName);
-    const stopRecord = getSession(sessionName);
-    const isTransportStop = !!stopRuntime
-      || stopRecord?.runtimeType === 'transport'
-      || (typeof stopRecord?.agentType === 'string' && isTransportAgent(stopRecord.agentType));
-    if (isTransportStop) {
-      emitTransportUserMessage(text);
-      // `/stop` is a priority control lane: receipt ack and queue clearing
-      // happen before any P2P config read, pending relaunch wait, transport
-      // mutex, context bootstrap, recall, or provider cancel await. The
-      // cancel itself runs in the background; failures surface as timeline
-      // state, not as a delayed command ack.
-      clearResend(sessionName);
-      emitAcceptedReceiptAck();
-      if (!stopRuntime) {
-        timelineEmitter.emit(sessionName, 'session.state', {
-          state: 'idle',
-          pendingCount: 0,
-          pendingMessages: [],
-          pendingMessageEntries: [],
-        }, { source: 'daemon', confidence: 'high' });
-        return;
-      }
-      void (async () => {
-        try {
-          supervisionAutomation.cancelSession(sessionName);
-          await stopRuntime.cancel();
-          // Mark session for fresh start so daemon restart doesn't resume the
-          // stuck conversation.
-          if (stopRecord?.agentType === 'qwen') {
-            upsertSession({ ...stopRecord, qwenFreshOnResume: true, updatedAt: Date.now() });
-          }
-        } catch (err) {
-          const errMsg = describeTransportSendError(err);
-          logger.error({ sessionName, err }, 'session.stop (transport) failed');
-          timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Stop failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
-          timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
-        }
-      })();
+    if (cancelTransportTurnNow(sessionName, effectiveId, serverLink)) {
+      receiptAcked = true;
       return;
     }
   }
@@ -3092,16 +3129,7 @@ async function handleInput(cmd: Record<string, unknown>): Promise<void> {
   const transportRuntime = getTransportRuntime(sessionName);
   if (transportRuntime) {
     if (data === '\x1b') {
-      try {
-        await transportRuntime.cancel();
-        // Mark Qwen sessions for fresh start so restart doesn't resume stuck conversation
-        const rec = getSession(sessionName);
-        if (rec?.agentType === 'qwen') {
-          upsertSession({ ...rec, qwenFreshOnResume: true, updatedAt: Date.now() });
-        }
-      } catch (err) {
-        logger.error({ sessionName, err }, 'session.input transport cancel failed');
-      }
+      cancelTransportTurnNow(sessionName, undefined, undefined);
     }
     return;
   }
@@ -4511,38 +4539,67 @@ log "[step 2] installing ${pkgSpec}"
 # \`npm install\` from inside the global package to repopulate it. Run with
 # --ignore-scripts again for the same reason.
 #
-# ── Retry on ETARGET (npm CDN replication race) ────────────────────────
+# ── Retry on publish propagation / transient network failures ──────────
 # Real-world failure mode caught on 116.62.239.78: server publishes a
 # new dev release to npm and broadcasts \`daemon.upgrade { targetVersion }\`
 # almost immediately. npm origin has the version but the regional CDN
 # edge serving this daemon hasn't replicated yet — so the packument
 # response is a 200 missing the new version → npm exits with ETARGET.
-# Pre-fix this killed the upgrade for that release entirely (no retry,
-# next try only when the server broadcasts again). We now retry up to
-# 4 times with 60/180/300s back-off (1m / 3m / 5m — the last gap is wide
-# enough to outlast a slow regional CDN: 2m wasn't enough on a real
-# replication-lagged edge node) and bust the packument cache between
-# attempts so npm refetches origin instead of serving the stale 200.
-# Total time-to-give-up: ~9 minutes from the first attempt.
-#
-# Non-ETARGET failures are NOT retried — they're typically deterministic
-# (network down, ENOSPC, registry auth issue). Logging the per-attempt
-# tail makes those diagnosable post-hoc without re-reading the giant
-# main log.
+# Pre-fix this either killed the upgrade for that release or, worse, ran
+# \`npm cache clean --force\`, deleting every cached dependency on the box.
+# The eventual successful install then had to redownload 200+ packages and
+# took minutes. We now use a cheap \`npm view\` precheck for pinned versions,
+# avoid full-cache wipes, and retry transient network failures like
+# ECONNRESET/ETIMEDOUT/EAI_AGAIN.
 INSTALL_OUT="${scriptDir}/install-attempt.log"
 INSTALL_RC=1
 ATTEMPT=0
-MAX_ATTEMPTS=4
+MAX_ATTEMPTS=5
 # Indexed sequentially with $ATTEMPT (1-based), so element 0 is unused.
-# 60s / 180s / 300s — see the comment block above for sizing rationale.
-RETRY_DELAYS=(0 60 180 300)
+# 15s / 30s / 60s / 120s keeps the common npm publish-CDN window quick
+# without stretching a bad target into a 10-minute local stall.
+RETRY_DELAYS=(0 15 30 60 120)
+
+is_etarget_output() {
+  grep -qiE 'code ETARGET|No matching version found' "$1" 2>/dev/null
+}
+
+is_transient_npm_output() {
+  grep -qiE 'code (ECONNRESET|ETIMEDOUT|EAI_AGAIN|ECONNREFUSED|ENOTFOUND|EHOSTUNREACH|ENETUNREACH)|network aborted|socket timeout|fetch failed|network socket disconnected|5[0-9][0-9]' "$1" 2>/dev/null
+}
+
 while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
   ATTEMPT=$((ATTEMPT + 1))
   log "[step 2] install attempt $ATTEMPT/$MAX_ATTEMPTS"
   : > "$INSTALL_OUT"
+
+  if [ "${targetVer}" != "latest" ]; then
+    log "[step 2] registry visibility precheck for ${pkgSpec}"
+    eval "$NPM_RUN view --prefer-online ${pkgSpec} version" >> "$INSTALL_OUT" 2>&1
+    VIEW_RC=$?
+    cat "$INSTALL_OUT" >> "$LOG"
+    if [ "$VIEW_RC" -ne 0 ] && is_etarget_output "$INSTALL_OUT"; then
+      log "[step 2] ${pkgSpec} not visible in registry yet"
+      if [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
+        log "[step 2] target never became visible across $MAX_ATTEMPTS attempts — giving up before heavyweight install"
+        INSTALL_RC=$VIEW_RC
+        break
+      fi
+      DELAY=\${RETRY_DELAYS[$ATTEMPT]}
+      log "[step 2] waiting \${DELAY}s for npm publish propagation"
+      sleep "$DELAY"
+      continue
+    fi
+    if [ "$VIEW_RC" -ne 0 ]; then
+      log "[step 2] registry precheck failed (exit $VIEW_RC); trying install anyway"
+    fi
+    : > "$INSTALL_OUT"
+  fi
+
   # --prefer-online: tell npm to revalidate cached packument metadata
-  # rather than serve potentially-stale entries. Belt & braces with the
-  # cache-clean we do between attempts.
+  # rather than serve potentially-stale entries. Do NOT use \`npm cache
+  # clean --force\` here: it wipes cached dependency tarballs too, which is
+  # exactly what made upgrades on large SDK dependency sets feel glacial.
   eval "$NPM_RUN install -g --ignore-scripts --prefer-online ${pkgSpec}" >> "$INSTALL_OUT" 2>&1
   INSTALL_RC=$?
   # Always tee the attempt's output into the main log for forensics.
@@ -4552,25 +4609,26 @@ while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
     break
   fi
   log "[step 2] install attempt $ATTEMPT failed (exit $INSTALL_RC)"
-  # Detect ETARGET (case-insensitive — npm versions vary slightly).
-  IS_ETARGET=0
-  if grep -qiE 'code ETARGET|No matching version found' "$INSTALL_OUT" 2>/dev/null; then
-    IS_ETARGET=1
+  IS_RETRYABLE=0
+  RETRY_REASON="non-retryable"
+  if is_etarget_output "$INSTALL_OUT"; then
+    IS_RETRYABLE=1
+    RETRY_REASON="target-not-visible"
+  elif is_transient_npm_output "$INSTALL_OUT"; then
+    IS_RETRYABLE=1
+    RETRY_REASON="transient-network"
   fi
-  if [ "$IS_ETARGET" -ne 1 ]; then
-    log "[step 2] non-ETARGET failure — not retrying. Tail of npm output:"
+  if [ "$IS_RETRYABLE" -ne 1 ]; then
+    log "[step 2] non-retryable npm failure — not retrying. Tail of npm output:"
     tail -20 "$INSTALL_OUT" | while IFS= read -r line; do log "[step 2]   $line"; done
     break
   fi
   if [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
-    log "[step 2] ETARGET persisted across $MAX_ATTEMPTS attempts — registry never replicated ${pkgSpec}"
+    log "[step 2] retryable npm failure ($RETRY_REASON) persisted across $MAX_ATTEMPTS attempts"
     break
   fi
   DELAY=\${RETRY_DELAYS[$ATTEMPT]}
-  log "[step 2] ETARGET — npm CDN likely hasn't replicated ${pkgSpec} yet; retrying in \${DELAY}s after busting packument cache"
-  # Bust the cached packument so the next attempt forces an origin
-  # round-trip instead of revalidating into the stale cached 200.
-  eval "$NPM_RUN cache clean --force" >> "$LOG" 2>&1 || log "[step 2] cache clean returned non-zero (ignored)"
+  log "[step 2] retryable npm failure ($RETRY_REASON) — retrying in \${DELAY}s"
   sleep "$DELAY"
 done
 if [ "$INSTALL_RC" -ne 0 ]; then

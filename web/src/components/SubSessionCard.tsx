@@ -10,7 +10,7 @@ import { resolveContextWindow } from '../model-context.js';
 import { shortModelLabel } from '../model-label.js';
 import { TerminalView } from './TerminalView.js';
 import { useTimeline } from '../hooks/useTimeline.js';
-import { sendSessionViaHttp } from '../api.js';
+import { cancelSessionViaHttp } from '../api.js';
 import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff } from '../types.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
@@ -223,18 +223,21 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     // fall back to HTTP on throw, surface only if both fail. The state
     // gate (already-stopped / stopping) stays — those are valid no-ops.
     if (sub.state === 'stopped' || sub.state === 'stopping') return;
-    const payload = { sessionName: sub.sessionName, text: '/stop' };
+    const payload = {
+      sessionName: sub.sessionName,
+      commandId: globalThis.crypto?.randomUUID?.() ?? `cancel-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    };
     let wsThrown: unknown = null;
     if (ws) {
       try {
-        ws.sendSessionCommandUrgent('send', payload);
+        ws.sendSessionCommandUrgent('cancel', payload);
         return;
       } catch (err) {
         wsThrown = err;
       }
     }
     if (serverId) {
-      void sendSessionViaHttp(serverId, payload).catch((httpErr) => {
+      void cancelSessionViaHttp(serverId, payload).catch((httpErr) => {
         // eslint-disable-next-line no-console
         console.warn('handleTransportStop: WS + HTTP both failed', { wsThrown, httpErr });
       });

@@ -1261,7 +1261,7 @@ export class WsBridge {
         return;
       }
 
-      // ── command.ack reliability: intercept session.send ────────────────
+      // ── command.ack reliability: intercept user sends and cancels ───────
       //
       // Three cases:
       //   1. daemon fully offline (past grace)       → immediately command.failed
@@ -1270,7 +1270,7 @@ export class WsBridge {
       //
       // In all cases we record an inflight entry so that the later command.ack
       // (or timeout / disconnect) can correlate back to the right browser.
-      if (msg.type === 'session.send' && typeof msg.commandId === 'string') {
+      if ((msg.type === 'session.send' || msg.type === DAEMON_COMMAND_TYPES.SESSION_CANCEL) && typeof msg.commandId === 'string') {
         const sessionName = typeof msg.sessionName === 'string'
           ? msg.sessionName
           : (typeof msg.session === 'string' ? msg.session : '');

@@ -9,6 +9,7 @@ import { REPO_MSG } from '@shared/repo-types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
+import { DAEMON_COMMAND_TYPES } from '@shared/daemon-command-types.js';
 import { CC_PRESET_MSG, type CcPreset, type CcPresetModelInfo } from '@shared/cc-presets.js';
 import { MEMORY_WS } from '@shared/memory-ws.js';
 import type {
@@ -367,8 +368,8 @@ export class WsClient {
    * swallow it. Caller should still wrap in try/catch and HTTP-fallback
    * on throw.
    */
-  sendSessionCommandUrgent(command: 'stop' | 'send' | 'restart', payload: object = {}): void {
-    this.sendUrgent({ type: `session.${command}`, ...payload });
+  sendSessionCommandUrgent(command: 'stop' | 'send' | 'restart' | 'cancel', payload: object = {}): void {
+    this.sendUrgent({ type: command === 'cancel' ? DAEMON_COMMAND_TYPES.SESSION_CANCEL : `session.${command}`, ...payload });
   }
 
   /**
@@ -512,8 +513,8 @@ export class WsClient {
     this.send({ type: TRANSPORT_MSG.APPROVAL_RESPONSE, sessionId, requestId, approved });
   }
 
-  sendSessionCommand(command: 'start' | 'stop' | 'send' | 'restart', payload: object = {}): void {
-    this.send({ type: `session.${command}`, ...payload });
+  sendSessionCommand(command: 'start' | 'stop' | 'send' | 'restart' | 'cancel', payload: object = {}): void {
+    this.send({ type: command === 'cancel' ? DAEMON_COMMAND_TYPES.SESSION_CANCEL : `session.${command}`, ...payload });
   }
 
   /**

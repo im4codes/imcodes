@@ -227,6 +227,22 @@ describe('session-mgmt persistence routes', () => {
     });
   });
 
+  it('POST /session/cancel relays direct SDK cancel without /stop text', async () => {
+    const app = await buildApp();
+    const res = await app.request('/api/server/srv-1/session/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionName: 'deck_proj_brain', commandId: 'cancel-1', text: '/stop' }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]))).toEqual({
+      type: DAEMON_COMMAND_TYPES.SESSION_CANCEL,
+      sessionName: 'deck_proj_brain',
+      commandId: 'cancel-1',
+    });
+  });
+
   it('PATCH /sessions/:name/rename updates the project name and relays session.rename', async () => {
     const { updateProjectName } = await import('../src/db/queries.js');
     const app = await buildApp();

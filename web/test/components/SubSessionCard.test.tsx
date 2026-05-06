@@ -305,7 +305,7 @@ describe('SubSessionCard', () => {
     expect(releaseRaw).toHaveBeenCalledOnce();
   });
 
-  it('renders the stop button in transport fallback input mode and sends /stop via the urgent path', async () => {
+  it('renders the stop button in transport fallback input mode and sends direct cancel via the urgent path', async () => {
     // Stop is highest-priority — it must use sendSessionCommandUrgent so a
     // visibility/focus probe-flip (`_connected = false`) can't silently
     // drop the click. See ws-client.ts sendUrgent for the full rationale.
@@ -327,9 +327,13 @@ describe('SubSessionCard', () => {
     fireEvent.click(stop!);
 
     await waitFor(() => {
-      expect(ws.sendSessionCommandUrgent).toHaveBeenCalledWith('send', { sessionName: 'deck_sub_sub-card-1', text: '/stop' });
+      expect(ws.sendSessionCommandUrgent).toHaveBeenCalledWith('cancel', {
+        sessionName: 'deck_sub_sub-card-1',
+        commandId: expect.any(String),
+      });
     });
-    // Regular sendSessionCommand should NOT have been used for stop.
+    // Stop must not be represented as a chat send.
+    expect(ws.sendSessionCommandUrgent).not.toHaveBeenCalledWith('send', expect.objectContaining({ text: '/stop' }));
     expect(ws.sendSessionCommand).not.toHaveBeenCalledWith('send', expect.objectContaining({ text: '/stop' }));
   });
 

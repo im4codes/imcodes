@@ -257,8 +257,24 @@ function gatherSendCalls(ws: ReturnType<typeof makeWs>): Array<Record<string, un
     .map(([, p]) => p as Record<string, unknown>);
 }
 
+function gatherCancelCalls(ws: ReturnType<typeof makeWs>): Array<Record<string, unknown>> {
+  return [
+    ...ws.sendSessionCommand.mock.calls,
+    ...ws.sendSessionCommandUrgent.mock.calls,
+  ]
+    .filter(([cmd]) => cmd === 'cancel')
+    .map(([, p]) => p as Record<string, unknown>);
+}
+
 function expectSendPayload(ws: ReturnType<typeof makeWs>, payload: Record<string, unknown>): void {
   expect(gatherSendCalls(ws)).toContainEqual(expect.objectContaining({
+    ...payload,
+    commandId: expect.any(String),
+  }));
+}
+
+function expectCancelPayload(ws: ReturnType<typeof makeWs>, payload: Record<string, unknown>): void {
+  expect(gatherCancelCalls(ws)).toContainEqual(expect.objectContaining({
     ...payload,
     commandId: expect.any(String),
   }));
@@ -1671,6 +1687,27 @@ afterEach(() => {
     });
   });
 
+  it('typing /stop in a transport input sends direct cancel instead of chat text', () => {
+    const ws = makeWs();
+    const onSend = vi.fn();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({ name: 'qwen-session', agentType: 'qwen', state: 'running' })}
+        quickData={makeQuickData() as any}
+        onSend={onSend}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = '/stop';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+
+    expectCancelPayload(ws, { sessionName: 'qwen-session' });
+    expect(gatherSendCalls(ws)).not.toContainEqual(expect.objectContaining({ text: '/stop' }));
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
   it('shows a running transport send in the queue instead of injecting a timeline bubble', () => {
     const ws = makeWs();
     const onSend = vi.fn();
@@ -2361,7 +2398,7 @@ afterEach(() => {
     expect(screen.queryByText('queued send')).toBeNull();
   });
 
-  it('pressing Escape in a running transport input sends /stop command', () => {
+  it('pressing Escape in a running transport input sends direct cancel', () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -2379,8 +2416,13 @@ afterEach(() => {
     const input = screen.getByRole('textbox') as HTMLDivElement;
     fireEvent.keyDown(input, { key: 'Escape' });
 
-    // Transport sessions send /stop instead of raw escape byte
-    expectSendPayload(ws, { sessionName: 'qwen-session', text: '/stop' });
+    // Transport sessions cancel the SDK turn directly instead of sending
+    // `/stop` as chat text.
+    expectCancelPayload(ws, { sessionName: 'qwen-session' });
+    expect(gatherSendCalls(ws)).not.toContainEqual(expect.objectContaining({
+      sessionName: 'qwen-session',
+      text: '/stop',
+    }));
     expect(ws.sendInput).not.toHaveBeenCalled();
   });
 
@@ -2403,10 +2445,11 @@ afterEach(() => {
     expect(stopBtn.textContent).toBe('■');
     expect(stopBtn.disabled).toBe(false);
     fireEvent.click(stopBtn);
-    expectSendPayload(ws, {
+    expectCancelPayload(ws, { sessionName: 'codex-sdk-session' });
+    expect(gatherSendCalls(ws)).not.toContainEqual(expect.objectContaining({
       sessionName: 'codex-sdk-session',
       text: '/stop',
-    });
+    }));
   });
 
   it('shows a compact Auto dropdown for supported transport sessions and enables supervised mode from saved defaults', async () => {

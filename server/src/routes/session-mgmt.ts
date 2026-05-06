@@ -17,6 +17,7 @@ export const sessionMgmtRoutes = new Hono<{ Bindings: Env; Variables: { userId: 
 /**
  * POST /api/server/:id/session/start
  * POST /api/server/:id/session/stop
+ * POST /api/server/:id/session/cancel
  * POST /api/server/:id/session/send
  *
  * All commands are relayed to the daemon via WsBridge (JSON over WebSocket).
@@ -24,7 +25,7 @@ export const sessionMgmtRoutes = new Hono<{ Bindings: Env; Variables: { userId: 
  *
  * Permission model:
  * - start/stop: requires owner | admin
- * - send: requires owner | admin | member
+ * - send/cancel: requires owner | admin | member
  */
 
 // Apply auth middleware globally to all session routes
@@ -309,6 +310,28 @@ sessionMgmtRoutes.post('/:id/session/stop', async (c) => {
     return c.json({ error: 'forbidden', reason: 'stop requires admin or owner role' }, 403);
   }
   return relayToDaemon(c, 'session.stop');
+});
+
+sessionMgmtRoutes.post('/:id/session/cancel', async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const role = await resolveServerRole(c.env.DB, c.req.param('id')!, userId);
+  if (role === 'none') {
+    return c.json({ error: 'forbidden', reason: 'not_authorized_for_server' }, 403);
+  }
+  let body: Record<string, unknown> = {};
+  try {
+    const parsed = await c.req.json();
+    body = parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : {};
+  } catch {
+    // body is optional; daemon will validate required fields
+  }
+  const sessionName = typeof body.sessionName === 'string' ? body.sessionName : undefined;
+  const session = typeof body.session === 'string' ? body.session : undefined;
+  const commandId = typeof body.commandId === 'string' ? body.commandId : undefined;
+  return relayToDaemon(c, DAEMON_COMMAND_TYPES.SESSION_CANCEL, {
+    ...(sessionName ? { sessionName } : session ? { session } : {}),
+    ...(commandId ? { commandId } : {}),
+  });
 });
 
 sessionMgmtRoutes.post('/:id/session/send', async (c) => {

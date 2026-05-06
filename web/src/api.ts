@@ -475,6 +475,16 @@ export async function sendSessionViaHttp(
   });
 }
 
+export async function cancelSessionViaHttp(
+  serverId: string,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  await apiFetch(`/api/server/${encodeURIComponent(serverId)}/session/cancel`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
 function isRetryableNonceExchangeError(error: unknown): boolean {
   if (error instanceof ApiError) {
     if (error.code === 'invalid_or_expired_nonce') return false;

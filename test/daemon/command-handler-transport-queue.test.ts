@@ -636,7 +636,7 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-clear-codex', status: 'accepted' });
   });
 
-  it('dispatches /stop immediately for transport sessions without emitting queued state', async () => {
+  it('dispatches direct session.cancel immediately for transport sessions without emitting /stop text', async () => {
     const cancel = vi.fn().mockResolvedValue(undefined);
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: 'route-transport',
@@ -646,23 +646,64 @@ describe('handleWebCommand transport queue behavior', () => {
       pendingMessages: ['a', 'b', 'c'],
     });
 
-    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: '/stop', commandId: 'cmd-stop' }, serverLink as any);
+    handleWebCommand({
+      type: DAEMON_COMMAND_TYPES.SESSION_CANCEL,
+      sessionName: 'deck_transport_brain',
+      commandId: 'cmd-stop',
+    }, serverLink as any);
     await flushAsync();
 
     expect(cancel).toHaveBeenCalledTimes(1);
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-stop', status: 'accepted' });
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
-      'user.message',
-      { text: '/stop', allowDuplicate: true, commandId: 'cmd-stop' },
-      undefined,
+      'session.state',
+      {
+        state: 'idle',
+        pendingCount: 0,
+        pendingMessages: [],
+        pendingMessageEntries: [],
+      },
+      expect.objectContaining({ source: 'daemon', confidence: 'high' }),
     );
-    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-stop', status: 'accepted' });
+    const stopUserMessages = emitMock.mock.calls.filter((call) =>
+      call[0] === 'deck_transport_brain'
+      && call[1] === 'user.message'
+      && (call[2] as Record<string, unknown>)?.text === '/stop',
+    );
+    expect(stopUserMessages).toEqual([]);
     expect(emitMock).not.toHaveBeenCalledWith(
       'deck_transport_brain',
       'session.state',
       expect.objectContaining({ state: 'queued' }),
       expect.anything(),
     );
+  });
+
+  it('keeps legacy /stop sends as direct cancel compatibility without emitting /stop text', async () => {
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      cancel,
+      send: vi.fn(() => 'queued'),
+      pendingCount: 1,
+      pendingMessages: ['a'],
+    });
+
+    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: '/stop', commandId: 'cmd-stop-legacy' }, serverLink as any);
+    await flushAsync();
+
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {
+      commandId: 'cmd-stop-legacy',
+      status: 'accepted',
+    });
+    const stopUserMessages = emitMock.mock.calls.filter((call) =>
+      call[0] === 'deck_transport_brain'
+      && call[1] === 'user.message'
+      && (call[2] as Record<string, unknown>)?.text === '/stop',
+    );
+    expect(stopUserMessages).toEqual([]);
   });
 
   it('acks /stop before provider cancellation settles', async () => {
@@ -675,7 +716,11 @@ describe('handleWebCommand transport queue behavior', () => {
       pendingMessages: ['blocked send'],
     });
 
-    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: '/stop', commandId: 'cmd-stop-cancel-hang' }, serverLink as any);
+    handleWebCommand({
+      type: DAEMON_COMMAND_TYPES.SESSION_CANCEL,
+      sessionName: 'deck_transport_brain',
+      commandId: 'cmd-stop-cancel-hang',
+    }, serverLink as any);
 
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {
       commandId: 'cmd-stop-cancel-hang',
@@ -690,7 +735,7 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(ackOrder).toBeLessThan(cancel.mock.invocationCallOrder[0]);
   });
 
-  it('keeps /stop on the priority lane while a transport model switch holds the send lock', async () => {
+  it('keeps direct session.cancel on the priority lane while a transport model switch holds the send lock', async () => {
     let resolveRuntimeConfig: ((value: unknown) => void) | null = null;
     getQwenRuntimeConfigMock.mockReturnValueOnce(new Promise((resolve) => {
       resolveRuntimeConfig = resolve;
@@ -724,9 +769,8 @@ describe('handleWebCommand transport queue behavior', () => {
     await flushAsync();
 
     handleWebCommand({
-      type: 'session.send',
-      session: 'deck_transport_brain',
-      text: '/stop',
+      type: DAEMON_COMMAND_TYPES.SESSION_CANCEL,
+      sessionName: 'deck_transport_brain',
       commandId: 'cmd-stop-priority',
     }, serverLink as any);
 

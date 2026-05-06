@@ -1003,7 +1003,7 @@ describe('WsClient', () => {
       expect(() => client.sendUrgent({ type: 'session.send', text: '/stop' })).toThrow('WebSocket not connected');
     });
 
-    it('sendSessionCommandUrgent emits session.<command> with payload', async () => {
+    it('sendSessionCommandUrgent maps cancel to session.cancel without /stop text', async () => {
       const client = new WsClient('http://localhost:8787', 'srv-1');
       client.connect();
       await flushAsync();
@@ -1014,11 +1014,10 @@ describe('WsClient', () => {
       lastWs!.send = (data: string) => { sentMessages.push(data); origSend(data); };
 
       (client as unknown as { _connected: boolean })._connected = false;
-      client.sendSessionCommandUrgent('send', { sessionName: 'deck_brain', text: '/stop', commandId: 'cmd-1' });
+      client.sendSessionCommandUrgent('cancel', { sessionName: 'deck_brain', commandId: 'cmd-1' });
       expect(JSON.parse(sentMessages[0])).toEqual({
-        type: 'session.send',
+        type: 'session.cancel',
         sessionName: 'deck_brain',
-        text: '/stop',
         commandId: 'cmd-1',
       });
 

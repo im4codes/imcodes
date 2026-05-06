@@ -1,8 +1,9 @@
 export const SESSION_COMPACT_COMMAND = '/compact' as const;
 export const SESSION_CLEAR_COMMAND = '/clear' as const;
+export const SESSION_STOP_COMMAND = '/stop' as const;
 export const SESSION_CONTROL_METADATA_COMMAND_FIELD = 'controlCommand' as const;
 
-export type SessionControlCommandId = 'compact' | 'clear';
+export type SessionControlCommandId = 'compact' | 'clear' | 'stop';
 export type SessionControlHandling = 'provider-dispatched' | 'daemon-managed';
 export type SessionControlVisibility = 'visible' | 'hidden';
 
@@ -36,6 +37,16 @@ export const SESSION_CONTROL_COMMANDS = [
     optimisticUserMessage: 'visible',
     daemonHandledReceiptAck: true,
     resetsProcessPreferenceContext: true,
+    resetsTransportPreferenceContextOnSend: false,
+  },
+  {
+    id: 'stop',
+    command: SESSION_STOP_COMMAND,
+    handling: 'daemon-managed',
+    timelineUserMessage: 'hidden',
+    optimisticUserMessage: 'hidden',
+    daemonHandledReceiptAck: true,
+    resetsProcessPreferenceContext: false,
     resetsTransportPreferenceContextOnSend: false,
   },
 ] as const satisfies readonly SessionControlCommandDefinition[];
