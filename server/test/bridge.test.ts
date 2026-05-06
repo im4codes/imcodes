@@ -1,6 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { WsBridge } from '../src/ws/bridge.js';
+import {
+  markDaemonUpgradeTargetVersionPublishedForTest,
+  resetDaemonUpgradePublicationGateForTest,
+} from '../src/ws/daemon-upgrade-publication-gate.js';
 import * as dbQueries from '../src/db/queries.js';
 import { PUSH_TIMELINE_EVENT_MAX_AGE_MS, TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 
@@ -85,10 +89,14 @@ describe('WsBridge', () => {
 
   beforeEach(() => {
     serverId = `test-${Math.random().toString(36).slice(2)}`;
+    resetDaemonUpgradePublicationGateForTest();
+    markDaemonUpgradeTargetVersionPublishedForTest('2026.4.905-dev.877');
+    markDaemonUpgradeTargetVersionPublishedForTest('2026.4.905');
   });
 
   afterEach(() => {
     WsBridge.getAll().clear();
+    resetDaemonUpgradePublicationGateForTest();
     vi.clearAllMocks();
   });
 

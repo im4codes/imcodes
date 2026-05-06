@@ -154,4 +154,29 @@ describe('server routes', () => {
       deliveryStatus: 'invalid_target',
     });
   });
+
+  it('surfaces npm publication gate state without pretending the upgrade was sent', async () => {
+    process.env.APP_VERSION = '2026.4.905-dev.877';
+    mockRequestDaemonUpgrade.mockReturnValue({
+      ok: true,
+      upgradeId: 'upgrade-1',
+      targetVersion: '2026.4.905-dev.877',
+      deliveryStatus: 'pending_publication',
+      nextAttemptAt: '2026-05-06T12:00:15.000Z',
+      reason: 'target_version_not_published',
+    });
+    const app = await buildTestApp();
+
+    const res = await app.request('/api/server/srv-1/upgrade', { method: 'POST' });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      ok: true,
+      upgradeId: 'upgrade-1',
+      targetVersion: '2026.4.905-dev.877',
+      deliveryStatus: 'pending_publication',
+      nextAttemptAt: '2026-05-06T12:00:15.000Z',
+      reason: 'target_version_not_published',
+    });
+  });
 });

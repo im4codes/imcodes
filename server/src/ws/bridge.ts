@@ -932,6 +932,14 @@ export class WsBridge {
               serverVersion,
               reason: result.reason,
             }, 'Version mismatch — auto daemon.upgrade in backoff');
+          } else if (result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_PUBLICATION) {
+            logger.info({
+              serverId: this.serverId,
+              daemonVersion: this.daemonVersion,
+              serverVersion,
+              nextAttemptAt: result.nextAttemptAt,
+              reason: result.reason,
+            }, 'Version mismatch — waiting for daemon upgrade target to appear on npm');
           }
         } else {
           // Version matches or auto-upgrade does not apply — reset retry state.
@@ -2541,6 +2549,12 @@ export class WsBridge {
         targetVersion: result.targetVersion,
         upgradeId: result.upgradeId,
       }, 'Flushed pending daemon.upgrade after daemon auth');
+    } else if (result?.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_PUBLICATION) {
+      logger.info({
+        serverId: this.serverId,
+        targetVersion: result.targetVersion,
+        nextAttemptAt: result.nextAttemptAt,
+      }, 'Pending daemon.upgrade is waiting for npm publication');
     }
   }
 
