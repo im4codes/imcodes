@@ -119,6 +119,8 @@
     "confirm_new": "¿Confirmar nuevo?",
     "stop": "✕ Detener",
     "stop_plain": "Detener",
+    "state_stop_requested": "Detención solicitada",
+    "state_stopping": "Deteniendo...",
     "confirm_stop": "¿Confirmar detención?",
     "confirm_stop_dialog": "¿Estás seguro de que quieres detener esta sesión? Esta acción no se puede deshacer.",
     "confirm_sub_stop_2": "⚠ ¿SEGURO detener {{label}}?",

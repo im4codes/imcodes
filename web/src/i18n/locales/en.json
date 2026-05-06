@@ -119,6 +119,8 @@
     "confirm_new": "Confirm new?",
     "stop": "✕ Stop",
     "stop_plain": "Stop",
+    "state_stop_requested": "Stop requested",
+    "state_stopping": "Stopping...",
     "confirm_stop": "Confirm stop?",
     "confirm_stop_dialog": "Are you sure you want to stop this session? This action cannot be undone.",
     "confirm_sub_stop_2": "⚠ REALLY stop {{label}}?",

@@ -161,6 +161,7 @@ import {
   type MemoryManagementBoundProject,
 } from '../../shared/memory-management-context.js';
 import {
+  getSessionControlTimelineFeedbackById,
   isDaemonHandledSessionControlSend,
   isSessionControlCommandText,
   shouldHideTimelineUserMessageForSessionControl,
@@ -1835,6 +1836,15 @@ function markTransportCancelIdle(sessionName: string, error?: string): void {
   }, { source: 'daemon', confidence: 'high' });
 }
 
+function emitSessionControlTimelineFeedback(sessionName: string, controlId: 'stop'): void {
+  const feedback = getSessionControlTimelineFeedbackById(controlId);
+  if (!feedback) return;
+  timelineEmitter.emit(sessionName, 'session.state', {
+    state: feedback.state,
+    reason: feedback.reason,
+  }, { source: 'daemon', confidence: 'high' });
+}
+
 function cancelTransportTurnNow(
   sessionName: string,
   commandId: string | undefined,
@@ -1849,6 +1859,7 @@ function cancelTransportTurnNow(
 
   clearResend(sessionName);
   if (commandId) emitCommandAck(sessionName, commandId, 'accepted', undefined, serverLink);
+  emitSessionControlTimelineFeedback(sessionName, 'stop');
   markTransportCancelIdle(sessionName);
 
   if (!stopRuntime) return true;

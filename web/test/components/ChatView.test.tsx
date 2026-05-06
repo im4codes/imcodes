@@ -5,6 +5,10 @@ import { h } from 'preact';
 import { render, waitFor, cleanup, fireEvent } from '@testing-library/preact';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { ChatView } from '../../src/components/ChatView.js';
+import {
+  SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
+  SESSION_CONTROL_TIMELINE_STATE_STOPPING,
+} from '../../../shared/session-control-commands.js';
 
 const chatMarkdownRenderSpy = vi.hoisted(() => vi.fn());
 const showToolCallsPref = vi.hoisted(() => ({
@@ -961,6 +965,28 @@ describe('ChatView', () => {
     );
 
     expect(container.textContent).toContain('Session stopped');
+  });
+
+  it('renders transport Stop cancel feedback as a visible system row', () => {
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-stop-requested',
+            type: 'session.state',
+            ts: 1000,
+            payload: {
+              state: SESSION_CONTROL_TIMELINE_STATE_STOPPING,
+              reason: SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
+            },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    expect(container.textContent).toContain('session.state_stop_requested');
   });
 
   it('restores mobile keyboard scroll position from bottom offset instead of snapping to top', async () => {

@@ -5,6 +5,10 @@ import { join } from 'node:path';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID } from '../../shared/ack-protocol.js';
 import { TRANSPORT_SESSION_AGENT_TYPES } from '../../shared/agent-types.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
+import {
+  SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
+  SESSION_CONTROL_TIMELINE_STATE_STOPPING,
+} from '../../shared/session-control-commands.js';
 import { MEMORY_WS } from '../../shared/memory-ws.js';
 import { MEMORY_MANAGEMENT_CONTEXT_FIELD } from '../../shared/memory-management-context.js';
 import { MEMORY_MANAGEMENT_ERROR_CODES } from '../../shared/memory-management.js';
@@ -659,6 +663,15 @@ describe('handleWebCommand transport queue behavior', () => {
       'deck_transport_brain',
       'session.state',
       {
+        state: SESSION_CONTROL_TIMELINE_STATE_STOPPING,
+        reason: SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
+      },
+      expect.objectContaining({ source: 'daemon', confidence: 'high' }),
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'session.state',
+      {
         state: 'idle',
         pendingCount: 0,
         pendingMessages: [],
@@ -666,6 +679,19 @@ describe('handleWebCommand transport queue behavior', () => {
       },
       expect.objectContaining({ source: 'daemon', confidence: 'high' }),
     );
+    const stopFeedbackOrder = firstInvocationOrder((call) =>
+      call[0] === 'deck_transport_brain'
+      && call[1] === 'session.state'
+      && (call[2] as Record<string, unknown>)?.state === SESSION_CONTROL_TIMELINE_STATE_STOPPING
+      && (call[2] as Record<string, unknown>)?.reason === SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
+    );
+    const idleOrder = firstInvocationOrder((call) =>
+      call[0] === 'deck_transport_brain'
+      && call[1] === 'session.state'
+      && (call[2] as Record<string, unknown>)?.state === 'idle',
+    );
+    expect(stopFeedbackOrder).toBeLessThan(idleOrder);
+    expect(stopFeedbackOrder).toBeLessThan(cancel.mock.invocationCallOrder[0]);
     const stopUserMessages = emitMock.mock.calls.filter((call) =>
       call[0] === 'deck_transport_brain'
       && call[1] === 'user.message'
@@ -698,6 +724,15 @@ describe('handleWebCommand transport queue behavior', () => {
       commandId: 'cmd-stop-legacy',
       status: 'accepted',
     });
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'session.state',
+      {
+        state: SESSION_CONTROL_TIMELINE_STATE_STOPPING,
+        reason: SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
+      },
+      expect.objectContaining({ source: 'daemon', confidence: 'high' }),
+    );
     const stopUserMessages = emitMock.mock.calls.filter((call) =>
       call[0] === 'deck_transport_brain'
       && call[1] === 'user.message'

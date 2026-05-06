@@ -9,6 +9,7 @@ import { memo } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { TimelineEvent, WsClient, MemoryContextTimelinePayload, MemoryContextTimelineItem } from '../ws-client.js';
 import type { FileChangeBatch, FileChangePatch } from '@shared/file-change.js';
+import { SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL } from '@shared/session-control-commands.js';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
 import { FileBrowser } from './file-browser-lazy.js';
 import { FloatingPanel } from './FloatingPanel.js';
@@ -1980,17 +1981,20 @@ const ChatEvent = memo(function ChatEvent({
 
     case 'session.state': {
       const state = String(event.payload.state ?? '');
+      const isUserCancelFeedback = event.payload.reason === SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL;
       const stateLabel: Record<string, string> = {
         idle: 'Agent idle — waiting for input',
         running: 'Agent working...',
         started: 'Session started',
         starting: 'Session starting...',
+        stopping: t('session.state_stopping'),
         stopped: 'Session stopped',
       };
+      const label = isUserCancelFeedback ? t('session.state_stop_requested') : (stateLabel[state] ?? state);
       const inline = state === 'idle' || state === 'running';
       return (
         <div class="chat-event chat-system" style={inline ? { display: 'flex', alignItems: 'center', gap: 8 } : undefined}>
-          <span>{stateLabel[state] ?? state}</span>
+          <span>{label}</span>
           {inline
             ? <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{new Date(event.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
             : <ChatTime ts={event.ts} />}

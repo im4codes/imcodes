@@ -2,10 +2,18 @@ export const SESSION_COMPACT_COMMAND = '/compact' as const;
 export const SESSION_CLEAR_COMMAND = '/clear' as const;
 export const SESSION_STOP_COMMAND = '/stop' as const;
 export const SESSION_CONTROL_METADATA_COMMAND_FIELD = 'controlCommand' as const;
+export const SESSION_CONTROL_TIMELINE_STATE_STOPPING = 'stopping' as const;
+export const SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL = 'user_cancel' as const;
 
 export type SessionControlCommandId = 'compact' | 'clear' | 'stop';
 export type SessionControlHandling = 'provider-dispatched' | 'daemon-managed';
 export type SessionControlVisibility = 'visible' | 'hidden';
+export type SessionControlTimelineFeedback =
+  | {
+      state: typeof SESSION_CONTROL_TIMELINE_STATE_STOPPING;
+      reason: typeof SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL;
+    }
+  | null;
 
 export interface SessionControlCommandDefinition {
   id: SessionControlCommandId;
@@ -13,6 +21,7 @@ export interface SessionControlCommandDefinition {
   handling: SessionControlHandling;
   timelineUserMessage: SessionControlVisibility;
   optimisticUserMessage: SessionControlVisibility;
+  timelineFeedback: SessionControlTimelineFeedback;
   daemonHandledReceiptAck: boolean;
   resetsProcessPreferenceContext: boolean;
   resetsTransportPreferenceContextOnSend: boolean;
@@ -25,6 +34,7 @@ export const SESSION_CONTROL_COMMANDS = [
     handling: 'provider-dispatched',
     timelineUserMessage: 'hidden',
     optimisticUserMessage: 'hidden',
+    timelineFeedback: null,
     daemonHandledReceiptAck: false,
     resetsProcessPreferenceContext: true,
     resetsTransportPreferenceContextOnSend: true,
@@ -35,6 +45,7 @@ export const SESSION_CONTROL_COMMANDS = [
     handling: 'daemon-managed',
     timelineUserMessage: 'visible',
     optimisticUserMessage: 'visible',
+    timelineFeedback: null,
     daemonHandledReceiptAck: true,
     resetsProcessPreferenceContext: true,
     resetsTransportPreferenceContextOnSend: false,
@@ -45,6 +56,10 @@ export const SESSION_CONTROL_COMMANDS = [
     handling: 'daemon-managed',
     timelineUserMessage: 'hidden',
     optimisticUserMessage: 'hidden',
+    timelineFeedback: {
+      state: SESSION_CONTROL_TIMELINE_STATE_STOPPING,
+      reason: SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
+    },
     daemonHandledReceiptAck: true,
     resetsProcessPreferenceContext: false,
     resetsTransportPreferenceContextOnSend: false,
@@ -80,6 +95,16 @@ export function shouldHideTimelineUserMessageForSessionControl(text: string): bo
 
 export function shouldHideOptimisticUserMessageForSessionControl(text: string): boolean {
   return classifySessionControlCommand(text)?.optimisticUserMessage === 'hidden';
+}
+
+export function getSessionControlTimelineFeedbackById(
+  id: SessionControlCommandId,
+): SessionControlTimelineFeedback {
+  return SESSION_CONTROL_COMMANDS.find((command) => command.id === id)?.timelineFeedback ?? null;
+}
+
+export function getSessionControlTimelineFeedback(text: string): SessionControlTimelineFeedback {
+  return classifySessionControlCommand(text)?.timelineFeedback ?? null;
 }
 
 export function shouldResetProcessPreferenceContextForSessionControl(text: string): boolean {

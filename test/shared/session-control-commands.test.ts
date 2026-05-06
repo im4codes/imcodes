@@ -1,8 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
   classifySessionControlCommand,
+  getSessionControlTimelineFeedback,
+  getSessionControlTimelineFeedbackById,
   isDaemonHandledSessionControlSend,
   isSessionControlCommandText,
+  SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
+  SESSION_CONTROL_TIMELINE_STATE_STOPPING,
   shouldHideOptimisticUserMessageForSessionControl,
   shouldHideTimelineUserMessageForSessionControl,
   shouldResetProcessPreferenceContextForSessionControl,
@@ -16,6 +20,7 @@ describe('session control command abstraction', () => {
       handling: 'provider-dispatched',
       timelineUserMessage: 'hidden',
       optimisticUserMessage: 'hidden',
+      timelineFeedback: null,
       daemonHandledReceiptAck: false,
       resetsProcessPreferenceContext: true,
       resetsTransportPreferenceContextOnSend: true,
@@ -31,6 +36,7 @@ describe('session control command abstraction', () => {
       handling: 'daemon-managed',
       timelineUserMessage: 'visible',
       optimisticUserMessage: 'visible',
+      timelineFeedback: null,
       daemonHandledReceiptAck: true,
       resetsProcessPreferenceContext: true,
       resetsTransportPreferenceContextOnSend: false,
@@ -38,6 +44,32 @@ describe('session control command abstraction', () => {
     expect(isDaemonHandledSessionControlSend('/clear')).toBe(true);
     expect(shouldHideTimelineUserMessageForSessionControl('/clear')).toBe(false);
     expect(shouldHideOptimisticUserMessageForSessionControl('/clear')).toBe(false);
+  });
+
+  it('models /stop as hidden user text with explicit timeline feedback', () => {
+    expect(classifySessionControlCommand('/stop')).toMatchObject({
+      id: 'stop',
+      handling: 'daemon-managed',
+      timelineUserMessage: 'hidden',
+      optimisticUserMessage: 'hidden',
+      timelineFeedback: {
+        state: SESSION_CONTROL_TIMELINE_STATE_STOPPING,
+        reason: SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
+      },
+      daemonHandledReceiptAck: true,
+      resetsProcessPreferenceContext: false,
+      resetsTransportPreferenceContextOnSend: false,
+    });
+    expect(getSessionControlTimelineFeedback('/stop')).toEqual({
+      state: SESSION_CONTROL_TIMELINE_STATE_STOPPING,
+      reason: SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
+    });
+    expect(getSessionControlTimelineFeedbackById('stop')).toEqual({
+      state: SESSION_CONTROL_TIMELINE_STATE_STOPPING,
+      reason: SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
+    });
+    expect(shouldHideTimelineUserMessageForSessionControl('/stop')).toBe(true);
+    expect(shouldHideOptimisticUserMessageForSessionControl('/stop')).toBe(true);
   });
 
   it('only matches exact control commands, not slash commands with arguments', () => {
