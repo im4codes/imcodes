@@ -16,7 +16,7 @@ import { P2pConfigPanel } from './P2pConfigPanel.js';
 import { useP2pCustomCombos } from './p2p-combos.js';
 import { parseBooleanish, usePref } from '../hooks/usePref.js';
 import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
-import { PREF_KEY_P2P_COMBO_CONFIRM_SKIP, PREF_KEY_P2P_SESSION_CONFIG_LEGACY, p2pSessionConfigPrefKey } from '../constants/prefs.js';
+import { PREF_KEY_P2P_COMBO_CONFIRM_SKIP, p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../constants/prefs.js';
 import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p-config-pref.js';
 import { uploadFile, sendSessionViaHttp, cancelSessionViaHttp } from '../api.js';
 import { patchSession, patchSubSession } from '../api.js';
@@ -1391,10 +1391,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return Object.values(p2pSavedConfig.sessions).some((entry) => entry?.enabled && entry.mode !== 'skip');
   }, [p2pSavedConfig]);
 
-  // P2P config is per main-session (sub-sessions follow parent), stored on server for cross-device sync
-  const p2pConfigKey = rootSession ? p2pSessionConfigPrefKey(rootSession) : null;
+  // P2P config is per server + main-session (sub-sessions follow parent), stored on server for cross-device sync.
+  const p2pConfigKey = rootSession ? p2pSessionConfigPrefKey(rootSession, serverId) : null;
   const p2pSavedConfigPref = usePref<P2pSavedConfig>(p2pConfigKey, {
-    legacyKey: PREF_KEY_P2P_SESSION_CONFIG_LEGACY,
+    legacyKey: rootSession ? p2pSessionConfigLegacyPrefKeys(rootSession) : undefined,
     parse: parseP2pSavedConfig,
     serialize: serializeP2pSavedConfig,
   });
@@ -1448,14 +1448,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   useEffect(() => {
     if (!ws || !rootSession || !p2pSavedConfig) return;
-    const signature = `${rootSession}:${JSON.stringify(p2pSavedConfig)}`;
+    const signature = `${serverId ?? ''}:${rootSession}:${JSON.stringify(p2pSavedConfig)}`;
     if (lastDaemonP2pSyncRef.current === signature) return;
     void persistP2pConfigToDaemon(rootSession, p2pSavedConfig, { awaitAck: false }).then((result) => {
       if (result.ok) {
         lastDaemonP2pSyncRef.current = signature;
       }
     });
-  }, [persistP2pConfigToDaemon, rootSession, p2pSavedConfig, ws]);
+  }, [persistP2pConfigToDaemon, rootSession, p2pSavedConfig, serverId, ws]);
 
   useEffect(() => {
     return () => {
@@ -1479,7 +1479,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         if (rootSession && p2pSavedConfig) {
           void persistP2pConfigToDaemon(rootSession, p2pSavedConfig, { awaitAck: false }).then((result) => {
             if (result.ok) {
-              lastDaemonP2pSyncRef.current = `${rootSession}:${JSON.stringify(p2pSavedConfig)}`;
+              lastDaemonP2pSyncRef.current = `${serverId ?? ''}:${rootSession}:${JSON.stringify(p2pSavedConfig)}`;
             }
           });
         }
@@ -1507,7 +1507,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       setOpenSpecChanges(changeNames);
       setOpenSpecError(null);
     });
-  }, [persistP2pConfigToDaemon, p2pSavedConfig, rejectAllPendingP2pConfigSaves, resolvePendingP2pConfigSave, rootSession, ws]);
+  }, [persistP2pConfigToDaemon, p2pSavedConfig, rejectAllPendingP2pConfigSaves, resolvePendingP2pConfigSave, rootSession, serverId, ws]);
 
   useEffect(() => {
     if (!hasConfiguredP2pParticipants && isComboMode(p2pMode)) {
@@ -3373,6 +3373,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         sessions={(sessions ?? []).map(s => ({ name: s.name, agentType: s.agentType, state: s.state }))}
         subSessions={subSessions ?? []}
         activeSession={activeSession?.name}
+        serverId={serverId}
         initialTab={p2pConfigInitialTab}
         onClose={() => setP2pConfigOpen(false)}
         onPersistDaemonConfig={(scopeSession, cfg) => persistP2pConfigToDaemon(scopeSession, cfg)}

@@ -360,7 +360,7 @@ afterEach(() => {
     patchSubSessionMock.mockResolvedValue(undefined);
     getUserPrefMock.mockImplementation(async (key: unknown) => {
       if (typeof key === 'string' && key.startsWith('p2p_session_config:')) {
-        const sessionKey = key.slice('p2p_session_config:'.length);
+        const sessionKey = key.split(':').pop() ?? key.slice('p2p_session_config:'.length);
         return JSON.stringify({
           sessions: {
             [sessionKey]: { enabled: true, mode: 'audit' },
@@ -736,6 +736,22 @@ afterEach(() => {
     await flushAsync();
     const currentFetches = getUserPrefMock.mock.calls.filter(([key]) => key === 'p2p_session_config:my-session').length;
     expect(currentFetches).toBe(initialFetches);
+  });
+
+  it('loads P2P config from a server-scoped preference key when a server is selected', async () => {
+    getUserPrefMock.mockResolvedValue(null);
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({ name: 'my-session' })}
+        serverId="srv-one"
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    await flushAsync();
+
+    expect(getUserPrefMock).toHaveBeenCalledWith('p2p_session_config:srv-one:my-session');
   });
 
   it('syncs loaded P2P config into daemon authority on mount', async () => {

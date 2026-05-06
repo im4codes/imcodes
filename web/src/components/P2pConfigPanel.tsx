@@ -5,7 +5,7 @@
 import { useState, useEffect, useMemo, useRef } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { usePref } from '../hooks/usePref.js';
-import { PREF_KEY_P2P_SESSION_CONFIG_LEGACY, p2pSessionConfigPrefKey } from '../constants/prefs.js';
+import { p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../constants/prefs.js';
 import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p-config-pref.js';
 import { P2pComboManager } from './P2pComboManager.js';
 import { useP2pCustomCombos } from './p2p-combos.js';
@@ -38,6 +38,8 @@ interface Props {
   subSessions: SubSessionRow[];
   /** Active main session name — only show sessions scoped to this one by default */
   activeSession?: string | null;
+  /** Active server ID — P2P participant names are server-local, so saved config must be too. */
+  serverId?: string | null;
   initialTab?: 'participants' | 'combos';
   onClose: () => void;
   onSave: (config: P2pSavedConfig) => void;
@@ -230,6 +232,7 @@ export function P2pConfigPanel({
   sessions,
   subSessions,
   activeSession,
+  serverId,
   initialTab = 'participants',
   onClose,
   onSave,
@@ -310,10 +313,10 @@ export function P2pConfigPanel({
     [allEligible, sessionCfg],
   );
 
-  // Config key uses the main session (sub-sessions follow parent config)
-  const configKey = scopeSession ? p2pSessionConfigPrefKey(scopeSession) : null;
+  // Config key uses server + main session (sub-sessions follow parent config).
+  const configKey = scopeSession ? p2pSessionConfigPrefKey(scopeSession, serverId) : null;
   const p2pConfigPref = usePref<P2pSavedConfig>(configKey, {
-    legacyKey: PREF_KEY_P2P_SESSION_CONFIG_LEGACY,
+    legacyKey: scopeSession ? p2pSessionConfigLegacyPrefKeys(scopeSession) : undefined,
     parse: parseP2pSavedConfig,
     serialize: serializeP2pSavedConfig,
   });

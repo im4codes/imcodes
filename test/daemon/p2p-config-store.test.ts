@@ -109,4 +109,25 @@ describe('p2p-config-store', () => {
       updatedAt: 456,
     });
   });
+
+  it('keeps same-named main session configs isolated by server-scoped keys', async () => {
+    const mod = await import('../../src/store/p2p-config-store.js');
+    await mod.upsertSavedP2pConfig('srv-one:deck_proj_brain', {
+      sessions: { deck_sub_one: { enabled: true, mode: 'audit' } },
+      rounds: 2,
+    });
+    await mod.upsertSavedP2pConfig('srv-two:deck_proj_brain', {
+      sessions: { deck_sub_two: { enabled: true, mode: 'review' } },
+      rounds: 5,
+    });
+
+    await expect(mod.getSavedP2pConfig('srv-one:deck_proj_brain')).resolves.toEqual({
+      sessions: { deck_sub_one: { enabled: true, mode: 'audit' } },
+      rounds: 2,
+    });
+    await expect(mod.getSavedP2pConfig('srv-two:deck_proj_brain')).resolves.toEqual({
+      sessions: { deck_sub_two: { enabled: true, mode: 'review' } },
+      rounds: 5,
+    });
+  });
 });

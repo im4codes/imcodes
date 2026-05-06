@@ -66,6 +66,7 @@ import { DAEMON_UPGRADE_TARGET_LATEST, normalizeDaemonUpgradeTargetVersion } fro
 import { CC_PRESET_MSG, type CcPreset } from '../../shared/cc-presets.js';
 import { MEMORY_WS } from '../../shared/memory-ws.js';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG, MAX_P2P_PARTICIPANTS } from '../../shared/p2p-config-events.js';
+import { p2pScopedSessionKey } from '../../shared/p2p-config-scope.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import {
   CLAUDE_SDK_EFFORT_LEVELS,
@@ -927,10 +928,26 @@ function resolveP2pConfigScopeSession(sessionName: string): string {
   return record?.parentSession ?? sessionName;
 }
 
-async function resolveStructuredP2pSessionConfig(sessionName: string, clientConfig?: P2pSessionConfig): Promise<P2pSessionConfig | undefined> {
+function getP2pConfigStoreScope(serverLink: ServerLink, scopeSession: string): string {
+  const serverId = typeof (serverLink as unknown as { getServerId?: () => string }).getServerId === 'function'
+    ? (serverLink as unknown as { getServerId: () => string }).getServerId()
+    : undefined;
+  return p2pScopedSessionKey(scopeSession, serverId);
+}
+
+async function resolveStructuredP2pSessionConfig(
+  sessionName: string,
+  serverLink: ServerLink,
+  clientConfig?: P2pSessionConfig,
+): Promise<P2pSessionConfig | undefined> {
   const scopeSession = resolveP2pConfigScopeSession(sessionName);
-  const saved = await getSavedP2pConfig(scopeSession);
+  const storeScope = getP2pConfigStoreScope(serverLink, scopeSession);
+  const saved = await getSavedP2pConfig(storeScope);
   if (saved?.sessions && typeof saved.sessions === 'object') return saved.sessions;
+  if (storeScope !== scopeSession) {
+    const legacySaved = await getSavedP2pConfig(scopeSession);
+    if (legacySaved?.sessions && typeof legacySaved.sessions === 'object') return legacySaved.sessions;
+  }
   return clientConfig;
 }
 
@@ -1512,7 +1529,7 @@ async function handleP2pConfigSave(cmd: Record<string, unknown>, serverLink: Ser
     return;
   }
   try {
-    await upsertSavedP2pConfig(scopeSession, config);
+    await upsertSavedP2pConfig(getP2pConfigStoreScope(serverLink, scopeSession), config);
     if (requestId) {
       serverLink?.send({
         type: P2P_CONFIG_MSG.SAVE_RESPONSE,
@@ -2043,7 +2060,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   }
 
   const p2pSessionConfig = wantsStructuredP2pRouting
-    ? await resolveStructuredP2pSessionConfig(sessionName, clientP2pSessionConfig)
+    ? await resolveStructuredP2pSessionConfig(sessionName, serverLink, clientP2pSessionConfig)
     : undefined;
 
   // ── P2P start gates (mandatory) ──

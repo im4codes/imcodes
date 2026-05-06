@@ -48,6 +48,7 @@ function renderPanel(overrides: {
   sessions?: typeof sessions;
   subSessions?: typeof subSessions;
   activeSession?: string;
+  serverId?: string | null;
   initialTab?: 'participants' | 'combos';
   onClose?: () => void;
   onSave?: (cfg: P2pSavedConfig) => void;
@@ -57,6 +58,7 @@ function renderPanel(overrides: {
     sessions: overrides.sessions ?? sessions,
     subSessions: overrides.subSessions ?? subSessions,
     activeSession: overrides.activeSession ?? 'deck_proj_brain',
+    serverId: overrides.serverId ?? 'srv-main',
     initialTab: overrides.initialTab,
     onClose: overrides.onClose ?? vi.fn(),
     onSave: overrides.onSave ?? vi.fn(),
@@ -119,7 +121,7 @@ describe('P2pConfigPanel', () => {
   it('shows loading UI until a cold P2P preference load resolves', async () => {
     const primary = deferred<unknown | null>();
     getUserPrefMock.mockImplementation((key: string) => {
-      if (key === 'p2p_session_config:deck_proj_brain') return primary.promise;
+      if (key === 'p2p_session_config:srv-main:deck_proj_brain') return primary.promise;
       return Promise.resolve(null);
     });
 
@@ -227,7 +229,7 @@ describe('P2pConfigPanel', () => {
     const onClose = vi.fn();
 
     getUserPrefMock.mockImplementation(async (key: string) => {
-      if (key === 'p2p_session_config:deck_proj_brain') {
+      if (key === 'p2p_session_config:srv-main:deck_proj_brain') {
         return JSON.stringify({ sessions: { deck_proj_brain: { enabled: true, mode: 'audit' } }, rounds: 3 });
       }
       return null;
@@ -341,7 +343,7 @@ describe('P2pConfigPanel', () => {
       ]),
     );
     getUserPrefMock.mockImplementation(async (key: string) => {
-      if (key === 'p2p_session_config:deck_proj_brain') {
+      if (key === 'p2p_session_config:srv-main:deck_proj_brain') {
         return JSON.stringify({ sessions: staleSessions, rounds: 3 });
       }
       return null;
@@ -409,7 +411,7 @@ describe('P2pConfigPanel', () => {
     await flush();
 
     expect(saveUserPrefMock).toHaveBeenCalledOnce();
-    expect(saveUserPrefMock.mock.calls[0][0]).toBe('p2p_session_config:deck_proj_brain');
+    expect(saveUserPrefMock.mock.calls[0][0]).toBe('p2p_session_config:srv-main:deck_proj_brain');
     // Second arg should be a JSON string
     const jsonArg = saveUserPrefMock.mock.calls[0][1];
     expect(typeof jsonArg).toBe('string');
@@ -479,7 +481,7 @@ describe('P2pConfigPanel', () => {
       rounds: 1,
     });
     getUserPrefMock.mockImplementation(async (key: string) => {
-      if (key === 'p2p_session_config:deck_proj_brain') return prefValue;
+      if (key === 'p2p_session_config:srv-main:deck_proj_brain') return prefValue;
       return null;
     });
 
@@ -496,7 +498,7 @@ describe('P2pConfigPanel', () => {
       rounds: 1,
     });
     window.dispatchEvent(new CustomEvent('imcodes:user-pref-changed', {
-      detail: { key: 'p2p_session_config:deck_proj_brain', value: prefValue },
+      detail: { key: 'p2p_session_config:srv-main:deck_proj_brain', value: prefValue },
     }));
     await flush();
 
@@ -572,7 +574,7 @@ describe('P2pConfigPanel', () => {
     // Session 1
     const { unmount: u1 } = renderPanel({ activeSession: 'deck_proj_brain', onSave: onSave1 });
     await flush();
-    expect(getUserPrefMock).toHaveBeenCalledWith('p2p_session_config:deck_proj_brain');
+    expect(getUserPrefMock).toHaveBeenCalledWith('p2p_session_config:srv-main:deck_proj_brain');
     u1();
     cleanup();
 
@@ -583,7 +585,24 @@ describe('P2pConfigPanel', () => {
     // Session 2 — different key
     renderPanel({ activeSession: 'deck_other_brain', onSave: onSave2 });
     await flush();
-    expect(getUserPrefMock).toHaveBeenCalledWith('p2p_session_config:deck_other_brain');
+    expect(getUserPrefMock).toHaveBeenCalledWith('p2p_session_config:srv-main:deck_other_brain');
+  });
+
+  it('uses separate P2P config keys for the same session name on different servers', async () => {
+    const { unmount } = renderPanel({ activeSession: 'deck_proj_brain', serverId: 'srv-one' });
+    await flush();
+    expect(getUserPrefMock).toHaveBeenCalledWith('p2p_session_config:srv-one:deck_proj_brain');
+    unmount();
+    cleanup();
+
+    vi.clearAllMocks();
+    getUserPrefMock.mockResolvedValue(null);
+    saveUserPrefMock.mockResolvedValue(undefined);
+
+    renderPanel({ activeSession: 'deck_proj_brain', serverId: 'srv-two' });
+    await flush();
+    expect(getUserPrefMock).toHaveBeenCalledWith('p2p_session_config:srv-two:deck_proj_brain');
+    expect(getUserPrefMock).not.toHaveBeenCalledWith('p2p_session_config:srv-one:deck_proj_brain');
   });
 
   it('loads saved config from server for the active session', async () => {
@@ -675,7 +694,7 @@ describe('P2pConfigPanel', () => {
   it('shares one P2P config GET across concurrent panel consumers', async () => {
     const savedConfig: P2pSavedConfig = { sessions: {}, rounds: 2 };
     getUserPrefMock.mockImplementation(async (key: string) => {
-      if (key === 'p2p_session_config:deck_proj_brain') return JSON.stringify(savedConfig);
+      if (key === 'p2p_session_config:srv-main:deck_proj_brain') return JSON.stringify(savedConfig);
       return null;
     });
 
@@ -683,13 +702,13 @@ describe('P2pConfigPanel', () => {
     renderPanel();
     await flush();
 
-    expect(callsForPrefKey('p2p_session_config:deck_proj_brain')).toHaveLength(1);
+    expect(callsForPrefKey('p2p_session_config:srv-main:deck_proj_brain')).toHaveLength(1);
   });
 
   it('uses the warm P2P config cache when reopening the panel for the same root', async () => {
     const savedConfig: P2pSavedConfig = { sessions: {}, rounds: 2 };
     getUserPrefMock.mockImplementation(async (key: string) => {
-      if (key === 'p2p_session_config:deck_proj_brain') return JSON.stringify(savedConfig);
+      if (key === 'p2p_session_config:srv-main:deck_proj_brain') return JSON.stringify(savedConfig);
       return null;
     });
 
@@ -699,12 +718,12 @@ describe('P2pConfigPanel', () => {
     renderPanel();
     await flush();
 
-    expect(callsForPrefKey('p2p_session_config:deck_proj_brain')).toHaveLength(1);
+    expect(callsForPrefKey('p2p_session_config:srv-main:deck_proj_brain')).toHaveLength(1);
   });
 
   it('applies primary P2P preference events without refetching', async () => {
     getUserPrefMock.mockImplementation(async (key: string) => {
-      if (key === 'p2p_session_config:deck_proj_brain') {
+      if (key === 'p2p_session_config:srv-main:deck_proj_brain') {
         return JSON.stringify({ sessions: { deck_proj_brain: { enabled: false, mode: 'audit' } }, rounds: 1 });
       }
       return null;
@@ -716,13 +735,13 @@ describe('P2pConfigPanel', () => {
 
     window.dispatchEvent(new CustomEvent('imcodes:user-pref-changed', {
       detail: {
-        key: 'p2p_session_config:deck_proj_brain',
+        key: 'p2p_session_config:srv-main:deck_proj_brain',
         value: JSON.stringify({ sessions: { deck_proj_brain: { enabled: true, mode: 'audit' } }, rounds: 1 }),
       },
     }));
     await flush();
 
-    expect(callsForPrefKey('p2p_session_config:deck_proj_brain')).toHaveLength(0);
+    expect(callsForPrefKey('p2p_session_config:srv-main:deck_proj_brain')).toHaveLength(0);
     expect((screen.getAllByRole('checkbox')[0] as HTMLInputElement).checked).toBe(true);
   });
 
@@ -736,14 +755,15 @@ describe('P2pConfigPanel', () => {
     renderPanel();
     await flush();
 
+    expect(callsForPrefKey('p2p_session_config:srv-main:deck_proj_brain')).toHaveLength(1);
     expect(callsForPrefKey('p2p_session_config:deck_proj_brain')).toHaveLength(1);
     expect(callsForPrefKey('p2p_session_config')).toHaveLength(1);
-    expect(saveUserPrefMock).toHaveBeenCalledWith('p2p_session_config:deck_proj_brain', JSON.stringify(legacyConfig));
+    expect(saveUserPrefMock).toHaveBeenCalledWith('p2p_session_config:srv-main:deck_proj_brain', JSON.stringify(legacyConfig));
   });
 
   it('does not let late P2P cache updates overwrite in-progress local edits', async () => {
     getUserPrefMock.mockImplementation(async (key: string) => {
-      if (key === 'p2p_session_config:deck_proj_brain') {
+      if (key === 'p2p_session_config:srv-main:deck_proj_brain') {
         return JSON.stringify({ sessions: {}, rounds: 1 });
       }
       return null;
@@ -756,7 +776,7 @@ describe('P2pConfigPanel', () => {
     fireEvent.click(screen.getAllByRole('button').find((button) => button.textContent === '5')!);
     window.dispatchEvent(new CustomEvent('imcodes:user-pref-changed', {
       detail: {
-        key: 'p2p_session_config:deck_proj_brain',
+        key: 'p2p_session_config:srv-main:deck_proj_brain',
         value: JSON.stringify({ sessions: {}, rounds: 2 }),
       },
     }));

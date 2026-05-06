@@ -251,6 +251,7 @@ describe('structured P2P routing via WS fields', () => {
   const mockServerLink = {
     send: vi.fn(),
     sendTimelineEvent: vi.fn(),
+    getServerId: vi.fn(() => 'srv-main'),
     daemonVersion: '0.1.0',
   };
 
@@ -388,7 +389,7 @@ describe('structured P2P routing via WS fields', () => {
 
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(upsertSavedP2pConfigMock).toHaveBeenCalledWith('deck_proj_brain', config);
+    expect(upsertSavedP2pConfigMock).toHaveBeenCalledWith('srv-main:deck_proj_brain', config);
     expect(mockServerLink.send).toHaveBeenCalledWith({
       type: P2P_CONFIG_MSG.SAVE_RESPONSE,
       requestId: 'req-save-ok',
@@ -415,6 +416,37 @@ describe('structured P2P routing via WS fields', () => {
       ok: false,
       error: P2P_CONFIG_ERROR.INVALID_CONFIG,
     });
+  });
+
+  it('falls back to legacy daemon-local P2P config when the server-scoped config is missing', async () => {
+    getSavedP2pConfigMock.mockImplementation(async (scope: string) => {
+      if (scope === 'srv-main:deck_proj_brain') return undefined;
+      if (scope === 'deck_proj_brain') {
+        return {
+          sessions: {
+            deck_proj_w1: { enabled: true, mode: 'audit' },
+          },
+          rounds: 1,
+        };
+      }
+      return undefined;
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_proj_brain',
+      text: 'review this code',
+      commandId: 'cmd-legacy-daemon-config',
+      p2pMode: 'review',
+    }, mockServerLink as any);
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(getSavedP2pConfigMock).toHaveBeenCalledWith('srv-main:deck_proj_brain');
+    expect(getSavedP2pConfigMock).toHaveBeenCalledWith('deck_proj_brain');
+    expect(startP2pRun).toHaveBeenCalledTimes(1);
+    const [{ targets }] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(targets).toEqual([{ session: 'deck_proj_w1', mode: 'review' }]);
   });
 
   it('p2pAtTargets with __all__ expands to all active sessions', async () => {

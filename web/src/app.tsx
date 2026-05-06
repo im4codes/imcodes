@@ -65,7 +65,7 @@ import { mergeSessionListEntry, type IncomingSessionListEntry } from './session-
 import { resolveSessionInfoRuntimeType } from './runtime-type.js';
 import { useSyncedPreference } from './hooks/useSyncedPreference.js';
 import { parseString, usePref } from './hooks/usePref.js';
-import { PREF_KEY_DEFAULT_SHELL, PREF_KEY_P2P_SESSION_CONFIG_LEGACY, p2pSessionConfigPrefKey } from './constants/prefs.js';
+import { PREF_KEY_DEFAULT_SHELL, p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from './constants/prefs.js';
 import {
   p2pSubSessionParentSignature,
   parseP2pSavedConfig,
@@ -1398,9 +1398,9 @@ export function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeSession, subSessionParentSignature]);
   const p2pConfigPref = usePref(
-    activeRootSession ? p2pSessionConfigPrefKey(activeRootSession) : null,
+    activeRootSession ? p2pSessionConfigPrefKey(activeRootSession, selectedServerId) : null,
     {
-      legacyKey: PREF_KEY_P2P_SESSION_CONFIG_LEGACY,
+      legacyKey: activeRootSession ? p2pSessionConfigLegacyPrefKeys(activeRootSession) : undefined,
       parse: parseP2pSavedConfig,
       serialize: serializeP2pSavedConfig,
     },
