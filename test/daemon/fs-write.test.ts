@@ -31,6 +31,7 @@ const mockReadFile = vi.mocked(fsp.readFile);
 const mockWriteFile = vi.mocked(fsp.writeFile);
 
 import { handleWebCommand, __resetFsGitCachesForTests } from '../../src/daemon/command-handler.js';
+import { FS_WRITE_ERROR } from '../../src/shared/transport/fs.js';
 
 /** Flush the microtask + macrotask queue so async handlers complete. */
 const flushAsync = () => new Promise<void>((r) => setTimeout(r, 0));
@@ -155,6 +156,69 @@ describe('fs.write handler', () => {
       requestId: 'req-ok',
       status: 'ok',
       mtime: newMtime,
+    });
+  });
+
+  it('creates a file atomically when createOnly is true', async () => {
+    const filePath = path.join(homedir(), 'new-create-only.txt');
+    const parentPath = path.dirname(filePath);
+    const content = '';
+    const newMtime = 1700000000100;
+
+    mockStat
+      .mockRejectedValueOnce(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }))
+      .mockResolvedValueOnce({ mtimeMs: newMtime } as fsp.Stats);
+    mockRealpath
+      .mockResolvedValueOnce(parentPath as unknown as string)
+      .mockResolvedValueOnce(filePath as unknown as string);
+    mockWriteFile.mockResolvedValue(undefined);
+
+    handleWebCommand({ type: 'fs.write', path: filePath, content, requestId: 'req-create-only', createOnly: true }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockWriteFile).toHaveBeenCalledWith(filePath, content, { encoding: 'utf-8', flag: 'wx' });
+    expect(sent[0]).toMatchObject({
+      type: 'fs.write_response',
+      requestId: 'req-create-only',
+      status: 'ok',
+      mtime: newMtime,
+    });
+  });
+
+  it('does not overwrite an existing file when createOnly is true', async () => {
+    const filePath = path.join(homedir(), 'existing-create-only.txt');
+
+    mockStat.mockResolvedValue({ mtimeMs: 1000 } as fsp.Stats);
+    mockRealpath.mockResolvedValue(filePath as unknown as string);
+
+    handleWebCommand({ type: 'fs.write', path: filePath, content: '', requestId: 'req-existing-create-only', createOnly: true }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockWriteFile).not.toHaveBeenCalled();
+    expect(sent[0]).toMatchObject({
+      type: 'fs.write_response',
+      requestId: 'req-existing-create-only',
+      status: 'error',
+      error: FS_WRITE_ERROR.FILE_EXISTS,
+    });
+  });
+
+  it('reports file_exists if a createOnly write loses the creation race', async () => {
+    const filePath = path.join(homedir(), 'race-create-only.txt');
+    const parentPath = path.dirname(filePath);
+
+    mockStat.mockRejectedValueOnce(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+    mockRealpath.mockResolvedValueOnce(parentPath as unknown as string);
+    mockWriteFile.mockRejectedValueOnce(Object.assign(new Error('EEXIST: file already exists'), { code: 'EEXIST' }));
+
+    handleWebCommand({ type: 'fs.write', path: filePath, content: '', requestId: 'req-create-race', createOnly: true }, mockServerLink as any);
+    await flushAsync();
+
+    expect(sent[0]).toMatchObject({
+      type: 'fs.write_response',
+      requestId: 'req-create-race',
+      status: 'error',
+      error: FS_WRITE_ERROR.FILE_EXISTS,
     });
   });
 

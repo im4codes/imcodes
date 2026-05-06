@@ -19,6 +19,10 @@ export interface GitStatusEntry {
   deletions?: number;
 }
 
+export const FS_WRITE_ERROR = {
+  FILE_EXISTS: 'file_exists',
+} as const;
+
 interface FsBaseResponse {
   requestId: string;
   path: string;
@@ -52,6 +56,15 @@ export interface FsWriteRequest {
   content: string;
   /** mtime from last read; omit = force write */
   expectedMtime?: number;
+  /** Create a new file only; fail if the target already exists. */
+  createOnly?: boolean;
+}
+
+export interface FsWriteOptions {
+  /** mtime from last read; omit = force write */
+  expectedMtime?: number;
+  /** Create a new file only; fail if the target already exists. */
+  createOnly?: boolean;
 }
 
 export interface FsWriteResponse extends Omit<FsBaseResponse, 'status'> {

@@ -33,6 +33,7 @@ import type {
   FsGitStatusResponse,
   FsGitDiffResponse,
   FsWriteResponse,
+  FsWriteOptions,
   FsMkdirResponse,
 } from '../../src/shared/transport/fs.js';
 
@@ -644,9 +645,20 @@ export class WsClient {
   }
 
   /** Write a file via the daemon. Returns requestId for matching the response. */
-  fsWriteFile(path: string, content: string, expectedMtime?: number): string {
+  fsWriteFile(path: string, content: string, expectedMtime?: number): string;
+  fsWriteFile(path: string, content: string, options?: FsWriteOptions): string;
+  fsWriteFile(path: string, content: string, expectedMtimeOrOptions?: number | FsWriteOptions): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'fs.write', path, content, expectedMtime, requestId });
+    const options = typeof expectedMtimeOrOptions === 'object' ? expectedMtimeOrOptions : undefined;
+    const expectedMtime = typeof expectedMtimeOrOptions === 'number' ? expectedMtimeOrOptions : options?.expectedMtime;
+    this.send({
+      type: 'fs.write',
+      path,
+      content,
+      requestId,
+      ...(expectedMtime !== undefined ? { expectedMtime } : {}),
+      ...(options?.createOnly ? { createOnly: true } : {}),
+    });
     return requestId;
   }
 

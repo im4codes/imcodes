@@ -52,7 +52,11 @@ vi.mock('react-i18next', () => {
     'file_browser.home': 'Home',
     'file_browser.timeout': 'Request timed out',
     'file_browser.mkdir_failed': 'Failed to create folder',
+    'file_browser.create_file_failed': 'Failed to create file',
+    'file_browser.file_exists': 'File already exists',
     'common.cancel': 'Cancel',
+    'chat.new_file': 'New file',
+    'chat.new_file_name': 'File name',
     'chat.new_folder': 'New folder',
     'chat.new_folder_name': 'Folder name',
     'chat.create': 'Create',
@@ -83,6 +87,11 @@ function makeWsFactory() {
     lastRequestId = 'mock-mkdir-id';
     return lastRequestId;
   });
+  const fsWriteFile = vi.fn((path: string) => {
+    lastSentPath = path;
+    lastRequestId = 'mock-write-id';
+    return lastRequestId;
+  });
 
   const ws: WsClient = {
     onMessage: (handler: (msg: ServerMessage) => void) => {
@@ -91,6 +100,7 @@ function makeWsFactory() {
     },
     fsListDir,
     fsMkdir,
+    fsWriteFile,
     fsReadFile: vi.fn(() => 'mock-read-id'),
     fsGitStatus: vi.fn(() => 'mock-git-status-id'),
     fsGitDiff: vi.fn(() => 'mock-git-diff-id'),
@@ -121,12 +131,13 @@ function makeWsFactory() {
     for (const messageHandler of messageHandlers) messageHandler(msg);
   };
 
-  return { ws, fsListDir, fsMkdir, respond, respondError, sendMsg, getLastPath: () => lastSentPath, getIncludeFiles: () => lastSentIncludeFiles };
+  return { ws, fsListDir, fsMkdir, fsWriteFile, respond, respondError, sendMsg, getLastPath: () => lastSentPath, getIncludeFiles: () => lastSentIncludeFiles };
 }
 
 describe('FileBrowser', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    localStorage.clear();
     __resetFileBrowserSharedChangesForTests();
   });
 
@@ -436,6 +447,78 @@ describe('FileBrowser', () => {
     expect(fsListDir).toHaveBeenLastCalledWith('/home/user', false, false);
   });
 
+  it('creates a new file, refreshes the parent directory, and opens the new file preview', async () => {
+    const { ws, respond, sendMsg, fsWriteFile, fsListDir } = makeWsFactory();
+    const fsReadFile = vi.mocked(ws.fsReadFile);
+    const { getByTitle, getByPlaceholderText, getByText } = render(
+      <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" onConfirm={vi.fn()} />,
+    );
+
+    await act(async () => {
+      respond([{ name: 'existing.ts', isDir: false }], '/home/user');
+    });
+
+    await act(async () => {
+      fireEvent.click(getByTitle('New file'));
+    });
+    await act(async () => {
+      fireEvent.input(getByPlaceholderText('File name'), { target: { value: 'new-file.ts' } });
+    });
+    await act(async () => {
+      fireEvent.click(getByText('Create'));
+    });
+
+    expect(fsWriteFile).toHaveBeenCalledWith('/home/user/new-file.ts', '', { createOnly: true });
+
+    await act(async () => {
+      sendMsg({ type: 'fs.write_response', requestId: 'mock-write-id', path: '/home/user/new-file.ts', resolvedPath: '/home/user/new-file.ts', status: 'ok', mtime: 2000 } as any);
+    });
+
+    expect(fsListDir).toHaveBeenLastCalledWith('/home/user', true, false);
+    expect(fsReadFile).toHaveBeenCalledWith('/home/user/new-file.ts');
+  });
+
+  it('shows a friendly error when new file creation would overwrite an existing file', async () => {
+    const { ws, respond, sendMsg, fsWriteFile } = makeWsFactory();
+    const fsReadFile = vi.mocked(ws.fsReadFile);
+    const { getByTitle, getByPlaceholderText, getByText } = render(
+      <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" onConfirm={vi.fn()} />,
+    );
+
+    await act(async () => {
+      respond([{ name: 'existing.ts', isDir: false }], '/home/user');
+    });
+
+    await act(async () => {
+      fireEvent.click(getByTitle('New file'));
+    });
+    await act(async () => {
+      fireEvent.input(getByPlaceholderText('File name'), { target: { value: 'existing.ts' } });
+    });
+    await act(async () => {
+      fireEvent.click(getByText('Create'));
+    });
+
+    expect(fsWriteFile).toHaveBeenCalledWith('/home/user/existing.ts', '', { createOnly: true });
+
+    await act(async () => {
+      sendMsg({ type: 'fs.write_response', requestId: 'mock-write-id', path: '/home/user/existing.ts', resolvedPath: '/home/user/existing.ts', status: 'error', error: 'file_exists' } as any);
+    });
+
+    expect(getByTitle('File already exists')).toBeDefined();
+    expect(fsReadFile).not.toHaveBeenCalledWith('/home/user/existing.ts');
+  });
+
+  it('does not show the new file action in directory-only mode', () => {
+    const { ws } = makeWsFactory();
+    const { queryByTitle, getByTitle } = render(
+      <FileBrowser ws={ws} mode="dir-only" layout="modal" initialPath="/home/user" onConfirm={vi.fn()} onClose={vi.fn()} />,
+    );
+
+    expect(queryByTitle('New file')).toBeNull();
+    expect(getByTitle('New folder')).toBeDefined();
+  });
+
   // ── Selection ──────────────────────────────────────────────────────────
 
   it('calls onConfirm with selected path in dir-only mode', async () => {
@@ -546,7 +629,7 @@ describe('FileBrowser', () => {
     expect(document.querySelector('.fb-node-git-badge')).not.toBeNull();
   });
 
-  it('requests stats only for shared changes queries, not tree git badges', () => {
+  it('requests stats only for shared changes queries, not tree git badges', async () => {
     const { ws } = makeWsFactory();
     render(
       <FileBrowser
@@ -558,6 +641,9 @@ describe('FileBrowser', () => {
         defaultTab="changes"
       />,
     );
+    await act(async () => {
+      await Promise.resolve();
+    });
 
     expect(ws.fsGitStatus).toHaveBeenCalledWith('~');
     expect(ws.fsGitStatus).toHaveBeenCalledWith('/home/user', { includeStats: true });
@@ -720,9 +806,9 @@ describe('FileBrowser', () => {
     render(
       <div>
         <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user/src"
-          changesRootPath="/home/user" onConfirm={vi.fn()} />
+          changesRootPath="/home/user" defaultTab="changes" onConfirm={vi.fn()} />
         <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user/src"
-          changesRootPath="/home/user" onConfirm={vi.fn()} />
+          changesRootPath="/home/user" defaultTab="changes" onConfirm={vi.fn()} />
       </div>,
     );
 
@@ -768,6 +854,7 @@ describe('FileBrowser', () => {
         layout="panel"
         initialPath="/home/user"
         changesRootPath="/home/user"
+        defaultTab="changes"
         onConfirm={vi.fn()}
       />,
     );
@@ -807,6 +894,7 @@ describe('FileBrowser', () => {
         layout="panel"
         initialPath="/home/user"
         changesRootPath="/home/user"
+        defaultTab="changes"
         onConfirm={vi.fn()}
       />,
     );
@@ -845,6 +933,7 @@ describe('FileBrowser', () => {
         layout="panel"
         initialPath="/home/user"
         changesRootPath="/home/user"
+        defaultTab="changes"
         onConfirm={vi.fn()}
       />,
     );
@@ -898,6 +987,7 @@ describe('FileBrowser', () => {
         layout="panel"
         initialPath="/home/user"
         changesRootPath="/home/user"
+        defaultTab="changes"
         onConfirm={vi.fn()}
       />,
     );
@@ -938,6 +1028,7 @@ describe('FileBrowser', () => {
         layout="panel"
         initialPath="/home/user"
         changesRootPath="/home/user"
+        defaultTab="changes"
         onConfirm={vi.fn()}
       />,
     );
@@ -973,6 +1064,7 @@ describe('FileBrowser', () => {
         layout="panel"
         initialPath="/home/user"
         changesRootPath="/home/user"
+        defaultTab="changes"
         onPreviewFile={onPreviewFile}
         onConfirm={vi.fn()}
       />,
@@ -1013,6 +1105,7 @@ describe('FileBrowser', () => {
         layout="panel"
         initialPath="/home/user"
         changesRootPath="/home/user"
+        defaultTab="changes"
         onPreviewFile={onPreviewFile}
         onConfirm={vi.fn()}
       />,
@@ -1055,6 +1148,7 @@ describe('FileBrowser', () => {
         layout="panel"
         initialPath="/home/user"
         changesRootPath="/home/user"
+        defaultTab="changes"
         onPreviewFile={onPreviewFile}
         onConfirm={vi.fn()}
       />,

@@ -16,6 +16,7 @@ import { useTranslation } from 'react-i18next';
 import type { WsClient, ServerMessage } from '../ws-client.js';
 import { lazy, Suspense } from 'preact/compat';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
+import { FS_WRITE_ERROR } from '../../../src/shared/transport/fs.js';
 import { FileEditor, FileEditorContent } from './file-editor-lazy.js';
 const FilePreviewPane = lazy(() => import('./FilePreviewPane.js'));
 const OfficePreview = lazy(() => import('./OfficePreview.js'));
@@ -355,6 +356,8 @@ function previewScrollKey(path: string, mode: PreviewScrollMode): string {
  *  working after the shared-changes cache moved to `git-status-store.ts`. */
 export const __resetFileBrowserSharedChangesForTests = __resetSharedChangesForTests;
 
+type NewEntryKind = 'file' | 'folder';
+
 export function FileBrowser({
   ws,
   mode,
@@ -428,8 +431,8 @@ export function FileBrowser({
     return () => { editorMsgHandlers.current.delete(handler); };
   }, []);
 
-  const [newFolderParent, setNewFolderParent] = useState<string | null>(null);
-  const [newFolderName, setNewFolderName] = useState('');
+  const [newEntry, setNewEntry] = useState<{ kind: NewEntryKind; parentPath: string } | null>(null);
+  const [newEntryName, setNewEntryName] = useState('');
   const [modifiedFiles, setModifiedFiles] = useState<Map<string, string>>(new Map()); // path → git code
   // Panel view: 'files' shows tree + changes section; 'changes' shows only changed files
   // Restore last active tab from localStorage
@@ -459,6 +462,7 @@ export function FileBrowser({
   const pendingGitDiffRef = useRef(new Map<string, PendingPreviewRequest>());
   const pendingPreviewDiffRef = useRef(new Map<string, PendingPreviewDiff>());
   const pendingMkdirRef = useRef(new Map<string, { parentPath: string; targetPath: string }>());
+  const pendingCreateFileRef = useRef(new Map<string, { parentPath: string; targetPath: string }>());
   const previewContentRef = useRef<HTMLDivElement | null>(null);
   const previewScrollSnapshotRef = useRef<PreviewScrollSnapshot | null>(null);
   const mountedRef = useRef(true);
@@ -482,6 +486,7 @@ export function FileBrowser({
       pendingGitDiffRef.current.clear();
       pendingPreviewDiffRef.current.clear();
       pendingMkdirRef.current.clear();
+      pendingCreateFileRef.current.clear();
       editorMsgHandlers.current.clear();
       if (pendingChangesTimerRef.current) clearTimeout(pendingChangesTimerRef.current);
       for (const timer of timersRef.current.values()) clearTimeout(timer);
@@ -560,6 +565,7 @@ export function FileBrowser({
         pendingRef.current.clear();
         pendingReadRef.current.clear();
         pendingGitDiffRef.current.clear();
+        pendingCreateFileRef.current.clear();
         activePreviewCycleRef.current = null;
         // Re-fetch root and changes
         if (mountedRef.current) fetchDir(startPath);
@@ -708,6 +714,24 @@ export function FileBrowser({
 
       // Forward write responses to FileEditor component
       if (msg.type === 'fs.write_response') {
+        const pendingCreate = pendingCreateFileRef.current.get(msg.requestId);
+        if (pendingCreate) {
+          pendingCreateFileRef.current.delete(msg.requestId);
+          if (!mountedRef.current) return;
+          if (msg.status === 'error' || msg.status === 'conflict') {
+            setError(msg.error === FS_WRITE_ERROR.FILE_EXISTS ? t('file_browser.file_exists') : (msg.error ?? t('file_browser.create_file_failed')));
+            return;
+          }
+          loadedRef.current.delete(pendingCreate.parentPath);
+          setError(null);
+          fetchDir(pendingCreate.parentPath);
+          if (includeFiles) {
+            setPanelView('files');
+            setSelectedPaths(new Set([pendingCreate.targetPath]));
+            fetchPreview(msg.resolvedPath ?? pendingCreate.targetPath);
+          }
+          return;
+        }
         for (const h of editorMsgHandlers.current) h(msg);
         return;
       }
@@ -829,16 +853,39 @@ export function FileBrowser({
 
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set([startPath]));
 
+  const buildChildPath = useCallback((parentPath: string, childName: string) => {
+    const sep = parentPath.includes('\\') ? '\\' : '/';
+    return `${parentPath}${parentPath.endsWith(sep) ? '' : sep}${childName}`;
+  }, []);
+
   const requestMkdir = useCallback((parentPath: string, folderName: string) => {
     const trimmed = folderName.trim();
     if (!trimmed) return;
-    const sep = parentPath.includes('\\') ? '\\' : '/';
-    const fullPath = `${parentPath}${parentPath.endsWith(sep) ? '' : sep}${trimmed}`;
+    const fullPath = buildChildPath(parentPath, trimmed);
     const requestId = ws.fsMkdir(fullPath);
     pendingMkdirRef.current.set(requestId, { parentPath, targetPath: fullPath });
-    setNewFolderParent(null);
-    setNewFolderName('');
-  }, [ws]);
+    setNewEntry(null);
+    setNewEntryName('');
+  }, [buildChildPath, ws]);
+
+  const requestCreateFile = useCallback((parentPath: string, fileName: string) => {
+    const trimmed = fileName.trim();
+    if (!trimmed) return;
+    const fullPath = buildChildPath(parentPath, trimmed);
+    const requestId = ws.fsWriteFile(fullPath, '', { createOnly: true });
+    pendingCreateFileRef.current.set(requestId, { parentPath, targetPath: fullPath });
+    setNewEntry(null);
+    setNewEntryName('');
+  }, [buildChildPath, ws]);
+
+  const requestNewEntry = useCallback(() => {
+    if (!newEntry) return;
+    if (newEntry.kind === 'folder') {
+      requestMkdir(newEntry.parentPath, newEntryName);
+      return;
+    }
+    requestCreateFile(newEntry.parentPath, newEntryName);
+  }, [newEntry, newEntryName, requestCreateFile, requestMkdir]);
 
   // Navigate to a path and push to history
   const jumpTo = useCallback((newPath: string) => {
@@ -890,6 +937,7 @@ export function FileBrowser({
       pendingRef.current.clear();
       pendingReadRef.current.clear();
       pendingGitDiffRef.current.clear();
+      pendingCreateFileRef.current.clear();
       pendingPreviewDiffRef.current.clear();
       activePreviewCycleRef.current = null;
       for (const timer of timersRef.current.values()) clearTimeout(timer);
@@ -1531,38 +1579,43 @@ export function FileBrowser({
         <input type="checkbox" checked={showHidden} onChange={(e) => setShowHidden((e.target as HTMLInputElement).checked)} />
         {' ·'}
       </label>
+      {includeFiles && (
+        <button
+          class="fb-create-btn fb-create-file-btn"
+          title={t('chat.new_file')}
+          aria-label={t('chat.new_file')}
+          onClick={() => { setNewEntry({ kind: 'file', parentPath: currentLabel }); setNewEntryName(''); }}
+        >＋</button>
+      )}
       <button
-        class="fb-new-folder-btn"
+        class="fb-create-btn fb-create-folder-btn"
         title={t('chat.new_folder')}
-        onClick={() => { setNewFolderParent(currentLabel); setNewFolderName(''); }}
-      >+</button>
+        aria-label={t('chat.new_folder')}
+        onClick={() => { setNewEntry({ kind: 'folder', parentPath: currentLabel }); setNewEntryName(''); }}
+      >＋</button>
     </div>
   );
 
-  const newFolderDialog = newFolderParent !== null ? (
+  const newEntryDialog = newEntry !== null ? (
     <div class="fb-new-folder-bar">
       <input
         type="text"
-        placeholder={t('chat.new_folder_name')}
-        value={newFolderName}
-        onInput={(e) => setNewFolderName((e.target as HTMLInputElement).value)}
+        placeholder={newEntry.kind === 'folder' ? t('chat.new_folder_name') : t('chat.new_file_name')}
+        value={newEntryName}
+        onInput={(e) => setNewEntryName((e.target as HTMLInputElement).value)}
         onKeyDown={(e) => {
-          if (e.key === 'Enter' && newFolderName.trim()) {
-            requestMkdir(newFolderParent!, newFolderName);
-          }
-          if (e.key === 'Escape') setNewFolderParent(null);
+          if (e.key === 'Enter' && newEntryName.trim()) requestNewEntry();
+          if (e.key === 'Escape') setNewEntry(null);
         }}
         autoFocus
       />
       <button
         class="btn btn-primary"
         style={{ padding: '4px 10px', fontSize: 12 }}
-        disabled={!newFolderName.trim()}
-        onClick={() => {
-          requestMkdir(newFolderParent!, newFolderName);
-        }}
+        disabled={!newEntryName.trim()}
+        onClick={requestNewEntry}
       >{t('chat.create')}</button>
-      <button class="fb-close" onClick={() => setNewFolderParent(null)} style={{ fontSize: 12 }}>✕</button>
+      <button class="fb-close" onClick={() => setNewEntry(null)} style={{ fontSize: 12 }}>✕</button>
     </div>
   ) : null;
 
@@ -1609,7 +1662,7 @@ export function FileBrowser({
         <div class="fb-panel">
           {tabs}
           {breadcrumb}
-          {newFolderDialog}
+          {newEntryDialog}
           <div class={`fb-body${hasPreview ? ' fb-body-split' : ''}`}>
             <div class={`fb-files-and-changes${hasPreview ? ' fb-tree-split' : ''}`} style={hasPreview && treeWidth ? { flex: 'none', width: treeWidth } : undefined}>
               {tree}
@@ -1646,7 +1699,7 @@ export function FileBrowser({
             <button class="fb-close" onClick={onClose}>✕</button>
           </div>
           {breadcrumb}
-          {newFolderDialog}
+          {newEntryDialog}
           <div class={`fb-body${hasPreview ? ' fb-body-split' : ''}`}>
             {tree}
             {previewPane}

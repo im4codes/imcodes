@@ -65,6 +65,7 @@ import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import { DAEMON_UPGRADE_TARGET_LATEST, normalizeDaemonUpgradeTargetVersion } from '../../shared/daemon-upgrade.js';
 import { CC_PRESET_MSG, type CcPreset } from '../../shared/cc-presets.js';
 import { MEMORY_WS } from '../../shared/memory-ws.js';
+import { FS_WRITE_ERROR } from '../shared/transport/fs.js';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG, MAX_P2P_PARTICIPANTS } from '../../shared/p2p-config-events.js';
 import { p2pScopedSessionKey } from '../../shared/p2p-config-scope.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
@@ -6019,6 +6020,7 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
   }
 
   const expectedMtime = typeof cmd.expectedMtime === 'number' ? cmd.expectedMtime : undefined;
+  const createOnly = cmd.createOnly === true;
 
   const expanded = rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath;
   const resolved = nodePath.resolve(expanded);
@@ -6045,6 +6047,11 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
       const allowed = isPathAllowed(real);
       if (!allowed) {
         try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
+        return;
+      }
+
+      if (createOnly) {
+        try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: FS_WRITE_ERROR.FILE_EXISTS }); } catch { /* ignore */ }
         return;
       }
 
@@ -6085,7 +6092,7 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
         return;
       }
       // Write the file
-      await fsWriteFile(resolved, content, 'utf-8');
+      await fsWriteFile(resolved, content, createOnly ? { encoding: 'utf-8', flag: 'wx' } : 'utf-8');
       const newStats = await fsStat(resolved);
       const real = await fsRealpath(resolved);
       invalidateFsListCachesForPath(real);
@@ -6093,8 +6100,10 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
       try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', mtime: newStats.mtimeMs }); } catch { /* ignore */ }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      const isNotFound = msg.includes('ENOENT') || msg.includes('no such file');
-      try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: isNotFound ? 'parent_not_found' : msg }); } catch { /* ignore */ }
+      const code = typeof err === 'object' && err !== null && 'code' in err ? String((err as { code?: unknown }).code) : '';
+      const isNotFound = code === 'ENOENT' || msg.includes('ENOENT') || msg.includes('no such file');
+      const isAlreadyExists = code === 'EEXIST' || msg.includes('EEXIST') || msg.includes('file already exists');
+      try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: isAlreadyExists ? FS_WRITE_ERROR.FILE_EXISTS : (isNotFound ? 'parent_not_found' : msg) }); } catch { /* ignore */ }
     }
   }
 }
