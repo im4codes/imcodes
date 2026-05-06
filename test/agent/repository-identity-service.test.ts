@@ -18,6 +18,20 @@ describe('GitOriginRepositoryIdentityService', () => {
     });
   });
 
+  it('normalizes self-hosted GitLab ssh:// remotes with SSH ports and mixed-case paths', () => {
+    const identity = service.resolve({
+      originUrl: 'ssh://git@172.16.253.211:2224/Hermit/ai_purchase2.git',
+    });
+
+    expect(identity).toMatchObject({
+      kind: 'git-origin',
+      key: '172.16.253.211/hermit/ai_purchase2',
+      host: '172.16.253.211',
+      owner: 'hermit',
+      repo: 'ai_purchase2',
+    });
+  });
+
   it('falls back to a stable local identity when origin is missing', () => {
     const a = service.resolve({ cwd: '/tmp/project-a' });
     const b = service.resolve({ cwd: '/tmp/project-a' });

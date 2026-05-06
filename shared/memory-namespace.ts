@@ -168,7 +168,8 @@ export function normalizeCanonicalRepoId(raw: string | undefined): string | unde
   try {
     const url = new URL(lower);
     if (url.hostname && url.pathname) {
-      return stripGitSuffix(`${url.hostname}/${url.pathname.replace(/^\/+|\/+$/g, '')}`).replace(/\/+/g, '/');
+      const host = url.protocol === 'ssh:' ? url.hostname : url.host;
+      return stripGitSuffix(`${host}/${url.pathname.replace(/^\/+|\/+$/g, '')}`).replace(/\/+/g, '/');
     }
   } catch {
     // Plain canonical keys such as github.com/owner/repo are accepted below.

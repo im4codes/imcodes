@@ -11,9 +11,15 @@ describe('project remote identity sync', () => {
     expect(normalizeCanonicalRepoId('git@github.com:Acme/Repo.git')).toBe('github.com/acme/repo');
     expect(normalizeCanonicalRepoId('https://github.com/acme/repo')).toBe('github.com/acme/repo');
     expect(normalizeCanonicalRepoId('github.com/acme/repo.git')).toBe('github.com/acme/repo');
+    expect(normalizeCanonicalRepoId('ssh://git@172.16.253.211:2224/Hermit/ai_purchase2.git')).toBe('172.16.253.211/hermit/ai_purchase2');
+    expect(normalizeCanonicalRepoId('https://git.corp.example.com:8443/Team/Internal.git')).toBe('git.corp.example.com:8443/team/internal');
     expect(sameCanonicalProject(
       { projectId: 'git@github.com:Acme/Repo.git' },
       { projectId: 'https://github.com/acme/repo' },
+    )).toBe(true);
+    expect(sameCanonicalProject(
+      { projectId: 'ssh://git@172.16.253.211:2224/Hermit/ai_purchase2.git' },
+      { projectId: '172.16.253.211/hermit/ai_purchase2' },
     )).toBe(true);
   });
 

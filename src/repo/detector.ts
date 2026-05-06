@@ -23,19 +23,36 @@ interface ParsedRemote {
   repo: string;
 }
 
+function stripGitSuffix(value: string): string {
+  return value.endsWith('.git') ? value.slice(0, -4) : value;
+}
+
+function parseUrlRemote(value: string): { host: string; owner: string; repo: string } | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:' && parsed.protocol !== 'ssh:') return null;
+  const parts = parsed.pathname.split('/').filter(Boolean);
+  if (parts.length !== 2) return null;
+  const host = parsed.protocol === 'ssh:' ? parsed.hostname : parsed.host;
+  const owner = parts[0];
+  const repo = stripGitSuffix(parts[1]);
+  if (!host || !owner || !repo) return null;
+  return { host, owner, repo };
+}
+
 /** Parse a single remote URL (HTTPS or SSH) into components. */
 function parseRemoteUrl(url: string): { host: string; owner: string; repo: string } | null {
-  // HTTPS: https://github.com/owner/repo.git
-  const httpsMatch = url.match(/^https?:\/\/([^/]+)\/([^/]+)\/([^/\s]+?)(?:\.git)?$/);
-  if (httpsMatch) return { host: httpsMatch[1], owner: httpsMatch[2], repo: httpsMatch[3] };
+  const value = url.trim();
+  const urlRemote = parseUrlRemote(value);
+  if (urlRemote) return urlRemote;
 
   // SSH: git@github.com:owner/repo.git
-  const sshMatch = url.match(/^git@([^:]+):([^/]+)\/([^/\s]+?)(?:\.git)?$/);
-  if (sshMatch) return { host: sshMatch[1], owner: sshMatch[2], repo: sshMatch[3] };
-
-  // SSH with ssh:// prefix: ssh://git@github.com/owner/repo.git
-  const sshUrlMatch = url.match(/^ssh:\/\/[^@]+@([^/]+)\/([^/]+)\/([^/\s]+?)(?:\.git)?$/);
-  if (sshUrlMatch) return { host: sshUrlMatch[1], owner: sshUrlMatch[2], repo: sshUrlMatch[3] };
+  const sshMatch = value.match(/^git@([^:]+):([^/]+)\/([^/\s]+?)(?:\.git)?$/);
+  if (sshMatch) return { host: sshMatch[1], owner: sshMatch[2], repo: stripGitSuffix(sshMatch[3]) };
 
   return null;
 }
@@ -225,7 +242,10 @@ export async function detectRepo(projectDir: string): Promise<RepoContext> {
   const resolvedHost = await resolveSSHHost(selected.host);
   const platform = await detectPlatform(selected.host);
   if (platform === 'unknown') {
-    return { info: null, status: 'unknown_platform' };
+    return {
+      info: { platform, owner: selected.owner, repo: selected.repo, remoteUrl: selected.url },
+      status: 'unknown_platform',
+    };
   }
 
   // Use resolved host for CLI auth checks (alias won't work with gh auth --hostname)

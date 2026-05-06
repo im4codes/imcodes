@@ -17,6 +17,10 @@ function sha(input: string): string {
   return createHash('sha1').update(input).digest('hex').slice(0, 12);
 }
 
+function canonicalPart(value: string): string {
+  return value.trim().toLowerCase();
+}
+
 type CanonicalParts = {
   host: string;
   owner: string;
@@ -28,9 +32,9 @@ export function parseCanonicalRepositoryKey(key: string): CanonicalParts | null 
   const match = /^([^/]+)\/([^/]+)\/([^/]+)$/.exec(trimmed);
   if (!match) return null;
   return {
-    host: match[1].toLowerCase(),
-    owner: match[2],
-    repo: match[3],
+    host: canonicalPart(match[1]),
+    owner: canonicalPart(match[2]),
+    repo: canonicalPart(match[3]),
   };
 }
 
@@ -40,12 +44,15 @@ export class GitOriginRepositoryIdentityService implements RepositoryIdentitySer
     if (originUrl) {
       const parsed = parseRemoteUrl(originUrl);
       if (parsed) {
+        const host = canonicalPart(parsed.host);
+        const owner = canonicalPart(parsed.owner);
+        const repo = canonicalPart(parsed.repo);
         return {
           kind: 'git-origin',
-          key: `${parsed.host.toLowerCase()}/${parsed.owner}/${parsed.repo}`,
-          host: parsed.host.toLowerCase(),
-          owner: parsed.owner,
-          repo: parsed.repo,
+          key: `${host}/${owner}/${repo}`,
+          host,
+          owner,
+          repo,
           originUrl,
         };
       }
@@ -73,7 +80,7 @@ export class GitOriginRepositoryIdentityService implements RepositoryIdentitySer
     const canonical = parseCanonicalRepositoryKey(canonicalKey);
     const alias = parseRemoteUrl(aliasOriginUrl.trim());
     if (!canonical || !alias) return null;
-    if (canonical.owner !== alias.owner || canonical.repo !== alias.repo) return null;
+    if (canonical.owner !== canonicalPart(alias.owner) || canonical.repo !== canonicalPart(alias.repo)) return null;
     return {
       aliasKey: aliasOriginUrl.trim(),
       canonicalKey,

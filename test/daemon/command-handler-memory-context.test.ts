@@ -198,6 +198,9 @@ vi.mock('../../src/repo/detector.js', () => ({
     if (url === 'git@github.com:imcodes/codedeck.git') {
       return { host: 'github.com', owner: 'imcodes', repo: 'codedeck' };
     }
+    if (url === 'ssh://git@172.16.253.211:2224/Hermit/ai_purchase2.git') {
+      return { host: '172.16.253.211', owner: 'Hermit', repo: 'ai_purchase2' };
+    }
     return null;
   }),
 }));
@@ -404,6 +407,50 @@ describe('handleWebCommand memory context timeline', () => {
           success: true,
           status: 'resolved',
           canonicalRepoId: 'github.com/imcodes/codedeck',
+        }));
+      });
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('resolves canonical ids from self-hosted GitLab remotes even when repo features cannot identify a platform', async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), 'imcodes-project-resolve-gitlab-'));
+    const projectDir = join(tempDir, 'ai_purchase2');
+    await mkdir(projectDir);
+    listSessionsMock.mockReturnValue([{ name: 'deck_ai_purchase2_brain', projectDir }]);
+    detectRepoMock.mockResolvedValueOnce({
+      status: 'unknown_platform',
+      info: {
+        platform: 'unknown',
+        owner: 'Hermit',
+        repo: 'ai_purchase2',
+        remoteUrl: 'ssh://git@172.16.253.211:2224/Hermit/ai_purchase2.git',
+      },
+    });
+
+    try {
+      handleWebCommand({
+        type: MEMORY_WS.PROJECT_RESOLVE,
+        requestId: 'resolve-gitlab-ssh-port',
+        projectDir,
+        [MEMORY_MANAGEMENT_CONTEXT_FIELD]: {
+          actorId: 'user-bob',
+          userId: 'user-bob',
+          role: 'user',
+          source: 'server_bridge',
+          requestId: 'resolve-gitlab-ssh-port',
+          boundProjects: [{ projectDir }],
+        },
+      }, serverLink as any);
+
+      await vi.waitFor(() => {
+        expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: MEMORY_WS.PROJECT_RESOLVE_RESPONSE,
+          requestId: 'resolve-gitlab-ssh-port',
+          success: true,
+          status: 'resolved',
+          canonicalRepoId: '172.16.253.211/hermit/ai_purchase2',
         }));
       });
     } finally {
