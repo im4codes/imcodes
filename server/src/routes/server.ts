@@ -356,6 +356,7 @@ serverRoutes.get('/', requireAuth(), async (c) => {
     name: s.name,
     status: s.status,
     lastHeartbeatAt: s.last_heartbeat_at,
+    daemonVersion: s.daemon_version,
     createdAt: s.created_at,
   }));
 
@@ -427,7 +428,9 @@ serverRoutes.post('/:id/heartbeat', async (c) => {
   );
   if (!server) return c.json({ error: 'unauthorized' }, 401);
 
-  await updateServerHeartbeat(c.env.DB, serverId);
+  const body = await c.req.json().catch(() => null) as Record<string, unknown> | null;
+  const daemonVersion = typeof body?.daemonVersion === 'string' ? body.daemonVersion : undefined;
+  await updateServerHeartbeat(c.env.DB, serverId, daemonVersion);
   return c.json({ ok: true });
 });
 

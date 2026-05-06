@@ -985,7 +985,11 @@ export class WsBridge {
       }
 
       if (msg.type === 'heartbeat') {
-        updateServerHeartbeat(db, this.serverId).catch((err) =>
+        const heartbeatDaemonVersion = typeof msg.daemonVersion === 'string'
+          ? msg.daemonVersion
+          : this.daemonVersion;
+        if (typeof heartbeatDaemonVersion === 'string') this.daemonVersion = heartbeatDaemonVersion;
+        updateServerHeartbeat(db, this.serverId, heartbeatDaemonVersion).catch((err) =>
           logger.error({ err }, 'Failed to update heartbeat'),
         );
         // Ack heartbeat so daemon watchdog doesn't consider the connection dead

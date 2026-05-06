@@ -60,7 +60,7 @@ async function buildTestApp() {
   return app;
 }
 
-describe('POST /api/server/:id/upgrade', () => {
+describe('server routes', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockGetServersByUserId.mockResolvedValue([{ id: 'srv-1', name: 'Alpha' }]);
@@ -71,6 +71,32 @@ describe('POST /api/server/:id/upgrade', () => {
       deliveryStatus: 'sent',
     });
     delete process.env.APP_VERSION;
+  });
+
+  it('GET /api/server returns persisted daemonVersion', async () => {
+    mockGetServersByUserId.mockResolvedValue([{
+      id: 'srv-1',
+      name: 'Alpha',
+      status: 'online',
+      last_heartbeat_at: 123,
+      daemon_version: '2026.5.2047-dev.2025',
+      created_at: 99,
+    }]);
+    const app = await buildTestApp();
+
+    const res = await app.request('/api/server');
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      servers: [{
+        id: 'srv-1',
+        name: 'Alpha',
+        status: 'online',
+        lastHeartbeatAt: 123,
+        daemonVersion: '2026.5.2047-dev.2025',
+        createdAt: 99,
+      }],
+    });
   });
 
   it('requests daemon.upgrade with the server app version as targetVersion', async () => {

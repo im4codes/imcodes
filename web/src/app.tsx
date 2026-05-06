@@ -202,6 +202,17 @@ function getFilePreviewInitialPath(request: FileBrowserPreviewRequest): string {
   return '~';
 }
 
+function updateServerDaemonVersion<T extends { id: string; daemonVersion?: string | null }>(
+  servers: T[],
+  serverId: string | null | undefined,
+  daemonVersion: string | null | undefined,
+): T[] {
+  if (!serverId || !daemonVersion) return servers;
+  return servers.map((server) => (
+    server.id === serverId ? { ...server, daemonVersion } : server
+  ));
+}
+
 interface AuthState {
   userId: string;
   baseUrl: string;
@@ -212,6 +223,7 @@ interface ServerInfo {
   name: string;
   status: string;
   lastHeartbeatAt: number | null;
+  daemonVersion?: string | null;
   createdAt: number;
 }
 
@@ -1710,7 +1722,11 @@ export function App() {
         }
         setDaemonOnline(true);
         if (sessionListRetryRef.current) { clearTimeout(sessionListRetryRef.current); sessionListRetryRef.current = null; }
-        setServers((prev) => markServerLive(prev, selectedServerId));
+        setServers((prev) => updateServerDaemonVersion(
+          markServerLive(prev, selectedServerId),
+          selectedServerId,
+          msg.daemonVersion,
+        ));
         const newSessions = msg.sessions.filter((s) => !s.name.startsWith('deck_sub_'));
         setSessions((prev) => newSessions.map((s) => {
           const existing = prev.find((p) => p.name === s.name);
@@ -2244,6 +2260,7 @@ export function App() {
     const unsubStats = ws.onMessage((msg) => {
       if (msg.type === 'daemon.stats') {
         setDaemonStats({ daemonVersion: msg.daemonVersion, cpu: msg.cpu, memUsed: msg.memUsed, memTotal: msg.memTotal, load1: msg.load1, load5: msg.load5, load15: msg.load15, uptime: msg.uptime });
+        setServers((prev) => updateServerDaemonVersion(prev, selectedServerId, msg.daemonVersion));
       }
     });
     setConnecting(true);
@@ -2995,6 +3012,7 @@ export function App() {
   const selectedServerInfo = selectedServerId
     ? servers.find((server) => server.id === selectedServerId) ?? null
     : null;
+  const daemonVersionForDisplay = daemonStats?.daemonVersion ?? selectedServerInfo?.daemonVersion ?? null;
   const daemonBadgeState = getDaemonBadgeState(connected, connecting, daemonOnline, selectedServerInfo);
 
   useEffect(() => {
@@ -3194,32 +3212,36 @@ export function App() {
           )}
         </div>
         <div style={{ flex: 1 }} />
-        {daemonStats && connected && (
+        {connected && (daemonStats || daemonVersionForDisplay) && (
           <div class="sidebar-stats">
-            {daemonStats.daemonVersion && (
+            {daemonVersionForDisplay && (
               <div class="sidebar-stats-row">
                 {/* Tooltip surfaces the full version (incl. dev counter) for support. */}
-                <span style={{ color: '#94a3b8' }} title={`Daemon v${daemonStats.daemonVersion}`}>
-                  Daemon v{formatDaemonVersionShort(daemonStats.daemonVersion)}
+                <span style={{ color: '#94a3b8' }} title={`Daemon v${daemonVersionForDisplay}`}>
+                  Daemon v{formatDaemonVersionShort(daemonVersionForDisplay)}
                 </span>
               </div>
             )}
-            <div class="sidebar-stats-row">
-              <span style={{ color: daemonStats.cpu > 80 ? '#f87171' : daemonStats.cpu > 50 ? '#fbbf24' : '#4ade80' }}>
-                CPU {daemonStats.cpu}%
-              </span>
-              <span style={{ color: '#a78bfa' }}>
-                Load {daemonStats.load1}
-              </span>
-            </div>
-            <div class="sidebar-stats-row">
-              <span style={{ color: '#60a5fa' }}>
-                Mem {(() => { const gb = daemonStats.memUsed / (1024 ** 3); return gb >= 1 ? `${gb.toFixed(1)}G` : `${(daemonStats.memUsed / (1024 ** 2)).toFixed(0)}M`; })()}/{(() => { const gb = daemonStats.memTotal / (1024 ** 3); return gb >= 1 ? `${gb.toFixed(1)}G` : `${(daemonStats.memTotal / (1024 ** 2)).toFixed(0)}M`; })()}
-              </span>
-              <span style={{ color: '#94a3b8' }}>
-                {(() => { const s = daemonStats.uptime; const d = Math.floor(s / 86400); const h = Math.floor((s % 86400) / 3600); return d > 0 ? `${d}d ${h}h` : `${h}h`; })()}
-              </span>
-            </div>
+            {daemonStats && (
+              <div class="sidebar-stats-row">
+                <span style={{ color: daemonStats.cpu > 80 ? '#f87171' : daemonStats.cpu > 50 ? '#fbbf24' : '#4ade80' }}>
+                  CPU {daemonStats.cpu}%
+                </span>
+                <span style={{ color: '#a78bfa' }}>
+                  Load {daemonStats.load1}
+                </span>
+              </div>
+            )}
+            {daemonStats && (
+              <div class="sidebar-stats-row">
+                <span style={{ color: '#60a5fa' }}>
+                  Mem {(() => { const gb = daemonStats.memUsed / (1024 ** 3); return gb >= 1 ? `${gb.toFixed(1)}G` : `${(daemonStats.memUsed / (1024 ** 2)).toFixed(0)}M`; })()}/{(() => { const gb = daemonStats.memTotal / (1024 ** 3); return gb >= 1 ? `${gb.toFixed(1)}G` : `${(daemonStats.memTotal / (1024 ** 2)).toFixed(0)}M`; })()}
+                </span>
+                <span style={{ color: '#94a3b8' }}>
+                  {(() => { const s = daemonStats.uptime; const d = Math.floor(s / 86400); const h = Math.floor((s % 86400) / 3600); return d > 0 ? `${d}d ${h}h` : `${h}h`; })()}
+                </span>
+              </div>
+            )}
           </div>
         )}
         <div style={{ padding: '12px 16px', borderTop: '1px solid #334155' }}>
@@ -3691,11 +3713,11 @@ export function App() {
             </div>
             {/* Footer */}
             <div class="mobile-sidebar-footer">
-              {daemonStats && connected && (
+              {connected && (daemonStats || daemonVersionForDisplay) && (
                 <div style={{ fontSize: 11, color: '#64748b', marginBottom: 4, display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <span title={daemonStats.daemonVersion ? `v${daemonStats.daemonVersion}` : undefined}>
-                    {daemonStats.daemonVersion && <span>v{formatDaemonVersionShort(daemonStats.daemonVersion)} · </span>}
-                    CPU {daemonStats.cpu}% · Load {daemonStats.load1}
+                  <span title={daemonVersionForDisplay ? `v${daemonVersionForDisplay}` : undefined}>
+                    {daemonVersionForDisplay && <span>v{formatDaemonVersionShort(daemonVersionForDisplay)}{daemonStats ? ' · ' : ''}</span>}
+                    {daemonStats && <span>CPU {daemonStats.cpu}% · Load {daemonStats.load1}</span>}
                   </span>
                   <button
                     style={{ fontSize: 10, color: '#38bdf8', background: 'none', border: '1px solid #334155', borderRadius: 4, padding: '1px 5px', cursor: 'pointer' }}
