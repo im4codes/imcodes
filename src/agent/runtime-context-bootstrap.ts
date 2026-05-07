@@ -131,7 +131,7 @@ function buildBootstrapResult(
 
 export function buildTransportStartupMemory(
   namespace: ContextNamespace,
-  limitOrOptions: number | { limit?: number; projectDir?: string; homeDir?: string } = STARTUP_MEMORY_TOTAL_LIMIT,
+  limitOrOptions: number | { limit?: number; projectDir?: string; homeDir?: string; skillsFeatureEnabled?: boolean } = STARTUP_MEMORY_TOTAL_LIMIT,
 ): TransportMemoryRecallArtifact | undefined {
   try {
     const options = typeof limitOrOptions === 'number'
@@ -144,6 +144,7 @@ export function buildTransportStartupMemory(
       namespace,
       projectDir: options.projectDir,
       homeDir: options.homeDir,
+      featureEnabled: options.skillsFeatureEnabled,
     });
     const selected = selectStartupMemoryByPolicy([
       ...processedItems.map(memorySearchItemToStartupCandidate),

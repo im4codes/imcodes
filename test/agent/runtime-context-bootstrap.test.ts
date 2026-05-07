@@ -2,7 +2,6 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { MEMORY_FEATURE_FLAGS_BY_NAME, memoryFeatureFlagEnvKey } from '../../shared/feature-flags.js';
 import { SKILL_REGISTRY_FILE_NAME, SKILL_REGISTRY_SCHEMA_VERSION, makeSkillUri } from '../../shared/skill-registry-types.js';
 import { configureSharedContextRuntime } from '../../src/context/shared-context-runtime.js';
 import { writeProcessedProjection } from '../../src/store/context-store.js';
@@ -486,9 +485,6 @@ describe('resolveTransportContextBootstrap', () => {
   });
 
   it('buildTransportStartupMemory renders registry skill references without reading skill markdown bodies', async () => {
-    vi.stubEnv(memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry), 'true');
-    vi.stubEnv(memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.observationStore), 'true');
-    vi.stubEnv(memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.skills), 'true');
     tempProjectDir = await mkdtemp(join(tmpdir(), 'runtime-skill-project-'));
     const skillDir = join(tempProjectDir, '.imc', 'skills', 'testing');
     await mkdir(skillDir, { recursive: true });
@@ -517,7 +513,7 @@ describe('resolveTransportContextBootstrap', () => {
     const startup = buildTransportStartupMemory({
       scope: 'personal',
       projectId: 'github.com/acme/repo',
-    }, { projectDir: tempProjectDir });
+    }, { projectDir: tempProjectDir, skillsFeatureEnabled: true });
 
     expect(startup?.items).toEqual([
       expect.objectContaining({

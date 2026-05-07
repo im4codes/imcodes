@@ -2,7 +2,6 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { MEMORY_FEATURE_FLAGS_BY_NAME, memoryFeatureFlagEnvKey } from '../../shared/feature-flags.js';
 import { getUserSkillPath } from '../../shared/skill-store.js';
 import { SKILL_REGISTRY_FILE_NAME } from '../../shared/skill-registry-types.js';
 import { buildUserSkillRegistry } from '../../src/context/skill-registry-builder.js';
@@ -16,12 +15,6 @@ const namespace = { scope: 'personal' as const, projectId: 'github.com/acme/repo
 describe('skill registry and on-demand resolver', () => {
   let homeDir: string | undefined;
 
-  function enableSkillFeature(): void {
-    vi.stubEnv(memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry), 'true');
-    vi.stubEnv(memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.observationStore), 'true');
-    vi.stubEnv(memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.skills), 'true');
-  }
-
   afterEach(async () => {
     if (homeDir) await rm(homeDir, { recursive: true, force: true });
     homeDir = undefined;
@@ -30,7 +23,6 @@ describe('skill registry and on-demand resolver', () => {
   });
 
   it('uses registry metadata at startup and reads full skill content only on demand', async () => {
-    enableSkillFeature();
     homeDir = await mkdtemp(join(tmpdir(), 'skill-registry-home-'));
     const skillPath = getUserSkillPath({ homeDir, category: 'testing', skillName: 'test-first' });
     await mkdir(join(homeDir, '.imcodes', 'skills', 'testing'), { recursive: true });
@@ -50,7 +42,7 @@ describe('skill registry and on-demand resolver', () => {
     buildUserSkillRegistry({ homeDir, context: { canonicalRepoId: 'github.com/acme/repo' } });
     await rm(skillPath);
 
-    const startup = buildTransportStartupMemory(namespace, { homeDir });
+    const startup = buildTransportStartupMemory(namespace, { homeDir, skillsFeatureEnabled: true });
     expect(startup?.injectedText).toContain('testing/test-first');
     expect(startup?.injectedText).not.toContain('Run tests before final handoff.');
 
@@ -159,7 +151,6 @@ describe('skill registry and on-demand resolver', () => {
   });
 
   it('does not render polluted absolute registry display paths in startup hints', async () => {
-    enableSkillFeature();
     homeDir = await mkdtemp(join(tmpdir(), 'skill-registry-home-'));
     await mkdir(join(homeDir, '.imcodes', 'skills'), { recursive: true });
     writeSkillRegistryManagementSnapshot(join(homeDir, '.imcodes', 'skills', SKILL_REGISTRY_FILE_NAME), [{
@@ -174,7 +165,7 @@ describe('skill registry and on-demand resolver', () => {
       updatedAt: Date.now(),
     }]);
 
-    const startup = buildTransportStartupMemory(namespace, { homeDir });
+    const startup = buildTransportStartupMemory(namespace, { homeDir, skillsFeatureEnabled: true });
     expect(startup?.injectedText).toContain('skill://');
     expect(startup?.injectedText).not.toContain('/home/alice');
   });

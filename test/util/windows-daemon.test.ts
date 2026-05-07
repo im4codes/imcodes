@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // ── Shared mock state ──────────────────────────────────────────────────────────
 
@@ -68,6 +68,7 @@ function reset(): void {
   state.execCalls = [];
   state.spawnCalls = [];
   state.rmSyncCalls = [];
+  vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
   vi.spyOn(process, 'kill').mockImplementation(((pid: number) => {
     if (!state.alivePids.has(pid)) throw new Error('not running');
     return true;
@@ -78,6 +79,9 @@ function reset(): void {
 
 describe('restartWindowsDaemon', () => {
   beforeEach(reset);
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
 
   // ── Launcher priority ──
 
