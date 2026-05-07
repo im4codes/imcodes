@@ -1,4 +1,31 @@
-# Force CRLF on Windows-only batch / VBS files regardless of host platform.
+# ── Force LF for Unix-format files regardless of host's core.autocrlf ──
+#
+# Why: a developer with `git config core.autocrlf=true` on Windows will
+# silently get CRLF on every text file at checkout, including shell
+# scripts.  Real-world hit on 2026-05-08: running scripts/restart-daemon.cmd
+# (which calls `npm install` / `npm run build` / `npm link --force`)
+# triggered git to refresh `bin/imcodes-launch.sh`, autocrlf converted it
+# to CRLF, `git status` showed it modified, and a careless `git add .`
+# would have committed CRLF into a #!/usr/bin/env bash script — bash on
+# Linux/macOS treats the trailing `\r` as part of the next token and
+# fails on every line ("$'\r': command not found", broken `if` tests,
+# malformed variable assignments, etc.).
+#
+# `text eol=lf` means: treat as text in the index, force LF on checkout
+# everywhere — overriding any local core.autocrlf=true setting.
+*.sh text eol=lf
+*.bash text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+*.mts text eol=lf
+*.cts text eol=lf
+# Files that have a Unix shebang interpreter — bin entries in npm
+# packages and the husky hook scripts.  Their extensions vary or are
+# missing, so list them explicitly.
+bin/* text eol=lf
+.husky/_/husky.sh text eol=lf
+
+# ── Force CRLF on Windows-only batch / VBS files regardless of host ──
 #
 # Why: cmd.exe parses LF inconsistently (especially inside `if (...)` blocks)
 # and a `\r`-less line tail can swallow the next line as part of the previous
