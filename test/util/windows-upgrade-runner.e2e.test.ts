@@ -146,7 +146,9 @@ describe.skipIf(!isWindows)('windows-upgrade-runner.mjs (real Node child)', () =
 
       expect(r.lockExists, `lock survived install failure: ${r.log}`).toBe(false);
       expect(r.log).toContain('install FAILED');
-      expect(r.log).toContain('lock acquired');
+      // "lock-acquired" comes from the runner's trace() marker; older
+      // versions logged "lock acquired" with a space.  Match either form.
+      expect(r.log).toMatch(/lock[- ]acquired/);
       expect(r.log).toContain('lock released');
       // Runner should report a clean exit even on expected aborts —
       // failure mode is the install, not the runner itself.
@@ -185,6 +187,7 @@ describe.skipIf(!isWindows)('windows-upgrade-runner.mjs (real Node child)', () =
       expect(r.log).toContain('lock released');
       expect(r.status).toBe(0);
     } finally {
+      // Tmp dir might be PRESERVED by runner on failure — clean up always
       rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -210,7 +213,9 @@ describe.skipIf(!isWindows)('windows-upgrade-runner.mjs (real Node child)', () =
       // Either the install is reported as failed (spawn returned null
       // status, treated as != 0) or a FATAL is logged.  Both end with
       // "lock released" via the finally block.
-      expect(r.log).toContain('lock acquired');
+      // "lock-acquired" comes from the runner's trace() marker; older
+      // versions logged "lock acquired" with a space.  Match either form.
+      expect(r.log).toMatch(/lock[- ]acquired/);
       expect(r.log).toContain('lock released');
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -244,7 +249,9 @@ describe.skipIf(!isWindows)('windows-upgrade-runner.mjs (real Node child)', () =
       // created (during step 1) and removed (in finally).  Both happen
       // through the Chinese-character path — Node fs handles this.
       expect(r.lockExists, `lock not removed under CN path: ${r.log}`).toBe(false);
-      expect(r.log).toContain('lock acquired');
+      // "lock-acquired" comes from the runner's trace() marker; older
+      // versions logged "lock acquired" with a space.  Match either form.
+      expect(r.log).toMatch(/lock[- ]acquired/);
       expect(r.log).toContain('lock released');
       // Log file at .../张三/... was written and readable, so the test
       // harness could read it back.  Sanity check: log file exists.
@@ -289,11 +296,81 @@ describe.skipIf(!isWindows)('windows-upgrade-runner.mjs (real Node child)', () =
       // `after`.  This confirms the runner ran in real time (not
       // some weird Atomics.wait misbehavior that returns instantly).
       const log = readFileSync(join(dir, 'upgrade.log'), 'utf8');
-      const acquireMatch = log.match(/\[([^\]]+)\] lock acquired/);
+      // Either "lock acquired" (older log line) or "[trace] step=1
+      // lock-acquired" (newer trace marker) — both fine.  Match the
+      // ISO timestamp at the start of either line.
+      const acquireMatch = log.match(/\[([^\]]+)\][^\n]*lock[- ]acquired/);
       expect(acquireMatch).toBeTruthy();
       const acquiredMs = new Date(acquireMatch![1]).getTime();
       expect(acquiredMs).toBeGreaterThanOrEqual(before - 1000);
       expect(acquiredMs).toBeLessThanOrEqual(after + 1000);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('npm spawn works through a path containing spaces (Node 24 cmd.exe quoting bug)', () => {
+    // Real-world incident on 2026-05-08: every auto-upgrade silently
+    // failed at `npm install` because the runner spawned npm.cmd via
+    // `cmd.exe /d /s /c "C:\Program Files\nodejs\npm.cmd" install ...`,
+    // and on Node 24 + Windows 10 the inner quotes around the
+    // path-with-spaces got stripped by cmd.exe /s, leaving:
+    //   'C:\Program' is not recognized as an internal or external command
+    // Daemon hit "memory freeze watchdog timeout" three times in a row,
+    // then died.
+    //
+    // Fix: bypass cmd.exe entirely by invoking npm-cli.js directly via
+    // node.exe (process.execPath npmDir/node_modules/npm/bin/npm-cli.js).
+    // node.exe is a real .exe so spawnSync handles it natively, no
+    // quoting hell.  Fallback: shell:true with bare 'npm' and
+    // PATH-prepended npmDir.
+    //
+    // This test mirrors the production failure: a fake "npm" set up
+    // under a path with embedded spaces.  Without the fix, the runner
+    // logs `'C:\Path with' is not recognized` or returns null status.
+    // With the fix, npm runs and we see real npm output (including
+    // the simulated install failure for our nonsense pkg spec).
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-runner-spaces '));  // <- intentional space
+    try {
+      const userProfile = join(dir, 'profile');
+      mkdirSync(join(userProfile, '.imcodes'), { recursive: true });
+
+      // Build a fake "npm" structure that mirrors the real layout:
+      //   <npmDir>/npm.cmd
+      //   <npmDir>/node_modules/npm/bin/npm-cli.js
+      // The runner prefers npm-cli.js (no cmd.exe involved) when found.
+      const npmDir = join(dir, 'with space dir');  // <- space in the dir
+      mkdirSync(join(npmDir, 'node_modules', 'npm', 'bin'), { recursive: true });
+      const cliJs = join(npmDir, 'node_modules', 'npm', 'bin', 'npm-cli.js');
+      writeFileSync(cliJs, [
+        '// Fake npm-cli.js — exits with simulated ETARGET',
+        'console.error("npm error code ETARGET");',
+        'console.error("npm error notarget No matching version found.");',
+        'process.exit(1);',
+      ].join('\n'));
+      // Also drop a non-functional npm.cmd so the resolveNpm... fallback
+      // can find it if it ever decides to use the shell:true path.
+      const npmCmd = join(npmDir, 'npm.cmd');
+      writeFileSync(npmCmd, '@echo off\r\necho fallback npm.cmd should not be used\r\nexit /b 99\r\n');
+
+      const r = runRunner({
+        scriptDir: dir,
+        fakeUserProfile: userProfile,
+        npmCmd,
+        pkgSpec: 'imcodes@9999.9.9-bogus',
+        targetVer: '9999.9.9-bogus',
+      });
+
+      // Critical assertions: we MUST see real npm error output (proving
+      // npm actually ran), NOT a 'is not recognized' / EINVAL signature.
+      const noQuotingFail = !r.log.includes('not recognized')
+        && !r.log.includes('EINVAL')
+        && !r.log.match(/install FAILED \(exit null/);
+      expect(noQuotingFail, `quoting failure detected:\n${r.log}`).toBe(true);
+      // Real npm output captured via spawnSync's stdio:'pipe'.
+      expect(r.log).toContain('ETARGET');
+      // Runner exited cleanly (expected abort, not a crash).
+      expect(r.status).toBe(0);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

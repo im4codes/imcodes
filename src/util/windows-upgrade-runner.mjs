@@ -55,7 +55,7 @@ import {
   rmSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 const HOME = homedir();
 const LOCK = join(HOME, '.imcodes', 'upgrade.lock');
@@ -76,6 +76,28 @@ function log(msg) {
     if (LOG_FILE) appendFileSync(LOG_FILE, line);
   } catch { /* ignore */ }
 }
+
+/** Emit a `[trace] step=N <stage>` marker.  When the runner dies silently
+ *  (or the daemon's 15-min watchdog timer fires before we kill it), the
+ *  LAST trace line in upgrade.log pinpoints exactly which step was last
+ *  reached.  Mirrors the same pattern in the legacy windows-upgrade-script
+ *  batch so post-mortems use the same grep — `grep -F '[trace]'`. */
+function trace(step, stage, extra) {
+  log(`[trace] step=${step} ${stage}${extra ? ' ' + extra : ''}`);
+}
+
+/** Default per-step timeout for spawnSync calls.  The runner used to call
+ *  spawnSync with no timeout, so any hung child (npm install stuck on a
+ *  slow registry, taskkill blocked behind a kernel handle, etc.) would
+ *  burn the daemon's full 15-minute memory-freeze timer.
+ *
+ *  Bound npm install at 10 minutes — typical install of imcodes is 1-3
+ *  min on a fast network, 5-7 min on slow links.  10 min is the cliff
+ *  past which we abandon and preserve the tmp dir for postmortem.
+ *  Other commands (prefix -g, --version, taskkill, repair-watchdog) get
+ *  a tight 60 s budget — none of them have any reason to take longer. */
+const NPM_INSTALL_TIMEOUT_MS = 10 * 60_000;
+const FAST_CMD_TIMEOUT_MS = 60_000;
 
 function sleepMs(ms) {
   // Synchronous sleep without setTimeout — matches the rest of the
@@ -107,25 +129,103 @@ function tryKillPid(pid) {
   catch { /* not running */ }
 }
 
-/** spawnSync wrapper that handles .cmd / .bat files via explicit cmd.exe.
+/** spawnSync wrapper that handles .cmd / .bat files reliably on Node 24+.
  *
- *  Node 24 (post CVE-2024-27980) returns EINVAL when spawn() is invoked
- *  on a .cmd/.bat file without `shell: true`.  We don't want shell:true
- *  because its quoting rules differ across platforms and surprise on
- *  args with spaces or `&`.  Explicit `cmd.exe /d /s /c <bat> <args>`
- *  is the documented Microsoft pattern for invoking batch files with
- *  precise argv preservation — Node passes our argv tokens through
- *  unchanged, cmd.exe parses them with its standard rules.
+ *  History of broken approaches we tried:
  *
- *  /d  skips AutoRun registry hooks (no surprise environment mutations)
- *  /s  forces the conservative "preserve quotes around the whole string"
- *      behavior; combined with /c it's the canonical safe invocation.
- *  /c  run the command and exit
- */
-function spawnCmdExe(file, args, options) {
-  const isBatch = /\.(cmd|bat)$/i.test(file);
-  if (!isBatch) return spawnSync(file, args, options);
-  return spawnSync('cmd.exe', ['/d', '/s', '/c', file, ...args], options);
+ *  1. Direct `spawnSync('foo.cmd', args)` — Node 24 (post CVE-2024-27980)
+ *     returns EINVAL.  Cannot use this any more.
+ *
+ *  2. `spawnSync('cmd.exe', ['/d', '/s', '/c', 'C:\\Program Files\\nodejs\\npm.cmd', ...])`
+ *     — looks correct on paper but FAILS when the path contains spaces.
+ *     Node serializes the argv into a Windows command line, wrapping the
+ *     path in quotes.  The result reaching Windows is roughly:
+ *       cmd.exe /d /s /c "C:\Program Files\nodejs\npm.cmd" --version
+ *     With /s, cmd.exe ought to preserve the inner quotes — but in our
+ *     real-world Node 24 + Windows 10 testing it does NOT, and cmd ends
+ *     up running `C:\Program` as the executable.  The empirical failure:
+ *       'C:\Program' is not recognized as an internal or external command
+ *     This was the cause of the 2026-05-08 daemon crash loop where every
+ *     auto-upgrade silently failed at `npm install` step, leaving the
+ *     daemon in "memory freeze" until its 15-min watchdog fired three
+ *     times in a row.
+ *
+ *  3. `shell: true` with absolute path — same quoting hell as (2).
+ *
+ *  WORKING APPROACH (current):
+ *
+ *  For .cmd files, we bypass cmd.exe entirely whenever possible:
+ *
+ *    a) NPM specifically: invoke npm's underlying `npm-cli.js` directly
+ *       via `node.exe`.  npm.cmd is just a shim around `node npm-cli.js`,
+ *       so calling node directly with the .js path skips all cmd.exe
+ *       quoting rules.  node.exe is a real .exe (not a batch file),
+ *       so spawnSync handles it without any Node 24 EINVAL issues.
+ *
+ *    b) For other .cmd files (e.g. the imcodes.cmd shim), fall back to
+ *       `shell: true` with the bare basename and the parent directory
+ *       prepended to PATH.  cmd.exe's PATH lookup handles spaces in
+ *       the directory path natively (it's how interactive cmd works).
+ *       Empirically verified: this is the ONLY pattern that reliably
+ *       runs npm.cmd / imcodes.cmd from a Node 24 child on Windows
+ *       when the install lives under a path with spaces. */
+function resolveNpmCliJs(npmCmd) {
+  // npm.cmd's directory contains node_modules/npm/bin/npm-cli.js on
+  // every official npm-with-Node distribution we've tested (the bundled
+  // npm shipped with node, nvm, fnm, volta, system).  If this layout
+  // doesn't match (custom prefixes, weird repacks), we fall through to
+  // the shell:true path below.
+  if (!npmCmd) return null;
+  const npmDir = dirname(npmCmd);
+  const candidates = [
+    join(npmDir, 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+    // Some installs (Homebrew on macOS — ignored on Windows but harmless
+    // to probe) put npm in a sibling layout one level up.
+    join(npmDir, '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+  ];
+  for (const cand of candidates) {
+    if (existsSync(cand)) return cand;
+  }
+  return null;
+}
+
+function spawnNpm(npmCmd, args, options) {
+  const opts = { timeout: FAST_CMD_TIMEOUT_MS, killSignal: 'SIGKILL', ...options };
+  // Path A (preferred): `node npm-cli.js <args>`.  No cmd.exe involved.
+  const cliJs = resolveNpmCliJs(npmCmd);
+  if (cliJs) {
+    const result = spawnSync(process.execPath, [cliJs, ...args], opts);
+    if (result.error) log(`spawnNpm(node ${cliJs}) error: ${result.error.code ?? ''} ${result.error.message}`);
+    if (result.signal) log(`spawnNpm killed by signal: ${result.signal} (likely timeout=${opts.timeout}ms)`);
+    return result;
+  }
+  // Path B (fallback): `shell: true` with bare 'npm', PATH-prepended.
+  const npmDir = dirname(npmCmd);
+  const env = {
+    ...(opts.env ?? process.env),
+    PATH: `${npmDir};${(opts.env?.PATH ?? process.env.PATH ?? '')}`,
+  };
+  const result = spawnSync('npm', args, { ...opts, env, shell: true });
+  if (result.error) log(`spawnNpm(shell npm) error: ${result.error.code ?? ''} ${result.error.message}`);
+  if (result.signal) log(`spawnNpm killed by signal: ${result.signal} (likely timeout=${opts.timeout}ms)`);
+  return result;
+}
+
+/** Run an arbitrary .cmd shim (e.g. imcodes.cmd repair-watchdog) by
+ *  prepending its directory to PATH and invoking the bare basename via
+ *  `shell: true`.  Same reliability story as spawnNpm path B. */
+function spawnCmdShim(shimCmd, args, options) {
+  const opts = { timeout: FAST_CMD_TIMEOUT_MS, killSignal: 'SIGKILL', ...options };
+  const dir = dirname(shimCmd);
+  const baseName = basename(shimCmd).replace(/\.(cmd|bat)$/i, '');
+  const env = {
+    ...(opts.env ?? process.env),
+    PATH: `${dir};${(opts.env?.PATH ?? process.env.PATH ?? '')}`,
+  };
+  const result = spawnSync(baseName, args, { ...opts, env, shell: true });
+  if (result.error) log(`spawnCmdShim(${baseName}) error: ${result.error.code ?? ''} ${result.error.message}`);
+  if (result.signal) log(`spawnCmdShim killed by signal: ${result.signal} (likely timeout=${opts.timeout}ms)`);
+  return result;
 }
 
 function readNumber(file) {
@@ -168,7 +268,7 @@ function killStaleWatchdogs() {
  *  is `npm prefix -g` itself. */
 function resolveNpmPrefix() {
   try {
-    const r = spawnCmdExe(NPM_CMD, ['prefix', '-g'], {
+    const r = spawnNpm(NPM_CMD, ['prefix', '-g'], {
       encoding: 'utf8', windowsHide: true,
     });
     if (r.status === 0) return r.stdout.trim();
@@ -200,7 +300,7 @@ function sharpRepair(npmPrefix) {
     }
   }
   if (!broken) return;
-  log(`sharp subtree broken (${brokenDep}/package.json missing) — repairing via nested npm install`);
+  log(`sharp subtree broken [${brokenDep}/package.json missing] — repairing via nested npm install`);
   for (const dep of checkDeps) {
     const dir = join(root, dep);
     const pkgJson = join(dir, 'package.json');
@@ -209,27 +309,36 @@ function sharpRepair(npmPrefix) {
     }
   }
   const imcodesDir = join(npmPrefix, 'node_modules', 'imcodes');
-  const result = spawnCmdExe(NPM_CMD, ['install', '--no-save', '--ignore-scripts', 'sharp@0.34.5'], {
+  const result = spawnNpm(NPM_CMD, ['install', '--no-save', '--ignore-scripts', 'sharp@0.34.5'], {
     cwd: imcodesDir,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
+    // Sharp install is a small nested install — bound it tighter than
+    // top-level npm install so a hung sharp install doesn't burn the
+    // full 10-minute budget.
+    timeout: 5 * 60_000,
   });
   if (result.status === 0) {
     log('sharp repair succeeded');
   } else {
-    log(`sharp repair FAILED (exit ${result.status}) — semantic memory recall will sticky-disable`);
+    log(`sharp repair FAILED [exit ${result.status} signal ${result.signal ?? 'none'}] — semantic memory recall will sticky-disable`);
     if (result.stderr) log(`sharp repair stderr: ${result.stderr.toString().trim()}`);
   }
 }
 
-function selfCleanup() {
-  // Self-cleanup deferred 60 s — long enough that you can tail the log
-  // for diagnostics, short enough that we don't litter %TEMP%.  We
-  // detach into a separate node child so this script can exit cleanly
-  // and the watchdog-spawned new daemon doesn't compete with us for
-  // the lock file write.
-  log('=== upgrade done ===');
+/** Schedule a deferred delete of the runner's tmp dir.
+ *
+ *  IMPORTANT: only call this on the SUCCESS path.  On failure paths we
+ *  PRESERVE the tmp dir (with its upgrade.log) so we have something to
+ *  postmortem.  Without this guard, the previous version self-cleaned
+ *  60 s after every run regardless of outcome — destroying the diagnostic
+ *  trail (lesson from 2026-05-08, three consecutive silent failures
+ *  whose upgrade.log files were already gone by the time we looked).
+ *
+ *  The 60 s defer runs in a detached node child so this script can exit
+ *  cleanly without holding open file handles in SCRIPT_DIR. */
+function scheduleTmpDelete() {
   if (!SCRIPT_DIR) return;
   const detached = spawn(process.execPath, [
     '-e',
@@ -238,25 +347,41 @@ function selfCleanup() {
   detached.unref();
 }
 
+/** Set to true at the very END of main() — only when every step has
+ *  succeeded (or failed in a way we explicitly accept).  The `finally`
+ *  block uses this to decide whether to delete the tmp dir or PRESERVE
+ *  it for postmortem diagnostics.
+ *
+ *  Lesson from 2026-05-08: three consecutive failed upgrade attempts on
+ *  PID 849488 (targets 2026.5.2070-dev.2047) silently failed AND
+ *  self-cleaned their tmp dirs 60 s later, so by the time we looked the
+ *  upgrade.log files were gone — we couldn't tell why npm install or
+ *  verify or any later step had failed.  Now: fail = preserve. */
+let upgradeSucceeded = false;
+
 async function main() {
   log('=== upgrade started ===');
   log(`pkg: ${PKG_SPEC}, target: ${TARGET_VER}`);
   log(`npm: ${NPM_CMD}`);
+  log(`script_dir: ${SCRIPT_DIR}`);
+  log(`runner_pid: ${process.pid}`);
+  trace(0, 'main-entry');
 
   // Step 1: Acquire upgrade lock (watchdog will park on it).
   // Use a directory write — even if upgrade.lock's parent .imcodes
   // doesn't yet exist for some reason, mkdir is idempotent.
   mkdirSync(join(HOME, '.imcodes'), { recursive: true });
   writeFileSync(LOCK, 'upgrade');
-  log('lock acquired');
+  trace(1, 'lock-acquired');
 
   // Step 2: Capture old daemon PID.
   const oldPid = readNumber(PIDFILE);
   log(`old daemon PID: ${oldPid ?? 'none'} (kill only after install succeeds)`);
+  trace(2, 'old-pid-captured', `pid=${oldPid ?? 'none'}`);
 
-  // Step 3: npm install (bounded heap).  Old daemon stays alive — its
-  // .js modules were loaded into V8 at startup, so npm overwriting them
-  // on disk doesn't affect the running process.
+  // Step 3: npm install (bounded heap, bounded wall-clock).  Old daemon
+  // stays alive — its .js modules were loaded into V8 at startup, so npm
+  // overwriting them on disk doesn't affect the running process.
   const env = {
     ...process.env,
     // Cap heap at 4 GB.  Older versions accumulated --max-old-space-size
@@ -266,24 +391,33 @@ async function main() {
     NODE_OPTIONS: '--max-old-space-size=4096',
   };
   log(`installing ${PKG_SPEC}...`);
-  const installResult = spawnCmdExe(
+  trace(3, 'pre-npm-install');
+  const installStartedAt = Date.now();
+  const installResult = spawnNpm(
     NPM_CMD,
     // --ignore-scripts: sharp's install hook is unreliable on global
     // npm-prefix installs (see sharpRepair() doc).  Skip post-install,
     // we'll nest-install sharp ourselves below.
     ['install', '-g', '--ignore-scripts', PKG_SPEC],
-    { env, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', windowsHide: true },
+    {
+      env, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', windowsHide: true,
+      timeout: NPM_INSTALL_TIMEOUT_MS,
+    },
   );
+  const installElapsedMs = Date.now() - installStartedAt;
   if (installResult.stdout) log(`npm stdout: ${installResult.stdout.trim()}`);
   if (installResult.stderr) log(`npm stderr: ${installResult.stderr.trim()}`);
+  trace(3, 'post-npm-install', `exit=${installResult.status} signal=${installResult.signal ?? 'none'} elapsed=${installElapsedMs}ms`);
   if (installResult.status !== 0) {
-    log(`install FAILED (exit ${installResult.status}) — old daemon untouched, lock released`);
-    return;  // finally clears the lock
+    log(`install FAILED (exit ${installResult.status}, signal ${installResult.signal ?? 'none'}) — old daemon untouched, lock released`);
+    return;  // finally clears the lock; tmp dir preserved (success flag stays false)
   }
   log('install OK');
 
   // Step 4: Verify install — shim must exist, version must match (if pinned).
+  trace(4, 'pre-resolve-npm-prefix');
   const npmPrefix = resolveNpmPrefix();
+  trace(4, 'post-resolve-npm-prefix', `prefix=${npmPrefix ?? 'null'}`);
   if (!npmPrefix) {
     log('could not resolve npm global prefix — aborting');
     return;
@@ -293,11 +427,15 @@ async function main() {
     log(`shim missing at ${shim} — aborting`);
     return;
   }
+  trace(4, 'shim-exists', `path=${shim}`);
   let installedVer = '';
   try {
-    const r = spawnCmdExe(shim, ['--version'], { encoding: 'utf8', windowsHide: true });
-    if (r.status === 0) installedVer = r.stdout.trim();
+    const r = spawnCmdShim(shim, ['--version'], {
+      encoding: 'utf8', windowsHide: true, timeout: FAST_CMD_TIMEOUT_MS,
+    });
+    if (r.status === 0) installedVer = (r.stdout || '').trim();
   } catch { /* ignore */ }
+  trace(4, 'post-version-check', `installed=${installedVer || '?'} target=${TARGET_VER}`);
   log(`installed version: ${installedVer || '?'}, target: ${TARGET_VER}`);
   if (TARGET_VER !== 'latest' && installedVer && installedVer !== TARGET_VER) {
     log('version mismatch after install — aborting');
@@ -305,14 +443,19 @@ async function main() {
   }
 
   // Step 5: Sharp repair (best effort).
+  trace(5, 'pre-sharp-repair');
   try { sharpRepair(npmPrefix); } catch (e) { log(`sharp repair threw: ${e?.message ?? e}`); }
+  trace(5, 'post-sharp-repair');
 
   // Step 6: Kill stale watchdogs and the old daemon.
+  trace(6, 'pre-kill-watchdogs');
   log('killing stale watchdogs');
   killStaleWatchdogs();
+  trace(6, 'post-kill-watchdogs');
   if (oldPid) {
     log(`stopping old daemon PID ${oldPid}`);
     tryKillPid(oldPid);
+    trace(6, 'old-daemon-killed', `pid=${oldPid}`);
   }
   // Brief settle so Windows finishes process teardown before we ask the
   // new shim to do its repair-watchdog dance.
@@ -320,30 +463,37 @@ async function main() {
 
   // Step 7: Regenerate launch chain via the new shim.
   // shim is .cmd → must go through cmd.exe explicitly under Node 24.
+  trace(7, 'pre-repair-watchdog');
   log('regenerating launch chain via repair-watchdog');
   try {
-    const r = spawnCmdExe(shim, ['repair-watchdog'], {
+    const r = spawnCmdShim(shim, ['repair-watchdog'], {
       stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', windowsHide: true,
+      timeout: FAST_CMD_TIMEOUT_MS,
     });
     if (r.status !== 0) log(`repair-watchdog exit ${r.status}: ${(r.stderr || '').trim()}`);
+    trace(7, 'post-repair-watchdog', `exit=${r.status}`);
   } catch (e) {
     log(`repair-watchdog warning: ${e?.message ?? e}`);
   }
 
   // Step 8: Spawn new watchdog via VBS (preferred — runs hidden).
+  trace(8, 'pre-vbs-launch');
   log('starting new watchdog via VBS');
   if (existsSync(VBS_LAUNCHER)) {
     spawn('wscript', [VBS_LAUNCHER], {
       detached: true, stdio: 'ignore', windowsHide: true,
     }).unref();
+    trace(8, 'post-vbs-launch');
   } else {
     log(`WARNING: VBS launcher not found at ${VBS_LAUNCHER}`);
+    trace(8, 'vbs-launcher-missing');
   }
 
   // Step 9: Lock removed in `finally` — watchdog exits :wait_loop and
   // launches the new daemon as soon as it sees the lock gone.
 
   // Step 10: Health check — wait up to 15s for a NEW daemon PID.
+  trace(10, 'pre-health-check');
   const deadline = Date.now() + 15_000;
   let newPid = null;
   while (Date.now() < deadline) {
@@ -351,8 +501,20 @@ async function main() {
     const pid = readNumber(PIDFILE);
     if (pid && pid !== oldPid) { newPid = pid; break; }
   }
-  if (newPid) log(`health check PASSED: new daemon PID ${newPid}`);
-  else log('health check FAILED: no new daemon PID within 15s (watchdog will keep retrying)');
+  if (newPid) {
+    log(`health check PASSED: new daemon PID ${newPid}`);
+    trace(10, 'health-check-passed', `pid=${newPid}`);
+  } else {
+    log('health check FAILED: no new daemon PID within 15s (watchdog will keep retrying)');
+    trace(10, 'health-check-failed');
+  }
+
+  // Mark the run as a success — even a failed health check counts as
+  // "ran to completion" because the watchdog will recover.  Only
+  // EARLY-RETURN aborts (install fail, no prefix, version mismatch)
+  // leave upgradeSucceeded === false → tmp preserved for postmortem.
+  upgradeSucceeded = true;
+  trace(99, 'main-exit-success');
 }
 
 // Top-level try/finally guarantees the lock gets cleared no matter how
@@ -361,9 +523,19 @@ async function main() {
 main()
   .catch((e) => {
     log(`FATAL: ${e?.stack ?? e?.message ?? String(e)}`);
+    trace(99, 'main-exit-fatal');
   })
   .finally(() => {
     const cleared = clearLock();
     log(cleared ? 'lock released' : 'WARNING: failed to release lock — watchdog self-heal will recover');
-    selfCleanup();
+    if (upgradeSucceeded) {
+      log('=== upgrade done — tmp dir scheduled for delete in 60s ===');
+      scheduleTmpDelete();
+    } else {
+      // PRESERVE the tmp dir on any failure path so its upgrade.log is
+      // available for postmortem.  This is the bug from 2026-05-08 that
+      // kept us blind to three consecutive silent failures.
+      log(`=== upgrade FAILED — tmp dir PRESERVED for postmortem: ${SCRIPT_DIR} ===`);
+      log('grep [trace] in upgrade.log to find the last reached step.');
+    }
   });
