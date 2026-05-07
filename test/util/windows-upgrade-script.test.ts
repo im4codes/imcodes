@@ -184,7 +184,7 @@ describe('buildWindowsUpgradeBatch', () => {
     expect(afterDone).toMatch(/WARNING:.*upgrade\.lock still present/i);
   });
 
-  it('every echo INSIDE an if(...) block has its literal parens escaped with ^', () => {
+  it('every echo INSIDE an if(...) block has NO literal parens at all (not even ^-escaped)', () => {
     // cmd.exe parses if-blocks `if COND ( ... )` purely by counting
     // parens.  An unescaped `(` or `)` inside an `echo` argument
     // prematurely closes the if-block, so the rest of what looked
@@ -196,9 +196,23 @@ describe('buildWindowsUpgradeBatch', () => {
     // logged on the same run, leaving the lock un-deleted because
     // the script's later `del "%UPGRADE_LOCK%"` got skipped.
     //
+    // FIRST FIX (commit 68947ccf): escape literal parens with ^ inside
+    // if-block echoes — `^(` and `^)`.
+    //
+    // SECOND OBSERVATION (2026-05-07, prod log /tmp/imcodes-upgrade-cdFehr/
+    // upgrade.log): even WITH ^-escapes, cmd.exe inside `if exist (...)`
+    // ate the closing `^)` of an echo.  Logged line was literally
+    //   "Old daemon PID: 777468 (will be killed only after install succeeds"
+    // — `(` printed but `)` was missing, even though source had `^(...^)`.
+    // Verified via `od -c` on the prod log, not a display artifact.
+    //
+    // PERMANENT FIX: forbid ALL parens inside if-block echoes — escaped
+    // or not.  Use `[...]` or `--...--` instead.  `[` and `]` are not
+    // magic to cmd.exe's block parser at any nesting depth.
+    //
     // Walk every line, track if-block depth from `(` at end-of-line
     // and `)` at start-of-line, and assert every `echo` line whose
-    // depth > 0 has matching `^(` / `^)` pairs (or no parens at all).
+    // depth > 0 has NO parens of any form.
     const lines = batch.split(/\r?\n/);
     let depth = 0;
     for (const line of lines) {
@@ -206,13 +220,95 @@ describe('buildWindowsUpgradeBatch', () => {
       // Closing paren on its own line decreases depth FIRST
       if (/^\)/.test(trimmed)) depth = Math.max(0, depth - 1);
       if (depth > 0 && /^\s*echo /.test(line)) {
-        // Strip any escaped parens, then assert no unescaped ones remain
-        const stripped = line.replace(/\^[()]/g, '');
-        expect(stripped, `unescaped paren in if-block echo: ${line}`).not.toMatch(/[()]/);
+        expect(line, `paren in if-block echo (use [...] or --...-- instead): ${line}`).not.toMatch(/[()]/);
       }
       // Opening paren at end-of-line increases depth AFTER scanning the line
       if (/\($/.test(trimmed)) depth += 1;
     }
+  });
+
+  it('emits trace markers at every major step so silent deaths are localizable', () => {
+    // Production log /tmp/imcodes-upgrade-cdFehr/upgrade.log on 2026-05-07
+    // showed npm install completing with "60 packages are looking for
+    // funding" — and then the script went absolutely silent.  No trace
+    // of which subsequent step (sharp-repair, npm prefix -g, version
+    // check, taskkill, repair-watchdog, VBS launch) ran or hung.  The
+    // resulting upgrade.lock stayed stranded at 19:11:57 and the watchdog
+    // could not respawn.
+    //
+    // Defense: every major step emits a `[trace] step=N <stage>` line
+    // BOTH before and after.  When the next silent death happens, the
+    // last `[trace]` line in the log pinpoints exactly where it died.
+    const expectedTraces = [
+      '[trace] step=1 lock-created',
+      '[trace] step=2 pre-npm-install',
+      '[trace] step=2 post-npm-install',
+      '[trace] step=2.1 pre-sharp-repair',
+      '[trace] step=2.1 post-sharp-repair',
+      '[trace] step=3 pre-npm-prefix',
+      '[trace] step=3 post-npm-prefix',
+      '[trace] step=3 pre-version-check',
+      '[trace] step=3 post-version-check',
+      '[trace] step=4 pre-kill-watchdogs',
+      '[trace] step=5 pre-repair-watchdog',
+      '[trace] step=5 post-repair-watchdog',
+      '[trace] step=6 pre-vbs-launch',
+      '[trace] step=6 post-vbs-launch',
+      '[trace] step=7 lock-removed',
+      '[trace] step=8 pre-health-check',
+    ];
+    for (const trace of expectedTraces) {
+      expect(batch, `missing trace marker: ${trace}`).toContain(trace);
+    }
+  });
+
+  it('trace markers appear in source-order so the log is read top-down', () => {
+    // The ordering is what makes the trace log debuggable — each marker
+    // must come strictly after the previous one in the generated batch.
+    const orderedTraces = [
+      '[trace] step=1 lock-created',
+      '[trace] step=2 pre-npm-install',
+      '[trace] step=2 post-npm-install',
+      '[trace] step=2.1 pre-sharp-repair',
+      '[trace] step=2.1 post-sharp-repair',
+      '[trace] step=3 pre-npm-prefix',
+      '[trace] step=3 post-npm-prefix',
+      '[trace] step=3 pre-version-check',
+      '[trace] step=3 post-version-check',
+      '[trace] step=4 pre-kill-watchdogs',
+      '[trace] step=5 pre-repair-watchdog',
+      '[trace] step=5 post-repair-watchdog',
+      '[trace] step=6 pre-vbs-launch',
+      '[trace] step=6 post-vbs-launch',
+      '[trace] step=7 lock-removed',
+      '[trace] step=8 pre-health-check',
+    ];
+    let prevIdx = -1;
+    for (const trace of orderedTraces) {
+      const idx = batch.indexOf(trace);
+      expect(idx, `out-of-order trace: ${trace}`).toBeGreaterThan(prevIdx);
+      prevIdx = idx;
+    }
+  });
+
+  it('post-npm-install trace captures the exit code so we can tell whether install actually succeeded', () => {
+    // The 2026-05-07 prod log left ambiguity: did npm install exit 0 and
+    // sharp-repair hang?  Or did npm install crash mid-cleanup?  The
+    // post-npm-install trace records `exit=%INSTALL_EXIT%` so the answer
+    // is unambiguous in the log.
+    expect(batch).toMatch(/\[trace\] step=2 post-npm-install exit=%INSTALL_EXIT%/);
+  });
+
+  it('uses brackets (not parens) inside every if-block echo so cmd.exe parser never eats a token', () => {
+    // Belt-and-suspenders for the paren-detection test — pin the
+    // specific phrasings that previously had paren bugs.
+    expect(batch).toContain('Old daemon PID: !OLD_DAEMON_PID! [will be killed only after install succeeds]');
+    expect(batch).toMatch(/tree-killing watchdog PID !STALE_WD! \[via powershell\]/);
+    expect(batch).toMatch(/tree-killing watchdog PID !STALE_WD! \[via wmic\]/);
+    // And forbid the old fragile forms anywhere in the batch
+    expect(batch).not.toMatch(/!OLD_DAEMON_PID! \^\(/);
+    expect(batch).not.toMatch(/\[via powershell\^\)/);
+    expect(batch).not.toMatch(/\[via wmic\^\)/);
   });
 
   it('NEVER uses `timeout /t` (regression: fails when launched via wscript)', () => {

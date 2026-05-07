@@ -89,16 +89,19 @@ ping -n 3 127.0.0.1 >nul 2>&1\r
 \r
 rem ── Step 1: Create upgrade lock — watchdog will pause (daemon keeps running) ──\r
 echo upgrade > "%UPGRADE_LOCK%"\r
-echo Upgrade lock created (old daemon still running, watchdog paused) >> "%LOG_FILE%"\r
+echo Upgrade lock created [old daemon still running, watchdog paused] >> "%LOG_FILE%"\r
+echo [trace] step=1 lock-created >> "%LOG_FILE%"\r
 \r
 rem Capture the OLD daemon's PID so we can kill it LATER (only after install OK)\r
 set "OLD_DAEMON_PID="\r
 if exist "%PIDFILE%" (\r
   set /p OLD_DAEMON_PID=<"%PIDFILE%"\r
-  rem cmd parses if-blocks by counting parens — escape literal parens\r
-  rem in echo args with ^ or the block terminates early and the rest\r
-  rem of the script falls outside.\r
-  echo Old daemon PID: !OLD_DAEMON_PID! ^(will be killed only after install succeeds^) >> "%LOG_FILE%"\r
+  rem NEVER use literal ( or ) inside echo args inside if-blocks — even with\r
+  rem ^-escaping cmd's parser can still eat one of them.  Observed in the\r
+  rem wild on 2026-05-07 (upgrade.log "Old daemon PID: 777468 (will be killed\r
+  rem only after install succeeds" — closing paren got eaten despite ^).\r
+  rem Use [ ... ] instead — they're not magic to cmd.\r
+  echo Old daemon PID: !OLD_DAEMON_PID! [will be killed only after install succeeds] >> "%LOG_FILE%"\r
 )\r
 \r
 rem Save the daemon's original NODE_OPTIONS so we can restore it BEFORE\r
@@ -116,7 +119,7 @@ rem more than ~1-2 GB, and 16 GB virtual reservation can fail the OS\r
 rem commit check while the OLD daemon is still resident.\r
 set "ORIG_NODE_OPTIONS=%NODE_OPTIONS%"\r
 set "NODE_OPTIONS=--max-old-space-size=4096"\r
-echo Using NODE_OPTIONS=%NODE_OPTIONS% (orig: %ORIG_NODE_OPTIONS%) >> "%LOG_FILE%"\r
+echo Using NODE_OPTIONS=%NODE_OPTIONS% [orig: %ORIG_NODE_OPTIONS%] >> "%LOG_FILE%"\r
 \r
 rem ── Step 2: Run npm install WHILE OLD DAEMON IS STILL ALIVE ──────────────\r
 rem On Windows, node's .js modules aren't locked by the running daemon\r
@@ -124,6 +127,7 @@ rem (node reads them into memory at load time), so npm CAN overwrite them\r
 rem safely while the old daemon keeps serving requests.  This is the key\r
 rem to guaranteeing the old daemon survives install failures.\r
 echo Installing ${pkgSpec}... >> "%LOG_FILE%"\r
+echo [trace] step=2 pre-npm-install >> "%LOG_FILE%"\r
 rem --ignore-scripts: see the matching block in command-handler.ts\r
 rem (handleDaemonUpgrade, "Sharp repair") for the full story.  TL;DR:\r
 rem strip-onnxruntime-gpu.mjs removes node_modules/sharp/ from the\r
@@ -137,6 +141,7 @@ rem @img/sharp-win32-x64 / @img/sharp-win32-arm64 package, which npm\r
 rem still fetches as a regular optionalDependency (no install script).\r
 call "${npmCmd}" install -g --ignore-scripts ${pkgSpec} >> "%LOG_FILE%" 2>&1\r
 set "INSTALL_EXIT=%errorlevel%"\r
+echo [trace] step=2 post-npm-install exit=%INSTALL_EXIT% >> "%LOG_FILE%"\r
 \r
 rem Restore the daemon's original NODE_OPTIONS NOW (right after npm install)\r
 rem so EVERY subsequent path — abort branches that wscript-relaunch the\r
@@ -156,11 +161,15 @@ if %INSTALL_EXIT% neq 0 (\r
   goto :done\r
 )\r
 \r
+echo [trace] step=2.1 pre-sharp-repair >> "%LOG_FILE%"\r
 ${buildBatchSharpRepair({ npmCmd })}\r
+echo [trace] step=2.1 post-sharp-repair >> "%LOG_FILE%"\r
 \r
 rem ── Step 3: Verify the install (shim exists, version matches) ──────────\r
+echo [trace] step=3 pre-npm-prefix >> "%LOG_FILE%"\r
 set "NPM_PREFIX="\r
 for /f "usebackq delims=" %%p in (\`call "${npmCmd}" prefix -g 2^>nul\`) do if not defined NPM_PREFIX set "NPM_PREFIX=%%p"\r
+echo [trace] step=3 post-npm-prefix prefix=%NPM_PREFIX% >> "%LOG_FILE%"\r
 if not defined NPM_PREFIX (\r
   echo Could not resolve npm global prefix after install. >> "%LOG_FILE%"\r
   echo === upgrade aborted at %date% %time% === >> "%LOG_FILE%"\r
@@ -180,9 +189,11 @@ if not exist "%CLI_SHIM%" (\r
   goto :done\r
 )\r
 \r
+echo [trace] step=3 pre-version-check >> "%LOG_FILE%"\r
 set "INSTALLED_VER="\r
 for /f "usebackq delims=" %%v in (\`call "%CLI_SHIM%" --version 2^>nul\`) do if not defined INSTALLED_VER set "INSTALLED_VER=%%v"\r
 echo Install succeeded. Installed version: %INSTALLED_VER%, target: ${targetVer}, shim: %CLI_SHIM% >> "%LOG_FILE%"\r
+echo [trace] step=3 post-version-check installed=%INSTALLED_VER% >> "%LOG_FILE%"\r
 if not "${targetVer}"=="latest" if /I not "%INSTALLED_VER%"=="${targetVer}" (\r
   echo Version mismatch after install — removing lock, old daemon keeps serving. >> "%LOG_FILE%"\r
   echo === upgrade aborted at %date% %time% === >> "%LOG_FILE%"\r
@@ -201,14 +212,15 @@ if %errorlevel% neq 0 (\r
 rem ── Step 4: Kill old daemon + stale watchdogs — ONLY now (install OK) ───\r
 rem Find watchdog cmd.exe processes by command-line pattern.  Try PowerShell\r
 rem first (deprecated-wmic-safe), fall back to wmic for legacy installs.\r
-echo Killing old daemon-watchdog cmd.exe processes (install succeeded)... >> "%LOG_FILE%"\r
+echo [trace] step=4 pre-kill-watchdogs >> "%LOG_FILE%"\r
+echo Killing old daemon-watchdog cmd.exe processes [install succeeded]... >> "%LOG_FILE%"\r
 set "PS_SCRIPT=%SCRIPT_DIR%\\find-stale-watchdog.ps1"\r
 > "%PS_SCRIPT%" echo Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" ^| Where-Object { $_.CommandLine -like '*daemon-watchdog*' } ^| ForEach-Object { $_.ProcessId }\r
 for /f "usebackq delims=" %%w in (\`powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%PS_SCRIPT%" 2^>nul\`) do (\r
   set "STALE_WD=%%w"\r
   set "STALE_WD=!STALE_WD: =!"\r
   if defined STALE_WD if not "!STALE_WD!"=="" (\r
-    echo   tree-killing watchdog PID !STALE_WD! ^(via powershell^) >> "%LOG_FILE%"\r
+    echo   tree-killing watchdog PID !STALE_WD! [via powershell] >> "%LOG_FILE%"\r
     taskkill /f /t /pid !STALE_WD! >nul 2>&1\r
   )\r
 )\r
@@ -216,7 +228,7 @@ for /f "tokens=2 delims==" %%w in ('wmic process where "Name='cmd.exe' and Comma
   set "STALE_WD=%%w"\r
   set "STALE_WD=!STALE_WD: =!"\r
   if defined STALE_WD if not "!STALE_WD!"=="" (\r
-    echo   tree-killing watchdog PID !STALE_WD! ^(via wmic^) >> "%LOG_FILE%"\r
+    echo   tree-killing watchdog PID !STALE_WD! [via wmic] >> "%LOG_FILE%"\r
     taskkill /f /t /pid !STALE_WD! >nul 2>&1\r
   )\r
 )\r
@@ -227,9 +239,12 @@ if defined OLD_DAEMON_PID if not "!OLD_DAEMON_PID!"=="" (\r
 ping -n 3 127.0.0.1 >nul 2>&1\r
 \r
 rem ── Step 5: Regenerate launch chain with the new binary's paths ────────\r
+echo [trace] step=5 pre-repair-watchdog >> "%LOG_FILE%"\r
 echo Regenerating daemon launch chain... >> "%LOG_FILE%"\r
 call "%CLI_SHIM%" repair-watchdog >> "%LOG_FILE%" 2>&1\r
-if %errorlevel% neq 0 (\r
+set "REPAIR_EXIT=%errorlevel%"\r
+echo [trace] step=5 post-repair-watchdog exit=%REPAIR_EXIT% >> "%LOG_FILE%"\r
+if %REPAIR_EXIT% neq 0 (\r
   echo WARNING: Launch chain regeneration failed >> "%LOG_FILE%"\r
 )\r
 \r
@@ -240,18 +255,22 @@ rem we delete it below.\r
 rem NODE_OPTIONS was restored to the daemon's original value right after\r
 rem npm install, so the new daemon inherits a clean env (no accumulated\r
 rem --max-old-space-size flags).\r
-echo Starting new watchdog via VBS (NODE_OPTIONS=%NODE_OPTIONS%)... >> "%LOG_FILE%"\r
+echo [trace] step=6 pre-vbs-launch >> "%LOG_FILE%"\r
+echo Starting new watchdog via VBS [NODE_OPTIONS=%NODE_OPTIONS%]... >> "%LOG_FILE%"\r
 if exist "%VBS_LAUNCHER%" (\r
   wscript "%VBS_LAUNCHER%"\r
 ) else (\r
   echo WARNING: VBS launcher not found at %VBS_LAUNCHER% >> "%LOG_FILE%"\r
 )\r
+echo [trace] step=6 post-vbs-launch >> "%LOG_FILE%"\r
 \r
 rem ── Step 7: Remove lock → watchdog starts the new daemon ───────────────\r
 echo Removing upgrade lock... >> "%LOG_FILE%"\r
 del "%UPGRADE_LOCK%" >nul 2>&1\r
+echo [trace] step=7 lock-removed >> "%LOG_FILE%"\r
 \r
 rem ── Step 8: Health-check the new daemon ────────────────────────────────\r
+echo [trace] step=8 pre-health-check >> "%LOG_FILE%"\r
 ping -n 11 127.0.0.1 >nul 2>&1\r
 if exist "%PIDFILE%" (\r
   set /p DAEMON_PID=<"%PIDFILE%"\r
