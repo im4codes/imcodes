@@ -44,9 +44,14 @@ import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { copyFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { ensureImcDir, imcSubDir } from '../util/imc-dir.js';
-import { buildWindowsCleanupScript, buildWindowsCleanupVbs, buildWindowsUpgradeBatch, buildWindowsUpgradeVbs } from '../util/windows-upgrade-script.js';
+import {
+  buildWindowsCleanupScript,
+  buildWindowsCleanupVbs,
+  buildWindowsUpgradeRunnerVbs,
+  resolveWindowsUpgradeRunnerPath,
+} from '../util/windows-upgrade-script.js';
 import { buildBashSharpRepair } from '../util/sharp-repair-script.js';
-import { UPGRADE_LOCK_FILE, encodeVbsAsUtf16, encodeCmdAsUtf8Bom } from '../util/windows-launch-artifacts.js';
+import { encodeVbsAsUtf16, encodeCmdAsUtf8Bom } from '../util/windows-launch-artifacts.js';
 import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
 import { sanitizeProjectName } from '../../shared/sanitize-project-name.js';
 import { isTemplatePrompt, isTemplateOriginSummary, isImperativeCommand } from '../../shared/template-prompt-patterns.js';
@@ -4118,7 +4123,7 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
   }
 
   const { spawn } = await import('child_process');
-  const { writeFileSync, mkdtempSync, existsSync } = await import('fs');
+  const { writeFileSync, readFileSync, mkdtempSync, existsSync } = await import('fs');
   const { join, dirname } = await import('path');
   const { tmpdir, homedir } = await import('os');
 
@@ -4243,39 +4248,55 @@ if [ -n "$STALE_PID" ] && kill -0 "$STALE_PID" 2>/dev/null; then
 fi
 launchctl load -w "${plist}"`;
   } else if (process.platform === 'win32') {
-    // Windows: generate a CMD batch script
+    // Windows: drive the upgrade with a Node.js runner instead of a
+    // cmd.exe batch.  The batch was the source of every Windows
+    // auto-upgrade outage we shipped (paren-counting in if-blocks,
+    // timeout-needs-stdin, del silent failures, codepage issues with
+    // non-ASCII %TEMP% / %USERPROFILE% paths).  Node fs APIs use the
+    // Windows wide-char API natively, so Chinese / Cyrillic / etc.
+    // paths round-trip transparently.
+    //
+    // Layout: copy the bundled runner to %TEMP%/imcodes-upgrade-X/upgrade.mjs
+    // BEFORE spawning, so the in-flight `npm install -g` doesn't
+    // overwrite the runner's source under itself when the new
+    // package's files land at the same global path.
     const npmBin = join(dirname(process.execPath), 'npm.cmd');
     const npmCmd = existsSync(npmBin) ? npmBin : 'npm';
     const pkgSpec = targetVersion ? `imcodes@${targetVersion}` : 'imcodes@latest';
-    const batchPath = join(scriptDir, 'upgrade.cmd');
-    const upgradeVbsPath = join(scriptDir, 'upgrade.vbs');
+    const targetVer = targetVersion ?? 'latest';
+
+    const runnerSrc = resolveWindowsUpgradeRunnerPath();
+    const runnerCopy = join(scriptDir, 'upgrade.mjs');
+    try {
+      // Read+write rather than cpSync so a broken runnerSrc fails loud.
+      writeFileSync(runnerCopy, readFileSync(runnerSrc));
+    } catch (err) {
+      logger.error({ err, runnerSrc }, 'daemon.upgrade: failed to stage upgrade runner — cannot proceed');
+      return;
+    }
+
+    // Cleanup .cmd is still cmd.exe — but it's a 4-line idempotent rmdir
+    // with NO control flow.  No parens, no timeout, no del — just one
+    // ping sleep and one rmdir.  Kept because the runner self-cleans via
+    // its own deferred rmSync, but this is a belt-and-suspenders for
+    // the case where the runner crashes before reaching the finally block.
     const cleanupPath = join(scriptDir, 'cleanup.cmd');
     const cleanupVbsPath = join(scriptDir, 'cleanup.vbs');
-    const targetVer = targetVersion ?? 'latest';
-    // .cmd files: UTF-8 + BOM, and the script itself switches to UTF-8 with
-    // `chcp 65001` before touching any non-ASCII paths.
-    // .vbs files: UTF-16 LE + BOM so wscript handles non-ASCII paths.
     writeFileSync(cleanupPath, encodeCmdAsUtf8Bom(buildWindowsCleanupScript(scriptDir)));
     writeFileSync(cleanupVbsPath, encodeVbsAsUtf16(buildWindowsCleanupVbs(cleanupPath)));
-    const vbsLauncherPath = join(homedir(), '.imcodes', 'daemon-launcher.vbs');
-    const batch = buildWindowsUpgradeBatch({
-      logFile,
-      scriptDir,
-      cleanupPath,
-      cleanupVbsPath,
-      npmCmd,
-      pkgSpec,
-      targetVer,
-      vbsLauncherPath,
-      upgradeLockFile: UPGRADE_LOCK_FILE,
+
+    // VBS launcher — runs the JS runner via `node upgrade.mjs <args>`
+    // hidden + detached.  Bake all paths as args so the runner doesn't
+    // depend on env-var expansion or working directory.
+    const upgradeVbsPath = join(scriptDir, 'upgrade.vbs');
+    const upgradeVbs = buildWindowsUpgradeRunnerVbs({
+      nodeExe: process.execPath,
+      runnerPath: runnerCopy,
+      args: [logFile, npmCmd, pkgSpec, targetVer, scriptDir],
     });
+    writeFileSync(upgradeVbsPath, encodeVbsAsUtf16(upgradeVbs));
 
-    writeFileSync(batchPath, encodeCmdAsUtf8Bom(batch));
-    writeFileSync(upgradeVbsPath, encodeVbsAsUtf16(buildWindowsUpgradeVbs(batchPath)));
-
-    // Launch via wscript on the wrapper VBS — this guarantees that ALL child
-    // processes spawned by the batch (wmic, find, tasklist, etc.) inherit a
-    // fully hidden parent and never flash console windows.
+    // Launch via wscript: hidden + fully detached, survives our exit.
     const child = spawn('wscript', [upgradeVbsPath], {
       detached: true,
       stdio: 'ignore',
@@ -4283,7 +4304,15 @@ launchctl load -w "${plist}"`;
     });
     child.unref();
 
-    logger.info({ log: logFile }, 'daemon.upgrade: Windows upgrade script spawned');
+    // Also kick off cleanup deferred 120 s — the runner cleans up too,
+    // but if it crashes before its finally block we still want %TEMP% tidy.
+    spawn('wscript', [cleanupVbsPath], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    }).unref();
+
+    logger.info({ log: logFile, runnerCopy }, 'daemon.upgrade: Windows JS upgrade runner spawned');
     upgradeScriptSpawned = true;
     scheduleUpgradeMemoryFreezeRelease();
     return;
