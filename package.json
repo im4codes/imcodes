@@ -8,13 +8,16 @@
     "url": "https://github.com/im4codes/imcodes"
   },
   "bin": {
-    "imcodes": "./dist/src/index.js"
+    "imcodes": "./dist/src/index.js",
+    "imcodes-launch": "./bin/imcodes-launch.sh",
+    "imcodes-launch-preflight": "./dist/src/util/windows-launch-preflight.mjs"
   },
   "type": "module",
   "main": "./dist/src/index.js",
   "files": [
     "dist/",
-    "config/"
+    "config/",
+    "bin/"
   ],
   "engines": {
     "node": ">=22"

@@ -96,6 +96,72 @@ describe('writeWatchdogCmd', () => {
     expect(cmd).toContain('goto loop');
   });
 
+  it('emits the preflight self-heal line via the npm shim env-var form when the shim is installed', async () => {
+    // The preflight (`imcodes-launch-preflight.cmd`) is the Windows-side
+    // counterpart of `bin/imcodes-launch.sh` — it runs BEFORE every
+    // daemon-launch attempt and reinstalls the pinned version when
+    // `node_modules` is half-installed (commander/ws/etc. as empty
+    // placeholder dirs). Without this line the watchdog only catches
+    // PROCESS death, not module-load failures, so a power-off mid-
+    // upgrade wedges the daemon in an infinite restart loop.
+    //
+    // Same env-var form as the launch line so non-ASCII usernames
+    // never get embedded in the .cmd body.
+    const { existsSync } = await import('fs');
+    (existsSync as ReturnType<typeof vi.fn>).mockImplementation(
+      (p: string) => p.endsWith('imcodes.cmd') || p.endsWith('imcodes-launch-preflight.cmd'),
+    );
+    const paths = {
+      nodeExe: 'C:\\Program Files\\nodejs\\node.exe',
+      imcodesScript: 'C:\\Users\\X\\AppData\\Roaming\\npm\\node_modules\\imcodes\\dist\\src\\index.js',
+      watchdogPath: 'C:\\Users\\X\\.imcodes\\daemon-watchdog.cmd',
+      vbsPath: 'C:\\Users\\X\\.imcodes\\daemon-launcher.vbs',
+      logPath: 'C:\\Users\\X\\.imcodes\\watchdog.log',
+    };
+    await writeWatchdogCmd(paths);
+    const cmd = written[paths.watchdogPath];
+    // Preflight line must use env-var form, not absolute path.
+    expect(cmd).toContain('call "%APPDATA%\\npm\\imcodes-launch-preflight.cmd"');
+    // No absolute path leakage (would break under non-ASCII usernames
+    // because of cmd.exe's UTF-8 ↔ ANSI roundtrip).
+    expect(cmd).not.toContain('C:\\Users\\X\\AppData\\Roaming\\npm\\imcodes-launch-preflight');
+    // Preflight output must go to the watchdog log so operators can
+    // see what self-repair did.
+    expect(cmd).toContain('imcodes-launch-preflight.cmd" >> "%USERPROFILE%\\.imcodes\\watchdog.log"');
+    // Order: preflight line MUST come before the launch line each
+    // iteration, otherwise we'd attempt a launch on a broken install
+    // first.
+    const preflightIdx = cmd.indexOf('imcodes-launch-preflight.cmd');
+    const launchIdx = cmd.indexOf('start --foreground');
+    expect(preflightIdx).toBeGreaterThan(-1);
+    expect(launchIdx).toBeGreaterThan(preflightIdx);
+  });
+
+  it('skips the preflight line when the shim is not installed (graceful degradation for older versions)', async () => {
+    // Older imcodes versions ship without the preflight bin entry, so
+    // the npm shim doesn't exist on disk. Watchdog must NOT emit a
+    // preflight line in that case — calling a missing shim would loop
+    // an error per iteration. The next upgrade lands the shim and
+    // step 3.5's launch-chain regen will rewrite the watchdog with
+    // the preflight included.
+    const { existsSync } = await import('fs');
+    (existsSync as ReturnType<typeof vi.fn>).mockImplementation(
+      (p: string) => p.endsWith('imcodes.cmd'), // only the launch shim, no preflight
+    );
+    const paths = {
+      nodeExe: 'C:\\Program Files\\nodejs\\node.exe',
+      imcodesScript: 'C:\\Users\\X\\AppData\\Roaming\\npm\\node_modules\\imcodes\\dist\\src\\index.js',
+      watchdogPath: 'C:\\Users\\X\\.imcodes\\daemon-watchdog.cmd',
+      vbsPath: 'C:\\Users\\X\\.imcodes\\daemon-launcher.vbs',
+      logPath: 'C:\\Users\\X\\.imcodes\\watchdog.log',
+    };
+    await writeWatchdogCmd(paths);
+    const cmd = written[paths.watchdogPath];
+    expect(cmd).not.toContain('imcodes-launch-preflight');
+    // Launch line still works as before.
+    expect(cmd).toContain('call "%APPDATA%\\npm\\imcodes.cmd" start --foreground');
+  });
+
   it('uses %APPDATA%\\npm\\imcodes.cmd via env-var expansion (no hardcoded path)', async () => {
     const paths = {
       nodeExe: 'C:\\Program Files\\nodejs\\node.exe',

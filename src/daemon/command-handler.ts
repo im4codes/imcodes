@@ -4831,12 +4831,30 @@ log "[step 3] version comparator: installed > current → restart"
 # clobber.
 log "[step 3.5] regenerating launch chain"
 NEW_IMCODES_SCRIPT="$GLOBAL_ROOT/imcodes/dist/src/index.js"
+NEW_LAUNCHER="$GLOBAL_ROOT/imcodes/bin/imcodes-launch.sh"
+
+# Prefer the self-healing launcher (bin/imcodes-launch.sh) when the
+# freshly-installed package ships it. Older installs (pre-launcher) fall
+# back to the direct node ExecStart so we never break versions that
+# don't ship the file. Either way the resulting unit/plist points at
+# absolute paths from THIS install — consistent with the rest of step
+# 3.5's contract.
+if [ -f "$NEW_LAUNCHER" ]; then
+  LINUX_EXEC="ExecStart=$NEW_LAUNCHER start --foreground"
+  DARWIN_PROGRAM_ARGS="[\\"$NEW_LAUNCHER\\",\\"start\\",\\"--foreground\\"]"
+  log "[step 3.5] using self-healing launcher: $NEW_LAUNCHER"
+else
+  LINUX_EXEC="ExecStart=$NODE $NEW_IMCODES_SCRIPT start --foreground"
+  DARWIN_PROGRAM_ARGS="[\\"$NODE\\",\\"$NEW_IMCODES_SCRIPT\\",\\"start\\",\\"--foreground\\"]"
+  log "[step 3.5] $NEW_LAUNCHER not present in this version — using direct node ExecStart"
+fi
+
 if [ ! -f "$NEW_IMCODES_SCRIPT" ]; then
   log "[step 3.5] $NEW_IMCODES_SCRIPT not found — skipping (will rely on existing launch chain)"
 elif [ "$(uname)" = "Linux" ]; then
   SVC="$HOME/.config/systemd/user/imcodes.service"
   if [ -f "$SVC" ]; then
-    NEW_EXEC="ExecStart=$NODE $NEW_IMCODES_SCRIPT start --foreground"
+    NEW_EXEC="$LINUX_EXEC"
     OLD_EXEC=$(grep -m1 '^ExecStart=' "$SVC" || echo '(none)')
     if [ "$OLD_EXEC" = "$NEW_EXEC" ]; then
       log "[step 3.5] systemd ExecStart already current"
@@ -4867,7 +4885,7 @@ elif [ "$(uname)" = "Darwin" ]; then
   if [ -f "$PLIST" ]; then
     if command -v plutil >/dev/null 2>&1; then
       log "[step 3.5] rewriting plist ProgramArguments"
-      if plutil -replace ProgramArguments -json "[\\"$NODE\\",\\"$NEW_IMCODES_SCRIPT\\",\\"start\\",\\"--foreground\\"]" "$PLIST" >> "$LOG" 2>&1; then
+      if plutil -replace ProgramArguments -json "$DARWIN_PROGRAM_ARGS" "$PLIST" >> "$LOG" 2>&1; then
         log "[step 3.5] plutil rewrite OK"
       else
         log "[step 3.5] plutil rewrite FAILED (non-fatal)"
