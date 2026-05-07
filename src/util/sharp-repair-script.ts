@@ -116,7 +116,7 @@ export function buildBatchSharpRepair(opts: { npmCmd: string }): string {
     `${depChecks}\r`,
     `)\r`,
     `if "!SHARP_BROKEN!"=="1" (\r`,
-    `  echo sharp subtree broken (!SHARP_BROKEN_DEP!/package.json missing) — repairing via nested npm install >> "%LOG_FILE%"\r`,
+    `  echo sharp subtree broken ^(!SHARP_BROKEN_DEP!/package.json missing^) — repairing via nested npm install >> "%LOG_FILE%"\r`,
     `${depCleanups}\r`,
     `  pushd "!GLOBAL_ROOT_CHECK!\\imcodes" >nul 2>&1\r`,
     `  call "${npmCmd}" install --no-save --ignore-scripts sharp@0.34.5 >> "%LOG_FILE%" 2>&1\r`,
@@ -125,7 +125,7 @@ export function buildBatchSharpRepair(opts: { npmCmd: string }): string {
     `  if !REPAIR_EXIT! equ 0 (\r`,
     `    echo sharp repair succeeded >> "%LOG_FILE%"\r`,
     `  ) else (\r`,
-    `    echo sharp repair FAILED (exit !REPAIR_EXIT!) — semantic memory recall will sticky-disable >> "%LOG_FILE%"\r`,
+    `    echo sharp repair FAILED ^(exit !REPAIR_EXIT!^) — semantic memory recall will sticky-disable >> "%LOG_FILE%"\r`,
     `  )\r`,
     `)\r`,
   ].join('\n');

@@ -184,6 +184,37 @@ describe('buildWindowsUpgradeBatch', () => {
     expect(afterDone).toMatch(/WARNING:.*upgrade\.lock still present/i);
   });
 
+  it('every echo INSIDE an if(...) block has its literal parens escaped with ^', () => {
+    // cmd.exe parses if-blocks `if COND ( ... )` purely by counting
+    // parens.  An unescaped `(` or `)` inside an `echo` argument
+    // prematurely closes the if-block, so the rest of what looked
+    // like the block falls outside as plain commands.  In the wild
+    // (kill-daemon.mjs, 2026-05-07) we observed an echo like
+    //   echo Watchdog launched (new daemon coming up in ~5s) >> log
+    // breaking the parser so badly that BOTH the if-branch's
+    // success message AND the else-branch's WARNING message got
+    // logged on the same run, leaving the lock un-deleted because
+    // the script's later `del "%UPGRADE_LOCK%"` got skipped.
+    //
+    // Walk every line, track if-block depth from `(` at end-of-line
+    // and `)` at start-of-line, and assert every `echo` line whose
+    // depth > 0 has matching `^(` / `^)` pairs (or no parens at all).
+    const lines = batch.split(/\r?\n/);
+    let depth = 0;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      // Closing paren on its own line decreases depth FIRST
+      if (/^\)/.test(trimmed)) depth = Math.max(0, depth - 1);
+      if (depth > 0 && /^\s*echo /.test(line)) {
+        // Strip any escaped parens, then assert no unescaped ones remain
+        const stripped = line.replace(/\^[()]/g, '');
+        expect(stripped, `unescaped paren in if-block echo: ${line}`).not.toMatch(/[()]/);
+      }
+      // Opening paren at end-of-line increases depth AFTER scanning the line
+      if (/\($/.test(trimmed)) depth += 1;
+    }
+  });
+
   it('NEVER uses `timeout /t` (regression: fails when launched via wscript)', () => {
     // `timeout /t N /nobreak` requires a real console for stdin (it polls
     // keypresses to detect interrupt).  When this batch is launched via

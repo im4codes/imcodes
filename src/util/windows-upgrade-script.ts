@@ -95,7 +95,10 @@ rem Capture the OLD daemon's PID so we can kill it LATER (only after install OK)
 set "OLD_DAEMON_PID="\r
 if exist "%PIDFILE%" (\r
   set /p OLD_DAEMON_PID=<"%PIDFILE%"\r
-  echo Old daemon PID: !OLD_DAEMON_PID! (will be killed only after install succeeds) >> "%LOG_FILE%"\r
+  rem cmd parses if-blocks by counting parens — escape literal parens\r
+  rem in echo args with ^ or the block terminates early and the rest\r
+  rem of the script falls outside.\r
+  echo Old daemon PID: !OLD_DAEMON_PID! ^(will be killed only after install succeeds^) >> "%LOG_FILE%"\r
 )\r
 \r
 rem Save the daemon's original NODE_OPTIONS so we can restore it BEFORE\r
