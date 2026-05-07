@@ -276,6 +276,34 @@ describe('QuickInputPanel history scope', () => {
     expect(screen.getByText('session b older')).toBeDefined();
   });
 
+  it('shows ten history rows on the first page before paginating', () => {
+    const sessionItems = Array.from({ length: 11 }, (_, index) => `session history ${index + 1}`);
+    render(
+      <QuickInputPanel
+        open
+        onClose={vi.fn()}
+        onSelect={vi.fn()}
+        onSend={vi.fn()}
+        agentType="claude-code"
+        sessionName="session-a"
+        data={{ history: [], sessionHistory: { 'session-a': sessionItems }, commands: [], phrases: [] }}
+        loaded
+        onAddCommand={vi.fn()}
+        onAddPhrase={vi.fn()}
+        onRemoveCommand={vi.fn()}
+        onRemovePhrase={vi.fn()}
+        onRemoveHistory={vi.fn()}
+        onRemoveSessionHistory={vi.fn()}
+        onClearHistory={vi.fn()}
+        onClearSessionHistory={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('session history 10')).toBeDefined();
+    expect(screen.queryByText('session history 11')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Older' })).toBeDefined();
+  });
+
   it('removes a custom phrase when its delete action is confirmed', () => {
     const removePhrase = vi.fn();
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);

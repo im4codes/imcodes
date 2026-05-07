@@ -660,7 +660,7 @@ body {
 .qp-trigger { padding: 6px 9px; background: #0f172a; border: 1px solid #334155; border-radius: 4px; color: #fbbf24; font-size: 14px; cursor: pointer; line-height: 1; transition: all 0.1s; flex-shrink: 0; }
 .qp-trigger:hover { background: #1e3a5f; border-color: #fbbf24; }
 .qp-backdrop { display: none; }
-.qp { position: absolute; bottom: calc(100% + 6px); left: 0; width: min(75vw, 1050px); max-height: 65vh; background: #1e293b; border: 1px solid #334155; border-radius: 8px; box-shadow: 0 8px 24px #00000070; z-index: 10002; display: flex; flex-direction: column; overflow: hidden; }
+.qp { position: absolute; bottom: calc(100% + 6px); left: 0; width: min(75vw, 1050px); max-height: min(78vh, 760px); background: #1e293b; border: 1px solid #334155; border-radius: 8px; box-shadow: 0 8px 24px #00000070; z-index: 10002; display: flex; flex-direction: column; overflow: hidden; }
 .qp-toolbar { display: flex; gap: 6px; padding: 8px 10px; border-bottom: 1px solid #334155; flex-shrink: 0; }
 .qp-toolbar-btn { padding: 4px 10px; background: #0f172a; border: 1px solid #334155; border-radius: 4px; color: #94a3b8; font-size: 11px; font-family: inherit; cursor: pointer; transition: all 0.1s; }
 .qp-toolbar-btn:hover { background: #1e3a5f; border-color: #3b82f6; color: #93c5fd; }
@@ -674,7 +674,7 @@ body {
 .qp-add-confirm:hover { background: #2563eb; }
 .qp-add-cancel { padding: 4px 6px; background: none; border: none; color: #64748b; font-size: 13px; cursor: pointer; }
 .qp-add-cancel:hover { color: #f87171; }
-.qp-list { flex: 1; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #334155 transparent; }
+.qp-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #334155 transparent; }
 .qp-section-header { padding: 6px 10px 3px; font-size: 10px; font-weight: 700; color: #475569; letter-spacing: 0.08em; text-transform: uppercase; position: sticky; top: 0; background: #1e293b; z-index: 1; }
 .qp-history-empty { padding: 6px 10px 8px; font-size: 11px; color: #475569; font-style: italic; }
 .qp-history-header { display: flex; align-items: center; justify-content: space-between; padding-right: 8px; }
@@ -714,7 +714,7 @@ body {
 /* Mobile responsive */
 @media (max-width: 640px) {
   .qp-backdrop { display: block; position: fixed; inset: 0; background: #00000070; z-index: 10001; }
-  .qp { position: fixed; bottom: 0; left: 0; right: 0; width: 100%; max-height: 60vh; border-radius: 12px 12px 0 0; border-bottom: none; }
+  .qp { position: fixed; bottom: 0; left: 0; right: 0; width: 100%; max-height: min(82vh, calc(var(--vvh, 100dvh) - var(--sat, 0px) - 72px)); border-radius: 12px 12px 0 0; border-bottom: none; }
 }
 
 /* Login */
@@ -2233,15 +2233,13 @@ body {
 /* QuickInputPanel files tab */
 .qp-tabs {
   display: flex;
-  min-height: 46px;
   background: linear-gradient(180deg, rgba(15,23,42,0.24), rgba(30,41,59,0));
   border-bottom: 1px solid #334155;
   flex-shrink: 0;
 }
 .qp-tab {
   flex: 1;
-  min-height: 46px;
-  padding: 10px 12px;
+  padding: 7px 10px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -2249,11 +2247,11 @@ body {
   background: none;
   border: none;
   color: #64748b;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 650;
   cursor: pointer;
   font-family: inherit;
-  border-bottom: 3px solid transparent;
+  border-bottom: 2px solid transparent;
   transition: background 0.15s, border-color 0.15s, color 0.15s;
 }
 .qp-tab.active {
