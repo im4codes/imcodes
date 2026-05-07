@@ -163,6 +163,8 @@ vi.mock('../../src/daemon/file-transfer-handler.js', () => ({
   handleFileUpload: vi.fn(),
   handleFileDownload: vi.fn(),
   createProjectFileHandle: vi.fn(),
+  createProjectFileHandleFromValidatedPath: vi.fn(),
+  tryCreateProjectFileHandle: vi.fn(),
   lookupAttachment: vi.fn(() => undefined),
 }));
 

@@ -909,6 +909,13 @@ export async function shutdown(exitCode = 0): Promise<void> {
   } catch { /* ignore */ }
 
   try {
+    const { shutdownDefaultPreviewReadCoordinatorForDaemon } = await import('./file-preview-read-coordinator.js');
+    await shutdownDefaultPreviewReadCoordinatorForDaemon();
+  } catch (err) {
+    logger.warn({ errorKind: err instanceof Error ? err.name : typeof err }, 'Daemon shutdown preview read drain failed');
+  }
+
+  try {
     if (healthTimer) clearInterval(healthTimer);
     if (codexQuotaTimer) clearInterval(codexQuotaTimer);
     if (contextReplicationTimer) clearInterval(contextReplicationTimer);

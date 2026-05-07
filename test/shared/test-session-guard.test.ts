@@ -15,6 +15,7 @@ describe('test session guard', () => {
     expect(isKnownTestSessionName('deck_restorecheckabc123_w10')).toBe(true);
     expect(isKnownTestSessionName('deck_storecheckabc123_brain')).toBe(true);
     expect(isKnownTestSessionName('deck_shutdownabc123_probe')).toBe(true);
+    expect(isKnownTestSessionName('deck_test_preview_abc123_brain')).toBe(true);
     expect(isKnownTestSessionName('deck_realproj_brain')).toBe(false);
   });
 
@@ -24,7 +25,9 @@ describe('test session guard', () => {
     expect(isKnownTestProjectName('restorecheckabc123')).toBe(true);
     expect(isKnownTestProjectName('storecheckabc123')).toBe(true);
     expect(isKnownTestProjectName('shutdownabc123')).toBe(true);
+    expect(isKnownTestProjectName('imcodes-test-preview-dist')).toBe(true);
     expect(isKnownTestProjectDir('/tmp/cxsdk-sub-e2e')).toBe(true);
+    expect(isKnownTestProjectDir('/tmp/imcodes-test-preview-dist-abc123/project')).toBe(true);
     expect(isKnownTestProjectDir('/Users/me/src/myapp')).toBe(false);
   });
 

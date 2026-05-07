@@ -26,6 +26,7 @@ import { sass } from '@codemirror/lang-sass';
 import { less } from '@codemirror/lang-less';
 import { wast } from '@codemirror/lang-wast';
 import { oneDark } from '@codemirror/theme-one-dark';
+import { FS_GENERIC_ERROR_CODES } from '@shared/fs-error-codes.js';
 
 export interface FileEditorProps {
   ws: WsClient;
@@ -109,7 +110,7 @@ export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessa
         setTimeout(() => setSaveStatus((s) => s === 'error' ? 'idle' : s), 3000);
       } else {
         setSaveStatus('error');
-        setSaveError(msg.error === 'file_too_large' ? t('fileBrowser.fileTooLarge') : t('fileBrowser.saveError'));
+        setSaveError(msg.error === FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE ? t('fileBrowser.fileTooLarge') : t('fileBrowser.saveError'));
         setTimeout(() => setSaveStatus((s) => s === 'error' ? 'idle' : s), 3000);
       }
     });

@@ -30,6 +30,7 @@ vi.mock('../../src/components/FilePreviewPane.js', () => ({
 
 import { FileBrowser, __resetFileBrowserSharedChangesForTests, mergePreviewState } from '../../src/components/FileBrowser.js';
 import type { WsClient, ServerMessage } from '../../src/ws-client.js';
+import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
 
 // Cleanup DOM/timers after each test
 afterEach(() => {
@@ -1558,6 +1559,35 @@ describe('FileBrowser', () => {
       path: '/home/user/bar.ts',
       preview: { status: 'ok', path: '/home/user/bar.ts', content: 'new bar', diff: '+new bar' },
     });
+  });
+
+  it.each([
+    FS_READ_ERROR_CODES.PREVIEW_WORKER_TIMEOUT,
+    FS_READ_ERROR_CODES.PREVIEW_WORKER_UNAVAILABLE,
+  ])('shows shared worker preview error %s as a visible preview failure', async (error) => {
+    const { ws, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/huge.bin"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/home/user/huge.bin',
+        status: 'error',
+        error,
+      });
+    });
+
+    expect(document.querySelector('.fb-preview-error')?.textContent).toBe('file_browser.preview_error');
   });
 
   it('polls only for an active inline preview', async () => {

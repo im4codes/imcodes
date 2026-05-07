@@ -2,9 +2,11 @@
  * Daemon-side file transfer handler.
  * Handles upload persistence, download resolution, and lifecycle cleanup.
  */
-import { mkdir, writeFile, readFile, readdir, stat, unlink } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
+import { mkdir, writeFile, readFile, readdir, stat, unlink, realpath as fsRealpath } from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomBytes } from 'node:crypto';
+import { homedir } from 'node:os';
 import logger from '../util/logger.js';
 import {
   FILE_TRANSFER_LIMITS,
@@ -16,13 +18,26 @@ import {
   type FileDownloadDone,
   type FileDownloadError,
 } from '../../shared/transport/file-transfer.js';
+import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import type { ServerLink } from './server-link.js';
-import { homedir } from 'node:os';
+import { validateCanonicalRealPath } from './file-preview-path-policy.js';
+import type { ValidatedRealPath } from './file-preview-path-policy.js';
+export type { ValidatedRealPath } from './file-preview-path-policy.js';
 
 /** Upload directory — ~/.imcodes/uploads (persists across reboots, unlike /tmp). */
 const UPLOAD_DIR = path.join(homedir(), '.imcodes', 'uploads');
 
 // ── Attachment registry ─────────────────────────────────────────────────────
+
+export interface TryCreateProjectFileHandleOptions {
+  /**
+   * Lenient canonicalization fallback paths are useful for best-effort
+   * directory listings, but they are not canonical enough to mint handles.
+   */
+  usedFallback?: boolean;
+}
+
+type LocalDownloadErrorMessage = 'not_found' | 'expired' | 'download_failed';
 
 interface AttachmentEntry {
   id: string;
@@ -39,6 +54,32 @@ const attachmentRegistry = new Map<string, AttachmentEntry>();
 
 function randomHex(bytes: number): string {
   return randomBytes(bytes).toString('hex');
+}
+
+function toValidatedRealPath(realPath: string): ValidatedRealPath {
+  const validated = validateCanonicalRealPath(realPath);
+  if (!validated) throw new Error(FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH);
+  return validated;
+}
+
+export async function validateProjectFilePath(filePath: string): Promise<ValidatedRealPath> {
+  const realPath = await fsRealpath(path.resolve(filePath));
+  return toValidatedRealPath(realPath);
+}
+
+function validateProjectFilePathSync(filePath: string): ValidatedRealPath {
+  const realPath = realpathSync(path.resolve(filePath));
+  return toValidatedRealPath(realPath);
+}
+
+function isNotFoundError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const code = (err as { code?: unknown }).code;
+  return code === 'ENOENT' || code === 'ENOTDIR';
+}
+
+function sanitizeLocalDownloadError(err: unknown): LocalDownloadErrorMessage {
+  return isNotFoundError(err) ? 'not_found' : 'download_failed';
 }
 
 // ── Init ────────────────────────────────────────────────────────────────────
@@ -173,9 +214,10 @@ export async function handleFileUpload(cmd: Record<string, unknown>, serverLink:
 export async function handleFileDownload(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const msg = cmd as unknown as FileDownloadRequest;
   const { downloadId, attachmentId } = msg;
+  let entry: AttachmentEntry | undefined;
 
   try {
-    const entry = attachmentRegistry.get(attachmentId);
+    entry = attachmentRegistry.get(attachmentId);
 
     if (!entry) {
       const response: FileDownloadError = {
@@ -214,7 +256,10 @@ export async function handleFileDownload(cmd: Record<string, unknown>, serverLin
       return;
     }
 
-    const buffer = await readFile(resolved);
+    const readPath = entry.source === 'local'
+      ? await validateProjectFilePath(entry.daemonPath)
+      : resolved;
+    const buffer = await readFile(readPath);
     const content = buffer.toString('base64');
 
     const response: FileDownloadDone = {
@@ -232,7 +277,9 @@ export async function handleFileDownload(cmd: Record<string, unknown>, serverLin
     const response: FileDownloadError = {
       type: 'file.download_error',
       downloadId,
-      message: errMsg.includes('ENOENT') ? 'not_found' : errMsg,
+      message: entry?.source === 'local'
+        ? sanitizeLocalDownloadError(err)
+        : (errMsg.includes('ENOENT') ? 'not_found' : errMsg),
     };
     serverLink.send(response);
   }
@@ -259,21 +306,26 @@ export function lookupAttachmentById(id: string): AttachmentEntry | undefined {
 }
 
 /**
- * Generate a controlled download handle for a project file without copying it.
- * Returns the AttachmentRef with a short-lived handle.
+ * Register a controlled, short-lived path handle for an already validated
+ * project file. The handle points at the current path and is not an immutable
+ * content snapshot.
  */
-export function createProjectFileHandle(
-  filePath: string,
+export function createProjectFileHandleFromValidatedPath(
+  validatedRealPath: ValidatedRealPath,
   originalName: string,
   mime?: string,
   size?: number,
 ): AttachmentRef {
+  const daemonPath = String(validatedRealPath);
+  const validated = validateCanonicalRealPath(daemonPath);
+  if (!validated) throw new Error(FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH);
+
   const id = randomHex(16);
   const now = Date.now();
 
   attachmentRegistry.set(id, {
     id,
-    daemonPath: path.resolve(filePath),
+    daemonPath,
     source: 'local',
     originalName,
     mime,
@@ -286,7 +338,7 @@ export function createProjectFileHandle(
     id,
     source: 'local',
     serverId: '',
-    daemonPath: path.resolve(filePath),
+    daemonPath,
     originalName,
     mime,
     size,
@@ -294,6 +346,46 @@ export function createProjectFileHandle(
     expiresAt: new Date(now + FILE_TRANSFER_LIMITS.HANDLE_TTL_MS).toISOString(),
     downloadable: true,
   };
+}
+
+/**
+ * Compatibility wrapper for existing callers. It now performs strict canonical
+ * validation before registering the local path handle.
+ */
+export function createProjectFileHandle(
+  filePath: string,
+  originalName: string,
+  mime?: string,
+  size?: number,
+): AttachmentRef {
+  return createProjectFileHandleFromValidatedPath(
+    validateProjectFilePathSync(filePath),
+    originalName,
+    mime,
+    size,
+  );
+}
+
+/**
+ * Tolerant helper for best-effort callers such as fs.ls includeMetadata. It
+ * preserves listing success when a file cannot safely receive a downloadId.
+ */
+export async function tryCreateProjectFileHandle(
+  filePath: string,
+  originalName: string,
+  mime?: string,
+  size?: number,
+  options: TryCreateProjectFileHandleOptions = {},
+): Promise<AttachmentRef | null> {
+  if (options.usedFallback) return null;
+
+  try {
+    const validated = await validateProjectFilePath(filePath);
+    return createProjectFileHandleFromValidatedPath(validated, originalName, mime, size);
+  } catch {
+    logger.debug({ event: 'try_create_project_file_handle_skipped' }, 'Skipped unsafe local project file download handle');
+    return null;
+  }
 }
 
 // ── Lifecycle cleanup ───────────────────────────────────────────────────────

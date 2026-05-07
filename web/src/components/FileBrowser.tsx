@@ -17,6 +17,7 @@ import type { WsClient, ServerMessage } from '../ws-client.js';
 import { lazy, Suspense } from 'preact/compat';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
 import { FS_WRITE_ERROR } from '../../../src/shared/transport/fs.js';
+import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
 import { FileEditor, FileEditorContent } from './file-editor-lazy.js';
 const FilePreviewPane = lazy(() => import('./FilePreviewPane.js'));
 const OfficePreview = lazy(() => import('./OfficePreview.js'));
@@ -646,8 +647,8 @@ export function FileBrowser({
         const dlId = msg.downloadId;
 
         if (msg.status === 'error') {
-          const errKey = msg.error === 'file_too_large' ? 'file_browser.preview_too_large'
-            : msg.error === 'forbidden_path' ? 'file_browser.preview_error'
+          const errKey = msg.error === FS_READ_ERROR_CODES.FILE_TOO_LARGE ? 'file_browser.preview_too_large'
+            : msg.error === FS_READ_ERROR_CODES.FORBIDDEN_PATH ? 'file_browser.preview_error'
             : 'file_browser.preview_error';
           setPreview({ status: 'error', path: filePath, error: t(errKey), downloadId: dlId });
           return;

@@ -27,7 +27,7 @@ import logger from '../util/logger.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID, MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
 import { homedir } from 'os';
-import { readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, stat as fsStat, unlink as fsUnlink, writeFile as fsWriteFile } from 'node:fs/promises';
+import { lstat as fsLstat, readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, stat as fsStat, unlink as fsUnlink, writeFile as fsWriteFile } from 'node:fs/promises';
 import * as nodePath from 'node:path';
 import { exec as execCb, execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -751,7 +751,16 @@ async function rewritePathsForSandbox(sessionName: string, text: string): Promis
   return result;
 }
 import { handleRepoCommand } from './repo-handler.js';
-import { handleFileUpload, handleFileDownload, createProjectFileHandle, lookupAttachment } from './file-transfer-handler.js';
+import {
+  handleFileUpload,
+  handleFileDownload,
+  tryCreateProjectFileHandle,
+  lookupAttachment,
+} from './file-transfer-handler.js';
+import { getDefaultPreviewReadCoordinator, __resetPreviewReadCoordinatorForTests } from './file-preview-read-coordinator.js';
+import { isFilePreviewPathAllowed, resolveCanonical } from './file-preview-path-policy.js';
+import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
+import { FS_READ_ERROR_CODES } from '../../shared/fs-read-error-codes.js';
 import { REPO_MSG } from '../shared/repo-types.js';
 import { handlePreviewCommand } from './preview-relay.js';
 import { PREVIEW_MSG } from '../../shared/preview-types.js';
@@ -4902,13 +4911,7 @@ const WINDOWS_DRIVES_PATH = ':drives:';
 const WINDOWS_DRIVES_ROOT = '__imcodes_windows_drives__';
 
 function isPathAllowed(realPath: string): boolean {
-  // Block sensitive directories (e.g. ~/.ssh, ~/.gnupg)
-  const home = homedir();
-  for (const dir of FS_DENIED_DIRS) {
-    const denied = nodePath.join(home, dir);
-    if (realPath === denied || realPath.startsWith(denied + nodePath.sep)) return false;
-  }
-  return true;
+  return isFilePreviewPathAllowed(realPath);
 }
 
 // ── P2P cancel/status handlers ────────────────────────────────────────────
@@ -5110,11 +5113,14 @@ const fsListCache = new Map<string, { expiresAt: number; value: FsLsSnapshot }>(
 const fsListInflight = new Map<string, Promise<FsLsSnapshot>>();
 const fsListGenerations = new Map<string, number>();
 
-function getFsListCacheKey(realPath: string, includeFiles: boolean, includeMetadata: boolean): string {
-  return `${realPath}::${includeFiles ? 'files' : 'dirs'}::${includeMetadata ? 'meta' : 'plain'}`;
+function getFsListCacheKey(realPath: string, includeFiles: boolean, includeMetadata: boolean, allowDownloadHandles: boolean): string {
+  const metadataMode = includeMetadata
+    ? (allowDownloadHandles ? 'meta' : 'meta-no-downloads')
+    : 'plain';
+  return `${realPath}::${includeFiles ? 'files' : 'dirs'}::${metadataMode}`;
 }
 
-async function loadFsListSnapshot(real: string, includeFiles: boolean, includeMetadata: boolean): Promise<FsLsSnapshot> {
+async function loadFsListSnapshot(real: string, includeFiles: boolean, includeMetadata: boolean, allowDownloadHandles: boolean): Promise<FsLsSnapshot> {
   const dirents = await fsReaddir(real, { withFileTypes: true });
   const filtered = dirents.filter((d) => d.isDirectory() || (includeFiles && d.isFile()));
 
@@ -5127,8 +5133,10 @@ async function loadFsListSnapshot(real: string, includeFiles: boolean, includeMe
         entry.size = fileStat.size;
         const ext = nodePath.extname(d.name).toLowerCase().slice(1);
         entry.mime = MIME_MAP[ext] || undefined;
-        const handle = createProjectFileHandle(filePath, d.name, entry.mime as string | undefined, fileStat.size);
-        entry.downloadId = handle.id;
+        if (allowDownloadHandles) {
+          const handle = await tryCreateProjectFileHandle(filePath, d.name, entry.mime as string | undefined, fileStat.size);
+          if (handle) entry.downloadId = handle.id;
+        }
       } catch { /* stat failed, skip metadata */ }
     }
     return entry;
@@ -5147,9 +5155,9 @@ async function loadFsListSnapshot(real: string, includeFiles: boolean, includeMe
   };
 }
 
-async function getFsListSnapshot(real: string, includeFiles: boolean, includeMetadata: boolean): Promise<FsLsSnapshot> {
+async function getFsListSnapshot(real: string, includeFiles: boolean, includeMetadata: boolean, allowDownloadHandles: boolean): Promise<FsLsSnapshot> {
   const dirSignature = await safeStatSignature(real);
-  const cacheKey = getFsListCacheKey(real, includeFiles, includeMetadata);
+  const cacheKey = getFsListCacheKey(real, includeFiles, includeMetadata, allowDownloadHandles);
   const cached = fsListCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now() && cached.value.dirSignature === dirSignature) {
     return cached.value;
@@ -5160,7 +5168,7 @@ async function getFsListSnapshot(real: string, includeFiles: boolean, includeMet
   const inflight = fsListInflight.get(inflightKey);
   if (inflight) return await inflight;
 
-  const promise = loadFsListSnapshot(real, includeFiles, includeMetadata)
+  const promise = loadFsListSnapshot(real, includeFiles, includeMetadata, allowDownloadHandles)
     .then(async (value) => {
       const currentSignature = await safeStatSignature(real);
       if (getResourceGeneration(fsListGenerations, real) === generation && currentSignature === value.dirSignature) {
@@ -5178,18 +5186,20 @@ async function getFsListSnapshot(real: string, includeFiles: boolean, includeMet
 function invalidateFsListCachesForPath(targetPath: string): void {
   const realTarget = normalizeFsPath(targetPath);
   bumpResourceGeneration(fsListGenerations, realTarget);
-  fsListCache.delete(getFsListCacheKey(realTarget, false, false));
-  fsListCache.delete(getFsListCacheKey(realTarget, true, false));
-  fsListCache.delete(getFsListCacheKey(realTarget, false, true));
-  fsListCache.delete(getFsListCacheKey(realTarget, true, true));
+  for (const includeFiles of [false, true]) {
+    fsListCache.delete(getFsListCacheKey(realTarget, includeFiles, false, true));
+    fsListCache.delete(getFsListCacheKey(realTarget, includeFiles, true, true));
+    fsListCache.delete(getFsListCacheKey(realTarget, includeFiles, true, false));
+  }
 
   const parent = nodePath.dirname(realTarget);
   if (parent !== realTarget) {
     bumpResourceGeneration(fsListGenerations, parent);
-    fsListCache.delete(getFsListCacheKey(parent, false, false));
-    fsListCache.delete(getFsListCacheKey(parent, true, false));
-    fsListCache.delete(getFsListCacheKey(parent, false, true));
-    fsListCache.delete(getFsListCacheKey(parent, true, true));
+    for (const includeFiles of [false, true]) {
+      fsListCache.delete(getFsListCacheKey(parent, includeFiles, false, true));
+      fsListCache.delete(getFsListCacheKey(parent, includeFiles, true, true));
+      fsListCache.delete(getFsListCacheKey(parent, includeFiles, true, false));
+    }
   }
 }
 
@@ -5207,7 +5217,11 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
     : (rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath);
   const resolved = isDrivesSentinel ? rawPath : nodePath.resolve(expanded);
 
-  const deadline = new Promise<never>((_, reject) => setTimeout(() => reject(new Error('fs_list_timeout')), FS_LIST_DEADLINE_MS));
+  let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+  const deadline = new Promise<never>((_, reject) => {
+    deadlineTimer = setTimeout(() => reject(new Error('fs_list_timeout')), FS_LIST_DEADLINE_MS);
+    deadlineTimer.unref?.();
+  });
 
   try {
     await Promise.race([handleFsListInner(resolved, rawPath, requestId, includeFiles, includeMetadata, serverLink), deadline]);
@@ -5218,6 +5232,8 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
     } else {
       try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: msg }); } catch { /* ignore */ }
     }
+  } finally {
+    if (deadlineTimer) clearTimeout(deadlineTimer);
   }
 }
 
@@ -5250,216 +5266,21 @@ async function handleFsListInner(resolved: string, rawPath: string, requestId: s
     return;
   }
 
-  let real: string;
-  try {
-    real = await fsRealpath(resolved);
-  } catch (err) {
-    if (process.platform === 'win32') {
-      logger.debug({ resolved, err }, 'fsRealpath failed on Windows, falling back to resolved path');
-      real = resolved;
-    } else {
-      throw err;
-    }
-  }
-
-  const allowed = isPathAllowed(real);
-  if (!allowed) {
-    try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
+  const canonical = await resolveCanonical(resolved, includeMetadata ? 'lenient' : 'strict');
+  if (!canonical) {
+    try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
     return;
   }
 
-  const snapshot = await getFsListSnapshot(real, includeFiles, includeMetadata);
+  const snapshot = await getFsListSnapshot(canonical.realPath, includeFiles, includeMetadata, !canonical.usedFallback);
 
   try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: snapshot.resolvedPath, status: 'ok', entries: snapshot.entries }); } catch { /* ignore */ }
 }
 
-const FS_READ_SIZE_LIMIT = 100 * 1024 * 1024; // 100 MB
-
-// Video files are not transferred over WS — the browser fetches them via the
-// HTTP download endpoint and plays them with <video>. We just need to detect
-// the MIME and check the size against this limit.
-const VIDEO_MIME: Record<string, string> = {
-  mp4: 'video/mp4',
-  m4v: 'video/mp4',
-  mov: 'video/quicktime',
-  webm: 'video/webm',
-  ogv: 'video/ogg',
-  ogg: 'video/ogg',
-  mkv: 'video/x-matroska',
-  avi: 'video/x-msvideo',
-};
-
-interface FsReadSnapshot {
-  path: string;
-  fileSignature: string;
-  status: 'ok' | 'error';
-  content?: string;
-  encoding?: 'base64';
-  mimeType?: string;
-  error?: string;
-  previewReason?: 'too_large' | 'binary' | 'unknown_type';
-}
-
-const fsReadCache = new Map<string, { expiresAt: number; value: FsReadSnapshot }>();
-const fsReadInflight = new Map<string, Promise<FsReadSnapshot>>();
-const fsReadGenerations = new Map<string, number>();
-const FS_READ_CACHE_TTL_MS = 5_000;
 const REPO_CONTEXT_CACHE_TTL_MS = 5_000;
 
-async function loadFsReadSnapshot(realPath: string, fileSignature: string): Promise<FsReadSnapshot> {
-  const ext = nodePath.extname(realPath).toLowerCase().slice(1);
-  const IMAGE_MIME: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', ico: 'image/x-icon', bmp: 'image/bmp', svg: 'image/svg+xml' };
-  const OFFICE_MIME: Record<string, string> = {
-    pdf: 'application/pdf',
-    docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-  };
-  const mimeType = IMAGE_MIME[ext] ?? OFFICE_MIME[ext];
-
-  if (mimeType) {
-    const buf = await fsReadFileRaw(realPath);
-    return {
-      path: realPath,
-      fileSignature,
-      status: 'ok',
-      content: buf.toString('base64'),
-      encoding: 'base64',
-      mimeType,
-    };
-  }
-
-  const content = await fsReadFileRaw(realPath, 'utf-8');
-  const sample = content.slice(0, 8192);
-  if (sample.includes('\0')) {
-    return {
-      path: realPath,
-      fileSignature,
-      status: 'error',
-      error: 'binary_file',
-      previewReason: 'binary',
-    };
-  }
-
-  return {
-    path: realPath,
-    fileSignature,
-    status: 'ok',
-    content,
-  };
-}
-
-async function getFsReadSnapshot(realPath: string, fileSignature: string): Promise<FsReadSnapshot> {
-  const cached = fsReadCache.get(realPath);
-  if (cached && cached.expiresAt > Date.now() && cached.value.fileSignature === fileSignature) {
-    return cached.value;
-  }
-  const generation = getResourceGeneration(fsReadGenerations, realPath);
-  const inflightKey = `${realPath}::${fileSignature}::${generation}`;
-  const inflight = fsReadInflight.get(inflightKey);
-  if (inflight) return await inflight;
-  const promise = loadFsReadSnapshot(realPath, fileSignature)
-    .then(async (value) => {
-      const currentSignature = await safeStatSignature(realPath);
-      if (getResourceGeneration(fsReadGenerations, realPath) === generation && currentSignature === value.fileSignature) {
-        fsReadCache.set(realPath, { value, expiresAt: Date.now() + FS_READ_CACHE_TTL_MS });
-      }
-      return value;
-    })
-    .finally(() => {
-      fsReadInflight.delete(inflightKey);
-    });
-  fsReadInflight.set(inflightKey, promise);
-  return await promise;
-}
-
 async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
-  const rawPath = cmd.path as string | undefined;
-  const requestId = cmd.requestId as string | undefined;
-  if (!rawPath || !requestId) return;
-
-  const expanded = rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath;
-  const resolved = nodePath.resolve(expanded);
-
-  try {
-    const real = await fsRealpath(resolved);
-    const allowed = isPathAllowed(real);
-    if (!allowed) {
-      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
-      return;
-    }
-
-    const stats = await fsStat(real);
-    const fileSignature = `${stats.mtimeMs}:${stats.size}`;
-
-    const ext = nodePath.extname(real).toLowerCase().slice(1);
-    const IMAGE_MIME: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', ico: 'image/x-icon', bmp: 'image/bmp', svg: 'image/svg+xml' };
-    // Office documents: send as base64 for frontend preview (PDF.js, docx-preview, xlsx)
-    const OFFICE_MIME: Record<string, string> = {
-      pdf: 'application/pdf',
-      docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-      xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    };
-    const videoMime = VIDEO_MIME[ext];
-    const mimeType = IMAGE_MIME[ext] ?? OFFICE_MIME[ext] ?? videoMime;
-    // Unified preview size cap (100 MB). Video, image, office, and text all
-    // share the same ceiling — videos are streamed via HTTP rather than the
-    // base64-over-WS path, so the cap is enforced for sanity, not transport.
-    const sizeLimit = FS_READ_SIZE_LIMIT;
-
-    // Always generate a download handle so the file can be downloaded even if preview fails
-    const fileName = nodePath.basename(real);
-    const handle = createProjectFileHandle(real, fileName, mimeType || MIME_MAP[ext], stats.size);
-
-    if (stats.size > sizeLimit) {
-      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: 'file_too_large', previewReason: 'too_large', downloadId: handle.id }); } catch { /* ignore */ }
-      return;
-    }
-
-    // Video files: skip WS content transfer entirely. The browser fetches
-    // the file via the HTTP download endpoint using the downloadId handle
-    // and plays it with <video>. Sending 100 MB as base64 over WS would
-    // be wasteful and break streaming/seek behavior.
-    if (videoMime) {
-      try {
-        serverLink.send({
-          type: 'fs.read_response',
-          requestId,
-          path: rawPath,
-          resolvedPath: real,
-          status: 'ok',
-          mimeType: videoMime,
-          previewMode: 'stream',
-          size: stats.size,
-          downloadId: handle.id,
-          mtime: stats.mtimeMs,
-        });
-      } catch { /* ignore */ }
-      return;
-    }
-
-    const mtime = stats.mtimeMs;
-    const snapshot = await getFsReadSnapshot(real, fileSignature);
-    if (snapshot.status === 'error') {
-      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: snapshot.error, previewReason: snapshot.previewReason, downloadId: handle.id }); } catch { /* ignore */ }
-      return;
-    }
-    try {
-      serverLink.send({
-        type: 'fs.read_response',
-        requestId,
-        path: rawPath,
-        resolvedPath: real,
-        status: 'ok',
-        content: snapshot.content,
-        ...(snapshot.encoding ? { encoding: snapshot.encoding } : {}),
-        ...(snapshot.mimeType ? { mimeType: snapshot.mimeType } : {}),
-        downloadId: handle.id,
-        mtime,
-      });
-    } catch { /* ignore */ }
-  } catch (err) {
-    try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, status: 'error', error: err instanceof Error ? err.message : String(err) }); } catch { /* ignore */ }
-  }
+  getDefaultPreviewReadCoordinator().handle(cmd.path, cmd.requestId, (message) => serverLink.send(message));
 }
 
 const GIT_STATUS_CACHE_TTL_MS = 5_000;
@@ -5852,16 +5673,12 @@ function collectAffectedRepoRoots(targetPath: string): Set<string> {
 
 function invalidateGitCachesForPath(targetPath: string): void {
   const normalized = normalizeFsPath(targetPath);
-  bumpResourceGeneration(fsReadGenerations, normalized);
+  getDefaultPreviewReadCoordinator().invalidate(normalized);
   bumpResourceGeneration(gitDiffGenerations, normalized);
   for (const repoRoot of collectAffectedRepoRoots(normalized)) {
     bumpResourceGeneration(gitRepoGenerations, repoRoot);
   }
-  fsReadCache.delete(normalized);
   gitDiffCache.delete(normalized);
-  for (const key of fsReadInflight.keys()) {
-    if (key.startsWith(`${normalized}::`)) fsReadInflight.delete(key);
-  }
   for (const key of gitDiffInflight.keys()) {
     if (key.startsWith(`${normalized}::`)) gitDiffInflight.delete(key);
   }
@@ -5885,9 +5702,7 @@ function invalidateGitCachesForPath(targetPath: string): void {
 }
 
 export function __resetFsGitCachesForTests(): void {
-  fsReadCache.clear();
-  fsReadInflight.clear();
-  fsReadGenerations.clear();
+  void __resetPreviewReadCoordinatorForTests();
   repoContextCache.clear();
   repoSignatureCache.clear();
   gitStatusCache.clear();
@@ -5918,7 +5733,7 @@ async function handleFsGitStatus(cmd: Record<string, unknown>, serverLink: Serve
     const real = await fsRealpath(resolved);
     const allowed = isPathAllowed(real);
     if (!allowed) {
-      try { serverLink.send({ type: 'fs.git_status_response', requestId, path: rawPath, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
+      try { serverLink.send({ type: 'fs.git_status_response', requestId, path: rawPath, status: 'error', error: FS_READ_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
       return;
     }
     const [snapshot, numstat] = await Promise.all([
@@ -5961,7 +5776,7 @@ async function handleFsGitDiff(cmd: Record<string, unknown>, serverLink: ServerL
     }
     const allowed = isPathAllowed(allowedProbe);
     if (!allowed) {
-      try { serverLink.send({ type: 'fs.git_diff_response', requestId, path: rawPath, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
+      try { serverLink.send({ type: 'fs.git_diff_response', requestId, path: rawPath, status: 'error', error: FS_READ_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
       return;
     }
     const snapshot = await getFileGitDiffSnapshot(resolved);
@@ -5988,7 +5803,7 @@ async function handleFsMkdir(cmd: Record<string, unknown>, serverLink: ServerLin
     const realParent = await fsRealpath(parent);
     const allowed = isPathAllowed(realParent);
     if (!allowed) {
-      try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
+      try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: FS_READ_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
       return;
     }
   } catch {
@@ -6008,13 +5823,21 @@ async function handleFsMkdir(cmd: Record<string, unknown>, serverLink: ServerLin
 }
 
 /** fs.write — write a file (with optional mtime conflict detection) */
+function getFsWriteErrorCode(err: unknown): string {
+  const code = typeof err === 'object' && err !== null && 'code' in err ? String((err as { code?: unknown }).code) : '';
+  const message = err instanceof Error ? err.message : String(err);
+  if (code === 'EEXIST' || message.includes('EEXIST') || message.includes('file already exists')) return FS_WRITE_ERROR.FILE_EXISTS;
+  if (code === 'ENOENT' || code === 'ENOTDIR' || message.includes('ENOENT') || message.includes('no such file')) return 'parent_not_found';
+  return FS_GENERIC_ERROR_CODES.INTERNAL_ERROR;
+}
+
 async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const rawPath = cmd.path as string | undefined;
   const requestId = cmd.requestId as string | undefined;
   const content = cmd.content as string | undefined;
   if (!rawPath || !requestId || content === undefined) {
     if (requestId) {
-      try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath ?? '', status: 'error', error: 'invalid_request' }); } catch { /* ignore */ }
+      try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath ?? '', status: 'error', error: FS_GENERIC_ERROR_CODES.INVALID_REQUEST }); } catch { /* ignore */ }
     }
     return;
   }
@@ -6027,7 +5850,7 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
 
   // Size check first (cheap, before any I/O)
   if (Buffer.byteLength(content, 'utf-8') > 1_048_576) {
-    try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: 'file_too_large' }); } catch { /* ignore */ }
+    try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE }); } catch { /* ignore */ }
     return;
   }
 
@@ -6046,7 +5869,7 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
       const real = await fsRealpath(resolved);
       const allowed = isPathAllowed(real);
       if (!allowed) {
-        try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
+        try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
         return;
       }
 
@@ -6079,7 +5902,8 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
       invalidateGitCachesForPath(real);
       try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', mtime: newStats.mtimeMs }); } catch { /* ignore */ }
     } catch (err) {
-      try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: err instanceof Error ? err.message : String(err) }); } catch { /* ignore */ }
+      logger.warn({ requestId, errorCode: getFsWriteErrorCode(err) }, 'fs.write failed');
+      try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: getFsWriteErrorCode(err) }); } catch { /* ignore */ }
     }
   } else {
     // New file: realpath of parent must be within FS_ALLOWED_ROOTS
@@ -6088,22 +5912,29 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
       const realParent = await fsRealpath(parent);
       const allowed = isPathAllowed(realParent);
       if (!allowed) {
-        try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
+        try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
         return;
       }
+      try {
+        const targetStats = await fsLstat(resolved);
+        const error = targetStats.isSymbolicLink() ? FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH : FS_WRITE_ERROR.FILE_EXISTS;
+        try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error }); } catch { /* ignore */ }
+        return;
+      } catch (err) {
+        const code = typeof err === 'object' && err !== null && 'code' in err ? String((err as { code?: unknown }).code) : '';
+        if (code !== 'ENOENT') throw err;
+      }
       // Write the file
-      await fsWriteFile(resolved, content, createOnly ? { encoding: 'utf-8', flag: 'wx' } : 'utf-8');
+      await fsWriteFile(resolved, content, { encoding: 'utf-8', flag: 'wx' });
       const newStats = await fsStat(resolved);
       const real = await fsRealpath(resolved);
       invalidateFsListCachesForPath(real);
       invalidateGitCachesForPath(real);
       try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', mtime: newStats.mtimeMs }); } catch { /* ignore */ }
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const code = typeof err === 'object' && err !== null && 'code' in err ? String((err as { code?: unknown }).code) : '';
-      const isNotFound = code === 'ENOENT' || msg.includes('ENOENT') || msg.includes('no such file');
-      const isAlreadyExists = code === 'EEXIST' || msg.includes('EEXIST') || msg.includes('file already exists');
-      try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: isAlreadyExists ? FS_WRITE_ERROR.FILE_EXISTS : (isNotFound ? 'parent_not_found' : msg) }); } catch { /* ignore */ }
+      const errorCode = getFsWriteErrorCode(err);
+      logger.warn({ requestId, errorCode }, 'fs.write failed');
+      try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: errorCode }); } catch { /* ignore */ }
     }
   }
 }
