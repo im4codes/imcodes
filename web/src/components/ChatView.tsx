@@ -18,6 +18,7 @@ import { usePref, parseBooleanish } from '../hooks/usePref.js';
 import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 import type { TimelineHistoryStatus, TimelineHistoryStepKey } from '../hooks/useTimeline.js';
 import { positionChatActionMenu } from '../chat-action-menu-position.js';
+import { splitTextByHttpUrls } from '../link-detection.js';
 
 interface Props {
   events: TimelineEvent[];
@@ -91,13 +92,6 @@ function hasFileExtension(path: string): boolean {
 
 function isLikelyDomainPath(value: string): boolean {
   return /^(?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/|$)/i.test(value);
-}
-
-function trimDetectedUrl(url: string): string {
-  const hardStop = url.search(/[（【《「『，。；：！？⬇]/u);
-  let next = hardStop >= 0 ? url.slice(0, hardStop) : url;
-  while (next.length > 1 && /[.,;:!?)}\]>）】》」』，。；：！？⬇]$/u.test(next)) next = next.slice(0, -1);
-  return next;
 }
 
 function formatMemoryContextScore(score: number | undefined): string | null {
@@ -1482,20 +1476,21 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
               );
             }
             if (item.type === 'tool-group') {
-              return <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onDownload={downloadHandler} serverId={serverId} />;
+              return <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} serverId={serverId} />;
             }
             const linkedEvents = item.linkedEvents ?? [];
             if (linkedEvents.length === 0) {
-              return <ChatEvent key={item.key} event={item.event!} onPathClick={pathClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />;
+              return <ChatEvent key={item.key} event={item.event!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />;
             }
             return (
               <div key={item.key} class="chat-linked-event-group">
-                <ChatEvent event={item.event!} onPathClick={pathClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />
+                <ChatEvent event={item.event!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />
                 {linkedEvents.map((linkedEvent) => (
                   <ChatEvent
                     key={linkedEvent.eventId}
                     event={linkedEvent}
                     onPathClick={pathClickHandler}
+                    onUrlClick={urlClickHandler}
                     onFileChangeOpen={handleFileChangeOpen}
                     onDownload={downloadHandler}
                     serverId={serverId}
@@ -1735,11 +1730,13 @@ function ToolBlockFold({ children }: { children: preact.ComponentChildren }) {
 function ToolCallGroup({
   events,
   onPathClick,
+  onUrlClick,
   onDownload,
   serverId,
 }: {
   events: TimelineEvent[];
   onPathClick?: (p: string) => void;
+  onUrlClick?: (url: string) => void;
   onDownload?: (path: string) => void;
   serverId?: string;
 }) {
@@ -1751,18 +1748,18 @@ function ToolCallGroup({
 
   return (
     <div class="chat-tool-group">
-      <ChatEvent event={first} onPathClick={onPathClick} onDownload={onDownload} serverId={serverId} />
+      <ChatEvent event={first} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} serverId={serverId} />
       <div class="chat-tool-group-indent">
         {middle.length > 0 && (
           expanded ? (
-            middle.map((ev) => <ChatEvent key={ev.eventId} event={ev} onPathClick={onPathClick} onDownload={onDownload} serverId={serverId} />)
+            middle.map((ev) => <ChatEvent key={ev.eventId} event={ev} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} serverId={serverId} />)
           ) : (
             <button class="chat-tool-fold-btn" onClick={() => setExpanded(true)}>
               {t('chat.tool_group_more', { count: middle.length })}
             </button>
           )
         )}
-        {last && <ChatEvent event={last} onPathClick={onPathClick} onDownload={onDownload} serverId={serverId} showTime />}
+        {last && <ChatEvent event={last} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} serverId={serverId} showTime />}
         {expanded && middle.length > 0 && (
           <button class="chat-tool-fold-btn" onClick={() => setExpanded(false)}>
             {t('chat.tool_group_collapse')}
@@ -1844,6 +1841,7 @@ function AttachmentDownloadButton({ att, serverId, onPathClick }: { att: { id: s
 const ChatEvent = memo(function ChatEvent({
   event,
   onPathClick,
+  onUrlClick,
   onFileChangeOpen,
   onDownload,
   serverId,
@@ -1852,6 +1850,7 @@ const ChatEvent = memo(function ChatEvent({
 }: {
   event: TimelineEvent;
   onPathClick?: (p: string) => void;
+  onUrlClick?: (url: string) => void;
   onFileChangeOpen?: (path: string, preferDiff?: boolean) => void;
   onDownload?: (path: string) => void;
   serverId?: string;
@@ -1882,7 +1881,7 @@ const ChatEvent = memo(function ChatEvent({
           {attachments && serverId && attachments.map((att) => (
             <AttachmentDownloadButton key={att.id} att={att} serverId={serverId} onPathClick={onPathClick} />
           ))}
-          {userText && <div class="chat-bubble-content">{splitPathsAndUrls(userText, onPathClick, undefined, onDownload)}</div>}
+          {userText && <div class="chat-bubble-content">{splitPathsAndUrls(userText, onPathClick, onUrlClick, onDownload)}</div>}
           {isPending && (
             <span
               class="chat-user-status chat-user-status-pending"
@@ -1930,12 +1929,12 @@ const ChatEvent = memo(function ChatEvent({
           <div class="chat-event chat-tool">
             <span class="chat-tool-icon">{'>'}</span>
             <span class="chat-tool-name">{toolName}</span>
-            {toolInput && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInput, onPathClick, undefined, onDownload)}</span>}
+            {toolInput && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInput, onPathClick, onUrlClick, onDownload)}</span>}
             {shouldShowTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{new Date(event.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>}
           </div>
           {toolOutput && (
             <div class="chat-event chat-tool chat-tool-result-preview">
-              <span class="chat-tool-output">{splitPathsAndUrls(toolOutput, onPathClick, undefined, onDownload)}</span>
+              <span class="chat-tool-output">{splitPathsAndUrls(toolOutput, onPathClick, onUrlClick, onDownload)}</span>
             </div>
           )}
           {(callDetail || resultDetail) && (
@@ -1963,7 +1962,7 @@ const ChatEvent = memo(function ChatEvent({
             {error ? (
             <span class="chat-tool-error">{`error: ${String(error)}`}</span>
           ) : output ? (
-              <span class="chat-tool-output">{splitPathsAndUrls(output, onPathClick, undefined, onDownload)}</span>
+              <span class="chat-tool-output">{splitPathsAndUrls(output, onPathClick, onUrlClick, onDownload)}</span>
             ) : (
               <span class="chat-tool-output">done</span>
             )}
@@ -2427,8 +2426,6 @@ const ChatTime = memo(function ChatTime({ ts }: { ts: number }) {
 // ── Markdown rendering delegated to ChatMarkdown.tsx ──────────────────────
 
 // ── URL detection (must run BEFORE path detection) ────────────────────────
-const URL_REGEX = /https?:\/\/[^\s<>"\])}）】》」』，。；：！？（【《「『]+/g;
-
 // Matches absolute paths (/foo/bar) and relative paths (docs/file.md, src/components/Foo.tsx).
 const PATH_REGEX = /(\\\\[\w.$ -]+\\[\w.$ \\-]+|[A-Za-z]:\\(?:[\w.$ -]+\\)*[\w.$ -]+|\.{1,2}\/[\w\p{L}.\-~/]+|\/[\w\p{L}.\-~][\w\p{L}.\-~/]*|(?<![:/\w\p{L}])[a-zA-Z_~][\w\p{L}.\-~]*(?:\/[\w\p{L}.\-~]+)+)/gu;
 
@@ -2443,22 +2440,7 @@ function splitPathsAndUrls(
 
   // Step 1: Split by URLs first (URLs take priority over path detection)
   const parts: preact.JSX.Element[] = [];
-  let last = 0;
-  let m: RegExpExecArray | null;
-  URL_REGEX.lastIndex = 0;
-
-  interface TextChunk { type: 'text' | 'url'; value: string; start: number }
-  const chunks: TextChunk[] = [];
-
-  while ((m = URL_REGEX.exec(text)) !== null) {
-    if (m.index > last) chunks.push({ type: 'text', value: text.slice(last, m.index), start: last });
-    // Strip trailing punctuation that likely isn't part of the URL
-    let url = trimDetectedUrl(m[0]);
-    chunks.push({ type: 'url', value: url, start: m.index });
-    last = m.index + url.length;
-    URL_REGEX.lastIndex = last; // adjust for stripped chars
-  }
-  if (last < text.length) chunks.push({ type: 'text', value: text.slice(last), start: last });
+  const chunks = splitTextByHttpUrls(text);
 
   // Step 2: For text chunks, apply path detection. URL chunks render as links.
   for (const chunk of chunks) {
@@ -2469,9 +2451,12 @@ function splitPathsAndUrls(
           class="chat-external-link"
           href={chunk.value}
           title={chunk.value}
+          target="_blank"
+          rel="noopener noreferrer"
           onClick={(e: Event) => {
+            if (!onUrlClick) return;
             e.preventDefault();
-            onUrlClick?.(chunk.value);
+            onUrlClick(chunk.value);
           }}
         >
           {chunk.value}

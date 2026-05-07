@@ -169,4 +169,62 @@ describe('ChatMarkdown', () => {
     const externalLinks = container.querySelectorAll('.chat-external-link');
     expect(externalLinks.length).toBe(1);
   });
+
+  it('keeps public mp4 URLs followed by the download glyph as external links', () => {
+    const url = 'https://media.example.test/public-results/pixelle/demo-video.mp4';
+    const text = `公网链接：${url}⬇为什么被标记为内部链接了, 这不是http url吗?`;
+    const { container } = render(
+      <ChatMarkdown
+        text={text}
+        onPathClick={() => {}}
+        onUrlClick={() => {}}
+        onDownload={() => {}}
+      />
+    );
+
+    const externalLink = container.querySelector('.chat-external-link') as HTMLAnchorElement | null;
+    expect(externalLink).not.toBeNull();
+    expect(externalLink?.textContent).toBe(url);
+    expect(externalLink?.href).toBe(url);
+    expect(container.textContent).toContain('⬇为什么被标记为内部链接了');
+    expect(container.querySelector('.chat-path-link')).toBeNull();
+    expect(container.querySelector('.chat-dl-btn')).toBeNull();
+  });
+
+  it('keeps public rich mp4 URLs as external links before path detection', () => {
+    const url = 'https://media.example.test/public-results/pixelle/demo-video-rich.mp4';
+    const { container } = render(
+      <ChatMarkdown
+        text={url}
+        onPathClick={() => {}}
+        onUrlClick={() => {}}
+        onDownload={() => {}}
+      />
+    );
+
+    const externalLink = container.querySelector('.chat-external-link') as HTMLAnchorElement | null;
+    expect(externalLink).not.toBeNull();
+    expect(externalLink?.textContent).toBe(url);
+    expect(externalLink?.href).toBe(url);
+    expect(container.querySelector('.chat-path-link')).toBeNull();
+    expect(container.querySelector('.chat-dl-btn')).toBeNull();
+  });
+
+  it('keeps backticked public URLs external instead of previewable local paths', () => {
+    const url = 'https://media.example.test/public-results/pixelle/demo-video-rich.mp4';
+    const { container } = render(
+      <ChatMarkdown
+        text={`\`${url}\``}
+        onPathClick={() => {}}
+        onUrlClick={() => {}}
+        onDownload={() => {}}
+      />
+    );
+
+    const externalLink = container.querySelector('.chat-external-link') as HTMLAnchorElement | null;
+    expect(externalLink).not.toBeNull();
+    expect(externalLink?.textContent).toBe(url);
+    expect(container.querySelector('.chat-path-link')).toBeNull();
+    expect(container.querySelector('.chat-dl-btn')).toBeNull();
+  });
 });
