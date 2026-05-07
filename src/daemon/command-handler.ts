@@ -1171,9 +1171,45 @@ export function setRouterContext(ctx: RouterContext): void {
 }
 
 export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
-  if (!msg || typeof msg !== 'object') return;
+  // Input validation: anything that isn't a non-null object goes
+  // straight to the floor.  We log a debug ping for arrays / primitives
+  // so a confused client gets diagnostic feedback without flooding.
+  if (!msg || typeof msg !== 'object' || Array.isArray(msg)) {
+    if (msg !== null && msg !== undefined) {
+      logger.debug({ kind: typeof msg, isArray: Array.isArray(msg) }, 'Ignoring non-object web command');
+    }
+    return;
+  }
   const cmd = msg as Record<string, unknown>;
 
+  // Top-level isolation: any synchronous throw inside a handler — e.g.
+  // a TypeError from `cmd.foo.bar` when `foo` is undefined, or a
+  // validation throw before the first await of an async function —
+  // would otherwise propagate out of the WebSocket onMessage callback
+  // and trip the global uncaughtException handler.  That handler keeps
+  // the daemon alive but emits a noisy "UNCAUGHT EXCEPTION" line and
+  // broadcasts a daemon.error event to every connected browser, so to
+  // operators the daemon LOOKED crashed.  Wrap the dispatch so a bad
+  // single command can't destabilize the whole connection.
+  //
+  // Note on async rejections: handlers in the switch use the
+  // `void handleX(...)` pattern so promise rejections propagate to
+  // process.on('unhandledRejection') in src/index.ts, which logs and
+  // forwards a daemon.error event but keeps the process alive.  The
+  // rare-but-real "throw before first await" case STILL surfaces to
+  // browsers, but the daemon does not crash.  Individual handlers
+  // already do their own try/catch where input validation matters.
+  try {
+    dispatchWebCommand(cmd, serverLink);
+  } catch (err) {
+    logger.warn(
+      { err, type: typeof cmd.type === 'string' ? cmd.type : '<non-string>' },
+      'Web command handler threw synchronously — daemon stays alive',
+    );
+  }
+}
+
+function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink): void {
   switch (cmd.type) {
     case 'inbound':
       void handleInbound(cmd);
