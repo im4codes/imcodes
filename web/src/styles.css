@@ -2231,10 +2231,37 @@ body {
 .hljs-addition { color: #c3e88d; background: rgba(195,232,141,0.1); }
 .hljs-deletion { color: #f07178; background: rgba(240,113,120,0.1); }
 /* QuickInputPanel files tab */
-.qp-tabs { display: flex; border-bottom: 1px solid #334155; flex-shrink: 0; }
-.qp-tab { flex: 1; padding: 6px 4px; background: none; border: none; color: #64748b; font-size: 12px; cursor: pointer; font-family: inherit; border-bottom: 2px solid transparent; transition: all 0.15s; }
-.qp-tab.active { color: #e2e8f0; border-bottom-color: #6366f1; }
-.qp-tab:hover:not(.active) { color: #94a3b8; }
+.qp-tabs {
+  display: flex;
+  min-height: 46px;
+  background: linear-gradient(180deg, rgba(15,23,42,0.24), rgba(30,41,59,0));
+  border-bottom: 1px solid #334155;
+  flex-shrink: 0;
+}
+.qp-tab {
+  flex: 1;
+  min-height: 46px;
+  padding: 10px 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  color: #64748b;
+  font-size: 13px;
+  font-weight: 650;
+  cursor: pointer;
+  font-family: inherit;
+  border-bottom: 3px solid transparent;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+.qp-tab.active {
+  color: #e2e8f0;
+  background: rgba(99,102,241,0.08);
+  border-bottom-color: #6366f1;
+}
+.qp-tab:hover:not(.active) { background: rgba(148,163,184,0.06); color: #94a3b8; }
 /* inline path links in chat */
 .chat-path-link { color: #818cf8; cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
 .chat-path-link:hover { color: #a5b4fc; }
