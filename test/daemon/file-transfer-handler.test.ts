@@ -39,7 +39,7 @@ describe('file-transfer local handle hardening', () => {
   let fakeHome: string;
 
   beforeEach(async () => {
-    rootDir = await mkdtemp(path.join(tmpdir(), 'imcodes-file-transfer-'));
+    rootDir = await realpath(await mkdtemp(path.join(tmpdir(), 'imcodes-file-transfer-')));
     fakeHome = path.join(rootDir, 'home');
     await mkdir(fakeHome, { recursive: true });
   });

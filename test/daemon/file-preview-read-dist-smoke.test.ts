@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -26,6 +26,8 @@ if (!distReady && distRequired) {
       const second = join(project, 'two.txt');
       await writeFile(first, 'one');
       await writeFile(second, 'two');
+      const firstRealPath = await realpath(first);
+      const secondRealPath = await realpath(second);
 
       const { PreviewReadWorkerPool } = await import(`${pathToFileURL(distPoolPath).href}?t=${Date.now()}`);
       const pool = new PreviewReadWorkerPool();
@@ -38,8 +40,8 @@ if (!distReady && distRequired) {
         ]);
 
         expect(pool.getSlotViews()).toHaveLength(2);
-        expect(one).toMatchObject({ phase: 'preflight', kind: 'success', realPath: first });
-        expect(two).toMatchObject({ phase: 'preflight', kind: 'success', realPath: second });
+        expect(one).toMatchObject({ phase: 'preflight', kind: 'success', realPath: firstRealPath });
+        expect(two).toMatchObject({ phase: 'preflight', kind: 'success', realPath: secondRealPath });
 
         const missing = await pool.dispatch({ phase: 'preflight', rawPath: join(project, 'missing.txt') });
         expect(missing).toMatchObject({ phase: 'preflight', kind: 'error', error: FS_READ_ERROR_CODES.INTERNAL_ERROR, sanitized: true });
