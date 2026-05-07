@@ -112,6 +112,16 @@ export async function writeWatchdogCmd(paths: LaunchPaths): Promise<void> {
   // We also separate the lock-wait state from the post-daemon retry:
   // logging ONCE on entry/exit instead of every poll, and polling at 30 s
   // intervals during lock-wait (vs 5 s after a clean daemon exit).
+  //
+  // SELF-HEALING for stuck locks: every wait_loop iteration runs a tiny
+  // PowerShell stale-lock probe.  If the upgrade.lock file is older than
+  // 10 minutes (= longer than any realistic npm install completion path),
+  // we assume the upgrade script crashed before reaching its `:done`
+  // safety-net and remove the lock ourselves.  This is the difference
+  // between "auto-upgrade silently wedges the daemon for hours until the
+  // user notices" and "auto-upgrade self-recovers within ~10 minutes
+  // even if the upgrade.cmd was malformed".  The exit-the-wait-state log
+  // line distinguishes the stale-lock recovery from a normal lock release.
   const watchdog = [
     '@echo off',
     'chcp 65001 >nul 2>&1',
@@ -124,7 +134,15 @@ export async function writeWatchdogCmd(paths: LaunchPaths): Promise<void> {
     'echo [%date% %time%] Upgrade in progress, waiting for lock to clear... >> "%USERPROFILE%\\.imcodes\\watchdog.log"',
     ':wait_loop',
     'ping -n 31 127.0.0.1 >nul 2>&1',
+    'if not exist "%USERPROFILE%\\.imcodes\\upgrade.lock" goto lock_cleared',
+    // Stale-lock probe: if the lock file mtime is >10 minutes old, the
+    // upgrade script crashed before its `:done` cleanup ran — remove the
+    // lock ourselves so the daemon can come back up.
+    'powershell -NoProfile -NonInteractive -Command "$f=\'%USERPROFILE%\\.imcodes\\upgrade.lock\'; if((Test-Path $f) -and ((Get-Item $f).LastWriteTime -lt (Get-Date).AddMinutes(-10))){Remove-Item -Force -ErrorAction SilentlyContinue $f}" >nul 2>&1',
     'if exist "%USERPROFILE%\\.imcodes\\upgrade.lock" goto wait_loop',
+    'echo [%date% %time%] Upgrade lock was stale ^(>10min^) -- removed by watchdog self-heal. >> "%USERPROFILE%\\.imcodes\\watchdog.log"',
+    'goto loop',
+    ':lock_cleared',
     'echo [%date% %time%] Upgrade lock cleared, resuming. >> "%USERPROFILE%\\.imcodes\\watchdog.log"',
     'goto loop',
     '',

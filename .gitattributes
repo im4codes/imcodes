@@ -1,0 +1,14 @@
+# Force CRLF on Windows-only batch / VBS files regardless of host platform.
+#
+# Why: cmd.exe parses LF inconsistently (especially inside `if (...)` blocks)
+# and a `\r`-less line tail can swallow the next line as part of the previous
+# command. Without this rule, git on macOS/Linux checks the file out with LF
+# (matching the blob), and any test that reads the bytes directly trips a
+# "bare LF — needs CRLF" assertion (see test/util/restart-daemon-cmd.test.ts).
+#
+# `text eol=crlf` means: treat as text in the index, force CRLF on checkout
+# everywhere. The blob can still be LF — git converts on the way out.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.vbs text eol=crlf
+*.ps1 text eol=crlf

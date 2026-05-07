@@ -231,6 +231,69 @@ describe('writeWatchdogCmd', () => {
     // And exactly one "cleared" exit message
     expect(cmd).toContain('Upgrade lock cleared, resuming');
   });
+
+  it('self-heals stuck upgrade.lock when older than 10 minutes', async () => {
+    // Stable fix for daemon auto-upgrade: if the upgrade script crashes
+    // before reaching its `:done` safety-net (the failure mode we hit
+    // 2026-04-27 from a doubled-backslash path AND 2026-05-07 from
+    // unescaped parens in an if-block echo), the lock would otherwise
+    // strand the watchdog in :wait_loop forever.
+    //
+    // The watchdog now runs a tiny PowerShell probe each poll: if the
+    // lock's mtime is >10 minutes old, remove it.  Real upgrades finish
+    // in well under 10 minutes (npm install on a healthy connection is
+    // ~1-3 min), so this cannot race with a live upgrade.
+    const paths = {
+      nodeExe: 'node.exe',
+      imcodesScript: 'C:\\npm\\node_modules\\imcodes\\dist\\src\\index.js',
+      watchdogPath: 'out.cmd',
+      vbsPath: 'out.vbs',
+      logPath: 'out.log',
+    };
+    await writeWatchdogCmd(paths);
+    const cmd = written[paths.watchdogPath];
+
+    // PowerShell probe must be present and check >10min mtime
+    expect(cmd).toContain('powershell -NoProfile -NonInteractive');
+    expect(cmd).toContain('LastWriteTime');
+    expect(cmd).toContain('AddMinutes(-10)');
+    expect(cmd).toContain('Remove-Item');
+
+    // Two distinct exit-from-wait paths so the operator can tell them apart:
+    //   - normal: "Upgrade lock cleared, resuming."
+    //   - self-heal: "Upgrade lock was stale (>10min) — removed by watchdog self-heal."
+    expect(cmd).toContain('Upgrade lock cleared, resuming');
+    expect(cmd).toMatch(/Upgrade lock was stale.*removed by watchdog self-heal/);
+    // ASCII-only — the watchdog .cmd file has a separate "no high bytes"
+    // assertion further down, so the self-heal message must use ASCII
+    // hyphens, not Unicode em-dashes.
+    // The two exit paths are distinct labels — :lock_cleared (normal) and
+    // a stale-removal block that falls through to `goto loop`.
+    expect(cmd).toContain(':lock_cleared');
+  });
+
+  it('stale-lock probe runs INSIDE wait_loop, after the 30s sleep', async () => {
+    // Order matters: we must ping-sleep first, then check the lock, then
+    // run the stale probe.  If we probed BEFORE sleeping, every entry to
+    // :wait_loop would re-check the mtime and could remove a lock that
+    // was just barely placed by a slow-starting upgrade.
+    const paths = {
+      nodeExe: 'node.exe',
+      imcodesScript: 'C:\\npm\\node_modules\\imcodes\\dist\\src\\index.js',
+      watchdogPath: 'out.cmd',
+      vbsPath: 'out.vbs',
+      logPath: 'out.log',
+    };
+    await writeWatchdogCmd(paths);
+    const cmd = written[paths.watchdogPath];
+
+    const waitLoopIdx = cmd.indexOf(':wait_loop');
+    const pingIdx = cmd.indexOf('ping -n 31', waitLoopIdx);
+    const psProbeIdx = cmd.indexOf('powershell -NoProfile', waitLoopIdx);
+    expect(waitLoopIdx).toBeGreaterThan(-1);
+    expect(pingIdx).toBeGreaterThan(waitLoopIdx);
+    expect(psProbeIdx).toBeGreaterThan(pingIdx);
+  });
 });
 
 describe('writeVbsLauncher', () => {

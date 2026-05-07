@@ -8,9 +8,11 @@ const state = vi.hoisted(() => ({
   scheduledTaskRunOk: false,
   vbsExists: false,
   startupCmdExists: false,
+  upgradeLockExists: false,
   alivePids: new Set<number>(),
   execCalls: [] as string[],
   spawnCalls: [] as Array<{ cmd: string; args: string[] }>,
+  rmSyncCalls: [] as string[],
 }));
 
 vi.mock('node:os', () => ({ homedir: () => 'C:\\Users\\tester' }));
@@ -24,12 +26,17 @@ vi.mock('node:fs', () => ({
   existsSync: vi.fn((path: string) => {
     if (path.endsWith('daemon-launcher.vbs')) return state.vbsExists;
     if (path.endsWith('imcodes-daemon.cmd')) return state.startupCmdExists;
+    if (path.endsWith('upgrade.lock')) return state.upgradeLockExists;
     return false;
   }),
   readFileSync: vi.fn(() => {
     const idx = Math.min(state.pidIndex, state.pidContents.length - 1);
     state.pidIndex += 1;
     return state.pidContents[idx] ?? '';
+  }),
+  rmSync: vi.fn((path: string) => {
+    state.rmSyncCalls.push(path);
+    if (path.endsWith('upgrade.lock')) state.upgradeLockExists = false;
   }),
 }));
 
@@ -56,9 +63,11 @@ function reset(): void {
   state.scheduledTaskRunOk = false;
   state.vbsExists = false;
   state.startupCmdExists = false;
+  state.upgradeLockExists = false;
   state.alivePids = new Set<number>();
   state.execCalls = [];
   state.spawnCalls = [];
+  state.rmSyncCalls = [];
   vi.spyOn(process, 'kill').mockImplementation(((pid: number) => {
     if (!state.alivePids.has(pid)) throw new Error('not running');
     return true;
@@ -182,5 +191,46 @@ describe('restartWindowsDaemon', () => {
     restartWindowsDaemon();
     const call = (spawn as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(call[2]).toEqual(expect.objectContaining({ windowsHide: true }));
+  });
+
+  // ── upgrade.lock recovery ──
+
+  it('clears stuck upgrade.lock so the new watchdog does not park in :wait_lock', async () => {
+    // Real-world incident on 2026-05-07: a daemon auto-upgrade triggered
+    // from an OLD daemon (pre-paren-fix) generated an upgrade.cmd with an
+    // unescaped `(` inside an `if exist ()` echo.  cmd.exe's paren-counting
+    // derailed partway through, so the success path's `del UPGRADE_LOCK`
+    // never ran.  The user then ran `imcodes restart` to recover, which
+    // timed out waiting for a new daemon PID — because the new watchdog
+    // we just spawned was parked on the stale lock from the wedged upgrade.
+    //
+    // Fix: after killing all watchdogs (any in-flight upgrade is by
+    // definition broken — we just killed its child processes), remove the
+    // lock unconditionally so the freshly-spawned watchdog can launch the
+    // daemon without spinning in :wait_lock.
+    state.pidContents = ['', '100'];
+    state.alivePids = new Set([100]);
+    state.vbsExists = true;
+    state.upgradeLockExists = true;
+
+    const { restartWindowsDaemon } = await import('../../src/util/windows-daemon.js');
+    expect(restartWindowsDaemon()).toBe(true);
+
+    // The lock must have been removed via fs.rmSync (the fast path).
+    expect(state.rmSyncCalls.some(p => p.endsWith('upgrade.lock'))).toBe(true);
+    expect(state.upgradeLockExists).toBe(false);
+  });
+
+  it('skips lock removal when no lock exists (no extra rmSync call)', async () => {
+    state.pidContents = ['', '100'];
+    state.alivePids = new Set([100]);
+    state.vbsExists = true;
+    state.upgradeLockExists = false;
+
+    const { restartWindowsDaemon } = await import('../../src/util/windows-daemon.js');
+    restartWindowsDaemon();
+
+    // No rmSync calls when lock is absent — avoids fs noise on the happy path.
+    expect(state.rmSyncCalls).toEqual([]);
   });
 });
