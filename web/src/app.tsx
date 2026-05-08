@@ -3477,7 +3477,6 @@ export function App() {
             <div
               ref={desktopWorkspaceBoundsRef}
               data-testid="desktop-workspace-bounds"
-              class={desktopLayoutCapable && subSessionBarCollapsed ? 'desktop-workspace-maximized' : undefined}
               style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', position: 'relative', overflow: 'hidden' }}
             >
             {/* Desktop local preview shortcut — available even before a session is active */}
