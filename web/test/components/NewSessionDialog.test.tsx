@@ -28,6 +28,7 @@ const makeWs = () => {
   return {
     sendSessionCommand: vi.fn(),
     send: vi.fn(),
+    requestSessionList: vi.fn(),
     connected: true,
     onMessage: vi.fn((handler: (msg: unknown) => void) => {
       handlers.add(handler);
@@ -203,17 +204,87 @@ describe('NewSessionDialog', () => {
       agentType: 'claude-code-sdk',
     }));
 
-    const handler = ws.onMessage.mock.calls.at(-1)?.[0];
-    expect(typeof handler).toBe('function');
-    handler?.({
+    act(() => ws.emit({
       type: 'session.event',
       event: 'started',
       session: 'deck_u6d4b_u8bd5_brain',
       state: 'idle',
-    });
+    }));
 
     expect(onSessionStarted).toHaveBeenCalledWith('deck_u6d4b_u8bd5_brain');
     expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it('accepts session_list as authoritative startup success after the local wait probe', () => {
+    vi.useFakeTimers();
+    try {
+      const ws = makeWs();
+      const onClose = vi.fn();
+      const onSessionStarted = vi.fn();
+      render(<NewSessionDialog ws={ws as any} onClose={onClose} onSessionStarted={onSessionStarted} isProviderConnected={() => false} />);
+
+      fireEvent.input(screen.getByPlaceholderText('my-project'), {
+        target: { value: 'my-app' },
+      });
+      fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), {
+        target: { value: '~/projects/my-app' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+      act(() => {
+        vi.advanceTimersByTime(15_000);
+      });
+
+      expect(ws.requestSessionList).toHaveBeenCalledOnce();
+      expect(screen.queryByText('timeout')).toBeNull();
+      expect(onClose).not.toHaveBeenCalled();
+
+      act(() => ws.emit({
+        type: 'session_list',
+        sessions: [
+          {
+            name: 'deck_my_app_brain',
+            project: 'my-app',
+            role: 'brain',
+            agentType: 'claude-code-sdk',
+            state: 'idle',
+          },
+        ],
+      }));
+
+      expect(onSessionStarted).toHaveBeenCalledWith('deck_my_app_brain');
+      expect(onClose).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('ignores session.error for other projects while a start is pending', () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), {
+      target: { value: 'my-app' },
+    });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), {
+      target: { value: '~/projects/my-app' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    act(() => ws.emit({
+      type: 'session.error',
+      project: 'other-project',
+      message: 'Other failed',
+    }));
+    expect(screen.queryByText('Other failed')).toBeNull();
+    expect(screen.getAllByText('starting').length).toBeGreaterThan(0);
+
+    act(() => ws.emit({
+      type: 'session.error',
+      project: 'my-app',
+      message: 'Start failed',
+    }));
+    expect(screen.getByText('Start failed')).toBeDefined();
   });
 
   it('shows cli/sdk difference hint when switching agent type', async () => {

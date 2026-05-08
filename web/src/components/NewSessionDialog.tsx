@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "preact/hooks";
+import { useState, useEffect, useMemo, useRef } from "preact/hooks";
 import { useTranslation } from "react-i18next";
 import type { WsClient } from "../ws-client.js";
 import { FileBrowser } from "./file-browser-lazy.js";
@@ -69,6 +69,11 @@ interface RemoteSession {
   label: string;
 }
 
+interface PendingStart {
+  project: string;
+  sessionName: string;
+}
+
 export function NewSessionDialog({
   ws,
   onClose,
@@ -86,6 +91,7 @@ export function NewSessionDialog({
   const [thinking, setThinking] = useState<TransportEffortLevel>("high");
   const [shells, setShells] = useState<string[]>([]);
   const [shellBin, setShellBin] = useState<string>("");
+  const pendingStartRef = useRef<PendingStart | null>(null);
   const agentGroups = getSessionAgentGroups("new-session");
 
   // CC env presets
@@ -238,25 +244,51 @@ export function NewSessionDialog({
 
   // (openclaw fallback removed — show connect hint instead of auto-switching)
 
-  // Listen for session.event started/error while dialog is open
+  // Listen while the dialog is mounted. A fast daemon can emit "started"
+  // before a starting-gated effect gets registered.
   useEffect(() => {
-    if (!ws || !starting) return;
+    if (!ws) return;
+    const finishStart = (sessionName: string) => {
+      pendingStartRef.current = null;
+      setError("");
+      setStarting(false);
+      onSessionStarted(sessionName);
+      onClose();
+    };
+    const matchesPendingSession = (name: string, pending: PendingStart) =>
+      name === pending.sessionName;
+    const matchesPendingProject = (value: unknown, pending: PendingStart) =>
+      typeof value === "string" && sanitizeProjectName(value) === pending.project;
     const unsub = ws.onMessage((msg) => {
+      const pending = pendingStartRef.current;
+      if (!pending) return;
       if (msg.type === "session.event") {
         const name = msg.session ?? "";
-        const slug = sanitizeProjectName(project);
-        if (msg.event === "started" && name.startsWith(`deck_${slug}_`)) {
-          unsub();
-          onSessionStarted(name);
-          onClose();
-        } else if (msg.event === "error" && name.startsWith(`deck_${slug}_`)) {
-          unsub();
+        if (msg.event === "started" && matchesPendingSession(name, pending)) {
+          finishStart(name);
+        } else if (msg.event === "error" && matchesPendingSession(name, pending)) {
+          pendingStartRef.current = null;
           setError(`Session failed to start: ${msg.state}`);
           setStarting(false);
         }
       }
+      if (msg.type === "session_list") {
+        const started = msg.sessions.find((session) =>
+          session.state !== "stopped" &&
+          (
+            session.name === pending.sessionName ||
+            (
+              session.role === "brain" &&
+              !session.name.startsWith("deck_sub_") &&
+              matchesPendingProject(session.project, pending)
+            )
+          )
+        );
+        if (started) finishStart(started.name);
+      }
       if (msg.type === "session.error") {
-        unsub();
+        if (!matchesPendingProject(msg.project, pending)) return;
+        pendingStartRef.current = null;
         setError(
           (msg as unknown as { message: string }).message ||
             "Failed to start session",
@@ -265,18 +297,22 @@ export function NewSessionDialog({
       }
     });
 
-    // Timeout after 15s
+    return unsub;
+  }, [ws, onClose, onSessionStarted]);
+
+  useEffect(() => {
+    if (!ws || !starting) return;
     const timeout = setTimeout(() => {
-      unsub();
-      setError(t("new_session.timeout"));
-      setStarting(false);
+      if (!pendingStartRef.current) return;
+      try {
+        ws.requestSessionList();
+      } catch {
+        /* best-effort probe; keep waiting for authoritative daemon state */
+      }
     }, 15_000);
 
-    return () => {
-      unsub();
-      clearTimeout(timeout);
-    };
-  }, [starting, ws, project]);
+    return () => clearTimeout(timeout);
+  }, [starting, ws]);
 
   const handleStart = () => {
     if (!project.trim()) {
@@ -296,6 +332,11 @@ export function NewSessionDialog({
       return;
     }
 
+    const slug = sanitizeProjectName(project.trim());
+    pendingStartRef.current = {
+      project: slug,
+      sessionName: `deck_${slug}_brain`,
+    };
     setError("");
     setStarting(true);
     if (shellBin)
