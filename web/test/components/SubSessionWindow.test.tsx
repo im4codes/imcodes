@@ -587,7 +587,7 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
       const panel = container.querySelector('.subsession-window') as HTMLElement | null;
       expect(panel).toBeTruthy();
       expect(panel?.style.left).toBe(`${window.innerWidth - 32}px`);
-      expect(panel?.style.top).toBe(`${window.innerHeight - 32}px`);
+      expect(panel?.style.top).toBe(`${window.innerHeight - 100 - 480}px`);
     });
   });
 
