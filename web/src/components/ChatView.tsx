@@ -555,11 +555,6 @@ interface SelectionMenu {
 const FILE_PANEL_MIN = 220;
 const FILE_PANEL_MAX_RATIO = 0.6; // 60% of viewport width
 const FILE_PANEL_DEFAULT = 340;
-// Desktop-only font dropdown gate. Same UA pattern used elsewhere in web/src
-// (SubSessionWindow, FloatingPanel, SubSessionBar, etc.) — the title bar +
-// font controls are intentionally hidden on touch devices to keep the chat
-// chrome lean.
-const CHAT_IS_MOBILE = typeof navigator !== 'undefined' && /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
 const panelWidthKey = (id: string | null | undefined) => `chatFilePanelWidth:${id ?? '_'}`;
 const panelOpenKey  = (id: string | null | undefined) => `chatFilePanelOpen:${id ?? '_'}`;
 
@@ -1303,9 +1298,10 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // Per-machine chat-window font preference (family + size). Stored in
   // localStorage under `imcodes_fontPrefs:chat`; not synced across devices,
   // because each machine's display, OS font availability, and viewing
-  // distance differ. Surfaced via the title-bar dropdown on desktop only.
+  // distance differ. Surfaced via the title-bar dropdown on every platform
+  // — phones included — so users can pick the font that reads best for them.
   const [chatFontPrefs, setChatFontPrefs] = useFontPrefs('chat', DEFAULT_CHAT_FONT);
-  const chatFontStyle = !CHAT_IS_MOBILE && !preview
+  const chatFontStyle = !preview
     ? { fontSize: `${chatFontPrefs.size}px`, fontFamily: chatFontPrefs.family }
     : undefined;
   const historySteps = useMemo(() => {
@@ -1342,7 +1338,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
         </button>
       )}
       <div class="chat-main">
-        {!CHAT_IS_MOBILE && !preview && (
+        {!preview && (
           <div
             class="chat-titlebar"
             style={{

@@ -24,13 +24,36 @@ const STORAGE_PREFIX = 'imcodes_fontPrefs:';
 const FONT_PREFS_EVENT = 'imcodes:fontPrefsChanged';
 
 /**
+ * CJK fallback stack appended to monospace presets. Latin-only programmer
+ * fonts (JetBrains Mono, Fira Code, etc.) don't ship CJK glyphs, so the
+ * browser does per-glyph fallback to whichever family later in the stack
+ * supports the character. Listing the common system CJK fonts explicitly
+ * gives consistent rendering across macOS / Windows / Linux / iOS / Android
+ * instead of relying on the browser's last-resort default which can be
+ * jarringly different per OS.
+ */
+const CJK_FALLBACK = [
+  '"PingFang SC"',          // macOS / iOS — Simplified Chinese
+  '"PingFang TC"',          // macOS / iOS — Traditional Chinese
+  '"Microsoft YaHei"',      // Windows — Simplified Chinese
+  '"Microsoft JhengHei"',   // Windows — Traditional Chinese
+  '"Hiragino Sans GB"',     // macOS — Simplified Chinese (older)
+  '"Hiragino Sans"',        // macOS — Japanese
+  '"Yu Gothic"',            // Windows — Japanese
+  '"Apple SD Gothic Neo"',  // macOS / iOS — Korean
+  '"Malgun Gothic"',        // Windows — Korean
+  '"Noto Sans CJK SC"',     // Linux / Android — Simplified Chinese
+  '"Source Han Sans SC"',   // Linux alternate
+].join(', ');
+
+/**
  * Default chat font. JetBrains Mono is bundled as a webfont (see
  * `web/src/main.tsx`) so it is always available regardless of the user's
- * installed system fonts. It is a popular programmer-friendly mono with
- * great hinting at small sizes and broad CJK fallback via the stack tail.
+ * installed system fonts. CJK characters fall back through the
+ * `CJK_FALLBACK` stack, then the last-resort `monospace`.
  */
 export const DEFAULT_CHAT_FONT: FontPrefs = {
-  family: '"JetBrains Mono", "JetBrains Mono NL", ui-monospace, Menlo, Consolas, monospace',
+  family: `"JetBrains Mono", "JetBrains Mono NL", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`,
   size: 14,
 };
 
@@ -42,13 +65,37 @@ function clampSize(n: number): number {
   return Math.max(MIN_SIZE, Math.min(MAX_SIZE, Math.round(n)));
 }
 
+/**
+ * Forward-compat: the first version of this component shipped preset
+ * stacks WITHOUT explicit CJK fallback, so users who picked a font in
+ * those builds have a Latin-only stack saved in localStorage. Without
+ * fallback, Chinese / Japanese / Korean characters land on the browser's
+ * last-resort font, which differs jarringly across OSes. This helper
+ * auto-injects the shared CJK_FALLBACK into any stored family that
+ * doesn't already contain a CJK marker, so an old save silently upgrades
+ * on the next page load.
+ *
+ * Idempotent: stacks that already include "PingFang" (added by us in
+ * every preset of the new build) are returned unchanged.
+ */
+function ensureCJKFallback(family: string): string {
+  if (family === 'system-ui') return family; // browser handles CJK natively
+  if (family.includes('PingFang')) return family; // already migrated
+  // Insert just before the trailing generic family (monospace / sans-serif /
+  // serif / cursive / fantasy) so the cascade order stays valid.
+  const match = family.match(/^(.+?),\s*(monospace|sans-serif|serif|cursive|fantasy)\s*$/i);
+  if (match) return `${match[1]}, ${CJK_FALLBACK}, ${match[2]}`;
+  return `${family}, ${CJK_FALLBACK}`;
+}
+
 export function readFontPrefs(scope: string, defaults: FontPrefs): FontPrefs {
   try {
     const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(STORAGE_PREFIX + scope) : null;
     if (!raw) return defaults;
     const parsed = JSON.parse(raw) as Partial<FontPrefs>;
+    const rawFamily = typeof parsed.family === 'string' && parsed.family.length > 0 ? parsed.family : defaults.family;
     return {
-      family: typeof parsed.family === 'string' && parsed.family.length > 0 ? parsed.family : defaults.family,
+      family: ensureCJKFallback(rawFamily),
       size: typeof parsed.size === 'number' ? clampSize(parsed.size) : defaults.size,
     };
   } catch {
@@ -130,26 +177,26 @@ interface FontFamilyOption {
  */
 const FAMILY_OPTIONS: readonly FontFamilyOption[] = [
   // JetBrains Mono — bundled webfont, default. Always shown.
-  { id: 'jetbrains-mono', cssValue: '"JetBrains Mono", "JetBrains Mono NL", ui-monospace, Menlo, Consolas, monospace' },
+  { id: 'jetbrains-mono', cssValue: `"JetBrains Mono", "JetBrains Mono NL", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace` },
   // Generic categories — always available
   { id: 'system', cssValue: 'system-ui' },
-  { id: 'sans', cssValue: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif' },
-  { id: 'serif', cssValue: 'Georgia, "Times New Roman", "Songti SC", "STSong", "SimSun", serif' },
-  { id: 'mono', cssValue: 'ui-monospace, "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace' },
-  { id: 'rounded', cssValue: '"SF Pro Rounded", -apple-system, "Nunito", "PingFang SC", system-ui, sans-serif' },
+  { id: 'sans', cssValue: `-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, ${CJK_FALLBACK}, "Helvetica Neue", Arial, sans-serif` },
+  { id: 'serif', cssValue: `Georgia, "Times New Roman", "Songti SC", "STSong", "SimSun", ${CJK_FALLBACK}, serif` },
+  { id: 'mono', cssValue: `ui-monospace, "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", ${CJK_FALLBACK}, monospace` },
+  { id: 'rounded', cssValue: `"SF Pro Rounded", -apple-system, "Nunito", ${CJK_FALLBACK}, system-ui, sans-serif` },
   // Other programmer mono — only shown if detected on this machine
-  { id: 'fira-code', cssValue: '"Fira Code", "Fira Mono", ui-monospace, Menlo, Consolas, monospace', detectFamily: 'Fira Code' },
-  { id: 'cascadia', cssValue: '"Cascadia Code", "Cascadia Mono", ui-monospace, Menlo, Consolas, monospace', detectFamily: 'Cascadia Code' },
-  { id: 'source-code-pro', cssValue: '"Source Code Pro", ui-monospace, Menlo, Consolas, monospace', detectFamily: 'Source Code Pro' },
-  { id: 'ibm-plex-mono', cssValue: '"IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace', detectFamily: 'IBM Plex Mono' },
-  { id: 'hack', cssValue: 'Hack, ui-monospace, Menlo, Consolas, monospace', detectFamily: 'Hack' },
-  { id: 'iosevka', cssValue: 'Iosevka, ui-monospace, Menlo, Consolas, monospace', detectFamily: 'Iosevka' },
-  { id: 'inconsolata', cssValue: 'Inconsolata, ui-monospace, Menlo, Consolas, monospace', detectFamily: 'Inconsolata' },
-  { id: 'roboto-mono', cssValue: '"Roboto Mono", ui-monospace, Menlo, Consolas, monospace', detectFamily: 'Roboto Mono' },
-  { id: 'ubuntu-mono', cssValue: '"Ubuntu Mono", ui-monospace, Menlo, Consolas, monospace', detectFamily: 'Ubuntu Mono' },
-  { id: 'menlo', cssValue: 'Menlo, ui-monospace, monospace', detectFamily: 'Menlo' },
-  { id: 'consolas', cssValue: 'Consolas, ui-monospace, monospace', detectFamily: 'Consolas' },
-  { id: 'sf-mono', cssValue: '"SF Mono", ui-monospace, monospace', detectFamily: 'SF Mono' },
+  { id: 'fira-code', cssValue: `"Fira Code", "Fira Mono", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Fira Code' },
+  { id: 'cascadia', cssValue: `"Cascadia Code", "Cascadia Mono", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Cascadia Code' },
+  { id: 'source-code-pro', cssValue: `"Source Code Pro", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Source Code Pro' },
+  { id: 'ibm-plex-mono', cssValue: `"IBM Plex Mono", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'IBM Plex Mono' },
+  { id: 'hack', cssValue: `Hack, ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Hack' },
+  { id: 'iosevka', cssValue: `Iosevka, ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Iosevka' },
+  { id: 'inconsolata', cssValue: `Inconsolata, ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Inconsolata' },
+  { id: 'roboto-mono', cssValue: `"Roboto Mono", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Roboto Mono' },
+  { id: 'ubuntu-mono', cssValue: `"Ubuntu Mono", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Ubuntu Mono' },
+  { id: 'menlo', cssValue: `Menlo, ui-monospace, ${CJK_FALLBACK}, monospace`, detectFamily: 'Menlo' },
+  { id: 'consolas', cssValue: `Consolas, ui-monospace, ${CJK_FALLBACK}, monospace`, detectFamily: 'Consolas' },
+  { id: 'sf-mono', cssValue: `"SF Mono", ui-monospace, ${CJK_FALLBACK}, monospace`, detectFamily: 'SF Mono' },
 ];
 
 /**
@@ -169,9 +216,13 @@ function isFontInstalled(family: string): boolean {
   }
 }
 
-/** Build a CSS font-family value for an arbitrary local family name. */
+/**
+ * Build a CSS font-family value for an arbitrary local family name. The
+ * picked font sits at the front; CJK fallback keeps Chinese / Japanese /
+ * Korean text readable when the user picks a Latin-only family.
+ */
 function localFamilyToCssValue(family: string): string {
-  return `"${family}", system-ui`;
+  return `"${family}", ${CJK_FALLBACK}, system-ui`;
 }
 
 interface Props {
