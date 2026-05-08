@@ -22,6 +22,13 @@
     "show": "显示",
     "hide": "隐藏"
   },
+  "window": {
+    "maximize": "最大化",
+    "restore": "还原",
+    "minimize": "最小化",
+    "close": "关闭",
+    "hide": "隐藏"
+  },
   "chat": {
     "sendFailedReason": {
       "daemonOffline": "连接中断",

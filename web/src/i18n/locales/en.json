@@ -22,6 +22,13 @@
     "show": "Show",
     "hide": "Hide"
   },
+  "window": {
+    "maximize": "Maximize",
+    "restore": "Restore",
+    "minimize": "Minimize",
+    "close": "Close",
+    "hide": "Hide"
+  },
   "chat": {
     "sendFailedReason": {
       "daemonOffline": "Connection lost",

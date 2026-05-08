@@ -22,6 +22,13 @@
     "show": "Показать",
     "hide": "Скрыть"
   },
+  "window": {
+    "maximize": "Развернуть",
+    "restore": "Восстановить",
+    "minimize": "Свернуть",
+    "close": "Закрыть",
+    "hide": "Скрыть"
+  },
   "chat": {
     "sendFailedReason": {
       "daemonOffline": "Соединение потеряно",

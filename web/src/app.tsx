@@ -7,6 +7,10 @@ import {
   openSubIdsKey,
   type DesktopWindowMeta,
 } from './window-stack.js';
+import {
+  workspaceBoundsFromRect,
+  type WorkspaceBounds,
+} from './desktop-window-maximize.js';
 import { lazy, Suspense } from 'preact/compat';
 import {
   FileBrowser,
@@ -299,6 +303,16 @@ export function App() {
     saveSidebarCollapsed(sidebarCollapsed);
   }, [sidebarCollapsed]);
   const [showDesktopFileBrowser, setShowDesktopFileBrowser] = useState(false);
+  const [desktopFileBrowserMaximized, setDesktopFileBrowserMaximized] = useState(false);
+  const [maximizedSubIds, setMaximizedSubIds] = useState<Set<string>>(() => new Set());
+  const desktopWorkspaceBoundsRef = useRef<HTMLDivElement | null>(null);
+  const getDesktopMaximizeBounds = useCallback((): WorkspaceBounds | null => {
+    const el = desktopWorkspaceBoundsRef.current;
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    return workspaceBoundsFromRect(rect);
+  }, []);
   const [showDesktopLocalWebPreview, setShowDesktopLocalWebPreview] = useState(false);
   const [localWebPreviewPort, setLocalWebPreviewPort] = useState('');
   const [localWebPreviewPath, setLocalWebPreviewPath] = useState('/');
@@ -936,6 +950,10 @@ export function App() {
   // (stable string) — never the stack object or the Set instance — so this
   // memo only invalidates on real ordering / membership changes.
   const openSubIdsKeyMemo = useMemo(() => openSubIdsKey(openSubIds), [openSubIds]);
+  const openSubIdsRef = useRef(openSubIds);
+  openSubIdsRef.current = openSubIds;
+  const maximizedSubIdsRef = useRef(maximizedSubIds);
+  maximizedSubIdsRef.current = maximizedSubIds;
   const focusedSubId = useMemo(
     () => (isMobileRef.current ? null : getFrontmostSubSessionId(stackRef.current!, openSubIds)),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- deps are intentionally [stackVersion, key] to avoid invalidating on every Set re-creation
@@ -1127,23 +1145,80 @@ export function App() {
     }, { bringToFront: true });
   }, [ensureDesktopWindow]);
 
+  const setSubSessionMaximized = useCallback((id: string, maximized: boolean) => {
+    setMaximizedSubIds((prev) => {
+      const has = prev.has(id);
+      if (has === maximized) return prev;
+      const next = new Set(prev);
+      if (maximized) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  }, []);
+
+  const clearSubSessionMaximized = useCallback((id: string) => {
+    setSubSessionMaximized(id, false);
+  }, [setSubSessionMaximized]);
+
+  const minimizeSubSessionWindow = useCallback((id: string) => {
+    clearSubSessionMaximized(id);
+    setOpenSubIds((prev) => {
+      if (!prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
+    removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id));
+  }, [clearSubSessionMaximized, removeDesktopWindow, setOpenSubIds]);
+
+  const openSubSessionMaximized = useCallback((id: string) => {
+    if (isMobileRef.current) {
+      setOpenSubIds((prev) => (prev.has(id) ? new Set() : new Set([id])));
+      return;
+    }
+    setSubSessionMaximized(id, true);
+    setOpenSubIds((prev) => {
+      if (prev.has(id)) return prev;
+      return new Set([...prev, id]);
+    });
+    bringSubToFront(id);
+  }, [bringSubToFront, setOpenSubIds, setSubSessionMaximized]);
+
+  const maximizeOpenSubSession = useCallback((id: string) => {
+    if (isMobileRef.current) return;
+    setSubSessionMaximized(id, true);
+    setOpenSubIds((prev) => (prev.has(id) ? prev : new Set([...prev, id])));
+    bringSubToFront(id);
+  }, [bringSubToFront, setOpenSubIds, setSubSessionMaximized]);
+
+  const restoreSubSession = useCallback((id: string) => {
+    clearSubSessionMaximized(id);
+    bringSubToFront(id);
+  }, [bringSubToFront, clearSubSessionMaximized]);
+
   const toggleSubSession = useCallback((id: string) => {
     const mobile = isMobileRef.current;
     let willOpen = false;
     setOpenSubIds((prev) => {
       if (mobile) {
         // Exclusive on mobile: close if already open, otherwise open only this one
-        if (prev.has(id)) return new Set();
+        if (prev.has(id)) {
+          clearSubSessionMaximized(id);
+          return new Set();
+        }
         willOpen = true;
+        clearSubSessionMaximized(id);
         return new Set([id]);
       }
       const next = new Set(prev);
       if (next.has(id)) {
         next.delete(id);
         willOpen = false;
+        clearSubSessionMaximized(id);
       } else {
         next.add(id);
         willOpen = true;
+        clearSubSessionMaximized(id);
       }
       return next;
     });
@@ -1152,7 +1227,7 @@ export function App() {
     } else {
       removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id));
     }
-  }, [bringSubToFront, removeDesktopWindow]);
+  }, [bringSubToFront, clearSubSessionMaximized, removeDesktopWindow, setOpenSubIds]);
 
   const activeSessionRef = useRef(activeSession);
   activeSessionRef.current = activeSession;
@@ -1206,6 +1281,7 @@ export function App() {
         serverId: selectedServerId ?? undefined,
       }, { bringToFront: true });
     } else {
+      setDesktopFileBrowserMaximized(false);
       removeDesktopWindow(DESKTOP_WINDOW_IDS.fileBrowser);
     }
   }, [showDesktopFileBrowser, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
@@ -1281,6 +1357,8 @@ export function App() {
     else localStorage.removeItem('rcc_session');
     setActiveSessionState(name);
     if (!opts?.keepSubWindows) {
+      setMaximizedSubIds(new Set());
+      setDesktopFileBrowserMaximized(false);
       // Restore saved open sub-sessions for the target main session
       if (name) {
         try {
@@ -1384,6 +1462,11 @@ export function App() {
     connected,
     activeSession,
   );
+  const closeSubSessionAndClearMaximized = useCallback((id: string) => {
+    clearSubSessionMaximized(id);
+    removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id));
+    closeSubSession(id);
+  }, [clearSubSessionMaximized, closeSubSession, removeDesktopWindow]);
 
   const defaultShellPref = usePref<string>(PREF_KEY_DEFAULT_SHELL, { parse: parseString });
   const subSessionParentSignature = useMemo(
@@ -1446,8 +1529,6 @@ export function App() {
   const termScrollFnsRef = useRef<Map<string, () => void>>(new Map());
   // Per-session chat scroll functions — registered by SessionPane
   const chatScrollFnsRef = useRef<Map<string, () => void>>(new Map());
-  const openSubIdsRef = useRef(openSubIds);
-  openSubIdsRef.current = openSubIds;
   // subSessionsRef itself is declared earlier (forward-declared before
   // bringSubToFront so the callback can close over it). Just sync each render.
   subSessionsRef.current = subSessions;
@@ -1564,6 +1645,8 @@ export function App() {
   }, [setPinnedPanels, subSessions, bringSubToFront]);
 
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+  isMobileRef.current = isMobile;
+  const desktopLayoutCapable = !isMobile;
   const defaultViewMode: ViewMode = isMobile ? 'chat' : 'terminal';
   // Per-session view mode: Record<sessionName, ViewMode>
   const [viewModes, setViewModes] = useState<Record<string, ViewMode>>(() => {
@@ -3076,7 +3159,7 @@ export function App() {
             onDropPanel={(type, id) => {
               if (type === 'subsession') {
                 const sub = subSessions.find(s => s.id === id);
-                if (sub) pinPanel('subsession', { sessionName: sub.sessionName, label: sub.label, serverId: selectedServerId }, () => setOpenSubIds((prev) => { const s = new Set(prev); s.delete(id); return s; }));
+                if (sub) pinPanel('subsession', { sessionName: sub.sessionName, label: sub.label, serverId: selectedServerId }, () => minimizeSubSessionWindow(id));
               }
             }}
           >
@@ -3371,6 +3454,11 @@ export function App() {
               sessionsLoaded={sessionsLoaded}
             />
 
+            <div
+              ref={desktopWorkspaceBoundsRef}
+              data-testid="desktop-workspace-bounds"
+              style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', position: 'relative', overflow: 'hidden' }}
+            >
             {/* Desktop local preview shortcut — available even before a session is active */}
             {!isMobile && selectedServerId && !resolvedActiveSessionExists && (
               <div class="desktop-view-toggle">
@@ -3470,7 +3558,25 @@ export function App() {
 
             {/* Desktop floating file browser */}
             {!isMobile && showDesktopFileBrowser && wsRef.current && activeSessionInfo && (
-              <FloatingPanel id="filebrowser" title={`📁 ${trans('picker.files')}`} onClose={() => setShowDesktopFileBrowser(false)} onPin={() => pinPanel('filebrowser', { sessionName: activeSession, projectDir: activeSessionInfo?.projectDir, serverId: selectedServerId }, () => setShowDesktopFileBrowser(false))} pinTooltip={trans('sidebar.pin_to_sidebar')} defaultW={420} defaultH={500} zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.fileBrowser, 5020)} onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.fileBrowser)}>
+              <FloatingPanel
+                id="filebrowser"
+                title={`📁 ${trans('picker.files')}`}
+                onClose={() => setShowDesktopFileBrowser(false)}
+                onPin={() => pinPanel('filebrowser', { sessionName: activeSession, projectDir: activeSessionInfo?.projectDir, serverId: selectedServerId }, () => setShowDesktopFileBrowser(false))}
+                pinTooltip={trans('sidebar.pin_to_sidebar')}
+                defaultW={420}
+                defaultH={500}
+                zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.fileBrowser, 5020)}
+                onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.fileBrowser)}
+                enableMaximize
+                isMaximized={desktopFileBrowserMaximized}
+                onToggleMaximized={() => {
+                  setDesktopFileBrowserMaximized((prev) => !prev);
+                  bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.fileBrowser);
+                }}
+                getMaximizeBounds={getDesktopMaximizeBounds}
+                desktopLayoutCapable={desktopLayoutCapable}
+              >
                 <FileBrowser
                   ws={wsRef.current}
                   serverId={selectedServerId}
@@ -3534,9 +3640,15 @@ export function App() {
               <SubSessionBar
                 subSessions={visibleSubSessions}
                 openIds={openSubIds}
+                maximizedIds={maximizedSubIds}
+                desktopLayoutCapable={desktopLayoutCapable}
                 idleFlashTokens={idleFlashTokens}
                 onOpen={toggleSubSession}
-                onClose={closeSubSession}
+                onClose={closeSubSessionAndClearMaximized}
+                onOpenMaximized={openSubSessionMaximized}
+                onMaximize={maximizeOpenSubSession}
+                onRestore={restoreSubSession}
+                onRestoreThenClose={minimizeSubSessionWindow}
                 onRestart={restartSubSession}
                 onNew={() => setShowSubDialog(true)}
                 onViewDiscussions={() => { setDiscussionInitialId(null); setShowDiscussionsPage(true); }}
@@ -3569,6 +3681,7 @@ export function App() {
                 onSubTransportConfigSaved={(subId, transportConfig) => updateSubLocal(subId, { transportConfig })}
               />
             )}
+            </div>
           </>
         )}
       </main>
@@ -4032,8 +4145,19 @@ export function App() {
               idleFlashToken={idleFlashTokens.get(sub.sessionName) ?? 0}
               onDiff={registerDiffApplyer}
               onHistory={registerHistoryApplyer}
-              onMinimize={() => setOpenSubIds((prev) => { const s = new Set(prev); s.delete(sub.id); return s; })}
-              onClose={() => closeSubSession(sub.id)}
+              onMinimize={() => minimizeSubSessionWindow(sub.id)}
+              onClose={() => closeSubSessionAndClearMaximized(sub.id)}
+              maximized={maximizedSubIds.has(sub.id)}
+              onToggleMaximized={() => {
+                if (maximizedSubIdsRef.current.has(sub.id)) {
+                  restoreSubSession(sub.id);
+                } else {
+                  maximizeOpenSubSession(sub.id);
+                }
+              }}
+              onRestoreBeforeClose={() => clearSubSessionMaximized(sub.id)}
+              getMaximizeBounds={getDesktopMaximizeBounds}
+              desktopLayoutCapable={desktopLayoutCapable}
               onRestart={() => restartSubSession(sub.id)}
               onRename={() => {
                 const label = prompt('Rename sub-session:', sub.label ?? '');
@@ -4059,7 +4183,7 @@ export function App() {
               }}
               onDesktopFileBrowserFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id))}
               onDesktopFileBrowserClose={() => removeDesktopWindow(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id))}
-              onPin={(vm) => pinPanel('subsession', { sessionName: sub.sessionName, viewMode: vm, label: sub.label, serverId: selectedServerId }, () => setOpenSubIds((prev) => { const s = new Set(prev); s.delete(sub.id); return s; }))}
+              onPin={(vm) => pinPanel('subsession', { sessionName: sub.sessionName, viewMode: vm, label: sub.label, serverId: selectedServerId }, () => minimizeSubSessionWindow(sub.id))}
               sessions={sessions}
               subSessions={subSessionsSlim}
               serverId={selectedServerId ?? undefined}
