@@ -8,6 +8,7 @@ import {
   type DesktopWindowMeta,
 } from './window-stack.js';
 import {
+  reserveWorkspaceBottom,
   workspaceBoundsFromRect,
   type WorkspaceBounds,
 } from './desktop-window-maximize.js';
@@ -31,8 +32,9 @@ import { SessionTabs } from './components/SessionTabs.js';
 import { SessionPane } from './components/SessionPane.js';
 import { useQuickData } from './components/QuickInputPanel.js';
 import { NewSessionDialog } from './components/NewSessionDialog.js';
-import { SubSessionBar } from './components/SubSessionBar.js';
+import { SubSessionBar, SUBSESSION_BAR_COLLAPSED_STORAGE_KEY } from './components/SubSessionBar.js';
 import { SubSessionWindow } from './components/SubSessionWindow.js';
+import { DesktopWindowMaximizeButton } from './components/DesktopWindowMaximizeButton.js';
 import { useSharedGitChanges, requestSharedChanges } from './git-status-store.js';
 import { applyFilePreviewRequestUpdate, updateFilePreviewCache } from './file-preview-state.js';
 import { StartSubSessionDialog } from './components/StartSubSessionDialog.js';
@@ -305,13 +307,25 @@ export function App() {
   const [showDesktopFileBrowser, setShowDesktopFileBrowser] = useState(false);
   const [desktopFileBrowserMaximized, setDesktopFileBrowserMaximized] = useState(false);
   const [maximizedSubIds, setMaximizedSubIds] = useState<Set<string>>(() => new Set());
+  const [subSessionBarCollapsed, setSubSessionBarCollapsed] = useState(() => {
+    try {
+      const raw = localStorage.getItem(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY);
+      if (raw !== null) return JSON.parse(raw) === true;
+    } catch { /* ignore */ }
+    return /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY, JSON.stringify(subSessionBarCollapsed));
+    } catch { /* ignore */ }
+  }, [subSessionBarCollapsed]);
   const desktopWorkspaceBoundsRef = useRef<HTMLDivElement | null>(null);
   const getDesktopMaximizeBounds = useCallback((): WorkspaceBounds | null => {
     const el = desktopWorkspaceBoundsRef.current;
     if (!el) return null;
     const rect = el.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return null;
-    return workspaceBoundsFromRect(rect);
+    return reserveWorkspaceBottom(workspaceBoundsFromRect(rect));
   }, []);
   const [showDesktopLocalWebPreview, setShowDesktopLocalWebPreview] = useState(false);
   const [localWebPreviewPort, setLocalWebPreviewPort] = useState('');
@@ -2566,7 +2580,10 @@ export function App() {
     const handler = (e: KeyboardEvent) => {
       if (isImeComposingKeyEvent(e)) return;
       const ws = wsRef.current;
-      const session = activeSession;
+      // If a sub-session window is frontmost (desktop only), keystrokes —
+      // including ESC/stop — must target THAT window, not the main session.
+      const focusedSubId = focusedSubIdRef.current;
+      const session = focusedSubId ? `deck_sub_${focusedSubId}` : activeSession;
       if (!ws?.connected || !session) return;
       const el = document.activeElement as HTMLElement | null;
       const target = e.target as HTMLElement | null;
@@ -2626,7 +2643,10 @@ export function App() {
   useEffect(() => {
     const handler = (e: ClipboardEvent) => {
       const ws = wsRef.current;
-      const session = activeSession;
+      // Mirror the keydown handler: paste must target the frontmost
+      // sub-session window when one is focused, not the main session.
+      const focusedSubId = focusedSubIdRef.current;
+      const session = focusedSubId ? `deck_sub_${focusedSubId}` : activeSession;
       if (!ws?.connected || !session) return;
       const target = e.target as HTMLElement | null;
       const el = document.activeElement as HTMLElement | null;
@@ -3457,6 +3477,7 @@ export function App() {
             <div
               ref={desktopWorkspaceBoundsRef}
               data-testid="desktop-workspace-bounds"
+              class={desktopLayoutCapable && subSessionBarCollapsed ? 'desktop-workspace-maximized' : undefined}
               style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', position: 'relative', overflow: 'hidden' }}
             >
             {/* Desktop local preview shortcut — available even before a session is active */}
@@ -3488,6 +3509,12 @@ export function App() {
                 >
                   🌐
                 </button>
+                <DesktopWindowMaximizeButton
+                  class="view-toggle desktop-main-maximize-toggle"
+                  data-testid="main-session-maximize-toggle"
+                  maximized={subSessionBarCollapsed}
+                  onClick={() => setSubSessionBarCollapsed((collapsed) => !collapsed)}
+                />
                 {!isTransportSession && (
                   <button class="view-toggle" data-onboarding="view-toggle" onClick={toggleViewMode}>
                     {viewMode === 'chat' ? '⌨ Terminal' : '💬 Chat'}
@@ -3642,6 +3669,8 @@ export function App() {
                 openIds={openSubIds}
                 maximizedIds={maximizedSubIds}
                 desktopLayoutCapable={desktopLayoutCapable}
+                collapsed={subSessionBarCollapsed}
+                onCollapsedChange={setSubSessionBarCollapsed}
                 idleFlashTokens={idleFlashTokens}
                 onOpen={toggleSubSession}
                 onClose={closeSubSessionAndClearMaximized}

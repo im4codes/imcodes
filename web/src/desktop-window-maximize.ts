@@ -27,6 +27,8 @@ export interface DomRectLike {
 
 export type StackOrderEntry = string | { id: string };
 
+export const DESKTOP_BOTTOM_WINDOW_RESERVE_PX = 100;
+
 const DEFAULT_MIN_W = 1;
 const DEFAULT_MIN_H = 1;
 const DEFAULT_VISIBLE_MARGIN = 32;
@@ -62,6 +64,17 @@ export function workspaceBoundsFromRect(rect: DomRectLike): WorkspaceBounds {
     y: finiteOr(rect.top, 0),
     w: Math.max(0, finiteOr(rect.width, 0)),
     h: Math.max(0, finiteOr(rect.height, 0)),
+  };
+}
+
+export function reserveWorkspaceBottom(
+  bounds: WorkspaceBounds,
+  reservePx = DESKTOP_BOTTOM_WINDOW_RESERVE_PX,
+): WorkspaceBounds {
+  const reserve = Math.max(0, finiteOr(reservePx, 0));
+  return {
+    ...bounds,
+    h: Math.max(0, finiteOr(bounds.h, 0) - reserve),
   };
 }
 

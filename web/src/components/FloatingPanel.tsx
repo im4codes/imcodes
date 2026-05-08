@@ -11,6 +11,7 @@ import {
   clampGeometryToWorkspace,
   geometryFromWorkspace,
   normalizeWindowGeometry,
+  reserveWorkspaceBottom,
   shouldPersistGeometry,
   type WorkspaceBounds,
   type WindowGeometry,
@@ -39,20 +40,25 @@ const MIN_H = 280;
 const DRAG_MARGIN = 32;
 
 function currentViewportBounds(): WorkspaceBounds {
-  return {
+  return reserveWorkspaceBottom({
     x: 0,
     y: 0,
     w: Math.max(MIN_W, window.innerWidth),
     h: Math.max(MIN_H, window.innerHeight),
-  };
+  });
 }
 
 function clampGeomToViewport(geom: WindowGeometry): WindowGeometry {
-  return clampGeometryToWorkspace(geom, currentViewportBounds(), {
+  const bounds = currentViewportBounds();
+  const clamped = clampGeometryToWorkspace(geom, bounds, {
     minW: MIN_W,
     minH: MIN_H,
     visibleMargin: DRAG_MARGIN,
   });
+  return {
+    ...clamped,
+    y: Math.min(clamped.y, Math.max(bounds.y, bounds.y + bounds.h - clamped.h)),
+  };
 }
 
 function loadGeom(id: string, dw: number, dh: number): WindowGeometry {
@@ -244,8 +250,10 @@ export function FloatingPanel({
       style={{
         position: 'fixed', left: displayGeom.x, top: displayGeom.y, width: displayGeom.w, height: displayGeom.h,
         zIndex, display: 'flex', flexDirection: 'column',
-        background: '#0f172a', border: '1px solid #334155', borderRadius: 8,
-        boxShadow: '0 12px 40px #00000060', overflow: 'hidden',
+        background: '#0f172a', border: isDesktopMaximized ? '2px solid #3b82f6' : '1px solid #334155', borderRadius: 8,
+        boxShadow: isDesktopMaximized ? '0 0 0 1px rgba(96,165,250,0.45), 0 12px 40px #00000060' : '0 12px 40px #00000060',
+        overflow: 'hidden',
+        boxSizing: 'border-box',
       }}
       onMouseDown={() => onFocus?.()}
     >

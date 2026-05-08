@@ -112,6 +112,19 @@ describe('FloatingPanel maximize integration', () => {
     expect(panel.style.height).not.toContain('NaN');
   });
 
+  it('keeps normal floating geometry above the reserved sub-session strip', () => {
+    localStorage.setItem('rcc_float_filebrowser', JSON.stringify({ x: 80, y: 999, w: 700, h: 520 }));
+
+    render(
+      <FloatingPanel id="filebrowser" title="Files" onClose={() => {}}>
+        <div>content</div>
+      </FloatingPanel>,
+    );
+
+    const panel = screen.getByTestId('floating-panel-filebrowser') as HTMLElement;
+    expect(parseFloat(panel.style.top) + parseFloat(panel.style.height)).toBeLessThanOrEqual(window.innerHeight - 100);
+  });
+
   it('does not persist maximized workspace geometry as normal panel geometry', () => {
     const saved = { x: 80, y: 90, w: 700, h: 520 };
     localStorage.setItem('rcc_float_filebrowser', JSON.stringify(saved));

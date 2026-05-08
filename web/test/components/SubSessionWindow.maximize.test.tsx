@@ -277,6 +277,18 @@ describe('SubSessionWindow maximize integration', () => {
     expect(panel.style.height).not.toContain('NaN');
   });
 
+  it('keeps normal window geometry above the reserved sub-session strip', async () => {
+    localStorage.setItem('rcc_subsession_sub-1', JSON.stringify({
+      geom: { x: 111, y: 999, w: 633, h: 444 },
+      viewMode: 'chat',
+    }));
+
+    const { container } = renderWindow({ onToggleMaximized: vi.fn() });
+    const panel = container.querySelector('.subsession-window') as HTMLElement;
+
+    expect(parseFloat(panel.style.top) + parseFloat(panel.style.height)).toBeLessThanOrEqual(window.innerHeight - 100);
+  });
+
   it('does not persist maximized geometry over normal localStorage', async () => {
     renderWindow({
       maximized: true,

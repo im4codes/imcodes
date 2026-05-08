@@ -6,6 +6,7 @@ import {
   clampGeometryToWorkspace,
   geometryFromWorkspace,
   normalizeWindowGeometry,
+  reserveWorkspaceBottom,
   resolveFrontmostMaximized,
   shouldPersistGeometry,
   workspaceBoundsFromRect,
@@ -26,6 +27,15 @@ describe('desktop-window-maximize helpers', () => {
       y: 34,
       w: 560,
       h: 420,
+    });
+  });
+
+  it('reserves bottom space for the sub-session button strip', () => {
+    expect(reserveWorkspaceBottom({ x: 12, y: 34, w: 560, h: 420 })).toEqual({
+      x: 12,
+      y: 34,
+      w: 560,
+      h: 320,
     });
   });
 

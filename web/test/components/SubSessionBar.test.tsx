@@ -62,6 +62,51 @@ describe('SubSessionBar', () => {
     cleanup();
   });
 
+  it('can share collapsed state with an external fullscreen control', () => {
+    const onCollapsedChange = vi.fn();
+    const view = render(
+      <SubSessionBar
+        subSessions={[makeSubSession()]}
+        openIds={new Set()}
+        collapsed={false}
+        onCollapsedChange={onCollapsedChange}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    expect(view.container.querySelector('.subcard-scroll')).toBeTruthy();
+
+    fireEvent.click(view.container.querySelector('.subcard-toolbar-btn') as HTMLButtonElement);
+
+    expect(onCollapsedChange).toHaveBeenCalledWith(true);
+
+    view.rerender(
+      <SubSessionBar
+        subSessions={[makeSubSession()]}
+        openIds={new Set()}
+        collapsed={true}
+        onCollapsedChange={onCollapsedChange}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    expect(view.container.querySelector('.subsession-bar')).toBeTruthy();
+  });
+
   it('only applies the running pulse to collapsed mini cards while the sub-session is running', () => {
     const idleView = render(
       <SubSessionBar

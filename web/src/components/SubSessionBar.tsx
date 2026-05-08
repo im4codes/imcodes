@@ -93,6 +93,8 @@ interface Props {
   detectedModels?: Map<string, string>;
   /** ID of the currently focused (topmost) sub-session window. */
   focusedSubId?: string | null;
+  collapsed?: boolean;
+  onCollapsedChange?: (collapsed: boolean) => void;
   /** Quick data for compact SessionControls in cards. */
   quickData?: import('./QuickInputPanel.js').UseQuickDataResult;
   /** All sessions — for @ picker. */
@@ -109,6 +111,7 @@ type Layout = 'single' | 'double';
 interface CardSize { w: number; h: number }
 
 const DEFAULT_SIZE: CardSize = { w: 350, h: 250 };
+export const SUBSESSION_BAR_COLLAPSED_STORAGE_KEY = 'rcc_subcard_collapsed';
 
 function load<T>(key: string, fallback: T): T {
   try {
@@ -173,11 +176,12 @@ function CollapsedSubSessionButton({ sub, isOpen, idleFlashToken, usage, inP2p, 
   );
 }
 
-export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, idleFlashTokens, onOpen, onClose, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, detectedModels, focusedSubId, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
+export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, idleFlashTokens, onOpen, onClose, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
   const { t } = useTranslation();
   const isMobile = !desktopLayoutCapable;
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
-  const [collapsed, setCollapsed] = useState(() => load('rcc_subcard_collapsed', !desktopLayoutCapable));
+  const [internalCollapsed, setInternalCollapsed] = useState(() => load(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY, !desktopLayoutCapable));
+  const collapsed = controlledCollapsed ?? internalCollapsed;
   const [p2pHidden, setP2pHidden] = useState(() => load('rcc_subcard_p2p_hidden', false));
   const [showSizePanel, setShowSizePanel] = useState(false);
   const [cardSize, setCardSize] = useState<CardSize>(() => load('rcc_subcard_size', DEFAULT_SIZE));
@@ -304,8 +308,14 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   dragOrderRef.current = dragOrder;
 
   useEffect(() => {
-    save('rcc_subcard_collapsed', collapsed);
+    save(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY, collapsed);
   }, [collapsed]);
+
+  const setCollapsed = useCallback((next: boolean | ((current: boolean) => boolean)) => {
+    const resolved = typeof next === 'function' ? next(collapsed) : next;
+    if (controlledCollapsed === undefined) setInternalCollapsed(resolved);
+    onCollapsedChange?.(resolved);
+  }, [collapsed, controlledCollapsed, onCollapsedChange]);
 
   useEffect(() => {
     save('rcc_subcard_p2p_hidden', p2pHidden);

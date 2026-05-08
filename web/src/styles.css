@@ -1002,6 +1002,8 @@ body {
 .view-toggle:hover { background: #334155; }
 .desktop-view-toggle { display: flex; justify-content: flex-end; padding: 2px 8px; background: #0f172a; gap: 4px; }
 .desktop-view-toggle .view-toggle { font-size: 12px; padding: 2px 8px; }
+.desktop-view-toggle .desktop-main-maximize-toggle { display: inline-flex; align-items: center; justify-content: center; min-width: 34px; }
+.desktop-workspace-maximized { box-shadow: inset 0 0 0 2px #3b82f6, inset 0 0 0 3px rgba(96,165,250,0.35); }
 .desktop-fb-float { position: fixed; z-index: 1500; display: flex; flex-direction: column; background: #0f172a; border: 1px solid #334155; border-radius: 8px; box-shadow: 0 8px 32px rgba(0,0,0,0.5); overflow: hidden; }
 .desktop-fb-titlebar { display: flex; align-items: center; justify-content: space-between; padding: 6px 10px; border-bottom: 1px solid #334155; cursor: grab; flex-shrink: 0; user-select: none; }
 .desktop-fb-titlebar:active { cursor: grabbing; }
@@ -1132,6 +1134,7 @@ body {
 
 /* ── Sub-session window ───────────────────────────────────────────────────── */
 .subsession-window { display: flex; flex-direction: column; background: #0f1117; border: 1px solid #334155; border-radius: 8px; box-shadow: 0 8px 32px rgba(0,0,0,0.6); overflow: hidden; min-width: 300px; min-height: 200px; isolation: isolate; }
+.subsession-window-maximized { border: 2px solid #3b82f6; box-shadow: 0 0 0 1px rgba(96,165,250,0.45), 0 8px 32px rgba(0,0,0,0.6); box-sizing: border-box; }
 .subsession-header { display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: #1a2233; border-bottom: 1px solid #1e293b; cursor: move; user-select: none; flex-shrink: 0; }
 .subsession-drag-icon { color: #475569; font-size: 16px; cursor: grab; }
 .subsession-title { font-size: 12px; color: #94a3b8; font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

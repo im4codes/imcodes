@@ -31,6 +31,7 @@ import {
   clampGeometryToWorkspace,
   geometryFromWorkspace,
   normalizeWindowGeometry,
+  reserveWorkspaceBottom,
   shouldPersistGeometry,
   type WindowGeometry,
   type WorkspaceBounds,
@@ -109,20 +110,25 @@ const MIN_H = 200;
 const DESKTOP_VISIBLE_MARGIN = 32;
 
 function currentDesktopBounds(): WorkspaceBounds {
-  return {
+  return reserveWorkspaceBottom({
     x: 0,
     y: 0,
     w: Math.max(MIN_W, window.innerWidth),
     h: Math.max(MIN_H, window.innerHeight),
-  };
+  });
 }
 
 function clampDesktopGeom(geom: WindowGeometry): WindowGeometry {
-  return clampGeometryToWorkspace(geom, currentDesktopBounds(), {
+  const bounds = currentDesktopBounds();
+  const clamped = clampGeometryToWorkspace(geom, bounds, {
     minW: MIN_W,
     minH: MIN_H,
     visibleMargin: DESKTOP_VISIBLE_MARGIN,
   });
+  return {
+    ...clamped,
+    y: Math.min(clamped.y, Math.max(bounds.y, bounds.y + bounds.h - clamped.h)),
+  };
 }
 
 function loadLocal(id: string): { geom: WindowGeometry; viewMode: ViewMode } {
@@ -545,7 +551,12 @@ export function SubSessionWindow({
     : { position: 'fixed', left: displayGeom.x, top: displayGeom.y, width: displayGeom.w, height: displayGeom.h, zIndex };
 
   return (
-    <div ref={swipeBackRef} class="subsession-window" style={style} onMouseDown={onFocus}>
+    <div
+      ref={swipeBackRef}
+      class={`subsession-window${isDesktopMaximized ? ' subsession-window-maximized' : ''}`}
+      style={style}
+      onMouseDown={onFocus}
+    >
       {activeIdleFlashToken ? <IdleFlashLayer key={`subwindow-idle-${activeIdleFlashToken}`} variant="frame" /> : null}
       {/* 8-direction resize handles (desktop only) */}
       {!isMobile && !isDesktopMaximized && (['n','s','e','w','ne','nw','se','sw'] as ResizeDir[]).map((dir) => (
