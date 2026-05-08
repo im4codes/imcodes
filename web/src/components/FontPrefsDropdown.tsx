@@ -305,7 +305,10 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
   const popStyle = {
     position: 'absolute' as const,
     top: 'calc(100% + 4px)',
-    right: 0,
+    // Anchor to the trigger's left edge — the trigger now sits on the left
+    // side of the chat title bar, so a left-anchored popover stays on screen
+    // and reads naturally left-to-right on both desktop and mobile.
+    left: 0,
     zIndex: 80,
     width: 252,
     background: '#1e293b',

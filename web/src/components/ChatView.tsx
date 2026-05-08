@@ -1344,7 +1344,10 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
             style={{
               display: 'flex',
               alignItems: 'center',
-              justifyContent: 'flex-end',
+              // Left-align the font dropdown so it doesn't collide with the
+              // absolutely-positioned `chat-panel-toggle` (⊞) at top:6/right:8.
+              // The two controls now sit at opposite ends and never overlap.
+              justifyContent: 'flex-start',
               gap: 6,
               padding: '4px 8px',
               minHeight: 30,
