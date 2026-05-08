@@ -125,7 +125,7 @@ import {
 } from './server-selection.js';
 import { installNativeAppResumeRefresh } from './app-resume-refresh.js';
 import { isImeComposingKeyEvent } from './ime-keyboard.js';
-import { markServerLive, markServerOffline, touchServerHeartbeat } from './server-online-state.js';
+import { markServerDaemonActivity, markServerOffline, touchServerHeartbeat } from './server-online-state.js';
 import { MSG_DAEMON_ONLINE, MSG_DAEMON_OFFLINE } from '@shared/ack-protocol.js';
 
 const DashboardPage = lazy(() => import('./pages/DashboardPage.js').then((m) => ({ default: m.DashboardPage })));
@@ -1723,7 +1723,7 @@ export function App() {
         setDaemonOnline(true);
         if (sessionListRetryRef.current) { clearTimeout(sessionListRetryRef.current); sessionListRetryRef.current = null; }
         setServers((prev) => updateServerDaemonVersion(
-          markServerLive(prev, selectedServerId),
+          markServerDaemonActivity(prev, selectedServerId),
           selectedServerId,
           msg.daemonVersion,
         ));
@@ -2140,7 +2140,7 @@ export function App() {
           daemonOfflineGraceTimerRef.current = null;
         }
         setDaemonOnline(true);
-        setServers((prev) => markServerLive(prev, selectedServerId));
+        setServers((prev) => markServerDaemonActivity(prev, selectedServerId));
       }
       if (msg.type === MSG_DAEMON_OFFLINE) {
         if (daemonOfflineGraceTimerRef.current) {
@@ -2260,7 +2260,16 @@ export function App() {
     const unsubStats = ws.onMessage((msg) => {
       if (msg.type === 'daemon.stats') {
         setDaemonStats({ daemonVersion: msg.daemonVersion, cpu: msg.cpu, memUsed: msg.memUsed, memTotal: msg.memTotal, load1: msg.load1, load5: msg.load5, load15: msg.load15, uptime: msg.uptime });
-        setServers((prev) => updateServerDaemonVersion(prev, selectedServerId, msg.daemonVersion));
+        if (daemonOfflineGraceTimerRef.current) {
+          clearTimeout(daemonOfflineGraceTimerRef.current);
+          daemonOfflineGraceTimerRef.current = null;
+        }
+        setDaemonOnline(true);
+        setServers((prev) => updateServerDaemonVersion(
+          markServerDaemonActivity(prev, selectedServerId),
+          selectedServerId,
+          msg.daemonVersion,
+        ));
       }
     });
     setConnecting(true);
