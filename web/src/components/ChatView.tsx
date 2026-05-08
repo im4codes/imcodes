@@ -14,6 +14,7 @@ import { parseUnifiedDiff } from '@shared/unified-diff.js';
 import { FileBrowser } from './file-browser-lazy.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
+import { FontPrefsDropdown, useFontPrefs, DEFAULT_CHAT_FONT } from './FontPrefsDropdown.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
 import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 import type { TimelineHistoryStatus, TimelineHistoryStepKey } from '../hooks/useTimeline.js';
@@ -554,6 +555,11 @@ interface SelectionMenu {
 const FILE_PANEL_MIN = 220;
 const FILE_PANEL_MAX_RATIO = 0.6; // 60% of viewport width
 const FILE_PANEL_DEFAULT = 340;
+// Desktop-only font dropdown gate. Same UA pattern used elsewhere in web/src
+// (SubSessionWindow, FloatingPanel, SubSessionBar, etc.) — the title bar +
+// font controls are intentionally hidden on touch devices to keep the chat
+// chrome lean.
+const CHAT_IS_MOBILE = typeof navigator !== 'undefined' && /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
 const panelWidthKey = (id: string | null | undefined) => `chatFilePanelWidth:${id ?? '_'}`;
 const panelOpenKey  = (id: string | null | undefined) => `chatFilePanelOpen:${id ?? '_'}`;
 
@@ -1294,6 +1300,14 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   }, [isTouchDevice, preview, openCtxMenu]);
 
   const canShowFilePanel = !preview && !!ws;
+  // Per-machine chat-window font preference (family + size). Stored in
+  // localStorage under `imcodes_fontPrefs:chat`; not synced across devices,
+  // because each machine's display, OS font availability, and viewing
+  // distance differ. Surfaced via the title-bar dropdown on desktop only.
+  const [chatFontPrefs, setChatFontPrefs] = useFontPrefs('chat', DEFAULT_CHAT_FONT);
+  const chatFontStyle = !CHAT_IS_MOBILE && !preview
+    ? { fontSize: `${chatFontPrefs.size}px`, fontFamily: chatFontPrefs.family }
+    : undefined;
   const historySteps = useMemo(() => {
     if (!historyStatus || historyStatus.phase === 'idle') return [];
     const order: TimelineHistoryStepKey[] = ['cache', 'textTail', 'daemon', 'http', 'older'];
@@ -1328,6 +1342,28 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
         </button>
       )}
       <div class="chat-main">
+        {!CHAT_IS_MOBILE && !preview && (
+          <div
+            class="chat-titlebar"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'flex-end',
+              gap: 6,
+              padding: '4px 8px',
+              minHeight: 30,
+              flexShrink: 0,
+              borderBottom: '1px solid rgba(51,65,85,0.5)',
+              background: 'rgba(15,23,42,0.35)',
+            }}
+          >
+            <FontPrefsDropdown
+              prefs={chatFontPrefs}
+              onChange={setChatFontPrefs}
+              variant="compact"
+            />
+          </div>
+        )}
         {showRefreshOverlay && (
           <div
             class={`chat-history-overlay${showHistoryProgress ? ' has-steps' : ''}`}
@@ -1383,7 +1419,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
             <span class="chat-pinned-last-sent-text">{lastSentUserMessage.text}</span>
           </div>
         )}
-        <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} onScroll={preview ? undefined : handleScroll}
+        <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} style={chatFontStyle} onScroll={preview ? undefined : handleScroll}
           // Keyboard parity for the floating "↓" button: End force-engages
           // follow and jumps to bottom. tabIndex={-1} keeps it scriptable
           // without inserting it into the natural tab order.
