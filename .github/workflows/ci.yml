@@ -309,16 +309,16 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
           cache: 'npm'
-      - name: Install tmux
-        run: sudo apt-get install -y tmux
-      - name: Prime tmux server
-        run: tmux new-session -d -s init && tmux kill-session -t init
+      # tmux + `npm run build` were needed when `test:coverage` also ran the
+      # e2e suite (which spawns real tmux + agent processes) and when older
+      # tests imported from `dist/`. The coverage script now skips e2e and
+      # all current tests resolve from `src/` via vitest's tsx transform, so
+      # neither prerequisite is needed — saves ~1–2 min per run.
       - run: ./scripts/ci-npm-ci.sh .
       - name: Install web deps (needed for tsx component tests)
         run: ./scripts/ci-npm-ci.sh web
       - name: Install server deps (needed for server route tests)
         run: ./scripts/ci-npm-ci.sh server
-      - run: npm run build
       - run: npm run test:coverage
       - name: Upload to Codecov
         if: ${{ env.CODECOV_TOKEN != '' }}
