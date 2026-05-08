@@ -152,6 +152,8 @@ export function useFontPrefs(scope: string, defaults: FontPrefs): [FontPrefs, (n
 
 interface FontFamilyOption {
   id: string;
+  /** Display name shown in the dropdown — typography terms or brand names. */
+  name: string;
   /** CSS `font-family` stack persisted to localStorage. */
   cssValue: string;
   /**
@@ -177,26 +179,26 @@ interface FontFamilyOption {
  */
 const FAMILY_OPTIONS: readonly FontFamilyOption[] = [
   // JetBrains Mono — bundled webfont, default. Always shown.
-  { id: 'jetbrains-mono', cssValue: `"JetBrains Mono", "JetBrains Mono NL", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace` },
+  { id: 'jetbrains-mono', name: 'JetBrains Mono', cssValue: `"JetBrains Mono", "JetBrains Mono NL", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace` },
   // Generic categories — always available
-  { id: 'system', cssValue: 'system-ui' },
-  { id: 'sans', cssValue: `-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, ${CJK_FALLBACK}, "Helvetica Neue", Arial, sans-serif` },
-  { id: 'serif', cssValue: `Georgia, "Times New Roman", "Songti SC", "STSong", "SimSun", ${CJK_FALLBACK}, serif` },
-  { id: 'mono', cssValue: `ui-monospace, "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", ${CJK_FALLBACK}, monospace` },
-  { id: 'rounded', cssValue: `"SF Pro Rounded", -apple-system, "Nunito", ${CJK_FALLBACK}, system-ui, sans-serif` },
+  { id: 'system', name: 'System', cssValue: 'system-ui' },
+  { id: 'sans', name: 'Sans', cssValue: `-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, ${CJK_FALLBACK}, "Helvetica Neue", Arial, sans-serif` },
+  { id: 'serif', name: 'Serif', cssValue: `Georgia, "Times New Roman", "Songti SC", "STSong", "SimSun", ${CJK_FALLBACK}, serif` },
+  { id: 'mono', name: 'Mono', cssValue: `ui-monospace, "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", ${CJK_FALLBACK}, monospace` },
+  { id: 'rounded', name: 'Rounded', cssValue: `"SF Pro Rounded", -apple-system, "Nunito", ${CJK_FALLBACK}, system-ui, sans-serif` },
   // Other programmer mono — only shown if detected on this machine
-  { id: 'fira-code', cssValue: `"Fira Code", "Fira Mono", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Fira Code' },
-  { id: 'cascadia', cssValue: `"Cascadia Code", "Cascadia Mono", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Cascadia Code' },
-  { id: 'source-code-pro', cssValue: `"Source Code Pro", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Source Code Pro' },
-  { id: 'ibm-plex-mono', cssValue: `"IBM Plex Mono", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'IBM Plex Mono' },
-  { id: 'hack', cssValue: `Hack, ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Hack' },
-  { id: 'iosevka', cssValue: `Iosevka, ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Iosevka' },
-  { id: 'inconsolata', cssValue: `Inconsolata, ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Inconsolata' },
-  { id: 'roboto-mono', cssValue: `"Roboto Mono", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Roboto Mono' },
-  { id: 'ubuntu-mono', cssValue: `"Ubuntu Mono", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Ubuntu Mono' },
-  { id: 'menlo', cssValue: `Menlo, ui-monospace, ${CJK_FALLBACK}, monospace`, detectFamily: 'Menlo' },
-  { id: 'consolas', cssValue: `Consolas, ui-monospace, ${CJK_FALLBACK}, monospace`, detectFamily: 'Consolas' },
-  { id: 'sf-mono', cssValue: `"SF Mono", ui-monospace, ${CJK_FALLBACK}, monospace`, detectFamily: 'SF Mono' },
+  { id: 'fira-code', name: 'Fira Code', cssValue: `"Fira Code", "Fira Mono", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Fira Code' },
+  { id: 'cascadia', name: 'Cascadia Code', cssValue: `"Cascadia Code", "Cascadia Mono", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Cascadia Code' },
+  { id: 'source-code-pro', name: 'Source Code Pro', cssValue: `"Source Code Pro", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Source Code Pro' },
+  { id: 'ibm-plex-mono', name: 'IBM Plex Mono', cssValue: `"IBM Plex Mono", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'IBM Plex Mono' },
+  { id: 'hack', name: 'Hack', cssValue: `Hack, ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Hack' },
+  { id: 'iosevka', name: 'Iosevka', cssValue: `Iosevka, ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Iosevka' },
+  { id: 'inconsolata', name: 'Inconsolata', cssValue: `Inconsolata, ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Inconsolata' },
+  { id: 'roboto-mono', name: 'Roboto Mono', cssValue: `"Roboto Mono", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Roboto Mono' },
+  { id: 'ubuntu-mono', name: 'Ubuntu Mono', cssValue: `"Ubuntu Mono", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Ubuntu Mono' },
+  { id: 'menlo', name: 'Menlo', cssValue: `Menlo, ui-monospace, ${CJK_FALLBACK}, monospace`, detectFamily: 'Menlo' },
+  { id: 'consolas', name: 'Consolas', cssValue: `Consolas, ui-monospace, ${CJK_FALLBACK}, monospace`, detectFamily: 'Consolas' },
+  { id: 'sf-mono', name: 'SF Mono', cssValue: `"SF Mono", ui-monospace, ${CJK_FALLBACK}, monospace`, detectFamily: 'SF Mono' },
 ];
 
 /**
@@ -239,10 +241,20 @@ type LocalFontsState =
   | { kind: 'denied' }
   | { kind: 'ready'; families: string[] };
 
+/** Sentinel value for the "load local fonts" entry inside the <select>. */
+const SENTINEL_LOAD_LOCAL = '__load_local__';
+
+/**
+ * Extract the primary (first quoted) family from a CSS font-family stack
+ * for display purposes when the stored value doesn't match any preset.
+ */
+function extractPrimaryFamily(css: string): string {
+  const m = css.match(/^\s*"?([^",]+?)"?\s*(?:,|$)/);
+  return m ? m[1].trim() : css;
+}
+
 export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Props) {
   const [open, setOpen] = useState(false);
-  const [showMore, setShowMore] = useState(false);
-  const [query, setQuery] = useState('');
   const [localFonts, setLocalFonts] = useState<LocalFontsState>({ kind: 'idle' });
   const wrapRef = useRef<HTMLDivElement>(null);
 
@@ -260,24 +272,16 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
   useEffect(() => {
     if (!open) return;
     const onDoc = (e: MouseEvent) => {
-      if (!wrapRef.current?.contains(e.target as Node)) {
-        setOpen(false);
-        setShowMore(false);
-      }
+      if (!wrapRef.current?.contains(e.target as Node)) setOpen(false);
     };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        if (showMore) setShowMore(false);
-        else setOpen(false);
-      }
-    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
     document.addEventListener('mousedown', onDoc);
     document.addEventListener('keydown', onKey);
     return () => {
       document.removeEventListener('mousedown', onDoc);
       document.removeEventListener('keydown', onKey);
     };
-  }, [open, showMore]);
+  }, [open]);
 
   const compact = variant === 'compact';
   const btnSize = compact ? 22 : 26;
@@ -305,12 +309,12 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
   const popStyle = {
     position: 'absolute' as const,
     top: 'calc(100% + 4px)',
-    // Anchor to the trigger's left edge — the trigger now sits on the left
-    // side of the chat title bar, so a left-anchored popover stays on screen
-    // and reads naturally left-to-right on both desktop and mobile.
+    // Anchor to the trigger's left edge — the trigger sits on the left side
+    // of the chat title bar, so a left-anchored popover stays on screen and
+    // reads naturally left-to-right on both desktop and mobile.
     left: 0,
     zIndex: 80,
-    width: 252,
+    width: 220,
     background: '#1e293b',
     border: '1px solid #334155',
     borderRadius: 8,
@@ -321,53 +325,25 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
     gap: 8,
   } as const;
 
-  const familyGridStyle = {
-    display: 'flex',
-    flexWrap: 'wrap' as const,
-    gap: 4,
-  } as const;
-
-  const familyBtnStyle = (selected: boolean, cssValue: string) => ({
-    width: 30,
-    height: 30,
-    display: 'inline-flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    background: selected ? '#1d4ed8' : '#0f172a',
-    border: `1px solid ${selected ? '#3b82f6' : '#334155'}`,
-    borderRadius: 6,
-    color: selected ? '#fff' : '#e2e8f0',
-    cursor: 'pointer',
-    fontSize: 13,
-    fontWeight: 600,
-    lineHeight: 1,
-    padding: 0,
-    fontFamily: cssValue,
-    transition: 'background 0.1s, border-color 0.1s',
-  } as const);
-
-  const moreBtnStyle = (active: boolean) => ({
-    width: 30,
-    height: 30,
-    display: 'inline-flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    background: active ? '#1d4ed8' : '#0f172a',
-    border: `1px solid ${active ? '#3b82f6' : '#334155'}`,
-    borderRadius: 6,
-    color: active ? '#fff' : '#94a3b8',
-    cursor: 'pointer',
-    fontSize: 16,
-    fontWeight: 700,
-    fontFamily: 'system-ui',
-    lineHeight: 1,
-    padding: 0,
-  } as const);
-
   const sizeRowStyle = {
     display: 'flex',
     alignItems: 'center',
     gap: 4,
+  } as const;
+
+  const selectStyle = {
+    width: '100%',
+    padding: '6px 8px',
+    background: '#0f172a',
+    color: '#e2e8f0',
+    border: '1px solid #334155',
+    borderRadius: 6,
+    fontSize: 13,
+    // Render the select itself in the currently-chosen font so the user
+    // gets an immediate preview of their selection as the menu collapses.
+    fontFamily: prefs.family,
+    boxSizing: 'border-box' as const,
+    cursor: 'pointer',
   } as const;
 
   const sizeBtnStyle = (disabled: boolean) => ({
@@ -407,32 +383,52 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
     if (cssValue !== prefs.family) onChange({ ...prefs, family: cssValue });
   };
 
-  const onMoreClick = async () => {
-    setShowMore((v) => !v);
+  const loadLocalFonts = async () => {
     if (!localFontsSupported) {
       setLocalFonts({ kind: 'unsupported' });
       return;
     }
-    if (localFonts.kind === 'idle') {
-      setLocalFonts({ kind: 'loading' });
-      try {
-        // Local Font Access API — Chromium-only at time of writing.
-        const data: Array<{ family: string }> = await (window as unknown as { queryLocalFonts: () => Promise<Array<{ family: string }>> }).queryLocalFonts();
-        const families = Array.from(new Set(data.map((f) => f.family))).filter(Boolean).sort((a, b) => a.localeCompare(b));
-        setLocalFonts({ kind: 'ready', families });
-      } catch {
-        // User dismissed permission prompt or denied access.
-        setLocalFonts({ kind: 'denied' });
-      }
+    if (localFonts.kind !== 'idle') return;
+    setLocalFonts({ kind: 'loading' });
+    try {
+      // Local Font Access API — Chromium-only at time of writing.
+      const data: Array<{ family: string }> = await (window as unknown as { queryLocalFonts: () => Promise<Array<{ family: string }>> }).queryLocalFonts();
+      const families = Array.from(new Set(data.map((f) => f.family))).filter(Boolean).sort((a, b) => a.localeCompare(b));
+      setLocalFonts({ kind: 'ready', families });
+    } catch {
+      // User dismissed permission prompt or denied access.
+      setLocalFonts({ kind: 'denied' });
     }
   };
 
-  const filteredFamilies = useMemo(() => {
-    if (localFonts.kind !== 'ready') return [];
-    const q = query.trim().toLowerCase();
-    if (!q) return localFonts.families;
-    return localFonts.families.filter((f) => f.toLowerCase().includes(q));
-  }, [localFonts, query]);
+  // Resolve the select's bound value to a known option's cssValue when the
+  // stored prefs.family differs slightly (e.g., older saves migrated by
+  // ensureCJKFallback). Falls back to the stored value so the orphan
+  // <option> can still hold the selection.
+  const selectValue = useMemo(() => {
+    const primary = extractPrimaryFamily(prefs.family);
+    const match = visibleOptions.find((o) => extractPrimaryFamily(o.cssValue) === primary);
+    if (match) return match.cssValue;
+    if (localFonts.kind === 'ready') {
+      const local = localFonts.families.find((f) => f === primary);
+      if (local) return localFamilyToCssValue(local);
+    }
+    return prefs.family;
+  }, [prefs.family, visibleOptions, localFonts]);
+
+  const isOrphan = useMemo(() => {
+    return !visibleOptions.some((o) => o.cssValue === selectValue)
+      && !(localFonts.kind === 'ready' && localFonts.families.some((f) => localFamilyToCssValue(f) === selectValue));
+  }, [selectValue, visibleOptions, localFonts]);
+
+  const handleSelectChange = (e: Event) => {
+    const v = (e.target as HTMLSelectElement).value;
+    if (v === SENTINEL_LOAD_LOCAL) {
+      void loadLocalFonts();
+      return;
+    }
+    pickFamily(v);
+  };
 
   return (
     <div ref={wrapRef} style={{ position: 'relative', display: 'inline-flex' }}>
@@ -447,124 +443,9 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
         Aa
       </button>
       {open && (
-        <div style={popStyle} role="dialog" aria-label="Aa">
-          <div style={familyGridStyle}>
-            {visibleOptions.map((opt) => {
-              const selected = prefs.family === opt.cssValue;
-              return (
-                <button
-                  key={opt.id}
-                  type="button"
-                  onClick={() => pickFamily(opt.cssValue)}
-                  style={familyBtnStyle(selected, opt.cssValue)}
-                  aria-pressed={selected}
-                  aria-label={opt.id}
-                  title={opt.detectFamily ?? opt.id}
-                >
-                  Aa
-                </button>
-              );
-            })}
-            <button
-              type="button"
-              onClick={onMoreClick}
-              style={moreBtnStyle(showMore)}
-              aria-pressed={showMore}
-              aria-label="more"
-              title="more"
-            >
-              …
-            </button>
-          </div>
-          {showMore && (
-            <div
-              style={{
-                display: 'flex',
-                flexDirection: 'column',
-                gap: 4,
-                borderTop: '1px solid #334155',
-                paddingTop: 8,
-              }}
-            >
-              {localFonts.kind === 'ready' && (
-                <input
-                  type="text"
-                  value={query}
-                  onInput={(e) => setQuery((e.target as HTMLInputElement).value)}
-                  placeholder="🔍"
-                  aria-label="search"
-                  style={{
-                    width: '100%',
-                    padding: '5px 8px',
-                    background: '#0f172a',
-                    color: '#e2e8f0',
-                    border: '1px solid #334155',
-                    borderRadius: 6,
-                    fontSize: 12,
-                    fontFamily: 'system-ui',
-                    boxSizing: 'border-box',
-                  }}
-                />
-              )}
-              {localFonts.kind === 'loading' && (
-                <div style={{ textAlign: 'center', color: '#64748b', fontSize: 18, padding: 12, fontFamily: 'system-ui' }}>…</div>
-              )}
-              {(localFonts.kind === 'unsupported' || localFonts.kind === 'denied') && (
-                <div
-                  style={{ textAlign: 'center', color: '#64748b', fontSize: 18, padding: 12, fontFamily: 'system-ui' }}
-                  aria-label={localFonts.kind === 'unsupported' ? 'browser does not support local fonts' : 'permission denied'}
-                  title={localFonts.kind === 'unsupported' ? 'queryLocalFonts is not supported in this browser' : 'Permission to enumerate local fonts was denied'}
-                >
-                  ⚠
-                </div>
-              )}
-              {localFonts.kind === 'ready' && (
-                <div
-                  style={{
-                    maxHeight: 220,
-                    overflowY: 'auto',
-                    border: '1px solid #334155',
-                    borderRadius: 6,
-                    background: '#0f172a',
-                  }}
-                >
-                  {filteredFamilies.length === 0 ? (
-                    <div style={{ textAlign: 'center', color: '#64748b', fontSize: 18, padding: 12 }}>∅</div>
-                  ) : (
-                    filteredFamilies.map((family) => {
-                      const cssValue = localFamilyToCssValue(family);
-                      const selected = prefs.family === cssValue;
-                      return (
-                        <button
-                          key={family}
-                          type="button"
-                          onClick={() => pickFamily(cssValue)}
-                          style={{
-                            display: 'block',
-                            width: '100%',
-                            padding: '6px 10px',
-                            background: selected ? '#1d4ed8' : 'transparent',
-                            border: 'none',
-                            borderBottom: '1px solid #1e293b',
-                            color: selected ? '#fff' : '#e2e8f0',
-                            cursor: 'pointer',
-                            fontSize: 13,
-                            fontFamily: cssValue,
-                            textAlign: 'left',
-                            lineHeight: 1.3,
-                          }}
-                          aria-pressed={selected}
-                          title={family}
-                        >
-                          {family}
-                        </button>
-                      );
-                    })
-                  )}
-                </div>
-              )}
-            </div>
-          )}
+        <div style={popStyle} role="dialog" aria-label="font">
+          {/* Row 1 — size adjuster (− current +). Always first so the most
+              common adjustment is the closest to the trigger. */}
           <div style={sizeRowStyle}>
             <button
               type="button"
@@ -586,6 +467,59 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
               +
             </button>
           </div>
+          {/* Row 2 — native <select> showing font names. Native selects
+              give us free scrolling, OS-native pickers on mobile (which
+              are touch-optimized), and built-in keyboard navigation —
+              far more usable than the previous wrap-grid of "Aa" tiles
+              once the preset list grew past a handful of entries. */}
+          <select
+            value={selectValue}
+            onChange={handleSelectChange}
+            style={selectStyle}
+            aria-label="font family"
+          >
+            {visibleOptions.map((opt) => (
+              <option key={opt.id} value={opt.cssValue} style={{ fontFamily: opt.cssValue }}>
+                {opt.name}
+              </option>
+            ))}
+            {/* Stored value isn't a known preset or local family — surface
+                it explicitly so the select stays "controlled" and the
+                user can still see what they have selected. */}
+            {isOrphan && (
+              <option value={selectValue} style={{ fontFamily: selectValue }}>
+                {extractPrimaryFamily(selectValue)}
+              </option>
+            )}
+            {/* Local-font enumeration is opt-in: the user must pick the
+                "…" entry to trigger the browser permission prompt. We
+                avoid prompting on mount so casual users aren't surprised. */}
+            {localFontsSupported && localFonts.kind === 'idle' && (
+              // Picking this entry invokes queryLocalFonts (separate
+              // permission prompt). The label is intentionally just an
+              // ellipsis — language-neutral and consistent with the
+              // icon-only aesthetic of the rest of the control.
+              <option value={SENTINEL_LOAD_LOCAL}>…</option>
+            )}
+            {localFonts.kind === 'loading' && (
+              <option disabled>…</option>
+            )}
+            {(localFonts.kind === 'unsupported' || localFonts.kind === 'denied') && (
+              <option disabled>⚠</option>
+            )}
+            {localFonts.kind === 'ready' && localFonts.families.length > 0 && (
+              <optgroup label="…">
+                {localFonts.families.map((family) => {
+                  const cv = localFamilyToCssValue(family);
+                  return (
+                    <option key={family} value={cv} style={{ fontFamily: cv }}>
+                      {family}
+                    </option>
+                  );
+                })}
+              </optgroup>
+            )}
+          </select>
         </div>
       )}
     </div>
