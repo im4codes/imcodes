@@ -721,4 +721,90 @@ describe('useQuickData persistence guard', () => {
       }),
     });
   });
+
+  // Regression: a visibility-driven invalidate() that resolved before the
+  // 2-second debounce fired used to overwrite the optimistic resource value
+  // with stale server data, erasing the user's just-added phrase from the
+  // UI. The pending-adds tracker re-layers unsaved additions onto every
+  // server response so the phrase survives the refresh.
+  it('preserves an optimistic phrase across a visibility-triggered refresh before the debounce fires', async () => {
+    apiFetchMock.mockResolvedValueOnce({ data: { history: [], sessionHistory: {}, commands: [], phrases: [] } });
+    let resolveRefresh!: (value: unknown) => void;
+    apiFetchMock.mockReturnValueOnce(new Promise((resolve) => { resolveRefresh = resolve; }));
+    apiFetchMock.mockResolvedValueOnce({ ok: true });
+
+    render(<Harness />);
+    await waitFor(() => expect(screen.getByTestId('loaded').textContent).toBe('true'));
+
+    // User adds a phrase — optimistic resource update + 2s debounced PUT scheduled.
+    fireEvent.click(screen.getByText('add-phrase'));
+    await waitFor(() => expect(screen.getByTestId('phrases').textContent).toBe('continue'));
+
+    // Visibility refresh fires before the 2s debounce elapses.
+    Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect(apiFetchMock).toHaveBeenCalledTimes(2); // GET + invalidate-GET
+
+    // Server returns its older snapshot (without the new phrase).
+    await act(async () => {
+      resolveRefresh({ data: { history: [], sessionHistory: {}, commands: [], phrases: [] } });
+      await Promise.resolve();
+    });
+
+    // Bug repro point: phrase must still be visible after the refresh.
+    expect(screen.getByTestId('phrases').textContent).toBe('continue');
+
+    // The debounced PUT eventually persists the phrase to the server.
+    vi.advanceTimersByTime(2000);
+    await waitFor(() => expect(apiFetchMock).toHaveBeenCalledTimes(3));
+    expect(apiFetchMock).toHaveBeenNthCalledWith(3, '/api/quick-data', {
+      method: 'PUT',
+      body: JSON.stringify({
+        data: {
+          history: [],
+          sessionHistory: {},
+          commands: [],
+          phrases: ['continue'],
+        },
+      }),
+    });
+  });
+
+  // Regression: closing the tab (or pagehide) inside the debounce window
+  // used to drop the pending PUT entirely. The flush handler now fires the
+  // save synchronously with fetch keepalive so the addition reaches the
+  // server even if the user reloads or closes the tab immediately.
+  it('flushes a pending save with keepalive on pagehide', async () => {
+    apiFetchMock.mockResolvedValueOnce({ data: { history: [], sessionHistory: {}, commands: [], phrases: [] } });
+    apiFetchMock.mockResolvedValueOnce({ ok: true });
+
+    render(<Harness />);
+    await waitFor(() => expect(screen.getByTestId('loaded').textContent).toBe('true'));
+
+    fireEvent.click(screen.getByText('add-phrase'));
+    await waitFor(() => expect(screen.getByTestId('phrases').textContent).toBe('continue'));
+
+    // Tab is hidden / closing — flush before the 2s debounce fires.
+    window.dispatchEvent(new Event('pagehide'));
+    await Promise.resolve();
+
+    expect(apiFetchMock).toHaveBeenCalledTimes(2);
+    expect(apiFetchMock).toHaveBeenNthCalledWith(2, '/api/quick-data', {
+      method: 'PUT',
+      body: JSON.stringify({
+        data: {
+          history: [],
+          sessionHistory: {},
+          commands: [],
+          phrases: ['continue'],
+        },
+      }),
+      keepalive: true,
+    });
+
+    // The flush already cleared the debounce timer, so no second PUT.
+    vi.advanceTimersByTime(2000);
+    await Promise.resolve();
+    expect(apiFetchMock).toHaveBeenCalledTimes(2);
+  });
 });
