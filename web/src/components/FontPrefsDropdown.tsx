@@ -331,9 +331,19 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
     gap: 4,
   } as const;
 
+  const selectWrapStyle = {
+    position: 'relative' as const,
+    width: '100%',
+  } as const;
+
   const selectStyle = {
     width: '100%',
-    padding: '6px 8px',
+    // Right padding leaves room for the custom ▾ chevron. The native
+    // arrow is suppressed via `appearance: none` (and the vendor
+    // prefixes for older Safari / Firefox) so the only arrow visible
+    // is the one we draw, guaranteeing the dropdown affordance reads
+    // the same on every browser and OS.
+    padding: '6px 26px 6px 8px',
     background: '#0f172a',
     color: '#e2e8f0',
     border: '1px solid #334155',
@@ -344,6 +354,21 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
     fontFamily: prefs.family,
     boxSizing: 'border-box' as const,
     cursor: 'pointer',
+    appearance: 'none' as const,
+    WebkitAppearance: 'none' as const,
+    MozAppearance: 'none' as const,
+  } as const;
+
+  const chevronStyle = {
+    position: 'absolute' as const,
+    right: 8,
+    top: '50%',
+    transform: 'translateY(-50%)',
+    pointerEvents: 'none' as const,
+    color: '#94a3b8',
+    fontSize: 10,
+    fontFamily: 'system-ui',
+    lineHeight: 1,
   } as const;
 
   const sizeBtnStyle = (disabled: boolean) => ({
@@ -471,7 +496,10 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
               give us free scrolling, OS-native pickers on mobile (which
               are touch-optimized), and built-in keyboard navigation —
               far more usable than the previous wrap-grid of "Aa" tiles
-              once the preset list grew past a handful of entries. */}
+              once the preset list grew past a handful of entries.
+              Wrapped so the custom ▾ chevron sits on the right edge as
+              an unmistakable dropdown affordance. */}
+          <div style={selectWrapStyle}>
           <select
             value={selectValue}
             onChange={handleSelectChange}
@@ -520,6 +548,11 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
               </optgroup>
             )}
           </select>
+          {/* Custom dropdown chevron — `pointer-events: none` so taps fall
+              through to the underlying <select>, opening the native picker
+              on mobile and the dropdown on desktop. */}
+          <span style={chevronStyle} aria-hidden="true">▾</span>
+          </div>
         </div>
       )}
     </div>
