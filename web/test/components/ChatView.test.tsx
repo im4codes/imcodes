@@ -5,6 +5,10 @@ import { h } from 'preact';
 import { render, waitFor, cleanup, fireEvent } from '@testing-library/preact';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { ChatView } from '../../src/components/ChatView.js';
+import {
+  SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
+  SESSION_CONTROL_TIMELINE_STATE_STOPPING,
+} from '../../../shared/session-control-commands.js';
 
 const chatMarkdownRenderSpy = vi.hoisted(() => vi.fn());
 const showToolCallsPref = vi.hoisted(() => ({
@@ -35,8 +39,23 @@ vi.mock('react-i18next', () => ({
 }));
 
 vi.mock('../../src/components/ChatMarkdown.js', () => ({
-  ChatMarkdown: ({ text }: { text: string }) => {
+  ChatMarkdown: ({ text, onUrlClick }: { text: string; onUrlClick?: (url: string) => void }) => {
     chatMarkdownRenderSpy(text);
+    const url = text.match(/https?:\/\/\S+/)?.[0];
+    if (url) {
+      return (
+        <a
+          class="chat-external-link"
+          href={url}
+          onClick={(e) => {
+            e.preventDefault();
+            onUrlClick?.(url);
+          }}
+        >
+          {url}
+        </a>
+      );
+    }
     return <div>{text}</div>;
   },
 }));
@@ -961,6 +980,55 @@ describe('ChatView', () => {
     );
 
     expect(container.textContent).toContain('Session stopped');
+  });
+
+  it('renders transport Stop cancel feedback as a visible system row', () => {
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-stop-requested',
+            type: 'session.state',
+            ts: 1000,
+            payload: {
+              state: SESSION_CONTROL_TIMELINE_STATE_STOPPING,
+              reason: SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
+            },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    expect(container.textContent).toContain('session.state_stop_requested');
+  });
+
+  it('opens external URLs in the themed confirmation dialog', () => {
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-user-link',
+            type: 'assistant.text',
+            ts: 1000,
+            payload: { text: 'https://example.com/release-notes' },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    const link = container.querySelector('.chat-external-link') as HTMLAnchorElement | null;
+    expect(link).not.toBeNull();
+    fireEvent.click(link!);
+
+    const dialog = container.querySelector('.external-link-dialog') as HTMLElement | null;
+    expect(dialog).not.toBeNull();
+    expect(container.querySelector('.dialog-box')).toBeNull();
+    expect(dialog?.getAttribute('role')).toBe('dialog');
+    expect(container.querySelector('.external-link-url')?.textContent).toBe('https://example.com/release-notes');
   });
 
   it('restores mobile keyboard scroll position from bottom offset instead of snapping to top', async () => {

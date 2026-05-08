@@ -16,6 +16,7 @@
 import { watch, readdir, stat, open, mkdir, writeFile } from 'fs/promises';
 import { readdirSync, statSync } from 'fs';
 import type { FileChangeInfo } from 'fs/promises';
+import { createHash } from 'crypto';
 import { join, dirname, basename } from 'path';
 import { homedir } from 'os';
 import { timelineEmitter } from './timeline-emitter.js';
@@ -366,10 +367,21 @@ export async function emitRecentHistory(sessionName: string, filePath: string): 
       timelineEmitter.emit(em.sessionName, em.type, em.payload, em.metadata);
     }
 
-    // Emit the most recent usage snapshot so the context bar populates on load
+    // Emit the most recent usage snapshot so the context bar populates on load.
+    // Round-2 audit (0699ea64-3e6 finding "5v2i100f #1" + brain A1): historical
+    // replay used to generate a fresh eventId every daemon restart (default
+    // `ts=Date.now()` in the emitter), inflating SUM(input_tokens) in
+    // context_turn_usage on every restart. Pass a deterministic eventId
+    // derived from the JSONL path + the usage payload so the partial UNIQUE
+    // index swallows duplicates while still allowing the JSONL append (which
+    // tolerates duplicates).
     if (lastUsagePayload) {
+      const stableUsageEventId = createHash('sha1')
+        .update(`${filePath}\0usage.update.final\0${JSON.stringify(lastUsagePayload)}`)
+        .digest('hex')
+        .slice(0, 24);
       timelineEmitter.emit(sessionName, 'usage.update', lastUsagePayload,
-        { source: 'daemon', confidence: 'high' });
+        { source: 'daemon', confidence: 'high', eventId: stableUsageEventId });
     }
   } catch {
     // best-effort

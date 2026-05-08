@@ -23,6 +23,15 @@ export function markServerOffline<T extends ServerLike>(servers: T[], serverId: 
 }
 
 /**
+ * A daemon-origin message proves the daemon is alive, not merely that the
+ * browser can reach the server pod. Use this for `session_list`,
+ * `daemon.online`, `daemon.reconnected`, and `daemon.stats`.
+ */
+export function markServerDaemonActivity<T extends ServerLike>(servers: T[], serverId: string | null | undefined, now = Date.now()): T[] {
+  return markServerLive(servers, serverId, now);
+}
+
+/**
  * Refresh `lastHeartbeatAt` without overriding an explicit offline status.
  * Used when a WS-level signal (e.g. pong) proves the server pod is reachable
  * but doesn't itself say anything new about daemon presence — we don't want

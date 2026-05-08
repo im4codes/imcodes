@@ -2,8 +2,10 @@ import { describe, it, expect } from 'vitest';
 import { inferContextWindow, resolveContextWindow } from '../../src/util/model-context.js';
 
 describe('model context inference', () => {
-  it('maps GPT-5.5 family to 922k context', () => {
+  it('maps GPT-5.5 family to API input-budget 922k context', () => {
     expect(inferContextWindow('gpt-5.5')).toBe(922_000);
+    expect(inferContextWindow('gpt5.5')).toBe(922_000);
+    expect(inferContextWindow('GPT-5.5 (high)')).toBe(922_000);
     expect(inferContextWindow('gpt-5.5-pro')).toBe(922_000);
     expect(inferContextWindow('gpt-5.5-2026-04-24')).toBe(922_000);
   });
@@ -44,5 +46,16 @@ describe('model context inference', () => {
     expect(resolveContextWindow(1_000_000, 'gpt-5.5')).toBe(922_000);
     expect(resolveContextWindow(200_000, 'claude-opus-4-1')).toBe(1_000_000);
     expect(resolveContextWindow(200_000, 'claude-sonnet-4-6')).toBe(1_000_000);
+  });
+
+  it('honors provider-sourced explicit context windows when requested', () => {
+    expect(resolveContextWindow(258_400, 'gpt-5.4-mini', 1_000_000, { preferExplicit: true })).toBe(258_400);
+    expect(resolveContextWindow(0, 'gpt-5.4-mini', 1_000_000, { preferExplicit: true })).toBe(1_000_000);
+  });
+
+  it('honors provider-sourced explicit context windows for GPT-5.5', () => {
+    expect(resolveContextWindow(258_400, 'gpt-5.5', 1_000_000, { preferExplicit: true })).toBe(258_400);
+    expect(resolveContextWindow(1_000_000, 'gpt-5.5', 1_000_000, { preferExplicit: true })).toBe(1_000_000);
+    expect(resolveContextWindow(258_400, 'gpt-5.5-pro', 1_000_000, { preferExplicit: true })).toBe(258_400);
   });
 });

@@ -8,13 +8,16 @@
     "url": "https://github.com/im4codes/imcodes"
   },
   "bin": {
-    "imcodes": "./dist/src/index.js"
+    "imcodes": "./dist/src/index.js",
+    "imcodes-launch": "./bin/imcodes-launch.sh",
+    "imcodes-launch-preflight": "./dist/src/util/windows-launch-preflight.mjs"
   },
   "type": "module",
   "main": "./dist/src/index.js",
   "files": [
     "dist/",
-    "config/"
+    "config/",
+    "bin/"
   ],
   "engines": {
     "node": ">=22"
@@ -32,7 +35,8 @@
     "test:web": "vitest run --project web",
     "test:e2e": "vitest run --project e2e",
     "test:integration": "vitest run --workspace vitest.integration.config.ts",
-    "test:coverage": "vitest run --coverage --no-file-parallelism --maxWorkers 1 --testTimeout 60000 --hookTimeout 60000 && node scripts/write-coverage-summary.mjs",
+    "test:preview-dist": "node scripts/run-preview-dist-smoke.mjs",
+    "test:coverage": "vitest run --coverage --project daemon --project web --project server && node scripts/write-coverage-summary.mjs",
     "test:watch": "vitest",
     "lint": "eslint src/",
     "typecheck": "tsc --noEmit",

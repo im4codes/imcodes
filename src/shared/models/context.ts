@@ -1,4 +1,9 @@
 export const OPENAI_CONTEXT_WINDOWS = {
+  // OpenAI's API model table lists gpt-5.5 with a 1,050,000-token
+  // total context window and 128,000 max output tokens. The generic UI meter
+  // tracks prompt/input occupancy, so the API-style fallback input budget is
+  // 922k. Codex SDK sessions can have a smaller product/effective live window
+  // and must prefer provider-sourced `model_context_window` when present.
   GPT_55: 922_000,
   GPT_54: 1_000_000,
   GPT_5_FAMILY: 400_000,
@@ -25,13 +30,21 @@ export const QWEN_CONTEXT_WINDOWS = {
   KIMI_K25: 262_144,
 } as const;
 
+function isGpt55Model(model: string): boolean {
+  return /^gpt[-_ ]?5\.5(?:$|[-_.\s(])/.test(model);
+}
+
+function isGpt54Model(model: string): boolean {
+  return /^gpt[-_ ]?5\.4(?:$|[-_.\s(])/.test(model);
+}
+
 /** Infer context window from model name when the provider doesn't send one explicitly. */
 export function inferContextWindow(model?: string | null): number | undefined {
   const m = model?.toLowerCase().trim();
   if (!m) return undefined;
 
-  if (/^gpt-5\.5(?:$|[-_.])/.test(m)) return OPENAI_CONTEXT_WINDOWS.GPT_55;
-  if (/^gpt-5\.4(?:$|[-_.])/.test(m)) return OPENAI_CONTEXT_WINDOWS.GPT_54;
+  if (isGpt55Model(m)) return OPENAI_CONTEXT_WINDOWS.GPT_55;
+  if (isGpt54Model(m)) return OPENAI_CONTEXT_WINDOWS.GPT_54;
 
   if (
     /^gpt-5(?:$|[-_.])/.test(m) ||
@@ -63,6 +76,31 @@ export function inferContextWindow(model?: string | null): number | undefined {
   return undefined;
 }
 
-export function resolveContextWindow(explicit: number | undefined, model?: string | null, fallback = 1_000_000): number {
-  return inferContextWindow(model) ?? explicit ?? fallback;
+export interface ResolveContextWindowOptions {
+  /**
+   * Some providers report the actual live window for the current turn/session.
+   * Prefer that value over model-family inference when the event explicitly
+   * marks the context window as provider-sourced. Keep the historical default
+   * of model inference first for older watcher events whose explicit value may
+   * be a stale preset/fallback.
+   */
+  preferExplicit?: boolean;
+}
+
+function validExplicitContextWindow(value: number | undefined): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+export function resolveContextWindow(
+  explicit: number | undefined,
+  model?: string | null,
+  fallback = 1_000_000,
+  options: ResolveContextWindowOptions = {},
+): number {
+  const safeExplicit = validExplicitContextWindow(explicit);
+  const inferred = inferContextWindow(model);
+  if (options.preferExplicit && safeExplicit !== undefined) {
+    return safeExplicit;
+  }
+  return inferred ?? safeExplicit ?? fallback;
 }

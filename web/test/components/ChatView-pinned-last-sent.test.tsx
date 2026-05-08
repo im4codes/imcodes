@@ -273,6 +273,30 @@ describe('ChatView — pinned last-sent banner', () => {
     expect((obs.target as HTMLElement).dataset.eventId).toBe('u-nested');
   });
 
+  it('preview mode never renders the pinned banner — and never installs an IO (regression: card chat infinite up/down jitter near bottom)', async () => {
+    // The pinned banner is a sibling of `.chat-view` inside `.chat-main`'s
+    // normal flow. In a sub-session card the user's last bubble can sit
+    // just outside the viewport top by ≤60 px; banner-shows pushes the
+    // bubble down by ~60 px, IO fires `isIntersecting=true`, banner-hides
+    // pulls the bubble back above viewport, IO fires above-viewport again,
+    // banner-shows … infinite oscillation around ~50–100 px from the
+    // bottom. Preview mode (used by `SubSessionCard`) MUST short-circuit
+    // both the banner render and the IO subscription.
+    const events = [
+      userEvent('u1', 'long prompt that would normally trigger the banner', 1000),
+      assistantEvent('a1', 'lots of new assistant text', 2000),
+    ];
+    const { container } = render(
+      <ChatView events={events} loading={false} sessionId="deck_preview_brain" preview />,
+    );
+
+    // No observer should be registered — the effect must bail before
+    // touching IntersectionObserver.
+    expect(instances.length).toBe(0);
+    // And the banner must not render even if internal state somehow flipped.
+    expect(container.querySelector('.chat-pinned-last-sent')).toBeNull();
+  });
+
   it('toggles the expanded state on first click (escape the 2-line clamp)', async () => {
     const events = [
       userEvent('u1', 'x', 1000),

@@ -27,13 +27,14 @@ import {
   listProcessedProjections,
   pruneArchiveIfDue,
   queryProcessedProjections,
+  recordCompressionRun,
   recordContextEvent,
   countStagedTokens,
   setReplicationState,
   updateContextJob,
   writeProcessedProjection,
 } from '../store/context-store.js';
-import { serializeContextNamespace } from './context-keys.js';
+import { serializeContextNamespace, serializeContextTarget } from './context-keys.js';
 import { countTokens } from './tokenizer.js';
 import { loadMemoryConfig, type MemoryConfig } from './memory-config.js';
 import { createMemoryConfigResolver, resolveMemoryConfigForNamespace, type MemoryConfigResolver } from './memory-config-resolver.js';
@@ -41,6 +42,23 @@ import { computeFingerprint } from '../../shared/memory-fingerprint.js';
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { incrementCounter } from '../util/metrics.js';
 import { redactSummaryPreservingPinned } from '../util/redact-with-pinned-region.js';
+import { timelineEmitter } from '../daemon/timeline-emitter.js';
+import {
+  decideSkillReviewSchedule,
+  type SkillReviewSchedulerPolicy,
+  type SkillReviewState,
+} from '../../shared/skill-review-scheduler.js';
+import type { SkillReviewTrigger } from '../../shared/skill-review-triggers.js';
+import {
+  MEMORY_FEATURE_FLAGS_BY_NAME,
+  memoryFeatureFlagEnvKey,
+  resolveMemoryFeatureFlagValue,
+} from '../../shared/feature-flags.js';
+import {
+  getMemoryFeatureConfigStoreDiagnostics,
+  getPersistedMemoryFeatureFlagValues,
+  getRuntimeMemoryFeatureFlagValues,
+} from '../store/memory-feature-config-store.js';
 
 export interface MaterializationThresholds {
   autoTriggerTokens: number;
@@ -66,6 +84,15 @@ export interface MaterializationCoordinatorOptions {
   compressor?: (input: import('./summary-compressor.js').CompressionInput) => Promise<import('./summary-compressor.js').CompressionResult>;
   /** Override archive writes for failure-injection tests. */
   archiveEventsForMaterialization?: typeof archiveEventsForMaterialization;
+  /**
+   * Optional post-response skill review scheduler. The coordinator invokes it
+   * only after SDK-backed materialization has completed, so auto-creation stays
+   * on the existing isolated background path and never enters the send ack or
+   * provider-delivery foreground paths.
+   */
+  skillReviewScheduler?: MaterializationSkillReviewScheduler;
+  /** Gate self-learning durable extraction/classification; defaults to the shared feature flag (default off). */
+  selfLearningEnabled?: boolean | (() => boolean);
 }
 
 export interface MaterializationResult {
@@ -74,6 +101,31 @@ export interface MaterializationResult {
   replicationQueued: boolean;
   compression?: CompressionResult;
   filteredOut?: boolean;
+}
+
+export interface MaterializationSkillReviewJob {
+  idempotencyKey: string;
+  scopeKey: string;
+  responseId: string;
+  trigger: SkillReviewTrigger;
+  target: ContextTargetRef;
+  projectionId: string;
+  sourceEventIds: readonly string[];
+  nextAttemptAt: number;
+  maxAttempts: number;
+  createdAt: number;
+}
+
+interface SkillReviewTriggerEvidence {
+  toolIterationCount: number;
+}
+
+export interface MaterializationSkillReviewScheduler {
+  featureEnabled: boolean | (() => boolean);
+  getState: (scopeKey: string) => SkillReviewState;
+  enqueue: (job: MaterializationSkillReviewJob) => void | Promise<void>;
+  policy?: Partial<SkillReviewSchedulerPolicy>;
+  isShuttingDown?: () => boolean;
 }
 
 const DEFAULT_THRESHOLDS: MaterializationThresholds = {
@@ -95,6 +147,7 @@ const DEFAULT_THRESHOLDS: MaterializationThresholds = {
  * producing the nested "--- Updated ---" chains observed in the field).
  */
 const MAX_SDK_RETRY_ATTEMPTS = 3;
+const MAX_SKILL_REVIEW_EVIDENCE_TARGETS = 256;
 
 export class MaterializationCoordinator {
   readonly thresholds: MaterializationThresholds;
@@ -104,10 +157,15 @@ export class MaterializationCoordinator {
   private readonly thresholdOverrides: Partial<MaterializationThresholds>;
   private readonly _compressor: MaterializationCoordinatorOptions['compressor'];
   private readonly _archiveEventsForMaterialization: typeof archiveEventsForMaterialization;
+  private readonly _skillReviewScheduler?: MaterializationSkillReviewScheduler;
+  private readonly _selfLearningEnabled?: boolean | (() => boolean);
+  private readonly skillReviewEvidenceByTarget = new Map<string, SkillReviewTriggerEvidence>();
 
   constructor(options?: MaterializationCoordinatorOptions) {
     this._compressor = options?.compressor;
     this._archiveEventsForMaterialization = options?.archiveEventsForMaterialization ?? archiveEventsForMaterialization;
+    this._skillReviewScheduler = options?.skillReviewScheduler;
+    this._selfLearningEnabled = options?.selfLearningEnabled;
     this.resolveMemoryConfig = options?.memoryConfigResolver ?? createMemoryConfigResolver({
       fixedConfig: options?.memoryConfig,
       fallbackCwd: options?.memoryConfigCwd,
@@ -149,6 +207,27 @@ export class MaterializationCoordinator {
 
   listDirtyTargets(namespace?: ContextNamespace): ContextDirtyTarget[] {
     return listDirtyTargets(namespace);
+  }
+
+  recordSkillReviewToolIteration(target: ContextTargetRef, count = 1): void {
+    const safeCount = Math.max(0, Math.floor(count));
+    if (safeCount <= 0) return;
+    const targetKey = serializeContextTarget(target);
+    const current = this.skillReviewEvidenceByTarget.get(targetKey)?.toolIterationCount ?? 0;
+    if (!this.skillReviewEvidenceByTarget.has(targetKey) && this.skillReviewEvidenceByTarget.size >= MAX_SKILL_REVIEW_EVIDENCE_TARGETS) {
+      const oldestKey = this.skillReviewEvidenceByTarget.keys().next().value as string | undefined;
+      if (oldestKey) {
+        this.skillReviewEvidenceByTarget.delete(oldestKey);
+        incrementCounter('mem.skill.evidence_evicted', { reason: 'lru_limit' });
+      }
+    }
+    this.skillReviewEvidenceByTarget.set(targetKey, {
+      toolIterationCount: Math.min(1_000_000, current + safeCount),
+    });
+  }
+
+  recordFilteredSkillReviewToolIteration(reason: 'hidden' | 'error'): void {
+    incrementCounter('mem.skill.evidence_filtered', { reason });
   }
 
   async materializeTarget(target: ContextTargetRef, trigger: ContextJobTrigger, now = Date.now()): Promise<MaterializationResult> {
@@ -215,6 +294,35 @@ export class MaterializationCoordinator {
           error: `compression_admission_closed: ${error.reason} — kept raw events for retry`,
         });
         incrementCounter('mem.materialization.compression_admission_closed', { reason: error.reason });
+        // Round-2 audit (0699ea64-3e6 finding A2/Commit B): admission_closed
+        // path used to early-return WITHOUT recording in
+        // context_compression_runs, leaving the schema's CHECK enum value
+        // 'admission_closed' as dead schema. Operators querying "how often
+        // does the upgrade-pending freeze block compactions" couldn't
+        // answer it. Now we record an SQLite row so the metric is queryable
+        // — but we explicitly do NOT emit a timeline event (would be chat
+        // noise: "nothing happened, but here's an event saying so").
+        try {
+          recordCompressionRun({
+            backend: 'none',
+            model: '',
+            usedBackup: false,
+            fromSdk: false,
+            namespaceKey: serializeContextNamespace(target.namespace),
+            targetKind: target.kind,
+            sessionName: target.sessionName ?? null,
+            trigger,
+            mode: 'auto',
+            eventCount: events.length,
+            inputTokens: 0,
+            outputTokens: 0,
+            targetTokens: 0,
+            durationMs: 0,
+            outcome: 'admission_closed',
+            errorCode: error.reason,
+            errorMessage: null,
+          });
+        } catch { /* never escape */ }
         return {
           replicationQueued: false,
         };
@@ -222,13 +330,93 @@ export class MaterializationCoordinator {
       // Compressor itself threw (not just a provider failure the compressor
       // swallowed into a local-fallback result). Treat as fromSdk: false and
       // let the abandonment/retry logic below decide what to do.
+      const errMsg = error instanceof Error ? error.message : String(error);
       compression = {
         summary: '',
         model: 'local-fallback',
         backend: 'none',
         usedBackup: false,
         fromSdk: false,
+        inputTokens: 0,
+        outputTokens: 0,
+        targetTokens: 0,
+        durationMs: 0,
+        errorMessage: errMsg.slice(0, 500),
       };
+    }
+
+    // Persist a row in context_compression_runs so operators can query
+    // model/token costs later. Best-effort — recording failures must never
+    // break compression; recordCompressionRun swallows internally.
+    //
+    // Round-2 audit (0699ea64-3e6 finding A2/Commit B): when events.length===0
+    // the compressor early-returns a fromSdk:false CompressionResult that
+    // used to be recorded as outcome='fallback' (because errorCode is also
+    // unset). That polluted SUM(outcome='fallback') analytics — those rows
+    // weren't real fallbacks, just no-ops. Skip recording + emit entirely
+    // for the no-op case; the path produces no projection and no LLM call,
+    // so there is nothing useful to log for cost analysis.
+    const outcome: 'success' | 'fallback' | 'error' = compression.fromSdk
+      ? (compression.usedBackup ? 'fallback' : 'success')
+      : (compression.errorCode || compression.errorMessage ? 'error' : 'fallback');
+    if (events.length > 0) {
+      try {
+        recordCompressionRun({
+          backend: compression.backend,
+          model: compression.model,
+          usedBackup: compression.usedBackup,
+          fromSdk: compression.fromSdk,
+          namespaceKey: serializeContextNamespace(target.namespace),
+          targetKind: target.kind,
+          sessionName: target.sessionName ?? null,
+          trigger,
+          mode: 'auto',
+          eventCount: events.length,
+          inputTokens: compression.inputTokens ?? 0,
+          outputTokens: compression.outputTokens ?? 0,
+          targetTokens: compression.targetTokens ?? 0,
+          durationMs: compression.durationMs ?? 0,
+          outcome,
+          errorCode: compression.errorCode ?? null,
+          errorMessage: compression.errorMessage ?? null,
+        });
+      } catch {
+        // Telemetry must never escape — recordCompressionRun already swallows
+        // its own errors, but defense-in-depth.
+      }
+    }
+
+    // Emit a `memory.compression` timeline event so the user can see in chat
+    // history that a compression just ran (web UI renders it COLLAPSED by
+    // default, click to expand). Persisted to JSONL via the timeline store.
+    // Only emit when we have a session-bound target — namespace-only
+    // (project-level) compactions don't have a chat thread to attach to.
+    // Same events.length>0 guard as the SQLite recording above.
+    if (target.sessionName && events.length > 0) {
+      try {
+        timelineEmitter.emit(
+          target.sessionName,
+          'memory.compression',
+          {
+            backend: compression.backend,
+            model: compression.model,
+            usedBackup: compression.usedBackup,
+            fromSdk: compression.fromSdk,
+            trigger,
+            mode: 'auto',
+            eventCount: events.length,
+            inputTokens: compression.inputTokens ?? 0,
+            outputTokens: compression.outputTokens ?? 0,
+            targetTokens: compression.targetTokens ?? 0,
+            durationMs: compression.durationMs ?? 0,
+            outcome,
+            ...(compression.errorCode ? { errorCode: compression.errorCode } : {}),
+          },
+          { source: 'daemon', confidence: 'high' },
+        );
+      } catch {
+        // Timeline emit must never escape compression.
+      }
     }
 
     // Only SDK-produced summaries are ever filtered by `isMemoryNoiseSummary`.
@@ -273,7 +461,15 @@ export class MaterializationCoordinator {
     const sdkFailed = !compression.fromSdk;
 
     if (sdkFailed) {
-      const retryBudgetExhausted = priorFailures >= MAX_SDK_RETRY_ATTEMPTS;
+      // Round-2 audit (0699ea64-3e6 finding android#1/Commit B):
+      // `priorFailures >= MAX_SDK_RETRY_ATTEMPTS` was off-by-one — the comparison
+      // didn't include the CURRENT failure, so the constant `3` actually meant
+      // "permit 3 prior failures + give up on the 4th". Operators reading
+      // `attempt 3/3` reasonably expected "next failure ends the batch", but
+      // the daemon would still try once more. Counting the current failure
+      // (priorFailures + 1) makes the constant match its name.
+      const totalFailuresIncludingCurrent = priorFailures + 1;
+      const retryBudgetExhausted = totalFailuresIncludingCurrent >= MAX_SDK_RETRY_ATTEMPTS;
       // Any legacy tentative rows from earlier versions of this code get
       // scrubbed here — the new design never writes tentatives, so the only
       // tentative rows that can exist are pre-migration leftovers.
@@ -288,7 +484,7 @@ export class MaterializationCoordinator {
         incrementCounter('mem.materialization.retry_exhausted_archived', { source: 'materializeTarget' });
         deleteStagedEventsByIds(sourceEventIds);
         updateContextJob(job.id, 'completed', { now,
-          error: `SDK compression abandoned after ${priorFailures} consecutive failures — events discarded, no summary written`,
+          error: `SDK compression abandoned after ${totalFailuresIncludingCurrent} consecutive failures — events discarded, no summary written`,
         });
         clearDirtyTarget(target);
         return {
@@ -301,7 +497,7 @@ export class MaterializationCoordinator {
       // Retry path: keep staged events, leave dirty target in place, mark
       // job materialization_failed so the next trigger retries SDK.
       updateContextJob(job.id, 'materialization_failed', { now,
-        error: `SDK compression unavailable (attempt ${priorFailures + 1}/${MAX_SDK_RETRY_ATTEMPTS}) — kept raw events for retry`,
+        error: `SDK compression unavailable (attempt ${totalFailuresIncludingCurrent}/${MAX_SDK_RETRY_ATTEMPTS}) — kept raw events for retry`,
       });
       return {
         replicationQueued: false,
@@ -332,6 +528,7 @@ export class MaterializationCoordinator {
     const summaryProjection = writeProcessedProjection({
       namespace: target.namespace,
       class: 'recent_summary',
+      origin: 'chat_compacted',
       sourceEventIds,
       summary: compression.summary,
       content: {
@@ -353,17 +550,19 @@ export class MaterializationCoordinator {
       updatedAt: now,
     });
     let durableProjection: ProcessedContextProjection | undefined;
-    try {
-      durableProjection = buildDurableProjection(
-        target.namespace,
-        events,
-        compression.summary,
-        sourceEventIds,
-        now,
-      );
-    } catch (error) {
-      incrementCounter('mem.materialization.durable_projection_failed', { source: 'materializeTarget' });
-      warnOncePerHour('mem.materialization.durable_projection_failed', { error: error instanceof Error ? error.message : String(error) });
+    if (this.isSelfLearningEnabled()) {
+      try {
+        durableProjection = buildDurableProjection(
+          target.namespace,
+          events,
+          compression.summary,
+          sourceEventIds,
+          now,
+        );
+      } catch (error) {
+        incrementCounter('mem.materialization.durable_projection_failed', { source: 'materializeTarget' });
+        warnOncePerHour('mem.materialization.durable_projection_failed', { error: error instanceof Error ? error.message : String(error) });
+      }
     }
 
     const replicationState = getReplicationState(target.namespace);
@@ -380,6 +579,12 @@ export class MaterializationCoordinator {
     deleteStagedEventsByIds(sourceEventIds);
     updateContextJob(job.id, 'completed', { now });
     clearDirtyTarget(target);
+    this.schedulePostResponseSkillReview({
+      target,
+      projectionId: summaryProjection.id,
+      sourceEventIds,
+      now,
+    });
 
     return {
       summaryProjection,
@@ -436,6 +641,76 @@ export class MaterializationCoordinator {
     );
   }
 
+  private schedulePostResponseSkillReview(input: {
+    target: ContextTargetRef;
+    projectionId: string;
+    sourceEventIds: readonly string[];
+    now: number;
+  }): void {
+    const scheduler = this._skillReviewScheduler;
+    if (!scheduler) return;
+    try {
+      const featureEnabled = typeof scheduler.featureEnabled === 'function'
+        ? scheduler.featureEnabled()
+        : scheduler.featureEnabled;
+      const scopeKey = serializeContextNamespace(input.target.namespace);
+      const targetKey = serializeContextTarget(input.target);
+      const triggerEvidence = this.skillReviewEvidenceByTarget.get(targetKey) ?? { toolIterationCount: 0 };
+      const responseId = [...input.sourceEventIds].reverse().find((id) => id.trim().length > 0)
+        ?? input.projectionId;
+      const decision = decideSkillReviewSchedule({
+        featureEnabled,
+        delivered: true,
+        phase: 'post_response_background',
+        trigger: 'tool_iteration_count',
+        scopeKey,
+        responseId,
+        now: input.now,
+        state: scheduler.getState(scopeKey),
+        policy: scheduler.policy,
+        shuttingDown: scheduler.isShuttingDown?.() ?? false,
+        triggerEvidence,
+      });
+      this.skillReviewEvidenceByTarget.delete(targetKey);
+      if (decision.action === 'skip') {
+        if (decision.reason === 'coalesced') {
+          incrementCounter('mem.skill.review_deduped', { source: 'materialization' });
+        } else if (decision.reason === 'below_trigger_threshold'
+          || decision.reason === 'invalid_trigger'
+          || decision.reason === 'not_delivered'
+          || decision.reason === 'not_background') {
+          incrementCounter('mem.skill.review_not_eligible', { reason: decision.reason });
+        } else if (decision.reason !== 'disabled' && decision.reason !== 'shutdown') {
+          incrementCounter('mem.skill.review_throttled', { reason: decision.reason });
+        }
+        return;
+      }
+      const job: MaterializationSkillReviewJob = {
+        idempotencyKey: decision.idempotencyKey,
+        scopeKey,
+        responseId,
+        trigger: 'tool_iteration_count',
+        target: input.target,
+        projectionId: input.projectionId,
+        sourceEventIds: [...input.sourceEventIds],
+        nextAttemptAt: decision.nextAttemptAt,
+        maxAttempts: decision.maxAttempts,
+        createdAt: input.now,
+      };
+      void Promise.resolve(scheduler.enqueue(job)).catch((error) => {
+        incrementCounter('mem.skill.review_failed', { source: 'materialization_enqueue' });
+        warnOncePerHour('mem.skill.review_failed', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    } catch (error) {
+      incrementCounter('mem.skill.review_failed', { source: 'materialization_schedule' });
+      warnOncePerHour('mem.skill.review_failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   private selectTrigger(dirtyTarget: ContextDirtyTarget, now: number): ContextJobTrigger | undefined {
     const thresholds = this.thresholdsForTarget(dirtyTarget.target);
     if (this.isRateLimited(dirtyTarget.target, now)) return undefined;
@@ -490,6 +765,19 @@ export class MaterializationCoordinator {
 
   private thresholdsForTarget(target: ContextTargetRef): MaterializationThresholds {
     return this.buildThresholds(this.configForTarget(target));
+  }
+
+  private isSelfLearningEnabled(): boolean {
+    if (typeof this._selfLearningEnabled === 'function') return this._selfLearningEnabled();
+    if (typeof this._selfLearningEnabled === 'boolean') return this._selfLearningEnabled;
+    const flag = MEMORY_FEATURE_FLAGS_BY_NAME.selfLearning;
+    const raw = process.env[memoryFeatureFlagEnvKey(flag)];
+    return resolveMemoryFeatureFlagValue(flag, {
+      runtimeConfigOverride: getRuntimeMemoryFeatureFlagValues(),
+      persistedConfig: getPersistedMemoryFeatureFlagValues(),
+      environmentStartupDefault: raw == null ? undefined : { [flag]: raw === 'true' || raw === '1' },
+      readFailed: !!getMemoryFeatureConfigStoreDiagnostics().lastLoadIssue,
+    });
   }
 
   private buildThresholds(memoryConfig: MemoryConfig): MaterializationThresholds {
@@ -566,6 +854,7 @@ export async function materializeMasterSummary(sessionName: string, namespace?: 
     id: `master:${computeFingerprint(`${namespaceKey}:${sessionName}`)}`,
     namespace: resolvedNamespace,
     class: 'master_summary',
+    origin: 'chat_compacted',
     sourceEventIds,
     summary,
     content: {
@@ -638,6 +927,7 @@ function buildDurableProjection(
   return writeProcessedProjection({
     namespace,
     class: 'durable_memory_candidate',
+    origin: 'agent_learned',
     sourceEventIds,
     summary: buildDurableSummary(signals),
     content: {

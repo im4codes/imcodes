@@ -28,8 +28,10 @@ export const RESEND_EXPIRY_MS = 5 * 60 * 1000;
 export const MAX_RESEND_ENTRIES = 10;
 
 export interface ResendEntry {
-  /** Raw user text — will be passed to runtime.send() verbatim. */
+  /** User-visible task text — will be passed to runtime.send() as userMessage. */
   text: string;
+  /** Provider-visible context to pass through TransportSessionRuntime messagePreamble. */
+  messagePreamble?: string;
   /** Original clientMessageId so command.ack correlation survives the resend. */
   commandId: string;
   /** Attachment refs at enqueue time. Not resolved lazily — we do not re-walk the store. */

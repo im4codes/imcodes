@@ -84,6 +84,10 @@ export class ServerLink {
     this.token = opts.token;
   }
 
+  getServerId(): string {
+    return this.serverId;
+  }
+
   connect(): void {
     // Clean up previous connection if any
     this.stopHeartbeat();

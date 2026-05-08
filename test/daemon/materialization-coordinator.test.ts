@@ -102,6 +102,7 @@ describe('MaterializationCoordinator', () => {
   it('materializes structured problem-resolution summaries from eligible events', async () => {
     const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
+      selfLearningEnabled: true,
       modelConfig: {
         primaryContextBackend: 'claude-code-sdk',
         primaryContextModel: 'sonnet',
@@ -257,12 +258,17 @@ describe('MaterializationCoordinator', () => {
         fromSdk: false,
       }),
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
+      selfLearningEnabled: true,
     });
 
     coordinator.ingestEvent({ id: 'evt-retry-user', target, eventType: 'user.turn', content: 'please remember this outage batch', createdAt: 100 });
     coordinator.ingestEvent({ id: 'evt-retry-assistant', target, eventType: 'assistant.text', content: 'working on the durable archive path', createdAt: 120 });
 
-    for (let i = 0; i < 3; i++) {
+    // Round-2 audit (0699ea64-3e6 finding android#1): retry off-by-one fix
+    // means MAX_SDK_RETRY_ATTEMPTS=3 now truly means "give up on the 3rd
+    // failure" (was "give up on the 4th"). The retry-then-exhaust loop
+    // therefore runs 2 retries (events kept) and exhausts on the 3rd.
+    for (let i = 0; i < 2; i++) {
       const result = await coordinator.materializeTarget(target, 'manual', 500 + i);
       expect(result.filteredOut).toBeUndefined();
       expect(listContextEvents(target).map((event) => event.id).sort()).toEqual(['evt-retry-assistant', 'evt-retry-user']);
@@ -379,6 +385,7 @@ describe('MaterializationCoordinator', () => {
         fromSdk: true,
       }),
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
+      selfLearningEnabled: true,
     });
 
     coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'keep startup notes stable', createdAt: 100 });
@@ -399,5 +406,23 @@ describe('MaterializationCoordinator', () => {
         preferences: ['Prefer durable-first startup context'],
       },
     }));
+  });
+
+  it('skips durable agent-learned projection writes when self-learning is disabled', async () => {
+    const coordinator = new MaterializationCoordinator({
+      compressor: localOnlyCompressor,
+      thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
+      selfLearningEnabled: false,
+    });
+
+    coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'remember this decision', createdAt: 100 });
+    coordinator.ingestEvent({ target, eventType: 'decision', content: 'self-learning gate must remain off by default', createdAt: 101 });
+    coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'noted the decision', createdAt: 102 });
+
+    const result = await coordinator.materializeTarget(target, 'manual', 500);
+
+    expect(result.summaryProjection.class).toBe('recent_summary');
+    expect(result.durableProjection).toBeUndefined();
+    expect(queryProcessedProjections({ projectId: namespace.projectId, projectionClass: 'durable_memory_candidate' })).toEqual([]);
   });
 });

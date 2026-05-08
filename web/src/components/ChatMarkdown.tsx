@@ -12,6 +12,7 @@ import { h } from 'preact';
 import { useMemo, useState } from 'preact/hooks';
 import { marked, type Token, type Tokens } from 'marked';
 import { useTranslation } from 'react-i18next';
+import { splitTextByHttpUrls, trimDetectedUrl } from '../link-detection.js';
 
 // ── Code block with copy button ────────────────────────────────────────────
 
@@ -63,25 +64,27 @@ function CodeBlock({
   return (
     <div class="chat-code-block">
       <div class="chat-code-header">
-        <span class="chat-code-lang">{lang || 'text'}</span>
-        <button
-          type="button"
-          class={`chat-code-copy-btn${copied ? ' is-copied' : ''}`}
-          onClick={handleCopy}
-          title={copied ? t('common.copied') : t('common.copy')}
-          aria-label={copied ? t('common.copied') : t('common.copy')}
-        >
-          {copied ? (
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <polyline points="20 6 9 17 4 12" />
-            </svg>
-          ) : (
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <rect x="9" y="9" width="11" height="11" rx="2" ry="2" />
-              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-            </svg>
-          )}
-        </button>
+        <div class="chat-code-titlebar">
+          <span class="chat-code-lang">{lang || 'text'}</span>
+          <button
+            type="button"
+            class={`chat-code-copy-btn${copied ? ' is-copied' : ''}`}
+            onClick={handleCopy}
+            title={copied ? t('common.copied') : t('common.copy')}
+            aria-label={copied ? t('common.copied') : t('common.copy')}
+          >
+            {copied ? (
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+            ) : (
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="9" y="9" width="11" height="11" rx="2" ry="2" />
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+              </svg>
+            )}
+          </button>
+        </div>
       </div>
       <pre><code>{splitPathsAndUrlsInternal(text, onPathClick, onUrlClick, onDownload)}</code></pre>
     </div>
@@ -104,13 +107,6 @@ function hasFileExtension(path: string): boolean {
 
 function isLikelyDomainPath(value: string): boolean {
   return /^(?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/|$)/i.test(value);
-}
-
-function trimDetectedUrl(url: string): string {
-  const hardStop = url.search(/[（【《「『，。；：！？⬇]/u);
-  let next = hardStop >= 0 ? url.slice(0, hardStop) : url;
-  while (next.length > 1 && /[.,;:!?)}\]>）】》」』，。；：！？⬇]$/u.test(next)) next = next.slice(0, -1);
-  return next;
 }
 
 // ── Token rendering ─────────────────────────────────────────────────────────
@@ -195,7 +191,11 @@ function renderToken(
 
     case 'codespan': {
       const t = token as Tokens.Codespan;
+      if (!inLink && splitTextByHttpUrls(t.text).some((chunk) => chunk.type === 'url')) {
+        return <code key={key} class="chat-inline-code">{splitPathsAndUrlsInternal(t.text, onPathClick, onUrlClick, onDownload)}</code>;
+      }
       // Detect file paths inside backtick code spans — agents commonly wrap paths in backticks
+      PATH_REGEX_INLINE.lastIndex = 0;
       if (onPathClick && PATH_REGEX_INLINE.test(t.text)) {
         PATH_REGEX_INLINE.lastIndex = 0;
         return <span key={key}>
@@ -241,18 +241,44 @@ function renderToken(
       const sanitizedHref = trimDetectedUrl(t.href);
       const inlineText = typeof (t as { text?: unknown }).text === 'string' ? String((t as { text?: unknown }).text) : '';
       const isAutoLinkLike = !inlineText || inlineText === t.href;
+      const trailingText = isAutoLinkLike && inlineText.startsWith(sanitizedHref)
+        ? inlineText.slice(sanitizedHref.length)
+        : '';
+      const linkText = isAutoLinkLike ? sanitizedHref : renderInlineTokens(t.tokens, onPathClick, onUrlClick, true, onDownload);
+      const link = (
+        <a
+          class="chat-external-link"
+          href={sanitizedHref}
+          title={sanitizedHref}
+          target="_blank"
+          rel="noopener noreferrer"
+          onClick={(e: Event) => {
+            if (!onUrlClick) return;
+            e.preventDefault();
+            onUrlClick(sanitizedHref);
+          }}
+        >
+          {linkText}
+        </a>
+      );
+      if (trailingText) {
+        return <span key={key}>{link}<span>{trailingText}</span></span>;
+      }
       return (
         <a
           key={key}
           class="chat-external-link"
           href={sanitizedHref}
           title={sanitizedHref}
+          target="_blank"
+          rel="noopener noreferrer"
           onClick={(e: Event) => {
+            if (!onUrlClick) return;
             e.preventDefault();
-            onUrlClick?.(sanitizedHref);
+            onUrlClick(sanitizedHref);
           }}
         >
-          {isAutoLinkLike ? sanitizedHref : renderInlineTokens(t.tokens, onPathClick, onUrlClick, true, onDownload)}
+          {linkText}
         </a>
       );
     }
@@ -338,7 +364,6 @@ function renderToken(
 
 // ── URL/Path detection (inline within text tokens) ──────────────────────────
 
-const URL_REGEX_INLINE = /https?:\/\/[^\s<>"\])}）】》」』，。；：！？（【《「『]+/g;
 const PATH_REGEX_INLINE = /(\\\\[\w.$ -]+\\[\w.$ \\-]+|[A-Za-z]:\\(?:[\w.$ -]+\\)*[\w.$ -]+|\.{1,2}\/[\w\p{L}.\-~/]+|\/[\w\p{L}.\-~][\w\p{L}.\-~/]*|(?<![:/\w\p{L}])[a-zA-Z_~][\w\p{L}.\-~]*(?:\/[\w\p{L}.\-~]+)+)/gu;
 
 function splitPathsAndUrlsInternal(
@@ -350,21 +375,7 @@ function splitPathsAndUrlsInternal(
   if (!onPathClick && !onUrlClick) return [<span>{text}</span>];
 
   const parts: h.JSX.Element[] = [];
-  let last = 0;
-  URL_REGEX_INLINE.lastIndex = 0;
-
-  interface Chunk { type: 'text' | 'url'; value: string; start: number }
-  const chunks: Chunk[] = [];
-  let m: RegExpExecArray | null;
-
-  while ((m = URL_REGEX_INLINE.exec(text)) !== null) {
-    if (m.index > last) chunks.push({ type: 'text', value: text.slice(last, m.index), start: last });
-    let url = trimDetectedUrl(m[0]);
-    chunks.push({ type: 'url', value: url, start: m.index });
-    last = m.index + url.length;
-    URL_REGEX_INLINE.lastIndex = last;
-  }
-  if (last < text.length) chunks.push({ type: 'text', value: text.slice(last), start: last });
+  const chunks = splitTextByHttpUrls(text);
 
   for (const chunk of chunks) {
     if (chunk.type === 'url') {
@@ -374,7 +385,13 @@ function splitPathsAndUrlsInternal(
           class="chat-external-link"
           href={chunk.value}
           title={chunk.value}
-          onClick={(e: Event) => { e.preventDefault(); onUrlClick?.(chunk.value); }}
+          target="_blank"
+          rel="noopener noreferrer"
+          onClick={(e: Event) => {
+            if (!onUrlClick) return;
+            e.preventDefault();
+            onUrlClick(chunk.value);
+          }}
         >
           {chunk.value}
         </a>,

@@ -42,6 +42,7 @@ import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 import { resolveTransportContextBootstrap } from './runtime-context-bootstrap.js';
 import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
+import { IMCODES_SESSION_ENV, IMCODES_SESSION_LABEL_ENV } from '../../shared/imcodes-send.js';
 
 import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
@@ -956,6 +957,41 @@ const transportRuntimes = new Map<string, TransportSessionRuntime>();
 const transportErrorRecoveryInFlight = new Map<string, Promise<boolean>>();
 const transportErrorRecoveryTimestamps = new Map<string, number[]>();
 
+function buildTransportSessionEnv(
+  sessionName: string,
+  label: string | null | undefined,
+  extraEnv?: Record<string, string>,
+): Record<string, string> {
+  return {
+    ...(extraEnv ?? {}),
+    [IMCODES_SESSION_ENV]: sessionName,
+    [IMCODES_SESSION_LABEL_ENV]: label?.trim() || sessionName,
+  };
+}
+
+function buildTransportImcodesIdentityPrompt(
+  sessionName: string,
+  label: string | null | undefined,
+): string {
+  const displayLabel = label?.trim() || sessionName;
+  return [
+    'IM.codes session identity:',
+    `- Exact session name: ${sessionName}`,
+    `- Display label: ${displayLabel}`,
+    `- When invoking \`imcodes send\`, prefer $${IMCODES_SESSION_ENV}. If a SDK/tool environment lacks it, prefix the command with ${IMCODES_SESSION_ENV}=${sessionName}. Do not use display labels as sender identity unless the exact session name is unavailable, because labels can be duplicated.`,
+  ].join('\n');
+}
+
+function mergeTransportSystemPromptWithIdentity(
+  systemPrompt: string | undefined,
+  sessionName: string,
+  label: string | null | undefined,
+): string {
+  return [systemPrompt?.trim(), buildTransportImcodesIdentityPrompt(sessionName, label)]
+    .filter(Boolean)
+    .join('\n\n');
+}
+
 function queueTransportErrorResendEntries(sessionName: string, entries: PendingTransportMessage[]): number {
   if (entries.length === 0) return getResendCount(sessionName);
   const existingCommandIds = new Set(getResendEntries(sessionName).map((entry) => entry.commandId));
@@ -963,6 +999,7 @@ function queueTransportErrorResendEntries(sessionName: string, entries: PendingT
     if (existingCommandIds.has(entry.clientMessageId)) continue;
     enqueueResend(sessionName, {
       text: entry.text,
+      ...(entry.messagePreamble ? { messagePreamble: entry.messagePreamble } : {}),
       commandId: entry.clientMessageId,
       ...(entry.attachments?.length ? { attachments: entry.attachments } : {}),
       queuedAt: Date.now(),
@@ -1379,11 +1416,11 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         sessionKey: effectiveSessionKey,
         bindExistingKey: freshAfterCancel ? undefined : (needsEphemeralRouteKey ? s.providerSessionId : s.providerSessionId),
         skipCreate: !freshAfterCancel && !!s.providerSessionId,
-        ...(extraEnv ? { env: extraEnv } : {}),
+        env: buildTransportSessionEnv(s.name, s.label, extraEnv),
         cwd: s.projectDir,
         label: s.label ?? s.name,
         description: s.description,
-        ...(systemPrompt ? { systemPrompt } : {}),
+        systemPrompt: mergeTransportSystemPromptWithIdentity(systemPrompt, s.name, s.label),
         ...(transportSettings ? { settings: transportSettings } : {}),
         contextNamespace: contextBootstrap.namespace,
         contextNamespaceDiagnostics: contextBootstrap.diagnostics,
@@ -1400,7 +1437,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         startupMemoryAlreadyInjected: s.startupMemoryInjected === true,
       });
       if (s.description) runtime.setDescription(s.description);
-      if (systemPrompt) runtime.setSystemPrompt(systemPrompt);
+      runtime.setSystemPrompt(mergeTransportSystemPromptWithIdentity(systemPrompt, s.name, s.label));
       if (effectiveRequestedModel) runtime.setAgentId(effectiveRequestedModel);
       if (s.effort) runtime.setEffort(s.effort);
       transportRuntimes.set(s.name, runtime);
@@ -1473,9 +1510,16 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         logger.info({ session: s.name, pendingCount }, 'Draining transport resend queue after reconnect');
         void drainResend(s.name, (entry) => {
           const attachments = entry.attachments ?? [];
-          const result = attachments.length > 0
-            ? runtime.send(entry.text, entry.commandId, attachments)
-            : runtime.send(entry.text, entry.commandId);
+          const result = entry.messagePreamble
+            ? runtime.send(
+              entry.text,
+              entry.commandId,
+              attachments.length > 0 ? attachments : undefined,
+              entry.messagePreamble,
+            )
+            : (attachments.length > 0
+                ? runtime.send(entry.text, entry.commandId, attachments)
+                : runtime.send(entry.text, entry.commandId));
           if (result === 'sent') {
             timelineEmitter.emit(
               s.name,
@@ -1669,11 +1713,11 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
       await runtime.initialize({
     sessionKey: effectiveSessionKey,
     fresh: !!opts.fresh,
-    ...(transportEnv ? { env: transportEnv } : {}),
+    env: buildTransportSessionEnv(name, label, transportEnv),
     cwd: projectDir,
     label: label || name,
     description,
-    ...(transportSystemPrompt ? { systemPrompt: transportSystemPrompt } : {}),
+    systemPrompt: mergeTransportSystemPromptWithIdentity(transportSystemPrompt, name, label),
     ...(transportSettings ? { settings: transportSettings } : {}),
     contextNamespace: contextBootstrap.namespace,
     contextNamespaceDiagnostics: contextBootstrap.diagnostics,

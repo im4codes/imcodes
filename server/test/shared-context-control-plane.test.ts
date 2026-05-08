@@ -161,9 +161,16 @@ function makeMockDb() {
         const document = documents.get(version.document_id);
         return document ? ({ document_id: version.document_id, enterprise_id: document.enterprise_id } as T) : null;
       }
-      if (s.includes('select enterprise_id from shared_context_document_bindings where id = $1')) {
+      if (
+        s.includes('select enterprise_id from shared_context_document_bindings where id = $1')
+        || s.includes('select enterprise_id, workspace_id, enrollment_id from shared_context_document_bindings where id = $1')
+      ) {
         const binding = bindings.get(params[0] as string);
-        return binding ? ({ enterprise_id: binding.enterprise_id } as T) : null;
+        return binding ? ({
+          enterprise_id: binding.enterprise_id,
+          workspace_id: binding.workspace_id,
+          enrollment_id: binding.enrollment_id,
+        } as T) : null;
       }
       if (s.includes('select role from team_members where team_id = $1 and user_id = $2 and role in')) {
         const member = teamMembers.get(params[0] as string)?.get(params[1] as string);
@@ -207,11 +214,12 @@ function makeMockDb() {
           status: entry.status,
         })) as T[];
       }
-      if (s.includes('select id, kind, title from shared_context_documents where enterprise_id = $1')) {
+      if (s.includes('from shared_context_documents where enterprise_id = $1') && s.includes('select id, kind, title')) {
         return [...documents.values()].filter((entry) => entry.enterprise_id === params[0]).map((entry) => ({
           id: entry.id,
           kind: entry.kind,
           title: entry.title,
+          created_by: entry.created_by,
         })) as T[];
       }
       if (s.includes('from shared_context_projections where enterprise_id = $1') && s.includes('select id, scope, project_id, projection_class, source_event_ids_json, summary, content_json, updated_at')) {
@@ -238,12 +246,12 @@ function makeMockDb() {
             status: 'active',
           })) as T[];
       }
-      if (s.includes('select id, version_number, status from shared_context_document_versions where document_id = $1')) {
+      if (s.includes('from shared_context_document_versions where document_id = $1') && s.includes('select id, version_number, status')) {
         return [...versions.values()]
           .filter((entry) => entry.document_id === params[0])
-          .map((entry) => ({ id: entry.id, version_number: entry.version_number, status: entry.status })) as T[];
+          .map((entry) => ({ id: entry.id, version_number: entry.version_number, status: entry.status, created_by: entry.created_by })) as T[];
       }
-      if (s.includes('select id, workspace_id, enrollment_id, document_id, version_id, binding_mode, applicability_repo_id, applicability_language, applicability_path_pattern, status from shared_context_document_bindings where enterprise_id = $1')) {
+      if (s.includes('from shared_context_document_bindings where enterprise_id = $1') && s.includes('select id, workspace_id, enrollment_id, document_id, version_id, binding_mode')) {
         return [...bindings.values()].filter((entry) => entry.enterprise_id === params[0]).map((entry) => ({
           id: entry.id,
           workspace_id: entry.workspace_id,
@@ -255,6 +263,7 @@ function makeMockDb() {
           applicability_language: entry.applicability_language,
           applicability_path_pattern: entry.applicability_path_pattern,
           status: entry.status,
+          created_by: entry.created_by,
         })) as T[];
       }
       if (s.includes('from shared_context_document_bindings b join shared_context_document_versions v on v.id = b.version_id where b.enterprise_id = $1 and b.status = \'active\' and v.status = \'active\'')) {
@@ -464,6 +473,7 @@ describe('shared-agent-context server control plane', () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    process.env.IMCODES_MEM_FEATURE_ORG_SHARED_AUTHORED_STANDARDS = 'true';
     mockDb = makeMockDb();
     app = await buildTestApp(makeEnv(mockDb.db));
   });
@@ -744,6 +754,59 @@ describe('shared-agent-context server control plane', () => {
     expect(await res.json()).toEqual({ enterpriseId: 'team-1', bindings: [] });
   });
 
+  it('gates org-wide authored standards behind the explicit feature flag without affecting workspace bindings', async () => {
+    process.env.IMCODES_MEM_FEATURE_ORG_SHARED_AUTHORED_STANDARDS = 'false';
+
+    const docRes = await app.request(...req('/api/shared-context/enterprises/team-1/documents', 'POST', {
+      kind: 'coding_standard',
+      title: 'Enterprise rules',
+    }, 'user-owner'));
+    const document = await docRes.json() as { id: string };
+    const versionRes = await app.request(...req(`/api/shared-context/documents/${document.id}/versions`, 'POST', {
+      contentMd: 'Org-wide rule',
+    }, 'user-owner'));
+    const version = await versionRes.json() as { id: string };
+    await app.request(...req(`/api/shared-context/document-versions/${version.id}/activate`, 'POST', {}, 'user-owner'));
+
+    let res = await app.request(...req('/api/shared-context/enterprises/team-1/document-bindings', 'POST', {
+      documentId: document.id,
+      versionId: version.id,
+      mode: 'required',
+    }, 'user-owner'));
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ ok: false, result: null, citation: null, error: 'not_found' });
+
+    process.env.IMCODES_MEM_FEATURE_ORG_SHARED_AUTHORED_STANDARDS = 'true';
+    res = await app.request(...req('/api/shared-context/enterprises/team-1/document-bindings', 'POST', {
+      documentId: document.id,
+      versionId: version.id,
+      mode: 'required',
+      applicabilityRepoId: 'github.com/acme/repo',
+    }, 'user-owner'));
+    expect(res.status).toBe(201);
+    const binding = await res.json() as { id: string; workspaceId: string | null; enrollmentId: string | null };
+    expect(binding.workspaceId).toBeNull();
+    expect(binding.enrollmentId).toBeNull();
+
+    res = await app.request(...req('/api/shared-context/enterprises/team-1/runtime-authored-context?canonicalRepoId=github.com/acme/repo', 'GET', undefined, 'user-member'));
+    expect(await res.json()).toEqual({
+      enterpriseId: 'team-1',
+      bindings: [
+        expect.objectContaining({
+          bindingId: binding.id,
+          documentVersionId: version.id,
+          scope: 'org_shared',
+          mode: 'required',
+          content: 'Org-wide rule',
+        }),
+      ],
+    });
+
+    process.env.IMCODES_MEM_FEATURE_ORG_SHARED_AUTHORED_STANDARDS = 'false';
+    res = await app.request(...req('/api/shared-context/enterprises/team-1/runtime-authored-context?canonicalRepoId=github.com/acme/repo', 'GET', undefined, 'user-member'));
+    expect(await res.json()).toEqual({ enterpriseId: 'team-1', bindings: [] });
+  });
+
   it('requires explicit migration reason for host-change aliases and rejects unrelated repo aliases', async () => {
     let res = await app.request(...req('/api/shared-context/enterprises/team-1/repository-aliases', 'POST', {
       canonicalRepoId: 'github.com/acme/repo',
@@ -869,6 +932,24 @@ describe('shared-agent-context server control plane', () => {
           status: 'active',
         },
       ],
+      projects: [
+        {
+          projectId: 'github.com/acme/repo-2',
+          displayName: 'github.com/acme/repo-2',
+          totalRecords: 1,
+          recentSummaryCount: 1,
+          durableCandidateCount: 0,
+          updatedAt: 1700000000500,
+        },
+        {
+          projectId: 'github.com/acme/repo',
+          displayName: 'github.com/acme/repo',
+          totalRecords: 1,
+          recentSummaryCount: 1,
+          durableCandidateCount: 0,
+          updatedAt: 1700000000000,
+        },
+      ],
     });
   });
 
@@ -979,6 +1060,16 @@ describe('shared-agent-context server control plane', () => {
           updatedAt: 1700000000100,
           hitCount: 0,
           status: 'active',
+        },
+      ],
+      projects: [
+        {
+          projectId: 'github.com/acme/repo',
+          displayName: 'github.com/acme/repo',
+          totalRecords: 2,
+          recentSummaryCount: 1,
+          durableCandidateCount: 1,
+          updatedAt: 1700000000100,
         },
       ],
     });

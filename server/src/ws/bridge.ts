@@ -18,8 +18,40 @@ import type { Env } from '../env.js';
 import { MemoryRateLimiter } from './rate-limiter.js';
 import { sha256Hex } from '../security/crypto.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
+import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
 import { TRANSPORT_RELAY_TYPES, TRANSPORT_MSG } from '../../../shared/transport-events.js';
+import {
+  MEMORY_WS,
+  isMemoryManagementRequestType,
+  isMemoryManagementResponseType,
+} from '../../../shared/memory-ws.js';
+import {
+  MEMORY_MANAGEMENT_CONTEXT_FIELD,
+  type AuthenticatedMemoryManagementContext,
+  type MemoryManagementBoundProject,
+  type MemoryManagementRole,
+} from '../../../shared/memory-management-context.js';
+import {
+  MEMORY_MANAGEMENT_BRIDGE_ERROR_CODES,
+  MEMORY_MANAGEMENT_ERROR_CODES,
+} from '../../../shared/memory-management.js';
+import {
+  MEMORY_FEATURE_CONFIG_MSG,
+  MEMORY_FEATURE_CONFIG_PREF_KEY,
+  MEMORY_FEATURE_FLAGS,
+  encodeMemoryFeatureFlagValuesJson,
+  getMemoryFeatureFlagDefinition,
+  isMemoryFeatureFlag,
+  memoryFeatureFlagEnvKey,
+  parseMemoryFeatureFlagValuesJson,
+  computeEffectiveMemoryFeatureFlags,
+  resolveMemoryFeatureFlagValue,
+  type FeatureFlagValueSource,
+  type MemoryFeatureFlag,
+  type MemoryFeatureFlagResolutionLayers,
+  type MemoryFeatureFlagValues,
+} from '../../../shared/feature-flags.js';
 import {
   MSG_COMMAND_ACK,
   MSG_COMMAND_FAILED,
@@ -52,15 +84,21 @@ import {
   type PreviewWsOpenedMessage,
 } from '../../../shared/preview-types.js';
 import { LocalWebPreviewRegistry } from '../preview/registry.js';
-import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, getSubSessionById, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent } from '../db/queries.js';
+import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, getSubSessionById, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent, getUserPref, setUserPref } from '../db/queries.js';
 import logger from '../util/logger.js';
+import { incrementCounter } from '../util/metrics.js';
 import { pickReadableSessionDisplay } from '../../../shared/session-display.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
 import { PUSH_TIMELINE_EVENT_MAX_AGE_MS, TIMELINE_SUPPRESS_PUSH_FIELD } from '../../../shared/push-notifications.js';
+import {
+  DAEMON_UPGRADE_DELIVERY_STATUS,
+} from '../../../shared/daemon-upgrade.js';
+import { DaemonUpgradeCoordinator, type DaemonUpgradeSource, type RequestDaemonUpgradeResult } from './daemon-upgrade-coordinator.js';
 
 const AUTH_TIMEOUT_MS = 5000;
 const MAX_QUEUE_SIZE = 100;
 const MAX_BROWSER_PAYLOAD = 65536; // 64KB (subsession.rebuild_all can include many sessions)
+const MAX_PENDING_MEMORY_MANAGEMENT_REQUESTS_PER_SOCKET = 32;
 // Desktop with pinned panels + many sessions can fire 60+ subscribe/repo/repo
 // detect / fs.git_status / chat.subscribe / ping messages on initial connect.
 // A reconnect within 10s doubles that. 120 was right at the cliff edge and
@@ -290,7 +328,7 @@ export class WsBridge {
   private daemonWs: WebSocket | null = null;
   private authenticated = false;
   private daemonVersion: string | null = null;
-  private upgradeAttempts = 0;
+  private daemonUpgradeCoordinator = new DaemonUpgradeCoordinator();
   private browserSockets = new Set<WebSocket>();
   private mobileSockets = new Set<WebSocket>();
   private queue: string[] = [];
@@ -338,6 +376,9 @@ export class WsBridge {
 
   /** Per-request timeline.history / timeline.replay pending map — routes responses via requestId unicast. */
   private pendingTimelineRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
+
+  /** Per-request memory management pending map — routes sensitive admin responses via requestId unicast. */
+  private pendingMemoryManagementRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
 
   /** Per-request HTTP timeline/history relay pending map. */
   private pendingHttpTimelineRequests = new Map<string, PendingHttpTimelineRequest>();
@@ -424,6 +465,360 @@ export class WsBridge {
     return WsBridge.instances;
   }
 
+  private registerMemoryManagementRequest(ws: WebSocket, msg: Record<string, unknown>): string | null {
+    if (!isMemoryManagementRequestType(msg.type)) return null;
+    const userId = this.browserUserIds.get(ws)?.trim();
+    if (!userId) {
+      safeSend(ws, JSON.stringify({
+        type: 'error',
+        code: MEMORY_MANAGEMENT_BRIDGE_ERROR_CODES.UNAUTHENTICATED,
+        message: 'memory management requests require an authenticated browser session',
+        originalType: msg.type,
+      }));
+      return null;
+    }
+    const pendingForSocket = [...this.pendingMemoryManagementRequests.values()].filter((pending) => pending.socket === ws).length;
+    if (pendingForSocket >= MAX_PENDING_MEMORY_MANAGEMENT_REQUESTS_PER_SOCKET) {
+      safeSend(ws, JSON.stringify({
+        type: 'error',
+        code: MEMORY_MANAGEMENT_BRIDGE_ERROR_CODES.TOO_MANY_PENDING_REQUESTS,
+        message: 'too many pending memory management requests',
+        originalType: msg.type,
+      }));
+      return null;
+    }
+    const requestId = typeof msg.requestId === 'string' && msg.requestId.trim()
+      ? msg.requestId.trim()
+      : null;
+    if (!requestId) {
+      safeSend(ws, JSON.stringify({
+        type: 'error',
+        code: MEMORY_MANAGEMENT_BRIDGE_ERROR_CODES.MISSING_REQUEST_ID,
+        message: 'memory management requests require requestId',
+        originalType: msg.type,
+      }));
+      return null;
+    }
+    const existing = this.pendingMemoryManagementRequests.get(requestId);
+    if (existing) {
+      safeSend(ws, JSON.stringify({
+        type: 'error',
+        code: MEMORY_MANAGEMENT_BRIDGE_ERROR_CODES.DUPLICATE_REQUEST_ID,
+        message: 'memory management requestId is already pending',
+        originalType: msg.type,
+        requestId,
+      }));
+      return null;
+    }
+    const timer = setTimeout(() => this.pendingMemoryManagementRequests.delete(requestId), 30_000);
+    this.pendingMemoryManagementRequests.set(requestId, { socket: ws, timer });
+    return requestId;
+  }
+
+  private clearPendingMemoryManagementRequest(requestId: string): WebSocket | undefined {
+    const pending = this.pendingMemoryManagementRequests.get(requestId);
+    if (!pending) return undefined;
+    clearTimeout(pending.timer);
+    this.pendingMemoryManagementRequests.delete(requestId);
+    return pending.socket;
+  }
+
+  private failMemoryManagementForward(ws: WebSocket, msg: Record<string, unknown>, requestId: string, error: unknown): void {
+    this.clearPendingMemoryManagementRequest(requestId);
+    logger.warn({
+      serverId: this.serverId,
+      type: msg.type,
+      requestId,
+      error: error instanceof Error ? error.message : String(error),
+    }, 'memory management context injection failed');
+    safeSend(ws, JSON.stringify({
+      type: 'error',
+      code: MEMORY_MANAGEMENT_BRIDGE_ERROR_CODES.CONTEXT_INJECTION_FAILED,
+      message: 'memory management request could not be authorized',
+      originalType: msg.type,
+      requestId,
+    }));
+  }
+
+  private readMemoryFeatureEnvironmentDefaults(): MemoryFeatureFlagValues {
+    const environmentStartupDefault: MemoryFeatureFlagValues = {};
+    for (const flag of MEMORY_FEATURE_FLAGS) {
+      const key = memoryFeatureFlagEnvKey(flag);
+      const raw = process.env[key];
+      if (raw != null) environmentStartupDefault[flag] = raw === 'true' || raw === '1';
+    }
+    return environmentStartupDefault;
+  }
+
+  private memoryFeatureLayers(userConfig: MemoryFeatureFlagValues): MemoryFeatureFlagResolutionLayers {
+    return {
+      persistedConfig: userConfig,
+      environmentStartupDefault: this.readMemoryFeatureEnvironmentDefaults(),
+    };
+  }
+
+  private featureFlagValueSource(flag: MemoryFeatureFlag, layers: MemoryFeatureFlagResolutionLayers): FeatureFlagValueSource {
+    if (layers.runtimeConfigOverride?.[flag] !== undefined) return 'runtime_config_override';
+    if (layers.persistedConfig?.[flag] !== undefined) return 'persisted_config';
+    if (layers.environmentStartupDefault?.[flag] !== undefined) return 'environment_startup_default';
+    return 'registry_default';
+  }
+
+  private requestedMemoryFeatureFlags(layers: MemoryFeatureFlagResolutionLayers): MemoryFeatureFlagValues {
+    const requested: MemoryFeatureFlagValues = {};
+    for (const flag of MEMORY_FEATURE_FLAGS) {
+      requested[flag] = resolveMemoryFeatureFlagValue(flag, layers);
+    }
+    return requested;
+  }
+
+  private buildMemoryFeatureAdminRecords(userConfig: MemoryFeatureFlagValues) {
+    const layers = this.memoryFeatureLayers(userConfig);
+    const requested = this.requestedMemoryFeatureFlags(layers);
+    const effective = computeEffectiveMemoryFeatureFlags(requested);
+    return MEMORY_FEATURE_FLAGS.map((flag) => {
+      const definition = getMemoryFeatureFlagDefinition(flag);
+      return {
+        flag,
+        requested: requested[flag] === true,
+        enabled: effective[flag],
+        source: this.featureFlagValueSource(flag, layers),
+        envKey: memoryFeatureFlagEnvKey(flag),
+        dependencies: definition.dependencies,
+        dependencyBlocked: requested[flag] === true && !effective[flag]
+          ? definition.dependencies.filter((dependency) => !effective[dependency])
+          : [],
+        disabledBehavior: definition.disabledBehavior,
+      };
+    });
+  }
+
+  private collectMemoryFeatureWithDependencies(flag: MemoryFeatureFlag, seen = new Set<MemoryFeatureFlag>()): Set<MemoryFeatureFlag> {
+    if (seen.has(flag)) return seen;
+    seen.add(flag);
+    for (const dependency of getMemoryFeatureFlagDefinition(flag).dependencies) {
+      this.collectMemoryFeatureWithDependencies(dependency, seen);
+    }
+    return seen;
+  }
+
+  private async readUserMemoryFeatureFlags(userId: string): Promise<MemoryFeatureFlagValues> {
+    if (!this.db) return {};
+    return parseMemoryFeatureFlagValuesJson(await getUserPref(this.db, userId, MEMORY_FEATURE_CONFIG_PREF_KEY));
+  }
+
+  private async writeUserMemoryFeatureFlags(userId: string, flags: MemoryFeatureFlagValues): Promise<MemoryFeatureFlagValues> {
+    if (!this.db) throw new Error('database_unavailable');
+    const normalized = parseMemoryFeatureFlagValuesJson(encodeMemoryFeatureFlagValuesJson(flags));
+    await setUserPref(this.db, userId, MEMORY_FEATURE_CONFIG_PREF_KEY, encodeMemoryFeatureFlagValuesJson(normalized));
+    return normalized;
+  }
+
+  private sendMemoryFeatureConfigApply(flags: MemoryFeatureFlagValues): void {
+    this.sendToDaemon(JSON.stringify({
+      type: MEMORY_FEATURE_CONFIG_MSG.APPLY,
+      flags,
+    }));
+  }
+
+  private async pushUserMemoryFeatureConfigToOnlineDaemons(userId: string, flags: MemoryFeatureFlagValues): Promise<void> {
+    const entries = [...WsBridge.instances.values()];
+    await Promise.all(entries.map(async (bridge) => {
+      if (!bridge.authenticated || !bridge.daemonWs || !bridge.db) return;
+      const row = await bridge.db.queryOne<{ user_id?: string }>(
+        'SELECT user_id FROM servers WHERE id = $1',
+        [bridge.serverId],
+      ).catch(() => null);
+      if (row?.user_id !== userId) return;
+      try {
+        bridge.sendMemoryFeatureConfigApply(flags);
+      } catch (error) {
+        logger.warn({ err: error, serverId: bridge.serverId }, 'failed to apply global memory feature config to daemon');
+      }
+    }));
+  }
+
+  private async handleMemoryFeaturesQuery(ws: WebSocket, msg: Record<string, unknown>): Promise<boolean> {
+    if (msg.type !== MEMORY_WS.FEATURES_QUERY) return false;
+    const requestId = this.registerMemoryManagementRequest(ws, msg);
+    if (!requestId) return true;
+    const userId = this.browserUserIds.get(ws)?.trim();
+    try {
+      const flags = userId ? await this.readUserMemoryFeatureFlags(userId) : {};
+      this.clearPendingMemoryManagementRequest(requestId);
+      safeSend(ws, JSON.stringify({
+        type: MEMORY_WS.FEATURES_RESPONSE,
+        requestId,
+        records: this.buildMemoryFeatureAdminRecords(flags),
+      }));
+    } catch (error) {
+      this.failMemoryManagementForward(ws, msg, requestId, error);
+    }
+    return true;
+  }
+
+  private async handleMemoryFeaturesSet(ws: WebSocket, msg: Record<string, unknown>): Promise<boolean> {
+    if (msg.type !== MEMORY_WS.FEATURES_SET) return false;
+    const requestId = this.registerMemoryManagementRequest(ws, msg);
+    if (!requestId) return true;
+    const userId = this.browserUserIds.get(ws)?.trim();
+    const flag = typeof msg.flag === 'string' ? msg.flag : undefined;
+    const enabled = msg.enabled;
+    const sendSetResponse = (payload: Record<string, unknown>) => {
+      this.clearPendingMemoryManagementRequest(requestId);
+      safeSend(ws, JSON.stringify({
+        type: MEMORY_WS.FEATURES_SET_RESPONSE,
+        requestId,
+        ...payload,
+      }));
+    };
+    if (!userId) {
+      sendSetResponse({ success: false, error: MEMORY_MANAGEMENT_BRIDGE_ERROR_CODES.UNAUTHENTICATED });
+      return true;
+    }
+    if (!isMemoryFeatureFlag(flag) || typeof enabled !== 'boolean') {
+      sendSetResponse({
+        success: false,
+        error: MEMORY_MANAGEMENT_ERROR_CODES.INVALID_FEATURE_FLAG,
+        errorCode: MEMORY_MANAGEMENT_ERROR_CODES.INVALID_FEATURE_FLAG,
+      });
+      return true;
+    }
+    try {
+      const current = await this.readUserMemoryFeatureFlags(userId);
+      const updates: MemoryFeatureFlagValues = enabled
+        ? Object.fromEntries([...this.collectMemoryFeatureWithDependencies(flag)].map((dependency) => [dependency, true])) as MemoryFeatureFlagValues
+        : { [flag]: false };
+      const next = await this.writeUserMemoryFeatureFlags(userId, { ...current, ...updates });
+      await this.pushUserMemoryFeatureConfigToOnlineDaemons(userId, next);
+      const records = this.buildMemoryFeatureAdminRecords(next);
+      sendSetResponse({
+        success: true,
+        flag,
+        requested: enabled,
+        enabled: records.find((record) => record.flag === flag)?.enabled ?? false,
+        records,
+      });
+    } catch (error) {
+      logger.warn({ err: error, serverId: this.serverId, flag }, 'failed to persist global memory feature config');
+      sendSetResponse({
+        success: false,
+        flag,
+        requested: enabled,
+        error: MEMORY_MANAGEMENT_ERROR_CODES.FEATURE_CONFIG_WRITE_FAILED,
+        errorCode: MEMORY_MANAGEMENT_ERROR_CODES.FEATURE_CONFIG_WRITE_FAILED,
+      });
+    }
+    return true;
+  }
+
+  private roleFromMembership(role: unknown, elevatedRole: Exclude<MemoryManagementRole, 'user'>): MemoryManagementRole {
+    return role === 'owner' || role === 'admin' ? elevatedRole : 'user';
+  }
+
+  private async resolveMemoryManagementAuthorization(params: {
+    userId: string;
+    canonicalRepoId?: string;
+    projectDir?: string;
+    workspaceId?: string;
+    orgId?: string;
+  }): Promise<{ role: MemoryManagementRole; boundProjects: MemoryManagementBoundProject[] }> {
+    if (!this.db) return { role: 'user', boundProjects: [] };
+    const { userId, canonicalRepoId, projectDir, workspaceId, orgId } = params;
+    try {
+      if (canonicalRepoId) {
+        const row = await this.db.queryOne<{ role?: string; workspace_id?: string | null; enterprise_id?: string | null }>(
+          `SELECT tm.role, e.workspace_id, e.enterprise_id
+             FROM shared_project_enrollments e
+             JOIN team_members tm ON tm.team_id = e.enterprise_id AND tm.user_id = $2
+            WHERE e.canonical_repo_id = $1
+              AND e.status = 'active'
+            ORDER BY CASE tm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END
+            LIMIT 1`,
+          [canonicalRepoId, userId],
+        );
+        if (typeof row?.role === 'string') {
+          return {
+            role: this.roleFromMembership(row.role, 'workspace_admin'),
+            boundProjects: [{
+              projectDir,
+              canonicalRepoId,
+              workspaceId: typeof row.workspace_id === 'string' ? row.workspace_id : undefined,
+              orgId: typeof row.enterprise_id === 'string' ? row.enterprise_id : undefined,
+            }],
+          };
+        }
+        return { role: 'user', boundProjects: [] };
+      }
+
+      if (workspaceId) {
+        const row = await this.db.queryOne<{ role?: string; enterprise_id?: string | null }>(
+          `SELECT tm.role, w.enterprise_id
+             FROM shared_context_workspaces w
+             JOIN team_members tm ON tm.team_id = w.enterprise_id AND tm.user_id = $2
+            WHERE w.id = $1`,
+          [workspaceId, userId],
+        );
+        if (typeof row?.role === 'string') {
+          return {
+            role: this.roleFromMembership(row.role, 'workspace_admin'),
+            boundProjects: [{
+              workspaceId,
+              orgId: typeof row.enterprise_id === 'string' ? row.enterprise_id : undefined,
+            }],
+          };
+        }
+        return { role: 'user', boundProjects: [] };
+      }
+
+      if (orgId) {
+        const row = await this.db.queryOne<{ role?: string }>(
+          'SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2',
+          [orgId, userId],
+        );
+        if (typeof row?.role === 'string') {
+          return {
+            role: this.roleFromMembership(row.role, 'org_admin'),
+            boundProjects: [{ orgId }],
+          };
+        }
+      }
+    } catch (error) {
+      logger.warn({ err: error, serverId: this.serverId }, 'memory management authorization derivation failed');
+    }
+    return { role: 'user', boundProjects: [] };
+  }
+
+  private async withMemoryManagementContext(ws: WebSocket, msg: Record<string, unknown>, requestId: string): Promise<Record<string, unknown>> {
+    const userId = this.browserUserIds.get(ws)?.trim();
+    if (!userId) return msg;
+    const canonicalRepoId = typeof msg.canonicalRepoId === 'string' && msg.canonicalRepoId.trim()
+      ? msg.canonicalRepoId.trim()
+      : undefined;
+    const projectDir = typeof msg.projectDir === 'string' && msg.projectDir.trim() ? msg.projectDir.trim() : undefined;
+    const workspaceId = typeof msg.workspaceId === 'string' && msg.workspaceId.trim() ? msg.workspaceId.trim() : undefined;
+    const orgId = typeof msg.orgId === 'string' && msg.orgId.trim()
+      ? msg.orgId.trim()
+      : (typeof msg.enterpriseId === 'string' && msg.enterpriseId.trim() ? msg.enterpriseId.trim() : undefined);
+    const authorization = await this.resolveMemoryManagementAuthorization({ userId, canonicalRepoId, projectDir, workspaceId, orgId });
+    const context: AuthenticatedMemoryManagementContext = {
+      actorId: userId,
+      userId,
+      role: authorization.role,
+      serverId: this.serverId,
+      requestId,
+      source: 'server_bridge',
+      boundProjects: authorization.boundProjects,
+    };
+    const { [MEMORY_MANAGEMENT_CONTEXT_FIELD]: _ignoredContext, managementContext: _ignoredLegacyContext, ...safeMsg } = msg;
+    void _ignoredContext;
+    void _ignoredLegacyContext;
+    return {
+      ...safeMsg,
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: context,
+    };
+  }
+
   // ── Daemon connection ──────────────────────────────────────────────────────
 
   handleDaemonConnection(ws: WebSocket, db: Database, env: Env, onAuthenticated?: () => void): void {
@@ -465,7 +860,10 @@ export class WsBridge {
         if (this.authTimer) clearTimeout(this.authTimer);
 
         const tokenHash = sha256Hex(msg.token);
-        const server = await db.queryOne<{ token_hash: string }>('SELECT token_hash FROM servers WHERE id = $1', [this.serverId]);
+        const server = await db.queryOne<{ token_hash: string; user_id?: string }>(
+          'SELECT token_hash, user_id FROM servers WHERE id = $1',
+          [this.serverId],
+        );
 
         if (!server || server.token_hash !== tokenHash) {
           logger.warn({ serverId: this.serverId }, 'Daemon auth failed');
@@ -484,8 +882,20 @@ export class WsBridge {
         updateServerHeartbeat(db, this.serverId, this.daemonVersion).catch((err) =>
           logger.error({ err }, 'Failed to update heartbeat on auth'),
         );
+        if (typeof server.user_id === 'string' && server.user_id.trim()) {
+          try {
+            this.sendMemoryFeatureConfigApply(await this.readUserMemoryFeatureFlags(server.user_id));
+          } catch (err) {
+            logger.warn({ err, serverId: this.serverId }, 'failed to push global memory feature config on daemon auth');
+          }
+        }
+        this.daemonUpgradeCoordinator.clearIfTargetVersionMatches(this.daemonVersion);
+        this.flushPendingDaemonUpgrade(ws);
 
-        // Auto-upgrade: on each reconnect, retry up to 3 times with 10-minute intervals.
+        // Auto-upgrade: on reconnect, retry up to 3 times, but never schedule
+        // more than one upgrade command per 15 minutes while the daemon remains
+        // on a mismatched version. This protects npm global install from
+        // reconnect storms and registry propagation windows.
         // Always target the server's exact version so dev↔stable mismatches converge to
         // the same channel in both directions.
         const serverVersion = process.env.APP_VERSION;
@@ -496,20 +906,44 @@ export class WsBridge {
           && this.daemonVersion !== serverVersion,
         );
         if (shouldUpgrade) {
-          this.upgradeAttempts = (this.upgradeAttempts ?? 0) + 1;
-          if (this.upgradeAttempts <= 3) {
-            logger.info({ serverId: this.serverId, daemonVersion: this.daemonVersion, serverVersion, attempt: this.upgradeAttempts }, 'Version mismatch — sending daemon.upgrade');
-            setTimeout(() => {
-              try { ws.send(JSON.stringify({ type: 'daemon.upgrade', targetVersion: serverVersion })); } catch { /* ignore */ }
-            }, 5000);
-            // Schedule retry: if daemon reconnects with the same old version after 10 min, the counter is already incremented.
-            // If daemon doesn't reconnect (upgrade succeeded and restarted), the next auth will have matching version → no upgrade sent.
-          } else {
-            logger.warn({ serverId: this.serverId, daemonVersion: this.daemonVersion, serverVersion, attempts: this.upgradeAttempts }, 'Version mismatch — max upgrade attempts reached, giving up');
+          const result = this.requestDaemonUpgrade({
+            targetVersion: serverVersion,
+            source: 'auto',
+            isStillCurrent: () => this.daemonWs === ws && this.authenticated && this.daemonVersion !== serverVersion,
+          });
+          if (result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.SENT) {
+            logger.info({
+              serverId: this.serverId,
+              daemonVersion: this.daemonVersion,
+              serverVersion,
+              upgradeId: result.upgradeId,
+            }, 'Version mismatch — scheduling daemon.upgrade');
+          } else if (result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.SUPPRESSED) {
+            logger.info({
+              serverId: this.serverId,
+              daemonVersion: this.daemonVersion,
+              serverVersion,
+              nextAttemptAt: result.nextAttemptAt,
+            }, 'Version mismatch — auto daemon.upgrade suppressed by 15-minute interval');
+          } else if (result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.BACKOFF) {
+            logger.warn({
+              serverId: this.serverId,
+              daemonVersion: this.daemonVersion,
+              serverVersion,
+              reason: result.reason,
+            }, 'Version mismatch — auto daemon.upgrade in backoff');
+          } else if (result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_PUBLICATION) {
+            logger.info({
+              serverId: this.serverId,
+              daemonVersion: this.daemonVersion,
+              serverVersion,
+              nextAttemptAt: result.nextAttemptAt,
+              reason: result.reason,
+            }, 'Version mismatch — waiting for daemon upgrade target to appear on npm');
           }
         } else {
-          // Version matches, daemon is newer, or auto-upgrade does not apply — reset retry counter
-          this.upgradeAttempts = 0;
+          // Version matches or auto-upgrade does not apply — reset retry state.
+          this.daemonUpgradeCoordinator.clearIfTargetVersionMatches(this.daemonVersion);
         }
 
         // Replay queued messages, skipping terminal.subscribe/unsubscribe — refs replay below is authoritative
@@ -517,6 +951,14 @@ export class WsBridge {
           try {
             const parsed = JSON.parse(queued) as { type?: string };
             if (parsed.type === 'terminal.subscribe' || parsed.type === 'terminal.unsubscribe') continue;
+            if (parsed.type === DAEMON_COMMAND_TYPES.DAEMON_UPGRADE) {
+              this.requestDaemonUpgrade({
+                targetVersion: (parsed as { targetVersion?: unknown }).targetVersion,
+                source: 'replay',
+                isStillCurrent: () => this.daemonWs === ws && this.authenticated,
+              });
+              continue;
+            }
             ws.send(queued);
           } catch { /* ignore */ }
         }
@@ -551,7 +993,11 @@ export class WsBridge {
       }
 
       if (msg.type === 'heartbeat') {
-        updateServerHeartbeat(db, this.serverId).catch((err) =>
+        const heartbeatDaemonVersion = typeof msg.daemonVersion === 'string'
+          ? msg.daemonVersion
+          : this.daemonVersion;
+        if (typeof heartbeatDaemonVersion === 'string') this.daemonVersion = heartbeatDaemonVersion;
+        updateServerHeartbeat(db, this.serverId, heartbeatDaemonVersion).catch((err) =>
           logger.error({ err }, 'Failed to update heartbeat'),
         );
         // Ack heartbeat so daemon watchdog doesn't consider the connection dead
@@ -657,7 +1103,7 @@ export class WsBridge {
       safeSend(ws, JSON.stringify({ type: TRANSPORT_MSG.SESSIONS_RESPONSE, providerId, sessions }));
     }
 
-    ws.on('message', (data) => {
+    ws.on('message', async (data) => {
       const raw = (data as Buffer).toString();
       if (Buffer.byteLength(raw, 'utf8') > MAX_BROWSER_PAYLOAD) {
         logger.warn({ serverId: this.serverId }, 'Browser message too large — dropped');
@@ -711,6 +1157,37 @@ export class WsBridge {
       }
 
       if (typeof msg.type !== 'string') {
+        return;
+      }
+
+      if (this.isBrowserForbiddenDaemonCommandType(msg.type)) {
+        logger.warn({ serverId: this.serverId, type: msg.type }, 'Browser attempted server-only daemon command — rejected');
+        safeSend(ws, JSON.stringify({
+          type: 'error',
+          code: 'server_only_command',
+          originalType: msg.type,
+          requestId: msg.requestId,
+        }));
+        return;
+      }
+
+      if (msg.type === MEMORY_WS.FEATURES_QUERY) {
+        await this.handleMemoryFeaturesQuery(ws, msg);
+        return;
+      }
+      if (msg.type === MEMORY_WS.FEATURES_SET) {
+        await this.handleMemoryFeaturesSet(ws, msg);
+        return;
+      }
+
+      if (isMemoryManagementRequestType(msg.type)) {
+        const requestId = this.registerMemoryManagementRequest(ws, msg);
+        if (!requestId) return;
+        try {
+          this.sendToDaemon(JSON.stringify(await this.withMemoryManagementContext(ws, msg, requestId)));
+        } catch (error) {
+          this.failMemoryManagementForward(ws, msg, requestId, error);
+        }
         return;
       }
 
@@ -796,7 +1273,7 @@ export class WsBridge {
         return;
       }
 
-      // ── command.ack reliability: intercept session.send ────────────────
+      // ── command.ack reliability: intercept user sends and cancels ───────
       //
       // Three cases:
       //   1. daemon fully offline (past grace)       → immediately command.failed
@@ -805,7 +1282,7 @@ export class WsBridge {
       //
       // In all cases we record an inflight entry so that the later command.ack
       // (or timeout / disconnect) can correlate back to the right browser.
-      if (msg.type === 'session.send' && typeof msg.commandId === 'string') {
+      if ((msg.type === 'session.send' || msg.type === DAEMON_COMMAND_TYPES.SESSION_CANCEL) && typeof msg.commandId === 'string') {
         const sessionName = typeof msg.sessionName === 'string'
           ? msg.sessionName
           : (typeof msg.session === 'string' ? msg.session : '');
@@ -868,6 +1345,21 @@ export class WsBridge {
 
     if (type === PREVIEW_MSG.ERROR) {
       this.failPreviewRequest(msg as unknown as PreviewErrorMessage);
+      return;
+    }
+
+    if (isMemoryManagementResponseType(type)) {
+      const requestId = msg.requestId as string | undefined;
+      const pending = requestId ? this.pendingMemoryManagementRequests.get(requestId) : undefined;
+      if (!requestId || !pending) {
+        incrementCounter('mem.bridge.unrouted_response', { type: String(type) });
+        logger.warn({ serverId: this.serverId, type, requestId }, 'memory management response missing pending request — dropped');
+        return;
+      }
+      this.clearPendingMemoryManagementRequest(requestId);
+      if (pending.socket.readyState === WebSocket.OPEN) {
+        pending.socket.send(JSON.stringify(msg));
+      }
       return;
     }
 
@@ -1740,6 +2232,12 @@ export class WsBridge {
         this.pendingTimelineRequests.delete(reqId);
       }
     }
+    for (const [reqId, pending] of this.pendingMemoryManagementRequests) {
+      if (pending.socket === ws) {
+        clearTimeout(pending.timer);
+        this.pendingMemoryManagementRequests.delete(reqId);
+      }
+    }
   }
 
   /**
@@ -2025,6 +2523,54 @@ export class WsBridge {
     return this.seenCommandAcks.has(commandId);
   }
 
+  requestDaemonUpgrade(input: {
+    targetVersion?: unknown;
+    source?: DaemonUpgradeSource;
+    isStillCurrent?: () => boolean;
+  } = {}): RequestDaemonUpgradeResult {
+    return this.daemonUpgradeCoordinator.request({
+      targetVersion: input.targetVersion,
+      source: input.source ?? 'manual',
+      isDaemonReady: () => this.isDaemonReadyForUpgrade(),
+      isStillCurrent: input.isStillCurrent,
+      send: (message) => this.sendDirectToDaemon(message),
+    });
+  }
+
+  private flushPendingDaemonUpgrade(ws: WebSocket): void {
+    const result = this.daemonUpgradeCoordinator.flushPending({
+      isDaemonReady: () => this.isDaemonReadyForUpgrade(),
+      isStillCurrent: () => this.daemonWs === ws && this.authenticated,
+      send: (message) => this.sendDirectToDaemon(message),
+    });
+    if (result?.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.SENT) {
+      logger.info({
+        serverId: this.serverId,
+        targetVersion: result.targetVersion,
+        upgradeId: result.upgradeId,
+      }, 'Flushed pending daemon.upgrade after daemon auth');
+    } else if (result?.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_PUBLICATION) {
+      logger.info({
+        serverId: this.serverId,
+        targetVersion: result.targetVersion,
+        nextAttemptAt: result.nextAttemptAt,
+      }, 'Pending daemon.upgrade is waiting for npm publication');
+    }
+  }
+
+  private isDaemonReadyForUpgrade(): boolean {
+    return Boolean(this.daemonWs && this.authenticated);
+  }
+
+  private sendDirectToDaemon(message: Record<string, unknown>): void {
+    if (!this.daemonWs || !this.authenticated) return;
+    try {
+      this.daemonWs.send(JSON.stringify(message));
+    } catch (err) {
+      logger.error({ serverId: this.serverId, err }, 'Failed to send daemon upgrade command');
+    }
+  }
+
   /** Force-close the daemon WebSocket. Use after token rotation to evict the stale connection. */
   kickDaemon(): void {
     if (this.daemonWs) {
@@ -2035,6 +2581,14 @@ export class WsBridge {
   }
 
   sendToDaemon(message: string): void {
+    const parsed = this.parseJsonObject(message);
+    if (parsed?.type === DAEMON_COMMAND_TYPES.DAEMON_UPGRADE) {
+      this.requestDaemonUpgrade({
+        targetVersion: parsed.targetVersion,
+        source: 'manual',
+      });
+      return;
+    }
     if (this.daemonWs && this.authenticated) {
       try {
         this.daemonWs.send(message);
@@ -2046,6 +2600,21 @@ export class WsBridge {
         this.queue.push(message);
       }
     }
+  }
+
+  private parseJsonObject(message: string): Record<string, unknown> | null {
+    try {
+      const parsed = JSON.parse(message) as unknown;
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? parsed as Record<string, unknown>
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private isBrowserForbiddenDaemonCommandType(type: string): boolean {
+    return type === DAEMON_COMMAND_TYPES.SERVER_DELETE || type.startsWith('daemon.');
   }
 
   requestTimelineHistory(params: {

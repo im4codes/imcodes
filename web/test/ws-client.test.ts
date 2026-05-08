@@ -6,10 +6,12 @@ import type { MessageHandler } from '../src/ws-client.js';
 
 // Mock WebSocket implementation
 class MockWebSocket {
+  static CONNECTING = 0;
   static OPEN = 1;
+  static CLOSING = 2;
   static CLOSED = 3;
 
-  readyState = MockWebSocket.OPEN;
+  readyState = MockWebSocket.CONNECTING;
   url: string;
   private listeners: Record<string, Array<(ev: unknown) => void>> = {};
 
@@ -31,6 +33,8 @@ class MockWebSocket {
 
   /** Test helper: trigger an event */
   emit(type: string, data?: unknown) {
+    if (type === 'open') this.readyState = MockWebSocket.OPEN;
+    if (type === 'close') this.readyState = MockWebSocket.CLOSED;
     for (const fn of this.listeners[type] ?? []) fn(data);
   }
 }
@@ -194,6 +198,134 @@ describe('WsClient', () => {
     await vi.advanceTimersByTimeAsync(2000);
     expect(lastWs).not.toBe(firstWs);
 
+    vi.useRealTimers();
+  });
+
+  it('keeps connecting=true while the browser WebSocket is still CONNECTING', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(lastWs).not.toBeNull();
+    expect(lastWs!.readyState).toBe(MockWebSocket.CONNECTING);
+    expect(client.connected).toBe(false);
+    expect(client.connecting).toBe(true);
+
+    lastWs!.emit('open');
+    expect(client.connected).toBe(true);
+    expect(client.connecting).toBe(false);
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('times out a hung ws-ticket request and retries instead of staying connecting forever', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => {
+        const err = new Error('aborted');
+        err.name = 'AbortError';
+        reject(err);
+      });
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    expect(client.connecting).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(client.connected).toBe(false);
+    // The first hung ticket attempt has yielded to a reconnect timer.
+    expect(client.connecting).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('times out a WebSocket that never opens and schedules a fresh connection', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    const firstWs = lastWs!;
+
+    expect(firstWs.readyState).toBe(MockWebSocket.CONNECTING);
+    await vi.advanceTimersByTimeAsync(15_000);
+
+    expect(firstWs.readyState).toBe(MockWebSocket.CLOSED);
+    expect(client.connected).toBe(false);
+    expect(client.connecting).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lastWs).not.toBe(firstWs);
+    expect(lastWs!.readyState).toBe(MockWebSocket.CONNECTING);
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('does not stack multiple reconnect timers for the same outage', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    const internal = client as unknown as { scheduleReconnect: () => void };
+
+    internal.scheduleReconnect();
+    internal.scheduleReconnect();
+    internal.scheduleReconnect();
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(lastWs).not.toBeNull();
+    const fetchMock = fetch as unknown as ReturnType<typeof vi.fn>;
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('reconnectNow(false) closes a stale CONNECTING socket before opening another one', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    const firstWs = lastWs!;
+
+    expect(firstWs.readyState).toBe(MockWebSocket.CONNECTING);
+    client.reconnectNow(false);
+    expect(firstWs.readyState).toBe(MockWebSocket.CLOSED);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lastWs).not.toBe(firstWs);
+    expect(lastWs!.readyState).toBe(MockWebSocket.CONNECTING);
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('resumeConnection(true) force-reconnects a stale open socket with no confirmed pong', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const firstWs = lastWs!;
+
+    client.resumeConnection(true);
+    expect(firstWs.readyState).toBe(MockWebSocket.CLOSED);
+    expect(client.connected).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lastWs).not.toBe(firstWs);
+
+    client.disconnect();
     vi.useRealTimers();
   });
 
@@ -871,7 +1003,7 @@ describe('WsClient', () => {
       expect(() => client.sendUrgent({ type: 'session.send', text: '/stop' })).toThrow('WebSocket not connected');
     });
 
-    it('sendSessionCommandUrgent emits session.<command> with payload', async () => {
+    it('sendSessionCommandUrgent maps cancel to session.cancel without /stop text', async () => {
       const client = new WsClient('http://localhost:8787', 'srv-1');
       client.connect();
       await flushAsync();
@@ -882,11 +1014,10 @@ describe('WsClient', () => {
       lastWs!.send = (data: string) => { sentMessages.push(data); origSend(data); };
 
       (client as unknown as { _connected: boolean })._connected = false;
-      client.sendSessionCommandUrgent('send', { sessionName: 'deck_brain', text: '/stop', commandId: 'cmd-1' });
+      client.sendSessionCommandUrgent('cancel', { sessionName: 'deck_brain', commandId: 'cmd-1' });
       expect(JSON.parse(sentMessages[0])).toEqual({
-        type: 'session.send',
+        type: 'session.cancel',
         sessionName: 'deck_brain',
-        text: '/stop',
         commandId: 'cmd-1',
       });
 

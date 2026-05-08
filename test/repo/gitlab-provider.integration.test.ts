@@ -15,7 +15,12 @@ import type { RepoIssue, RepoPR, RepoBranch, RepoCommit } from '../../src/repo/t
 let glabAvailable = false;
 try {
   execFileSync('glab', ['auth', 'status'], { timeout: 10_000, stdio: 'pipe' });
-  glabAvailable = true;
+  const probe = execFileSync('glab', ['api', '/projects/gitlab-org%2Fgitlab/issues?per_page=1&page=1'], {
+    timeout: 15_000,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  glabAvailable = Array.isArray(JSON.parse(probe));
 } catch {
   // glab not installed or not authenticated — skip tests
 }

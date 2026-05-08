@@ -640,7 +640,10 @@ export function restoreWeztermPane(name: string, paneId: string): void {
 const XTERM_KEY_MAP: Record<string, string> = {
   '\x1b[A': 'Up',   '\x1b[B': 'Down',
   '\x1b[C': 'Right','\x1b[D': 'Left',
+  '\x1bOA': 'Up',   '\x1bOB': 'Down',
+  '\x1bOC': 'Right','\x1bOD': 'Left',
   '\x1b[F': 'End',  '\x1b[H': 'Home',
+  '\x1bOF': 'End',  '\x1bOH': 'Home',
   '\x1b[1~': 'Home','\x1b[3~': 'DC',
   '\x1b[4~': 'End', '\x1b[5~': 'PPage',
   '\x1b[6~': 'NPage','\x1b[2~': 'IC',

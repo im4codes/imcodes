@@ -55,6 +55,8 @@ function mergeLoadedSubSession(s: SubSessionData, existing?: SubSession): SubSes
     transportPendingMessageEntries: existing.transportPendingMessageEntries ?? base.transportPendingMessageEntries,
     ...(preserveCodexDisplay ? {
       codexAvailableModels: base.codexAvailableModels ?? existing.codexAvailableModels ?? null,
+      requestedModel: base.requestedModel ?? existing.requestedModel ?? null,
+      activeModel: base.activeModel ?? existing.activeModel ?? null,
       modelDisplay: base.modelDisplay ?? existing.modelDisplay ?? null,
       planLabel: base.planLabel ?? existing.planLabel ?? null,
       quotaLabel: base.quotaLabel ?? existing.quotaLabel ?? null,

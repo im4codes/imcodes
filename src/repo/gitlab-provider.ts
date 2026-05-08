@@ -43,10 +43,35 @@ function translateError(stderr: string): RepoError {
   const lower = stderr.toLowerCase();
   if (lower.includes('auth') || lower.includes('401')) return 'unauthorized';
   if (lower.includes('rate limit') || lower.includes('429')) return 'rate_limited';
+  if (lower.includes('404') || lower.includes('not found')) return 'unknown_project';
   return 'cli_error';
 }
 
 const SAFE_NAME_RE = /^[a-zA-Z0-9._-]+$/;
+
+function repoError(code: RepoError): Error {
+  const error = new Error(`glab error: ${code}`);
+  (error as { code?: RepoError }).code = code;
+  return error;
+}
+
+function translatePayloadError(payload: unknown): RepoError {
+  if (!payload || typeof payload !== 'object') return 'cli_error';
+  const message = (payload as { message?: unknown; error?: unknown }).message
+    ?? (payload as { error?: unknown }).error
+    ?? '';
+  const lower = String(message).toLowerCase();
+  if (lower.includes('401') || lower.includes('unauthorized') || lower.includes('auth')) return 'unauthorized';
+  if (lower.includes('429') || lower.includes('rate limit')) return 'rate_limited';
+  if (lower.includes('404') || lower.includes('not found')) return 'unknown_project';
+  return 'cli_error';
+}
+
+function parseGitLabArray(raw: string): any[] {
+  const payload = JSON.parse(raw || '[]');
+  if (Array.isArray(payload)) return payload;
+  throw repoError(translatePayloadError(payload));
+}
 
 export class GitLabProvider implements RepoProvider {
   private readonly encodedProject: string;
@@ -83,7 +108,7 @@ export class GitLabProvider implements RepoProvider {
     if (opts?.state) params.set('state', opts.state === 'open' ? 'opened' : opts.state);
 
     const raw = await this.glab(['api', `/projects/${this.encodedProject}/issues?${params}`]);
-    const data: any[] = JSON.parse(raw);
+    const data = parseGitLabArray(raw);
 
     const items: RepoIssue[] = data.map((i) => ({
       id: String(i.id),
@@ -114,7 +139,7 @@ export class GitLabProvider implements RepoProvider {
     if (opts?.state) params.set('state', opts.state === 'open' ? 'opened' : opts.state);
 
     const raw = await this.glab(['api', `/projects/${this.encodedProject}/merge_requests?${params}`]);
-    const data: any[] = JSON.parse(raw);
+    const data = parseGitLabArray(raw);
 
     const items: RepoPR[] = data.map((mr) => ({
       number: mr.iid,
@@ -139,7 +164,7 @@ export class GitLabProvider implements RepoProvider {
 
   async listBranches(): Promise<RepoListResult<RepoBranch>> {
     const raw = await this.glab(['api', `/projects/${this.encodedProject}/repository/branches?per_page=${DEFAULT_PAGE_SIZE}`]);
-    const data: any[] = JSON.parse(raw);
+    const data = parseGitLabArray(raw);
 
     // Determine current branch via git
     let currentBranch: string | undefined;
@@ -177,7 +202,7 @@ export class GitLabProvider implements RepoProvider {
     if (opts?.branch) params.set('ref_name', opts.branch);
 
     const raw = await this.glab(['api', `/projects/${this.encodedProject}/repository/commits?${params}`]);
-    const data: any[] = JSON.parse(raw);
+    const data = parseGitLabArray(raw);
 
     const items: RepoCommit[] = data.map((c) => ({
       sha: c.id,
@@ -347,9 +372,7 @@ export class GitLabProvider implements RepoProvider {
     } catch (err: any) {
       const stderr: string = err?.stderr ?? err?.message ?? '';
       const code = translateError(stderr);
-      const error = new Error(`glab error: ${code}`);
-      (error as any).code = code;
-      throw error;
+      throw repoError(code);
     }
   }
 }

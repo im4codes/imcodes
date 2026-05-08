@@ -30,6 +30,7 @@ const makeWs = () => ({
 
 describe('StartSubSessionDialog', () => {
   afterEach(() => {
+    localStorage.clear();
     cleanup();
   });
 
@@ -118,6 +119,30 @@ describe('StartSubSessionDialog', () => {
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
     expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, { thinking: 'high' });
+  });
+
+  it('passes requestedModel for codex-sdk sub-sessions', () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /codex_sdk/i }));
+    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'gpt-5.5' } });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, {
+      requestedModel: 'gpt-5.5',
+      thinking: 'high',
+    });
   });
 
   it('clicking the backdrop does not call onClose', () => {

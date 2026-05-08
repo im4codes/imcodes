@@ -18,6 +18,7 @@ const mockServerLink = {
 
 // ── Mock fs/promises ───────────────────────────────────────────────────────
 vi.mock('node:fs/promises', () => ({
+  lstat: vi.fn(),
   readdir: vi.fn(),
   realpath: vi.fn(),
   readFile: vi.fn(),
@@ -25,12 +26,15 @@ vi.mock('node:fs/promises', () => ({
   writeFile: vi.fn(),
 }));
 
+const mockLstat = vi.mocked(fsp.lstat);
 const mockRealpath = vi.mocked(fsp.realpath);
 const mockStat = vi.mocked(fsp.stat);
 const mockReadFile = vi.mocked(fsp.readFile);
 const mockWriteFile = vi.mocked(fsp.writeFile);
 
 import { handleWebCommand, __resetFsGitCachesForTests } from '../../src/daemon/command-handler.js';
+import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
+import { FS_WRITE_ERROR } from '../../src/shared/transport/fs.js';
 
 /** Flush the microtask + macrotask queue so async handlers complete. */
 const flushAsync = () => new Promise<void>((r) => setTimeout(r, 0));
@@ -40,6 +44,7 @@ describe('fs.write handler', () => {
     vi.clearAllMocks();
     sent.length = 0;
     mockServerLink.send.mockImplementation((msg: unknown) => { sent.push(msg); });
+    mockLstat.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
     __resetFsGitCachesForTests();
   });
 
@@ -158,6 +163,90 @@ describe('fs.write handler', () => {
     });
   });
 
+  it('creates a file atomically when createOnly is true', async () => {
+    const filePath = path.join(homedir(), 'new-create-only.txt');
+    const parentPath = path.dirname(filePath);
+    const content = '';
+    const newMtime = 1700000000100;
+
+    mockStat
+      .mockRejectedValueOnce(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }))
+      .mockResolvedValueOnce({ mtimeMs: newMtime } as fsp.Stats);
+    mockRealpath
+      .mockResolvedValueOnce(parentPath as unknown as string)
+      .mockResolvedValueOnce(filePath as unknown as string);
+    mockWriteFile.mockResolvedValue(undefined);
+
+    handleWebCommand({ type: 'fs.write', path: filePath, content, requestId: 'req-create-only', createOnly: true }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockWriteFile).toHaveBeenCalledWith(filePath, content, { encoding: 'utf-8', flag: 'wx' });
+    expect(sent[0]).toMatchObject({
+      type: 'fs.write_response',
+      requestId: 'req-create-only',
+      status: 'ok',
+      mtime: newMtime,
+    });
+  });
+
+  it('does not overwrite an existing file when createOnly is true', async () => {
+    const filePath = path.join(homedir(), 'existing-create-only.txt');
+
+    mockStat.mockResolvedValue({ mtimeMs: 1000 } as fsp.Stats);
+    mockRealpath.mockResolvedValue(filePath as unknown as string);
+
+    handleWebCommand({ type: 'fs.write', path: filePath, content: '', requestId: 'req-existing-create-only', createOnly: true }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockWriteFile).not.toHaveBeenCalled();
+    expect(sent[0]).toMatchObject({
+      type: 'fs.write_response',
+      requestId: 'req-existing-create-only',
+      status: 'error',
+      error: FS_WRITE_ERROR.FILE_EXISTS,
+    });
+  });
+
+  it('reports file_exists if a createOnly write loses the creation race', async () => {
+    const filePath = path.join(homedir(), 'race-create-only.txt');
+    const parentPath = path.dirname(filePath);
+
+    mockStat.mockRejectedValueOnce(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+    mockRealpath.mockResolvedValueOnce(parentPath as unknown as string);
+    mockWriteFile.mockRejectedValueOnce(Object.assign(new Error('EEXIST: file already exists'), { code: 'EEXIST' }));
+
+    handleWebCommand({ type: 'fs.write', path: filePath, content: '', requestId: 'req-create-race', createOnly: true }, mockServerLink as any);
+    await flushAsync();
+
+    expect(sent[0]).toMatchObject({
+      type: 'fs.write_response',
+      requestId: 'req-create-race',
+      status: 'error',
+      error: FS_WRITE_ERROR.FILE_EXISTS,
+    });
+  });
+
+  it('sanitizes unexpected write errors instead of returning raw host paths', async () => {
+    const filePath = path.join(homedir(), 'raw-error.txt');
+    const rawError = new Error(`EACCES: permission denied, open '${path.join(homedir(), '.ssh', 'id_rsa')}'`);
+
+    mockStat.mockResolvedValue({ mtimeMs: 1000 } as fsp.Stats);
+    mockRealpath.mockResolvedValue(filePath as unknown as string);
+    mockWriteFile.mockRejectedValue(rawError);
+
+    handleWebCommand({ type: 'fs.write', path: filePath, content: 'updated', requestId: 'req-raw-error' }, mockServerLink as any);
+    await flushAsync();
+
+    expect(sent[0]).toMatchObject({
+      type: 'fs.write_response',
+      requestId: 'req-raw-error',
+      status: 'error',
+      error: FS_GENERIC_ERROR_CODES.INTERNAL_ERROR,
+    });
+    expect(JSON.stringify(sent[0])).not.toContain('.ssh');
+    expect(JSON.stringify(sent[0])).not.toContain('EACCES');
+  });
+
   it('returns invalid_request error (not silent hang) when path is missing', async () => {
     handleWebCommand({ type: 'fs.write', content: 'hello', requestId: 'req-no-path' }, mockServerLink as any);
     await flushAsync();
@@ -207,6 +296,27 @@ describe('fs.write handler', () => {
       status: 'error',
       error: 'forbidden_path',
     });
+  });
+
+  it('fails closed when a new target appears as a symlink after the initial existence check', async () => {
+    const filePath = path.join(homedir(), 'new-link-to-secret.txt');
+    const parentPath = path.dirname(filePath);
+
+    mockStat.mockRejectedValueOnce(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+    mockRealpath.mockResolvedValueOnce(parentPath as unknown as string);
+    mockLstat.mockResolvedValueOnce({ isSymbolicLink: () => true } as fsp.Stats);
+
+    handleWebCommand({ type: 'fs.write', path: filePath, content: 'evil', requestId: 'req-new-symlink' }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockWriteFile).not.toHaveBeenCalled();
+    expect(sent[0]).toMatchObject({
+      type: 'fs.write_response',
+      requestId: 'req-new-symlink',
+      status: 'error',
+      error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH,
+    });
+    expect(JSON.stringify(sent[0])).not.toContain('.ssh');
   });
 });
 

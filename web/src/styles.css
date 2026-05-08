@@ -660,7 +660,7 @@ body {
 .qp-trigger { padding: 6px 9px; background: #0f172a; border: 1px solid #334155; border-radius: 4px; color: #fbbf24; font-size: 14px; cursor: pointer; line-height: 1; transition: all 0.1s; flex-shrink: 0; }
 .qp-trigger:hover { background: #1e3a5f; border-color: #fbbf24; }
 .qp-backdrop { display: none; }
-.qp { position: absolute; bottom: calc(100% + 6px); left: 0; width: min(75vw, 1050px); max-height: 65vh; background: #1e293b; border: 1px solid #334155; border-radius: 8px; box-shadow: 0 8px 24px #00000070; z-index: 10002; display: flex; flex-direction: column; overflow: hidden; }
+.qp { position: absolute; bottom: calc(100% + 6px); left: 0; width: min(75vw, 1050px); max-height: min(78vh, 760px); background: #1e293b; border: 1px solid #334155; border-radius: 8px; box-shadow: 0 8px 24px #00000070; z-index: 10002; display: flex; flex-direction: column; overflow: hidden; }
 .qp-toolbar { display: flex; gap: 6px; padding: 8px 10px; border-bottom: 1px solid #334155; flex-shrink: 0; }
 .qp-toolbar-btn { padding: 4px 10px; background: #0f172a; border: 1px solid #334155; border-radius: 4px; color: #94a3b8; font-size: 11px; font-family: inherit; cursor: pointer; transition: all 0.1s; }
 .qp-toolbar-btn:hover { background: #1e3a5f; border-color: #3b82f6; color: #93c5fd; }
@@ -674,7 +674,7 @@ body {
 .qp-add-confirm:hover { background: #2563eb; }
 .qp-add-cancel { padding: 4px 6px; background: none; border: none; color: #64748b; font-size: 13px; cursor: pointer; }
 .qp-add-cancel:hover { color: #f87171; }
-.qp-list { flex: 1; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #334155 transparent; }
+.qp-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #334155 transparent; }
 .qp-section-header { padding: 6px 10px 3px; font-size: 10px; font-weight: 700; color: #475569; letter-spacing: 0.08em; text-transform: uppercase; position: sticky; top: 0; background: #1e293b; z-index: 1; }
 .qp-history-empty { padding: 6px 10px 8px; font-size: 11px; color: #475569; font-style: italic; }
 .qp-history-header { display: flex; align-items: center; justify-content: space-between; padding-right: 8px; }
@@ -714,7 +714,7 @@ body {
 /* Mobile responsive */
 @media (max-width: 640px) {
   .qp-backdrop { display: block; position: fixed; inset: 0; background: #00000070; z-index: 10001; }
-  .qp { position: fixed; bottom: 0; left: 0; right: 0; width: 100%; max-height: 60vh; border-radius: 12px 12px 0 0; border-bottom: none; }
+  .qp { position: fixed; bottom: 0; left: 0; right: 0; width: 100%; max-height: min(82vh, calc(var(--vvh, 100dvh) - var(--sat, 0px) - 72px)); border-radius: 12px 12px 0 0; border-bottom: none; }
 }
 
 /* Login */
@@ -815,7 +815,16 @@ body {
    message in chat history for the full content. */
 .chat-pinned-last-sent.chat-pinned-expanded .chat-pinned-last-sent-text { -webkit-line-clamp: 3; line-clamp: 3; }
 .chat-view { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 8px 12px; display: flex; flex-direction: column; gap: 2px; scrollbar-width: thin; scrollbar-color: #6366f1 #1e293b; overflow-anchor: none; }
-.chat-view-preview { justify-content: flex-end; }
+/* In sub-session cards `.subcard-preview` (parent) owns the scrollbar. If
+   `.chat-view` ALSO scrolls (default rule above), every new event triggers
+   two independent scrollTop writes — one from ChatView's preview-mode auto-
+   follow, one from SubSessionCard.forceFollowLatest — and near the bottom
+   they oscillate against each other, producing the "infinite up/down jitter"
+   reported when card height ≈ content height. Force `.chat-view-preview`
+   to stop being a scroll container so the only scroll surface is
+   `.subcard-preview`. `justify-content: flex-end` keeps content pinned to
+   bottom inside the bounded card, just like before. */
+.chat-view-preview { overflow-y: visible; overflow-x: visible; justify-content: flex-end; }
 .chat-view::-webkit-scrollbar { width: 5px; }
 .chat-view::-webkit-scrollbar-track { background: #1e293b; border-radius: 3px; }
 .chat-view::-webkit-scrollbar-thumb { background: linear-gradient(180deg, #3b82f6, #6366f1, #3b82f6); border-radius: 3px; box-shadow: 0 0 8px #6366f1cc; }
@@ -852,12 +861,13 @@ body {
 .chat-code-block { background: #1a1a2e; border-radius: 8px; margin: 8px 0; overflow: hidden; }
 .chat-code-block pre { margin: 0; padding: 12px; overflow-x: auto; -webkit-overflow-scrolling: touch; font-size: 13px; line-height: 1.4; }
 .chat-code-block code { font-family: 'Cascadia Code', 'Fira Code', 'SF Mono', monospace; color: #e2e8f0; }
-.chat-code-header { display: flex; align-items: center; justify-content: space-between; background: #2a2a4a; }
-.chat-code-header .chat-code-lang { background: transparent; padding: 4px 12px; }
+.chat-code-header { display: flex; align-items: center; background: #2a2a4a; padding: 3px 6px; }
+.chat-code-titlebar { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; }
+.chat-code-header .chat-code-lang { background: transparent; padding: 2px 6px; }
 .chat-code-lang { background: #2a2a4a; color: #94a3b8; font-size: 11px; padding: 4px 12px; font-family: sans-serif; }
-.chat-code-copy-btn { display: inline-flex; align-items: center; justify-content: center; background: transparent; color: #94a3b8; border: none; padding: 4px 10px; cursor: pointer; line-height: 0; transition: color 0.15s; -webkit-tap-highlight-color: transparent; }
-.chat-code-copy-btn:hover { color: #e2e8f0; }
-.chat-code-copy-btn.is-copied { color: #34d399; }
+.chat-code-copy-btn { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; background: rgba(15,23,42,0.28); color: #94a3b8; border: 1px solid rgba(148,163,184,0.18); border-radius: 6px; padding: 0; cursor: pointer; line-height: 0; transition: color 0.15s, background 0.15s, border-color 0.15s; -webkit-tap-highlight-color: transparent; }
+.chat-code-copy-btn:hover { color: #e2e8f0; background: rgba(15,23,42,0.58); border-color: rgba(148,163,184,0.36); }
+.chat-code-copy-btn.is-copied { color: #34d399; background: rgba(16,185,129,0.12); border-color: rgba(52,211,153,0.32); }
 .chat-code-copy-btn svg { display: block; }
 .chat-inline-code { background: #1e293b; color: #93c5fd; padding: 1px 5px; border-radius: 3px; font-family: 'Cascadia Code', 'Fira Code', 'SF Mono', monospace; font-size: 0.9em; }
 .chat-tool { color: #94a3b8; font-size: 14px; line-height: 1.6; min-height: 28px; padding: 6px 10px; background: #1e293b; border-radius: 6px; border-left: 3px solid #3b82f6; overflow: visible; white-space: normal; word-break: break-all; flex-shrink: 0; }
@@ -970,7 +980,7 @@ body {
 @keyframes thinking-pulse { 0%, 100% { opacity: 0.3; } 50% { opacity: 1; } }
 .chat-bubble-content { white-space: pre-wrap; word-break: break-word; }
 .chat-bubble-time { font-size: 10px; color: #64748b; margin-top: 2px; }
-.chat-sel-menu { position: absolute; transform: translate(-50%, calc(-100% - 8px)); z-index: 20; pointer-events: auto; display: flex; gap: 4px; }
+.chat-sel-menu { position: absolute; z-index: 20; pointer-events: auto; display: flex; flex-wrap: wrap; gap: 4px; max-width: calc(100% - 16px); box-sizing: border-box; }
 /* Mobile: disable native text selection/callout in chat — custom long-press timer handles Copy/Quote. */
 @media (pointer: coarse) { .chat-view { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; } }
 .chat-sel-btn { background: #1e293b; border: 1px solid #475569; color: #e2e8f0; font-size: 13px; padding: 5px 14px; border-radius: 6px; cursor: pointer; font-family: inherit; white-space: nowrap; box-shadow: 0 4px 12px rgba(0,0,0,0.4); transition: background 0.15s; }
@@ -992,6 +1002,8 @@ body {
 .view-toggle:hover { background: #334155; }
 .desktop-view-toggle { display: flex; justify-content: flex-end; padding: 2px 8px; background: #0f172a; gap: 4px; }
 .desktop-view-toggle .view-toggle { font-size: 12px; padding: 2px 8px; }
+.desktop-view-toggle .desktop-main-maximize-toggle { display: inline-flex; align-items: center; justify-content: center; min-width: 34px; }
+.desktop-workspace-maximized { box-shadow: inset 0 0 0 2px #3b82f6, inset 0 0 0 3px rgba(96,165,250,0.35); }
 .desktop-fb-float { position: fixed; z-index: 1500; display: flex; flex-direction: column; background: #0f172a; border: 1px solid #334155; border-radius: 8px; box-shadow: 0 8px 32px rgba(0,0,0,0.5); overflow: hidden; }
 .desktop-fb-titlebar { display: flex; align-items: center; justify-content: space-between; padding: 6px 10px; border-bottom: 1px solid #334155; cursor: grab; flex-shrink: 0; user-select: none; }
 .desktop-fb-titlebar:active { cursor: grabbing; }
@@ -1122,6 +1134,7 @@ body {
 
 /* ── Sub-session window ───────────────────────────────────────────────────── */
 .subsession-window { display: flex; flex-direction: column; background: #0f1117; border: 1px solid #334155; border-radius: 8px; box-shadow: 0 8px 32px rgba(0,0,0,0.6); overflow: hidden; min-width: 300px; min-height: 200px; isolation: isolate; }
+.subsession-window-maximized { border: 2px solid #3b82f6; box-shadow: 0 0 0 1px rgba(96,165,250,0.45), 0 8px 32px rgba(0,0,0,0.6); box-sizing: border-box; }
 .subsession-header { display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: #1a2233; border-bottom: 1px solid #1e293b; cursor: move; user-select: none; flex-shrink: 0; }
 .subsession-drag-icon { color: #475569; font-size: 16px; cursor: grab; }
 .subsession-title { font-size: 12px; color: #94a3b8; font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1326,8 +1339,8 @@ body {
 .discussion-filepath { font-size: 11px; color: #64748b; margin-top: 4px; font-family: monospace; }
 
 /* ── Discussions Page ──────────────────────────────────────────────────── */
-.discussions-page { display: flex; flex: 1; min-height: 0; flex-direction: column; height: 100%; background: #0a0e1a; color: #e2e8f0; }
-.discussions-layout { display: flex; flex: 1; overflow: hidden; }
+.discussions-page { display: flex; flex: 1; min-width: 0; min-height: 0; flex-direction: column; height: 100%; background: #0a0e1a; color: #e2e8f0; }
+.discussions-layout { display: flex; flex: 1; min-width: 0; min-height: 0; overflow: hidden; }
 .discussions-list { width: 320px; min-width: 280px; border-right: 1px solid #1e293b; overflow-y: auto; }
 .discussions-list-item { padding: 12px 16px; border-bottom: 1px solid #1e293b10; cursor: pointer; transition: background 0.15s; }
 .discussions-list-item:hover { background: #1e293b60; }
@@ -1703,14 +1716,17 @@ body {
 }
 .discussions-progress-node.is-skipped { color: #f87171; border-color: rgba(248, 113, 113, 0.3); }
 .discussions-progress-node.is-pending { color: #64748b; }
-.discussions-detail { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
-.discussions-detail-scroll { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior-x: contain; }
+.discussions-detail { position: relative; flex: 1 1 auto; min-width: 0; max-width: 100%; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+.discussions-detail-scroll { flex: 1; width: 100%; max-width: 100%; min-width: 0; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior-x: contain; }
 .discussions-file-preview {
   width: 100%;
+  max-width: 100%;
   min-width: 0;
   overflow-x: hidden;
 }
 .discussions-file-preview .fb-preview-md {
+  box-sizing: border-box;
+  width: 100%;
   min-width: 0;
   max-width: 100%;
   overflow-x: hidden;
@@ -1718,14 +1734,36 @@ body {
   word-break: break-word;
   overflow-wrap: anywhere;
 }
-.discussions-file-preview .fb-preview-md pre,
-.discussions-file-preview .fb-preview-md table {
+.discussions-file-preview .fb-preview-md * {
   max-width: 100%;
-  overflow-x: auto;
+}
+.discussions-file-preview .fb-preview-md p,
+.discussions-file-preview .fb-preview-md li,
+.discussions-file-preview .fb-preview-md blockquote,
+.discussions-file-preview .fb-preview-md code,
+.discussions-file-preview .fb-preview-md pre,
+.discussions-file-preview .fb-preview-md pre code {
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+.discussions-file-preview .fb-preview-md pre {
+  max-width: 100%;
+  overflow-x: hidden;
   -webkit-overflow-scrolling: touch;
 }
 .discussions-file-preview .fb-preview-md table {
-  display: block;
+  display: table;
+  width: 100%;
+  max-width: 100%;
+  table-layout: fixed;
+  overflow-wrap: anywhere;
+}
+.discussions-file-preview .fb-preview-md th,
+.discussions-file-preview .fb-preview-md td {
+  white-space: normal;
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 .discussions-file-preview .fb-preview-md img {
   max-width: 100%;
@@ -1736,6 +1774,10 @@ body {
   align-items: center;
   flex-wrap: wrap;
   gap: 8px;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
   padding: 10px 16px;
   flex-shrink: 0;
   position: sticky;
@@ -1753,6 +1795,7 @@ body {
   justify-content: flex-end;
   gap: 10px;
   min-width: 0;
+  max-width: 100%;
 }
 .discussions-back-btn { background: none; border: none; color: #3b82f6; cursor: pointer; padding: 0; font-size: 14px; line-height: 1.2; text-align: left; }
 @media (min-width: 769px) { .discussions-back-btn { display: none; } }
@@ -2001,9 +2044,20 @@ body {
 .fb-files-and-changes.fb-tree-split { flex: 0 0 38%; min-width: 180px; border-right: 1px solid #334155; overflow: hidden; }
 .fb-files-and-changes .fb-tree { flex: 3; overflow-y: auto; min-height: 0; }
 .fb-body-split .fb-files-and-changes { border-right: 1px solid #334155; }
-/* Git changes section */
-.fb-changes-section { border-top: 1px solid #1e293b; flex: 1; max-height: 25%; overflow: hidden; display: flex; flex-direction: column; }
-.fb-body > .fb-changes-section { max-height: none; flex: 1; border-top: none; }
+/* Git changes section.
+   Currently always the sole content of its container — directly under
+   `.fb-body` when no preview is split, inside `.fb-tree.fb-tree-split`
+   when a preview pane is open. The earlier `max-height: 25%` cap was
+   for the old layout where the section sat alongside the file tree
+   inside `.fb-files-and-changes` (embedded use removed in commit
+   6c3c1169). With no sibling to share space with, the cap just clipped
+   the list to ~10 items because `.fb-changes-section` is also
+   `overflow: hidden` — hiding everything past the cap even though
+   `.fb-changes-list` is `overflow-y: auto`. Let the section fill its
+   container so the list scrolls naturally. */
+.fb-changes-section { flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
+.fb-tree.fb-changes-tree { display: flex; flex-direction: column; overflow: hidden; padding: 0; }
+.fb-tree.fb-changes-tree > .fb-changes-section { flex: 1; min-height: 0; }
 .fb-changes-header { display: flex; align-items: center; justify-content: space-between; padding: 5px 10px; background: #0f172a; flex-shrink: 0; }
 .fb-changes-title { font-size: 11px; font-weight: 600; color: #64748b; text-transform: uppercase; letter-spacing: .05em; }
 .fb-changes-refresh { background: none; border: none; color: #64748b; cursor: pointer; font-size: 14px; padding: 0 4px; }
@@ -2038,8 +2092,12 @@ body {
 .fb-nav-hidden-toggle { display: flex; align-items: center; gap: 3px; color: #475569; font-size: 11px; cursor: pointer; flex-shrink: 0; user-select: none; }
 .fb-nav-hidden-toggle:hover { color: #94a3b8; }
 .fb-nav-hidden-toggle input { cursor: pointer; accent-color: #6366f1; }
-.fb-new-folder-btn { background: none; border: 1px dashed #334155; color: #64748b; font-size: 12px; padding: 0 6px; cursor: pointer; border-radius: 4px; flex-shrink: 0; line-height: 18px; }
-.fb-new-folder-btn:hover { color: #94a3b8; border-color: #475569; }
+.fb-create-btn { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 20px; background: #111827; border: 1px solid #334155; color: #94a3b8; font-size: 13px; cursor: pointer; border-radius: 5px; flex-shrink: 0; line-height: 1; }
+.fb-create-btn::before { content: ""; position: absolute; left: 4px; top: 4px; width: 8px; height: 10px; border: 1px solid currentColor; border-radius: 1px; opacity: 0.55; }
+.fb-create-folder-btn::before { top: 6px; width: 10px; height: 7px; border-radius: 2px; }
+.fb-create-folder-btn::after { content: ""; position: absolute; left: 4px; top: 4px; width: 6px; height: 3px; border-radius: 2px 2px 0 0; background: currentColor; opacity: 0.45; }
+.fb-create-btn:hover { color: #e2e8f0; border-color: #475569; background: #172033; }
+.fb-create-btn:active { transform: translateY(1px); }
 .fb-new-folder-bar { display: flex; gap: 6px; padding: 4px 12px; align-items: center; }
 .fb-new-folder-bar input { flex: 1; background: #0f172a; border: 1px solid #334155; color: #e2e8f0; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-family: inherit; }
 .fb-tree { flex: 1; overflow-y: auto; padding: 4px 0; min-height: 0; }
@@ -2176,10 +2234,35 @@ body {
 .hljs-addition { color: #c3e88d; background: rgba(195,232,141,0.1); }
 .hljs-deletion { color: #f07178; background: rgba(240,113,120,0.1); }
 /* QuickInputPanel files tab */
-.qp-tabs { display: flex; border-bottom: 1px solid #334155; flex-shrink: 0; }
-.qp-tab { flex: 1; padding: 6px 4px; background: none; border: none; color: #64748b; font-size: 12px; cursor: pointer; font-family: inherit; border-bottom: 2px solid transparent; transition: all 0.15s; }
-.qp-tab.active { color: #e2e8f0; border-bottom-color: #6366f1; }
-.qp-tab:hover:not(.active) { color: #94a3b8; }
+.qp-tabs {
+  display: flex;
+  background: linear-gradient(180deg, rgba(15,23,42,0.24), rgba(30,41,59,0));
+  border-bottom: 1px solid #334155;
+  flex-shrink: 0;
+}
+.qp-tab {
+  flex: 1;
+  padding: 7px 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+  font-family: inherit;
+  border-bottom: 2px solid transparent;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+.qp-tab.active {
+  color: #e2e8f0;
+  background: rgba(99,102,241,0.08);
+  border-bottom-color: #6366f1;
+}
+.qp-tab:hover:not(.active) { background: rgba(148,163,184,0.06); color: #94a3b8; }
 /* inline path links in chat */
 .chat-path-link { color: #818cf8; cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
 .chat-path-link:hover { color: #a5b4fc; }
@@ -2187,6 +2270,93 @@ body {
 .chat-dl-btn:hover { color: #818cf8; }
 .chat-external-link { color: #60a5fa; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
 .chat-external-link:hover { color: #93c5fd; }
+.external-link-overlay {
+  background:
+    radial-gradient(circle at 50% 0%, rgba(59,130,246,0.18), transparent 34%),
+    rgba(2,6,23,0.76);
+  backdrop-filter: blur(6px);
+}
+.external-link-dialog {
+  width: min(460px, calc(100vw - 32px));
+  max-height: calc(100vh - var(--sat, 0px) - env(safe-area-inset-bottom, 0px) - 32px);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px;
+  background: #0f172a;
+  border: 1px solid rgba(100,116,139,0.55);
+  border-radius: 10px;
+  box-shadow: 0 24px 80px rgba(0,0,0,0.52), inset 0 1px 0 rgba(255,255,255,0.04);
+}
+.external-link-heading { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.external-link-icon {
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  border-radius: 8px;
+  background: rgba(37,99,235,0.16);
+  border: 1px solid rgba(96,165,250,0.28);
+  color: #93c5fd;
+  font-size: 15px;
+}
+.external-link-title {
+  min-width: 0;
+  color: #f1f5f9;
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1.25;
+}
+.external-link-url {
+  max-height: 108px;
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid rgba(51,65,85,0.9);
+  border-radius: 8px;
+  background: #020617;
+  color: #bfdbfe;
+  font-size: 12px;
+  line-height: 1.45;
+  font-family: 'Menlo', 'Monaco', 'Consolas', monospace;
+  overflow-wrap: anywhere;
+  scrollbar-width: thin;
+}
+.external-link-warning {
+  padding: 9px 11px;
+  border-radius: 8px;
+  background: rgba(245,158,11,0.10);
+  border: 1px solid rgba(245,158,11,0.22);
+  color: #fbbf24;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.external-link-actions { display: flex; justify-content: flex-end; gap: 8px; padding-top: 2px; }
+.external-link-btn {
+  border: 1px solid #334155;
+  border-radius: 7px;
+  background: #1e293b;
+  color: #cbd5e1;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 7px 12px;
+}
+.external-link-btn:hover { border-color: #475569; color: #f8fafc; background: #253348; }
+.external-link-btn-primary {
+  border-color: rgba(96,165,250,0.5);
+  background: #2563eb;
+  color: #eff6ff;
+}
+.external-link-btn-primary:hover { background: #1d4ed8; border-color: rgba(147,197,253,0.72); }
+@media (max-width: 520px) {
+  .external-link-dialog { width: calc(100vw - 24px); padding: 16px; }
+  .external-link-actions { flex-direction: column-reverse; }
+  .external-link-btn { width: 100%; }
+}
 /* GFM tables in chat */
 .chat-table { border-collapse: collapse; margin: 8px 0; font-size: 13px; width: auto; max-width: 100%; overflow-x: auto; display: block; }
 .chat-table th, .chat-table td { border: 1px solid #334155; padding: 4px 10px; text-align: left; white-space: nowrap; }

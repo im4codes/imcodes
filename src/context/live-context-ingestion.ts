@@ -6,6 +6,8 @@ import type { TransportContextBootstrap } from '../agent/runtime-context-bootstr
 import { MaterializationCoordinator, type MaterializationCoordinatorOptions } from './materialization-coordinator.js';
 import { isMemoryNoiseTurn } from '../../shared/memory-noise-patterns.js';
 import { createMemoryConfigResolver, rememberMemoryConfigProjectDir } from './memory-config-resolver.js';
+import { scheduleMarkdownMemoryIngest } from './md-ingest-worker.js';
+import { subscribeRuntimeMemoryCacheInvalidation } from './runtime-memory-cache-bus.js';
 
 const BOOTSTRAP_CACHE_MS = 30_000;
 
@@ -45,6 +47,7 @@ export class LiveContextIngestion {
   private readonly onError?: LiveContextIngestionOptions['onError'];
   private readonly sessionWork = new Map<string, Promise<void>>();
   private readonly bootstrapCache = new Map<string, BootstrapCacheEntry>();
+  private readonly unsubscribeCacheInvalidation: () => void;
 
   constructor(options: LiveContextIngestionOptions) {
     const memoryConfigResolver = options.memoryConfigResolver ?? (options.memoryConfig ? undefined : createMemoryConfigResolver({
@@ -61,6 +64,9 @@ export class LiveContextIngestion {
     this.sessionLookup = options.sessionLookup;
     this.resolveBootstrap = options.resolveBootstrap;
     this.onError = options.onError;
+    this.unsubscribeCacheInvalidation = subscribeRuntimeMemoryCacheInvalidation(() => {
+      this.bootstrapCache.clear();
+    });
   }
 
   handleTimelineEvent(event: TimelineEvent): Promise<void> {
@@ -73,6 +79,12 @@ export class LiveContextIngestion {
       });
     this.sessionWork.set(event.sessionId, next);
     return next;
+  }
+
+  dispose(): void {
+    this.unsubscribeCacheInvalidation();
+    this.bootstrapCache.clear();
+    this.sessionWork.clear();
   }
 
   async flushDueTargets(now = Date.now()): Promise<void> {
@@ -129,6 +141,16 @@ export class LiveContextIngestion {
       return;
     }
 
+    if (event.type === 'tool.result') {
+      const filteredReason = toolResultEvidenceFilteredReason(event);
+      if (filteredReason) {
+        this.coordinator.recordFilteredSkillReviewToolIteration(filteredReason);
+      } else {
+        this.coordinator.recordSkillReviewToolIteration(target);
+      }
+      return;
+    }
+
     const mapped = mapTimelineEvent(event);
     if (!mapped) return;
     const result = this.coordinator.ingestEvent({
@@ -152,6 +174,7 @@ export class LiveContextIngestion {
     }
     const value = await this.resolveBootstrap(session);
     rememberMemoryConfigProjectDir(value.namespace, session.projectDir);
+    scheduleMarkdownMemoryIngest({ projectDir: session.projectDir, namespace: value.namespace });
     this.bootstrapCache.set(session.name, {
       recordUpdatedAt: session.updatedAt,
       expiresAt: Date.now() + BOOTSTRAP_CACHE_MS,
@@ -169,6 +192,16 @@ export class LiveContextIngestion {
   private hasAnyActivity(target: ContextTargetRef): boolean {
     return this.hasDirtyTarget(target) || listProcessedProjections(target.namespace).length > 0;
   }
+}
+
+
+function toolResultEvidenceFilteredReason(event: TimelineEvent): 'hidden' | 'error' | null {
+  if (event.hidden === true || event.payload.hidden === true) return 'hidden';
+  if (event.payload.error !== undefined && event.payload.error !== null && event.payload.error !== false) return 'error';
+  const exitCode = event.payload.exit_code ?? event.payload.exitCode ?? event.payload.code;
+  if (typeof exitCode === 'number' && exitCode !== 0) return 'error';
+  if (event.payload.success === false) return 'error';
+  return null;
 }
 
 function toSessionTarget(sessionName: string, bootstrap: TransportContextBootstrap): ContextTargetRef {

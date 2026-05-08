@@ -256,4 +256,52 @@ describe('TerminalView', () => {
     expect(Array.from(mockWrite.mock.calls[0][0] as Uint8Array)).toEqual([65, 66]);
     expect(mockScrollToBottom).toHaveBeenCalledOnce();
   });
+
+  it('sends clipboard text to the session when pasting into the terminal', async () => {
+    const { Terminal } = await import('xterm');
+    const mockFocus = vi.fn();
+    (Terminal as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      open: vi.fn(),
+      write: vi.fn(),
+      reset: vi.fn(),
+      loadAddon: vi.fn(),
+      dispose: vi.fn(),
+      options: {},
+      attachCustomKeyEventHandler: vi.fn(),
+      hasSelection: vi.fn().mockReturnValue(false),
+      getSelection: vi.fn().mockReturnValue(''),
+      onData: vi.fn(),
+      onResize: vi.fn(),
+      onScroll: vi.fn(),
+      focus: mockFocus,
+      scrollToBottom: vi.fn(),
+      buffer: { active: { baseY: 0, viewportY: 0 } },
+      cols: 80,
+      rows: 24,
+    }));
+    const sendInput = vi.fn();
+
+    const { container } = render(
+      <TerminalView
+        sessionName="paste-session"
+        ws={{
+          sendInput,
+          onTerminalRaw: vi.fn(() => vi.fn()),
+          onMessage: vi.fn(() => vi.fn()),
+        } as any}
+      />,
+    );
+    const terminal = container.querySelector('.terminal-container') as HTMLElement;
+    Object.defineProperty(terminal, 'clientWidth', { value: 640, configurable: true });
+    Object.defineProperty(terminal, 'clientHeight', { value: 360, configurable: true });
+    const event = new Event('paste', { bubbles: true, cancelable: true }) as ClipboardEvent;
+    Object.defineProperty(event, 'clipboardData', {
+      value: { getData: vi.fn(() => 'echo pasted\n') },
+    });
+    terminal.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(mockFocus).toHaveBeenCalled();
+    expect(sendInput).toHaveBeenCalledWith('paste-session', 'echo pasted\n');
+  });
 });

@@ -17,8 +17,10 @@ import { sha256Hex, randomHex } from '../security/crypto.js';
 import { requireAuth } from '../security/authorization.js';
 import { z } from 'zod';
 import type {
+  ContextMemoryProjectView,
   ContextMemoryRecordView,
   ContextMemoryStatsView,
+  ContextMemoryView,
   ProcessedContextReplicationBody,
   RuntimeAuthoredContextBinding,
   SharedContextNamespaceResolution,
@@ -33,20 +35,54 @@ import {
 import { searchSemanticMemoryView } from '../util/semantic-memory-view.js';
 import { deletePersonalMemoryProjection } from '../util/memory-delete.js';
 import { isMemoryNoiseSummary } from '../../../shared/memory-noise-patterns.js';
+import { MEMORY_ORIGINS } from '../../../shared/memory-origin.js';
+import { OBSERVATION_CLASSES } from '../../../shared/memory-observation.js';
+import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
+import {
+  SYNCED_PROJECTION_MEMORY_SCOPES,
+  type AuthoredContextScope,
+  type SharedContextProjectionScope,
+} from '../../../shared/memory-scope.js';
+import { computeProjectionContentHash } from '../memory/citation.js';
 import { SUPERVISION_USER_DEFAULT_PREF_KEY } from '../../../shared/supervision-config.js';
+import {
+  MEMORY_FEATURE_CONFIG_PREF_KEY,
+  parseMemoryFeatureFlagValuesJson,
+} from '../../../shared/feature-flags.js';
+import {
+  authoredContextScopeForBinding,
+  expandSearchRequestScope,
+  compareRuntimeAuthoredContextBindings,
+  isMemoryFeatureEnabled,
+  isSearchRequestScope,
+  matchesAuthoredContextPathPattern,
+  MEMORY_FEATURES,
+  sameShapeMemoryLookupEnvelope,
+  sameShapeSearchEnvelope,
+} from '../memory/scope-policy.js';
 
 export const serverRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
+
+const OWNER_PRIVATE_MAX_RECORDS = 100;
+const OWNER_PRIVATE_MAX_TEXT_BYTES = 32 * 1024;
+const OWNER_PRIVATE_MAX_CONTENT_BYTES = 128 * 1024;
+const OWNER_PRIVATE_MAX_QUERY_CHARS = 512;
+
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
 
 const processedProjectionSchema = z.object({
   id: z.string().min(1),
   namespace: z.object({
-    scope: z.enum(['personal', 'project_shared', 'workspace_shared', 'org_shared']),
+    scope: z.enum(SYNCED_PROJECTION_MEMORY_SCOPES),
     projectId: z.string().min(1),
     userId: z.string().optional(),
     workspaceId: z.string().optional(),
     enterpriseId: z.string().optional(),
   }),
   class: z.enum(['recent_summary', 'durable_memory_candidate']),
+  origin: z.enum(MEMORY_ORIGINS),
   sourceEventIds: z.array(z.string()),
   summary: z.string(),
   content: z.record(z.string(), z.unknown()),
@@ -57,6 +93,42 @@ const processedProjectionSchema = z.object({
 const processedReplicationSchema = z.object({
   namespace: processedProjectionSchema.shape.namespace,
   projections: z.array(processedProjectionSchema).min(1),
+});
+
+const ownerPrivateRecordSchema = z.object({
+  id: z.string().min(1).optional(),
+  kind: z.enum(OBSERVATION_CLASSES),
+  origin: z.enum(MEMORY_ORIGINS),
+  fingerprint: z.string().min(1).max(256),
+  text: z.string().min(1).refine((value) => utf8Bytes(value) <= OWNER_PRIVATE_MAX_TEXT_BYTES, {
+    message: 'text_too_large',
+  }),
+  content: z.record(z.string(), z.unknown()).optional().default({}),
+  idempotencyKey: z.string().min(1).max(256).optional(),
+  createdAt: z.number().finite().optional(),
+  updatedAt: z.number().finite().optional(),
+}).superRefine((record, ctx) => {
+  if (utf8Bytes(JSON.stringify(record.content)) > OWNER_PRIVATE_MAX_CONTENT_BYTES) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['content'],
+      message: 'content_too_large',
+    });
+  }
+});
+
+const ownerPrivateReplicationSchema = z.object({
+  namespace: z.object({
+    scope: z.literal('user_private'),
+    userId: z.string().optional(),
+  }),
+  records: z.array(ownerPrivateRecordSchema).min(1).max(OWNER_PRIVATE_MAX_RECORDS),
+});
+
+const ownerPrivateSearchSchema = z.object({
+  query: z.string().trim().max(OWNER_PRIVATE_MAX_QUERY_CHARS).optional().default(''),
+  scope: z.unknown().optional(),
+  limit: z.number().finite().min(1).max(100).optional().default(20),
 });
 
 const authoredContextQuerySchema = z.object({
@@ -119,18 +191,43 @@ type MemoryStatsRow = {
   project_count?: number | null;
 };
 
+type MemoryProjectStatsRow = {
+  project_id: string;
+  total_records?: number | null;
+  recent_summary_count?: number | null;
+  durable_candidate_count?: number | null;
+  updated_at?: number | null;
+};
+
 type MemoryRecordRow = {
   id: string;
-  scope: 'personal' | 'project_shared' | 'workspace_shared' | 'org_shared';
+  scope: SharedContextProjectionScope;
   project_id: string;
   projection_class: 'recent_summary' | 'durable_memory_candidate';
   source_event_ids_json: string | string[];
   summary: string;
+  content_json?: string | Record<string, unknown> | null;
   updated_at: number;
   hit_count?: number | null;
   last_used_at?: number | null;
   status?: 'active' | 'archived' | null;
 };
+
+function parseRecordContent(raw: string | Record<string, unknown> | null | undefined): Record<string, unknown> {
+  if (!raw) return {};
+  if (typeof raw === 'object' && !Array.isArray(raw)) return raw;
+  if (typeof raw !== 'string') return {};
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
+}
+
+function metadataUserId(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
 
 function buildMemoryStatsView(
   row: MemoryStatsRow | null | undefined,
@@ -149,26 +246,73 @@ function buildMemoryStatsView(
 }
 
 function mapMemoryRecordRows(rows: MemoryRecordRow[]): ContextMemoryRecordView[] {
-  return rows.map((row) => ({
-    id: row.id,
-    scope: row.scope,
-    projectId: row.project_id,
-    summary: row.summary,
-    projectionClass: row.projection_class,
-    sourceEventCount: Array.isArray(row.source_event_ids_json)
-      ? row.source_event_ids_json.length
-      : JSON.parse(row.source_event_ids_json || '[]').length,
-    updatedAt: row.updated_at,
-    hitCount: row.hit_count ?? 0,
-    lastUsedAt: row.last_used_at ?? undefined,
-    status: row.status ?? 'active',
-  }));
+  return rows.map((row) => {
+    const content = parseRecordContent(row.content_json);
+    const ownerUserId = metadataUserId(content.ownerUserId) ?? metadataUserId(content.ownedByUserId) ?? metadataUserId(content.userId);
+    const createdByUserId = metadataUserId(content.createdByUserId) ?? metadataUserId(content.authorUserId) ?? ownerUserId;
+    return {
+      id: row.id,
+      scope: row.scope,
+      projectId: row.project_id,
+      ownerUserId,
+      createdByUserId,
+      updatedByUserId: metadataUserId(content.updatedByUserId) ?? createdByUserId,
+      summary: row.summary,
+      projectionClass: row.projection_class,
+      sourceEventCount: Array.isArray(row.source_event_ids_json)
+        ? row.source_event_ids_json.length
+        : JSON.parse(row.source_event_ids_json || '[]').length,
+      updatedAt: row.updated_at,
+      hitCount: row.hit_count ?? 0,
+      lastUsedAt: row.last_used_at ?? undefined,
+      status: row.status ?? 'active',
+    };
+  });
+}
+
+function mapMemoryProjectRows(rows: MemoryProjectStatsRow[]): ContextMemoryProjectView[] {
+  return rows
+    .filter((row) => row.project_id)
+    .map((row) => ({
+      projectId: row.project_id,
+      displayName: row.project_id,
+      totalRecords: row.total_records ?? 0,
+      recentSummaryCount: row.recent_summary_count ?? 0,
+      durableCandidateCount: row.durable_candidate_count ?? 0,
+      updatedAt: row.updated_at ?? undefined,
+    }));
+}
+
+function buildMemoryProjectsFromRows(rows: Array<Pick<MemoryProjectStatsRow, 'project_id'> & {
+  projection_class: 'recent_summary' | 'durable_memory_candidate';
+  updated_at: number;
+}>): ContextMemoryProjectView[] {
+  const projects = new Map<string, ContextMemoryProjectView>();
+  for (const row of rows) {
+    if (!row.project_id) continue;
+    const current = projects.get(row.project_id) ?? {
+      projectId: row.project_id,
+      displayName: row.project_id,
+      totalRecords: 0,
+      recentSummaryCount: 0,
+      durableCandidateCount: 0,
+      updatedAt: row.updated_at,
+    };
+    current.totalRecords += 1;
+    if (row.projection_class === 'recent_summary') current.recentSummaryCount += 1;
+    if (row.projection_class === 'durable_memory_candidate') current.durableCandidateCount += 1;
+    current.updatedAt = Math.max(current.updatedAt ?? 0, row.updated_at ?? 0) || undefined;
+    projects.set(row.project_id, current);
+  }
+  return Array.from(projects.values())
+    .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0) || b.totalRecords - a.totalRecords || a.projectId.localeCompare(b.projectId))
+    .slice(0, 200);
 }
 
 function buildRemoteMemoryResponse(
   rows: Array<{
     id: string;
-    scope: 'personal' | 'project_shared' | 'workspace_shared' | 'org_shared';
+    scope: SharedContextProjectionScope;
     project_id: string;
     projection_class: 'recent_summary' | 'durable_memory_candidate';
     source_event_ids_json: string | string[];
@@ -181,7 +325,7 @@ function buildRemoteMemoryResponse(
   }>,
   query?: string,
   limit = 20,
-): { stats: ContextMemoryStatsView; records: ContextMemoryRecordView[] } {
+): ContextMemoryView {
   const normalizedQuery = query?.trim() ?? '';
   const cleanRows = rows.filter((row) => !isMemoryNoiseSummary(row.summary));
   const filtered = cleanRows.filter((row) => matchesMemoryQuery(
@@ -198,6 +342,7 @@ function buildRemoteMemoryResponse(
       project_count: projectIds.size,
     }, filtered.length),
     records: mapMemoryRecordRows(filtered.slice(0, limit)),
+    projects: buildMemoryProjectsFromRows(cleanRows),
   };
 }
 
@@ -211,6 +356,7 @@ serverRoutes.get('/', requireAuth(), async (c) => {
     name: s.name,
     status: s.status,
     lastHeartbeatAt: s.last_heartbeat_at,
+    daemonVersion: s.daemon_version,
     createdAt: s.created_at,
   }));
 
@@ -237,7 +383,7 @@ serverRoutes.delete('/:id', requireAuth(), async (c) => {
 
   // Notify daemon to self-destruct (best-effort — daemon may be offline)
   try {
-    WsBridge.get(serverId).sendToDaemon(JSON.stringify({ type: 'server.delete' }));
+    WsBridge.get(serverId).sendToDaemon(JSON.stringify({ type: DAEMON_COMMAND_TYPES.SERVER_DELETE }));
   } catch { /* daemon may be offline, continue with DB deletion */ }
 
   const deleted = await deleteServer(c.env.DB, serverId, userId);
@@ -251,15 +397,21 @@ serverRoutes.post('/:id/upgrade', requireAuth(), async (c) => {
   const serverId = c.req.param('id') ?? '';
   const dbServers = await getServersByUserId(c.env.DB, userId);
   if (!dbServers.find((s) => s.id === serverId)) return c.json({ error: 'not_found' }, 404);
-  try {
-    WsBridge.get(serverId).sendToDaemon(JSON.stringify({
-      type: 'daemon.upgrade',
-      ...(process.env.APP_VERSION ? { targetVersion: process.env.APP_VERSION } : {}),
-    }));
-    return c.json({ ok: true });
-  } catch {
-    return c.json({ error: 'daemon_offline' }, 503);
+  const result = WsBridge.get(serverId).requestDaemonUpgrade({
+    targetVersion: process.env.APP_VERSION,
+    source: 'manual',
+  });
+  if (!result.ok) {
+    return c.json({ error: result.reason ?? 'upgrade_request_failed', deliveryStatus: result.deliveryStatus }, 400);
   }
+  return c.json({
+    ok: true,
+    upgradeId: result.upgradeId,
+    targetVersion: result.targetVersion,
+    deliveryStatus: result.deliveryStatus,
+    ...(result.nextAttemptAt ? { nextAttemptAt: result.nextAttemptAt } : {}),
+    ...(result.reason ? { reason: result.reason } : {}),
+  });
 });
 
 // POST /api/server/:id/heartbeat — authenticated via Bearer server token
@@ -276,7 +428,9 @@ serverRoutes.post('/:id/heartbeat', async (c) => {
   );
   if (!server) return c.json({ error: 'unauthorized' }, 401);
 
-  await updateServerHeartbeat(c.env.DB, serverId);
+  const body = await c.req.json().catch(() => null) as Record<string, unknown> | null;
+  const daemonVersion = typeof body?.daemonVersion === 'string' ? body.daemonVersion : undefined;
+  await updateServerHeartbeat(c.env.DB, serverId, daemonVersion);
   return c.json({ ok: true });
 });
 
@@ -494,12 +648,16 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
     const safeEnterpriseId = isPersonal ? null : (serverRow.team_id ?? projection.namespace.enterpriseId ?? null);
     const safeWorkspaceId = isPersonal ? null : (projection.namespace.workspaceId ?? null);
     const safeUserId = isPersonal ? serverRow.user_id : (projection.namespace.userId ?? null);
+    const contentHash = computeProjectionContentHash({
+      summary: projection.summary,
+      content: projection.content,
+    });
     await c.env.DB.execute(
       `INSERT INTO shared_context_projections (
         id, server_id, scope, enterprise_id, workspace_id, user_id, project_id,
         projection_class, source_event_ids_json, summary, content_json,
-        created_at, updated_at, replicated_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::jsonb, $12, $13, $14)
+        content_hash, origin, created_at, updated_at, replicated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::jsonb, $12, $13, $14, $15, $16)
       ON CONFLICT (id) DO UPDATE SET
         scope = excluded.scope,
         enterprise_id = excluded.enterprise_id,
@@ -510,6 +668,8 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
         source_event_ids_json = excluded.source_event_ids_json,
         summary = excluded.summary,
         content_json = excluded.content_json,
+        content_hash = excluded.content_hash,
+        origin = excluded.origin,
         created_at = excluded.created_at,
         updated_at = excluded.updated_at,
         replicated_at = excluded.replicated_at`,
@@ -525,6 +685,8 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
         JSON.stringify(projection.sourceEventIds),
         projection.summary,
         JSON.stringify(projection.content),
+        contentHash,
+        projection.origin,
         projection.createdAt,
         projection.updatedAt,
         now,
@@ -537,8 +699,8 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
       await c.env.DB.execute(
         `INSERT INTO shared_context_records (
           id, projection_id, server_id, scope, enterprise_id, workspace_id, user_id, project_id,
-          record_class, summary, content_json, status, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, 'candidate', $12, $13)
+          record_class, summary, content_json, status, origin, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, 'candidate', $12, $13, $14)
         ON CONFLICT (projection_id) DO UPDATE SET
           scope = excluded.scope,
           enterprise_id = excluded.enterprise_id,
@@ -548,6 +710,7 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
           record_class = excluded.record_class,
           summary = excluded.summary,
           content_json = excluded.content_json,
+          origin = excluded.origin,
           updated_at = excluded.updated_at`,
         [
           `record:${projection.id}`,
@@ -561,6 +724,7 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
           projection.class,
           projection.summary,
           JSON.stringify(projection.content),
+          projection.origin,
           projection.createdAt,
           projection.updatedAt,
         ],
@@ -581,6 +745,125 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
     ok: true,
     replicatedAt: now,
     projectionCount: acceptedCount,
+  });
+});
+
+serverRoutes.post('/:id/shared-context/owner-private', async (c) => {
+  const auth = c.req.header('Authorization');
+  if (!auth?.startsWith('Bearer ')) return c.json({ error: 'unauthorized' }, 401);
+  const tokenHash = sha256Hex(auth.slice(7));
+
+  const serverRow = await c.env.DB.queryOne<{ id: string; user_id: string }>(
+    'SELECT id, user_id FROM servers WHERE token_hash = $1 AND id = $2',
+    [tokenHash, c.req.param('id')],
+  );
+  if (!serverRow) return c.json({ error: 'unauthorized' }, 401);
+  const featureFlags = parseMemoryFeatureFlagValuesJson(
+    await getUserPref(c.env.DB, serverRow.user_id, MEMORY_FEATURE_CONFIG_PREF_KEY),
+  );
+  if (!isMemoryFeatureEnabled(c.env, MEMORY_FEATURES.userPrivateSync, featureFlags)) {
+    return c.json(sameShapeMemoryLookupEnvelope(), 404);
+  }
+
+  const body = await c.req.json().catch(() => null);
+  const parsed = ownerPrivateReplicationSchema.safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+  if (parsed.data.namespace.userId && parsed.data.namespace.userId !== serverRow.user_id) {
+    return c.json(sameShapeMemoryLookupEnvelope(), 404);
+  }
+
+  const now = Date.now();
+  let acceptedCount = 0;
+  for (const record of parsed.data.records) {
+    const idempotencyKey = record.idempotencyKey
+      ?? sha256Hex(`owner-private:v1:${serverRow.user_id}:${record.kind}:${record.fingerprint}:${record.text}`);
+    const recordId = record.id ?? sha256Hex(`owner-private-id:v1:${serverRow.user_id}:${idempotencyKey}`);
+    const createdAt = record.createdAt ?? now;
+    const updatedAt = record.updatedAt ?? createdAt;
+    await c.env.DB.execute(
+      `INSERT INTO owner_private_memories (
+        id, owner_user_id, scope, kind, origin, fingerprint, text, content_json,
+        idempotency_key, source_server_id, created_at, updated_at, replicated_at
+      ) VALUES ($1, $2, 'user_private', $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12)
+      ON CONFLICT (owner_user_id, idempotency_key) DO UPDATE SET
+        kind = excluded.kind,
+        origin = excluded.origin,
+        fingerprint = excluded.fingerprint,
+        text = excluded.text,
+        content_json = excluded.content_json,
+        source_server_id = excluded.source_server_id,
+        updated_at = excluded.updated_at,
+        replicated_at = excluded.replicated_at`,
+      [
+        recordId,
+        serverRow.user_id,
+        record.kind,
+        record.origin,
+        record.fingerprint,
+        record.text,
+        JSON.stringify(record.content),
+        idempotencyKey,
+        serverRow.id,
+        createdAt,
+        updatedAt,
+        now,
+      ],
+    );
+    acceptedCount += 1;
+  }
+
+  return c.json({ ok: true, replicatedAt: now, memoryCount: acceptedCount });
+});
+
+serverRoutes.post('/:id/shared-context/owner-private/search', async (c) => {
+  const auth = c.req.header('Authorization');
+  if (!auth?.startsWith('Bearer ')) return c.json({ error: 'unauthorized' }, 401);
+  const tokenHash = sha256Hex(auth.slice(7));
+
+  const serverRow = await c.env.DB.queryOne<{ id: string; user_id: string }>(
+    'SELECT id, user_id FROM servers WHERE token_hash = $1 AND id = $2',
+    [tokenHash, c.req.param('id')],
+  );
+  if (!serverRow) return c.json({ error: 'unauthorized' }, 401);
+  const featureFlags = parseMemoryFeatureFlagValuesJson(
+    await getUserPref(c.env.DB, serverRow.user_id, MEMORY_FEATURE_CONFIG_PREF_KEY),
+  );
+  if (!isMemoryFeatureEnabled(c.env, MEMORY_FEATURES.userPrivateSync, featureFlags)) {
+    return c.json(sameShapeSearchEnvelope());
+  }
+
+  const body = await c.req.json().catch(() => null);
+  const parsed = ownerPrivateSearchSchema.safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+  const requestScope = isSearchRequestScope(parsed.data.scope) ? parsed.data.scope : 'owner_private';
+  const scopes = expandSearchRequestScope(requestScope, { includeOwnerPrivate: true });
+  if (!scopes.includes('user_private')) return c.json(sameShapeSearchEnvelope());
+  const query = parsed.data.query.trim();
+  const rows = await c.env.DB.query<{
+    id: string;
+    kind: string;
+    origin: (typeof MEMORY_ORIGINS)[number];
+    text: string;
+    updated_at: number;
+  }>(
+    `SELECT id, kind, origin, text, updated_at
+     FROM owner_private_memories
+     WHERE owner_user_id = $1
+       ${query ? 'AND text ILIKE $2' : ''}
+     ORDER BY updated_at DESC
+     LIMIT $${query ? 3 : 2}`,
+    [serverRow.user_id, ...(query ? [`%${query}%`] : []), parsed.data.limit],
+  );
+  return c.json({
+    results: rows.map((row) => ({
+      id: row.id,
+      scope: 'user_private' as const,
+      kind: row.kind,
+      origin: row.origin,
+      preview: row.text.slice(0, 240),
+      updatedAt: row.updated_at,
+    })),
+    nextCursor: null,
   });
 });
 
@@ -647,9 +930,26 @@ serverRoutes.get('/:id/shared-context/personal-memory', requireAuth(), async (c)
        LIMIT $${projectId ? (projectionClass ? 4 : 3) : (projectionClass ? 3 : 2)}`,
       [userId, ...(projectId ? [projectId] : []), ...(projectionClass ? [projectionClass] : []), limit],
     );
+    const projectRows = await c.env.DB.query<MemoryProjectStatsRow>(
+      `SELECT project_id,
+              COUNT(*)::int AS total_records,
+              COUNT(*) FILTER (WHERE projection_class = 'recent_summary')::int AS recent_summary_count,
+              COUNT(*) FILTER (WHERE projection_class = 'durable_memory_candidate')::int AS durable_candidate_count,
+              MAX(updated_at) AS updated_at
+       FROM shared_context_projections
+       WHERE user_id = $1
+         AND scope = 'personal'
+         ${projectId ? 'AND project_id = $2' : ''}
+         ${projectionClass ? `AND projection_class = $${projectId ? 3 : 2}` : ''}
+       GROUP BY project_id
+       ORDER BY MAX(updated_at) DESC
+       LIMIT 200`,
+      [userId, ...(projectId ? [projectId] : []), ...(projectionClass ? [projectionClass] : [])],
+    );
     return c.json({
       stats: buildMemoryStatsView(stats, stats?.total_records ?? 0),
       records: mapMemoryRecordRows(rows.filter((row) => !isMemoryNoiseSummary(row.summary))),
+      projects: mapMemoryProjectRows(projectRows),
     });
   }
 
@@ -684,8 +984,8 @@ serverRoutes.post('/:id/shared-context/authored-bindings', async (c) => {
   const token = auth.slice(7);
   const tokenHash = sha256Hex(token);
 
-  const serverRow = await c.env.DB.queryOne<{ id: string; team_id: string | null }>(
-    'SELECT id, team_id FROM servers WHERE token_hash = $1 AND id = $2',
+  const serverRow = await c.env.DB.queryOne<{ id: string; team_id: string | null; user_id: string }>(
+    'SELECT id, team_id, user_id FROM servers WHERE token_hash = $1 AND id = $2',
     [tokenHash, c.req.param('id')],
   );
   if (!serverRow) return c.json({ error: 'unauthorized' }, 401);
@@ -704,7 +1004,8 @@ serverRoutes.post('/:id/shared-context/authored-bindings', async (c) => {
     binding_id: string;
     version_id: string;
     binding_mode: RuntimeAuthoredContextBinding['mode'];
-    scope: RuntimeAuthoredContextBinding['scope'];
+    workspace_id: string | null;
+    enrollment_id: string | null;
     applicability_repo_id: string | null;
     applicability_language: string | null;
     applicability_path_pattern: string | null;
@@ -716,11 +1017,8 @@ serverRoutes.post('/:id/shared-context/authored-bindings', async (c) => {
         b.id AS binding_id,
         v.id AS version_id,
         b.binding_mode,
-        CASE
-          WHEN b.enrollment_id IS NOT NULL THEN 'project_shared'
-          WHEN b.workspace_id IS NOT NULL THEN 'workspace_shared'
-          ELSE 'org_shared'
-        END AS scope,
+        b.workspace_id,
+        b.enrollment_id,
         b.applicability_repo_id,
         b.applicability_language,
         b.applicability_path_pattern,
@@ -744,20 +1042,30 @@ serverRoutes.post('/:id/shared-context/authored-bindings', async (c) => {
     [enterpriseId, namespace.workspaceId ?? null, namespace.projectId],
   );
 
+  const featureFlags = parseMemoryFeatureFlagValuesJson(
+    await getUserPref(c.env.DB, serverRow.user_id, MEMORY_FEATURE_CONFIG_PREF_KEY),
+  );
+  const orgAuthoredEnabled = isMemoryFeatureEnabled(c.env, MEMORY_FEATURES.orgSharedAuthoredStandards, featureFlags);
   const bindings: RuntimeAuthoredContextBinding[] = rows
     .map((row) => ({
       bindingId: row.binding_id,
       documentVersionId: row.version_id,
       mode: row.binding_mode,
-      scope: row.scope,
+      scope: authoredContextScopeForBinding({
+        workspaceId: row.workspace_id,
+        enrollmentId: row.enrollment_id,
+      }),
       repository: row.applicability_repo_id ?? undefined,
       language: row.applicability_language ?? undefined,
       pathPattern: row.applicability_path_pattern ?? undefined,
       content: row.content_md,
       active: true,
     }))
+    .filter((binding) => binding.scope !== 'org_shared' || orgAuthoredEnabled)
+    .filter((binding) => !binding.repository || binding.repository === namespace.projectId)
     .filter((binding) => !binding.language || binding.language === language)
-    .filter((binding) => !binding.pathPattern || !!filePath);
+    .filter((binding) => !binding.pathPattern || (!!filePath && matchesAuthoredContextPathPattern(binding.pathPattern, filePath)))
+    .sort(compareRuntimeAuthoredContextBindings);
 
   return c.json({ bindings });
 });
@@ -805,7 +1113,7 @@ serverRoutes.post('/:id/shared-context/resolve-namespace', async (c) => {
     id: string;
     enterprise_id: string;
     workspace_id: string | null;
-    scope: 'project_shared' | 'workspace_shared' | 'org_shared';
+    scope: AuthoredContextScope;
     status: 'active' | 'pending_removal' | 'removed';
   }>(
     'SELECT id, enterprise_id, workspace_id, scope, status FROM shared_project_enrollments WHERE enterprise_id = $1 AND canonical_repo_id = $2',

@@ -2,9 +2,9 @@
  * E2E integration tests for P2P config per-session storage + legacy migration.
  *
  * Uses real PostgreSQL (testcontainers) + Hono app to verify:
- *   - Per-session config stored via /api/preferences/:key
+ *   - Per-server/session config stored via /api/preferences/:key
  *   - Legacy global key migrated to per-session key
- *   - Config isolated between sessions
+ *   - Config isolated between sessions and servers
  *   - Config shared across devices (same user, same API)
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
@@ -13,6 +13,7 @@ import { runMigrations } from '../src/db/migrate.js';
 import { buildApp } from '../src/index.js';
 import { hashPassword, signJwt, randomHex } from '../src/security/crypto.js';
 import type { Env } from '../src/env.js';
+import { P2P_SESSION_CONFIG_PREF_KEY, p2pSessionConfigPrefKey } from '../../shared/p2p-config-scope.js';
 
 let db: Database;
 const JWT_KEY = 'test-jwt-key-p2p-config-integration-000';
@@ -79,7 +80,7 @@ describe('P2P config per-session storage', () => {
   });
 
   it('saves and retrieves per-session P2P config', async () => {
-    const key = 'p2p_session_config:deck_proj_brain';
+    const key = p2pSessionConfigPrefKey('deck_proj_brain', 'srv-main');
     const config = { sessions: { 'deck_sub_abc': { enabled: true, mode: 'audit' } }, rounds: 3 };
 
     // Save
@@ -102,8 +103,8 @@ describe('P2P config per-session storage', () => {
   });
 
   it('isolates config between different sessions', async () => {
-    const key1 = 'p2p_session_config:deck_proj_brain';
-    const key2 = 'p2p_session_config:deck_other_brain';
+    const key1 = p2pSessionConfigPrefKey('deck_proj_brain', 'srv-main');
+    const key2 = p2pSessionConfigPrefKey('deck_other_brain', 'srv-main');
     const config1 = { sessions: {}, rounds: 2 };
     const config2 = { sessions: {}, rounds: 5 };
 
@@ -128,9 +129,38 @@ describe('P2P config per-session storage', () => {
     expect(d2.rounds).toBe(5);
   });
 
+  it('isolates config between different servers with the same session name', async () => {
+    const key1 = p2pSessionConfigPrefKey('deck_proj_brain', 'srv-one');
+    const key2 = p2pSessionConfigPrefKey('deck_proj_brain', 'srv-two');
+    const config1 = { sessions: { deck_sub_one: { enabled: true, mode: 'audit' } }, rounds: 2 };
+    const config2 = { sessions: { deck_sub_two: { enabled: true, mode: 'review' } }, rounds: 5 };
+
+    await app.request(`/api/preferences/${key1}`, {
+      method: 'PUT',
+      headers: csrfHeaders(token),
+      body: JSON.stringify({ value: JSON.stringify(config1) }),
+    });
+    await app.request(`/api/preferences/${key2}`, {
+      method: 'PUT',
+      headers: csrfHeaders(token),
+      body: JSON.stringify({ value: JSON.stringify(config2) }),
+    });
+
+    const res1 = await app.request(`/api/preferences/${key1}`, { headers: csrfHeaders(token) });
+    const res2 = await app.request(`/api/preferences/${key2}`, { headers: csrfHeaders(token) });
+
+    const d1 = JSON.parse((await res1.json() as { value: string }).value);
+    const d2 = JSON.parse((await res2.json() as { value: string }).value);
+
+    expect(d1.sessions.deck_sub_one.mode).toBe('audit');
+    expect(d1.rounds).toBe(2);
+    expect(d2.sessions.deck_sub_two.mode).toBe('review');
+    expect(d2.rounds).toBe(5);
+  });
+
   it('legacy global key readable alongside per-session key', async () => {
-    const legacyKey = 'p2p_session_config';
-    const sessionKey = 'p2p_session_config:deck_proj_brain';
+    const legacyKey = P2P_SESSION_CONFIG_PREF_KEY;
+    const sessionKey = p2pSessionConfigPrefKey('deck_proj_brain', 'srv-main');
     const legacyConfig = { sessions: { 'deck_sub_old': { enabled: true, mode: 'review' } }, rounds: 1 };
 
     // Save under legacy key (simulates old client)
@@ -154,8 +184,8 @@ describe('P2P config per-session storage', () => {
   });
 
   it('migration: writing per-session key after reading legacy key', async () => {
-    const legacyKey = 'p2p_session_config';
-    const sessionKey = 'p2p_session_config:deck_proj_brain';
+    const legacyKey = P2P_SESSION_CONFIG_PREF_KEY;
+    const sessionKey = p2pSessionConfigPrefKey('deck_proj_brain', 'srv-main');
     const config = { sessions: {}, rounds: 3, extraPrompt: 'be thorough' };
 
     // Legacy save
@@ -184,7 +214,7 @@ describe('P2P config per-session storage', () => {
   });
 
   it('config accessible from different "devices" (same user token)', async () => {
-    const key = 'p2p_session_config:deck_proj_brain';
+    const key = p2pSessionConfigPrefKey('deck_proj_brain', 'srv-main');
     const config = { sessions: { 's1': { enabled: true, mode: 'brainstorm' } }, rounds: 2 };
 
     // "Device 1" saves

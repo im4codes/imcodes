@@ -1,5 +1,11 @@
 export const PREF_KEY_DEFAULT_SHELL = 'default_shell';
-export const PREF_KEY_P2P_SESSION_CONFIG_LEGACY = 'p2p_session_config';
+export {
+  P2P_SESSION_CONFIG_PREF_KEY as PREF_KEY_P2P_SESSION_CONFIG_LEGACY,
+  p2pLegacySessionConfigPrefKey,
+  p2pScopedSessionKey,
+  p2pSessionConfigLegacyPrefKeys,
+  p2pSessionConfigPrefKey,
+} from '@shared/p2p-config-scope.js';
 export const PREF_KEY_P2P_COMBO_CONFIRM_SKIP = 'p2p_combo_direct_send_skip_confirm';
 export const PREF_KEY_P2P_CUSTOM_COMBOS = 'p2p_custom_combos';
 /**
@@ -21,7 +27,3 @@ export const PREF_KEY_P2P_CUSTOM_COMBOS = 'p2p_custom_combos';
  * GET, one cache entry, and one cross-tab listener.
  */
 export const PREF_KEY_SHOW_TOOL_CALLS = 'show_tool_calls';
-
-export function p2pSessionConfigPrefKey(root: string): string {
-  return `${PREF_KEY_P2P_SESSION_CONFIG_LEGACY}:${root}`;
-}

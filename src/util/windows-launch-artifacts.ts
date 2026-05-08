@@ -100,6 +100,41 @@ export async function writeWatchdogCmd(paths: LaunchPaths): Promise<void> {
     ? `call "${shimLaunchTarget}" start --foreground`
     : `call "${paths.nodeExe}" "${paths.imcodesScript}" start --foreground`;
 
+  // Preflight script — Windows-side equivalent of `bin/imcodes-launch.sh`.
+  // Detects half-installed `node_modules` (commander/ws/hono/etc. as
+  // empty placeholder dirs from a killed `npm install -g imcodes@…`)
+  // and same-pinned-version-reinstalls BEFORE each daemon-launch
+  // attempt. Without this, the watchdog only catches PROCESS death and
+  // a stuck upgrade.lock — a half-finished install crashes the daemon
+  // at first import, watchdog restarts it, same crash, infinite loop.
+  //
+  // Routed through the npm-generated .cmd shim
+  // (`<prefix>\imcodes-launch-preflight.cmd`) for the same reason the
+  // launch line uses `imcodes.cmd`: avoid embedding absolute paths
+  // (which contain the username) into the .cmd body, since cmd.exe's
+  // UTF-8 ↔ ANSI roundtrip mangles non-ASCII characters. Env-var form
+  // works because the shim resolves the actual node + script paths
+  // internally via Win32 wide-char APIs.
+  //
+  // Three regimes:
+  //   a) default prefix (%APPDATA%\npm) AND shim present → env-var
+  //      form, no path embedding.
+  //   b) custom prefix (nvm/fnm/volta) AND shim present → absolute
+  //      shim path. Username may leak but those installs typically
+  //      don't have non-ASCII paths anyway.
+  //   c) shim absent (older imcodes versions that pre-date the
+  //      preflight) → emit no preflight line, fall through to launch
+  //      directly (graceful degradation; the next upgrade lands the
+  //      shim and self-heal kicks in from then on).
+  const preflightShimPath = path.win32.join(npmGlobalBin, 'imcodes-launch-preflight.cmd');
+  const preflightShimExists = existsSync(preflightShimPath);
+  const preflightShimTarget = isDefaultPrefix
+    ? '%APPDATA%\\npm\\imcodes-launch-preflight.cmd'
+    : preflightShimPath;
+  const preflightLine = preflightShimExists
+    ? `call "${preflightShimTarget}" >> "%USERPROFILE%\\.imcodes\\watchdog.log" 2>&1`
+    : null;
+
   // CRITICAL: use `ping`-based sleep instead of `timeout /t N /nobreak`.
   // `timeout` requires a real console for stdin (it polls keypresses to
   // detect interrupt).  When this watchdog is launched via wscript →
@@ -112,11 +147,28 @@ export async function writeWatchdogCmd(paths: LaunchPaths): Promise<void> {
   // We also separate the lock-wait state from the post-daemon retry:
   // logging ONCE on entry/exit instead of every poll, and polling at 30 s
   // intervals during lock-wait (vs 5 s after a clean daemon exit).
+  //
+  // SELF-HEALING for stuck locks: every wait_loop iteration runs a tiny
+  // PowerShell stale-lock probe.  If the upgrade.lock file is older than
+  // 10 minutes (= longer than any realistic npm install completion path),
+  // we assume the upgrade script crashed before reaching its `:done`
+  // safety-net and remove the lock ourselves.  This is the difference
+  // between "auto-upgrade silently wedges the daemon for hours until the
+  // user notices" and "auto-upgrade self-recovers within ~10 minutes
+  // even if the upgrade.cmd was malformed".  The exit-the-wait-state log
+  // line distinguishes the stale-lock recovery from a normal lock release.
   const watchdog = [
     '@echo off',
     'chcp 65001 >nul 2>&1',
     ':loop',
     'if exist "%USERPROFILE%\\.imcodes\\upgrade.lock" goto wait_lock',
+    // Preflight FIRST (when the shim is installed): detects half-
+    // installed node_modules / missing dist/ from a killed
+    // `npm install -g imcodes@…` and reinstalls the pinned version
+    // BEFORE we let cmd.exe try to launch a daemon that would crash
+    // at first import. Older installs that pre-date the preflight
+    // shim simply skip this line — graceful degradation.
+    ...(preflightLine ? [preflightLine] : []),
     `${launchCmd} >> "%USERPROFILE%\\.imcodes\\watchdog.log" 2>&1`,
     'ping -n 6 127.0.0.1 >nul 2>&1',
     'goto loop',
@@ -124,7 +176,15 @@ export async function writeWatchdogCmd(paths: LaunchPaths): Promise<void> {
     'echo [%date% %time%] Upgrade in progress, waiting for lock to clear... >> "%USERPROFILE%\\.imcodes\\watchdog.log"',
     ':wait_loop',
     'ping -n 31 127.0.0.1 >nul 2>&1',
+    'if not exist "%USERPROFILE%\\.imcodes\\upgrade.lock" goto lock_cleared',
+    // Stale-lock probe: if the lock file mtime is >10 minutes old, the
+    // upgrade script crashed before its `:done` cleanup ran — remove the
+    // lock ourselves so the daemon can come back up.
+    'powershell -NoProfile -NonInteractive -Command "$f=\'%USERPROFILE%\\.imcodes\\upgrade.lock\'; if((Test-Path $f) -and ((Get-Item $f).LastWriteTime -lt (Get-Date).AddMinutes(-10))){Remove-Item -Force -ErrorAction SilentlyContinue $f}" >nul 2>&1',
     'if exist "%USERPROFILE%\\.imcodes\\upgrade.lock" goto wait_loop',
+    'echo [%date% %time%] Upgrade lock was stale ^(>10min^) -- removed by watchdog self-heal. >> "%USERPROFILE%\\.imcodes\\watchdog.log"',
+    'goto loop',
+    ':lock_cleared',
     'echo [%date% %time%] Upgrade lock cleared, resuming. >> "%USERPROFILE%\\.imcodes\\watchdog.log"',
     'goto loop',
     '',

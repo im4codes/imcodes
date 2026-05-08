@@ -346,6 +346,56 @@ describe('ChatView tool payload formatting', () => {
     expect(container.querySelector('.chat-dl-btn')).toBeNull();
   });
 
+  it('opens user-authored public mp4 URLs as external links instead of local file previews', () => {
+    const url = 'https://media.example.test/public-results/pixelle/demo-video.mp4';
+    const events = [
+      makeEvent({
+        type: 'user.message',
+        payload: {
+          text: `公网链接：${url}⬇为什么被标记为内部链接了, 这不是http url吗?`,
+        },
+      }),
+    ];
+
+    const { container } = render(<ChatView events={events} loading={false} />);
+
+    const externalLink = container.querySelector('.chat-external-link') as HTMLAnchorElement | null;
+    expect(externalLink).not.toBeNull();
+    expect(externalLink?.textContent).toBe(url);
+    expect(externalLink?.href).toBe(url);
+    expect(container.querySelector('.chat-path-link')).toBeNull();
+    expect(container.querySelector('.chat-dl-btn')).toBeNull();
+
+    fireEvent.click(externalLink!);
+
+    expect(screen.getByText('external_link_title')).toBeDefined();
+    expect(container.querySelector('.external-link-url')?.textContent).toBe(url);
+  });
+
+  it('opens public rich mp4 URLs as external links instead of file preview paths', () => {
+    const url = 'https://media.example.test/public-results/pixelle/demo-video-rich.mp4';
+    const events = [
+      makeEvent({
+        type: 'user.message',
+        payload: { text: url },
+      }),
+    ];
+
+    const { container } = render(<ChatView events={events} loading={false} />);
+
+    const externalLink = container.querySelector('.chat-external-link') as HTMLAnchorElement | null;
+    expect(externalLink).not.toBeNull();
+    expect(externalLink?.textContent).toBe(url);
+    expect(externalLink?.href).toBe(url);
+    expect(container.querySelector('.chat-path-link')).toBeNull();
+    expect(container.querySelector('.chat-dl-btn')).toBeNull();
+
+    fireEvent.click(externalLink!);
+
+    expect(screen.getByText('external_link_title')).toBeDefined();
+    expect(container.querySelector('.external-link-url')?.textContent).toBe(url);
+  });
+
   it('renders OpenClaw transport tool rows for realistic sessions_send payloads', () => {
     const events = [
       makeEvent({

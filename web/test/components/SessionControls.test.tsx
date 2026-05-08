@@ -257,8 +257,24 @@ function gatherSendCalls(ws: ReturnType<typeof makeWs>): Array<Record<string, un
     .map(([, p]) => p as Record<string, unknown>);
 }
 
+function gatherCancelCalls(ws: ReturnType<typeof makeWs>): Array<Record<string, unknown>> {
+  return [
+    ...ws.sendSessionCommand.mock.calls,
+    ...ws.sendSessionCommandUrgent.mock.calls,
+  ]
+    .filter(([cmd]) => cmd === 'cancel')
+    .map(([, p]) => p as Record<string, unknown>);
+}
+
 function expectSendPayload(ws: ReturnType<typeof makeWs>, payload: Record<string, unknown>): void {
   expect(gatherSendCalls(ws)).toContainEqual(expect.objectContaining({
+    ...payload,
+    commandId: expect.any(String),
+  }));
+}
+
+function expectCancelPayload(ws: ReturnType<typeof makeWs>, payload: Record<string, unknown>): void {
+  expect(gatherCancelCalls(ws)).toContainEqual(expect.objectContaining({
     ...payload,
     commandId: expect.any(String),
   }));
@@ -344,7 +360,7 @@ afterEach(() => {
     patchSubSessionMock.mockResolvedValue(undefined);
     getUserPrefMock.mockImplementation(async (key: unknown) => {
       if (typeof key === 'string' && key.startsWith('p2p_session_config:')) {
-        const sessionKey = key.slice('p2p_session_config:'.length);
+        const sessionKey = key.split(':').pop() ?? key.slice('p2p_session_config:'.length);
         return JSON.stringify({
           sessions: {
             [sessionKey]: { enabled: true, mode: 'audit' },
@@ -720,6 +736,22 @@ afterEach(() => {
     await flushAsync();
     const currentFetches = getUserPrefMock.mock.calls.filter(([key]) => key === 'p2p_session_config:my-session').length;
     expect(currentFetches).toBe(initialFetches);
+  });
+
+  it('loads P2P config from a server-scoped preference key when a server is selected', async () => {
+    getUserPrefMock.mockResolvedValue(null);
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({ name: 'my-session' })}
+        serverId="srv-one"
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    await flushAsync();
+
+    expect(getUserPrefMock).toHaveBeenCalledWith('p2p_session_config:srv-one:my-session');
   });
 
   it('syncs loaded P2P config into daemon authority on mount', async () => {
@@ -1671,6 +1703,27 @@ afterEach(() => {
     });
   });
 
+  it('typing /stop in a transport input sends direct cancel instead of chat text', () => {
+    const ws = makeWs();
+    const onSend = vi.fn();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({ name: 'qwen-session', agentType: 'qwen', state: 'running' })}
+        quickData={makeQuickData() as any}
+        onSend={onSend}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = '/stop';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+
+    expectCancelPayload(ws, { sessionName: 'qwen-session' });
+    expect(gatherSendCalls(ws)).not.toContainEqual(expect.objectContaining({ text: '/stop' }));
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
   it('shows a running transport send in the queue instead of injecting a timeline bubble', () => {
     const ws = makeWs();
     const onSend = vi.fn();
@@ -2126,6 +2179,34 @@ afterEach(() => {
     expect(screen.queryByRole('button', { name: '1 queued' })).toBeNull();
   });
 
+  it('sends /compact without creating an optimistic user bubble', () => {
+    const ws = makeWs();
+    const onSend = vi.fn();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'idle',
+        })}
+        quickData={makeQuickData() as any}
+        onSend={onSend}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = '/compact';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+
+    expectSendPayload(ws, {
+      sessionName: 'qwen-session',
+      text: '/compact',
+    });
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
   it('qwen oauth model dropdown only shows coder-model even if stale model list exists', () => {
     render(<SessionControls
       ws={makeWs() as any}
@@ -2333,7 +2414,7 @@ afterEach(() => {
     expect(screen.queryByText('queued send')).toBeNull();
   });
 
-  it('pressing Escape in a running transport input sends /stop command', () => {
+  it('pressing Escape in a running transport input sends direct cancel', () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -2351,8 +2432,13 @@ afterEach(() => {
     const input = screen.getByRole('textbox') as HTMLDivElement;
     fireEvent.keyDown(input, { key: 'Escape' });
 
-    // Transport sessions send /stop instead of raw escape byte
-    expectSendPayload(ws, { sessionName: 'qwen-session', text: '/stop' });
+    // Transport sessions cancel the SDK turn directly instead of sending
+    // `/stop` as chat text.
+    expectCancelPayload(ws, { sessionName: 'qwen-session' });
+    expect(gatherSendCalls(ws)).not.toContainEqual(expect.objectContaining({
+      sessionName: 'qwen-session',
+      text: '/stop',
+    }));
     expect(ws.sendInput).not.toHaveBeenCalled();
   });
 
@@ -2375,10 +2461,11 @@ afterEach(() => {
     expect(stopBtn.textContent).toBe('■');
     expect(stopBtn.disabled).toBe(false);
     fireEvent.click(stopBtn);
-    expectSendPayload(ws, {
+    expectCancelPayload(ws, { sessionName: 'codex-sdk-session' });
+    expect(gatherSendCalls(ws)).not.toContainEqual(expect.objectContaining({
       sessionName: 'codex-sdk-session',
       text: '/stop',
-    });
+    }));
   });
 
   it('shows a compact Auto dropdown for supported transport sessions and enables supervised mode from saved defaults', async () => {
@@ -2692,6 +2779,58 @@ afterEach(() => {
 
     fireEvent.keyDown(input, { key: 'ArrowDown' });
     expect(input.textContent).toBe('draft text');
+  });
+
+  it('ignores input keyboard shortcuts while IME composition is active', async () => {
+    const ws = makeWs();
+    const quickData = makeQuickData();
+    quickData.data = {
+      history: ['session newest'],
+      sessionHistory: {
+        'my-session': ['session newest'],
+      },
+      commands: [],
+      phrases: [],
+    };
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={quickData as any} />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+
+    input.textContent = '拼';
+    fireEvent.input(input);
+    input.dispatchEvent(new Event('compositionstart', { bubbles: true, cancelable: true }));
+
+    fireEvent.keyDown(input, { key: 'ArrowUp' });
+    expect(input.textContent).toBe('拼');
+
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+
+    input.dispatchEvent(new Event('compositionend', { bubbles: true, cancelable: true }));
+    fireEvent.keyDown(input, { key: 'ArrowUp' });
+    expect(input.textContent).toBe('session newest');
+  });
+
+  it('ignores history navigation when keydown itself is marked composing', () => {
+    const ws = makeWs();
+    const quickData = makeQuickData();
+    quickData.data = {
+      history: ['session newest'],
+      sessionHistory: {
+        'my-session': ['session newest'],
+      },
+      commands: [],
+      phrases: [],
+    };
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={quickData as any} />);
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+
+    input.textContent = 'pin';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'ArrowUp', isComposing: true, keyCode: 229 });
+    expect(input.textContent).toBe('pin');
   });
 
   it('closes @ picker if user keeps typing without making a selection', () => {
@@ -3500,6 +3639,45 @@ afterEach(() => {
     });
   });
 
+  it('uses saved codex model preference as a legacy fallback for model-less codex-sdk sessions', () => {
+    localStorage.setItem('imcodes-codex-model', 'gpt-5.5');
+
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({
+          name: 'codex-sdk-session',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: /^gpt-5.5$/i })).toBeDefined();
+    expect(screen.queryByRole('button', { name: /^default$/i })).toBeNull();
+  });
+
+  it('does not let saved codex model preference override confirmed codex-sdk session metadata', () => {
+    localStorage.setItem('imcodes-codex-model', 'gpt-5.5');
+
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({
+          name: 'codex-sdk-session',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+          activeModel: 'gpt-5.4',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: /^gpt-5.4$/i })).toBeDefined();
+    expect(screen.queryByRole('button', { name: /^gpt-5.5$/i })).toBeNull();
+  });
+
   it('prefers dynamically discovered codex-sdk models over the static fallback list', async () => {
     const ws = makeWs();
     render(
@@ -3530,7 +3708,7 @@ afterEach(() => {
       isAuthenticated: true,
     }));
 
-    fireEvent.click(screen.getByRole('button', { name: /^default$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^gpt-5.4$/i }));
     fireEvent.click(screen.getAllByRole('button', { name: /gpt-5.5/i })[0]!);
 
     expectSendPayload(ws, {
@@ -3585,7 +3763,7 @@ afterEach(() => {
       isAuthenticated: true,
     }));
 
-    fireEvent.click(screen.getByRole('button', { name: /^default$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^gpt-5.4$/i }));
     expect(screen.getByRole('button', { name: /gpt-5.5/i })).toBeDefined();
   });
 

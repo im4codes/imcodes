@@ -27,9 +27,19 @@ describe('parseRemoteUrl', () => {
     expect(result).toEqual({ host: 'github.com', owner: 'acme', repo: 'repo' });
   });
 
+  it('parses ssh:// URLs with explicit SSH transport ports without using the port as canonical host', () => {
+    const result = parseRemoteUrl('ssh://git@172.16.253.211:2224/Hermit/ai_purchase2.git');
+    expect(result).toEqual({ host: '172.16.253.211', owner: 'Hermit', repo: 'ai_purchase2' });
+  });
+
   it('parses self-hosted URL', () => {
     const result = parseRemoteUrl('https://git.corp.example.com/team/internal-tool.git');
     expect(result).toEqual({ host: 'git.corp.example.com', owner: 'team', repo: 'internal-tool' });
+  });
+
+  it('preserves explicit HTTP(S) service ports for self-hosted remotes', () => {
+    const result = parseRemoteUrl('https://git.corp.example.com:8443/team/internal-tool.git');
+    expect(result).toEqual({ host: 'git.corp.example.com:8443', owner: 'team', repo: 'internal-tool' });
   });
 
   it('parses SSH alias format (e.g. github-work)', () => {

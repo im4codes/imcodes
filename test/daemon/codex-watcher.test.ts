@@ -53,11 +53,11 @@ function agentMessageLine(message: string, phase: string): string {
   });
 }
 
-function tokenCountLine(): string {
+function tokenCountLine(info: Record<string, unknown> = {}): string {
   return JSON.stringify({
     timestamp: '2026-03-13T00:03:00.000Z',
     type: 'event_msg',
-    payload: { type: 'token_count', info: {} },
+    payload: { type: 'token_count', info },
   });
 }
 
@@ -217,6 +217,107 @@ describe('parseLine — ignored line types', () => {
   it('ignores token_count events', () => {
     parseLine('session-c', tokenCountLine());
     expect(timelineEmitter.emit).not.toHaveBeenCalled();
+  });
+
+  it('emits current-window token_count usage with provider-sourced context window', () => {
+    parseLine('session-c', tokenCountLine({
+      total_token_usage: {
+        input_tokens: 140_000,
+        cached_input_tokens: 35_000,
+        output_tokens: 2,
+        total_tokens: 140_002,
+        reasoning_output_tokens: 0,
+      },
+      last_token_usage: {
+        input_tokens: 12_000,
+        cached_input_tokens: 3_000,
+        output_tokens: 2,
+        total_tokens: 12_002,
+      },
+      model_context_window: 258_400,
+    }), 'gpt-5.4-mini');
+
+    expect(timelineEmitter.emit).toHaveBeenCalledWith(
+      'session-c',
+      'usage.update',
+      expect.objectContaining({
+        inputTokens: 9_000,
+        cacheTokens: 3_000,
+        outputTokens: 2,
+        contextWindow: 258_400,
+        contextWindowSource: 'provider',
+        model: 'gpt-5.4-mini',
+      }),
+      expect.objectContaining({ source: 'daemon', confidence: 'high' }),
+    );
+  });
+
+  it('honors Codex provider effective window for GPT-5.5', () => {
+    parseLine('session-c', tokenCountLine({
+      total_token_usage: {
+        input_tokens: 140_000,
+        cached_input_tokens: 35_000,
+        output_tokens: 2,
+        total_tokens: 140_002,
+        reasoning_output_tokens: 0,
+      },
+      last_token_usage: {
+        input_tokens: 12_000,
+        cached_input_tokens: 3_000,
+        output_tokens: 2,
+        total_tokens: 12_002,
+      },
+      model_context_window: 258_400,
+    }), 'gpt-5.5');
+
+    expect(timelineEmitter.emit).toHaveBeenCalledWith(
+      'session-c',
+      'usage.update',
+      expect.objectContaining({
+        inputTokens: 9_000,
+        cacheTokens: 3_000,
+        contextWindow: 258_400,
+        contextWindowSource: 'provider',
+        model: 'gpt-5.5',
+      }),
+      expect.objectContaining({ source: 'daemon', confidence: 'high' }),
+    );
+    const payload = vi.mocked(timelineEmitter.emit).mock.calls[0]?.[2] as Record<string, unknown>;
+    expect(payload.contextWindowSource).toBe('provider');
+  });
+
+  it('honors Codex provider 1M context window when reported for GPT-5.5', () => {
+    parseLine('session-c', tokenCountLine({
+      total_token_usage: {
+        input_tokens: 140_000,
+        cached_input_tokens: 35_000,
+        output_tokens: 2,
+        total_tokens: 140_002,
+        reasoning_output_tokens: 0,
+      },
+      last_token_usage: {
+        input_tokens: 12_000,
+        cached_input_tokens: 3_000,
+        output_tokens: 2,
+        total_tokens: 12_002,
+      },
+      model_context_window: 1_000_000,
+    }), 'gpt-5.5');
+
+    expect(timelineEmitter.emit).toHaveBeenCalledWith(
+      'session-c',
+      'usage.update',
+      expect.objectContaining({
+        inputTokens: 9_000,
+        cacheTokens: 3_000,
+        contextWindow: 1_000_000,
+        contextWindowSource: 'provider',
+        model: 'gpt-5.5',
+      }),
+      expect.objectContaining({ source: 'daemon', confidence: 'high' }),
+    );
+    const payload = vi.mocked(timelineEmitter.emit).mock.calls[0]?.[2] as Record<string, unknown>;
+    expect(payload.contextWindowSource).toBe('provider');
   });
 
   it('ignores non-tool response_item lines (e.g. assistant message)', () => {

@@ -27,7 +27,7 @@ import logger from '../util/logger.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID, MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
 import { homedir } from 'os';
-import { readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, stat as fsStat, writeFile as fsWriteFile } from 'node:fs/promises';
+import { lstat as fsLstat, readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, stat as fsStat, unlink as fsUnlink, writeFile as fsWriteFile } from 'node:fs/promises';
 import * as nodePath from 'node:path';
 import { exec as execCb, execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -44,9 +44,14 @@ import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { copyFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { ensureImcDir, imcSubDir } from '../util/imc-dir.js';
-import { buildWindowsCleanupScript, buildWindowsCleanupVbs, buildWindowsUpgradeBatch, buildWindowsUpgradeVbs } from '../util/windows-upgrade-script.js';
+import {
+  buildWindowsCleanupScript,
+  buildWindowsCleanupVbs,
+  buildWindowsUpgradeRunnerVbs,
+  resolveWindowsUpgradeRunnerPath,
+} from '../util/windows-upgrade-script.js';
 import { buildBashSharpRepair } from '../util/sharp-repair-script.js';
-import { UPGRADE_LOCK_FILE, encodeVbsAsUtf16, encodeCmdAsUtf8Bom } from '../util/windows-launch-artifacts.js';
+import { encodeVbsAsUtf16, encodeCmdAsUtf8Bom } from '../util/windows-launch-artifacts.js';
 import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
 import { sanitizeProjectName } from '../../shared/sanitize-project-name.js';
 import { isTemplatePrompt, isTemplateOriginSummary, isImperativeCommand } from '../../shared/template-prompt-patterns.js';
@@ -62,9 +67,12 @@ import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from '../agent/codex-display.js';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import { DAEMON_UPGRADE_TARGET_LATEST, normalizeDaemonUpgradeTargetVersion } from '../../shared/daemon-upgrade.js';
 import { CC_PRESET_MSG, type CcPreset } from '../../shared/cc-presets.js';
 import { MEMORY_WS } from '../../shared/memory-ws.js';
+import { FS_WRITE_ERROR } from '../shared/transport/fs.js';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG, MAX_P2P_PARTICIPANTS } from '../../shared/p2p-config-events.js';
+import { p2pScopedSessionKey } from '../../shared/p2p-config-scope.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import {
   CLAUDE_SDK_EFFORT_LEVELS,
@@ -77,7 +85,25 @@ import {
   type TransportEffortLevel,
 } from '../../shared/effort-levels.js';
 import { getSavedP2pConfig, upsertSavedP2pConfig } from '../store/p2p-config-store.js';
-import { getProcessedProjectionStats, queryPendingContextEvents, queryProcessedProjections, recordMemoryHits } from '../store/context-store.js';
+import {
+  deleteContextObservation,
+  ensureContextNamespace,
+  getProcessedProjectionStats,
+  getProcessedProjectionById,
+  listMemoryProjectSummaries,
+  listContextNamespaces,
+  listContextObservations,
+  queryPendingContextEvents,
+  promoteContextObservation,
+  queryProcessedProjections,
+  recordMemoryHits,
+  updateProcessedProjectionSummary,
+  upsertPinnedNote,
+  updateContextObservationText,
+  writeContextObservation,
+  writeProcessedProjection,
+} from '../store/context-store.js';
+import { serializeContextNamespace } from '../context/context-keys.js';
 import {
   isKnownTestProjectName,
   isKnownTestSessionName,
@@ -91,20 +117,261 @@ import { getContextModelConfig } from '../context/context-model-config.js';
 import { getCompressionQueueState, resumeAcceptingCompression, stopAcceptingCompression } from '../context/summary-compressor.js';
 import { closeLiveContextMaterializationAdmission, reopenLiveContextMaterializationAdmission } from '../context/live-context-ingestion.js';
 import { getInflightMasterCompactionCount, resumeAcceptingMasterCompactions, stopAcceptingMasterCompactions } from './master-compaction-registry.js';
-import { detectRepo } from '../repo/detector.js';
+import { detectRepo, parseRemotes } from '../repo/detector.js';
 import { GitOriginRepositoryIdentityService } from '../agent/repository-identity-service.js';
 import {
   SUPERVISION_MODE,
   extractSessionSupervisionSnapshot,
   isSupportedSupervisionTargetSessionType,
 } from '../../shared/supervision-config.js';
+import {
+  PREFERENCE_FEATURE_FLAG,
+  PREFERENCE_INGEST_OBSERVATION_CLASS,
+  PREFERENCE_INGEST_OBSERVATION_STATE,
+  PREFERENCE_INGEST_ORIGIN,
+  PREFERENCE_INGEST_SCOPE,
+  PREFERENCE_IDEMPOTENCY_PREFIX,
+  prependPreferenceProviderContext,
+  processPreferenceLines,
+  renderPreferenceProviderContext,
+  type PreferenceIngestRecord,
+  type PreferenceProviderContextRecord,
+} from '../../shared/preference-ingest.js';
+import { normalizeSendOrigin, type SendOrigin } from '../../shared/send-origin.js';
+import {
+  getMemoryFeatureFlagDefinition,
+  computeEffectiveMemoryFeatureFlags,
+  isMemoryFeatureFlag,
+  MEMORY_FEATURE_CONFIG_MSG,
+  MEMORY_FEATURE_FLAGS,
+  MEMORY_FEATURE_FLAGS_BY_NAME,
+  memoryFeatureFlagEnvKey,
+  resolveMemoryFeatureFlagValue,
+  sanitizeMemoryFeatureFlagValues,
+  type FeatureFlagValueSource,
+  type MemoryFeatureFlagValues,
+  type MemoryFeatureFlag,
+  type MemoryFeatureFlagResolutionLayers,
+} from '../../shared/feature-flags.js';
+import { incrementCounter } from '../util/metrics.js';
+import { computeMemoryFingerprint } from '../../shared/memory-fingerprint.js';
+import { isMemoryScope, isOwnerPrivateMemoryScope, isSharedProjectionScope, type MemoryScope } from '../../shared/memory-scope.js';
+import { isObservationClass } from '../../shared/memory-observation.js';
+import { SKILL_MAX_BYTES } from '../../shared/skill-envelope.js';
+import { MD_INGEST_FEATURE_FLAG } from '../../shared/md-ingest.js';
+import { MEMORY_MANAGEMENT_ERROR_CODES, type MemoryManagementErrorCode } from '../../shared/memory-management.js';
+import type { MemoryProjectResolutionStatus } from '../../shared/memory-project-options.js';
+import {
+  MEMORY_MANAGEMENT_CONTEXT_FIELD,
+  isAuthenticatedMemoryManagementContext,
+  type AuthenticatedMemoryManagementContext,
+  type MemoryManagementBoundProject,
+} from '../../shared/memory-management-context.js';
+import {
+  getSessionControlTimelineFeedbackById,
+  isDaemonHandledSessionControlSend,
+  isSessionControlCommandText,
+  shouldHideTimelineUserMessageForSessionControl,
+  shouldResetProcessPreferenceContextForSessionControl,
+} from '../../shared/session-control-commands.js';
+import type { ContextMemoryStatsView, ContextNamespace } from '../../shared/context-types.js';
+import { publishRuntimeMemoryCacheInvalidation } from '../context/runtime-memory-cache-bus.js';
+import { assertManagedSkillPathSync, ManagedSkillPathError } from '../context/managed-skill-path.js';
+import {
+  getMemoryFeatureConfigStoreDiagnostics,
+  getPersistedMemoryFeatureFlagValues,
+  getRuntimeMemoryFeatureFlagValues,
+  setPersistedMemoryFeatureFlagValues,
+  setRuntimeMemoryFeatureFlagValues,
+} from '../store/memory-feature-config-store.js';
 
 const MAX_P2P_FILE_PULL_COUNT = 20;
 const processRecallRepositoryIdentityService = new GitOriginRepositoryIdentityService();
+const DAEMON_LOCAL_PREFERENCE_USER_ID = 'daemon-local';
 
 function isEligibleSupervisionTaskText(text: string): boolean {
   const trimmed = text.trim();
   return trimmed.length > 0 && !trimmed.startsWith('/');
+}
+
+function readBooleanEnv(value: string | undefined): boolean | undefined {
+  if (value == null) return undefined;
+  return value === 'true' || value === '1';
+}
+
+function isMemoryFeatureEnabled(flag: MemoryFeatureFlag): boolean {
+  return getEffectiveMemoryFeatureFlags()[flag];
+}
+
+function readMemoryFeatureEnvironmentDefaults(): MemoryFeatureFlagValues {
+  const environmentStartupDefault: MemoryFeatureFlagValues = {};
+  for (const flag of MEMORY_FEATURE_FLAGS) {
+    const envValue = readBooleanEnv(process.env[memoryFeatureFlagEnvKey(flag)]);
+    if (envValue !== undefined) environmentStartupDefault[flag] = envValue;
+  }
+  return environmentStartupDefault;
+}
+
+function readMemoryFeatureResolutionLayers(): MemoryFeatureFlagResolutionLayers {
+  const persistedConfig = getPersistedMemoryFeatureFlagValues();
+  return {
+    runtimeConfigOverride: getRuntimeMemoryFeatureFlagValues(),
+    persistedConfig,
+    environmentStartupDefault: readMemoryFeatureEnvironmentDefaults(),
+    readFailed: !!getMemoryFeatureConfigStoreDiagnostics().lastLoadIssue,
+  };
+}
+
+function readRequestedMemoryFeatureFlags(layers: MemoryFeatureFlagResolutionLayers = readMemoryFeatureResolutionLayers()): MemoryFeatureFlagValues {
+  const requested: MemoryFeatureFlagValues = {};
+  for (const flag of MEMORY_FEATURE_FLAGS) {
+    requested[flag] = resolveMemoryFeatureFlagValue(flag, layers);
+  }
+  return requested;
+}
+
+function getEffectiveMemoryFeatureFlags(): Record<MemoryFeatureFlag, boolean> {
+  return computeEffectiveMemoryFeatureFlags(readRequestedMemoryFeatureFlags());
+}
+
+function featureFlagValueSource(flag: MemoryFeatureFlag, layers: MemoryFeatureFlagResolutionLayers): FeatureFlagValueSource {
+  if (layers.runtimeConfigOverride?.[flag] !== undefined) return 'runtime_config_override';
+  if (layers.persistedConfig?.[flag] !== undefined) return 'persisted_config';
+  if (layers.environmentStartupDefault?.[flag] !== undefined) return 'environment_startup_default';
+  return 'registry_default';
+}
+
+function isPreferenceFeatureEnabled(): boolean {
+  return isMemoryFeatureEnabled(PREFERENCE_FEATURE_FLAG);
+}
+
+function preferenceUserIdForSend(cmd: Record<string, unknown>, record: SessionRecord | null | undefined): string {
+  const fromCommand = typeof cmd.userId === 'string' ? cmd.userId.trim() : '';
+  if (fromCommand) return fromCommand;
+  const fromNamespace = record?.contextNamespace?.userId?.trim();
+  return fromNamespace || DAEMON_LOCAL_PREFERENCE_USER_ID;
+}
+
+const processPreferenceContextSignatures = new Map<string, string>();
+
+function normalizePreferenceProviderContextSignature(context: string): string {
+  return context.replace(/\s+/g, ' ').trim();
+}
+
+function prepareProcessPreferenceProviderText(input: {
+  sessionName: string;
+  providerText: string;
+  preferenceContext: string;
+}): string {
+  const context = input.preferenceContext.trim();
+  if (!context) return input.providerText;
+  const trimmedText = input.providerText.trim();
+  if (trimmedText.startsWith('/')) {
+    if (shouldResetProcessPreferenceContextForSessionControl(trimmedText)) {
+      processPreferenceContextSignatures.delete(input.sessionName);
+    }
+    return input.providerText;
+  }
+  const signature = normalizePreferenceProviderContextSignature(context);
+  if (!signature) return input.providerText;
+  if (processPreferenceContextSignatures.get(input.sessionName) === signature) {
+    return input.providerText;
+  }
+  processPreferenceContextSignatures.set(input.sessionName, signature);
+  return prependPreferenceProviderContext(input.providerText, context);
+}
+
+function loadPreferenceProviderContext(input: {
+  enabled: boolean;
+  userId: string;
+  currentRecords: readonly PreferenceIngestRecord[];
+}): string {
+  if (!input.enabled) return '';
+  const records: PreferenceProviderContextRecord[] = input.currentRecords.map((record) => ({
+    text: record.text,
+    fingerprint: record.fingerprint,
+  }));
+  const scopeKey = `${PREFERENCE_INGEST_SCOPE}:${input.userId}`;
+  const idempotencyPrefix = [
+    PREFERENCE_IDEMPOTENCY_PREFIX,
+    input.userId,
+    scopeKey,
+    '',
+  ].join('\u0000');
+  try {
+    for (const observation of listContextObservations({
+      scope: PREFERENCE_INGEST_SCOPE,
+      class: PREFERENCE_INGEST_OBSERVATION_CLASS,
+    })) {
+      if (observation.state !== PREFERENCE_INGEST_OBSERVATION_STATE) continue;
+      const preferenceText = typeof observation.content.text === 'string'
+        ? observation.content.text
+        : '';
+      if (!preferenceText.trim()) continue;
+      const idempotencyKey = typeof observation.content.idempotencyKey === 'string'
+        ? observation.content.idempotencyKey
+        : '';
+      if (!idempotencyKey.startsWith(idempotencyPrefix)) continue;
+      records.push({
+        text: preferenceText,
+        fingerprint: observation.fingerprint,
+        updatedAt: observation.updatedAt,
+      });
+    }
+  } catch (err) {
+    logger.warn({ err, userId: input.userId }, 'failed to load preference context for provider dispatch');
+  }
+  return renderPreferenceProviderContext(records);
+}
+
+function schedulePreferencePersistence(input: {
+  userId: string;
+  commandId: string;
+  records: readonly PreferenceIngestRecord[];
+  sendOrigin: SendOrigin;
+}): void {
+  if (input.records.length === 0) return;
+  setTimeout(() => {
+    try {
+      const namespace = ensureContextNamespace({
+        scope: PREFERENCE_INGEST_SCOPE,
+        userId: input.userId,
+        name: 'preferences',
+      });
+      for (const record of input.records) {
+        const alreadyPersisted = listContextObservations({
+          namespaceId: namespace.id,
+          class: PREFERENCE_INGEST_OBSERVATION_CLASS,
+        }).some((observation) => (
+          observation.fingerprint === record.fingerprint
+          && observation.content.idempotencyKey === record.idempotencyKey
+        ));
+        writeContextObservation({
+          namespaceId: namespace.id,
+          scope: PREFERENCE_INGEST_SCOPE,
+          class: PREFERENCE_INGEST_OBSERVATION_CLASS,
+          origin: PREFERENCE_INGEST_ORIGIN,
+          fingerprint: record.fingerprint,
+          content: {
+            text: record.text,
+            ownerUserId: input.userId,
+            createdByUserId: input.userId,
+            updatedByUserId: input.userId,
+            idempotencyKey: record.idempotencyKey,
+          },
+          text: record.text,
+          sourceEventIds: [input.commandId],
+          state: PREFERENCE_INGEST_OBSERVATION_STATE,
+        });
+        incrementCounter(alreadyPersisted ? 'mem.preferences.duplicate_ignored' : 'mem.preferences.persisted', {
+          sendOrigin: input.sendOrigin,
+        });
+      }
+    } catch (err) {
+      incrementCounter('mem.preferences.persistence_failed', { source: 'schedulePreferencePersistence' });
+      logger.warn({ err }, 'preference ingest persistence failed after send receipt');
+    }
+  }, 0);
 }
 
 /**
@@ -343,15 +610,12 @@ function supportsTransportClear(agentType: string | undefined): agentType is 'cl
     || agentType === 'qwen';
 }
 
-// Note: an earlier `supportsTransportCompact` helper synthesized `/compact`
-// behaviour daemon-side by replaying transport history, calling the memory
-// compressor, and relaunching a fresh conversation. That was rolled back —
-// transport SDKs (claude-code-sdk and friends) accept the literal `/compact`
-// text and run their own native compaction, which is materially better than
-// a daemon-side fresh relaunch (preserves SDK tool config, system prompts,
-// and resume identity). The daemon's automatic materialization pipeline
-// continues to record raw events into `context_event_archive` regardless,
-// so no provenance is lost when the SDK compacts.
+// `/compact` is provider-dispatched, not daemon-synthesized. Provider adapters
+// that expose a compact RPC translate the raw command at the SDK boundary;
+// verified slash-command providers receive the literal command; unsupported
+// providers fail visibly. The daemon's automatic materialization pipeline still
+// records raw events into `context_event_archive`, so provenance is preserved
+// independently of provider-side compaction.
 
 function supportsProcessClear(agentType: string | undefined): agentType is 'claude-code' | 'codex' | 'opencode' {
   return agentType === 'claude-code' || agentType === 'codex' || agentType === 'opencode';
@@ -492,7 +756,16 @@ async function rewritePathsForSandbox(sessionName: string, text: string): Promis
   return result;
 }
 import { handleRepoCommand } from './repo-handler.js';
-import { handleFileUpload, handleFileDownload, createProjectFileHandle, lookupAttachment } from './file-transfer-handler.js';
+import {
+  handleFileUpload,
+  handleFileDownload,
+  tryCreateProjectFileHandle,
+  lookupAttachment,
+} from './file-transfer-handler.js';
+import { getDefaultPreviewReadCoordinator, __resetPreviewReadCoordinatorForTests } from './file-preview-read-coordinator.js';
+import { isFilePreviewPathAllowed, resolveCanonical } from './file-preview-path-policy.js';
+import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
+import { FS_READ_ERROR_CODES } from '../../shared/fs-read-error-codes.js';
 import { REPO_MSG } from '../shared/repo-types.js';
 import { handlePreviewCommand } from './preview-relay.js';
 import { PREVIEW_MSG } from '../../shared/preview-types.js';
@@ -670,10 +943,26 @@ function resolveP2pConfigScopeSession(sessionName: string): string {
   return record?.parentSession ?? sessionName;
 }
 
-async function resolveStructuredP2pSessionConfig(sessionName: string, clientConfig?: P2pSessionConfig): Promise<P2pSessionConfig | undefined> {
+function getP2pConfigStoreScope(serverLink: ServerLink, scopeSession: string): string {
+  const serverId = typeof (serverLink as unknown as { getServerId?: () => string }).getServerId === 'function'
+    ? (serverLink as unknown as { getServerId: () => string }).getServerId()
+    : undefined;
+  return p2pScopedSessionKey(scopeSession, serverId);
+}
+
+async function resolveStructuredP2pSessionConfig(
+  sessionName: string,
+  serverLink: ServerLink,
+  clientConfig?: P2pSessionConfig,
+): Promise<P2pSessionConfig | undefined> {
   const scopeSession = resolveP2pConfigScopeSession(sessionName);
-  const saved = await getSavedP2pConfig(scopeSession);
+  const storeScope = getP2pConfigStoreScope(serverLink, scopeSession);
+  const saved = await getSavedP2pConfig(storeScope);
   if (saved?.sessions && typeof saved.sessions === 'object') return saved.sessions;
+  if (storeScope !== scopeSession) {
+    const legacySaved = await getSavedP2pConfig(scopeSession);
+    if (legacySaved?.sessions && typeof legacySaved.sessions === 'object') return legacySaved.sessions;
+  }
   return clientConfig;
 }
 
@@ -882,9 +1171,45 @@ export function setRouterContext(ctx: RouterContext): void {
 }
 
 export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
-  if (!msg || typeof msg !== 'object') return;
+  // Input validation: anything that isn't a non-null object goes
+  // straight to the floor.  We log a debug ping for arrays / primitives
+  // so a confused client gets diagnostic feedback without flooding.
+  if (!msg || typeof msg !== 'object' || Array.isArray(msg)) {
+    if (msg !== null && msg !== undefined) {
+      logger.debug({ kind: typeof msg, isArray: Array.isArray(msg) }, 'Ignoring non-object web command');
+    }
+    return;
+  }
   const cmd = msg as Record<string, unknown>;
 
+  // Top-level isolation: any synchronous throw inside a handler — e.g.
+  // a TypeError from `cmd.foo.bar` when `foo` is undefined, or a
+  // validation throw before the first await of an async function —
+  // would otherwise propagate out of the WebSocket onMessage callback
+  // and trip the global uncaughtException handler.  That handler keeps
+  // the daemon alive but emits a noisy "UNCAUGHT EXCEPTION" line and
+  // broadcasts a daemon.error event to every connected browser, so to
+  // operators the daemon LOOKED crashed.  Wrap the dispatch so a bad
+  // single command can't destabilize the whole connection.
+  //
+  // Note on async rejections: handlers in the switch use the
+  // `void handleX(...)` pattern so promise rejections propagate to
+  // process.on('unhandledRejection') in src/index.ts, which logs and
+  // forwards a daemon.error event but keeps the process alive.  The
+  // rare-but-real "throw before first await" case STILL surfaces to
+  // browsers, but the daemon does not crash.  Individual handlers
+  // already do their own try/catch where input validation matters.
+  try {
+    dispatchWebCommand(cmd, serverLink);
+  } catch (err) {
+    logger.warn(
+      { err, type: typeof cmd.type === 'string' ? cmd.type : '<non-string>' },
+      'Web command handler threw synchronously — daemon stays alive',
+    );
+  }
+}
+
+function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink): void {
   switch (cmd.type) {
     case 'inbound':
       void handleInbound(cmd);
@@ -897,6 +1222,9 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
       break;
     case 'session.restart':
       void handleRestart(cmd, serverLink);
+      break;
+    case DAEMON_COMMAND_TYPES.SESSION_CANCEL:
+      void handleSessionCancel(cmd, serverLink);
       break;
     case DAEMON_COMMAND_TYPES.SESSION_UPDATE_TRANSPORT_CONFIG:
       void handleSessionTransportConfigUpdate(cmd, serverLink);
@@ -1047,11 +1375,19 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case 'discussion.list':
       handleDiscussionList(serverLink);
       break;
-    case 'server.delete':
+    case DAEMON_COMMAND_TYPES.SERVER_DELETE:
       void handleServerDelete();
       break;
-    case 'daemon.upgrade':
-      void handleDaemonUpgrade(cmd.targetVersion as string | undefined, serverLink);
+    case DAEMON_COMMAND_TYPES.DAEMON_UPGRADE:
+      try {
+        const normalizedTarget = normalizeDaemonUpgradeTargetVersion(cmd.targetVersion);
+        void handleDaemonUpgrade(
+          normalizedTarget === DAEMON_UPGRADE_TARGET_LATEST ? undefined : normalizedTarget,
+          serverLink,
+        );
+      } catch {
+        logger.warn({ targetVersion: cmd.targetVersion }, 'daemon.upgrade rejected invalid targetVersion');
+      }
       break;
     case 'file.search':
       void handleFileSearch(cmd, serverLink);
@@ -1064,6 +1400,15 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
       break;
     case MEMORY_WS.RESTORE:
       void handleMemoryRestore(cmd, serverLink);
+      break;
+    case MEMORY_WS.CREATE:
+      void handleMemoryCreate(cmd, serverLink);
+      break;
+    case MEMORY_WS.UPDATE:
+      void handleMemoryUpdate(cmd, serverLink);
+      break;
+    case MEMORY_WS.PIN:
+      void handleMemoryPin(cmd, serverLink);
       break;
     case MEMORY_WS.DELETE:
       void handleMemoryDelete(cmd, serverLink);
@@ -1104,8 +1449,59 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case SHARED_CONTEXT_RUNTIME_CONFIG_MSG.APPLY:
       void handleSharedContextRuntimeConfigApply(cmd);
       break;
+    case MEMORY_FEATURE_CONFIG_MSG.APPLY:
+      handleMemoryFeatureConfigApply(cmd);
+      break;
     case MEMORY_WS.PERSONAL_QUERY:
       void handlePersonalMemoryQuery(cmd, serverLink);
+      break;
+    case MEMORY_WS.PROJECT_RESOLVE:
+      void handleMemoryProjectResolve(cmd, serverLink);
+      break;
+    case MEMORY_WS.FEATURES_QUERY:
+      handleMemoryFeaturesQuery(cmd, serverLink);
+      break;
+    case MEMORY_WS.FEATURES_SET:
+      handleMemoryFeaturesSet(cmd, serverLink);
+      break;
+    case MEMORY_WS.PREF_QUERY:
+      void handleMemoryPreferencesQuery(cmd, serverLink);
+      break;
+    case MEMORY_WS.PREF_CREATE:
+      void handleMemoryPreferenceCreate(cmd, serverLink);
+      break;
+    case MEMORY_WS.PREF_UPDATE:
+      void handleMemoryPreferenceUpdate(cmd, serverLink);
+      break;
+    case MEMORY_WS.PREF_DELETE:
+      void handleMemoryPreferenceDelete(cmd, serverLink);
+      break;
+    case MEMORY_WS.SKILL_QUERY:
+      void handleMemorySkillsQuery(cmd, serverLink);
+      break;
+    case MEMORY_WS.SKILL_REBUILD:
+      void handleMemorySkillsRebuild(cmd, serverLink);
+      break;
+    case MEMORY_WS.SKILL_READ:
+      void handleMemorySkillRead(cmd, serverLink);
+      break;
+    case MEMORY_WS.SKILL_DELETE:
+      void handleMemorySkillDelete(cmd, serverLink);
+      break;
+    case MEMORY_WS.MD_INGEST_RUN:
+      void handleMemoryMarkdownIngestRun(cmd, serverLink);
+      break;
+    case MEMORY_WS.OBSERVATION_QUERY:
+      void handleMemoryObservationsQuery(cmd, serverLink);
+      break;
+    case MEMORY_WS.OBSERVATION_UPDATE:
+      void handleMemoryObservationUpdate(cmd, serverLink);
+      break;
+    case MEMORY_WS.OBSERVATION_DELETE:
+      void handleMemoryObservationDelete(cmd, serverLink);
+      break;
+    case MEMORY_WS.OBSERVATION_PROMOTE:
+      void handleMemoryObservationPromote(cmd, serverLink);
       break;
     case 'file.upload':
       void handleFileUpload(cmd, serverLink);
@@ -1184,7 +1580,7 @@ async function handleP2pConfigSave(cmd: Record<string, unknown>, serverLink: Ser
     return;
   }
   try {
-    await upsertSavedP2pConfig(scopeSession, config);
+    await upsertSavedP2pConfig(getP2pConfigStoreScope(serverLink, scopeSession), config);
     if (requestId) {
       serverLink?.send({
         type: P2P_CONFIG_MSG.SAVE_RESPONSE,
@@ -1492,6 +1888,87 @@ async function handleStop(cmd: Record<string, unknown>, serverLink: ServerLink):
   try { serverLink.send({ type: 'session.error', project, message: `Shutdown failed: ${message}` }); } catch { /* ignore */ }
 }
 
+function resolveSessionCommandName(cmd: Record<string, unknown>): string | undefined {
+  return (typeof cmd.sessionName === 'string' && cmd.sessionName)
+    ? cmd.sessionName
+    : (typeof cmd.session === 'string' && cmd.session ? cmd.session : undefined);
+}
+
+function markTransportCancelIdle(sessionName: string, error?: string): void {
+  timelineEmitter.emit(sessionName, 'session.state', {
+    state: 'idle',
+    pendingCount: 0,
+    pendingMessages: [],
+    pendingMessageEntries: [],
+    ...(error ? { error } : {}),
+  }, { source: 'daemon', confidence: 'high' });
+}
+
+function emitSessionControlTimelineFeedback(sessionName: string, controlId: 'stop'): void {
+  const feedback = getSessionControlTimelineFeedbackById(controlId);
+  if (!feedback) return;
+  timelineEmitter.emit(sessionName, 'session.state', {
+    state: feedback.state,
+    reason: feedback.reason,
+  }, { source: 'daemon', confidence: 'high' });
+}
+
+function cancelTransportTurnNow(
+  sessionName: string,
+  commandId: string | undefined,
+  serverLink: Pick<ServerLink, 'send'> | undefined,
+): boolean {
+  const stopRuntime = getTransportRuntime(sessionName);
+  const stopRecord = getSession(sessionName);
+  const isTransportStop = !!stopRuntime
+    || stopRecord?.runtimeType === 'transport'
+    || (typeof stopRecord?.agentType === 'string' && isTransportAgent(stopRecord.agentType));
+  if (!isTransportStop) return false;
+
+  clearResend(sessionName);
+  if (commandId) emitCommandAck(sessionName, commandId, 'accepted', undefined, serverLink);
+  emitSessionControlTimelineFeedback(sessionName, 'stop');
+  markTransportCancelIdle(sessionName);
+
+  if (!stopRuntime) return true;
+
+  void (async () => {
+    try {
+      supervisionAutomation.cancelSession(sessionName);
+      await stopRuntime.cancel();
+      // Mark session for fresh start so daemon restart doesn't resume the
+      // stuck conversation.
+      if (stopRecord?.agentType === 'qwen') {
+        upsertSession({ ...stopRecord, qwenFreshOnResume: true, updatedAt: Date.now() });
+      }
+    } catch (err) {
+      const errMsg = describeTransportSendError(err);
+      logger.error({ sessionName, err }, 'session.cancel (transport) failed');
+      timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Stop failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+      markTransportCancelIdle(sessionName, errMsg);
+    }
+  })();
+
+  return true;
+}
+
+async function handleSessionCancel(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const sessionName = resolveSessionCommandName(cmd);
+  const commandId = typeof cmd.commandId === 'string' && cmd.commandId.trim()
+    ? cmd.commandId.trim()
+    : undefined;
+  if (!sessionName) {
+    logger.warn('session.cancel: missing sessionName');
+    return;
+  }
+
+  if (cancelTransportTurnNow(sessionName, commandId, serverLink)) return;
+
+  const errMsg = 'Transport session unavailable';
+  logger.warn({ sessionName }, 'session.cancel: session is not a transport session');
+  if (commandId) emitCommandAck(sessionName, commandId, 'error', errMsg, serverLink);
+}
+
 /**
  * Send a command to a session, handling `!`-prefixed shell commands:
  * - claude-code: send `!` first (with delayed-Enter), then send the rest of the command
@@ -1610,7 +2087,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     || text.includes('@@all(')
     || text.includes('@@p2p-config(');
   const isDaemonHandledControlSend = trimmedText === '/stop'
-    || trimmedText === '/clear'
+    || isDaemonHandledSessionControlSend(trimmedText)
     || /^\/model\s+\S+/.test(trimmedText)
     || /^\/(?:thinking|effort)\s+\S+/.test(trimmedText);
   // For ordinary user turns, command.ack is a daemon-receipt acknowledgement:
@@ -1627,51 +2104,14 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   }
 
   if (trimmedText === '/stop') {
-    const stopRuntime = getTransportRuntime(sessionName);
-    const stopRecord = getSession(sessionName);
-    const isTransportStop = !!stopRuntime
-      || stopRecord?.runtimeType === 'transport'
-      || (typeof stopRecord?.agentType === 'string' && isTransportAgent(stopRecord.agentType));
-    if (isTransportStop) {
-      emitTransportUserMessage(text);
-      // `/stop` is a priority control lane: receipt ack and queue clearing
-      // happen before any P2P config read, pending relaunch wait, transport
-      // mutex, context bootstrap, recall, or provider cancel await. The
-      // cancel itself runs in the background; failures surface as timeline
-      // state, not as a delayed command ack.
-      clearResend(sessionName);
-      emitAcceptedReceiptAck();
-      if (!stopRuntime) {
-        timelineEmitter.emit(sessionName, 'session.state', {
-          state: 'idle',
-          pendingCount: 0,
-          pendingMessages: [],
-          pendingMessageEntries: [],
-        }, { source: 'daemon', confidence: 'high' });
-        return;
-      }
-      void (async () => {
-        try {
-          supervisionAutomation.cancelSession(sessionName);
-          await stopRuntime.cancel();
-          // Mark session for fresh start so daemon restart doesn't resume the
-          // stuck conversation.
-          if (stopRecord?.agentType === 'qwen') {
-            upsertSession({ ...stopRecord, qwenFreshOnResume: true, updatedAt: Date.now() });
-          }
-        } catch (err) {
-          const errMsg = describeTransportSendError(err);
-          logger.error({ sessionName, err }, 'session.stop (transport) failed');
-          timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Stop failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
-          timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
-        }
-      })();
+    if (cancelTransportTurnNow(sessionName, effectiveId, serverLink)) {
+      receiptAcked = true;
       return;
     }
   }
 
   const p2pSessionConfig = wantsStructuredP2pRouting
-    ? await resolveStructuredP2pSessionConfig(sessionName, clientP2pSessionConfig)
+    ? await resolveStructuredP2pSessionConfig(sessionName, serverLink, clientP2pSessionConfig)
     : undefined;
 
   // ── P2P start gates (mandatory) ──
@@ -1963,12 +2403,37 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   // Transport sessions — route directly to the provider runtime, bypassing tmux.
   const transportRuntime = getTransportRuntime(sessionName);
   const record = (await import('../store/session-store.js')).getSession(sessionName);
+  const preferenceUserId = preferenceUserIdForSend(cmd, record);
+  const preferenceFeatureEnabled = isPreferenceFeatureEnabled();
+  const preferenceIngest = processPreferenceLines({
+    text,
+    featureEnabled: preferenceFeatureEnabled,
+    sendOrigin: cmd.origin,
+    userId: preferenceUserId,
+    scopeKey: `${PREFERENCE_INGEST_SCOPE}:${preferenceUserId}`,
+    messageId: effectiveId,
+  });
+  for (const event of preferenceIngest.telemetry) {
+    incrementCounter(event.counter, { sendOrigin: event.sendOrigin });
+  }
+  const displayText = preferenceIngest.providerText;
+  const preferenceMessagePreamble = loadPreferenceProviderContext({
+    enabled: preferenceFeatureEnabled,
+    userId: preferenceUserId,
+    currentRecords: preferenceIngest.records,
+  });
+  schedulePreferencePersistence({
+    userId: preferenceUserId,
+    commandId: effectiveId,
+    records: preferenceIngest.records,
+    sendOrigin: normalizeSendOrigin(cmd.origin),
+  });
   const supervisionSnapshot = isSupportedSupervisionTargetSessionType(record?.agentType)
     ? extractSessionSupervisionSnapshot(record?.transportConfig ?? null)
     : null;
   const shouldTrackSupervisionTaskRun = supervisionSnapshot != null
     && supervisionSnapshot.mode !== SUPERVISION_MODE.OFF
-    && isEligibleSupervisionTaskText(text);
+    && isEligibleSupervisionTaskText(displayText);
   const attachments: TransportAttachment[] = [];
   const transportUserEventId = (clientMessageId: string) => `transport-user:${clientMessageId}`;
   const isTransportSession = record?.runtimeType === 'transport'
@@ -1991,9 +2456,14 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       { sessionName, providerId: record.providerId, commandId: effectiveId },
       'session.send: transport session has no runtime — queuing for resend after reconnect',
     );
-    enqueueResend(sessionName, { text, commandId: effectiveId, queuedAt: Date.now() });
+    enqueueResend(sessionName, {
+      text: displayText,
+      ...(preferenceMessagePreamble ? { messagePreamble: preferenceMessagePreamble } : {}),
+      commandId: effectiveId,
+      queuedAt: Date.now(),
+    });
     if (shouldTrackSupervisionTaskRun) {
-      supervisionAutomation.queueTaskIntent(sessionName, effectiveId, text, supervisionSnapshot);
+      supervisionAutomation.queueTaskIntent(sessionName, effectiveId, displayText, supervisionSnapshot);
     }
     const queued = getResendEntries(sessionName);
     const infoMsg = `⏳ Provider ${providerLabel} not connected yet — will resend ${queued.length} queued message${queued.length === 1 ? '' : 's'} once reconnected.`;
@@ -2050,9 +2520,14 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       { sessionName, providerId: record?.providerId, commandId: effectiveId },
       'session.send: transport runtime missing provider session id — queuing and auto-resuming',
     );
-    enqueueResend(sessionName, { text, commandId: effectiveId, queuedAt: Date.now() });
+    enqueueResend(sessionName, {
+      text: displayText,
+      ...(preferenceMessagePreamble ? { messagePreamble: preferenceMessagePreamble } : {}),
+      commandId: effectiveId,
+      queuedAt: Date.now(),
+    });
     if (shouldTrackSupervisionTaskRun) {
-      supervisionAutomation.queueTaskIntent(sessionName, effectiveId, text, supervisionSnapshot);
+      supervisionAutomation.queueTaskIntent(sessionName, effectiveId, displayText, supervisionSnapshot);
     }
     const queued = getResendEntries(sessionName);
     const infoMsg = `⏳ Provider ${providerLabel} is restarting — will auto-resend ${queued.length} queued message${queued.length === 1 ? '' : 's'} once the runtime is back.`;
@@ -2096,7 +2571,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     return;
   }
   if (transportRuntime) {
-    if (trimmedText === '/clear' && supportsTransportClear(record?.agentType)) {
+    if (isSessionControlCommandText(trimmedText, 'clear') && supportsTransportClear(record?.agentType)) {
       emitTransportUserMessage(text);
       // Fresh conversation must not replay stale queued messages from the prior
       // offline window — drop anything we had buffered for resend.
@@ -2129,15 +2604,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       }
       return;
     }
-    // `/compact` is intentionally NOT intercepted here. Transport SDKs
-    // (claude-code-sdk, codex-sdk, copilot-sdk, cursor-headless, openclaw,
-    // qwen) accept the literal `/compact` text and run their own native
-    // compaction — preserving SDK tool config, system prompts, and resume
-    // identity. The daemon's automatic materialization pipeline already
-    // archives every memory-eligible event into `context_event_archive`
-    // independently, so daemon-side memory provenance is preserved whether
-    // or not the SDK compacts. Falling through to the default send path
-    // forwards `/compact` to the transport untouched.
+    // `/compact` is intentionally NOT handled as daemon-side compaction here.
+    // The transport runtime/provider capability decides whether it is translated
+    // to an SDK RPC, forwarded as a verified slash command, or rejected visibly.
+    // Falling through preserves the ordinary receipt-ack contract while keeping
+    // provider-specific compact semantics at the SDK boundary.
     const release = await getMutex(sessionName).acquire();
     try {
       const modelMatch = trimmedText.match(/^\/model\s+(\S+)(?:\s+.*)?$/);
@@ -2357,25 +2828,34 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
 
       // send() is synchronous: dispatches immediately if idle, queues if busy.
       // Status changes come from transport runtime's onStatusChange callback.
-      const result = attachments.length > 0
-        ? transportRuntime.send(text, effectiveId, attachments)
-        : transportRuntime.send(text, effectiveId);
+      const result = preferenceMessagePreamble
+        ? transportRuntime.send(
+          displayText,
+          effectiveId,
+          attachments.length > 0 ? attachments : undefined,
+          preferenceMessagePreamble,
+        )
+        : (attachments.length > 0
+            ? transportRuntime.send(displayText, effectiveId, attachments)
+            : transportRuntime.send(displayText, effectiveId));
       if (shouldTrackSupervisionTaskRun) {
         if (result === 'queued') {
-          supervisionAutomation.queueTaskIntent(sessionName, effectiveId, text, supervisionSnapshot);
+          supervisionAutomation.queueTaskIntent(sessionName, effectiveId, displayText, supervisionSnapshot);
         } else if (result === 'sent') {
-          supervisionAutomation.registerTaskIntent(sessionName, effectiveId, text, supervisionSnapshot);
+          supervisionAutomation.registerTaskIntent(sessionName, effectiveId, displayText, supervisionSnapshot);
         }
       }
       if (result === 'sent') {
-        emitTransportUserMessage(
-          text,
-          {
-            clientMessageId: effectiveId,
-            ...(attachments.length > 0 ? { attachments } : {}),
-          },
-          transportUserEventId(effectiveId),
-        );
+        if (!shouldHideTimelineUserMessageForSessionControl(displayText)) {
+          emitTransportUserMessage(
+            displayText,
+            {
+              clientMessageId: effectiveId,
+              ...(attachments.length > 0 ? { attachments } : {}),
+            },
+            transportUserEventId(effectiveId),
+          );
+        }
       }
       if (result === 'queued') {
         timelineEmitter.emit(sessionName, 'session.state', {
@@ -2393,7 +2873,8 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     } catch (err) {
       const errMsg = describeTransportSendError(err);
       logger.error({ sessionName, err }, 'session.send (transport) failed');
-      timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Send failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+      const failureLabel = isSessionControlCommandText(displayText, 'compact') ? 'Compact failed' : 'Send failed';
+      timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ ${failureLabel}: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
       timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
       if (!receiptAcked) {
         emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
@@ -2404,10 +2885,16 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     return;
   }
 
-  // Preserve raw @file references for normal sends.
-  const finalText = text;
+  // Preserve raw @file references for normal sends. Stable preferences are
+  // session context, not per-turn recall: for tmux/process agents inject them
+  // once per provider conversation, and reset the gate on clear/compact.
+  const finalText = prepareProcessPreferenceProviderText({
+    sessionName,
+    providerText: displayText,
+    preferenceContext: preferenceMessagePreamble,
+  });
 
-  if (text.trim() === '/clear' && record?.runtimeType !== 'transport' && supportsProcessClear(record?.agentType)) {
+  if (isSessionControlCommandText(text, 'clear') && record?.runtimeType !== 'transport' && supportsProcessClear(record?.agentType)) {
     emitTransportUserMessage(text);
     try {
       await runExclusiveSessionRelaunch(sessionName, async () => {
@@ -2457,7 +2944,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
 
   try {
     await sendProcessSessionMessage(sessionName, finalText, attachments, {
-      originalText: text,
+      originalText: displayText,
       commandId: effectiveId,
       isLegacy,
       ackAlreadySent: receiptAcked,
@@ -2721,16 +3208,7 @@ async function handleInput(cmd: Record<string, unknown>): Promise<void> {
   const transportRuntime = getTransportRuntime(sessionName);
   if (transportRuntime) {
     if (data === '\x1b') {
-      try {
-        await transportRuntime.cancel();
-        // Mark Qwen sessions for fresh start so restart doesn't resume stuck conversation
-        const rec = getSession(sessionName);
-        if (rec?.agentType === 'qwen') {
-          upsertSession({ ...rec, qwenFreshOnResume: true, updatedAt: Date.now() });
-        }
-      } catch (err) {
-        logger.error({ sessionName, err }, 'session.input transport cancel failed');
-      }
+      cancelTransportTurnNow(sessionName, undefined, undefined);
     }
     return;
   }
@@ -3613,6 +4091,7 @@ function compareDaemonVersions(a: string, b: string): -1 | 0 | 1 {
  *     may resolve to an older release than what's currently installed.
  */
 async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLink): Promise<void> {
+  const UPGRADE_MEMORY_FREEZE_TTL_MS = 15 * 60 * 1000;
   const activeRuns = getActiveP2pRunsBlockingDaemonUpgrade();
   if (activeRuns.length > 0) {
     logger.warn({
@@ -3680,7 +4159,7 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
   }
 
   const { spawn } = await import('child_process');
-  const { writeFileSync, mkdtempSync, existsSync } = await import('fs');
+  const { writeFileSync, readFileSync, mkdtempSync, existsSync } = await import('fs');
   const { join, dirname } = await import('path');
   const { tmpdir, homedir } = await import('os');
 
@@ -3743,6 +4222,13 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
       reopenLiveContextMaterializationAdmission();
     };
   })();
+  const scheduleUpgradeMemoryFreezeRelease = () => {
+    const timer = setTimeout(() => {
+      logger.warn({ targetVersion }, 'daemon.upgrade: releasing memory freeze after watchdog timeout');
+      releaseUpgradeMemoryFreeze();
+    }, UPGRADE_MEMORY_FREEZE_TTL_MS);
+    timer.unref?.();
+  };
 
   try {
     const postFreezeMasterCompactions = getInflightMasterCompactionCount();
@@ -3798,39 +4284,55 @@ if [ -n "$STALE_PID" ] && kill -0 "$STALE_PID" 2>/dev/null; then
 fi
 launchctl load -w "${plist}"`;
   } else if (process.platform === 'win32') {
-    // Windows: generate a CMD batch script
+    // Windows: drive the upgrade with a Node.js runner instead of a
+    // cmd.exe batch.  The batch was the source of every Windows
+    // auto-upgrade outage we shipped (paren-counting in if-blocks,
+    // timeout-needs-stdin, del silent failures, codepage issues with
+    // non-ASCII %TEMP% / %USERPROFILE% paths).  Node fs APIs use the
+    // Windows wide-char API natively, so Chinese / Cyrillic / etc.
+    // paths round-trip transparently.
+    //
+    // Layout: copy the bundled runner to %TEMP%/imcodes-upgrade-X/upgrade.mjs
+    // BEFORE spawning, so the in-flight `npm install -g` doesn't
+    // overwrite the runner's source under itself when the new
+    // package's files land at the same global path.
     const npmBin = join(dirname(process.execPath), 'npm.cmd');
     const npmCmd = existsSync(npmBin) ? npmBin : 'npm';
     const pkgSpec = targetVersion ? `imcodes@${targetVersion}` : 'imcodes@latest';
-    const batchPath = join(scriptDir, 'upgrade.cmd');
-    const upgradeVbsPath = join(scriptDir, 'upgrade.vbs');
+    const targetVer = targetVersion ?? 'latest';
+
+    const runnerSrc = resolveWindowsUpgradeRunnerPath();
+    const runnerCopy = join(scriptDir, 'upgrade.mjs');
+    try {
+      // Read+write rather than cpSync so a broken runnerSrc fails loud.
+      writeFileSync(runnerCopy, readFileSync(runnerSrc));
+    } catch (err) {
+      logger.error({ err, runnerSrc }, 'daemon.upgrade: failed to stage upgrade runner — cannot proceed');
+      return;
+    }
+
+    // Cleanup .cmd is still cmd.exe — but it's a 4-line idempotent rmdir
+    // with NO control flow.  No parens, no timeout, no del — just one
+    // ping sleep and one rmdir.  Kept because the runner self-cleans via
+    // its own deferred rmSync, but this is a belt-and-suspenders for
+    // the case where the runner crashes before reaching the finally block.
     const cleanupPath = join(scriptDir, 'cleanup.cmd');
     const cleanupVbsPath = join(scriptDir, 'cleanup.vbs');
-    const targetVer = targetVersion ?? 'latest';
-    // .cmd files: UTF-8 + BOM, and the script itself switches to UTF-8 with
-    // `chcp 65001` before touching any non-ASCII paths.
-    // .vbs files: UTF-16 LE + BOM so wscript handles non-ASCII paths.
     writeFileSync(cleanupPath, encodeCmdAsUtf8Bom(buildWindowsCleanupScript(scriptDir)));
     writeFileSync(cleanupVbsPath, encodeVbsAsUtf16(buildWindowsCleanupVbs(cleanupPath)));
-    const vbsLauncherPath = join(homedir(), '.imcodes', 'daemon-launcher.vbs');
-    const batch = buildWindowsUpgradeBatch({
-      logFile,
-      scriptDir,
-      cleanupPath,
-      cleanupVbsPath,
-      npmCmd,
-      pkgSpec,
-      targetVer,
-      vbsLauncherPath,
-      upgradeLockFile: UPGRADE_LOCK_FILE,
+
+    // VBS launcher — runs the JS runner via `node upgrade.mjs <args>`
+    // hidden + detached.  Bake all paths as args so the runner doesn't
+    // depend on env-var expansion or working directory.
+    const upgradeVbsPath = join(scriptDir, 'upgrade.vbs');
+    const upgradeVbs = buildWindowsUpgradeRunnerVbs({
+      nodeExe: process.execPath,
+      runnerPath: runnerCopy,
+      args: [logFile, npmCmd, pkgSpec, targetVer, scriptDir],
     });
+    writeFileSync(upgradeVbsPath, encodeVbsAsUtf16(upgradeVbs));
 
-    writeFileSync(batchPath, encodeCmdAsUtf8Bom(batch));
-    writeFileSync(upgradeVbsPath, encodeVbsAsUtf16(buildWindowsUpgradeVbs(batchPath)));
-
-    // Launch via wscript on the wrapper VBS — this guarantees that ALL child
-    // processes spawned by the batch (wmic, find, tasklist, etc.) inherit a
-    // fully hidden parent and never flash console windows.
+    // Launch via wscript: hidden + fully detached, survives our exit.
     const child = spawn('wscript', [upgradeVbsPath], {
       detached: true,
       stdio: 'ignore',
@@ -3838,8 +4340,17 @@ launchctl load -w "${plist}"`;
     });
     child.unref();
 
-    logger.info({ log: logFile }, 'daemon.upgrade: Windows upgrade script spawned');
+    // Also kick off cleanup deferred 120 s — the runner cleans up too,
+    // but if it crashes before its finally block we still want %TEMP% tidy.
+    spawn('wscript', [cleanupVbsPath], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    }).unref();
+
+    logger.info({ log: logFile, runnerCopy }, 'daemon.upgrade: Windows JS upgrade runner spawned');
     upgradeScriptSpawned = true;
+    scheduleUpgradeMemoryFreezeRelease();
     return;
   } else {
     logger.warn('daemon.upgrade: unsupported platform, cannot restart service');
@@ -3894,7 +4405,10 @@ launchctl load -w "${plist}"`;
   // instead of evaporating in 60 s. Operators running into a stuck daemon
   // can grep `find /tmp -name 'imcodes-upgrade-*' -mmin -1440` after the
   // fact. Successful upgrades still clean up via the same timer; the only
-  // observable change is debugability.
+  // observable change is debugability. On Linux the delayed cleanup must run
+  // in its own transient user unit; a background `sleep 86400` spawned from
+  // imcodes.service stays in the daemon's cgroup and pollutes systemctl status
+  // until it exits.
   const CLEANUP_AFTER_SEC = 24 * 60 * 60;
   const script = `#!/bin/bash
 # imcodes daemon-upgrade script. Generated by daemon.upgrade.
@@ -3903,7 +4417,34 @@ launchctl load -w "${plist}"`;
 # stuck or failed restart can be diagnosed post-hoc.
 
 LOG="${logFile}"
+SCRIPT_DIR="${scriptDir}"
+CLEANUP_AFTER_SEC=${CLEANUP_AFTER_SEC}
 log() { echo "[$(date '+%Y-%m-%dT%H:%M:%S%z')] $*" >> "$LOG"; }
+
+schedule_self_cleanup() {
+  if [ -z "$SCRIPT_DIR" ] || [ ! -d "$SCRIPT_DIR" ]; then
+    return 0
+  fi
+
+  if [ "$(uname)" = "Linux" ]; then
+    if command -v systemd-run >/dev/null 2>&1; then
+      CLEANUP_LABEL=$(printf '%s' "$(basename "$SCRIPT_DIR")" | tr -c 'A-Za-z0-9_.-' '-')
+      CLEANUP_UNIT="imcodes-upgrade-cleanup-$CLEANUP_LABEL"
+      if systemd-run --user --unit="$CLEANUP_UNIT" --collect --quiet /bin/sh -c 'sleep "$1"; rm -rf "$2"' imcodes-upgrade-cleanup "$CLEANUP_AFTER_SEC" "$SCRIPT_DIR" >> "$LOG" 2>&1; then
+        log "[cleanup] scheduled via systemd-run user unit: $CLEANUP_UNIT"
+        return 0
+      fi
+      log "[cleanup] systemd-run scheduling failed (non-fatal); leaving $SCRIPT_DIR for manual cleanup"
+    else
+      log "[cleanup] systemd-run unavailable; leaving $SCRIPT_DIR for manual cleanup"
+    fi
+    log "[cleanup] skipped background sleeper on Linux to avoid leaking into imcodes.service cgroup"
+    return 0
+  fi
+
+  (sleep "$CLEANUP_AFTER_SEC" && rm -rf "$SCRIPT_DIR") >/dev/null 2>&1 &
+  log "[cleanup] scheduled via background sleeper"
+}
 
 log "=== imcodes upgrade started ==="
 log "[step 0] daemon PID at gen time: ${oldDaemonPid}"
@@ -3991,7 +4532,7 @@ release_upgrade_lock() {
 
 if ! acquire_upgrade_lock; then
   log "=== upgrade skipped: another upgrade is in progress ==="
-  sleep ${CLEANUP_AFTER_SEC} && rm -rf "${scriptDir}" &
+  schedule_self_cleanup
   exit 0
 fi
 trap release_upgrade_lock EXIT
@@ -4101,38 +4642,67 @@ log "[step 2] installing ${pkgSpec}"
 # \`npm install\` from inside the global package to repopulate it. Run with
 # --ignore-scripts again for the same reason.
 #
-# ── Retry on ETARGET (npm CDN replication race) ────────────────────────
+# ── Retry on publish propagation / transient network failures ──────────
 # Real-world failure mode caught on 116.62.239.78: server publishes a
 # new dev release to npm and broadcasts \`daemon.upgrade { targetVersion }\`
 # almost immediately. npm origin has the version but the regional CDN
 # edge serving this daemon hasn't replicated yet — so the packument
 # response is a 200 missing the new version → npm exits with ETARGET.
-# Pre-fix this killed the upgrade for that release entirely (no retry,
-# next try only when the server broadcasts again). We now retry up to
-# 4 times with 60/180/300s back-off (1m / 3m / 5m — the last gap is wide
-# enough to outlast a slow regional CDN: 2m wasn't enough on a real
-# replication-lagged edge node) and bust the packument cache between
-# attempts so npm refetches origin instead of serving the stale 200.
-# Total time-to-give-up: ~9 minutes from the first attempt.
-#
-# Non-ETARGET failures are NOT retried — they're typically deterministic
-# (network down, ENOSPC, registry auth issue). Logging the per-attempt
-# tail makes those diagnosable post-hoc without re-reading the giant
-# main log.
+# Pre-fix this either killed the upgrade for that release or, worse, ran
+# \`npm cache clean --force\`, deleting every cached dependency on the box.
+# The eventual successful install then had to redownload 200+ packages and
+# took minutes. We now use a cheap \`npm view\` precheck for pinned versions,
+# avoid full-cache wipes, and retry transient network failures like
+# ECONNRESET/ETIMEDOUT/EAI_AGAIN.
 INSTALL_OUT="${scriptDir}/install-attempt.log"
 INSTALL_RC=1
 ATTEMPT=0
-MAX_ATTEMPTS=4
+MAX_ATTEMPTS=5
 # Indexed sequentially with $ATTEMPT (1-based), so element 0 is unused.
-# 60s / 180s / 300s — see the comment block above for sizing rationale.
-RETRY_DELAYS=(0 60 180 300)
+# 15s / 30s / 60s / 120s keeps the common npm publish-CDN window quick
+# without stretching a bad target into a 10-minute local stall.
+RETRY_DELAYS=(0 15 30 60 120)
+
+is_etarget_output() {
+  grep -qiE 'code ETARGET|No matching version found' "$1" 2>/dev/null
+}
+
+is_transient_npm_output() {
+  grep -qiE 'code (ECONNRESET|ETIMEDOUT|EAI_AGAIN|ECONNREFUSED|ENOTFOUND|EHOSTUNREACH|ENETUNREACH)|network aborted|socket timeout|fetch failed|network socket disconnected|5[0-9][0-9]' "$1" 2>/dev/null
+}
+
 while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
   ATTEMPT=$((ATTEMPT + 1))
   log "[step 2] install attempt $ATTEMPT/$MAX_ATTEMPTS"
   : > "$INSTALL_OUT"
+
+  if [ "${targetVer}" != "latest" ]; then
+    log "[step 2] registry visibility precheck for ${pkgSpec}"
+    eval "$NPM_RUN view --prefer-online ${pkgSpec} version" >> "$INSTALL_OUT" 2>&1
+    VIEW_RC=$?
+    cat "$INSTALL_OUT" >> "$LOG"
+    if [ "$VIEW_RC" -ne 0 ] && is_etarget_output "$INSTALL_OUT"; then
+      log "[step 2] ${pkgSpec} not visible in registry yet"
+      if [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
+        log "[step 2] target never became visible across $MAX_ATTEMPTS attempts — giving up before heavyweight install"
+        INSTALL_RC=$VIEW_RC
+        break
+      fi
+      DELAY=\${RETRY_DELAYS[$ATTEMPT]}
+      log "[step 2] waiting \${DELAY}s for npm publish propagation"
+      sleep "$DELAY"
+      continue
+    fi
+    if [ "$VIEW_RC" -ne 0 ]; then
+      log "[step 2] registry precheck failed (exit $VIEW_RC); trying install anyway"
+    fi
+    : > "$INSTALL_OUT"
+  fi
+
   # --prefer-online: tell npm to revalidate cached packument metadata
-  # rather than serve potentially-stale entries. Belt & braces with the
-  # cache-clean we do between attempts.
+  # rather than serve potentially-stale entries. Do NOT use \`npm cache
+  # clean --force\` here: it wipes cached dependency tarballs too, which is
+  # exactly what made upgrades on large SDK dependency sets feel glacial.
   eval "$NPM_RUN install -g --ignore-scripts --prefer-online ${pkgSpec}" >> "$INSTALL_OUT" 2>&1
   INSTALL_RC=$?
   # Always tee the attempt's output into the main log for forensics.
@@ -4142,31 +4712,32 @@ while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
     break
   fi
   log "[step 2] install attempt $ATTEMPT failed (exit $INSTALL_RC)"
-  # Detect ETARGET (case-insensitive — npm versions vary slightly).
-  IS_ETARGET=0
-  if grep -qiE 'code ETARGET|No matching version found' "$INSTALL_OUT" 2>/dev/null; then
-    IS_ETARGET=1
+  IS_RETRYABLE=0
+  RETRY_REASON="non-retryable"
+  if is_etarget_output "$INSTALL_OUT"; then
+    IS_RETRYABLE=1
+    RETRY_REASON="target-not-visible"
+  elif is_transient_npm_output "$INSTALL_OUT"; then
+    IS_RETRYABLE=1
+    RETRY_REASON="transient-network"
   fi
-  if [ "$IS_ETARGET" -ne 1 ]; then
-    log "[step 2] non-ETARGET failure — not retrying. Tail of npm output:"
+  if [ "$IS_RETRYABLE" -ne 1 ]; then
+    log "[step 2] non-retryable npm failure — not retrying. Tail of npm output:"
     tail -20 "$INSTALL_OUT" | while IFS= read -r line; do log "[step 2]   $line"; done
     break
   fi
   if [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
-    log "[step 2] ETARGET persisted across $MAX_ATTEMPTS attempts — registry never replicated ${pkgSpec}"
+    log "[step 2] retryable npm failure ($RETRY_REASON) persisted across $MAX_ATTEMPTS attempts"
     break
   fi
   DELAY=\${RETRY_DELAYS[$ATTEMPT]}
-  log "[step 2] ETARGET — npm CDN likely hasn't replicated ${pkgSpec} yet; retrying in \${DELAY}s after busting packument cache"
-  # Bust the cached packument so the next attempt forces an origin
-  # round-trip instead of revalidating into the stale cached 200.
-  eval "$NPM_RUN cache clean --force" >> "$LOG" 2>&1 || log "[step 2] cache clean returned non-zero (ignored)"
+  log "[step 2] retryable npm failure ($RETRY_REASON) — retrying in \${DELAY}s"
   sleep "$DELAY"
 done
 if [ "$INSTALL_RC" -ne 0 ]; then
   log "[step 2] install FAILED after $ATTEMPT attempts (final exit $INSTALL_RC) — keeping current daemon running"
   log "=== upgrade aborted ==="
-  sleep ${CLEANUP_AFTER_SEC} && rm -rf "${scriptDir}" &
+  schedule_self_cleanup
   exit 0
 fi
 log "[step 2] install succeeded after $ATTEMPT attempt(s)"
@@ -4182,7 +4753,7 @@ log "[step 3] installed version: $INSTALLED_VER, target: ${targetVer}"
 if [ "${targetVer}" != "latest" ] && [ "$INSTALLED_VER" != "${targetVer}" ]; then
   log "[step 3] version mismatch — keeping current daemon running"
   log "=== upgrade aborted ==="
-  sleep ${CLEANUP_AFTER_SEC} && rm -rf "${scriptDir}" &
+  schedule_self_cleanup
   exit 0
 fi
 
@@ -4214,13 +4785,13 @@ CMP=$?
 if [ "$CMP" = "1" ]; then
   log "[step 3] installed $INSTALLED_VER is OLDER than current $CURRENT_VER — refusing to downgrade"
   log "=== upgrade aborted ==="
-  sleep ${CLEANUP_AFTER_SEC} && rm -rf "${scriptDir}" &
+  schedule_self_cleanup
   exit 0
 fi
 if [ "$CMP" = "0" ]; then
   log "[step 3] installed $INSTALLED_VER matches current — no restart needed"
   log "=== upgrade complete (no-op) ==="
-  sleep ${CLEANUP_AFTER_SEC} && rm -rf "${scriptDir}" &
+  schedule_self_cleanup
   exit 0
 fi
 log "[step 3] version comparator: installed > current → restart"
@@ -4260,12 +4831,30 @@ log "[step 3] version comparator: installed > current → restart"
 # clobber.
 log "[step 3.5] regenerating launch chain"
 NEW_IMCODES_SCRIPT="$GLOBAL_ROOT/imcodes/dist/src/index.js"
+NEW_LAUNCHER="$GLOBAL_ROOT/imcodes/bin/imcodes-launch.sh"
+
+# Prefer the self-healing launcher (bin/imcodes-launch.sh) when the
+# freshly-installed package ships it. Older installs (pre-launcher) fall
+# back to the direct node ExecStart so we never break versions that
+# don't ship the file. Either way the resulting unit/plist points at
+# absolute paths from THIS install — consistent with the rest of step
+# 3.5's contract.
+if [ -f "$NEW_LAUNCHER" ]; then
+  LINUX_EXEC="ExecStart=$NEW_LAUNCHER start --foreground"
+  DARWIN_PROGRAM_ARGS="[\\"$NEW_LAUNCHER\\",\\"start\\",\\"--foreground\\"]"
+  log "[step 3.5] using self-healing launcher: $NEW_LAUNCHER"
+else
+  LINUX_EXEC="ExecStart=$NODE $NEW_IMCODES_SCRIPT start --foreground"
+  DARWIN_PROGRAM_ARGS="[\\"$NODE\\",\\"$NEW_IMCODES_SCRIPT\\",\\"start\\",\\"--foreground\\"]"
+  log "[step 3.5] $NEW_LAUNCHER not present in this version — using direct node ExecStart"
+fi
+
 if [ ! -f "$NEW_IMCODES_SCRIPT" ]; then
   log "[step 3.5] $NEW_IMCODES_SCRIPT not found — skipping (will rely on existing launch chain)"
 elif [ "$(uname)" = "Linux" ]; then
   SVC="$HOME/.config/systemd/user/imcodes.service"
   if [ -f "$SVC" ]; then
-    NEW_EXEC="ExecStart=$NODE $NEW_IMCODES_SCRIPT start --foreground"
+    NEW_EXEC="$LINUX_EXEC"
     OLD_EXEC=$(grep -m1 '^ExecStart=' "$SVC" || echo '(none)')
     if [ "$OLD_EXEC" = "$NEW_EXEC" ]; then
       log "[step 3.5] systemd ExecStart already current"
@@ -4296,7 +4885,7 @@ elif [ "$(uname)" = "Darwin" ]; then
   if [ -f "$PLIST" ]; then
     if command -v plutil >/dev/null 2>&1; then
       log "[step 3.5] rewriting plist ProgramArguments"
-      if plutil -replace ProgramArguments -json "[\\"$NODE\\",\\"$NEW_IMCODES_SCRIPT\\",\\"start\\",\\"--foreground\\"]" "$PLIST" >> "$LOG" 2>&1; then
+      if plutil -replace ProgramArguments -json "$DARWIN_PROGRAM_ARGS" "$PLIST" >> "$LOG" 2>&1; then
         log "[step 3.5] plutil rewrite OK"
       else
         log "[step 3.5] plutil rewrite FAILED (non-fatal)"
@@ -4369,7 +4958,7 @@ fi
 log "=== upgrade script done ==="
 
 # Self-cleanup after 24 h so failures stay debuggable.
-sleep ${CLEANUP_AFTER_SEC} && rm -rf "${scriptDir}" &
+schedule_self_cleanup
 `;
 
   writeFileSync(scriptPath, script, { mode: 0o755 });
@@ -4383,6 +4972,7 @@ sleep ${CLEANUP_AFTER_SEC} && rm -rf "${scriptDir}" &
 
   logger.info({ log: logFile }, 'daemon.upgrade: upgrade script spawned, will restart in ~3 s');
   upgradeScriptSpawned = true;
+  scheduleUpgradeMemoryFreezeRelease();
   } finally {
     if (!upgradeScriptSpawned) {
       releaseUpgradeMemoryFreeze();
@@ -4404,13 +4994,7 @@ const WINDOWS_DRIVES_PATH = ':drives:';
 const WINDOWS_DRIVES_ROOT = '__imcodes_windows_drives__';
 
 function isPathAllowed(realPath: string): boolean {
-  // Block sensitive directories (e.g. ~/.ssh, ~/.gnupg)
-  const home = homedir();
-  for (const dir of FS_DENIED_DIRS) {
-    const denied = nodePath.join(home, dir);
-    if (realPath === denied || realPath.startsWith(denied + nodePath.sep)) return false;
-  }
-  return true;
+  return isFilePreviewPathAllowed(realPath);
 }
 
 // ── P2P cancel/status handlers ────────────────────────────────────────────
@@ -4612,11 +5196,14 @@ const fsListCache = new Map<string, { expiresAt: number; value: FsLsSnapshot }>(
 const fsListInflight = new Map<string, Promise<FsLsSnapshot>>();
 const fsListGenerations = new Map<string, number>();
 
-function getFsListCacheKey(realPath: string, includeFiles: boolean, includeMetadata: boolean): string {
-  return `${realPath}::${includeFiles ? 'files' : 'dirs'}::${includeMetadata ? 'meta' : 'plain'}`;
+function getFsListCacheKey(realPath: string, includeFiles: boolean, includeMetadata: boolean, allowDownloadHandles: boolean): string {
+  const metadataMode = includeMetadata
+    ? (allowDownloadHandles ? 'meta' : 'meta-no-downloads')
+    : 'plain';
+  return `${realPath}::${includeFiles ? 'files' : 'dirs'}::${metadataMode}`;
 }
 
-async function loadFsListSnapshot(real: string, includeFiles: boolean, includeMetadata: boolean): Promise<FsLsSnapshot> {
+async function loadFsListSnapshot(real: string, includeFiles: boolean, includeMetadata: boolean, allowDownloadHandles: boolean): Promise<FsLsSnapshot> {
   const dirents = await fsReaddir(real, { withFileTypes: true });
   const filtered = dirents.filter((d) => d.isDirectory() || (includeFiles && d.isFile()));
 
@@ -4629,8 +5216,10 @@ async function loadFsListSnapshot(real: string, includeFiles: boolean, includeMe
         entry.size = fileStat.size;
         const ext = nodePath.extname(d.name).toLowerCase().slice(1);
         entry.mime = MIME_MAP[ext] || undefined;
-        const handle = createProjectFileHandle(filePath, d.name, entry.mime as string | undefined, fileStat.size);
-        entry.downloadId = handle.id;
+        if (allowDownloadHandles) {
+          const handle = await tryCreateProjectFileHandle(filePath, d.name, entry.mime as string | undefined, fileStat.size);
+          if (handle) entry.downloadId = handle.id;
+        }
       } catch { /* stat failed, skip metadata */ }
     }
     return entry;
@@ -4649,9 +5238,9 @@ async function loadFsListSnapshot(real: string, includeFiles: boolean, includeMe
   };
 }
 
-async function getFsListSnapshot(real: string, includeFiles: boolean, includeMetadata: boolean): Promise<FsLsSnapshot> {
+async function getFsListSnapshot(real: string, includeFiles: boolean, includeMetadata: boolean, allowDownloadHandles: boolean): Promise<FsLsSnapshot> {
   const dirSignature = await safeStatSignature(real);
-  const cacheKey = getFsListCacheKey(real, includeFiles, includeMetadata);
+  const cacheKey = getFsListCacheKey(real, includeFiles, includeMetadata, allowDownloadHandles);
   const cached = fsListCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now() && cached.value.dirSignature === dirSignature) {
     return cached.value;
@@ -4662,7 +5251,7 @@ async function getFsListSnapshot(real: string, includeFiles: boolean, includeMet
   const inflight = fsListInflight.get(inflightKey);
   if (inflight) return await inflight;
 
-  const promise = loadFsListSnapshot(real, includeFiles, includeMetadata)
+  const promise = loadFsListSnapshot(real, includeFiles, includeMetadata, allowDownloadHandles)
     .then(async (value) => {
       const currentSignature = await safeStatSignature(real);
       if (getResourceGeneration(fsListGenerations, real) === generation && currentSignature === value.dirSignature) {
@@ -4680,18 +5269,20 @@ async function getFsListSnapshot(real: string, includeFiles: boolean, includeMet
 function invalidateFsListCachesForPath(targetPath: string): void {
   const realTarget = normalizeFsPath(targetPath);
   bumpResourceGeneration(fsListGenerations, realTarget);
-  fsListCache.delete(getFsListCacheKey(realTarget, false, false));
-  fsListCache.delete(getFsListCacheKey(realTarget, true, false));
-  fsListCache.delete(getFsListCacheKey(realTarget, false, true));
-  fsListCache.delete(getFsListCacheKey(realTarget, true, true));
+  for (const includeFiles of [false, true]) {
+    fsListCache.delete(getFsListCacheKey(realTarget, includeFiles, false, true));
+    fsListCache.delete(getFsListCacheKey(realTarget, includeFiles, true, true));
+    fsListCache.delete(getFsListCacheKey(realTarget, includeFiles, true, false));
+  }
 
   const parent = nodePath.dirname(realTarget);
   if (parent !== realTarget) {
     bumpResourceGeneration(fsListGenerations, parent);
-    fsListCache.delete(getFsListCacheKey(parent, false, false));
-    fsListCache.delete(getFsListCacheKey(parent, true, false));
-    fsListCache.delete(getFsListCacheKey(parent, false, true));
-    fsListCache.delete(getFsListCacheKey(parent, true, true));
+    for (const includeFiles of [false, true]) {
+      fsListCache.delete(getFsListCacheKey(parent, includeFiles, false, true));
+      fsListCache.delete(getFsListCacheKey(parent, includeFiles, true, true));
+      fsListCache.delete(getFsListCacheKey(parent, includeFiles, true, false));
+    }
   }
 }
 
@@ -4709,7 +5300,11 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
     : (rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath);
   const resolved = isDrivesSentinel ? rawPath : nodePath.resolve(expanded);
 
-  const deadline = new Promise<never>((_, reject) => setTimeout(() => reject(new Error('fs_list_timeout')), FS_LIST_DEADLINE_MS));
+  let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+  const deadline = new Promise<never>((_, reject) => {
+    deadlineTimer = setTimeout(() => reject(new Error('fs_list_timeout')), FS_LIST_DEADLINE_MS);
+    deadlineTimer.unref?.();
+  });
 
   try {
     await Promise.race([handleFsListInner(resolved, rawPath, requestId, includeFiles, includeMetadata, serverLink), deadline]);
@@ -4720,6 +5315,8 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
     } else {
       try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: msg }); } catch { /* ignore */ }
     }
+  } finally {
+    if (deadlineTimer) clearTimeout(deadlineTimer);
   }
 }
 
@@ -4752,216 +5349,21 @@ async function handleFsListInner(resolved: string, rawPath: string, requestId: s
     return;
   }
 
-  let real: string;
-  try {
-    real = await fsRealpath(resolved);
-  } catch (err) {
-    if (process.platform === 'win32') {
-      logger.debug({ resolved, err }, 'fsRealpath failed on Windows, falling back to resolved path');
-      real = resolved;
-    } else {
-      throw err;
-    }
-  }
-
-  const allowed = isPathAllowed(real);
-  if (!allowed) {
-    try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
+  const canonical = await resolveCanonical(resolved, includeMetadata ? 'lenient' : 'strict');
+  if (!canonical) {
+    try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
     return;
   }
 
-  const snapshot = await getFsListSnapshot(real, includeFiles, includeMetadata);
+  const snapshot = await getFsListSnapshot(canonical.realPath, includeFiles, includeMetadata, !canonical.usedFallback);
 
   try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: snapshot.resolvedPath, status: 'ok', entries: snapshot.entries }); } catch { /* ignore */ }
 }
 
-const FS_READ_SIZE_LIMIT = 100 * 1024 * 1024; // 100 MB
-
-// Video files are not transferred over WS — the browser fetches them via the
-// HTTP download endpoint and plays them with <video>. We just need to detect
-// the MIME and check the size against this limit.
-const VIDEO_MIME: Record<string, string> = {
-  mp4: 'video/mp4',
-  m4v: 'video/mp4',
-  mov: 'video/quicktime',
-  webm: 'video/webm',
-  ogv: 'video/ogg',
-  ogg: 'video/ogg',
-  mkv: 'video/x-matroska',
-  avi: 'video/x-msvideo',
-};
-
-interface FsReadSnapshot {
-  path: string;
-  fileSignature: string;
-  status: 'ok' | 'error';
-  content?: string;
-  encoding?: 'base64';
-  mimeType?: string;
-  error?: string;
-  previewReason?: 'too_large' | 'binary' | 'unknown_type';
-}
-
-const fsReadCache = new Map<string, { expiresAt: number; value: FsReadSnapshot }>();
-const fsReadInflight = new Map<string, Promise<FsReadSnapshot>>();
-const fsReadGenerations = new Map<string, number>();
-const FS_READ_CACHE_TTL_MS = 5_000;
 const REPO_CONTEXT_CACHE_TTL_MS = 5_000;
 
-async function loadFsReadSnapshot(realPath: string, fileSignature: string): Promise<FsReadSnapshot> {
-  const ext = nodePath.extname(realPath).toLowerCase().slice(1);
-  const IMAGE_MIME: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', ico: 'image/x-icon', bmp: 'image/bmp', svg: 'image/svg+xml' };
-  const OFFICE_MIME: Record<string, string> = {
-    pdf: 'application/pdf',
-    docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-  };
-  const mimeType = IMAGE_MIME[ext] ?? OFFICE_MIME[ext];
-
-  if (mimeType) {
-    const buf = await fsReadFileRaw(realPath);
-    return {
-      path: realPath,
-      fileSignature,
-      status: 'ok',
-      content: buf.toString('base64'),
-      encoding: 'base64',
-      mimeType,
-    };
-  }
-
-  const content = await fsReadFileRaw(realPath, 'utf-8');
-  const sample = content.slice(0, 8192);
-  if (sample.includes('\0')) {
-    return {
-      path: realPath,
-      fileSignature,
-      status: 'error',
-      error: 'binary_file',
-      previewReason: 'binary',
-    };
-  }
-
-  return {
-    path: realPath,
-    fileSignature,
-    status: 'ok',
-    content,
-  };
-}
-
-async function getFsReadSnapshot(realPath: string, fileSignature: string): Promise<FsReadSnapshot> {
-  const cached = fsReadCache.get(realPath);
-  if (cached && cached.expiresAt > Date.now() && cached.value.fileSignature === fileSignature) {
-    return cached.value;
-  }
-  const generation = getResourceGeneration(fsReadGenerations, realPath);
-  const inflightKey = `${realPath}::${fileSignature}::${generation}`;
-  const inflight = fsReadInflight.get(inflightKey);
-  if (inflight) return await inflight;
-  const promise = loadFsReadSnapshot(realPath, fileSignature)
-    .then(async (value) => {
-      const currentSignature = await safeStatSignature(realPath);
-      if (getResourceGeneration(fsReadGenerations, realPath) === generation && currentSignature === value.fileSignature) {
-        fsReadCache.set(realPath, { value, expiresAt: Date.now() + FS_READ_CACHE_TTL_MS });
-      }
-      return value;
-    })
-    .finally(() => {
-      fsReadInflight.delete(inflightKey);
-    });
-  fsReadInflight.set(inflightKey, promise);
-  return await promise;
-}
-
 async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
-  const rawPath = cmd.path as string | undefined;
-  const requestId = cmd.requestId as string | undefined;
-  if (!rawPath || !requestId) return;
-
-  const expanded = rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath;
-  const resolved = nodePath.resolve(expanded);
-
-  try {
-    const real = await fsRealpath(resolved);
-    const allowed = isPathAllowed(real);
-    if (!allowed) {
-      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
-      return;
-    }
-
-    const stats = await fsStat(real);
-    const fileSignature = `${stats.mtimeMs}:${stats.size}`;
-
-    const ext = nodePath.extname(real).toLowerCase().slice(1);
-    const IMAGE_MIME: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', ico: 'image/x-icon', bmp: 'image/bmp', svg: 'image/svg+xml' };
-    // Office documents: send as base64 for frontend preview (PDF.js, docx-preview, xlsx)
-    const OFFICE_MIME: Record<string, string> = {
-      pdf: 'application/pdf',
-      docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-      xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    };
-    const videoMime = VIDEO_MIME[ext];
-    const mimeType = IMAGE_MIME[ext] ?? OFFICE_MIME[ext] ?? videoMime;
-    // Unified preview size cap (100 MB). Video, image, office, and text all
-    // share the same ceiling — videos are streamed via HTTP rather than the
-    // base64-over-WS path, so the cap is enforced for sanity, not transport.
-    const sizeLimit = FS_READ_SIZE_LIMIT;
-
-    // Always generate a download handle so the file can be downloaded even if preview fails
-    const fileName = nodePath.basename(real);
-    const handle = createProjectFileHandle(real, fileName, mimeType || MIME_MAP[ext], stats.size);
-
-    if (stats.size > sizeLimit) {
-      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: 'file_too_large', previewReason: 'too_large', downloadId: handle.id }); } catch { /* ignore */ }
-      return;
-    }
-
-    // Video files: skip WS content transfer entirely. The browser fetches
-    // the file via the HTTP download endpoint using the downloadId handle
-    // and plays it with <video>. Sending 100 MB as base64 over WS would
-    // be wasteful and break streaming/seek behavior.
-    if (videoMime) {
-      try {
-        serverLink.send({
-          type: 'fs.read_response',
-          requestId,
-          path: rawPath,
-          resolvedPath: real,
-          status: 'ok',
-          mimeType: videoMime,
-          previewMode: 'stream',
-          size: stats.size,
-          downloadId: handle.id,
-          mtime: stats.mtimeMs,
-        });
-      } catch { /* ignore */ }
-      return;
-    }
-
-    const mtime = stats.mtimeMs;
-    const snapshot = await getFsReadSnapshot(real, fileSignature);
-    if (snapshot.status === 'error') {
-      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: snapshot.error, previewReason: snapshot.previewReason, downloadId: handle.id }); } catch { /* ignore */ }
-      return;
-    }
-    try {
-      serverLink.send({
-        type: 'fs.read_response',
-        requestId,
-        path: rawPath,
-        resolvedPath: real,
-        status: 'ok',
-        content: snapshot.content,
-        ...(snapshot.encoding ? { encoding: snapshot.encoding } : {}),
-        ...(snapshot.mimeType ? { mimeType: snapshot.mimeType } : {}),
-        downloadId: handle.id,
-        mtime,
-      });
-    } catch { /* ignore */ }
-  } catch (err) {
-    try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, status: 'error', error: err instanceof Error ? err.message : String(err) }); } catch { /* ignore */ }
-  }
+  getDefaultPreviewReadCoordinator().handle(cmd.path, cmd.requestId, (message) => serverLink.send(message));
 }
 
 const GIT_STATUS_CACHE_TTL_MS = 5_000;
@@ -5354,16 +5756,12 @@ function collectAffectedRepoRoots(targetPath: string): Set<string> {
 
 function invalidateGitCachesForPath(targetPath: string): void {
   const normalized = normalizeFsPath(targetPath);
-  bumpResourceGeneration(fsReadGenerations, normalized);
+  getDefaultPreviewReadCoordinator().invalidate(normalized);
   bumpResourceGeneration(gitDiffGenerations, normalized);
   for (const repoRoot of collectAffectedRepoRoots(normalized)) {
     bumpResourceGeneration(gitRepoGenerations, repoRoot);
   }
-  fsReadCache.delete(normalized);
   gitDiffCache.delete(normalized);
-  for (const key of fsReadInflight.keys()) {
-    if (key.startsWith(`${normalized}::`)) fsReadInflight.delete(key);
-  }
   for (const key of gitDiffInflight.keys()) {
     if (key.startsWith(`${normalized}::`)) gitDiffInflight.delete(key);
   }
@@ -5387,9 +5785,7 @@ function invalidateGitCachesForPath(targetPath: string): void {
 }
 
 export function __resetFsGitCachesForTests(): void {
-  fsReadCache.clear();
-  fsReadInflight.clear();
-  fsReadGenerations.clear();
+  void __resetPreviewReadCoordinatorForTests();
   repoContextCache.clear();
   repoSignatureCache.clear();
   gitStatusCache.clear();
@@ -5420,7 +5816,7 @@ async function handleFsGitStatus(cmd: Record<string, unknown>, serverLink: Serve
     const real = await fsRealpath(resolved);
     const allowed = isPathAllowed(real);
     if (!allowed) {
-      try { serverLink.send({ type: 'fs.git_status_response', requestId, path: rawPath, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
+      try { serverLink.send({ type: 'fs.git_status_response', requestId, path: rawPath, status: 'error', error: FS_READ_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
       return;
     }
     const [snapshot, numstat] = await Promise.all([
@@ -5463,7 +5859,7 @@ async function handleFsGitDiff(cmd: Record<string, unknown>, serverLink: ServerL
     }
     const allowed = isPathAllowed(allowedProbe);
     if (!allowed) {
-      try { serverLink.send({ type: 'fs.git_diff_response', requestId, path: rawPath, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
+      try { serverLink.send({ type: 'fs.git_diff_response', requestId, path: rawPath, status: 'error', error: FS_READ_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
       return;
     }
     const snapshot = await getFileGitDiffSnapshot(resolved);
@@ -5490,7 +5886,7 @@ async function handleFsMkdir(cmd: Record<string, unknown>, serverLink: ServerLin
     const realParent = await fsRealpath(parent);
     const allowed = isPathAllowed(realParent);
     if (!allowed) {
-      try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
+      try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: FS_READ_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
       return;
     }
   } catch {
@@ -5510,25 +5906,34 @@ async function handleFsMkdir(cmd: Record<string, unknown>, serverLink: ServerLin
 }
 
 /** fs.write — write a file (with optional mtime conflict detection) */
+function getFsWriteErrorCode(err: unknown): string {
+  const code = typeof err === 'object' && err !== null && 'code' in err ? String((err as { code?: unknown }).code) : '';
+  const message = err instanceof Error ? err.message : String(err);
+  if (code === 'EEXIST' || message.includes('EEXIST') || message.includes('file already exists')) return FS_WRITE_ERROR.FILE_EXISTS;
+  if (code === 'ENOENT' || code === 'ENOTDIR' || message.includes('ENOENT') || message.includes('no such file')) return 'parent_not_found';
+  return FS_GENERIC_ERROR_CODES.INTERNAL_ERROR;
+}
+
 async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const rawPath = cmd.path as string | undefined;
   const requestId = cmd.requestId as string | undefined;
   const content = cmd.content as string | undefined;
   if (!rawPath || !requestId || content === undefined) {
     if (requestId) {
-      try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath ?? '', status: 'error', error: 'invalid_request' }); } catch { /* ignore */ }
+      try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath ?? '', status: 'error', error: FS_GENERIC_ERROR_CODES.INVALID_REQUEST }); } catch { /* ignore */ }
     }
     return;
   }
 
   const expectedMtime = typeof cmd.expectedMtime === 'number' ? cmd.expectedMtime : undefined;
+  const createOnly = cmd.createOnly === true;
 
   const expanded = rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath;
   const resolved = nodePath.resolve(expanded);
 
   // Size check first (cheap, before any I/O)
   if (Buffer.byteLength(content, 'utf-8') > 1_048_576) {
-    try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: 'file_too_large' }); } catch { /* ignore */ }
+    try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE }); } catch { /* ignore */ }
     return;
   }
 
@@ -5547,7 +5952,12 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
       const real = await fsRealpath(resolved);
       const allowed = isPathAllowed(real);
       if (!allowed) {
-        try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
+        try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
+        return;
+      }
+
+      if (createOnly) {
+        try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: FS_WRITE_ERROR.FILE_EXISTS }); } catch { /* ignore */ }
         return;
       }
 
@@ -5575,7 +5985,8 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
       invalidateGitCachesForPath(real);
       try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', mtime: newStats.mtimeMs }); } catch { /* ignore */ }
     } catch (err) {
-      try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: err instanceof Error ? err.message : String(err) }); } catch { /* ignore */ }
+      logger.warn({ requestId, errorCode: getFsWriteErrorCode(err) }, 'fs.write failed');
+      try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: getFsWriteErrorCode(err) }); } catch { /* ignore */ }
     }
   } else {
     // New file: realpath of parent must be within FS_ALLOWED_ROOTS
@@ -5584,20 +5995,29 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
       const realParent = await fsRealpath(parent);
       const allowed = isPathAllowed(realParent);
       if (!allowed) {
-        try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
+        try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
         return;
       }
+      try {
+        const targetStats = await fsLstat(resolved);
+        const error = targetStats.isSymbolicLink() ? FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH : FS_WRITE_ERROR.FILE_EXISTS;
+        try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error }); } catch { /* ignore */ }
+        return;
+      } catch (err) {
+        const code = typeof err === 'object' && err !== null && 'code' in err ? String((err as { code?: unknown }).code) : '';
+        if (code !== 'ENOENT') throw err;
+      }
       // Write the file
-      await fsWriteFile(resolved, content, 'utf-8');
+      await fsWriteFile(resolved, content, { encoding: 'utf-8', flag: 'wx' });
       const newStats = await fsStat(resolved);
       const real = await fsRealpath(resolved);
       invalidateFsListCachesForPath(real);
       invalidateGitCachesForPath(real);
       try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', mtime: newStats.mtimeMs }); } catch { /* ignore */ }
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const isNotFound = msg.includes('ENOENT') || msg.includes('no such file');
-      try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: isNotFound ? 'parent_not_found' : msg }); } catch { /* ignore */ }
+      const errorCode = getFsWriteErrorCode(err);
+      logger.warn({ requestId, errorCode }, 'fs.write failed');
+      try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: errorCode }); } catch { /* ignore */ }
     }
   }
 }
@@ -5905,10 +6325,35 @@ async function handleSharedContextRuntimeConfigApply(cmd: Record<string, unknown
   }
 }
 
+function handleMemoryFeatureConfigApply(cmd: Record<string, unknown>): void {
+  const nextFlags = sanitizeMemoryFeatureFlagValues(cmd.flags);
+  const previous = getRuntimeMemoryFeatureFlagValues() ?? {};
+  setRuntimeMemoryFeatureFlagValues(nextFlags);
+  if (
+    previous[MEMORY_FEATURE_FLAGS_BY_NAME.skills] !== nextFlags[MEMORY_FEATURE_FLAGS_BY_NAME.skills]
+    || previous[MEMORY_FEATURE_FLAGS_BY_NAME.skillAutoCreation] !== nextFlags[MEMORY_FEATURE_FLAGS_BY_NAME.skillAutoCreation]
+  ) {
+    publishRuntimeMemoryCacheInvalidation({ kind: 'skill_registry' });
+  }
+}
+
 async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
   if (!requestId) return;
-  const projectId = typeof cmd.projectId === 'string' ? cmd.projectId.trim() : '';
+  const ctx = commandManagementContext(cmd);
+  if (!ctx) {
+    serverLink.send({
+      type: MEMORY_WS.PERSONAL_RESPONSE,
+      requestId,
+      stats: emptyMemoryStatsView(),
+      records: [],
+      pendingRecords: [],
+      ...memoryManagementContextError(),
+    });
+    return;
+  }
+  const projectId = commandCanonicalRepoId(cmd) || commandString(cmd, 'projectId');
+  const ownerUserId = ctx.userId;
   const projectionClass = cmd.projectionClass === 'recent_summary' || cmd.projectionClass === 'durable_memory_candidate' || cmd.projectionClass === 'master_summary'
     ? cmd.projectionClass
     : undefined;
@@ -5917,6 +6362,8 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
   const includeArchived = cmd.includeArchived === true;
   const baseStats = getProcessedProjectionStats({
     scope: 'personal',
+    userId: ownerUserId,
+    includeLegacyPersonalOwner: true,
     projectId: projectId || undefined,
     projectionClass,
     includeArchived,
@@ -5926,6 +6373,9 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
     id: string;
     scope: 'personal';
     projectId: string;
+    ownerUserId?: string;
+    createdByUserId?: string;
+    updatedByUserId?: string;
     summary: string;
     projectionClass: 'recent_summary' | 'durable_memory_candidate' | 'master_summary';
     sourceEventCount: number;
@@ -5940,17 +6390,21 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
     const { searchLocalMemorySemantic } = await import('../context/memory-search.js');
     const semantic = await searchLocalMemorySemantic({
       query,
+      scope: 'personal',
+      userId: ownerUserId,
+      includeLegacyPersonalOwner: true,
       repo: projectId || undefined,
       projectionClass,
       limit,
       includeArchived,
     });
     records = semantic.items
-      .filter((item) => item.type === 'processed')
+      .filter((item) => item.type === 'processed' && item.scope === 'personal' && personalOwnerMatchesManagementUser(item.userId, ownerUserId))
       .map((item) => ({
         id: item.id,
         scope: 'personal' as const,
-        projectId: item.projectId,
+        projectId: item.projectId ?? '',
+        ownerUserId: item.userId ?? ownerUserId,
         summary: item.summary,
         projectionClass: item.projectionClass ?? 'recent_summary',
         sourceEventCount: item.sourceEventCount ?? 0,
@@ -5963,6 +6417,8 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
   } else {
     records = queryProcessedProjections({
       scope: 'personal',
+      userId: ownerUserId,
+      includeLegacyPersonalOwner: true,
       projectId: projectId || undefined,
       projectionClass,
       limit,
@@ -5970,7 +6426,13 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
     }).map((projection) => ({
       id: projection.id,
       scope: projection.namespace.scope as 'personal',
-      projectId: projection.namespace.projectId,
+      projectId: projection.namespace.projectId ?? '',
+      ownerUserId: recordOwnerUserIdFromContent(projection.content, projection.namespace) ?? ownerUserId,
+      createdByUserId: recordCreatedByUserIdFromContent(
+        projection.content,
+        recordOwnerUserIdFromContent(projection.content, projection.namespace) ?? ownerUserId,
+      ),
+      updatedByUserId: recordUpdatedByUserIdFromContent(projection.content),
       summary: projection.summary,
       projectionClass: projection.class,
       sourceEventCount: projection.sourceEventIds.length,
@@ -5988,9 +6450,19 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
   };
   const pendingRecords = queryPendingContextEvents({
     scope: 'personal',
+    userId: ownerUserId,
+    includeLegacyPersonalOwner: true,
     projectId: projectId || undefined,
     query: query || undefined,
     limit,
+  });
+  const projects = listMemoryProjectSummaries({
+    scope: 'personal',
+    userId: ownerUserId,
+    includeLegacyPersonalOwner: true,
+    projectId: projectId || undefined,
+    projectionClass,
+    includeArchived,
   });
   serverLink.send({
     type: MEMORY_WS.PERSONAL_RESPONSE,
@@ -5998,25 +6470,1236 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
     stats,
     records,
     pendingRecords,
+    projects,
   });
 }
 
+function commandString(cmd: Record<string, unknown>, key: string): string {
+  const value = cmd[key];
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function commandManagementContext(cmd: Record<string, unknown>): AuthenticatedMemoryManagementContext | null {
+  const raw = cmd[MEMORY_MANAGEMENT_CONTEXT_FIELD];
+  if (isAuthenticatedMemoryManagementContext(raw)) {
+    const requestId = commandString(cmd, 'requestId');
+    if (raw.source === 'server_bridge' && raw.requestId && requestId && raw.requestId !== requestId) {
+      return null;
+    }
+    return {
+      ...raw,
+      actorId: raw.actorId.trim(),
+      userId: raw.userId.trim(),
+      boundProjects: raw.boundProjects ?? [],
+    };
+  }
+  return null;
+}
+
+function commandCanonicalRepoId(cmd: Record<string, unknown>): string | undefined {
+  return commandString(cmd, 'canonicalRepoId') || undefined;
+}
+
+function contextProjectHint(ctx: AuthenticatedMemoryManagementContext, projectDir?: string, canonicalRepoId?: string): {
+  projectDir?: string;
+  canonicalRepoId?: string;
+  workspaceId?: string;
+  orgId?: string;
+} {
+  const trimmedProjectDir = projectDir?.trim();
+  const trimmedCanonicalRepoId = canonicalRepoId?.trim();
+  const matched = trimmedCanonicalRepoId
+    ? ctx.boundProjects?.find((project) => project.canonicalRepoId === trimmedCanonicalRepoId)
+    : (trimmedProjectDir
+      ? ctx.boundProjects?.find((project) => project.projectDir === trimmedProjectDir)
+      : ctx.boundProjects?.[0]);
+  return {
+    projectDir: matched?.projectDir,
+    canonicalRepoId: matched?.canonicalRepoId,
+    workspaceId: matched?.workspaceId,
+    orgId: matched?.orgId,
+  };
+}
+
+function commandMemoryScope(cmd: Record<string, unknown>, fallback: MemoryScope): MemoryScope {
+  const value = cmd.scope;
+  return isMemoryScope(value) ? value : fallback;
+}
+
+function commandNamespace(cmd: Record<string, unknown>, fallbackScope: MemoryScope, ctx?: AuthenticatedMemoryManagementContext): ContextNamespace {
+  const scope = commandMemoryScope(cmd, fallbackScope);
+  const projectHint = ctx ? contextProjectHint(ctx, commandString(cmd, 'projectDir') || undefined, commandCanonicalRepoId(cmd)) : undefined;
+  return {
+    scope,
+    userId: ctx?.userId || commandString(cmd, 'userId') || (scope === 'personal' || scope === 'user_private' ? DAEMON_LOCAL_PREFERENCE_USER_ID : undefined),
+    projectId: ctx ? projectHint?.canonicalRepoId : commandString(cmd, 'projectId') || commandString(cmd, 'canonicalRepoId') || undefined,
+    workspaceId: ctx ? projectHint?.workspaceId : commandString(cmd, 'workspaceId') || undefined,
+    enterpriseId: ctx ? projectHint?.orgId : commandString(cmd, 'enterpriseId') || commandString(cmd, 'orgId') || undefined,
+  };
+}
+
+function metadataUserId(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function recordOwnerUserIdFromContent(content: Record<string, unknown>, namespace?: ContextNamespace): string | undefined {
+  return metadataUserId(content.ownerUserId)
+    ?? metadataUserId(content.ownedByUserId)
+    ?? metadataUserId(content.userId)
+    ?? (namespace && isOwnerPrivateMemoryScope(namespace.scope) ? metadataUserId(namespace.userId) : undefined);
+}
+
+function trustedRecordOwnerUserIdFromContent(content: Record<string, unknown>, namespace?: ContextNamespace): string | undefined {
+  return metadataUserId(content.ownerUserId)
+    ?? metadataUserId(content.ownedByUserId)
+    ?? (namespace && isOwnerPrivateMemoryScope(namespace.scope) ? metadataUserId(namespace.userId) : undefined);
+}
+
+function recordCreatedByUserIdFromContent(content: Record<string, unknown>, fallbackOwnerUserId?: string): string | undefined {
+  return metadataUserId(content.createdByUserId)
+    ?? metadataUserId(content.authorUserId)
+    ?? metadataUserId(content.createdBy)
+    ?? fallbackOwnerUserId;
+}
+
+function trustedRecordCreatedByUserIdFromContent(content: Record<string, unknown>, fallbackOwnerUserId?: string): string | undefined {
+  return metadataUserId(content.createdByUserId)
+    ?? fallbackOwnerUserId;
+}
+
+function recordUpdatedByUserIdFromContent(content: Record<string, unknown>): string | undefined {
+  return metadataUserId(content.updatedByUserId)
+    ?? metadataUserId(content.lastEditedByUserId)
+    ?? metadataUserId(content.updatedBy);
+}
+
+function recordOwnedOrCreatedByUser(content: Record<string, unknown>, namespace: ContextNamespace | undefined, userId: string): boolean {
+  const ownerUserId = trustedRecordOwnerUserIdFromContent(content, namespace);
+  const createdByUserId = trustedRecordCreatedByUserIdFromContent(content, ownerUserId);
+  return ownerUserId === userId || createdByUserId === userId;
+}
+
+function preferenceOwnerFromObservation(observation: { content: Record<string, unknown> }): string {
+  const explicitOwner = trustedRecordOwnerUserIdFromContent(observation.content);
+  if (explicitOwner) return explicitOwner;
+  const idempotencyKey = typeof observation.content.idempotencyKey === 'string' ? observation.content.idempotencyKey : '';
+  const parts = idempotencyKey.split('\u0000');
+  return typeof parts[1] === 'string' && parts[1].trim() ? parts[1] : DAEMON_LOCAL_PREFERENCE_USER_ID;
+}
+
+function observationNamespace(namespaceId: string): ContextNamespace | undefined {
+  return listContextNamespaces().find((namespace) => namespace.id === namespaceId);
+}
+
+function personalOwnerMatchesManagementUser(namespaceUserId: string | undefined, ownerUserId: string): boolean {
+  return namespaceUserId === ownerUserId
+    || !namespaceUserId?.trim()
+    || namespaceUserId === DAEMON_LOCAL_PREFERENCE_USER_ID;
+}
+
+function managementContextCanAccessNamespace(namespace: ContextNamespace | undefined, ctx: AuthenticatedMemoryManagementContext): boolean {
+  if (!namespace) return false;
+  if (namespace.scope === 'user_private') {
+    return namespace.userId === ctx.userId;
+  }
+  const boundProjects = ctx.boundProjects ?? [];
+  if (namespace.scope === 'personal') {
+    if (!personalOwnerMatchesManagementUser(namespace.userId, ctx.userId)) return false;
+    if (namespace.projectId) {
+      if (boundProjects.length === 0) return true;
+      return boundProjects.some((project) => project.canonicalRepoId === namespace.projectId);
+    }
+    return true;
+  }
+  if (namespace.scope === 'project_shared') {
+    return Boolean(namespace.projectId && boundProjects.some((project) => project.canonicalRepoId === namespace.projectId));
+  }
+  if (namespace.scope === 'workspace_shared') {
+    return Boolean(namespace.workspaceId && boundProjects.some((project) => project.workspaceId === namespace.workspaceId));
+  }
+  if (namespace.scope === 'org_shared') {
+    return Boolean(namespace.enterpriseId && boundProjects.some((project) => project.orgId === namespace.enterpriseId));
+  }
+  return false;
+}
+
+function commandProjectBinding(
+  cmd: Record<string, unknown>,
+  ctx: AuthenticatedMemoryManagementContext,
+): MemoryManagementBoundProject | undefined {
+  const projectDir = commandString(cmd, 'projectDir') || undefined;
+  const projectId = commandCanonicalRepoId(cmd);
+  if (!projectDir && !projectId) return undefined;
+  return (ctx.boundProjects ?? []).find((project) => (
+    (!projectDir || project.projectDir === projectDir)
+    && (!projectId || project.canonicalRepoId === projectId)
+  ));
+}
+
+async function validateProjectScopedManagementBinding(
+  cmd: Record<string, unknown>,
+  ctx: AuthenticatedMemoryManagementContext,
+): Promise<{ projectDir: string; canonicalRepoId: string; binding: MemoryManagementBoundProject } | { errorCode: MemoryManagementErrorCode }> {
+  const projectDir = commandString(cmd, 'projectDir');
+  const canonicalRepoId = commandCanonicalRepoId(cmd);
+  if (!projectDir) return { errorCode: MEMORY_MANAGEMENT_ERROR_CODES.MISSING_PROJECT_DIR };
+  if (!canonicalRepoId) return { errorCode: MEMORY_MANAGEMENT_ERROR_CODES.MISSING_PROJECT_IDENTITY };
+  const binding = commandProjectBinding(cmd, ctx);
+  if (!binding || binding.canonicalRepoId !== canonicalRepoId || binding.projectDir !== projectDir) {
+    return { errorCode: MEMORY_MANAGEMENT_ERROR_CODES.PROJECT_IDENTITY_MISMATCH };
+  }
+  const stat = await fsStat(projectDir).catch(() => null);
+  if (!stat?.isDirectory()) return { errorCode: MEMORY_MANAGEMENT_ERROR_CODES.INVALID_PROJECT_DIR };
+  if (!(await validateCanonicalProjectIdentity(projectDir, canonicalRepoId))) {
+    return { errorCode: MEMORY_MANAGEMENT_ERROR_CODES.PROJECT_IDENTITY_MISMATCH };
+  }
+  return { projectDir, canonicalRepoId, binding };
+}
+
+function observationVisibleToManagementContext(
+  observation: { scope: MemoryScope; namespaceId: string },
+  ctx: AuthenticatedMemoryManagementContext,
+): boolean {
+  return managementContextCanAccessNamespace(observationNamespace(observation.namespaceId), ctx);
+}
+
+function observationMutableByManagementContext(
+  observation: { scope: MemoryScope; namespaceId: string; content: Record<string, unknown> },
+  ctx: AuthenticatedMemoryManagementContext,
+): boolean {
+  const namespace = observationNamespace(observation.namespaceId);
+  if (!managementContextCanAccessNamespace(namespace, ctx)) return false;
+  if (isOwnerPrivateMemoryScope(observation.scope)) return true;
+  if (isSharedProjectionScope(observation.scope)) {
+    return ctx.role === 'workspace_admin'
+      || ctx.role === 'org_admin'
+      || recordOwnedOrCreatedByUser(observation.content, namespace, ctx.userId);
+  }
+  return false;
+}
+
+function projectionMutableByManagementContext(
+  projection: { namespace: ContextNamespace; content: Record<string, unknown> },
+  ctx: AuthenticatedMemoryManagementContext,
+): boolean {
+  const namespace = projection.namespace;
+  if (!managementContextCanAccessNamespace(namespace, ctx)) return false;
+  if (isOwnerPrivateMemoryScope(namespace.scope)) return true;
+  if (isSharedProjectionScope(namespace.scope)) {
+    return ctx.role === 'workspace_admin'
+      || ctx.role === 'org_admin'
+      || recordOwnedOrCreatedByUser(projection.content, namespace, ctx.userId);
+  }
+  return false;
+}
+
+function fingerprintKindForObservationClass(observationClass: string): 'preference' | 'skill' | 'decision' | 'note' {
+  if (observationClass === 'preference') return 'preference';
+  if (observationClass === 'skill_candidate') return 'skill';
+  if (observationClass === 'decision') return 'decision';
+  return 'note';
+}
+
+async function validateCanonicalProjectIdentity(projectDir: string, projectIdentity: string): Promise<boolean> {
+  try {
+    const { stdout } = await execFileAsync('git', ['remote', '-v'], { cwd: projectDir, timeout: 3000 });
+    const remotes = parseRemotes(stdout);
+    const selected = remotes.find((remote) => remote.name === 'origin') ?? remotes[0];
+    if (!selected) return false;
+    const canonical = processRecallRepositoryIdentityService.resolve({ originUrl: selected.url });
+    return canonical.key === projectIdentity.trim();
+  } catch {
+    return false;
+  }
+}
+
+function observationText(content: Record<string, unknown>): string {
+  if (typeof content.text === 'string') return content.text;
+  if (typeof content.summary === 'string') return content.summary;
+  if (typeof content.title === 'string') return content.title;
+  return JSON.stringify(content);
+}
+
+function emptyMemoryStatsView(): ContextMemoryStatsView {
+  return {
+    totalRecords: 0,
+    matchedRecords: 0,
+    recentSummaryCount: 0,
+    durableCandidateCount: 0,
+    projectCount: 0,
+    stagedEventCount: 0,
+    dirtyTargetCount: 0,
+    pendingJobCount: 0,
+  };
+}
+
+function memoryManagementError(code: MemoryManagementErrorCode): { errorCode: MemoryManagementErrorCode; error: string } {
+  return { errorCode: code, error: code };
+}
+
+function memoryManagementContextError(): { errorCode: MemoryManagementErrorCode; error: string } {
+  incrementCounter('mem.management.unauthorized', { reason: 'missing_context' });
+  return memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MANAGEMENT_REQUEST_UNROUTED);
+}
+
+function skillsFeatureEnabled(): boolean {
+  return isMemoryFeatureEnabled(MEMORY_FEATURE_FLAGS_BY_NAME.skills);
+}
+
+function mdIngestFeatureEnabled(): boolean {
+  return isMemoryFeatureEnabled(MD_INGEST_FEATURE_FLAG);
+}
+
+function observationStoreFeatureEnabled(): boolean {
+  return isMemoryFeatureEnabled(MEMORY_FEATURE_FLAGS_BY_NAME.observationStore);
+}
+
+function processedMemoryManagementFeatureEnabled(): boolean {
+  return observationStoreFeatureEnabled();
+}
+
+function buildMemoryFeatureAdminRecords() {
+  const layers = readMemoryFeatureResolutionLayers();
+  const requested = readRequestedMemoryFeatureFlags(layers);
+  const effective = computeEffectiveMemoryFeatureFlags(requested);
+  return MEMORY_FEATURE_FLAGS.map((flag) => {
+    const definition = getMemoryFeatureFlagDefinition(flag);
+    return {
+      flag,
+      requested: requested[flag] === true,
+      enabled: effective[flag],
+      source: featureFlagValueSource(flag, layers),
+      envKey: memoryFeatureFlagEnvKey(flag),
+      dependencies: definition.dependencies,
+      dependencyBlocked: requested[flag] === true && !effective[flag]
+        ? definition.dependencies.filter((dependency) => !effective[dependency])
+        : [],
+      disabledBehavior: definition.disabledBehavior,
+    };
+  });
+}
+
+function collectMemoryFeatureWithDependencies(flag: MemoryFeatureFlag, seen = new Set<MemoryFeatureFlag>()): Set<MemoryFeatureFlag> {
+  if (seen.has(flag)) return seen;
+  seen.add(flag);
+  for (const dependency of getMemoryFeatureFlagDefinition(flag).dependencies) {
+    collectMemoryFeatureWithDependencies(dependency, seen);
+  }
+  return seen;
+}
+
+function handleMemoryFeaturesQuery(cmd: Record<string, unknown>, serverLink: ServerLink): void {
+  const requestId = commandString(cmd, 'requestId') || undefined;
+  serverLink.send({
+    type: MEMORY_WS.FEATURES_RESPONSE,
+    requestId,
+    records: buildMemoryFeatureAdminRecords(),
+  });
+}
+
+function handleMemoryFeaturesSet(cmd: Record<string, unknown>, serverLink: ServerLink): void {
+  // In normal server-backed operation the bridge consumes FEATURES_SET,
+  // persists the account-level user-global config, and pushes
+  // MEMORY_FEATURE_CONFIG_MSG.APPLY to every online daemon owned by that user.
+  // This direct daemon write path is retained only as a local fallback for
+  // legacy/offline control planes; it is not the primary UI persistence plane.
+  const requestId = commandString(cmd, 'requestId') || undefined;
+  const flag = commandString(cmd, 'flag');
+  const enabled = cmd.enabled;
+  const ctx = commandManagementContext(cmd);
+  if (!ctx) {
+    serverLink.send({
+      type: MEMORY_WS.FEATURES_SET_RESPONSE,
+      requestId,
+      success: false,
+      ...memoryManagementContextError(),
+    });
+    return;
+  }
+  if (!isMemoryFeatureFlag(flag) || typeof enabled !== 'boolean') {
+    serverLink.send({
+      type: MEMORY_WS.FEATURES_SET_RESPONSE,
+      requestId,
+      success: false,
+      ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.INVALID_FEATURE_FLAG),
+    });
+    return;
+  }
+
+  try {
+    const updates: MemoryFeatureFlagValues = enabled
+      ? Object.fromEntries([...collectMemoryFeatureWithDependencies(flag)].map((dependency) => [dependency, true])) as MemoryFeatureFlagValues
+      : { [flag]: false };
+    setPersistedMemoryFeatureFlagValues(updates);
+    if (flag === MEMORY_FEATURE_FLAGS_BY_NAME.skills || flag === MEMORY_FEATURE_FLAGS_BY_NAME.skillAutoCreation) {
+      publishRuntimeMemoryCacheInvalidation({ kind: 'skill_registry' });
+    }
+    const records = buildMemoryFeatureAdminRecords();
+    serverLink.send({
+      type: MEMORY_WS.FEATURES_SET_RESPONSE,
+      requestId,
+      success: true,
+      flag,
+      requested: enabled,
+      enabled: records.find((record) => record.flag === flag)?.enabled ?? false,
+      records,
+    });
+  } catch (err) {
+    logger.warn({ flag, enabled, err }, 'Failed to persist memory feature flag override');
+    serverLink.send({
+      type: MEMORY_WS.FEATURES_SET_RESPONSE,
+      requestId,
+      success: false,
+      flag,
+      requested: enabled,
+      ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.FEATURE_CONFIG_WRITE_FAILED),
+    });
+  }
+}
+
+async function handleMemoryProjectResolve(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = commandString(cmd, 'requestId') || undefined;
+  const projectDir = commandString(cmd, 'projectDir');
+  const claimedCanonicalRepoId = commandCanonicalRepoId(cmd);
+  const send = (payload: {
+    success: boolean;
+    status: MemoryProjectResolutionStatus;
+    projectDir?: string;
+    canonicalRepoId?: string;
+    displayName?: string;
+    error?: string;
+    errorCode?: MemoryManagementErrorCode;
+  }) => {
+    serverLink.send({
+      type: MEMORY_WS.PROJECT_RESOLVE_RESPONSE,
+      requestId,
+      ...payload,
+    });
+  };
+
+  if (!projectDir) {
+    send({
+      success: false,
+      status: 'invalid_dir',
+      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.MISSING_PROJECT_DIR,
+    });
+    return;
+  }
+
+  const requestedRealpath = await fsRealpath(projectDir).catch(() => undefined);
+  const knownProjectDirs = listSessions()
+    .map((session) => session.projectDir?.trim())
+    .filter((value): value is string => Boolean(value));
+  const knownProjectRealpaths = new Set<string>();
+  for (const dir of knownProjectDirs) {
+    const real = await fsRealpath(dir).catch(() => undefined);
+    if (real) knownProjectRealpaths.add(real);
+  }
+  const isKnownProjectDir = knownProjectDirs.includes(projectDir)
+    || Boolean(requestedRealpath && knownProjectRealpaths.has(requestedRealpath));
+  if (!isKnownProjectDir) {
+    send({
+      success: false,
+      status: 'unauthorized',
+      projectDir,
+      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.PROJECT_IDENTITY_MISMATCH,
+    });
+    return;
+  }
+
+  const stat = await fsStat(projectDir).catch(() => null);
+  if (!stat?.isDirectory()) {
+    send({
+      success: false,
+      status: 'invalid_dir',
+      projectDir,
+      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.INVALID_PROJECT_DIR,
+    });
+    return;
+  }
+
+  try {
+    const repo = await detectRepo(projectDir);
+    if (!repo.info?.remoteUrl) {
+      const status: MemoryProjectResolutionStatus = repo.status === 'multiple_remotes'
+        ? 'multiple_remotes'
+        : repo.status === 'no_repo'
+          ? 'no_repo'
+          : repo.status === 'unauthorized'
+            ? 'unauthorized'
+            : 'error';
+      send({
+        success: false,
+        status,
+        projectDir,
+        errorCode: status === 'unauthorized'
+          ? MEMORY_MANAGEMENT_ERROR_CODES.PROJECT_IDENTITY_MISMATCH
+          : MEMORY_MANAGEMENT_ERROR_CODES.MISSING_PROJECT_IDENTITY,
+      });
+      return;
+    }
+
+    const canonical = processRecallRepositoryIdentityService.resolve({
+      cwd: projectDir,
+      originUrl: repo.info.remoteUrl,
+    });
+    if (claimedCanonicalRepoId && claimedCanonicalRepoId !== canonical.key) {
+      send({
+        success: false,
+        status: 'mismatch',
+        projectDir,
+        canonicalRepoId: canonical.key,
+        displayName: `${repo.info.owner}/${repo.info.repo}`,
+        errorCode: MEMORY_MANAGEMENT_ERROR_CODES.PROJECT_IDENTITY_MISMATCH,
+      });
+      return;
+    }
+
+    send({
+      success: true,
+      status: 'resolved',
+      projectDir,
+      canonicalRepoId: canonical.key,
+      displayName: `${repo.info.owner}/${repo.info.repo}`,
+    });
+  } catch (error) {
+    logger.warn({ error, projectDir }, 'memory project resolve failed');
+    send({
+      success: false,
+      status: 'error',
+      projectDir,
+      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+async function handleMemoryPreferencesQuery(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = commandString(cmd, 'requestId') || undefined;
+  const userIdFilter = commandString(cmd, 'userId');
+  if (!isPreferenceFeatureEnabled()) {
+    serverLink.send({ type: MEMORY_WS.PREF_RESPONSE, requestId, records: [], featureEnabled: false });
+    return;
+  }
+  const ctx = commandManagementContext(cmd);
+  if (!ctx) {
+    serverLink.send({ type: MEMORY_WS.PREF_RESPONSE, requestId, records: [], featureEnabled: true, ...memoryManagementContextError() });
+    return;
+  }
+  const records = listContextObservations({
+    scope: PREFERENCE_INGEST_SCOPE,
+    class: PREFERENCE_INGEST_OBSERVATION_CLASS,
+  })
+    .filter((observation) => observation.state === PREFERENCE_INGEST_OBSERVATION_STATE)
+    .map((observation) => {
+      const userId = preferenceOwnerFromObservation(observation);
+      const createdByUserId = recordCreatedByUserIdFromContent(observation.content, userId);
+      return {
+        id: observation.id,
+        userId,
+        ownerUserId: userId,
+        createdByUserId,
+        updatedByUserId: recordUpdatedByUserIdFromContent(observation.content) ?? createdByUserId,
+        text: observationText(observation.content),
+        fingerprint: observation.fingerprint,
+        origin: observation.origin,
+        state: observation.state,
+        createdAt: observation.createdAt,
+        updatedAt: observation.updatedAt,
+      };
+    })
+    .filter((record) => record.userId === ctx.userId)
+    .filter((record) => !userIdFilter || userIdFilter === ctx.userId && record.userId === userIdFilter)
+    .slice(0, 100);
+  serverLink.send({ type: MEMORY_WS.PREF_RESPONSE, requestId, records, featureEnabled: isPreferenceFeatureEnabled() });
+}
+
+async function handleMemoryPreferenceCreate(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = commandString(cmd, 'requestId') || undefined;
+  const text = commandString(cmd, 'text');
+  if (!isPreferenceFeatureEnabled()) {
+    serverLink.send({ type: MEMORY_WS.PREF_CREATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.FEATURE_DISABLED) });
+    return;
+  }
+  const ctx = commandManagementContext(cmd);
+  if (!ctx) {
+    serverLink.send({ type: MEMORY_WS.PREF_CREATE_RESPONSE, requestId, success: false, ...memoryManagementContextError() });
+    return;
+  }
+  const userId = ctx.userId;
+  if (!text) {
+    serverLink.send({ type: MEMORY_WS.PREF_CREATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_PREFERENCE_TEXT) });
+    return;
+  }
+  try {
+    const scopeKey = `${PREFERENCE_INGEST_SCOPE}:${userId}`;
+    const fingerprint = computeMemoryFingerprint({ kind: 'preference', content: text, scopeKey });
+    const namespace = ensureContextNamespace({ scope: PREFERENCE_INGEST_SCOPE, userId, name: 'preferences' });
+    const row = writeContextObservation({
+      namespaceId: namespace.id,
+      scope: PREFERENCE_INGEST_SCOPE,
+      class: PREFERENCE_INGEST_OBSERVATION_CLASS,
+      origin: PREFERENCE_INGEST_ORIGIN,
+      fingerprint,
+      content: {
+        text,
+        ownerUserId: userId,
+        createdByUserId: ctx.actorId,
+        updatedByUserId: ctx.actorId,
+        idempotencyKey: [PREFERENCE_IDEMPOTENCY_PREFIX, userId, scopeKey, `manual:${requestId || fingerprint}`, fingerprint].join('\u0000'),
+      },
+      text,
+      sourceEventIds: [`manual-pref:${requestId || fingerprint}`],
+      state: PREFERENCE_INGEST_OBSERVATION_STATE,
+    });
+    incrementCounter('mem.preferences.persisted', { sendOrigin: 'interactive_user' });
+    publishRuntimeMemoryCacheInvalidation({ kind: 'preference', userId });
+    serverLink.send({ type: MEMORY_WS.PREF_CREATE_RESPONSE, requestId, success: true, id: row.id });
+  } catch (error) {
+    logger.warn({ error }, 'memory preference management create failed');
+    serverLink.send({ type: MEMORY_WS.PREF_CREATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+  }
+}
+
+async function handleMemoryPreferenceUpdate(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = commandString(cmd, 'requestId') || undefined;
+  const id = commandString(cmd, 'id');
+  const text = commandString(cmd, 'text');
+  if (!isPreferenceFeatureEnabled()) {
+    serverLink.send({ type: MEMORY_WS.PREF_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.FEATURE_DISABLED) });
+    return;
+  }
+  const ctx = commandManagementContext(cmd);
+  if (!ctx) {
+    serverLink.send({ type: MEMORY_WS.PREF_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementContextError() });
+    return;
+  }
+  if (!id) {
+    serverLink.send({ type: MEMORY_WS.PREF_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_ID) });
+    return;
+  }
+  if (!text) {
+    serverLink.send({ type: MEMORY_WS.PREF_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_PREFERENCE_TEXT) });
+    return;
+  }
+  const existingPreference = listContextObservations({
+    scope: PREFERENCE_INGEST_SCOPE,
+    class: PREFERENCE_INGEST_OBSERVATION_CLASS,
+  }).find((observation) => observation.id === id);
+  if (!existingPreference) {
+    serverLink.send({ type: MEMORY_WS.PREF_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.PREFERENCE_NOT_FOUND) });
+    return;
+  }
+  if (preferenceOwnerFromObservation(existingPreference) !== ctx.userId) {
+    incrementCounter('mem.preferences.unauthorized_delete', { source: 'memory_management' });
+    serverLink.send({ type: MEMORY_WS.PREF_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.PREFERENCE_FORBIDDEN_OWNER) });
+    return;
+  }
+  try {
+    const scopeKey = `${PREFERENCE_INGEST_SCOPE}:${ctx.userId}`;
+    const fingerprint = computeMemoryFingerprint({ kind: 'preference', content: text, scopeKey });
+    const row = updateContextObservationText({
+      observationId: id,
+      text,
+      observationClass: PREFERENCE_INGEST_OBSERVATION_CLASS,
+      fingerprint,
+      ownerUserId: ctx.userId,
+      createdByUserId: trustedRecordCreatedByUserIdFromContent(existingPreference.content, ctx.userId),
+      updatedByUserId: ctx.actorId,
+    });
+    if (!row) {
+      serverLink.send({ type: MEMORY_WS.PREF_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.PREFERENCE_NOT_FOUND) });
+      return;
+    }
+    publishRuntimeMemoryCacheInvalidation({ kind: 'preference', userId: ctx.userId });
+    serverLink.send({ type: MEMORY_WS.PREF_UPDATE_RESPONSE, requestId, success: true, id: row.id });
+  } catch (error) {
+    logger.warn({ error }, 'memory preference management update failed');
+    serverLink.send({ type: MEMORY_WS.PREF_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+  }
+}
+
+async function handleMemoryPreferenceDelete(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = commandString(cmd, 'requestId') || undefined;
+  const id = commandString(cmd, 'id');
+  if (!isPreferenceFeatureEnabled()) {
+    serverLink.send({ type: MEMORY_WS.PREF_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.FEATURE_DISABLED) });
+    return;
+  }
+  const ctx = commandManagementContext(cmd);
+  if (!ctx) {
+    serverLink.send({ type: MEMORY_WS.PREF_DELETE_RESPONSE, requestId, success: false, ...memoryManagementContextError() });
+    return;
+  }
+  if (!id) {
+    serverLink.send({ type: MEMORY_WS.PREF_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_ID) });
+    return;
+  }
+  const existingPreference = listContextObservations({
+    scope: PREFERENCE_INGEST_SCOPE,
+    class: PREFERENCE_INGEST_OBSERVATION_CLASS,
+  }).find((observation) => observation.id === id);
+  if (!existingPreference) {
+    serverLink.send({ type: MEMORY_WS.PREF_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.PREFERENCE_NOT_FOUND) });
+    return;
+  }
+  if (preferenceOwnerFromObservation(existingPreference) !== ctx.userId) {
+    incrementCounter('mem.preferences.unauthorized_delete', { source: 'memory_management' });
+    serverLink.send({ type: MEMORY_WS.PREF_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.PREFERENCE_FORBIDDEN_OWNER) });
+    return;
+  }
+  const success = deleteContextObservation(id);
+  if (success) publishRuntimeMemoryCacheInvalidation({ kind: 'preference', userId: ctx.userId });
+  serverLink.send({ type: MEMORY_WS.PREF_DELETE_RESPONSE, requestId, success });
+}
+
+function skillAdminRecord(entry: import('../../shared/skill-registry-types.js').SkillRegistryEntry) {
+  return {
+    key: entry.key,
+    layer: entry.layer,
+    name: entry.metadata.name,
+    category: entry.metadata.category,
+    description: entry.metadata.description,
+    displayPath: entry.displayPath,
+    uri: entry.uri,
+    fingerprint: entry.fingerprint,
+    updatedAt: entry.updatedAt,
+    enforcement: entry.enforcement,
+    project: entry.project,
+  };
+}
+
+async function handleMemorySkillsQuery(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = commandString(cmd, 'requestId') || undefined;
+  const projectDir = commandString(cmd, 'projectDir') || undefined;
+  const canonicalRepoId = commandCanonicalRepoId(cmd);
+  if (!skillsFeatureEnabled()) {
+    serverLink.send({
+      type: MEMORY_WS.SKILL_RESPONSE,
+      requestId,
+      entries: [],
+      sourceCounts: {},
+      featureEnabled: false,
+    });
+    return;
+  }
+  const ctx = commandManagementContext(cmd);
+  if (!ctx) {
+    serverLink.send({ type: MEMORY_WS.SKILL_RESPONSE, requestId, entries: [], sourceCounts: {}, featureEnabled: true, ...memoryManagementContextError() });
+    return;
+  }
+  if (projectDir || canonicalRepoId) {
+    const validation = await validateProjectScopedManagementBinding(cmd, ctx);
+    if ('errorCode' in validation) {
+      serverLink.send({ type: MEMORY_WS.SKILL_RESPONSE, requestId, entries: [], sourceCounts: {}, featureEnabled: true, ...memoryManagementError(validation.errorCode) });
+      return;
+    }
+  }
+  const { getSkillRegistryManagementSnapshot } = await import('../context/skill-registry.js');
+  const snapshot = getSkillRegistryManagementSnapshot({ projectDir });
+  serverLink.send({
+    type: MEMORY_WS.SKILL_RESPONSE,
+    requestId,
+    entries: snapshot.entries.map(skillAdminRecord),
+    sourceCounts: snapshot.sourceCounts,
+    featureEnabled: skillsFeatureEnabled(),
+  });
+}
+
+async function handleMemorySkillsRebuild(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = commandString(cmd, 'requestId') || undefined;
+  const projectDir = commandString(cmd, 'projectDir') || undefined;
+  const canonicalRepoId = commandCanonicalRepoId(cmd);
+  if (!skillsFeatureEnabled()) {
+    serverLink.send({ type: MEMORY_WS.SKILL_REBUILD_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.FEATURE_DISABLED) });
+    return;
+  }
+  const ctx = commandManagementContext(cmd);
+  if (!ctx) {
+    serverLink.send({ type: MEMORY_WS.SKILL_REBUILD_RESPONSE, requestId, success: false, ...memoryManagementContextError() });
+    return;
+  }
+  if (projectDir || canonicalRepoId) {
+    const validation = await validateProjectScopedManagementBinding(cmd, ctx);
+    if ('errorCode' in validation) {
+      serverLink.send({ type: MEMORY_WS.SKILL_REBUILD_RESPONSE, requestId, success: false, ...memoryManagementError(validation.errorCode) });
+      return;
+    }
+  }
+  try {
+    const { buildProjectSkillRegistry, buildUserSkillRegistry } = await import('../context/skill-registry-builder.js');
+    const user = buildUserSkillRegistry();
+    const project = projectDir ? buildProjectSkillRegistry({ projectDir }) : undefined;
+    publishRuntimeMemoryCacheInvalidation({ kind: 'skill_registry' });
+    serverLink.send({
+      type: MEMORY_WS.SKILL_REBUILD_RESPONSE,
+      requestId,
+      success: true,
+      userCount: user.entries.length,
+      projectCount: project?.entries.length ?? 0,
+    });
+  } catch (error) {
+    logger.warn({ error }, 'memory skill registry rebuild failed');
+    serverLink.send({ type: MEMORY_WS.SKILL_REBUILD_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+  }
+}
+
+async function handleMemorySkillRead(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = commandString(cmd, 'requestId') || undefined;
+  const key = commandString(cmd, 'key');
+  const layer = commandString(cmd, 'layer');
+  const projectDir = commandString(cmd, 'projectDir') || undefined;
+  const canonicalRepoId = commandCanonicalRepoId(cmd);
+  if (!skillsFeatureEnabled()) {
+    serverLink.send({ type: MEMORY_WS.SKILL_READ_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.FEATURE_DISABLED) });
+    return;
+  }
+  const ctx = commandManagementContext(cmd);
+  if (!ctx) {
+    serverLink.send({ type: MEMORY_WS.SKILL_READ_RESPONSE, requestId, success: false, ...memoryManagementContextError() });
+    return;
+  }
+  if (projectDir || canonicalRepoId) {
+    const validation = await validateProjectScopedManagementBinding(cmd, ctx);
+    if ('errorCode' in validation) {
+      serverLink.send({ type: MEMORY_WS.SKILL_READ_RESPONSE, requestId, success: false, ...memoryManagementError(validation.errorCode) });
+      return;
+    }
+  }
+  try {
+    const { getSkillRegistryManagementSnapshot } = await import('../context/skill-registry.js');
+    const entry = getSkillRegistryManagementSnapshot({ projectDir }).entries.find((candidate) => (
+      candidate.key === key && candidate.layer === layer
+    ));
+    if (!entry?.path) {
+      serverLink.send({ type: MEMORY_WS.SKILL_READ_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.SKILL_PATH_NOT_READABLE) });
+      return;
+    }
+    let managedPath;
+    try {
+      managedPath = assertManagedSkillPathSync({ path: entry.path, projectDir, maxBytes: SKILL_MAX_BYTES });
+    } catch (error) {
+      const code = error instanceof ManagedSkillPathError && error.reason === 'oversize'
+        ? MEMORY_MANAGEMENT_ERROR_CODES.SKILL_FILE_TOO_LARGE
+        : MEMORY_MANAGEMENT_ERROR_CODES.SKILL_PATH_NOT_READABLE;
+      serverLink.send({ type: MEMORY_WS.SKILL_READ_RESPONSE, requestId, success: false, ...memoryManagementError(code) });
+      return;
+    }
+    const content = await fsReadFileRaw(managedPath.realPath, 'utf8');
+    serverLink.send({ type: MEMORY_WS.SKILL_READ_RESPONSE, requestId, success: true, key, layer, content });
+  } catch (error) {
+    logger.warn({ error }, 'memory skill preview failed');
+    serverLink.send({ type: MEMORY_WS.SKILL_READ_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+  }
+}
+
+async function handleMemorySkillDelete(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = commandString(cmd, 'requestId') || undefined;
+  const key = commandString(cmd, 'key');
+  const layer = commandString(cmd, 'layer');
+  const projectDir = commandString(cmd, 'projectDir') || undefined;
+  const canonicalRepoId = commandCanonicalRepoId(cmd);
+  if (!skillsFeatureEnabled()) {
+    serverLink.send({ type: MEMORY_WS.SKILL_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.FEATURE_DISABLED) });
+    return;
+  }
+  const ctx = commandManagementContext(cmd);
+  if (!ctx) {
+    serverLink.send({ type: MEMORY_WS.SKILL_DELETE_RESPONSE, requestId, success: false, ...memoryManagementContextError() });
+    return;
+  }
+  if (projectDir || canonicalRepoId) {
+    const validation = await validateProjectScopedManagementBinding(cmd, ctx);
+    if ('errorCode' in validation) {
+      serverLink.send({ type: MEMORY_WS.SKILL_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(validation.errorCode) });
+      return;
+    }
+  }
+  try {
+    const { getSkillRegistryManagementSnapshot, getSkillRegistryPathsForManagement, writeSkillRegistryManagementSnapshot } = await import('../context/skill-registry.js');
+    const snapshot = getSkillRegistryManagementSnapshot({ projectDir });
+    const entry = snapshot.entries.find((candidate) => candidate.key === key && candidate.layer === layer);
+    if (!entry?.path) {
+      serverLink.send({ type: MEMORY_WS.SKILL_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.SKILL_NOT_FOUND) });
+      return;
+    }
+    let managedPath;
+    try {
+      managedPath = assertManagedSkillPathSync({ path: entry.path, projectDir });
+    } catch (error) {
+      serverLink.send({ type: MEMORY_WS.SKILL_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.SKILL_OUTSIDE_MANAGED_ROOTS) });
+      return;
+    }
+    const rootKind = managedPath.rootKind;
+    await fsUnlink(managedPath.realPath).catch((error) => {
+      const code = typeof error === 'object' && error && 'code' in error ? String((error as { code?: unknown }).code) : '';
+      if (code !== 'ENOENT') throw error;
+    });
+    const paths = getSkillRegistryPathsForManagement({ projectDir });
+    if (rootKind === 'user') {
+      writeSkillRegistryManagementSnapshot(paths.user, snapshot.entries.filter((candidate) => {
+        try {
+          if (candidate.path && assertManagedSkillPathSync({ path: candidate.path, projectDir }).rootKind !== 'user') return false;
+        } catch {
+          return false;
+        }
+        return !(candidate.key === key && candidate.layer === layer && candidate.path === entry.path);
+      }));
+    } else if (paths.project) {
+      writeSkillRegistryManagementSnapshot(paths.project, snapshot.entries.filter((candidate) => {
+        try {
+          if (candidate.path && assertManagedSkillPathSync({ path: candidate.path, projectDir }).rootKind !== 'project') return false;
+        } catch {
+          return false;
+        }
+        return !(candidate.key === key && candidate.layer === layer && candidate.path === entry.path);
+      }));
+    }
+    publishRuntimeMemoryCacheInvalidation({ kind: 'skill_registry' });
+    serverLink.send({ type: MEMORY_WS.SKILL_DELETE_RESPONSE, requestId, success: true });
+  } catch (error) {
+    logger.warn({ error }, 'memory skill delete failed');
+    serverLink.send({ type: MEMORY_WS.SKILL_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+  }
+}
+
+async function handleMemoryMarkdownIngestRun(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = commandString(cmd, 'requestId') || undefined;
+  const projectDir = commandString(cmd, 'projectDir');
+  const projectIdentity = commandCanonicalRepoId(cmd);
+  if (!mdIngestFeatureEnabled()) {
+    serverLink.send({ type: MEMORY_WS.MD_INGEST_RUN_RESPONSE, requestId, success: false, featureEnabled: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.FEATURE_DISABLED) });
+    return;
+  }
+  const ctx = commandManagementContext(cmd);
+  if (!ctx) {
+    serverLink.send({ type: MEMORY_WS.MD_INGEST_RUN_RESPONSE, requestId, success: false, featureEnabled: true, ...memoryManagementContextError() });
+    return;
+  }
+  if (!projectDir) {
+    serverLink.send({ type: MEMORY_WS.MD_INGEST_RUN_RESPONSE, requestId, success: false, featureEnabled: true, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_PROJECT_DIR) });
+    return;
+  }
+  if (!projectIdentity) {
+    serverLink.send({ type: MEMORY_WS.MD_INGEST_RUN_RESPONSE, requestId, success: false, featureEnabled: true, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_PROJECT_IDENTITY) });
+    return;
+  }
+  const stat = await fsStat(projectDir).catch(() => null);
+  if (!stat?.isDirectory()) {
+    serverLink.send({ type: MEMORY_WS.MD_INGEST_RUN_RESPONSE, requestId, success: false, featureEnabled: true, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.INVALID_PROJECT_DIR) });
+    return;
+  }
+  if (!(await validateCanonicalProjectIdentity(projectDir, projectIdentity))) {
+    serverLink.send({ type: MEMORY_WS.MD_INGEST_RUN_RESPONSE, requestId, success: false, featureEnabled: true, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.PROJECT_IDENTITY_MISMATCH) });
+    return;
+  }
+  if (!commandProjectBinding(cmd, ctx)) {
+    serverLink.send({ type: MEMORY_WS.MD_INGEST_RUN_RESPONSE, requestId, success: false, featureEnabled: true, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.PROJECT_IDENTITY_MISMATCH) });
+    return;
+  }
+  try {
+    const namespace = commandNamespace(cmd, 'personal', ctx);
+    const { runMarkdownMemoryIngest } = await import('../context/md-ingest-worker.js');
+    const result = await runMarkdownMemoryIngest({ projectDir, namespace, actorUserId: ctx.actorId });
+    if (result.droppedReason === 'unsupported_scope') {
+      serverLink.send({ type: MEMORY_WS.MD_INGEST_RUN_RESPONSE, requestId, success: false, featureEnabled: true, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.UNSUPPORTED_MD_INGEST_SCOPE), ...result });
+      return;
+    }
+    publishRuntimeMemoryCacheInvalidation({ kind: 'md_ingest', projectDir, namespace });
+    serverLink.send({ type: MEMORY_WS.MD_INGEST_RUN_RESPONSE, requestId, success: true, featureEnabled: true, ...result });
+  } catch (error) {
+    logger.warn({ error }, 'manual markdown memory ingest failed');
+    serverLink.send({ type: MEMORY_WS.MD_INGEST_RUN_RESPONSE, requestId, success: false, featureEnabled: true, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+  }
+}
+
+async function handleMemoryObservationsQuery(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = commandString(cmd, 'requestId') || undefined;
+  const scope = isMemoryScope(cmd.scope) ? cmd.scope : undefined;
+  const observationClass = commandString(cmd, 'class');
+  if (!observationStoreFeatureEnabled()) {
+    serverLink.send({ type: MEMORY_WS.OBSERVATION_RESPONSE, requestId, records: [], featureEnabled: false });
+    return;
+  }
+  const ctx = commandManagementContext(cmd);
+  if (!ctx) {
+    serverLink.send({ type: MEMORY_WS.OBSERVATION_RESPONSE, requestId, records: [], featureEnabled: true, ...memoryManagementContextError() });
+    return;
+  }
+  const limit = Math.max(1, Math.min(200, typeof cmd.limit === 'number' ? cmd.limit : 50));
+  const records = listContextObservations({
+    scope,
+    class: isObservationClass(observationClass) ? observationClass : undefined,
+  }).filter((observation) => observationVisibleToManagementContext(observation, ctx)).slice(0, limit).map((observation) => {
+    const namespace = observationNamespace(observation.namespaceId);
+    const ownerUserId = trustedRecordOwnerUserIdFromContent(observation.content, namespace);
+    const createdByUserId = recordCreatedByUserIdFromContent(observation.content, ownerUserId);
+    return {
+      id: observation.id,
+      scope: observation.scope,
+      class: observation.class,
+      origin: observation.origin,
+      state: observation.state,
+      ownerUserId,
+      createdByUserId,
+      updatedByUserId: recordUpdatedByUserIdFromContent(observation.content) ?? createdByUserId,
+      text: observationText(observation.content),
+      fingerprint: observation.fingerprint,
+      namespaceId: observation.namespaceId,
+      projectionId: observation.projectionId,
+      createdAt: observation.createdAt,
+      updatedAt: observation.updatedAt,
+    };
+  });
+  serverLink.send({ type: MEMORY_WS.OBSERVATION_RESPONSE, requestId, records, featureEnabled: observationStoreFeatureEnabled() });
+}
+
+async function handleMemoryObservationUpdate(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = commandString(cmd, 'requestId') || undefined;
+  const observationId = commandString(cmd, 'id');
+  const text = commandString(cmd, 'text');
+  const expectedFromScope = isMemoryScope(cmd.expectedFromScope) ? cmd.expectedFromScope : undefined;
+  if (!observationStoreFeatureEnabled()) {
+    serverLink.send({ type: MEMORY_WS.OBSERVATION_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.FEATURE_DISABLED) });
+    return;
+  }
+  const ctx = commandManagementContext(cmd);
+  if (!ctx) {
+    serverLink.send({ type: MEMORY_WS.OBSERVATION_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementContextError() });
+    return;
+  }
+  if (!observationId) {
+    serverLink.send({ type: MEMORY_WS.OBSERVATION_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_ID) });
+    return;
+  }
+  if (!text) {
+    serverLink.send({ type: MEMORY_WS.OBSERVATION_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_OBSERVATION_TEXT) });
+    return;
+  }
+  if (!expectedFromScope) {
+    serverLink.send({ type: MEMORY_WS.OBSERVATION_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_EXPECTED_FROM_SCOPE) });
+    return;
+  }
+  try {
+    const observation = listContextObservations().find((candidate) => candidate.id === observationId);
+    if (!observation) {
+      serverLink.send({ type: MEMORY_WS.OBSERVATION_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_NOT_FOUND) });
+      return;
+    }
+    if (observation.scope !== expectedFromScope) {
+      serverLink.send({ type: MEMORY_WS.OBSERVATION_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_FROM_SCOPE_MISMATCH) });
+      return;
+    }
+    if (!observationMutableByManagementContext(observation, ctx)) {
+      incrementCounter('mem.observation.unauthorized_promotion_attempt', { source: 'memory_management' });
+      serverLink.send({ type: MEMORY_WS.OBSERVATION_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_MUTATION_FORBIDDEN) });
+      return;
+    }
+    const fingerprint = computeMemoryFingerprint({
+      kind: fingerprintKindForObservationClass(observation.class),
+      content: text,
+      scopeKey: `${observation.scope}:${observation.namespaceId}`,
+    });
+    const namespace = observationNamespace(observation.namespaceId);
+    const ownerUserId = trustedRecordOwnerUserIdFromContent(observation.content, namespace);
+    const row = updateContextObservationText({
+      observationId,
+      text,
+      observationClass: observation.class,
+      fingerprint,
+      ownerUserId,
+      createdByUserId: trustedRecordCreatedByUserIdFromContent(observation.content, ownerUserId),
+      updatedByUserId: ctx.actorId,
+    });
+    if (!row) {
+      serverLink.send({ type: MEMORY_WS.OBSERVATION_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_NOT_FOUND) });
+      return;
+    }
+    publishRuntimeMemoryCacheInvalidation({ kind: 'observation', observationId, namespace });
+    if (observation.projectionId) {
+      publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId: observation.projectionId, namespace });
+    }
+    serverLink.send({ type: MEMORY_WS.OBSERVATION_UPDATE_RESPONSE, requestId, success: true, id: row.id });
+  } catch (error) {
+    logger.warn({ error }, 'memory observation update failed');
+    serverLink.send({ type: MEMORY_WS.OBSERVATION_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+  }
+}
+
+async function handleMemoryObservationDelete(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = commandString(cmd, 'requestId') || undefined;
+  const observationId = commandString(cmd, 'id');
+  const expectedFromScope = isMemoryScope(cmd.expectedFromScope) ? cmd.expectedFromScope : undefined;
+  if (!observationStoreFeatureEnabled()) {
+    serverLink.send({ type: MEMORY_WS.OBSERVATION_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.FEATURE_DISABLED) });
+    return;
+  }
+  const ctx = commandManagementContext(cmd);
+  if (!ctx) {
+    serverLink.send({ type: MEMORY_WS.OBSERVATION_DELETE_RESPONSE, requestId, success: false, ...memoryManagementContextError() });
+    return;
+  }
+  if (!observationId) {
+    serverLink.send({ type: MEMORY_WS.OBSERVATION_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_ID) });
+    return;
+  }
+  if (!expectedFromScope) {
+    serverLink.send({ type: MEMORY_WS.OBSERVATION_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_EXPECTED_FROM_SCOPE) });
+    return;
+  }
+  try {
+    const observation = listContextObservations().find((candidate) => candidate.id === observationId);
+    if (!observation) {
+      serverLink.send({ type: MEMORY_WS.OBSERVATION_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_NOT_FOUND) });
+      return;
+    }
+    if (observation.scope !== expectedFromScope) {
+      serverLink.send({ type: MEMORY_WS.OBSERVATION_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_FROM_SCOPE_MISMATCH) });
+      return;
+    }
+    if (!observationMutableByManagementContext(observation, ctx)) {
+      incrementCounter('mem.observation.unauthorized_promotion_attempt', { source: 'memory_management' });
+      serverLink.send({ type: MEMORY_WS.OBSERVATION_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_MUTATION_FORBIDDEN) });
+      return;
+    }
+    const success = deleteContextObservation(observationId);
+    if (success) {
+      publishRuntimeMemoryCacheInvalidation({ kind: 'observation', observationId, namespace: observationNamespace(observation.namespaceId) });
+      if (observation.projectionId) {
+        publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId: observation.projectionId, namespace: observationNamespace(observation.namespaceId) });
+      }
+    }
+    serverLink.send({ type: MEMORY_WS.OBSERVATION_DELETE_RESPONSE, requestId, success });
+  } catch (error) {
+    logger.warn({ error }, 'memory observation delete failed');
+    serverLink.send({ type: MEMORY_WS.OBSERVATION_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+  }
+}
+
+async function handleMemoryObservationPromote(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = commandString(cmd, 'requestId') || undefined;
+  const observationId = commandString(cmd, 'id');
+  const toScopeRaw = cmd.toScope;
+  const ctx = commandManagementContext(cmd);
+  const reason = commandString(cmd, 'reason') || undefined;
+  const expectedFromScope = isMemoryScope(cmd.expectedFromScope) ? cmd.expectedFromScope : undefined;
+  if (!observationStoreFeatureEnabled()) {
+    serverLink.send({ type: MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.FEATURE_DISABLED) });
+    return;
+  }
+  if (!ctx) {
+    serverLink.send({ type: MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE, requestId, success: false, ...memoryManagementContextError() });
+    return;
+  }
+  const actorId = ctx.actorId;
+  if (!observationId) {
+    serverLink.send({ type: MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_ID) });
+    return;
+  }
+  if (!isMemoryScope(toScopeRaw)) {
+    serverLink.send({ type: MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.INVALID_TARGET_SCOPE) });
+    return;
+  }
+  if (!expectedFromScope) {
+    serverLink.send({ type: MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_EXPECTED_FROM_SCOPE) });
+    return;
+  }
+  const toScope = toScopeRaw;
+  try {
+    const observation = listContextObservations().find((candidate) => candidate.id === observationId);
+    if (!observation) {
+      serverLink.send({ type: MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_NOT_FOUND) });
+      return;
+    }
+    if (!observationVisibleToManagementContext(observation, ctx)) {
+      incrementCounter('mem.observation.unauthorized_promotion_attempt', { source: 'memory_management' });
+      serverLink.send({ type: MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.PROMOTION_REQUIRES_AUTHORIZATION) });
+      return;
+    }
+    if (isOwnerPrivateMemoryScope(observation.scope) && isSharedProjectionScope(toScope) && ctx.role !== 'workspace_admin' && ctx.role !== 'org_admin') {
+      incrementCounter('mem.observation.cross_scope_promotion_blocked', { source: 'memory_management' });
+      serverLink.send({ type: MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.PROMOTION_REQUIRES_AUTHORIZATION) });
+      return;
+    }
+    if (isSharedProjectionScope(toScope) && ctx.role !== 'workspace_admin' && ctx.role !== 'org_admin') {
+      incrementCounter('mem.observation.cross_scope_promotion_blocked', { source: 'memory_management' });
+      serverLink.send({ type: MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.PROMOTION_REQUIRES_AUTHORIZATION) });
+      return;
+    }
+    if (observation.scope !== expectedFromScope) {
+      serverLink.send({ type: MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_FROM_SCOPE_MISMATCH) });
+      return;
+    }
+    const audit = promoteContextObservation({ observationId, actorId, toScope, reason, action: 'web_ui_promote', actorRole: ctx.role, expectedFromScope });
+    publishRuntimeMemoryCacheInvalidation({ kind: 'observation', observationId });
+    serverLink.send({ type: MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE, requestId, success: true, audit });
+  } catch (error) {
+    logger.warn({ error }, 'memory observation promotion failed');
+    const message = error instanceof Error ? error.message : String(error);
+    const errorCode = message === 'observation not found'
+      ? MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_NOT_FOUND
+      : message.startsWith('observation scope changed from expected ')
+        ? MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_FROM_SCOPE_MISMATCH
+        : MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED;
+    serverLink.send({ type: MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE, requestId, success: false, ...memoryManagementError(errorCode) });
+  }
+}
+
 async function handleMemorySearch(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
-  const { searchLocalMemory } = await import('../context/memory-search.js');
+  const { searchLocalMemoryAuthorized } = await import('../context/memory-search.js');
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
-  const result = searchLocalMemory({
+  if (!isMemoryFeatureEnabled(MEMORY_FEATURE_FLAGS_BY_NAME.quickSearch)) {
+    serverLink.send({
+      type: MEMORY_WS.SEARCH_RESPONSE,
+      requestId,
+      items: [],
+      stats: { total: 0, disabled: true },
+    });
+    return;
+  }
+  const ctx = commandManagementContext(cmd);
+  if (!ctx) {
+    serverLink.send({
+      type: MEMORY_WS.SEARCH_RESPONSE,
+      requestId,
+      items: [],
+      stats: { total: 0, disabled: false },
+      ...memoryManagementContextError(),
+    });
+    return;
+  }
+  const repo = typeof cmd.repo === 'string' ? cmd.repo.trim() : '';
+  const effectiveRepo = repo;
+  const searchBinding = (ctx.boundProjects ?? []).find((project) => project.canonicalRepoId === effectiveRepo);
+  if (!effectiveRepo || !searchBinding) {
+    incrementCounter('mem.search.unauthorized_lookup', { source: 'memory_management' });
+    serverLink.send({
+      type: MEMORY_WS.SEARCH_RESPONSE,
+      requestId,
+      items: [],
+      stats: { total: 0, disabled: false },
+      ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_QUERY_FORBIDDEN),
+    });
+    return;
+  }
+  const authorizedNamespaces: ContextNamespace[] = [
+    { scope: 'personal', projectId: effectiveRepo, userId: ctx.userId },
+    { scope: 'project_shared', projectId: effectiveRepo, workspaceId: searchBinding.workspaceId, enterpriseId: searchBinding.orgId },
+  ];
+  if (searchBinding.workspaceId) authorizedNamespaces.push({ scope: 'workspace_shared', workspaceId: searchBinding.workspaceId, enterpriseId: searchBinding.orgId });
+  if (searchBinding.orgId) authorizedNamespaces.push({ scope: 'org_shared', enterpriseId: searchBinding.orgId });
+  const result = searchLocalMemoryAuthorized({
     query: typeof cmd.query === 'string' ? cmd.query : undefined,
-    repo: typeof cmd.repo === 'string' ? cmd.repo : undefined,
+    authorizedNamespaces,
     projectionClass: typeof cmd.projectionClass === 'string'
       ? cmd.projectionClass as 'recent_summary' | 'durable_memory_candidate'
       : undefined,
-    includeRaw: cmd.includeRaw === true,
     eventType: typeof cmd.eventType === 'string' ? cmd.eventType : undefined,
     limit: typeof cmd.limit === 'number' ? cmd.limit : 50,
     offset: typeof cmd.offset === 'number' ? cmd.offset : 0,
   });
   serverLink.send({
-    type: 'memory.search_response',
+    type: MEMORY_WS.SEARCH_RESPONSE,
     requestId,
     items: result.items,
     stats: result.stats,
@@ -6025,38 +7708,231 @@ async function handleMemorySearch(cmd: Record<string, unknown>, serverLink: Serv
 
 async function handleMemoryArchive(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
+  if (!processedMemoryManagementFeatureEnabled()) {
+    serverLink.send({ type: MEMORY_WS.ARCHIVE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.FEATURE_DISABLED) });
+    return;
+  }
   const id = typeof cmd.id === 'string' ? cmd.id : '';
   if (!id) {
-    serverLink.send({ type: MEMORY_WS.ARCHIVE_RESPONSE, requestId, success: false, error: 'Missing id' });
+    serverLink.send({ type: MEMORY_WS.ARCHIVE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_ID) });
+    return;
+  }
+  const ctx = commandManagementContext(cmd);
+  if (!ctx) {
+    serverLink.send({ type: MEMORY_WS.ARCHIVE_RESPONSE, requestId, success: false, ...memoryManagementContextError() });
+    return;
+  }
+  const projection = getProcessedProjectionById(id);
+  if (!projection || !projectionMutableByManagementContext(projection, ctx)) {
+    serverLink.send({ type: MEMORY_WS.ARCHIVE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_QUERY_FORBIDDEN) });
     return;
   }
   const { archiveMemory } = await import('../store/context-store.js');
   const success = archiveMemory(id);
+  if (success) publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId: id, namespace: projection.namespace });
   serverLink.send({ type: MEMORY_WS.ARCHIVE_RESPONSE, requestId, success });
 }
 
 async function handleMemoryRestore(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
+  if (!processedMemoryManagementFeatureEnabled()) {
+    serverLink.send({ type: MEMORY_WS.RESTORE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.FEATURE_DISABLED) });
+    return;
+  }
   const id = typeof cmd.id === 'string' ? cmd.id : '';
   if (!id) {
-    serverLink.send({ type: MEMORY_WS.RESTORE_RESPONSE, requestId, success: false, error: 'Missing id' });
+    serverLink.send({ type: MEMORY_WS.RESTORE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_ID) });
+    return;
+  }
+  const ctx = commandManagementContext(cmd);
+  if (!ctx) {
+    serverLink.send({ type: MEMORY_WS.RESTORE_RESPONSE, requestId, success: false, ...memoryManagementContextError() });
+    return;
+  }
+  const projection = getProcessedProjectionById(id);
+  if (!projection || !projectionMutableByManagementContext(projection, ctx)) {
+    serverLink.send({ type: MEMORY_WS.RESTORE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_QUERY_FORBIDDEN) });
     return;
   }
   const { restoreArchivedMemory } = await import('../store/context-store.js');
   const success = restoreArchivedMemory(id);
+  if (success) publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId: id, namespace: projection.namespace });
   serverLink.send({ type: MEMORY_WS.RESTORE_RESPONSE, requestId, success });
+}
+
+async function handleMemoryCreate(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
+  if (!processedMemoryManagementFeatureEnabled()) {
+    serverLink.send({ type: MEMORY_WS.CREATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.FEATURE_DISABLED) });
+    return;
+  }
+  const text = commandString(cmd, 'text');
+  if (!text) {
+    serverLink.send({ type: MEMORY_WS.CREATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_MEMORY_TEXT) });
+    return;
+  }
+  const ctx = commandManagementContext(cmd);
+  if (!ctx) {
+    serverLink.send({ type: MEMORY_WS.CREATE_RESPONSE, requestId, success: false, ...memoryManagementContextError() });
+    return;
+  }
+  const canonicalRepoId = commandCanonicalRepoId(cmd);
+  if (!canonicalRepoId) {
+    serverLink.send({ type: MEMORY_WS.CREATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_PROJECT_IDENTITY) });
+    return;
+  }
+  if (!ctx.boundProjects?.some((project) => project.canonicalRepoId === canonicalRepoId)) {
+    serverLink.send({ type: MEMORY_WS.CREATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_QUERY_FORBIDDEN) });
+    return;
+  }
+  const requestedClass = commandString(cmd, 'projectionClass');
+  const projectionClass = requestedClass === 'recent_summary' || requestedClass === 'durable_memory_candidate'
+    ? requestedClass
+    : 'durable_memory_candidate';
+  const namespace: ContextNamespace = { scope: 'personal', projectId: canonicalRepoId, userId: ctx.userId };
+  try {
+    const fingerprint = computeMemoryFingerprint({ kind: 'note', content: text, scopeKey: `personal:${ctx.userId}:${canonicalRepoId}` });
+    const projection = writeProcessedProjection({
+      namespace,
+      class: projectionClass,
+      sourceEventIds: [`manual-memory:${requestId || fingerprint}`],
+      summary: text,
+      content: {
+        text,
+        summary: text,
+        manual: true,
+        origin: 'user_note',
+        source: 'web_management',
+        ownerUserId: ctx.userId,
+        createdByUserId: ctx.actorId,
+        updatedByUserId: ctx.actorId,
+      },
+      origin: 'user_note',
+    });
+    publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId: projection.id, namespace });
+    serverLink.send({ type: MEMORY_WS.CREATE_RESPONSE, requestId, success: true, id: projection.id });
+  } catch (error) {
+    logger.warn({ error }, 'manual memory create failed');
+    serverLink.send({ type: MEMORY_WS.CREATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+  }
+}
+
+async function handleMemoryUpdate(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
+  if (!processedMemoryManagementFeatureEnabled()) {
+    serverLink.send({ type: MEMORY_WS.UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.FEATURE_DISABLED) });
+    return;
+  }
+  const id = typeof cmd.id === 'string' ? cmd.id : '';
+  const text = commandString(cmd, 'text');
+  if (!id) {
+    serverLink.send({ type: MEMORY_WS.UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_ID) });
+    return;
+  }
+  if (!text) {
+    serverLink.send({ type: MEMORY_WS.UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_MEMORY_TEXT) });
+    return;
+  }
+  const ctx = commandManagementContext(cmd);
+  if (!ctx) {
+    serverLink.send({ type: MEMORY_WS.UPDATE_RESPONSE, requestId, success: false, ...memoryManagementContextError() });
+    return;
+  }
+  const projection = getProcessedProjectionById(id);
+  if (!projection) {
+    serverLink.send({ type: MEMORY_WS.UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MEMORY_NOT_FOUND) });
+    return;
+  }
+  if (!projectionMutableByManagementContext(projection, ctx)) {
+    serverLink.send({ type: MEMORY_WS.UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_QUERY_FORBIDDEN) });
+    return;
+  }
+  try {
+    const ownerUserId = trustedRecordOwnerUserIdFromContent(projection.content, projection.namespace) ?? ctx.userId;
+    const updated = updateProcessedProjectionSummary({
+      projectionId: id,
+      summary: text,
+      ownerUserId,
+      createdByUserId: trustedRecordCreatedByUserIdFromContent(projection.content, ownerUserId),
+      updatedByUserId: ctx.actorId,
+    });
+    if (!updated) {
+      serverLink.send({ type: MEMORY_WS.UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MEMORY_NOT_FOUND) });
+      return;
+    }
+    publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId: id, namespace: updated.namespace });
+    serverLink.send({ type: MEMORY_WS.UPDATE_RESPONSE, requestId, success: true, id });
+  } catch (error) {
+    logger.warn({ error }, 'manual memory update failed');
+    serverLink.send({ type: MEMORY_WS.UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+  }
+}
+
+async function handleMemoryPin(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
+  if (!processedMemoryManagementFeatureEnabled()) {
+    serverLink.send({ type: MEMORY_WS.PIN_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.FEATURE_DISABLED) });
+    return;
+  }
+  const id = typeof cmd.id === 'string' ? cmd.id : '';
+  if (!id) {
+    serverLink.send({ type: MEMORY_WS.PIN_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_ID) });
+    return;
+  }
+  const ctx = commandManagementContext(cmd);
+  if (!ctx) {
+    serverLink.send({ type: MEMORY_WS.PIN_RESPONSE, requestId, success: false, ...memoryManagementContextError() });
+    return;
+  }
+  const projection = getProcessedProjectionById(id);
+  if (!projection) {
+    serverLink.send({ type: MEMORY_WS.PIN_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MEMORY_NOT_FOUND) });
+    return;
+  }
+  if (!projectionMutableByManagementContext(projection, ctx)) {
+    serverLink.send({ type: MEMORY_WS.PIN_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_QUERY_FORBIDDEN) });
+    return;
+  }
+  try {
+    const pinned = upsertPinnedNote({
+      id: `projection:${projection.id}`,
+      namespaceKey: serializeContextNamespace(projection.namespace),
+      content: projection.summary,
+      origin: 'manual_pin',
+    });
+    publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId: projection.id, namespace: projection.namespace });
+    serverLink.send({ type: MEMORY_WS.PIN_RESPONSE, requestId, success: true, id: pinned.id });
+  } catch (error) {
+    logger.warn({ error }, 'manual memory pin failed');
+    serverLink.send({ type: MEMORY_WS.PIN_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+  }
 }
 
 
 async function handleMemoryDelete(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
+  if (!processedMemoryManagementFeatureEnabled()) {
+    serverLink.send({ type: MEMORY_WS.DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.FEATURE_DISABLED) });
+    return;
+  }
   const id = typeof cmd.id === 'string' ? cmd.id : '';
   if (!id) {
-    serverLink.send({ type: MEMORY_WS.DELETE_RESPONSE, requestId, success: false, error: 'Missing id' });
+    serverLink.send({ type: MEMORY_WS.DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_ID) });
+    return;
+  }
+  const ctx = commandManagementContext(cmd);
+  if (!ctx) {
+    serverLink.send({ type: MEMORY_WS.DELETE_RESPONSE, requestId, success: false, ...memoryManagementContextError() });
+    return;
+  }
+  const projection = getProcessedProjectionById(id);
+  if (!projection || !projectionMutableByManagementContext(projection, ctx)) {
+    serverLink.send({ type: MEMORY_WS.DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_QUERY_FORBIDDEN) });
     return;
   }
   const { deleteMemory } = await import('../store/context-store.js');
   const success = deleteMemory(id);
+  if (success) publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId: id, namespace: projection.namespace });
   serverLink.send({ type: MEMORY_WS.DELETE_RESPONSE, requestId, success });
 }
 

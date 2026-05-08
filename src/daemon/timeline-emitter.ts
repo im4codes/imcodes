@@ -11,6 +11,7 @@ import type { TimelineEvent, TimelineEventType, TimelineSource, TimelineConfiden
 import { timelineStore } from './timeline-store.js';
 import { preferTimelineEvent } from '../shared/timeline/merge.js';
 import { isMemoryNoiseTurn } from '../../shared/memory-noise-patterns.js';
+import { recordTurnUsage } from '../store/context-store.js';
 
 /** Pattern matching temp file instruction: "Read and execute all instructions in @<path>" */
 const TEMP_FILE_RE = /^Read and execute all instructions in @(.+\.imcodes-prompt-[0-9a-f]+\.md)$/;
@@ -145,6 +146,33 @@ export class TimelineEmitter {
     const isStreamingDelta = isStableUpdate && payload.streaming === true;
     if (!isStreamingDelta) {
       timelineStore.append(event);
+      // Mirror per-turn `usage.update` into SQLite so operators can query
+      // historical token spend without parsing JSONL. Best-effort — failures
+      // never escape (recordTurnUsage swallows internally + extra try/catch).
+      // Final-only: streaming deltas don't reach here.
+      //
+      // Round-2 audit (0699ea64-3e6 finding A1): synchronous call + eventId
+      // idempotency key. Replaced the previous `void import(...).then(...)`
+      // pattern — there is no real cyclic dependency on context-store, and
+      // the .then deferred path lost rows under SIGTERM races. Passing
+      // `eventId` lets the partial UNIQUE index swallow replay duplicates
+      // (e.g. gemini-watcher's deterministic stableId on daemon restart).
+      if (type === 'usage.update') {
+        try {
+          recordTurnUsage({
+            createdAt: ts,
+            sessionName: sessionId,
+            agentType: typeof payload.agentType === 'string' ? payload.agentType : null,
+            model: typeof payload.model === 'string' ? payload.model : null,
+            inputTokens: typeof payload.inputTokens === 'number' ? payload.inputTokens : 0,
+            cacheTokens: typeof payload.cacheTokens === 'number' ? payload.cacheTokens : 0,
+            outputTokens: typeof payload.outputTokens === 'number' ? payload.outputTokens : 0,
+            contextWindow: typeof payload.contextWindow === 'number' ? payload.contextWindow : null,
+            costUsd: typeof payload.costUsd === 'number' ? payload.costUsd : null,
+            eventId,
+          });
+        } catch { /* swallow — telemetry must never escape */ }
+      }
     }
 
     // Notify handlers

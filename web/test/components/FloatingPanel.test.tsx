@@ -6,6 +6,12 @@ import { h } from 'preact';
 import { cleanup, fireEvent, render, screen } from '@testing-library/preact';
 import { FloatingPanel } from '../../src/components/FloatingPanel.js';
 
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string) => key,
+  }),
+}));
+
 afterEach(() => {
   cleanup();
   localStorage.clear();

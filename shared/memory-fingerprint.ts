@@ -23,6 +23,58 @@ import { createHash } from 'node:crypto';
  * durable_memory_candidate) are never cross-matched.
  */
 
+export const FINGERPRINT_KINDS = ['summary', 'preference', 'skill', 'decision', 'note'] as const;
+export type FingerprintKind = (typeof FINGERPRINT_KINDS)[number];
+
+export const MEMORY_FINGERPRINT_VERSIONS = ['v1'] as const;
+export type MemoryFingerprintVersion = (typeof MEMORY_FINGERPRINT_VERSIONS)[number];
+
+export interface ComputeMemoryFingerprintArgs {
+  kind: FingerprintKind;
+  content: string;
+  scopeKey?: string;
+  version?: MemoryFingerprintVersion;
+}
+
+const MEMORY_FINGERPRINT_DOMAIN = 'imcodes:memory-fingerprint';
+const FRONT_MATTER_PATTERN = /^\uFEFF?---[ \t]*\n[\s\S]*?\n---[ \t]*(?:\n|$)/;
+
+function normalizeUnicodeAndLineEndings(content: string): string {
+  return content.normalize('NFC').replace(/\r\n?/g, '\n').replace(/\u0000/g, '\uFFFD');
+}
+
+function collapseWhitespace(content: string): string {
+  return content.replace(/\s+/gu, ' ').trim();
+}
+
+function normalizeCaseFoldedText(content: string): string {
+  return collapseWhitespace(normalizeUnicodeAndLineEndings(content)).toLocaleLowerCase('en-US');
+}
+
+function stripPreferencePrefixes(content: string): string {
+  return normalizeUnicodeAndLineEndings(content)
+    .split('\n')
+    .map((line) => line.replace(/^\s*@pref:\s*/iu, ''))
+    .join('\n');
+}
+
+function stripSkillFrontMatter(content: string): string {
+  return normalizeUnicodeAndLineEndings(content).replace(FRONT_MATTER_PATTERN, '');
+}
+
+function normalizeSkillContent(content: string): string {
+  return stripSkillFrontMatter(content)
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function normalizeNoteContent(content: string): string {
+  return collapseWhitespace(normalizeUnicodeAndLineEndings(content));
+}
+
 /** Normalize a summary for equality-based dedup.
  *  - lowercase (case-insensitive)
  *  - collapse all whitespace runs to a single space
@@ -32,13 +84,46 @@ import { createHash } from 'node:crypto';
  *  collapse by accident.
  */
 export function normalizeSummaryForFingerprint(summary: string): string {
-  return summary.toLowerCase().replace(/\s+/g, ' ').trim();
+  return normalizeCaseFoldedText(summary);
+}
+
+export function normalizeContentForFingerprint(kind: FingerprintKind, content: string): string {
+  switch (kind) {
+    case 'summary':
+      return normalizeSummaryForFingerprint(content);
+    case 'preference':
+      return normalizeCaseFoldedText(stripPreferencePrefixes(content));
+    case 'skill':
+      return normalizeSkillContent(content);
+    case 'decision':
+      return normalizeCaseFoldedText(content);
+    case 'note':
+      return normalizeNoteContent(content);
+  }
+}
+
+/**
+ * Canonical post-1.1 memory fingerprint API.
+ *
+ * The hash preimage includes version, kind, scope/namespace key, and normalized
+ * content. Including `scopeKey` prevents otherwise-identical memories from
+ * being deduplicated across authorization or namespace boundaries.
+ */
+export function computeMemoryFingerprint(args: ComputeMemoryFingerprintArgs): string {
+  const version = args.version ?? 'v1';
+  const normalized = normalizeContentForFingerprint(args.kind, args.content);
+  const normalizedScope = normalizeUnicodeAndLineEndings(args.scopeKey ?? '').trim();
+  const preimage = [MEMORY_FINGERPRINT_DOMAIN, version, args.kind, normalizedScope, normalized].join('\u0000');
+  return createHash('sha256').update(preimage, 'utf8').digest('hex');
 }
 
 /** Deterministic content key for a processed projection.
  *  Same (namespaceKey, class, normalized summary) always produces the same
  *  string. Opaque by design — callers should treat it as a fingerprint, not
  *  a parsable structure.
+ *
+ * @deprecated Internal legacy projection helper. New memory call sites should
+ * use `computeMemoryFingerprint({ kind, content, scopeKey, version: 'v1' })`.
  */
 export function fingerprintProjection(args: {
   namespaceKey: string;
@@ -46,15 +131,17 @@ export function fingerprintProjection(args: {
   summary: string;
 }): string {
   const normalized = normalizeSummaryForFingerprint(args.summary);
-  // Use a simple null-separated join. The individual components never contain
-  // U+0000 by contract (namespaceKey is a slash-separated path, class is a
-  // fixed enum, summary is user-facing text), so this is unambiguous without
-  // needing a real hash function that would pull in crypto on hot paths.
+  // Keep the historical un-hashed key shape for existing local callers.
   return `${args.namespaceKey}\u0000${args.projectionClass}\u0000${normalized}`;
 }
 
-
-/** Return a stable SHA-256 hex fingerprint for already-normalized memory text. */
+/**
+ * Return a stable SHA-256 hex fingerprint for already-normalized memory text.
+ *
+ * @deprecated Internal summary-only helper. New memory call sites should use
+ * `computeMemoryFingerprint()` so the kind, version, and scope are in the
+ * fingerprint preimage.
+ */
 export function computeFingerprint(normalizedSummary: string): string {
   return createHash('sha256').update(normalizedSummary, 'utf8').digest('hex');
 }

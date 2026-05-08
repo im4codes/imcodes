@@ -86,6 +86,56 @@ function pickString(record: CursorRecord, ...keys: string[]): string | undefined
   return undefined;
 }
 
+/**
+ * cursor-agent CLI emits per-turn usage in **camelCase** (verified against
+ * 2026.05.04-08e5280 by piping `echo "what is 1+1" | cursor-agent --print
+ * --output-format stream-json --force`):
+ *   {"usage":{"inputTokens":1227,"outputTokens":13,"cacheReadTokens":10624,"cacheWriteTokens":0}}
+ *
+ * Everything downstream — `transport-relay.normalizeUsageUpdatePayload`,
+ * `ProviderUsageUpdate.usage`, the SQLite write path — expects
+ * `ProviderUsageUpdate.usage` shape (snake_case `input_tokens` /
+ * `output_tokens`). Cursor's cache counters are not provider-window occupancy:
+ * long-running sessions have shown `cacheReadTokens` exceeding the model
+ * context window while the live prompt is small. Preserve those counters under
+ * cursor-specific diagnostic keys instead of mapping them to canonical cache
+ * fields; otherwise the UI context meter reads cumulative/billing cache as
+ * live context and shows impossible values such as 1.3M / 1M.
+ *
+ * Without translation every cursor turn produced `undefined` token fields:
+ * the chat header context bar showed "0 / 1M (0.0%)", and `context_turn_usage`
+ * had zero rows for `cursor-headless` sessions even after the May 5 telemetry
+ * commit. Translate cursor's camelCase into the canonical snake_case here so
+ * the rest of the pipeline can treat cursor like every other provider.
+ */
+function normalizeCursorUsage(raw: CursorRecord | undefined): CursorRecord | undefined {
+  if (!raw) return undefined;
+  const result: CursorRecord = {};
+  // Pass through any already-snake_case fields (defensive — cursor-agent could
+  // change shape in a future release without warning).
+  for (const k of Object.keys(raw)) result[k] = raw[k];
+  // camelCase → snake_case mapping. Each mapping only fires when the
+  // canonical field is absent so a future cursor-agent emitting native
+  // snake_case won't be double-overwritten.
+  const map: Array<[string, string]> = [
+    ['inputTokens', 'input_tokens'],
+    ['outputTokens', 'output_tokens'],
+    ['contextWindow', 'model_context_window'],
+  ];
+  for (const [from, to] of map) {
+    if (typeof raw[from] === 'number' && typeof result[to] !== 'number') {
+      result[to] = raw[from];
+    }
+  }
+  if (typeof raw.cacheReadTokens === 'number' && typeof result.cursor_cache_read_tokens !== 'number') {
+    result.cursor_cache_read_tokens = raw.cacheReadTokens;
+  }
+  if (typeof raw.cacheWriteTokens === 'number' && typeof result.cursor_cache_write_tokens !== 'number') {
+    result.cursor_cache_write_tokens = raw.cacheWriteTokens;
+  }
+  return result;
+}
+
 function pickRecord(value: unknown): CursorRecord | undefined {
   return isRecord(value) ? value : undefined;
 }
@@ -245,7 +295,8 @@ function parseCursorRecord(record: unknown, fallbackSessionId?: string): CursorP
       ?? extractTextFromContent(record.text)
       ?? extractTextFromContent(pickRecord(record.message)?.content)
       ?? (typeof record.result === 'string' ? record.result : undefined);
-    const usage = pickRecord(record.usage) ?? pickRecord(pickRecord(record.message)?.usage);
+    const rawUsage = pickRecord(record.usage) ?? pickRecord(pickRecord(record.message)?.usage);
+    const usage = normalizeCursorUsage(rawUsage);
     return {
       kind: 'result.success',
       raw: record,

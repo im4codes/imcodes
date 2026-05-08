@@ -146,6 +146,41 @@ function tryStartStartupShortcut(): boolean {
   return true;
 }
 
+/** Remove the upgrade.lock if it exists.  Returns true if a lock was removed.
+ *
+ *  When the user explicitly invokes `imcodes restart`, OR after we tree-kill
+ *  the entire watchdog tree, any in-progress upgrade is by definition
+ *  already broken — we just killed its daemon and watchdog.  Leaving the
+ *  lock would only block the freshly spawned watchdog from launching the
+ *  new daemon (it would enter `:wait_lock` and spin forever).
+ *
+ *  Real-world incident on 2026-05-07: an auto-upgrade triggered from an
+ *  OLD daemon (pre-paren-fix) generated an upgrade.cmd with an unescaped
+ *  `(` inside an `if exist ()` block.  cmd.exe's paren-counting derailed
+ *  partway through the script, so the success path's `del UPGRADE_LOCK`
+ *  never ran.  The user then ran `imcodes restart` to recover, which timed
+ *  out at 15 s waiting for a new daemon PID — because the new watchdog was
+ *  parked on the stale lock from the wedged auto-upgrade.
+ *
+ *  Try `del` first; if the file is held open by a transient AV scan or a
+ *  weird ACL, fall back to PowerShell `Remove-Item -Force`. */
+function clearUpgradeLock(): boolean {
+  if (process.platform !== 'win32') return false;
+  const lockPath = resolve(homedir(), '.imcodes', 'upgrade.lock');
+  if (!existsSync(lockPath)) return false;
+  try {
+    rmSync(lockPath, { force: true });
+    if (!existsSync(lockPath)) return true;
+  } catch { /* fall through to PS */ }
+  try {
+    execSync(
+      `powershell -NoProfile -NonInteractive -Command "Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath '${lockPath}'"`,
+      { stdio: 'ignore', windowsHide: true },
+    );
+  } catch { /* ignore */ }
+  return !existsSync(lockPath);
+}
+
 /** Restart the Windows daemon by killing the entire watchdog tree and
  *  spawning a fresh hidden watchdog.
  *
@@ -156,8 +191,11 @@ function tryStartStartupShortcut(): boolean {
  *
  *  Now we:
  *  1. Kill the entire watchdog tree (wscript→cmd→node) so nothing stale remains.
- *  2. Launch a fresh hidden watchdog via VBS (preferred) / schtask / shortcut.
- *  3. Wait for a new daemon PID. */
+ *  2. Clear any stale upgrade.lock — the old daemon and watchdogs are dead, so
+ *     any in-progress upgrade is already broken; leaving the lock would park
+ *     the new watchdog in :wait_lock indefinitely.
+ *  3. Launch a fresh hidden watchdog via VBS (preferred) / schtask / shortcut.
+ *  4. Wait for a new daemon PID. */
 export function restartWindowsDaemon(currentPid?: number): boolean {
   const previousPid = readDaemonPid(currentPid);
   if (previousPid) {
@@ -171,6 +209,10 @@ export function restartWindowsDaemon(currentPid?: number): boolean {
   // "is not a recognized command" forever.  Without this kill, the new
   // watchdog we spawn below will race with the old one.
   killAllStaleWatchdogs();
+  // After killing all watchdogs and the daemon, any auto-upgrade that was
+  // mid-flight is already broken — clear its lock so the new watchdog
+  // doesn't park on it.  See clearUpgradeLock() doc for the full incident.
+  clearUpgradeLock();
 
   // If no watchdog is running (e.g. first start after bind), launch one.
   // Priority: VBS (always hidden) > scheduled task > startup shortcut.

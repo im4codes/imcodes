@@ -51,6 +51,22 @@ export interface CompressionResult {
   backend: string;
   usedBackup: boolean;
   fromSdk: boolean;
+  /** Token telemetry — populated for every call so callers can persist a
+   *  run row for later cost / efficiency analysis. `inputTokens` is the
+   *  prompt size (including previous summary + serialized events).
+   *  `outputTokens` is the produced summary size. `targetTokens` is the
+   *  budget that was passed to the LLM. All counted via `countTokens`. */
+  inputTokens: number;
+  outputTokens: number;
+  targetTokens: number;
+  /** Wall-clock duration of the SDK call (or local-fallback path). */
+  durationMs: number;
+  /** Classified error code when `fromSdk: false` and the path was an
+   *  exception (not a "no events" early return). One of the
+   *  `CompressionErrorClassification.code` values. Undefined on success. */
+  errorCode?: 'auth' | 'model' | 'session' | 'quota' | 'timeout' | 'empty_response' | 'agent_missing' | 'transient';
+  /** Truncated last error message when the SDK path failed. */
+  errorMessage?: string;
 }
 
 export type CompressionAdmissionReason = 'shutdown' | 'upgrade-pending' | 'test-reset';
@@ -157,7 +173,7 @@ const RETRY_MAX_DELAY_MS = 8000;
 /** Classify error as retryable (transient) or permanent. */
 interface CompressionErrorClassification {
   retryable: boolean;
-  code: 'auth' | 'model' | 'session' | 'quota' | 'timeout' | 'empty_response' | 'transient';
+  code: 'auth' | 'model' | 'session' | 'quota' | 'timeout' | 'empty_response' | 'agent_missing' | 'transient';
 }
 
 function classifyCompressionError(err: unknown): CompressionErrorClassification {
@@ -178,6 +194,41 @@ function classifyCompressionError(err: unknown): CompressionErrorClassification 
     || msg.includes('credit')
   ) {
     return { retryable: false, code: 'quota' };
+  }
+  // Permanent: agent CLI binary missing on the host.
+  //
+  // Real-world hit: 213 (big@172.16.253.213) ran imcodes daemon configured with
+  // `claude-code-sdk` as the primary compression backend, but had no `claude`
+  // CLI installed. The Anthropic Claude Agent SDK threw
+  //   "Claude Code native binary not found at claude. Please ensure
+  //    Claude Code is installed via native installer..."
+  // Without classification, this fell through to "transient" and the retry
+  // loop kept the compression lane busy. Each retry was 1-8s × 3 = up to 27s
+  // of wasted active time per call, with the next materialization tick (10s)
+  // queuing another. Net effect: `getCompressionQueueState().idle` was never
+  // true, so the daemon-upgrade gate `if (!compressionState.idle) block` kept
+  // the daemon stuck on an old version that ALSO had a phantom-SIGTERM bug,
+  // producing a 13-second restart loop and a 4-hour outage.
+  //
+  // Patterns covered:
+  //   - `Claude Code native binary not found at claude` (Anthropic SDK raw)
+  //   - `Codex binary not found` / `Cursor binary not found` (imcodes provider
+  //     wrappers — `src/agent/providers/{codex-sdk,cursor-headless}.ts`)
+  //   - `spawn <cmd> ENOENT` (Node.js child_process default)
+  //   - `command not found` (shell-level)
+  //   - PROVIDER_NOT_FOUND error code (imcodes shared error taxonomy)
+  // Permanent means: no retry, immediate circuit-breaker tick, fall through to
+  // backup backend → local fallback. Compression lane releases in <50 ms instead
+  // of holding for tens of seconds.
+  if (
+    msg.includes('native binary not found')
+    || msg.includes('binary not found at')
+    || /\bbinary not found\b/.test(msg)
+    || /\bspawn\s+\S+\s+enoent\b/.test(msg)
+    || msg.includes('command not found')
+    || msg.includes('provider_not_found')
+  ) {
+    return { retryable: false, code: 'agent_missing' };
   }
   if (msg.includes('timed out') || msg.includes('timeout')) return { retryable: true, code: 'timeout' };
   if (msg.includes('empty response')) return { retryable: true, code: 'empty_response' };
@@ -206,7 +257,20 @@ async function sendWithRetry(prompt: string, selection: CompressionBackendSelect
       return await sendToProvider(selection, prompt);
     } catch (err) {
       lastErr = err;
-      if (!isRetryableError(err) || attempt === MAX_RETRIES_PER_BACKEND) {
+      const classification = classifyCompressionError(err);
+      if (!classification.retryable || attempt === MAX_RETRIES_PER_BACKEND) {
+        // Surface "agent CLI missing" loudly + actionably the FIRST time it
+        // happens — operators usually don't notice the per-call warn until
+        // hours later when something else (daemon-upgrade stall, drained
+        // memory recall) makes the missing CLI a visible problem.
+        if (classification.code === 'agent_missing') {
+          warnOncePerHour('mem.compression.agent_missing', {
+            backend: selection.backend,
+            error: err instanceof Error ? err.message : String(err),
+            hint: agentInstallHint(selection.backend),
+          });
+          incrementCounter('mem.compression.agent_missing', { backend: selection.backend });
+        }
         throw err;
       }
       // Tear down and retry with fresh provider
@@ -218,6 +282,22 @@ async function sendWithRetry(prompt: string, selection: CompressionBackendSelect
     }
   }
   throw lastErr;
+}
+
+/** Best-effort install hint per backend so operators have an actionable next step. */
+function agentInstallHint(backend: string): string {
+  switch (backend) {
+    case 'claude-code-sdk':
+      return 'install Claude Code CLI: npm install -g @anthropic-ai/claude-code';
+    case 'codex-sdk':
+      return 'install Codex CLI (see codex.openai.com docs)';
+    case 'qwen':
+      return 'install qwen CLI on PATH';
+    case 'gemini-sdk':
+      return 'install Gemini CLI on PATH';
+    default:
+      return `install the ${backend} CLI on PATH or configure a different primaryContextBackend`;
+  }
 }
 
 export function resetFailureTracking(): void {
@@ -340,16 +420,21 @@ const COMPRESSOR_SYSTEM_PROMPT = `You are a memory compression engine. Your outp
 export async function localOnlyCompressor(input: CompressionInput): Promise<CompressionResult> {
   // Tests expect local-only compression to behave as if SDK succeeded (fromSdk=true)
   // so the coordinator commits the result instead of entering retry mode.
+  const summary = ensurePinnedNotesSection(
+    buildLocalFallbackSummary(input.events, input.previousSummary),
+    input.pinnedNotes ?? [],
+    input.extraRedactPatterns ?? [],
+  );
   return {
-    summary: ensurePinnedNotesSection(
-      buildLocalFallbackSummary(input.events, input.previousSummary),
-      input.pinnedNotes ?? [],
-      input.extraRedactPatterns ?? [],
-    ),
+    summary,
     model: 'local-only-test',
     backend: 'local',
     usedBackup: false,
     fromSdk: true,
+    inputTokens: 0,
+    outputTokens: countTokens(summary),
+    targetTokens: input.targetTokens ?? 0,
+    durationMs: 0,
   };
 }
 
@@ -488,6 +573,7 @@ function trimPreviousSummary(previousSummary: string | undefined, maxTokens = DE
 
 async function compressWithSdkInner(input: CompressionInput): Promise<CompressionResult> {
   const { events, modelConfig } = input;
+  const startedAt = Date.now();
   const extraRedactPatterns = input.extraRedactPatterns ?? [];
   const previousSummary = trimPreviousSummary(
     input.previousSummary ? redactSummaryPreservingPinned(input.previousSummary, extraRedactPatterns) : undefined,
@@ -495,9 +581,14 @@ async function compressWithSdkInner(input: CompressionInput): Promise<Compressio
   );
 
   if (events.length === 0) {
+    const summary = ensurePinnedNotesSection(previousSummary ?? 'No events to compress.', input.pinnedNotes ?? [], extraRedactPatterns);
     return {
-      summary: ensurePinnedNotesSection(previousSummary ?? 'No events to compress.', input.pinnedNotes ?? [], extraRedactPatterns),
+      summary,
       model: '', backend: '', usedBackup: false, fromSdk: false,
+      inputTokens: 0,
+      outputTokens: countTokens(summary),
+      targetTokens: input.targetTokens ?? 0,
+      durationMs: Date.now() - startedAt,
     };
   }
 
@@ -514,6 +605,10 @@ ${serializedEvents}`);
   });
   const now = Date.now();
 
+  // Track the last error from any tier so we can attach it to the final
+  // local-fallback CompressionResult (callers persist this for analytics).
+  let lastErr: unknown;
+
   // Try primary (gated by circuit breaker)
   if (canCall(modelConfig.primaryContextBackend, now)) {
     try {
@@ -523,11 +618,17 @@ ${serializedEvents}`);
         preset: modelConfig.primaryContextPreset,
       });
       recordSuccess(modelConfig.primaryContextBackend);
+      const summary = ensurePinnedNotesSection(result, input.pinnedNotes ?? [], extraRedactPatterns);
       return {
-        summary: ensurePinnedNotesSection(result, input.pinnedNotes ?? [], extraRedactPatterns), model: modelConfig.primaryContextModel,
-        backend: modelConfig.primaryContextBackend, usedBackup: false, fromSdk: true,
+        summary,
+        model: modelConfig.primaryContextModel,
+        backend: modelConfig.primaryContextBackend,
+        usedBackup: false, fromSdk: true,
+        inputTokens, outputTokens: countTokens(summary),
+        targetTokens, durationMs: Date.now() - startedAt,
       };
     } catch (err) {
+      lastErr = err;
       recordFailure(modelConfig.primaryContextBackend, now);
       await shutdownCompressionProvider();
       logger.warn({ err, backend: modelConfig.primaryContextBackend },
@@ -548,11 +649,17 @@ ${serializedEvents}`);
           preset: modelConfig.backupContextPreset,
         });
         recordSuccess(modelConfig.backupContextBackend);
+        const summary = ensurePinnedNotesSection(result, input.pinnedNotes ?? [], extraRedactPatterns);
         return {
-          summary: ensurePinnedNotesSection(result, input.pinnedNotes ?? [], extraRedactPatterns), model: modelConfig.backupContextModel,
-          backend: modelConfig.backupContextBackend, usedBackup: true, fromSdk: true,
+          summary,
+          model: modelConfig.backupContextModel,
+          backend: modelConfig.backupContextBackend,
+          usedBackup: true, fromSdk: true,
+          inputTokens, outputTokens: countTokens(summary),
+          targetTokens, durationMs: Date.now() - startedAt,
         };
       } catch (err) {
+        lastErr = err;
         recordFailure(modelConfig.backupContextBackend, now);
         await shutdownCompressionProvider();
         logger.warn({ err, backend: modelConfig.backupContextBackend },
@@ -565,9 +672,20 @@ ${serializedEvents}`);
   }
 
   // All SDK attempts failed / circuits open — local fallback
+  const fallbackSummary = ensurePinnedNotesSection(
+    buildLocalFallbackSummary(events, previousSummary),
+    input.pinnedNotes ?? [],
+    extraRedactPatterns,
+  );
+  const errorClassification = lastErr ? classifyCompressionError(lastErr) : undefined;
+  const errorMessage = lastErr instanceof Error ? lastErr.message : (lastErr ? String(lastErr) : undefined);
   return {
-    summary: ensurePinnedNotesSection(buildLocalFallbackSummary(events, previousSummary), input.pinnedNotes ?? [], extraRedactPatterns),
+    summary: fallbackSummary,
     model: 'local-fallback', backend: 'none', usedBackup: false, fromSdk: false,
+    inputTokens, outputTokens: countTokens(fallbackSummary),
+    targetTokens, durationMs: Date.now() - startedAt,
+    errorCode: errorClassification?.code,
+    errorMessage: errorMessage ? errorMessage.slice(0, 500) : undefined,
   };
 }
 

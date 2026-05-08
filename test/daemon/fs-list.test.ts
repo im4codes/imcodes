@@ -15,8 +15,14 @@ const mockServerLink = {
   sendBinary: vi.fn(),
 };
 
+const mockPreviewCoordinator = vi.hoisted(() => ({
+  handle: vi.fn(),
+  invalidate: vi.fn(),
+}));
+
 // ── Mock fs/promises ───────────────────────────────────────────────────────
 vi.mock('node:fs/promises', () => ({
+  lstat: vi.fn(),
   readdir: vi.fn(),
   realpath: vi.fn(),
   stat: vi.fn(),
@@ -24,6 +30,11 @@ vi.mock('node:fs/promises', () => ({
 const mockReaddir = vi.mocked(fsp.readdir);
 const mockRealpath = vi.mocked(fsp.realpath);
 const mockStat = vi.mocked(fsp.stat);
+
+vi.mock('../../src/daemon/file-preview-read-coordinator.js', () => ({
+  getDefaultPreviewReadCoordinator: vi.fn(() => mockPreviewCoordinator),
+  __resetPreviewReadCoordinatorForTests: vi.fn(),
+}), { virtual: true });
 
 // ── Pull the handler function out of command-handler indirectly ────────────
 // We test via handleWebCommand to keep the test at the public API level.
@@ -47,6 +58,7 @@ describe('fs.ls handler', () => {
     sent.length = 0;
     // Restore send implementation after clearAllMocks resets it
     mockServerLink.send.mockImplementation((msg: unknown) => { sent.push(msg); });
+    mockPreviewCoordinator.handle.mockImplementation(() => {});
     mockStat.mockResolvedValue({ mtimeMs: 1, size: 0 } as any);
   });
 
@@ -174,6 +186,30 @@ describe('fs.ls handler', () => {
     expect(resp.entries.every((e: any) => e.isDir)).toBe(true);
   });
 
+  it('keeps non-preview fs.ls responsive while preview worker slots are blocked', async () => {
+    const testDir = path.join(homedir(), 'responsive-dir');
+    mockRealpath.mockResolvedValue(testDir as unknown as string);
+    mockReaddir.mockResolvedValue([makeDirent('src', true)] as unknown as fsp.Dirent<string>[]);
+    const blockedPreviewReads: Array<{ path: unknown; requestId: unknown }> = [];
+    mockPreviewCoordinator.handle.mockImplementation((previewPath: unknown, requestId: unknown) => {
+      blockedPreviewReads.push({ path: previewPath, requestId });
+    });
+
+    handleWebCommand({ type: 'fs.read', path: path.join(testDir, 'huge.bin'), requestId: 'read-pending' }, mockServerLink as any);
+    handleWebCommand({ type: 'fs.read', path: path.join(testDir, 'huge-2.bin'), requestId: 'read-pending-2' }, mockServerLink as any);
+    handleWebCommand({ type: 'fs.ls', path: testDir, requestId: 'ls-responsive', includeFiles: false }, mockServerLink as any);
+    await flushAsync();
+
+    expect(blockedPreviewReads).toHaveLength(2);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({
+      type: 'fs.ls_response',
+      requestId: 'ls-responsive',
+      status: 'ok',
+      entries: [{ name: 'src', isDir: true }],
+    });
+  });
+
   it('reuses a hot directory listing cache for repeated requests', async () => {
     const testDir = path.join(homedir(), 'cached-dir');
     mockRealpath.mockResolvedValue(testDir as unknown as string);
@@ -209,6 +245,110 @@ describe('fs.ls handler', () => {
     const names = resp.entries.map((e: any) => e.name);
     expect(names).toContain('src');
     expect(names).toContain('README.md');
+  });
+
+  it('includes downloadId for allowed files when includeMetadata is true', async () => {
+    const testDir = path.join(homedir(), 'metadata-allowed-dir');
+    const filePath = path.join(testDir, 'README.md');
+    mockRealpath.mockImplementation(async (target) => String(target));
+    mockReaddir.mockResolvedValue([
+      makeDirent('README.md', false),
+    ] as unknown as fsp.Dirent<string>[]);
+    mockStat.mockResolvedValue({ size: 42, mtimeMs: 101 } as fsp.Stats);
+
+    handleWebCommand({ type: 'fs.ls', path: testDir, requestId: 'req-meta-allowed', includeFiles: true, includeMetadata: true }, mockServerLink as any);
+    await flushAsync();
+
+    const resp = sent[0] as any;
+    expect(resp.status).toBe('ok');
+    expect(resp.entries).toHaveLength(1);
+    expect(resp.entries[0]).toMatchObject({
+      name: 'README.md',
+      path: filePath,
+      size: 42,
+      mime: 'text/markdown',
+    });
+    expect(resp.entries[0].downloadId).toEqual(expect.any(String));
+  });
+
+  it('omits downloadId for denied metadata entries without failing the listing', async () => {
+    const testDir = path.join(homedir(), 'metadata-denied-dir');
+    const filePath = path.join(testDir, 'id_rsa');
+    const deniedRealPath = path.join(homedir(), '.ssh', 'id_rsa');
+    mockRealpath.mockImplementation(async (target) => {
+      const value = String(target);
+      if (value === filePath) return deniedRealPath;
+      return value;
+    });
+    mockReaddir.mockResolvedValue([
+      makeDirent('id_rsa', false),
+    ] as unknown as fsp.Dirent<string>[]);
+    mockStat.mockResolvedValue({ size: 99, mtimeMs: 202 } as fsp.Stats);
+
+    handleWebCommand({ type: 'fs.ls', path: testDir, requestId: 'req-meta-denied', includeFiles: true, includeMetadata: true }, mockServerLink as any);
+    await flushAsync();
+
+    const resp = sent[0] as any;
+    expect(resp.status).toBe('ok');
+    expect(resp.entries).toHaveLength(1);
+    expect(resp.entries[0]).toMatchObject({
+      name: 'id_rsa',
+      path: filePath,
+      size: 99,
+    });
+    expect(resp.entries[0].downloadId).toBeUndefined();
+  });
+
+  it('omits downloadId for Windows realpath fallback entries without failing the listing', async () => {
+    const origPlatform = process.platform;
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    const testDir = path.join(homedir(), 'metadata-fallback-dir');
+    mockRealpath.mockRejectedValue(new Error('expected reparse fallback'));
+    mockReaddir.mockResolvedValue([
+      makeDirent('fallback.txt', false),
+    ] as unknown as fsp.Dirent<string>[]);
+    mockStat.mockResolvedValue({ size: 7, mtimeMs: 303 } as fsp.Stats);
+
+    try {
+      handleWebCommand({ type: 'fs.ls', path: testDir, requestId: 'req-meta-fallback', includeFiles: true, includeMetadata: true }, mockServerLink as any);
+      await flushAsync();
+
+      const resp = sent[0] as any;
+      expect(resp.status).toBe('ok');
+      expect(resp.entries).toHaveLength(1);
+      expect(resp.entries[0]).toMatchObject({
+        name: 'fallback.txt',
+        size: 7,
+      });
+      expect(resp.entries[0].downloadId).toBeUndefined();
+    } finally {
+      Object.defineProperty(process, 'platform', { value: origPlatform });
+    }
+  });
+
+  it('fails closed for Windows realpath fallback when includeMetadata is false', async () => {
+    const origPlatform = process.platform;
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    const testDir = path.join(homedir(), 'plain-fallback-dir');
+    mockRealpath.mockRejectedValue(new Error('expected reparse fallback'));
+    mockReaddir.mockResolvedValue([
+      makeDirent('fallback.txt', false),
+    ] as unknown as fsp.Dirent<string>[]);
+
+    try {
+      handleWebCommand({ type: 'fs.ls', path: testDir, requestId: 'req-plain-fallback', includeFiles: true, includeMetadata: false }, mockServerLink as any);
+      await flushAsync();
+
+      expect(mockReaddir).not.toHaveBeenCalled();
+      expect(sent[0]).toMatchObject({
+        type: 'fs.ls_response',
+        requestId: 'req-plain-fallback',
+        status: 'error',
+        error: 'forbidden_path',
+      });
+    } finally {
+      Object.defineProperty(process, 'platform', { value: origPlatform });
+    }
   });
 
   it('sorts: directories first, hidden last within each group', async () => {

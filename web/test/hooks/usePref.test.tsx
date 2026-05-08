@@ -30,7 +30,7 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-function Probe({ prefKey, label = 'value', legacyKey }: { prefKey: string | null; label?: string; legacyKey?: string }) {
+function Probe({ prefKey, label = 'value', legacyKey }: { prefKey: string | null; label?: string; legacyKey?: string | readonly string[] }) {
   const pref = usePref<string>(prefKey, { parse: parseString, legacyKey });
   return (
     <div>
@@ -179,6 +179,25 @@ describe('usePref', () => {
     await screen.findByText('legacy-late:true');
     expect(getUserPrefMock).toHaveBeenCalledWith('legacy');
     expect(saveUserPrefMock).toHaveBeenCalledWith('primary', 'legacy-late');
+  });
+
+  it('checks legacy fallback keys in order and migrates the first non-null value', async () => {
+    getUserPrefMock.mockImplementation(async (key: string) => {
+      if (key === 'primary') return null;
+      if (key === 'legacy-empty') return null;
+      if (key === 'legacy-hit') return 'legacy-value';
+      return null;
+    });
+
+    render(<Probe prefKey="primary" legacyKey={['legacy-empty', 'legacy-hit']} />);
+
+    await screen.findByText('legacy-value:true');
+    expect(getUserPrefMock.mock.calls.map(([key]) => key)).toEqual([
+      'primary',
+      'legacy-empty',
+      'legacy-hit',
+    ]);
+    expect(saveUserPrefMock).toHaveBeenCalledWith('primary', 'legacy-value');
   });
 
   it('does not run late legacy fallback after the primary is already authoritative', async () => {

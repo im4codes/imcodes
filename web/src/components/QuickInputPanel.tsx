@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useMemo } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import { apiFetch } from '../api.js';
-import { createSharedResource } from '../stores/shared-resource.js';
+import { createSharedResource, type SharedResource } from '../stores/shared-resource.js';
 import { FileBrowser } from './file-browser-lazy.js';
 import type { WsClient } from '../ws-client.js';
 import type { JSX, RefObject } from 'preact';
@@ -86,6 +86,30 @@ let _hasHydratedFromServer = false;
 let _mutatedBeforeHydration = false;
 let _visibilityInstalled = false;
 let _visibilityHandler: (() => void) | null = null;
+let _pageHideHandler: (() => void) | null = null;
+
+// ── Pending-add tracking ─────────────────────────────────────────────────
+// User-added custom phrases/commands are persisted via a 2-second debounced
+// PUT. In a few uncommon scenarios that window is wide enough to lose data:
+//
+//   1. The shared resource's `invalidate()` (e.g. tab visibility refresh)
+//      triggers a re-fetch. The fetcher returned server data as-is, which
+//      OVERWROTE the optimistic resource value containing the just-added
+//      phrase. The phrase vanished from the UI; if the user then mutated
+//      again, the new `scheduleSave` cancelled the original closure-captured
+//      timer, and the phrase was never persisted.
+//
+//   2. The user closed/reloaded the tab inside the 2-second debounce window.
+//      The timer never fired, so the addition was lost server-side.
+//
+// Fix: track every unsaved phrase/command addition in module-level Sets.
+// `applyPendingAdds` layers them onto every server response so optimistic
+// items survive `invalidate()`, and the visibility/pagehide handlers flush
+// the pending PUT synchronously via fetch `keepalive`. Successful saves
+// clear the in-flight snapshot from the pending sets; failures keep them
+// in place so the next mutation (or next flush) will retry.
+const _pendingPhraseAdds = new Set<string>();
+const _pendingCommandAdds = new Set<string>();
 
 function normalizeStringList(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
@@ -143,17 +167,74 @@ function mergeQuickDataForHydration(server: QuickData, local: QuickData): QuickD
   };
 }
 
+/**
+ * Layer pending (unsaved) custom additions onto a server snapshot so an
+ * `invalidate()`-triggered re-fetch never wipes optimistic state. Only
+ * additions are tracked — removals fall through to the closure-captured
+ * `data` payload in the in-flight PUT, which already conveys deletes
+ * correctly.
+ */
+function applyPendingAdds(server: QuickData): QuickData {
+  if (_pendingPhraseAdds.size === 0 && _pendingCommandAdds.size === 0) return server;
+  const phrases = server.phrases.slice();
+  for (const p of _pendingPhraseAdds) if (!phrases.includes(p)) phrases.push(p);
+  const commands = server.commands.slice();
+  for (const c of _pendingCommandAdds) if (!commands.includes(c)) commands.push(c);
+  return { ...server, phrases, commands };
+}
+
 function scheduleSave(data: QuickData, canPersist: boolean): void {
   if (!canPersist) return;
   if (_debounceTimer) clearTimeout(_debounceTimer);
   _debounceTimer = setTimeout(() => {
-    apiFetch('/api/quick-data', { method: 'PUT', body: JSON.stringify({ data }) }).catch((err) => {
-      console.error('[quick-data] save failed:', err);
-    });
+    _debounceTimer = null;
+    runSave(data);
   }, 2000);
 }
 
-let quickDataResource = createSharedResource<QuickData>({
+/**
+ * Fire a PUT for the supplied snapshot. Snapshots the pending-add sets so
+ * a successful response can drop only the items that were actually
+ * persisted, while concurrent mutations during the in-flight PUT are
+ * preserved for the next save cycle.
+ */
+function runSave(data: QuickData, opts?: { keepalive?: boolean }): void {
+  const snapPhraseAdds = new Set(_pendingPhraseAdds);
+  const snapCommandAdds = new Set(_pendingCommandAdds);
+  const init: RequestInit = { method: 'PUT', body: JSON.stringify({ data }) };
+  if (opts?.keepalive) init.keepalive = true;
+  apiFetch('/api/quick-data', init)
+    .then(() => {
+      // Persisted — remove just the items that were in the in-flight
+      // snapshot. New adds that arrived during the PUT remain pending and
+      // will be flushed by the next debounced save.
+      for (const p of snapPhraseAdds) _pendingPhraseAdds.delete(p);
+      for (const c of snapCommandAdds) _pendingCommandAdds.delete(c);
+    })
+    .catch((err) => {
+      console.error('[quick-data] save failed:', err);
+      // Pending sets keep the in-flight items so the next scheduleSave
+      // (or unload flush) will retry them.
+    });
+}
+
+/**
+ * Synchronously flush a pending debounced save during page hide / unload.
+ * Uses fetch `keepalive` so the request survives the tab closing. No-op
+ * when there is nothing to flush.
+ */
+function flushPendingSave(): void {
+  if (!_debounceTimer || !_hasHydratedFromServer) return;
+  clearTimeout(_debounceTimer);
+  _debounceTimer = null;
+  const data = normalizeQuickData(quickDataResource.peek().value ?? EMPTY_QUICK_DATA);
+  runSave(data, { keepalive: true });
+}
+
+// Explicit annotation: the fetcher closure references `quickDataResource`
+// (in both the merge-on-hydrate path and the keep-current-on-error path),
+// so TS needs the type up front to avoid `implicitly any` in the cycle.
+let quickDataResource: SharedResource<QuickData> = createSharedResource<QuickData>({
   fetcher: async () => {
     try {
       const res = await apiFetch<{ data: QuickData }>('/api/quick-data');
@@ -163,11 +244,19 @@ let quickDataResource = createSharedResource<QuickData>({
         _mutatedBeforeHydration = false;
         const merged = mergeQuickDataForHydration(server, normalizeQuickData(quickDataResource.peek().value ?? EMPTY_QUICK_DATA));
         quickDataResource.mutate(merged);
-        return merged;
+        return applyPendingAdds(merged);
       }
-      return server;
+      // Re-fetch path: ensure optimistic phrase/command additions that
+      // haven't yet been persisted survive the refresh. Without this, a
+      // visibility-triggered invalidate would replace the in-memory value
+      // with server data and erase the user's just-added entry from the UI.
+      return applyPendingAdds(server);
     } catch {
-      return EMPTY_QUICK_DATA;
+      // Don't wipe the in-memory value on transient fetch errors — keep
+      // whatever is currently in the resource (or EMPTY on first load).
+      return _hasHydratedFromServer
+        ? normalizeQuickData(quickDataResource.peek().value ?? EMPTY_QUICK_DATA)
+        : EMPTY_QUICK_DATA;
     }
   },
 });
@@ -177,9 +266,22 @@ function installQuickDataVisibilityListener(): void {
   _visibilityHandler = () => {
     if (document.visibilityState === 'visible' && quickDataResource.hasSubscribers()) {
       quickDataResource.invalidate();
+    } else if (document.visibilityState === 'hidden') {
+      // Tab is going away (mobile background, window minimize, switch
+      // tabs) — flush any pending debounced save synchronously so a
+      // quick close/refresh doesn't drop the user's last edit.
+      flushPendingSave();
     }
   };
   document.addEventListener('visibilitychange', _visibilityHandler);
+  // `pagehide` is the most reliable unload signal across browsers
+  // (especially mobile Safari, which throttles visibilitychange and
+  // skips beforeunload on swipe-away). Pair it with the visibility
+  // hook above for full coverage.
+  if (typeof window !== 'undefined') {
+    _pageHideHandler = flushPendingSave;
+    window.addEventListener('pagehide', _pageHideHandler);
+  }
   _visibilityInstalled = true;
 }
 
@@ -218,19 +320,28 @@ export function useQuickData(): UseQuickDataResult {
   const addCommand = (cmd: string) => {
     const trimmed = cmd.trim();
     if (!trimmed) return;
+    // Mark pending BEFORE the optimistic mutation so a racing fetcher
+    // (a no-op `set` doesn't trigger one, but defensive ordering keeps
+    // the invariant simple) sees the addition.
+    _pendingCommandAdds.add(trimmed);
     updateQuickData((prev) => prev.commands.includes(trimmed) ? prev : { ...prev, commands: [...prev.commands, trimmed] });
   };
 
   const addPhrase = (phrase: string) => {
     const trimmed = phrase.trim();
     if (!trimmed) return;
+    _pendingPhraseAdds.add(trimmed);
     updateQuickData((prev) => prev.phrases.includes(trimmed) ? prev : { ...prev, phrases: [...prev.phrases, trimmed] });
   };
 
   const removeCommand = (cmd: string) => {
+    // If the user adds-then-removes inside the debounce window, drop the
+    // pending entry — there is nothing to preserve across a refresh.
+    _pendingCommandAdds.delete(cmd);
     updateQuickData((prev) => prev.commands.includes(cmd) ? { ...prev, commands: prev.commands.filter((c) => c !== cmd) } : prev);
   };
   const removePhrase = (phrase: string) => {
+    _pendingPhraseAdds.delete(phrase);
     updateQuickData((prev) => prev.phrases.includes(phrase) ? { ...prev, phrases: prev.phrases.filter((p) => p !== phrase) } : prev);
   };
   const removeHistory = (text: string) => {
@@ -258,10 +369,16 @@ export function __resetQuickDataForTests(): void {
   _debounceTimer = null;
   _hasHydratedFromServer = false;
   _mutatedBeforeHydration = false;
+  _pendingPhraseAdds.clear();
+  _pendingCommandAdds.clear();
   if (_visibilityHandler && typeof document !== 'undefined') {
     document.removeEventListener('visibilitychange', _visibilityHandler);
   }
   _visibilityHandler = null;
+  if (_pageHideHandler && typeof window !== 'undefined') {
+    window.removeEventListener('pagehide', _pageHideHandler);
+  }
+  _pageHideHandler = null;
   _visibilityInstalled = false;
   quickDataResource.disposeForTests();
 }

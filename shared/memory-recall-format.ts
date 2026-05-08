@@ -12,6 +12,7 @@ export interface RelatedPastWorkRenderableItem {
 
 export const RELATED_PAST_WORK_HEADER = '[Related past work]';
 export const STARTUP_PROJECT_MEMORY_HEADER = '# Recent project memory (reference only)';
+export const STARTUP_SKILL_INDEX_HEADER = '# Available skills (read on demand)';
 
 export function formatRelatedPastWorkSummary(summary: string, maxLength = 200): string {
   return summary.split('\n')[0]?.slice(0, maxLength) ?? '';

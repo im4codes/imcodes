@@ -127,6 +127,14 @@ interface GeminiSdkSessionState {
   /** Track last emitted signature per tool to deduplicate identical updates. */
   emittedToolSignatures: Map<string, string>;
   lastStatusSignature: string | null;
+  /** Most recent ACP `usage_update.tokens` for this session — captured here so
+   *  the onComplete `metadata.usage` can carry per-turn token counts to the
+   *  daemon's transport-relay (where they end up as `usage.update` timeline
+   *  events and rows in `context_turn_usage`). Without this, gemini-sdk
+   *  `metadata.usage` is empty and EVERY gemini-sdk turn is invisible in
+   *  cost analytics — confirmed by inspecting the production SQLite
+   *  (`context_turn_usage` had 0 gemini-sdk rows out of 599 total). */
+  lastTurnUsage?: Record<string, unknown>;
 }
 
 interface MergedToolCall {
@@ -152,6 +160,13 @@ export class GeminiSdkProvider implements TransportProvider {
     attachments: false,
     reasoningEffort: false,
     contextSupport: 'degraded-message-side-context-mapping',
+    compact: {
+      execution: 'unsupported',
+      verified: true,
+      completion: 'none',
+      cancellation: 'none',
+      reason: 'Verified with Gemini CLI 0.39.1: regular CLI registers /compress with /compact and /summarize aliases, but the --acp command registry used by this adapter does not register compress/compact.',
+    },
   };
 
   private config: ProviderConfig | null = null;
@@ -683,6 +698,13 @@ export class GeminiSdkProvider implements TransportProvider {
       );
       return;
     }
+    // Snapshot + clear the per-turn ACP usage so each onComplete carries its
+    // OWN token counts (not the previous turn's). Transport-relay's
+    // normalizeUsageUpdatePayload reads `metadata.usage` to emit usage.update
+    // → recorded in context_turn_usage with the turn's eventId.
+    const turnUsage = state.lastTurnUsage;
+    state.lastTurnUsage = undefined;
+
     if (stopReason === 'max_tokens' || stopReason === 'max_turn_requests') {
       // Still emit whatever text we accumulated — it's a partial but useful
       // response — and mark metadata so the UI can show the truncation cause.
@@ -698,6 +720,7 @@ export class GeminiSdkProvider implements TransportProvider {
           stopReason,
           ...(state.model ? { model: state.model } : {}),
           ...(state.acpSessionId ? { resumeId: state.acpSessionId } : {}),
+          ...(turnUsage ? { usage: turnUsage } : {}),
         },
       };
       for (const cb of this.completeCallbacks) cb(sessionId, msg);
@@ -716,6 +739,7 @@ export class GeminiSdkProvider implements TransportProvider {
       metadata: {
         ...(state.model ? { model: state.model } : {}),
         ...(state.acpSessionId ? { resumeId: state.acpSessionId } : {}),
+        ...(turnUsage ? { usage: turnUsage } : {}),
       },
     };
     for (const cb of this.completeCallbacks) cb(sessionId, msg);
@@ -765,10 +789,21 @@ export class GeminiSdkProvider implements TransportProvider {
         // Map ACP's usage update onto our generic quota/session-info signal.
         // ACP's `UsageUpdate` is experimental; guard every field.
         const u = update as Record<string, unknown>;
+        const tokens = (typeof u.tokens === 'object' && u.tokens)
+          ? (u.tokens as Record<string, unknown>)
+          : undefined;
+        // Cache for the next onComplete so transport-relay can normalize it
+        // into a `usage.update` timeline event with input/output token data.
+        // ACP token field names vary across Gemini ACP versions; pass the
+        // raw map through and let transport-relay's normalizeUsageUpdatePayload
+        // pick up `input_tokens`/`output_tokens`/`cache_*` whichever form
+        // Gemini emitted.
+        if (tokens) {
+          const sessionState = this.sessions.get(routeId);
+          if (sessionState) sessionState.lastTurnUsage = tokens;
+        }
         this.emitSessionInfo(routeId, {
-          ...(typeof u.tokens === 'object' && u.tokens
-            ? { quotaMeta: u.tokens as Record<string, unknown> as never }
-            : {}),
+          ...(tokens ? { quotaMeta: tokens as Record<string, unknown> as never } : {}),
         });
         return;
       }

@@ -91,12 +91,14 @@ function makeSubSession(overrides: Partial<SubSession> = {}): SubSession {
 
 describe('SubSessionCard', () => {
   beforeEach(() => {
+    localStorage.clear();
     vi.clearAllMocks();
     timelineEvents = [{ type: 'assistant.text', payload: { text: 'hello' } }];
   });
 
   afterEach(() => {
     cleanup();
+    localStorage.clear();
   });
 
   it('forces preview scroll to bottom after sending from the card input', async () => {
@@ -303,7 +305,7 @@ describe('SubSessionCard', () => {
     expect(releaseRaw).toHaveBeenCalledOnce();
   });
 
-  it('renders the stop button in transport fallback input mode and sends /stop via the urgent path', async () => {
+  it('renders the stop button in transport fallback input mode and sends direct cancel via the urgent path', async () => {
     // Stop is highest-priority — it must use sendSessionCommandUrgent so a
     // visibility/focus probe-flip (`_connected = false`) can't silently
     // drop the click. See ws-client.ts sendUrgent for the full rationale.
@@ -325,9 +327,13 @@ describe('SubSessionCard', () => {
     fireEvent.click(stop!);
 
     await waitFor(() => {
-      expect(ws.sendSessionCommandUrgent).toHaveBeenCalledWith('send', { sessionName: 'deck_sub_sub-card-1', text: '/stop' });
+      expect(ws.sendSessionCommandUrgent).toHaveBeenCalledWith('cancel', {
+        sessionName: 'deck_sub_sub-card-1',
+        commandId: expect.any(String),
+      });
     });
-    // Regular sendSessionCommand should NOT have been used for stop.
+    // Stop must not be represented as a chat send.
+    expect(ws.sendSessionCommandUrgent).not.toHaveBeenCalledWith('send', expect.objectContaining({ text: '/stop' }));
     expect(ws.sendSessionCommand).not.toHaveBeenCalledWith('send', expect.objectContaining({ text: '/stop' }));
   });
 
@@ -384,6 +390,85 @@ describe('SubSessionCard', () => {
       const controls = document.querySelector('[data-testid="session-controls"]') as HTMLElement | null;
       expect(controls?.dataset.queued).toBe('queued send');
     });
+  });
+
+  it('uses saved codex preference as legacy fallback for compact model-less codex-sdk sessions', async () => {
+    localStorage.setItem('imcodes-codex-model:deck_sub_sub-card-1', 'gpt-5.5');
+    timelineEvents = [{
+      type: 'usage.update',
+      payload: {
+        inputTokens: 166_000,
+        cacheTokens: 0,
+        contextWindow: 258_400,
+        contextWindowSource: 'provider',
+      },
+    }] as any;
+
+    const { container } = render(
+      <SubSessionCard
+        sub={makeSubSession({ type: 'codex-sdk', runtimeType: 'transport' as any } as any)}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        quickData={{} as any}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(sessionControlsSpy).toHaveBeenCalled();
+    });
+
+    const props = sessionControlsSpy.mock.calls.at(-1)?.[0];
+    expect(props.detectedModel).toBe('gpt-5.5');
+    const ctxBar = container.querySelector('.subcard-ctx-bar') as HTMLElement | null;
+    expect(ctxBar?.getAttribute('title')).toContain('Context: 166k / 258k (64%)');
+    expect(ctxBar?.getAttribute('title')).not.toContain('/ 922k');
+  });
+
+  it('passes model metadata to compact controls and computes GPT-5.5 ctx from session metadata when usage omits model', async () => {
+    timelineEvents = [{
+      type: 'usage.update',
+      payload: {
+        inputTokens: 100_000,
+        cacheTokens: 0,
+        contextWindow: 258_400,
+        contextWindowSource: 'provider',
+      },
+    }] as any;
+
+    const { container } = render(
+      <SubSessionCard
+        sub={makeSubSession({
+          type: 'codex-sdk',
+          runtimeType: 'transport' as any,
+          activeModel: 'gpt-5.5',
+          requestedModel: 'gpt-5.5',
+          modelDisplay: 'gpt-5.5',
+        } as any)}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        quickData={{} as any}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(sessionControlsSpy).toHaveBeenCalled();
+    });
+
+    const props = sessionControlsSpy.mock.calls.at(-1)?.[0];
+    expect(props.activeSession.activeModel).toBe('gpt-5.5');
+    expect(props.activeSession.requestedModel).toBe('gpt-5.5');
+    expect(props.detectedModel).toBe('gpt-5.5');
+
+    const ctxBar = container.querySelector('.subcard-ctx-bar') as HTMLElement | null;
+    expect(ctxBar?.getAttribute('title')).toContain('Context: 100k / 258k (39%)');
   });
 
   it('raises the whole card above neighbors while a compact dropdown is open', async () => {

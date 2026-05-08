@@ -1,12 +1,16 @@
-import type { ContextMemoryView } from '../../../shared/context-types.js';
+import type { ContextMemoryProjectView, ContextMemoryView } from '../../../shared/context-types.js';
 import { computeRelevanceScore, type MemoryScoringWeights, type ProjectionClass } from '../../../shared/memory-scoring.js';
+import {
+  REPLICABLE_SHARED_PROJECTION_SCOPES,
+  type SharedContextProjectionScope,
+} from '../../../shared/memory-scope.js';
 import type { Database } from '../db/client.js';
 import { embeddingToSql, generateEmbedding } from './embedding.js';
 import { isMemoryNoiseSummary } from '../../../shared/memory-noise-patterns.js';
 
 type MemoryScope = 'personal' | 'enterprise';
 type ProjectionClassFilter = 'recent_summary' | 'durable_memory_candidate' | 'master_summary';
-type ProjectionScope = 'personal' | 'project_shared' | 'workspace_shared' | 'org_shared';
+type ProjectionScope = SharedContextProjectionScope;
 type ProjectionStatus = 'active' | 'archived' | 'archived_dedup';
 
 export interface SemanticMemoryViewInput {
@@ -43,6 +47,14 @@ interface ScopedStatsRow {
   project_count: number;
 }
 
+interface ScopedProjectStatsRow {
+  project_id: string;
+  total_records: number;
+  recent_summary_count: number;
+  durable_candidate_count: number;
+  updated_at: number;
+}
+
 function parseSourceEventCount(sourceEventIds: string | string[]): number {
   if (Array.isArray(sourceEventIds)) return sourceEventIds.length;
   try {
@@ -70,7 +82,8 @@ export function buildScopedWhereClause(input: SemanticMemoryViewInput, includeAl
     conditions.push(`${alias}user_id = ${p(input.userId)}`);
   } else {
     if (!input.enterpriseId) throw new Error('enterpriseId is required for enterprise semantic memory search');
-    conditions.push(`${alias}scope IN ('project_shared', 'workspace_shared', 'org_shared')`);
+    const sharedScopePlaceholders = REPLICABLE_SHARED_PROJECTION_SCOPES.map((scope) => p(scope)).join(', ');
+    conditions.push(`${alias}scope IN (${sharedScopePlaceholders})`);
     conditions.push(`${alias}enterprise_id = ${p(input.enterpriseId)}`);
   }
 
@@ -107,6 +120,33 @@ async function loadScopedStats(db: Database, input: SemanticMemoryViewInput): Pr
   };
 }
 
+async function loadScopedProjectRows(db: Database, input: SemanticMemoryViewInput): Promise<ContextMemoryProjectView[]> {
+  const { clause, params } = buildScopedWhereClause(input, false);
+  const rows = await db.query<ScopedProjectStatsRow>(
+    `SELECT project_id,
+            COUNT(*)::int AS total_records,
+            COUNT(*) FILTER (WHERE projection_class = 'recent_summary')::int AS recent_summary_count,
+            COUNT(*) FILTER (WHERE projection_class = 'durable_memory_candidate')::int AS durable_candidate_count,
+            MAX(updated_at) AS updated_at
+       FROM shared_context_projections
+      WHERE ${clause}
+      GROUP BY project_id
+      ORDER BY MAX(updated_at) DESC
+      LIMIT 200`,
+    params,
+  );
+  return rows
+    .filter((row) => row.project_id)
+    .map((row) => ({
+      projectId: row.project_id,
+      displayName: row.project_id,
+      totalRecords: row.total_records,
+      recentSummaryCount: row.recent_summary_count,
+      durableCandidateCount: row.durable_candidate_count,
+      updatedAt: row.updated_at,
+    }));
+}
+
 async function loadScopedVectorRows(db: Database, input: SemanticMemoryViewInput, queryEmbeddingSql: string, candidateLimit: number): Promise<ScopedMemoryRow[]> {
   const { clause, params } = buildScopedWhereClause(input, true);
   const vectorParam = `$${params.length + 1}`;
@@ -136,7 +176,10 @@ export async function searchSemanticMemoryView(input: SemanticMemoryViewInput): 
   const rows = await loadScopedVectorRows(input.db, input, embeddingToSql(embedding), candidateLimit);
   if (rows.length === 0) return null;
 
-  const stats = await loadScopedStats(input.db, input);
+  const [stats, projects] = await Promise.all([
+    loadScopedStats(input.db, input),
+    loadScopedProjectRows(input.db, input),
+  ]);
   const currentProjectId = input.projectId ?? '__unknown_current_project__';
   const ranked = rows
     .filter((row) => !isMemoryNoiseSummary(row.summary))
@@ -180,5 +223,6 @@ export async function searchSemanticMemoryView(input: SemanticMemoryViewInput): 
       lastUsedAt: row.last_used_at ?? undefined,
       status: row.status ?? 'active',
     })),
+    projects,
   };
 }

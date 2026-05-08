@@ -9,6 +9,7 @@ import { shortModelLabel } from '../model-label.js';
 import { getSessionCost, getWeeklyCost, getMonthlyCost, formatCost } from '../cost-tracker.js';
 import type { UsageData } from '../usage-data.js';
 import { formatProviderQuotaLabel, type ProviderQuotaMeta } from '@shared/provider-quota.js';
+import { USAGE_CONTEXT_WINDOW_SOURCES } from '@shared/usage-context-window.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
 import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 
@@ -107,7 +108,12 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   }, [planLabel, t]);
 
   const { ctx, total, cachePct, newPct, pctStr, tip } = useMemo(() => {
-    const ctx = resolveContextWindow(usage.contextWindow, displayModel);
+    const ctx = resolveContextWindow(
+      usage.contextWindow,
+      displayModel,
+      1_000_000,
+      { preferExplicit: usage.contextWindowSource === USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER },
+    );
     const total = usage.inputTokens + usage.cacheTokens;
     const totalPct = Math.min(100, total / ctx * 100);
     const cachePct = Math.min(totalPct, usage.cacheTokens / ctx * 100);
@@ -122,12 +128,18 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
       quotaUsageLabel ? t('session.provider_quota_usage_title', { value: quotaUsageLabel }) : '',
     ].filter(Boolean).join('\n');
     return { ctx, total, totalPct, cachePct, newPct, pctStr, tip };
-  }, [usage.inputTokens, usage.cacheTokens, usage.contextWindow, displayModel, displayPlanLabel, displayQuotaLabel, quotaUsageLabel, t]);
+  }, [usage.inputTokens, usage.cacheTokens, usage.contextWindow, usage.contextWindowSource, displayModel, displayPlanLabel, displayQuotaLabel, quotaUsageLabel, t]);
 
   const sessionCost = showCost ? getSessionCost(sessionName) : 0;
   const weeklyCost = sessionCost > 0 ? getWeeklyCost() : 0;
   const monthlyCost = sessionCost > 0 ? getMonthlyCost() : 0;
   const modelLabel = shortModelLabel(displayModel);
+  // Keep the ctx meter visible even before the first non-zero usage event when
+  // the session/model is known. A zero-token session still has useful context
+  // capacity information (e.g. "0 / 922k" for GPT-5.5); hiding it made Codex
+  // SDK sessions look like ctx tracking had disappeared after stale cumulative
+  // usage snapshots were filtered out.
+  const hasContextInfo = total > 0 || (usage.contextWindow ?? 0) > 0 || !!modelLabel;
   const inlineQuotaText = displayQuotaLabel;
   const liveStatusMode = isAgentless
     ? null
@@ -155,7 +167,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     : [];
   return (
     <div class="session-usage-footer" title={tip} data-agent-type={agentType ?? undefined}>
-      {total > 0 && (
+      {hasContextInfo && (
         <div class="session-ctx-bar">
           <div class="session-ctx-cache" style={{ width: `${cachePct}%` }} />
           <div class="session-ctx-input" style={{ width: `${newPct}%`, left: `${cachePct}%` }} />
@@ -220,7 +232,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
             </button>
           </span>
           {modelLabel && <span class="session-usage-model">{modelLabel}</span>}
-          {total > 0 && <span class="session-usage-tokens">{fmt(total)} / {fmt(ctx)} ({pctStr}%)</span>}
+          {hasContextInfo && <span class="session-usage-tokens">{fmt(total)} / {fmt(ctx)} ({pctStr}%)</span>}
           {inlineQuotaText && codexQuotaLines.length === 0 && <span class="session-usage-tokens">{inlineQuotaText}</span>}
           {sessionCost > 0 && (
             <span class="session-usage-cost">

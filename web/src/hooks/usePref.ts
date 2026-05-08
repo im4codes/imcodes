@@ -4,7 +4,7 @@ import { getUserPref, onUserPrefChanged, saveUserPref, type UserPrefChangedMeta 
 import { createSharedResource, type SharedResource } from '../stores/shared-resource.js';
 
 export interface UsePrefOptions<T> {
-  legacyKey?: string;
+  legacyKey?: string | readonly string[];
   parse?: (raw: unknown) => T | null;
   serialize?: (value: T) => unknown;
 }
@@ -23,7 +23,7 @@ export interface UsePrefResult<T> {
 
 type PrefEntry = {
   key: string;
-  legacyKey?: string;
+  legacyKeys: string[];
   resource: SharedResource<unknown>;
   migrationAttempted: boolean;
   primaryAuthoritative: boolean;
@@ -75,7 +75,7 @@ function ensurePrefDispatcher(): void {
       for (const entry of prefEntries.values()) {
         if (changedKey === entry.key) {
           applyPrimaryEvent(entry, rawValue, meta);
-        } else if (entry.legacyKey && changedKey === entry.legacyKey) {
+        } else if (entry.legacyKeys.includes(changedKey)) {
           applyLegacyEvent(entry, rawValue);
         }
       }
@@ -136,7 +136,7 @@ function applyLegacyEvent(entry: PrefEntry, rawValue: unknown): void {
   if (entry.primaryAuthoritative || entry.hasLocalPrimaryWrite) return;
   entry.migrationAttempted = true;
   if (rawValue == null) return;
-  if (entry.legacyKey) {
+  if (entry.legacyKeys.length > 0) {
     entry.primaryAuthoritative = true;
     recordLocalWrite(entry, rawValue, 'migration');
     entry.resource.mutate(rawValue);
@@ -144,10 +144,22 @@ function applyLegacyEvent(entry: PrefEntry, rawValue: unknown): void {
   }
 }
 
-function createPrefEntry(key: string, legacyKey?: string): PrefEntry {
+function normalizeLegacyKeys(key: string, legacyKey?: string | readonly string[]): string[] {
+  const raw = Array.isArray(legacyKey) ? legacyKey : legacyKey ? [legacyKey] : [];
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const candidate of raw) {
+    if (!candidate || candidate === key || seen.has(candidate)) continue;
+    seen.add(candidate);
+    result.push(candidate);
+  }
+  return result;
+}
+
+function createPrefEntry(key: string, legacyKeys: string[]): PrefEntry {
   const entry: PrefEntry = {
     key,
-    legacyKey,
+    legacyKeys,
     resource: undefined as unknown as SharedResource<unknown>,
     migrationAttempted: false,
     primaryAuthoritative: false,
@@ -163,32 +175,41 @@ function createPrefEntry(key: string, legacyKey?: string): PrefEntry {
         entry.primaryAuthoritative = true;
         return primary;
       }
-      if (!entry.legacyKey || entry.migrationAttempted) return null;
+      if (entry.legacyKeys.length === 0 || entry.migrationAttempted) return null;
       entry.migrationAttempted = true;
-      const legacy = await getUserPref(entry.legacyKey);
-      if (entry.primaryAuthoritative || entry.hasLocalPrimaryWrite) return entry.resource.peek().value ?? null;
-      if (legacy !== null) {
-        recordLocalWrite(entry, legacy, 'migration');
-        entry.primaryAuthoritative = true;
-        void saveUserPref(key, legacy).catch(() => undefined);
+      for (const legacyKey of entry.legacyKeys) {
+        const legacy = await getUserPref(legacyKey);
+        if (entry.primaryAuthoritative || entry.hasLocalPrimaryWrite) return entry.resource.peek().value ?? null;
+        if (legacy !== null) {
+          recordLocalWrite(entry, legacy, 'migration');
+          entry.primaryAuthoritative = true;
+          void saveUserPref(key, legacy).catch(() => undefined);
+          return legacy;
+        }
       }
-      return legacy;
+      return null;
     },
   });
   return entry;
 }
 
-function getPrefEntry(key: string, legacyKey?: string): PrefEntry {
+function getPrefEntry(key: string, legacyKey?: string | readonly string[]): PrefEntry {
   ensurePrefDispatcher();
+  const legacyKeys = normalizeLegacyKeys(key, legacyKey);
   let entry = prefEntries.get(key);
   if (!entry) {
-    entry = createPrefEntry(key, legacyKey);
+    entry = createPrefEntry(key, legacyKeys);
     prefEntries.set(key, entry);
-  } else if (legacyKey && !entry.legacyKey) {
-    entry.legacyKey = legacyKey;
+  } else {
+    const previousCount = entry.legacyKeys.length;
+    for (const candidate of legacyKeys) {
+      if (!entry.legacyKeys.includes(candidate)) entry.legacyKeys.push(candidate);
+    }
+    if (entry.legacyKeys.length > previousCount) entry.migrationAttempted = false;
     const snapshot = entry.resource.peek();
     if (
-      snapshot.loaded
+      entry.legacyKeys.length > previousCount
+      && snapshot.loaded
       && snapshot.value == null
       && !entry.migrationAttempted
       && !entry.primaryAuthoritative

@@ -62,6 +62,51 @@ describe('SubSessionBar', () => {
     cleanup();
   });
 
+  it('can share collapsed state with an external fullscreen control', () => {
+    const onCollapsedChange = vi.fn();
+    const view = render(
+      <SubSessionBar
+        subSessions={[makeSubSession()]}
+        openIds={new Set()}
+        collapsed={false}
+        onCollapsedChange={onCollapsedChange}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    expect(view.container.querySelector('.subcard-scroll')).toBeTruthy();
+
+    fireEvent.click(view.container.querySelector('.subcard-toolbar-btn') as HTMLButtonElement);
+
+    expect(onCollapsedChange).toHaveBeenCalledWith(true);
+
+    view.rerender(
+      <SubSessionBar
+        subSessions={[makeSubSession()]}
+        openIds={new Set()}
+        collapsed={true}
+        onCollapsedChange={onCollapsedChange}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    expect(view.container.querySelector('.subsession-bar')).toBeTruthy();
+  });
+
   it('only applies the running pulse to collapsed mini cards while the sub-session is running', () => {
     const idleView = render(
       <SubSessionBar
@@ -200,6 +245,61 @@ describe('SubSessionBar', () => {
     );
 
     expect(second.container.querySelector('.subsession-bar')).not.toBeNull();
+  });
+
+  it('uses saved codex preference as legacy fallback for collapsed model-less codex-sdk sessions', () => {
+    localStorage.setItem('imcodes-codex-model:deck_sub_sub-1', 'gpt-5.5');
+    const view = render(
+      <SubSessionBar
+        subSessions={[makeSubSession({ type: 'codex-sdk' } as any)]}
+        openIds={new Set()}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        subUsages={new Map([[
+          'deck_sub_sub-1',
+          { inputTokens: 166_000, cacheTokens: 0, contextWindow: 258_400, contextWindowSource: 'provider' },
+        ]]) as any}
+      />,
+    );
+
+    fireEvent.click(view.container.querySelector('.subcard-toolbar-btn') as HTMLButtonElement);
+    const card = view.container.querySelector('.subsession-card') as HTMLButtonElement;
+    expect(card.title).toContain('gpt-5.5');
+    expect(card.title).toContain('ctx 64%');
+    expect(card.title).not.toContain('ctx 18%');
+  });
+
+  it('uses sub-session model metadata when collapsed usage omits model but has a provider window', () => {
+    const view = render(
+      <SubSessionBar
+        subSessions={[makeSubSession({ type: 'codex-sdk', activeModel: 'gpt-5.5' } as any)]}
+        openIds={new Set()}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        subUsages={new Map([[
+          'deck_sub_sub-1',
+          { inputTokens: 100_000, cacheTokens: 0, contextWindow: 258_400, contextWindowSource: 'provider' },
+        ]]) as any}
+      />,
+    );
+
+    fireEvent.click(view.container.querySelector('.subcard-toolbar-btn') as HTMLButtonElement);
+    const card = view.container.querySelector('.subsession-card') as HTMLButtonElement;
+    expect(card.title).toContain('gpt-5.5');
+    expect(card.title).toContain('ctx 39%');
+    expect(card.title).not.toContain('ctx 11%');
   });
 
 });

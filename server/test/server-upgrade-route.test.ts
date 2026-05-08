@@ -4,6 +4,7 @@ import type { Env } from '../src/env.js';
 
 const mockGetServersByUserId = vi.fn();
 const mockSendToDaemon = vi.fn();
+const mockRequestDaemonUpgrade = vi.fn();
 
 vi.mock('../src/security/authorization.js', () => ({
   requireAuth: () => async (c: { set: (key: string, value: string) => void }, next: () => Promise<void>) => {
@@ -25,6 +26,7 @@ vi.mock('../src/ws/bridge.js', () => ({
   WsBridge: {
     get: () => ({
       sendToDaemon: (...args: unknown[]) => mockSendToDaemon(...args),
+      requestDaemonUpgrade: (...args: unknown[]) => mockRequestDaemonUpgrade(...args),
     }),
   },
 }));
@@ -58,32 +60,123 @@ async function buildTestApp() {
   return app;
 }
 
-describe('POST /api/server/:id/upgrade', () => {
+describe('server routes', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockGetServersByUserId.mockResolvedValue([{ id: 'srv-1', name: 'Alpha' }]);
+    mockRequestDaemonUpgrade.mockReturnValue({
+      ok: true,
+      upgradeId: 'upgrade-1',
+      targetVersion: 'latest',
+      deliveryStatus: 'sent',
+    });
     delete process.env.APP_VERSION;
   });
 
-  it('sends daemon.upgrade with the server app version as targetVersion', async () => {
-    process.env.APP_VERSION = '2026.4.905-dev.877';
+  it('GET /api/server returns persisted daemonVersion', async () => {
+    mockGetServersByUserId.mockResolvedValue([{
+      id: 'srv-1',
+      name: 'Alpha',
+      status: 'online',
+      last_heartbeat_at: 123,
+      daemon_version: '2026.5.2047-dev.2025',
+      created_at: 99,
+    }]);
     const app = await buildTestApp();
 
-    const res = await app.request('/api/server/srv-1/upgrade', { method: 'POST' });
+    const res = await app.request('/api/server');
 
     expect(res.status).toBe(200);
-    expect(mockSendToDaemon).toHaveBeenCalledWith(JSON.stringify({
-      type: 'daemon.upgrade',
-      targetVersion: '2026.4.905-dev.877',
-    }));
+    expect(await res.json()).toEqual({
+      servers: [{
+        id: 'srv-1',
+        name: 'Alpha',
+        status: 'online',
+        lastHeartbeatAt: 123,
+        daemonVersion: '2026.5.2047-dev.2025',
+        createdAt: 99,
+      }],
+    });
   });
 
-  it('omits targetVersion only when APP_VERSION is unavailable', async () => {
+  it('requests daemon.upgrade with the server app version as targetVersion', async () => {
+    process.env.APP_VERSION = '2026.4.905-dev.877';
+    mockRequestDaemonUpgrade.mockReturnValue({
+      ok: true,
+      upgradeId: 'upgrade-1',
+      targetVersion: '2026.4.905-dev.877',
+      deliveryStatus: 'sent',
+    });
     const app = await buildTestApp();
 
     const res = await app.request('/api/server/srv-1/upgrade', { method: 'POST' });
 
     expect(res.status).toBe(200);
-    expect(mockSendToDaemon).toHaveBeenCalledWith(JSON.stringify({ type: 'daemon.upgrade' }));
+    expect(await res.json()).toEqual({
+      ok: true,
+      upgradeId: 'upgrade-1',
+      targetVersion: '2026.4.905-dev.877',
+      deliveryStatus: 'sent',
+    });
+    expect(mockRequestDaemonUpgrade).toHaveBeenCalledWith({
+      targetVersion: '2026.4.905-dev.877',
+      source: 'manual',
+    });
+    expect(mockSendToDaemon).not.toHaveBeenCalled();
+  });
+
+  it('requests latest only when APP_VERSION is unavailable', async () => {
+    const app = await buildTestApp();
+
+    const res = await app.request('/api/server/srv-1/upgrade', { method: 'POST' });
+
+    expect(res.status).toBe(200);
+    expect(mockRequestDaemonUpgrade).toHaveBeenCalledWith({
+      targetVersion: undefined,
+      source: 'manual',
+    });
+  });
+
+  it('returns 400 when the upgrade target is invalid', async () => {
+    process.env.APP_VERSION = '2026.4.905-dev.877;touch /tmp/pwn';
+    mockRequestDaemonUpgrade.mockReturnValue({
+      ok: false,
+      deliveryStatus: 'invalid_target',
+      reason: 'invalid_target_version',
+    });
+    const app = await buildTestApp();
+
+    const res = await app.request('/api/server/srv-1/upgrade', { method: 'POST' });
+
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({
+      error: 'invalid_target_version',
+      deliveryStatus: 'invalid_target',
+    });
+  });
+
+  it('surfaces npm publication gate state without pretending the upgrade was sent', async () => {
+    process.env.APP_VERSION = '2026.4.905-dev.877';
+    mockRequestDaemonUpgrade.mockReturnValue({
+      ok: true,
+      upgradeId: 'upgrade-1',
+      targetVersion: '2026.4.905-dev.877',
+      deliveryStatus: 'pending_publication',
+      nextAttemptAt: '2026-05-06T12:00:15.000Z',
+      reason: 'target_version_not_published',
+    });
+    const app = await buildTestApp();
+
+    const res = await app.request('/api/server/srv-1/upgrade', { method: 'POST' });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      ok: true,
+      upgradeId: 'upgrade-1',
+      targetVersion: '2026.4.905-dev.877',
+      deliveryStatus: 'pending_publication',
+      nextAttemptAt: '2026-05-06T12:00:15.000Z',
+      reason: 'target_version_not_published',
+    });
   });
 });

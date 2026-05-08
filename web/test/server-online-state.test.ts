@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { markServerLive, markServerOffline, touchServerHeartbeat } from '../src/server-online-state.js';
+import { markServerDaemonActivity, markServerLive, markServerOffline, touchServerHeartbeat } from '../src/server-online-state.js';
 
 describe('markServerLive', () => {
   it('marks the selected server online and refreshes its heartbeat timestamp', () => {
@@ -31,6 +31,20 @@ describe('markServerOffline', () => {
     expect(markServerOffline(servers, 'srv-1')).toEqual([
       { id: 'srv-1', name: 'one', status: 'offline', lastHeartbeatAt: 111 },
       { id: 'srv-2', name: 'two', status: 'online', lastHeartbeatAt: 222 },
+    ]);
+  });
+});
+
+describe('markServerDaemonActivity', () => {
+  it('promotes the selected server online because daemon-origin messages prove daemon liveness', () => {
+    const servers = [
+      { id: 'srv-1', name: 'one', status: 'offline', lastHeartbeatAt: 100 },
+      { id: 'srv-2', name: 'two', status: 'online', lastHeartbeatAt: 200 },
+    ];
+
+    expect(markServerDaemonActivity(servers, 'srv-1', 999)).toEqual([
+      { id: 'srv-1', name: 'one', status: 'online', lastHeartbeatAt: 999 },
+      { id: 'srv-2', name: 'two', status: 'online', lastHeartbeatAt: 200 },
     ]);
   });
 });

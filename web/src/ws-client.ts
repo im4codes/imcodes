@@ -9,8 +9,18 @@ import { REPO_MSG } from '@shared/repo-types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
+import { DAEMON_COMMAND_TYPES } from '@shared/daemon-command-types.js';
 import { CC_PRESET_MSG, type CcPreset, type CcPresetModelInfo } from '@shared/cc-presets.js';
 import { MEMORY_WS } from '@shared/memory-ws.js';
+import type {
+  MemoryFeatureAdminRecord,
+  MemoryFeatureSetResponse,
+  MemoryManagementErrorCode,
+  MemoryObservationAdminRecord,
+  MemoryPreferenceAdminRecord,
+  MemorySkillAdminRecord,
+} from '@shared/memory-management.js';
+import type { MemoryProjectResolveResponsePayload } from '@shared/memory-project-options.js';
 import {
   MSG_COMMAND_FAILED,
   MSG_DAEMON_ONLINE,
@@ -23,6 +33,7 @@ import type {
   FsGitStatusResponse,
   FsGitDiffResponse,
   FsWriteResponse,
+  FsWriteOptions,
   FsMkdirResponse,
 } from '../../src/shared/transport/fs.js';
 
@@ -119,10 +130,32 @@ export type ServerMessage =
     stats: import('../../shared/context-types.js').ContextMemoryStatsView;
     records: Array<import('../../shared/context-types.js').ContextMemoryRecordView>;
     pendingRecords?: Array<import('../../shared/context-types.js').ContextPendingEventView>;
+    projects?: Array<import('../../shared/context-types.js').ContextMemoryProjectView>;
+    error?: string;
+    errorCode?: MemoryManagementErrorCode;
   }
-  | { type: typeof MEMORY_WS.ARCHIVE_RESPONSE; requestId?: string; success: boolean; error?: string }
-  | { type: typeof MEMORY_WS.RESTORE_RESPONSE; requestId?: string; success: boolean; error?: string }
-  | { type: typeof MEMORY_WS.DELETE_RESPONSE; requestId?: string; success: boolean; error?: string };
+  | { type: typeof MEMORY_WS.ARCHIVE_RESPONSE; requestId?: string; success: boolean; error?: string; errorCode?: MemoryManagementErrorCode }
+  | { type: typeof MEMORY_WS.RESTORE_RESPONSE; requestId?: string; success: boolean; error?: string; errorCode?: MemoryManagementErrorCode }
+  | { type: typeof MEMORY_WS.CREATE_RESPONSE; requestId?: string; success: boolean; id?: string; error?: string; errorCode?: MemoryManagementErrorCode }
+  | { type: typeof MEMORY_WS.UPDATE_RESPONSE; requestId?: string; success: boolean; id?: string; error?: string; errorCode?: MemoryManagementErrorCode }
+  | { type: typeof MEMORY_WS.PIN_RESPONSE; requestId?: string; success: boolean; id?: string; error?: string; errorCode?: MemoryManagementErrorCode }
+  | { type: typeof MEMORY_WS.DELETE_RESPONSE; requestId?: string; success: boolean; error?: string; errorCode?: MemoryManagementErrorCode }
+  | ({ type: typeof MEMORY_WS.PROJECT_RESOLVE_RESPONSE } & MemoryProjectResolveResponsePayload)
+  | { type: typeof MEMORY_WS.FEATURES_RESPONSE; requestId?: string; records: MemoryFeatureAdminRecord[] }
+  | ({ type: typeof MEMORY_WS.FEATURES_SET_RESPONSE } & MemoryFeatureSetResponse)
+  | { type: typeof MEMORY_WS.PREF_RESPONSE; requestId?: string; records: MemoryPreferenceAdminRecord[]; featureEnabled?: boolean }
+  | { type: typeof MEMORY_WS.PREF_CREATE_RESPONSE; requestId?: string; success: boolean; id?: string; error?: string; errorCode?: MemoryManagementErrorCode }
+  | { type: typeof MEMORY_WS.PREF_UPDATE_RESPONSE; requestId?: string; success: boolean; id?: string; error?: string; errorCode?: MemoryManagementErrorCode }
+  | { type: typeof MEMORY_WS.PREF_DELETE_RESPONSE; requestId?: string; success: boolean; error?: string; errorCode?: MemoryManagementErrorCode }
+  | { type: typeof MEMORY_WS.SKILL_RESPONSE; requestId?: string; entries: MemorySkillAdminRecord[]; sourceCounts?: Record<string, number>; featureEnabled?: boolean }
+  | { type: typeof MEMORY_WS.SKILL_REBUILD_RESPONSE; requestId?: string; success: boolean; userCount?: number; projectCount?: number; error?: string; errorCode?: MemoryManagementErrorCode }
+  | { type: typeof MEMORY_WS.SKILL_READ_RESPONSE; requestId?: string; success: boolean; key?: string; layer?: string; content?: string; error?: string; errorCode?: MemoryManagementErrorCode }
+  | { type: typeof MEMORY_WS.SKILL_DELETE_RESPONSE; requestId?: string; success: boolean; error?: string; errorCode?: MemoryManagementErrorCode }
+  | { type: typeof MEMORY_WS.MD_INGEST_RUN_RESPONSE; requestId?: string; success: boolean; filesChecked?: number; observationsWritten?: number; error?: string; errorCode?: MemoryManagementErrorCode; featureEnabled?: boolean }
+  | { type: typeof MEMORY_WS.OBSERVATION_RESPONSE; requestId?: string; records: MemoryObservationAdminRecord[]; featureEnabled?: boolean }
+  | { type: typeof MEMORY_WS.OBSERVATION_UPDATE_RESPONSE; requestId?: string; success: boolean; id?: string; error?: string; errorCode?: MemoryManagementErrorCode }
+  | { type: typeof MEMORY_WS.OBSERVATION_DELETE_RESPONSE; requestId?: string; success: boolean; error?: string; errorCode?: MemoryManagementErrorCode }
+  | { type: typeof MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE; requestId?: string; success: boolean; audit?: Record<string, unknown>; error?: string; errorCode?: MemoryManagementErrorCode };
 
 export type {
   TimelineEvent,
@@ -162,6 +195,9 @@ const HEARTBEAT_MS = 10000; // lowered from 25s for faster dead-connection detec
 const PONG_TIMEOUT_MS = 8_000;
 const RESUME_PROBE_TIMEOUT_MS = 8_000;
 const PONG_MISSES_BEFORE_RECONNECT = 2;
+const WS_TICKET_TIMEOUT_MS = 15_000;
+const WS_OPEN_TIMEOUT_MS = 15_000;
+const RESUME_FORCE_STALE_PONG_MS = 30_000;
 /** If we received a pong within this window, treat the socket as already
  *  proven alive and skip the resume probe. This eliminates UI churn (and the
  *  brief "disconnected" flash) when the user rapidly switches tabs / focuses
@@ -175,6 +211,10 @@ export class WsClient {
   private handlers = new Set<MessageHandler>();
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private wsTicketTimer: ReturnType<typeof setTimeout> | null = null;
+  private wsTicketAbort: AbortController | null = null;
+  private wsOpenTimer: ReturnType<typeof setTimeout> | null = null;
+  private socketGeneration = 0;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private baseUrl: string;
   private serverId: string;
@@ -231,7 +271,9 @@ export class WsClient {
   }
 
   get connecting(): boolean {
-    return this._connecting || (!this._connected && !this._destroyed && this.reconnectTimer !== null);
+    return this._connecting
+      || this.ws?.readyState === WebSocket.CONNECTING
+      || (!this._connected && !this._destroyed && this.reconnectTimer !== null);
   }
 
   get pingLatency(): number | null {
@@ -261,7 +303,12 @@ export class WsClient {
   }
 
   connect(): void {
-    if (this.ws) return;
+    if (this._destroyed) return;
+    if (this.ws) {
+      if (this.ws.readyState === WebSocket.OPEN) return;
+      if (this._connecting && this.ws.readyState === WebSocket.CONNECTING) return;
+      this.detachCurrentSocket(4001, 'client reconnect stale socket');
+    }
     void this.openSocket();
   }
 
@@ -322,8 +369,8 @@ export class WsClient {
    * swallow it. Caller should still wrap in try/catch and HTTP-fallback
    * on throw.
    */
-  sendSessionCommandUrgent(command: 'stop' | 'send' | 'restart', payload: object = {}): void {
-    this.sendUrgent({ type: `session.${command}`, ...payload });
+  sendSessionCommandUrgent(command: 'stop' | 'send' | 'restart' | 'cancel', payload: object = {}): void {
+    this.sendUrgent({ type: command === 'cancel' ? DAEMON_COMMAND_TYPES.SESSION_CANCEL : `session.${command}`, ...payload });
   }
 
   /**
@@ -366,6 +413,31 @@ export class WsClient {
     this.clearPongWatchdog();
     this._resumeProbeMisses = 0;
     this.sendResumeProbePing(timeoutMs);
+  }
+
+  /**
+   * Foreground/native-app resume entrypoint. Normal tab focus uses the cheap
+   * probe path, but native resume or a long background gap can request a
+   * stronger stale check. This keeps healthy sockets stable while bounding
+   * mobile WebView zombie states that otherwise require killing the app.
+   */
+  resumeConnection(forceIfStale = false): void {
+    if (this._destroyed) return;
+    if (!forceIfStale) {
+      this.probeConnection();
+      return;
+    }
+    const lastPongAge = this._lastPongAt > 0 ? Date.now() - this._lastPongAt : Number.POSITIVE_INFINITY;
+    if (
+      !this.ws
+      || this.ws.readyState !== WebSocket.OPEN
+      || !this._connected
+      || lastPongAge > RESUME_FORCE_STALE_PONG_MS
+    ) {
+      this.reconnectNow(true);
+      return;
+    }
+    this.probeConnection();
   }
 
   onMessage(handler: MessageHandler): () => void {
@@ -442,8 +514,8 @@ export class WsClient {
     this.send({ type: TRANSPORT_MSG.APPROVAL_RESPONSE, sessionId, requestId, approved });
   }
 
-  sendSessionCommand(command: 'start' | 'stop' | 'send' | 'restart', payload: object = {}): void {
-    this.send({ type: `session.${command}`, ...payload });
+  sendSessionCommand(command: 'start' | 'stop' | 'send' | 'restart' | 'cancel', payload: object = {}): void {
+    this.send({ type: command === 'cancel' ? DAEMON_COMMAND_TYPES.SESSION_CANCEL : `session.${command}`, ...payload });
   }
 
   /**
@@ -573,9 +645,20 @@ export class WsClient {
   }
 
   /** Write a file via the daemon. Returns requestId for matching the response. */
-  fsWriteFile(path: string, content: string, expectedMtime?: number): string {
+  fsWriteFile(path: string, content: string, expectedMtime?: number): string;
+  fsWriteFile(path: string, content: string, options?: FsWriteOptions): string;
+  fsWriteFile(path: string, content: string, expectedMtimeOrOptions?: number | FsWriteOptions): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'fs.write', path, content, expectedMtime, requestId });
+    const options = typeof expectedMtimeOrOptions === 'object' ? expectedMtimeOrOptions : undefined;
+    const expectedMtime = typeof expectedMtimeOrOptions === 'number' ? expectedMtimeOrOptions : options?.expectedMtime;
+    this.send({
+      type: 'fs.write',
+      path,
+      content,
+      requestId,
+      ...(expectedMtime !== undefined ? { expectedMtime } : {}),
+      ...(options?.createOnly ? { createOnly: true } : {}),
+    });
     return requestId;
   }
 
@@ -683,7 +766,12 @@ export class WsClient {
 
   private async openSocket(): Promise<void> {
     if (this._connecting) return;
+    if (this.ws) {
+      if (this.ws.readyState === WebSocket.OPEN) return;
+      this.detachCurrentSocket(4001, 'client reconnect stale socket');
+    }
     this._connecting = true;
+    const generation = ++this.socketGeneration;
 
     const wsUrl = this.baseUrl
       .replace(/^http/, 'ws')
@@ -691,20 +779,40 @@ export class WsClient {
 
     // Get a short-lived ws-ticket before connecting.
     let ticket: string;
+    const ticketAbort = new AbortController();
+    this.wsTicketAbort = ticketAbort;
+    let ticketTimer: ReturnType<typeof setTimeout> | null = null;
     try {
-      const data = await apiFetch<{ ticket: string }>('/api/auth/ws-ticket', {
-        method: 'POST',
-        body: JSON.stringify({ serverId: this.serverId }),
+      const ticketTimeout = new Promise<never>((_, reject) => {
+        ticketTimer = setTimeout(() => {
+          ticketAbort.abort();
+          reject(new Error('ws_ticket_timeout'));
+        }, WS_TICKET_TIMEOUT_MS);
+        this.wsTicketTimer = ticketTimer;
       });
+      const data = await Promise.race([
+        apiFetch<{ ticket: string }>('/api/auth/ws-ticket', {
+          method: 'POST',
+          body: JSON.stringify({ serverId: this.serverId }),
+          signal: ticketAbort.signal,
+        }),
+        ticketTimeout,
+      ]);
       ticket = data.ticket;
     } catch (err) {
+      if (generation !== this.socketGeneration) return;
       this._connecting = false;
       // Auth expired (401) → onAuthExpired already fired, don't keep reconnecting
       if (err instanceof ApiError && err.status === 401) return;
       this.scheduleReconnect();
       return;
+    } finally {
+      if (ticketTimer) clearTimeout(ticketTimer);
+      if (this.wsTicketTimer === ticketTimer) this.wsTicketTimer = null;
+      if (this.wsTicketAbort === ticketAbort) this.wsTicketAbort = null;
     }
 
+    if (generation !== this.socketGeneration) return;
     if (this._destroyed) {
       this._connecting = false;
       return;
@@ -712,14 +820,22 @@ export class WsClient {
 
     const url = `${wsUrl}/api/server/${this.serverId}/ws?ticket=${encodeURIComponent(ticket)}`;
 
+    if (this.ws) {
+      this.detachCurrentSocket(4001, 'client replace stale socket');
+      this._connecting = true;
+    }
+
     const socket = new WebSocket(url);
     this.ws = socket;
     socket.binaryType = 'arraybuffer';
-    this._connecting = false;
+    this.armWsOpenTimer(socket, generation);
 
     socket.addEventListener('open', () => {
-      if (this.ws !== socket) return;
+      if (!this.isCurrentSocket(socket, generation)) return;
+      this.clearWsOpenTimer();
+      this._connecting = false;
       this._connected = true;
+      this.clearReconnectTimer();
       this.reconnectAttempt = 0;
       this.startHeartbeat();
       // Reset per-session stream-reset bookkeeping on reconnect. Stale pending
@@ -747,7 +863,7 @@ export class WsClient {
     });
 
     socket.addEventListener('message', (ev) => {
-      if (this.ws !== socket) return;
+      if (!this.isCurrentSocket(socket, generation)) return;
       // Binary frame: raw PTY data
       if (ev.data instanceof ArrayBuffer) {
         this.handleRawFrame(ev.data);
@@ -792,12 +908,12 @@ export class WsClient {
     });
 
     socket.addEventListener('close', () => {
-      if (this.ws !== socket) return;
+      if (!this.isCurrentSocket(socket, generation)) return;
       const wasConnected = this._connected;
       this._connected = false;
       this._connecting = false;
       this.ws = null;
-      this.clearTimers();
+      this.clearSocketTimers();
       if (wasConnected) {
         this.dispatch({ type: 'session.event', event: 'disconnected', session: '', state: 'disconnected' });
       }
@@ -805,7 +921,7 @@ export class WsClient {
     });
 
     socket.addEventListener('error', () => {
-      if (this.ws !== socket) return;
+      if (!this.isCurrentSocket(socket, generation)) return;
       socket.close();
     });
   }
@@ -890,11 +1006,85 @@ export class WsClient {
     }, remaining);
   }
 
+  private isCurrentSocket(socket: WebSocket, generation: number): boolean {
+    return this.ws === socket && this.socketGeneration === generation;
+  }
+
+  private clearReconnectTimer(): void {
+    if (!this.reconnectTimer) return;
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+  }
+
+  private clearWsTicketRequest(): void {
+    if (this.wsTicketTimer) {
+      clearTimeout(this.wsTicketTimer);
+      this.wsTicketTimer = null;
+    }
+    this.wsTicketAbort = null;
+  }
+
+  private abortWsTicketRequest(): void {
+    const controller = this.wsTicketAbort;
+    this.clearWsTicketRequest();
+    if (controller && !controller.signal.aborted) {
+      try { controller.abort(); } catch { /* ignore */ }
+    }
+  }
+
+  private clearWsOpenTimer(): void {
+    if (!this.wsOpenTimer) return;
+    clearTimeout(this.wsOpenTimer);
+    this.wsOpenTimer = null;
+  }
+
+  private armWsOpenTimer(socket: WebSocket, generation: number): void {
+    this.clearWsOpenTimer();
+    this.wsOpenTimer = setTimeout(() => {
+      if (!this.isCurrentSocket(socket, generation)) return;
+      this.detachCurrentSocket(4001, 'client ws open timeout');
+      if (!this._destroyed) this.scheduleReconnect();
+    }, WS_OPEN_TIMEOUT_MS);
+  }
+
+  private clearSocketTimers(): void {
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    this.clearPongWatchdog();
+    if (this._resumeProbeTimer) clearTimeout(this._resumeProbeTimer);
+    if (this._visibilityListener && typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this._visibilityListener);
+    }
+    this.clearWsOpenTimer();
+    this.heartbeatTimer = null;
+    this._visibilityListener = null;
+    this._resumeProbeTimer = null;
+    this._pingSentAt = null;
+    this._missedHeartbeatPongs = 0;
+    this._resumeProbeMisses = 0;
+  }
+
+  private detachCurrentSocket(code: number, reason: string): void {
+    const socket = this.ws;
+    const wasConnected = this._connected;
+    this.ws = null;
+    this._connected = false;
+    this._connecting = false;
+    this.clearSocketTimers();
+    if (wasConnected) {
+      this.dispatch({ type: 'session.event', event: 'disconnected', session: '', state: 'disconnected' });
+    }
+    if (socket && socket.readyState !== WebSocket.CLOSED) {
+      try { socket.close(code, reason); } catch { /* ignore */ }
+    }
+  }
+
   private scheduleReconnect(): void {
     if (this._destroyed) return;
+    if (this.reconnectTimer) return;
     const delay = Math.min(RECONNECT_BASE_MS * 2 ** this.reconnectAttempt, RECONNECT_MAX_MS);
     this.reconnectAttempt++;
     this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
       if (!this._destroyed) void this.openSocket();
     }, delay);
   }
@@ -903,21 +1093,21 @@ export class WsClient {
   reconnectNow(force = false): void {
     if (this._destroyed) return;
     if (!force && this.ws && this.ws.readyState === WebSocket.OPEN) return; // already connected
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    this.reconnectTimer = null;
+    this.clearReconnectTimer();
     this.reconnectAttempt = 0;
 
-    if (force && this.ws) {
-      const staleSocket = this.ws;
-      const wasConnected = this._connected;
-      this.ws = null;
+    if (this._connecting && !this.ws) {
+      this.socketGeneration++;
+      this.abortWsTicketRequest();
+      this._connecting = false;
+    }
+
+    if (this.ws) {
+      this.detachCurrentSocket(4001, force ? 'client refresh' : 'client reconnect stale socket');
+    } else if (force) {
       this._connected = false;
       this._connecting = false;
-      this.clearTimers();
-      if (wasConnected) {
-        this.dispatch({ type: 'session.event', event: 'disconnected', session: '', state: 'disconnected' });
-      }
-      try { staleSocket.close(4001, 'client refresh'); } catch { /* ignore */ }
+      this.clearSocketTimers();
     }
 
     void this.openSocket();
@@ -967,20 +1157,9 @@ export class WsClient {
   }
 
   private clearTimers(): void {
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
-    this.clearPongWatchdog();
-    if (this._resumeProbeTimer) clearTimeout(this._resumeProbeTimer);
-    if (this._visibilityListener && typeof document !== 'undefined') {
-      document.removeEventListener('visibilitychange', this._visibilityListener);
-    }
-    this.reconnectTimer = null;
-    this.heartbeatTimer = null;
-    this._visibilityListener = null;
-    this._resumeProbeTimer = null;
-    this._pingSentAt = null;
-    this._missedHeartbeatPongs = 0;
-    this._resumeProbeMisses = 0;
+    this.clearReconnectTimer();
+    this.abortWsTicketRequest();
+    this.clearSocketTimers();
   }
 
   private isDocumentHidden(): boolean {

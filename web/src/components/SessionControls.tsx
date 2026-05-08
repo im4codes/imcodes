@@ -16,10 +16,11 @@ import { P2pConfigPanel } from './P2pConfigPanel.js';
 import { useP2pCustomCombos } from './p2p-combos.js';
 import { parseBooleanish, usePref } from '../hooks/usePref.js';
 import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
-import { PREF_KEY_P2P_COMBO_CONFIRM_SKIP, PREF_KEY_P2P_SESSION_CONFIG_LEGACY, p2pSessionConfigPrefKey } from '../constants/prefs.js';
+import { PREF_KEY_P2P_COMBO_CONFIRM_SKIP, p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../constants/prefs.js';
 import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p-config-pref.js';
-import { uploadFile, sendSessionViaHttp } from '../api.js';
+import { uploadFile, sendSessionViaHttp, cancelSessionViaHttp } from '../api.js';
 import { patchSession, patchSubSession } from '../api.js';
+import { isImeComposingKeyEvent } from '../ime-keyboard.js';
 import { isRunningSessionState } from '../thinking-utils.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { MSG_COMMAND_FAILED } from '@shared/ack-protocol.js';
@@ -38,7 +39,9 @@ import { getQwenAuthTier, QWEN_AUTH_TIERS } from '@shared/qwen-auth.js';
 import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/qwen-models.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions, normalizeClaudeCodeModelId } from '../../../src/shared/models/options.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
+import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { useTransportModels, supportsDynamicTransportModels } from '../hooks/useTransportModels.js';
+import { loadCodexModelPreference, loadLegacyCodexModelPreferenceForModelessSession, saveCodexModelPreference } from '../codex-model-preference.js';
 import {
   buildTransportConfigWithSupervision,
   extractSessionSupervisionSnapshot,
@@ -50,6 +53,7 @@ import {
   type SupervisionMode,
 } from '@shared/supervision-config.js';
 import { FILE_TRANSFER_LIMITS } from '@shared/transport/file-transfer.js';
+import { shouldHideOptimisticUserMessageForSessionControl } from '@shared/session-control-commands.js';
 
 interface Props {
   ws: WsClient | null;
@@ -202,7 +206,6 @@ type QwenModelChoice = string;
 type P2pMode = string; // 'solo' | single modes | combo pipelines like 'brainstorm>discuss>plan' | typeof P2P_CONFIG_MODE
 
 const MODEL_STORAGE_KEY = 'imcodes-model';
-const CODEX_MODEL_STORAGE_KEY = 'imcodes-codex-model';
 const QWEN_MODEL_STORAGE_KEY = 'imcodes-qwen-model';
 const CODEX_MODELS: CodexModelChoice[] = [...CODEX_MODEL_IDS];
 const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
@@ -374,14 +377,6 @@ function loadModel(): ModelChoice | null {
   return null;
 }
 
-function loadCodexModel(): CodexModelChoice | null {
-  try {
-    const v = localStorage.getItem(CODEX_MODEL_STORAGE_KEY);
-    if (v?.trim()) return v;
-  } catch { /* ignore */ }
-  return null;
-}
-
 function loadQwenModel(): QwenModelChoice | null {
   try {
     const v = localStorage.getItem(QWEN_MODEL_STORAGE_KEY);
@@ -478,7 +473,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [openSpecExpandedChange, setOpenSpecExpandedChange] = useState<string | null>(null);
   const [openSpecLayoutTick, setOpenSpecLayoutTick] = useState(0);
   const [model, setModel] = useState<ModelChoice | null>(loadModel);
-  const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModel);
+  const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModelPreference);
   const [qwenModel, setQwenModel] = useState<QwenModelChoice | null>(loadQwenModel);
   const [editingQueuedMessageId, setEditingQueuedMessageId] = useState<string | null>(null);
   const queuedHiddenStorageKey = useMemo(() => (
@@ -558,6 +553,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   // History navigation state
   const histIdxRef = useRef(-1);   // -1 = not navigating; 0 = most recent
   const draftRef = useRef('');      // saved unsent text while navigating
+  const imeComposingRef = useRef(false);
   const attachmentDraftRef = useRef<ComposerAttachment[]>([]);
   // File upload state
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -573,6 +569,19 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   useEffect(() => {
     if (inputRef) (inputRef as { current: HTMLDivElement | null }).current = divRef.current;
   });
+
+  useEffect(() => {
+    const el = divRef.current;
+    if (!el) return;
+    const handleCompositionStart = () => { imeComposingRef.current = true; };
+    const handleCompositionEnd = () => { imeComposingRef.current = false; };
+    el.addEventListener('compositionstart', handleCompositionStart);
+    el.addEventListener('compositionend', handleCompositionEnd);
+    return () => {
+      el.removeEventListener('compositionstart', handleCompositionStart);
+      el.removeEventListener('compositionend', handleCompositionEnd);
+    };
+  }, []);
 
   useEffect(() => {
     if (!pendingPrefillText || !divRef.current) return;
@@ -795,10 +804,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     activeSession?.codexAvailableModels,
     dynamicTransportModels.models,
   ]);
-  const genericTransportModel = activeSession?.activeModel
-    ?? activeSession?.requestedModel
-    ?? detectedModel
-    ?? null;
+  const legacyCodexModel = loadLegacyCodexModelPreferenceForModelessSession(activeSession, detectedModel);
+  const genericTransportModel = resolveEffectiveSessionModel(activeSession, detectedModel, legacyCodexModel) ?? null;
+  const displayedCodexModel = activeSession?.agentType === 'codex-sdk'
+    ? genericTransportModel
+    : (genericTransportModel ?? codexModel);
   const thinkingLevels = useMemo((): readonly TransportEffortLevel[] => (
     activeSession?.agentType === 'claude-code-sdk'
       ? CLAUDE_SDK_EFFORT_LEVELS
@@ -1381,10 +1391,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return Object.values(p2pSavedConfig.sessions).some((entry) => entry?.enabled && entry.mode !== 'skip');
   }, [p2pSavedConfig]);
 
-  // P2P config is per main-session (sub-sessions follow parent), stored on server for cross-device sync
-  const p2pConfigKey = rootSession ? p2pSessionConfigPrefKey(rootSession) : null;
+  // P2P config is per server + main-session (sub-sessions follow parent), stored on server for cross-device sync.
+  const p2pConfigKey = rootSession ? p2pSessionConfigPrefKey(rootSession, serverId) : null;
   const p2pSavedConfigPref = usePref<P2pSavedConfig>(p2pConfigKey, {
-    legacyKey: PREF_KEY_P2P_SESSION_CONFIG_LEGACY,
+    legacyKey: rootSession ? p2pSessionConfigLegacyPrefKeys(rootSession) : undefined,
     parse: parseP2pSavedConfig,
     serialize: serializeP2pSavedConfig,
   });
@@ -1438,14 +1448,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   useEffect(() => {
     if (!ws || !rootSession || !p2pSavedConfig) return;
-    const signature = `${rootSession}:${JSON.stringify(p2pSavedConfig)}`;
+    const signature = `${serverId ?? ''}:${rootSession}:${JSON.stringify(p2pSavedConfig)}`;
     if (lastDaemonP2pSyncRef.current === signature) return;
     void persistP2pConfigToDaemon(rootSession, p2pSavedConfig, { awaitAck: false }).then((result) => {
       if (result.ok) {
         lastDaemonP2pSyncRef.current = signature;
       }
     });
-  }, [persistP2pConfigToDaemon, rootSession, p2pSavedConfig, ws]);
+  }, [persistP2pConfigToDaemon, rootSession, p2pSavedConfig, serverId, ws]);
 
   useEffect(() => {
     return () => {
@@ -1469,7 +1479,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         if (rootSession && p2pSavedConfig) {
           void persistP2pConfigToDaemon(rootSession, p2pSavedConfig, { awaitAck: false }).then((result) => {
             if (result.ok) {
-              lastDaemonP2pSyncRef.current = `${rootSession}:${JSON.stringify(p2pSavedConfig)}`;
+              lastDaemonP2pSyncRef.current = `${serverId ?? ''}:${rootSession}:${JSON.stringify(p2pSavedConfig)}`;
             }
           });
         }
@@ -1497,7 +1507,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       setOpenSpecChanges(changeNames);
       setOpenSpecError(null);
     });
-  }, [persistP2pConfigToDaemon, p2pSavedConfig, rejectAllPendingP2pConfigSaves, resolvePendingP2pConfigSave, rootSession, ws]);
+  }, [persistP2pConfigToDaemon, p2pSavedConfig, rejectAllPendingP2pConfigSaves, resolvePendingP2pConfigSave, rootSession, serverId, ws]);
 
   useEffect(() => {
     if (!hasConfiguredP2pParticipants && isComboMode(p2pMode)) {
@@ -1672,21 +1682,41 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     globalThis.crypto?.randomUUID?.() ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`
   ), []);
 
+  const cancelActiveTransportTurn = useCallback((commandId = makeCommandId()): string | null => {
+    if (!activeSession) return null;
+    const payload = {
+      sessionName: activeSession.name,
+      commandId,
+    };
+    if (!ws) {
+      if (!serverId) return null;
+      void cancelSessionViaHttp(serverId, payload).catch((fallbackErr) => {
+        console.warn('session.cancel HTTP fallback failed', fallbackErr);
+      });
+      return commandId;
+    }
+    try {
+      ws.sendSessionCommandUrgent('cancel', payload);
+    } catch (err) {
+      if (!serverId) throw err;
+      void cancelSessionViaHttp(serverId, payload).catch((fallbackErr) => {
+        console.warn('session.cancel HTTP fallback failed', fallbackErr);
+      });
+    }
+    return commandId;
+  }, [activeSession, makeCommandId, serverId, ws]);
+
   const sendSessionMessage = useCallback((text: string, extra: Record<string, unknown> = {}, commandId = makeCommandId()): string | null => {
     if (!activeSession) return null;
+    if (effectiveRuntimeType === 'transport' && text.trim() === '/stop') {
+      return cancelActiveTransportTurn(commandId);
+    }
     const payload = {
       sessionName: activeSession.name,
       text,
       ...extra,
       commandId,
     };
-    // `/stop` is highest-priority — bypass the WS probe-state gate so a
-    // focus/visibility tick (probeConnection sets `_connected = false`
-    // for ~50-200 ms while pinging) doesn't drop it. Regular messages
-    // still go through the gated path: a probe-detected dead socket
-    // shouldn't accept a new message that would silently disappear,
-    // but the user's STOP intent must be honored on a best-effort basis.
-    const isStop = text === '/stop';
     if (!ws) {
       if (!serverId) return null;
       void sendSessionViaHttp(serverId, payload).catch((fallbackErr) => {
@@ -1695,8 +1725,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       return commandId;
     }
     try {
-      if (isStop) ws.sendSessionCommandUrgent('send', payload);
-      else ws.sendSessionCommand('send', payload);
+      ws.sendSessionCommand('send', payload);
     } catch (err) {
       if (!serverId) throw err;
       void sendSessionViaHttp(serverId, payload).catch((fallbackErr) => {
@@ -1704,7 +1733,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       });
     }
     return commandId;
-  }, [activeSession, makeCommandId, serverId, ws]);
+  }, [activeSession, cancelActiveTransportTurn, effectiveRuntimeType, makeCommandId, serverId, ws]);
 
   const sendQueuedMessageMutation = useCallback((type: 'session.edit_queued_message' | 'session.undo_queued_message', payload: Record<string, unknown>) => {
     if (!ws || !activeSession) return false;
@@ -1725,6 +1754,29 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       || (typeof payload.extra.p2pMode === 'string' && payload.extra.p2pMode.length > 0)
       || (payload.extra.p2pSessionConfig != null && typeof payload.extra.p2pSessionConfig === 'object')
     );
+    const clearComposerState = () => {
+      pendingAtTargetsRef.current = [];
+      pendingConfigOverrideRef.current = null;
+      if (divRef.current) divRef.current.textContent = '';
+      setHasText(false);
+      setMobileComposerExpanded(false);
+      setMobileComposerMultiline(false);
+      setAttachments([]);
+      if (quotes && quotes.length > 0) {
+        for (let i = quotes.length - 1; i >= 0; i--) onRemoveQuote?.(i);
+      }
+      atSelectionLockRef.current = false;
+      atSelectionSnapshotRef.current = '';
+      histIdxRef.current = -1;
+      draftRef.current = '';
+      if (draftKey) sessionStorage.removeItem(draftKey);
+      if (attachmentDraftKey) sessionStorage.removeItem(attachmentDraftKey);
+    };
+    if (effectiveRuntimeType === 'transport' && !isP2pSend && payload.text.trim() === '/stop') {
+      if (!cancelActiveTransportTurn()) return;
+      if (options?.clearComposer) clearComposerState();
+      return;
+    }
     if (editingQueuedMessageId && effectiveRuntimeType === 'transport') {
       try {
         if (!sendQueuedMessageMutation('session.edit_queued_message', {
@@ -1744,22 +1796,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         ));
       });
       if (options?.clearComposer) {
-        pendingAtTargetsRef.current = [];
-        pendingConfigOverrideRef.current = null;
-        if (divRef.current) divRef.current.textContent = '';
-        setHasText(false);
-        setMobileComposerExpanded(false);
-        setMobileComposerMultiline(false);
-        setAttachments([]);
-        if (quotes && quotes.length > 0) {
-          for (let i = quotes.length - 1; i >= 0; i--) onRemoveQuote?.(i);
-        }
-        atSelectionLockRef.current = false;
-        atSelectionSnapshotRef.current = '';
-        histIdxRef.current = -1;
-        draftRef.current = '';
-        if (draftKey) sessionStorage.removeItem(draftKey);
-        if (attachmentDraftKey) sessionStorage.removeItem(attachmentDraftKey);
+        clearComposerState();
       }
       return;
     }
@@ -1791,7 +1828,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           originalName: a.name,
       }))
       : undefined;
-    if (!shouldShowAsQueued) {
+    const suppressOptimisticUserBubble = shouldHideOptimisticUserMessageForSessionControl(payload.text) && !localFailure;
+    if (!shouldShowAsQueued && !suppressOptimisticUserBubble) {
       onSend?.(activeSession.name, payload.text, {
         commandId,
         ...(attachmentSnapshot ? { attachments: attachmentSnapshot } : {}),
@@ -1800,24 +1838,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       });
     }
     if (options?.clearComposer) {
-      pendingAtTargetsRef.current = [];
-      pendingConfigOverrideRef.current = null;
-      if (divRef.current) divRef.current.textContent = '';
-      setHasText(false);
-      setMobileComposerExpanded(false);
-      setMobileComposerMultiline(false);
-      setAttachments([]);
-      if (quotes && quotes.length > 0) {
-        for (let i = quotes.length - 1; i >= 0; i--) onRemoveQuote?.(i);
-      }
-      atSelectionLockRef.current = false;
-      atSelectionSnapshotRef.current = '';
-      histIdxRef.current = -1;
-      draftRef.current = '';
-      if (draftKey) sessionStorage.removeItem(draftKey);
-      if (attachmentDraftKey) sessionStorage.removeItem(attachmentDraftKey);
+      clearComposerState();
     }
-  }, [activeSession, attachmentDraftKey, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, makeCommandId, onRemoveQuote, onSend, quickData, quotes, sendQueuedMessageMutation, sendSessionMessage, transportSendShouldQueue]);
+  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, makeCommandId, onRemoveQuote, onSend, quickData, quotes, sendQueuedMessageMutation, sendSessionMessage, transportSendShouldQueue]);
 
   const handleQueuedMessageEdit = useCallback((entry: { clientMessageId: string; text: string }) => {
     if (!isEditableQueuedEntry(entry)) return;
@@ -1960,9 +1983,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [buildModeOnlySendPayload, requestSend]);
 
   const handleKeyDown = (e: KeyboardEvent) => {
+    if (imeComposingRef.current || isImeComposingKeyEvent(e)) return;
+
     if (e.key === 'Escape' && effectiveRuntimeType === 'transport' && isRunningSessionState(activeSession?.state)) {
       e.preventDefault();
-      sendSessionMessage('/stop');
+      cancelActiveTransportTurn();
       return;
     }
 
@@ -2172,7 +2197,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const handleCodexModelSelect = (m: CodexModelChoice) => {
     if (!ws || !activeSession) return;
     setCodexModel(m);
-    try { localStorage.setItem(CODEX_MODEL_STORAGE_KEY, m); } catch { /* ignore */ }
+    saveCodexModelPreference(m, activeSession.name);
     if (activeSession.agentType === 'codex-sdk') {
       sendSessionMessage(`/model ${m}`);
     } else {
@@ -2281,7 +2306,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               aria-label={t('session.stop_plain')}
               disabled={disabled || activeSession?.state === 'stopped'}
               onClick={() => {
-                sendSessionMessage('/stop');
+                cancelActiveTransportTurn();
               }}
               style={isRunningSessionState(activeSession?.state) ? { color: '#f87171' } : undefined}
             >
@@ -2588,20 +2613,20 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               class="shortcut-btn"
               onClick={() => setModelOpen((o) => !o)}
               disabled={disabled}
-              title={codexModel ? `Model: ${codexModel}` : 'Model: default — tap to select'}
-              style={{ color: codexModel ? '#34d399' : '#6b7280', fontSize: 10 }}
+              title={displayedCodexModel ? `Model: ${displayedCodexModel}` : 'Model: default — tap to select'}
+              style={{ color: displayedCodexModel ? '#34d399' : '#6b7280', fontSize: 10 }}
             >
-              {codexModel ?? 'default'}
+              {displayedCodexModel ?? 'default'}
             </button>
             {modelOpen && (
               <div class="menu-dropdown">
                 {codexModelSuggestions.map((m) => (
                   <button
                     key={m}
-                    class={`menu-item ${codexModel === m ? 'menu-item-active' : ''}`}
+                    class={`menu-item ${displayedCodexModel === m ? 'menu-item-active' : ''}`}
                     onClick={() => handleCodexModelSelect(m)}
                   >
-                    {codexModel === m ? '● ' : '○ '}{m}
+                    {displayedCodexModel === m ? '● ' : '○ '}{m}
                   </button>
                 ))}
               </div>
@@ -3348,6 +3373,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         sessions={(sessions ?? []).map(s => ({ name: s.name, agentType: s.agentType, state: s.state }))}
         subSessions={subSessions ?? []}
         activeSession={activeSession?.name}
+        serverId={serverId}
         initialTab={p2pConfigInitialTab}
         onClose={() => setP2pConfigOpen(false)}
         onPersistDaemonConfig={(scopeSession, cfg) => persistP2pConfigToDaemon(scopeSession, cfg)}

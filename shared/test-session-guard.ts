@@ -16,6 +16,7 @@ const SESSION_NAME_PATTERNS: RegExp[] = [
   /^deck_restorecheck[a-z0-9-]+_(brain|w\d+)$/i,
   /^deck_storecheck[a-z0-9-]+_(brain|w\d+)$/i,
   /^deck_shutdown[a-z0-9-]+_(brain|w\d+|probe)$/i,
+  /^deck_test_preview_[a-z0-9-]+_(brain|w\d+|probe)$/i,
   /^deck_sub_(?:cxsdk_e2e|cxsdk_effort|ccsdk_minimax_sub)$/i,
 ];
 
@@ -27,6 +28,7 @@ const PROJECT_NAME_PATTERNS: RegExp[] = [
   /^restorecheck[a-z0-9-]+$/i,
   /^storecheck[a-z0-9-]+$/i,
   /^shutdown[a-z0-9-]+$/i,
+  /^imcodes-test-preview[-_]/i,
   /^e2e[-_]/i,
 ];
 
@@ -34,6 +36,7 @@ const PROJECT_DIR_PATTERNS: RegExp[] = [
   /[/\\]tmp[/\\].*e2e/i,
   /[/\\]tmp[/\\].*modeaware/i,
   /[/\\]tmp[/\\].*bootmain/i,
+  /[/\\]tmp[/\\].*imcodes-test-preview/i,
 ];
 
 function normalize(value: string | null | undefined): string | undefined {

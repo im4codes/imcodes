@@ -17,6 +17,7 @@ import { updateSessionState } from '../store/session-store.js';
 import { resolveContextWindow } from '../util/model-context.js';
 import { registerWatcherControl, unregisterWatcherControl, type WatcherControl } from './watcher-controls.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
+import { USAGE_CONTEXT_WINDOW_SOURCES } from '../../shared/usage-context-window.js';
 
 // ── Codex SQLite helpers ────────────────────────────────────────────────────────
 
@@ -269,13 +270,33 @@ export function parseLine(sessionName: string, line: string, model?: string): vo
   if (!pl) return;
 
   if (pl.type === 'token_count') {
+    const total = pl.info?.total_token_usage;
     const last = pl.info?.last_token_usage;
-    if (last && typeof last.input_tokens === 'number') {
+    // Codex CLI reports `last_token_usage` for the current prompt/window and
+    // `total_token_usage` as cumulative billing/thread usage. The UI ctx meter
+    // must match Codex CLI's live window occupancy, so prefer `last`; `total`
+    // is only a compatibility fallback when old payloads omit `last`.
+    const usage = last ?? total;
+    if (usage && typeof usage.input_tokens === 'number') {
+      const cachedInput = typeof usage.cached_input_tokens === 'number' ? usage.cached_input_tokens : 0;
+      const modelContextWindow = typeof pl.info?.model_context_window === 'number' && Number.isFinite(pl.info.model_context_window) && pl.info.model_context_window > 0
+        ? pl.info.model_context_window
+        : undefined;
+      const contextWindow = resolveContextWindow(
+        modelContextWindow,
+        model,
+        1_000_000,
+        { preferExplicit: modelContextWindow !== undefined },
+      );
+      const contextWindowSource = modelContextWindow !== undefined && contextWindow === modelContextWindow
+        ? USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER
+        : undefined;
       timelineEmitter.emit(sessionName, 'usage.update', {
-        inputTokens: last.input_tokens,
-        cacheTokens: last.cached_input_tokens ?? 0,
-        outputTokens: last.output_tokens ?? 0,
-        contextWindow: resolveContextWindow(pl.info.model_context_window, model),
+        inputTokens: Math.max(0, usage.input_tokens - cachedInput),
+        cacheTokens: cachedInput,
+        outputTokens: usage.output_tokens ?? 0,
+        contextWindow,
+        ...(contextWindowSource ? { contextWindowSource } : {}),
         ...(model ? { model } : {}),
       }, { source: 'daemon', confidence: 'high', ...(ts ? { ts } : {}) });
     }

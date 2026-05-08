@@ -78,6 +78,18 @@ jobs:
       - run: npm run build
       - run: npm run test:unit
 
+  preview-dist-smoke:
+    name: Preview Dist Smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION_PRIMARY }}
+          cache: 'npm'
+      - run: ./scripts/ci-npm-ci.sh .
+      - run: npm run test:preview-dist
+
   embedding-real-tests:
     name: Embedding Integration Tests
     runs-on: ubuntu-latest
@@ -132,7 +144,11 @@ jobs:
       - run: bash ./scripts/ci-npm-ci.sh .
       - run: npm run build
       - name: Run Windows-specific unit tests
-        run: npx vitest run test/agent/wezterm.test.ts test/daemon/hook-send.test.ts test/daemon/env-injection.test.ts test/cli/send.test.ts test/util/windows-daemon.test.ts test/util/windows-upgrade-script.test.ts test/util/windows-launch-artifacts.test.ts test/util/windows-launch-artifacts.cmd-parse.test.ts test/util/windows-stale-watchdog-cleanup.test.ts test/util/postinstall-sharp-repair.test.ts
+        run: npx vitest run test/agent/wezterm.test.ts test/daemon/hook-send.test.ts test/daemon/env-injection.test.ts test/cli/send.test.ts test/util/windows-daemon.test.ts test/util/windows-upgrade-script.test.ts test/util/windows-upgrade-runner.test.ts test/util/windows-launch-artifacts.test.ts test/util/windows-launch-artifacts.cmd-parse.test.ts test/util/postinstall-sharp-repair.test.ts test/util/sharp-repair-script.test.ts test/util/restart-daemon-cmd.test.ts
+        env:
+          IMCODES_MUX: wezterm
+      - name: Run Windows process-cleanup regression tests
+        run: npx vitest run test/util/windows-stale-watchdog-cleanup.test.ts
         env:
           IMCODES_MUX: wezterm
 
@@ -148,7 +164,9 @@ jobs:
       - run: bash ./scripts/ci-npm-ci.sh .
       - run: npm run build
       - name: Run Windows ConPTY / startup regression tests
-        run: npx vitest run test/agent/conpty.test.ts test/agent/drivers/drivers.test.ts test/util/windows-daemon.test.ts test/util/windows-upgrade-script.test.ts test/util/windows-launch-artifacts.test.ts test/util/windows-launch-artifacts.cmd-parse.test.ts test/util/windows-stale-watchdog-cleanup.test.ts
+        run: npx vitest run test/agent/conpty.test.ts test/agent/drivers/drivers.test.ts test/util/windows-daemon.test.ts test/util/windows-upgrade-script.test.ts test/util/windows-upgrade-runner.test.ts test/util/windows-launch-artifacts.test.ts test/util/windows-launch-artifacts.cmd-parse.test.ts test/util/sharp-repair-script.test.ts test/util/restart-daemon-cmd.test.ts
+      - name: Run Windows ConPTY process-cleanup regression tests
+        run: npx vitest run test/util/windows-stale-watchdog-cleanup.test.ts
   # ── Web frontend tests ────────────────────────────────────────────────────
 
   web-tests-unit:
@@ -291,10 +309,17 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
           cache: 'npm'
-      - name: Install tmux
-        run: sudo apt-get install -y tmux
-      - name: Prime tmux server
-        run: tmux new-session -d -s init && tmux kill-session -t init
+      # tmux is no longer needed here: `test:coverage` skips the e2e project
+      # (which spawns real tmux + agent processes), saving ~1 min per run.
+      #
+      # `npm run build` IS still needed: although most tests resolve from
+      # `src/` via vitest's tsx transform, two suites assert against the
+      # built output and FAIL without `dist/`:
+      #   - test/packaging.test.ts             (verifies bin/main/files paths)
+      #   - test/util/postinstall-sharp-repair.test.ts (executes dist/.../postinstall-sharp-repair.js)
+      # Both run in the `daemon` project, which is included in coverage. They
+      # pass in the regular Unit Tests jobs because those run `npm run build`
+      # first; coverage must do the same.
       - run: ./scripts/ci-npm-ci.sh .
       - name: Install web deps (needed for tsx component tests)
         run: ./scripts/ci-npm-ci.sh web

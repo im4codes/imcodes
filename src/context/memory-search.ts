@@ -3,6 +3,7 @@
  * Used by CLI (`imcodes memory`), WS command (`memory.search`), and web UI.
  */
 import type {
+  ContextScope,
   ContextNamespace,
   LocalContextEvent,
   ProcessedContextClass,
@@ -10,6 +11,7 @@ import type {
   ProcessedContextProjectionStatus,
   ContextMemoryStatsView,
 } from '../../shared/context-types.js';
+import { projectionSemanticContent } from '../../shared/memory-content-hash.js';
 import { computeRelevanceScore, type ProjectionClass } from '../../shared/memory-scoring.js';
 import { normalizeSummaryForFingerprint } from '../../shared/memory-fingerprint.js';
 import { getContextModelConfig } from './context-model-config.js';
@@ -19,6 +21,7 @@ import {
   listContextEvents,
   listDirtyTargets,
   queryProcessedProjections,
+  LEGACY_DAEMON_LOCAL_USER_ID,
   getProjectionEmbeddings,
   saveProjectionEmbedding,
 } from '../store/context-store.js';
@@ -30,10 +33,16 @@ export interface MemorySearchQuery {
   query?: string;
   /** Filter by effective namespace. When provided, namespace fields are matched exactly. */
   namespace?: ContextNamespace;
+  /** Filter by scope without requiring an exact namespace match. */
+  scope?: ContextScope;
   /** Optional enterprise context used for ranking when search scope is broader than one namespace. */
   currentEnterpriseId?: string;
   /** Filter by canonical repository ID (matches namespace.projectId). */
   repo?: string;
+  /** Optional owner/user filter used by authenticated management reads. */
+  userId?: string;
+  /** Include legacy local personal rows that have no durable owner id. */
+  includeLegacyPersonalOwner?: boolean;
   /** Filter by projection class. */
   projectionClass?: ProcessedContextClass;
   /** Include raw unprocessed staged events. */
@@ -85,6 +94,11 @@ export interface MemorySearchResultItem {
 export interface MemorySearchResult {
   items: MemorySearchResultItem[];
   stats: ContextMemoryStatsView;
+}
+
+export interface AuthorizedMemorySearchQuery extends Omit<MemorySearchQuery, 'namespace' | 'repo' | 'includeRaw'> {
+  /** Exact namespaces the management caller is authorized to search. */
+  authorizedNamespaces: readonly ContextNamespace[];
 }
 
 // ── Search implementation ────────────────────────────────────────────────────
@@ -336,6 +350,52 @@ export function searchLocalMemory(query: MemorySearchQuery): MemorySearchResult 
   };
 }
 
+export function searchLocalMemoryAuthorized(query: AuthorizedMemorySearchQuery): MemorySearchResult {
+  const allItems: MemorySearchResultItem[] = [];
+  const seenProjectionIds = new Set<string>();
+  const requestedWindow = Math.max((query.limit ?? 50) + (query.offset ?? 0), query.limit ?? 50, 50);
+
+  for (const namespace of query.authorizedNamespaces) {
+    const projections = queryProcessedProjections({
+      scope: namespace.scope,
+      enterpriseId: namespace.enterpriseId,
+      workspaceId: namespace.workspaceId,
+      userId: namespace.userId,
+      projectId: namespace.projectId,
+      includeLegacyPersonalOwner: query.includeLegacyPersonalOwner,
+      projectionClass: query.projectionClass,
+      query: query.query,
+      includeArchived: query.includeArchived,
+      limit: requestedWindow,
+    });
+    for (const projection of projections) {
+      if (seenProjectionIds.has(projection.id)) continue;
+      seenProjectionIds.add(projection.id);
+      const item = projectionToItem(projection);
+      if (matchesQuery(item, query)) {
+        allItems.push(item);
+      }
+    }
+  }
+
+  allItems.sort((a, b) => (b.updatedAt ?? b.createdAt) - (a.updatedAt ?? a.createdAt));
+  const stats = computeStats(allItems);
+  const offset = query.offset ?? 0;
+  const limit = query.limit ?? 50;
+  const paginated = allItems.slice(offset, offset + limit);
+
+  return {
+    items: paginated,
+    stats: {
+      ...stats,
+      matchedRecords: allItems.length,
+      stagedEventCount: 0,
+      dirtyTargetCount: listDirtyTargets().length,
+      pendingJobCount: 0,
+    },
+  };
+}
+
 // ── Output formatting ────────────────────────────────────────────────────────
 
 export function formatSearchResults(result: MemorySearchResult, format: MemorySearchFormat): string {
@@ -395,11 +455,12 @@ function formatAge(timestamp: number): string {
 
 function collectProcessedProjections(query: MemorySearchQuery): ProcessedContextProjection[] {
   return queryProcessedProjections({
-    scope: query.namespace?.scope,
+    scope: query.namespace?.scope ?? query.scope,
     enterpriseId: query.namespace?.enterpriseId,
     workspaceId: query.namespace?.workspaceId,
-    userId: query.namespace?.userId,
+    userId: query.namespace?.userId ?? query.userId,
     projectId: query.namespace?.projectId ?? query.repo,
+    includeLegacyPersonalOwner: query.includeLegacyPersonalOwner,
     projectionClass: query.projectionClass,
     query: query.query,
     includeArchived: query.includeArchived,
@@ -421,26 +482,29 @@ function collectRawEvents(query: MemorySearchQuery): MemorySearchResultItem[] {
 }
 
 function projectionToItem(projection: ProcessedContextProjection): MemorySearchResultItem {
-  const content = projection.content;
+  const content = projectionSemanticContent(projection.content);
+  const contentRecord = content && typeof content === 'object' && !Array.isArray(content)
+    ? content as Record<string, unknown>
+    : undefined;
   return {
     type: 'processed',
     id: projection.id,
-    projectId: projection.namespace.projectId,
+    projectId: projection.namespace.projectId ?? '',
     scope: projection.namespace.scope,
     enterpriseId: projection.namespace.enterpriseId,
     workspaceId: projection.namespace.workspaceId,
     userId: projection.namespace.userId,
     projectionClass: projection.class,
     summary: projection.summary,
-    content: typeof content === 'object' ? JSON.stringify(content) : undefined,
+    content: contentRecord ? JSON.stringify(contentRecord) : undefined,
     createdAt: projection.createdAt,
     updatedAt: projection.updatedAt,
     hitCount: projection.hitCount,
     lastUsedAt: projection.lastUsedAt,
     status: projection.status,
-    sourceEventCount: typeof content?.eventCount === 'number' ? content.eventCount : undefined,
+    sourceEventCount: typeof contentRecord?.eventCount === 'number' ? contentRecord.eventCount : undefined,
     sourceEventIds: projection.sourceEventIds,
-    processingModel: typeof content?.primaryContextModel === 'string' ? content.primaryContextModel : undefined,
+    processingModel: typeof contentRecord?.primaryContextModel === 'string' ? contentRecord.primaryContextModel : undefined,
   };
 }
 
@@ -448,7 +512,7 @@ function eventToItem(event: LocalContextEvent): MemorySearchResultItem {
   return {
     type: 'raw',
     id: event.id,
-    projectId: event.target.namespace.projectId,
+    projectId: event.target.namespace.projectId ?? '',
     scope: event.target.namespace.scope,
     enterpriseId: event.target.namespace.enterpriseId,
     workspaceId: event.target.namespace.workspaceId,
@@ -494,10 +558,16 @@ function matchesNamespace(
     if (item.scope !== namespace.scope) return false;
     if ((item.enterpriseId ?? undefined) !== (namespace.enterpriseId ?? undefined)) return false;
     if ((item.workspaceId ?? undefined) !== (namespace.workspaceId ?? undefined)) return false;
-    if ((item.userId ?? undefined) !== (namespace.userId ?? undefined)) return false;
+    if ((item.userId ?? undefined) !== (namespace.userId ?? undefined)) {
+      if (!(query.includeLegacyPersonalOwner && namespace.scope === 'personal' && (!item.userId || item.userId === LEGACY_DAEMON_LOCAL_USER_ID))) return false;
+    }
     return true;
   }
+  if (query.scope && item.scope !== query.scope) return false;
   if (query.repo && item.projectId !== query.repo) return false;
+  if (query.userId && item.userId !== query.userId) {
+    if (!(query.includeLegacyPersonalOwner && item.scope === 'personal' && (!item.userId || item.userId === LEGACY_DAEMON_LOCAL_USER_ID))) return false;
+  }
   return true;
 }
 

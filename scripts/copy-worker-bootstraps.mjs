@@ -11,7 +11,7 @@
  * `dist/src/`, preserving directory structure.
  */
 
-import { cpSync, existsSync, mkdirSync, readdirSync, statSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -49,4 +49,13 @@ function walk(dir) {
 }
 
 walk(srcRoot);
-console.log(`copy-worker-bootstraps: copied ${copied} .mjs file(s) to dist/src/`);
+
+const builtinSkillManifestDir = join(repoRoot, 'dist', 'builtin-skills');
+mkdirSync(builtinSkillManifestDir, { recursive: true });
+writeFileSync(
+  join(builtinSkillManifestDir, 'manifest.json'),
+  `${JSON.stringify({ version: 1, skills: [] }, null, 2)}\n`,
+  'utf8',
+);
+
+console.log(`copy-worker-bootstraps: copied ${copied} .mjs file(s) to dist/src/ and wrote dist/builtin-skills/manifest.json`);

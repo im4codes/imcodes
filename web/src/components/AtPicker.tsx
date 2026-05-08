@@ -12,6 +12,7 @@ import {
 } from '@shared/p2p-modes.js';
 import { P2pComboManager } from './P2pComboManager.js';
 import { useP2pCustomCombos } from './p2p-combos.js';
+import { isImeComposingKeyEvent } from '../ime-keyboard.js';
 
 interface SessionEntry {
   name: string;
@@ -316,6 +317,7 @@ export function AtPicker({
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
       if (!visible) return;
+      if (isImeComposingKeyEvent(e)) return;
 
       // Config rounds sub-picker
       if (configRoundsPicker) {

@@ -1,0 +1,25 @@
+export const MEMORY_DEFAULTS = {
+  startupTotalTokens: 8000,
+  pinnedTokens: 1600,
+  durableTokens: 4000,
+  recentTokens: 2400,
+  skillTokens: 1000,
+  projectDocsTokens: 2000,
+  markdownMaxBytes: 51200,
+  markdownMaxSections: 30,
+  markdownMaxSectionBytes: 16 * 1024,
+  markdownParserBudgetMs: 5000,
+  skillMaxBytes: 4096,
+  skillRegistryMaxBytes: 1024 * 1024,
+  skillRegistryMaxEntries: 1024,
+  featureFlagPropagationP99Ms: 60000,
+  skillReviewToolIterationThreshold: 10,
+  skillReviewMinIntervalMs: 600000,
+  skillReviewDailyLimit: 6,
+  skillReviewManualMinIntervalMs: 60000,
+  skillReviewManualDailyLimit: 50,
+  citationIdempotencyRetentionDays: 180,
+  preferenceIdempotencyRetentionDays: 180,
+} as const;
+
+export type MemoryDefaults = typeof MEMORY_DEFAULTS;

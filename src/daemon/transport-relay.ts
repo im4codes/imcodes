@@ -5,7 +5,7 @@
  * JSONL watchers), so ChatView renders them without any special handling.
  * Also cached to local JSONL for replay on reconnect/restart.
  */
-import type { TransportProvider, ProviderError, ProviderStatusUpdate } from '../agent/transport-provider.js';
+import type { TransportProvider, ProviderError, ProviderStatusUpdate, ProviderUsageUpdate } from '../agent/transport-provider.js';
 import type { MessageDelta, AgentMessage, ToolCallEvent } from '../../shared/agent-message.js';
 import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { resolveSessionName, isEphemeralProviderSid } from '../agent/session-manager.js';
@@ -17,6 +17,9 @@ import { getSession } from '../store/session-store.js';
 import { getCachedPresetContextWindow } from './cc-presets.js';
 import { TIMELINE_EVENT_FILE_CHANGE } from '../../shared/file-change.js';
 import { normalizeCodexSdkFileChange, normalizeQwenFileChange } from './file-change-normalizer.js';
+import { USAGE_CONTEXT_WINDOW_SOURCES } from '../../shared/usage-context-window.js';
+import { resolveEffectiveSessionModel } from '../../shared/session-model.js';
+import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
 
 let sendToServer: ((msg: Record<string, unknown>) => void) | null = null;
 const inFlightMessages = new Map<string, { messageId: string; eventId: string; text: string }>();
@@ -31,6 +34,12 @@ const STREAM_UPDATE_INTERVAL_MS = 40;
 const pendingFileLikeTools = new Map<string, ToolCallEvent>();
 const completedFileLikeTools = new Set<string>();
 const MAX_TRACKED_FILE_TOOLS = 512;
+
+function isCompactControlCompletion(message: AgentMessage): boolean {
+  return message.kind === 'system'
+    && message.role === 'system'
+    && message.metadata?.[SESSION_CONTROL_METADATA_COMMAND_FIELD] === 'compact';
+}
 
 function rememberCompletedFileLikeTool(key: string): void {
   completedFileLikeTools.add(key);
@@ -67,26 +76,48 @@ function clearPendingStreamUpdate(eventId: string): void {
 
 function normalizeUsageUpdatePayload(
   sessionName: string,
-  usage: {
-    input_tokens?: number;
-    output_tokens?: number;
-    cache_read_input_tokens?: number;
-    cache_creation_input_tokens?: number;
-  } | undefined,
+  usage: ProviderUsageUpdate['usage'] | undefined,
   model: string | undefined,
 ): Record<string, unknown> | null {
   if (!usage && !model) return null;
   const session = getSession(sessionName);
+  const effectiveModel = resolveEffectiveSessionModel(session, model);
   const presetCtx = session?.presetContextWindow
     ?? (session?.ccPreset ? getCachedPresetContextWindow(session.ccPreset) : undefined);
   const inputTokens = typeof usage?.input_tokens === 'number'
     ? usage.input_tokens + (usage.cache_creation_input_tokens ?? 0)
     : undefined;
+  // Round-2 audit (0699ea64-3e6 finding A3): `output_tokens` was being silently
+  // dropped here, leaving every transport-SDK turn at output_tokens=0 in
+  // context_turn_usage. Map it through so analytics aren't all-zero for SDK
+  // sessions (codex-sdk, claude-code-sdk via onComplete metadata, cursor, ...).
+  const outputTokens = typeof usage?.output_tokens === 'number' && usage.output_tokens >= 0
+    ? usage.output_tokens
+    : undefined;
+  const cacheTokens = typeof usage?.cache_read_input_tokens === 'number'
+    ? usage.cache_read_input_tokens
+    : typeof usage?.cached_input_tokens === 'number'
+      ? usage.cached_input_tokens
+      : undefined;
+  const explicitContextWindow = typeof usage?.model_context_window === 'number' && Number.isFinite(usage.model_context_window) && usage.model_context_window > 0
+    ? usage.model_context_window
+    : undefined;
+  const contextWindow = resolveContextWindow(
+    explicitContextWindow ?? presetCtx,
+    effectiveModel,
+    1_000_000,
+    { preferExplicit: explicitContextWindow !== undefined },
+  );
+  const contextWindowSource = explicitContextWindow !== undefined && contextWindow === explicitContextWindow
+    ? USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER
+    : undefined;
   const payload: Record<string, unknown> = {
     ...(typeof inputTokens === 'number' ? { inputTokens } : {}),
-    ...(typeof usage?.cache_read_input_tokens === 'number' ? { cacheTokens: usage.cache_read_input_tokens } : {}),
-    ...(model ? { model } : {}),
-    contextWindow: resolveContextWindow(presetCtx, model),
+    ...(typeof cacheTokens === 'number' ? { cacheTokens } : {}),
+    ...(typeof outputTokens === 'number' ? { outputTokens } : {}),
+    ...(effectiveModel ? { model: effectiveModel } : {}),
+    contextWindow,
+    ...(contextWindowSource ? { contextWindowSource } : {}),
   };
   return payload;
 }
@@ -179,6 +210,14 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       logger.debug({ providerSid }, 'transport-relay: unresolved route for complete — dropped');
       return;
     }
+    if (isCompactControlCompletion(message)) {
+      const tracked = inFlightMessages.get(sessionName);
+      if (tracked) {
+        inFlightMessages.delete(sessionName);
+        clearPendingStreamUpdate(tracked.eventId);
+      }
+      return;
+    }
     const finalText = message.content;
 
     // Replace streaming event with final version (same eventId → in-place update)
@@ -198,6 +237,8 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       output_tokens?: number;
       cache_read_input_tokens?: number;
       cache_creation_input_tokens?: number;
+      cached_input_tokens?: number;
+      model_context_window?: number;
     } | undefined;
     const model = typeof message.metadata?.model === 'string' ? message.metadata.model : undefined;
     const usagePayload = normalizeUsageUpdatePayload(sessionName, usage, model);
@@ -429,6 +470,19 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     }, { source: 'daemon', confidence: 'high' });
   });
 
+  provider.onUsage?.((providerSid: string, update: ProviderUsageUpdate) => {
+    const sessionName = resolveSessionName(providerSid);
+    if (!sessionName) {
+      logger.debug({ providerSid }, 'transport-relay: unresolved route for usage — dropped');
+      return;
+    }
+
+    const usagePayload = normalizeUsageUpdatePayload(sessionName, update.usage, update.model);
+    if (usagePayload) {
+      timelineEmitter.emit(sessionName, 'usage.update', usagePayload, { source: 'daemon', confidence: 'high' });
+    }
+  });
+
   provider.onApprovalRequest?.((providerSid: string, request) => {
     const sessionName = resolveSessionName(providerSid);
     if (!sessionName) {
@@ -494,3 +548,8 @@ async function pushProviderSessions(providerId: string): Promise<void> {
     logger.warn({ err, providerId }, 'Failed to push provider sessions on connect');
   }
 }
+
+/** @internal Exported for tests only — see test/daemon/transport-relay-usage-payload.test.ts. */
+export const __testing__ = {
+  normalizeUsageUpdatePayload,
+};

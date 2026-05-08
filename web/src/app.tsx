@@ -7,6 +7,11 @@ import {
   openSubIdsKey,
   type DesktopWindowMeta,
 } from './window-stack.js';
+import {
+  reserveWorkspaceBottom,
+  workspaceBoundsFromRect,
+  type WorkspaceBounds,
+} from './desktop-window-maximize.js';
 import { lazy, Suspense } from 'preact/compat';
 import {
   FileBrowser,
@@ -16,6 +21,7 @@ import {
 } from './components/file-browser-lazy.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { RECONNECT_GRACE_MS } from '@shared/ack-protocol.js';
+import type { UsageContextWindowSource } from '@shared/usage-context-window.js';
 import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate } from './p2p-run-mapping.js';
 import { useTranslation } from 'react-i18next';
 import { ErrorBoundary } from './components/ErrorBoundary.js';
@@ -26,9 +32,11 @@ import { SessionTabs } from './components/SessionTabs.js';
 import { SessionPane } from './components/SessionPane.js';
 import { useQuickData } from './components/QuickInputPanel.js';
 import { NewSessionDialog } from './components/NewSessionDialog.js';
-import { SubSessionBar } from './components/SubSessionBar.js';
+import { SubSessionBar, SUBSESSION_BAR_COLLAPSED_STORAGE_KEY } from './components/SubSessionBar.js';
 import { SubSessionWindow } from './components/SubSessionWindow.js';
+import { DesktopWindowMaximizeButton } from './components/DesktopWindowMaximizeButton.js';
 import { useSharedGitChanges, requestSharedChanges } from './git-status-store.js';
+import { applyFilePreviewRequestUpdate, updateFilePreviewCache } from './file-preview-state.js';
 import { StartSubSessionDialog } from './components/StartSubSessionDialog.js';
 import { SessionSettingsDialog } from './components/SessionSettingsDialog.js';
 import { StartDiscussionDialog, type DiscussionPrefs, type SubSessionOption } from './components/StartDiscussionDialog.js';
@@ -42,6 +50,7 @@ import { CronManager } from './pages/CronManager.js';
 import { SharedContextManagementPanel } from './components/SharedContextManagementPanel.js';
 import { ContextDiagnosticsPanel } from './components/ContextDiagnosticsPanel.js';
 import { NewUserGuide, type NewUserGuideStep } from './components/NewUserGuide.js';
+import { isPlausibleUsagePayload } from './usage-data.js';
 import { ServerIconBar } from './components/ServerIconBar.js';
 import { Sidebar, loadSidebarCollapsed, saveSidebarCollapsed } from './components/Sidebar.js';
 import { SessionTree } from './components/SessionTree.js';
@@ -62,7 +71,7 @@ import { mergeSessionListEntry, type IncomingSessionListEntry } from './session-
 import { resolveSessionInfoRuntimeType } from './runtime-type.js';
 import { useSyncedPreference } from './hooks/useSyncedPreference.js';
 import { parseString, usePref } from './hooks/usePref.js';
-import { PREF_KEY_DEFAULT_SHELL, PREF_KEY_P2P_SESSION_CONFIG_LEGACY, p2pSessionConfigPrefKey } from './constants/prefs.js';
+import { PREF_KEY_DEFAULT_SHELL, p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from './constants/prefs.js';
 import {
   p2pSubSessionParentSignature,
   parseP2pSavedConfig,
@@ -106,6 +115,8 @@ import {
 import { ingestTimelineEventForCache, requestActiveTimelineRefresh } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
+import { resolveEffectiveSessionModel } from '@shared/session-model.js';
+import { loadLegacyCodexModelPreferenceForModelessSession } from './codex-model-preference.js';
 import { updateMainSessionLabel } from './session-label-api.js';
 import { buildDocumentTitle } from './tab-title.js';
 import {
@@ -119,7 +130,8 @@ import {
   shouldShowInitialConnectingGate,
 } from './server-selection.js';
 import { installNativeAppResumeRefresh } from './app-resume-refresh.js';
-import { markServerLive, markServerOffline, touchServerHeartbeat } from './server-online-state.js';
+import { isImeComposingKeyEvent } from './ime-keyboard.js';
+import { markServerDaemonActivity, markServerOffline, touchServerHeartbeat } from './server-online-state.js';
 import { MSG_DAEMON_ONLINE, MSG_DAEMON_OFFLINE } from '@shared/ack-protocol.js';
 
 const DashboardPage = lazy(() => import('./pages/DashboardPage.js').then((m) => ({ default: m.DashboardPage })));
@@ -132,6 +144,16 @@ const nativeCallback = typeof window !== 'undefined'
   : null;
 
 type ViewMode = TerminalSubscribeViewMode;
+
+function isTextEntryElement(el: HTMLElement | null): boolean {
+  if (!el) return false;
+  const tag = el.tagName;
+  return tag === 'INPUT'
+    || tag === 'TEXTAREA'
+    || tag === 'SELECT'
+    || el.isContentEditable
+    || !!el.closest?.('.cm-editor, .fb-editor-cm');
+}
 
 type SharedContextDiagnosticsWindowState = {
   enterpriseId?: string;
@@ -186,6 +208,17 @@ function getFilePreviewInitialPath(request: FileBrowserPreviewRequest): string {
   return '~';
 }
 
+function updateServerDaemonVersion<T extends { id: string; daemonVersion?: string | null }>(
+  servers: T[],
+  serverId: string | null | undefined,
+  daemonVersion: string | null | undefined,
+): T[] {
+  if (!serverId || !daemonVersion) return servers;
+  return servers.map((server) => (
+    server.id === serverId ? { ...server, daemonVersion } : server
+  ));
+}
+
 interface AuthState {
   userId: string;
   baseUrl: string;
@@ -196,6 +229,7 @@ interface ServerInfo {
   name: string;
   status: string;
   lastHeartbeatAt: number | null;
+  daemonVersion?: string | null;
   createdAt: number;
 }
 
@@ -271,6 +305,28 @@ export function App() {
     saveSidebarCollapsed(sidebarCollapsed);
   }, [sidebarCollapsed]);
   const [showDesktopFileBrowser, setShowDesktopFileBrowser] = useState(false);
+  const [desktopFileBrowserMaximized, setDesktopFileBrowserMaximized] = useState(false);
+  const [maximizedSubIds, setMaximizedSubIds] = useState<Set<string>>(() => new Set());
+  const [subSessionBarCollapsed, setSubSessionBarCollapsed] = useState(() => {
+    try {
+      const raw = localStorage.getItem(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY);
+      if (raw !== null) return JSON.parse(raw) === true;
+    } catch { /* ignore */ }
+    return /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY, JSON.stringify(subSessionBarCollapsed));
+    } catch { /* ignore */ }
+  }, [subSessionBarCollapsed]);
+  const desktopWorkspaceBoundsRef = useRef<HTMLDivElement | null>(null);
+  const getDesktopMaximizeBounds = useCallback((): WorkspaceBounds | null => {
+    const el = desktopWorkspaceBoundsRef.current;
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    return reserveWorkspaceBottom(workspaceBoundsFromRect(rect));
+  }, []);
   const [showDesktopLocalWebPreview, setShowDesktopLocalWebPreview] = useState(false);
   const [localWebPreviewPort, setLocalWebPreviewPort] = useState('');
   const [localWebPreviewPath, setLocalWebPreviewPath] = useState('/');
@@ -785,7 +841,8 @@ export function App() {
   const [idleFlashTokens, setIdleFlashTokens] = useState<Map<string, number>>(() => new Map());
   const [toasts, setToasts] = useState<Array<{ id: number; sessionName: string; project: string; kind: 'idle' | 'notification'; title?: string; message?: string; openRepoLatest?: boolean; failedJobName?: string; failedStepName?: string }>>([]);
   const [detectedModels, setDetectedModels] = useState<Map<string, string>>(new Map());
-  const [subUsages, setSubUsages] = useState<Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; model?: string }>>(new Map());
+  const detectedModelsRef = useRef<Map<string, string>>(new Map());
+  const [subUsages, setSubUsages] = useState<Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string }>>(new Map());
   const quickData = useQuickData();
   const lastImcodesActivityRef = useRef(Date.now());
   const resubscribeTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
@@ -907,6 +964,10 @@ export function App() {
   // (stable string) — never the stack object or the Set instance — so this
   // memo only invalidates on real ordering / membership changes.
   const openSubIdsKeyMemo = useMemo(() => openSubIdsKey(openSubIds), [openSubIds]);
+  const openSubIdsRef = useRef(openSubIds);
+  openSubIdsRef.current = openSubIds;
+  const maximizedSubIdsRef = useRef(maximizedSubIds);
+  maximizedSubIdsRef.current = maximizedSubIds;
   const focusedSubId = useMemo(
     () => (isMobileRef.current ? null : getFrontmostSubSessionId(stackRef.current!, openSubIds)),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- deps are intentionally [stackVersion, key] to avoid invalidating on every Set re-creation
@@ -1065,6 +1126,21 @@ export function App() {
   // during the initial synchronous render path.
   const subSessionsRef = useRef<readonly SubSession[]>([]);
 
+  const recordDetectedModel = useCallback((sessionName: string, detected: string) => {
+    if (detectedModelsRef.current.get(sessionName) !== detected) {
+      const immediate = new Map(detectedModelsRef.current);
+      immediate.set(sessionName, detected);
+      detectedModelsRef.current = immediate;
+    }
+    setDetectedModels((prev) => {
+      if (prev.get(sessionName) === detected) return prev;
+      const next = new Map(prev);
+      next.set(sessionName, detected);
+      detectedModelsRef.current = next;
+      return next;
+    });
+  }, []);
+
   /**
    * Sub-session bring-to-front. Wraps the shared stack so the rest of the
    * codebase keeps the same affordance during migration. Ensures the window
@@ -1083,23 +1159,80 @@ export function App() {
     }, { bringToFront: true });
   }, [ensureDesktopWindow]);
 
+  const setSubSessionMaximized = useCallback((id: string, maximized: boolean) => {
+    setMaximizedSubIds((prev) => {
+      const has = prev.has(id);
+      if (has === maximized) return prev;
+      const next = new Set(prev);
+      if (maximized) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  }, []);
+
+  const clearSubSessionMaximized = useCallback((id: string) => {
+    setSubSessionMaximized(id, false);
+  }, [setSubSessionMaximized]);
+
+  const minimizeSubSessionWindow = useCallback((id: string) => {
+    clearSubSessionMaximized(id);
+    setOpenSubIds((prev) => {
+      if (!prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
+    removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id));
+  }, [clearSubSessionMaximized, removeDesktopWindow, setOpenSubIds]);
+
+  const openSubSessionMaximized = useCallback((id: string) => {
+    if (isMobileRef.current) {
+      setOpenSubIds((prev) => (prev.has(id) ? new Set() : new Set([id])));
+      return;
+    }
+    setSubSessionMaximized(id, true);
+    setOpenSubIds((prev) => {
+      if (prev.has(id)) return prev;
+      return new Set([...prev, id]);
+    });
+    bringSubToFront(id);
+  }, [bringSubToFront, setOpenSubIds, setSubSessionMaximized]);
+
+  const maximizeOpenSubSession = useCallback((id: string) => {
+    if (isMobileRef.current) return;
+    setSubSessionMaximized(id, true);
+    setOpenSubIds((prev) => (prev.has(id) ? prev : new Set([...prev, id])));
+    bringSubToFront(id);
+  }, [bringSubToFront, setOpenSubIds, setSubSessionMaximized]);
+
+  const restoreSubSession = useCallback((id: string) => {
+    clearSubSessionMaximized(id);
+    bringSubToFront(id);
+  }, [bringSubToFront, clearSubSessionMaximized]);
+
   const toggleSubSession = useCallback((id: string) => {
     const mobile = isMobileRef.current;
     let willOpen = false;
     setOpenSubIds((prev) => {
       if (mobile) {
         // Exclusive on mobile: close if already open, otherwise open only this one
-        if (prev.has(id)) return new Set();
+        if (prev.has(id)) {
+          clearSubSessionMaximized(id);
+          return new Set();
+        }
         willOpen = true;
+        clearSubSessionMaximized(id);
         return new Set([id]);
       }
       const next = new Set(prev);
       if (next.has(id)) {
         next.delete(id);
         willOpen = false;
+        clearSubSessionMaximized(id);
       } else {
         next.add(id);
         willOpen = true;
+        clearSubSessionMaximized(id);
       }
       return next;
     });
@@ -1108,7 +1241,7 @@ export function App() {
     } else {
       removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id));
     }
-  }, [bringSubToFront, removeDesktopWindow]);
+  }, [bringSubToFront, clearSubSessionMaximized, removeDesktopWindow, setOpenSubIds]);
 
   const activeSessionRef = useRef(activeSession);
   activeSessionRef.current = activeSession;
@@ -1162,6 +1295,7 @@ export function App() {
         serverId: selectedServerId ?? undefined,
       }, { bringToFront: true });
     } else {
+      setDesktopFileBrowserMaximized(false);
       removeDesktopWindow(DESKTOP_WINDOW_IDS.fileBrowser);
     }
   }, [showDesktopFileBrowser, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
@@ -1237,6 +1371,8 @@ export function App() {
     else localStorage.removeItem('rcc_session');
     setActiveSessionState(name);
     if (!opts?.keepSubWindows) {
+      setMaximizedSubIds(new Set());
+      setDesktopFileBrowserMaximized(false);
       // Restore saved open sub-sessions for the target main session
       if (name) {
         try {
@@ -1340,6 +1476,11 @@ export function App() {
     connected,
     activeSession,
   );
+  const closeSubSessionAndClearMaximized = useCallback((id: string) => {
+    clearSubSessionMaximized(id);
+    removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id));
+    closeSubSession(id);
+  }, [clearSubSessionMaximized, closeSubSession, removeDesktopWindow]);
 
   const defaultShellPref = usePref<string>(PREF_KEY_DEFAULT_SHELL, { parse: parseString });
   const subSessionParentSignature = useMemo(
@@ -1354,9 +1495,9 @@ export function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeSession, subSessionParentSignature]);
   const p2pConfigPref = usePref(
-    activeRootSession ? p2pSessionConfigPrefKey(activeRootSession) : null,
+    activeRootSession ? p2pSessionConfigPrefKey(activeRootSession, selectedServerId) : null,
     {
-      legacyKey: PREF_KEY_P2P_SESSION_CONFIG_LEGACY,
+      legacyKey: activeRootSession ? p2pSessionConfigLegacyPrefKeys(activeRootSession) : undefined,
       parse: parseP2pSavedConfig,
       serialize: serializeP2pSavedConfig,
     },
@@ -1402,8 +1543,6 @@ export function App() {
   const termScrollFnsRef = useRef<Map<string, () => void>>(new Map());
   // Per-session chat scroll functions — registered by SessionPane
   const chatScrollFnsRef = useRef<Map<string, () => void>>(new Map());
-  const openSubIdsRef = useRef(openSubIds);
-  openSubIdsRef.current = openSubIds;
   // subSessionsRef itself is declared earlier (forward-declared before
   // bringSubToFront so the callback can close over it). Just sync each render.
   subSessionsRef.current = subSessions;
@@ -1479,33 +1618,8 @@ export function App() {
   }, [previewFileCache]);
 
   const handlePreviewStateChange = useCallback((update: FileBrowserPreviewUpdate) => {
-    setPreviewFileCache((prev) => {
-      const existing = prev[update.path];
-      if (existing?.preview === update.preview && existing.preferDiff === update.preferDiff) return prev;
-      return {
-        ...prev,
-        [update.path]: {
-          preferDiff: update.preferDiff,
-          preview: update.preview,
-        },
-      };
-    });
-    setPreviewFileRequest((prev) => {
-      if (!prev) return prev;
-      if (prev.path === update.path) {
-        return {
-          ...prev,
-          preferDiff: prev.preferDiff ?? update.preferDiff,
-          preview: update.preview,
-        };
-      }
-      return {
-        ...prev,
-        path: update.path,
-        preferDiff: update.preferDiff,
-        preview: update.preview,
-      };
-    });
+    setPreviewFileCache((prev) => updateFilePreviewCache(prev, update));
+    setPreviewFileRequest((prev) => applyFilePreviewRequestUpdate(prev, update));
   }, []);
 
   /** Generic unpin: remove from pinnedPanels + reopen the source floating window. */
@@ -1545,6 +1659,8 @@ export function App() {
   }, [setPinnedPanels, subSessions, bringSubToFront]);
 
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+  isMobileRef.current = isMobile;
+  const desktopLayoutCapable = !isMobile;
   const defaultViewMode: ViewMode = isMobile ? 'chat' : 'terminal';
   // Per-session view mode: Record<sessionName, ViewMode>
   const [viewModes, setViewModes] = useState<Record<string, ViewMode>>(() => {
@@ -1703,7 +1819,11 @@ export function App() {
         }
         setDaemonOnline(true);
         if (sessionListRetryRef.current) { clearTimeout(sessionListRetryRef.current); sessionListRetryRef.current = null; }
-        setServers((prev) => markServerLive(prev, selectedServerId));
+        setServers((prev) => updateServerDaemonVersion(
+          markServerDaemonActivity(prev, selectedServerId),
+          selectedServerId,
+          msg.daemonVersion,
+        ));
         const newSessions = msg.sessions.filter((s) => !s.name.startsWith('deck_sub_'));
         setSessions((prev) => newSessions.map((s) => {
           const existing = prev.find((p) => p.name === s.name);
@@ -1730,12 +1850,7 @@ export function App() {
         const geminiMatch = stripped.match(/\b(gemini[- ]\d[\w.-]*)\b/);
         const detected = claudeModel ?? (gptMatch ? gptMatch[1] : null) ?? (geminiMatch ? geminiMatch[1] : null);
         if (detected) {
-          setDetectedModels((prev) => {
-            if (prev.get(sessionName) === detected) return prev;
-            const next = new Map(prev);
-            next.set(sessionName, detected);
-            return next;
-          });
+          recordDetectedModel(sessionName, detected);
         }
       }
       // Detect model from JSONL usage.update events (authoritative, overrides terminal scan)
@@ -1844,19 +1959,27 @@ export function App() {
             const gemM = modelStr.match(/\b(gemini[- ]\d[\w.-]*)\b/);
             const det = claudeM ?? (gptM ? gptM[1] : null) ?? (gemM ? gemM[1] : null);
             if (det) {
-              setDetectedModels((prev) => {
-                if (prev.get(event.sessionId) === det) return prev;
-                const next = new Map(prev);
-                next.set(event.sessionId, det);
-                return next;
-              });
+              recordDetectedModel(event.sessionId, det);
             }
           }
           // Track usage data for all sub-sessions (ctx bar in collapsed buttons)
-          if (event.sessionId.startsWith('deck_sub_') && event.payload.inputTokens) {
+          if (event.sessionId.startsWith('deck_sub_') && isPlausibleUsagePayload(event.payload as Record<string, unknown>)) {
+            const payload = event.payload as { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string };
+            const sub = subSessionsRef.current.find((candidate) => candidate.sessionName === event.sessionId);
+            const detectedModel = detectedModelsRef.current.get(event.sessionId);
+            const legacyCodexModel = loadLegacyCodexModelPreferenceForModelessSession(sub, detectedModel, payload.model);
+            const effectiveModel = resolveEffectiveSessionModel(
+              sub,
+              detectedModel,
+              payload.model,
+              legacyCodexModel,
+            );
+            const displayPayload = effectiveModel && payload.model !== effectiveModel
+              ? { ...payload, model: effectiveModel }
+              : payload;
             setSubUsages((prev) => {
               const next = new Map(prev);
-              next.set(event.sessionId, event.payload as { inputTokens: number; cacheTokens: number; contextWindow: number; model?: string });
+              next.set(event.sessionId, displayPayload);
               return next;
             });
           }
@@ -2114,7 +2237,7 @@ export function App() {
           daemonOfflineGraceTimerRef.current = null;
         }
         setDaemonOnline(true);
-        setServers((prev) => markServerLive(prev, selectedServerId));
+        setServers((prev) => markServerDaemonActivity(prev, selectedServerId));
       }
       if (msg.type === MSG_DAEMON_OFFLINE) {
         if (daemonOfflineGraceTimerRef.current) {
@@ -2234,6 +2357,16 @@ export function App() {
     const unsubStats = ws.onMessage((msg) => {
       if (msg.type === 'daemon.stats') {
         setDaemonStats({ daemonVersion: msg.daemonVersion, cpu: msg.cpu, memUsed: msg.memUsed, memTotal: msg.memTotal, load1: msg.load1, load5: msg.load5, load15: msg.load15, uptime: msg.uptime });
+        if (daemonOfflineGraceTimerRef.current) {
+          clearTimeout(daemonOfflineGraceTimerRef.current);
+          daemonOfflineGraceTimerRef.current = null;
+        }
+        setDaemonOnline(true);
+        setServers((prev) => updateServerDaemonVersion(
+          markServerDaemonActivity(prev, selectedServerId),
+          selectedServerId,
+          msg.daemonVersion,
+        ));
       }
     });
     setConnecting(true);
@@ -2243,19 +2376,28 @@ export function App() {
     // While the probe is waiting for pong, WsClient marks itself disconnected
     // so the first user send cannot disappear into a stale-open socket.
     let lastResumeCheckAt = 0;
-    const handleResume = () => {
+    let lastResumeCheckWasForce = false;
+    let hiddenSinceAt = 0;
+    const handleResume = (forceIfStale = false) => {
       const now = Date.now();
-      if (now - lastResumeCheckAt < 500) return;
+      if (now - lastResumeCheckAt < 500 && (!forceIfStale || lastResumeCheckWasForce)) return;
       lastResumeCheckAt = now;
-      ws.probeConnection();
+      lastResumeCheckWasForce = forceIfStale;
+      ws.resumeConnection(forceIfStale);
       requestActiveTimelineRefresh({ resetCooldowns: true });
     };
     const onVisibility = () => {
-      if (document.visibilityState === 'hidden') return;
-      handleResume();
+      if (document.visibilityState === 'hidden') {
+        hiddenSinceAt = Date.now();
+        return;
+      }
+      const wasLongHidden = hiddenSinceAt > 0 && Date.now() - hiddenSinceAt > 60_000;
+      hiddenSinceAt = 0;
+      handleResume(wasLongHidden);
     };
     document.addEventListener('visibilitychange', onVisibility);
-    window.addEventListener('focus', handleResume);
+    const onFocus = () => handleResume(false);
+    window.addEventListener('focus', onFocus);
     const onPageShow = (ev: PageTransitionEvent) => {
       if (ev.persisted) handleResume();
     };
@@ -2264,7 +2406,7 @@ export function App() {
     let removeAppStateListener: (() => void) | null = null;
     if (isNative()) {
       void import('@capacitor/app')
-        .then(({ App }) => installNativeAppResumeRefresh(true, () => ws.probeConnection(), App))
+        .then(({ App }) => installNativeAppResumeRefresh(true, (force) => ws.resumeConnection(force), App))
         .then((cleanup) => {
           removeAppStateListener = cleanup;
         })
@@ -2273,7 +2415,7 @@ export function App() {
 
     return () => {
       document.removeEventListener('visibilitychange', onVisibility);
-      window.removeEventListener('focus', handleResume);
+      window.removeEventListener('focus', onFocus);
       window.removeEventListener('pageshow', onPageShow);
       removeAppStateListener?.();
       unsub();
@@ -2436,13 +2578,17 @@ export function App() {
   // Global keyboard passthrough
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      if (isImeComposingKeyEvent(e)) return;
       const ws = wsRef.current;
-      const session = activeSession;
+      // If a sub-session window is frontmost (desktop only), keystrokes —
+      // including ESC/stop — must target THAT window, not the main session.
+      const focusedSubId = focusedSubIdRef.current;
+      const session = focusedSubId ? `deck_sub_${focusedSubId}` : activeSession;
       if (!ws?.connected || !session) return;
       const el = document.activeElement as HTMLElement | null;
-      const tag = el?.tagName ?? '';
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-      if (el?.isContentEditable) return;
+      const target = e.target as HTMLElement | null;
+      if (isTextEntryElement(target) || isTextEntryElement(el)) return;
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') return;
 
       const currentViewMode = viewModesRef.current[session] ?? defaultViewMode;
       if (currentViewMode === 'chat') {
@@ -2492,7 +2638,29 @@ export function App() {
     };
     document.addEventListener('keydown', handler);
     return () => document.removeEventListener('keydown', handler);
-  }, [activeSession, connected]);
+  }, [activeSession, connected, defaultViewMode]);
+
+  useEffect(() => {
+    const handler = (e: ClipboardEvent) => {
+      const ws = wsRef.current;
+      // Mirror the keydown handler: paste must target the frontmost
+      // sub-session window when one is focused, not the main session.
+      const focusedSubId = focusedSubIdRef.current;
+      const session = focusedSubId ? `deck_sub_${focusedSubId}` : activeSession;
+      if (!ws?.connected || !session) return;
+      const target = e.target as HTMLElement | null;
+      const el = document.activeElement as HTMLElement | null;
+      if (isTextEntryElement(target) || isTextEntryElement(el)) return;
+      const currentViewMode = viewModesRef.current[session] ?? defaultViewMode;
+      if (currentViewMode !== 'terminal') return;
+      const text = e.clipboardData?.getData('text/plain') ?? '';
+      if (!text) return;
+      e.preventDefault();
+      ws.sendInput(session, text);
+    };
+    document.addEventListener('paste', handler);
+    return () => document.removeEventListener('paste', handler);
+  }, [activeSession, connected, defaultViewMode]);
 
   // Ctrl+B (Cmd+B on Mac) — toggle sidebar collapse (desktop only)
   useEffect(() => {
@@ -2956,6 +3124,7 @@ export function App() {
   const selectedServerInfo = selectedServerId
     ? servers.find((server) => server.id === selectedServerId) ?? null
     : null;
+  const daemonVersionForDisplay = daemonStats?.daemonVersion ?? selectedServerInfo?.daemonVersion ?? null;
   const daemonBadgeState = getDaemonBadgeState(connected, connecting, daemonOnline, selectedServerInfo);
 
   useEffect(() => {
@@ -3010,7 +3179,7 @@ export function App() {
             onDropPanel={(type, id) => {
               if (type === 'subsession') {
                 const sub = subSessions.find(s => s.id === id);
-                if (sub) pinPanel('subsession', { sessionName: sub.sessionName, label: sub.label, serverId: selectedServerId }, () => setOpenSubIds((prev) => { const s = new Set(prev); s.delete(id); return s; }));
+                if (sub) pinPanel('subsession', { sessionName: sub.sessionName, label: sub.label, serverId: selectedServerId }, () => minimizeSubSessionWindow(id));
               }
             }}
           >
@@ -3155,32 +3324,36 @@ export function App() {
           )}
         </div>
         <div style={{ flex: 1 }} />
-        {daemonStats && connected && (
+        {connected && (daemonStats || daemonVersionForDisplay) && (
           <div class="sidebar-stats">
-            {daemonStats.daemonVersion && (
+            {daemonVersionForDisplay && (
               <div class="sidebar-stats-row">
                 {/* Tooltip surfaces the full version (incl. dev counter) for support. */}
-                <span style={{ color: '#94a3b8' }} title={`Daemon v${daemonStats.daemonVersion}`}>
-                  Daemon v{formatDaemonVersionShort(daemonStats.daemonVersion)}
+                <span style={{ color: '#94a3b8' }} title={`Daemon v${daemonVersionForDisplay}`}>
+                  Daemon v{formatDaemonVersionShort(daemonVersionForDisplay)}
                 </span>
               </div>
             )}
-            <div class="sidebar-stats-row">
-              <span style={{ color: daemonStats.cpu > 80 ? '#f87171' : daemonStats.cpu > 50 ? '#fbbf24' : '#4ade80' }}>
-                CPU {daemonStats.cpu}%
-              </span>
-              <span style={{ color: '#a78bfa' }}>
-                Load {daemonStats.load1}
-              </span>
-            </div>
-            <div class="sidebar-stats-row">
-              <span style={{ color: '#60a5fa' }}>
-                Mem {(() => { const gb = daemonStats.memUsed / (1024 ** 3); return gb >= 1 ? `${gb.toFixed(1)}G` : `${(daemonStats.memUsed / (1024 ** 2)).toFixed(0)}M`; })()}/{(() => { const gb = daemonStats.memTotal / (1024 ** 3); return gb >= 1 ? `${gb.toFixed(1)}G` : `${(daemonStats.memTotal / (1024 ** 2)).toFixed(0)}M`; })()}
-              </span>
-              <span style={{ color: '#94a3b8' }}>
-                {(() => { const s = daemonStats.uptime; const d = Math.floor(s / 86400); const h = Math.floor((s % 86400) / 3600); return d > 0 ? `${d}d ${h}h` : `${h}h`; })()}
-              </span>
-            </div>
+            {daemonStats && (
+              <div class="sidebar-stats-row">
+                <span style={{ color: daemonStats.cpu > 80 ? '#f87171' : daemonStats.cpu > 50 ? '#fbbf24' : '#4ade80' }}>
+                  CPU {daemonStats.cpu}%
+                </span>
+                <span style={{ color: '#a78bfa' }}>
+                  Load {daemonStats.load1}
+                </span>
+              </div>
+            )}
+            {daemonStats && (
+              <div class="sidebar-stats-row">
+                <span style={{ color: '#60a5fa' }}>
+                  Mem {(() => { const gb = daemonStats.memUsed / (1024 ** 3); return gb >= 1 ? `${gb.toFixed(1)}G` : `${(daemonStats.memUsed / (1024 ** 2)).toFixed(0)}M`; })()}/{(() => { const gb = daemonStats.memTotal / (1024 ** 3); return gb >= 1 ? `${gb.toFixed(1)}G` : `${(daemonStats.memTotal / (1024 ** 2)).toFixed(0)}M`; })()}
+                </span>
+                <span style={{ color: '#94a3b8' }}>
+                  {(() => { const s = daemonStats.uptime; const d = Math.floor(s / 86400); const h = Math.floor((s % 86400) / 3600); return d > 0 ? `${d}d ${h}h` : `${h}h`; })()}
+                </span>
+              </div>
+            )}
           </div>
         )}
         <div style={{ padding: '12px 16px', borderTop: '1px solid #334155' }}>
@@ -3301,6 +3474,12 @@ export function App() {
               sessionsLoaded={sessionsLoaded}
             />
 
+            <div
+              ref={desktopWorkspaceBoundsRef}
+              data-testid="desktop-workspace-bounds"
+              class={desktopLayoutCapable && subSessionBarCollapsed ? 'desktop-workspace-maximized' : undefined}
+              style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', position: 'relative', overflow: 'hidden' }}
+            >
             {/* Desktop local preview shortcut — available even before a session is active */}
             {!isMobile && selectedServerId && !resolvedActiveSessionExists && (
               <div class="desktop-view-toggle">
@@ -3330,6 +3509,12 @@ export function App() {
                 >
                   🌐
                 </button>
+                <DesktopWindowMaximizeButton
+                  class="view-toggle desktop-main-maximize-toggle"
+                  data-testid="main-session-maximize-toggle"
+                  maximized={subSessionBarCollapsed}
+                  onClick={() => setSubSessionBarCollapsed((collapsed) => !collapsed)}
+                />
                 {!isTransportSession && (
                   <button class="view-toggle" data-onboarding="view-toggle" onClick={toggleViewMode}>
                     {viewMode === 'chat' ? '⌨ Terminal' : '💬 Chat'}
@@ -3400,7 +3585,25 @@ export function App() {
 
             {/* Desktop floating file browser */}
             {!isMobile && showDesktopFileBrowser && wsRef.current && activeSessionInfo && (
-              <FloatingPanel id="filebrowser" title={`📁 ${trans('picker.files')}`} onClose={() => setShowDesktopFileBrowser(false)} onPin={() => pinPanel('filebrowser', { sessionName: activeSession, projectDir: activeSessionInfo?.projectDir, serverId: selectedServerId }, () => setShowDesktopFileBrowser(false))} pinTooltip={trans('sidebar.pin_to_sidebar')} defaultW={420} defaultH={500} zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.fileBrowser, 5020)} onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.fileBrowser)}>
+              <FloatingPanel
+                id="filebrowser"
+                title={`📁 ${trans('picker.files')}`}
+                onClose={() => setShowDesktopFileBrowser(false)}
+                onPin={() => pinPanel('filebrowser', { sessionName: activeSession, projectDir: activeSessionInfo?.projectDir, serverId: selectedServerId }, () => setShowDesktopFileBrowser(false))}
+                pinTooltip={trans('sidebar.pin_to_sidebar')}
+                defaultW={420}
+                defaultH={500}
+                zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.fileBrowser, 5020)}
+                onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.fileBrowser)}
+                enableMaximize
+                isMaximized={desktopFileBrowserMaximized}
+                onToggleMaximized={() => {
+                  setDesktopFileBrowserMaximized((prev) => !prev);
+                  bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.fileBrowser);
+                }}
+                getMaximizeBounds={getDesktopMaximizeBounds}
+                desktopLayoutCapable={desktopLayoutCapable}
+              >
                 <FileBrowser
                   ws={wsRef.current}
                   serverId={selectedServerId}
@@ -3464,9 +3667,17 @@ export function App() {
               <SubSessionBar
                 subSessions={visibleSubSessions}
                 openIds={openSubIds}
+                maximizedIds={maximizedSubIds}
+                desktopLayoutCapable={desktopLayoutCapable}
+                collapsed={subSessionBarCollapsed}
+                onCollapsedChange={setSubSessionBarCollapsed}
                 idleFlashTokens={idleFlashTokens}
                 onOpen={toggleSubSession}
-                onClose={closeSubSession}
+                onClose={closeSubSessionAndClearMaximized}
+                onOpenMaximized={openSubSessionMaximized}
+                onMaximize={maximizeOpenSubSession}
+                onRestore={restoreSubSession}
+                onRestoreThenClose={minimizeSubSessionWindow}
                 onRestart={restartSubSession}
                 onNew={() => setShowSubDialog(true)}
                 onViewDiscussions={() => { setDiscussionInitialId(null); setShowDiscussionsPage(true); }}
@@ -3490,6 +3701,7 @@ export function App() {
                 onViewRepo={() => setShowRepoPage(true)}
                 onViewCron={() => setShowCronManager(true)}
                 subUsages={subUsages}
+                detectedModels={detectedModels}
                 focusedSubId={focusedSubId}
                 quickData={quickData}
                 sessions={sessions}
@@ -3498,6 +3710,7 @@ export function App() {
                 onSubTransportConfigSaved={(subId, transportConfig) => updateSubLocal(subId, { transportConfig })}
               />
             )}
+            </div>
           </>
         )}
       </main>
@@ -3651,11 +3864,11 @@ export function App() {
             </div>
             {/* Footer */}
             <div class="mobile-sidebar-footer">
-              {daemonStats && connected && (
+              {connected && (daemonStats || daemonVersionForDisplay) && (
                 <div style={{ fontSize: 11, color: '#64748b', marginBottom: 4, display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <span title={daemonStats.daemonVersion ? `v${daemonStats.daemonVersion}` : undefined}>
-                    {daemonStats.daemonVersion && <span>v{formatDaemonVersionShort(daemonStats.daemonVersion)} · </span>}
-                    CPU {daemonStats.cpu}% · Load {daemonStats.load1}
+                  <span title={daemonVersionForDisplay ? `v${daemonVersionForDisplay}` : undefined}>
+                    {daemonVersionForDisplay && <span>v{formatDaemonVersionShort(daemonVersionForDisplay)}{daemonStats ? ' · ' : ''}</span>}
+                    {daemonStats && <span>CPU {daemonStats.cpu}% · Load {daemonStats.load1}</span>}
                   </span>
                   <button
                     style={{ fontSize: 10, color: '#38bdf8', background: 'none', border: '1px solid #334155', borderRadius: 4, padding: '1px 5px', cursor: 'pointer' }}
@@ -3835,6 +4048,15 @@ export function App() {
             serverId={selectedServerId ?? undefined}
             ws={wsRef.current}
             onEnterpriseChange={(enterpriseId) => setSharedContextManagementProps((prev) => ({ ...prev, enterpriseId, serverId: selectedServerId }))}
+            activeProjectDir={activeSessionInfo?.projectDir ?? null}
+            memoryProjectCandidates={sessions
+              .filter((session) => Boolean(session.projectDir))
+              .map((session) => ({
+                projectDir: session.projectDir,
+                displayName: session.label || session.project || session.name,
+                sessionName: session.name,
+                source: session.name === activeSession ? 'active_session' as const : 'recent_session' as const,
+              }))}
           />
         </FloatingPanel>
       )}
@@ -3952,8 +4174,19 @@ export function App() {
               idleFlashToken={idleFlashTokens.get(sub.sessionName) ?? 0}
               onDiff={registerDiffApplyer}
               onHistory={registerHistoryApplyer}
-              onMinimize={() => setOpenSubIds((prev) => { const s = new Set(prev); s.delete(sub.id); return s; })}
-              onClose={() => closeSubSession(sub.id)}
+              onMinimize={() => minimizeSubSessionWindow(sub.id)}
+              onClose={() => closeSubSessionAndClearMaximized(sub.id)}
+              maximized={maximizedSubIds.has(sub.id)}
+              onToggleMaximized={() => {
+                if (maximizedSubIdsRef.current.has(sub.id)) {
+                  restoreSubSession(sub.id);
+                } else {
+                  maximizeOpenSubSession(sub.id);
+                }
+              }}
+              onRestoreBeforeClose={() => clearSubSessionMaximized(sub.id)}
+              getMaximizeBounds={getDesktopMaximizeBounds}
+              desktopLayoutCapable={desktopLayoutCapable}
               onRestart={() => restartSubSession(sub.id)}
               onRename={() => {
                 const label = prompt('Rename sub-session:', sub.label ?? '');
@@ -3979,10 +4212,11 @@ export function App() {
               }}
               onDesktopFileBrowserFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id))}
               onDesktopFileBrowserClose={() => removeDesktopWindow(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id))}
-              onPin={(vm) => pinPanel('subsession', { sessionName: sub.sessionName, viewMode: vm, label: sub.label, serverId: selectedServerId }, () => setOpenSubIds((prev) => { const s = new Set(prev); s.delete(sub.id); return s; }))}
+              onPin={(vm) => pinPanel('subsession', { sessionName: sub.sessionName, viewMode: vm, label: sub.label, serverId: selectedServerId }, () => minimizeSubSessionWindow(sub.id))}
               sessions={sessions}
               subSessions={subSessionsSlim}
               serverId={selectedServerId ?? undefined}
+              detectedModelHint={detectedModels.get(sub.sessionName)}
               inP2p={p2pSessionLabels.has(sub.sessionName)}
               pendingPrefillText={pendingPrefills[sub.sessionName] ?? null}
               onPendingPrefillApplied={() => setPendingPrefills((prev) => {

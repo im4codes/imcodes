@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import { sha256Hex } from '../src/security/crypto.js';
 import { serverRoutes } from '../src/routes/server.js';
@@ -24,6 +24,11 @@ vi.mock('../src/security/authorization.js', () => ({
 beforeEach(() => {
   generateEmbeddingMock.mockReset();
   generateEmbeddingMock.mockResolvedValue(null);
+  process.env.IMCODES_MEM_FEATURE_ORG_SHARED_AUTHORED_STANDARDS = 'true';
+});
+
+afterEach(() => {
+  delete process.env.IMCODES_MEM_FEATURE_ORG_SHARED_AUTHORED_STANDARDS;
 });
 
 function makeMockDb() {
@@ -37,6 +42,8 @@ function makeMockDb() {
       version_id: 'doc-v2',
       binding_mode: 'required',
       scope: 'project_shared',
+      workspace_id: null,
+      enrollment_id: 'enr-1',
       applicability_repo_id: 'github.com/acme/repo',
       applicability_language: 'typescript',
       applicability_path_pattern: 'src/**',
@@ -47,6 +54,8 @@ function makeMockDb() {
       version_id: 'doc-v1',
       binding_mode: 'advisory',
       scope: 'org_shared',
+      workspace_id: null,
+      enrollment_id: null,
       applicability_repo_id: null,
       applicability_language: null,
       applicability_path_pattern: null,
@@ -143,7 +152,10 @@ function makeMockDb() {
             project_count: 1,
           } as T;
         }
-        if (normalized.includes("scope in ('project_shared', 'workspace_shared', 'org_shared')")) {
+        if (
+          normalized.includes("scope in ('project_shared', 'workspace_shared', 'org_shared')")
+          || normalized.includes('scope in ($')
+        ) {
           return {
             total_records: 1,
             recent_summary_count: 0,
@@ -180,7 +192,11 @@ function makeMockDb() {
             },
           ] as T[];
         }
-        if (normalized.includes("p.scope in ('project_shared', 'workspace_shared', 'org_shared')")) {
+        if (
+          normalized.includes("p.scope in ('project_shared', 'workspace_shared', 'org_shared')")
+          || normalized.includes('p.scope in ($')
+          || normalized.includes('p.scope = any(')
+        ) {
           return [
             {
               id: 'shared-projection-1',
@@ -198,6 +214,28 @@ function makeMockDb() {
             },
           ] as T[];
         }
+      }
+      if (normalized.includes('group by project_id') && normalized.includes("scope = 'personal'")) {
+        return [
+          {
+            project_id: 'github.com/acme/repo',
+            total_records: 1,
+            recent_summary_count: 1,
+            durable_candidate_count: 0,
+            updated_at: 1700000000000,
+          },
+        ] as T[];
+      }
+      if (normalized.includes('group by project_id') && normalized.includes('enterprise_id =')) {
+        return [
+          {
+            project_id: 'github.com/acme/repo',
+            total_records: 1,
+            recent_summary_count: 0,
+            durable_candidate_count: 1,
+            updated_at: 1700000002000,
+          },
+        ] as T[];
       }
       if (normalized.includes("from shared_context_projections where user_id = $1 and scope = 'personal'")) {
         return [
@@ -242,6 +280,7 @@ function makeMockDb() {
           user_id: params[5],
           project_id: params[6],
           projection_class: params[7],
+          origin: params[12],
         });
         return { changes: 1 };
       }
@@ -256,6 +295,7 @@ function makeMockDb() {
           user_id: params[6],
           project_id: params[7],
           record_class: params[8],
+          origin: params[11],
         });
         return { changes: 1 };
       }
@@ -317,6 +357,7 @@ describe('shared-context processed remote route', () => {
               enterpriseId: 'ent-1',
             },
             class: 'recent_summary',
+            origin: 'chat_compacted',
             sourceEventIds: ['evt-1'],
             summary: 'summary',
             content: { foo: 'bar' },
@@ -331,6 +372,7 @@ describe('shared-context processed remote route', () => {
               enterpriseId: 'ent-1',
             },
             class: 'durable_memory_candidate',
+            origin: 'chat_compacted',
             sourceEventIds: ['evt-2'],
             summary: 'decision',
             content: { kind: 'decision' },
@@ -351,6 +393,7 @@ describe('shared-context processed remote route', () => {
       expect.objectContaining({
         projection_id: 'proj-2',
         record_class: 'durable_memory_candidate',
+        origin: 'chat_compacted',
       }),
     ]);
     expect(aliasRows).toHaveLength(0);
@@ -383,6 +426,7 @@ describe('shared-context processed remote route', () => {
               enterpriseId: 'ent-1',
             },
             class: 'recent_summary',
+            origin: 'chat_compacted',
             sourceEventIds: ['evt-bad'],
             summary: '**Assistant:** [API Error: Connection error. (cause: fetch failed)]',
             content: {},
@@ -397,6 +441,7 @@ describe('shared-context processed remote route', () => {
               enterpriseId: 'ent-1',
             },
             class: 'recent_summary',
+            origin: 'chat_compacted',
             sourceEventIds: ['evt-good'],
             summary: 'useful summary',
             content: {},
@@ -412,6 +457,57 @@ describe('shared-context processed remote route', () => {
     expect(projectionRows).toEqual([
       expect.objectContaining({ id: 'good-proj' }),
     ]);
+    expect(recordRows).toEqual([]);
+  });
+
+  it('rejects processed projection writes without an emit-safe explicit origin', async () => {
+    const { db, projectionRows, recordRows } = makeMockDb();
+    const app = new Hono<{ Bindings: Env }>();
+    app.route('/api/server', serverRoutes);
+
+    for (const projection of [
+      {
+        id: 'missing-origin',
+        namespace: { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1' },
+        class: 'recent_summary',
+        sourceEventIds: ['evt-missing'],
+        summary: 'missing origin',
+        content: {},
+        createdAt: 100,
+        updatedAt: 101,
+      },
+      {
+        id: 'reserved-origin',
+        namespace: { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1' },
+        class: 'recent_summary',
+        origin: 'quick_search_cache',
+        sourceEventIds: ['evt-reserved'],
+        summary: 'reserved origin',
+        content: {},
+        createdAt: 100,
+        updatedAt: 101,
+      },
+    ]) {
+      const response = await app.request('/api/server/srv-1/shared-context/processed', {
+        method: 'POST',
+        headers: {
+          authorization: 'Bearer daemon-token',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          namespace: {
+            scope: 'project_shared',
+            projectId: 'github.com/acme/repo',
+            enterpriseId: 'ent-1',
+          },
+          projections: [projection],
+        }),
+      }, makeEnv(db));
+
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: 'invalid_body' });
+    }
+    expect(projectionRows).toEqual([]);
     expect(recordRows).toEqual([]);
   });
 
@@ -443,6 +539,7 @@ describe('shared-context processed remote route', () => {
               workspaceId: 'wrong-ws',
             },
             class: 'durable_memory_candidate',
+            origin: 'chat_compacted',
             sourceEventIds: ['evt-1'],
             summary: 'personal summary',
             content: { foo: 'bar' },
@@ -461,6 +558,7 @@ describe('shared-context processed remote route', () => {
       workspace_id: null,
       user_id: 'user-1',
       project_id: 'github.com/acme/repo',
+      origin: 'chat_compacted',
     }));
     expect(recordRows).toContainEqual(expect.objectContaining({
       projection_id: 'personal-proj-1',
@@ -468,6 +566,7 @@ describe('shared-context processed remote route', () => {
       enterprise_id: null,
       workspace_id: null,
       user_id: 'user-1',
+      origin: 'chat_compacted',
     }));
 
     const forbidden = await app.request('/api/server/srv-1/shared-context/processed', {
@@ -491,6 +590,7 @@ describe('shared-context processed remote route', () => {
               userId: 'user-other',
             },
             class: 'recent_summary',
+            origin: 'chat_compacted',
             sourceEventIds: ['evt-2'],
             summary: 'mismatch',
             content: { foo: 'bar' },
@@ -689,6 +789,16 @@ describe('shared-context processed remote route', () => {
           status: 'active',
         },
       ],
+      projects: [
+        {
+          projectId: 'github.com/acme/repo',
+          displayName: 'github.com/acme/repo',
+          totalRecords: 1,
+          recentSummaryCount: 1,
+          durableCandidateCount: 0,
+          updatedAt: 1700000000000,
+        },
+      ],
     });
   });
 
@@ -726,6 +836,16 @@ describe('shared-context processed remote route', () => {
           status: 'active',
         },
       ],
+      projects: [
+        {
+          projectId: 'github.com/acme/repo',
+          displayName: 'github.com/acme/repo',
+          totalRecords: 1,
+          recentSummaryCount: 1,
+          durableCandidateCount: 0,
+          updatedAt: 1700000000000,
+        },
+      ],
     });
   });
 
@@ -761,6 +881,16 @@ describe('shared-context processed remote route', () => {
           updatedAt: 1700000000000,
           hitCount: 0,
           status: 'active',
+        },
+      ],
+      projects: [
+        {
+          projectId: 'github.com/acme/repo',
+          displayName: 'github.com/acme/repo',
+          totalRecords: 1,
+          recentSummaryCount: 1,
+          durableCandidateCount: 0,
+          updatedAt: 1700000000000,
         },
       ],
     });
@@ -826,6 +956,16 @@ describe('shared-context processed remote route', () => {
           status: 'active',
         },
       ],
+      projects: [
+        {
+          projectId: 'github.com/acme/repo',
+          displayName: 'github.com/acme/repo',
+          totalRecords: 1,
+          recentSummaryCount: 1,
+          durableCandidateCount: 0,
+          updatedAt: 1700000000000,
+        },
+      ],
     });
   });
 
@@ -864,6 +1004,16 @@ describe('shared-context processed remote route', () => {
           hitCount: 7,
           lastUsedAt: 1700000003000,
           status: 'active',
+        },
+      ],
+      projects: [
+        {
+          projectId: 'github.com/acme/repo',
+          displayName: 'github.com/acme/repo',
+          totalRecords: 1,
+          recentSummaryCount: 0,
+          durableCandidateCount: 1,
+          updatedAt: 1700000002000,
         },
       ],
     });

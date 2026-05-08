@@ -125,4 +125,35 @@ describe('buildBatchSharpRepair', () => {
     const customBlock = buildBatchSharpRepair({ npmCmd: customNpm });
     expect(customBlock).toContain(customNpm);
   });
+
+  it('uses brackets (not parens) inside if-block echoes — cmd.exe eats parens even when ^-escaped', () => {
+    // Same root cause as windows-upgrade-script.ts: inside `if "!SHARP_BROKEN!"=="1" (...)`
+    // and the nested `if !REPAIR_EXIT! equ 0 (...) else (...)`, the
+    // 2026-05-07 fix originally used `^(...^)` to escape literal parens.
+    // But the prod log on the same day showed cmd.exe eating one of the
+    // escaped parens anyway, leaving the line truncated and (worse) the
+    // if-block prematurely closed.
+    //
+    // Walk the generated batch and assert NO parens (escaped or not)
+    // appear inside any echo line that lives inside an if-block.
+    const lines = block.split(/\r?\n/);
+    let depth = 0;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (/^\)/.test(trimmed)) depth = Math.max(0, depth - 1);
+      if (depth > 0 && /^\s*echo /.test(line)) {
+        expect(line, `paren in if-block echo (use [...] or --...-- instead): ${line}`).not.toMatch(/[()]/);
+      }
+      if (/\($/.test(trimmed)) depth += 1;
+    }
+  });
+
+  it('logs broken-dep diagnostic and failure messages without literal parens', () => {
+    // Pin the new bracket phrasings.
+    expect(block).toContain('sharp subtree broken [!SHARP_BROKEN_DEP!/package.json missing]');
+    expect(block).toContain('sharp repair FAILED [exit !REPAIR_EXIT!]');
+    // Forbid the old fragile `^(`/`^)` forms.
+    expect(block).not.toMatch(/sharp subtree broken \^\(/);
+    expect(block).not.toMatch(/sharp repair FAILED \^\(/);
+  });
 });

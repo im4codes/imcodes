@@ -69,7 +69,9 @@ vi.mock('../../src/util/logger.js', () => ({
 import { QwenProvider } from '../../src/agent/providers/qwen.js';
 import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
 import type { ToolCallEvent } from '../../src/agent/transport-provider.js';
+import type { AgentMessage } from '../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
+import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -109,6 +111,13 @@ describe('QwenProvider', () => {
     expect(call?.[1]).toContain('--version');
     expect(provider.capabilities.reasoningEffort).toBe(true);
     expect(provider.capabilities.supportedEffortLevels).toEqual(['off', 'low', 'medium', 'high']);
+    expect(provider.capabilities.compact).toMatchObject({
+      execution: 'slash-command',
+      providerCommand: '/compress',
+      verified: true,
+      completion: 'command-result',
+      cancellation: 'provider-cancel',
+    });
   });
 
   it('writes qwen reasoning settings and switches them per session effort', async () => {
@@ -446,6 +455,69 @@ describe('QwenProvider', () => {
     expect(spawnEntry.args).toContain('Context block\n\nship it');
     expect(spawnEntry.args).toContain('--append-system-prompt');
     expect(spawnEntry.args).toContain('Normalized system text');
+  });
+
+  it('translates IM.codes /compact into Qwen CLI /compress without context preambles', async () => {
+    const provider = new QwenProvider();
+    const statuses: Array<{ status: string | null; label?: string | null }> = [];
+    const completed: AgentMessage[] = [];
+    provider.onStatus((_sid, status) => statuses.push(status));
+    provider.onComplete((_sid, message) => completed.push(message));
+
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-compact',
+      cwd: '/tmp/project',
+      description: 'Legacy description must not be appended',
+    });
+
+    await provider.send('sess-compact', {
+      userMessage: ' /compact ',
+      assembledMessage: 'Shared history\n\n/compact',
+      systemText: 'Enterprise standard must not be appended',
+      messagePreamble: 'Shared history',
+      attachments: [],
+      context: {
+        systemText: 'Enterprise standard must not be appended',
+        messagePreamble: 'Shared history',
+        requiredAuthoredContext: ['must not be sent'],
+        advisoryAuthoredContext: ['must not be sent'],
+        appliedDocumentVersionIds: ['doc-1'],
+        diagnostics: ['diag'],
+      },
+      authority: {
+        namespace: { scope: 'project_shared', projectId: 'repo' },
+        authoritySource: 'processed_remote',
+        freshness: 'fresh',
+        fallbackAllowed: false,
+        retryScheduled: false,
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: ['diag'],
+    });
+
+    const run = lastSpawn();
+    const promptIndex = run.args.indexOf('-p');
+    expect(run.args.slice(promptIndex, promptIndex + 2)).toEqual(['-p', '/compress']);
+    expect(run.args).not.toContain('--append-system-prompt');
+    expect(statuses[0]).toEqual({ status: 'compacting', label: 'Compacting conversation...' });
+
+    run.child.stdout.write(`${JSON.stringify({ type: 'result', result: 'Context compressed (100 -> 25).' })}\n`);
+    run.child.emit('close', 0, null);
+    await flushIO();
+
+    expect(completed).toHaveLength(1);
+    expect(completed[0]).toMatchObject({
+      kind: 'system',
+      role: 'system',
+      content: 'Context compressed (100 -> 25).',
+      metadata: {
+        [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact',
+        event: 'session.history.compress',
+        providerCommand: '/compress',
+      },
+    });
   });
 
   it('rejects normalized payloads combined with legacy extraSystemPrompt', async () => {

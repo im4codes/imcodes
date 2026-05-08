@@ -5,8 +5,17 @@
  */
 import { useState, useRef, useCallback, useEffect } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
-
-interface WindowGeometry { x: number; y: number; w: number; h: number }
+import { useTranslation } from 'react-i18next';
+import { DesktopWindowMaximizeButton } from './DesktopWindowMaximizeButton.js';
+import {
+  clampGeometryToWorkspace,
+  geometryFromWorkspace,
+  normalizeWindowGeometry,
+  reserveWorkspaceBottom,
+  shouldPersistGeometry,
+  type WorkspaceBounds,
+  type WindowGeometry,
+} from '../desktop-window-maximize.js';
 
 interface Props {
   id: string;
@@ -19,54 +28,101 @@ interface Props {
   pinTooltip?: string;
   defaultW?: number;
   defaultH?: number;
+  enableMaximize?: boolean;
+  isMaximized?: boolean;
+  onToggleMaximized?: () => void;
+  getMaximizeBounds?: () => WorkspaceBounds | null;
+  desktopLayoutCapable?: boolean;
 }
 
 const MIN_W = 360;
 const MIN_H = 280;
 const DRAG_MARGIN = 32;
 
+function currentViewportBounds(): WorkspaceBounds {
+  return reserveWorkspaceBottom({
+    x: 0,
+    y: 0,
+    w: Math.max(MIN_W, window.innerWidth),
+    h: Math.max(MIN_H, window.innerHeight),
+  });
+}
+
 function clampGeomToViewport(geom: WindowGeometry): WindowGeometry {
-  const w = Math.max(MIN_W, geom.w);
-  const h = Math.max(MIN_H, geom.h);
-  const minX = DRAG_MARGIN - w;
-  const maxX = window.innerWidth - DRAG_MARGIN;
-  const maxY = Math.max(0, window.innerHeight - DRAG_MARGIN);
+  const bounds = currentViewportBounds();
+  const clamped = clampGeometryToWorkspace(geom, bounds, {
+    minW: MIN_W,
+    minH: MIN_H,
+    visibleMargin: DRAG_MARGIN,
+  });
   return {
-    x: Math.min(Math.max(geom.x, minX), maxX),
-    y: Math.min(Math.max(geom.y, 0), maxY),
-    w,
-    h,
+    ...clamped,
+    y: Math.min(clamped.y, Math.max(bounds.y, bounds.y + bounds.h - clamped.h)),
   };
 }
 
 function loadGeom(id: string, dw: number, dh: number): WindowGeometry {
-  try {
-    const raw = localStorage.getItem(`rcc_float_${id}`);
-    if (raw) return clampGeomToViewport(JSON.parse(raw) as WindowGeometry);
-  } catch { /* ignore */ }
-  return clampGeomToViewport({
+  const fallback = {
     x: Math.max(0, (window.innerWidth - dw) / 2),
     y: Math.max(0, (window.innerHeight - dh) / 2 - 40),
-    w: dw, h: dh,
-  });
+    w: dw,
+    h: dh,
+  };
+  try {
+    const raw = localStorage.getItem(`rcc_float_${id}`);
+    if (raw) return clampGeomToViewport(normalizeWindowGeometry(JSON.parse(raw), fallback));
+  } catch { /* ignore */ }
+  return clampGeomToViewport(fallback);
 }
 
 function saveGeom(id: string, geom: WindowGeometry) {
   try { localStorage.setItem(`rcc_float_${id}`, JSON.stringify(geom)); } catch { /* ignore */ }
 }
 
-export function FloatingPanel({ id, title, children, onClose, zIndex = 2000, onFocus, onPin, pinTooltip, defaultW = 700, defaultH = 520 }: Props) {
+function fallbackMaximizedGeometry(): WindowGeometry {
+  return geometryFromWorkspace(currentViewportBounds());
+}
+
+export function FloatingPanel({
+  id,
+  title,
+  children,
+  onClose,
+  zIndex = 2000,
+  onFocus,
+  onPin,
+  pinTooltip,
+  defaultW = 700,
+  defaultH = 520,
+  enableMaximize = false,
+  isMaximized = false,
+  onToggleMaximized,
+  getMaximizeBounds,
+  desktopLayoutCapable = true,
+}: Props) {
+  const { t } = useTranslation();
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+  const canUseDesktopMaximize = enableMaximize && desktopLayoutCapable;
+  const isDesktopMaximized = canUseDesktopMaximize && isMaximized;
   const [geom, setGeom] = useState(() => loadGeom(id, defaultW, defaultH));
+  const [, forceWorkspaceRender] = useState(0);
   const geomRef = useRef(geom);
   geomRef.current = geom;
 
-  useEffect(() => { saveGeom(id, geom); }, [id, geom]);
   useEffect(() => {
-    const onResize = () => setGeom((g) => clampGeomToViewport(g));
+    if (shouldPersistGeometry(isDesktopMaximized)) saveGeom(id, geom);
+  }, [id, geom, isDesktopMaximized]);
+  useEffect(() => {
+    const onResize = () => {
+      if (isDesktopMaximized) {
+        forceWorkspaceRender((n) => n + 1);
+        return;
+      }
+      setGeom((g) => clampGeomToViewport(g));
+    };
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);
-  }, []);
+  }, [isDesktopMaximized]);
 
   // ── Drag ─────────────────────────────────────────────────────────────────
   const dragStart = useRef<{ mx: number; my: number; ox: number; oy: number } | null>(null);
@@ -77,6 +133,10 @@ export function FloatingPanel({ id, title, children, onClose, zIndex = 2000, onF
   }), []);
 
   const startDrag = useCallback((e: MouseEvent) => {
+    if (isDesktopMaximized) {
+      onFocus?.();
+      return;
+    }
     if ((e.target as HTMLElement).closest('button, input, textarea, [contenteditable], a')) return;
     dragStart.current = { mx: e.clientX, my: e.clientY, ox: geomRef.current.x, oy: geomRef.current.y };
     onFocus?.();
@@ -97,7 +157,7 @@ export function FloatingPanel({ id, title, children, onClose, zIndex = 2000, onF
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup', onUp);
     e.preventDefault();
-  }, [onFocus, clampPos]);
+  }, [isDesktopMaximized, onFocus, clampPos]);
 
   // ── Resize ───────────────────────────────────────────────────────────────
   type ResizeDir = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw';
@@ -105,6 +165,7 @@ export function FloatingPanel({ id, title, children, onClose, zIndex = 2000, onF
   const onResizeMouseDown = useCallback((dir: ResizeDir) => (e: MouseEvent) => {
     e.stopPropagation();
     e.preventDefault();
+    if (isDesktopMaximized) return;
     onFocus?.();
     const startG = { ...geomRef.current };
     const sx = e.clientX, sy = e.clientY;
@@ -136,7 +197,12 @@ export function FloatingPanel({ id, title, children, onClose, zIndex = 2000, onF
     };
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup', onUp);
-  }, [onFocus]);
+  }, [isDesktopMaximized, onFocus]);
+
+  const onMaximizeClick = useCallback(() => {
+    onFocus?.();
+    onToggleMaximized?.();
+  }, [onFocus, onToggleMaximized]);
 
   // Mobile: fullscreen with title bar
   if (isMobile) {
@@ -159,7 +225,12 @@ export function FloatingPanel({ id, title, children, onClose, zIndex = 2000, onF
           >
             {title}
           </span>
-          <button onClick={onClose} style={{ background: 'none', border: 'none', color: '#94a3b8', cursor: 'pointer', fontSize: 18, padding: '4px 8px', flexShrink: 0 }}>✕</button>
+          <button
+            onClick={onClose}
+            title={t('window.close')}
+            aria-label={t('window.close')}
+            style={{ background: 'none', border: 'none', color: '#94a3b8', cursor: 'pointer', fontSize: 18, padding: '4px 8px', flexShrink: 0 }}
+          >✕</button>
         </div>
         <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
           {children}
@@ -170,14 +241,19 @@ export function FloatingPanel({ id, title, children, onClose, zIndex = 2000, onF
 
   // Desktop: floating window
   const rh = 5; // resize handle size
+  const displayGeom = isDesktopMaximized
+    ? geometryFromWorkspace(getMaximizeBounds?.() ?? fallbackMaximizedGeometry())
+    : geom;
   return (
     <div
       data-testid={`floating-panel-${id}`}
       style={{
-        position: 'fixed', left: geom.x, top: geom.y, width: geom.w, height: geom.h,
+        position: 'fixed', left: displayGeom.x, top: displayGeom.y, width: displayGeom.w, height: displayGeom.h,
         zIndex, display: 'flex', flexDirection: 'column',
-        background: '#0f172a', border: '1px solid #334155', borderRadius: 8,
-        boxShadow: '0 12px 40px #00000060', overflow: 'hidden',
+        background: '#0f172a', border: isDesktopMaximized ? '2px solid #3b82f6' : '1px solid #334155', borderRadius: 8,
+        boxShadow: isDesktopMaximized ? '0 0 0 1px rgba(96,165,250,0.45), 0 12px 40px #00000060' : '0 12px 40px #00000060',
+        overflow: 'hidden',
+        boxSizing: 'border-box',
       }}
       onMouseDown={() => onFocus?.()}
     >
@@ -186,7 +262,7 @@ export function FloatingPanel({ id, title, children, onClose, zIndex = 2000, onF
         onMouseDown={startDrag}
         style={{
           display: 'flex', alignItems: 'center', gap: 8,
-          padding: '6px 12px', background: '#1e293b', cursor: 'grab',
+          padding: '6px 12px', background: '#1e293b', cursor: isDesktopMaximized ? 'default' : 'grab',
           borderBottom: '1px solid #334155', flexShrink: 0, userSelect: 'none',
         }}
       >
@@ -209,18 +285,27 @@ export function FloatingPanel({ id, title, children, onClose, zIndex = 2000, onF
           <button
             onClick={onPin}
             class="subsession-minimize-btn"
-            title={pinTooltip ?? 'Pin to sidebar'}
+            title={pinTooltip ?? t('sidebar.pin_to_sidebar')}
           >📌</button>
+        )}
+        {canUseDesktopMaximize && onToggleMaximized && (
+          <DesktopWindowMaximizeButton
+            data-testid="floating-maximize-toggle"
+            onClick={onMaximizeClick}
+            maximized={isDesktopMaximized}
+          />
         )}
         <button
           onClick={onClose}
           class="subsession-minimize-btn"
-          title="Minimize"
+          title={t('window.minimize')}
+          aria-label={t('window.minimize')}
         >▾</button>
         <button
           onClick={onClose}
           class="subsession-close-btn"
-          title="Close"
+          title={t('window.close')}
+          aria-label={t('window.close')}
         >×</button>
       </div>
 
@@ -230,19 +315,23 @@ export function FloatingPanel({ id, title, children, onClose, zIndex = 2000, onF
       </div>
 
       {/* Resize handles */}
-      <div data-testid="floating-resize-se" onMouseDown={onResizeMouseDown('se')} style={{ position: 'absolute', right: 0, bottom: 0, width: 16, height: 16, cursor: 'se-resize', zIndex: 3 }} />
-      <div data-testid="floating-resize-e" onMouseDown={onResizeMouseDown('e')} style={{ position: 'absolute', right: 0, top: rh, bottom: rh, width: rh, cursor: 'e-resize', zIndex: 3 }} />
-      <div data-testid="floating-resize-s" onMouseDown={onResizeMouseDown('s')} style={{ position: 'absolute', bottom: 0, left: rh, right: rh, height: rh, cursor: 's-resize', zIndex: 3 }} />
-      <div data-testid="floating-resize-w" onMouseDown={onResizeMouseDown('w')} style={{ position: 'absolute', left: 0, top: rh, bottom: rh, width: rh, cursor: 'w-resize', zIndex: 3 }} />
-      <div data-testid="floating-resize-n" onMouseDown={onResizeMouseDown('n')} style={{ position: 'absolute', top: 0, left: rh, right: rh, height: rh, cursor: 'n-resize', zIndex: 3 }} />
-      <div data-testid="floating-resize-nw" onMouseDown={onResizeMouseDown('nw')} style={{ position: 'absolute', left: 0, top: 0, width: 16, height: 16, cursor: 'nw-resize', zIndex: 3 }} />
-      <div data-testid="floating-resize-ne" onMouseDown={onResizeMouseDown('ne')} style={{ position: 'absolute', right: 0, top: 0, width: 16, height: 16, cursor: 'ne-resize', zIndex: 3 }} />
-      <div data-testid="floating-resize-sw" onMouseDown={onResizeMouseDown('sw')} style={{ position: 'absolute', left: 0, bottom: 0, width: 16, height: 16, cursor: 'sw-resize', zIndex: 3 }} />
-      <div
-        data-testid="floating-bottom-drag"
-        onMouseDown={startDrag}
-        style={{ position: 'absolute', left: 24, right: 24, bottom: rh, height: 14, cursor: 'grab', zIndex: 2 }}
-      />
+      {!isDesktopMaximized && (
+        <>
+          <div data-testid="floating-resize-se" onMouseDown={onResizeMouseDown('se')} style={{ position: 'absolute', right: 0, bottom: 0, width: 16, height: 16, cursor: 'se-resize', zIndex: 3 }} />
+          <div data-testid="floating-resize-e" onMouseDown={onResizeMouseDown('e')} style={{ position: 'absolute', right: 0, top: rh, bottom: rh, width: rh, cursor: 'e-resize', zIndex: 3 }} />
+          <div data-testid="floating-resize-s" onMouseDown={onResizeMouseDown('s')} style={{ position: 'absolute', bottom: 0, left: rh, right: rh, height: rh, cursor: 's-resize', zIndex: 3 }} />
+          <div data-testid="floating-resize-w" onMouseDown={onResizeMouseDown('w')} style={{ position: 'absolute', left: 0, top: rh, bottom: rh, width: rh, cursor: 'w-resize', zIndex: 3 }} />
+          <div data-testid="floating-resize-n" onMouseDown={onResizeMouseDown('n')} style={{ position: 'absolute', top: 0, left: rh, right: rh, height: rh, cursor: 'n-resize', zIndex: 3 }} />
+          <div data-testid="floating-resize-nw" onMouseDown={onResizeMouseDown('nw')} style={{ position: 'absolute', left: 0, top: 0, width: 16, height: 16, cursor: 'nw-resize', zIndex: 3 }} />
+          <div data-testid="floating-resize-ne" onMouseDown={onResizeMouseDown('ne')} style={{ position: 'absolute', right: 0, top: 0, width: 16, height: 16, cursor: 'ne-resize', zIndex: 3 }} />
+          <div data-testid="floating-resize-sw" onMouseDown={onResizeMouseDown('sw')} style={{ position: 'absolute', left: 0, bottom: 0, width: 16, height: 16, cursor: 'sw-resize', zIndex: 3 }} />
+          <div
+            data-testid="floating-bottom-drag"
+            onMouseDown={startDrag}
+            style={{ position: 'absolute', left: 24, right: 24, bottom: rh, height: 14, cursor: 'grab', zIndex: 2 }}
+          />
+        </>
+      )}
     </div>
   );
 }

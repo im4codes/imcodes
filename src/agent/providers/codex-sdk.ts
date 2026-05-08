@@ -12,6 +12,7 @@ import type {
   SessionConfig,
   SessionInfoUpdate,
   ProviderStatusUpdate,
+  ProviderUsageUpdate,
   ToolCallEvent,
 } from '../transport-provider.js';
 import {
@@ -22,6 +23,10 @@ import {
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
+import {
+  SESSION_CONTROL_METADATA_COMMAND_FIELD,
+  isSessionControlCommandText,
+} from '../../../shared/session-control-commands.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 import logger from '../../util/logger.js';
 import { CODEX_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
@@ -30,6 +35,43 @@ import { getCodexBaseInstructions } from '../codex-runtime-config.js';
 
 const CODEX_BIN = 'codex';
 const CANCEL_INTERRUPT_TIMEOUT_MS = 1_500;
+const COMPACT_START_ACCEPT_TIMEOUT_MS = 15_000;
+const COMPACT_NO_SIGNAL_SETTLE_MS = 5_000;
+const COMPACT_HARD_TIMEOUT_MS = 120_000;
+const DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 32_000;
+const MIN_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 4_000;
+const MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 128_000;
+
+function getCodexSdkContextInjectionMaxChars(): number {
+  const raw = process.env.IMCODES_CODEX_SDK_CONTEXT_MAX_CHARS;
+  if (raw === undefined || raw.trim() === '') return DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) return DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS;
+  if (parsed < MIN_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS) return MIN_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS;
+  if (parsed > MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS) return MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS;
+  return parsed;
+}
+
+function capCodexSdkContextInjection(text: string, maxChars = getCodexSdkContextInjectionMaxChars()): string {
+  if (text.length <= maxChars) return text;
+  const marker = `\n\n[IM.codes: injected context truncated from ${text.length} to ${maxChars} chars to prevent SDK auto-compaction.]`;
+  if (maxChars <= marker.length + 16) return text.slice(0, maxChars);
+  return `${text.slice(0, maxChars - marker.length).trimEnd()}${marker}`;
+}
+
+function buildCodexTurnInput(payload: ProviderContextPayload): string {
+  const contextParts: string[] = [];
+  const systemText = payload.systemText?.trim();
+  const messagePreamble = payload.messagePreamble?.trim();
+  if (systemText) contextParts.push(`Context instructions:\n${systemText}`);
+  if (messagePreamble) contextParts.push(messagePreamble);
+  if (contextParts.length === 0) return payload.assembledMessage;
+
+  const contextText = capCodexSdkContextInjection(contextParts.join('\n\n'));
+  const userMessage = messagePreamble ? payload.userMessage : payload.assembledMessage;
+  const trimmedUserMessage = userMessage.trim();
+  return trimmedUserMessage ? `${contextText}\n\n${trimmedUserMessage}` : contextText;
+}
 
 /**
  * Provider-neutral fallback `baseInstructions` used when codex's own
@@ -102,22 +144,146 @@ export interface CodexDiscoveredModel {
 interface CodexSdkSessionState {
   routeId: string;
   cwd: string;
+  env?: Record<string, string>;
   model?: string;
   effort?: TransportEffortLevel;
   threadId?: string;
   loaded: boolean;
   runningTurnId?: string;
+  runningCompact: boolean;
   currentMessageId: string | null;
   currentText: string;
   pendingComplete?: AgentMessage;
   cancelled: boolean;
   cancelTimer: ReturnType<typeof setTimeout> | null;
+  compactSettleTimer: ReturnType<typeof setTimeout> | null;
+  compactHardTimer: ReturnType<typeof setTimeout> | null;
+  compactObserved: boolean;
   lastUsage?: {
+    /**
+     * Context-bar usage must represent the current prompt/window occupancy,
+     * not cumulative billing/thread totals. Codex app-server emits both
+     * `last` and `total`; `total` grows across turns and can exceed the model
+     * context window, so provider-neutral fields normalize from `last` when
+     * available and keep cumulative `total` fields only for diagnostics.
+     */
     input_tokens: number;
+    cache_read_input_tokens: number;
     cached_input_tokens: number;
     output_tokens: number;
+    total_tokens?: number;
+    reasoning_output_tokens?: number;
+    model_context_window?: number;
+    codex_total_input_tokens?: number;
+    codex_total_cached_input_tokens?: number;
+    codex_total_output_tokens?: number;
+    codex_last_input_tokens?: number;
+    codex_last_cached_input_tokens?: number;
+    codex_last_output_tokens?: number;
   };
   lastStatusSignature: string | null;
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
+  return value;
+}
+
+function normalizeCodexTokenUsage(params: Record<string, any>): CodexSdkSessionState['lastUsage'] | undefined {
+  const tokenUsage = params.tokenUsage;
+  if (!tokenUsage || typeof tokenUsage !== 'object') return undefined;
+
+  const total = tokenUsage.total && typeof tokenUsage.total === 'object'
+    ? tokenUsage.total as Record<string, unknown>
+    : undefined;
+  const last = tokenUsage.last && typeof tokenUsage.last === 'object'
+    ? tokenUsage.last as Record<string, unknown>
+    : undefined;
+  if (!total && !last) return undefined;
+
+  const totalInput = finiteNumber(total?.inputTokens);
+  const totalCached = finiteNumber(total?.cachedInputTokens);
+  const totalOutput = finiteNumber(total?.outputTokens);
+  const lastInput = finiteNumber(last?.inputTokens);
+  const lastCached = finiteNumber(last?.cachedInputTokens);
+  const lastOutput = finiteNumber(last?.outputTokens);
+
+  const inputTokens = lastInput ?? totalInput;
+  const cachedTokens = lastCached ?? totalCached;
+  const outputTokens = lastOutput ?? totalOutput;
+  if (inputTokens === undefined && cachedTokens === undefined && outputTokens === undefined) return undefined;
+  const cachedForUi = cachedTokens ?? 0;
+  // Codex/OpenAI-style `inputTokens` includes cached input as a subset
+  // (`totalTokens === inputTokens + outputTokens` in Codex JSONL). The web ctx
+  // bar renders `inputTokens + cacheTokens`, matching Anthropic's split fields.
+  // Therefore expose the uncached remainder as provider-neutral `input_tokens`
+  // and carry the raw Codex total separately for diagnostics.
+  const inputForUi = Math.max(0, (inputTokens ?? 0) - cachedForUi);
+
+  const modelContextWindow = finiteNumber(tokenUsage.modelContextWindow)
+    // Backward-compat with older tests / adapters that briefly placed this
+    // beside `tokenUsage`; generated app-server types now nest it inside.
+    ?? finiteNumber(params.modelContextWindow);
+
+  return {
+    input_tokens: inputForUi,
+    cache_read_input_tokens: cachedForUi,
+    // Keep Codex's native name too for diagnostics and direct provider users.
+    cached_input_tokens: cachedForUi,
+    output_tokens: outputTokens ?? 0,
+    ...(finiteNumber(total?.totalTokens) !== undefined ? { total_tokens: finiteNumber(total?.totalTokens)! } : {}),
+    ...(finiteNumber(total?.reasoningOutputTokens) !== undefined ? { reasoning_output_tokens: finiteNumber(total?.reasoningOutputTokens)! } : {}),
+    ...(modelContextWindow !== undefined && modelContextWindow > 0 ? { model_context_window: modelContextWindow } : {}),
+    ...(totalInput !== undefined ? { codex_total_input_tokens: totalInput } : {}),
+    ...(totalCached !== undefined ? { codex_total_cached_input_tokens: totalCached } : {}),
+    ...(totalOutput !== undefined ? { codex_total_output_tokens: totalOutput } : {}),
+    ...(lastInput !== undefined ? { codex_last_input_tokens: lastInput } : {}),
+    ...(lastCached !== undefined ? { codex_last_cached_input_tokens: lastCached } : {}),
+    ...(lastOutput !== undefined ? { codex_last_output_tokens: lastOutput } : {}),
+  };
+}
+
+function readParamThreadId(params: Record<string, any>): string | undefined {
+  const threadId = params.threadId ?? params.thread_id ?? params.thread?.id ?? params.thread?.threadId ?? params.thread?.thread_id;
+  return typeof threadId === 'string' && threadId.trim() ? threadId : undefined;
+}
+
+function readParamTurnId(params: Record<string, any>): string | undefined {
+  const turnId = params.turnId ?? params.turn_id ?? params.turn?.id ?? params.turn?.turnId ?? params.turn?.turn_id;
+  return typeof turnId === 'string' && turnId.trim() ? turnId : undefined;
+}
+
+function readThreadStatus(params: Record<string, any>): string | undefined {
+  const raw = params.status ?? params.threadStatus ?? params.thread_status ?? params.thread?.status;
+  if (typeof raw === 'string' && raw.trim()) return raw.trim();
+  if (!raw || typeof raw !== 'object') return undefined;
+  const nested = (raw as Record<string, any>).type
+    ?? (raw as Record<string, any>).kind
+    ?? (raw as Record<string, any>).state
+    ?? (raw as Record<string, any>).status;
+  return typeof nested === 'string' && nested.trim() ? nested.trim() : undefined;
+}
+
+function normalizeStatusName(status: string | undefined): string {
+  return (status ?? '').replace(/[_\s-]+/g, '').toLowerCase();
+}
+
+function isThreadActiveStatus(status: string | undefined): boolean {
+  const normalized = normalizeStatusName(status);
+  return normalized === 'active'
+    || normalized === 'running'
+    || normalized === 'busy'
+    || normalized === 'compacting'
+    || normalized === 'inprogress';
+}
+
+function isThreadIdleStatus(status: string | undefined): boolean {
+  const normalized = normalizeStatusName(status);
+  return normalized === 'idle'
+    || normalized === 'ready'
+    || normalized === 'complete'
+    || normalized === 'completed'
+    || normalized === 'notloaded';
 }
 
 function toolFromItem(item: Record<string, any>, lifecycle: 'started' | 'completed'): ToolCallEvent | null {
@@ -276,6 +442,12 @@ export class CodexSdkProvider implements TransportProvider {
     reasoningEffort: true,
     supportedEffortLevels: CODEX_SDK_EFFORT_LEVELS,
     contextSupport: 'degraded-message-side-context-mapping',
+    compact: {
+      execution: 'sdk-rpc',
+      verified: true,
+      completion: 'provider-event',
+      cancellation: 'local-cancel',
+    },
   };
 
   private config: ProviderConfig | null = null;
@@ -287,6 +459,7 @@ export class CodexSdkProvider implements TransportProvider {
   private toolCallCallbacks: Array<(sessionId: string, tool: ToolCallEvent) => void> = [];
   private sessionInfoCallbacks: Array<(sessionId: string, info: SessionInfoUpdate) => void> = [];
   private statusCallbacks: Array<(sessionId: string, status: ProviderStatusUpdate) => void> = [];
+  private usageCallbacks: Array<(sessionId: string, update: ProviderUsageUpdate) => void> = [];
   private child: ChildProcessWithoutNullStreams | null = null;
   private rl: ReadlineInterface | null = null;
   private nextRequestId = 1;
@@ -303,7 +476,7 @@ export class CodexSdkProvider implements TransportProvider {
         execFile(resolved.executable, [...resolved.prependArgs, '--version'], { windowsHide: true }, (err) => (err ? reject(err) : resolve()));
       });
     });
-    await this.startAppServer(binaryPath);
+    await this.startAppServer(binaryPath, config);
     this.config = config;
     logger.info({ provider: this.id, resolved: resolved.executable, prepend: resolved.prependArgs }, 'Codex SDK provider connected via app-server');
   }
@@ -312,6 +485,10 @@ export class CodexSdkProvider implements TransportProvider {
     this.rejectPending(new Error('Codex app-server disconnected'));
     this.rl?.close();
     this.rl = null;
+    for (const state of this.sessions.values()) {
+      this.clearCancelTimer(state);
+      this.clearCompactTimers(state);
+    }
     // `child.kill('SIGTERM')` only terminates the node wrapper; the native
     // codex binary it spawned lives on and leaks ~60MB per abandoned pair.
     // Walk the descendant tree and tree-kill instead. Fire-and-forget is
@@ -331,16 +508,21 @@ export class CodexSdkProvider implements TransportProvider {
     this.sessions.set(routeId, {
       routeId,
       cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
+      env: { ...(existing?.env ?? {}), ...((config.env as Record<string, string> | undefined) ?? {}) },
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
       effort: config.effort ?? existing?.effort,
       threadId: config.resumeId ?? existing?.threadId,
       loaded: false,
       runningTurnId: undefined,
+      runningCompact: false,
       currentMessageId: null,
       currentText: '',
       pendingComplete: undefined,
       cancelled: false,
       cancelTimer: null,
+      compactSettleTimer: null,
+      compactHardTimer: null,
+      compactObserved: false,
       lastUsage: undefined,
       lastStatusSignature: null,
     });
@@ -352,6 +534,7 @@ export class CodexSdkProvider implements TransportProvider {
     const state = this.sessions.get(sessionId);
     if (!state) return;
     this.clearCancelTimer(state);
+    this.clearCompactTimers(state);
     if (state.threadId && state.loaded) {
       await this.request('thread/unsubscribe', { threadId: state.threadId }).catch(() => {});
       this.threadToSession.delete(state.threadId);
@@ -403,6 +586,14 @@ export class CodexSdkProvider implements TransportProvider {
     };
   }
 
+  onUsage(cb: (sessionId: string, update: ProviderUsageUpdate) => void): () => void {
+    this.usageCallbacks.push(cb);
+    return () => {
+      const idx = this.usageCallbacks.indexOf(cb);
+      if (idx >= 0) this.usageCallbacks.splice(idx, 1);
+    };
+  }
+
   setSessionAgentId(sessionId: string, agentId: string): void {
     const state = this.sessions.get(sessionId);
     if (!state) return;
@@ -424,7 +615,7 @@ export class CodexSdkProvider implements TransportProvider {
     if (!state) {
       throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Unknown Codex SDK session: ${sessionId}`, false);
     }
-    if (state.runningTurnId) {
+    if (state.runningTurnId || state.runningCompact) {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Codex SDK session is already busy', true);
     }
 
@@ -436,12 +627,29 @@ export class CodexSdkProvider implements TransportProvider {
     state.lastUsage = undefined;
     state.lastStatusSignature = null;
     const payload = normalizeProviderPayload(payloadOrMessage, attachments, extraSystemPrompt);
+    if (this.isCompactCommand(payload)) {
+      await this.startCompact(sessionId, state);
+      return;
+    }
     await this.startTurn(sessionId, state, payload);
   }
 
   async cancel(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
-    if (!state?.threadId || !state.runningTurnId) return;
+    if (!state?.threadId) return;
+    if (state.runningCompact) {
+      state.cancelled = true;
+      const turnId = state.runningTurnId;
+      if (turnId) {
+        void this.request('turn/interrupt', {
+          threadId: state.threadId,
+          turnId,
+        }).catch(() => {});
+      }
+      this.cancelCompactLocally(sessionId, state);
+      return;
+    }
+    if (!state.runningTurnId) return;
     state.cancelled = true;
     const turnId = state.runningTurnId;
     await this.request('turn/interrupt', {
@@ -460,7 +668,7 @@ export class CodexSdkProvider implements TransportProvider {
     state.cancelTimer.unref?.();
   }
 
-  private async startAppServer(binaryPath: string): Promise<void> {
+  private async startAppServer(binaryPath: string, config: ProviderConfig): Promise<void> {
     await this.disconnect().catch(() => {});
     // Resolve npm .cmd shims into (node.exe, [scriptPath]) so spawn works
     // without shell:true (which has its own quoting issues on Windows).
@@ -468,7 +676,7 @@ export class CodexSdkProvider implements TransportProvider {
     const args = [...resolved.prependArgs, 'app-server'];
     const child = spawn(resolved.executable, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: process.env,
+      env: { ...process.env, ...((config.env as Record<string, string> | undefined) ?? {}) },
       windowsHide: true,
     });
     this.child = child;
@@ -509,13 +717,12 @@ export class CodexSdkProvider implements TransportProvider {
   private async startTurn(sessionId: string, state: CodexSdkSessionState, payload: ProviderContextPayload): Promise<void> {
     try {
       await this.ensureThreadLoaded(sessionId, state);
-      const inputText = payload.systemText
-        ? `Context instructions:\n${payload.systemText}\n\n${payload.assembledMessage}`
-        : payload.assembledMessage;
+      const inputText = buildCodexTurnInput(payload);
       const result = await this.request('turn/start', {
         threadId: state.threadId,
         input: [{ type: 'text', text: inputText }],
         cwd: state.cwd,
+        ...this.sessionEnvironmentParams(state),
         approvalPolicy: 'never',
         sandboxPolicy: { type: 'dangerFullAccess' },
         ...(state.model ? { model: state.model } : {}),
@@ -524,6 +731,53 @@ export class CodexSdkProvider implements TransportProvider {
       state.runningTurnId = result?.turn?.id;
     } catch (err) {
       state.runningTurnId = undefined;
+      this.emitError(sessionId, this.normalizeError(err));
+    }
+  }
+
+  private isCompactCommand(payload: ProviderContextPayload): boolean {
+    // Codex slash commands are app-client controls, not ordinary model text.
+    // The daemon still forwards `/compact` through the ordinary transport send
+    // path; this provider adapter is the SDK boundary that maps the raw command
+    // to Codex app-server's native compaction RPC. Using `assembledMessage`
+    // here would be wrong because shared-context/preference preambles may wrap
+    // the provider-visible text, while `userMessage` preserves the user's raw
+    // command token.
+    return isSessionControlCommandText(payload.userMessage, 'compact');
+  }
+
+  private async startCompact(sessionId: string, state: CodexSdkSessionState): Promise<void> {
+    try {
+      await this.ensureThreadLoaded(sessionId, state);
+      state.runningCompact = true;
+      state.compactObserved = false;
+      state.currentText = '';
+      state.currentMessageId = null;
+      this.emitStatus(sessionId, state, {
+        status: 'compacting',
+        label: 'Compacting context...',
+      });
+      this.armCompactHardTimeout(sessionId, state);
+      const result = await this.request('thread/compact/start', {
+        threadId: state.threadId,
+      }, COMPACT_START_ACCEPT_TIMEOUT_MS);
+      // Some Codex app-server builds accept `thread/compact/start` as a
+      // synchronous/no-op request when there is no compactable turn and never
+      // emit `thread/compacted` or a `contextCompaction` item. Do not leave the
+      // IM.codes runtime permanently busy in that accepted-but-silent state;
+      // give the native event stream a short grace window, then settle the UI
+      // as a completed native compact request. If a real compaction item/status
+      // arrives, `compactObserved` cancels this fallback and we wait for the
+      // native completion signal instead.
+      if (state.runningCompact && !state.compactObserved) {
+        this.armCompactNoSignalSettle(sessionId, state, readParamTurnId(result ?? {}));
+      }
+    } catch (err) {
+      this.clearCompactTimers(state);
+      this.clearStatus(sessionId, state);
+      state.runningCompact = false;
+      state.runningTurnId = undefined;
+      state.compactObserved = false;
       this.emitError(sessionId, this.normalizeError(err));
     }
   }
@@ -547,6 +801,7 @@ export class CodexSdkProvider implements TransportProvider {
       // mid-flight.
       const result = await this.request('thread/resume', {
         threadId: state.threadId,
+        ...this.sessionEnvironmentParams(state),
         ...(state.model ? { model: state.model } : {}),
         baseInstructions,
       });
@@ -560,6 +815,7 @@ export class CodexSdkProvider implements TransportProvider {
 
     const result = await this.request('thread/start', {
       cwd: state.cwd,
+      ...this.sessionEnvironmentParams(state),
       approvalPolicy: 'never',
       sandbox: 'danger-full-access',
       personality: 'none',
@@ -574,6 +830,10 @@ export class CodexSdkProvider implements TransportProvider {
     state.loaded = true;
     this.threadToSession.set(threadId, sessionId);
     this.emitSessionInfo(sessionId, { resumeId: threadId, ...(state.model ? { model: state.model } : {}) });
+  }
+
+  private sessionEnvironmentParams(state: CodexSdkSessionState): { env?: Record<string, string> } {
+    return state.env && Object.keys(state.env).length > 0 ? { env: state.env } : {};
   }
 
   private handleLine(line: string): void {
@@ -618,20 +878,53 @@ export class CodexSdkProvider implements TransportProvider {
     }
 
     if (method === 'thread/tokenUsage/updated') {
-      const sessionId = this.threadToSession.get(params.threadId);
+      const threadId = readParamThreadId(params);
+      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
       const state = sessionId ? this.sessions.get(sessionId) : null;
-      const last = params.tokenUsage?.last;
-      if (!state || !last) return;
-      state.lastUsage = {
-        input_tokens: Number(last.inputTokens ?? 0),
-        cached_input_tokens: Number(last.cachedInputTokens ?? 0),
-        output_tokens: Number(last.outputTokens ?? 0),
-      };
+      if (!sessionId || !state) return;
+      const normalizedUsage = normalizeCodexTokenUsage(params);
+      if (!normalizedUsage) return;
+      state.lastUsage = normalizedUsage;
+      for (const cb of this.usageCallbacks) cb(sessionId, {
+        usage: normalizedUsage,
+        ...(state.model ? { model: state.model } : {}),
+      });
+      return;
+    }
+
+    if (method === 'thread/compacted') {
+      const threadId = readParamThreadId(params);
+      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
+      const state = sessionId ? this.sessions.get(sessionId) : null;
+      if (!sessionId || !state || !state.runningCompact) return;
+      this.completeCompact(sessionId, state, readParamTurnId(params));
+      return;
+    }
+
+    if (method === 'thread/status/changed') {
+      const threadId = readParamThreadId(params);
+      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
+      const state = sessionId ? this.sessions.get(sessionId) : null;
+      if (!sessionId || !state || !state.runningCompact) return;
+      const status = readThreadStatus(params);
+      if (isThreadActiveStatus(status)) {
+        state.compactObserved = true;
+        this.clearCompactSettleTimer(state);
+        this.emitStatus(sessionId, state, {
+          status: 'compacting',
+          label: 'Compacting context...',
+        });
+        return;
+      }
+      if (isThreadIdleStatus(status)) {
+        this.completeCompact(sessionId, state, readParamTurnId(params));
+      }
       return;
     }
 
     if (method === 'item/agentMessage/delta') {
-      const sessionId = this.threadToSession.get(params.threadId);
+      const threadId = readParamThreadId(params);
+      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
       this.clearStatus(sessionId, state);
@@ -648,12 +941,29 @@ export class CodexSdkProvider implements TransportProvider {
     }
 
     if (method === 'item/started' || method === 'item/completed') {
-      const sessionId = this.threadToSession.get(params.threadId);
+      const threadId = readParamThreadId(params);
+      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
 
       const item = params.item as Record<string, any> | undefined;
       if (!item) return;
+
+      if (item.type === 'contextCompaction') {
+        state.runningCompact = true;
+        state.compactObserved = true;
+        this.clearCompactSettleTimer(state);
+        state.runningTurnId = readParamTurnId(params) ?? state.runningTurnId;
+        if (method === 'item/completed') {
+          this.completeCompact(sessionId, state, readParamTurnId(params));
+          return;
+        }
+        this.emitStatus(sessionId, state, {
+          status: 'compacting',
+          label: 'Compacting context...',
+        });
+        return;
+      }
 
       if (item.type === 'reasoning') {
         this.emitStatus(sessionId, state, {
@@ -690,7 +1000,8 @@ export class CodexSdkProvider implements TransportProvider {
     }
 
     if (method === 'turn/completed') {
-      const sessionId = this.threadToSession.get(params.threadId);
+      const threadId = readParamThreadId(params);
+      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
       const turn = params.turn ?? {};
@@ -698,13 +1009,19 @@ export class CodexSdkProvider implements TransportProvider {
 
       if (status === 'failed') {
         this.clearCancelTimer(state);
+        this.clearCompactTimers(state);
         this.clearStatus(sessionId, state);
+        state.runningCompact = false;
+        state.compactObserved = false;
         state.runningTurnId = undefined;
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, turn.error?.message ?? 'Codex turn failed', false, turn.error));
         return;
       }
       if (status === 'interrupted') {
         this.clearCancelTimer(state);
+        this.clearCompactTimers(state);
+        state.runningCompact = false;
+        state.compactObserved = false;
         if (!state.runningTurnId && state.cancelled) {
           state.cancelled = false;
           return;
@@ -712,6 +1029,11 @@ export class CodexSdkProvider implements TransportProvider {
         this.clearStatus(sessionId, state);
         state.runningTurnId = undefined;
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
+        return;
+      }
+
+      if (state.runningCompact) {
+        this.completeCompact(sessionId, state, typeof turn.id === 'string' ? turn.id : undefined);
         return;
       }
 
@@ -741,16 +1063,61 @@ export class CodexSdkProvider implements TransportProvider {
     }
   }
 
-  private request(method: string, params: Record<string, any>): Promise<any> {
+  private request(method: string, params: Record<string, any>, timeoutMs?: number): Promise<any> {
     if (!this.child?.stdin.writable) {
       return Promise.reject(new Error('Codex app-server stdin is not writable'));
     }
     const id = this.nextRequestId++;
     const payload = JSON.stringify({ id, method, params });
     return new Promise((resolve, reject) => {
-      this.pendingRequests.set(id, { resolve, reject });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      if (timeoutMs && timeoutMs > 0 && Number.isFinite(timeoutMs)) {
+        timer = setTimeout(() => {
+          if (!this.pendingRequests.delete(id)) return;
+          reject(new Error(`Codex app-server request ${method} did not settle within ${Math.round(timeoutMs)}ms`));
+        }, timeoutMs);
+        timer.unref?.();
+      }
+      this.pendingRequests.set(id, {
+        resolve: (value) => {
+          if (timer) clearTimeout(timer);
+          resolve(value);
+        },
+        reject: (error) => {
+          if (timer) clearTimeout(timer);
+          reject(error);
+        },
+      });
       this.child!.stdin.write(`${payload}\n`);
     });
+  }
+
+  private completeCompact(sessionId: string, state: CodexSdkSessionState, turnId?: string): void {
+    this.clearCancelTimer(state);
+    this.clearCompactTimers(state);
+    this.clearStatus(sessionId, state);
+    state.runningCompact = false;
+    state.runningTurnId = undefined;
+    state.compactObserved = false;
+    state.currentMessageId = null;
+    state.currentText = '';
+    const completed: AgentMessage = {
+      id: turnId ? `${turnId}:context-compaction` : `${sessionId}:context-compaction:${Date.now()}`,
+      sessionId,
+      kind: 'system',
+      role: 'system',
+      content: 'Codex context compacted.',
+      timestamp: Date.now(),
+      status: 'complete',
+      metadata: {
+        provider: this.id,
+        event: 'thread/compacted',
+        [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact',
+        ...(state.threadId ? { resumeId: state.threadId } : {}),
+        ...(turnId ? { turnId } : {}),
+      },
+    };
+    for (const cb of this.completeCallbacks) cb(sessionId, completed);
   }
 
   /**
@@ -869,6 +1236,19 @@ export class CodexSdkProvider implements TransportProvider {
     this.emitStatus(sessionId, state, { status: null, label: null });
   }
 
+  private cancelCompactLocally(sessionId: string, state: CodexSdkSessionState): void {
+    this.clearCancelTimer(state);
+    this.clearCompactTimers(state);
+    this.clearStatus(sessionId, state);
+    state.runningCompact = false;
+    state.runningTurnId = undefined;
+    state.compactObserved = false;
+    state.currentMessageId = null;
+    state.currentText = '';
+    state.pendingComplete = undefined;
+    this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex compact cancelled', true));
+  }
+
   private emitError(sessionId: string, error: ProviderError): void {
     for (const cb of this.errorCallbacks) cb(sessionId, error);
   }
@@ -896,5 +1276,53 @@ export class CodexSdkProvider implements TransportProvider {
     if (!state.cancelTimer) return;
     clearTimeout(state.cancelTimer);
     state.cancelTimer = null;
+  }
+
+  private armCompactNoSignalSettle(sessionId: string, state: CodexSdkSessionState, turnId?: string): void {
+    this.clearCompactSettleTimer(state);
+    state.compactSettleTimer = setTimeout(() => {
+      if (!this.sessions.has(sessionId)) return;
+      if (!state.runningCompact || state.compactObserved) return;
+      this.completeCompact(sessionId, state, turnId);
+    }, COMPACT_NO_SIGNAL_SETTLE_MS);
+    state.compactSettleTimer.unref?.();
+  }
+
+  private armCompactHardTimeout(sessionId: string, state: CodexSdkSessionState): void {
+    this.clearCompactHardTimer(state);
+    state.compactHardTimer = setTimeout(() => {
+      if (!this.sessions.has(sessionId)) return;
+      if (!state.runningCompact) return;
+      this.clearCompactTimers(state);
+      this.clearStatus(sessionId, state);
+      state.runningCompact = false;
+      state.runningTurnId = undefined;
+      state.compactObserved = false;
+      state.currentMessageId = null;
+      state.currentText = '';
+      this.emitError(sessionId, this.makeError(
+        PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+        `Codex SDK compact did not complete within ${Math.round(COMPACT_HARD_TIMEOUT_MS)}ms`,
+        true,
+      ));
+    }, COMPACT_HARD_TIMEOUT_MS);
+    state.compactHardTimer.unref?.();
+  }
+
+  private clearCompactSettleTimer(state: CodexSdkSessionState): void {
+    if (!state.compactSettleTimer) return;
+    clearTimeout(state.compactSettleTimer);
+    state.compactSettleTimer = null;
+  }
+
+  private clearCompactHardTimer(state: CodexSdkSessionState): void {
+    if (!state.compactHardTimer) return;
+    clearTimeout(state.compactHardTimer);
+    state.compactHardTimer = null;
+  }
+
+  private clearCompactTimers(state: CodexSdkSessionState): void {
+    this.clearCompactSettleTimer(state);
+    this.clearCompactHardTimer(state);
   }
 }

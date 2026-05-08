@@ -11,6 +11,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // ── Module mocks (must be hoisted before any imports) ───────────────────────
 
+const getSessionMock = vi.hoisted(() => vi.fn());
+
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({
   timelineEmitter: {
     emit: vi.fn(),
@@ -24,6 +26,10 @@ vi.mock('../../src/daemon/transport-history.js', () => ({
 // Mock resolveSessionName to return identity mapping (providerSid === sessionName for tests)
 vi.mock('../../src/agent/session-manager.js', () => ({
   resolveSessionName: (providerSid: string) => providerSid,
+}));
+
+vi.mock('../../src/store/session-store.js', () => ({
+  getSession: getSessionMock,
 }));
 
 // ── Imports after mocks ──────────────────────────────────────────────────────
@@ -41,6 +47,7 @@ import { appendTransportEvent } from '../../src/daemon/transport-history.js';
 import type { TransportProvider } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
 import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
+import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
 
 // ── Mock provider factory ────────────────────────────────────────────────────
 
@@ -49,6 +56,7 @@ type CompleteCb = (sessionId: string, message: AgentMessage) => void;
 type ErrorCb = (sessionId: string, error: { code: string; message: string; recoverable: boolean }) => void;
 type ToolCb = (sessionId: string, tool: ToolCallEvent) => void;
 type StatusCb = (sessionId: string, status: { status: string | null; label?: string | null }) => void;
+type UsageCb = (sessionId: string, update: { usage?: Record<string, unknown>; model?: string }) => void;
 type ApprovalCb = (sessionId: string, request: { id: string; description: string; tool?: string }) => void;
 
 function makeMockProvider() {
@@ -57,6 +65,7 @@ function makeMockProvider() {
   let errorCb: ErrorCb | undefined;
   let toolCb: ToolCb | undefined;
   let statusCb: StatusCb | undefined;
+  let usageCb: UsageCb | undefined;
   let approvalCb: ApprovalCb | undefined;
 
   return {
@@ -66,6 +75,7 @@ function makeMockProvider() {
       onError: (cb: ErrorCb) => { errorCb = cb; return () => { errorCb = undefined; }; },
       onToolCall: (cb: ToolCb) => { toolCb = cb; },
       onStatus: (cb: StatusCb) => { statusCb = cb; return () => { statusCb = undefined; }; },
+      onUsage: (cb: UsageCb) => { usageCb = cb; return () => { usageCb = undefined; }; },
       onApprovalRequest: (cb: ApprovalCb) => { approvalCb = cb; },
     } as unknown as TransportProvider,
     fireDelta: (sid: string, delta: MessageDelta) => deltaCb?.(sid, delta),
@@ -73,6 +83,7 @@ function makeMockProvider() {
     fireError: (sid: string, err: { code: string; message: string; recoverable: boolean }) => errorCb?.(sid, err),
     fireTool: (sid: string, tool: ToolCallEvent) => toolCb?.(sid, tool),
     fireStatus: (sid: string, status: { status: string | null; label?: string | null }) => statusCb?.(sid, status),
+    fireUsage: (sid: string, update: { usage?: Record<string, unknown>; model?: string }) => usageCb?.(sid, update),
     fireApproval: (sid: string, request: { id: string; description: string; tool?: string }) => approvalCb?.(sid, request),
   };
 }
@@ -115,6 +126,7 @@ describe('transport-relay (timeline-emitter based)', () => {
     appendMock = vi.mocked(appendTransportEvent);
     emitMock.mockClear();
     appendMock.mockClear();
+    getSessionMock.mockReset();
   });
 
   afterEach(() => {
@@ -272,6 +284,21 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(textCall![2].text).toBe('part1 part2');
     });
 
+    it('does not render provider compact control completions as assistant text', () => {
+      const { provider, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireComplete('sess-1', makeMessage({
+        id: 'msg-compact',
+        kind: 'system',
+        role: 'system',
+        content: 'Context compressed.',
+        metadata: { [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact' },
+      }));
+
+      expect(emitMock.mock.calls.filter(c => c[1] === 'assistant.text')).toHaveLength(0);
+    });
+
     it('emits usage.update using current usage semantics when completion metadata includes model and usage', () => {
       const { provider, fireComplete } = makeMockProvider();
       wireProviderToRelay(provider);
@@ -295,6 +322,199 @@ describe('transport-relay (timeline-emitter based)', () => {
         inputTokens: 115,
         cacheTokens: 5,
         model: 'qwen3-coder-plus',
+      });
+    });
+
+    it('emits Codex SDK current-window context usage instead of cumulative billing usage', () => {
+      const { provider, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireComplete('sess-1', makeMessage({
+        id: 'msg-codex-usage',
+        metadata: {
+          model: 'gpt-5.4-mini',
+          usage: {
+            // CodexSdkProvider normalizes app-server tokenUsage.last into the
+            // provider-neutral fields and keeps tokenUsage.total only as diagnostics.
+            input_tokens: 9_000,
+            cached_input_tokens: 3_000,
+            cache_read_input_tokens: 3_000,
+            output_tokens: 200,
+            model_context_window: 258_400,
+            codex_total_input_tokens: 140_000,
+            codex_last_input_tokens: 12_000,
+            codex_last_cached_input_tokens: 3_000,
+          },
+        },
+      }));
+
+      const usageCall = emitMock.mock.calls.find(c => c[1] === 'usage.update');
+      expect(usageCall).toBeDefined();
+      expect(usageCall![2]).toMatchObject({
+        inputTokens: 9_000,
+        cacheTokens: 3_000,
+        model: 'gpt-5.4-mini',
+        contextWindow: 258_400,
+        contextWindowSource: 'provider',
+      });
+      expect(Number(usageCall![2].inputTokens) + Number(usageCall![2].cacheTokens)).toBe(12_000);
+    });
+
+    it('emits provider usage updates even when they arrive outside message completion', () => {
+      const { provider, fireUsage } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireUsage('sess-1', {
+        model: 'gpt-5.5',
+        usage: {
+          input_tokens: 42_000,
+          cache_read_input_tokens: 8_000,
+          cached_input_tokens: 8_000,
+          model_context_window: 258_400,
+        },
+      });
+
+      const usageCall = emitMock.mock.calls.find(c => c[1] === 'usage.update');
+      expect(usageCall).toBeDefined();
+      expect(usageCall![2]).toMatchObject({
+        inputTokens: 42_000,
+        cacheTokens: 8_000,
+        model: 'gpt-5.5',
+        contextWindow: 258_400,
+        contextWindowSource: 'provider',
+      });
+    });
+
+    it('honors Codex SDK provider effective window for GPT-5.5', () => {
+      const { provider, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireComplete('sess-1', makeMessage({
+        id: 'msg-codex-gpt55-usage',
+        metadata: {
+          model: 'gpt-5.5',
+          usage: {
+            input_tokens: 9_000,
+            cached_input_tokens: 3_000,
+            cache_read_input_tokens: 3_000,
+            model_context_window: 258_400,
+          },
+        },
+      }));
+
+      const usageCall = emitMock.mock.calls.find(c => c[1] === 'usage.update');
+      expect(usageCall).toBeDefined();
+      expect(usageCall![2]).toMatchObject({
+        inputTokens: 9_000,
+        cacheTokens: 3_000,
+        model: 'gpt-5.5',
+        contextWindow: 258_400,
+        contextWindowSource: 'provider',
+      });
+    });
+
+    it('honors Codex SDK provider 1M context window when reported for GPT-5.5', () => {
+      const { provider, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireComplete('sess-1', makeMessage({
+        id: 'msg-codex-gpt55-usage-1m',
+        metadata: {
+          model: 'gpt-5.5',
+          usage: {
+            input_tokens: 9_000,
+            cached_input_tokens: 3_000,
+            cache_read_input_tokens: 3_000,
+            model_context_window: 1_000_000,
+          },
+        },
+      }));
+
+      const usageCall = emitMock.mock.calls.find(c => c[1] === 'usage.update');
+      expect(usageCall).toBeDefined();
+      expect(usageCall![2]).toMatchObject({
+        inputTokens: 9_000,
+        cacheTokens: 3_000,
+        model: 'gpt-5.5',
+        contextWindow: 1_000_000,
+        contextWindowSource: 'provider',
+      });
+    });
+
+    it('uses the stored session model when Codex SDK usage omits model and honors 258k provider window for GPT-5.5', () => {
+      getSessionMock.mockReturnValue({
+        name: 'sess-1',
+        activeModel: 'gpt-5.5',
+      });
+      const { provider, fireUsage } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireUsage('sess-1', {
+        usage: {
+          input_tokens: 185_000,
+          cached_input_tokens: 5_000,
+          model_context_window: 258_400,
+        },
+      });
+
+      const usageCall = emitMock.mock.calls.find(c => c[1] === 'usage.update');
+      expect(usageCall).toBeDefined();
+      expect(usageCall![2]).toMatchObject({
+        inputTokens: 185_000,
+        cacheTokens: 5_000,
+        model: 'gpt-5.5',
+        contextWindow: 258_400,
+        contextWindowSource: 'provider',
+      });
+    });
+
+    it('uses the stored session model when usage omits both model and provider context window, using the API input-budget fallback for GPT-5.5', () => {
+      getSessionMock.mockReturnValue({
+        name: 'sess-1',
+        modelDisplay: 'gpt-5.5',
+      });
+      const { provider, fireUsage } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireUsage('sess-1', {
+        usage: {
+          input_tokens: 9_000,
+          cached_input_tokens: 0,
+        },
+      });
+
+      const usageCall = emitMock.mock.calls.find(c => c[1] === 'usage.update');
+      expect(usageCall).toBeDefined();
+      expect(usageCall![2]).toMatchObject({
+        inputTokens: 9_000,
+        cacheTokens: 0,
+        model: 'gpt-5.5',
+        contextWindow: 922_000,
+      });
+    });
+
+    it('uses the same stored session model fallback for non-GPT-5.5 models when usage omits model', () => {
+      getSessionMock.mockReturnValue({
+        name: 'sess-1',
+        activeModel: 'qwen3-coder-next',
+      });
+      const { provider, fireUsage } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireUsage('sess-1', {
+        usage: {
+          input_tokens: 12_000,
+          cached_input_tokens: 2_000,
+        },
+      });
+
+      const usageCall = emitMock.mock.calls.find(c => c[1] === 'usage.update');
+      expect(usageCall).toBeDefined();
+      expect(usageCall![2]).toMatchObject({
+        inputTokens: 12_000,
+        cacheTokens: 2_000,
+        model: 'qwen3-coder-next',
+        contextWindow: 262_144,
       });
     });
 

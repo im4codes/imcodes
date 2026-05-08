@@ -22,6 +22,7 @@ import { loadConfig, type Config } from '../config.js';
 import { loadCredentials } from '../bind/bind-flow.js';
 import { sendKeys } from '../agent/tmux.js';
 import logger from '../util/logger.js';
+import { recordDaemonStart } from '../util/daemon-status.js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -33,6 +34,7 @@ import { configureSharedContextRuntime } from '../context/shared-context-runtime
 import { fetchBackendSharedContextRuntimeConfig } from '../context/backend-runtime-config.js';
 import { setContextModelRuntimeConfig } from '../context/context-model-config.js';
 import { closeLiveContextMaterializationAdmission, LiveContextIngestion } from '../context/live-context-ingestion.js';
+import { LocalSkillReviewWorker } from '../context/skill-review-worker.js';
 import { resolveTransportContextBootstrap } from '../agent/runtime-context-bootstrap.js';
 import { pruneLocalMemory } from '../context/memory-pruning.js';
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
@@ -326,6 +328,7 @@ export async function startup(): Promise<DaemonContext> {
   }, 'Daemon starting');
   lockServer = await acquireInstanceLock();
   writePidFile();
+  recordDaemonStart({ version: DAEMON_VERSION });
 
   const config = await loadConfig();
   logger.info({ config: config.daemon }, 'Config loaded');
@@ -425,8 +428,10 @@ export async function startup(): Promise<DaemonContext> {
     }
   })();
 
+  const skillReviewWorker = new LocalSkillReviewWorker();
   const liveContextIngestion = new LiveContextIngestion({
     sessionLookup: getSession,
+    skillReviewScheduler: skillReviewWorker,
     resolveBootstrap: (session) => resolveTransportContextBootstrap({
       projectDir: session.projectDir,
       transportConfig: getSession(session.name)?.transportConfig ?? session.transportConfig ?? {},
@@ -902,6 +907,13 @@ export async function shutdown(exitCode = 0): Promise<void> {
     const { disconnectAll } = await import('../agent/provider-registry.js');
     await disconnectAll();
   } catch { /* ignore */ }
+
+  try {
+    const { shutdownDefaultPreviewReadCoordinatorForDaemon } = await import('./file-preview-read-coordinator.js');
+    await shutdownDefaultPreviewReadCoordinatorForDaemon();
+  } catch (err) {
+    logger.warn({ errorKind: err instanceof Error ? err.name : typeof err }, 'Daemon shutdown preview read drain failed');
+  }
 
   try {
     if (healthTimer) clearInterval(healthTimer);

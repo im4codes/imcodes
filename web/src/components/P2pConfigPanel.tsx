@@ -5,7 +5,7 @@
 import { useState, useEffect, useMemo, useRef } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { usePref } from '../hooks/usePref.js';
-import { PREF_KEY_P2P_SESSION_CONFIG_LEGACY, p2pSessionConfigPrefKey } from '../constants/prefs.js';
+import { p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../constants/prefs.js';
 import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p-config-pref.js';
 import { P2pComboManager } from './P2pComboManager.js';
 import { useP2pCustomCombos } from './p2p-combos.js';
@@ -38,6 +38,8 @@ interface Props {
   subSessions: SubSessionRow[];
   /** Active main session name — only show sessions scoped to this one by default */
   activeSession?: string | null;
+  /** Active server ID — P2P participant names are server-local, so saved config must be too. */
+  serverId?: string | null;
   initialTab?: 'participants' | 'combos';
   onClose: () => void;
   onSave: (config: P2pSavedConfig) => void;
@@ -230,6 +232,7 @@ export function P2pConfigPanel({
   sessions,
   subSessions,
   activeSession,
+  serverId,
   initialTab = 'participants',
   onClose,
   onSave,
@@ -310,10 +313,10 @@ export function P2pConfigPanel({
     [allEligible, sessionCfg],
   );
 
-  // Config key uses the main session (sub-sessions follow parent config)
-  const configKey = scopeSession ? p2pSessionConfigPrefKey(scopeSession) : null;
+  // Config key uses server + main session (sub-sessions follow parent config).
+  const configKey = scopeSession ? p2pSessionConfigPrefKey(scopeSession, serverId) : null;
   const p2pConfigPref = usePref<P2pSavedConfig>(configKey, {
-    legacyKey: PREF_KEY_P2P_SESSION_CONFIG_LEGACY,
+    legacyKey: scopeSession ? p2pSessionConfigLegacyPrefKeys(scopeSession) : undefined,
     parse: parseP2pSavedConfig,
     serialize: serializeP2pSavedConfig,
   });
@@ -363,13 +366,19 @@ export function P2pConfigPanel({
 
   const toggleEnabled = (key: string) => {
     markFormDirty();
+    const eligibleKeys = new Set(allEligible.map((entry) => entry.key));
     setSessionCfg((prev) => {
       const cur = prev[key] ?? { enabled: false, mode: 'audit' };
       const willEnable = !cur.enabled;
-      if (willEnable) {
-        // Enforce hard cap at toggle time so the UI never lets a user select more than MAX_P2P_PARTICIPANTS.
+      const willCountAsParticipant = willEnable && cur.mode !== 'skip';
+      if (willCountAsParticipant) {
+        // Enforce hard cap at toggle time so the UI never lets a user select
+        // more than MAX_P2P_PARTICIPANTS. Count only currently eligible
+        // sessions: old saved configs can contain stale/closed/other-scope
+        // entries, and those are pruned on save, so they must not block a
+        // user from selecting the visible in-scope participants.
         const currentlyEnabledCount = Object.entries(prev).filter(
-          ([k, e]) => k !== key && e?.enabled === true && e.mode !== 'skip',
+          ([k, e]) => k !== key && eligibleKeys.has(k) && e?.enabled === true && e.mode !== 'skip',
         ).length;
         if (currentlyEnabledCount >= MAX_P2P_PARTICIPANTS) {
           setSaveError(
@@ -387,8 +396,25 @@ export function P2pConfigPanel({
 
   const setMode = (key: string, mode: string) => {
     markFormDirty();
+    const eligibleKeys = new Set(allEligible.map((entry) => entry.key));
     setSessionCfg((prev) => {
       const cur = prev[key] ?? { enabled: false, mode: 'audit' };
+      const willCountAsParticipant = cur.enabled && mode !== 'skip';
+      const didCountAsParticipant = cur.enabled && cur.mode !== 'skip';
+      if (willCountAsParticipant && !didCountAsParticipant) {
+        const currentlyEnabledCount = Object.entries(prev).filter(
+          ([k, e]) => k !== key && eligibleKeys.has(k) && e?.enabled === true && e.mode !== 'skip',
+        ).length;
+        if (currentlyEnabledCount >= MAX_P2P_PARTICIPANTS) {
+          setSaveError(
+            t('p2p.settings_max_participants', 'P2P is limited to {{max}} participants. Disable one before enabling another.', {
+              max: MAX_P2P_PARTICIPANTS,
+            }),
+          );
+          return prev;
+        }
+      }
+      setSaveError(null);
       return { ...prev, [key]: { ...cur, mode } };
     });
   };

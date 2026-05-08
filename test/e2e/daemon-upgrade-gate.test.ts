@@ -304,7 +304,7 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
     addTransportSession('deck_stuck_codex_brain', { status: 'error' });
 
     const serverLink = { send: vi.fn() } as { send: ReturnType<typeof vi.fn> };
-    handleWebCommand({ type: 'daemon.upgrade' }, serverLink as any);
+    handleWebCommand({ type: 'daemon.upgrade', targetVersion: '99.99.99-test' }, serverLink as any);
     await waitForCondition(() => mocks.spawnCalls.length > 0, 5000).catch(() => {});
 
     expect(getBlockedMessage(serverLink)).toBeUndefined();
@@ -323,7 +323,7 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
     );
 
     const serverLink = { send: vi.fn() } as { send: ReturnType<typeof vi.fn> };
-    handleWebCommand({ type: 'daemon.upgrade' }, serverLink as any);
+    handleWebCommand({ type: 'daemon.upgrade', targetVersion: '99.99.99-test' }, serverLink as any);
     await waitForCondition(() => mocks.spawnCalls.length > 0, 5000).catch(() => {});
 
     expect(getBlockedMessage(serverLink)).toBeUndefined();
@@ -337,7 +337,7 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
     addTransportSession('deck_idle_brain', { status: 'idle' });
 
     const serverLink = { send: vi.fn() } as { send: ReturnType<typeof vi.fn> };
-    handleWebCommand({ type: 'daemon.upgrade' }, serverLink as any);
+    handleWebCommand({ type: 'daemon.upgrade', targetVersion: '99.99.99-test' }, serverLink as any);
     await waitForCondition(() => mocks.spawnCalls.length > 0, 5000).catch(() => {});
 
     expect(getBlockedMessage(serverLink)).toBeUndefined();
@@ -352,7 +352,7 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
     addTransportSession('deck_thinking_brain', { status: 'thinking' });
 
     const serverLink = { send: vi.fn() } as { send: ReturnType<typeof vi.fn> };
-    handleWebCommand({ type: 'daemon.upgrade' }, serverLink as any);
+    handleWebCommand({ type: 'daemon.upgrade', targetVersion: '99.99.99-test' }, serverLink as any);
     await flushAsync();
 
     expect(getBlockedMessage(serverLink)).toMatchObject({
@@ -380,7 +380,7 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
     addTransportSession('deck_streaming_brain', { status: 'streaming' });
 
     const serverLink = { send: vi.fn() } as { send: ReturnType<typeof vi.fn> };
-    handleWebCommand({ type: 'daemon.upgrade' }, serverLink as any);
+    handleWebCommand({ type: 'daemon.upgrade', targetVersion: '99.99.99-test' }, serverLink as any);
     await flushAsync();
 
     expect(getBlockedMessage(serverLink)).toMatchObject({
@@ -397,7 +397,7 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
     addTransportSession('deck_sending_brain', { status: 'idle', sending: true });
 
     const serverLink = { send: vi.fn() } as { send: ReturnType<typeof vi.fn> };
-    handleWebCommand({ type: 'daemon.upgrade' }, serverLink as any);
+    handleWebCommand({ type: 'daemon.upgrade', targetVersion: '99.99.99-test' }, serverLink as any);
     await flushAsync();
 
     expect(getBlockedMessage(serverLink)).toMatchObject({
@@ -413,7 +413,7 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
     addTransportSession('deck_queued_brain', { status: 'idle', pendingCount: 2 });
 
     const serverLink = { send: vi.fn() } as { send: ReturnType<typeof vi.fn> };
-    handleWebCommand({ type: 'daemon.upgrade' }, serverLink as any);
+    handleWebCommand({ type: 'daemon.upgrade', targetVersion: '99.99.99-test' }, serverLink as any);
     await flushAsync();
 
     expect(getBlockedMessage(serverLink)).toMatchObject({
@@ -434,7 +434,7 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
     addTransportSession('deck_stuck_brain', { status: 'error' });
 
     const serverLink = { send: vi.fn() } as { send: ReturnType<typeof vi.fn> };
-    handleWebCommand({ type: 'daemon.upgrade' }, serverLink as any);
+    handleWebCommand({ type: 'daemon.upgrade', targetVersion: '99.99.99-test' }, serverLink as any);
     await flushAsync();
 
     const blocked = getBlockedMessage(serverLink);
@@ -448,7 +448,7 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
 
   it("proceeds with no transport sessions and no P2P runs", async () => {
     const serverLink = { send: vi.fn() } as { send: ReturnType<typeof vi.fn> };
-    handleWebCommand({ type: 'daemon.upgrade' }, serverLink as any);
+    handleWebCommand({ type: 'daemon.upgrade', targetVersion: '99.99.99-test' }, serverLink as any);
     await waitForCondition(() => mocks.spawnCalls.length > 0, 5000).catch(() => {});
 
     expect(getBlockedMessage(serverLink)).toBeUndefined();
@@ -478,7 +478,7 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
     // No runtime registered for this session name.
 
     const serverLink = { send: vi.fn() } as { send: ReturnType<typeof vi.fn> };
-    handleWebCommand({ type: 'daemon.upgrade' }, serverLink as any);
+    handleWebCommand({ type: 'daemon.upgrade', targetVersion: '99.99.99-test' }, serverLink as any);
     await waitForCondition(() => mocks.spawnCalls.length > 0, 5000).catch(() => {});
 
     expect(getBlockedMessage(serverLink)).toBeUndefined();
@@ -500,8 +500,8 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
 //
 // These tests pin the post-fix contract for the bash branch:
 //   1. Real install exit code is captured (no more "(exit 0)" lie).
-//   2. ETARGET retries 4× with 30/60/120s back-off + cache-clean.
-//   3. Non-ETARGET errors fail-fast and tail the npm output into the log.
+//   2. Pinned versions use a cheap registry precheck before heavyweight install.
+//   3. Retryable npm errors back off without wiping the entire npm cache.
 //   4. Generated bash is syntactically valid.
 //
 // Skipped on Windows because that branch returns early — see the
@@ -541,29 +541,28 @@ skipOnWindows('daemon.upgrade — Linux/macOS upgrade.sh contract', () => {
     expect(sh).not.toMatch(/install FAILED \(exit \$\?\) — keeping current daemon running/);
   });
 
-  it('retries up to 4 times on ETARGET with packument cache-clean between attempts', async () => {
+  it('prechecks pinned target visibility and retries without wiping the whole npm cache', async () => {
     const sh = await captureUpgradeScript();
-    // Loop bounded by MAX_ATTEMPTS=4 with explicit per-attempt back-off.
-    // 60/180/300s = 1m/3m/5m — the 5-min last gap is the deliberately
-    // wide window: a real production CDN edge took >2m to replicate
-    // and the previous 120s ceiling missed it.
-    expect(sh).toMatch(/MAX_ATTEMPTS=4/);
-    expect(sh).toMatch(/RETRY_DELAYS=\(0 60 180 300\)/);
-    // ETARGET detection is the trigger; non-ETARGET must NOT retry.
+
+    expect(sh).toMatch(/MAX_ATTEMPTS=5/);
+    expect(sh).toMatch(/RETRY_DELAYS=\(0 15 30 60 120\)/);
+    expect(sh).toContain('registry visibility precheck for');
+    expect(sh).toMatch(/view --prefer-online imcodes@99\.99\.99-test version/);
+    expect(sh).toContain('target never became visible across $MAX_ATTEMPTS attempts');
     expect(sh).toMatch(/grep -qiE 'code ETARGET\|No matching version found'/);
-    // Cache-clean between attempts so npm refetches origin instead of
-    // revalidating into the stale cached 200.
-    expect(sh).toMatch(/cache clean --force/);
+    // Regression: `npm cache clean --force` made the next successful
+    // install redownload the whole SDK dependency graph.
+    expect(sh).not.toMatch(/eval "\$NPM_RUN cache clean --force"/);
     // --prefer-online forces revalidation on the first attempt too.
     expect(sh).toMatch(/install -g --ignore-scripts --prefer-online/);
   });
 
-  it('non-ETARGET failures bail after 1 attempt and tail npm output into the log', async () => {
+  it('retries transient network failures and tails non-retryable npm output', async () => {
     const sh = await captureUpgradeScript();
-    // The non-ETARGET branch must `break` out of the retry loop AND
-    // surface the npm error tail prefixed into upgrade.log so operators
-    // can diagnose without re-reading the giant per-attempt file.
-    expect(sh).toMatch(/non-ETARGET failure — not retrying/);
+
+    expect(sh).toMatch(/ECONNRESET\|ETIMEDOUT\|EAI_AGAIN/);
+    expect(sh).toContain('retryable npm failure ($RETRY_REASON) — retrying');
+    expect(sh).toMatch(/non-retryable npm failure — not retrying/);
     expect(sh).toMatch(/tail -20 "\$INSTALL_OUT"/);
   });
 
@@ -583,6 +582,16 @@ skipOnWindows('daemon.upgrade — Linux/macOS upgrade.sh contract', () => {
     expect(restartIdx).toBeGreaterThan(-1);
     expect(lockIdx).toBeLessThan(installIdx);
     expect(lockIdx).toBeLessThan(restartIdx);
+  });
+
+  it('does not leave a raw 24h cleanup sleeper inside the daemon service cgroup on Linux', async () => {
+    const sh = await captureUpgradeScript();
+
+    expect(sh).toContain('schedule_self_cleanup()');
+    expect(sh).toContain('systemd-run --user --unit="$CLEANUP_UNIT"');
+    expect(sh).toContain('skipped background sleeper on Linux to avoid leaking into imcodes.service cgroup');
+    expect(sh).not.toMatch(/sleep 86400 && rm -rf/);
+    expect(sh.match(/schedule_self_cleanup/g)?.length ?? 0).toBeGreaterThanOrEqual(6);
   });
 
   it('generated bash is syntactically valid (`bash -n` passes)', async () => {

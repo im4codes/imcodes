@@ -66,6 +66,31 @@ export type ProviderErrorCode = typeof PROVIDER_ERROR_CODES[keyof typeof PROVIDE
 
 // ── Supporting types ────────────────────────────────────────────────────────
 
+export type ProviderCompactExecution = 'sdk-rpc' | 'slash-command' | 'unsupported';
+export type ProviderCompactCompletion =
+  | 'rpc-result'
+  | 'provider-event'
+  | 'rpc-result-or-provider-event'
+  | 'command-result'
+  | 'status-only'
+  | 'none';
+export type ProviderCompactCancellation = 'provider-cancel' | 'local-cancel' | 'timeout-only' | 'none';
+
+export interface ProviderCompactCapability {
+  /** How this provider executes the `/compact` control command. */
+  execution: ProviderCompactExecution;
+  /** Provider-native slash command used when execution is `slash-command`. */
+  providerCommand?: `/${string}`;
+  /** Whether the execution strategy is backed by this locked SDK/protocol version. */
+  verified: boolean;
+  /** Where completion signals come from, if any. */
+  completion: ProviderCompactCompletion;
+  /** Whether an in-flight compact can be cancelled or only locally abandoned. */
+  cancellation: ProviderCompactCancellation;
+  /** Human-readable reason for unsupported or unverified behavior. */
+  reason?: string;
+}
+
 /**
  * Provider capability flags.
  * Consumers MUST check the relevant flag before calling optional interface methods.
@@ -89,6 +114,8 @@ export interface ProviderCapabilities {
   supportedEffortLevels?: readonly TransportEffortLevel[];
   /** How well this provider can honor normalized shared-context payloads. */
   contextSupport?: ProviderSupportClass;
+  /** Provider-specific `/compact` execution support. */
+  compact?: ProviderCompactCapability;
 }
 
 /**
@@ -223,6 +250,22 @@ export interface ProviderStatusUpdate {
   label?: string | null;
 }
 
+/** Provider-reported token/context usage update. */
+export interface ProviderUsageUpdate {
+  /** Provider-native usage fields normalized enough for the daemon relay. */
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
+    cached_input_tokens?: number;
+    model_context_window?: number;
+    [key: string]: unknown;
+  };
+  /** Active model for resolving display context-window limits. */
+  model?: string;
+}
+
 // ── TransportProvider interface ─────────────────────────────────────────────
 
 /**
@@ -334,6 +377,14 @@ export interface TransportProvider {
    * Used by SDK-backed providers that can surface phases before a final response arrives.
    */
   onStatus?(cb: (sessionId: string, status: ProviderStatusUpdate) => void): () => void;
+
+  /**
+   * Register a callback for token/context usage updates that can arrive
+   * independently from final assistant messages. Used by transports such as
+   * Codex SDK where tokenUsage notifications may race before or after
+   * item/turn completion.
+   */
+  onUsage?(cb: (sessionId: string, update: ProviderUsageUpdate) => void): () => void;
 
   /**
    * Register a callback for approval requests from the agent.

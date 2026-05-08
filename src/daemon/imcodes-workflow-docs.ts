@@ -2,6 +2,7 @@
  * Shared IM.codes workflow docs reused across agent bootstrap context and
  * supervision prompts so command guidance stays consistent.
  */
+import { IMCODES_SESSION_ENV, IMCODES_SESSION_LABEL_ENV } from '../../shared/imcodes-send.js';
 
 export const AGENT_SEND_DOCS = `
 ## Inter-Agent Communication
@@ -23,7 +24,9 @@ Use \`imcodes send --list\` to see available sibling sessions.
 Notes:
 - Messages are delivered via the daemon's hook server. If the target is busy, the message is queued.
 - The \`--files\` flag attaches file references; format depends on the target agent type.
-- Your session identity is auto-detected from $IMCODES_SESSION.
+- Your session identity is auto-detected from $${IMCODES_SESSION_ENV}. SDK/transport sessions also expose
+  $${IMCODES_SESSION_LABEL_ENV} for display only; prefer $${IMCODES_SESSION_ENV} in generated commands because labels
+  can be duplicated.
 - If the user wants the agent to coordinate with another session, ask another worker to help, or hand work/results to a sibling session, this is usually actionable through \`imcodes send\` and should not by itself force human intervention.
 `.trim();
 

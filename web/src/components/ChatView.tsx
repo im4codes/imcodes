@@ -9,13 +9,17 @@ import { memo } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { TimelineEvent, WsClient, MemoryContextTimelinePayload, MemoryContextTimelineItem } from '../ws-client.js';
 import type { FileChangeBatch, FileChangePatch } from '@shared/file-change.js';
+import { SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL } from '@shared/session-control-commands.js';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
 import { FileBrowser } from './file-browser-lazy.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
+import { FontPrefsDropdown, useFontPrefs, DEFAULT_CHAT_FONT } from './FontPrefsDropdown.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
 import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 import type { TimelineHistoryStatus, TimelineHistoryStepKey } from '../hooks/useTimeline.js';
+import { positionChatActionMenu } from '../chat-action-menu-position.js';
+import { splitTextByHttpUrls } from '../link-detection.js';
 
 interface Props {
   events: TimelineEvent[];
@@ -89,13 +93,6 @@ function hasFileExtension(path: string): boolean {
 
 function isLikelyDomainPath(value: string): boolean {
   return /^(?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/|$)/i.test(value);
-}
-
-function trimDetectedUrl(url: string): string {
-  const hardStop = url.search(/[（【《「『，。；：！？⬇]/u);
-  let next = hardStop >= 0 ? url.slice(0, hardStop) : url;
-  while (next.length > 1 && /[.,;:!?)}\]>）】》」』，。；：！？⬇]$/u.test(next)) next = next.slice(0, -1);
-  return next;
 }
 
 function formatMemoryContextScore(score: number | undefined): string | null {
@@ -550,6 +547,8 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
 interface SelectionMenu {
   x: number;
   y: number;
+  anchorClientX: number;
+  anchorClientY: number;
   text: string;
 }
 
@@ -610,12 +609,14 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const bottomRef = useRef<HTMLDivElement>(null);
   const [fileBrowserTarget, setFileBrowserTarget] = useState<FileBrowserTarget | null>(null);
   const [selMenu, setSelMenu] = useState<SelectionMenu | null>(null);
+  const selMenuRef = useRef<HTMLDivElement>(null);
   const [copied, setCopied] = useState(false);
   const [pendingUrl, setPendingUrl] = useState<string | null>(null);
   const [highlightEl, setHighlightEl] = useState<HTMLElement | null>(null);
   const highlightElRef = useRef(highlightEl);
   highlightElRef.current = highlightEl;
-  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; text: string } | null>(null);
+  const [ctxMenu, setCtxMenu] = useState<SelectionMenu | null>(null);
+  const ctxMenuRef = useRef<HTMLDivElement>(null);
   // Timestamp when ctx menu was opened — clicks within 400ms are synthetic (from long-press release)
   const menuOpenedAtRef = useRef(0);
 
@@ -894,6 +895,19 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // otherwise have to scroll up to re-read it. Below / intersecting cases
   // both leave the pin hidden.
   useEffect(() => {
+    // Preview mode (sub-session card) never renders the pinned banner — it
+    // sits in `.chat-main`'s normal flow as a sibling of `.chat-view`, so its
+    // appearance/disappearance shifts content height by ~60 px. Inside the
+    // small preview card the user's last bubble can be just outside the
+    // viewport top by ≤60 px; banner-shows pushes the bubble down into the
+    // viewport, IO fires `isIntersecting=true`, banner-hides pulls the
+    // bubble back above viewport, IO fires again — infinite oscillation
+    // around ~50–100 px from bottom. Bail in preview so neither the banner
+    // nor the observer can run.
+    if (preview) {
+      setPinnedAboveViewport(false);
+      return;
+    }
     if (!lastSentUserMessage) {
       setPinnedAboveViewport(false);
       return;
@@ -947,7 +961,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     }, { root, threshold: [0, 1] });
     observer.observe(target);
     return () => observer.disconnect();
-  }, [lastSentUserMessage?.eventId]);
+  }, [lastSentUserMessage?.eventId, preview]);
 
   // Auto-scroll only on visible new events — agent.status / assistant.thinking / usage.update
   // events are filtered from the chat view but still part of `events`, so using the raw last ts
@@ -1126,6 +1140,42 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   }, [preview]);
 
   const isTouchDevice = 'ontouchstart' in window;
+  const getActionMenuContainerRect = useCallback(() => {
+    const container = scrollRef.current;
+    if (!container) return null;
+    const mainEl = container.closest('.chat-main') as HTMLElement | null;
+    return (mainEl ?? container).getBoundingClientRect();
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!selMenu || !selMenuRef.current) return;
+    const containerRect = getActionMenuContainerRect();
+    if (!containerRect) return;
+    const menuRect = selMenuRef.current.getBoundingClientRect();
+    const next = positionChatActionMenu(
+      selMenu.anchorClientX,
+      selMenu.anchorClientY,
+      containerRect,
+      { width: menuRect.width, height: menuRect.height },
+    );
+    if (Math.abs(selMenu.x - next.x) < 0.5 && Math.abs(selMenu.y - next.y) < 0.5) return;
+    setSelMenu({ ...selMenu, ...next });
+  }, [getActionMenuContainerRect, selMenu]);
+
+  useLayoutEffect(() => {
+    if (!ctxMenu || !ctxMenuRef.current) return;
+    const containerRect = getActionMenuContainerRect();
+    if (!containerRect) return;
+    const menuRect = ctxMenuRef.current.getBoundingClientRect();
+    const next = positionChatActionMenu(
+      ctxMenu.anchorClientX,
+      ctxMenu.anchorClientY,
+      containerRect,
+      { width: menuRect.width, height: menuRect.height },
+    );
+    if (Math.abs(ctxMenu.x - next.x) < 0.5 && Math.abs(ctxMenu.y - next.y) < 0.5) return;
+    setCtxMenu({ ...ctxMenu, ...next });
+  }, [ctxMenu, getActionMenuContainerRect]);
 
   // Desktop: show selection popup menu when text is selected within the chat view
   useEffect(() => {
@@ -1145,11 +1195,15 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       const text = sel.toString().trim();
       if (!text) { setSelMenu(null); return; }
       const selRect = range.getBoundingClientRect();
-      const wrapEl = container.closest('.chat-view-wrap') as HTMLElement | null;
-      const wrapRect = (wrapEl ?? container).getBoundingClientRect();
+      const mainEl = container.closest('.chat-main') as HTMLElement | null;
+      const mainRect = (mainEl ?? container).getBoundingClientRect();
+      const anchorClientX = selRect.left + selRect.width / 2;
+      const anchorClientY = selRect.top;
+      const position = positionChatActionMenu(anchorClientX, anchorClientY, mainRect);
       setSelMenu({
-        x: selRect.left + selRect.width / 2 - wrapRect.left,
-        y: selRect.top - wrapRect.top,
+        ...position,
+        anchorClientX,
+        anchorClientY,
         text,
       });
       setCopied(false);
@@ -1165,15 +1219,17 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     setHighlightEl(target);
     const text = extractChatEventText(target);
     if (!text) return;
-    const mainEl = scrollRef.current?.closest('.chat-main') as HTMLElement | null;
-    const mainRect = (mainEl ?? scrollRef.current!).getBoundingClientRect();
+    const mainRect = getActionMenuContainerRect();
+    if (!mainRect) return;
+    const position = positionChatActionMenu(clientX, clientY, mainRect);
     menuOpenedAtRef.current = Date.now();
     setCtxMenu({
-      x: Math.max(40, Math.min(clientX - mainRect.left, mainRect.width - 80)),
-      y: Math.max(10, Math.min(clientY - mainRect.top - 40, mainRect.height - 120)),
+      ...position,
+      anchorClientX: clientX,
+      anchorClientY: clientY,
       text,
     });
-  }, []);
+  }, [getActionMenuContainerRect]);
 
   // Desktop: right-click → contextmenu event → custom menu
   const handleContextMenu = useCallback((e: Event) => {
@@ -1239,6 +1295,15 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   }, [isTouchDevice, preview, openCtxMenu]);
 
   const canShowFilePanel = !preview && !!ws;
+  // Per-machine chat-window font preference (family + size). Stored in
+  // localStorage under `imcodes_fontPrefs:chat`; not synced across devices,
+  // because each machine's display, OS font availability, and viewing
+  // distance differ. Surfaced via the title-bar dropdown on every platform
+  // — phones included — so users can pick the font that reads best for them.
+  const [chatFontPrefs, setChatFontPrefs] = useFontPrefs('chat', DEFAULT_CHAT_FONT);
+  const chatFontStyle = !preview
+    ? { fontSize: `${chatFontPrefs.size}px`, fontFamily: chatFontPrefs.family }
+    : undefined;
   const historySteps = useMemo(() => {
     if (!historyStatus || historyStatus.phase === 'idle') return [];
     const order: TimelineHistoryStepKey[] = ['cache', 'textTail', 'daemon', 'http', 'older'];
@@ -1273,6 +1338,31 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
         </button>
       )}
       <div class="chat-main">
+        {!preview && (
+          <div
+            class="chat-titlebar"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              // Left-align the font dropdown so it doesn't collide with the
+              // absolutely-positioned `chat-panel-toggle` (⊞) at top:6/right:8.
+              // The two controls now sit at opposite ends and never overlap.
+              justifyContent: 'flex-start',
+              gap: 6,
+              padding: '4px 8px',
+              minHeight: 30,
+              flexShrink: 0,
+              borderBottom: '1px solid rgba(51,65,85,0.5)',
+              background: 'rgba(15,23,42,0.35)',
+            }}
+          >
+            <FontPrefsDropdown
+              prefs={chatFontPrefs}
+              onChange={setChatFontPrefs}
+              variant="compact"
+            />
+          </div>
+        )}
         {showRefreshOverlay && (
           <div
             class={`chat-history-overlay${showHistoryProgress ? ' has-steps' : ''}`}
@@ -1297,7 +1387,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
             )}
           </div>
         )}
-        {pinnedAboveViewport && lastSentUserMessage && (
+        {!preview && pinnedAboveViewport && lastSentUserMessage && (
           <div
             class={`chat-pinned-last-sent${pinnedExpanded ? ' chat-pinned-expanded' : ''}`}
             role="button"
@@ -1328,7 +1418,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
             <span class="chat-pinned-last-sent-text">{lastSentUserMessage.text}</span>
           </div>
         )}
-        <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} onScroll={preview ? undefined : handleScroll}
+        <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} style={chatFontStyle} onScroll={preview ? undefined : handleScroll}
           // Keyboard parity for the floating "↓" button: End force-engages
           // follow and jumps to bottom. tabIndex={-1} keeps it scriptable
           // without inserting it into the natural tab order.
@@ -1421,20 +1511,21 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
               );
             }
             if (item.type === 'tool-group') {
-              return <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onDownload={downloadHandler} serverId={serverId} />;
+              return <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} serverId={serverId} />;
             }
             const linkedEvents = item.linkedEvents ?? [];
             if (linkedEvents.length === 0) {
-              return <ChatEvent key={item.key} event={item.event!} onPathClick={pathClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />;
+              return <ChatEvent key={item.key} event={item.event!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />;
             }
             return (
               <div key={item.key} class="chat-linked-event-group">
-                <ChatEvent event={item.event!} onPathClick={pathClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />
+                <ChatEvent event={item.event!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />
                 {linkedEvents.map((linkedEvent) => (
                   <ChatEvent
                     key={linkedEvent.eventId}
                     event={linkedEvent}
                     onPathClick={pathClickHandler}
+                    onUrlClick={urlClickHandler}
                     onFileChangeOpen={handleFileChangeOpen}
                     onDownload={downloadHandler}
                     serverId={serverId}
@@ -1464,6 +1555,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
         )}
         {selMenu && !preview && (
           <div
+            ref={selMenuRef}
             class="chat-sel-menu"
             style={{ left: `${selMenu.x}px`, top: `${selMenu.y}px` }}
             onMouseDown={(e) => e.preventDefault()}
@@ -1498,6 +1590,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
         )}
         {ctxMenu && !preview && (
           <div
+            ref={ctxMenuRef}
             class="chat-sel-menu"
             style={{ left: `${ctxMenu.x}px`, top: `${ctxMenu.y}px` }}
             onMouseDown={(e) => e.preventDefault()}
@@ -1569,14 +1662,23 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       )}
       {/* External link confirm dialog */}
       {pendingUrl && (
-        <div class="dialog-overlay" onClick={() => setPendingUrl(null)}>
-          <div class="dialog-box" onClick={(e: Event) => e.stopPropagation()}>
-            <div class="dialog-title">{t('chat.external_link_title')}</div>
-            <p style={{ fontSize: 13, color: '#94a3b8', margin: '8px 0', wordBreak: 'break-all' }}>{pendingUrl}</p>
-            <p style={{ fontSize: 12, color: '#f59e0b', margin: '8px 0' }}>{t('chat.external_link_warning')}</p>
-            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 12 }}>
-              <button class="dialog-btn" onClick={() => setPendingUrl(null)}>{t('chat.external_link_cancel')}</button>
-              <button class="dialog-btn dialog-btn-primary" onClick={() => {
+        <div class="dialog-overlay external-link-overlay" onClick={() => setPendingUrl(null)}>
+          <div
+            class="external-link-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="external-link-dialog-title"
+            onClick={(e: Event) => e.stopPropagation()}
+          >
+            <div class="external-link-heading">
+              <span class="external-link-icon" aria-hidden="true">↗</span>
+              <div class="external-link-title" id="external-link-dialog-title">{t('chat.external_link_title')}</div>
+            </div>
+            <div class="external-link-url" title={pendingUrl}>{pendingUrl}</div>
+            <div class="external-link-warning">{t('chat.external_link_warning')}</div>
+            <div class="external-link-actions">
+              <button class="external-link-btn" onClick={() => setPendingUrl(null)}>{t('chat.external_link_cancel')}</button>
+              <button class="external-link-btn external-link-btn-primary" onClick={() => {
                 window.open(pendingUrl, '_blank', 'noopener,noreferrer');
                 setPendingUrl(null);
               }}>{t('chat.external_link_open')}</button>
@@ -1663,11 +1765,13 @@ function ToolBlockFold({ children }: { children: preact.ComponentChildren }) {
 function ToolCallGroup({
   events,
   onPathClick,
+  onUrlClick,
   onDownload,
   serverId,
 }: {
   events: TimelineEvent[];
   onPathClick?: (p: string) => void;
+  onUrlClick?: (url: string) => void;
   onDownload?: (path: string) => void;
   serverId?: string;
 }) {
@@ -1679,18 +1783,18 @@ function ToolCallGroup({
 
   return (
     <div class="chat-tool-group">
-      <ChatEvent event={first} onPathClick={onPathClick} onDownload={onDownload} serverId={serverId} />
+      <ChatEvent event={first} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} serverId={serverId} />
       <div class="chat-tool-group-indent">
         {middle.length > 0 && (
           expanded ? (
-            middle.map((ev) => <ChatEvent key={ev.eventId} event={ev} onPathClick={onPathClick} onDownload={onDownload} serverId={serverId} />)
+            middle.map((ev) => <ChatEvent key={ev.eventId} event={ev} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} serverId={serverId} />)
           ) : (
             <button class="chat-tool-fold-btn" onClick={() => setExpanded(true)}>
               {t('chat.tool_group_more', { count: middle.length })}
             </button>
           )
         )}
-        {last && <ChatEvent event={last} onPathClick={onPathClick} onDownload={onDownload} serverId={serverId} showTime />}
+        {last && <ChatEvent event={last} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} serverId={serverId} showTime />}
         {expanded && middle.length > 0 && (
           <button class="chat-tool-fold-btn" onClick={() => setExpanded(false)}>
             {t('chat.tool_group_collapse')}
@@ -1772,6 +1876,7 @@ function AttachmentDownloadButton({ att, serverId, onPathClick }: { att: { id: s
 const ChatEvent = memo(function ChatEvent({
   event,
   onPathClick,
+  onUrlClick,
   onFileChangeOpen,
   onDownload,
   serverId,
@@ -1780,6 +1885,7 @@ const ChatEvent = memo(function ChatEvent({
 }: {
   event: TimelineEvent;
   onPathClick?: (p: string) => void;
+  onUrlClick?: (url: string) => void;
   onFileChangeOpen?: (path: string, preferDiff?: boolean) => void;
   onDownload?: (path: string) => void;
   serverId?: string;
@@ -1810,7 +1916,7 @@ const ChatEvent = memo(function ChatEvent({
           {attachments && serverId && attachments.map((att) => (
             <AttachmentDownloadButton key={att.id} att={att} serverId={serverId} onPathClick={onPathClick} />
           ))}
-          {userText && <div class="chat-bubble-content">{splitPathsAndUrls(userText, onPathClick, undefined, onDownload)}</div>}
+          {userText && <div class="chat-bubble-content">{splitPathsAndUrls(userText, onPathClick, onUrlClick, onDownload)}</div>}
           {isPending && (
             <span
               class="chat-user-status chat-user-status-pending"
@@ -1858,12 +1964,12 @@ const ChatEvent = memo(function ChatEvent({
           <div class="chat-event chat-tool">
             <span class="chat-tool-icon">{'>'}</span>
             <span class="chat-tool-name">{toolName}</span>
-            {toolInput && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInput, onPathClick, undefined, onDownload)}</span>}
+            {toolInput && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInput, onPathClick, onUrlClick, onDownload)}</span>}
             {shouldShowTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{new Date(event.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>}
           </div>
           {toolOutput && (
             <div class="chat-event chat-tool chat-tool-result-preview">
-              <span class="chat-tool-output">{splitPathsAndUrls(toolOutput, onPathClick, undefined, onDownload)}</span>
+              <span class="chat-tool-output">{splitPathsAndUrls(toolOutput, onPathClick, onUrlClick, onDownload)}</span>
             </div>
           )}
           {(callDetail || resultDetail) && (
@@ -1891,7 +1997,7 @@ const ChatEvent = memo(function ChatEvent({
             {error ? (
             <span class="chat-tool-error">{`error: ${String(error)}`}</span>
           ) : output ? (
-              <span class="chat-tool-output">{splitPathsAndUrls(output, onPathClick, undefined, onDownload)}</span>
+              <span class="chat-tool-output">{splitPathsAndUrls(output, onPathClick, onUrlClick, onDownload)}</span>
             ) : (
               <span class="chat-tool-output">done</span>
             )}
@@ -1918,17 +2024,20 @@ const ChatEvent = memo(function ChatEvent({
 
     case 'session.state': {
       const state = String(event.payload.state ?? '');
+      const isUserCancelFeedback = event.payload.reason === SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL;
       const stateLabel: Record<string, string> = {
         idle: 'Agent idle — waiting for input',
         running: 'Agent working...',
         started: 'Session started',
         starting: 'Session starting...',
+        stopping: t('session.state_stopping'),
         stopped: 'Session stopped',
       };
+      const label = isUserCancelFeedback ? t('session.state_stop_requested') : (stateLabel[state] ?? state);
       const inline = state === 'idle' || state === 'running';
       return (
         <div class="chat-event chat-system" style={inline ? { display: 'flex', alignItems: 'center', gap: 8 } : undefined}>
-          <span>{stateLabel[state] ?? state}</span>
+          <span>{label}</span>
           {inline
             ? <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{new Date(event.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
             : <ChatTime ts={event.ts} />}
@@ -2352,8 +2461,6 @@ const ChatTime = memo(function ChatTime({ ts }: { ts: number }) {
 // ── Markdown rendering delegated to ChatMarkdown.tsx ──────────────────────
 
 // ── URL detection (must run BEFORE path detection) ────────────────────────
-const URL_REGEX = /https?:\/\/[^\s<>"\])}）】》」』，。；：！？（【《「『]+/g;
-
 // Matches absolute paths (/foo/bar) and relative paths (docs/file.md, src/components/Foo.tsx).
 const PATH_REGEX = /(\\\\[\w.$ -]+\\[\w.$ \\-]+|[A-Za-z]:\\(?:[\w.$ -]+\\)*[\w.$ -]+|\.{1,2}\/[\w\p{L}.\-~/]+|\/[\w\p{L}.\-~][\w\p{L}.\-~/]*|(?<![:/\w\p{L}])[a-zA-Z_~][\w\p{L}.\-~]*(?:\/[\w\p{L}.\-~]+)+)/gu;
 
@@ -2368,22 +2475,7 @@ function splitPathsAndUrls(
 
   // Step 1: Split by URLs first (URLs take priority over path detection)
   const parts: preact.JSX.Element[] = [];
-  let last = 0;
-  let m: RegExpExecArray | null;
-  URL_REGEX.lastIndex = 0;
-
-  interface TextChunk { type: 'text' | 'url'; value: string; start: number }
-  const chunks: TextChunk[] = [];
-
-  while ((m = URL_REGEX.exec(text)) !== null) {
-    if (m.index > last) chunks.push({ type: 'text', value: text.slice(last, m.index), start: last });
-    // Strip trailing punctuation that likely isn't part of the URL
-    let url = trimDetectedUrl(m[0]);
-    chunks.push({ type: 'url', value: url, start: m.index });
-    last = m.index + url.length;
-    URL_REGEX.lastIndex = last; // adjust for stripped chars
-  }
-  if (last < text.length) chunks.push({ type: 'text', value: text.slice(last), start: last });
+  const chunks = splitTextByHttpUrls(text);
 
   // Step 2: For text chunks, apply path detection. URL chunks render as links.
   for (const chunk of chunks) {
@@ -2394,9 +2486,12 @@ function splitPathsAndUrls(
           class="chat-external-link"
           href={chunk.value}
           title={chunk.value}
+          target="_blank"
+          rel="noopener noreferrer"
           onClick={(e: Event) => {
+            if (!onUrlClick) return;
             e.preventDefault();
-            onUrlClick?.(chunk.value);
+            onUrlClick(chunk.value);
           }}
         >
           {chunk.value}

@@ -26,6 +26,7 @@ import { sass } from '@codemirror/lang-sass';
 import { less } from '@codemirror/lang-less';
 import { wast } from '@codemirror/lang-wast';
 import { oneDark } from '@codemirror/theme-one-dark';
+import { FS_GENERIC_ERROR_CODES } from '@shared/fs-error-codes.js';
 
 export interface FileEditorProps {
   ws: WsClient;
@@ -109,7 +110,7 @@ export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessa
         setTimeout(() => setSaveStatus((s) => s === 'error' ? 'idle' : s), 3000);
       } else {
         setSaveStatus('error');
-        setSaveError(msg.error === 'file_too_large' ? t('fileBrowser.fileTooLarge') : t('fileBrowser.saveError'));
+        setSaveError(msg.error === FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE ? t('fileBrowser.fileTooLarge') : t('fileBrowser.saveError'));
         setTimeout(() => setSaveStatus((s) => s === 'error' ? 'idle' : s), 3000);
       }
     });
@@ -118,7 +119,7 @@ export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessa
   const doSave = useCallback((forceWrite = false) => {
     setSaveStatus('saving');
     setSaveError(null);
-    const requestId = ws.fsWriteFile(path, currentContent || content, forceWrite ? undefined : originalMtime);
+    const requestId = ws.fsWriteFile(path, currentContent ?? content, forceWrite ? undefined : originalMtime);
     pendingWriteRef.current.set(requestId, path);
     const tid = setTimeout(() => {
       if (pendingWriteRef.current.has(requestId)) {
@@ -209,6 +210,15 @@ export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage,
           onContentChange?.(newContent);
         }
       }),
+      EditorView.domEventHandlers({
+        paste: (event, view) => {
+          const text = event.clipboardData?.getData('text/plain');
+          if (text === undefined) return false;
+          event.preventDefault();
+          view.dispatch(view.state.replaceSelection(text));
+          return true;
+        },
+      }),
       EditorView.theme({
         '&': { height: '100%', fontSize: '12px', fontFamily: "'Menlo', 'Monaco', 'Consolas', monospace" },
         '.cm-scroller': { overflow: 'auto' },
@@ -226,6 +236,7 @@ export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage,
       parent: containerRef.current,
     });
     viewRef.current = view;
+    view.focus();
 
     return () => {
       view.destroy();

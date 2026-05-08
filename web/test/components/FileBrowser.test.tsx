@@ -30,6 +30,7 @@ vi.mock('../../src/components/FilePreviewPane.js', () => ({
 
 import { FileBrowser, __resetFileBrowserSharedChangesForTests, mergePreviewState } from '../../src/components/FileBrowser.js';
 import type { WsClient, ServerMessage } from '../../src/ws-client.js';
+import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
 
 // Cleanup DOM/timers after each test
 afterEach(() => {
@@ -52,7 +53,11 @@ vi.mock('react-i18next', () => {
     'file_browser.home': 'Home',
     'file_browser.timeout': 'Request timed out',
     'file_browser.mkdir_failed': 'Failed to create folder',
+    'file_browser.create_file_failed': 'Failed to create file',
+    'file_browser.file_exists': 'File already exists',
     'common.cancel': 'Cancel',
+    'chat.new_file': 'New file',
+    'chat.new_file_name': 'File name',
     'chat.new_folder': 'New folder',
     'chat.new_folder_name': 'Folder name',
     'chat.create': 'Create',
@@ -83,6 +88,11 @@ function makeWsFactory() {
     lastRequestId = 'mock-mkdir-id';
     return lastRequestId;
   });
+  const fsWriteFile = vi.fn((path: string) => {
+    lastSentPath = path;
+    lastRequestId = 'mock-write-id';
+    return lastRequestId;
+  });
 
   const ws: WsClient = {
     onMessage: (handler: (msg: ServerMessage) => void) => {
@@ -91,6 +101,7 @@ function makeWsFactory() {
     },
     fsListDir,
     fsMkdir,
+    fsWriteFile,
     fsReadFile: vi.fn(() => 'mock-read-id'),
     fsGitStatus: vi.fn(() => 'mock-git-status-id'),
     fsGitDiff: vi.fn(() => 'mock-git-diff-id'),
@@ -121,12 +132,13 @@ function makeWsFactory() {
     for (const messageHandler of messageHandlers) messageHandler(msg);
   };
 
-  return { ws, fsListDir, fsMkdir, respond, respondError, sendMsg, getLastPath: () => lastSentPath, getIncludeFiles: () => lastSentIncludeFiles };
+  return { ws, fsListDir, fsMkdir, fsWriteFile, respond, respondError, sendMsg, getLastPath: () => lastSentPath, getIncludeFiles: () => lastSentIncludeFiles };
 }
 
 describe('FileBrowser', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    localStorage.clear();
     __resetFileBrowserSharedChangesForTests();
   });
 
@@ -436,6 +448,78 @@ describe('FileBrowser', () => {
     expect(fsListDir).toHaveBeenLastCalledWith('/home/user', false, false);
   });
 
+  it('creates a new file, refreshes the parent directory, and opens the new file preview', async () => {
+    const { ws, respond, sendMsg, fsWriteFile, fsListDir } = makeWsFactory();
+    const fsReadFile = vi.mocked(ws.fsReadFile);
+    const { getByTitle, getByPlaceholderText, getByText } = render(
+      <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" onConfirm={vi.fn()} />,
+    );
+
+    await act(async () => {
+      respond([{ name: 'existing.ts', isDir: false }], '/home/user');
+    });
+
+    await act(async () => {
+      fireEvent.click(getByTitle('New file'));
+    });
+    await act(async () => {
+      fireEvent.input(getByPlaceholderText('File name'), { target: { value: 'new-file.ts' } });
+    });
+    await act(async () => {
+      fireEvent.click(getByText('Create'));
+    });
+
+    expect(fsWriteFile).toHaveBeenCalledWith('/home/user/new-file.ts', '', { createOnly: true });
+
+    await act(async () => {
+      sendMsg({ type: 'fs.write_response', requestId: 'mock-write-id', path: '/home/user/new-file.ts', resolvedPath: '/home/user/new-file.ts', status: 'ok', mtime: 2000 } as any);
+    });
+
+    expect(fsListDir).toHaveBeenLastCalledWith('/home/user', true, false);
+    expect(fsReadFile).toHaveBeenCalledWith('/home/user/new-file.ts');
+  });
+
+  it('shows a friendly error when new file creation would overwrite an existing file', async () => {
+    const { ws, respond, sendMsg, fsWriteFile } = makeWsFactory();
+    const fsReadFile = vi.mocked(ws.fsReadFile);
+    const { getByTitle, getByPlaceholderText, getByText } = render(
+      <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" onConfirm={vi.fn()} />,
+    );
+
+    await act(async () => {
+      respond([{ name: 'existing.ts', isDir: false }], '/home/user');
+    });
+
+    await act(async () => {
+      fireEvent.click(getByTitle('New file'));
+    });
+    await act(async () => {
+      fireEvent.input(getByPlaceholderText('File name'), { target: { value: 'existing.ts' } });
+    });
+    await act(async () => {
+      fireEvent.click(getByText('Create'));
+    });
+
+    expect(fsWriteFile).toHaveBeenCalledWith('/home/user/existing.ts', '', { createOnly: true });
+
+    await act(async () => {
+      sendMsg({ type: 'fs.write_response', requestId: 'mock-write-id', path: '/home/user/existing.ts', resolvedPath: '/home/user/existing.ts', status: 'error', error: 'file_exists' } as any);
+    });
+
+    expect(getByTitle('File already exists')).toBeDefined();
+    expect(fsReadFile).not.toHaveBeenCalledWith('/home/user/existing.ts');
+  });
+
+  it('does not show the new file action in directory-only mode', () => {
+    const { ws } = makeWsFactory();
+    const { queryByTitle, getByTitle } = render(
+      <FileBrowser ws={ws} mode="dir-only" layout="modal" initialPath="/home/user" onConfirm={vi.fn()} onClose={vi.fn()} />,
+    );
+
+    expect(queryByTitle('New file')).toBeNull();
+    expect(getByTitle('New folder')).toBeDefined();
+  });
+
   // ── Selection ──────────────────────────────────────────────────────────
 
   it('calls onConfirm with selected path in dir-only mode', async () => {
@@ -546,7 +630,7 @@ describe('FileBrowser', () => {
     expect(document.querySelector('.fb-node-git-badge')).not.toBeNull();
   });
 
-  it('requests stats only for shared changes queries, not tree git badges', () => {
+  it('requests stats only for shared changes queries, not tree git badges', async () => {
     const { ws } = makeWsFactory();
     render(
       <FileBrowser
@@ -558,6 +642,9 @@ describe('FileBrowser', () => {
         defaultTab="changes"
       />,
     );
+    await act(async () => {
+      await Promise.resolve();
+    });
 
     expect(ws.fsGitStatus).toHaveBeenCalledWith('~');
     expect(ws.fsGitStatus).toHaveBeenCalledWith('/home/user', { includeStats: true });
@@ -720,9 +807,9 @@ describe('FileBrowser', () => {
     render(
       <div>
         <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user/src"
-          changesRootPath="/home/user" onConfirm={vi.fn()} />
+          changesRootPath="/home/user" defaultTab="changes" onConfirm={vi.fn()} />
         <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user/src"
-          changesRootPath="/home/user" onConfirm={vi.fn()} />
+          changesRootPath="/home/user" defaultTab="changes" onConfirm={vi.fn()} />
       </div>,
     );
 
@@ -768,6 +855,7 @@ describe('FileBrowser', () => {
         layout="panel"
         initialPath="/home/user"
         changesRootPath="/home/user"
+        defaultTab="changes"
         onConfirm={vi.fn()}
       />,
     );
@@ -798,6 +886,99 @@ describe('FileBrowser', () => {
     expect(document.querySelector('.fb-preview-content pre')).toBeNull();
   });
 
+  it('keeps source visible while a Changes-tab diff is still pending', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        changesRootPath="/home/user"
+        defaultTab="changes"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([], '/home/user'); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'ok',
+        files: [{ path: '/home/user/new-file.ts', code: 'A' }],
+      });
+    });
+
+    const changesTab = document.querySelector('.fb-panel-tab:last-child') as HTMLElement;
+    await act(async () => { fireEvent.click(changesTab); });
+
+    const changeItem = document.querySelector('.fb-changes-item') as HTMLElement;
+    await act(async () => { fireEvent.click(changeItem); });
+    await act(async () => {
+      sendMsg({ type: 'fs.read_response', requestId: 'mock-read-id', path: '/home/user/new-file.ts', status: 'ok', content: 'const fresh = true;' });
+    });
+
+    expect(document.querySelector('.fb-diff')).toBeNull();
+    expect(screen.getByTestId('mock-file-preview').textContent).toContain('const fresh = true;');
+  });
+
+  it('preserves a Changes-tab diff that arrives before the file read response', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        changesRootPath="/home/user"
+        defaultTab="changes"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([], '/home/user'); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'ok',
+        files: [{ path: '/home/user/new-file.ts', code: 'A' }],
+      });
+    });
+
+    const changesTab = document.querySelector('.fb-panel-tab:last-child') as HTMLElement;
+    await act(async () => { fireEvent.click(changesTab); });
+
+    const changeItem = document.querySelector('.fb-changes-item') as HTMLElement;
+    await act(async () => { fireEvent.click(changeItem); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_diff_response',
+        requestId: 'mock-git-diff-id',
+        path: '/home/user/new-file.ts',
+        status: 'ok',
+        diff: [
+          'diff --git a/new-file.ts b/new-file.ts',
+          'new file mode 100644',
+          '--- /dev/null',
+          '+++ b/new-file.ts',
+          '@@ -0,0 +1 @@',
+          '+const fresh = true;',
+        ].join('\n'),
+      });
+      sendMsg({ type: 'fs.read_response', requestId: 'mock-read-id', path: '/home/user/new-file.ts', status: 'ok', content: 'const fresh = true;' });
+    });
+
+    expect(document.querySelector('.fb-diff')).not.toBeNull();
+    expect(document.querySelector('.fb-diff')?.textContent).toContain('const fresh = true;');
+    expect(document.querySelector('.fb-preview-content pre')).toBeNull();
+  });
+
   it('falls back to source preview when an untracked file has no diff content', async () => {
     const { ws, respond, sendMsg } = makeWsFactory();
     render(
@@ -807,6 +988,7 @@ describe('FileBrowser', () => {
         layout="panel"
         initialPath="/home/user"
         changesRootPath="/home/user"
+        defaultTab="changes"
         onConfirm={vi.fn()}
       />,
     );
@@ -838,6 +1020,41 @@ describe('FileBrowser', () => {
     expect(screen.getByTestId('mock-file-preview').textContent).toContain('const fresh = true;');
   });
 
+  it('uses a dedicated flex scroll container for split Changes view', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        changesRootPath="/home/user"
+        defaultTab="changes"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([], '/home/user'); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'ok',
+        files: [{ path: '/home/user/foo.ts', code: 'M' }],
+      });
+    });
+
+    const changesTab = document.querySelector('.fb-panel-tab:last-child') as HTMLElement;
+    await act(async () => { fireEvent.click(changesTab); });
+    const changeItem = document.querySelector('.fb-changes-item') as HTMLElement;
+    await act(async () => { fireEvent.click(changeItem); });
+
+    expect(document.querySelector('.fb-tree.fb-tree-split.fb-changes-tree')).not.toBeNull();
+    expect(document.querySelector('.fb-tree.fb-changes-tree > .fb-changes-section')).not.toBeNull();
+  });
+
   it('passes preferDiff to external previews opened from the Changes tab', async () => {
     const { ws, respond, sendMsg } = makeWsFactory();
     const onPreviewFile = vi.fn();
@@ -848,6 +1065,7 @@ describe('FileBrowser', () => {
         layout="panel"
         initialPath="/home/user"
         changesRootPath="/home/user"
+        defaultTab="changes"
         onPreviewFile={onPreviewFile}
         onConfirm={vi.fn()}
       />,
@@ -888,6 +1106,7 @@ describe('FileBrowser', () => {
         layout="panel"
         initialPath="/home/user"
         changesRootPath="/home/user"
+        defaultTab="changes"
         onPreviewFile={onPreviewFile}
         onConfirm={vi.fn()}
       />,
@@ -930,6 +1149,7 @@ describe('FileBrowser', () => {
         layout="panel"
         initialPath="/home/user"
         changesRootPath="/home/user"
+        defaultTab="changes"
         onPreviewFile={onPreviewFile}
         onConfirm={vi.fn()}
       />,
@@ -1341,6 +1561,35 @@ describe('FileBrowser', () => {
     });
   });
 
+  it.each([
+    FS_READ_ERROR_CODES.PREVIEW_WORKER_TIMEOUT,
+    FS_READ_ERROR_CODES.PREVIEW_WORKER_UNAVAILABLE,
+  ])('shows shared worker preview error %s as a visible preview failure', async (error) => {
+    const { ws, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/huge.bin"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/home/user/huge.bin',
+        status: 'error',
+        error,
+      });
+    });
+
+    expect(document.querySelector('.fb-preview-error')?.textContent).toBe('file_browser.preview_error');
+  });
+
   it('polls only for an active inline preview', async () => {
     vi.useFakeTimers();
     const { ws, respond, sendMsg } = makeWsFactory();
@@ -1370,6 +1619,48 @@ describe('FileBrowser', () => {
 
     expect((ws.fsReadFile as any).mock.calls).toHaveLength(2);
     expect((ws.fsGitDiff as any).mock.calls).toHaveLength(2);
+    vi.useRealTimers();
+  });
+
+  it('preserves the preview scroll position when auto-refresh updates the current file', async () => {
+    vi.useFakeTimers();
+    const { ws, respond, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/foo.ts"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([{ name: 'foo.ts', isDir: false }], '/home/user'); });
+    await act(async () => {
+      sendMsg({ type: 'fs.read_response', requestId: 'mock-read-id', path: '/home/user/foo.ts', status: 'ok', content: 'const before = 1;' });
+      sendMsg({ type: 'fs.git_diff_response', requestId: 'mock-git-diff-id', path: '/home/user/foo.ts', status: 'ok', diff: '' });
+    });
+
+    const previewContent = document.querySelector('.fb-preview-content') as HTMLDivElement;
+    previewContent.scrollTop = 360;
+    previewContent.scrollLeft = 24;
+    fireEvent.scroll(previewContent);
+
+    await act(async () => {
+      vi.advanceTimersByTime(5_000);
+    });
+
+    previewContent.scrollTop = 0;
+    previewContent.scrollLeft = 0;
+    await act(async () => {
+      sendMsg({ type: 'fs.read_response', requestId: 'mock-read-id', path: '/home/user/foo.ts', status: 'ok', content: 'const after = 2;' });
+      sendMsg({ type: 'fs.git_diff_response', requestId: 'mock-git-diff-id', path: '/home/user/foo.ts', status: 'ok', diff: '' });
+    });
+
+    expect(screen.getByTestId('mock-file-preview').textContent).toContain('const after = 2;');
+    expect(previewContent.scrollTop).toBe(360);
+    expect(previewContent.scrollLeft).toBe(24);
     vi.useRealTimers();
   });
 

@@ -8,6 +8,7 @@ import { COOKIE_SESSION, COOKIE_CSRF, HEADER_CSRF } from '@shared/cookie-names.j
 import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM } from '@shared/preview-types.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
 import type { ContextMemoryView, ContextModelConfig } from '@shared/context-types.js';
+import type { AuthoredContextScope } from '@shared/memory-scope.js';
 import type { SharedContextRuntimeConfigSnapshot } from '@shared/shared-context-runtime-config.js';
 import { isNative } from './native.js';
 import {
@@ -469,6 +470,16 @@ export async function sendSessionViaHttp(
   payload: Record<string, unknown>,
 ): Promise<void> {
   await apiFetch(`/api/server/${encodeURIComponent(serverId)}/session/send`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function cancelSessionViaHttp(
+  serverId: string,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  await apiFetch(`/api/server/${encodeURIComponent(serverId)}/session/cancel`, {
     method: 'POST',
     body: JSON.stringify(payload),
   });
@@ -1242,7 +1253,7 @@ export interface SharedProject {
   workspaceId: string | null;
   canonicalRepoId: string;
   displayName: string | null;
-  scope: 'project_shared' | 'workspace_shared' | 'org_shared';
+  scope: AuthoredContextScope;
   status: 'unenrolled' | 'active' | 'pending_removal' | 'removed';
 }
 
@@ -1258,6 +1269,7 @@ export interface SharedDocumentVersion {
   id: string;
   versionNumber: number;
   status: string;
+  createdByUserId?: string;
 }
 
 export interface SharedDocument {
@@ -1265,6 +1277,7 @@ export interface SharedDocument {
   enterpriseId: string;
   kind: 'coding_standard' | 'architecture_guideline' | 'repo_playbook' | 'knowledge_doc';
   title: string;
+  createdByUserId?: string;
   versions: SharedDocumentVersion[];
 }
 
@@ -1279,13 +1292,14 @@ export interface SharedDocumentBinding {
   applicabilityLanguage: string | null;
   applicabilityPathPattern: string | null;
   status: string;
+  createdByUserId?: string;
 }
 
 export interface RuntimeAuthoredContextBindingView {
   bindingId: string;
   documentVersionId: string;
   mode: 'required' | 'advisory';
-  scope: 'project_shared' | 'workspace_shared' | 'org_shared';
+  scope: AuthoredContextScope;
   repository?: string;
   language?: string;
   pathPattern?: string;
@@ -1400,7 +1414,7 @@ export async function enrollSharedProject(
     canonicalRepoId: string;
     displayName?: string;
     workspaceId?: string | null;
-    scope: 'project_shared' | 'workspace_shared' | 'org_shared';
+    scope: AuthoredContextScope;
   },
 ): Promise<{ id: string }> {
   return apiFetch(`/api/shared-context/enterprises/${encodeURIComponent(enterpriseId)}/projects/enroll`, {

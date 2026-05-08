@@ -19,6 +19,7 @@ import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 import { homedir, hostname } from 'node:os';
 import { dockerComposeTemplate, caddyfileTemplate, envTemplate } from './templates.js';
+import { resolveDaemonLaunchTarget, renderSystemdExecStart } from '../util/launch-target.js';
 
 const CREDS_DIR = join(homedir(), '.imcodes');
 const CREDS_PATH = join(CREDS_DIR, 'server.json');
@@ -376,9 +377,13 @@ function installService(): void {
 function installSystemdService(): void {
   const serviceDir = join(homedir(), '.config', 'systemd', 'user');
   const servicePath = join(serviceDir, 'imcodes.service');
-  const nodeExec = process.execPath;
-  const imcodesPath = process.argv[1];
   const logPath = join(CREDS_DIR, 'daemon.log');
+
+  // Prefer the self-healing launcher when this install ships it. See
+  // `src/util/launch-target.ts` for the why — half-finished `npm install`
+  // wedges the daemon in a Restart=always crash loop unless the launch
+  // chain has a non-Node guardian in front.
+  const target = resolveDaemonLaunchTarget();
 
   const unit = `[Unit]
 Description=IM.codes Daemon
@@ -386,7 +391,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=${nodeExec} ${imcodesPath} start --foreground
+ExecStart=${renderSystemdExecStart(target)}
 Restart=on-failure
 RestartSec=5
 KillMode=process

@@ -1,3 +1,5 @@
+import type { FsReadErrorCode, FsReadPreviewReason } from '../../../shared/fs-read-error-codes.js';
+
 export interface FsEntry {
   name: string;
   /** Absolute path for this entry when the parent is a virtual root (e.g. Windows drives). */
@@ -19,6 +21,10 @@ export interface GitStatusEntry {
   deletions?: number;
 }
 
+export const FS_WRITE_ERROR = {
+  FILE_EXISTS: 'file_exists',
+} as const;
+
 interface FsBaseResponse {
   requestId: string;
   path: string;
@@ -38,7 +44,8 @@ export interface FsReadResponse extends FsBaseResponse {
   encoding?: 'base64';
   mimeType?: string;
   /** Preview metadata: why preview is unavailable. */
-  previewReason?: 'too_large' | 'binary' | 'unknown_type';
+  previewReason?: FsReadPreviewReason;
+  error?: FsReadErrorCode | string;
   /** Controlled download handle ID for this file. */
   downloadId?: string;
   /** File's last modified time in milliseconds (for conflict detection). */
@@ -52,6 +59,15 @@ export interface FsWriteRequest {
   content: string;
   /** mtime from last read; omit = force write */
   expectedMtime?: number;
+  /** Create a new file only; fail if the target already exists. */
+  createOnly?: boolean;
+}
+
+export interface FsWriteOptions {
+  /** mtime from last read; omit = force write */
+  expectedMtime?: number;
+  /** Create a new file only; fail if the target already exists. */
+  createOnly?: boolean;
 }
 
 export interface FsWriteResponse extends Omit<FsBaseResponse, 'status'> {

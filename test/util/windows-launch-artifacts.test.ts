@@ -96,6 +96,72 @@ describe('writeWatchdogCmd', () => {
     expect(cmd).toContain('goto loop');
   });
 
+  it('emits the preflight self-heal line via the npm shim env-var form when the shim is installed', async () => {
+    // The preflight (`imcodes-launch-preflight.cmd`) is the Windows-side
+    // counterpart of `bin/imcodes-launch.sh` — it runs BEFORE every
+    // daemon-launch attempt and reinstalls the pinned version when
+    // `node_modules` is half-installed (commander/ws/etc. as empty
+    // placeholder dirs). Without this line the watchdog only catches
+    // PROCESS death, not module-load failures, so a power-off mid-
+    // upgrade wedges the daemon in an infinite restart loop.
+    //
+    // Same env-var form as the launch line so non-ASCII usernames
+    // never get embedded in the .cmd body.
+    const { existsSync } = await import('fs');
+    (existsSync as ReturnType<typeof vi.fn>).mockImplementation(
+      (p: string) => p.endsWith('imcodes.cmd') || p.endsWith('imcodes-launch-preflight.cmd'),
+    );
+    const paths = {
+      nodeExe: 'C:\\Program Files\\nodejs\\node.exe',
+      imcodesScript: 'C:\\Users\\X\\AppData\\Roaming\\npm\\node_modules\\imcodes\\dist\\src\\index.js',
+      watchdogPath: 'C:\\Users\\X\\.imcodes\\daemon-watchdog.cmd',
+      vbsPath: 'C:\\Users\\X\\.imcodes\\daemon-launcher.vbs',
+      logPath: 'C:\\Users\\X\\.imcodes\\watchdog.log',
+    };
+    await writeWatchdogCmd(paths);
+    const cmd = written[paths.watchdogPath];
+    // Preflight line must use env-var form, not absolute path.
+    expect(cmd).toContain('call "%APPDATA%\\npm\\imcodes-launch-preflight.cmd"');
+    // No absolute path leakage (would break under non-ASCII usernames
+    // because of cmd.exe's UTF-8 ↔ ANSI roundtrip).
+    expect(cmd).not.toContain('C:\\Users\\X\\AppData\\Roaming\\npm\\imcodes-launch-preflight');
+    // Preflight output must go to the watchdog log so operators can
+    // see what self-repair did.
+    expect(cmd).toContain('imcodes-launch-preflight.cmd" >> "%USERPROFILE%\\.imcodes\\watchdog.log"');
+    // Order: preflight line MUST come before the launch line each
+    // iteration, otherwise we'd attempt a launch on a broken install
+    // first.
+    const preflightIdx = cmd.indexOf('imcodes-launch-preflight.cmd');
+    const launchIdx = cmd.indexOf('start --foreground');
+    expect(preflightIdx).toBeGreaterThan(-1);
+    expect(launchIdx).toBeGreaterThan(preflightIdx);
+  });
+
+  it('skips the preflight line when the shim is not installed (graceful degradation for older versions)', async () => {
+    // Older imcodes versions ship without the preflight bin entry, so
+    // the npm shim doesn't exist on disk. Watchdog must NOT emit a
+    // preflight line in that case — calling a missing shim would loop
+    // an error per iteration. The next upgrade lands the shim and
+    // step 3.5's launch-chain regen will rewrite the watchdog with
+    // the preflight included.
+    const { existsSync } = await import('fs');
+    (existsSync as ReturnType<typeof vi.fn>).mockImplementation(
+      (p: string) => p.endsWith('imcodes.cmd'), // only the launch shim, no preflight
+    );
+    const paths = {
+      nodeExe: 'C:\\Program Files\\nodejs\\node.exe',
+      imcodesScript: 'C:\\Users\\X\\AppData\\Roaming\\npm\\node_modules\\imcodes\\dist\\src\\index.js',
+      watchdogPath: 'C:\\Users\\X\\.imcodes\\daemon-watchdog.cmd',
+      vbsPath: 'C:\\Users\\X\\.imcodes\\daemon-launcher.vbs',
+      logPath: 'C:\\Users\\X\\.imcodes\\watchdog.log',
+    };
+    await writeWatchdogCmd(paths);
+    const cmd = written[paths.watchdogPath];
+    expect(cmd).not.toContain('imcodes-launch-preflight');
+    // Launch line still works as before.
+    expect(cmd).toContain('call "%APPDATA%\\npm\\imcodes.cmd" start --foreground');
+  });
+
   it('uses %APPDATA%\\npm\\imcodes.cmd via env-var expansion (no hardcoded path)', async () => {
     const paths = {
       nodeExe: 'C:\\Program Files\\nodejs\\node.exe',
@@ -230,6 +296,69 @@ describe('writeWatchdogCmd', () => {
     expect(waitingHits).toBe(1);
     // And exactly one "cleared" exit message
     expect(cmd).toContain('Upgrade lock cleared, resuming');
+  });
+
+  it('self-heals stuck upgrade.lock when older than 10 minutes', async () => {
+    // Stable fix for daemon auto-upgrade: if the upgrade script crashes
+    // before reaching its `:done` safety-net (the failure mode we hit
+    // 2026-04-27 from a doubled-backslash path AND 2026-05-07 from
+    // unescaped parens in an if-block echo), the lock would otherwise
+    // strand the watchdog in :wait_loop forever.
+    //
+    // The watchdog now runs a tiny PowerShell probe each poll: if the
+    // lock's mtime is >10 minutes old, remove it.  Real upgrades finish
+    // in well under 10 minutes (npm install on a healthy connection is
+    // ~1-3 min), so this cannot race with a live upgrade.
+    const paths = {
+      nodeExe: 'node.exe',
+      imcodesScript: 'C:\\npm\\node_modules\\imcodes\\dist\\src\\index.js',
+      watchdogPath: 'out.cmd',
+      vbsPath: 'out.vbs',
+      logPath: 'out.log',
+    };
+    await writeWatchdogCmd(paths);
+    const cmd = written[paths.watchdogPath];
+
+    // PowerShell probe must be present and check >10min mtime
+    expect(cmd).toContain('powershell -NoProfile -NonInteractive');
+    expect(cmd).toContain('LastWriteTime');
+    expect(cmd).toContain('AddMinutes(-10)');
+    expect(cmd).toContain('Remove-Item');
+
+    // Two distinct exit-from-wait paths so the operator can tell them apart:
+    //   - normal: "Upgrade lock cleared, resuming."
+    //   - self-heal: "Upgrade lock was stale (>10min) — removed by watchdog self-heal."
+    expect(cmd).toContain('Upgrade lock cleared, resuming');
+    expect(cmd).toMatch(/Upgrade lock was stale.*removed by watchdog self-heal/);
+    // ASCII-only — the watchdog .cmd file has a separate "no high bytes"
+    // assertion further down, so the self-heal message must use ASCII
+    // hyphens, not Unicode em-dashes.
+    // The two exit paths are distinct labels — :lock_cleared (normal) and
+    // a stale-removal block that falls through to `goto loop`.
+    expect(cmd).toContain(':lock_cleared');
+  });
+
+  it('stale-lock probe runs INSIDE wait_loop, after the 30s sleep', async () => {
+    // Order matters: we must ping-sleep first, then check the lock, then
+    // run the stale probe.  If we probed BEFORE sleeping, every entry to
+    // :wait_loop would re-check the mtime and could remove a lock that
+    // was just barely placed by a slow-starting upgrade.
+    const paths = {
+      nodeExe: 'node.exe',
+      imcodesScript: 'C:\\npm\\node_modules\\imcodes\\dist\\src\\index.js',
+      watchdogPath: 'out.cmd',
+      vbsPath: 'out.vbs',
+      logPath: 'out.log',
+    };
+    await writeWatchdogCmd(paths);
+    const cmd = written[paths.watchdogPath];
+
+    const waitLoopIdx = cmd.indexOf(':wait_loop');
+    const pingIdx = cmd.indexOf('ping -n 31', waitLoopIdx);
+    const psProbeIdx = cmd.indexOf('powershell -NoProfile', waitLoopIdx);
+    expect(waitLoopIdx).toBeGreaterThan(-1);
+    expect(pingIdx).toBeGreaterThan(waitLoopIdx);
+    expect(psProbeIdx).toBeGreaterThan(pingIdx);
   });
 });
 
