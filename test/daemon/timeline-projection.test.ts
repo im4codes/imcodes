@@ -272,6 +272,31 @@ describe('timeline projection', () => {
     expect(explicitlyRebuilt?.map((event) => event.seq)).toEqual([2, 3]);
   });
 
+  it('does not let a stale scheduled rebuild repopulate after delete', async () => {
+    const { timelineProjection, timelineStore } = await loadModules();
+    const sessionId = 'projection_delete_cancels_scheduled_rebuild';
+    const timelineFile = timelineStore.filePath(sessionId);
+    mkdirSync(join(tempHome!, '.imcodes', 'timeline'), { recursive: true });
+
+    timelineStore.append(makeEvent(sessionId, 1, 'assistant.text', { text: 'one' }, 1000));
+    timelineStore.append(makeEvent(sessionId, 2, 'assistant.text', { text: 'two' }, 1001));
+    await timelineProjection.rebuildSession(sessionId);
+
+    appendFileSync(timelineFile, `${JSON.stringify(makeEvent(sessionId, 3, 'assistant.text', { text: 'three' }, 1002))}\n`);
+    const stale = await timelineProjection.queryHistory({ sessionId, limit: 10 });
+    expect(stale?.map((event) => event.seq)).toEqual([1, 2]);
+
+    await timelineProjection.deleteSession(sessionId);
+    await sleep(100);
+
+    const afterDelete = await timelineProjection.queryHistory({ sessionId, limit: 10 });
+    expect(afterDelete?.map((event) => event.seq)).toEqual([]);
+
+    await timelineProjection.rebuildSession(sessionId);
+    const explicitlyRebuilt = await timelineProjection.queryHistory({ sessionId, limit: 10 });
+    expect(explicitlyRebuilt?.map((event) => event.seq)).toEqual([1, 2, 3]);
+  });
+
   it('does not parse appended JSONL tails on the read path', async () => {
     const { timelineProjection, timelineStore } = await loadModules();
     const sessionId = 'projection_incremental_tail';

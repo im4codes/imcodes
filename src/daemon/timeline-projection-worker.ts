@@ -28,6 +28,7 @@ const dbPath = typeof workerData?.dbPath === 'string' && workerData.dbPath
 
 let db: DatabaseSyncInstance | null = null;
 const rebuildPromises = new Map<string, Promise<boolean>>();
+const sessionMutationGenerations = new Map<string, number>();
 let writesSinceCheckpoint = 0;
 
 function sessionFilePath(sessionId: string): string {
@@ -145,6 +146,7 @@ function upsertSessionMeta(sessionId: string, meta: {
 }
 
 function deleteSessionRows(sessionId: string): void {
+  sessionMutationGenerations.set(sessionId, (sessionMutationGenerations.get(sessionId) ?? 0) + 1);
   const database = ensureDb();
   database.prepare('DELETE FROM timeline_projection_events WHERE session_id = ?').run(sessionId);
   database.prepare('DELETE FROM timeline_projection_sessions WHERE session_id = ?').run(sessionId);
@@ -289,7 +291,9 @@ async function rebuildSessionInternal(sessionId: string): Promise<boolean> {
 }
 
 function scheduleSessionRebuild(sessionId: string): void {
+  const scheduledGeneration = sessionMutationGenerations.get(sessionId) ?? 0;
   setImmediate(() => {
+    if ((sessionMutationGenerations.get(sessionId) ?? 0) !== scheduledGeneration) return;
     void rebuildSessionInternal(sessionId).catch(() => {
       // Query paths must stay fast and fail-open; an explicit rebuild request or
       // the next append/query can retry projection repair.
