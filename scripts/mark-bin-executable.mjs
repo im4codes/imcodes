@@ -13,6 +13,7 @@ const targets = [
   '../dist/src/index.js',
   '../bin/imcodes-launch.sh',
   '../dist/src/util/windows-launch-preflight.mjs',
+  '../dist/src/util/preinstall-cleanup.mjs',
 ];
 
 for (const rel of targets) {

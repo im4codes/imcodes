@@ -344,21 +344,31 @@ if (existsSync(imcodesPkgPath)) {
   const imcodesPkg = JSON.parse(readFileSync(imcodesPkgPath, 'utf8'));
   imcodesPkg.scripts = imcodesPkg.scripts ?? {};
   const NOOP = 'echo "imcodes: published tarball, lifecycle scripts disabled"';
-  // Path is relative to the imcodes package root at install time, which is
-  // also the postinstall script's cwd. Forward slashes work on Windows for
-  // `node` invocation (Node accepts both separators on the CLI).
+  // Paths are relative to the imcodes package root at install time, which
+  // is also the lifecycle scripts' cwd. Forward slashes work on Windows
+  // for `node` invocation (Node accepts both separators on the CLI).
   const POSTINSTALL_CMD = 'node dist/src/util/postinstall-sharp-repair.js';
+  // Preinstall handles the "previous install was killed mid-way" residue
+  // (`.imcodes-XXXXX` siblings, stale upgrade.lock.d/) and aborts with a
+  // clear message when a parallel daemon-triggered upgrade is detected
+  // — preventing the confusing ENOTEMPTY collision that 215 hit on
+  // 2026-05-08. Pure Node built-ins so it runs even before our deps are
+  // extracted.
+  const PREINSTALL_CMD = 'node dist/src/util/preinstall-cleanup.mjs || true';
   let neutralized = 0;
   for (const key of Object.keys(imcodesPkg.scripts)) {
-    if (key === 'postinstall') continue; // handled below
+    if (key === 'postinstall' || key === 'preinstall') continue; // handled below
     if (imcodesPkg.scripts[key] !== NOOP) {
       imcodesPkg.scripts[key] = NOOP;
       neutralized += 1;
     }
   }
-  // Force-write the published-only postinstall. The source-tree package.json
-  // doesn't define one (we have a `prepare` hook for husky during dev), so
-  // this is purely additive at pack time and gets reverted by postpack.
+  // Force-write the published-only preinstall + postinstall. The source-tree
+  // package.json doesn't define either (dev uses `prepare` for husky), so
+  // these are purely additive at pack time and get reverted by postpack.
+  if (imcodesPkg.scripts.preinstall !== PREINSTALL_CMD) {
+    imcodesPkg.scripts.preinstall = PREINSTALL_CMD;
+  }
   if (imcodesPkg.scripts.postinstall !== POSTINSTALL_CMD) {
     imcodesPkg.scripts.postinstall = POSTINSTALL_CMD;
   }
