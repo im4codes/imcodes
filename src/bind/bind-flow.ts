@@ -348,6 +348,27 @@ WantedBy=default.target
 
   execSync('systemctl --user daemon-reload', { stdio: 'inherit' });
   execSync('systemctl --user enable --now imcodes', { stdio: 'inherit' });
+
+  // Enable lingering so the service keeps running when the user logs out
+  // / SSH disconnects. Without this, systemd-logind tears down the
+  // per-user `systemd --user` instance after the last session ends, and
+  // imcodes goes down with it. Symptom in the wild: daemon "mysteriously
+  // disappears" overnight on every server bound via `imcodes bind` —
+  // exactly the 212/213/215 family of incidents on 2026-05-09.
+  //
+  // Best-effort: lingering requires polkit auth on some distros and may
+  // legitimately fail in rootless containers. Don't gate the rest of the
+  // bind flow on it — log a hint so the operator can run it themselves.
+  // `setup-flow.ts.installSystemdService` does the equivalent (line 415).
+  try {
+    execSync('loginctl enable-linger', { stdio: 'ignore' });
+    console.log('Systemd user-linger enabled (daemon survives logout).');
+  } catch {
+    console.log(
+      'Note: could not enable systemd user-linger automatically. The daemon '
+      + 'will stop when you log out unless you run: `loginctl enable-linger`',
+    );
+  }
   console.log(`Systemd user service installed: ${servicePath}`);
 }
 
