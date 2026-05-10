@@ -92,6 +92,20 @@ export interface P2pWorkflowNodeDraft {
   dispatchStyle?: P2pNodeDispatchStyle;
   permissionScope?: P2pPermissionScope;
   promptAppend?: string;
+  /**
+   * R3 v2 PR-μ — Optional per-node override for the round-end summary
+   * prompt. When unset, the orchestrator uses
+   * `P2P_PRESET_DEFAULT_SUMMARY_PROMPT[preset]`. The canvas inspector
+   * exposes this as an editable textarea with the default-prompt as
+   * placeholder so users see what the auto-summary will say.
+   *
+   * Setting `summaryPromptOverride: ''` (empty string after trim) is
+   * treated as "use default"; setting any non-empty value forces the
+   * orchestrator to dispatch a summary hop on the initiator at the end
+   * of this round even when `dispatchStyle === 'single_main'` (which
+   * previously skipped the summary phase).
+   */
+  summaryPromptOverride?: string;
   timeoutMs?: number;
   routingAuthority?: P2pRoutingAuthority;
   script?: P2pScriptNodeContract;
@@ -188,6 +202,14 @@ export interface P2pCompiledNode {
   dispatchStyle?: P2pNodeDispatchStyle;
   permissionScope: P2pPermissionScope;
   promptAppend?: string;
+  /**
+   * R3 v2 PR-μ — User-authored override of the round-end summary
+   * prompt. Carried verbatim from `P2pWorkflowNodeDraft.summaryPromptOverride`.
+   * The orchestrator's adapter (`mapCompiledNodeToLegacyRound`) resolves
+   * this against `P2P_PRESET_DEFAULT_SUMMARY_PROMPT[preset]` to compute
+   * the effective summary prompt for the round.
+   */
+  summaryPromptOverride?: string;
   routingAuthority: P2pRoutingAuthority;
   script?: P2pScriptNodeContract;
   /**

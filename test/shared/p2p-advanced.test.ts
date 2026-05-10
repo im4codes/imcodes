@@ -181,4 +181,70 @@ describe('resolveP2pRoundPlan', () => {
       ],
     })).toThrow(/eligible SDK-backed participant/i);
   });
+
+  /*
+   * R3 v2 PR-μ — Workflow round summaries. The legacy combo system always
+   * ran a per-round summary; the previous workflow implementation only
+   * fired summary on `multi_dispatch` rounds AND lost the rich per-mode
+   * prompts. The new behaviour: ANY round with a non-empty
+   * `effectiveSummaryPrompt` (set by the workflow adapter) gets
+   * `synthesisStyle='initiator_summary'` so the orchestrator dispatches a
+   * summary hop on the initiator — including `single_main` rounds.
+   */
+  it('R3 v2 PR-μ — single_main round with effectiveSummaryPrompt forces synthesisStyle=initiator_summary', () => {
+    const round: P2pAdvancedRound = {
+      id: 'r1',
+      title: 'Implementation',
+      preset: 'implementation',
+      executionMode: 'single_main',
+      permissionScope: 'implementation',
+      effectiveSummaryPrompt: 'Write a detailed implementation summary…',
+    };
+    const plan = resolveP2pRoundPlan({ advancedRounds: [round], participants: [] });
+    expect(plan.rounds).toHaveLength(1);
+    const resolved = plan.rounds[0]!;
+    expect(resolved.synthesisStyle).toBe('initiator_summary');
+    expect(resolved.summaryPrompt).toBe('Write a detailed implementation summary…');
+  });
+
+  it('R3 v2 PR-μ — single_main round WITHOUT effectiveSummaryPrompt preserves legacy synthesisStyle=none', () => {
+    const round: P2pAdvancedRound = {
+      id: 'r1',
+      title: 'Implementation',
+      preset: 'implementation',
+      executionMode: 'single_main',
+      permissionScope: 'implementation',
+    };
+    const plan = resolveP2pRoundPlan({ advancedRounds: [round], participants: [] });
+    expect(plan.rounds[0]!.synthesisStyle).toBe('none');
+    expect(plan.rounds[0]!.summaryPrompt).toBeUndefined();
+  });
+
+  it('R3 v2 PR-μ — empty / whitespace-only effectiveSummaryPrompt is treated as absent', () => {
+    const round: P2pAdvancedRound = {
+      id: 'r1',
+      title: 'Implementation',
+      preset: 'implementation',
+      executionMode: 'single_main',
+      permissionScope: 'implementation',
+      effectiveSummaryPrompt: '   \n   ',
+    };
+    const plan = resolveP2pRoundPlan({ advancedRounds: [round], participants: [] });
+    expect(plan.rounds[0]!.synthesisStyle).toBe('none');
+    expect(plan.rounds[0]!.summaryPrompt).toBeUndefined();
+  });
+
+  it('R3 v2 PR-μ — multi_dispatch round inherits the override summary prompt verbatim', () => {
+    const round: P2pAdvancedRound = {
+      id: 'r1',
+      title: 'Discuss',
+      preset: 'discussion',
+      executionMode: 'multi_dispatch',
+      permissionScope: 'analysis_only',
+      effectiveSummaryPrompt: 'Custom rich summary prompt for this round.',
+    };
+    const plan = resolveP2pRoundPlan({ advancedRounds: [round], participants: [] });
+    expect(plan.rounds[0]!.summaryPrompt).toBe('Custom rich summary prompt for this round.');
+    expect(plan.rounds[0]!.synthesisStyle).toBe('initiator_summary');
+  });
 });

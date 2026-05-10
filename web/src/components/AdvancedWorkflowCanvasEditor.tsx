@@ -27,11 +27,17 @@ import { useTranslation } from 'react-i18next';
 import {
   P2P_EDGE_CONDITION_KINDS,
   P2P_EDGE_KINDS,
+  P2P_NODE_DISPATCH_STYLES,
   P2P_NODE_KINDS,
   P2P_PERMISSION_SCOPES,
+  P2P_PRESET_DEFAULT_DISPATCH_STYLE,
+  P2P_PRESET_DEFAULT_PERMISSION_SCOPE,
+  P2P_PRESET_DEFAULT_PROMPT,
+  P2P_PRESET_DEFAULT_SUMMARY_PROMPT,
   P2P_PRESET_KEYS,
   type P2pEdgeConditionKind,
   type P2pEdgeKind,
+  type P2pNodeDispatchStyle,
   type P2pNodeKind,
   type P2pPermissionScope,
   type P2pPresetKey,
@@ -372,11 +378,36 @@ export function AdvancedWorkflowCanvasEditor({ value, onChange, readOnly }: Adva
             style={{ ...inputStyle, fontWeight: 600 }}
             aria-label={`node-${node.id}-title`}
           />
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 6 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 6 }}>
             <label style={labelStyle}>
               <span>{t('p2p.workflow.editor.node.preset_label', 'Preset')}</span>
               {select(`node-${node.id}-preset`, node.preset, P2P_PRESET_KEYS,
-                (preset) => updateNode(node.id, (current) => ({ ...current, preset: preset as P2pPresetKey })))}
+                (preset) => updateNode(node.id, (current) => {
+                  /*
+                   * R3 v2 PR-λ — Auto-align permissionScope + dispatchStyle to
+                   * the picked preset. Without this, picking `implementation`
+                   * left `permissionScope='analysis_only'` and the validator
+                   * rejected the workflow with a cryptic
+                   * `invalid_workflow_graph (nodes[N])` error.
+                   *
+                   * We only overwrite scope/dispatchStyle when they are still
+                   * at the OLD preset's defaults — if the user has manually
+                   * customised either, we preserve their choice. This keeps
+                   * power-users in control while saving brand-new users from
+                   * tripping over the validator.
+                   */
+                  const next = preset as P2pPresetKey;
+                  const previousPresetDefaultScope = P2P_PRESET_DEFAULT_PERMISSION_SCOPE[current.preset];
+                  const previousPresetDefaultDispatch = P2P_PRESET_DEFAULT_DISPATCH_STYLE[current.preset];
+                  const scopeIsDefault = (current.permissionScope ?? 'analysis_only') === previousPresetDefaultScope;
+                  const dispatchIsDefault = (current.dispatchStyle ?? previousPresetDefaultDispatch) === previousPresetDefaultDispatch;
+                  return {
+                    ...current,
+                    preset: next,
+                    permissionScope: scopeIsDefault ? P2P_PRESET_DEFAULT_PERMISSION_SCOPE[next] : current.permissionScope,
+                    dispatchStyle: dispatchIsDefault ? P2P_PRESET_DEFAULT_DISPATCH_STYLE[next] : current.dispatchStyle,
+                  };
+                }))}
             </label>
             <label style={labelStyle}>
               <span>nodeKind</span>
@@ -385,16 +416,53 @@ export function AdvancedWorkflowCanvasEditor({ value, onChange, readOnly }: Adva
             </label>
             <label style={labelStyle}>
               <span>{t('p2p.workflow.editor.node.permission_scope_label', 'Permission scope')}</span>
-              {select(`node-${node.id}-scope`, node.permissionScope ?? 'analysis_only', P2P_PERMISSION_SCOPES,
+              {select(`node-${node.id}-scope`, node.permissionScope ?? P2P_PRESET_DEFAULT_PERMISSION_SCOPE[node.preset], P2P_PERMISSION_SCOPES,
                 (scope) => updateNode(node.id, (current) => ({ ...current, permissionScope: scope as P2pPermissionScope })))}
+            </label>
+            <label style={labelStyle}>
+              {/*
+               * R3 v2 PR-λ — User feedback: "我安排了单节点的node, 比如实施这种节点
+               * 肯定是单节点node, 默认是发起节点(可以选其它的), 讨论那些是多节点讨论
+               * node, 这里面完全没有做区分". The data model carries
+               * `dispatchStyle` already; surface it in the inspector so users
+               * can flip between single_main (one authoritative agent) and
+               * multi_dispatch (fan-out to all participants).
+               */}
+              <span>{t('p2p.workflow.editor.node.dispatch_style_label', 'Dispatch style')}</span>
+              {select(`node-${node.id}-dispatch-style`, node.dispatchStyle ?? P2P_PRESET_DEFAULT_DISPATCH_STYLE[node.preset], P2P_NODE_DISPATCH_STYLES,
+                (style) => updateNode(node.id, (current) => ({ ...current, dispatchStyle: style as P2pNodeDispatchStyle })))}
             </label>
           </div>
           <textarea
-            value={node.promptAppend ?? ''} disabled={readOnly} rows={2} placeholder="promptAppend"
+            value={node.promptAppend ?? ''}
+            disabled={readOnly}
+            rows={3}
+            placeholder={P2P_PRESET_DEFAULT_PROMPT[node.preset]}
             onInput={(event) => updateNode(node.id, (current) => ({ ...current, promptAppend: (event.target as HTMLTextAreaElement).value }))}
             style={{ ...inputStyle, resize: 'vertical' }}
             aria-label={`node-${node.id}-prompt-append`}
           />
+          {/*
+           * R3 v2 PR-μ — Per-node summary prompt override. Surfaces the
+           * default per-preset summary prompt as the placeholder so users
+           * see what the auto-summary will say. Leaving the field blank
+           * means "use the default"; typing anything overrides it AND
+           * forces a summary phase to run even on `single_main` nodes
+           * (where previously `synthesisStyle='none'` skipped summary).
+           */}
+          <label style={{ ...labelStyle, marginTop: 4 }}>
+            <span>{t('p2p.workflow.editor.node.summary_prompt_label', 'Round summary prompt (auto-runs after this node)')}</span>
+            <textarea
+              value={node.summaryPromptOverride ?? ''}
+              disabled={readOnly}
+              rows={4}
+              placeholder={P2P_PRESET_DEFAULT_SUMMARY_PROMPT[node.preset]}
+              onInput={(event) => updateNode(node.id, (current) => ({ ...current, summaryPromptOverride: (event.target as HTMLTextAreaElement).value }))}
+              style={{ ...inputStyle, resize: 'vertical' }}
+              aria-label={`node-${node.id}-summary-prompt`}
+              data-testid={`p2p-editor-node-${node.id}-summary-prompt`}
+            />
+          </label>
         </div>
       );
     }

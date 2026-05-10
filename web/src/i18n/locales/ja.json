@@ -509,6 +509,7 @@
   "p2p": {
     "final_original_request_reminder": "議論の要約だけで終わらせず、議論を統合した後は必ず元のユーザー依頼に直接対応してください。\n元のユーザー依頼: \"{{request}}\"",
     "post_summary_execute_prompt": "P2P議論は完了しました。議論ファイルを文脈として使い、このセッションで元のユーザー依頼を直接実行してください。\n議論ファイル: {{discussionFile}}\n元のユーザー依頼: \"{{request}}\"\n議論の要約だけで再び終わらせないでください。",
+    "discussion_language_instruction": "{{language}}で回答してください。",
     "ring": {
       "active": "R{{round}}/{{totalRounds}}",
       "label_active": "Round {{round}}/{{totalRounds}}",
@@ -606,6 +607,7 @@
     "settings_filter_sdk": "SDK",
     "settings_filter_cli": "CLI",
     "settings_save": "保存",
+    "settings_save_and_close": "保存して閉じる",
     "settings_close": "閉じる",
     "confirm_cancel": "キャンセルしますか?",
     "combo_send_confirm_title": "コンボ送信の確認",
@@ -713,7 +715,9 @@
         "node": {
           "section_label": "ノード",
           "preset_label": "プリセット",
-          "permission_scope_label": "権限スコープ"
+          "permission_scope_label": "権限スコープ",
+          "dispatch_style_label": "ディスパッチ方式",
+          "summary_prompt_label": "ラウンドサマリープロンプト（ノード後に自動実行）"
         },
         "edge": {
           "section_label": "エッジ",

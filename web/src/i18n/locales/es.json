@@ -509,6 +509,7 @@
   "p2p": {
     "final_original_request_reminder": "No te quedes solo en el resumen de la discusión. Después de sintetizarla, asegúrate de responder y ejecutar directamente la solicitud original del usuario.\nLa solicitud original del usuario es: \"{{request}}\"",
     "post_summary_execute_prompt": "La discusión P2P ha terminado. Usa el archivo de discusión como contexto y luego cumple directamente la solicitud original del usuario en esta sesión.\nArchivo de discusión: {{discussionFile}}\nLa solicitud original del usuario es: \"{{request}}\"\nNo te quedes otra vez solo en un resumen de la discusión.",
+    "discussion_language_instruction": "Responde en {{language}}.",
     "ring": {
       "active": "R{{round}}/{{totalRounds}}",
       "label_active": "Round {{round}}/{{totalRounds}}",
@@ -606,6 +607,7 @@
     "settings_filter_sdk": "SDK",
     "settings_filter_cli": "CLI",
     "settings_save": "Guardar",
+    "settings_save_and_close": "Guardar y cerrar",
     "settings_close": "Cerrar",
     "confirm_cancel": "¿Seguro que desea cancelar?",
     "combo_send_confirm_title": "Confirmar envío combinado",
@@ -713,7 +715,9 @@
         "node": {
           "section_label": "Nodo",
           "preset_label": "Predeterminado",
-          "permission_scope_label": "Alcance de permiso"
+          "permission_scope_label": "Alcance de permiso",
+          "dispatch_style_label": "Estilo de despacho",
+          "summary_prompt_label": "Prompt de resumen de la ronda (se ejecuta tras este nodo)"
         },
         "edge": {
           "section_label": "Enlace",

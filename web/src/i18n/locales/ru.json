@@ -509,6 +509,7 @@
   "p2p": {
     "final_original_request_reminder": "Не ограничивайся только сводкой обсуждения. После синтеза обсуждения обязательно напрямую выполни и полностью ответь на исходный запрос пользователя.\nИсходный запрос пользователя: \"{{request}}\"",
     "post_summary_execute_prompt": "P2P-обсуждение завершено. Используй файл обсуждения как контекст, а затем прямо выполни исходный запрос пользователя в этой сессии.\nФайл обсуждения: {{discussionFile}}\nИсходный запрос пользователя: \"{{request}}\"\nНе останавливайся снова только на сводке обсуждения.",
+    "discussion_language_instruction": "Отвечай на {{language}}.",
     "ring": {
       "active": "R{{round}}/{{totalRounds}}",
       "label_active": "Round {{round}}/{{totalRounds}}",
@@ -606,6 +607,7 @@
     "settings_filter_sdk": "SDK",
     "settings_filter_cli": "CLI",
     "settings_save": "Сохранить",
+    "settings_save_and_close": "Сохранить и закрыть",
     "settings_close": "Закрыть",
     "confirm_cancel": "Точно отменить?",
     "combo_send_confirm_title": "Подтвердить комбинированную отправку",
@@ -713,7 +715,9 @@
         "node": {
           "section_label": "Узел",
           "preset_label": "Пресет",
-          "permission_scope_label": "Область разрешений"
+          "permission_scope_label": "Область разрешений",
+          "dispatch_style_label": "Стиль отправки",
+          "summary_prompt_label": "Промпт сводки раунда (запускается после узла)"
         },
         "edge": {
           "section_label": "Связь",

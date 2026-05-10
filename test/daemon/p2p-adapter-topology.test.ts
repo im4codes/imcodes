@@ -138,6 +138,44 @@ describe('mapCompiledNodeToLegacyRound (A1 / W3)', () => {
     const round = mapCompiledNodeToLegacyRound(compiled, { ...baseWorkflow, nodes: [compiled] });
     expect(round.artifactConvention).toBe('explicit');
   });
+
+  /*
+   * R3 v2 PR-μ — Adapter must populate `effectiveSummaryPrompt` from
+   * either the user's override or the per-preset default. Empty /
+   * whitespace-only overrides are treated as "use default".
+   */
+  it('R3 v2 PR-μ — uses summaryPromptOverride when the user set one', () => {
+    const compiled = buildCompiledNode({
+      id: 'node',
+      preset: 'implementation' as P2pCompiledNode['preset'],
+      summaryPromptOverride: 'Custom summary by user',
+    });
+    const round = mapCompiledNodeToLegacyRound(compiled, { ...baseWorkflow, nodes: [compiled] });
+    expect(round.effectiveSummaryPrompt).toBe('Custom summary by user');
+  });
+
+  it('R3 v2 PR-μ — falls back to P2P_PRESET_DEFAULT_SUMMARY_PROMPT when no override', () => {
+    const compiled = buildCompiledNode({
+      id: 'node',
+      preset: 'implementation' as P2pCompiledNode['preset'],
+    });
+    const round = mapCompiledNodeToLegacyRound(compiled, { ...baseWorkflow, nodes: [compiled] });
+    // Default for `implementation` is non-empty and starts with the
+    // structured "Implementation Summary" header.
+    expect(round.effectiveSummaryPrompt).toBeTruthy();
+    expect(round.effectiveSummaryPrompt!).toMatch(/Implementation Summary/);
+  });
+
+  it('R3 v2 PR-μ — whitespace-only override falls back to default', () => {
+    const compiled = buildCompiledNode({
+      id: 'node',
+      preset: 'audit' as P2pCompiledNode['preset'],
+      summaryPromptOverride: '   \n   ',
+    });
+    const round = mapCompiledNodeToLegacyRound(compiled, { ...baseWorkflow, nodes: [compiled] });
+    // Default for `audit` is the structured "Audit Report" prompt, not whitespace.
+    expect(round.effectiveSummaryPrompt!).toMatch(/Audit Report/);
+  });
 });
 
 describe('mapConditionalEdgeToJumpRule (A8 / Cu1-N3)', () => {

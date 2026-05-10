@@ -144,6 +144,169 @@ export const P2P_PERMISSION_SCOPES = [
 ] as const;
 export type P2pPermissionScope = (typeof P2P_PERMISSION_SCOPES)[number];
 
+/**
+ * R3 v2 PR-λ — Default `permissionScope` for each preset. The
+ * `validateNodeCombination` rules in `shared/p2p-workflow-validators.ts`
+ * are strict about which preset/scope pairs compile (e.g.
+ * `implementation` requires `implementation` scope, `openspec_propose`
+ * requires `artifact_generation`). The canvas editor reads this lookup
+ * to auto-switch the scope when the user picks a preset, so they never
+ * land in an invalid combination by accident.
+ */
+export const P2P_PRESET_DEFAULT_PERMISSION_SCOPE: Record<P2pPresetKey, P2pPermissionScope> = {
+  brainstorm: 'analysis_only',
+  discuss: 'analysis_only',
+  audit: 'analysis_only',
+  review: 'analysis_only',
+  plan: 'analysis_only',
+  openspec_propose: 'artifact_generation',
+  proposal_audit: 'analysis_only',
+  implementation: 'implementation',
+  implementation_audit: 'analysis_only',
+  custom: 'analysis_only',
+};
+
+/**
+ * R3 v2 PR-λ — Default dispatch style for each preset. Single-main
+ * presets (`implementation`, `openspec_propose`, `proposal_audit`,
+ * `implementation_audit`) have ONE authoritative agent; multi-dispatch
+ * presets (`brainstorm`, `discuss`, `audit`, `review`, `plan`) fan out
+ * to every enabled participant. `custom` defaults to `single_main`
+ * because logic / script nodes are inherently single-actor.
+ */
+export const P2P_PRESET_DEFAULT_DISPATCH_STYLE: Record<P2pPresetKey, P2pNodeDispatchStyle> = {
+  brainstorm: 'multi_dispatch',
+  discuss: 'multi_dispatch',
+  audit: 'multi_dispatch',
+  review: 'multi_dispatch',
+  plan: 'multi_dispatch',
+  openspec_propose: 'single_main',
+  proposal_audit: 'single_main',
+  implementation: 'single_main',
+  implementation_audit: 'single_main',
+  custom: 'single_main',
+};
+
+/**
+ * R3 v2 PR-λ — Default prompt suggestion for each workflow preset.
+ * Surfaced in the canvas editor as the `promptAppend` textarea
+ * placeholder so users see what the preset will guide the agent to do
+ * even when they leave the field blank. The text intentionally mirrors
+ * the legacy `PRESET_PROMPTS` map in `shared/p2p-advanced.ts` for the
+ * three overlapping presets (`openspec_propose`, `proposal_audit`,
+ * `implementation`, `implementation_audit`, `custom`) and adds prompts
+ * for the five remaining workflow-only presets.
+ */
+export const P2P_PRESET_DEFAULT_PROMPT: Record<P2pPresetKey, string> = {
+  brainstorm: 'Explore the request from multiple angles. Generate diverse ideas, alternative approaches, and unexpected connections without prematurely converging.',
+  discuss: 'Clarify the request, surface missing constraints, and synthesize the strongest next-step understanding from the discussion file and referenced code.',
+  audit: 'Audit the provided context for security vulnerabilities, logic errors, and risks. Cite specific code locations and rate severity.',
+  review: 'Review the provided context for code quality, maintainability, performance, and adherence to best practices. Suggest concrete improvements.',
+  plan: 'Design an implementation plan from the request and discussion evidence. Break down work into clear steps, identify dependencies and risks, and define acceptance criteria.',
+  openspec_propose: 'Produce an OpenSpec-ready proposal/design/tasks result from the discussion and code context. Write concrete artifacts, acceptance criteria, and implementation scope rather than broad notes.',
+  proposal_audit: 'Audit the proposal artifacts for missing scope, missing acceptance criteria, contradictions, and weak assumptions. Strengthen the proposal without changing the requested objective.',
+  implementation: 'Execute the implementation work required by the current round. Prefer concrete code and tests over commentary, while staying within the stated scope and artifact targets.',
+  implementation_audit: 'Audit the implementation result against the requested scope, artifact outputs, and acceptance criteria. End with an authoritative verdict marker.',
+  custom: 'Follow the configured round contract exactly. Stay within the declared permission scope and use the configured outputs and prompt append as the operative instruction.',
+};
+
+/**
+ * R3 v2 PR-μ — Default *summary* prompt for each workflow preset.
+ *
+ * The legacy combo system (`audit→plan` etc.) attached a rich,
+ * structured summary prompt to every mode (see `BUILT_IN_MODES` in
+ * `shared/p2p-modes.ts`). The previous workflow-system implementation
+ * lost this almost entirely:
+ *
+ *   1. workflow presets `brainstorm/discuss/audit/review/plan` were
+ *      collapsed to legacy `'discussion'` by `roundPresetFromWorkflowPreset`,
+ *      so the rich `BUILT_IN_MODES.audit.summaryPrompt` etc. NEVER fired.
+ *   2. `single_main` rounds (`implementation`, `proposal_audit`,
+ *      `implementation_audit`, `openspec_propose`) had
+ *      `synthesisStyle = 'none'` → no summary phase at all.
+ *   3. Final-run synthesis fell back to a generic one-liner.
+ *
+ * This map is the single source of truth for the per-preset summary
+ * prompt. The canvas inspector exposes it as the placeholder for an
+ * editable `summaryPromptOverride` textarea, the workflow adapter
+ * carries it onto the legacy round, and the orchestrator dispatches a
+ * summary hop on EVERY round that has a non-empty effective summary
+ * prompt — including `single_main`. See PR-μ in `tasks.md`.
+ */
+export const P2P_PRESET_DEFAULT_SUMMARY_PROMPT: Record<P2pPresetKey, string> = {
+  brainstorm:
+    'Write a complete **Ideas & Approaches Summary** that organizes all ideas generated this round. Structure it as:\n'
+    + '1. **Top Recommendations** — the 3-5 strongest ideas, each with description, key advantage, feasibility, and rough effort.\n'
+    + '2. **Alternative Approaches** — other viable options grouped by theme, with pros/cons.\n'
+    + '3. **Creative Angles** — unconventional ideas worth exploring further.\n'
+    + '4. **Discarded Ideas** — approaches considered and rejected, with reasons.\n'
+    + '5. **Suggested Next Steps** — concrete actions to evaluate or prototype the top recommendations.',
+  discuss:
+    'Write a complete **Discussion Conclusion** that synthesizes all perspectives this round. Structure it as:\n'
+    + '1. **Consensus** — positions where all participants agreed, with supporting reasoning.\n'
+    + '2. **Key Trade-offs** — the main trade-offs evaluated, with analysis of each option.\n'
+    + '3. **Recommendation** — the recommended path forward with justification.\n'
+    + '4. **Dissenting Views** — important disagreements that remain.\n'
+    + '5. **Action Items** — concrete next steps.',
+  audit:
+    'Write a complete **Audit Report** that consolidates all findings this round. Structure it as:\n'
+    + '1. **Executive Summary** — one-paragraph overall risk assessment.\n'
+    + '2. **Critical Findings** — vulnerabilities and logic errors with: description, code location, severity (Critical/High/Medium/Low), exploitation scenario, recommended fix.\n'
+    + '3. **Additional Findings** — code quality issues and edge cases.\n'
+    + '4. **Positive Observations** — things done well that should be preserved.\n'
+    + '5. **Recommended Actions** — prioritized list with effort estimates.\n'
+    + 'Cite file paths, line numbers, and code snippets for every finding.',
+  review:
+    'Write a complete **Code Review Report** that consolidates all feedback this round. Structure it as:\n'
+    + '1. **Summary** — overall code quality and readiness verdict (approve / request changes / needs major rework).\n'
+    + '2. **Must Fix** — blocking issues: bugs, performance, security, broken contracts.\n'
+    + '3. **Should Fix** — non-blocking but important: naming, structure, missing error handling, test gaps.\n'
+    + '4. **Consider** — optional improvements: refactoring opportunities, alternatives, documentation.\n'
+    + '5. **Strengths** — well-designed aspects worth highlighting.\n'
+    + 'Cite the specific file and code, explain the problem, and provide a concrete fix or code suggestion for each item.',
+  plan:
+    'Write a complete **Implementation Plan** that synthesizes the request and discussion evidence into an actionable blueprint. Structure it as:\n'
+    + '1. **Goal and Scope** — what must be delivered, what is in scope, what is explicitly out of scope.\n'
+    + '2. **Current Context** — relevant existing behavior, constraints, conclusions that drive the plan.\n'
+    + '3. **Architecture Overview** — key components, data flow, interfaces, state transitions.\n'
+    + '4. **Implementation Phases** — ordered tasks with file paths, function/type changes, dependencies, sequencing, edge cases, rollout notes.\n'
+    + '5. **Acceptance and Validation** — explicit acceptance criteria + concrete verification steps and tests.\n'
+    + '6. **Risk Assessment** — risks with mitigation strategies.\n'
+    + '7. **Open Questions** — unresolved decisions needing stakeholder input.',
+  openspec_propose:
+    'Write a complete **OpenSpec Proposal Synthesis** for this round. Structure it as:\n'
+    + '1. **Proposal Statement** — what the change is and why.\n'
+    + '2. **Scope and Out of Scope** — explicit boundaries.\n'
+    + '3. **Design Highlights** — key architectural decisions and why.\n'
+    + '4. **Tasks Breakdown** — actionable items with acceptance signals.\n'
+    + '5. **Risks and Mitigations**.\n'
+    + 'Reference the artifact files (proposal.md / design.md / tasks.md) you authored.',
+  proposal_audit:
+    'Write one authoritative **Proposal Audit Synthesis** for this round. Structure it as:\n'
+    + '1. **Audit Verdict** — one sentence on whether the proposal is ready.\n'
+    + '2. **Missing Scope** — what the proposal does not yet cover.\n'
+    + '3. **Weak Assumptions** — claims that need stronger evidence.\n'
+    + '4. **Contradictions** — internal inconsistencies.\n'
+    + '5. **Recommended Strengthening** — concrete edits to apply before proceeding.',
+  implementation:
+    'Write a complete **Implementation Summary** for this round. Structure it as:\n'
+    + '1. **What Was Implemented** — concise list of what changed.\n'
+    + '2. **Files Touched** — relative paths grouped by purpose.\n'
+    + '3. **Test Coverage Added** — new/updated tests with what they prove.\n'
+    + '4. **Known Gaps / Followups** — anything intentionally deferred.\n'
+    + '5. **Validation Results** — outcome of build / typecheck / tests if run.\n'
+    + 'Be specific: name files and functions, do not summarize abstractly.',
+  implementation_audit:
+    'Write one authoritative **Implementation Audit Synthesis** for this round. Structure it as:\n'
+    + '1. **Verdict Marker** — end the synthesis with EXACTLY one of: `<!-- P2P_VERDICT: PASS -->` or `<!-- P2P_VERDICT: REWORK -->`.\n'
+    + '2. **What Was Audited** — files and behaviors examined.\n'
+    + '3. **Issues Found** — each with severity, file/line citation, and required fix.\n'
+    + '4. **Acceptance Criteria Check** — pass/fail per criterion from the proposal.\n'
+    + '5. **Required Followup Tasks** — only when verdict is REWORK.',
+  custom:
+    'Write a synthesis of this round\'s outputs that follows the configured round contract. Be specific and cite files; do not summarize abstractly.',
+};
+
 export const P2P_ARTIFACT_CONVENTIONS = [
   'none',
   'explicit_paths',

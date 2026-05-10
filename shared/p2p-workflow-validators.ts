@@ -363,6 +363,12 @@ export function validateNodeDraft(input: unknown, fieldPath: string): P2pWorkflo
   if (typeof node.promptAppend === 'string' && byteLength(node.promptAppend) > P2P_WORKFLOW_MAX_PROMPT_APPEND_BYTES) {
     diagnostics.push(makeP2pWorkflowDiagnostic('invalid_prompt_append', 'compile', { fieldPath: `${fieldPath}.promptAppend` }));
   }
+  // R3 v2 PR-μ — `summaryPromptOverride` shares the prompt-append byte
+  // budget; over-budget overrides emit the same `invalid_prompt_append`
+  // diagnostic so the canvas surfaces them inline.
+  if (typeof node.summaryPromptOverride === 'string' && byteLength(node.summaryPromptOverride) > P2P_WORKFLOW_MAX_PROMPT_APPEND_BYTES) {
+    diagnostics.push(makeP2pWorkflowDiagnostic('invalid_prompt_append', 'compile', { fieldPath: `${fieldPath}.summaryPromptOverride` }));
+  }
   if (node.nodeKind === 'script') {
     diagnostics.push(...validateP2pScriptNodeContract(node.script, `${fieldPath}.script`));
   } else if (node.script !== undefined) {

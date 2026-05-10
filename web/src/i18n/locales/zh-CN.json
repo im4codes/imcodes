@@ -510,6 +510,7 @@
   "p2p": {
     "final_original_request_reminder": "在完成讨论综合后，务必直接落实并完整回应用户的原始请求，不要只停留在讨论总结。\n用户的原始请求是：\"{{request}}\"",
     "post_summary_execute_prompt": "P2P 讨论已经完成。请把讨论文件作为上下文，然后在当前会话里直接落实并完成用户的原始请求。\n讨论文件：{{discussionFile}}\n用户的原始请求是：\"{{request}}\"\n不要再次停留在讨论总结。",
+    "discussion_language_instruction": "请用{{language}}回复。",
     "ring": {
       "active": "R{{round}}/{{totalRounds}}",
       "label_active": "Round {{round}}/{{totalRounds}}",
@@ -607,6 +608,7 @@
     "settings_filter_sdk": "SDK",
     "settings_filter_cli": "CLI",
     "settings_save": "保存",
+    "settings_save_and_close": "保存并关闭",
     "settings_close": "关闭",
     "confirm_cancel": "确定取消?",
     "combo_send_confirm_title": "确认组合流程发送",
@@ -714,7 +716,9 @@
         "node": {
           "section_label": "节点",
           "preset_label": "预设",
-          "permission_scope_label": "权限范围"
+          "permission_scope_label": "权限范围",
+          "dispatch_style_label": "派发模式",
+          "summary_prompt_label": "本轮总结提示词（节点结束后自动运行）"
         },
         "edge": {
           "section_label": "边",

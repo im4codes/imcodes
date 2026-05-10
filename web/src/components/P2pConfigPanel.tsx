@@ -780,7 +780,13 @@ export function P2pConfigPanel({
     });
   };
 
-  const handleSave = async () => {
+  /*
+   * R3 v2 PR-λ — Save now accepts a `keepOpen` option so the workflow
+   * library editor can persist incremental changes without dismissing
+   * the whole panel. The original `Save & Close` semantics are preserved
+   * (default `keepOpen: false`); the footer renders TWO buttons.
+   */
+  const handleSave = async (options: { keepOpen?: boolean } = {}) => {
     // Hard gate: a future-version draft/projection cannot be safely re-saved
     // by this client — it would silently re-serialise unknown fields. Refuse
     // and surface a translated diagnostic. The Save button is also disabled
@@ -887,7 +893,9 @@ export function P2pConfigPanel({
         return;
       }
       setSaving(false);
-      onClose();
+      // R3 v2 PR-λ — Honor `keepOpen` so the user can continue editing
+      // the workflow library after a save without re-opening the panel.
+      if (!options.keepOpen) onClose();
       return;
     } catch {
       setSaveError(t('p2p.settings_save_error', 'Failed to save P2P settings. Check your connection and try again.'));
@@ -919,8 +927,15 @@ export function P2pConfigPanel({
     background: '#1e293b',
     border: '1px solid #334155',
     borderRadius: isMobile ? 0 : 10,
-    width: isMobile ? '100vw' : 'min(780px, calc(100vw - 32px))',
-    maxWidth: isMobile ? '100vw' : 780,
+    /*
+     * R3 v2 PR-λ — Panel widened from 780 → 1400 px on desktop. The
+     * advanced tab now hosts the workflow library list + name input +
+     * canvas editor + allowed-executables section + capability
+     * banners; at 780 px those sections were getting cramped. Mobile
+     * stays at full viewport width.
+     */
+    width: isMobile ? '100vw' : 'min(1400px, calc(100vw - 32px))',
+    maxWidth: isMobile ? '100vw' : 1400,
     height: isMobile ? 'calc(100vh - env(safe-area-inset-top, 0px) - 12px)' : 'auto',
     maxHeight: isMobile ? 'calc(100vh - env(safe-area-inset-top, 0px) - 12px)' : '90vh',
     display: 'flex',
@@ -1543,14 +1558,34 @@ export function P2pConfigPanel({
             </div>
           )}
           <button style={btnSecondaryStyle} onClick={onClose}>{t('p2p.settings_close')}</button>
+          {/*
+           * R3 v2 PR-λ — User feedback: "高级工作流的保存按钮, 应该是
+           * 保存当前编辑的工作流而不是, 关闭整个窗口". The footer now
+           * exposes TWO buttons:
+           *   - "Save" (default): persists changes AND keeps the panel
+           *     open so users can continue editing the workflow library.
+           *   - "Save & Close": preserves the original behaviour for
+           *     users who want one click to save + dismiss.
+           */}
           <button
-            style={{ ...btnPrimaryStyle, opacity: saving || saveBlocked ? 0.6 : 1, cursor: saveBlocked ? 'not-allowed' : 'pointer' }}
-            onClick={() => { void handleSave(); }}
+            style={{ ...btnSecondaryStyle, color: '#bfdbfe', borderColor: '#3b82f6', opacity: saving || saveBlocked ? 0.6 : 1, cursor: saveBlocked ? 'not-allowed' : 'pointer' }}
+            onClick={() => { void handleSave({ keepOpen: true }); }}
             disabled={saving || loading || saveBlocked}
+            data-testid="p2p-save-keep-open"
             data-advanced-launch-disabled={advancedLaunchDisabled ? 'true' : 'false'}
             data-save-blocked={saveBlocked ? 'true' : 'false'}
           >
             {t('p2p.settings_save')}
+          </button>
+          <button
+            style={{ ...btnPrimaryStyle, opacity: saving || saveBlocked ? 0.6 : 1, cursor: saveBlocked ? 'not-allowed' : 'pointer' }}
+            onClick={() => { void handleSave(); }}
+            disabled={saving || loading || saveBlocked}
+            data-testid="p2p-save-and-close"
+            data-advanced-launch-disabled={advancedLaunchDisabled ? 'true' : 'false'}
+            data-save-blocked={saveBlocked ? 'true' : 'false'}
+          >
+            {t('p2p.settings_save_and_close', 'Save & Close')}
           </button>
         </div>
       </div>

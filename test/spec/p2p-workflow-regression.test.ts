@@ -2000,4 +2000,282 @@ describe('p2p-workflow reverse-regression', () => {
       "'queued' must be included in PROCESS_IN_PROGRESS_STATES so queued turns also block daemon upgrade",
     ).toBe(true);
   });
+
+  /*
+   * Reverse-regression #75 (R3 v2 PR-λ — User feedback: "高级工作流的
+   * 保存按钮, 应该是保存当前编辑的工作流而不是, 关闭整个窗口" +
+   * "实施这个有 bug, 会失败" + "我安排了单节点的node, 比如实施这种节点
+   * 肯定是单节点node, 默认是发起节点, 讨论那些是多节点讨论node, 这里面
+   * 完全没有做区分?" + "每个节点的默认提示词也要有" + "p2p的配置页面
+   * 可以加宽了, 至少加宽一倍, 手机版最多全屏宽度").
+   *
+   * Locked invariants:
+   *   1. Three shared default-lookup maps exist for all 10 workflow
+   *      presets — `P2P_PRESET_DEFAULT_PERMISSION_SCOPE`,
+   *      `P2P_PRESET_DEFAULT_DISPATCH_STYLE`, `P2P_PRESET_DEFAULT_PROMPT`.
+   *   2. The canvas editor reads all three to (a) auto-align scope +
+   *      dispatchStyle on preset change, (b) surface the default prompt
+   *      as the textarea placeholder, (c) expose a dispatchStyle
+   *      dropdown.
+   *   3. The panel widens to 1400 px on desktop and exposes BOTH
+   *      `p2p-save-keep-open` and `p2p-save-and-close` testids in the
+   *      footer so the user can save without dismissing the panel.
+   */
+  it('#75 workflow preset defaults + canvas auto-align + dispatchStyle dropdown (R3 v2 PR-λ)', () => {
+    const constants = read('shared/p2p-workflow-constants.ts');
+    for (const symbol of [
+      'P2P_PRESET_DEFAULT_PERMISSION_SCOPE',
+      'P2P_PRESET_DEFAULT_DISPATCH_STYLE',
+      'P2P_PRESET_DEFAULT_PROMPT',
+    ]) {
+      expect(
+        new RegExp(`export\\s+const\\s+${symbol}\\b`).test(constants.text),
+        `shared/p2p-workflow-constants.ts must export ${symbol}`,
+      ).toBe(true);
+    }
+    // Implementation preset MUST default to implementation scope so the
+    // canvas auto-fix actually closes the validator failure.
+    const scopeMap = constants.text.match(/P2P_PRESET_DEFAULT_PERMISSION_SCOPE[\s\S]*?\{([\s\S]*?)\};/);
+    expect(scopeMap, 'P2P_PRESET_DEFAULT_PERMISSION_SCOPE map must exist').not.toBeNull();
+    expect(
+      /implementation:\s*['"]implementation['"]/.test(scopeMap![1]),
+      "implementation preset must default to 'implementation' permission scope",
+    ).toBe(true);
+
+    const editor = read('web/src/components/AdvancedWorkflowCanvasEditor.tsx');
+    expect(
+      editor.text.includes('P2P_PRESET_DEFAULT_PERMISSION_SCOPE'),
+      'Canvas editor must reference P2P_PRESET_DEFAULT_PERMISSION_SCOPE for the auto-fix on preset change',
+    ).toBe(true);
+    expect(
+      editor.text.includes('P2P_PRESET_DEFAULT_DISPATCH_STYLE'),
+      'Canvas editor must reference P2P_PRESET_DEFAULT_DISPATCH_STYLE for the auto-fix on preset change',
+    ).toBe(true);
+    expect(
+      editor.text.includes('P2P_PRESET_DEFAULT_PROMPT'),
+      'Canvas editor must reference P2P_PRESET_DEFAULT_PROMPT for the textarea placeholder',
+    ).toBe(true);
+    // Dispatch-style dropdown surface must exist. The canvas wires the
+    // dropdown through the `select(ariaLabel, ...)` helper, so we anchor
+    // on the `node-{id}-dispatch-style` template-string argument.
+    expect(
+      /select\(\s*`node-\$\{node\.id\}-dispatch-style`/.test(editor.text),
+      'Canvas editor must render a dispatchStyle dropdown via select(`node-${node.id}-dispatch-style`, ...)',
+    ).toBe(true);
+  });
+
+  it('#75b panel SHALL widen to 1400 px on desktop AND split Save into keep-open + close (R3 v2 PR-λ)', () => {
+    const file = read('web/src/components/P2pConfigPanel.tsx');
+    // Desktop width must be at least the new 1400 px target. Match
+    // against either a `min(1400px, ...)` expression or a literal 1400
+    // anywhere in the panelStyle block.
+    expect(
+      /min\(1400px,\s*calc\(100vw\s*-\s*32px\)\)/.test(file.text),
+      'Panel desktop width must use min(1400px, calc(100vw - 32px))',
+    ).toBe(true);
+    expect(
+      /maxWidth:\s*isMobile\s*\?\s*['"]100vw['"]\s*:\s*1400/.test(file.text),
+      'Panel desktop maxWidth must be 1400',
+    ).toBe(true);
+    // Footer must expose BOTH save buttons.
+    for (const testId of ['p2p-save-keep-open', 'p2p-save-and-close']) {
+      expect(
+        file.text.includes(`data-testid="${testId}"`),
+        `Footer must expose data-testid="${testId}"`,
+      ).toBe(true);
+    }
+    // handleSave must accept a keepOpen option so the keep-open path
+    // can suppress the onClose() call.
+    expect(
+      /handleSave\s*=\s*async\s*\(options:\s*\{\s*keepOpen\?:\s*boolean\s*\}\s*=\s*\{\}\)/.test(file.text),
+      'handleSave must accept a keepOpen option object',
+    ).toBe(true);
+    expect(
+      /if\s*\(!options\.keepOpen\)\s*onClose\(\)/.test(file.text),
+      'handleSave must skip onClose() when keepOpen is true',
+    ).toBe(true);
+  });
+
+  /*
+   * Reverse-regression #76 (R3 v2 PR-μ — User feedback: "之前的p2p默认
+   * 自己带总结的, 你这里怎么实现? 只有implementation? 这里自动包含
+   * 总结了吗? 你对比下看看"). The legacy combo system always ran a
+   * structured per-mode summary (Audit Report / Code Review Report / ...);
+   * the previous workflow implementation lost it almost entirely.
+   *
+   * Locked invariants:
+   *   1. `P2P_PRESET_DEFAULT_SUMMARY_PROMPT` exists in shared constants
+   *      and covers ALL 10 workflow presets — no preset is silently
+   *      missing a summary prompt.
+   *   2. `P2pWorkflowNodeDraft` and `P2pCompiledNode` carry a
+   *      `summaryPromptOverride?: string` field so users can override
+   *      the default per node from the canvas inspector.
+   *   3. `mapCompiledNodeToLegacyRound` resolves the user override
+   *      against the per-preset default and writes the result into
+   *      `P2pAdvancedRound.effectiveSummaryPrompt`.
+   *   4. `normalizeAdvancedRound` honors `effectiveSummaryPrompt` and
+   *      forces `synthesisStyle = 'initiator_summary'` whenever it is
+   *      non-empty — including on `single_main` rounds (where the
+   *      previous implementation set `synthesisStyle = 'none'` and
+   *      skipped summary entirely).
+   *   5. The orchestrator's final-run synthesis falls back through:
+   *      finalRound.summaryPrompt → BUILT_IN_MODES[mode].summaryPrompt
+   *      → generic one-liner. Reading the workflow round summary first
+   *      means workflow runs no longer hit the generic fallback.
+   *   6. The canvas editor mounts a per-node summaryPromptOverride
+   *      textarea using the per-preset default as placeholder.
+   */
+  it('#76 workflow runs SHALL auto-include per-round summary for all presets (R3 v2 PR-μ)', () => {
+    // (1) Per-preset summary table covers all 10 workflow presets.
+    const constants = read('shared/p2p-workflow-constants.ts');
+    expect(
+      /export\s+const\s+P2P_PRESET_DEFAULT_SUMMARY_PROMPT\s*:\s*Record<P2pPresetKey,\s*string>/.test(constants.text),
+      'P2P_PRESET_DEFAULT_SUMMARY_PROMPT must be exported as Record<P2pPresetKey, string>',
+    ).toBe(true);
+    const summaryMap = constants.text.match(/P2P_PRESET_DEFAULT_SUMMARY_PROMPT[\s\S]*?\{([\s\S]*?)\n\};/);
+    expect(summaryMap, 'Summary prompt map must exist').not.toBeNull();
+    for (const preset of [
+      'brainstorm', 'discuss', 'audit', 'review', 'plan',
+      'openspec_propose', 'proposal_audit', 'implementation', 'implementation_audit', 'custom',
+    ]) {
+      expect(
+        new RegExp(`${preset}:\\s*['"]`).test(summaryMap![1]) || new RegExp(`${preset}:\\s*\n\\s*['"]`).test(summaryMap![1]),
+        `Workflow preset '${preset}' must have a default summary prompt`,
+      ).toBe(true);
+    }
+
+    // (2) summaryPromptOverride is on both draft + compiled types.
+    const types = read('shared/p2p-workflow-types.ts');
+    expect(
+      /summaryPromptOverride\?\:\s*string;/.test(types.text),
+      'P2pWorkflowNodeDraft + P2pCompiledNode must declare optional summaryPromptOverride: string',
+    ).toBe(true);
+    // Verify both interfaces declare it (regex matches twice — once per declaration).
+    const overrideOccurrences = types.text.match(/summaryPromptOverride\?\:\s*string;/g)?.length ?? 0;
+    expect(overrideOccurrences, 'summaryPromptOverride must appear on BOTH P2pWorkflowNodeDraft and P2pCompiledNode').toBeGreaterThanOrEqual(2);
+
+    // (3) Adapter writes effectiveSummaryPrompt onto the legacy round.
+    const cmd = read('src/daemon/command-handler.ts');
+    expect(
+      /P2P_PRESET_DEFAULT_SUMMARY_PROMPT\[node\.preset\]/.test(cmd.text),
+      'mapCompiledNodeToLegacyRound must source the default summary prompt from the per-preset table',
+    ).toBe(true);
+    expect(
+      /effectiveSummaryPrompt/.test(cmd.text),
+      'mapCompiledNodeToLegacyRound must write effectiveSummaryPrompt onto the legacy round',
+    ).toBe(true);
+
+    // (4) Compiler propagates summaryPromptOverride through.
+    const compiler = read('shared/p2p-workflow-compiler.ts');
+    expect(
+      /node\.summaryPromptOverride/.test(compiler.text),
+      'compileNode must propagate summaryPromptOverride from draft to compiled node',
+    ).toBe(true);
+
+    // (5) Validator shape-checks the override using the prompt-append byte cap.
+    const validators = read('shared/p2p-workflow-validators.ts');
+    expect(
+      /node\.summaryPromptOverride[\s\S]*?invalid_prompt_append/.test(validators.text),
+      'validateP2pWorkflowDraft must enforce a byte cap on summaryPromptOverride',
+    ).toBe(true);
+
+    // (6) normalizeAdvancedRound honors effectiveSummaryPrompt to force synthesis.
+    const advanced = read('shared/p2p-advanced.ts');
+    expect(
+      /effectiveSummaryPrompt[\s\S]{0,800}initiator_summary/.test(advanced.text),
+      'normalizeAdvancedRound must force synthesisStyle=initiator_summary when effectiveSummaryPrompt is non-empty',
+    ).toBe(true);
+
+    // (7) Orchestrator final-run synthesis prefers round.summaryPrompt over BUILT_IN_MODES.
+    const orchestrator = read('src/daemon/p2p-orchestrator.ts');
+    expect(
+      /finalRoundSummaryPrompt[\s\S]{0,400}legacyModeSummaryPrompt/.test(orchestrator.text),
+      'Final-run synthesis must check finalRound.summaryPrompt before falling back to BUILT_IN_MODES',
+    ).toBe(true);
+
+    // (8) Canvas editor mounts the override textarea with the default as placeholder.
+    const canvas = read('web/src/components/AdvancedWorkflowCanvasEditor.tsx');
+    expect(
+      canvas.text.includes('P2P_PRESET_DEFAULT_SUMMARY_PROMPT'),
+      'Canvas editor must reference P2P_PRESET_DEFAULT_SUMMARY_PROMPT for the textarea placeholder',
+    ).toBe(true);
+    expect(
+      /aria-label=\{?`?node-\$\{node\.id\}-summary-prompt/.test(canvas.text),
+      'Canvas editor must render a summary-prompt textarea with aria-label `node-{id}-summary-prompt`',
+    ).toBe(true);
+  });
+
+  /*
+   * Reverse-regression #77 (R3 v2 PR-ν — User feedback: "i18n 的讨论
+   * 语言要加进去, 尽量精简相关 prompt"). The legacy 79-char bilingual
+   * line ("Use the user's selected i18n language (Chinese (Simplified))
+   * for the discussion.") was injected into `p2pExtraPrompt` and only
+   * appeared at the END of the prompt — buried where models often skim.
+   * The replacement is a concise locale-native one-liner pulled from the
+   * i18n dictionary (`p2p.discussion_language_instruction`), surfaced
+   * right after the baseline prompt in BOTH the legacy combo and
+   * advanced workflow prompt builders.
+   *
+   * Locked invariants:
+   *   1. The i18n key `p2p.discussion_language_instruction` exists in
+   *      ALL 7 supported locales with the `{{language}}` placeholder.
+   *   2. `buildP2pLanguageInstruction` is exported from the orchestrator.
+   *   3. Both `buildHopPrompt` (legacy combo) and
+   *      `buildAdvancedPromptCommon` (workflow) call the helper and
+   *      inject the result right after `P2P_BASELINE_PROMPT`.
+   *   4. The legacy verbose extraPrompt-mutation regex is GONE from
+   *      `command-handler.ts` so the daemon no longer pollutes
+   *      user-supplied `extraPrompt` with a language hint.
+   */
+  it('#77 concise i18n discussion-language reminder MUST be injected via shared helper (R3 v2 PR-ν)', () => {
+    // (1) The i18n key exists in all 7 locales with the placeholder.
+    for (const locale of ['en', 'zh-CN', 'zh-TW', 'es', 'ja', 'ko', 'ru']) {
+      const file = read(`web/src/i18n/locales/${locale}.json`);
+      const json = JSON.parse(file.text) as { p2p?: { discussion_language_instruction?: string } };
+      const value = json.p2p?.discussion_language_instruction;
+      expect(typeof value, `${locale}: p2p.discussion_language_instruction must be a string`).toBe('string');
+      expect(value!.includes('{{language}}'), `${locale}: must contain the {{language}} placeholder`).toBe(true);
+      // Concise: under 40 chars (the new line is much shorter than the
+      // 79-char English legacy injection it replaced).
+      expect(value!.length, `${locale}: instruction must stay concise (<= 40 chars)`).toBeLessThanOrEqual(40);
+    }
+
+    // (2) Helper is exported from the orchestrator.
+    const orchestrator = read('src/daemon/p2p-orchestrator.ts');
+    expect(
+      /export\s+function\s+buildP2pLanguageInstruction/.test(orchestrator.text),
+      'buildP2pLanguageInstruction must be exported from p2p-orchestrator.ts',
+    ).toBe(true);
+    // The helper must read both autonyms AND the i18n template.
+    expect(
+      orchestrator.text.includes('P2P_DISCUSSION_LANGUAGE_TEMPLATES')
+        && orchestrator.text.includes('P2P_LANGUAGE_AUTONYMS'),
+      'helper must combine the per-locale template + autonym tables',
+    ).toBe(true);
+
+    // (3) Both prompt builders call the helper AND inject the line right
+    // after P2P_BASELINE_PROMPT.
+    const advancedAnchor = orchestrator.text.indexOf('function buildAdvancedPromptCommon');
+    expect(advancedAnchor, 'buildAdvancedPromptCommon must exist').toBeGreaterThan(0);
+    const advancedWindow = orchestrator.text.slice(advancedAnchor, advancedAnchor + 2000);
+    expect(
+      /P2P_BASELINE_PROMPT[\s\S]{0,400}buildP2pLanguageInstruction/.test(advancedWindow),
+      'buildAdvancedPromptCommon must call buildP2pLanguageInstruction after P2P_BASELINE_PROMPT',
+    ).toBe(true);
+
+    const legacyAnchor = orchestrator.text.indexOf('export function buildHopPrompt');
+    expect(legacyAnchor, 'buildHopPrompt must exist').toBeGreaterThan(0);
+    const legacyWindow = orchestrator.text.slice(legacyAnchor, legacyAnchor + 1500);
+    expect(
+      /P2P_BASELINE_PROMPT[\s\S]{0,400}buildP2pLanguageInstruction/.test(legacyWindow),
+      'buildHopPrompt must call buildP2pLanguageInstruction after P2P_BASELINE_PROMPT',
+    ).toBe(true);
+
+    // (4) The legacy verbose injection in command-handler is GONE.
+    const cmd = read('src/daemon/command-handler.ts');
+    expect(
+      cmd.text.includes("Use the user's selected i18n language"),
+      'The verbose legacy injection MUST be removed from command-handler.ts',
+    ).toBe(false);
+  });
 });

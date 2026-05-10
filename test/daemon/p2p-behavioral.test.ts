@@ -3,7 +3,7 @@
  * Covers: rounds clamping via startP2pRun, extraPrompt in buildHopPrompt.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { buildHopPrompt, buildPostSummaryExecutionPrompt, type P2pRun, type HopOpts } from '../../src/daemon/p2p-orchestrator.js';
+import { buildHopPrompt, buildP2pLanguageInstruction, buildPostSummaryExecutionPrompt, type P2pRun, type HopOpts } from '../../src/daemon/p2p-orchestrator.js';
 import { getP2pMode } from '../../shared/p2p-modes.js';
 
 // ── buildHopPrompt tests ──────────────────────────────────────────────────────
@@ -221,5 +221,82 @@ describe('P2P_MAX_ROUNDS clamping — production constant', () => {
     const code = await fs.readFile('src/daemon/p2p-orchestrator.ts', 'utf8');
     expect(code).toContain('P2P_MAX_ROUNDS = 6');
     expect(code).toContain('Math.min(P2P_MAX_ROUNDS');
+  });
+});
+
+// ── R3 v2 PR-ν — Concise i18n discussion-language reminder ────────────────
+
+describe('buildP2pLanguageInstruction — concise locale-native reminder', () => {
+  it('returns the English autonym for en', () => {
+    expect(buildP2pLanguageInstruction('en')).toBe('Reply in English.');
+  });
+
+  it('returns the simplified-Chinese autonym + native template for zh-CN', () => {
+    expect(buildP2pLanguageInstruction('zh-CN')).toBe('请用中文回复。');
+  });
+
+  it('returns the traditional-Chinese autonym + native template for zh-TW', () => {
+    expect(buildP2pLanguageInstruction('zh-TW')).toBe('請用繁體中文回覆。');
+  });
+
+  it('returns the Japanese autonym + native template for ja', () => {
+    expect(buildP2pLanguageInstruction('ja')).toBe('日本語で回答してください。');
+  });
+
+  it('returns the Korean autonym + native template for ko', () => {
+    expect(buildP2pLanguageInstruction('ko')).toBe('한국어로 답변하세요.');
+  });
+
+  it('returns the Spanish autonym + native template for es', () => {
+    expect(buildP2pLanguageInstruction('es')).toBe('Responde en Español.');
+  });
+
+  it('returns the Russian autonym + native template for ru', () => {
+    expect(buildP2pLanguageInstruction('ru')).toBe('Отвечай на Русский.');
+  });
+
+  it('returns empty string for missing locale (caller skips line)', () => {
+    expect(buildP2pLanguageInstruction(undefined)).toBe('');
+  });
+
+  it('returns empty string for unknown locale (graceful fallback)', () => {
+    expect(buildP2pLanguageInstruction('klingon')).toBe('');
+  });
+});
+
+describe('buildHopPrompt — language reminder injection', () => {
+  it('injects the locale-native language line right after the baseline prompt', () => {
+    const run = makeRun({ locale: 'zh-CN' });
+    const mode = getP2pMode('audit');
+    const prompt = buildHopPrompt(run, mode, defaultOpts);
+    expect(prompt).toContain('请用中文回复。');
+    // The reminder must appear BEFORE the mode-specific prompt so the agent
+    // reads the language requirement before any task-specific instructions.
+    const langIdx = prompt.indexOf('请用中文回复。');
+    const modeIdx = prompt.indexOf(mode!.prompt);
+    expect(langIdx).toBeGreaterThan(-1);
+    expect(modeIdx).toBeGreaterThan(-1);
+    expect(langIdx).toBeLessThan(modeIdx);
+  });
+
+  it('omits the language line entirely when locale is undefined', () => {
+    const run = makeRun({ locale: undefined });
+    const mode = getP2pMode('audit');
+    const prompt = buildHopPrompt(run, mode, defaultOpts);
+    expect(prompt).not.toContain('Reply in');
+    expect(prompt).not.toContain('请用');
+    expect(prompt).not.toContain('日本語で');
+  });
+
+  it('does NOT pollute extraPrompt with the language hint (it is now structured)', () => {
+    const run = makeRun({ locale: 'en', extraPrompt: 'focus on security' });
+    const mode = getP2pMode('audit');
+    const prompt = buildHopPrompt(run, mode, defaultOpts);
+    // extraPrompt is unchanged: only the user-supplied "focus on security"
+    // appears in the "Additional instructions:" trailer.
+    expect(prompt).toContain('Additional instructions: focus on security');
+    expect(prompt).not.toContain("Use the user's selected i18n language");
+    // The concise language line still appears at the top.
+    expect(prompt).toContain('Reply in English.');
   });
 });

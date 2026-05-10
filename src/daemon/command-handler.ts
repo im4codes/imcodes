@@ -73,7 +73,7 @@ import { MEMORY_WS } from '../../shared/memory-ws.js';
 import { FS_WRITE_ERROR } from '../shared/transport/fs.js';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG, MAX_P2P_PARTICIPANTS } from '../../shared/p2p-config-events.js';
 import { p2pScopedSessionKey } from '../../shared/p2p-config-scope.js';
-import { P2P_WORKFLOW_SCHEMA_VERSION } from '../../shared/p2p-workflow-constants.js';
+import { P2P_PRESET_DEFAULT_SUMMARY_PROMPT, P2P_WORKFLOW_SCHEMA_VERSION } from '../../shared/p2p-workflow-constants.js';
 import { makeP2pWorkflowDiagnostic, type P2pWorkflowDiagnostic } from '../../shared/p2p-workflow-diagnostics.js';
 import { compileP2pWorkflowDraft } from '../../shared/p2p-workflow-compiler.js';
 import { materializeOldAdvancedConfigToWorkflowDraft } from '../../shared/p2p-workflow-materialize.js';
@@ -2160,6 +2160,18 @@ export function mapCompiledNodeToLegacyRound(
     node.artifacts.length > 0
       ? (node.artifacts[0].convention as 'explicit' | 'openspec_convention')
       : undefined;
+  /*
+   * R3 v2 PR-μ — Resolve the per-round summary prompt:
+   *   1. Use the user's `summaryPromptOverride` (canvas inspector) when set.
+   *   2. Fall back to `P2P_PRESET_DEFAULT_SUMMARY_PROMPT[node.preset]`.
+   * The legacy round carries the resolved string in
+   * `effectiveSummaryPrompt` so `normalizeAdvancedRound` can force the
+   * summary phase on EVERY workflow round, including single_main nodes
+   * that previously had `synthesisStyle='none'`.
+   */
+  const effectiveSummaryPrompt = (node.summaryPromptOverride ?? '').trim().length > 0
+    ? (node.summaryPromptOverride ?? '').trim()
+    : P2P_PRESET_DEFAULT_SUMMARY_PROMPT[node.preset];
   return {
     id: node.id,
     title: node.title ?? node.id,
@@ -2176,6 +2188,7 @@ export function mapCompiledNodeToLegacyRound(
     ...(node.script ? { script: node.script } : {}),
     ...(node.routingAuthority ? { routingAuthority: node.routingAuthority } : {}),
     ...(artifactConvention ? { artifactConvention } : {}),
+    ...(effectiveSummaryPrompt ? { effectiveSummaryPrompt } : {}),
   } satisfies P2pAdvancedRound;
 }
 
@@ -2731,17 +2744,20 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
 
       const record = getSession(sessionName);
       const projectDir = record?.projectDir ?? '';
-      // Auto-append language instruction based on the user's selected i18n locale
-      if (p2pLocale && !p2pExtraPrompt?.match(/语言|language|lang|中文|日本語|한국어|español|русский/i)) {
-        const LOCALE_NAMES: Record<string, string> = {
-          'en': 'English',
-          'zh-CN': 'Chinese (Simplified)', 'zh-TW': 'Chinese (Traditional)',
-          'ja': 'Japanese', 'ko': 'Korean', 'es': 'Spanish', 'ru': 'Russian',
-        };
-        const langName = LOCALE_NAMES[p2pLocale] ?? p2pLocale;
-        const langInstr = `Use the user's selected i18n language (${langName}) for the discussion.`;
-        p2pExtraPrompt = p2pExtraPrompt ? `${p2pExtraPrompt}\n${langInstr}` : langInstr;
-      }
+      // R3 v2 PR-ν — Removed the legacy verbose language-instruction
+      // injection that mutated `p2pExtraPrompt` with a 79-char bilingual
+      // English line. The language hint is now a first-class structured
+      // field: `run.locale` flows through to `buildHopPrompt` /
+      // `buildAdvancedPromptCommon`, which call
+      // `buildP2pLanguageInstruction(locale)` to emit the concise
+      // locale-native one-liner from the i18n dictionary
+      // (`p2p.discussion_language_instruction`). The new line sits right
+      // after `P2P_BASELINE_PROMPT` — a more prominent slot than the
+      // tail-of-prompt extraPrompt position the old line ended up in —
+      // and the autonym (中文 / 日本語 / etc.) ensures the agent reads
+      // the instruction in the same language it's being asked to reply in.
+      // The extraPrompt field is left untouched for user-supplied custom
+      // hints; nothing the daemon writes leaks into it now.
       const advancedLaunchRequested = hasOldAdvancedLaunchFields(cmd)
         || isPlainRecord((cmd as Record<string, unknown>).p2pWorkflowLaunchEnvelope)
         || isPlainRecord((cmd as Record<string, unknown>).workflowLaunchEnvelope);

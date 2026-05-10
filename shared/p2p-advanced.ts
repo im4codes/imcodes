@@ -66,6 +66,19 @@ export interface P2pAdvancedRound {
   script?: P2pScriptNodeContract;
   routingAuthority?: P2pRoutingAuthority;
   artifactConvention?: 'none' | 'explicit' | 'openspec_convention';
+  /**
+   * R3 v2 PR-μ — Effective per-round summary prompt resolved by the
+   * adapter (`mapCompiledNodeToLegacyRound`) from the workflow node's
+   * `summaryPromptOverride` (user-editable in canvas inspector) or
+   * `P2P_PRESET_DEFAULT_SUMMARY_PROMPT[preset]` when no override is set.
+   * `normalizeAdvancedRound` reads this field to (a) populate
+   * `P2pResolvedRound.summaryPrompt` and (b) force
+   * `synthesisStyle = 'initiator_summary'` even for single_main rounds
+   * so EVERY round in a workflow run gets a structured summary by
+   * default — matching the legacy combo-mode behaviour the user relied
+   * on.
+   */
+  effectiveSummaryPrompt?: string;
 }
 
 export interface P2pParticipantSnapshotEntry {
@@ -299,7 +312,24 @@ function normalizeAdvancedRound(round: P2pAdvancedRound): P2pResolvedRound {
         ? [...round.artifactOutputs]
         : ['openspec/changes'])
     : [...(round.artifactOutputs ?? [])];
-  const synthesisStyle: P2pSynthesisStyle = round.executionMode === 'multi_dispatch' ? 'initiator_summary' : 'none';
+  /*
+   * R3 v2 PR-μ — Summary phase is now driven by the presence of an
+   * effective summary prompt rather than `executionMode` alone. The
+   * workflow adapter populates `round.effectiveSummaryPrompt` from the
+   * canvas user's override or the per-preset default, so EVERY workflow
+   * round (single_main + multi_dispatch alike) auto-runs an initiator
+   * summary unless the user explicitly cleared it. Legacy oldAdvanced
+   * fixtures (no `effectiveSummaryPrompt` set) preserve the original
+   * behaviour: multi_dispatch summarises, single_main does not.
+   */
+  const summaryFromOverride = typeof round.effectiveSummaryPrompt === 'string'
+    ? round.effectiveSummaryPrompt.trim()
+    : '';
+  const summaryFromLegacyMap = SUMMARY_PROMPTS[round.preset];
+  const effectiveSummary = summaryFromOverride.length > 0
+    ? summaryFromOverride
+    : (round.executionMode === 'multi_dispatch' ? summaryFromLegacyMap : undefined);
+  const synthesisStyle: P2pSynthesisStyle = effectiveSummary ? 'initiator_summary' : 'none';
   const requiresVerdict = verdictPolicy !== 'none';
   const authoritativeVerdictWriter = requiresVerdict
     ? (round.executionMode === 'multi_dispatch' ? 'initiator_summary' : 'initiator_only')
@@ -321,7 +351,7 @@ function normalizeAdvancedRound(round: P2pAdvancedRound): P2pResolvedRound {
     synthesisStyle,
     requiresVerdict,
     presetPrompt: PRESET_PROMPTS[round.preset],
-    summaryPrompt: synthesisStyle === 'initiator_summary' ? SUMMARY_PROMPTS[round.preset] : undefined,
+    summaryPrompt: effectiveSummary,
     authoritativeVerdictWriter,
     allowRouting,
     artifactOutputs,

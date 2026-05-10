@@ -857,19 +857,40 @@ describe('P2pConfigPanel', () => {
     expect(cfg.advancedRounds).toBeUndefined();
   });
 
-  it('calls onClose after save completes', async () => {
+  it('Save & Close button calls onClose after save completes', async () => {
     const onClose = vi.fn();
 
     renderPanel({ onClose });
     await flush();
 
-    const saveBtn = screen.getByText('settings_save');
+    // R3 v2 PR-λ — The footer now exposes TWO save buttons. The
+    // "Save & Close" variant preserves the original close-on-save
+    // behaviour; the plain "Save" variant keeps the panel open so
+    // the user can keep editing the workflow library.
+    const saveAndCloseBtn = screen.getByTestId('p2p-save-and-close');
     await act(async () => {
-      fireEvent.click(saveBtn);
+      fireEvent.click(saveAndCloseBtn);
     });
     await flush();
 
     expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it('R3 v2 PR-λ — Save (keep open) button persists changes WITHOUT closing the panel', async () => {
+    const onClose = vi.fn();
+    const onSave = vi.fn();
+
+    renderPanel({ onClose, onSave });
+    await flush();
+
+    const saveKeepOpen = screen.getByTestId('p2p-save-keep-open');
+    await act(async () => {
+      fireEvent.click(saveKeepOpen);
+    });
+    await flush();
+
+    expect(onSave).toHaveBeenCalledOnce();
+    expect(onClose).not.toHaveBeenCalled();
   });
 
   it('uses per-session config key for different sessions', async () => {
@@ -1295,10 +1316,13 @@ describe('P2pConfigPanel', () => {
       const presetSelect = screen.getByLabelText('node-node_1-preset') as HTMLSelectElement;
       expect(presetSelect.value).toBe('discuss');
 
-      // Switch the new node's preset to 'implementation' WITHOUT changing
-      // permissionScope. validateNodeCombination requires
-      // implementation→implementation scope, so this MUST surface an inline
-      // diagnostic about the invalid combination.
+      // R3 v2 PR-λ — Switching the preset to `implementation` USED to leave
+      // `permissionScope='analysis_only'` and surface a cryptic
+      // `invalid_workflow_graph (nodes[N])` diagnostic. The canvas editor
+      // now auto-aligns `permissionScope` (and `dispatchStyle`) to the
+      // picked preset so users never land on an invalid combination by
+      // accident. Verify: NO diagnostic appears, AND the scope dropdown
+      // jumps to 'implementation'.
       await act(async () => {
         presetSelect.value = 'implementation';
         // Preact attaches handlers via the input event for native form
@@ -1306,18 +1330,20 @@ describe('P2pConfigPanel', () => {
         fireEvent.input(presetSelect, { target: { value: 'implementation' } });
       });
       await flush();
-      const diagnostics = screen.getByTestId('p2p-editor-diagnostics');
-      expect(diagnostics.textContent).toMatch(/invalid_workflow_graph|combination/i);
+      expect(screen.queryByTestId('p2p-editor-diagnostics')).toBeNull();
+      const scopeSelect = screen.getByLabelText('node-node_1-scope') as HTMLSelectElement;
+      expect(scopeSelect.value).toBe('implementation');
+      // Dispatch style auto-flips to single_main for implementation preset.
+      const dispatchSelect = screen.getByLabelText('node-node_1-dispatch-style') as HTMLSelectElement;
+      expect(dispatchSelect.value).toBe('single_main');
 
-      // Remove the offending node from the inspector and confirm diagnostic
-      // disappears AND the SVG shape is gone.
+      // Remove the new node from the inspector and confirm the SVG shape is gone.
       await act(async () => {
         fireEvent.click(screen.getByTestId('p2p-editor-remove-node-node_1'));
       });
       await flush();
       expect(screen.queryByTestId('p2p-editor-node-shape-node_1')).toBeNull();
       expect(screen.queryByTestId('p2p-editor-node-node_1')).toBeNull();
-      expect(screen.queryByTestId('p2p-editor-diagnostics')).toBeNull();
     });
 
     it('select existing edge and switch to conditional routing_key_equals updates draft', async () => {

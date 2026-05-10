@@ -568,7 +568,12 @@ describe('structured P2P routing via WS fields', () => {
   });
 
 
-  it('auto-appends the selected i18n language instruction for p2p runs', async () => {
+  it('R3 v2 PR-ν — passes p2pLocale through to startP2pRun without polluting extraPrompt', async () => {
+    // R3 v2 PR-ν changed the language hint plumbing: it is now a structured
+    // `run.locale` field (resolved through `buildP2pLanguageInstruction` at
+    // prompt-build time) instead of a verbose mutation of `extraPrompt`. The
+    // command handler MUST forward `p2pLocale` unchanged on the run options
+    // and MUST NOT inject the legacy 79-char English line into extraPrompt.
     handleWebCommand({
       type: 'session.send',
       sessionName: 'deck_proj_brain',
@@ -581,9 +586,14 @@ describe('structured P2P routing via WS fields', () => {
     await new Promise((r) => setTimeout(r, 100));
 
     expect(startP2pRun).toHaveBeenCalledOnce();
-    expect((startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0]).toHaveLength(1);
-    const [{ extraPrompt }] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(extraPrompt).toContain("Use the user's selected i18n language (Chinese (Simplified)) for the discussion.");
+    const [opts] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
+    // Locale is forwarded as a first-class field.
+    expect(opts.locale).toBe('zh-CN');
+    // extraPrompt is NOT polluted with the legacy English instruction.
+    const extraPrompt = opts.extraPrompt as string | undefined;
+    if (typeof extraPrompt === 'string' && extraPrompt.length > 0) {
+      expect(extraPrompt).not.toMatch(/Use the user's selected i18n language/);
+    }
   });
 
   it('forwards advanced p2p options through the structured session.send path', async () => {

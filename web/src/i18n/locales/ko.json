@@ -509,6 +509,7 @@
   "p2p": {
     "final_original_request_reminder": "토론 요약으로 끝내지 말고, 논의를 종합한 뒤에는 반드시 원래 사용자 요청을 직접 완전히 처리하세요.\n원래 사용자 요청: \"{{request}}\"",
     "post_summary_execute_prompt": "P2P 토론이 완료되었습니다. 토론 파일을 문맥으로 사용한 뒤, 이 세션에서 원래 사용자 요청을 직접 수행하세요.\n토론 파일: {{discussionFile}}\n원래 사용자 요청: \"{{request}}\"\n다시 토론 요약으로만 끝내지 마세요.",
+    "discussion_language_instruction": "{{language}}로 답변하세요.",
     "ring": {
       "active": "R{{round}}/{{totalRounds}}",
       "label_active": "Round {{round}}/{{totalRounds}}",
@@ -606,6 +607,7 @@
     "settings_filter_sdk": "SDK",
     "settings_filter_cli": "CLI",
     "settings_save": "저장",
+    "settings_save_and_close": "저장하고 닫기",
     "settings_close": "닫기",
     "confirm_cancel": "취소하시겠습니까?",
     "combo_send_confirm_title": "콤보 전송 확인",
@@ -713,7 +715,9 @@
         "node": {
           "section_label": "노드",
           "preset_label": "프리셋",
-          "permission_scope_label": "권한 범위"
+          "permission_scope_label": "권한 범위",
+          "dispatch_style_label": "디스패치 방식",
+          "summary_prompt_label": "라운드 요약 프롬프트 (노드 종료 후 자동 실행)"
         },
         "edge": {
           "section_label": "엣지",

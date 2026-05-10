@@ -77,6 +77,12 @@ function compileNode(node: P2pWorkflowNodeDraft, edges: P2pWorkflowEdgeDraft[]):
     ...(node.dispatchStyle ? { dispatchStyle: node.dispatchStyle } : {}),
     permissionScope: node.permissionScope ?? 'analysis_only',
     ...(node.promptAppend ? { promptAppend: node.promptAppend } : {}),
+    // R3 v2 PR-μ — Carry the user's per-node summary-prompt override
+    // through compile so the orchestrator's `mapCompiledNodeToLegacyRound`
+    // can resolve `effectiveSummaryPrompt` against the per-preset
+    // default. Empty / whitespace-only overrides are treated as "use
+    // default" by the adapter.
+    ...(node.summaryPromptOverride ? { summaryPromptOverride: node.summaryPromptOverride } : {}),
     routingAuthority: node.routingAuthority ?? deriveRoutingAuthority(node, edges),
     ...(node.script ? { script: node.script } : {}),
     // R3 v1b follow-up — pass logic contract through unchanged so the
