@@ -588,6 +588,12 @@
       "discuss": "討論"
     },
     "mode_config": "配置",
+    "dropdown": {
+      "tab_combos": "組合流程",
+      "tab_workflows": "進階工作流",
+      "workflows_empty": "尚未保存任何工作流。前往「設定 → 進階工作流」開始設計。",
+      "workflows_manage": "管理工作流"
+    },
     "settings_button": "P2P設定",
     "settings_title": "P2P 參與者設定",
     "cross_session": "包含其他專案的工作階段",

@@ -588,6 +588,12 @@
       "discuss": "讨论"
     },
     "mode_config": "配置",
+    "dropdown": {
+      "tab_combos": "组合流程",
+      "tab_workflows": "高级工作流",
+      "workflows_empty": "还没有保存的工作流。打开「设置 → 高级工作流」开始设计。",
+      "workflows_manage": "管理工作流"
+    },
     "settings_button": "P2P设置",
     "settings_title": "P2P 参与者设置",
     "cross_session": "包含其他项目的会话",

@@ -587,6 +587,12 @@
       "discuss": "토론"
     },
     "mode_config": "설정",
+    "dropdown": {
+      "tab_combos": "콤보",
+      "tab_workflows": "워크플로",
+      "workflows_empty": "저장된 워크플로가 없습니다. 설정 → 고급 워크플로에서 새로 만들어 보세요.",
+      "workflows_manage": "워크플로 관리"
+    },
     "settings_button": "P2P 설정",
     "settings_title": "P2P 참가자 설정",
     "cross_session": "다른 프로젝트의 세션 포함",

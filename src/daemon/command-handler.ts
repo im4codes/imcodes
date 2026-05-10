@@ -5789,8 +5789,16 @@ export function getTransportSessionUpgradeBlockReason(sessionName: string): Tran
  *  `'running'` is set by tmux/ConPTY drivers when the underlying CLI agent
  *  (claude-code, codex, opencode, gemini) has emitted activity that the
  *  driver classifies as "agent generating" — a self-upgrade restart in that
- *  window kills the agent's child process mid-turn and discards its work. */
-const PROCESS_IN_PROGRESS_STATES: ReadonlySet<string> = new Set(['running']);
+ *  window kills the agent's child process mid-turn and discards its work.
+ *
+ *  `'queued'` represents a turn that the user has dispatched but the driver
+ *  has not yet flipped to `'running'` (e.g. waiting in tmux for the prompt
+ *  delivery to settle, or waiting for a session restart-on-relaunch handshake
+ *  to complete). The web client's `isRunningSessionState` already counts
+ *  `'queued'` as busy; the upgrade gate previously did not, so a turn
+ *  dispatched a few hundred ms before an `daemon.upgrade` broadcast would be
+ *  silently killed. Including `'queued'` here closes that race. */
+const PROCESS_IN_PROGRESS_STATES: ReadonlySet<string> = new Set(['running', 'queued']);
 
 /** Per-session reason a daemon upgrade is currently blocked. Covers both
  *  transport-runtime sessions (claude-code-sdk, codex-sdk, qwen, …) and

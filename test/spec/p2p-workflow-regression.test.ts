@@ -1923,4 +1923,81 @@ describe('p2p-workflow reverse-regression', () => {
       ).toBe(true);
     }
   });
+
+  /*
+   * Reverse-regression #73 (R3 v2 PR-κ — User feedback: "P2P下拉没有
+   * 高级工作流的列表" + "需要增加一个tab切换高级工作流和普通的流程" +
+   * "全局记住上次的切换的tab"). The P2P quick-pick dropdown above the
+   * chat input gains a tab switcher between the original combo presets
+   * list and the saved advanced workflow library, with the user's last
+   * tab choice persisted GLOBALLY (not per-session).
+   *
+   * Locked invariants:
+   *   1. `PREF_KEY_P2P_DROPDOWN_TAB` exists in `web/src/constants/prefs.ts`
+   *      and is referenced in `SessionControls.tsx` so the persisted-tab
+   *      pref cannot be dropped by accident.
+   *   2. The dropdown carries both tab buttons + a workflows body marker.
+   *   3. The dropdown's `Manage workflows` footer routes to the panel's
+   *      `'advanced'` tab so library editing is reachable in one click.
+   */
+  it('#73 P2P dropdown MUST expose a workflow-library tab + global tab pref (R3 v2 PR-κ)', () => {
+    const prefs = read('web/src/constants/prefs.ts');
+    expect(
+      /export\s+const\s+PREF_KEY_P2P_DROPDOWN_TAB\s*=\s*['"]p2p_dropdown_tab['"]/.test(prefs.text),
+      "PREF_KEY_P2P_DROPDOWN_TAB must be exported with the key 'p2p_dropdown_tab'",
+    ).toBe(true);
+
+    const controls = read('web/src/components/SessionControls.tsx');
+    expect(
+      controls.text.includes('PREF_KEY_P2P_DROPDOWN_TAB'),
+      'SessionControls must reference PREF_KEY_P2P_DROPDOWN_TAB so the dropdown remembers its tab',
+    ).toBe(true);
+
+    // Tab buttons + workflows body must each appear exactly once.
+    for (const testId of [
+      'p2p-dropdown',
+      'p2p-dropdown-tabs',
+      'p2p-dropdown-tab-combos',
+      'p2p-dropdown-tab-workflows',
+      'p2p-dropdown-workflows-body',
+      'p2p-dropdown-workflows-manage',
+    ]) {
+      expect(
+        controls.text.includes(`data-testid="${testId}"`),
+        `Dropdown UI marker missing: data-testid="${testId}"`,
+      ).toBe(true);
+    }
+
+    // Manage-workflows footer routes to the panel's 'advanced' tab.
+    const manageRouteRegex = /openP2pConfigPanel\(['"]advanced['"]\)/;
+    expect(
+      manageRouteRegex.test(controls.text),
+      "Dropdown must call openP2pConfigPanel('advanced') from the workflow-tab manage button",
+    ).toBe(true);
+  });
+
+  /*
+   * Reverse-regression #74 (R3 v2 PR-κ — User feedback: "在有任何
+   * turn running的时候不准触发升级, 这个好像现在无效了, 只有P2P
+   * running才能拦住"). The daemon upgrade gate previously only counted
+   * `'running'` as in-progress for process agents; queued turns slipped
+   * through and got killed by the upgrade restart. The fix: include
+   * `'queued'` in `PROCESS_IN_PROGRESS_STATES`.
+   */
+  it('#74 daemon upgrade gate MUST include queued state for process agents (R3 v2 PR-κ)', () => {
+    const file = read('src/daemon/command-handler.ts');
+    // Anchor on the exact constant declaration so a future edit that
+    // moves it elsewhere or renames it forces this test to be rewritten.
+    const match = file.text.match(/PROCESS_IN_PROGRESS_STATES\s*:\s*ReadonlySet<string>\s*=\s*new\s+Set\(\[([^\]]+)\]\)/);
+    expect(match, 'PROCESS_IN_PROGRESS_STATES Set declaration must exist').not.toBeNull();
+    const body = match![1];
+    expect(
+      /['"]running['"]/.test(body),
+      "'running' must remain in PROCESS_IN_PROGRESS_STATES",
+    ).toBe(true);
+    expect(
+      /['"]queued['"]/.test(body),
+      "'queued' must be included in PROCESS_IN_PROGRESS_STATES so queued turns also block daemon upgrade",
+    ).toBe(true);
+  });
 });

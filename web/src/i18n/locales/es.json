@@ -587,6 +587,12 @@
       "discuss": "Discusión"
     },
     "mode_config": "Config",
+    "dropdown": {
+      "tab_combos": "Combos",
+      "tab_workflows": "Flujos",
+      "workflows_empty": "Aún no hay flujos guardados. Abre Ajustes → Flujo de trabajo avanzado para diseñar uno.",
+      "workflows_manage": "Gestionar flujos"
+    },
     "settings_button": "Ajustes P2P",
     "settings_title": "Ajustes de participantes P2P",
     "cross_session": "Incluir sesiones de otros proyectos",

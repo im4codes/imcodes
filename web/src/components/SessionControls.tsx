@@ -21,7 +21,7 @@ import {
 import { useP2pCustomCombos } from './p2p-combos.js';
 import { parseBooleanish, usePref } from '../hooks/usePref.js';
 import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
-import { PREF_KEY_P2P_COMBO_CONFIRM_SKIP, p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../constants/prefs.js';
+import { PREF_KEY_P2P_COMBO_CONFIRM_SKIP, PREF_KEY_P2P_DROPDOWN_TAB, p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../constants/prefs.js';
 import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p-config-pref.js';
 import { uploadFile, sendSessionViaHttp, cancelSessionViaHttp } from '../api.js';
 import { patchSession, patchSubSession } from '../api.js';
@@ -40,6 +40,8 @@ import {
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import type { P2pSavedConfig } from '@shared/p2p-modes.js';
+import { migrateLegacyWorkflowDraft, normalizeWorkflowLibrary } from '@shared/p2p-workflow-library.js';
+import type { P2pWorkflowDraft } from '@shared/p2p-workflow-types.js';
 import { getQwenAuthTier, QWEN_AUTH_TIERS } from '@shared/qwen-auth.js';
 import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/qwen-models.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions, normalizeClaudeCodeModelId } from '../../../src/shared/models/options.js';
@@ -328,7 +330,7 @@ type ManualP2pResolveResult = {
   cleanText: string;
 };
 
-type P2pConfigTab = 'participants' | 'combos';
+type P2pConfigTab = 'participants' | 'combos' | 'advanced';
 
 type P2pConfigPersistResult = { ok: boolean; error?: string };
 
@@ -904,6 +906,27 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     () => [...allCombos.presets.map((combo) => combo.key), ...allCombos.custom],
     [allCombos],
   );
+
+  // R3 v2 PR-κ — Workflow library list available for the active session.
+  // Normalised + migrated from legacy single-draft on read so the dropdown
+  // never sees malformed entries even when an older client wrote the
+  // saved config.
+  const workflowLibraryItems = useMemo(() => {
+    if (!p2pSavedConfig) return [] as P2pWorkflowDraft[];
+    const migrated = migrateLegacyWorkflowDraft(p2pSavedConfig);
+    return normalizeWorkflowLibrary(migrated.workflowLibrary ?? []);
+  }, [p2pSavedConfig]);
+
+  // R3 v2 PR-κ — Persist the dropdown's active tab globally so the user's
+  // choice ("combos" vs. "workflows") follows them across sessions and
+  // survives a page reload. Default falls back to the safer "combos" tab
+  // because that's what the dropdown shipped with for years.
+  const dropdownTabPref = usePref<string>(PREF_KEY_P2P_DROPDOWN_TAB);
+  type P2pDropdownTab = 'combos' | 'workflows';
+  const dropdownActiveTab: P2pDropdownTab = dropdownTabPref.value === 'workflows' ? 'workflows' : 'combos';
+  const setDropdownActiveTab = useCallback((tab: P2pDropdownTab) => {
+    void dropdownTabPref.save(tab).catch(() => {});
+  }, [dropdownTabPref]);
 
   const comboSkipPref = usePref<boolean>(PREF_KEY_P2P_COMBO_CONFIRM_SKIP, { parse: parseBooleanish });
   useEffect(() => {
@@ -2008,6 +2031,36 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     requestSend(buildSendPayload(payloadOptions), { clearComposer: true });
   }, [buildSendPayload, p2pSavedConfig, requestSend]);
 
+  /*
+   * R3 v2 PR-κ — Click-to-launch a saved workflow from the P2P dropdown.
+   * Builds a config snapshot with the chosen workflow as active so the
+   * launch envelope (built downstream by `appendOptionalAdvancedP2pConfig`
+   * via `getActiveWorkflowFromConfig`) carries the user-picked entry. We
+   * pass the snapshot through `syntheticConfigOverride` so the picked
+   * workflow takes effect for THIS turn even if the saved config still
+   * names a different active id (the user did not commit the picked id
+   * via the panel — they just one-shot launched it).
+   */
+  const handleDirectWorkflowSelect = useCallback((workflowId: string) => {
+    setP2pOpen(false);
+    if (!p2pSavedConfig || workflowLibraryItems.length === 0) return;
+    const target = workflowLibraryItems.find((entry) => entry.id === workflowId);
+    if (!target) return;
+    const chosenConfig: P2pSavedConfig = { ...p2pSavedConfig, activeWorkflowId: workflowId };
+    const selection = buildP2pConfigSelection(chosenConfig, P2P_CONFIG_MODE);
+    const titleLabel = (target.title?.trim() || workflowId).slice(0, 40);
+    const payloadOptions: BuildSendPayloadOptions = {
+      modeOverride: P2P_CONFIG_MODE,
+      syntheticAtTargets: [{
+        session: '__all__',
+        mode: 'config',
+        label: `@@all(workflow:${titleLabel})`,
+      }],
+      syntheticConfigOverride: selection,
+    };
+    requestSend(buildSendPayload(payloadOptions), { clearComposer: true });
+  }, [buildSendPayload, p2pSavedConfig, requestSend, workflowLibraryItems]);
+
   const handleComboSendCancel = useCallback(() => {
     maybePersistComboSendSkip();
     setPendingComboSendConfirm(null);
@@ -2787,7 +2840,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             <span class="p2p-settings-label">{t('p2p.settings_button')}</span>
           </button>
           {p2pOpen && (
-            <div class="menu-dropdown menu-dropdown-p2p">
+            <div class="menu-dropdown menu-dropdown-p2p" data-testid="p2p-dropdown">
               <button
                 class={`menu-item ${p2pMode === 'solo' ? 'menu-item-active' : ''}`}
                 onClick={() => {
@@ -2800,37 +2853,138 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 {p2pMode === 'solo' ? '● ' : '○ '}{getP2pModeLabel('solo', t)}
               </button>
               <div class="menu-divider" />
-              <div class="p2p-menu-section-label">{t('p2p.combo_label')}</div>
-              {!hasConfiguredP2pParticipants && (
-                <div class="p2p-menu-section-label" style={{ textTransform: 'none', letterSpacing: 'normal', color: '#fbbf24', marginTop: 4 }}>
-                  {t('p2p.combo_requires_participants_hint')}
+              {/*
+               * R3 v2 PR-κ — Tab switcher between the original combo
+               * presets list and the saved advanced workflow library.
+               * Tab choice persists globally via PREF_KEY_P2P_DROPDOWN_TAB
+               * so the user's preference follows them across sessions.
+               */}
+              <div
+                class="p2p-dropdown-tabs"
+                style={{ display: 'flex', gap: 4, padding: '4px 8px' }}
+                data-testid="p2p-dropdown-tabs"
+              >
+                <button
+                  type="button"
+                  class={`menu-item p2p-dropdown-tab ${dropdownActiveTab === 'combos' ? 'menu-item-active' : ''}`}
+                  data-testid="p2p-dropdown-tab-combos"
+                  data-active={dropdownActiveTab === 'combos' ? 'true' : 'false'}
+                  onClick={() => setDropdownActiveTab('combos')}
+                  style={{
+                    flex: 1, fontSize: 11, padding: '4px 8px', borderRadius: 4,
+                    background: dropdownActiveTab === 'combos' ? '#1d4ed840' : 'transparent',
+                    color: dropdownActiveTab === 'combos' ? '#bfdbfe' : '#94a3b8',
+                    fontWeight: dropdownActiveTab === 'combos' ? 600 : 500,
+                  }}
+                >
+                  {t('p2p.dropdown.tab_combos', t('p2p.combo_label', 'Combos'))}
+                </button>
+                <button
+                  type="button"
+                  class={`menu-item p2p-dropdown-tab ${dropdownActiveTab === 'workflows' ? 'menu-item-active' : ''}`}
+                  data-testid="p2p-dropdown-tab-workflows"
+                  data-active={dropdownActiveTab === 'workflows' ? 'true' : 'false'}
+                  onClick={() => setDropdownActiveTab('workflows')}
+                  style={{
+                    flex: 1, fontSize: 11, padding: '4px 8px', borderRadius: 4,
+                    background: dropdownActiveTab === 'workflows' ? '#1d4ed840' : 'transparent',
+                    color: dropdownActiveTab === 'workflows' ? '#bfdbfe' : '#94a3b8',
+                    fontWeight: dropdownActiveTab === 'workflows' ? 600 : 500,
+                  }}
+                >
+                  {t('p2p.dropdown.tab_workflows', 'Workflows')}
+                </button>
+              </div>
+              {dropdownActiveTab === 'combos' ? (
+                <>
+                  {!hasConfiguredP2pParticipants && (
+                    <div class="p2p-menu-section-label" style={{ textTransform: 'none', letterSpacing: 'normal', color: '#fbbf24', marginTop: 4 }}>
+                      {t('p2p.combo_requires_participants_hint')}
+                    </div>
+                  )}
+                  {comboMenuItems.map((key) => (
+                    <button
+                      key={key}
+                      class="menu-item"
+                      onClick={() => {
+                        if (!hasConfiguredP2pParticipants) return;
+                        handleDirectComboSelect(key);
+                      }}
+                      disabled={!hasConfiguredP2pParticipants}
+                      title={!hasConfiguredP2pParticipants ? t('p2p.combo_requires_participants_hint') : undefined}
+                      style={{ color: getP2pModeColor(key), fontSize: 12, opacity: hasConfiguredP2pParticipants ? 1 : 0.45, cursor: hasConfiguredP2pParticipants ? 'pointer' : 'not-allowed' }}
+                    >
+                      ○ {getP2pModeLabel(key, t)}
+                    </button>
+                  ))}
+                  <div class="menu-divider" />
+                  <button
+                    class="menu-item"
+                    onClick={() => {
+                      setP2pOpen(false);
+                      openP2pConfigPanel('combos');
+                    }}
+                  >
+                    {t('p2p.settings_button')}
+                  </button>
+                </>
+              ) : (
+                <div data-testid="p2p-dropdown-workflows-body">
+                  {!hasConfiguredP2pParticipants && (
+                    <div class="p2p-menu-section-label" style={{ textTransform: 'none', letterSpacing: 'normal', color: '#fbbf24', marginTop: 4 }}>
+                      {t('p2p.combo_requires_participants_hint')}
+                    </div>
+                  )}
+                  {workflowLibraryItems.length === 0 ? (
+                    <div
+                      class="p2p-menu-section-label"
+                      style={{ textTransform: 'none', letterSpacing: 'normal', color: '#94a3b8', padding: '8px 12px', whiteSpace: 'normal' }}
+                      data-testid="p2p-dropdown-workflows-empty"
+                    >
+                      {t('p2p.dropdown.workflows_empty', 'No saved workflows yet. Open Settings → Advanced Workflow to design one.')}
+                    </div>
+                  ) : (
+                    workflowLibraryItems.map((entry) => {
+                      const isActive = entry.id === p2pSavedConfig?.activeWorkflowId;
+                      const titleText = entry.title?.trim() ? entry.title : t('p2p.tab.advanced_workflow_starter_title', 'Untitled workflow');
+                      return (
+                        <button
+                          key={entry.id}
+                          class="menu-item"
+                          data-testid={`p2p-dropdown-workflow-${entry.id}`}
+                          data-active={isActive ? 'true' : 'false'}
+                          onClick={() => {
+                            if (!hasConfiguredP2pParticipants) return;
+                            handleDirectWorkflowSelect(entry.id);
+                          }}
+                          disabled={!hasConfiguredP2pParticipants}
+                          title={!hasConfiguredP2pParticipants ? t('p2p.combo_requires_participants_hint') : titleText}
+                          style={{
+                            fontSize: 12,
+                            opacity: hasConfiguredP2pParticipants ? 1 : 0.45,
+                            cursor: hasConfiguredP2pParticipants ? 'pointer' : 'not-allowed',
+                            color: isActive ? '#bfdbfe' : '#e2e8f0',
+                            fontWeight: isActive ? 600 : 500,
+                          }}
+                        >
+                          {isActive ? '● ' : '○ '}{titleText}
+                        </button>
+                      );
+                    })
+                  )}
+                  <div class="menu-divider" />
+                  <button
+                    class="menu-item"
+                    data-testid="p2p-dropdown-workflows-manage"
+                    onClick={() => {
+                      setP2pOpen(false);
+                      openP2pConfigPanel('advanced');
+                    }}
+                  >
+                    {t('p2p.dropdown.workflows_manage', 'Manage workflows')}
+                  </button>
                 </div>
               )}
-              {comboMenuItems.map((key) => (
-                <button
-                  key={key}
-                  class="menu-item"
-                  onClick={() => {
-                    if (!hasConfiguredP2pParticipants) return;
-                    handleDirectComboSelect(key);
-                  }}
-                  disabled={!hasConfiguredP2pParticipants}
-                  title={!hasConfiguredP2pParticipants ? t('p2p.combo_requires_participants_hint') : undefined}
-                  style={{ color: getP2pModeColor(key), fontSize: 12, opacity: hasConfiguredP2pParticipants ? 1 : 0.45, cursor: hasConfiguredP2pParticipants ? 'pointer' : 'not-allowed' }}
-                >
-                  ○ {getP2pModeLabel(key, t)}
-                </button>
-              ))}
-              <div class="menu-divider" />
-              <button
-                class="menu-item"
-                onClick={() => {
-                  setP2pOpen(false);
-                  openP2pConfigPanel('combos');
-                }}
-              >
-                {t('p2p.settings_button')}
-              </button>
               {p2pMode !== 'solo' && (
                 <>
                   <div class="menu-divider" />

@@ -588,6 +588,12 @@
       "discuss": "Discuss"
     },
     "mode_config": "Config",
+    "dropdown": {
+      "tab_combos": "Combos",
+      "tab_workflows": "Workflows",
+      "workflows_empty": "No saved workflows yet. Open Settings → Advanced Workflow to design one.",
+      "workflows_manage": "Manage workflows"
+    },
     "settings_button": "P2P Settings",
     "settings_title": "P2P Participant Settings",
     "cross_session": "Include sessions from other projects",

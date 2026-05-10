@@ -587,6 +587,12 @@
       "discuss": "ディスカッション"
     },
     "mode_config": "設定",
+    "dropdown": {
+      "tab_combos": "コンボ",
+      "tab_workflows": "ワークフロー",
+      "workflows_empty": "保存済みのワークフローはまだありません。設定 → 高度なワークフローで作成してください。",
+      "workflows_manage": "ワークフローを管理"
+    },
     "settings_button": "P2P設定",
     "settings_title": "P2P参加者設定",
     "cross_session": "他のプロジェクトのセッションを含める",
