@@ -107,6 +107,113 @@ export function nextLocalId(prefix: string, existing: ReadonlySet<string>): stri
 }
 
 /**
+ * Audit fix (e940d73f-a8e / A1+N3) — given a node draft and a target
+ * `nodeKind`, return the partial mutation that brings the node into a
+ * combination the validator (`shared/p2p-workflow-validators.ts:578-583`)
+ * will accept.
+ *
+ * Why: `nodeKind === 'logic'` requires `preset='custom'` AND
+ * `permissionScope='analysis_only'`; `nodeKind === 'script'` requires
+ * `preset='custom'`. The R3 v2 PR-λ landed the **forward** direction
+ * (preset onChange aligns scope/dispatch) but missed the **reverse** —
+ * picking nodeKind=logic on a default `llm+discuss+analysis_only` node
+ * produced the cryptic `invalid_workflow_graph (nodes[N])` error in
+ * the user screenshot.
+ *
+ * For `script` we deliberately do NOT auto-fill `script.argv[0]` — the
+ * executable is a security boundary that must align with the daemon's
+ * `allowedExecutables` policy. Leaving `script` unset lets the
+ * validator surface a precise required-field error instead of a
+ * silently-broken default.
+ */
+export function alignNodeForKind(
+  current: P2pWorkflowNodeDraft,
+  nextKind: P2pNodeKind,
+): Partial<P2pWorkflowNodeDraft> {
+  if (nextKind === 'logic') {
+    return {
+      nodeKind: 'logic',
+      preset: 'custom',
+      permissionScope: 'analysis_only',
+      dispatchStyle: 'single_main',
+    };
+  }
+  if (nextKind === 'script') {
+    return {
+      nodeKind: 'script',
+      preset: 'custom',
+      dispatchStyle: 'single_main',
+    };
+  }
+  // llm: fall back to the preset default (preserving an explicit user
+  // customisation by leaving non-default values untouched, matching the
+  // existing PR-λ preset onChange contract).
+  const presetDefaultScope = P2P_PRESET_DEFAULT_PERMISSION_SCOPE[current.preset];
+  const presetDefaultDispatch = P2P_PRESET_DEFAULT_DISPATCH_STYLE[current.preset];
+  // When coming back from logic/script, scope was forced to
+  // `analysis_only` and dispatch to `single_main`; restore preset default
+  // unless the user already moved away from it.
+  return {
+    nodeKind: 'llm',
+    permissionScope: (current.permissionScope ?? presetDefaultScope) === presetDefaultScope
+      ? presetDefaultScope
+      : current.permissionScope,
+    dispatchStyle: (current.dispatchStyle ?? presetDefaultDispatch) === presetDefaultDispatch
+      ? presetDefaultDispatch
+      : current.dispatchStyle,
+  };
+}
+
+/**
+ * Audit fix (e940d73f-a8e / N3) — load-time normalize.
+ *
+ * Returns the input draft with each node coerced into a validator-
+ * legal combination, plus a list of repairs the UI can render in a
+ * banner so the user can review before saving.
+ *
+ * Pure function — no DOM, no side effects, no implicit `onChange`. The
+ * caller is expected to use the result as new local form state and let
+ * the user explicitly Save (mirroring Cx1 R2-Cx1-1's design constraint:
+ * never silently rewrite legacy data on render).
+ */
+export interface P2pWorkflowNodeRepair {
+  nodeId: string;
+  fields: Array<'preset' | 'permissionScope' | 'dispatchStyle'>;
+  reason: string;
+}
+
+export function normalizeP2pWorkflowDraftForEditing(draft: P2pWorkflowDraft): {
+  draft: P2pWorkflowDraft;
+  repairs: P2pWorkflowNodeRepair[];
+} {
+  const repairs: P2pWorkflowNodeRepair[] = [];
+  const nodes = draft.nodes.map((node) => {
+    if (node.nodeKind !== 'logic' && node.nodeKind !== 'script') return node;
+    const aligned = alignNodeForKind(node, node.nodeKind);
+    const fields: P2pWorkflowNodeRepair['fields'] = [];
+    if (aligned.preset !== undefined && aligned.preset !== node.preset) fields.push('preset');
+    if (
+      aligned.permissionScope !== undefined
+      && aligned.permissionScope !== node.permissionScope
+    ) fields.push('permissionScope');
+    if (
+      aligned.dispatchStyle !== undefined
+      && aligned.dispatchStyle !== node.dispatchStyle
+    ) fields.push('dispatchStyle');
+    if (fields.length === 0) return node;
+    repairs.push({
+      nodeId: node.id,
+      fields,
+      reason: node.nodeKind === 'logic'
+        ? 'logic node requires preset=custom + permissionScope=analysis_only'
+        : 'script node requires preset=custom',
+    });
+    return { ...node, ...aligned };
+  });
+  return { draft: { ...draft, nodes }, repairs };
+}
+
+/**
  * Deterministic auto-layout — places nodes on a grid in declaration order so
  * tests can assert position math without snapshotting RNG.
  */
@@ -154,6 +261,19 @@ const inspectorCardStyle = {
 export function AdvancedWorkflowCanvasEditor({ value, onChange, readOnly }: AdvancedWorkflowCanvasEditorProps) {
   const { t } = useTranslation();
   const diagnostics = useMemo(() => validateP2pWorkflowDraft(value).diagnostics, [value]);
+  // Audit fix (e940d73f-a8e / N3) — detect legacy nodes that violate the
+  // logic/script combination contract. Repairs are surfaced as a banner
+  // with an explicit "Apply" button; we never silently rewrite `value`
+  // on render (Cx1 R2-Cx1-1 design constraint).
+  const normalizationPreview = useMemo(() => normalizeP2pWorkflowDraftForEditing(value), [value]);
+  const [normalizeDismissed, setNormalizeDismissed] = useState(false);
+  const showNormalizeBanner = !readOnly
+    && !normalizeDismissed
+    && normalizationPreview.repairs.length > 0;
+  const applyNormalize = () => {
+    if (readOnly) return;
+    onChange(normalizationPreview.draft);
+  };
   const nodeIds = useMemo(() => new Set(value.nodes.map((node) => node.id)), [value.nodes]);
   const edgeIds = useMemo(() => new Set(value.edges.map((edge) => edge.id)), [value.edges]);
   const nodesById = useMemo(() => {
@@ -499,7 +619,15 @@ export function AdvancedWorkflowCanvasEditor({ value, onChange, readOnly }: Adva
             <label style={labelStyle}>
               <span>nodeKind</span>
               {select(`node-${node.id}-kind`, node.nodeKind, P2P_NODE_KINDS,
-                (kind) => updateNode(node.id, (current) => ({ ...current, nodeKind: kind as P2pNodeKind })))}
+                // Audit fix (e940d73f-a8e / A1) — switching nodeKind must
+                // co-align preset/scope/dispatch so the validator does not
+                // reject a `logic+discuss+analysis_only` or
+                // `script+discuss+*` node on the very next render. See
+                // alignNodeForKind() at the top of this file.
+                (kind) => updateNode(node.id, (current) => ({
+                  ...current,
+                  ...alignNodeForKind(current, kind as P2pNodeKind),
+                })))}
             </label>
             <label style={labelStyle}>
               <span>{t('p2p.workflow.editor.node.permission_scope_label', 'Permission scope')}</span>
@@ -641,6 +769,53 @@ export function AdvancedWorkflowCanvasEditor({ value, onChange, readOnly }: Adva
           data-testid="p2p-editor-readonly-notice"
         >
           {t('p2p.workflow.editor.read_only_notice', 'This workflow uses a future schema and is read-only here.')}
+        </div>
+      )}
+
+      {showNormalizeBanner && (
+        <div
+          style={{
+            background: '#1e293b',
+            border: '1px solid #f59e0b',
+            borderRadius: 6,
+            padding: 8,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: 8,
+            fontSize: 12,
+            color: '#fcd34d',
+          }}
+          data-testid="p2p-editor-normalize-banner"
+          data-repairs-count={normalizationPreview.repairs.length}
+        >
+          <span>
+            {t(
+              'p2p.workflow.editor.normalize_banner',
+              {
+                count: normalizationPreview.repairs.length,
+                defaultValue: '{{count}} legacy node(s) need preset/scope alignment for logic/script. Click Apply to fix.',
+              },
+            )}
+          </span>
+          <div style={{ display: 'flex', gap: 6 }}>
+            <button
+              type="button"
+              style={btnStyle}
+              onClick={applyNormalize}
+              data-testid="p2p-editor-normalize-apply"
+            >
+              {t('p2p.workflow.editor.normalize_apply', 'Apply')}
+            </button>
+            <button
+              type="button"
+              style={btnStyle}
+              onClick={() => setNormalizeDismissed(true)}
+              data-testid="p2p-editor-normalize-dismiss"
+            >
+              {t('p2p.workflow.editor.normalize_dismiss', 'Dismiss')}
+            </button>
+          </div>
         </div>
       )}
 

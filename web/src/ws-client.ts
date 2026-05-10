@@ -9,6 +9,7 @@ import { REPO_MSG } from '@shared/repo-types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
 import { P2P_WORKFLOW_MSG, isP2pWorkflowRequestId } from '@shared/p2p-workflow-messages.js';
+import { TRANSPORT_EVENT } from '@shared/transport-events.js';
 import { P2P_CAPABILITY_FRESHNESS_TTL_MS } from '@shared/p2p-workflow-constants.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import { DAEMON_COMMAND_TYPES } from '@shared/daemon-command-types.js';
@@ -279,6 +280,23 @@ export class WsClient {
    *  decide whether the launch button is enabled. */
   private daemonCapabilitySnapshot: DaemonCapabilitySnapshot | null = null;
   private daemonCapabilityListeners = new Set<(snapshot: DaemonCapabilitySnapshot | null) => void>();
+  /**
+   * Audit fix (e940d73f-a8e / N4) — wall-clock of the last incoming
+   * **daemon-originated** message. Decouples the "is daemon alive"
+   * question from the "what capabilities did daemon advertise" question.
+   *
+   * Stale-banner judgment(`isDaemonCapabilityStale()`)now uses this
+   * field instead of `daemonCapabilitySnapshot.observedAt`. Without it,
+   * a healthy long-lived browser page tripped the 30 s TTL after the
+   * one-time `daemon.hello` even though the daemon kept sending stats /
+   * timeline events every few seconds.
+   *
+   * Strict whitelist: server-synthesized `pong` / `session.event` /
+   * `daemon.offline` MUST NOT bump this — they don't prove the daemon
+   * is reachable, and counting them would let the UI show "fresh" while
+   * the daemon is actually down. See {@link DAEMON_ORIGIN_MESSAGE_TYPES}.
+   */
+  private daemonLastSeenAt = 0;
 
   /** Per-session callbacks for raw PTY binary frames. Supports multiple subscribers per session. */
   private _terminalRawHandlers = new Map<string, Set<(data: Uint8Array) => void>>();
@@ -689,12 +707,24 @@ export class WsClient {
       : null;
   }
 
-  /** True when no capability snapshot has been observed, or the latest
-   *  snapshot is older than `P2P_CAPABILITY_FRESHNESS_TTL_MS`. The advanced
-   *  workflow launch UI uses this to disable the launch action. */
+  /** True when no capability snapshot has been observed, or no
+   *  daemon-originated message has arrived within
+   *  `P2P_CAPABILITY_FRESHNESS_TTL_MS`. The advanced workflow launch
+   *  UI uses this to disable the launch action.
+   *
+   *  Audit fix (e940d73f-a8e / N4) — judgment is now based on
+   *  `daemonLastSeenAt` (any whitelisted daemon-originated message
+   *  bumps it) rather than the one-time `daemon.hello.observedAt`.
+   *  This prevents the false-positive stale banner that long-lived
+   *  browser pages displayed 30 s after first connection. Falls back
+   *  to the snapshot's `observedAt` for the brief window before the
+   *  first daemon-originated message arrives. */
   isDaemonCapabilityStale(now = Date.now()): boolean {
     if (!this.daemonCapabilitySnapshot) return true;
-    return now - this.daemonCapabilitySnapshot.observedAt > P2P_CAPABILITY_FRESHNESS_TTL_MS;
+    const lastSeen = this.daemonLastSeenAt > 0
+      ? this.daemonLastSeenAt
+      : this.daemonCapabilitySnapshot.observedAt;
+    return now - lastSeen > P2P_CAPABILITY_FRESHNESS_TTL_MS;
   }
 
   /** Subscribe to capability snapshot changes (incl. disconnect-driven clears).
@@ -710,6 +740,12 @@ export class WsClient {
 
   private setDaemonCapabilitySnapshot(snapshot: DaemonCapabilitySnapshot | null): void {
     this.daemonCapabilitySnapshot = snapshot;
+    // Audit fix (e940d73f-a8e / N4) — keep the liveness clock in sync
+    // with snapshot teardown. Without this, after a WS close clears
+    // the snapshot the next reconnect would show "fresh" for up to
+    // TTL based on a stale `daemonLastSeenAt` from the previous
+    // session.
+    if (!snapshot) this.daemonLastSeenAt = 0;
     const view = this.getDaemonCapabilitySnapshot();
     for (const listener of this.daemonCapabilityListeners) {
       try {
@@ -717,6 +753,49 @@ export class WsClient {
       } catch {
         // ignore listener errors
       }
+    }
+  }
+
+  /**
+   * Audit fix (e940d73f-a8e / N4) — strict whitelist of message types
+   * that prove the **daemon** (not the server) is reachable. Anything
+   * synthesized server-side (`pong`, `session.event`, `daemon.offline`)
+   * is excluded. `timeline.event` is included because both
+   * daemon-direct and transport-relayed timeline events imply the
+   * daemon process produced something within the last few seconds.
+   *
+   * If a new daemon-originated message type is added, it MUST be added
+   * here too (PR review checklist item).
+   */
+  private static readonly DAEMON_ORIGIN_MESSAGE_TYPES: ReadonlySet<string> = new Set<string>([
+    P2P_WORKFLOW_MSG.DAEMON_HELLO,
+    P2P_WORKFLOW_MSG.RUN_UPDATE,
+    P2P_WORKFLOW_MSG.STATUS_RESPONSE,
+    P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE,
+    P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE,
+    'daemon.stats',
+    'timeline.event',
+    'session_list',
+    'repo.detected',
+    TRANSPORT_MSG.PROVIDER_STATUS,
+    TRANSPORT_MSG.CHAT_HISTORY,
+    TRANSPORT_EVENT.CHAT_DELTA,
+    TRANSPORT_EVENT.CHAT_COMPLETE,
+    TRANSPORT_EVENT.CHAT_ERROR,
+    TRANSPORT_EVENT.CHAT_STATUS,
+    TRANSPORT_EVENT.CHAT_TOOL,
+    TRANSPORT_EVENT.CHAT_APPROVAL,
+  ]);
+
+  /**
+   * Audit fix (e940d73f-a8e / N4) — bump `daemonLastSeenAt` if the
+   * incoming message proves the daemon is reachable. No-op for
+   * server-synthesized messages.
+   */
+  private bumpDaemonLastSeenIfFromDaemon(msg: { type?: unknown }): void {
+    if (typeof msg.type !== 'string') return;
+    if (WsClient.DAEMON_ORIGIN_MESSAGE_TYPES.has(msg.type)) {
+      this.daemonLastSeenAt = Date.now();
     }
   }
 
@@ -1057,6 +1136,10 @@ export class WsClient {
           this.dispatch(msg); // Let TerminalView know to reset terminal state
           return;
         }
+        // Audit fix (e940d73f-a8e / N4) — bump daemon-liveness clock
+        // before dispatch so any listener that immediately re-asks
+        // `isDaemonCapabilityStale()` sees the fresh value.
+        this.bumpDaemonLastSeenIfFromDaemon(msg);
         this.dispatch(msg);
       } catch {
         // ignore parse errors

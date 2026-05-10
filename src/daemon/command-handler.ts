@@ -4398,37 +4398,65 @@ function isPathUnderDir(filePath: string, dir: string): boolean {
 async function handleP2pListDiscussions(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const requestId = cmd.requestId as string | undefined;
   const scope = await resolveP2pDiscussionProjectScope(cmd);
-  if (!scope) {
-    serverLink.send({ type: P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE, requestId, discussions: [], error: 'missing_or_invalid_scope' });
-    return;
+  // Audit fix (e940d73f-a8e / M7-B) — when the caller cannot supply scope
+  // (mobile global view, multi-project daemon's "view discussions" entry
+  // without an active session), aggregate discussions across **all** known
+  // projects instead of failing closed. The `error` field is still set so
+  // the UI can show a "scope optional" hint, but the list is no longer
+  // empty. Each entry carries `projectDir` so subsequent reads can route
+  // back. Single-project daemons still return the same one-project list.
+  const projectsToScan: Array<{ projectDir: string }> = [];
+  if (scope) {
+    projectsToScan.push({ projectDir: scope.projectDir });
+  } else {
+    const known = await collectKnownProjectDirs();
+    for (const projectDir of known.values()) projectsToScan.push({ projectDir });
   }
-  const discussions: Array<{ id: string; fileName: string; preview: string; mtime: number }> = [];
-  const dir = imcSubDir(scope.projectDir, 'discussions');
-  try {
-    const entries = await fsReaddir(dir);
-    const files = entries.filter((entry) => {
-      if (!entry.endsWith('.md')) return false;
-      // Keep only canonical discussion documents in the history list.
-      // Intermediate hop artifacts and reducer snapshots are implementation
-      // details and should not crowd out the main discussion file.
-      if (/\.round\d+\.hop\d+\.md$/i.test(entry)) return false;
-      if (/\.reducer\.\d+\.md$/i.test(entry)) return false;
-      return true;
-    });
-    for (const f of files) {
-      try {
-        const fullPath = nodePath.join(dir, f);
-        const s = await fsStat(fullPath);
-        const content = await fsReadFileRaw(fullPath, 'utf8');
-        const reqMatch = content.match(/## User Request\s*\n+(.+)/);
-        const preview = reqMatch?.[1]?.trim().slice(0, 120) || f;
-        discussions.push({ id: f.replace('.md', ''), fileName: f, preview, mtime: s.mtimeMs });
-      } catch { /* skip unreadable */ }
-    }
-  } catch { /* dir may not exist */ }
+  const discussions: Array<{ id: string; fileName: string; preview: string; mtime: number; projectDir?: string }> = [];
+  for (const { projectDir } of projectsToScan) {
+    const dir = imcSubDir(projectDir, 'discussions');
+    try {
+      const entries = await fsReaddir(dir);
+      const files = entries.filter((entry) => {
+        if (!entry.endsWith('.md')) return false;
+        // Keep only canonical discussion documents in the history list.
+        // Intermediate hop artifacts and reducer snapshots are implementation
+        // details and should not crowd out the main discussion file.
+        if (/\.round\d+\.hop\d+\.md$/i.test(entry)) return false;
+        if (/\.reducer\.\d+\.md$/i.test(entry)) return false;
+        return true;
+      });
+      for (const f of files) {
+        try {
+          const fullPath = nodePath.join(dir, f);
+          const s = await fsStat(fullPath);
+          const content = await fsReadFileRaw(fullPath, 'utf8');
+          const reqMatch = content.match(/## User Request\s*\n+(.+)/);
+          const preview = reqMatch?.[1]?.trim().slice(0, 120) || f;
+          discussions.push({
+            id: f.replace('.md', ''),
+            fileName: f,
+            preview,
+            mtime: s.mtimeMs,
+            // Tag with projectDir only when aggregating across multiple
+            // projects so the UI can render scope hints. Single-project
+            // (scope-resolved) responses keep the legacy shape.
+            ...(scope ? {} : { projectDir }),
+          });
+        } catch { /* skip unreadable */ }
+      }
+    } catch { /* dir may not exist */ }
+  }
   // Sort by mtime descending, cap at 50
   discussions.sort((a, b) => b.mtime - a.mtime);
-  serverLink.send({ type: P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE, requestId, discussions: discussions.slice(0, 50) });
+  serverLink.send({
+    type: P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE,
+    requestId,
+    discussions: discussions.slice(0, 50),
+    // Surface to the caller that the list was aggregated across projects.
+    // Old clients ignore unknown fields.
+    ...(scope ? {} : { aggregated: true }),
+  });
 }
 
 async function handleP2pReadDiscussion(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
@@ -4439,10 +4467,53 @@ async function handleP2pReadDiscussion(cmd: Record<string, unknown>, serverLink:
     serverLink.send({ type: P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE, id, requestId, error: 'invalid_id' });
     return;
   }
-  const scope = await resolveP2pDiscussionProjectScope(cmd);
+  let scope = await resolveP2pDiscussionProjectScope(cmd);
   if (!scope) {
-    serverLink.send({ type: P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE, id, requestId, error: 'missing_or_invalid_scope' });
-    return;
+    // Audit fix (e940d73f-a8e / M7-B) — defense-in-depth scope fallback.
+    // Multi-project daemons require explicit scope from the UI, but several
+    // call sites (mobile push-into discussions, global "view discussions"
+    // entry without an active session) did not pass one. Returning
+    // `missing_or_invalid_scope` straight to the UI surfaced as
+    // "(加载失败)". Before erroring out, try to derive scope from:
+    //   1. an active P2P run whose `id`/`discussionId` matches — the run's
+    //      `contextFilePath` carries the authoritative project root.
+    //   2. otherwise, sweep `collectKnownProjectDirs()` for an
+    //      `<id>.md` hit under each project's `imcSubDir(.../discussions)`.
+    // The id is a 12-char UUID slice (low collision risk) so a cross-
+    // project search is acceptable. Lexical traversal is still guarded by
+    // `isPathUnderDir` below so this does NOT widen the safety boundary.
+    for (const run of listP2pRuns()) {
+      if (run.id !== id && run.discussionId !== id) continue;
+      const ctx = run.contextFilePath;
+      if (typeof ctx !== 'string' || ctx.length === 0) continue;
+      const runDiscussionsDir = nodePath.dirname(ctx);
+      // contextFilePath is `<projectDir>/.imc/discussions/<id>.md` so
+      // walking up two parents recovers the project root.
+      const inferredProjectDir = nodePath.resolve(runDiscussionsDir, '..', '..');
+      try {
+        const canonical = await canonicalProjectDir(inferredProjectDir);
+        scope = { projectDir: inferredProjectDir, canonicalProjectDir: canonical };
+        break;
+      } catch { /* ignore — fall through to cross-project sweep */ }
+    }
+    if (!scope) {
+      const known = await collectKnownProjectDirs();
+      for (const [canonical, projectDir] of known.entries()) {
+        const probeDir = nodePath.resolve(imcSubDir(projectDir, 'discussions'));
+        const probe = nodePath.join(probeDir, `${id}.md`);
+        if (!isPathUnderDir(probe, probeDir)) continue;
+        try {
+          // `fsStat` throws on ENOENT — successful resolve == file exists.
+          await fsStat(probe);
+          scope = { projectDir, canonicalProjectDir: canonical };
+          break;
+        } catch { /* file not in this project, keep sweeping */ }
+      }
+    }
+    if (!scope) {
+      serverLink.send({ type: P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE, id, requestId, error: 'missing_or_invalid_scope' });
+      return;
+    }
   }
   const discussionsDir = nodePath.resolve(imcSubDir(scope.projectDir, 'discussions'));
 

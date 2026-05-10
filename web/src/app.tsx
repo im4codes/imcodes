@@ -3959,6 +3959,21 @@ export function App() {
               onBack={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }}
               initialSelectedId={discussionInitialId}
               liveDiscussions={discussions}
+              // Audit fix (e940d73f-a8e / M7-A) — wire the active session
+              // into requestScope. Without this, multi-project daemons fail
+              // `resolveP2pDiscussionProjectScope` and every read returns
+              // `missing_or_invalid_scope` → the UI shows "(加载失败)".
+              // Single-project daemons fall through the size-1 fallback in
+              // the daemon, which is why the bug only surfaces in
+              // multi-project setups.
+              requestScope={
+                activeSession || activeSessionInfo?.projectDir
+                  ? {
+                      ...(activeSession ? { sessionName: activeSession } : {}),
+                      ...(activeSessionInfo?.projectDir ? { projectDir: activeSessionInfo.projectDir } : {}),
+                    }
+                  : undefined
+              }
               onStopDiscussion={(id) => {
                 if (id.startsWith('p2p_')) {
                   wsRef.current?.send({ type: P2P_WORKFLOW_MSG.CANCEL, runId: id.slice(4) });

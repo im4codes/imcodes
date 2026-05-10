@@ -570,31 +570,62 @@ function validateNodeCombination(node: Partial<P2pWorkflowNodeDraft>, fieldPath:
   const scope = node.permissionScope ?? 'analysis_only';
   if (!isOneOf(scope, P2P_PERMISSION_SCOPES)) return [];
   const artifacts = Array.isArray(node.artifacts) ? node.artifacts : [];
-  const invalid = () => [makeP2pWorkflowDiagnostic('invalid_workflow_graph', 'compile', {
-    fieldPath,
-    summary: `Invalid nodeKind/preset/permissionScope combination: ${node.nodeKind}/${node.preset}/${scope}.`,
-  })];
+
+  // Audit fix (e940d73f-a8e / N5) — refine the diagnostic's fieldPath so
+  // the UI can highlight the exact dropdown that's wrong, not surface a
+  // cryptic `nodes[N] invalid`. Each violation produces its own diagnostic
+  // with a precise sub-path; multiple simultaneous violations therefore
+  // yield multiple diagnostics (one per field) — see test
+  // p2p-workflow-validators-fieldpath.
+  const make = (subPath: string | null, summary: string): P2pWorkflowDiagnostic =>
+    makeP2pWorkflowDiagnostic('invalid_workflow_graph', 'compile', {
+      fieldPath: subPath ? `${fieldPath}.${subPath}` : fieldPath,
+      summary,
+    });
 
   if (node.nodeKind === 'logic') {
-    return node.preset === 'custom' && scope === 'analysis_only' ? [] : invalid();
+    const errs: P2pWorkflowDiagnostic[] = [];
+    if (node.preset !== 'custom') {
+      errs.push(make('preset', `logic node requires preset='custom' (got '${node.preset}').`));
+    }
+    if (scope !== 'analysis_only') {
+      errs.push(make('permissionScope', `logic node requires permissionScope='analysis_only' (got '${scope}').`));
+    }
+    return errs;
   }
   if (node.nodeKind === 'script') {
-    return node.preset === 'custom' ? [] : invalid();
+    return node.preset === 'custom'
+      ? []
+      : [make('preset', `script node requires preset='custom' (got '${node.preset}').`)];
   }
   if (node.nodeKind !== 'llm') return [];
 
   if (node.preset === 'audit' || node.preset === 'proposal_audit' || node.preset === 'implementation_audit') {
-    return scope === 'analysis_only' ? [] : invalid();
+    return scope === 'analysis_only'
+      ? []
+      : [make('permissionScope', `preset '${node.preset}' requires permissionScope='analysis_only' (got '${scope}').`)];
   }
   if (node.preset === 'openspec_propose') {
-    return scope === 'artifact_generation' && artifacts.some((artifact) => isRecord(artifact) && artifact.convention === 'openspec_convention') ? [] : invalid();
+    if (scope !== 'artifact_generation') {
+      return [make('permissionScope', `preset 'openspec_propose' requires permissionScope='artifact_generation' (got '${scope}').`)];
+    }
+    if (!artifacts.some((artifact) => isRecord(artifact) && artifact.convention === 'openspec_convention')) {
+      return [make('artifacts', `preset 'openspec_propose' requires an artifact with convention='openspec_convention'.`)];
+    }
+    return [];
   }
   if (node.preset === 'implementation') {
-    return scope === 'implementation' ? [] : invalid();
+    return scope === 'implementation'
+      ? []
+      : [make('permissionScope', `preset 'implementation' requires permissionScope='implementation' (got '${scope}').`)];
   }
   if (scope === 'analysis_only') return [];
-  if (scope === 'artifact_generation') return artifacts.length > 0 ? [] : invalid();
-  return invalid();
+  if (scope === 'artifact_generation') {
+    return artifacts.length > 0
+      ? []
+      : [make('artifacts', `permissionScope='artifact_generation' requires at least one artifact contract.`)];
+  }
+  return [make(null, `Invalid nodeKind/preset/permissionScope combination: ${node.nodeKind}/${node.preset}/${scope}.`)];
 }
 
 function validateDiscussionOffset(input: unknown, fieldPath: string): P2pWorkflowDiagnostic[] {

@@ -141,6 +141,70 @@ describe('p2p.list_discussions', () => {
       error: 'not_found',
     });
   });
+
+  // Audit fix (e940d73f-a8e / M7-B) regression coverage.
+  it('aggregates discussions across known projects when scope is omitted on a multi-project daemon', async () => {
+    await writeFile(join(imcSubDir(projectDir, 'discussions'), 'run-main.md'), '## User Request\nmain request\n', 'utf8');
+    await writeFile(join(imcSubDir(otherProjectDir, 'discussions'), 'run-secret.md'), '## User Request\nsecret request\n', 'utf8');
+
+    handleWebCommand({
+      type: P2P_WORKFLOW_MSG.LIST_DISCUSSIONS,
+      requestId: 'p2p-list-no-scope',
+    }, serverLink as any);
+    await waitForSentCount(1);
+
+    const response = sent[0] as { discussions: Array<{ id: string; projectDir?: string }>; aggregated?: boolean };
+    expect(response.aggregated).toBe(true);
+    const ids = response.discussions.map((d) => d.id).sort();
+    expect(ids).toEqual(['run-main', 'run-secret']);
+    // Each entry MUST carry projectDir when aggregated so the UI can route reads back.
+    for (const entry of response.discussions) {
+      expect(typeof entry.projectDir).toBe('string');
+    }
+  });
+
+  it('reads a discussion via cross-project file sweep when scope is omitted', async () => {
+    await writeFile(join(imcSubDir(otherProjectDir, 'discussions'), 'run-elsewhere.md'), '## User Request\nelsewhere\n', 'utf8');
+
+    handleWebCommand({
+      type: P2P_WORKFLOW_MSG.READ_DISCUSSION,
+      requestId: 'p2p-read-no-scope',
+      id: 'run-elsewhere',
+    }, serverLink as any);
+    await waitForSentCount(1);
+
+    expect(sent[0]).toMatchObject({
+      type: P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE,
+      requestId: 'p2p-read-no-scope',
+      id: 'run-elsewhere',
+      content: expect.stringContaining('elsewhere'),
+    });
+    expect((sent[0] as { error?: string }).error).toBeUndefined();
+  });
+
+  it('reads a discussion via active P2P run lookup when scope is omitted', async () => {
+    const runDiscussionsDir = imcSubDir(projectDir, 'discussions');
+    const runFile = join(runDiscussionsDir, 'live-run.md');
+    await writeFile(runFile, '## User Request\nlive\n', 'utf8');
+    mockListP2pRuns.mockReturnValue([
+      { id: 'live-run', discussionId: 'live-run', contextFilePath: runFile, status: 'running' },
+    ]);
+
+    handleWebCommand({
+      type: P2P_WORKFLOW_MSG.READ_DISCUSSION,
+      requestId: 'p2p-read-active-no-scope',
+      id: 'live-run',
+    }, serverLink as any);
+    await waitForSentCount(1);
+
+    expect(sent[0]).toMatchObject({
+      type: P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE,
+      requestId: 'p2p-read-active-no-scope',
+      id: 'live-run',
+      content: expect.stringContaining('live'),
+    });
+    expect((sent[0] as { error?: string }).error).toBeUndefined();
+  });
 });
 
 describe('p2p.status', () => {
