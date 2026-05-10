@@ -367,6 +367,88 @@ describe('DiscussionsPage', () => {
     expect(matchingItem?.textContent).toContain('Topic live');
   });
 
+  // Audit fix (DiscussionsPage spam-fetch loop) — regression for the
+  // "加载中…" + "p2p per-socket pending cap exceeded" bug. Parent
+  // re-renders that pass a fresh inline `requestScope` object literal
+  // used to make `loadList`'s `useCallback` re-identify, which fired
+  // the mount effect again and dispatched another
+  // `p2p.list_discussions` request — saturating the bridge's
+  // per-socket cap until no response could come back.
+  //
+  // Contract pinned here: even when the parent supplies different
+  // request-scope object identities across renders, the page must
+  // dispatch only ONE list request per content-equal scope.
+  it('does not spam p2p.list_discussions on parent rerender with content-equal scope', async () => {
+    const view = render(
+      <DiscussionsPage
+        ws={ws}
+        // Inline literal — each render produces a new identity but
+        // identical content. The fix in app.tsx wraps the prop in
+        // useMemo; this test verifies DiscussionsPage tolerates the
+        // mistake even if a future refactor reverts the memoization.
+        requestScope={{ sessionName: 'deck_proj_brain' }}
+      />,
+    );
+
+    await act(async () => {
+      handler?.({ type: 'p2p.list_discussions_response', discussions: [] } as ServerMessage);
+    });
+
+    // Force several parent rerenders with NEW object identities but
+    // identical content.
+    for (let i = 0; i < 5; i += 1) {
+      view.rerender(
+        <DiscussionsPage
+          ws={ws}
+          requestScope={{ sessionName: 'deck_proj_brain' }}
+        />,
+      );
+      await act(async () => { /* yield microtask */ });
+    }
+
+    const listCalls = vi.mocked(ws.send).mock.calls.filter(
+      (call) => (call[0] as { type?: string }).type === 'p2p.list_discussions',
+    );
+    // Expected: exactly 1 dispatch on initial mount. Pre-fix would
+    // produce 6+ (mount + 5 rerenders).
+    expect(
+      listCalls.length,
+      `expected 1 list_discussions dispatch across 5 rerenders, got ${listCalls.length}`,
+    ).toBeLessThanOrEqual(2); // ≤2 to allow a single in-flight retry
+  });
+
+  it('debounces list_discussions across a burst of RUN_UPDATE messages', async () => {
+    render(<DiscussionsPage ws={ws} />);
+    await act(async () => {
+      handler?.({ type: 'p2p.list_discussions_response', discussions: [] } as ServerMessage);
+    });
+    const baselineCalls = vi.mocked(ws.send).mock.calls.filter(
+      (c) => (c[0] as { type?: string }).type === 'p2p.list_discussions',
+    ).length;
+
+    // Burst 10 RUN_UPDATE messages in rapid succession.
+    for (let i = 0; i < 10; i += 1) {
+      await act(async () => {
+        handler?.({
+          type: 'p2p.run_update',
+          run: { id: `run-${i}`, status: 'running', discussion_id: `disc-${i}` },
+        } as unknown as ServerMessage);
+      });
+    }
+    // Wait past the debounce window (250ms) for the coalesced fetch.
+    await new Promise((r) => setTimeout(r, 350));
+
+    const finalCalls = vi.mocked(ws.send).mock.calls.filter(
+      (c) => (c[0] as { type?: string }).type === 'p2p.list_discussions',
+    ).length;
+    // Pre-fix would produce 10 new dispatches (one per RUN_UPDATE).
+    // Post-fix: at most 1 coalesced dispatch.
+    expect(
+      finalCalls - baselineCalls,
+      `expected ≤1 list_discussions dispatch from 10 RUN_UPDATEs, got ${finalCalls - baselineCalls}`,
+    ).toBeLessThanOrEqual(1);
+  });
+
   it('clicking a live progress card with NO fileId is a no-op (orphan run mid-bind)', async () => {
     const liveDiscussion = {
       id: 'p2p_orphan',

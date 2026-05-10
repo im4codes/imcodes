@@ -2958,6 +2958,26 @@ export function App() {
 
   const activeSessionInfo = sessions.find((s) => s.name === activeSession) ?? null;
 
+  // Audit fix (DiscussionsPage spam-fetch loop) — memoize the
+  // request-scope object so its identity stays stable across parent
+  // renders. Without this `useMemo`, every parent render of `App`
+  // produced a fresh object literal which made
+  // `DiscussionsPage`'s `useCallback(loadList, [requestScope])`
+  // re-identify, which fired its `useEffect([loadList])` and dispatched
+  // another `p2p.list_discussions` request — producing dozens of
+  // pending requests per second until the bridge's per-socket cap
+  // tripped (`p2p per-socket pending cap exceeded — dropped`) and the
+  // page hung on "加载中…" because no response ever returned.
+  const discussionsRequestScope = useMemo(() => {
+    const sessionName = activeSession ?? undefined;
+    const projectDir = activeSessionInfo?.projectDir ?? undefined;
+    if (!sessionName && !projectDir) return undefined;
+    const scope: { sessionName?: string; projectDir?: string } = {};
+    if (sessionName) scope.sessionName = sessionName;
+    if (projectDir) scope.projectDir = projectDir;
+    return scope;
+  }, [activeSession, activeSessionInfo?.projectDir]);
+
   useEffect(() => {
     if (typeof document === 'undefined') return;
     document.title = buildDocumentTitle(resolvedSelectedServerName, activeSessionInfo);
@@ -4014,14 +4034,12 @@ export function App() {
               // Single-project daemons fall through the size-1 fallback in
               // the daemon, which is why the bug only surfaces in
               // multi-project setups.
-              requestScope={
-                activeSession || activeSessionInfo?.projectDir
-                  ? {
-                      ...(activeSession ? { sessionName: activeSession } : {}),
-                      ...(activeSessionInfo?.projectDir ? { projectDir: activeSessionInfo.projectDir } : {}),
-                    }
-                  : undefined
-              }
+              //
+              // The value MUST come from `useMemo` — see
+              // `discussionsRequestScope` above. Inline object literals
+              // here cause an infinite list-fetch loop inside
+              // `DiscussionsPage`.
+              requestScope={discussionsRequestScope}
               onStopDiscussion={(id) => {
                 if (id.startsWith('p2p_')) {
                   wsRef.current?.send({ type: P2P_WORKFLOW_MSG.CANCEL, runId: id.slice(4) });

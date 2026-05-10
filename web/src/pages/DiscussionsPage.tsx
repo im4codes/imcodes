@@ -109,17 +109,42 @@ export function DiscussionsPage({ ws, initialSelectedId, requestScope, liveDiscu
     scrollDetailTo(el.scrollHeight, mode);
   }, [scrollDetailTo]);
 
+  // Audit fix (DiscussionsPage spam-fetch loop) — stabilize the
+  // request-scope identity by content. See the long comment on
+  // `stableRequestScope` below for the rationale.
+  const stableRequestScopeKey = useMemo(() => JSON.stringify(requestScope ?? null), [requestScope]);
+  const stableRequestScope = useMemo(() => requestScope, [stableRequestScopeKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const sendReadDiscussion = useCallback((id: string): string | null => {
-    return ws?.p2pReadDiscussion(id, requestScope) ?? null;
-  }, [requestScope, ws]);
+    return ws?.p2pReadDiscussion(id, stableRequestScope) ?? null;
+  }, [stableRequestScope, ws]);
 
   const loadList = useCallback(() => {
     if (!ws) return;
     setLoading(true);
-    ws.p2pListDiscussions(requestScope);
-  }, [requestScope, ws]);
+    ws.p2pListDiscussions(stableRequestScope);
+  }, [stableRequestScope, ws]);
 
   useEffect(() => { loadList(); }, [loadList]);
+
+  // Audit fix (spam-fetch loop) — even though `loadList` itself is
+  // stable when `requestScope` has a stable identity, the
+  // `RUN_UPDATE` handler below calls `loadList()` on every P2P run
+  // update push from the daemon. With many runs updating in quick
+  // succession (canvas projection at 5 Hz × N runs) this can still
+  // saturate the bridge's per-socket pending cap. A small debounced
+  // wrapper coalesces bursts into a single fetch.
+  const loadListDebouncedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const requestListRefresh = useCallback(() => {
+    if (loadListDebouncedTimerRef.current) clearTimeout(loadListDebouncedTimerRef.current);
+    loadListDebouncedTimerRef.current = setTimeout(() => {
+      loadListDebouncedTimerRef.current = null;
+      loadList();
+    }, 250);
+  }, [loadList]);
+  useEffect(() => () => {
+    if (loadListDebouncedTimerRef.current) clearTimeout(loadListDebouncedTimerRef.current);
+  }, []);
 
   const selectDiscussion = useCallback((id: string) => {
     setSelected(id);
@@ -231,8 +256,10 @@ export function DiscussionsPage({ ws, initialSelectedId, requestScope, liveDiscu
       if (msg.type === P2P_WORKFLOW_MSG.RUN_UPDATE) {
         const run = (msg as any).run;
         if (!run) return;
-        // Refresh list to pick up new/updated discussions
-        loadList();
+        // Refresh list to pick up new/updated discussions — debounced
+        // so a burst of run updates doesn't saturate the bridge's
+        // per-socket pending cap.
+        requestListRefresh();
         // If we're viewing this discussion's file, reload content
         const runFileId = run.discussion_id ? String(run.discussion_id) : run.id;
         if (selected && (selected === runFileId || selected.includes(run.id))) {
@@ -244,7 +271,7 @@ export function DiscussionsPage({ ws, initialSelectedId, requestScope, liveDiscu
         }
       }
     });
-  }, [copyText, loadList, selected, sendReadDiscussion, t, ws]);
+  }, [copyText, requestListRefresh, selected, sendReadDiscussion, t, ws]);
 
   useEffect(() => () => {
     if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
