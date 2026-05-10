@@ -725,7 +725,9 @@
           "preset_label": "Пресет",
           "permission_scope_label": "Область разрешений",
           "dispatch_style_label": "Стиль отправки",
-          "summary_prompt_label": "Промпт сводки раунда (запускается после узла)"
+          "summary_prompt_label": "Промпт сводки раунда (запускается после узла)",
+          "script_argv_label": "Команда скрипта (одна запись argv в строке; первая строка — исполняемый файл)",
+          "script_argv_placeholder": "/usr/bin/python3\n/абсолютный/путь/script.py\n--flag\nvalue"
         },
         "edge": {
           "section_label": "Связь",

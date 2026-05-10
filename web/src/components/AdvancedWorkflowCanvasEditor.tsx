@@ -107,6 +107,70 @@ export function nextLocalId(prefix: string, existing: ReadonlySet<string>): stri
 }
 
 /**
+ * Audit fix (a8495587-... follow-up) — given a target nodeKind, return
+ * the validator-legal subset of presets the user is allowed to pick.
+ *
+ * Why: the previous canvas editor exposed the full `P2P_PRESET_KEYS`
+ * dropdown regardless of nodeKind. A user who switched `nodeKind` to
+ * `logic` (auto-aligned to `preset=custom` via `alignNodeForKind`) and
+ * then clicked the preset dropdown could pick `implementation_audit`
+ * again — leaving the node in a permanent
+ * `logic+implementation_audit` invalid state with the cryptic
+ * `nodes[N].preset` diagnostic. Restricting the option set at source
+ * makes that state structurally unreachable through the UI.
+ */
+export function getValidPresetsForNodeKind(kind: P2pNodeKind): readonly P2pPresetKey[] {
+  if (kind === 'logic' || kind === 'script') return ['custom'];
+  return P2P_PRESET_KEYS;
+}
+
+/**
+ * Audit fix (a8495587-... follow-up) — validator-legal subset of
+ * `permissionScope` for a given nodeKind/preset combination.
+ *
+ * Mirrors the validator's `validateNodeCombination` (see
+ * `shared/p2p-workflow-validators.ts`):
+ *   - logic            → only `analysis_only`
+ *   - script           → any (script policy is on `script.argv` + daemon allowlist)
+ *   - llm + audit/proposal_audit/implementation_audit → only `analysis_only`
+ *   - llm + openspec_propose → only `artifact_generation`
+ *   - llm + implementation → only `implementation`
+ *   - llm + others (brainstorm/discuss/review/plan/custom) → `analysis_only`
+ *     or `artifact_generation` (the `implementation` scope is reserved
+ *     for the `implementation` preset by the validator).
+ */
+export function getValidScopesForNodeKindAndPreset(
+  kind: P2pNodeKind,
+  preset: P2pPresetKey,
+): readonly P2pPermissionScope[] {
+  if (kind === 'logic') return ['analysis_only'];
+  if (kind === 'script') return P2P_PERMISSION_SCOPES;
+  // llm
+  if (preset === 'audit' || preset === 'proposal_audit' || preset === 'implementation_audit') {
+    return ['analysis_only'];
+  }
+  if (preset === 'openspec_propose') return ['artifact_generation'];
+  if (preset === 'implementation') return ['implementation'];
+  // brainstorm / discuss / review / plan / custom: `implementation` scope
+  // is rejected by the validator for non-`implementation` presets.
+  return ['analysis_only', 'artifact_generation'];
+}
+
+/**
+ * Audit fix (a8495587-... follow-up) — validator-legal subset of
+ * `dispatchStyle` for a given nodeKind.
+ *
+ * Logic/script nodes are single-actor (one authoritative executor),
+ * so `multi_dispatch` is always rejected. LLM nodes accept both.
+ */
+export function getValidDispatchStylesForNodeKind(
+  kind: P2pNodeKind,
+): readonly P2pNodeDispatchStyle[] {
+  if (kind === 'logic' || kind === 'script') return ['single_main'];
+  return P2P_NODE_DISPATCH_STYLES;
+}
+
+/**
  * Audit fix (e940d73f-a8e / A1+N3) — given a node draft and a target
  * `nodeKind`, return the partial mutation that brings the node into a
  * combination the validator (`shared/p2p-workflow-validators.ts:578-583`)
@@ -535,14 +599,26 @@ export function AdvancedWorkflowCanvasEditor({ value, onChange, readOnly }: Adva
   const select = <T extends string>(
     ariaLabel: string, current: T, options: readonly T[],
     onSelect: (next: T) => void,
+    extraDisabled = false,
   ) => (
     <select
       value={current}
-      disabled={readOnly}
+      disabled={readOnly || extraDisabled}
       onInput={(event) => onSelect((event.target as HTMLSelectElement).value as T)}
       style={inputStyle}
       aria-label={ariaLabel}
     >
+      {/*
+       * Audit fix (a8495587-... follow-up) — when the current value is
+       * NOT in the validator-legal subset (e.g., a legacy draft loaded
+       * with `logic+implementation_audit`), include it as a transient
+       * option so the `<select>` still has a matching `value`. Without
+       * this, the browser falls back to the first option visually and
+       * the user can't see what's actually set.
+       */}
+      {!options.includes(current) && (
+        <option key={`__current-${current}`} value={current}>{current}</option>
+      )}
       {options.map((option) => <option key={option} value={option}>{option}</option>)}
     </select>
   );
@@ -585,69 +661,150 @@ export function AdvancedWorkflowCanvasEditor({ value, onChange, readOnly }: Adva
             style={{ ...inputStyle, fontWeight: 600 }}
             aria-label={`node-${node.id}-title`}
           />
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 6 }}>
+          {/*
+           * Audit fix (a8495587-... follow-up) — every dropdown below
+           * filters its option set against the validator's
+           * nodeKind+preset combination rules so the user cannot
+           * select a value that immediately fails compile. Single-
+           * option dropdowns (e.g., logic node's preset locked to
+           * `custom`) are rendered disabled to make the constraint
+           * explicit.
+           */}
+          {(() => {
+            const validPresets = getValidPresetsForNodeKind(node.nodeKind);
+            const validScopes = getValidScopesForNodeKindAndPreset(node.nodeKind, node.preset);
+            const validDispatchStyles = getValidDispatchStylesForNodeKind(node.nodeKind);
+            return (
+              <div
+                style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 6 }}
+                data-testid={`p2p-editor-node-${node.id}-fields`}
+                data-valid-presets={validPresets.join(',')}
+                data-valid-scopes={validScopes.join(',')}
+                data-valid-dispatch-styles={validDispatchStyles.join(',')}
+              >
+                <label style={labelStyle}>
+                  <span>{t('p2p.workflow.editor.node.preset_label', 'Preset')}</span>
+                  {select(`node-${node.id}-preset`, node.preset, validPresets,
+                    (preset) => updateNode(node.id, (current) => {
+                      /*
+                       * R3 v2 PR-λ — Auto-align permissionScope + dispatchStyle to
+                       * the picked preset. Without this, picking `implementation`
+                       * left `permissionScope='analysis_only'` and the validator
+                       * rejected the workflow with a cryptic
+                       * `invalid_workflow_graph (nodes[N])` error.
+                       *
+                       * We only overwrite scope/dispatchStyle when they are still
+                       * at the OLD preset's defaults — if the user has manually
+                       * customised either, we preserve their choice. This keeps
+                       * power-users in control while saving brand-new users from
+                       * tripping over the validator.
+                       */
+                      const next = preset as P2pPresetKey;
+                      const previousPresetDefaultScope = P2P_PRESET_DEFAULT_PERMISSION_SCOPE[current.preset];
+                      const previousPresetDefaultDispatch = P2P_PRESET_DEFAULT_DISPATCH_STYLE[current.preset];
+                      const scopeIsDefault = (current.permissionScope ?? 'analysis_only') === previousPresetDefaultScope;
+                      const dispatchIsDefault = (current.dispatchStyle ?? previousPresetDefaultDispatch) === previousPresetDefaultDispatch;
+                      return {
+                        ...current,
+                        preset: next,
+                        permissionScope: scopeIsDefault ? P2P_PRESET_DEFAULT_PERMISSION_SCOPE[next] : current.permissionScope,
+                        dispatchStyle: dispatchIsDefault ? P2P_PRESET_DEFAULT_DISPATCH_STYLE[next] : current.dispatchStyle,
+                      };
+                    }),
+                    validPresets.length <= 1)}
+                </label>
+                <label style={labelStyle}>
+                  <span>nodeKind</span>
+                  {select(`node-${node.id}-kind`, node.nodeKind, P2P_NODE_KINDS,
+                    // Audit fix (e940d73f-a8e / A1) — switching nodeKind must
+                    // co-align preset/scope/dispatch so the validator does not
+                    // reject a `logic+discuss+analysis_only` or
+                    // `script+discuss+*` node on the very next render. See
+                    // alignNodeForKind() at the top of this file.
+                    (kind) => updateNode(node.id, (current) => ({
+                      ...current,
+                      ...alignNodeForKind(current, kind as P2pNodeKind),
+                    })))}
+                </label>
+                <label style={labelStyle}>
+                  <span>{t('p2p.workflow.editor.node.permission_scope_label', 'Permission scope')}</span>
+                  {select(`node-${node.id}-scope`, node.permissionScope ?? P2P_PRESET_DEFAULT_PERMISSION_SCOPE[node.preset], validScopes,
+                    (scope) => updateNode(node.id, (current) => ({ ...current, permissionScope: scope as P2pPermissionScope })),
+                    validScopes.length <= 1)}
+                </label>
+                <label style={labelStyle}>
+                  {/*
+                   * R3 v2 PR-λ — User feedback: "我安排了单节点的node, 比如实施这种节点
+                   * 肯定是单节点node, 默认是发起节点(可以选其它的), 讨论那些是多节点讨论
+                   * node, 这里面完全没有做区分". The data model carries
+                   * `dispatchStyle` already; surface it in the inspector so users
+                   * can flip between single_main (one authoritative agent) and
+                   * multi_dispatch (fan-out to all participants).
+                   */}
+                  <span>{t('p2p.workflow.editor.node.dispatch_style_label', 'Dispatch style')}</span>
+                  {select(`node-${node.id}-dispatch-style`, node.dispatchStyle ?? P2P_PRESET_DEFAULT_DISPATCH_STYLE[node.preset], validDispatchStyles,
+                    (style) => updateNode(node.id, (current) => ({ ...current, dispatchStyle: style as P2pNodeDispatchStyle })),
+                    validDispatchStyles.length <= 1)}
+                </label>
+              </div>
+            );
+          })()}
+          {/*
+           * Audit fix (a8495587-... follow-up) — surface
+           * `script.argv` inline for script nodes. Without this the
+           * inspector left script nodes with no command UI, so every
+           * script node compiled with `invalid_script_contract
+           * (nodes[N].script.argv)`. One textarea, one argv entry per
+           * line; first entry is the executable, the rest are
+           * positional args.
+           *
+           * The daemon's `allowedExecutables` policy still gates
+           * argv[0] at bind-time — this UI only carries the user's
+           * intent verbatim to the validator. Whitespace-only lines
+           * are stripped before storing.
+           */}
+          {node.nodeKind === 'script' && (
             <label style={labelStyle}>
-              <span>{t('p2p.workflow.editor.node.preset_label', 'Preset')}</span>
-              {select(`node-${node.id}-preset`, node.preset, P2P_PRESET_KEYS,
-                (preset) => updateNode(node.id, (current) => {
-                  /*
-                   * R3 v2 PR-λ — Auto-align permissionScope + dispatchStyle to
-                   * the picked preset. Without this, picking `implementation`
-                   * left `permissionScope='analysis_only'` and the validator
-                   * rejected the workflow with a cryptic
-                   * `invalid_workflow_graph (nodes[N])` error.
-                   *
-                   * We only overwrite scope/dispatchStyle when they are still
-                   * at the OLD preset's defaults — if the user has manually
-                   * customised either, we preserve their choice. This keeps
-                   * power-users in control while saving brand-new users from
-                   * tripping over the validator.
-                   */
-                  const next = preset as P2pPresetKey;
-                  const previousPresetDefaultScope = P2P_PRESET_DEFAULT_PERMISSION_SCOPE[current.preset];
-                  const previousPresetDefaultDispatch = P2P_PRESET_DEFAULT_DISPATCH_STYLE[current.preset];
-                  const scopeIsDefault = (current.permissionScope ?? 'analysis_only') === previousPresetDefaultScope;
-                  const dispatchIsDefault = (current.dispatchStyle ?? previousPresetDefaultDispatch) === previousPresetDefaultDispatch;
+              <span>{t('p2p.workflow.editor.node.script_argv_label', 'Script command (one argv entry per line; first line is the executable)')}</span>
+              <textarea
+                value={(node.script?.argv ?? []).join('\n')}
+                disabled={readOnly}
+                rows={4}
+                placeholder={t('p2p.workflow.editor.node.script_argv_placeholder', '/usr/bin/python3\n/abs/path/to/script.py\n--flag\nvalue')}
+                onInput={(event) => updateNode(node.id, (current) => {
+                  const raw = (event.target as HTMLTextAreaElement).value;
+                  const argv = raw.split('\n').map((entry) => entry.trim()).filter((entry) => entry !== '');
+                  if (argv.length === 0) {
+                    // Drop the script field entirely so the validator
+                    // surfaces a clean `script.argv` required-field
+                    // error instead of an opaque empty-array hit.
+                    const { script: _drop, ...rest } = current;
+                    void _drop;
+                    return rest;
+                  }
+                  const prior = current.script;
                   return {
                     ...current,
-                    preset: next,
-                    permissionScope: scopeIsDefault ? P2P_PRESET_DEFAULT_PERMISSION_SCOPE[next] : current.permissionScope,
-                    dispatchStyle: dispatchIsDefault ? P2P_PRESET_DEFAULT_DISPATCH_STYLE[next] : current.dispatchStyle,
+                    script: {
+                      commandKind: prior?.commandKind ?? 'argv',
+                      argv,
+                      ...(prior?.commandKind === 'interpreter' && typeof prior?.interpreter === 'string'
+                        ? { interpreter: prior.interpreter }
+                        : {}),
+                      ...(typeof prior?.stdin === 'string' ? { stdin: prior.stdin } : {}),
+                      ...(Array.isArray(prior?.envAllowlist) ? { envAllowlist: [...prior.envAllowlist] } : {}),
+                      ...(typeof prior?.timeoutMs === 'number' ? { timeoutMs: prior.timeoutMs } : {}),
+                      ...(prior?.requiredMachineOutput !== undefined ? { requiredMachineOutput: prior.requiredMachineOutput } : {}),
+                      ...(prior?.caps ? { caps: { ...prior.caps } } : {}),
+                    },
                   };
-                }))}
+                })}
+                style={{ ...inputStyle, resize: 'vertical', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}
+                aria-label={`node-${node.id}-script-argv`}
+                data-testid={`p2p-editor-node-${node.id}-script-argv`}
+              />
             </label>
-            <label style={labelStyle}>
-              <span>nodeKind</span>
-              {select(`node-${node.id}-kind`, node.nodeKind, P2P_NODE_KINDS,
-                // Audit fix (e940d73f-a8e / A1) — switching nodeKind must
-                // co-align preset/scope/dispatch so the validator does not
-                // reject a `logic+discuss+analysis_only` or
-                // `script+discuss+*` node on the very next render. See
-                // alignNodeForKind() at the top of this file.
-                (kind) => updateNode(node.id, (current) => ({
-                  ...current,
-                  ...alignNodeForKind(current, kind as P2pNodeKind),
-                })))}
-            </label>
-            <label style={labelStyle}>
-              <span>{t('p2p.workflow.editor.node.permission_scope_label', 'Permission scope')}</span>
-              {select(`node-${node.id}-scope`, node.permissionScope ?? P2P_PRESET_DEFAULT_PERMISSION_SCOPE[node.preset], P2P_PERMISSION_SCOPES,
-                (scope) => updateNode(node.id, (current) => ({ ...current, permissionScope: scope as P2pPermissionScope })))}
-            </label>
-            <label style={labelStyle}>
-              {/*
-               * R3 v2 PR-λ — User feedback: "我安排了单节点的node, 比如实施这种节点
-               * 肯定是单节点node, 默认是发起节点(可以选其它的), 讨论那些是多节点讨论
-               * node, 这里面完全没有做区分". The data model carries
-               * `dispatchStyle` already; surface it in the inspector so users
-               * can flip between single_main (one authoritative agent) and
-               * multi_dispatch (fan-out to all participants).
-               */}
-              <span>{t('p2p.workflow.editor.node.dispatch_style_label', 'Dispatch style')}</span>
-              {select(`node-${node.id}-dispatch-style`, node.dispatchStyle ?? P2P_PRESET_DEFAULT_DISPATCH_STYLE[node.preset], P2P_NODE_DISPATCH_STYLES,
-                (style) => updateNode(node.id, (current) => ({ ...current, dispatchStyle: style as P2pNodeDispatchStyle })))}
-            </label>
-          </div>
+          )}
           <textarea
             value={node.promptAppend ?? ''}
             disabled={readOnly}

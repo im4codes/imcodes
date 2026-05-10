@@ -726,7 +726,9 @@
           "preset_label": "Preset",
           "permission_scope_label": "Permission scope",
           "dispatch_style_label": "Dispatch style",
-          "summary_prompt_label": "Round summary prompt (auto-runs after this node)"
+          "summary_prompt_label": "Round summary prompt (auto-runs after this node)",
+          "script_argv_label": "Script command (one argv entry per line; first line is the executable)",
+          "script_argv_placeholder": "/usr/bin/python3\n/abs/path/to/script.py\n--flag\nvalue"
         },
         "edge": {
           "section_label": "Edge",

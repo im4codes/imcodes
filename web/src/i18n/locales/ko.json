@@ -725,7 +725,9 @@
           "preset_label": "프리셋",
           "permission_scope_label": "권한 범위",
           "dispatch_style_label": "디스패치 방식",
-          "summary_prompt_label": "라운드 요약 프롬프트 (노드 종료 후 자동 실행)"
+          "summary_prompt_label": "라운드 요약 프롬프트 (노드 종료 후 자동 실행)",
+          "script_argv_label": "스크립트 명령어 (한 줄에 argv 항목 하나, 첫 줄이 실행 파일)",
+          "script_argv_placeholder": "/usr/bin/python3\n/절대경로/script.py\n--flag\nvalue"
         },
         "edge": {
           "section_label": "엣지",

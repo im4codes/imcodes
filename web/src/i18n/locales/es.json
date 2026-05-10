@@ -725,7 +725,9 @@
           "preset_label": "Predeterminado",
           "permission_scope_label": "Alcance de permiso",
           "dispatch_style_label": "Estilo de despacho",
-          "summary_prompt_label": "Prompt de resumen de la ronda (se ejecuta tras este nodo)"
+          "summary_prompt_label": "Prompt de resumen de la ronda (se ejecuta tras este nodo)",
+          "script_argv_label": "Comando del script (un argv por línea; la primera línea es el ejecutable)",
+          "script_argv_placeholder": "/usr/bin/python3\n/ruta/absoluta/script.py\n--flag\nvalor"
         },
         "edge": {
           "section_label": "Enlace",

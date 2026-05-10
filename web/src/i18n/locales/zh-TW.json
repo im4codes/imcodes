@@ -726,7 +726,9 @@
           "preset_label": "預設",
           "permission_scope_label": "權限範圍",
           "dispatch_style_label": "派發模式",
-          "summary_prompt_label": "本輪總結提示詞（節點結束後自動執行）"
+          "summary_prompt_label": "本輪總結提示詞（節點結束後自動執行）",
+          "script_argv_label": "腳本命令（每行一個 argv 項目，首行為可執行檔）",
+          "script_argv_placeholder": "/usr/bin/python3\n/絕對路徑/腳本.py\n--flag\nvalue"
         },
         "edge": {
           "section_label": "邊",

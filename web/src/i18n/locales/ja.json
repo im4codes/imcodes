@@ -725,7 +725,9 @@
           "preset_label": "プリセット",
           "permission_scope_label": "権限スコープ",
           "dispatch_style_label": "ディスパッチ方式",
-          "summary_prompt_label": "ラウンドサマリープロンプト（ノード後に自動実行）"
+          "summary_prompt_label": "ラウンドサマリープロンプト（ノード後に自動実行）",
+          "script_argv_label": "スクリプトコマンド（1行につき argv 1項目、最初の行が実行ファイル）",
+          "script_argv_placeholder": "/usr/bin/python3\n/絶対パス/script.py\n--flag\nvalue"
         },
         "edge": {
           "section_label": "エッジ",
