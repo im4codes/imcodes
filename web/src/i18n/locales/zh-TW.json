@@ -676,7 +676,7 @@
         "mixed_advanced_schema_fields": "Old and new advanced workflow fields are mixed.",
         "static_policy_mismatch_recompiled": "Daemon policy changed, so the workflow was recompiled.",
         "missing_required_capability": "The daemon is missing a required workflow capability.",
-        "capability_stale": "Daemon workflow capability information is stale.",
+        "capability_stale": "與 daemon 失聯 — 已儲存的設定不受影響，但新的進階工作流啟動會暫停，直到 daemon 重連（通常 <30 秒）。",
         "capability_downgraded_during_run": "A required capability was downgraded during the run.",
         "invalid_launch_envelope": "The workflow launch envelope is invalid.",
         "invalid_workflow_graph": "The workflow graph is invalid.",
@@ -711,7 +711,10 @@
         "remove_edge": "移除邊",
         "diagnostics_header": "診斷",
         "read_only_notice": "此工作流使用未來 schema,在此僅供唯讀。",
-        "canvas_hint": "拖曳節點調整位置，從右側錨點 (●) 拖到另一節點即可建立邊。",
+        "canvas_hint": "拖曳節點調整位置，從右側錨點 (●) 拖到另一節點即可建立邊。滑鼠滾輪或捏合縮放。",
+        "zoom_in": "放大",
+        "zoom_out": "縮小",
+        "zoom_reset": "重置縮放",
         "inspector_empty": "選擇一個節點或邊以編輯其屬性。",
         "node": {
           "section_label": "節點",
@@ -729,12 +732,13 @@
       },
       "allowed_executables": {
         "title": "腳本可執行檔白名單",
-        "hint": "腳本節點僅可啟動此清單中的可執行檔。使用絕對路徑（如 /usr/bin/jq）或 PATH 相對名稱。清單為空時此設定禁止腳本執行。",
+        "hint": "在腳本啟動時強制生效。列出腳本節點允許呼叫的絕對路徑（如 /usr/bin/jq）或 PATH 相對名稱。純 LLM 工作流無需新增任何項目。",
         "placeholder": "/usr/bin/jq",
         "input_label": "新增可執行路徑",
         "add": "新增",
         "remove": "移除",
-        "empty": "尚未允許任何可執行檔。腳本節點將在 bind 階段被拒絕。"
+        "empty": "尚未允許任何可執行檔。本工作流的腳本節點會在 bind 階段被拒絕，至少新增一條後才能執行。",
+        "script_nodes_need_entries": "腳本節點必須設定"
       },
       "library": {
         "title": "工作流庫",

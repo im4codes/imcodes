@@ -676,7 +676,7 @@
         "mixed_advanced_schema_fields": "Old and new advanced workflow fields are mixed.",
         "static_policy_mismatch_recompiled": "Daemon policy changed, so the workflow was recompiled.",
         "missing_required_capability": "The daemon is missing a required workflow capability.",
-        "capability_stale": "Daemon workflow capability information is stale.",
+        "capability_stale": "与 daemon 失联 — 已保存的配置不受影响，但新的高级工作流启动会暂停，直到 daemon 重连（通常 <30 秒）。",
         "capability_downgraded_during_run": "A required capability was downgraded during the run.",
         "invalid_launch_envelope": "The workflow launch envelope is invalid.",
         "invalid_workflow_graph": "The workflow graph is invalid.",
@@ -711,7 +711,10 @@
         "remove_edge": "删除边",
         "diagnostics_header": "诊断",
         "read_only_notice": "此工作流使用未来 schema,这里只读。",
-        "canvas_hint": "拖动节点调整位置，从右侧锚点 (●) 拖到另一节点即可创建边。",
+        "canvas_hint": "拖动节点调整位置，从右侧锚点 (●) 拖到另一节点即可创建边。鼠标滚轮或捏合缩放。",
+        "zoom_in": "放大",
+        "zoom_out": "缩小",
+        "zoom_reset": "重置缩放",
         "inspector_empty": "选择一个节点或边以编辑其属性。",
         "node": {
           "section_label": "节点",
@@ -729,12 +732,13 @@
       },
       "allowed_executables": {
         "title": "脚本可执行文件白名单",
-        "hint": "脚本节点只能启动此列表中的可执行文件。使用绝对路径（如 /usr/bin/jq）或 PATH 相对名称。列表为空时此配置禁止脚本执行。",
+        "hint": "在脚本启动时强制生效。列出脚本节点允许调用的绝对路径（如 /usr/bin/jq）或 PATH 相对名称。纯 LLM 工作流无需添加任何条目。",
         "placeholder": "/usr/bin/jq",
         "input_label": "新的可执行路径",
         "add": "添加",
         "remove": "移除",
-        "empty": "尚未允许任何可执行文件。脚本节点将在 bind 阶段被拒绝。"
+        "empty": "尚未允许任何可执行文件。本工作流的脚本节点会在 bind 阶段被拒绝，添加至少一条后才能运行。",
+        "script_nodes_need_entries": "脚本节点必须配置"
       },
       "library": {
         "title": "工作流库",

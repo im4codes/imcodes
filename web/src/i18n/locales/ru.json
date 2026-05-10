@@ -675,7 +675,7 @@
         "mixed_advanced_schema_fields": "Old and new advanced workflow fields are mixed.",
         "static_policy_mismatch_recompiled": "Daemon policy changed, so the workflow was recompiled.",
         "missing_required_capability": "The daemon is missing a required workflow capability.",
-        "capability_stale": "Daemon workflow capability information is stale.",
+        "capability_stale": "Связь с демоном потеряна — сохранённые конфигурации продолжают работать, но новые запуски расширенного воркфлоу приостановлены до переподключения демона (обычно <30 с).",
         "capability_downgraded_during_run": "A required capability was downgraded during the run.",
         "invalid_launch_envelope": "The workflow launch envelope is invalid.",
         "invalid_workflow_graph": "The workflow graph is invalid.",
@@ -710,7 +710,10 @@
         "remove_edge": "Удалить связь",
         "diagnostics_header": "Диагностика",
         "read_only_notice": "Этот workflow использует будущую схему и здесь доступен только для чтения.",
-        "canvas_hint": "Перетащите узлы для размещения. Перетащите от правого якоря (●) к другому узлу, чтобы создать связь.",
+        "canvas_hint": "Перетащите узлы для размещения. Перетащите от правого якоря (●) к другому узлу, чтобы создать связь. Колесо мыши или жест pinch для масштабирования.",
+        "zoom_in": "Увеличить",
+        "zoom_out": "Уменьшить",
+        "zoom_reset": "Сбросить масштаб",
         "inspector_empty": "Выберите узел или связь, чтобы редактировать свойства.",
         "node": {
           "section_label": "Узел",
@@ -728,12 +731,13 @@
       },
       "allowed_executables": {
         "title": "Разрешённые исполняемые файлы для скриптов",
-        "hint": "Узлы-скрипты могут запускать только перечисленные исполняемые файлы. Используйте абсолютные пути (например, /usr/bin/jq) или имена относительно PATH. Пустой список отключает запуск скриптов в этой конфигурации.",
+        "hint": "Жёстко применяется при запуске скрипта. Добавьте абсолютные пути (например, /usr/bin/jq) или имена относительно PATH, которые могут вызывать узлы-скрипты. Воркфлоу только из LLM не требуют записей здесь.",
         "placeholder": "/usr/bin/jq",
         "input_label": "Новый путь к исполняемому файлу",
         "add": "Добавить",
         "remove": "Удалить",
-        "empty": "Пока нет разрешённых исполняемых файлов. Узлы-скрипты будут отклонены на этапе bind."
+        "empty": "Пока нет разрешённых исполняемых файлов. Узлы-скрипты этого воркфлоу будут отклонены на этапе bind, пока вы не добавите хотя бы одну запись.",
+        "script_nodes_need_entries": "Требуется для узлов-скриптов"
       },
       "library": {
         "title": "Библиотека воркфлоу",

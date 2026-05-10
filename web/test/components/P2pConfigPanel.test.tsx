@@ -1608,24 +1608,85 @@ describe('P2pConfigPanel', () => {
     // `P2pStaticPolicy.allowedExecutables`.
     // ─────────────────────────────────────────────────────────────────
 
-    it('Allowed executables section renders alongside the canvas editor', async () => {
+    /*
+     * R3 v2 PR-ξ — Helper that builds a saved config whose workflow has a
+     * script node, making the allowed-executables section relevant. Without
+     * this the new gate hides the section entirely.
+     */
+    function makeSavedConfigWithScriptNode(extras: Partial<P2pSavedConfig> = {}): P2pSavedConfig {
+      const draft: P2pWorkflowDraft = {
+        schemaVersion: P2P_WORKFLOW_SCHEMA_VERSION,
+        id: 'draft-script',
+        title: 'Draft with script',
+        nodes: [
+          { id: 'discuss', title: 'Discuss', nodeKind: 'llm', preset: 'discuss', permissionScope: 'analysis_only' },
+          { id: 'fmt', title: 'Format', nodeKind: 'script', preset: 'custom', permissionScope: 'analysis_only', script: { commandKind: 'argv', argv: ['/usr/bin/jq', '.'], requireMachineOutput: false, declaresArtifacts: false, declaresVariables: false } as never },
+        ],
+        edges: [{ id: 'e1', fromNodeId: 'discuss', toNodeId: 'fmt', edgeKind: 'default' }],
+      };
+      const envelope: P2pWorkflowLaunchEnvelope = {
+        workflowSchemaVersion: P2P_WORKFLOW_SCHEMA_VERSION,
+        workflowKind: 'advanced',
+        advancedDraft: draft,
+        requiredDaemonCapabilities: [P2P_WORKFLOW_CAPABILITY_V1],
+      };
+      return { sessions: {}, rounds: 2, workflowDraft: draft, workflowLaunchEnvelope: envelope, ...extras };
+    }
+
+    /*
+     * R3 v2 PR-ξ — User feedback: the allowlist UI was always visible
+     * for any advanced workflow (after the bootstrap auto-creates an
+     * LLM-only draft). For LLM-only workflows the allowlist is
+     * irrelevant noise. The section is now hidden entirely when no
+     * workflow in the library has a script node AND no entries exist.
+     * Tests below assert the new gate.
+     */
+    it('R3 v2 PR-ξ — allowlist section is HIDDEN for LLM-only workflows with no entries', async () => {
       getUserPrefMock.mockResolvedValue(JSON.stringify(makeSavedConfigWithDraft()));
+      renderPanel({ initialTab: 'advanced' });
+      await flush();
+      // Workflow has only LLM nodes, no allowedExecutables → section MUST NOT appear.
+      expect(screen.queryByTestId('p2p-allowed-executables-section')).toBeNull();
+    });
+
+    it('R3 v2 PR-ξ — allowlist section is VISIBLE when the workflow has a script node, but COLLAPSED by default', async () => {
+      getUserPrefMock.mockResolvedValue(JSON.stringify(makeSavedConfigWithScriptNode()));
       renderPanel({ initialTab: 'advanced' });
       await flush();
       const section = screen.getByTestId('p2p-allowed-executables-section');
       expect(section).toBeDefined();
-      expect(section.getAttribute('data-readonly')).toBe('false');
-      // Empty state visible when no entries are configured.
-      expect(screen.getByTestId('p2p-allowed-executables-empty')).toBeDefined();
-      // Add row exposed.
+      expect(section.getAttribute('data-relevant')).toBe('true');
+      // Disclosure toggle is rendered.
+      const toggle = screen.getByTestId('p2p-allowed-executables-toggle');
+      expect(toggle.getAttribute('aria-expanded')).toBe('false');
+      // Body is collapsed: input + empty state are NOT in the DOM yet.
+      expect(screen.queryByTestId('p2p-allowed-executables-input')).toBeNull();
+      expect(screen.queryByTestId('p2p-allowed-executables-empty')).toBeNull();
+    });
+
+    it('R3 v2 PR-ξ — clicking the disclosure toggle expands the body and shows the input + empty state', async () => {
+      getUserPrefMock.mockResolvedValue(JSON.stringify(makeSavedConfigWithScriptNode()));
+      renderPanel({ initialTab: 'advanced' });
+      await flush();
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-allowed-executables-toggle'));
+      });
+      await flush();
+      // After expand: body markers are in the DOM.
       expect(screen.getByTestId('p2p-allowed-executables-input')).toBeDefined();
+      expect(screen.getByTestId('p2p-allowed-executables-empty')).toBeDefined();
       expect(screen.getByTestId('p2p-allowed-executables-add')).toBeDefined();
     });
 
     it('adds an executable to the allowlist and persists it through Save', async () => {
       const onSave = vi.fn();
-      getUserPrefMock.mockResolvedValue(JSON.stringify(makeSavedConfigWithDraft()));
+      getUserPrefMock.mockResolvedValue(JSON.stringify(makeSavedConfigWithScriptNode()));
       renderPanel({ onSave, initialTab: 'advanced' });
+      await flush();
+      // Expand the disclosure first (default collapsed under PR-ξ).
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-allowed-executables-toggle'));
+      });
       await flush();
       const input = screen.getByTestId('p2p-allowed-executables-input') as HTMLInputElement;
       await act(async () => {
@@ -1640,7 +1701,7 @@ describe('P2pConfigPanel', () => {
       // Saving propagates the entry both into `cfg.allowedExecutables` and
       // into the materialized envelope.
       await act(async () => {
-        fireEvent.click(screen.getByText('settings_save'));
+        fireEvent.click(screen.getByTestId('p2p-save-and-close'));
       });
       await flush();
       const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
@@ -1656,6 +1717,12 @@ describe('P2pConfigPanel', () => {
       }));
       renderPanel({ onSave, initialTab: 'advanced' });
       await flush();
+      // Existing entries make the section visible (gate condition met).
+      // Disclosure starts collapsed → click to expand before asserting entries.
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-allowed-executables-toggle'));
+      });
+      await flush();
       expect(screen.getByTestId('p2p-allowed-executables-entry-/usr/bin/jq')).toBeDefined();
       expect(screen.getByTestId('p2p-allowed-executables-entry-/bin/echo')).toBeDefined();
       await act(async () => {
@@ -1664,7 +1731,7 @@ describe('P2pConfigPanel', () => {
       await flush();
       expect(screen.queryByTestId('p2p-allowed-executables-entry-/bin/echo')).toBeNull();
       await act(async () => {
-        fireEvent.click(screen.getByText('settings_save'));
+        fireEvent.click(screen.getByTestId('p2p-save-and-close'));
       });
       await flush();
       const cfg: P2pSavedConfig = onSave.mock.calls[0][0];

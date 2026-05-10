@@ -51,13 +51,25 @@ import { validateP2pWorkflowDraft } from '@shared/p2p-workflow-validators.js';
 
 // ── Layout constants ────────────────────────────────────────────────────────
 // Kept as module-level constants so unit tests can import + assert layout.
-export const CANVAS_NODE_WIDTH = 168;
-export const CANVAS_NODE_HEIGHT = 78;
-export const CANVAS_GRID_X = 220;
-export const CANVAS_GRID_Y = 120;
+//
+// R3 v2 PR-π — Default node + grid sizes shrunk ~20% per user feedback
+// "默认节点小一点". The canvas is also zoomable now (mouse wheel + Mac
+// touchpad pinch — see `zoom` state in the component) so users who want
+// even bigger / smaller can pinch to taste.
+export const CANVAS_NODE_WIDTH = 132;
+export const CANVAS_NODE_HEIGHT = 62;
+export const CANVAS_GRID_X = 180;
+export const CANVAS_GRID_Y = 100;
 export const CANVAS_VIEW_WIDTH = 720;
 export const CANVAS_VIEW_HEIGHT = 420;
 export const CANVAS_NODES_PER_ROW = 3;
+// R3 v2 PR-π — Zoom range. Min 0.5 lets the user zoom out to see the
+// whole graph; max 2.0 lets them zoom in for fine-grained edge editing.
+// Default 1.0 matches the shrunk defaults above.
+export const CANVAS_ZOOM_MIN = 0.5;
+export const CANVAS_ZOOM_MAX = 2.0;
+export const CANVAS_ZOOM_DEFAULT = 1.0;
+export const CANVAS_ZOOM_STEP = 1.1;
 
 interface NodePosition {
   x: number;
@@ -179,6 +191,47 @@ export function AdvancedWorkflowCanvasEditor({ value, onChange, readOnly }: Adva
   const dragRef = useRef<PointerDragState | null>(null);
   // Force re-render during drag without storing transient state in React.
   const [, forceTick] = useState(0);
+
+  /*
+   * R3 v2 PR-π — Canvas zoom state. Driven by:
+   *   - Mouse wheel over the canvas (deltaY > 0 = zoom out, < 0 = zoom in)
+   *   - Mac touchpad pinch gesture (the browser delivers it as a `wheel`
+   *     event with `ctrlKey === true`; we consume both)
+   *   - +/-/0 keyboard buttons in the canvas toolbar (manual control)
+   *
+   * Zoom is implemented by scaling the viewBox extent (NOT a `<g>` SVG
+   * transform) so `getScreenCTM().inverse()` continues to map client
+   * coords to viewBox-space coords without manual divide-by-zoom math
+   * inside the drag handlers.
+   */
+  const [zoom, setZoom] = useState<number>(CANVAS_ZOOM_DEFAULT);
+  const clampedZoom = Math.max(CANVAS_ZOOM_MIN, Math.min(CANVAS_ZOOM_MAX, zoom));
+  const adjustZoom = (factor: number) => {
+    setZoom((current) => {
+      const next = current * factor;
+      return Math.max(CANVAS_ZOOM_MIN, Math.min(CANVAS_ZOOM_MAX, next));
+    });
+  };
+  const onCanvasWheel = (event: WheelEvent) => {
+    // Mac touchpad pinch arrives as wheel + ctrlKey = true. Plain wheel
+    // also zooms when over the canvas (vs page-scrolling) so the
+    // gesture is symmetric across input devices.
+    event.preventDefault();
+    const factor = event.deltaY < 0 ? CANVAS_ZOOM_STEP : 1 / CANVAS_ZOOM_STEP;
+    adjustZoom(factor);
+  };
+  // Mouse wheel inside the canvas should NOT page-scroll. We attach via
+  // useEffect with `{ passive: false }` because React's `onWheel` JSX
+  // handler is registered as passive and `preventDefault()` is ignored
+  // there.
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    const listener = (event: Event) => onCanvasWheel(event as WheelEvent);
+    svg.addEventListener('wheel', listener, { passive: false });
+    return () => { svg.removeEventListener('wheel', listener); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Drop selection if the selected entity disappears (e.g., user removes node).
   useEffect(() => {
@@ -555,19 +608,86 @@ export function AdvancedWorkflowCanvasEditor({ value, onChange, readOnly }: Adva
         </div>
       )}
 
-      <div style={{ fontSize: 11, color: '#64748b' }} data-testid="p2p-editor-canvas-hint">
-        {t('p2p.workflow.editor.canvas_hint', 'Drag nodes to position. Drag from the right anchor (●) to another node to create an edge.')}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
+        <div style={{ fontSize: 11, color: '#64748b' }} data-testid="p2p-editor-canvas-hint">
+          {t('p2p.workflow.editor.canvas_hint', 'Drag nodes to position. Drag from the right anchor (●) to another node to create an edge. Mouse wheel or pinch to zoom.')}
+        </div>
+        {/*
+         * R3 v2 PR-π — Zoom toolbar: button-driven control for users
+         * who don't have a wheel or want exact zoom levels. The same
+         * `setZoom` state is shared with the wheel handler so both
+         * surfaces stay in sync.
+         */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }} data-testid="p2p-editor-zoom-toolbar">
+          <button
+            type="button"
+            onClick={() => adjustZoom(1 / CANVAS_ZOOM_STEP)}
+            disabled={clampedZoom <= CANVAS_ZOOM_MIN + 0.001}
+            style={{
+              padding: '2px 8px', borderRadius: 4, border: '1px solid #475569',
+              background: '#1e293b', color: '#cbd5e1', fontSize: 12, cursor: 'pointer',
+              opacity: clampedZoom <= CANVAS_ZOOM_MIN + 0.001 ? 0.5 : 1,
+            }}
+            data-testid="p2p-editor-zoom-out"
+            aria-label={t('p2p.workflow.editor.zoom_out', 'Zoom out')}
+          >−</button>
+          <button
+            type="button"
+            onClick={() => setZoom(CANVAS_ZOOM_DEFAULT)}
+            style={{
+              padding: '2px 8px', borderRadius: 4, border: '1px solid #475569',
+              background: '#1e293b', color: '#cbd5e1', fontSize: 11, fontFamily: 'monospace',
+              cursor: 'pointer', minWidth: 56,
+            }}
+            data-testid="p2p-editor-zoom-reset"
+            aria-label={t('p2p.workflow.editor.zoom_reset', 'Reset zoom')}
+            title={t('p2p.workflow.editor.zoom_reset', 'Reset zoom')}
+          >{Math.round(clampedZoom * 100)}%</button>
+          <button
+            type="button"
+            onClick={() => adjustZoom(CANVAS_ZOOM_STEP)}
+            disabled={clampedZoom >= CANVAS_ZOOM_MAX - 0.001}
+            style={{
+              padding: '2px 8px', borderRadius: 4, border: '1px solid #475569',
+              background: '#1e293b', color: '#cbd5e1', fontSize: 12, cursor: 'pointer',
+              opacity: clampedZoom >= CANVAS_ZOOM_MAX - 0.001 ? 0.5 : 1,
+            }}
+            data-testid="p2p-editor-zoom-in"
+            aria-label={t('p2p.workflow.editor.zoom_in', 'Zoom in')}
+          >+</button>
+        </div>
       </div>
 
       <svg
         ref={(element) => { svgRef.current = element ?? null; }}
-        viewBox={`0 0 ${CANVAS_VIEW_WIDTH} ${CANVAS_VIEW_HEIGHT}`}
+        /*
+         * R3 v2 PR-π — viewBox extent inversely scaled by zoom: smaller
+         * viewBox = same screen size shows less area = "zoomed in"
+         * (nodes appear bigger). Because `getScreenCTM().inverse()`
+         * already accounts for the viewBox, drag math in
+         * `beginNodeDrag` / `beginEdgeCreate` keeps working without
+         * manual zoom-divides.
+         */
+        viewBox={`0 0 ${CANVAS_VIEW_WIDTH / clampedZoom} ${CANVAS_VIEW_HEIGHT / clampedZoom}`}
         width="100%"
         style={{
           display: 'block', background: '#070d1a', border: '1px solid #1e293b',
           borderRadius: 6, touchAction: 'none', userSelect: 'none',
           minHeight: 320,
+          /*
+           * R3 v2 PR-ο — Cap the SVG visual width to its native viewBox
+           * width. Without this cap the SVG stretches to fill the parent
+           * (which became 1400 px wide under PR-λ), and because SVGs with
+           * a viewBox preserve aspect ratio, the node geometry scales up
+           * with the width — nodes ended up ~80% bigger than the
+           * 168×78 px designed size. Capping at `CANVAS_VIEW_WIDTH` keeps
+           * the canvas at 1:1 scale so nodes render at their authored
+           * pixel size; the empty space to the right of the canvas
+           * becomes panel breathing room for the inspector etc.
+           */
+          maxWidth: CANVAS_VIEW_WIDTH,
         }}
+        data-canvas-zoom={clampedZoom.toFixed(2)}
         data-testid="p2p-editor-canvas"
         data-canvas-width={CANVAS_VIEW_WIDTH}
         data-canvas-height={CANVAS_VIEW_HEIGHT}
@@ -690,19 +810,19 @@ export function AdvancedWorkflowCanvasEditor({ value, onChange, readOnly }: Adva
                 onPointerDown={(event) => beginNodeDrag(event as unknown as PointerEvent, node.id)}
               />
               <text
-                x={10} y={22} fill="#e2e8f0" fontSize="13" fontWeight="600"
+                x={8} y={18} fill="#e2e8f0" fontSize="11" fontWeight="600"
                 pointerEvents="none"
               >
-                {(node.title ?? node.id).slice(0, 22)}
+                {(node.title ?? node.id).slice(0, 18)}
               </text>
               <text
-                x={10} y={40} fill="#94a3b8" fontSize="10"
+                x={8} y={33} fill="#94a3b8" fontSize="9"
                 pointerEvents="none"
               >
                 {node.nodeKind} · {node.preset}
               </text>
               <text
-                x={10} y={56} fill="#64748b" fontSize="10"
+                x={8} y={47} fill="#64748b" fontSize="9"
                 pointerEvents="none"
               >
                 {node.permissionScope ?? 'analysis_only'}

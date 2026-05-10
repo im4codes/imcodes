@@ -675,7 +675,7 @@
         "mixed_advanced_schema_fields": "Old and new advanced workflow fields are mixed.",
         "static_policy_mismatch_recompiled": "Daemon policy changed, so the workflow was recompiled.",
         "missing_required_capability": "The daemon is missing a required workflow capability.",
-        "capability_stale": "Daemon workflow capability information is stale.",
+        "capability_stale": "Se perdió el contacto con el daemon — las configuraciones guardadas siguen funcionando, pero los nuevos lanzamientos de flujo avanzado están pausados hasta que el daemon se reconecte (normalmente <30 s).",
         "capability_downgraded_during_run": "A required capability was downgraded during the run.",
         "invalid_launch_envelope": "The workflow launch envelope is invalid.",
         "invalid_workflow_graph": "The workflow graph is invalid.",
@@ -710,7 +710,10 @@
         "remove_edge": "Eliminar enlace",
         "diagnostics_header": "Diagnósticos",
         "read_only_notice": "Este flujo usa un esquema futuro y aquí es de solo lectura.",
-        "canvas_hint": "Arrastra los nodos para colocarlos. Arrastra desde el ancla derecha (●) hasta otro nodo para crear un enlace.",
+        "canvas_hint": "Arrastra los nodos para colocarlos. Arrastra desde el ancla derecha (●) hasta otro nodo para crear un enlace. Rueda del ratón o pellizco para hacer zoom.",
+        "zoom_in": "Acercar",
+        "zoom_out": "Alejar",
+        "zoom_reset": "Restablecer zoom",
         "inspector_empty": "Selecciona un nodo o enlace para editar sus propiedades.",
         "node": {
           "section_label": "Nodo",
@@ -728,12 +731,13 @@
       },
       "allowed_executables": {
         "title": "Ejecutables permitidos para scripts",
-        "hint": "Los nodos de script solo pueden ejecutar los ejecutables listados aquí. Usa rutas absolutas (p.ej. /usr/bin/jq) o nombres relativos al PATH. Lista vacía deshabilita la ejecución de scripts en esta configuración.",
+        "hint": "Aplicado al lanzar scripts. Añade rutas absolutas (p.ej. /usr/bin/jq) o nombres relativos al PATH que los nodos de script pueden invocar. Los flujos solo-LLM no necesitan ninguna entrada aquí.",
         "placeholder": "/usr/bin/jq",
         "input_label": "Nueva ruta de ejecutable",
         "add": "Añadir",
         "remove": "Eliminar",
-        "empty": "Aún no hay ejecutables permitidos. Los nodos de script serán rechazados en bind."
+        "empty": "Aún no hay ejecutables permitidos. Los nodos de script de este flujo serán rechazados en bind hasta que añadas al menos una entrada.",
+        "script_nodes_need_entries": "Requerido para nodos de script"
       },
       "library": {
         "title": "Biblioteca de flujos",

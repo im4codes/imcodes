@@ -676,7 +676,7 @@
         "mixed_advanced_schema_fields": "Old and new advanced workflow fields are mixed.",
         "static_policy_mismatch_recompiled": "Daemon policy changed, so the workflow was recompiled.",
         "missing_required_capability": "The daemon is missing a required workflow capability.",
-        "capability_stale": "Daemon workflow capability information is stale.",
+        "capability_stale": "Lost contact with the daemon — saved configs still work, but new advanced workflow launches are paused until the daemon reconnects (usually <30s).",
         "capability_downgraded_during_run": "A required capability was downgraded during the run.",
         "invalid_launch_envelope": "The workflow launch envelope is invalid.",
         "invalid_workflow_graph": "The workflow graph is invalid.",
@@ -711,7 +711,10 @@
         "remove_edge": "Remove edge",
         "diagnostics_header": "Diagnostics",
         "read_only_notice": "This workflow uses a future schema and is read-only here.",
-        "canvas_hint": "Drag nodes to position. Drag from the right anchor (●) to another node to create an edge.",
+        "canvas_hint": "Drag nodes to position. Drag from the right anchor (●) to another node to create an edge. Mouse wheel or pinch to zoom.",
+        "zoom_in": "Zoom in",
+        "zoom_out": "Zoom out",
+        "zoom_reset": "Reset zoom",
         "inspector_empty": "Select a node or edge to edit its properties.",
         "node": {
           "section_label": "Node",
@@ -729,12 +732,13 @@
       },
       "allowed_executables": {
         "title": "Allowed script executables",
-        "hint": "Script nodes may only spawn executables listed here. Use absolute paths (e.g. /usr/bin/jq) or PATH-relative names. Empty list disables script execution for this config.",
+        "hint": "Hard-enforced at script spawn time. Add absolute paths (e.g. /usr/bin/jq) or PATH-relative names that script nodes are permitted to invoke. LLM-only workflows do not need any entries here.",
         "placeholder": "/usr/bin/jq",
         "input_label": "New executable path",
         "add": "Add",
         "remove": "Remove",
-        "empty": "No executables allowed yet. Script nodes will be rejected at bind time."
+        "empty": "No executables allowed yet. Script nodes in this workflow will be rejected at bind time until you add at least one entry.",
+        "script_nodes_need_entries": "Required for script nodes"
       },
       "library": {
         "title": "Workflow library",

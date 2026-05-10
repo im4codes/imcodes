@@ -2227,6 +2227,182 @@ describe('p2p-workflow reverse-regression', () => {
    *      `command-handler.ts` so the daemon no longer pollutes
    *      user-supplied `extraPrompt` with a language hint.
    */
+  /*
+   * Reverse-regression #78 (R3 v2 PR-ξ — User feedback: "这个白名单
+   * 不太现实啊。Enforce 了吗？这个默认不开启！"). The allowlist UI was
+   * always visible after the bootstrap auto-created an LLM-only draft,
+   * suggesting a configuration burden where none existed (LLM-only
+   * workflows do not need any entries — the allowlist is only checked
+   * when a script node spawns a child process).
+   *
+   * Locked invariants:
+   *   1. The allowlist section is HIDDEN entirely when neither (a) any
+   *      workflow in the library has a `script` node nor (b) the user
+   *      has previously configured entries.
+   *   2. When the section IS surfaced, it stays COLLAPSED by default
+   *      behind a disclosure button (`p2p-allowed-executables-toggle`).
+   *      The body (input / empty state / list) only renders when the
+   *      `allowedExecutablesExpanded` flag is true.
+   *   3. The script-runner enforcement at spawn time is unchanged:
+   *      empty allowlist still rejects every script with
+   *      `script_executable_denied`.
+   */
+  /*
+   * Reverse-regression #79 (R3 v2 PR-ο — User feedback: "让你加宽
+   * 配置页面不是加大 node 节点, 这个要缩小"). PR-λ widened the panel
+   * to 1400 px. The canvas SVG had `width="100%"` with a viewBox, so it
+   * stretched to fill the parent and — since SVGs with a viewBox
+   * preserve aspect ratio — every node scaled up proportionally too,
+   * ending ~80% bigger than its authored 168×78 px.
+   *
+   * Locked invariant: the canvas SVG's `style.maxWidth` MUST be capped
+   * at `CANVAS_VIEW_WIDTH` so the canvas renders at 1:1 scale and node
+   * geometry stays at its authored pixel size regardless of the
+   * surrounding panel width.
+   */
+  /*
+   * Reverse-regression #80 (R3 v2 PR-π — User feedback: "canvas 要能
+   * 缩放的 鼠标滚轮或者捏触摸板(mac) 默认节点小一点" + "Daemon
+   * workflow capability information is stale. 这个到底啥意思, 也不
+   * 翻译? 看不懂能用还是不能用").
+   *
+   * Two unrelated fixes shipped together:
+   *
+   * A. Canvas zoom — wheel + Mac touchpad pinch event-handling, plus
+   *    a button toolbar (zoom out / reset / zoom in). Default node +
+   *    grid sizes shrunk so the out-of-the-box canvas is denser.
+   *
+   * B. `capability_stale` diagnostic was hardcoded English in EVERY
+   *    locale ("Daemon workflow capability information is stale.")
+   *    AND too vague to be actionable. Rewritten with locale-native
+   *    text that explains what still works (saved configs) vs. what
+   *    is paused (new advanced workflow launches).
+   *
+   * Locked invariants:
+   *   1. Canvas constants `CANVAS_ZOOM_MIN/MAX/DEFAULT/STEP` are
+   *      exported.
+   *   2. `data-canvas-zoom` attribute is set on the SVG so tests can
+   *      assert the rendered zoom level.
+   *   3. Wheel listener attached with `{ passive: false }` so
+   *      `preventDefault()` works (otherwise the browser page-scrolls
+   *      AND zooms simultaneously).
+   *   4. Zoom toolbar testids `p2p-editor-zoom-out / -reset / -in`.
+   *   5. `capability_stale` MUST NOT contain the literal phrase
+   *      "Daemon workflow capability information is stale" in any
+   *      non-English locale.
+   *   6. The English string MUST be rewritten away from the old
+   *      verbose generic — anchored on the actionable phrase
+   *      "saved configs still work" so it doesn't drift back.
+   */
+  it('#80 canvas zoom + capability_stale i18n must be wired (R3 v2 PR-π)', () => {
+    const file = read('web/src/components/AdvancedWorkflowCanvasEditor.tsx');
+    for (const symbol of ['CANVAS_ZOOM_MIN', 'CANVAS_ZOOM_MAX', 'CANVAS_ZOOM_DEFAULT', 'CANVAS_ZOOM_STEP']) {
+      expect(
+        new RegExp(`export\\s+const\\s+${symbol}\\s*=`).test(file.text),
+        `Canvas constant ${symbol} must be exported`,
+      ).toBe(true);
+    }
+    expect(
+      file.text.includes('data-canvas-zoom='),
+      'Canvas SVG must expose data-canvas-zoom for tests to assert the rendered zoom',
+    ).toBe(true);
+    // Wheel handler attached non-passively so preventDefault works.
+    expect(
+      /addEventListener\('wheel',\s*[\s\S]{0,80}\{\s*passive:\s*false\s*\}/.test(file.text),
+      'Canvas must attach wheel listener with { passive: false } so preventDefault stops page-scroll',
+    ).toBe(true);
+    for (const testId of ['p2p-editor-zoom-toolbar', 'p2p-editor-zoom-out', 'p2p-editor-zoom-reset', 'p2p-editor-zoom-in']) {
+      expect(
+        file.text.includes(`data-testid="${testId}"`),
+        `Zoom toolbar must expose data-testid="${testId}"`,
+      ).toBe(true);
+    }
+
+    // capability_stale i18n: every non-en locale MUST NOT carry the
+    // legacy English string; English MUST be rewritten away from the
+    // generic "Daemon workflow capability information is stale" line.
+    for (const locale of ['en', 'zh-CN', 'zh-TW', 'es', 'ja', 'ko', 'ru']) {
+      const localeFile = read(`web/src/i18n/locales/${locale}.json`);
+      const json = JSON.parse(localeFile.text) as { p2p?: { workflow?: { diagnostics?: { capability_stale?: string } } } };
+      const value = json.p2p?.workflow?.diagnostics?.capability_stale;
+      expect(typeof value, `${locale}: capability_stale must be a string`).toBe('string');
+      expect(
+        value!.includes('Daemon workflow capability information is stale'),
+        `${locale}: must NOT contain the legacy English placeholder`,
+      ).toBe(false);
+      // Each locale's value should describe what works AND what is paused
+      // — heuristic: more than 30 chars (the legacy line was 50 chars but
+      // the new ones are all 60+ chars in every language).
+      expect(
+        value!.length,
+        `${locale}: capability_stale must be a substantive sentence (≥ 30 chars)`,
+      ).toBeGreaterThanOrEqual(30);
+    }
+  });
+
+  it('#79 canvas SVG width MUST be capped at CANVAS_VIEW_WIDTH so nodes do not auto-scale (R3 v2 PR-ο)', () => {
+    const file = read('web/src/components/AdvancedWorkflowCanvasEditor.tsx');
+    expect(
+      /maxWidth:\s*CANVAS_VIEW_WIDTH/.test(file.text),
+      'Canvas SVG must set style.maxWidth = CANVAS_VIEW_WIDTH to stop auto-scaling with the panel',
+    ).toBe(true);
+    // The viewBox-driven render must still be the source of truth, so
+    // CANVAS_VIEW_WIDTH must be exported (callers + tests need it) and
+    // reachable from the SVG props.
+    expect(
+      /export\s+const\s+CANVAS_VIEW_WIDTH\s*=/.test(file.text),
+      'CANVAS_VIEW_WIDTH must remain an exported module-level constant',
+    ).toBe(true);
+    // R3 v2 PR-π — viewBox now divides extents by `clampedZoom` so the
+    // user can pinch/wheel zoom. Match either the original literal
+    // form OR the new zoom-divided form.
+    expect(
+      /viewBox=\{`0 0 \$\{CANVAS_VIEW_WIDTH(?:\s*\/\s*clampedZoom)?\}/.test(file.text),
+      'Canvas SVG viewBox must be derived from CANVAS_VIEW_WIDTH',
+    ).toBe(true);
+  });
+
+  it('#78 allowlist UI MUST hide for LLM-only workflows AND default-collapse when relevant (R3 v2 PR-ξ)', () => {
+    const file = read('web/src/components/P2pConfigPanel.tsx');
+
+    // (1) The section must be gated by both the script-node check AND
+    // the existing-entries fallback. The composite condition lives in
+    // the JSX: `{workflowDraft && (workflowHasScriptNode || allowedExecutables.length > 0) && (...)}`.
+    expect(
+      /workflowDraft\s*&&\s*\(workflowHasScriptNode\s*\|\|\s*allowedExecutables\.length\s*>\s*0\)\s*&&/.test(file.text),
+      'allowed-executables section must be gated by (workflowHasScriptNode || allowedExecutables.length > 0)',
+    ).toBe(true);
+
+    // (2) The disclosure toggle + state are present.
+    expect(
+      file.text.includes('data-testid="p2p-allowed-executables-toggle"'),
+      'allowlist disclosure toggle must carry data-testid="p2p-allowed-executables-toggle"',
+    ).toBe(true);
+    expect(
+      /useState\(false\)/.test(file.text)
+        && /allowedExecutablesExpanded/.test(file.text),
+      'allowedExecutablesExpanded must be a useState(false) — collapsed by default',
+    ).toBe(true);
+    // The body is gated by the expanded state.
+    expect(
+      /allowedExecutablesExpanded\s*&&[\s\S]{0,40}<>/.test(file.text)
+        || /allowedExecutablesExpanded\s*&&\s*\(/.test(file.text),
+      'allowed-executables body markers must be gated by allowedExecutablesExpanded',
+    ).toBe(true);
+
+    // (3) The script-runner enforcement at spawn time is unchanged:
+    // an empty allowlist still produces `script_executable_denied`.
+    const runner = read('src/daemon/p2p-workflow-script-runner.ts');
+    expect(
+      /allowed\s*=\s*new\s+Set\(policy\.allowedExecutables\)/.test(runner.text),
+      'script runner must still build the allowlist Set from policy.allowedExecutables',
+    ).toBe(true);
+    expect(
+      /if\s*\(!allowed\.has\(executable\)\)\s*\{[\s\S]{0,200}script_executable_denied/.test(runner.text),
+      'script runner must still emit script_executable_denied when the executable is not in the allowlist',
+    ).toBe(true);
+  });
+
   it('#77 concise i18n discussion-language reminder MUST be injected via shared helper (R3 v2 PR-ν)', () => {
     // (1) The i18n key exists in all 7 locales with the placeholder.
     for (const locale of ['en', 'zh-CN', 'zh-TW', 'es', 'ja', 'ko', 'ru']) {

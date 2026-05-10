@@ -675,7 +675,7 @@
         "mixed_advanced_schema_fields": "Old and new advanced workflow fields are mixed.",
         "static_policy_mismatch_recompiled": "Daemon policy changed, so the workflow was recompiled.",
         "missing_required_capability": "The daemon is missing a required workflow capability.",
-        "capability_stale": "Daemon workflow capability information is stale.",
+        "capability_stale": "데몬과의 연결이 끊어졌습니다 — 저장된 구성은 계속 작동하지만, 새 고급 워크플로 실행은 데몬이 재연결될 때까지 일시 정지됩니다(보통 30초 이내).",
         "capability_downgraded_during_run": "A required capability was downgraded during the run.",
         "invalid_launch_envelope": "The workflow launch envelope is invalid.",
         "invalid_workflow_graph": "The workflow graph is invalid.",
@@ -710,7 +710,10 @@
         "remove_edge": "엣지 제거",
         "diagnostics_header": "진단",
         "read_only_notice": "이 워크플로는 향후 스키마를 사용하며 여기에서는 읽기 전용입니다.",
-        "canvas_hint": "노드를 드래그하여 배치합니다. 오른쪽 앵커 (●)에서 다른 노드로 드래그하여 엣지를 만듭니다.",
+        "canvas_hint": "노드를 드래그하여 배치합니다. 오른쪽 앵커 (●)에서 다른 노드로 드래그하여 엣지를 만듭니다. 마우스 휠이나 핀치로 확대/축소.",
+        "zoom_in": "확대",
+        "zoom_out": "축소",
+        "zoom_reset": "확대 초기화",
         "inspector_empty": "속성을 편집하려면 노드나 엣지를 선택하세요.",
         "node": {
           "section_label": "노드",
@@ -728,12 +731,13 @@
       },
       "allowed_executables": {
         "title": "스크립트 실행 파일 허용 목록",
-        "hint": "스크립트 노드는 여기 나열된 실행 파일만 실행할 수 있습니다. 절대 경로(예: /usr/bin/jq) 또는 PATH 상대 이름을 사용하세요. 빈 목록은 이 설정에서 스크립트 실행을 비활성화합니다.",
+        "hint": "스크립트 실행 시점에 강제됩니다. 스크립트 노드가 호출할 수 있는 절대 경로(예: /usr/bin/jq) 또는 PATH 상대 이름을 추가하세요. LLM 전용 워크플로에는 항목이 필요 없습니다.",
         "placeholder": "/usr/bin/jq",
         "input_label": "새 실행 파일 경로",
         "add": "추가",
         "remove": "제거",
-        "empty": "아직 허용된 실행 파일이 없습니다. 스크립트 노드는 bind 단계에서 거부됩니다."
+        "empty": "아직 허용된 실행 파일이 없습니다. 이 워크플로의 스크립트 노드는 최소 한 개를 추가할 때까지 bind 단계에서 거부됩니다.",
+        "script_nodes_need_entries": "스크립트 노드에 필수"
       },
       "library": {
         "title": "워크플로 라이브러리",

@@ -675,7 +675,7 @@
         "mixed_advanced_schema_fields": "Old and new advanced workflow fields are mixed.",
         "static_policy_mismatch_recompiled": "Daemon policy changed, so the workflow was recompiled.",
         "missing_required_capability": "The daemon is missing a required workflow capability.",
-        "capability_stale": "Daemon workflow capability information is stale.",
+        "capability_stale": "デーモンとの通信が途絶えました — 保存済み設定は引き続き動作しますが、新しい高度ワークフローの起動はデーモンの再接続まで一時停止されます（通常 30 秒以内）。",
         "capability_downgraded_during_run": "A required capability was downgraded during the run.",
         "invalid_launch_envelope": "The workflow launch envelope is invalid.",
         "invalid_workflow_graph": "The workflow graph is invalid.",
@@ -710,7 +710,10 @@
         "remove_edge": "エッジを削除",
         "diagnostics_header": "診断",
         "read_only_notice": "このワークフローは将来のスキーマを使用しており、ここでは読み取り専用です。",
-        "canvas_hint": "ノードをドラッグして配置します。右のアンカー (●) から別のノードへドラッグするとエッジを作成できます。",
+        "canvas_hint": "ノードをドラッグして配置します。右のアンカー (●) から別のノードへドラッグするとエッジを作成できます。マウスホイールまたはピンチでズーム。",
+        "zoom_in": "拡大",
+        "zoom_out": "縮小",
+        "zoom_reset": "ズームをリセット",
         "inspector_empty": "プロパティを編集するノードまたはエッジを選択してください。",
         "node": {
           "section_label": "ノード",
@@ -728,12 +731,13 @@
       },
       "allowed_executables": {
         "title": "スクリプト実行ファイル許可リスト",
-        "hint": "スクリプトノードはここに記載された実行ファイルのみ起動できます。絶対パス（例: /usr/bin/jq）または PATH 相対名を使用します。空のリストはこの設定でのスクリプト実行を無効化します。",
+        "hint": "スクリプト起動時に強制適用されます。スクリプトノードが起動できる絶対パス（例: /usr/bin/jq）または PATH 相対名を追加してください。LLM のみのワークフローには項目を追加する必要はありません。",
         "placeholder": "/usr/bin/jq",
         "input_label": "新しい実行ファイルのパス",
         "add": "追加",
         "remove": "削除",
-        "empty": "まだ許可された実行ファイルはありません。スクリプトノードは bind 時に拒否されます。"
+        "empty": "まだ許可された実行ファイルはありません。このワークフローのスクリプトノードは、少なくとも 1 件追加するまで bind 時に拒否されます。",
+        "script_nodes_need_entries": "スクリプトノードに必須"
       },
       "library": {
         "title": "ワークフローライブラリ",

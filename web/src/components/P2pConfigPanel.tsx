@@ -500,6 +500,19 @@ export function P2pConfigPanel({
     }) ?? undefined,
     [workflowLibrary, activeWorkflowId],
   );
+  /*
+   * R3 v2 PR-ξ — True when ANY workflow in the library has at least one
+   * script node. Drives whether the allowed-executables section is
+   * surfaced at all. The allowlist is hard-enforced at script bind +
+   * spawn time (`script_executable_denied`); for workflows with no
+   * script nodes the allowlist is irrelevant and hiding it removes a
+   * lot of cognitive noise from the advanced tab.
+   */
+  const workflowHasScriptNode = useMemo(
+    () => workflowLibrary.some((wf) => Array.isArray(wf.nodes)
+      && wf.nodes.some((node) => node?.nodeKind === 'script')),
+    [workflowLibrary],
+  );
   const [workflowLaunchEnvelope, setWorkflowLaunchEnvelope] = useState<P2pWorkflowLaunchEnvelope | undefined>(undefined);
   // R3 PR-α follow-up — UI-managed script executable allowlist. Round-trips
   // through `P2pSavedConfig.allowedExecutables` (userPref) and is written
@@ -508,6 +521,19 @@ export function P2pConfigPanel({
   // into the bind-time `P2pStaticPolicy.allowedExecutables`.
   const [allowedExecutables, setAllowedExecutables] = useState<string[]>([]);
   const [allowedExecutableDraft, setAllowedExecutableDraft] = useState('');
+  /*
+   * R3 v2 PR-ξ — User feedback: the allowlist UI was always visible
+   * for any advanced workflow (since the bootstrap auto-creates a
+   * draft). For workflows that don't use script nodes (the common
+   * case — most users design LLM-only graphs), the visible allowlist
+   * is intrusive noise that suggests a configuration burden where
+   * none exists. Hide the section entirely unless EITHER:
+   *   1. Some workflow in the library actually has a `script` node, OR
+   *   2. The user already has entries (so they explicitly opted in).
+   * When relevant we still default to a COLLAPSED disclosure — users
+   * have to click to open it.
+   */
+  const [allowedExecutablesExpanded, setAllowedExecutablesExpanded] = useState(false);
   const [advancedMigrationNeeded, setAdvancedMigrationNeeded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -1372,28 +1398,66 @@ export function P2pConfigPanel({
                 )}
 
                 {/*
-                 * R3 PR-α follow-up — UI-managed script executable allowlist.
-                 * Replaces the previous `~/.imcodes/p2p-policy.json` daemon-side
-                 * file (off-product for a UI-driven IM client). Entries are
-                 * round-tripped through `P2pSavedConfig.allowedExecutables`
-                 * and written into every advanced launch envelope. The
-                 * daemon merges them into the bind-time
-                 * `P2pStaticPolicy.allowedExecutables` so script bind sees
-                 * exactly what the user authored.
+                 * R3 PR-α follow-up + R3 v2 PR-ξ — UI-managed script
+                 * executable allowlist. The allowlist itself is hard-
+                 * enforced at script bind + spawn time
+                 * (`script_executable_denied`). Per PR-ξ user feedback,
+                 * we now hide the section entirely when:
+                 *   - The workflow library has NO script nodes, AND
+                 *   - The user has not previously configured entries
+                 * — so LLM-only workflows (the common case) don't see
+                 * irrelevant security configuration noise. When the
+                 * section IS surfaced, it stays collapsed by default
+                 * behind a disclosure button so the user explicitly
+                 * opens it when needed.
                  */}
-                {workflowDraft && (
+                {workflowDraft && (workflowHasScriptNode || allowedExecutables.length > 0) && (
                   <div
                     style={{ ...sectionCardStyle, marginTop: 12 }}
                     data-testid="p2p-allowed-executables-section"
                     data-readonly={readOnlyMode ? 'true' : 'false'}
+                    data-relevant={workflowHasScriptNode ? 'true' : 'false'}
                   >
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-                      <div style={{ ...sectionLabelStyle, marginTop: 0, marginBottom: 0 }}>
-                        {t('p2p.workflow.allowed_executables.title', 'Allowed script executables')}
+                    <button
+                      type="button"
+                      onClick={() => setAllowedExecutablesExpanded((expanded) => !expanded)}
+                      data-testid="p2p-allowed-executables-toggle"
+                      aria-expanded={allowedExecutablesExpanded}
+                      style={{
+                        width: '100%',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        gap: 8,
+                        background: 'none',
+                        border: 'none',
+                        padding: 0,
+                        cursor: 'pointer',
+                        color: '#cbd5e1',
+                      }}
+                    >
+                      <div style={{ ...sectionLabelStyle, marginTop: 0, marginBottom: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <span>{allowedExecutablesExpanded ? '▾' : '▸'}</span>
+                        <span>{t('p2p.workflow.allowed_executables.title', 'Allowed script executables')}</span>
+                        {allowedExecutables.length > 0 && (
+                          <span style={{
+                            fontSize: 10, fontWeight: 600, padding: '1px 6px', borderRadius: 999,
+                            background: '#1e3a8a', color: '#bfdbfe',
+                          }}>
+                            {allowedExecutables.length}
+                          </span>
+                        )}
                       </div>
-                    </div>
+                      {workflowHasScriptNode && allowedExecutables.length === 0 && (
+                        <span style={{ fontSize: 10, color: '#fbbf24' }}>
+                          {t('p2p.workflow.allowed_executables.script_nodes_need_entries', 'Required for script nodes')}
+                        </span>
+                      )}
+                    </button>
+                    {allowedExecutablesExpanded && (
+                    <>
                     <div style={{ fontSize: 11, color: '#94a3b8', lineHeight: 1.5, marginTop: 6 }}>
-                      {t('p2p.workflow.allowed_executables.hint', 'Script nodes may only spawn executables listed here. Use absolute paths (e.g. /usr/bin/jq) or PATH-relative names. Empty list disables script execution for this config.')}
+                      {t('p2p.workflow.allowed_executables.hint', 'Hard-enforced at script spawn time. Add absolute paths (e.g. /usr/bin/jq) or PATH-relative names that script nodes are permitted to invoke. LLM-only workflows do not need any entries here.')}
                     </div>
                     {!readOnlyMode && (
                       <div
@@ -1500,6 +1564,8 @@ export function P2pConfigPanel({
                           </li>
                         ))}
                       </ul>
+                    )}
+                    </>
                     )}
                   </div>
                 )}
