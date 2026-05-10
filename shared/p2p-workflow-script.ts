@@ -8,7 +8,7 @@ import {
 } from './p2p-workflow-constants.js';
 import { makeP2pWorkflowDiagnostic, makeP2pWorkflowWarning, type P2pWorkflowDiagnostic } from './p2p-workflow-diagnostics.js';
 import type { P2pScriptMachineOutputFrame, P2pScriptNodeContract, P2pWorkflowVariableValue } from './p2p-workflow-types.js';
-import { isP2pArtifactRelativePath } from './p2p-workflow-artifacts.js';
+import { isP2pArtifactRelativePath } from './p2p-workflow-artifact-paths.js';
 
 export type P2pScriptContractValidationResult =
   | { ok: true; contract: P2pScriptNodeContract; diagnostics: P2pWorkflowDiagnostic[] }

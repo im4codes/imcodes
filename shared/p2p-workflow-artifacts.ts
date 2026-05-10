@@ -7,12 +7,19 @@ import {
   P2P_WORKFLOW_ARTIFACT_MAX_TOTAL_BYTES,
 } from './p2p-workflow-constants.js';
 import { makeP2pWorkflowDiagnostic, type P2pWorkflowDiagnostic } from './p2p-workflow-diagnostics.js';
+import {
+  getP2pArtifactPathDepth,
+  isP2pArtifactRelativePath,
+} from './p2p-workflow-artifact-paths.js';
 import { canonicalize, stableStringify } from './p2p-workflow-policy.js';
 import type { P2pJsonValue } from './p2p-workflow-types.js';
 
-export type P2pArtifactPathValidationResult =
-  | { ok: true; path: string; diagnostics: P2pWorkflowDiagnostic[] }
-  | { ok: false; diagnostics: P2pWorkflowDiagnostic[] };
+export {
+  getP2pArtifactPathDepth,
+  isP2pArtifactRelativePath,
+  validateP2pArtifactRelativePath,
+} from './p2p-workflow-artifact-paths.js';
+export type { P2pArtifactPathValidationResult } from './p2p-workflow-artifact-paths.js';
 
 export interface P2pArtifactFileBaseline {
   path: string;
@@ -31,33 +38,6 @@ export interface P2pArtifactBaselineHashInput {
 export type P2pArtifactBaselineValidationResult =
   | { ok: true; baseline: P2pArtifactBaselineHashInput; diagnostics: P2pWorkflowDiagnostic[] }
   | { ok: false; diagnostics: P2pWorkflowDiagnostic[] };
-
-export function validateP2pArtifactRelativePath(input: unknown, fieldPath = 'artifact.path'): P2pArtifactPathValidationResult {
-  if (typeof input !== 'string') {
-    return {
-      ok: false,
-      diagnostics: [makeP2pWorkflowDiagnostic('unsafe_artifact_path', 'compile', { fieldPath, summary: 'Artifact path must be a string.' })],
-    };
-  }
-  if (!isP2pArtifactRelativePath(input)) {
-    return {
-      ok: false,
-      diagnostics: [makeP2pWorkflowDiagnostic('unsafe_artifact_path', 'compile', { fieldPath })],
-    };
-  }
-  return { ok: true, path: input, diagnostics: [] };
-}
-
-export function isP2pArtifactRelativePath(path: string): boolean {
-  if (path === '' || path.includes('\0')) return false;
-  if (path.startsWith('/') || path.startsWith('~') || path.includes('\\')) return false;
-  if (/^[a-zA-Z]:/.test(path) || path.startsWith('//')) return false;
-  return path.split('/').every((segment) => segment !== '' && segment !== '.' && segment !== '..');
-}
-
-export function getP2pArtifactPathDepth(path: string): number {
-  return path.split('/').filter(Boolean).length;
-}
 
 export function validateP2pArtifactBaseline(input: unknown): P2pArtifactBaselineValidationResult {
   if (!isRecord(input) || !Array.isArray(input.files)) {

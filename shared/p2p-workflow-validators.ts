@@ -28,7 +28,7 @@ import {
 } from './p2p-workflow-constants.js';
 import { makeP2pWorkflowDiagnostic, type P2pWorkflowDiagnostic } from './p2p-workflow-diagnostics.js';
 import { P2P_WORKFLOW_DIAGNOSTIC_CODES } from './p2p-workflow-diagnostics.js';
-import { getP2pArtifactPathDepth, isP2pArtifactRelativePath } from './p2p-workflow-artifacts.js';
+import { getP2pArtifactPathDepth, isP2pArtifactRelativePath } from './p2p-workflow-artifact-paths.js';
 import { validateP2pScriptContract } from './p2p-workflow-script.js';
 import type {
   P2pArtifactContract,

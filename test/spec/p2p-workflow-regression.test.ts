@@ -238,6 +238,31 @@ describe('p2p-workflow reverse-regression', () => {
     expect(offenders, `Artifact runtime must not use readdir().join() as success evidence:\n${offenders.join('\n')}`).toEqual([]);
   });
 
+  it('browser-reachable workflow validators do not import Node-only artifact helpers', () => {
+    const files = [
+      'shared/p2p-workflow-validators.ts',
+      'shared/p2p-workflow-script.ts',
+      'shared/p2p-workflow-materialize.ts',
+      'web/src/components/AdvancedWorkflowCanvasEditor.tsx',
+      'web/src/components/P2pConfigPanel.tsx',
+      'web/src/components/SessionControls.tsx',
+    ].filter((rel) => existsSync(resolve(ROOT, rel)));
+
+    const offenders: string[] = [];
+    for (const rel of files) {
+      const file = read(rel);
+      file.lines.forEach((line, index) => {
+        if (/from ['"](?:@shared\/|\.\.?\/)*p2p-workflow-artifacts\.js['"]/.test(line) || /from ['"]node:/.test(line)) {
+          offenders.push(`${rel}:${index + 1}: ${line.trim()}`);
+        }
+      });
+    }
+    expect(
+      offenders,
+      `Web bundle reachable workflow modules must use browser-safe artifact path helpers, not Node-only artifact baseline helpers:\n${offenders.join('\n')}`,
+    ).toEqual([]);
+  });
+
   // ── 6. Every caller of `findForbiddenEnvelopeField` must check the return
   //      value against null and use it to bail out. A launch path that calls
   //      the helper and then ignores the result silently allows forbidden
