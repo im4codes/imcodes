@@ -24,6 +24,11 @@ export interface P2pHopState {
 
 export interface P2pProgressDiscussion {
   id: string;
+  /** Discussion file id (filename without `.md`). For P2P runs this is
+   *  the run's `discussion_id` — distinct from `id` which is the
+   *  prefixed run id (`p2p_<runId>`). Set when the run has produced
+   *  a file the user can navigate to. */
+  fileId?: string;
   topic: string;
   state: string;
   modeKey?: string;

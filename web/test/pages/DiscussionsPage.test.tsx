@@ -13,8 +13,20 @@ vi.mock('react-i18next', () => ({
   }),
 }));
 
+// Forward onClick + the discussion shape so the click-to-select test
+// below can fire the click handler DiscussionsPage hands the live
+// cards. Production P2pProgressCard renders a complex SVG layout we
+// don't need here; only the click contract matters for this test
+// surface.
 vi.mock('../../src/components/P2pProgressCard.js', () => ({
-  P2pProgressCard: () => null,
+  P2pProgressCard: (props: { discussion: { id: string; fileId?: string }; onClick?: () => void }) => (
+    <button
+      type="button"
+      data-testid={`p2p-progress-card-${props.discussion.id}`}
+      data-file-id={props.discussion.fileId ?? ''}
+      onClick={props.onClick}
+    >progress card {props.discussion.id}</button>
+  ),
 }));
 
 vi.mock('../../src/components/FilePreviewPane.js', () => ({
@@ -301,5 +313,77 @@ describe('DiscussionsPage', () => {
 
     expect(container.querySelector('.discussions-nav-controls .discussions-copy-btn')).toBeTruthy();
     expect(container.querySelectorAll('.discussions-nav-controls .discussions-scroll-btn-floating')).toHaveLength(3);
+  });
+
+  // Audit fix (live-bar ↔ list connection) — clicking a live P2P
+  // progress card on the discussions page used to do nothing (the
+  // bar at the top and the file list below were unrelated). Users
+  // had to manually find the matching entry in the list by id.
+  // The fix wires `onClick` on the cards to `selectDiscussion(fileId)`,
+  // which sends a `p2p.read_discussion` and highlights the matching
+  // list entry as active.
+  it('clicking a live P2P progress card opens the matching discussion file', async () => {
+    const FILE_ID = 'live-disc-7';
+    const liveDiscussion = {
+      id: `p2p_${FILE_ID}`,
+      fileId: FILE_ID,
+      topic: 'Live P2P run',
+      state: 'running',
+      currentRound: 1,
+      maxRounds: 3,
+    } as Parameters<typeof DiscussionsPage>[0]['liveDiscussions'][number];
+
+    const { container } = render(
+      <DiscussionsPage ws={ws} liveDiscussions={[liveDiscussion]} />,
+    );
+
+    // Seed the file list with the matching entry so the active-class
+    // assertion has something to match against.
+    await act(async () => {
+      handler?.({
+        type: 'p2p.list_discussions_response',
+        discussions: [{ id: FILE_ID, fileName: `${FILE_ID}.md`, preview: 'Topic live', mtime: 100 }],
+      } as ServerMessage);
+    });
+
+    // Clicking the live card should send a p2p.read_discussion for
+    // FILE_ID — same code path as clicking the list entry.
+    const card = screen.getByTestId(`p2p-progress-card-p2p_${FILE_ID}`);
+    expect(card.getAttribute('data-file-id')).toBe(FILE_ID);
+
+    const sendCallsBefore = vi.mocked(ws.send).mock.calls.length;
+    fireEvent.click(card);
+    const sendCallsAfter = vi.mocked(ws.send).mock.calls.length;
+    expect(sendCallsAfter).toBeGreaterThan(sendCallsBefore);
+
+    const lastSend = vi.mocked(ws.send).mock.calls.at(-1)?.[0] as { type?: string; id?: string };
+    expect(lastSend.type).toBe('p2p.read_discussion');
+    expect(lastSend.id).toBe(FILE_ID);
+
+    // Matching list entry must get the `active` class so the user
+    // sees the connection between bar and list.
+    const matchingItem = container.querySelector(`.discussions-list-item.active`);
+    expect(matchingItem).not.toBeNull();
+    expect(matchingItem?.textContent).toContain('Topic live');
+  });
+
+  it('clicking a live progress card with NO fileId is a no-op (orphan run mid-bind)', async () => {
+    const liveDiscussion = {
+      id: 'p2p_orphan',
+      // fileId intentionally omitted — runs that never produced a file
+      // (failed bind, supervision-internal, etc.) shouldn't crash the
+      // page on click.
+      topic: 'Orphan',
+      state: 'queued',
+      currentRound: 0,
+      maxRounds: 1,
+    } as Parameters<typeof DiscussionsPage>[0]['liveDiscussions'][number];
+
+    render(<DiscussionsPage ws={ws} liveDiscussions={[liveDiscussion]} />);
+    const card = screen.getByTestId('p2p-progress-card-p2p_orphan');
+    const sendCallsBefore = vi.mocked(ws.send).mock.calls.length;
+    fireEvent.click(card);
+    // No onClick wired (fileId missing) — no new send calls.
+    expect(vi.mocked(ws.send).mock.calls.length).toBe(sendCallsBefore);
   });
 });

@@ -307,6 +307,19 @@ export function DiscussionsPage({ ws, initialSelectedId, requestScope, liveDiscu
                     key={d.id}
                     discussion={d}
                     onStopDiscussion={onStopDiscussion}
+                    // Clicking a live progress card opens the
+                    // associated discussion file in the right-hand
+                    // detail pane (or full-screen on mobile). Without
+                    // this, the bar at the top and the discussion
+                    // list below were two unrelated UIs — users had
+                    // to manually find the matching entry in the list
+                    // by id, even though the live bar already knows
+                    // the fileId. The mapping in
+                    // `p2p-run-mapping.ts` puts `discussion_id` (=
+                    // the discussion file's id) onto `fileId`, which
+                    // matches the `id` of an entry in the
+                    // `discussions` list rendered below.
+                    onClick={d.fileId ? () => selectDiscussion(d.fileId!) : undefined}
                   />
                 ))}
               </div>
