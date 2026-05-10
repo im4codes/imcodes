@@ -591,6 +591,13 @@
     "settings_button": "P2P設定",
     "settings_title": "P2P 參與者設定",
     "cross_session": "包含其他專案的工作階段",
+    "tab": {
+      "advanced_workflow": "進階工作流",
+      "advanced_workflow_intro": "設計有向 P2P 工作流。節點為智慧代理輪次（LLM、腳本或邏輯判定），邊用於控制路由。在此編輯會覆寫「智慧代理」分頁中設定的簡易輪次/模式流水線。",
+      "advanced_workflow_empty_hint": "正在初始化空白工作流草稿。請在下方畫布中加入節點與邊，編排你的 P2P 流程。",
+      "advanced_workflow_starter_title": "未命名工作流",
+      "advanced_workflow_starter_node_title": "起始節點"
+    },
     "settings_filter_sdk": "SDK",
     "settings_filter_cli": "CLI",
     "settings_save": "儲存",

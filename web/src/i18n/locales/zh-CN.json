@@ -591,6 +591,13 @@
     "settings_button": "P2P设置",
     "settings_title": "P2P 参与者设置",
     "cross_session": "包含其他项目的会话",
+    "tab": {
+      "advanced_workflow": "高级工作流",
+      "advanced_workflow_intro": "设计有向 P2P 工作流。节点为智能体轮次（LLM、脚本或逻辑判定），边用于控制路由。在此编辑会覆盖「智能体」标签页里配置的简易轮次/模式流水线。",
+      "advanced_workflow_empty_hint": "正在初始化空白工作流草稿。请在下方画布中添加节点与边以编排你的 P2P 流程。",
+      "advanced_workflow_starter_title": "未命名工作流",
+      "advanced_workflow_starter_node_title": "起始节点"
+    },
     "settings_filter_sdk": "SDK",
     "settings_filter_cli": "CLI",
     "settings_save": "保存",

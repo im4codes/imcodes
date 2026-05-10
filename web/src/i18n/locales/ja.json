@@ -590,6 +590,13 @@
     "settings_button": "P2P設定",
     "settings_title": "P2P参加者設定",
     "cross_session": "他のプロジェクトのセッションを含める",
+    "tab": {
+      "advanced_workflow": "高度なワークフロー",
+      "advanced_workflow_intro": "有向 P2P ワークフローを設計します。ノードはエージェントのラウンド（LLM・スクリプト・論理ゲート）、エッジはルーティングを制御します。ここでの編集は「エージェント」タブで構成された簡易ラウンド/モードパイプラインを上書きします。",
+      "advanced_workflow_empty_hint": "空のワークフロー下書きを初期化中です。下のキャンバスでノードとエッジを追加し、P2P パイプラインを設計してください。",
+      "advanced_workflow_starter_title": "無題のワークフロー",
+      "advanced_workflow_starter_node_title": "開始"
+    },
     "settings_filter_sdk": "SDK",
     "settings_filter_cli": "CLI",
     "settings_save": "保存",

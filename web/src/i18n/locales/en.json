@@ -591,6 +591,13 @@
     "settings_button": "P2P Settings",
     "settings_title": "P2P Participant Settings",
     "cross_session": "Include sessions from other projects",
+    "tab": {
+      "advanced_workflow": "Advanced Workflow",
+      "advanced_workflow_intro": "Design a directed P2P workflow. Nodes are agent rounds (LLM, script, or logic gates); edges control routing. Edits here override the simple round/mode pipeline configured under Agents.",
+      "advanced_workflow_empty_hint": "Initializing a blank workflow draft. Add nodes and edges in the canvas below to design your P2P pipeline.",
+      "advanced_workflow_starter_title": "Untitled workflow",
+      "advanced_workflow_starter_node_title": "Start"
+    },
     "settings_filter_sdk": "SDK",
     "settings_filter_cli": "CLI",
     "settings_save": "Save",

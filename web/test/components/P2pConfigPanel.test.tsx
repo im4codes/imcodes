@@ -80,7 +80,7 @@ function renderPanel(overrides: {
   subSessions?: typeof subSessions;
   activeSession?: string;
   serverId?: string | null;
-  initialTab?: 'participants' | 'combos';
+  initialTab?: 'participants' | 'combos' | 'advanced';
   onClose?: () => void;
   onSave?: (cfg: P2pSavedConfig) => void;
   onPersistDaemonConfig?: (scopeSession: string, cfg: P2pSavedConfig) => Promise<{ ok: boolean; error?: string }> | { ok: boolean; error?: string };
@@ -319,6 +319,78 @@ describe('P2pConfigPanel', () => {
 
     expect(screen.getByText('+mode_brainstorm')).toBeDefined();
     expect(screen.queryByText('brain')).toBeNull();
+  });
+
+  // ── R3 v2 PR-θ — dedicated advanced workflow tab ─────────────────────────
+  describe('advanced workflow tab', () => {
+    it('exposes the advanced workflow tab button on every panel mount', async () => {
+      renderPanel();
+      await flush();
+
+      const tabButton = screen.getByTestId('p2p-tab-advanced');
+      expect(tabButton).toBeDefined();
+      expect(tabButton.tagName).toBe('BUTTON');
+    });
+
+    it('clicking the advanced tab on a fresh panel auto-bootstraps a starter draft and renders the canvas', async () => {
+      // Cold panel — no saved config, no draft, no preset.
+      getUserPrefMock.mockResolvedValue(null);
+      renderPanel();
+      await flush();
+
+      // Initially, the canvas is NOT in the DOM (we are on participants tab
+      // and there is no draft yet).
+      expect(screen.queryByTestId('p2p-editor-canvas')).toBeNull();
+
+      // Click into the advanced tab.
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-tab-advanced'));
+      });
+      await flush();
+
+      // After tab switch the bootstrap effect runs and a starter draft is
+      // injected. The canvas root + a single seed node MUST be rendered.
+      expect(screen.getByTestId('p2p-editor-canvas')).toBeDefined();
+      expect(screen.getByTestId('p2p-editor-node-shape-node_1')).toBeDefined();
+
+      // The participants tab content (agent grid header, rounds, hop-timeout)
+      // must NOT be in the DOM — we have switched away.
+      expect(screen.queryByText('settings_rounds')).toBeNull();
+      expect(screen.queryByText('settings_hop_timeout')).toBeNull();
+    });
+
+    it('opening the panel directly with initialTab=advanced renders the canvas immediately', async () => {
+      getUserPrefMock.mockResolvedValue(null);
+      renderPanel({ initialTab: 'advanced' });
+      await flush();
+
+      // Bootstrap fires synchronously on mount when activeTab is 'advanced'.
+      expect(screen.getByTestId('p2p-editor-canvas')).toBeDefined();
+      expect(screen.getByTestId('p2p-editor-node-shape-node_1')).toBeDefined();
+    });
+
+    it('participants tab no longer hosts the canvas, allowed-executables section, or workflow banners', async () => {
+      // A draft is loaded — under the old layout this would surface the
+      // canvas + banners on the participants tab. Under the new layout it
+      // must NOT, because all advanced UI lives under the advanced tab.
+      const draft: P2pWorkflowDraft = {
+        schemaVersion: P2P_WORKFLOW_SCHEMA_VERSION,
+        id: 'draft-x',
+        title: 'X',
+        nodes: [{ id: 'a', title: 'A', nodeKind: 'llm', preset: 'discuss', permissionScope: 'analysis_only' }],
+        edges: [],
+      };
+      getUserPrefMock.mockResolvedValue(JSON.stringify({ sessions: {}, rounds: 1, workflowDraft: draft }));
+
+      renderPanel({ initialTab: 'participants' });
+      await flush();
+
+      expect(screen.queryByTestId('p2p-editor-canvas')).toBeNull();
+      expect(screen.queryByTestId('p2p-allowed-executables-section')).toBeNull();
+      expect(screen.queryByTestId('p2p-future-schema-banner')).toBeNull();
+      expect(screen.queryByTestId('p2p-capability-stale-banner')).toBeNull();
+      expect(screen.queryByTestId('p2p-missing-capability-banner')).toBeNull();
+    });
   });
 
   it('new sessions not in saved config default to disabled with audit mode', async () => {
@@ -854,7 +926,10 @@ describe('P2pConfigPanel', () => {
         getSnapshot: () => null,
         subscribe: () => () => {},
       };
-      renderPanel({ daemonCapabilitySource: stubSource });
+      // R3 v2 PR-θ — capability/migration/future-schema banners now live
+      // under the dedicated `advanced` tab (canvas + advanced controls).
+      // Open the panel directly on that tab so the banner is in the DOM.
+      renderPanel({ daemonCapabilitySource: stubSource, initialTab: 'advanced' });
       await flush();
 
       // Banner must use the translated diagnostic key (the test mock returns
@@ -878,7 +953,7 @@ describe('P2pConfigPanel', () => {
 
       // Fresh snapshot but no p2p.workflow.v1 capability — required cap missing.
       const source = freshCapabilitySource(['some.other.cap']);
-      renderPanel({ daemonCapabilitySource: source });
+      renderPanel({ daemonCapabilitySource: source, initialTab: 'advanced' });
       await flush();
 
       expect(screen.getByTestId('p2p-missing-capability-banner')).toBeDefined();
@@ -925,7 +1000,8 @@ describe('P2pConfigPanel', () => {
       getUserPrefMock.mockResolvedValue(JSON.stringify(savedConfig));
 
       const onSave = vi.fn();
-      renderPanel({ onSave });
+      // Future-schema banner lives on the advanced tab.
+      renderPanel({ onSave, initialTab: 'advanced' });
       await flush();
 
       expect(screen.getByTestId('p2p-future-schema-banner')).toBeDefined();
@@ -982,7 +1058,8 @@ describe('P2pConfigPanel', () => {
 
     it('renders the editor when a draft is present and not in future-schema mode', async () => {
       getUserPrefMock.mockResolvedValue(JSON.stringify(makeSavedConfigWithDraft()));
-      renderPanel();
+      // R3 v2 PR-θ — canvas + advanced controls live under the `advanced` tab.
+      renderPanel({ initialTab: 'advanced' });
       await flush();
 
       const editor = screen.getByTestId('p2p-advanced-workflow-editor');
@@ -1009,7 +1086,7 @@ describe('P2pConfigPanel', () => {
     it('add node and remove node update draft state and surface validator diagnostics inline', async () => {
       const onSave = vi.fn();
       getUserPrefMock.mockResolvedValue(JSON.stringify(makeSavedConfigWithDraft()));
-      renderPanel({ onSave });
+      renderPanel({ onSave, initialTab: 'advanced' });
       await flush();
 
       // Initial: 2 nodes (rendered as SVG shapes on the canvas).
@@ -1060,7 +1137,7 @@ describe('P2pConfigPanel', () => {
     it('select existing edge and switch to conditional routing_key_equals updates draft', async () => {
       const onSave = vi.fn();
       getUserPrefMock.mockResolvedValue(JSON.stringify(makeSavedConfigWithDraft()));
-      renderPanel({ onSave });
+      renderPanel({ onSave, initialTab: 'advanced' });
       await flush();
 
       // The seed already has edge `e1` rendered as an SVG shape. Select it
@@ -1125,7 +1202,7 @@ describe('P2pConfigPanel', () => {
       };
       getUserPrefMock.mockResolvedValue(JSON.stringify(savedConfig));
 
-      renderPanel();
+      renderPanel({ initialTab: 'advanced' });
       await flush();
 
       const editor = screen.getByTestId('p2p-advanced-workflow-editor');
@@ -1163,7 +1240,7 @@ describe('P2pConfigPanel', () => {
     it('editor edits never include forbidden envelope fields in onChange output', async () => {
       const onSave = vi.fn();
       getUserPrefMock.mockResolvedValue(JSON.stringify(makeSavedConfigWithDraft()));
-      renderPanel({ onSave });
+      renderPanel({ onSave, initialTab: 'advanced' });
       await flush();
 
       // Make a few edits — select discuss node, change preset, add a node,
@@ -1244,7 +1321,7 @@ describe('P2pConfigPanel', () => {
       currentTranslator = (key: string, fallback?: string) => lookup(key) ?? fallback ?? key;
       try {
         getUserPrefMock.mockResolvedValue(JSON.stringify(makeSavedConfigWithDraft()));
-        renderPanel();
+        renderPanel({ initialTab: 'advanced' });
         await flush();
 
         const expectedTitle = lookup('p2p.workflow.editor.title');
@@ -1321,7 +1398,7 @@ describe('P2pConfigPanel', () => {
 
     it('Allowed executables section renders alongside the canvas editor', async () => {
       getUserPrefMock.mockResolvedValue(JSON.stringify(makeSavedConfigWithDraft()));
-      renderPanel();
+      renderPanel({ initialTab: 'advanced' });
       await flush();
       const section = screen.getByTestId('p2p-allowed-executables-section');
       expect(section).toBeDefined();
@@ -1336,7 +1413,7 @@ describe('P2pConfigPanel', () => {
     it('adds an executable to the allowlist and persists it through Save', async () => {
       const onSave = vi.fn();
       getUserPrefMock.mockResolvedValue(JSON.stringify(makeSavedConfigWithDraft()));
-      renderPanel({ onSave });
+      renderPanel({ onSave, initialTab: 'advanced' });
       await flush();
       const input = screen.getByTestId('p2p-allowed-executables-input') as HTMLInputElement;
       await act(async () => {
@@ -1365,7 +1442,7 @@ describe('P2pConfigPanel', () => {
         ...makeSavedConfigWithDraft(),
         allowedExecutables: ['/usr/bin/jq', '/bin/echo'],
       }));
-      renderPanel({ onSave });
+      renderPanel({ onSave, initialTab: 'advanced' });
       await flush();
       expect(screen.getByTestId('p2p-allowed-executables-entry-/usr/bin/jq')).toBeDefined();
       expect(screen.getByTestId('p2p-allowed-executables-entry-/bin/echo')).toBeDefined();
@@ -1400,7 +1477,7 @@ describe('P2pConfigPanel', () => {
         allowedExecutables: ['/usr/bin/jq'],
       };
       getUserPrefMock.mockResolvedValue(JSON.stringify(savedConfig));
-      renderPanel();
+      renderPanel({ initialTab: 'advanced' });
       await flush();
       const section = screen.getByTestId('p2p-allowed-executables-section');
       expect(section.getAttribute('data-readonly')).toBe('true');

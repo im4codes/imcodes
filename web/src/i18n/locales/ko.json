@@ -590,6 +590,13 @@
     "settings_button": "P2P 설정",
     "settings_title": "P2P 참가자 설정",
     "cross_session": "다른 프로젝트의 세션 포함",
+    "tab": {
+      "advanced_workflow": "고급 워크플로",
+      "advanced_workflow_intro": "유향 P2P 워크플로를 설계합니다. 노드는 에이전트 라운드(LLM, 스크립트, 논리 게이트)이며 엣지가 라우팅을 제어합니다. 여기에서 편집한 내용은 「에이전트」 탭에서 구성한 간단한 라운드/모드 파이프라인을 재정의합니다.",
+      "advanced_workflow_empty_hint": "빈 워크플로 초안을 초기화하는 중입니다. 아래 캔버스에서 노드와 엣지를 추가해 P2P 파이프라인을 설계하세요.",
+      "advanced_workflow_starter_title": "이름 없는 워크플로",
+      "advanced_workflow_starter_node_title": "시작"
+    },
     "settings_filter_sdk": "SDK",
     "settings_filter_cli": "CLI",
     "settings_save": "저장",

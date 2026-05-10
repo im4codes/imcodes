@@ -1727,4 +1727,90 @@ describe('p2p-workflow reverse-regression', () => {
       'jump-rebound must reset scriptRetryCounts for the target round',
     ).toBe(true);
   });
+
+  /*
+   * Reverse-regression #71 (R3 v2 PR-θ — UX accessibility: dedicated
+   * "advanced workflow" tab so the canvas editor is reachable from a
+   * cold panel, and so the participants tab is no longer overloaded
+   * with the canvas + allowed-executables + workflow banners).
+   *
+   * Locked invariants:
+   *   1. `P2pConfigPanel` declares an `'advanced'` member in its
+   *      `initialTab` union AND in the `useState` type so users may
+   *      open the panel directly on the canvas.
+   *   2. The tab button is rendered with `data-testid="p2p-tab-advanced"`
+   *      and a tab-name `t()` key (`p2p.tab.advanced_workflow`).
+   *   3. A `useEffect` auto-bootstraps a starter `P2pWorkflowDraft` when
+   *      the user enters the advanced tab with no prior draft, so the
+   *      canvas is never blank-and-unreachable for a new user.
+   *   4. The advanced tab branch in the body switch hosts the
+   *      `<AdvancedWorkflowCanvasEditor>` AND the allowed-executables
+   *      section — the participants branch must NOT host either.
+   *   5. The 7 supported locales each carry the
+   *      `p2p.tab.advanced_workflow*` key block (parity is asserted by
+   *      the existing i18n parity test; here we only guard the source
+   *      code structure that emits those keys).
+   */
+  it('#71 advanced workflow tab MUST exist and host the canvas (R3 v2 PR-θ)', () => {
+    const file = read('web/src/components/P2pConfigPanel.tsx');
+
+    // (1) initialTab + useState type must include 'advanced'.
+    expect(
+      /initialTab\?:\s*'participants'\s*\|\s*'combos'\s*\|\s*'advanced'/.test(file.text),
+      "Props.initialTab must include 'advanced' so callers can open directly on the canvas tab",
+    ).toBe(true);
+    expect(
+      /useState<'participants'\s*\|\s*'combos'\s*\|\s*'advanced'>/.test(file.text),
+      "activeTab useState type union must include 'advanced'",
+    ).toBe(true);
+
+    // (2) Tab button with stable testid + i18n key.
+    expect(
+      /data-testid=\"p2p-tab-advanced\"/.test(file.text),
+      'Advanced tab button must carry data-testid="p2p-tab-advanced" for tests + a11y selectors',
+    ).toBe(true);
+    expect(
+      /t\(\s*['\"]p2p\.tab\.advanced_workflow['\"]/.test(file.text),
+      "Advanced tab button label must read from the i18n key 'p2p.tab.advanced_workflow'",
+    ).toBe(true);
+
+    // (3) Bootstrap useEffect: when activeTab === 'advanced' AND no draft
+    // exists yet, a starter draft must be injected. We don't pin the exact
+    // useEffect body — just that the conditional bootstrap path exists in
+    // the source and refers to the canvas-relevant state.
+    const bootstrapAnchor = file.text.indexOf("if (activeTab !== 'advanced') return;");
+    expect(
+      bootstrapAnchor,
+      "A bootstrap useEffect early-return guarding on `activeTab !== 'advanced'` must exist",
+    ).toBeGreaterThan(0);
+    const bootstrapWindow = file.text.slice(bootstrapAnchor, bootstrapAnchor + 1500);
+    expect(
+      /setWorkflowDraft\(starter\)/.test(bootstrapWindow),
+      'The advanced-tab bootstrap effect must inject a starter draft via setWorkflowDraft(starter)',
+    ).toBe(true);
+
+    // (4) The advanced tab branch must contain the canvas + allowed
+    // executables. We anchor on the comment marker placed in the advanced
+    // tab branch and scan forward for the canvas + allowlist mounts.
+    const advancedAnchor = file.text.indexOf('R3 v2 PR-θ — Advanced Workflow tab');
+    expect(advancedAnchor, 'Advanced tab branch comment marker must be present').toBeGreaterThan(0);
+    const advancedWindow = file.text.slice(advancedAnchor, advancedAnchor + 8000);
+    expect(
+      /<AdvancedWorkflowCanvasEditor[\s\S]*?value=\{workflowDraft\}/.test(advancedWindow),
+      'Advanced tab branch must mount <AdvancedWorkflowCanvasEditor value={workflowDraft}>',
+    ).toBe(true);
+    expect(
+      /data-testid=\"p2p-allowed-executables-section\"/.test(advancedWindow),
+      'Allowed-executables section must live inside the advanced tab branch',
+    ).toBe(true);
+
+    // The canvas + allowed-executables MUST NOT appear ANYWHERE else (i.e.
+    // not inside the participants branch). We assert the file contains
+    // exactly one of each marker so the participants branch can never
+    // re-acquire them via accidental copy/paste.
+    const canvasOccurrences = file.text.match(/<AdvancedWorkflowCanvasEditor/g)?.length ?? 0;
+    expect(canvasOccurrences, 'Canvas editor must be mounted exactly once (advanced tab only)').toBe(1);
+    const allowlistOccurrences = file.text.match(/data-testid=\"p2p-allowed-executables-section\"/g)?.length ?? 0;
+    expect(allowlistOccurrences, 'Allowed-executables section must be mounted exactly once').toBe(1);
+  });
 });

@@ -590,6 +590,13 @@
     "settings_button": "Ajustes P2P",
     "settings_title": "Ajustes de participantes P2P",
     "cross_session": "Incluir sesiones de otros proyectos",
+    "tab": {
+      "advanced_workflow": "Flujo de trabajo avanzado",
+      "advanced_workflow_intro": "Diseña un flujo de trabajo P2P dirigido. Los nodos son rondas de agentes (LLM, script o puertas lógicas); las aristas controlan el enrutamiento. Las ediciones aquí anulan la canalización simple de rondas/modos configurada en Agentes.",
+      "advanced_workflow_empty_hint": "Inicializando un borrador de flujo de trabajo en blanco. Añade nodos y aristas en el lienzo de abajo para diseñar tu canalización P2P.",
+      "advanced_workflow_starter_title": "Flujo de trabajo sin título",
+      "advanced_workflow_starter_node_title": "Inicio"
+    },
     "settings_filter_sdk": "SDK",
     "settings_filter_cli": "CLI",
     "settings_save": "Guardar",

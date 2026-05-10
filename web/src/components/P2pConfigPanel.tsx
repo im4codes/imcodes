@@ -72,7 +72,7 @@ interface Props {
   activeSession?: string | null;
   /** Active server ID — P2P participant names are server-local, so saved config must be too. */
   serverId?: string | null;
-  initialTab?: 'participants' | 'combos';
+  initialTab?: 'participants' | 'combos' | 'advanced';
   onClose: () => void;
   onSave: (config: P2pSavedConfig) => void;
   onPersistDaemonConfig?: (scopeSession: string, config: P2pSavedConfig) => Promise<{ ok: boolean; error?: string }> | { ok: boolean; error?: string };
@@ -352,25 +352,6 @@ const sectionCardStyle: Record<string, string | number> = {
   padding: 14,
 };
 
-const fieldLabelStyle: Record<string, string | number> = {
-  display: 'flex',
-  flexDirection: 'column',
-  gap: 6,
-  fontSize: 12,
-  color: '#cbd5e1',
-};
-
-const fieldInputStyle: Record<string, string | number> = {
-  width: '100%',
-  background: '#0f172a',
-  border: '1px solid #334155',
-  borderRadius: 6,
-  color: '#e2e8f0',
-  fontSize: 13,
-  padding: '7px 9px',
-  outline: 'none',
-};
-
 const roundsBtnStyle = (active: boolean): Record<string, string | number> => ({
   padding: '4px 12px',
   borderRadius: 6,
@@ -424,7 +405,7 @@ export function P2pConfigPanel({
 }: Props) {
   const { t } = useTranslation();
   const [agentFlavorFilter, setAgentFlavorFilter] = useState<AgentFlavorFilter>('sdk');
-  const [activeTab, setActiveTab] = useState<'participants' | 'combos'>(initialTab);
+  const [activeTab, setActiveTab] = useState<'participants' | 'combos' | 'advanced'>(initialTab);
   const { customCombos, saveCustomCombos } = useP2pCustomCombos();
   const [isMobile, setIsMobile] = useState(() => typeof window !== 'undefined' && window.innerWidth < 768);
 
@@ -471,7 +452,12 @@ export function P2pConfigPanel({
   const [rounds, setRounds] = useState(3);
   const [hopTimeoutMinutes, setHopTimeoutMinutes] = useState(8);
   const [extraPrompt, setExtraPrompt] = useState('');
-  const [advancedExpanded, setAdvancedExpanded] = useState(false);
+  // R3 v2 PR-θ — these state vars retain saved-config compatibility for
+  // legacy "old-advanced" presets that round-trip through `P2pSavedConfig`.
+  // Their authoring UI was retired with the canvas-only refactor (no toggle
+  // surface), but they are still rehydrated on load and re-emitted on save
+  // so users with pre-existing `advancedPresetKey`/`advancedRounds` configs
+  // do not silently lose data.
   const [advancedPresetKey, setAdvancedPresetKey] = useState<P2pAdvancedPresetKey | ''>('');
   const [advancedRounds, setAdvancedRounds] = useState<P2pAdvancedRound[] | undefined>(undefined);
   const [advancedRunTimeoutMinutes, setAdvancedRunTimeoutMinutes] = useState(30);
@@ -491,7 +477,6 @@ export function P2pConfigPanel({
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saveWarning, setSaveWarning] = useState<string | null>(null);
-  const showAdvancedWorkflowSettings = false;
   const formDirtyRef = useRef(false);
   const seededConfigKeyRef = useRef<string | null>(null);
 
@@ -638,13 +623,6 @@ export function P2pConfigPanel({
     setWorkflowLaunchEnvelope(parsed.workflowLaunchEnvelope ?? materializedEnvelope ?? undefined);
     const needsMigration = hasOldAdvancedConfig(parsed) && !parsed.workflowDraft && !parsed.workflowLaunchEnvelope;
     setAdvancedMigrationNeeded(needsMigration);
-    setAdvancedExpanded(Boolean(
-      parsed.advancedPresetKey ||
-      parsed.workflowDraft ||
-      parsed.workflowLaunchEnvelope ||
-      parsed.contextReducer ||
-      parsed.advancedRunTimeoutMinutes != null,
-    ));
   }, [configKey, p2pConfigPref.value, scopeSession]);
 
   useEffect(() => {
@@ -669,6 +647,31 @@ export function P2pConfigPanel({
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
   }, []);
+
+  /*
+   * R3 v2 PR-θ — Auto-bootstrap an empty workflow draft when the user
+   * lands on the advanced tab and has nothing to edit yet. The canvas
+   * editor refuses to render without a `workflowDraft`, so without this
+   * a brand-new user would see an empty tab and have no path forward.
+   * The starter draft contains a single root LLM node so validation
+   * passes immediately; users can rename / reshape from the canvas.
+   */
+  useEffect(() => {
+    if (activeTab !== 'advanced') return;
+    if (workflowDraft || workflowLaunchEnvelope || advancedPresetKey) return;
+    const starter: P2pWorkflowDraft = {
+      schemaVersion: P2P_WORKFLOW_SCHEMA_VERSION,
+      id: `draft_${Date.now().toString(36)}`,
+      title: t('p2p.tab.advanced_workflow_starter_title', 'Untitled workflow'),
+      nodes: [
+        { id: 'node_1', title: t('p2p.tab.advanced_workflow_starter_node_title', 'Start'), nodeKind: 'llm', preset: 'discuss', permissionScope: 'analysis_only' },
+      ],
+      edges: [],
+      rootNodeId: 'node_1',
+    };
+    setWorkflowDraft(starter);
+    markFormDirty();
+  }, [activeTab, workflowDraft, workflowLaunchEnvelope, advancedPresetKey, t]);
 
   const toggleEnabled = (key: string) => {
     markFormDirty();
@@ -824,32 +827,15 @@ export function P2pConfigPanel({
   };
 
   const getEntry = (key: string) => sessionCfg[key] ?? { enabled: false, mode: 'audit' };
-  const handleAdvancedPresetChange = (value: string) => {
-    markFormDirty();
-    const nextPreset = value as P2pAdvancedPresetKey | '';
-    setAdvancedPresetKey(nextPreset);
-    if (!nextPreset) {
-      setAdvancedRounds(undefined);
-      setContextReducerMode('');
-      setContextReducerSession('');
-      setContextReducerTemplate('');
-      setWorkflowDraft(undefined);
-      setWorkflowLaunchEnvelope(undefined);
-      setAdvancedMigrationNeeded(false);
-      return;
-    }
-    setAdvancedRounds((prev) => prev ?? (JSON.parse(JSON.stringify(BUILT_IN_ADVANCED_PRESETS[nextPreset])) as P2pAdvancedRound[]));
-    setAdvancedRunTimeoutMinutes((prev) => (prev > 0 ? prev : 30));
-    setAdvancedMigrationNeeded(true);
-  };
 
-  const updateAdvancedRound = (roundId: string, updater: (round: P2pAdvancedRound) => P2pAdvancedRound) => {
-    markFormDirty();
-    setAdvancedRounds((prev) => {
-      if (!prev) return prev;
-      return prev.map((round) => (round.id === roundId ? updater(round) : round));
-    });
-  };
+  // R3 v2 PR-θ — old-advanced authoring (preset selector, rounds editor,
+  // context-reducer dropdowns) was retired with the canvas-only refactor.
+  // The state vars above stay for round-trip compatibility, but interactive
+  // editing is now done exclusively through `AdvancedWorkflowCanvasEditor`
+  // in the new `advanced` tab. `BUILT_IN_ADVANCED_PRESETS` is still imported
+  // because `handleSave` resolves preset → rounds when round-tripping a
+  // legacy `advancedPresetKey` config that has no explicit `advancedRounds`.
+
   const overlayStyle: Record<string, string | number> = {
     position: 'fixed',
     inset: 0,
@@ -888,6 +874,18 @@ export function P2pConfigPanel({
           </button>
           <button type="button" style={tabStyle(activeTab === 'combos')} onClick={() => setActiveTab('combos')}>
             {t('p2p.combo_label')}
+          </button>
+          {/* R3 v2 PR-θ — dedicated tab for the visual advanced workflow
+              canvas. Separates the simple mode-pipeline editor (combos)
+              from the full graph editor (workflow) so users have an
+              obvious entry point. Empty drafts auto-bootstrap on entry. */}
+          <button
+            type="button"
+            style={tabStyle(activeTab === 'advanced')}
+            onClick={() => setActiveTab('advanced')}
+            data-testid="p2p-tab-advanced"
+          >
+            {t('p2p.tab.advanced_workflow', '高级工作流')}
           </button>
         </div>
 
@@ -1038,6 +1036,37 @@ export function P2pConfigPanel({
                   />
                 </div>
 
+              </>
+            ) : activeTab === 'combos' ? (
+              <>
+                <div style={sectionCardStyle}>
+                  <div style={{ ...sectionLabelStyle, marginTop: 0 }}>{t('p2p.combo_label')}</div>
+                  <P2pComboManager
+                    customCombos={customCombos}
+                    onCustomCombosChange={saveCustomCombos}
+                  />
+                </div>
+              </>
+            ) : (
+              /*
+               * R3 v2 PR-θ — Advanced Workflow tab. Single home for the
+               * full canvas-based graph editor plus every advanced-config
+               * block (migration banner, allowed-executables allowlist,
+               * future-schema banner, capability stale/missing banners).
+               * The participants tab no longer holds any advanced UI —
+               * users always reach the canvas through this tab. A brand-
+               * new user who clicks the tab gets an empty starter draft
+               * auto-bootstrapped (see useEffect above) so the canvas
+               * never appears blank without an entry path.
+               */
+              <>
+                <div
+                  style={{ ...sectionCardStyle, marginTop: 0, color: '#94a3b8', fontSize: 12, lineHeight: 1.5 }}
+                  data-testid="p2p-advanced-tab-intro"
+                >
+                  {t('p2p.tab.advanced_workflow_intro', 'Design a directed P2P workflow. Nodes are agent rounds (LLM, script, or logic gates); edges control routing. Edits here override the simple round/mode pipeline configured under Agents.')}
+                </div>
+
                 {(advancedMigrationNeeded || workflowLaunchEnvelope) && (
                   <div style={{ ...sectionCardStyle, marginTop: 12, borderColor: advancedMigrationNeeded ? '#f59e0b' : '#334155' }}>
                     <div style={{ ...sectionLabelStyle, marginTop: 0 }}>
@@ -1051,19 +1080,30 @@ export function P2pConfigPanel({
                   </div>
                 )}
 
+                {!workflowDraft && !workflowLaunchEnvelope && !advancedPresetKey && (
+                  <div
+                    style={{ ...sectionCardStyle, marginTop: 12, color: '#94a3b8', fontSize: 12, lineHeight: 1.5 }}
+                    data-testid="p2p-advanced-empty-hint"
+                  >
+                    {t('p2p.tab.advanced_workflow_empty_hint', 'Initializing a blank workflow draft. Add nodes and edges in the canvas below to design your P2P pipeline.')}
+                  </div>
+                )}
+
                 {workflowDraft && (
-                  <AdvancedWorkflowCanvasEditor
-                    value={workflowDraft}
-                    readOnly={readOnlyMode}
-                    onChange={(next) => {
-                      markFormDirty();
-                      setWorkflowDraft(next);
-                      // Strip the launch envelope so Save will re-derive a
-                      // fresh one from the edited draft. Keeps the editor as
-                      // the single source of truth while the dialog is open.
-                      setWorkflowLaunchEnvelope(undefined);
-                    }}
-                  />
+                  <div style={{ marginTop: 12 }}>
+                    <AdvancedWorkflowCanvasEditor
+                      value={workflowDraft}
+                      readOnly={readOnlyMode}
+                      onChange={(next) => {
+                        markFormDirty();
+                        setWorkflowDraft(next);
+                        // Strip the launch envelope so Save will re-derive a
+                        // fresh one from the edited draft. Keeps the editor as
+                        // the single source of truth while the dialog is open.
+                        setWorkflowLaunchEnvelope(undefined);
+                      }}
+                    />
+                  </div>
                 )}
 
                 {/*
@@ -1240,339 +1280,6 @@ export function P2pConfigPanel({
                     </div>
                   </div>
                 )}
-
-                {showAdvancedWorkflowSettings && <div style={{ ...sectionCardStyle, marginTop: 12 }}>
-                  <button
-                    type="button"
-                    onClick={() => setAdvancedExpanded((value) => !value)}
-                    style={{
-                      width: '100%',
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'space-between',
-                      background: 'none',
-                      border: 'none',
-                      color: '#e2e8f0',
-                      fontSize: 13,
-                      fontWeight: 600,
-                      cursor: 'pointer',
-                      padding: 0,
-                    }}
-                    aria-expanded={advancedExpanded}
-                  >
-                    <span>{t('p2p.settings_advanced_title', 'Advanced workflow')}</span>
-                    <span>{advancedExpanded ? '▾' : '▸'}</span>
-                  </button>
-                  {advancedExpanded && (
-                    <div style={{ display: 'grid', gap: 12, marginTop: 12 }}>
-                      <label style={fieldLabelStyle}>
-                        <span>{t('p2p.settings_advanced_preset', 'Advanced preset')}</span>
-                        <select
-                          value={advancedPresetKey}
-                          onChange={(event) => handleAdvancedPresetChange((event.target as HTMLSelectElement).value)}
-                          style={fieldInputStyle}
-                          aria-label={t('p2p.settings_advanced_preset', 'Advanced preset')}
-                        >
-                          <option value="">{t('common.off', 'Off')}</option>
-                          <option value="openspec">OpenSpec</option>
-                        </select>
-                      </label>
-
-                      {advancedPresetKey && (
-                        <>
-                          <label style={fieldLabelStyle}>
-                            <span>{t('p2p.settings_advanced_run_timeout', 'Whole-run timeout')}</span>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                              <input
-                                type="number"
-                                min={1}
-                                max={240}
-                                value={advancedRunTimeoutMinutes}
-                                onInput={(event) => {
-                                  const next = parseInt((event.target as HTMLInputElement).value, 10);
-                                  if (Number.isFinite(next) && next >= 1 && next <= 240) {
-                                    markFormDirty();
-                                    setAdvancedRunTimeoutMinutes(next);
-                                  }
-                                }}
-                                style={{ ...fieldInputStyle, width: 88, textAlign: 'center' }}
-                                aria-label={t('p2p.settings_advanced_run_timeout', 'Whole-run timeout')}
-                              />
-                              <span style={{ fontSize: 12, color: '#94a3b8' }}>{t('p2p.settings_advanced_run_timeout_unit', 'minutes total')}</span>
-                            </div>
-                          </label>
-
-                          <label style={fieldLabelStyle}>
-                            <span>{t('p2p.settings_context_reducer_mode', 'Reducer mode')}</span>
-                            <select
-                              value={contextReducerMode}
-                              onChange={(event) => {
-                                markFormDirty();
-                                setContextReducerMode((event.target as HTMLSelectElement).value as P2pContextReducerMode | '');
-                              }}
-                              style={fieldInputStyle}
-                              aria-label={t('p2p.settings_context_reducer_mode', 'Reducer mode')}
-                            >
-                              <option value="">{t('common.none', 'None')}</option>
-                              <option value="reuse_existing_session">{t('p2p.settings_context_reducer_reuse', 'Reuse existing SDK participant')}</option>
-                              <option value="clone_sdk_session">{t('p2p.settings_context_reducer_clone', 'Clone SDK session template')}</option>
-                            </select>
-                          </label>
-
-                          {contextReducerMode === 'reuse_existing_session' && (
-                            <label style={fieldLabelStyle}>
-                              <span>{t('p2p.settings_context_reducer_session', 'Reducer participant')}</span>
-                              <select
-                                value={contextReducerSession}
-                                onChange={(event) => {
-                                  markFormDirty();
-                                  setContextReducerSession((event.target as HTMLSelectElement).value);
-                                }}
-                                style={fieldInputStyle}
-                                aria-label={t('p2p.settings_context_reducer_session', 'Reducer participant')}
-                              >
-                                <option value="">{enabledSdkParticipants.length > 0 ? t('common.select', 'Select') : t('p2p.picker.no_agents_available')}</option>
-                                {enabledSdkParticipants.map((entry) => (
-                                  <option key={entry.key} value={entry.key}>{entry.shortName}</option>
-                                ))}
-                              </select>
-                            </label>
-                          )}
-
-                          {contextReducerMode === 'clone_sdk_session' && (
-                            <label style={fieldLabelStyle}>
-                              <span>{t('p2p.settings_context_reducer_template', 'Template participant')}</span>
-                              <select
-                                value={contextReducerTemplate}
-                                onChange={(event) => {
-                                  markFormDirty();
-                                  setContextReducerTemplate((event.target as HTMLSelectElement).value);
-                                }}
-                                style={fieldInputStyle}
-                                aria-label={t('p2p.settings_context_reducer_template', 'Template participant')}
-                              >
-                                <option value="">{enabledSdkParticipants.length > 0 ? t('common.select', 'Select') : t('p2p.picker.no_agents_available')}</option>
-                                {enabledSdkParticipants.map((entry) => (
-                                  <option key={entry.key} value={entry.key}>{entry.shortName}</option>
-                                ))}
-                              </select>
-                            </label>
-                          )}
-
-                          {advancedRounds && advancedRounds.length > 0 && (
-                            <div style={{ display: 'grid', gap: 10 }}>
-                              <div style={{ ...sectionLabelStyle, marginTop: 4, marginBottom: 0 }}>
-                                {t('p2p.settings_advanced_rounds', 'Advanced rounds')}
-                              </div>
-                              {advancedRounds.map((round) => (
-                                <div
-                                  key={round.id}
-                                  style={{
-                                    display: 'grid',
-                                    gap: 10,
-                                    background: '#0b1220',
-                                    border: '1px solid #334155',
-                                    borderRadius: 8,
-                                    padding: 12,
-                                  }}
-                                >
-                                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
-                                    <div style={{ minWidth: 0 }}>
-                                      <div style={{ fontSize: 13, fontWeight: 600, color: '#e2e8f0' }}>{round.title}</div>
-                                      <div style={{ fontSize: 11, color: '#64748b' }}>{round.id} · {round.preset}</div>
-                                    </div>
-                                    <select
-                                      value={round.executionMode}
-                                      onChange={(event) => updateAdvancedRound(round.id, (current) => ({
-                                        ...current,
-                                        executionMode: (event.target as HTMLSelectElement).value as P2pAdvancedRound['executionMode'],
-                                      }))}
-                                      style={{ ...fieldInputStyle, width: 180 }}
-                                      aria-label={`${round.id}-execution-mode`}
-                                    >
-                                      <option value="single_main">{t('p2p.settings_single_main', 'Single main')}</option>
-                                      <option value="multi_dispatch">{t('p2p.settings_multi_dispatch', 'Multi-dispatch')}</option>
-                                    </select>
-                                  </div>
-
-                                  <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : 'repeat(2, minmax(0, 1fr))', gap: 10 }}>
-                                    <label style={fieldLabelStyle}>
-                                      <span>{t('p2p.settings_round_timeout', 'Round timeout')}</span>
-                                      <input
-                                        type="number"
-                                        min={1}
-                                        max={60}
-                                        value={round.timeoutMinutes ?? 5}
-                                        onInput={(event) => {
-                                          const next = parseInt((event.target as HTMLInputElement).value, 10);
-                                          if (Number.isFinite(next) && next >= 1 && next <= 60) {
-                                            updateAdvancedRound(round.id, (current) => ({ ...current, timeoutMinutes: next }));
-                                          }
-                                        }}
-                                        style={fieldInputStyle}
-                                        aria-label={`${round.id}-timeout`}
-                                      />
-                                    </label>
-                                    <label style={fieldLabelStyle}>
-                                      <span>{t('p2p.settings_verdict_policy', 'Verdict policy')}</span>
-                                      <select
-                                        value={round.verdictPolicy ?? 'none'}
-                                        onChange={(event) => updateAdvancedRound(round.id, (current) => ({
-                                          ...current,
-                                          verdictPolicy: (event.target as HTMLSelectElement).value as NonNullable<P2pAdvancedRound['verdictPolicy']>,
-                                          jumpRule: (event.target as HTMLSelectElement).value === 'none'
-                                            ? undefined
-                                            : current.jumpRule ?? {
-                                              targetRoundId: advancedRounds.find((candidate) => candidate.id !== current.id)?.id ?? '',
-                                              marker: 'REWORK',
-                                              minTriggers: 0,
-                                              maxTriggers: 2,
-                                            },
-                                        }))}
-                                        style={fieldInputStyle}
-                                        aria-label={`${round.id}-verdict-policy`}
-                                      >
-                                        <option value="none">{t('common.none', 'None')}</option>
-                                        <option value="smart_gate">{t('p2p.settings_smart_gate', 'Smart gate')}</option>
-                                        <option value="forced_rework">{t('p2p.settings_forced_rework', 'Forced rework')}</option>
-                                      </select>
-                                    </label>
-                                  </div>
-
-                                  {(round.verdictPolicy === 'smart_gate' || round.verdictPolicy === 'forced_rework' || round.jumpRule) && (
-                                    <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : 'repeat(4, minmax(0, 1fr))', gap: 10 }}>
-                                      <label style={fieldLabelStyle}>
-                                        <span>{t('p2p.settings_jump_target', 'Jump target')}</span>
-                                        <select
-                                          value={round.jumpRule?.targetRoundId ?? ''}
-                                          onChange={(event) => updateAdvancedRound(round.id, (current) => ({
-                                            ...current,
-                                            jumpRule: {
-                                              targetRoundId: (event.target as HTMLSelectElement).value,
-                                              marker: current.jumpRule?.marker ?? 'REWORK',
-                                              minTriggers: current.jumpRule?.minTriggers ?? 0,
-                                              maxTriggers: current.jumpRule?.maxTriggers ?? 2,
-                                            },
-                                          }))}
-                                          style={fieldInputStyle}
-                                          aria-label={`${round.id}-jump-target`}
-                                        >
-                                          <option value="">{t('common.none', 'None')}</option>
-                                          {advancedRounds
-                                            .filter((candidate) => candidate.id !== round.id)
-                                            .map((candidate) => (
-                                              <option key={candidate.id} value={candidate.id}>{candidate.title}</option>
-                                            ))}
-                                        </select>
-                                      </label>
-                                      <label style={fieldLabelStyle}>
-                                        <span>{t('p2p.settings_jump_marker', 'Jump marker')}</span>
-                                        <select
-                                          value={round.jumpRule?.marker ?? 'REWORK'}
-                                          onChange={(event) => updateAdvancedRound(round.id, (current) => ({
-                                            ...current,
-                                            jumpRule: current.jumpRule ? {
-                                              ...current.jumpRule,
-                                              marker: (event.target as HTMLSelectElement).value as 'PASS' | 'REWORK',
-                                            } : undefined,
-                                          }))}
-                                          style={fieldInputStyle}
-                                          aria-label={`${round.id}-jump-marker`}
-                                        >
-                                          <option value="REWORK">REWORK</option>
-                                          <option value="PASS">PASS</option>
-                                        </select>
-                                      </label>
-                                      <label style={fieldLabelStyle}>
-                                        <span>{t('p2p.settings_min_triggers', 'Min triggers')}</span>
-                                        <input
-                                          type="number"
-                                          min={0}
-                                          max={10}
-                                          value={round.jumpRule?.minTriggers ?? 0}
-                                          onInput={(event) => updateAdvancedRound(round.id, (current) => ({
-                                            ...current,
-                                            jumpRule: current.jumpRule ? {
-                                              ...current.jumpRule,
-                                              minTriggers: parseInt((event.target as HTMLInputElement).value, 10) || 0,
-                                            } : undefined,
-                                          }))}
-                                          style={fieldInputStyle}
-                                          aria-label={`${round.id}-min-triggers`}
-                                        />
-                                      </label>
-                                      <label style={fieldLabelStyle}>
-                                        <span>{t('p2p.settings_max_triggers', 'Max triggers')}</span>
-                                        <input
-                                          type="number"
-                                          min={1}
-                                          max={10}
-                                          value={round.jumpRule?.maxTriggers ?? 2}
-                                          onInput={(event) => updateAdvancedRound(round.id, (current) => ({
-                                            ...current,
-                                            jumpRule: current.jumpRule ? {
-                                              ...current.jumpRule,
-                                              maxTriggers: parseInt((event.target as HTMLInputElement).value, 10) || 1,
-                                            } : undefined,
-                                          }))}
-                                          style={fieldInputStyle}
-                                          aria-label={`${round.id}-max-triggers`}
-                                        />
-                                      </label>
-                                    </div>
-                                  )}
-
-                                  {(round.permissionScope === 'artifact_generation' || (round.artifactOutputs?.length ?? 0) > 0) && (
-                                    <label style={fieldLabelStyle}>
-                                      <span>{t('p2p.settings_artifact_outputs', 'Artifact outputs')}</span>
-                                      <input
-                                        type="text"
-                                        value={(round.artifactOutputs ?? []).join(', ')}
-                                        onInput={(event) => updateAdvancedRound(round.id, (current) => ({
-                                          ...current,
-                                          artifactOutputs: (event.target as HTMLInputElement).value
-                                            .split(',')
-                                            .map((entry) => entry.trim())
-                                            .filter(Boolean),
-                                        }))}
-                                        style={fieldInputStyle}
-                                        aria-label={`${round.id}-artifact-outputs`}
-                                      />
-                                    </label>
-                                  )}
-
-                                  <label style={fieldLabelStyle}>
-                                    <span>{t('p2p.settings_prompt_append', 'Prompt append')}</span>
-                                    <textarea
-                                      value={round.promptAppend ?? ''}
-                                      onInput={(event) => updateAdvancedRound(round.id, (current) => ({
-                                        ...current,
-                                        promptAppend: (event.target as HTMLTextAreaElement).value,
-                                      }))}
-                                      rows={2}
-                                      style={{ ...fieldInputStyle, resize: 'vertical' }}
-                                      aria-label={`${round.id}-prompt-append`}
-                                    />
-                                  </label>
-                                </div>
-                              ))}
-                            </div>
-                          )}
-                        </>
-                      )}
-                    </div>
-                  )}
-                </div>}
-              </>
-            ) : (
-              <>
-                <div style={sectionCardStyle}>
-                  <div style={{ ...sectionLabelStyle, marginTop: 0 }}>{t('p2p.combo_label')}</div>
-                  <P2pComboManager
-                    customCombos={customCombos}
-                    onCustomCombosChange={saveCustomCombos}
-                  />
-                </div>
               </>
             )
           )}
