@@ -7,6 +7,7 @@ import {
   P2P_WORKFLOW_SCRIPT_ARGV_CAPABILITY_V1,
 } from '../../shared/p2p-workflow-constants.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
+import { SESSION_GROUP_CLONE_CAPABILITY_V1 } from '../../shared/session-group-clone.js';
 import type {
   P2pBindRuntimeContext,
   P2pCompiledWorkflow,
@@ -183,6 +184,7 @@ describe('ServerLink P2P workflow hello', () => {
       P2P_WORKFLOW_CAPABILITY_V1,
       P2P_WORKFLOW_OPENSPEC_ARTIFACTS_CAPABILITY_V1,
       P2P_WORKFLOW_IMPLEMENTATION_CAPABILITY_V1,
+      SESSION_GROUP_CLONE_CAPABILITY_V1,
     ]);
 
     link.updateP2pWorkflowCapabilities([
@@ -254,6 +256,7 @@ describe('ServerLink P2P workflow hello', () => {
         P2P_WORKFLOW_CAPABILITY_V1,
         P2P_WORKFLOW_OPENSPEC_ARTIFACTS_CAPABILITY_V1,
         P2P_WORKFLOW_IMPLEMENTATION_CAPABILITY_V1,
+        SESSION_GROUP_CLONE_CAPABILITY_V1,
       ],
       helloEpoch: 1,
       sentAt: Date.parse('2026-05-09T12:00:00.000Z'),

@@ -72,12 +72,13 @@ import { CC_PRESET_MSG, type CcPreset } from '../../shared/cc-presets.js';
 import { MEMORY_WS } from '../../shared/memory-ws.js';
 import { FS_WRITE_ERROR } from '../shared/transport/fs.js';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG, MAX_P2P_PARTICIPANTS } from '../../shared/p2p-config-events.js';
-import { p2pScopedSessionKey } from '../../shared/p2p-config-scope.js';
 import { P2P_PRESET_DEFAULT_SUMMARY_PROMPT, P2P_WORKFLOW_SCHEMA_VERSION } from '../../shared/p2p-workflow-constants.js';
 import { makeP2pWorkflowDiagnostic, type P2pWorkflowDiagnostic } from '../../shared/p2p-workflow-diagnostics.js';
 import { compileP2pWorkflowDraft } from '../../shared/p2p-workflow-compiler.js';
 import { materializeOldAdvancedConfigToWorkflowDraft } from '../../shared/p2p-workflow-materialize.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
+import { SESSION_GROUP_CLONE_MSG } from '../../shared/session-group-clone.js';
+import { getP2pConfigStoreScope, handleSessionGroupCloneCancel, handleSessionGroupCloneCommand } from './session-group-clone.js';
 import { buildDefaultP2pStaticPolicy } from '../../shared/p2p-workflow-policy.js';
 import {
   validateP2pWorkflowDraft,
@@ -975,13 +976,6 @@ function resolveP2pConfigScopeSession(sessionName: string): string {
   return record?.parentSession ?? sessionName;
 }
 
-function getP2pConfigStoreScope(serverLink: ServerLink, scopeSession: string): string {
-  const serverId = typeof (serverLink as unknown as { getServerId?: () => string }).getServerId === 'function'
-    ? (serverLink as unknown as { getServerId: () => string }).getServerId()
-    : undefined;
-  return p2pScopedSessionKey(scopeSession, serverId);
-}
-
 async function resolveStructuredP2pSessionConfig(
   sessionName: string,
   serverLink: ServerLink,
@@ -1257,6 +1251,12 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       break;
     case DAEMON_COMMAND_TYPES.SESSION_CANCEL:
       void handleSessionCancel(cmd, serverLink);
+      break;
+    case SESSION_GROUP_CLONE_MSG.START:
+      void handleSessionGroupCloneCommand(cmd, serverLink);
+      break;
+    case SESSION_GROUP_CLONE_MSG.CANCEL:
+      handleSessionGroupCloneCancel(cmd, serverLink);
       break;
     case DAEMON_COMMAND_TYPES.SESSION_UPDATE_TRANSPORT_CONFIG:
       void handleSessionTransportConfigUpdate(cmd, serverLink);

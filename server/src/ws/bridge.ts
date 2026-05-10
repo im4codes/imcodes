@@ -17,6 +17,7 @@ import type { Database } from '../db/client.js';
 import type { Env } from '../env.js';
 import { MemoryRateLimiter } from './rate-limiter.js';
 import { sha256Hex } from '../security/crypto.js';
+import { resolveServerRole } from '../security/authorization.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
@@ -84,7 +85,7 @@ import {
   type PreviewWsOpenedMessage,
 } from '../../../shared/preview-types.js';
 import { LocalWebPreviewRegistry } from '../preview/registry.js';
-import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, getSubSessionById, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent, getUserPref, setUserPref } from '../db/queries.js';
+import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, getSubSessionById, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent, getUserPref, setUserPref, deleteUserPref, getDbSessionsByServer } from '../db/queries.js';
 import logger from '../util/logger.js';
 import { incrementCounter } from '../util/metrics.js';
 import { pickReadableSessionDisplay } from '../../../shared/session-display.js';
@@ -112,6 +113,22 @@ import {
   sanitizeP2pRunForPersistAndBroadcast,
   sanitizeP2pRunUpdateForBroadcast,
 } from '../p2p-workflow-sanitize.js';
+import { sanitizeProjectName } from '../../../shared/sanitize-project-name.js';
+import {
+  SESSION_GROUP_CLONE_CAPABILITY_V1,
+  SESSION_GROUP_CLONE_MSG,
+  SESSION_GROUP_CLONE_STATES,
+  cloneP2pConfigWithSessionRemap,
+  mainSessionNameForProjectSlug,
+  type SessionGroupCloneCleanupResource,
+  type SessionGroupCloneEvent,
+  type SessionGroupCloneResult,
+  type SessionGroupCloneSkippedMember,
+  type SessionGroupCloneWarning,
+} from '../../../shared/session-group-clone.js';
+import { P2P_CONFIG_MSG } from '../../../shared/p2p-config-events.js';
+import { p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../../../shared/p2p-config-scope.js';
+import { isP2pSavedConfig, type P2pSavedConfig } from '../../../shared/p2p-modes.js';
 
 const AUTH_TIMEOUT_MS = 5000;
 const MAX_QUEUE_SIZE = 100;
@@ -126,6 +143,7 @@ const MAX_PENDING_MEMORY_MANAGEMENT_REQUESTS_PER_SOCKET = 32;
 // real abuse patterns send orders-of-magnitude more.
 const BROWSER_RATE_LIMIT = 300;
 const BROWSER_RATE_WINDOW = 10_000; // 10s
+const SESSION_GROUP_CLONE_CONTEXT_TTL_MS = 10 * 60 * 1000;
 /**
  * Master switch for the per-browser rate limiter.
  *
@@ -277,6 +295,17 @@ type PendingP2pWorkflowRequest = {
   createdAt: number;
 };
 
+interface SessionGroupCloneOperationContext {
+  userId: string;
+  sourceMainSessionName: string;
+  createdAt: number;
+}
+
+interface SessionGroupCloneCachedEvent {
+  event: SessionGroupCloneEvent;
+  createdAt: number;
+}
+
 // ── WS tunnel state ───────────────────────────────────────────────────────────
 
 interface WsTunnelState {
@@ -334,6 +363,275 @@ function mergeRecentTextRows(rows: WatchRecentTextRow[]): WatchRecentTextRow[] {
     return merged.slice(merged.length - WATCH_RECENT_TEXT_CAP);
   }
   return merged;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
+function optionalNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function optionalBoolean(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined;
+}
+
+type CloneOptionalStringResult =
+  | { ok: true; value: string | null | undefined }
+  | { ok: false };
+
+const SESSION_GROUP_CLONE_TERMINAL_STATES = new Set<SessionGroupCloneEvent['state']>(
+  SESSION_GROUP_CLONE_STATES.filter((state): state is SessionGroupCloneEvent['state'] => (
+    state === 'succeeded'
+    || state === 'failed'
+    || state === 'cancelled'
+    || state === 'cleanup_required'
+  )),
+);
+
+function readCloneOptionalString(body: Record<string, unknown>, key: string): CloneOptionalStringResult {
+  if (!Object.prototype.hasOwnProperty.call(body, key)) return { ok: true, value: undefined };
+  const value = body[key];
+  if (value === null) return { ok: true, value: null };
+  if (typeof value === 'string') return { ok: true, value };
+  return { ok: false };
+}
+
+function sanitizeCloneWarnings(value: unknown): SessionGroupCloneWarning[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const warnings: SessionGroupCloneWarning[] = [];
+  for (const item of value) {
+    if (!isPlainRecord(item) || typeof item.code !== 'string') continue;
+    warnings.push({
+      code: item.code as SessionGroupCloneWarning['code'],
+      ...(typeof item.fieldPath === 'string' ? { fieldPath: item.fieldPath } : {}),
+      ...(typeof item.sourceSessionName === 'string' ? { sourceSessionName: item.sourceSessionName } : {}),
+      ...(typeof item.message === 'string' ? { message: item.message } : {}),
+    });
+  }
+  return warnings.length ? warnings : undefined;
+}
+
+function sanitizeCloneSkippedMembers(value: unknown): SessionGroupCloneSkippedMember[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const skippedMembers: SessionGroupCloneSkippedMember[] = [];
+  for (const item of value) {
+    if (!isPlainRecord(item) || typeof item.sessionName !== 'string' || typeof item.reason !== 'string') continue;
+    skippedMembers.push({
+      sessionName: item.sessionName,
+      reason: item.reason as SessionGroupCloneSkippedMember['reason'],
+    });
+  }
+  return skippedMembers.length ? skippedMembers : undefined;
+}
+
+function sanitizeCloneCleanupResources(value: unknown): SessionGroupCloneCleanupResource[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const resources: SessionGroupCloneCleanupResource[] = [];
+  for (const item of value) {
+    if (!isPlainRecord(item) || typeof item.kind !== 'string' || typeof item.id !== 'string') continue;
+    resources.push({
+      kind: item.kind as SessionGroupCloneCleanupResource['kind'],
+      id: item.id,
+      ...(typeof item.sessionName === 'string' ? { sessionName: item.sessionName } : {}),
+      ...(typeof item.serverId === 'string' ? { serverId: item.serverId } : {}),
+      ...(typeof item.providerId === 'string' ? { providerId: item.providerId } : {}),
+      ...(typeof item.retriable === 'boolean' ? { retriable: item.retriable } : {}),
+    });
+  }
+  return resources.length ? resources : undefined;
+}
+
+function sanitizeStringRecord(value: unknown): Record<string, string> {
+  if (!isPlainRecord(value)) return {};
+  const result: Record<string, string> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry === 'string') result[key] = entry;
+  }
+  return result;
+}
+
+function sanitizeCopiedSubSessionIds(value: unknown): Array<{ sourceId: string; clonedId: string }> {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!isPlainRecord(item) || typeof item.sourceId !== 'string' || typeof item.clonedId !== 'string') return [];
+    return [{ sourceId: item.sourceId, clonedId: item.clonedId }];
+  });
+}
+
+function sanitizeCloneResult(value: unknown): SessionGroupCloneResult | undefined {
+  if (!isPlainRecord(value)) return undefined;
+  const operationId = optionalString(value.operationId);
+  const idempotencyKey = optionalString(value.idempotencyKey);
+  const sourceMainSession = optionalString(value.sourceMainSession);
+  const clonedMainSession = optionalString(value.clonedMainSession);
+  const targetProjectName = optionalString(value.targetProjectName);
+  const targetProjectSlug = optionalString(value.targetProjectSlug);
+  if (!operationId || !idempotencyKey || !sourceMainSession || !clonedMainSession || !targetProjectName || !targetProjectSlug) {
+    return undefined;
+  }
+  return {
+    operationId,
+    idempotencyKey,
+    sourceMainSession,
+    clonedMainSession,
+    targetProjectName,
+    targetProjectSlug,
+    sessionNameMap: sanitizeStringRecord(value.sessionNameMap),
+    copiedSubSessionIds: sanitizeCopiedSubSessionIds(value.copiedSubSessionIds),
+    skippedMembers: sanitizeCloneSkippedMembers(value.skippedMembers) ?? [],
+    skippedCronJobs: optionalNumber(value.skippedCronJobs) ?? 0,
+    skippedOrchestrationRuns: optionalNumber(value.skippedOrchestrationRuns) ?? 0,
+    warnings: sanitizeCloneWarnings(value.warnings) ?? [],
+  };
+}
+
+function sanitizeSessionGroupCloneEvent(msg: Record<string, unknown>): SessionGroupCloneEvent | null {
+  const operationId = optionalString(msg.operationId);
+  const idempotencyKey = optionalString(msg.idempotencyKey);
+  const state = optionalString(msg.state);
+  if (!operationId || !idempotencyKey || !state || !SESSION_GROUP_CLONE_STATES.includes(state as never)) {
+    return null;
+  }
+  const event: SessionGroupCloneEvent = {
+    type: SESSION_GROUP_CLONE_MSG.EVENT,
+    operationId,
+    idempotencyKey,
+    state: state as SessionGroupCloneEvent['state'],
+  };
+  const sourceMainSessionName = optionalString(msg.sourceMainSessionName);
+  if (sourceMainSessionName) event.sourceMainSessionName = sourceMainSessionName;
+  const clonedMainSessionName = optionalString(msg.clonedMainSessionName);
+  if (clonedMainSessionName) event.clonedMainSessionName = clonedMainSessionName;
+  const totalSubSessions = optionalNumber(msg.totalSubSessions);
+  if (totalSubSessions !== undefined) event.totalSubSessions = totalSubSessions;
+  const subSessionsCreated = optionalNumber(msg.subSessionsCreated);
+  if (subSessionsCreated !== undefined) event.subSessionsCreated = subSessionsCreated;
+  const skippedMembers = sanitizeCloneSkippedMembers(msg.skippedMembers);
+  if (skippedMembers) event.skippedMembers = skippedMembers;
+  const skippedCronJobs = optionalNumber(msg.skippedCronJobs);
+  if (skippedCronJobs !== undefined) event.skippedCronJobs = skippedCronJobs;
+  const skippedOrchestrationRuns = optionalNumber(msg.skippedOrchestrationRuns);
+  if (skippedOrchestrationRuns !== undefined) event.skippedOrchestrationRuns = skippedOrchestrationRuns;
+  const warnings = sanitizeCloneWarnings(msg.warnings);
+  if (warnings) event.warnings = warnings;
+  const errorCode = optionalString(msg.errorCode);
+  if (errorCode) event.errorCode = errorCode as SessionGroupCloneEvent['errorCode'];
+  const cleanupRequired = optionalBoolean(msg.cleanupRequired);
+  if (cleanupRequired !== undefined) event.cleanupRequired = cleanupRequired;
+  const cleanupResources = sanitizeCloneCleanupResources(msg.cleanupResources);
+  if (cleanupResources) event.cleanupResources = cleanupResources;
+  const result = sanitizeCloneResult(msg.result);
+  if (result) event.result = result;
+  return event;
+}
+
+function parseStoredP2pConfig(raw: string | null): P2pSavedConfig | null {
+  if (raw === null) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return isP2pSavedConfig(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function getUserP2pConfigForRoot(
+  db: Database,
+  userId: string,
+  serverId: string,
+  rootSessionName: string,
+): Promise<{ key: string; config: P2pSavedConfig } | null> {
+  const keys = [
+    p2pSessionConfigPrefKey(rootSessionName, serverId),
+    ...p2pSessionConfigLegacyPrefKeys(rootSessionName),
+  ];
+  for (const key of keys) {
+    const config = parseStoredP2pConfig(await getUserPref(db, userId, key));
+    if (config) return { key, config };
+  }
+  return null;
+}
+
+function sourceProjectSlugFromMainSessionName(sessionName: string | undefined): string | null {
+  if (!sessionName) return null;
+  const match = sessionName.match(/^deck_(.+)_brain$/);
+  return match?.[1] ?? null;
+}
+
+function numericCount(row: Record<string, unknown> | null): number {
+  const value = row?.count;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string') {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  return 0;
+}
+
+function mergeSkippedScheduledWorkCounts(
+  event: SessionGroupCloneEvent,
+  counts: { skippedCronJobs: number; skippedOrchestrationRuns: number },
+): SessionGroupCloneEvent {
+  const skippedCronJobs = Math.max(event.skippedCronJobs ?? event.result?.skippedCronJobs ?? 0, counts.skippedCronJobs);
+  const skippedOrchestrationRuns = Math.max(
+    event.skippedOrchestrationRuns ?? event.result?.skippedOrchestrationRuns ?? 0,
+    counts.skippedOrchestrationRuns,
+  );
+  return {
+    ...event,
+    skippedCronJobs,
+    skippedOrchestrationRuns,
+    ...(event.result ? {
+      result: {
+        ...event.result,
+        skippedCronJobs,
+        skippedOrchestrationRuns,
+      },
+    } : {}),
+  };
+}
+
+class SessionGroupCloneServerP2pError extends Error {
+  readonly cleanupResources: SessionGroupCloneCleanupResource[];
+
+  constructor(message: string, cleanupResources: SessionGroupCloneCleanupResource[]) {
+    super(message);
+    this.name = 'SessionGroupCloneServerP2pError';
+    this.cleanupResources = cleanupResources;
+  }
+}
+
+async function writeSessionGroupCloneAudit(
+  db: Database,
+  entry: {
+    userId?: string;
+    serverId: string;
+    action: string;
+    details: Record<string, unknown>;
+  },
+): Promise<void> {
+  try {
+    await db.execute(
+      'INSERT INTO audit_log (id, user_id, server_id, action, details, ip, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+      [
+        sha256Hex(`${entry.serverId}:${entry.userId ?? 'unknown'}:${entry.action}:${Date.now()}:${Math.random()}`).slice(0, 32),
+        entry.userId ?? null,
+        entry.serverId,
+        entry.action,
+        JSON.stringify(entry.details),
+        null,
+        Date.now(),
+      ],
+    );
+  } catch (err) {
+    logger.error({ action: entry.action, err }, 'Audit log write failed');
+  }
 }
 
 // ── Inflight command bookkeeping (ack reliability) ───────────────────────
@@ -406,6 +704,14 @@ export class WsBridge {
   private providerStatus = new Map<string, boolean>();
   /** Cached advanced P2P capabilities for the current authenticated daemon socket. */
   private daemonP2pWorkflowCapabilities: DaemonP2pWorkflowCapabilities | null = null;
+  /** idempotencyKey → initiating user/source, used to copy user-scoped P2P preferences after daemon success. */
+  private sessionGroupCloneContexts = new Map<string, SessionGroupCloneOperationContext>();
+  /**
+   * idempotencyKey → latest daemon operation event.
+   * This server-side idempotency cache starts after the daemon has emitted an
+   * operation event, because the daemon owns operationId creation.
+   */
+  private sessionGroupCloneEvents = new Map<string, SessionGroupCloneCachedEvent>();
   /** Cached remote sessions from providers — pushed to browsers on connect, persisted to DB. */
   private providerRemoteSessions = new Map<string, unknown[]>();
 
@@ -523,6 +829,76 @@ export class WsBridge {
 
   static getAll(): Map<string, WsBridge> {
     return WsBridge.instances;
+  }
+
+  private pruneSessionGroupCloneContexts(now = Date.now()): void {
+    for (const [key, context] of this.sessionGroupCloneContexts.entries()) {
+      if (now - context.createdAt > SESSION_GROUP_CLONE_CONTEXT_TTL_MS) {
+        this.sessionGroupCloneContexts.delete(key);
+      }
+    }
+    for (const [key, cached] of this.sessionGroupCloneEvents.entries()) {
+      if (now - cached.createdAt > SESSION_GROUP_CLONE_CONTEXT_TTL_MS) {
+        this.sessionGroupCloneEvents.delete(key);
+      }
+    }
+  }
+
+  registerSessionGroupCloneOperationContext(context: {
+    idempotencyKey: string;
+    userId: string;
+    sourceMainSessionName: string;
+  }): void {
+    const idempotencyKey = context.idempotencyKey.trim();
+    const userId = context.userId.trim();
+    const sourceMainSessionName = context.sourceMainSessionName.trim();
+    if (!idempotencyKey || !userId || !sourceMainSessionName) return;
+    this.pruneSessionGroupCloneContexts();
+    this.sessionGroupCloneContexts.set(idempotencyKey, {
+      userId,
+      sourceMainSessionName,
+      createdAt: Date.now(),
+    });
+  }
+
+  getSessionGroupCloneOperationEvent(idempotencyKey: string): SessionGroupCloneEvent | null {
+    const key = idempotencyKey.trim();
+    if (!key) return null;
+    this.pruneSessionGroupCloneContexts();
+    return this.sessionGroupCloneEvents.get(key)?.event ?? null;
+  }
+
+  async findExplicitSessionGroupCloneTargetConflict(targetProjectName: string | null | undefined): Promise<string | null> {
+    if (typeof targetProjectName !== 'string' || !targetProjectName.trim()) return null;
+    const targetMainSessionName = mainSessionNameForProjectSlug(sanitizeProjectName(targetProjectName.trim()));
+    if (this.activeMainSessions.has(targetMainSessionName)) return targetMainSessionName;
+    if (!this.db) return null;
+    const row = await this.db.queryOne<Record<string, unknown>>(
+      'SELECT 1 FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
+      [this.serverId, targetMainSessionName],
+    );
+    return row ? targetMainSessionName : null;
+  }
+
+  private async getServerVisibleSessionNames(): Promise<string[]> {
+    if (!this.db) return [];
+    try {
+      const sessions = await getDbSessionsByServer(this.db, this.serverId);
+      return sessions
+        .map((session) => session.name)
+        .filter((name): name is string => typeof name === 'string' && name.length > 0);
+    } catch (err) {
+      logger.warn({ err, serverId: this.serverId }, 'session-group clone server-visible session lookup failed');
+      return [];
+    }
+  }
+
+  private rememberSessionGroupCloneOperationEvent(event: SessionGroupCloneEvent): void {
+    this.pruneSessionGroupCloneContexts();
+    this.sessionGroupCloneEvents.set(event.idempotencyKey, {
+      event,
+      createdAt: Date.now(),
+    });
   }
 
   private registerMemoryManagementRequest(ws: WebSocket, msg: Record<string, unknown>): string | null {
@@ -1298,6 +1674,11 @@ export class WsBridge {
         return;
       }
 
+      if (msg.type === SESSION_GROUP_CLONE_MSG.START || msg.type === SESSION_GROUP_CLONE_MSG.CANCEL) {
+        await this.handleBrowserSessionGroupCloneCommand(ws, msg);
+        return;
+      }
+
       const p2pBrowserMessage = parseP2pWorkflowMessageType(msg.type);
       if (p2pBrowserMessage.kind === 'drop' && p2pBrowserMessage.reason === 'unknown_p2p_message') {
         incrementCounter('p2p.bridge.unknown_message_drop', { direction: 'browser_to_daemon' });
@@ -1474,6 +1855,314 @@ export class WsBridge {
     });
   }
 
+  private async handleBrowserSessionGroupCloneCommand(ws: WebSocket, msg: Record<string, unknown>): Promise<void> {
+    const type = msg.type;
+    const requestId = msg.requestId;
+    const sendError = (code: string, extra: Record<string, unknown> = {}) => {
+      safeSend(ws, JSON.stringify({
+        type: 'error',
+        code,
+        error: code,
+        originalType: type,
+        ...(typeof requestId === 'string' ? { requestId } : {}),
+        ...extra,
+      }));
+    };
+
+    if (msg.serverId !== this.serverId) {
+      sendError('invalid_request', { reason: 'serverId_required' });
+      return;
+    }
+
+    const db = this.db;
+    const userId = this.browserUserIds.get(ws)?.trim();
+    if (!db || !userId) {
+      sendError('forbidden');
+      return;
+    }
+
+    const role = await resolveServerRole(db, this.serverId, userId);
+    if (role !== 'owner' && role !== 'admin') {
+      await writeSessionGroupCloneAudit(db, {
+        userId,
+        serverId: this.serverId,
+        action: 'session_group_clone.forbidden',
+        details: {
+          role,
+          sourceMainSessionName: typeof msg.sourceMainSessionName === 'string' ? msg.sourceMainSessionName : undefined,
+          idempotencyKey: typeof msg.idempotencyKey === 'string' && msg.idempotencyKey.trim() ? msg.idempotencyKey.trim() : undefined,
+          errorCode: 'forbidden',
+        },
+      });
+      sendError('forbidden');
+      return;
+    }
+
+    if (type === SESSION_GROUP_CLONE_MSG.START) {
+      const duplicateEvent = this.getSessionGroupCloneOperationEvent(
+        typeof msg.idempotencyKey === 'string' ? msg.idempotencyKey : '',
+      );
+      if (duplicateEvent) {
+        this.broadcastToBrowsers(JSON.stringify(duplicateEvent));
+        return;
+      }
+    }
+
+    if (!this.hasDaemonCapability(SESSION_GROUP_CLONE_CAPABILITY_V1)) {
+      sendError('unsupported_command', { missingCapability: SESSION_GROUP_CLONE_CAPABILITY_V1 });
+      return;
+    }
+
+    if (type === SESSION_GROUP_CLONE_MSG.CANCEL) {
+      const operationId = typeof msg.operationId === 'string' ? msg.operationId.trim() : '';
+      const idempotencyKey = typeof msg.idempotencyKey === 'string' ? msg.idempotencyKey.trim() : '';
+      if (!operationId && !idempotencyKey) {
+        sendError('invalid_request', { reason: 'operationId_or_idempotencyKey_required' });
+        return;
+      }
+      this.sendToDaemon(JSON.stringify({
+        type: SESSION_GROUP_CLONE_MSG.CANCEL,
+        serverId: this.serverId,
+        ...(operationId ? { operationId } : {}),
+        ...(idempotencyKey ? { idempotencyKey } : {}),
+      }));
+      return;
+    }
+
+    const sourceMainSessionName = typeof msg.sourceMainSessionName === 'string' ? msg.sourceMainSessionName.trim() : '';
+    const idempotencyKey = typeof msg.idempotencyKey === 'string' ? msg.idempotencyKey.trim() : '';
+    const targetProjectName = readCloneOptionalString(msg, 'targetProjectName');
+    const cwdOverride = readCloneOptionalString(msg, 'cwdOverride');
+    if (!sourceMainSessionName || !idempotencyKey || !targetProjectName.ok || !cwdOverride.ok) {
+      sendError('invalid_request');
+      return;
+    }
+    if (typeof targetProjectName.value === 'string' && targetProjectName.value.trim() === '') {
+      sendError('blank_target_project');
+      return;
+    }
+    const targetMainSessionName = await this.findExplicitSessionGroupCloneTargetConflict(targetProjectName.value);
+    if (targetMainSessionName) {
+      await writeSessionGroupCloneAudit(db, {
+        userId,
+        serverId: this.serverId,
+        action: 'session_group_clone.failed',
+        details: {
+          role,
+          sourceMainSessionName,
+          idempotencyKey,
+          targetProjectSlug: typeof targetProjectName.value === 'string' && targetProjectName.value.trim()
+            ? sanitizeProjectName(targetProjectName.value.trim())
+            : undefined,
+          errorCode: 'name_taken',
+        },
+      });
+      sendError('name_taken', { targetMainSessionName });
+      return;
+    }
+
+    const payload: Record<string, unknown> = {
+      type: SESSION_GROUP_CLONE_MSG.START,
+      serverId: this.serverId,
+      sourceMainSessionName,
+      idempotencyKey,
+    };
+    if (targetProjectName.value !== undefined) payload.targetProjectName = targetProjectName.value;
+    if (cwdOverride.value !== undefined) payload.cwdOverride = cwdOverride.value;
+    const unavailableSessionNames = await this.getServerVisibleSessionNames();
+    if (unavailableSessionNames.length > 0) payload.unavailableSessionNames = unavailableSessionNames;
+    this.registerSessionGroupCloneOperationContext({ idempotencyKey, userId, sourceMainSessionName });
+    this.sendToDaemon(JSON.stringify(payload));
+    await writeSessionGroupCloneAudit(db, {
+      userId,
+      serverId: this.serverId,
+      action: 'session_group_clone.accepted',
+      details: {
+        role,
+        sourceMainSessionName,
+        idempotencyKey,
+        targetProjectSlug: typeof targetProjectName.value === 'string' && targetProjectName.value.trim()
+          ? sanitizeProjectName(targetProjectName.value.trim())
+          : undefined,
+      },
+    });
+  }
+
+  private auditSessionGroupCloneTerminalEvent(event: SessionGroupCloneEvent): void {
+    if (!this.db || !SESSION_GROUP_CLONE_TERMINAL_STATES.has(event.state)) return;
+    const result = event.result;
+    void writeSessionGroupCloneAudit(this.db, {
+      serverId: this.serverId,
+      action: `session_group_clone.${event.state}`,
+      details: {
+        operationId: event.operationId,
+        idempotencyKey: event.idempotencyKey,
+        sourceMainSessionName: event.sourceMainSessionName ?? result?.sourceMainSession,
+        clonedMainSessionName: event.clonedMainSessionName ?? result?.clonedMainSession,
+        targetProjectSlug: result?.targetProjectSlug,
+        clonedSubSessionCount: result?.copiedSubSessionIds.length,
+        skippedCronJobs: event.skippedCronJobs ?? result?.skippedCronJobs,
+        skippedOrchestrationRuns: event.skippedOrchestrationRuns ?? result?.skippedOrchestrationRuns,
+        errorCode: event.errorCode,
+        cleanupRequired: event.cleanupRequired === true ? true : undefined,
+        cleanupResources: event.cleanupResources?.map((resource) => ({
+          kind: resource.kind,
+          id: resource.id,
+          sessionName: resource.sessionName,
+          serverId: resource.serverId,
+          providerId: resource.providerId,
+          retriable: resource.retriable,
+        })),
+      },
+    });
+  }
+
+  private async prepareSucceededSessionGroupCloneEvent(event: SessionGroupCloneEvent): Promise<SessionGroupCloneEvent> {
+    let finalEvent = event;
+    try {
+      const counts = await this.countSkippedScheduledWorkForClone(event);
+      if (counts) finalEvent = mergeSkippedScheduledWorkCounts(event, counts);
+    } catch (err) {
+      logger.warn({ err, serverId: this.serverId, operationId: event.operationId }, 'session-group clone skipped scheduled-work count failed');
+    }
+
+    try {
+      await this.copyServerSyncedP2pConfigForClone(finalEvent);
+    } catch (err) {
+      const cleanupResources = err instanceof SessionGroupCloneServerP2pError ? err.cleanupResources : [];
+      logger.warn({ err, serverId: this.serverId, operationId: event.operationId }, 'session-group clone server-synced P2P preference copy failed');
+      finalEvent = {
+        ...finalEvent,
+        state: 'cleanup_required',
+        errorCode: 'server_p2p_commit_failed',
+        cleanupRequired: true,
+        ...(cleanupResources.length ? { cleanupResources } : {}),
+      };
+    }
+    return finalEvent;
+  }
+
+  private async countSkippedScheduledWorkForClone(event: SessionGroupCloneEvent): Promise<{
+    skippedCronJobs: number;
+    skippedOrchestrationRuns: number;
+  } | null> {
+    const db = this.db;
+    const result = event.result;
+    if (!db || !result) return null;
+
+    const sourceSessionNames = Array.from(new Set([
+      ...Object.keys(result.sessionNameMap),
+      result.sourceMainSession,
+      event.sourceMainSessionName,
+    ].filter((name): name is string => typeof name === 'string' && name.length > 0)));
+    if (!sourceSessionNames.length) return null;
+
+    const sourceProjectSlug = sourceProjectSlugFromMainSessionName(result.sourceMainSession || event.sourceMainSessionName);
+    const cronRow = await db.queryOne<Record<string, unknown>>(
+      `SELECT COUNT(*)::int AS count
+       FROM cron_jobs
+       WHERE server_id = $1
+         AND (
+           target_session_name = ANY($2)
+           OR ($3::text IS NOT NULL AND target_role = $4 AND project_name = $3)
+         )`,
+      [this.serverId, sourceSessionNames, sourceProjectSlug, 'brain'],
+    );
+    const orchestrationRow = await db.queryOne<Record<string, unknown>>(
+      `SELECT COUNT(*)::int AS count
+       FROM discussion_orchestration_runs
+       WHERE server_id = $1
+         AND (
+           main_session = ANY($2)
+           OR initiator_session = ANY($2)
+           OR current_target_session = ANY($2)
+           OR final_return_session = ANY($2)
+         )`,
+      [this.serverId, sourceSessionNames],
+    );
+
+    return {
+      skippedCronJobs: numericCount(cronRow),
+      skippedOrchestrationRuns: numericCount(orchestrationRow),
+    };
+  }
+
+  private async copyServerSyncedP2pConfigForClone(event: SessionGroupCloneEvent): Promise<void> {
+    const db = this.db;
+    const result = event.result;
+    if (!db || event.state !== 'succeeded' || !result) return;
+
+    this.pruneSessionGroupCloneContexts();
+    const context = this.sessionGroupCloneContexts.get(event.idempotencyKey);
+    if (!context) return;
+
+    const sourceMainSessionName = result.sourceMainSession || event.sourceMainSessionName || context.sourceMainSessionName;
+    const source = await getUserP2pConfigForRoot(db, context.userId, this.serverId, sourceMainSessionName);
+    if (!source) return;
+
+    const targetKey = p2pSessionConfigPrefKey(result.clonedMainSession, this.serverId);
+    const previousTargetValue = await getUserPref(db, context.userId, targetKey);
+    const remapped = cloneP2pConfigWithSessionRemap(source.config, result.sessionNameMap, Date.now(), {
+      sourceGroupSessionNames: [
+        ...Object.keys(result.sessionNameMap),
+        ...result.skippedMembers.map((member) => member.sessionName),
+      ],
+    });
+
+    try {
+      await setUserPref(db, context.userId, targetKey, JSON.stringify(remapped.config));
+      this.sendToDaemon(JSON.stringify({
+        type: P2P_CONFIG_MSG.SAVE,
+        requestId: `session-group-clone:${event.operationId}`,
+        scopeSession: result.clonedMainSession,
+        config: remapped.config,
+      }));
+      await writeSessionGroupCloneAudit(db, {
+        userId: context.userId,
+        serverId: this.serverId,
+        action: 'session_group_clone.p2p_config_copied',
+        details: {
+          operationId: event.operationId,
+          idempotencyKey: event.idempotencyKey,
+          sourceMainSessionName,
+          clonedMainSessionName: result.clonedMainSession,
+          sourcePreferenceKey: source.key,
+          targetPreferenceKey: targetKey,
+          warningCount: remapped.warnings.length,
+        },
+      });
+    } catch (err) {
+      try {
+        if (previousTargetValue === null) {
+          await deleteUserPref(db, context.userId, targetKey);
+        } else {
+          await setUserPref(db, context.userId, targetKey, previousTargetValue);
+        }
+      } catch (restoreErr) {
+        logger.warn({ err: restoreErr, serverId: this.serverId, targetKey }, 'session-group clone P2P preference rollback failed');
+      }
+      logger.warn({ err, serverId: this.serverId, operationId: event.operationId }, 'session-group clone server-synced P2P preference copy failed');
+      await writeSessionGroupCloneAudit(db, {
+        userId: context.userId,
+        serverId: this.serverId,
+        action: 'session_group_clone.p2p_config_failed',
+        details: {
+          operationId: event.operationId,
+          idempotencyKey: event.idempotencyKey,
+          sourceMainSessionName,
+          clonedMainSessionName: result.clonedMainSession,
+        },
+      });
+      throw new SessionGroupCloneServerP2pError('server-synced P2P preference copy failed', [{
+        kind: 'server_p2p_pref',
+        id: targetKey,
+        sessionName: result.clonedMainSession,
+        serverId: this.serverId,
+        retriable: true,
+      }]);
+    }
+  }
+
   private registerP2pWorkflowRequest(
     ws: WebSocket,
     msg: Record<string, unknown>,
@@ -1567,6 +2256,27 @@ export class WsBridge {
    */
   private relayToBrowsers(msg: Record<string, unknown>): void {
     const type = msg.type as string;
+
+    if (type === SESSION_GROUP_CLONE_MSG.EVENT) {
+      const event = sanitizeSessionGroupCloneEvent(msg);
+      if (!event) {
+        logger.warn({ serverId: this.serverId }, 'session group clone event malformed — discarded');
+        return;
+      }
+      if (event.state === 'succeeded') {
+        void this.prepareSucceededSessionGroupCloneEvent(event)
+          .then((finalEvent) => {
+            this.auditSessionGroupCloneTerminalEvent(finalEvent);
+            this.rememberSessionGroupCloneOperationEvent(finalEvent);
+            this.broadcastToBrowsers(JSON.stringify(finalEvent));
+          });
+        return;
+      }
+      this.auditSessionGroupCloneTerminalEvent(event);
+      this.rememberSessionGroupCloneOperationEvent(event);
+      this.broadcastToBrowsers(JSON.stringify(event));
+      return;
+    }
 
     const p2pDaemonMessage = parseP2pWorkflowMessageType(type);
     if (p2pDaemonMessage.kind === 'known' && !p2pDaemonMessage.descriptor.allowedIngress.includes('daemon')) {
@@ -3793,5 +4503,9 @@ export class WsBridge {
       ...this.daemonP2pWorkflowCapabilities,
       capabilities: [...this.daemonP2pWorkflowCapabilities.capabilities],
     };
+  }
+
+  hasDaemonCapability(capability: string, now = Date.now()): boolean {
+    return this.getDaemonP2pWorkflowCapabilities(now)?.capabilities.includes(capability) ?? false;
   }
 }

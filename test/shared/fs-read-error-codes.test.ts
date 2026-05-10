@@ -22,8 +22,12 @@ import {
 const PRODUCTION_SOURCE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx']);
 const ALLOWED_NON_FS_READ_LITERAL_FILES = new Map<string, ReadonlySet<string>>([
   ['server/src/routes/file-transfer.ts', new Set(['file_too_large'])],
+  ['server/src/routes/session-mgmt.ts', new Set(['invalid_request', 'internal_error'])],
   ['server/src/routes/terminal.ts', new Set(['internal_error'])],
+  ['server/src/ws/bridge.ts', new Set(['invalid_request'])],
   ['src/daemon/file-preview-read-observability.ts', new Set(['stale_read'])],
+  ['src/daemon/session-group-clone.ts', new Set(['invalid_request', 'internal_error'])],
+  ['web/src/components/CloneSessionGroupDialog.tsx', new Set(['internal_error'])],
   ['web/src/components/SessionControls.tsx', new Set(['file_too_large'])],
 ]);
 

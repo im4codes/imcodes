@@ -13,6 +13,12 @@ import { TRANSPORT_EVENT } from '@shared/transport-events.js';
 import { P2P_CAPABILITY_FRESHNESS_TTL_MS } from '@shared/p2p-workflow-constants.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import { DAEMON_COMMAND_TYPES } from '@shared/daemon-command-types.js';
+import {
+  SESSION_GROUP_CLONE_MSG,
+  type SessionGroupCloneCancelRequest,
+  type SessionGroupCloneEvent,
+  type SessionGroupCloneRequest,
+} from '@shared/session-group-clone.js';
 import { CC_PRESET_MSG, type CcPreset, type CcPresetModelInfo } from '@shared/cc-presets.js';
 import { MEMORY_WS } from '@shared/memory-ws.js';
 import type {
@@ -89,7 +95,7 @@ export type ServerMessage =
   | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'p2p_active'; activeRunIds?: string[] }
   | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'transport_busy'; activeSessionNames?: string[]; blockedSessions?: TransportUpgradeBlockedSession[] }
   | { type: 'daemon.error'; kind: 'uncaughtException' | 'unhandledRejection' | 'warning'; message: string; stack?: string; ts: number }
-  | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; project: string; role: string; agentType: string; agentVersion?: string; state: string; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; qwenModel?: string; requestedModel?: string; activeModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; copilotAvailableModels?: string[]; cursorAvailableModels?: string[]; codexAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; permissionLabel?: string; quotaLabel?: string; quotaUsageLabel?: string; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace']; contextNamespaceDiagnostics?: string[]; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextRetryExhausted?: boolean; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride; transportConfig?: Record<string, unknown> | null; transportPendingMessages?: string[]; transportPendingMessageEntries?: Array<{ clientMessageId: string; text: string }> }> }
+  | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; project: string; role: string; agentType: string; agentVersion?: string; state: string; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; userCreated?: boolean; qwenModel?: string; requestedModel?: string; activeModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; copilotAvailableModels?: string[]; cursorAvailableModels?: string[]; codexAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; permissionLabel?: string; quotaLabel?: string; quotaUsageLabel?: string; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace']; contextNamespaceDiagnostics?: string[]; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextRetryExhausted?: boolean; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride; transportConfig?: Record<string, unknown> | null; transportPendingMessages?: string[]; transportPendingMessageEntries?: Array<{ clientMessageId: string; text: string }> }> }
   | { type: 'outbound'; platform: string; channelId: string; content: string }
   | { type: 'timeline.event'; event: TimelineEvent }
   | { type: 'timeline.replay'; sessionName: string; requestId?: string; events: TimelineEvent[]; truncated: boolean; epoch: number }
@@ -127,6 +133,7 @@ export type ServerMessage =
   | { type: typeof CC_PRESET_MSG.LIST_RESPONSE; presets: CcPreset[] }
   | { type: typeof CC_PRESET_MSG.SAVE_RESPONSE; ok: boolean }
   | { type: typeof CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE; requestId?: string; presetName: string; ok: boolean; preset?: CcPreset; models?: CcPresetModelInfo[]; endpoint?: string; error?: string }
+  | SessionGroupCloneEvent
   | FsGitDiffResponse
   | FsWriteResponse
   | FsMkdirResponse
@@ -615,6 +622,25 @@ export class WsClient {
     this.send({ type: 'get_sessions' });
   }
 
+  async cloneSessionGroup(payload: Omit<SessionGroupCloneRequest, 'type'>): Promise<void> {
+    if (payload.serverId && payload.sourceMainSessionName) {
+      await apiFetch(`/api/server/${encodeURIComponent(payload.serverId)}/sessions/${encodeURIComponent(payload.sourceMainSessionName)}/group-clone`, {
+        method: 'POST',
+        body: JSON.stringify({
+          idempotencyKey: payload.idempotencyKey,
+          ...(payload.targetProjectName !== undefined ? { targetProjectName: payload.targetProjectName } : {}),
+          ...(payload.cwdOverride !== undefined ? { cwdOverride: payload.cwdOverride } : {}),
+        }),
+      });
+      return;
+    }
+    this.send({ type: SESSION_GROUP_CLONE_MSG.START, ...payload });
+  }
+
+  cancelSessionGroupClone(payload: Omit<SessionGroupCloneCancelRequest, 'type'>): void {
+    this.send({ type: SESSION_GROUP_CLONE_MSG.CANCEL, ...payload });
+  }
+
   // ── Sub-session commands ──────────────────────────────────────────────────
 
   subSessionStart(id: string, sessionType: string, shellBin?: string, cwd?: string, ccSessionId?: string, parentSession?: string | null): void {
@@ -785,6 +811,7 @@ export class WsClient {
     TRANSPORT_EVENT.CHAT_STATUS,
     TRANSPORT_EVENT.CHAT_TOOL,
     TRANSPORT_EVENT.CHAT_APPROVAL,
+    SESSION_GROUP_CLONE_MSG.EVENT,
   ]);
 
   /**

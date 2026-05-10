@@ -128,9 +128,10 @@ async function persistSessionToWorker(
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}`, 'X-Server-Id': serverId },
       body: JSON.stringify(payload),
     });
-    if (!res.ok) logger.warn({ status: res.status, name }, 'persistSessionToWorker: non-ok response');
+    if (!res.ok) throw new Error(`persistSessionToWorker non-ok response: ${res.status}`);
   } catch (e) {
     logger.warn({ err: e, name }, 'persistSessionToWorker: fetch failed');
+    throw e;
   }
 }
 
@@ -140,9 +141,10 @@ async function deleteSessionFromWorker(workerUrl: string, serverId: string, toke
       method: 'DELETE',
       headers: { Authorization: `Bearer ${token}`, 'X-Server-Id': serverId },
     });
-    if (!res.ok) logger.warn({ status: res.status, name }, 'deleteSessionFromWorker: non-ok response');
+    if (!res.ok) throw new Error(`deleteSessionFromWorker non-ok response: ${res.status}`);
   } catch (e) {
     logger.warn({ err: e, name }, 'deleteSessionFromWorker: fetch failed');
+    throw e;
   }
 }
 
@@ -152,9 +154,10 @@ async function deleteSubSessionFromWorker(workerUrl: string, serverId: string, t
       method: 'DELETE',
       headers: { Authorization: `Bearer ${token}`, 'X-Server-Id': serverId },
     });
-    if (!res.ok) logger.warn({ status: res.status, id }, 'deleteSubSessionFromWorker: non-ok response');
+    if (!res.ok) throw new Error(`deleteSubSessionFromWorker non-ok response: ${res.status}`);
   } catch (e) {
     logger.warn({ err: e, id }, 'deleteSubSessionFromWorker: fetch failed');
+    throw e;
   }
 }
 

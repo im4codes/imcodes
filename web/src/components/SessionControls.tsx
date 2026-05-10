@@ -8,6 +8,7 @@ import { QuickInputPanel } from './QuickInputPanel.js';
 import { getNavigableHistory } from './QuickInputPanel.js';
 import type { UseQuickDataResult } from './QuickInputPanel.js';
 import { FileBrowser } from './file-browser-lazy.js';
+import { CloneSessionGroupDialog } from './CloneSessionGroupDialog.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
@@ -280,6 +281,27 @@ function getP2pMenuItemColor(mode: string, active: boolean): string {
   return getP2pModeColor(mode);
 }
 
+function CopySessionGroupIcon() {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      focusable="false"
+      style={{ flex: '0 0 auto' }}
+    >
+      <rect width="14" height="14" x="8" y="8" rx="2" ry="2" />
+      <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" />
+    </svg>
+  );
+}
+
 function getAnchoredOverlayStyle(
   trigger: DOMRect,
   minWidth: number,
@@ -525,6 +547,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [modelOpen, setModelOpen] = useState(false);
   const [autoOpen, setAutoOpen] = useState(false);
   const [thinkingOpen, setThinkingOpen] = useState(false);
+  const [cloneDialogOpen, setCloneDialogOpen] = useState(false);
   const [quickOpen, setQuickOpen] = useState(false);
   const [p2pMode, setP2pMode] = useState<P2pMode>('solo');
   const [p2pExcludeSameType, setP2pExcludeSameType] = useState(true);
@@ -794,6 +817,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [activeSession?.agentType, activeSession?.qwenModel, qwenModel]);
 
   const hasSession = !!activeSession;
+  const canShowCloneGroupAction = !!activeSession
+    && !subSessionId
+    && !compact
+    && activeSession.role === 'brain'
+    && !activeSession.name.startsWith('deck_sub_')
+    && activeSession.userCreated !== false;
   // Input only disabled when there's no session at all (can type while disconnected)
   const inputDisabled = !hasSession;
   // Send/action buttons disabled when disconnected or no session
@@ -973,6 +1002,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     || p2pOpen
     || p2pConfigOpen
     || openSpecOpen
+    || cloneDialogOpen
     || openSpecAuditMenu !== null
     || openSpecProposeMenuOpen
     || voiceOpen
@@ -1109,6 +1139,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
+  useEffect(() => { setCloneDialogOpen(false); }, [activeSession?.name]);
   useEffect(() => {
     setPendingComboSendConfirm(null);
     setRememberComboSendChoice(false);
@@ -3503,6 +3534,20 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                   {t('session.settings')}
                 </button>
               )}
+              {canShowCloneGroupAction && (
+                <button
+                  class="menu-item"
+                  onClick={() => {
+                    setCloneDialogOpen(true);
+                    setMenuOpen(false);
+                    resetConfirm();
+                  }}
+                  style={{ display: 'flex', alignItems: 'center', gap: 8 }}
+                >
+                  <CopySessionGroupIcon />
+                  <span>{t('session.clone.menu')}</span>
+                </button>
+              )}
               <div class="menu-divider" />
               <button
                 class={`menu-item ${confirm === 'stop' ? 'menu-item-danger' : ''}`}
@@ -3516,6 +3561,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           )}
         </div>}
       </div>
+      {cloneDialogOpen && activeSession && (
+        <CloneSessionGroupDialog
+          ws={ws}
+          serverId={serverId}
+          sourceSession={activeSession}
+          sessions={sessions}
+          subSessions={subSessions}
+          onClose={() => setCloneDialogOpen(false)}
+        />
+      )}
       {queuedTransportMessages.length > 0 && (
         queuedHintExpanded ? (
           <div class="controls-queued-hint" role="status" aria-live="polite">

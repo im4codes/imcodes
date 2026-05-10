@@ -43,6 +43,7 @@ export interface IncomingSessionListEntry {
   projectDir?: string;
   runtimeType?: string;
   label?: string | null;
+  userCreated?: boolean;
   description?: string | null;
   qwenModel?: string;
   requestedModel?: string;
@@ -106,6 +107,7 @@ export function mergeSessionListEntry(
       agentType: incoming.agentType,
     }),
     label: incoming.label ?? existing?.label,
+    userCreated: incoming.userCreated ?? existing?.userCreated,
     description: incoming.description ?? existing?.description,
     qwenModel: incoming.qwenModel ?? existing?.qwenModel,
     requestedModel: incoming.requestedModel ?? existing?.requestedModel,

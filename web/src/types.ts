@@ -36,6 +36,7 @@ export interface SessionInfo {
   agentVersion?: string;
   state: 'queued' | 'running' | 'idle' | 'stopped' | 'stopping' | 'error' | 'unknown';
   label?: string | null;
+  userCreated?: boolean;
   projectDir?: string;
   description?: string | null;
   /** Runtime backing: 'process' for tmux-backed, 'transport' for network-backed. */

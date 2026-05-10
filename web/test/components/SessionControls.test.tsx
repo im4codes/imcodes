@@ -67,6 +67,7 @@ vi.mock('react-i18next', () => ({
         return 'Paste is too large for inline input here. Upload it as a file instead.';
       }
       if (key === 'session.stop_plain') return 'Stop';
+      if (key === 'session.clone.menu') return 'Copy session group';
       if (key === 'session.supervision.quickLabel') return 'Auto';
       if (key === 'session.supervision.quickTitle') return 'Auto mode';
       if (key === 'session.approval.pending') return 'Approval required';
@@ -240,7 +241,12 @@ const makeWs = (overrides: { capabilitySnapshot?: { daemonId: string; capabiliti
     // Stop must reach the server even during a brief WS probe (`_connected
     // = false` for ~50-200ms after focus/visibility ticks).
     sendSessionCommandUrgent: vi.fn(),
+    cloneSessionGroup: vi.fn(),
+    cancelSessionGroupClone: vi.fn(),
     sendInput: vi.fn(),
+    requestSessionList: vi.fn(),
+    p2pStatus: vi.fn(),
+    p2pListDiscussions: vi.fn(),
     subscribeTransportSession: vi.fn(),
     unsubscribeTransportSession: vi.fn(),
     respondTransportApproval: vi.fn(),
@@ -394,6 +400,64 @@ afterEach(() => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
     expect(screen.getByRole('textbox')).toBeDefined();
     expect(screen.getByRole('button', { name: /send/i })).toBeDefined();
+  });
+
+  it('shows copy group action only for main-session controls and hides it from sub/compact surfaces', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={mainSession}
+        serverId="server-1"
+        sessions={[mainSession]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle('actions'));
+    expect(screen.getByText('Copy session group')).toBeDefined();
+    fireEvent.click(screen.getByText('Copy session group'));
+    expect(screen.getByRole('dialog')).toBeDefined();
+    expect(screen.getByDisplayValue('deck_my-project_brain')).toBeDefined();
+    expect(screen.getByText('deck_my_project_1_brain')).toBeDefined();
+    expect(screen.queryByText('brain copy')).toBeNull();
+
+    cleanup();
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={mainSession}
+        subSessionId="abc"
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle('actions'));
+    expect(screen.queryByText('Copy session group')).toBeNull();
+
+    cleanup();
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={subSession('deck_sub_worker', 'Worker')}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle('actions'));
+    expect(screen.queryByText('Copy session group')).toBeNull();
+
+    cleanup();
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={mainSession}
+        quickData={makeQuickData() as any}
+        compact
+      />,
+    );
+
+    expect(screen.queryByTitle('actions')).toBeNull();
+    expect(screen.queryByText('Copy session group')).toBeNull();
   });
 
   it('keeps openspec through p2p settings controls visible in compact card mode', () => {

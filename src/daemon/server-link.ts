@@ -14,6 +14,7 @@ import {
   type P2pWorkflowCapability,
 } from '../../shared/p2p-workflow-constants.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
+import { SESSION_GROUP_CLONE_CAPABILITY_V1 } from '../../shared/session-group-clone.js';
 
 interface SystemStats {
   cpu: number;
@@ -127,6 +128,7 @@ export class ServerLink {
     P2P_WORKFLOW_CAPABILITY_V1,
     P2P_WORKFLOW_OPENSPEC_ARTIFACTS_CAPABILITY_V1,
     P2P_WORKFLOW_IMPLEMENTATION_CAPABILITY_V1,
+    SESSION_GROUP_CLONE_CAPABILITY_V1,
   ];
 
   constructor(opts: ServerLinkOpts) {

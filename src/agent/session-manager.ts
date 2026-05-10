@@ -158,6 +158,10 @@ export function persistSessionRecord(record: SessionRecord | null, name: string)
   emitSessionPersist(record, name);
 }
 
+export async function persistSessionRecordAwaited(record: SessionRecord | null, name: string): Promise<void> {
+  await _onSessionPersist?.(record, name);
+}
+
 export interface ProjectConfig {
   name: string;
   dir: string;
