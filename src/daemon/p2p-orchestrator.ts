@@ -54,6 +54,7 @@ import { makeP2pWorkflowDiagnostic, type P2pWorkflowDiagnostic } from '../../sha
 import { evaluateP2pLogic } from '../../shared/p2p-workflow-logic-evaluator.js';
 import type { P2pWorkflowVariableValue } from '../../shared/p2p-workflow-types.js';
 import {
+  P2P_ROUTING_HISTORY_RETENTION_COUNT,
   P2P_SCRIPT_RETRIABLE_DIAGNOSTIC_CODES,
   P2P_SCRIPT_RETRY_DEFAULT_ATTEMPTS,
   P2P_WORKFLOW_VARIABLE_ARRAY_MAX_ELEMENTS,
@@ -265,6 +266,28 @@ export interface P2pRun {
 // ── In-memory store ───────────────────────────────────────────────────────
 
 const activeRuns = new Map<string, P2pRun>();
+
+/**
+ * Audit fix (94b9b837-822 / N1) — module-level registry of "currently
+ * running script aborter" per active P2P run. Lets `cancelP2pRun` and the
+ * deadline watchdog terminate hung script-node child processes by calling
+ * the AbortController stored here, instead of relying on `run._cancelled`
+ * which a blocking `await runP2pScriptNode(...)` will never see.
+ *
+ * Without this, a script with `argv: ['/bin/sleep', '9999']` and no
+ * `script.timeoutMs` set would block `executeAdvancedChain` forever; the
+ * outer `ensureRunDeadline` check on the next loop iteration would not
+ * fire because the loop never advances. The result was that `failRun`
+ * never executed, `transition()` never ran, `scheduleP2pRunTerminalCleanup`
+ * never scheduled, and the `P2pRun` object stayed reachable in
+ * `activeRuns` until daemon restart (the underlying OOM trigger).
+ */
+const currentScriptAborters = new Map<string, () => void>();
+
+/** Test-only: clear the abort registry between tests. */
+export function __resetCurrentScriptAbortersForTests(): void {
+  currentScriptAborters.clear();
+}
 
 const P2P_POST_SUMMARY_EXECUTE_TEMPLATES: Record<string, string> = {
   en: enLocale.p2p.post_summary_execute_prompt,
@@ -887,6 +910,16 @@ export async function cancelP2pRun(runId: string, serverLink: ServerLink | null)
   run._cancelled = true;
   run.runPhase = 'cancelled';
 
+  // Audit fix (94b9b837-822 / N1) — abort any in-flight script-node child
+  // process. `_cancelled` is invisible to a blocking `await
+  // runP2pScriptNode(...)`; the AbortController sends SIGTERM (then
+  // SIGKILL after 5 s grace) to the child process group so the await
+  // settles instead of leaving the run stuck in `running` forever.
+  const aborter = currentScriptAborters.get(runId);
+  if (aborter) {
+    try { aborter(); } catch { /* ignore — best effort */ }
+  }
+
   if (run.status === 'queued') {
     run.activePhase = 'queued';
     transition(run, 'cancelled', serverLink);
@@ -1274,9 +1307,8 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
 
   // Keep in memory for a bit so status queries work, then clean up run entry only.
   // Discussion files are kept on disk (in .imc/discussions/) for history access.
-  setTimeout(() => {
-    activeRuns.delete(run.id);
-  }, 60_000);
+  // A3: `activeRuns.delete` is now scheduled by `scheduleP2pRunTerminalCleanup`
+  // (called from `transition('completed')` above), so no explicit timer here.
 }
 
 // Audit:R3 hardening / task 10.6 — diagnostic retention.
@@ -1299,6 +1331,24 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
 //  - Stable ordering: insertion order preserved among retained entries.
 const P2P_HELPER_DIAGNOSTIC_RETENTION_COUNT = 100;
 const P2P_HELPER_DIAGNOSTIC_RETENTION_BYTES = 64 * 1024; // 64 KiB / run
+
+/**
+ * Audit fix (94b9b837-822 / A2) — bound `run.routingHistory` with a FIFO
+ * trim, mirroring the count-cap part of `addHelperDiagnostic`. Long-running
+ * advanced workflows that loop through compiled-edge jumps push to
+ * `routingHistory` on every jump and default-edge advance with no upper
+ * bound; combined with the projection-flush spread `[...routingHistory]`
+ * per debounce tick this is a real per-run growth source.
+ *
+ * Stable ordering: the most recent {@link P2P_ROUTING_HISTORY_RETENTION_COUNT}
+ * entries are retained — the oldest are dropped first.
+ */
+function pushRoutingHistory(run: P2pRun, entry: P2pRun['routingHistory'][number]): void {
+  run.routingHistory.push(entry);
+  while (run.routingHistory.length > P2P_ROUTING_HISTORY_RETENTION_COUNT) {
+    run.routingHistory.shift();
+  }
+}
 
 function addHelperDiagnostic(run: P2pRun, diagnostic: Omit<P2pHelperDiagnostic, 'timestamp'>): void {
   run.helperDiagnostics.push({ ...diagnostic, timestamp: Date.now() });
@@ -1800,6 +1850,27 @@ async function dispatchScriptRoundOrFail(
     failRun(run, 'failed', `Script slot pool exhausted (${slot.inUse}/${slot.capacity}); see daemon_busy.`, serverLink);
     return { kind: 'fail_closed' };
   }
+  // Audit fix (94b9b837-822 / N1) — wire an AbortController so the script
+  // child process can be terminated when (a) the user cancels the run,
+  // (b) the run's overall `deadlineAt` (default 30 min via the resolver,
+  // see `shared/p2p-advanced.ts`) expires while the script is blocked, or
+  // (c) the script's own `timeoutMs` is unset and would otherwise let
+  // `child.spawn(...)` run unbounded. Stored in the module-level
+  // `currentScriptAborters` so `cancelP2pRun` can reach in.
+  const ac = new AbortController();
+  currentScriptAborters.set(run.id, () => ac.abort());
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  if (typeof run.deadlineAt === 'number' && Number.isFinite(run.deadlineAt)) {
+    const remainingMs = Math.max(0, run.deadlineAt - Date.now());
+    if (remainingMs === 0) {
+      // Already past deadline — abort before we even launch.
+      ac.abort();
+    } else {
+      deadlineTimer = setTimeout(() => ac.abort(), remainingMs);
+      try { (deadlineTimer as { unref?: () => void }).unref?.(); } catch { /* ignore */ }
+    }
+  }
+  if (run._cancelled) ac.abort();
   try {
     const result = await runP2pScriptNode({
       script: scriptContract,
@@ -1807,6 +1878,7 @@ async function dispatchScriptRoundOrFail(
       repoRoot: bound.bindContext.repoRoot,
       runId: run.id,
       nodeId: round.id,
+      signal: ac.signal,
     });
     // Append a discussion-file segment so downstream verdict parsing /
     // summary generation still sees the round's authoritative output.
@@ -1825,28 +1897,46 @@ async function dispatchScriptRoundOrFail(
     // `authoritativeSegment` is the verdict source-of-truth so the write
     // does NOT gate dispatch latency. Failures still surface via helper
     // diagnostic + logger.warn so audit gaps are visible.
-    enqueueP2pDiscussionWrite(
-      run.contextFilePath,
-      segment,
-      (error: unknown) => {
-        const message = error instanceof Error ? error.message : String(error);
-        addHelperDiagnostic(run, {
-          code: 'P2P_DISCUSSION_WRITE_FAILED',
-          attempt: run.currentRoundAttempt,
-          sourceSession: run.initiatorSession,
-          message: `Failed to append script segment to ${run.contextFilePath}: ${message}`,
-        });
-      },
-      // R3 v2 PR-ζ (M1) — surface backpressure drops as helper diagnostic.
-      (droppedBytes, queuedBytes) => {
-        addHelperDiagnostic(run, {
-          code: 'P2P_DISCUSSION_WRITE_FAILED',
-          attempt: run.currentRoundAttempt,
-          sourceSession: run.initiatorSession,
-          message: `Discussion writer dropped ${droppedBytes}B due to backpressure (queued=${queuedBytes}B)`,
-        });
-      },
-    );
+    //
+    // Audit fix (94b9b837-822 / A4) — closures below capture `runId` /
+    // `contextFilePath` / `attempt` as primitives instead of the full
+    // `run` object. The discussion writer's per-file `RunQueue` retains
+    // these closures via `onWriteFailure` / `onSegmentDropped`; capturing
+    // primitives means a terminal-cleanup activeRuns delete can actually
+    // free the P2pRun even if the queue hasn't drained yet. Stale-run
+    // failures swallow gracefully (no helper diagnostic destination).
+    {
+      const runId = run.id;
+      const contextFilePath = run.contextFilePath;
+      const attemptAtEnqueue = run.currentRoundAttempt;
+      const initiatorAtEnqueue = run.initiatorSession;
+      enqueueP2pDiscussionWrite(
+        contextFilePath,
+        segment,
+        (error: unknown) => {
+          const live = getP2pRun(runId);
+          if (!live) return;
+          const message = error instanceof Error ? error.message : String(error);
+          addHelperDiagnostic(live, {
+            code: 'P2P_DISCUSSION_WRITE_FAILED',
+            attempt: attemptAtEnqueue,
+            sourceSession: initiatorAtEnqueue,
+            message: `Failed to append script segment to ${contextFilePath}: ${message}`,
+          });
+        },
+        // R3 v2 PR-ζ (M1) — surface backpressure drops as helper diagnostic.
+        (droppedBytes, queuedBytes) => {
+          const live = getP2pRun(runId);
+          if (!live) return;
+          addHelperDiagnostic(live, {
+            code: 'P2P_DISCUSSION_WRITE_FAILED',
+            attempt: attemptAtEnqueue,
+            sourceSession: initiatorAtEnqueue,
+            message: `Discussion writer dropped ${droppedBytes}B due to backpressure (queued=${queuedBytes}B)`,
+          });
+        },
+      );
+    }
     if (!result.ok) {
       // R3 PR-α (B1 / B5) + v1b follow-up (script retry) — script
       // execution failure either fails the round closed OR triggers a
@@ -1921,6 +2011,13 @@ async function dispatchScriptRoundOrFail(
     return { kind: 'fail_closed' };
   } finally {
     releaseScriptSlot();
+    // Audit fix (94b9b837-822 / N1) — drop the aborter handle and any
+    // deadline watchdog timer. Calling `ac.abort()` here is intentional:
+    // it tears down the runner's listener even if it already settled,
+    // which is a no-op but reduces the chance of dangling event-emitter
+    // references.
+    currentScriptAborters.delete(run.id);
+    if (deadlineTimer) clearTimeout(deadlineTimer);
   }
 }
 
@@ -2259,23 +2356,34 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
       // R3 v1b (W2) + v2 PR-ζ (M1) — non-blocking + drop surfaces helper
       // diagnostic. D-O3: in-memory authoritativeSegment is verdict
       // source-of-truth.
+      //
+      // Audit fix (94b9b837-822 / A4) — see corresponding script-dispatch
+      // call site for rationale; closures capture primitives, not `run`.
+      const logicRunId = run.id;
+      const logicContextFilePath = run.contextFilePath;
+      const logicAttemptAtEnqueue = run.currentRoundAttempt;
+      const logicInitiatorAtEnqueue = run.initiatorSession;
       enqueueP2pDiscussionWrite(
-        run.contextFilePath,
+        logicContextFilePath,
         segment,
         (error: unknown) => {
+          const live = getP2pRun(logicRunId);
+          if (!live) return;
           const message = error instanceof Error ? error.message : String(error);
-          addHelperDiagnostic(run, {
+          addHelperDiagnostic(live, {
             code: 'P2P_DISCUSSION_WRITE_FAILED',
-            attempt: run.currentRoundAttempt,
-            sourceSession: run.initiatorSession,
-            message: `Failed to append logic segment to ${run.contextFilePath}: ${message}`,
+            attempt: logicAttemptAtEnqueue,
+            sourceSession: logicInitiatorAtEnqueue,
+            message: `Failed to append logic segment to ${logicContextFilePath}: ${message}`,
           });
         },
         (droppedBytes, queuedBytes) => {
-          addHelperDiagnostic(run, {
+          const live = getP2pRun(logicRunId);
+          if (!live) return;
+          addHelperDiagnostic(live, {
             code: 'P2P_DISCUSSION_WRITE_FAILED',
-            attempt: run.currentRoundAttempt,
-            sourceSession: run.initiatorSession,
+            attempt: logicAttemptAtEnqueue,
+            sourceSession: logicInitiatorAtEnqueue,
             message: `Discussion writer dropped ${droppedBytes}B due to backpressure (queued=${queuedBytes}B)`,
           });
         },
@@ -2551,7 +2659,7 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
       // starts fresh, not "halfway through" a previous transient-error
       // budget that was consumed during the prior visit.
       if (run.scriptRetryCounts) delete run.scriptRetryCounts[jump];
-      run.routingHistory.push({
+      pushRoutingHistory(run, {
         fromRoundId: round.id,
         toRoundId: jump,
         trigger: jumpTriggerLabel,
@@ -2583,7 +2691,7 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
         if (!run.compiledEdgeUseCounts) run.compiledEdgeUseCounts = {};
         run.compiledEdgeUseCounts[next.id] = (run.compiledEdgeUseCounts[next.id] ?? 0) + 1;
         if (run.scriptRetryCounts) delete run.scriptRetryCounts[next.toNodeId];
-        run.routingHistory.push({
+        pushRoutingHistory(run, {
           fromRoundId: round.id,
           toRoundId: next.toNodeId,
           trigger: 'default',
@@ -2688,7 +2796,9 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
   run.completedAt = new Date().toISOString();
   transition(run, 'completed', serverLink);
   await dispatchPostSummaryExecutionPrompt(run);
-  setTimeout(() => { activeRuns.delete(run.id); }, 60_000);
+  // A3: `activeRuns.delete` is now scheduled by
+  // `scheduleP2pRunTerminalCleanup` (called from `transition('completed')`
+  // above), so no explicit timer here.
 }
 
 // ── Single hop dispatch + wait ────────────────────────────────────────────
@@ -3114,6 +3224,17 @@ export function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: Hop
  * everything in a single 60 s `setTimeout` so a late web read can still
  * see the discussion file / identity for a brief grace window — matching
  * the existing `activeRuns.delete` cadence.
+ *
+ * Audit fix (94b9b837-822 / A3) — `activeRuns.delete(run.id)` is now
+ * funnelled through this single cleanup point. Previously the failed /
+ * timed_out paths hit `failRun()` which called this helper but did NOT
+ * remove the `P2pRun` from `activeRuns`, so failure/timeout runs leaked
+ * indefinitely. Only the success path (line 1278) and the older summary
+ * path (line 2710) had their own 60 s `setTimeout` to delete from
+ * `activeRuns`, so anything reaching `failed`/`timed_out` stayed forever.
+ * Cancel paths still call `activeRuns.delete(runId)` synchronously for
+ * immediate UX disappearance — the deferred delete here is then a
+ * harmless no-op miss.
  */
 const terminalCleanupScheduled = new Set<string>();
 function scheduleP2pRunTerminalCleanup(run: P2pRun): void {
@@ -3130,6 +3251,8 @@ function scheduleP2pRunTerminalCleanup(run: P2pRun): void {
     try {
       runArtifactRootCache.delete(run.id);
     } catch { /* ignore */ }
+    // A3: unified activeRuns delete — covers completed/failed/timed_out/cancelled.
+    activeRuns.delete(run.id);
     terminalCleanupScheduled.delete(run.id);
   }, 60_000);
 }

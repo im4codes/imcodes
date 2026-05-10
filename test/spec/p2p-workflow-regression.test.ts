@@ -1493,10 +1493,19 @@ describe('p2p-workflow reverse-regression', () => {
     const orchestrator = read('src/daemon/p2p-orchestrator.ts');
     // R3 v2 PR-ζ ζ-4 / M1 — enqueueP2pDiscussionWrite now takes an
     // optional fourth `onSegmentDropped` callback so backpressure drops
-    // surface as helper diagnostics. The orchestrator passes
-    // `run.contextFilePath` as the first arg in both forms.
+    // surface as helper diagnostics. The orchestrator passes the run's
+    // discussion-file path as the first arg in both forms.
+    //
+    // Audit fix (94b9b837-822 / A4) — the call site previously passed
+    // `run.contextFilePath` directly and the helper-diagnostic closures
+    // captured the full `run` object, which kept failed/timed_out runs
+    // alive in the writer queue's callback retainer. The orchestrator
+    // now stages a primitive `contextFilePath` (or
+    // `logicContextFilePath`) local variable before the call so the
+    // closures only retain strings. We must accept either form for
+    // forward-compat with the OOM-fix variant.
     expect(
-      /enqueueP2pDiscussionWrite\([\s\S]{0,40}run\.contextFilePath/.test(orchestrator.text),
+      /enqueueP2pDiscussionWrite\([\s\S]{0,80}(?:run\.contextFilePath|logicContextFilePath|contextFilePath)/.test(orchestrator.text),
       'orchestrator script + logic dispatch must use enqueueP2pDiscussionWrite, not awaited appendFile',
     ).toBe(true);
     expect(

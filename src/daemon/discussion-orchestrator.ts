@@ -79,6 +79,40 @@ interface Discussion {
 
 const discussions = new Map<string, Discussion>();
 
+// Tracks discussions that already have a delayed cleanup timer scheduled, so
+// success/failure/stop paths each calling `scheduleDiscussionCleanup` don't
+// pile up duplicate timers.
+const discussionCleanupScheduled = new Set<string>();
+
+/**
+ * Schedule a 60 s delayed delete of a discussion entry from the in-memory
+ * `discussions` Map after it reaches a terminal state (`done`/`failed`).
+ *
+ * Mirrors the cadence used by P2P advanced runs in
+ * `src/daemon/p2p-orchestrator.ts:scheduleP2pRunTerminalCleanup` so that a
+ * late web read can still see the conclusion for a brief grace window.
+ *
+ * Without this, the module-level `discussions` Map was append-only — every
+ * discussion ever started stayed in memory until daemon restart. See the
+ * round 1–3 audit in `.imc/discussions/94b9b837-822.md` (finding A1).
+ *
+ * Idempotent: safe to call from `runDiscussion` success path, the
+ * fire-and-forget `.catch` failure path, and `stopDiscussion`.
+ */
+function scheduleDiscussionCleanup(id: string): void {
+  if (discussionCleanupScheduled.has(id)) return;
+  discussionCleanupScheduled.add(id);
+  setTimeout(() => {
+    discussions.delete(id);
+    discussionCleanupScheduled.delete(id);
+  }, 60_000);
+}
+
+/** Test-only: clear the cleanup-scheduled set (vitest fake-timer flushing). */
+export function __resetDiscussionCleanupScheduledForTests(): void {
+  discussionCleanupScheduled.clear();
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 function participantStrength(p: DiscussionParticipant): number {
@@ -440,6 +474,7 @@ async function runDiscussion(
   d.state = 'done';
   d.conclusion = verdict.slice(0, 500);
   d.updatedAt = Date.now();
+  scheduleDiscussionCleanup(d.id);
 
   // Save verdict as a round
   onUpdate({
@@ -564,6 +599,7 @@ export async function startDiscussion(
   void runDiscussion(discussion, onUpdate).catch(async (e) => {
     discussion.state = 'failed';
     discussion.error = e instanceof Error ? e.message : String(e);
+    scheduleDiscussionCleanup(discussion.id);
     onUpdate({ type: 'discussion.error', discussionId: discussion.id, error: discussion.error });
     onUpdate({
       type: 'discussion.save',
@@ -615,6 +651,7 @@ export async function stopDiscussion(id: string): Promise<void> {
   if (!d) return;
   d.state = 'failed';
   d.error = 'stopped by user';
+  scheduleDiscussionCleanup(id);
   for (const p of d.participants) {
     // Only stop sub-sessions that the discussion created — NEVER close reused ones
     if (!p.reused) {

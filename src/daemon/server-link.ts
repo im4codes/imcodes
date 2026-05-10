@@ -52,8 +52,43 @@ function collectSystemStats(): SystemStats {
 
 const HEARTBEAT_MS = 5_000;
 const STATS_MS = 5_000; // daemon.stats update interval (separate from heartbeat)
-const INITIAL_BACKOFF_MS = 1_000;
-const MAX_BACKOFF_MS = 60_000;
+/**
+ * Audit fix (94b9b837-822 / A6) — reconnect tuning.
+ *
+ * Previously `INITIAL_BACKOFF_MS=1_000`, `MAX_BACKOFF_MS=60_000`. A typical
+ * `docker compose pull && up -d server` outage is 5-30 s — well below the
+ * 60 s ceiling — but the daemon's exponential backoff (1s → 2s → 4s → 8s
+ * → 16s → 32s → 60s) climbs past 30 s in five attempts, so when the
+ * server came back the daemon could still be sitting in a 32-60 s wait.
+ * That was the user-visible "等很久" reconnect symptom.
+ *
+ * Server-side `daemonConnectLimiter.check(daemon:${ip}, 5, 10_000)` in
+ * `server/src/index.ts:322` allows 5 attempts per 10 s per IP, so a 500
+ * ms initial / 5 s ceiling stays comfortably inside the budget while
+ * cutting the worst-case "first attempt after server is back" delay
+ * from 60 s to 5 s.
+ */
+const INITIAL_BACKOFF_MS = 500;
+const MAX_BACKOFF_MS = 5_000;
+/**
+ * Audit fix (94b9b837-822 / A6) — explicit per-attempt connect timeout.
+ *
+ * `new WebSocket(url)` does not enforce a connect deadline; if the TCP
+ * SYN never gets a SYN-ACK (server still pulling images, ingress
+ * reconfiguring) the OS layer waits ~75 s on macOS or up to ~127 s on
+ * Linux (`tcp_syn_retries=6`) before giving up. During that window
+ * neither `error` nor `close` fires, so the backoff cursor doesn't
+ * advance and the daemon looks frozen. 8 s is short enough to keep the
+ * client responsive without aborting genuinely slow handshakes.
+ */
+const CONNECT_TIMEOUT_MS = 8_000;
+/**
+ * Audit fix (94b9b837-822 / A6) — ±20% jitter ratio on scheduled
+ * reconnects. Without jitter, multiple daemons behind a single NAT or
+ * the CI test cluster all retry on the same millisecond and trip the
+ * server-side IP rate limiter together.
+ */
+const RECONNECT_JITTER_RATIO = 0.4;
 const WATCHDOG_MS = 15_000;           // check connection health every 15s
 const PONG_TIMEOUT_MS = 10_000;       // if no pong within 10s, connection is dead
 
@@ -75,6 +110,8 @@ export class ServerLink {
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private watchdogTimer?: ReturnType<typeof setInterval>;
   private pongTimer?: ReturnType<typeof setTimeout>;
+  /** A6 connect-timeout watchdog. Cleared on open/close/error. */
+  private connectTimeoutTimer?: ReturnType<typeof setTimeout>;
   private backoffMs = INITIAL_BACKOFF_MS;
   private stopping = false;
   private reconnecting = false;
@@ -130,8 +167,32 @@ export class ServerLink {
     const ws = new WebSocket(wsUrl);
     this.ws = ws;
 
+    // Audit fix (94b9b837-822 / A6) — kill the connect attempt after
+    // CONNECT_TIMEOUT_MS so a hung TCP SYN cannot wedge the daemon
+    // for 75-127 s. Cleared on any of open/close/error.
+    if (this.connectTimeoutTimer) clearTimeout(this.connectTimeoutTimer);
+    this.connectTimeoutTimer = setTimeout(() => {
+      if (this.ws !== ws) return;
+      if (ws.readyState === WebSocket.OPEN) return;
+      logger.warn(
+        { url: wsUrl, timeoutMs: CONNECT_TIMEOUT_MS },
+        'ServerLink: connect timeout — closing socket so reconnect can proceed',
+      );
+      try { ws.close(); } catch { /* ignore */ }
+      // close handler will schedule reconnect.
+    }, CONNECT_TIMEOUT_MS);
+    try { (this.connectTimeoutTimer as { unref?: () => void }).unref?.(); } catch { /* ignore */ }
+
+    const clearConnectTimeout = () => {
+      if (this.connectTimeoutTimer) {
+        clearTimeout(this.connectTimeoutTimer);
+        this.connectTimeoutTimer = undefined;
+      }
+    };
+
     ws.addEventListener('open', () => {
       if (this.ws !== ws) return; // replaced before open
+      clearConnectTimeout();
       logger.info('ServerLink: connected');
       this.backoffMs = INITIAL_BACKOFF_MS;
       this.lastPong = Date.now();
@@ -177,6 +238,7 @@ export class ServerLink {
 
     ws.addEventListener('error', (event) => {
       if (this.ws !== ws) return; // stale socket — a newer connection already took over
+      clearConnectTimeout();
       logger.warn({ error: (event as ErrorEvent).message ?? 'unknown' }, 'ServerLink: error');
       // Close event *should* fire after error, but in edge cases (non-101 response,
       // DNS failure) it may not. Schedule reconnect as a safety net — scheduleReconnect()
@@ -207,6 +269,7 @@ export class ServerLink {
       // this one with 1001 "replaced" — that's expected and we must NOT reconnect,
       // otherwise the newer connection gets kicked and we loop forever.
       if (this.ws !== ws) return;
+      clearConnectTimeout();
       logger.info({ code: event.code, reason: event.reason }, 'ServerLink: closed');
       this.stopHeartbeat();
       this.stopWatchdog();
@@ -309,6 +372,10 @@ export class ServerLink {
     this.stopWatchdog();
     if (this.pongTimer) clearTimeout(this.pongTimer);
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    if (this.connectTimeoutTimer) {
+      clearTimeout(this.connectTimeoutTimer);
+      this.connectTimeoutTimer = undefined;
+    }
     this.ws?.close();
     this.ws = null;
   }
@@ -379,11 +446,17 @@ export class ServerLink {
     // Prevent double scheduling from error+close firing in sequence
     if (this.reconnecting) return;
     this.reconnecting = true;
-    logger.info({ backoffMs: this.backoffMs }, 'ServerLink: scheduling reconnect');
+    // Audit fix (94b9b837-822 / A6) — apply ±20% jitter to the
+    // scheduled delay so multiple daemons behind one NAT don't all
+    // fire on the same millisecond. `Math.max(0, …)` guards against
+    // a negative jittered delay if the ratio config ever goes wild.
+    const jitterMultiplier = 1 + (Math.random() - 0.5) * RECONNECT_JITTER_RATIO;
+    const delayMs = Math.max(0, Math.round(this.backoffMs * jitterMultiplier));
+    logger.info({ backoffMs: this.backoffMs, delayMs }, 'ServerLink: scheduling reconnect');
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = setTimeout(() => {
       this.connect();
       this.backoffMs = Math.min(this.backoffMs * 2, MAX_BACKOFF_MS);
-    }, this.backoffMs);
+    }, delayMs);
   }
 }

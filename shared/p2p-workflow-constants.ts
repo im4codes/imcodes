@@ -34,6 +34,21 @@ export const P2P_WORKFLOW_VARIABLE_ARRAY_MAX_ELEMENTS = 64;
 export const P2P_WORKFLOW_VARIABLE_ARRAY_MAX_ELEMENT_BYTES = 8 * 1024;
 
 /**
+ * Audit fix (94b9b837-822 / A2) — FIFO retention cap for
+ * `P2pRun.routingHistory`. Long-running advanced workflows that loop
+ * through compiled-edge jumps push to `routingHistory` on every jump and
+ * default-edge advance with no upper bound; combined with the
+ * projection-flush spread `[...routingHistory]` per debounce tick this is
+ * a real per-run growth source. Cap mirrors the FIFO-trim pattern used
+ * for `helperDiagnostics` (`p2p-orchestrator.ts:1306-1310`).
+ *
+ * 500 entries is large enough to keep meaningful forensic history for
+ * any reasonable workflow (P2P_WORKFLOW_MAX_NODES = 64) while bounding
+ * worst-case heap pressure under loops.
+ */
+export const P2P_ROUTING_HISTORY_RETENTION_COUNT = 500;
+
+/**
  * R3 v2 PR-ζ (Cx1-A6 / ζ-14) — Allowed executable path pattern + cap.
  * Reuses visible-ASCII charset of `P2P_REQUEST_ID_ASCII_PATTERN` but
  * removes the 128-char length limit so absolute paths up to 256 bytes
