@@ -4673,8 +4673,96 @@ function compareDaemonVersions(a: string, b: string): -1 | 0 | 1 {
  *     `npm install` catches the `targetVersion === 'latest'` case where npm
  *     may resolve to an older release than what's currently installed.
  */
+/** Auto-upgrade cooldown: rate-limit server-driven (no-targetVersion)
+ *  upgrade commands so a CI-publish flurry doesn't translate to a flurry
+ *  of daemon restarts. See handleDaemonUpgrade comment for context.
+ *
+ *  Pure function (testable). Returns:
+ *    onCooldown: true → caller should decline the upgrade
+ *    remainingMs: ms until the cooldown elapses (0 when not on cooldown)
+ *    lastAt: epoch ms of the last successful upgrade (null if sentinel
+ *            missing/unreadable — treated as "never upgraded")
+ */
+export interface AutoUpgradeCooldownInput {
+  /** Caller-specified targetVersion. Empty / 'latest' = auto upgrade. */
+  targetVersion: string | undefined;
+  /** Now (epoch ms). Defaults to Date.now(); param exists for tests. */
+  now?: number;
+  /** Cooldown window in ms. */
+  cooldownMs: number;
+  /** Reads the sentinel file; returns its trimmed text or null on miss. */
+  readSentinel: () => string | null;
+}
+export interface AutoUpgradeCooldownVerdict {
+  onCooldown: boolean;
+  remainingMs: number;
+  lastAt: number | null;
+}
+export function evaluateAutoUpgradeCooldown(
+  input: AutoUpgradeCooldownInput,
+): AutoUpgradeCooldownVerdict {
+  const { targetVersion, cooldownMs } = input;
+  const now = input.now ?? Date.now();
+  const isAutoUpgrade = !targetVersion || targetVersion === 'latest' || targetVersion === '';
+  if (!isAutoUpgrade) return { onCooldown: false, remainingMs: 0, lastAt: null };
+  if (!Number.isFinite(cooldownMs) || cooldownMs <= 0) return { onCooldown: false, remainingMs: 0, lastAt: null };
+  let raw: string | null = null;
+  try { raw = input.readSentinel(); } catch { /* sentinel unreadable */ }
+  if (!raw) return { onCooldown: false, remainingMs: 0, lastAt: null };
+  const lastAt = parseInt(raw.trim(), 10);
+  if (!Number.isFinite(lastAt)) return { onCooldown: false, remainingMs: 0, lastAt: null };
+  const ageMs = now - lastAt;
+  // Negative age (clock skew, sentinel from the future) → ignore the
+  // sentinel rather than blocking forever. Operator can also delete
+  // the file to force-bypass the cooldown.
+  if (ageMs < 0) return { onCooldown: false, remainingMs: 0, lastAt };
+  if (ageMs >= cooldownMs) return { onCooldown: false, remainingMs: 0, lastAt };
+  return { onCooldown: true, remainingMs: cooldownMs - ageMs, lastAt };
+}
+
 async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLink): Promise<void> {
   const UPGRADE_MEMORY_FREEZE_TTL_MS = 15 * 60 * 1000;
+
+  // ── Auto-upgrade cooldown ─────────────────────────────────────────────────
+  // Server pushes `daemon.upgrade` whenever it sees a new dev tag on the
+  // npm registry. With CI publishing every ~5 min during active dev work,
+  // four daemons each restarting on every tag = ~7 s offline × 4 boxes
+  // every few minutes, which a human operator perceives as "always
+  // offline". Bypassed when the operator names a specific targetVersion.
+  // Sentinel: ~/.imcodes/last-upgrade-at, updated by upgrade.sh.
+  try {
+    const { homedir: _homedir } = await import('os');
+    const { join: _join } = await import('path');
+    const { readFileSync: _readFile } = await import('fs');
+    const sentinelPath = _join(_homedir(), '.imcodes', 'last-upgrade-at');
+    const verdict = evaluateAutoUpgradeCooldown({
+      targetVersion,
+      cooldownMs: parseInt(
+        process.env.IMCODES_UPGRADE_COOLDOWN_MS ?? String(10 * 60 * 1000),
+        10,
+      ),
+      readSentinel: () => {
+        try { return _readFile(sentinelPath, 'utf8'); } catch { return null; }
+      },
+    });
+    if (verdict.onCooldown) {
+      logger.info({
+        targetVersion,
+        lastUpgradeAt: verdict.lastAt,
+        cooldownRemainingMs: verdict.remainingMs,
+      }, 'daemon.upgrade: auto-upgrade declined (cooldown active)');
+      try {
+        serverLink?.send({
+          type: DAEMON_MSG.UPGRADE_BLOCKED,
+          reason: 'cooldown_active',
+          cooldownRemainingMs: verdict.remainingMs,
+          lastUpgradeAt: verdict.lastAt,
+        });
+      } catch { /* ignore */ }
+      return;
+    }
+  } catch { /* defensive — never block the upgrade on a sentinel read error */ }
+
   const activeRuns = getActiveP2pRunsBlockingDaemonUpgrade();
   if (activeRuns.length > 0) {
     logger.warn({
@@ -5536,6 +5624,15 @@ if [ -z "$HEALTH_PID" ]; then
   log "[step 5] WARN: no live new daemon after 14s — service unit may have a stale path or the new binary crashes on startup"
   log "[step 5] WARN: check 'systemctl --user status imcodes' (linux) or 'log show --predicate \"subsystem == \\\"imcodes\\\"\"' (macos)"
   log "[step 5] WARN: if path-stale, manually fix ExecStart in $HOME/.config/systemd/user/imcodes.service then 'systemctl --user daemon-reload && systemctl --user restart imcodes'"
+else
+  # Drop the auto-upgrade cooldown sentinel — handleDaemonUpgrade
+  # consults this on the new daemon's next auto-upgrade attempt to
+  # rate-limit dev-tag-poll-driven restarts. Survives restart by
+  # design (the very transition we are throttling against).
+  # date +%s%3N = epoch ms (matches Date.now in JS). Best-effort: a
+  # missing sentinel means no cooldown applies.
+  date +%s%3N > "$HOME/.imcodes/last-upgrade-at" 2>/dev/null || true
+  log "[step 5] cooldown sentinel updated: $HOME/.imcodes/last-upgrade-at"
 fi
 
 log "=== upgrade script done ==="
