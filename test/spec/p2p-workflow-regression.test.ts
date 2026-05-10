@@ -2347,6 +2347,62 @@ describe('p2p-workflow reverse-regression', () => {
    *      `P2P_WORKFLOW_MSG.DAEMON_HELLO` to the new browser when one
    *      is cached.
    */
+  /*
+   * Reverse-regression #83 (R3 v2 PR-τ — User clarification: PR-μ over-
+   * generalised the summary contract. The correct rule:
+   *
+   *   - `multi_dispatch` (N parallel workers) → ALWAYS run an
+   *     initiator-led synthesis hop afterward. Workers are isolated
+   *     within the round (each writes to its own copy of the discussion
+   *     file); the only place their outputs converge into one
+   *     authoritative paragraph is the synthesis hop. Never let it
+   *     opt out — fall back to a generic prompt when no override or
+   *     preset prompt is supplied.
+   *   - `single_main` (1 worker = the initiator) → NEVER run a
+   *     synthesis hop. The worker's own output IS the round's
+   *     authoritative segment; asking the same agent to summarise
+   *     itself is wasteful + confusing.
+   *
+   * Locked invariants:
+   *   1. `normalizeAdvancedRound` MUST set `synthesisStyle` purely
+   *      from `executionMode` — `multi_dispatch` → `'initiator_summary'`,
+   *      anything else → `'none'`.
+   *   2. `multi_dispatch` MUST always have a non-empty `summaryPrompt`
+   *      on the resolved round (override > preset > generic fallback).
+   *   3. The canvas inspector MUST hide the summary-prompt textarea
+   *      for `single_main` nodes (it would have been dead config).
+   */
+  it('#83 synthesisStyle MUST be locked by executionMode (R3 v2 PR-τ)', () => {
+    const file = read('shared/p2p-advanced.ts');
+
+    // (1) synthesisStyle decision uses executionMode as the gate, not
+    // the presence of an effective summary prompt.
+    expect(
+      /synthesisStyle[\s\S]{0,200}round\.executionMode\s*===\s*['"]multi_dispatch['"][\s\S]{0,80}initiator_summary[\s\S]{0,40}none/.test(file.text),
+      'normalizeAdvancedRound MUST gate synthesisStyle on round.executionMode === multi_dispatch',
+    ).toBe(true);
+
+    // (2) multi_dispatch falls back to a generic summary prompt when
+    // no override / preset prompt is supplied (the `custom` preset has
+    // no SUMMARY_PROMPTS entry — exactly the previously-broken case).
+    expect(
+      /GENERIC_MULTI_DISPATCH_SUMMARY/.test(file.text),
+      'normalizeAdvancedRound MUST declare a generic fallback summary prompt for multi_dispatch',
+    ).toBe(true);
+    expect(
+      /multi_dispatch[\s\S]{0,200}GENERIC_MULTI_DISPATCH_SUMMARY/.test(file.text),
+      'The generic fallback MUST be reachable from the multi_dispatch branch',
+    ).toBe(true);
+
+    // (3) Canvas inspector hides the summary-prompt textarea for
+    // single_main nodes.
+    const canvas = read('web/src/components/AdvancedWorkflowCanvasEditor.tsx');
+    expect(
+      /\(node\.dispatchStyle\s*\?\?\s*P2P_PRESET_DEFAULT_DISPATCH_STYLE\[node\.preset\]\)\s*===\s*['"]multi_dispatch['"][\s\S]{0,800}node-\$\{node\.id\}-summary-prompt/.test(canvas.text),
+      'Canvas inspector MUST gate the summary-prompt textarea on dispatchStyle === multi_dispatch',
+    ).toBe(true);
+  });
+
   it('#82 canvas full-width via ResizeObserver + bridge replays cached hello (R3 v2 PR-σ)', () => {
     // (A) Canvas full-width via ResizeObserver.
     const canvas = read('web/src/components/AdvancedWorkflowCanvasEditor.tsx');

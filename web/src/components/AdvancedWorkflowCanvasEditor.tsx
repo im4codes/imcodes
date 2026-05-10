@@ -530,26 +530,28 @@ export function AdvancedWorkflowCanvasEditor({ value, onChange, readOnly }: Adva
             aria-label={`node-${node.id}-prompt-append`}
           />
           {/*
-           * R3 v2 PR-μ — Per-node summary prompt override. Surfaces the
-           * default per-preset summary prompt as the placeholder so users
-           * see what the auto-summary will say. Leaving the field blank
-           * means "use the default"; typing anything overrides it AND
-           * forces a summary phase to run even on `single_main` nodes
-           * (where previously `synthesisStyle='none'` skipped summary).
+           * R3 v2 PR-τ — Summary prompt is ONLY relevant for
+           * `multi_dispatch` nodes (where the executor runs an
+           * initiator-led synthesis hop after the parallel workers).
+           * `single_main` nodes have no second LLM to consolidate, so
+           * the summary prompt is dead config there — hide the input
+           * to remove the false signal that filling it does anything.
            */}
-          <label style={{ ...labelStyle, marginTop: 4 }}>
-            <span>{t('p2p.workflow.editor.node.summary_prompt_label', 'Round summary prompt (auto-runs after this node)')}</span>
-            <textarea
-              value={node.summaryPromptOverride ?? ''}
-              disabled={readOnly}
-              rows={4}
-              placeholder={P2P_PRESET_DEFAULT_SUMMARY_PROMPT[node.preset]}
-              onInput={(event) => updateNode(node.id, (current) => ({ ...current, summaryPromptOverride: (event.target as HTMLTextAreaElement).value }))}
-              style={{ ...inputStyle, resize: 'vertical' }}
-              aria-label={`node-${node.id}-summary-prompt`}
-              data-testid={`p2p-editor-node-${node.id}-summary-prompt`}
-            />
-          </label>
+          {(node.dispatchStyle ?? P2P_PRESET_DEFAULT_DISPATCH_STYLE[node.preset]) === 'multi_dispatch' && (
+            <label style={{ ...labelStyle, marginTop: 4 }}>
+              <span>{t('p2p.workflow.editor.node.summary_prompt_label', 'Round summary prompt (auto-runs after this node)')}</span>
+              <textarea
+                value={node.summaryPromptOverride ?? ''}
+                disabled={readOnly}
+                rows={4}
+                placeholder={P2P_PRESET_DEFAULT_SUMMARY_PROMPT[node.preset]}
+                onInput={(event) => updateNode(node.id, (current) => ({ ...current, summaryPromptOverride: (event.target as HTMLTextAreaElement).value }))}
+                style={{ ...inputStyle, resize: 'vertical' }}
+                aria-label={`node-${node.id}-summary-prompt`}
+                data-testid={`p2p-editor-node-${node.id}-summary-prompt`}
+              />
+            </label>
+          )}
         </div>
       );
     }

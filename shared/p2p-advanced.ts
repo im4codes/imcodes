@@ -313,23 +313,37 @@ function normalizeAdvancedRound(round: P2pAdvancedRound): P2pResolvedRound {
         : ['openspec/changes'])
     : [...(round.artifactOutputs ?? [])];
   /*
-   * R3 v2 PR-μ — Summary phase is now driven by the presence of an
-   * effective summary prompt rather than `executionMode` alone. The
-   * workflow adapter populates `round.effectiveSummaryPrompt` from the
-   * canvas user's override or the per-preset default, so EVERY workflow
-   * round (single_main + multi_dispatch alike) auto-runs an initiator
-   * summary unless the user explicitly cleared it. Legacy oldAdvanced
-   * fixtures (no `effectiveSummaryPrompt` set) preserve the original
-   * behaviour: multi_dispatch summarises, single_main does not.
+   * R3 v2 PR-τ — Summary phase is locked by `executionMode`:
+   *
+   *   - `multi_dispatch` (N parallel workers) → ALWAYS runs an
+   *     initiator-led synthesis hop afterward. Workers are isolated
+   *     within the round (each writes to its own copy of the discussion
+   *     file); the only place their outputs converge into one
+   *     authoritative paragraph is the synthesis hop. We never let it
+   *     opt out — if the user (or legacy oldAdvanced fixtures) didn't
+   *     supply a summary prompt, we fall back to a generic one.
+   *   - `single_main` (1 worker, the initiator itself) → NEVER runs a
+   *     synthesis hop. There is no second LLM to consolidate, and asking
+   *     the same agent to summarise itself is wasteful + confusing. The
+   *     worker's own output is the round's authoritative segment.
+   *
+   * `summaryPrompt` on the resolved round is left populated even for
+   * single_main so the FINAL-RUN synthesis can still pick it up via
+   * `finalRound.summaryPrompt` (PR-μ chain) when this happens to be the
+   * last round of the chain.
    */
   const summaryFromOverride = typeof round.effectiveSummaryPrompt === 'string'
     ? round.effectiveSummaryPrompt.trim()
     : '';
   const summaryFromLegacyMap = SUMMARY_PROMPTS[round.preset];
-  const effectiveSummary = summaryFromOverride.length > 0
-    ? summaryFromOverride
-    : (round.executionMode === 'multi_dispatch' ? summaryFromLegacyMap : undefined);
-  const synthesisStyle: P2pSynthesisStyle = effectiveSummary ? 'initiator_summary' : 'none';
+  const GENERIC_MULTI_DISPATCH_SUMMARY =
+    'Synthesize the worker outputs above into one authoritative round summary. Highlight points of agreement, key disagreements, and concrete next-step focus.';
+  const effectiveSummary = round.executionMode === 'multi_dispatch'
+    ? (summaryFromOverride || summaryFromLegacyMap || GENERIC_MULTI_DISPATCH_SUMMARY)
+    : (summaryFromOverride || summaryFromLegacyMap || undefined);
+  const synthesisStyle: P2pSynthesisStyle = round.executionMode === 'multi_dispatch'
+    ? 'initiator_summary'
+    : 'none';
   const requiresVerdict = verdictPolicy !== 'none';
   const authoritativeVerdictWriter = requiresVerdict
     ? (round.executionMode === 'multi_dispatch' ? 'initiator_summary' : 'initiator_only')
