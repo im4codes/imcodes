@@ -421,4 +421,74 @@ describe('mapP2pRunToDiscussion', () => {
 
     expect(discussion.diagnostics?.map((d) => d.code)).toEqual(['daemon_busy']);
   });
+
+  // Audit fix (P2P bar scoping) — pin the contract that the mapping
+  // preserves session-identity fields so `app.tsx` can filter the bar
+  // to the user's current session view. Without these, every active
+  // session view rendered the bar for every running P2P discussion
+  // across the daemon.
+  describe('session-identity fields for bar scoping', () => {
+    it('preserves mainSession + initiatorSession + participantSessions for advanced runs', () => {
+      const discussion = mapP2pRunToDiscussion({
+        id: 'run_with_sessions',
+        status: 'running',
+        mode_key: 'discuss',
+        current_round: 1,
+        total_rounds: 1,
+        active_phase: 'hop',
+        main_session: 'deck_proj_brain',
+        initiator_session: 'deck_proj_brain',
+        current_target_session: 'deck_sub_a',
+        hop_states: [
+          { hop_index: 1, round_index: 1, session: 'deck_sub_a', status: 'running' },
+          { hop_index: 2, round_index: 1, session: 'deck_sub_b', status: 'queued' },
+        ],
+      });
+
+      expect(discussion.mainSession).toBe('deck_proj_brain');
+      expect(discussion.initiatorSession).toBe('deck_proj_brain');
+      // De-duplicated set: initiator + main + current target + every hop session.
+      expect(discussion.participantSessions?.sort()).toEqual([
+        'deck_proj_brain', 'deck_sub_a', 'deck_sub_b',
+      ]);
+    });
+
+    it('omits session fields when run payload lacks them (legacy)', () => {
+      const discussion = mapP2pRunToDiscussion({
+        id: 'run_legacy_no_session',
+        status: 'running',
+        mode_key: 'audit',
+        current_round: 1,
+        total_rounds: 1,
+        total_hops: 0,
+        active_phase: 'queued',
+      });
+
+      expect(discussion.mainSession).toBeUndefined();
+      expect(discussion.initiatorSession).toBeUndefined();
+      // Legacy: undefined — caller treats this as "show unscoped".
+      expect(discussion.participantSessions).toBeUndefined();
+    });
+
+    it('aggregates participants from all_targets when hop_states is absent', () => {
+      const discussion = mapP2pRunToDiscussion({
+        id: 'run_pre_dispatch',
+        status: 'queued',
+        mode_key: 'audit',
+        current_round: 1,
+        total_rounds: 1,
+        active_phase: 'queued',
+        main_session: 'deck_proj_brain',
+        initiator_session: 'deck_proj_brain',
+        all_targets: [
+          { session: 'deck_sub_a', mode: 'audit' },
+          { session: 'deck_sub_b', mode: 'audit' },
+        ],
+      });
+
+      expect(discussion.participantSessions?.sort()).toEqual([
+        'deck_proj_brain', 'deck_sub_a', 'deck_sub_b',
+      ]);
+    });
+  });
 });

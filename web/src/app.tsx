@@ -1117,6 +1117,17 @@ export function App() {
     startedAt?: number;
     /** Epoch ms when the current hop/phase started (for hop-level elapsed timer) */
     hopStartedAt?: number;
+    /** Main session this discussion belongs to (parent of any sub-session
+     *  initiator). Used by SubSessionBar to scope the discussion banner
+     *  to the relevant session view only. */
+    mainSession?: string;
+    /** Session that originated the discussion. May equal mainSession or
+     *  may be a sub-session under it. */
+    initiatorSession?: string;
+    /** Every session participating in this run (initiator + targets +
+     *  hops). The bar matches against this set so any session involved
+     *  in the discussion shows the bar. */
+    participantSessions?: string[];
   }>>([]);
 
   /** Set of session names enabled in the P2P config for the active root session. */
@@ -3730,7 +3741,38 @@ export function App() {
                 onNew={() => setShowSubDialog(true)}
                 onViewDiscussions={() => { setDiscussionInitialId(null); setShowDiscussionsPage(true); }}
                 onViewDiscussion={(fileId) => { setDiscussionInitialId(fileId); setShowDiscussionsPage(true); }}
-                discussions={discussions.filter((d) => d.state !== 'done')}
+                // Scope the P2P bar to discussions whose participants
+                // overlap the active session view. Without this filter
+                // every running P2P run renders its banner in every
+                // session's bar, creating cross-session noise.
+                //
+                // Match logic — a discussion is relevant when:
+                //   - its `mainSession` equals the active root session
+                //     (covers the common case: discussion launched
+                //     from the user's current session or any of its
+                //     sub-sessions, since `activeRootSession` resolves
+                //     sub→parent), OR
+                //   - any participant matches the active session or
+                //     its root (covers cases where the user navigates
+                //     into a sub-session that's a hop in another root
+                //     session's discussion).
+                //
+                // Legacy discussions without `mainSession` /
+                // `participantSessions` (e.g. mid-rollout state from
+                // before this commit) fall through and show
+                // unscoped — preserves the previous behaviour for
+                // those entries instead of hiding them entirely.
+                discussions={discussions.filter((d) => {
+                  if (d.state === 'done') return false;
+                  const hasScope = !!d.mainSession || (d.participantSessions && d.participantSessions.length > 0);
+                  if (!hasScope) return true; // legacy entry — show unscoped
+                  if (d.mainSession && activeRootSession && d.mainSession === activeRootSession) return true;
+                  if (d.participantSessions) {
+                    if (activeSession && d.participantSessions.includes(activeSession)) return true;
+                    if (activeRootSession && d.participantSessions.includes(activeRootSession)) return true;
+                  }
+                  return false;
+                })}
                 onStopDiscussion={(id) => {
                   if (id.startsWith('p2p_')) {
                     // P2P runs use p2p.cancel with the actual run ID (strip p2p_ prefix)

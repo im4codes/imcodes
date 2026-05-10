@@ -154,6 +154,41 @@ export function mapP2pRunToDiscussion(r: Record<string, any>) {
     status: String(hop.status ?? 'queued') as 'queued' | 'dispatched' | 'running' | 'completed' | 'timed_out' | 'failed' | 'cancelled',
   })) : undefined;
 
+  // Audit fix (P2P bar scoping) — preserve session-identity fields so
+  // the bar in `app.tsx` can filter discussions to the active session.
+  // Without these, every active main-session view rendered the bar for
+  // every running P2P discussion across the whole daemon, regardless
+  // of whether the user's currently-selected session participated.
+  const mainSession = typeof source.main_session === 'string' && source.main_session
+    ? source.main_session
+    : undefined;
+  const initiatorSession = typeof source.initiator_session === 'string' && source.initiator_session
+    ? source.initiator_session
+    : undefined;
+  // Aggregate every session that participates in this run so the bar's
+  // filter can match by ANY participant (initiator + every hop).
+  // Falls back to mainSession only when the run has no compiled hop
+  // states yet (legacy adapter projection).
+  const participantSessions = (() => {
+    const set = new Set<string>();
+    if (initiatorSession) set.add(initiatorSession);
+    if (mainSession) set.add(mainSession);
+    if (typeof source.current_target_session === 'string' && source.current_target_session) {
+      set.add(source.current_target_session);
+    }
+    if (Array.isArray(source.hop_states)) {
+      for (const hop of source.hop_states) {
+        if (hop && typeof hop.session === 'string' && hop.session) set.add(hop.session);
+      }
+    }
+    if (Array.isArray(source.all_targets)) {
+      for (const t of source.all_targets) {
+        if (t && typeof t.session === 'string' && t.session) set.add(t.session);
+      }
+    }
+    return set.size > 0 ? [...set] : undefined;
+  })();
+
   return {
     id,
     fileId: typeof source.discussion_id === 'string' && source.discussion_id
@@ -161,6 +196,9 @@ export function mapP2pRunToDiscussion(r: Record<string, any>) {
       : undefined,
     topic: `P2P ${currentRoundMode} · ${initiatorLabel}`,
     state,
+    mainSession,
+    initiatorSession,
+    participantSessions,
     modeKey: currentRoundMode,
     currentRound: useAdvancedNodes
       ? ((advancedCurrentIndex >= 0 ? advancedCurrentIndex + 1 : 1))
