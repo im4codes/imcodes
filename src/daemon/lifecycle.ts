@@ -798,6 +798,7 @@ export async function startup(): Promise<DaemonContext> {
   startCodexQuotaPoller(serverLink);
   startContextReplicationPoller(workerUrl, serverId, token);
   startContextMaterializationPoller(liveContextIngestion);
+  startGcPoller();
 
   logger.info('Daemon started');
 
@@ -920,6 +921,7 @@ export async function shutdown(exitCode = 0): Promise<void> {
     if (codexQuotaTimer) clearInterval(codexQuotaTimer);
     if (contextReplicationTimer) clearInterval(contextReplicationTimer);
     if (contextMaterializationTimer) clearInterval(contextMaterializationTimer);
+    if (gcTimer) clearInterval(gcTimer);
     hookServer?.close();
     ctx?.serverLink?.disconnect();
     configureSharedContextRuntime(null);
@@ -944,10 +946,15 @@ const HEALTH_POLL_MS = 30_000;
 const CODEX_QUOTA_REFRESH_MS = 60_000;
 const CONTEXT_REPLICATION_POLL_MS = 30_000;
 const CONTEXT_MATERIALIZATION_POLL_MS = 15_000;
+/** Periodic V8 major-GC trigger (5 min by default; tuneable via env).
+ *  See `startGcPoller()` for the rationale.
+ */
+const GC_POLL_MS = parseInt(process.env.IMCODES_GC_POLL_MS ?? '300000', 10);
 let healthTimer: ReturnType<typeof setInterval> | null = null;
 let codexQuotaTimer: ReturnType<typeof setInterval> | null = null;
 let contextReplicationTimer: ReturnType<typeof setInterval> | null = null;
 let contextMaterializationTimer: ReturnType<typeof setInterval> | null = null;
+let gcTimer: ReturnType<typeof setInterval> | null = null;
 let hookServer: http.Server | null = null;
 
 /** Periodically check all running sessions; restart any that have disappeared or died. */
@@ -1015,6 +1022,65 @@ function startContextMaterializationPoller(liveContextIngestion: LiveContextInge
       logger.warn({ err }, 'Context materialization poll failed');
     });
   }, CONTEXT_MATERIALIZATION_POLL_MS);
+}
+
+/**
+ * Periodically force a V8 major GC.
+ *
+ * Why: production daemon on a self-hosted server (211) was OOM-crashing
+ * every 1–9 hours despite holding only ~218 MB of *live* objects. Manual
+ * SIGUSR2 (which forces a heap-snapshot pre-GC) shrunk RSS from 2755 MB
+ * → 1976 MB in one shot — i.e. ~780 MB of *unreachable* garbage was
+ * sitting in V8's old generation waiting for major GC. With V8's default
+ * heap limit of 4 GB, major GC only triggers when heap pressure forces
+ * it, by which point the daemon is already at the edge of OOM. If a
+ * legitimate spike in live data (e.g. a large transformers tokenizer
+ * batch) lands during that window, V8 aborts the process with
+ * "Reached heap limit Allocation failed".
+ *
+ * The bigger heap limit (`--max-old-space-size=12288` env override on
+ * 211) keeps the daemon alive but doesn't fix the underlying behavior
+ * — major GC still runs lazily, RSS climbs to many GB before
+ * collection, and each major GC pause is multi-second on a fat heap
+ * (looks like "the daemon went offline" to the operator). Forcing a
+ * GC every few minutes keeps RSS bounded near actual live size and
+ * keeps GC pauses short.
+ *
+ * Requires `--expose-gc`. Without it, `globalThis.gc` is undefined and
+ * the poller is a silent no-op (so this is safe to ship without
+ * mandating the flag — the worst case is we don't get the speedup).
+ */
+function startGcPoller(): void {
+  const gc = (globalThis as { gc?: () => void }).gc;
+  if (typeof gc !== 'function') {
+    logger.info('GC poller: --expose-gc not enabled, skipping (set NODE_OPTIONS to "--expose-gc --max-old-space-size=N" to enable)');
+    return;
+  }
+  if (!Number.isFinite(GC_POLL_MS) || GC_POLL_MS < 30_000) {
+    logger.info({ requested: process.env.IMCODES_GC_POLL_MS }, 'GC poller: interval clamped or invalid, defaulting to 5 min');
+  }
+  const intervalMs = Number.isFinite(GC_POLL_MS) && GC_POLL_MS >= 30_000 ? GC_POLL_MS : 300_000;
+  gcTimer = setInterval(() => {
+    const t0 = Date.now();
+    const before = process.memoryUsage().rss;
+    try {
+      gc();
+    } catch (err) {
+      logger.warn({ err }, 'GC poller: gc() threw');
+      return;
+    }
+    const after = process.memoryUsage().rss;
+    const elapsed = Date.now() - t0;
+    // Only log meaningful GCs (freed > 50 MB or took > 200 ms) to avoid
+    // chatty logs on quiet daemons.
+    if (before - after > 50 * 1024 * 1024 || elapsed > 200) {
+      logger.info(
+        { rssBeforeMB: (before / 1024 / 1024) | 0, rssAfterMB: (after / 1024 / 1024) | 0, elapsedMs: elapsed },
+        'GC poller: forced major GC',
+      );
+    }
+  }, intervalMs);
+  logger.info({ intervalMs }, 'GC poller: started');
 }
 
 function setupSignalHandlers(): void {

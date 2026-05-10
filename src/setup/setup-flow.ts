@@ -398,6 +398,10 @@ KillMode=process
 Environment=PATH=${process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin'}
 Environment=HOME=${homedir()}
 Environment=NODE_ENV=production
+# See bind-flow.ts.installSystemdService for rationale on these two.
+# Mirrors the flags there so the one-click setup and the manual bind
+# install produce equivalent units.
+Environment="NODE_OPTIONS=--expose-gc --max-old-space-size=8192"
 StandardOutput=append:${logPath}
 StandardError=append:${logPath}
 
