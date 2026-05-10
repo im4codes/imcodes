@@ -61,6 +61,22 @@ export const P2P_WORKFLOW_MAX_PROMPT_APPEND_BYTES = 16 * 1024;
 export const P2P_WORKFLOW_MAX_DIAGNOSTICS = 100 as const;
 export const P2P_WORKFLOW_MAX_DIAGNOSTIC_BYTES = 64 * 1024;
 
+/**
+ * R3 v2 PR-ι — Maximum number of workflow drafts a single
+ * `P2pSavedConfig` may store. Each entry can be ~64 nodes / 128 edges
+ * deep, so 20 keeps the saved-config payload bounded (~few hundred KB
+ * worst case) while still giving users plenty of room to organise
+ * variations.
+ */
+export const P2P_WORKFLOW_LIBRARY_MAX_ENTRIES = 20 as const;
+
+/**
+ * R3 v2 PR-ι — Maximum byte length of a workflow title (UTF-8 encoded).
+ * Mirrors the cap used by `P2P_WORKFLOW_VARIABLE_*` keys so library titles
+ * cannot overflow rendered list items.
+ */
+export const P2P_WORKFLOW_TITLE_MAX_BYTES = 128 as const;
+
 export const P2P_WORKFLOW_ARTIFACT_MAX_FILES = 200 as const;
 export const P2P_WORKFLOW_ARTIFACT_MAX_TOTAL_BYTES = 64 * 1024 * 1024;
 export const P2P_WORKFLOW_ARTIFACT_MAX_FILE_BYTES = 8 * 1024 * 1024;

@@ -25,6 +25,18 @@ import type {
   P2pWorkflowLaunchEnvelope,
 } from '@shared/p2p-workflow-types.js';
 import { isFutureWorkflowSchema } from '@shared/p2p-workflow-validators.js';
+import {
+  P2P_WORKFLOW_DEFAULT_TITLE,
+  P2P_WORKFLOW_LIBRARY_MAX_ENTRIES,
+  addWorkflowToLibrary,
+  duplicateWorkflowInLibrary,
+  generateWorkflowDraftId,
+  getActiveWorkflowFromConfig,
+  migrateLegacyWorkflowDraft,
+  normalizeWorkflowLibrary,
+  removeWorkflowFromLibrary,
+  replaceActiveWorkflowInConfig,
+} from '@shared/p2p-workflow-library.js';
 import type {
   P2pAdvancedPresetKey,
   P2pAdvancedRound,
@@ -184,7 +196,13 @@ export function buildP2pWorkflowLaunchEnvelopeFromConfig(
     if (isLaunchableEnvelope(candidate)) return candidate;
   }
 
-  let draft: P2pWorkflowDraft | null = config.workflowDraft ? cloneJson(config.workflowDraft) : null;
+  // R3 v2 PR-ι — Resolve the active workflow through the centralised
+  // helper so the launch path and the UI agree on which entry of the
+  // library the envelope captures. `getActiveWorkflowFromConfig` falls
+  // back to the legacy `workflowDraft` field for pre-PR-ι configs that
+  // were saved before the library refactor.
+  const activeWorkflow = getActiveWorkflowFromConfig(config);
+  let draft: P2pWorkflowDraft | null = activeWorkflow ? cloneJson(activeWorkflow) : null;
   if (!draft && hasOldAdvancedConfig(config)) {
     try {
       draft = materializeOldAdvancedConfigToWorkflowDraft({
@@ -464,7 +482,24 @@ export function P2pConfigPanel({
   const [contextReducerMode, setContextReducerMode] = useState<P2pContextReducerMode | ''>('');
   const [contextReducerSession, setContextReducerSession] = useState('');
   const [contextReducerTemplate, setContextReducerTemplate] = useState('');
-  const [workflowDraft, setWorkflowDraft] = useState<P2pWorkflowDraft | undefined>(undefined);
+  // R3 v2 PR-ι — Workflow library state. `workflowLibrary` is the master
+  // list, `activeWorkflowId` selects the entry the canvas + launch
+  // envelope currently target. The legacy `workflowDraft` mirror is kept
+  // because some downstream code still reads it directly (e.g. saved
+  // envelope diffing); it is always derived from
+  // `workflowLibrary[activeWorkflowId]` via the helper module so the two
+  // representations cannot drift.
+  const [workflowLibrary, setWorkflowLibrary] = useState<P2pWorkflowDraft[]>([]);
+  const [activeWorkflowId, setActiveWorkflowId] = useState<string | undefined>(undefined);
+  const workflowDraft = useMemo(
+    () => getActiveWorkflowFromConfig({
+      sessions: {},
+      rounds: 0,
+      workflowLibrary,
+      activeWorkflowId,
+    }) ?? undefined,
+    [workflowLibrary, activeWorkflowId],
+  );
   const [workflowLaunchEnvelope, setWorkflowLaunchEnvelope] = useState<P2pWorkflowLaunchEnvelope | undefined>(undefined);
   // R3 PR-α follow-up — UI-managed script executable allowlist. Round-trips
   // through `P2pSavedConfig.allowedExecutables` (userPref) and is written
@@ -512,7 +547,7 @@ export function P2pConfigPanel({
   }, [capabilitySnapshot]);
 
   const advancedEnvelopePreview = useMemo(() => {
-    if (!workflowLaunchEnvelope && !workflowDraft && !advancedPresetKey) return null;
+    if (!workflowLaunchEnvelope && workflowLibrary.length === 0 && !advancedPresetKey) return null;
     const draft: P2pSavedConfig = {
       sessions: {},
       rounds,
@@ -522,12 +557,13 @@ export function P2pConfigPanel({
       advancedPresetKey: advancedPresetKey || undefined,
       advancedRounds,
       advancedRunTimeoutMinutes: advancedPresetKey ? advancedRunTimeoutMinutes : undefined,
-      workflowDraft,
+      workflowLibrary,
+      activeWorkflowId,
       workflowLaunchEnvelope,
       ...(allowedExecutables.length > 0 ? { allowedExecutables } : {}),
     };
     return buildP2pWorkflowLaunchEnvelopeFromConfig(draft, { sessionName: scopeSession ?? undefined });
-  }, [advancedPresetKey, advancedRounds, advancedRunTimeoutMinutes, allowedExecutables, extraPrompt, hopTimeoutMinutes, rounds, scopeSession, workflowDraft, workflowLaunchEnvelope]);
+  }, [advancedPresetKey, advancedRounds, advancedRunTimeoutMinutes, allowedExecutables, activeWorkflowId, extraPrompt, hopTimeoutMinutes, rounds, scopeSession, workflowLibrary, workflowLaunchEnvelope]);
 
   const hasAdvancedConfig = Boolean(advancedPresetKey || workflowDraft || workflowLaunchEnvelope);
   const futureSchemaDetected = useMemo(() => {
@@ -616,12 +652,26 @@ export function P2pConfigPanel({
       ? parsed.allowedExecutables.filter((entry): entry is string => typeof entry === 'string')
       : []);
     setAllowedExecutableDraft('');
-    const materializedEnvelope = buildP2pWorkflowLaunchEnvelopeFromConfig(parsed, {
+    // R3 v2 PR-ι — Lift any legacy single `workflowDraft` into the
+    // workflow library before hydrating UI state. The migration is
+    // idempotent + non-destructive, so users with mixed-shape configs
+    // (saved by older clients still on the rolling-deploy window) load
+    // cleanly into the library editor.
+    const migrated = migrateLegacyWorkflowDraft(parsed);
+    const materializedEnvelope = buildP2pWorkflowLaunchEnvelopeFromConfig(migrated, {
       sessionName: scopeSession ?? undefined,
     });
-    setWorkflowDraft(parsed.workflowDraft ?? materializedEnvelope?.advancedDraft);
+    const initialLibrary = normalizeWorkflowLibrary(
+      migrated.workflowLibrary
+        ?? (materializedEnvelope?.advancedDraft ? [materializedEnvelope.advancedDraft] : []),
+    );
+    setWorkflowLibrary(initialLibrary);
+    const desiredActive = migrated.activeWorkflowId
+      ?? initialLibrary.find((entry) => entry.id === parsed.activeWorkflowId)?.id
+      ?? initialLibrary[0]?.id;
+    setActiveWorkflowId(desiredActive);
     setWorkflowLaunchEnvelope(parsed.workflowLaunchEnvelope ?? materializedEnvelope ?? undefined);
-    const needsMigration = hasOldAdvancedConfig(parsed) && !parsed.workflowDraft && !parsed.workflowLaunchEnvelope;
+    const needsMigration = hasOldAdvancedConfig(parsed) && !parsed.workflowDraft && !parsed.workflowLaunchEnvelope && initialLibrary.length === 0;
     setAdvancedMigrationNeeded(needsMigration);
   }, [configKey, p2pConfigPref.value, scopeSession]);
 
@@ -649,29 +699,31 @@ export function P2pConfigPanel({
   }, []);
 
   /*
-   * R3 v2 PR-θ — Auto-bootstrap an empty workflow draft when the user
-   * lands on the advanced tab and has nothing to edit yet. The canvas
-   * editor refuses to render without a `workflowDraft`, so without this
-   * a brand-new user would see an empty tab and have no path forward.
-   * The starter draft contains a single root LLM node so validation
-   * passes immediately; users can rename / reshape from the canvas.
+   * R3 v2 PR-θ + PR-ι — Auto-bootstrap a starter workflow when the user
+   * lands on the advanced tab with an empty workflow library. The
+   * canvas editor refuses to render without an active workflow, so
+   * without this a brand-new user would see an empty tab and have no
+   * path forward. The starter contains a single root LLM node so
+   * validation passes immediately; users can rename / reshape / add
+   * more entries from the canvas + library sidebar.
    */
   useEffect(() => {
     if (activeTab !== 'advanced') return;
-    if (workflowDraft || workflowLaunchEnvelope || advancedPresetKey) return;
+    if (workflowLibrary.length > 0 || workflowLaunchEnvelope || advancedPresetKey) return;
     const starter: P2pWorkflowDraft = {
       schemaVersion: P2P_WORKFLOW_SCHEMA_VERSION,
-      id: `draft_${Date.now().toString(36)}`,
-      title: t('p2p.tab.advanced_workflow_starter_title', 'Untitled workflow'),
+      id: generateWorkflowDraftId(),
+      title: t('p2p.tab.advanced_workflow_starter_title', P2P_WORKFLOW_DEFAULT_TITLE),
       nodes: [
         { id: 'node_1', title: t('p2p.tab.advanced_workflow_starter_node_title', 'Start'), nodeKind: 'llm', preset: 'discuss', permissionScope: 'analysis_only' },
       ],
       edges: [],
       rootNodeId: 'node_1',
     };
-    setWorkflowDraft(starter);
+    setWorkflowLibrary([starter]);
+    setActiveWorkflowId(starter.id);
     markFormDirty();
-  }, [activeTab, workflowDraft, workflowLaunchEnvelope, advancedPresetKey, t]);
+  }, [activeTab, workflowLibrary.length, workflowLaunchEnvelope, advancedPresetKey, t]);
 
   const toggleEnabled = (key: string) => {
     markFormDirty();
@@ -769,6 +821,14 @@ export function P2pConfigPanel({
     const resolvedAdvancedRounds = advancedPresetKey
       ? (advancedRounds ? JSON.parse(JSON.stringify(advancedRounds)) as P2pAdvancedRound[] : JSON.parse(JSON.stringify(BUILT_IN_ADVANCED_PRESETS[advancedPresetKey])) as P2pAdvancedRound[])
       : undefined;
+    // R3 v2 PR-ι — normalize the in-memory library before save so any
+    // mid-edit invalid entries are dropped and the entry cap is enforced
+    // before the config touches storage.
+    const normalizedLibrary = normalizeWorkflowLibrary(workflowLibrary);
+    const resolvedActiveId = activeWorkflowId
+      && normalizedLibrary.some((entry) => entry.id === activeWorkflowId)
+      ? activeWorkflowId
+      : normalizedLibrary[0]?.id;
     const oldAdvancedCfg: P2pSavedConfig = {
       sessions: merged,
       rounds,
@@ -779,14 +839,15 @@ export function P2pConfigPanel({
       advancedRounds: resolvedAdvancedRounds,
       advancedRunTimeoutMinutes: advancedPresetKey ? advancedRunTimeoutMinutes : undefined,
       contextReducer,
-      workflowDraft,
+      workflowLibrary: normalizedLibrary,
+      activeWorkflowId: resolvedActiveId,
       workflowLaunchEnvelope,
       ...(allowedExecutables.length > 0 ? { allowedExecutables } : {}),
     };
     const envelope = buildP2pWorkflowLaunchEnvelopeFromConfig(oldAdvancedCfg, {
       sessionName: scopeSession ?? undefined,
     });
-    if ((advancedPresetKey || workflowDraft || workflowLaunchEnvelope) && !envelope) {
+    if ((advancedPresetKey || normalizedLibrary.length > 0 || workflowLaunchEnvelope) && !envelope) {
       setSaveError(t('p2p.settings_workflow_migration_error'));
       setSaving(false);
       return;
@@ -797,6 +858,14 @@ export function P2pConfigPanel({
       updatedAt: oldAdvancedCfg.updatedAt,
       hopTimeoutMinutes,
       extraPrompt: oldAdvancedCfg.extraPrompt,
+      // R3 v2 PR-ι — Persist the full library + active id. Also keep
+      // `workflowDraft` in sync as the legacy mirror so older clients
+      // (mid-rolling-deploy) continue to launch the active workflow
+      // from the single-draft slot. Library size always >= active count.
+      ...(normalizedLibrary.length > 0 ? {
+        workflowLibrary: normalizedLibrary,
+        activeWorkflowId: resolvedActiveId,
+      } : {}),
       ...(envelope ? { workflowDraft: envelope.advancedDraft, workflowLaunchEnvelope: envelope } : {}),
       // R3 PR-α follow-up — Persist the UI-managed allowlist so it
       // round-trips through userPref and is available to the next
@@ -1089,6 +1158,180 @@ export function P2pConfigPanel({
                   </div>
                 )}
 
+                {/*
+                 * R3 v2 PR-ι — Workflow library manager. Users can store up
+                 * to `P2P_WORKFLOW_LIBRARY_MAX_ENTRIES` named workflows per
+                 * scope-session and switch the active one for the next P2P
+                 * launch. Naming, duplication, and deletion all flow
+                 * through the shared helpers in `p2p-workflow-library.ts`
+                 * so the UI and the launch envelope agree on which entry
+                 * the canvas + envelope-build path target.
+                 */}
+                {workflowLibrary.length > 0 && (
+                  <div
+                    style={{ ...sectionCardStyle, marginTop: 12 }}
+                    data-testid="p2p-workflow-library-section"
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
+                      <div style={{ ...sectionLabelStyle, marginTop: 0, marginBottom: 0 }}>
+                        {t('p2p.workflow.library.title', 'Workflow library')}
+                      </div>
+                      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                        <button
+                          type="button"
+                          disabled={readOnlyMode || workflowLibrary.length >= P2P_WORKFLOW_LIBRARY_MAX_ENTRIES}
+                          data-testid="p2p-workflow-library-new"
+                          style={{
+                            padding: '4px 10px', borderRadius: 5, border: '1px solid #475569',
+                            background: '#1e293b', color: '#cbd5e1', fontSize: 11,
+                            cursor: readOnlyMode || workflowLibrary.length >= P2P_WORKFLOW_LIBRARY_MAX_ENTRIES ? 'not-allowed' : 'pointer',
+                          }}
+                          onClick={() => {
+                            const fresh: P2pWorkflowDraft = {
+                              schemaVersion: P2P_WORKFLOW_SCHEMA_VERSION,
+                              id: generateWorkflowDraftId(),
+                              title: t('p2p.tab.advanced_workflow_starter_title', P2P_WORKFLOW_DEFAULT_TITLE),
+                              nodes: [
+                                { id: 'node_1', title: t('p2p.tab.advanced_workflow_starter_node_title', 'Start'), nodeKind: 'llm', preset: 'discuss', permissionScope: 'analysis_only' },
+                              ],
+                              edges: [],
+                              rootNodeId: 'node_1',
+                            };
+                            const seed: P2pSavedConfig = { sessions: {}, rounds: 0, workflowLibrary, activeWorkflowId };
+                            const next = addWorkflowToLibrary(seed, fresh, { activate: true });
+                            setWorkflowLibrary(next.workflowLibrary ?? []);
+                            setActiveWorkflowId(next.activeWorkflowId);
+                            setWorkflowLaunchEnvelope(undefined);
+                            markFormDirty();
+                          }}
+                        >
+                          {t('p2p.workflow.library.new', '+ New')}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={readOnlyMode || !activeWorkflowId || workflowLibrary.length >= P2P_WORKFLOW_LIBRARY_MAX_ENTRIES}
+                          data-testid="p2p-workflow-library-duplicate"
+                          style={{
+                            padding: '4px 10px', borderRadius: 5, border: '1px solid #475569',
+                            background: '#1e293b', color: '#cbd5e1', fontSize: 11,
+                            cursor: readOnlyMode || !activeWorkflowId || workflowLibrary.length >= P2P_WORKFLOW_LIBRARY_MAX_ENTRIES ? 'not-allowed' : 'pointer',
+                          }}
+                          onClick={() => {
+                            if (!activeWorkflowId) return;
+                            const seed: P2pSavedConfig = { sessions: {}, rounds: 0, workflowLibrary, activeWorkflowId };
+                            const next = duplicateWorkflowInLibrary(seed, activeWorkflowId, t('p2p.workflow.library.copy_suffix', ' (copy)'));
+                            setWorkflowLibrary(next.workflowLibrary ?? []);
+                            setActiveWorkflowId(next.activeWorkflowId);
+                            setWorkflowLaunchEnvelope(undefined);
+                            markFormDirty();
+                          }}
+                        >
+                          {t('p2p.workflow.library.duplicate', 'Duplicate')}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={readOnlyMode || !activeWorkflowId || workflowLibrary.length <= 1}
+                          data-testid="p2p-workflow-library-delete"
+                          style={{
+                            padding: '4px 10px', borderRadius: 5, border: '1px solid #7f1d1d',
+                            background: '#1e293b', color: '#fca5a5', fontSize: 11,
+                            cursor: readOnlyMode || !activeWorkflowId || workflowLibrary.length <= 1 ? 'not-allowed' : 'pointer',
+                          }}
+                          onClick={() => {
+                            if (!activeWorkflowId) return;
+                            const target = workflowLibrary.find((entry) => entry.id === activeWorkflowId);
+                            if (!target) return;
+                            const ok = typeof window !== 'undefined' && typeof window.confirm === 'function'
+                              ? window.confirm(t('p2p.workflow.library.delete_confirm', 'Delete workflow "{{title}}"? This cannot be undone.', { title: target.title ?? P2P_WORKFLOW_DEFAULT_TITLE }))
+                              : true;
+                            if (!ok) return;
+                            const seed: P2pSavedConfig = { sessions: {}, rounds: 0, workflowLibrary, activeWorkflowId };
+                            const next = removeWorkflowFromLibrary(seed, activeWorkflowId);
+                            setWorkflowLibrary(next.workflowLibrary ?? []);
+                            setActiveWorkflowId(next.activeWorkflowId);
+                            setWorkflowLaunchEnvelope(undefined);
+                            markFormDirty();
+                          }}
+                        >
+                          {t('p2p.workflow.library.delete', 'Delete')}
+                        </button>
+                      </div>
+                    </div>
+                    <div style={{ fontSize: 11, color: '#94a3b8', lineHeight: 1.5, marginTop: 6 }}>
+                      {t('p2p.workflow.library.hint', 'Saved workflows for this session. The active one is sent to P2P launches. Up to {{max}} entries.', { max: P2P_WORKFLOW_LIBRARY_MAX_ENTRIES })}
+                    </div>
+                    <ul
+                      style={{ margin: '8px 0 0', padding: 0, listStyle: 'none', display: 'grid', gap: 4 }}
+                      data-testid="p2p-workflow-library-list"
+                    >
+                      {workflowLibrary.map((entry) => {
+                        const isActive = entry.id === activeWorkflowId;
+                        return (
+                          <li
+                            key={entry.id}
+                            data-testid={`p2p-workflow-library-entry-${entry.id}`}
+                            data-active={isActive ? 'true' : 'false'}
+                            style={{
+                              display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6,
+                              background: isActive ? '#1d4ed840' : '#0b1220',
+                              border: `1px solid ${isActive ? '#3b82f6' : '#1e293b'}`,
+                              borderRadius: 5, padding: '6px 10px',
+                              cursor: 'pointer',
+                            }}
+                            onClick={() => {
+                              if (entry.id === activeWorkflowId) return;
+                              setActiveWorkflowId(entry.id);
+                              setWorkflowLaunchEnvelope(undefined);
+                              markFormDirty();
+                            }}
+                          >
+                            <span style={{ fontSize: 13, color: isActive ? '#bfdbfe' : '#e2e8f0', fontWeight: isActive ? 600 : 500, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                              {entry.title?.trim() ? entry.title : t('p2p.tab.advanced_workflow_starter_title', P2P_WORKFLOW_DEFAULT_TITLE)}
+                            </span>
+                            {isActive && (
+                              <span style={{ ...badgeStyle, background: '#1e3a8a', color: '#bfdbfe', fontSize: 10 }}>
+                                {t('p2p.workflow.library.active_badge', 'Active')}
+                              </span>
+                            )}
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </div>
+                )}
+
+                {workflowDraft && (
+                  <div style={{ ...sectionCardStyle, marginTop: 12 }} data-testid="p2p-workflow-name-section">
+                    <label style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                      <span style={{ ...sectionLabelStyle, marginTop: 0, marginBottom: 0 }}>
+                        {t('p2p.workflow.library.name_label', 'Workflow name')}
+                      </span>
+                      <input
+                        type="text"
+                        value={workflowDraft.title ?? ''}
+                        disabled={readOnlyMode}
+                        maxLength={128}
+                        placeholder={t('p2p.workflow.library.name_placeholder', 'e.g. Audit + plan workflow')}
+                        data-testid="p2p-workflow-name-input"
+                        onInput={(event) => {
+                          const value = (event.target as HTMLInputElement).value;
+                          const next: P2pWorkflowDraft = { ...workflowDraft, title: value };
+                          const seed: P2pSavedConfig = { sessions: {}, rounds: 0, workflowLibrary, activeWorkflowId };
+                          const updated = replaceActiveWorkflowInConfig(seed, next);
+                          setWorkflowLibrary(updated.workflowLibrary ?? []);
+                          setActiveWorkflowId(updated.activeWorkflowId);
+                          setWorkflowLaunchEnvelope(undefined);
+                          markFormDirty();
+                        }}
+                        style={{
+                          width: '100%', background: '#0f172a', border: '1px solid #334155', borderRadius: 6,
+                          color: '#e2e8f0', fontSize: 13, padding: '7px 9px', outline: 'none',
+                        }}
+                      />
+                    </label>
+                  </div>
+                )}
+
                 {workflowDraft && (
                   <div style={{ marginTop: 12 }}>
                     <AdvancedWorkflowCanvasEditor
@@ -1096,7 +1339,14 @@ export function P2pConfigPanel({
                       readOnly={readOnlyMode}
                       onChange={(next) => {
                         markFormDirty();
-                        setWorkflowDraft(next);
+                        // R3 v2 PR-ι — Route the canvas edit through the
+                        // library so the active entry stays in sync. The
+                        // helper preserves the active id even when the
+                        // editor returns a new draft object.
+                        const seed: P2pSavedConfig = { sessions: {}, rounds: 0, workflowLibrary, activeWorkflowId };
+                        const updated = replaceActiveWorkflowInConfig(seed, next);
+                        setWorkflowLibrary(updated.workflowLibrary ?? []);
+                        setActiveWorkflowId(updated.activeWorkflowId);
                         // Strip the launch envelope so Save will re-derive a
                         // fresh one from the edited draft. Keeps the editor as
                         // the single source of truth while the dialog is open.

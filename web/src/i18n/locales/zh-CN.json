@@ -725,6 +725,18 @@
         "add": "添加",
         "remove": "移除",
         "empty": "尚未允许任何可执行文件。脚本节点将在 bind 阶段被拒绝。"
+      },
+      "library": {
+        "title": "工作流库",
+        "hint": "本会话保存的工作流。激活的会用于 P2P 调用。最多 {{max}} 个。",
+        "new": "+ 新建",
+        "duplicate": "复制",
+        "delete": "删除",
+        "delete_confirm": "确定删除工作流「{{title}}」？此操作不可撤销。",
+        "copy_suffix": "（副本）",
+        "active_badge": "已激活",
+        "name_label": "工作流名称",
+        "name_placeholder": "例如：审计 + 计划工作流"
       }
     }
   },

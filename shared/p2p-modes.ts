@@ -30,10 +30,35 @@ export interface P2pSavedConfig {
   advancedRunTimeoutMinutes?: number;
   /** Optional context compression/helper config for advanced workflows. */
   contextReducer?: P2pContextReducerConfig;
-  /** Versioned advanced workflow draft for smart P2P workflow v1+. */
+  /**
+   * Versioned advanced workflow draft for smart P2P workflow v1+.
+   * **Legacy single-draft slot.** Retained for backwards compatibility with
+   * configs saved before the workflow-library refactor (R3 v2 PR-ι). New
+   * code should prefer `workflowLibrary` + `activeWorkflowId`. On load,
+   * `migrateLegacyWorkflowDraft` (in `shared/p2p-workflow-library.ts`) lifts
+   * a present `workflowDraft` into the library when no library exists yet.
+   */
   workflowDraft?: P2pWorkflowDraft;
   /** Optional saved launch envelope for scheduled/supervised advanced workflow launch. */
   workflowLaunchEnvelope?: P2pWorkflowLaunchEnvelope;
+  /**
+   * R3 v2 PR-ι — Multi-workflow library. Each entry is an independently
+   * editable `P2pWorkflowDraft` with its own id + title. Users can name,
+   * duplicate, and delete entries through the `P2pConfigPanel` advanced
+   * tab. The currently active workflow (used by P2P launches) is selected
+   * via `activeWorkflowId`. Library size is capped by
+   * `P2P_WORKFLOW_LIBRARY_MAX_ENTRIES` to keep the saved-config payload
+   * bounded.
+   */
+  workflowLibrary?: P2pWorkflowDraft[];
+  /**
+   * R3 v2 PR-ι — Identifier (matching `P2pWorkflowDraft.id`) of the
+   * currently active workflow in `workflowLibrary`. When unset, the first
+   * library entry (or the legacy `workflowDraft`) is treated as active.
+   * Reading is centralised through `getActiveWorkflowFromConfig` so the
+   * resolution rules cannot drift between UI and launch envelope code.
+   */
+  activeWorkflowId?: string;
   /**
    * R3 PR-α follow-up — UI-managed allowlist of executable absolute paths
    * (or `PATH`-relative basenames) that script nodes in this config's
@@ -87,6 +112,16 @@ export function isP2pSavedConfig(value: unknown): value is P2pSavedConfig {
   if (record.contextReducer != null && typeof record.contextReducer !== 'object') return false;
   if (record.workflowDraft != null && (typeof record.workflowDraft !== 'object' || Array.isArray(record.workflowDraft))) return false;
   if (record.workflowLaunchEnvelope != null && (typeof record.workflowLaunchEnvelope !== 'object' || Array.isArray(record.workflowLaunchEnvelope))) return false;
+  // R3 v2 PR-ι — workflow library shape check. Per-entry validation
+  // (schemaVersion, id, nodes/edges shape) is performed when each entry is
+  // surfaced through `validateP2pWorkflowDraft` / launch envelope build.
+  const libraryRaw = (record as { workflowLibrary?: unknown }).workflowLibrary;
+  if (libraryRaw != null) {
+    if (!Array.isArray(libraryRaw)) return false;
+    if (libraryRaw.some((entry) => !entry || typeof entry !== 'object' || Array.isArray(entry))) return false;
+  }
+  const activeIdRaw = (record as { activeWorkflowId?: unknown }).activeWorkflowId;
+  if (activeIdRaw != null && typeof activeIdRaw !== 'string') return false;
   // R3 PR-α follow-up — UI-managed allowedExecutables. We perform only a
   // shape check here; per-entry validation lives in
   // `validateP2pWorkflowLaunchEnvelope` so the same rules apply on launch.

@@ -393,6 +393,192 @@ describe('P2pConfigPanel', () => {
     });
   });
 
+  // ── R3 v2 PR-ι — workflow library (multi-workflow CRUD) ─────────────────
+  describe('workflow library', () => {
+    it('renders the library section + active badge after the canvas auto-bootstraps', async () => {
+      getUserPrefMock.mockResolvedValue(null);
+      renderPanel({ initialTab: 'advanced' });
+      await flush();
+
+      // Bootstrap effect synthesises one starter workflow → library has one entry.
+      const section = screen.getByTestId('p2p-workflow-library-section');
+      expect(section).toBeDefined();
+      const list = screen.getByTestId('p2p-workflow-library-list');
+      expect(list.querySelectorAll('li').length).toBe(1);
+      // The single entry is active.
+      const entries = list.querySelectorAll('li');
+      expect(entries[0].getAttribute('data-active')).toBe('true');
+      // Delete is disabled for a single-entry library (cannot delete the last).
+      const deleteBtn = screen.getByTestId('p2p-workflow-library-delete') as HTMLButtonElement;
+      expect(deleteBtn.disabled).toBe(true);
+    });
+
+    it('clicking + New adds a second workflow, activates it, and persists both through Save', async () => {
+      const onSave = vi.fn();
+      getUserPrefMock.mockResolvedValue(null);
+      renderPanel({ initialTab: 'advanced', onSave });
+      await flush();
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-workflow-library-new'));
+      });
+      await flush();
+
+      const list = screen.getByTestId('p2p-workflow-library-list');
+      const entries = Array.from(list.querySelectorAll('li'));
+      expect(entries).toHaveLength(2);
+      // The second one auto-activates.
+      expect(entries[1].getAttribute('data-active')).toBe('true');
+      expect(entries[0].getAttribute('data-active')).toBe('false');
+
+      // Save and inspect the persisted shape.
+      await act(async () => {
+        fireEvent.click(screen.getByText('settings_save'));
+      });
+      await flush();
+      const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
+      expect(cfg.workflowLibrary?.length).toBe(2);
+      expect(cfg.activeWorkflowId).toBeDefined();
+      // The persisted active id should match the second library entry.
+      expect(cfg.activeWorkflowId).toBe(cfg.workflowLibrary?.[1]?.id);
+      // Legacy mirror is set so older clients can still launch.
+      expect(cfg.workflowDraft?.id).toBe(cfg.activeWorkflowId);
+    });
+
+    it('clicking a non-active library entry switches the canvas + active id', async () => {
+      const onSave = vi.fn();
+      getUserPrefMock.mockResolvedValue(null);
+      renderPanel({ initialTab: 'advanced', onSave });
+      await flush();
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-workflow-library-new'));
+      });
+      await flush();
+
+      // Now click the FIRST entry to switch back.
+      const list = screen.getByTestId('p2p-workflow-library-list');
+      const entries = Array.from(list.querySelectorAll('li'));
+      await act(async () => {
+        fireEvent.click(entries[0]);
+      });
+      await flush();
+      const updated = Array.from(screen.getByTestId('p2p-workflow-library-list').querySelectorAll('li'));
+      expect(updated[0].getAttribute('data-active')).toBe('true');
+      expect(updated[1].getAttribute('data-active')).toBe('false');
+    });
+
+    it('Duplicate clones the active workflow with a copy suffix', async () => {
+      const onSave = vi.fn();
+      getUserPrefMock.mockResolvedValue(null);
+      renderPanel({ initialTab: 'advanced', onSave });
+      await flush();
+      // Rename so we can assert the suffix attaches to the right title.
+      const nameInput = screen.getByTestId('p2p-workflow-name-input') as HTMLInputElement;
+      await act(async () => {
+        fireEvent.input(nameInput, { target: { value: 'Audit pipeline' } });
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-workflow-library-duplicate'));
+      });
+      await flush();
+      const list = screen.getByTestId('p2p-workflow-library-list');
+      const titles = Array.from(list.querySelectorAll('li > span')).map((s) => s.textContent);
+      expect(titles).toContain('Audit pipeline');
+      // Find the copy: the test translator returns the LAST segment of the
+      // i18n key as the rendered text, so the suffix here resolves to the
+      // raw English fallback because the translator just echoes the key.
+      expect(titles.some((t) => t?.includes('Audit pipeline'))).toBe(true);
+      // After Duplicate, the second list entry is active.
+      const entries = Array.from(list.querySelectorAll('li'));
+      expect(entries[1].getAttribute('data-active')).toBe('true');
+    });
+
+    it('Delete removes the active workflow and promotes the first remaining entry', async () => {
+      const onSave = vi.fn();
+      getUserPrefMock.mockResolvedValue(null);
+      // Stub confirm so the test does not get a JSDOM "not implemented" warning.
+      const originalConfirm = window.confirm;
+      window.confirm = () => true;
+      try {
+        renderPanel({ initialTab: 'advanced', onSave });
+        await flush();
+        await act(async () => {
+          fireEvent.click(screen.getByTestId('p2p-workflow-library-new'));
+        });
+        await flush();
+        // Now library has 2; delete should not be disabled.
+        const deleteBtn = screen.getByTestId('p2p-workflow-library-delete') as HTMLButtonElement;
+        expect(deleteBtn.disabled).toBe(false);
+        await act(async () => {
+          fireEvent.click(deleteBtn);
+        });
+        await flush();
+        const list = screen.getByTestId('p2p-workflow-library-list');
+        expect(list.querySelectorAll('li')).toHaveLength(1);
+      } finally {
+        window.confirm = originalConfirm;
+      }
+    });
+
+    it('renaming an active workflow updates the title input AND the library list label', async () => {
+      const onSave = vi.fn();
+      getUserPrefMock.mockResolvedValue(null);
+      renderPanel({ initialTab: 'advanced', onSave });
+      await flush();
+      const nameInput = screen.getByTestId('p2p-workflow-name-input') as HTMLInputElement;
+      await act(async () => {
+        fireEvent.input(nameInput, { target: { value: 'My audit flow' } });
+      });
+      await flush();
+      // List entry text should now reflect the rename.
+      const list = screen.getByTestId('p2p-workflow-library-list');
+      const titles = Array.from(list.querySelectorAll('li > span')).map((s) => s.textContent);
+      expect(titles).toContain('My audit flow');
+      // The input value should also be the rename (not the bootstrap default).
+      expect((screen.getByTestId('p2p-workflow-name-input') as HTMLInputElement).value).toBe('My audit flow');
+      // Save and confirm the persisted active workflow carries the new title.
+      await act(async () => {
+        fireEvent.click(screen.getByText('settings_save'));
+      });
+      await flush();
+      const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
+      const active = cfg.workflowLibrary?.find((e) => e.id === cfg.activeWorkflowId);
+      expect(active?.title).toBe('My audit flow');
+    });
+
+    it('hydrates a previously-saved library + activeWorkflowId from saved config', async () => {
+      const a: P2pWorkflowDraft = {
+        schemaVersion: P2P_WORKFLOW_SCHEMA_VERSION,
+        id: 'wf_a',
+        title: 'Alpha',
+        nodes: [{ id: 'n1', title: 'N', nodeKind: 'llm', preset: 'discuss', permissionScope: 'analysis_only' }],
+        edges: [],
+        rootNodeId: 'n1',
+      };
+      const b: P2pWorkflowDraft = { ...a, id: 'wf_b', title: 'Beta' };
+      const savedConfig: P2pSavedConfig = {
+        sessions: {},
+        rounds: 1,
+        workflowLibrary: [a, b],
+        activeWorkflowId: 'wf_b',
+      };
+      getUserPrefMock.mockResolvedValue(JSON.stringify(savedConfig));
+      renderPanel({ initialTab: 'advanced' });
+      await flush();
+      const list = screen.getByTestId('p2p-workflow-library-list');
+      const entries = Array.from(list.querySelectorAll('li'));
+      expect(entries.map((e) => e.getAttribute('data-testid'))).toEqual([
+        'p2p-workflow-library-entry-wf_a',
+        'p2p-workflow-library-entry-wf_b',
+      ]);
+      // wf_b is active per saved activeWorkflowId.
+      expect(entries[1].getAttribute('data-active')).toBe('true');
+      // Title input mirrors the active workflow title.
+      const nameInput = screen.getByTestId('p2p-workflow-name-input') as HTMLInputElement;
+      expect(nameInput.value).toBe('Beta');
+    });
+  });
+
   it('new sessions not in saved config default to disabled with audit mode', async () => {
     const savedConfig: P2pSavedConfig = {
       sessions: {}, // no prior config for any session

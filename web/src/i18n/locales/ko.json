@@ -724,6 +724,18 @@
         "add": "추가",
         "remove": "제거",
         "empty": "아직 허용된 실행 파일이 없습니다. 스크립트 노드는 bind 단계에서 거부됩니다."
+      },
+      "library": {
+        "title": "워크플로 라이브러리",
+        "hint": "이 세션에 저장된 워크플로입니다. 활성 워크플로가 P2P 호출에 전송됩니다. 최대 {{max}}개.",
+        "new": "+ 새로 만들기",
+        "duplicate": "복제",
+        "delete": "삭제",
+        "delete_confirm": "워크플로 \"{{title}}\"을(를) 삭제하시겠습니까? 이 작업은 취소할 수 없습니다.",
+        "copy_suffix": " (복사)",
+        "active_badge": "활성",
+        "name_label": "워크플로 이름",
+        "name_placeholder": "예: 감사 + 계획 워크플로"
       }
     }
   },

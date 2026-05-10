@@ -1784,9 +1784,13 @@ describe('p2p-workflow reverse-regression', () => {
       "A bootstrap useEffect early-return guarding on `activeTab !== 'advanced'` must exist",
     ).toBeGreaterThan(0);
     const bootstrapWindow = file.text.slice(bootstrapAnchor, bootstrapAnchor + 1500);
+    // R3 v2 PR-ι — bootstrap now seeds the workflow LIBRARY (single-entry)
+    // rather than the legacy workflowDraft state. Either pattern is
+    // acceptable — both keep the canvas reachable from a cold panel.
     expect(
-      /setWorkflowDraft\(starter\)/.test(bootstrapWindow),
-      'The advanced-tab bootstrap effect must inject a starter draft via setWorkflowDraft(starter)',
+      /setWorkflowDraft\(starter\)/.test(bootstrapWindow)
+        || /setWorkflowLibrary\(\[starter\]\)/.test(bootstrapWindow),
+      'The advanced-tab bootstrap effect must inject a starter draft via setWorkflowDraft(starter) or setWorkflowLibrary([starter])',
     ).toBe(true);
 
     // (4) The advanced tab branch must contain the canvas + allowed
@@ -1794,7 +1798,10 @@ describe('p2p-workflow reverse-regression', () => {
     // tab branch and scan forward for the canvas + allowlist mounts.
     const advancedAnchor = file.text.indexOf('R3 v2 PR-θ — Advanced Workflow tab');
     expect(advancedAnchor, 'Advanced tab branch comment marker must be present').toBeGreaterThan(0);
-    const advancedWindow = file.text.slice(advancedAnchor, advancedAnchor + 8000);
+    // Window grew with the PR-ι library section + name input — bump the
+    // scan range so the canvas + allowlist mounts (which now sit deeper
+    // in the branch) still fall inside it.
+    const advancedWindow = file.text.slice(advancedAnchor, advancedAnchor + 16000);
     expect(
       /<AdvancedWorkflowCanvasEditor[\s\S]*?value=\{workflowDraft\}/.test(advancedWindow),
       'Advanced tab branch must mount <AdvancedWorkflowCanvasEditor value={workflowDraft}>',
@@ -1812,5 +1819,108 @@ describe('p2p-workflow reverse-regression', () => {
     expect(canvasOccurrences, 'Canvas editor must be mounted exactly once (advanced tab only)').toBe(1);
     const allowlistOccurrences = file.text.match(/data-testid=\"p2p-allowed-executables-section\"/g)?.length ?? 0;
     expect(allowlistOccurrences, 'Allowed-executables section must be mounted exactly once').toBe(1);
+  });
+
+  /*
+   * Reverse-regression #72 (R3 v2 PR-ι — Workflow library: multi-workflow
+   * data model so users can save/name/edit/duplicate/delete workflows
+   * and pick which one P2P invokes).
+   *
+   * Locked invariants:
+   *   1. `P2pSavedConfig` declares optional `workflowLibrary?: P2pWorkflowDraft[]`
+   *      AND `activeWorkflowId?: string` fields (with comments tying them
+   *      to PR-ι), and `isP2pSavedConfig` validates their shape.
+   *   2. The shared `p2p-workflow-library.ts` helper module exists and
+   *      exports the resolution + mutator functions used by the UI and
+   *      the launch-envelope builder. Centralising these prevents drift
+   *      between UI and launch.
+   *   3. `buildP2pWorkflowLaunchEnvelopeFromConfig` MUST resolve the
+   *      active workflow through `getActiveWorkflowFromConfig` (rather
+   *      than reading `config.workflowDraft` directly), so the envelope
+   *      always launches the user-selected entry.
+   *   4. `P2pConfigPanel` mounts the workflow library section
+   *      (`data-testid="p2p-workflow-library-section"`) and the title
+   *      input (`data-testid="p2p-workflow-name-input"`) inside the
+   *      advanced tab.
+   */
+  it('#72 P2pSavedConfig MUST carry a workflow library + active id (R3 v2 PR-ι)', () => {
+    const file = read('shared/p2p-modes.ts');
+
+    expect(
+      /workflowLibrary\?\:\s*P2pWorkflowDraft\[\]/.test(file.text),
+      'P2pSavedConfig must declare optional workflowLibrary: P2pWorkflowDraft[]',
+    ).toBe(true);
+    expect(
+      /activeWorkflowId\?\:\s*string/.test(file.text),
+      'P2pSavedConfig must declare optional activeWorkflowId: string',
+    ).toBe(true);
+
+    // Validator must shape-check both new fields so malformed payloads from
+    // the wire don't slip through and crash the editor.
+    expect(
+      /workflowLibrary\?\:\s*unknown/.test(file.text),
+      'isP2pSavedConfig must accept workflowLibrary as a checked unknown',
+    ).toBe(true);
+    expect(
+      /activeWorkflowId\?\:\s*unknown/.test(file.text),
+      'isP2pSavedConfig must accept activeWorkflowId as a checked unknown',
+    ).toBe(true);
+  });
+
+  it('#72b shared workflow library helpers exist and are wired into the launch path (R3 v2 PR-ι)', () => {
+    const helpers = read('shared/p2p-workflow-library.ts');
+    // Required exports — the UI + launch builder import these symbols.
+    for (const symbol of [
+      'P2P_WORKFLOW_DEFAULT_TITLE',
+      'P2P_WORKFLOW_LIBRARY_MAX_ENTRIES',
+      'generateWorkflowDraftId',
+      'normalizeWorkflowLibrary',
+      'migrateLegacyWorkflowDraft',
+      'getActiveWorkflowFromConfig',
+      'addWorkflowToLibrary',
+      'removeWorkflowFromLibrary',
+      'duplicateWorkflowInLibrary',
+      'replaceActiveWorkflowInConfig',
+    ]) {
+      // Accept either `export const FOO` / `export function FOO` (declaration
+      // form) or `export { FOO }` / `export { FOO, BAR }` (re-export form).
+      const declared = new RegExp(`export\\s+(function|const)\\s+${symbol}\\b`).test(helpers.text);
+      const reExported = new RegExp(`export\\s*\\{[^}]*\\b${symbol}\\b[^}]*\\}`).test(helpers.text);
+      expect(
+        declared || reExported,
+        `shared/p2p-workflow-library.ts must export ${symbol}`,
+      ).toBe(true);
+    }
+
+    // The launch envelope builder must source the active workflow through
+    // the helper, never by reading `config.workflowDraft` as the primary
+    // path (which would skip the library entirely).
+    const panel = read('web/src/components/P2pConfigPanel.tsx');
+    expect(
+      /getActiveWorkflowFromConfig\(config\)/.test(panel.text),
+      'buildP2pWorkflowLaunchEnvelopeFromConfig must call getActiveWorkflowFromConfig(config)',
+    ).toBe(true);
+  });
+
+  it('#72c P2pConfigPanel MUST mount the workflow library section + title input under the advanced tab (R3 v2 PR-ι)', () => {
+    const file = read('web/src/components/P2pConfigPanel.tsx');
+
+    // Both UI markers must exist exactly once each so a future edit cannot
+    // accidentally drop the surface or double-mount it.
+    const sectionCount = file.text.match(/data-testid=\"p2p-workflow-library-section\"/g)?.length ?? 0;
+    expect(sectionCount, 'Library section must be mounted exactly once').toBe(1);
+    const nameInputCount = file.text.match(/data-testid=\"p2p-workflow-name-input\"/g)?.length ?? 0;
+    expect(nameInputCount, 'Workflow name input must be mounted exactly once').toBe(1);
+    for (const testId of [
+      'p2p-workflow-library-new',
+      'p2p-workflow-library-duplicate',
+      'p2p-workflow-library-delete',
+      'p2p-workflow-library-list',
+    ]) {
+      expect(
+        file.text.includes(`data-testid="${testId}"`),
+        `Library action button must carry data-testid="${testId}"`,
+      ).toBe(true);
+    }
   });
 });

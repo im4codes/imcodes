@@ -724,6 +724,18 @@
         "add": "Añadir",
         "remove": "Eliminar",
         "empty": "Aún no hay ejecutables permitidos. Los nodos de script serán rechazados en bind."
+      },
+      "library": {
+        "title": "Biblioteca de flujos",
+        "hint": "Flujos guardados para esta sesión. El activo se envía en los lanzamientos P2P. Hasta {{max}} entradas.",
+        "new": "+ Nuevo",
+        "duplicate": "Duplicar",
+        "delete": "Eliminar",
+        "delete_confirm": "¿Eliminar el flujo de trabajo \"{{title}}\"? Esta acción no se puede deshacer.",
+        "copy_suffix": " (copia)",
+        "active_badge": "Activo",
+        "name_label": "Nombre del flujo",
+        "name_placeholder": "p. ej. Flujo auditoría + plan"
       }
     }
   },

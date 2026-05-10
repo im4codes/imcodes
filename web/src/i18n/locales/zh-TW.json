@@ -725,6 +725,18 @@
         "add": "新增",
         "remove": "移除",
         "empty": "尚未允許任何可執行檔。腳本節點將在 bind 階段被拒絕。"
+      },
+      "library": {
+        "title": "工作流庫",
+        "hint": "本工作階段儲存的工作流。已啟用的會用於 P2P 呼叫。最多 {{max}} 個。",
+        "new": "+ 新增",
+        "duplicate": "複製",
+        "delete": "刪除",
+        "delete_confirm": "確定刪除工作流「{{title}}」？此操作無法復原。",
+        "copy_suffix": "（副本）",
+        "active_badge": "已啟用",
+        "name_label": "工作流名稱",
+        "name_placeholder": "例如：稽核 + 計劃工作流"
       }
     }
   },

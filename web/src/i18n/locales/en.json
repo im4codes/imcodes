@@ -725,6 +725,18 @@
         "add": "Add",
         "remove": "Remove",
         "empty": "No executables allowed yet. Script nodes will be rejected at bind time."
+      },
+      "library": {
+        "title": "Workflow library",
+        "hint": "Saved workflows for this session. The active one is sent to P2P launches. Up to {{max}} entries.",
+        "new": "+ New",
+        "duplicate": "Duplicate",
+        "delete": "Delete",
+        "delete_confirm": "Delete workflow \"{{title}}\"? This cannot be undone.",
+        "copy_suffix": " (copy)",
+        "active_badge": "Active",
+        "name_label": "Workflow name",
+        "name_placeholder": "e.g. Audit + plan workflow"
       }
     }
   },
