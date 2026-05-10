@@ -153,6 +153,63 @@ describe('WsBridge', () => {
       expect(ws.closed).toBe(true);
     });
 
+    // Audit fix (78-server reconnect-storm investigation, 2026-05-11) —
+    // pinned regression for the auth-handshake race that produced
+    // "Daemon authenticated" log entries every ~500 ms in production
+    // (and `code:4001 reason:auth_required` on the daemon side). Daemon
+    // sends `auth` immediately followed by `daemon.hello` on every WS
+    // connect, and the previous async message handler let the second
+    // message race the DB lookup of the first.
+    it('does NOT 4001-close when auth and daemon.hello arrive back-to-back during DB lookup', async () => {
+      // Build a DB whose token-hash lookup is deferred so we can emit
+      // both messages BEFORE the query resolves — this is the production
+      // race window. Without the fix, daemon.hello hits
+      // `if (msg.type !== 'auth') ws.close(4001, 'auth_required')`
+      // because `this.authenticated` is still false at that moment.
+      let resolveQuery: (value: { token_hash: string } | null) => void = () => {};
+      const queryPromise = new Promise<{ token_hash: string } | null>((res) => { resolveQuery = res; });
+      const db = {
+        queryOne: () => queryPromise,
+        query: async () => [],
+        execute: async () => ({ changes: 1 }),
+        exec: async () => {},
+        transaction: async <T>(fn: (tx: import('../src/db/client.js').Database) => Promise<T>) => fn(db as unknown as import('../src/db/client.js').Database),
+        close: () => {},
+      } as unknown as import('../src/db/client.js').Database;
+
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, db, {} as never);
+
+      // Emit BOTH messages before the query resolves. The race only
+      // shows up under `await db.queryOne(...)` being pending when the
+      // second message handler runs.
+      ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token' }));
+      ws.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: serverId,
+        capabilities: [P2P_WORKFLOW_CAPABILITY_V1],
+        helloEpoch: 1,
+        sentAt: Date.now(),
+      }));
+      // Let microtasks settle so the auth handler is parked at its
+      // `await db.queryOne(...)` and the daemon.hello handler has had a
+      // chance to run if the bug were present.
+      await flushAsync();
+
+      // Pre-fix expectation: ws.closed === true with code 4001. Post-fix
+      // expectation: socket stays open and waits for auth to complete.
+      expect(ws.closed).toBe(false);
+      expect(ws.closeCode).toBeUndefined();
+
+      // Now resolve the DB query and let auth complete.
+      resolveQuery({ token_hash: 'valid-hash' });
+      await flushAsync();
+
+      expect(bridge.isAuthenticated).toBe(true);
+      expect(ws.closed).toBe(false);
+    });
+
     it('sends daemon.upgrade when daemon is older than server version', async () => {
       vi.useFakeTimers();
       process.env.APP_VERSION = '2026.4.905-dev.877';

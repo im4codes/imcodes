@@ -367,6 +367,27 @@ export class WsBridge {
   private mobileSockets = new Set<WebSocket>();
   private queue: string[] = [];
   private authTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Audit fix (78-server reconnect-storm investigation, 2026-05-11) —
+   * holds the in-flight auth promise so concurrent message handlers
+   * don't race against the DB lookup.
+   *
+   * The daemon sends `auth` immediately followed by `daemon.hello` on
+   * every WS connect (`server-link.ts:201-202`). With the previous
+   * `async` message handler, both messages started executing in
+   * parallel; the `auth` handler awaited `db.queryOne(...)` for the
+   * token check, and while that await was pending the `daemon.hello`
+   * handler observed `this.authenticated === false` and
+   * `msg.type !== 'auth'` → `ws.close(4001, 'auth_required')`. The
+   * server logged "Daemon authenticated" (success path) AFTER the
+   * close, but the daemon saw the 4001 first and reconnected — every
+   * ~500 ms — producing the auth-storm we found in production logs.
+   *
+   * Fix: every message handler awaits this promise before evaluating
+   * `this.authenticated`, so the `daemon.hello` cannot run until the
+   * auth check has settled.
+   */
+  private authPromise: Promise<void> | null = null;
   private browserRateLimiter = new MemoryRateLimiter();
 
   /** browser socket → session name → raw-enabled flag */
@@ -868,6 +889,10 @@ export class WsBridge {
     }
     this.daemonWs = ws;
     this.authenticated = false;
+    // New connection: drop any auth promise from a prior connection so
+    // late-arriving messages don't await a stale (and possibly resolved
+    // for a different `ws`) auth.
+    this.authPromise = null;
 
     // Auth timeout
     this.authTimer = setTimeout(() => {
@@ -891,6 +916,19 @@ export class WsBridge {
         return;
       }
 
+      // Audit fix (78-server reconnect-storm) — wait for any in-flight
+      // auth handshake before evaluating `this.authenticated`. Without
+      // this, `daemon.hello` (sent back-to-back with `auth` by every
+      // daemon) raced the auth DB lookup and was rejected with
+      // `ws.close(4001, 'auth_required')` even though auth was about to
+      // succeed milliseconds later. See `authPromise` field doc above.
+      if (this.authPromise) {
+        try { await this.authPromise; } catch { /* ignore — closed below */ }
+        // The connection may have been closed while we awaited (auth
+        // failed / timed out / replaced). Bail out before processing.
+        if (this.daemonWs !== ws) return;
+      }
+
       if (!this.authenticated) {
         if (msg.type !== 'auth' || typeof msg.token !== 'string' || typeof msg.serverId !== 'string') {
           ws.close(4001, 'auth_required');
@@ -898,15 +936,35 @@ export class WsBridge {
         }
         if (this.authTimer) clearTimeout(this.authTimer);
 
+        // Capture the auth flow in `authPromise` so concurrent message
+        // handlers (the `daemon.hello` that arrives ~1 ms after `auth`)
+        // can `await` it instead of racing the DB lookup. The promise
+        // ALWAYS resolves (never rejects) — failure modes are signaled
+        // via `ws.close()` + `this.daemonWs = null`, which the awaiting
+        // handlers detect with their `daemonWs !== ws` bail-out check.
+        // Resolving (vs rejecting) avoids unhandled-rejection warnings
+        // when no concurrent handler is currently awaiting.
+        let resolveAuth!: () => void;
+        this.authPromise = new Promise<void>((res) => { resolveAuth = res; });
+
         const tokenHash = sha256Hex(msg.token);
-        const server = await db.queryOne<{ token_hash: string; user_id?: string }>(
-          'SELECT token_hash, user_id FROM servers WHERE id = $1',
-          [this.serverId],
-        );
+        let server: { token_hash: string; user_id?: string } | null = null;
+        try {
+          server = await db.queryOne<{ token_hash: string; user_id?: string }>(
+            'SELECT token_hash, user_id FROM servers WHERE id = $1',
+            [this.serverId],
+          );
+        } catch (err) {
+          resolveAuth();
+          this.authPromise = null;
+          throw err;
+        }
 
         if (!server || server.token_hash !== tokenHash) {
           logger.warn({ serverId: this.serverId }, 'Daemon auth failed');
           ws.close(4001, 'auth_failed');
+          resolveAuth();
+          this.authPromise = null;
           return;
         }
 
@@ -1028,6 +1086,13 @@ export class WsBridge {
         this.broadcastToBrowsers(JSON.stringify({ type: MSG_DAEMON_ONLINE }));
         this.startAckHousekeepingIfNeeded();
 
+        // Audit fix (78-server reconnect-storm) — release waiters now
+        // that auth + replay are complete. Concurrent message handlers
+        // (e.g. the `daemon.hello` that landed before auth finished)
+        // will resume past their `await this.authPromise` and observe
+        // `this.authenticated === true`.
+        resolveAuth();
+        this.authPromise = null;
         return;
       }
 
@@ -1088,6 +1153,12 @@ export class WsBridge {
       if (this.daemonWs === ws) {
         this.daemonWs = null;
         this.authenticated = false;
+        // Audit fix (78-server reconnect-storm) — drop the auth promise
+        // so the next reconnect's message handlers don't await a stale
+        // pending promise. If auth was still in flight when the socket
+        // closed, the awaiting handlers will fall through and observe
+        // `this.daemonWs !== ws` and bail out.
+        this.authPromise = null;
         this.recentTextBySession.clear();
         this.activeMainSessions.clear();
         this.activeSubSessions.clear();
@@ -2889,6 +2960,7 @@ export class WsBridge {
       try { this.daemonWs.close(4001, 'token_rotated'); } catch { /* ignore */ }
       this.daemonWs = null;
       this.authenticated = false;
+      this.authPromise = null;
       this.daemonP2pWorkflowCapabilities = null;
     }
   }
