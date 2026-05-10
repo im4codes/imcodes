@@ -151,6 +151,29 @@ describe('SubSessionWindow metadata wiring', () => {
     activeToolCallMock = false;
   });
 
+  it('exposes the accent color as a CSS variable on the window root', () => {
+    const { container } = render(
+      <SubSessionWindow
+        sub={makeSubSession()}
+        ws={ws}
+        connected={true}
+        active={true}
+        accentColor="#34d399"
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    const root = container.querySelector('.subsession-window') as HTMLElement;
+    expect(root.style.getPropertyValue('--subsession-accent-color')).toBe('#34d399');
+  });
+
   it('passes model, level, and quota metadata through for transport sub-sessions', async () => {
     const sub = makeSubSession({
       type: 'codex-sdk',

@@ -38,6 +38,7 @@ import {
 } from '../desktop-window-maximize.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
+import { DEFAULT_SUBSESSION_ACCENT_COLOR } from '../subsession-accent-colors.js';
 
 type GetMaximizeBounds = () => WorkspaceBounds | null;
 
@@ -87,6 +88,7 @@ interface Props {
   detectedModelHint?: string;
   /** Whether this sub-session is participating in an active P2P discussion. */
   inP2p?: boolean;
+  accentColor?: string;
 }
 
 type ViewMode = 'terminal' | 'chat';
@@ -158,7 +160,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onTransportConfigSaved, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, detectedModelHint, inP2p,
+  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onTransportConfigSaved, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, detectedModelHint, inP2p, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR,
 }: Props) {
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
@@ -540,6 +542,7 @@ export function SubSessionWindow({
 
   const style: Record<string, string | number> = isMobile
     ? {
+        '--subsession-accent-color': accentColor,
         position: 'fixed',
         top: 'var(--sat, 0px)',
         left: 0,
@@ -548,7 +551,7 @@ export function SubSessionWindow({
         height: `calc(${vvh}px - var(--sat, 0px) - ${controlsHeight}px)`,
         zIndex,
       }
-    : { position: 'fixed', left: displayGeom.x, top: displayGeom.y, width: displayGeom.w, height: displayGeom.h, zIndex };
+    : { '--subsession-accent-color': accentColor, position: 'fixed', left: displayGeom.x, top: displayGeom.y, width: displayGeom.w, height: displayGeom.h, zIndex };
 
   return (
     <div

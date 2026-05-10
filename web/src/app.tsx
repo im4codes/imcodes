@@ -58,6 +58,10 @@ import { SessionTree } from './components/SessionTree.js';
 import { P2pRingProgress } from './components/P2pRingProgress.js';
 import { useUnreadCounts } from './hooks/useUnreadCounts.js';
 import { SidebarPinnedPanel } from './components/SidebarPinnedPanel.js';
+import {
+  DEFAULT_SUBSESSION_ACCENT_COLOR,
+  getSubSessionAccentColorMap,
+} from './subsession-accent-colors.js';
 import type { PanelRenderContext } from './components/PinnedPanelRegistry.js';
 import './components/pinnedPanelTypes.js'; // register all panel types
 import {
@@ -3051,6 +3055,31 @@ export function App() {
     subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession })),
     [subSessions]
   );
+  const [subSessionVisualOrderIds, setSubSessionVisualOrderIds] = useState<string[]>([]);
+  const handleSubSessionVisualOrderChange = useCallback((ids: string[]) => {
+    setSubSessionVisualOrderIds((prev) => {
+      if (prev.length === ids.length && prev.every((id, index) => id === ids[index])) return prev;
+      return ids;
+    });
+  }, []);
+  const visibleSubSessionAccentColors = useMemo(
+    () => {
+      const byId = new Map(visibleSubSessions.map((sub) => [sub.id, sub]));
+      const seen = new Set<string>();
+      const ordered = subSessionVisualOrderIds
+        .map((id) => byId.get(id))
+        .filter((sub): sub is typeof visibleSubSessions[number] => {
+          if (!sub || seen.has(sub.id)) return false;
+          seen.add(sub.id);
+          return true;
+        });
+      for (const sub of visibleSubSessions) {
+        if (!seen.has(sub.id)) ordered.push(sub);
+      }
+      return getSubSessionAccentColorMap(ordered);
+    },
+    [subSessionVisualOrderIds, visibleSubSessions],
+  );
 
   const visiblePinnedPanels = useMemo(() =>
     pinnedPanels.filter((p) => (
@@ -3689,6 +3718,7 @@ export function App() {
                 desktopLayoutCapable={desktopLayoutCapable}
                 collapsed={subSessionBarCollapsed}
                 onCollapsedChange={setSubSessionBarCollapsed}
+                onVisualOrderChange={handleSubSessionVisualOrderChange}
                 idleFlashTokens={idleFlashTokens}
                 onOpen={toggleSubSession}
                 onClose={closeSubSessionAndClearMaximized}
@@ -4236,6 +4266,7 @@ export function App() {
               serverId={selectedServerId ?? undefined}
               detectedModelHint={detectedModels.get(sub.sessionName)}
               inP2p={p2pSessionLabels.has(sub.sessionName)}
+              accentColor={visibleSubSessionAccentColors.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
               pendingPrefillText={pendingPrefills[sub.sessionName] ?? null}
               onPendingPrefillApplied={() => setPendingPrefills((prev) => {
                 if (!(sub.sessionName in prev)) return prev;

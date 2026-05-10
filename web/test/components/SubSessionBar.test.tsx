@@ -3,7 +3,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
-import { cleanup, fireEvent, render } from '@testing-library/preact';
+import { cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -15,7 +15,12 @@ vi.mock('react-i18next', () => ({
 }));
 
 vi.mock('../../src/components/SubSessionCard.js', () => ({
-  SubSessionCard: () => null,
+  SubSessionCard: ({ sub, accentColor }: { sub: SubSession; accentColor?: string }) => (
+    <div
+      data-testid={`subsession-preview-${sub.id}`}
+      style={{ '--subsession-accent-color': accentColor } as any}
+    />
+  ),
 }));
 
 vi.mock('../../src/components/P2pProgressCard.js', () => ({
@@ -33,6 +38,7 @@ vi.mock('../../src/api.js', () => ({
 
 import { SubSessionBar } from '../../src/components/SubSessionBar.js';
 import type { SubSession } from '../../src/hooks/useSubSessions.js';
+import { SUBSESSION_ACCENT_COLORS } from '../../src/subsession-accent-colors.js';
 
 function makeSubSession(overrides: Partial<SubSession> = {}): SubSession {
   return {
@@ -148,6 +154,98 @@ describe('SubSessionBar', () => {
     }
     const runningCard = runningView.container.querySelector('.subsession-card') as HTMLButtonElement;
     expect(runningCard.className).toContain('subcard-running-pulse');
+  });
+
+  it('assigns ordered accent colors to collapsed buttons and cycles after the palette', () => {
+    const subSessions = Array.from({ length: 16 }, (_, index) => makeSubSession({
+      id: `sub-${index + 1}`,
+      sessionName: `deck_sub_sub-${index + 1}`,
+      label: `worker-${index + 1}`,
+    }));
+
+    const view = render(
+      <SubSessionBar
+        subSessions={subSessions}
+        openIds={new Set()}
+        collapsed={true}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    const buttons = Array.from(view.container.querySelectorAll('.subsession-card')) as HTMLElement[];
+    expect(buttons).toHaveLength(16);
+    expect(buttons[0].style.getPropertyValue('--subsession-accent-color')).toBe(SUBSESSION_ACCENT_COLORS[0]);
+    expect(buttons[14].style.getPropertyValue('--subsession-accent-color')).toBe(SUBSESSION_ACCENT_COLORS[14]);
+    expect(buttons[15].style.getPropertyValue('--subsession-accent-color')).toBe(SUBSESSION_ACCENT_COLORS[0]);
+  });
+
+  it('passes the same ordered accent colors to expanded preview cards', () => {
+    const subSessions = [
+      makeSubSession({ id: 'sub-a', sessionName: 'deck_sub_sub-a', label: 'a' }),
+      makeSubSession({ id: 'sub-b', sessionName: 'deck_sub_sub-b', label: 'b' }),
+    ];
+
+    const view = render(
+      <SubSessionBar
+        subSessions={subSessions}
+        openIds={new Set()}
+        collapsed={false}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    expect((view.getByTestId('subsession-preview-sub-a') as HTMLElement).style.getPropertyValue('--subsession-accent-color')).toBe(SUBSESSION_ACCENT_COLORS[0]);
+    expect((view.getByTestId('subsession-preview-sub-b') as HTMLElement).style.getPropertyValue('--subsession-accent-color')).toBe(SUBSESSION_ACCENT_COLORS[1]);
+  });
+
+  it('recalculates accent colors and reports visual order after drag reorder', async () => {
+    const onVisualOrderChange = vi.fn();
+    const subSessions = [
+      makeSubSession({ id: 'sub-a', sessionName: 'deck_sub_sub-a', label: 'a' }),
+      makeSubSession({ id: 'sub-b', sessionName: 'deck_sub_sub-b', label: 'b' }),
+    ];
+
+    const view = render(
+      <SubSessionBar
+        subSessions={subSessions}
+        openIds={new Set()}
+        collapsed={false}
+        onVisualOrderChange={onVisualOrderChange}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    const wraps = Array.from(view.container.querySelectorAll('.subcard-drag-wrap')) as HTMLElement[];
+    const dataTransfer = { effectAllowed: '', dropEffect: '' };
+    fireEvent.dragStart(wraps[0], { dataTransfer });
+    fireEvent.dragOver(wraps[1], { dataTransfer });
+
+    await waitFor(() => {
+      expect((view.getByTestId('subsession-preview-sub-b') as HTMLElement).style.getPropertyValue('--subsession-accent-color')).toBe(SUBSESSION_ACCENT_COLORS[0]);
+      expect((view.getByTestId('subsession-preview-sub-a') as HTMLElement).style.getPropertyValue('--subsession-accent-color')).toBe(SUBSESSION_ACCENT_COLORS[1]);
+      expect(onVisualOrderChange).toHaveBeenLastCalledWith(['sub-b', 'sub-a']);
+    });
   });
 
   it('shows idle flash on collapsed buttons only when the token increments after mount', () => {

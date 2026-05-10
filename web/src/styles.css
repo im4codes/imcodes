@@ -1037,7 +1037,7 @@ body {
 .subcard-drag-wrap:active { cursor: grabbing; }
 
 /* Individual card */
-.subcard { width: 350px; height: 250px; min-width: 350px; background: #0f1117; border: 1px solid #334155; border-radius: 8px; cursor: pointer; transition: border-color 0.15s, box-shadow 0.15s; display: flex; flex-direction: column; isolation: isolate; }
+.subcard { width: 350px; height: 250px; min-width: 350px; background: #0f1117; border: 1px solid #334155; border-top: 3px solid var(--subsession-accent-color, #38bdf8); border-radius: 8px; cursor: pointer; transition: border-color 0.15s, box-shadow 0.15s; display: flex; flex-direction: column; isolation: isolate; }
 .subcard-header { border-radius: 8px 8px 0 0; overflow: hidden; }
 .subcard:hover { border-color: #475569; box-shadow: 0 2px 12px rgba(0,0,0,0.4); }
 .subcard-open { border-color: #334d6b; }
@@ -1048,6 +1048,11 @@ body {
 @keyframes subcard-focus-glow { 0%, 100% { box-shadow: 0 0 8px #60a5faaa, 0 0 20px #3b82f644; } 50% { box-shadow: 0 0 16px #60a5facc, 0 0 32px #3b82f666; } }
 .subcard-focused:not(.subcard-running-pulse) { border-color: #60a5fa; border-width: 2px; box-shadow: 0 0 8px #60a5faaa, 0 0 20px #3b82f644; }
 .subcard-focused.subcard-running-pulse { border-width: 2px; box-shadow: 0 0 12px #60a5faaa, 0 0 24px #3b82f644; }
+.subcard,
+.subcard:hover,
+.subcard-open,
+.subcard-focused,
+.subcard-running-pulse { border-top-color: var(--subsession-accent-color, #38bdf8) !important; border-top-width: 3px; }
 .subcard:not(.subcard-running-pulse):not(.subcard-focused) { transition: border-color 0.3s ease-out, box-shadow 0.3s ease-out; }
 
 @keyframes idle-flash-opacity { 0%, 100% { opacity: 0; } 50% { opacity: 1; } }
@@ -1119,9 +1124,13 @@ body {
 /* Quick input trigger in shortcuts row: hidden by default, shown when shell input is hidden */
 .shell-quick-trigger { display: none !important; }
 .kb-open .shell-terminal-pane .shell-quick-trigger { display: inline-flex !important; color: #fbbf24 !important; }
-.subsession-card { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: 52px; min-height: 52px; padding: 6px 10px; background: #1a2233; border: 1px solid #334155; border-radius: 8px; color: #94a3b8; cursor: pointer; font-family: inherit; font-size: 11px; transition: all 0.15s; flex-shrink: 0; position: relative; isolation: isolate; overflow: hidden; }
+.subsession-card { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: 52px; min-height: 52px; padding: 6px 10px; background: #1a2233; border: 1px solid #334155; border-top: 3px solid var(--subsession-accent-color, #38bdf8); border-radius: 8px; color: #94a3b8; cursor: pointer; font-family: inherit; font-size: 11px; transition: all 0.15s; flex-shrink: 0; position: relative; isolation: isolate; overflow: hidden; }
 .subsession-card:hover, .subsession-card.open { border-color: #3b82f6; background: #1e3a5f; color: #93c5fd; }
 .subsession-card.open { transform: scale(1.12); z-index: 1; box-shadow: 0 0 8px rgba(59,130,246,0.4); }
+.subsession-card,
+.subsession-card:hover,
+.subsession-card.open,
+.subsession-card.subcard-running-pulse { border-top-color: var(--subsession-accent-color, #38bdf8) !important; border-top-width: 3px; }
 .subsession-card-icon { font-size: 13px; font-weight: 700; letter-spacing: -0.5px; line-height: 1; }
 .subsession-card-label { font-size: 10px; color: #64748b; }
 .subsession-card.open .subsession-card-label { color: #93c5fd; }
@@ -1132,8 +1141,8 @@ body {
 .subsession-card-ctx-fill { display: block; height: 100%; background: #3b82f6; border-radius: 1px; transition: width 0.3s; }
 
 /* ── Sub-session window ───────────────────────────────────────────────────── */
-.subsession-window { display: flex; flex-direction: column; background: #0f1117; border: 1px solid #334155; border-radius: 8px; box-shadow: 0 8px 32px rgba(0,0,0,0.6); overflow: hidden; min-width: 300px; min-height: 200px; isolation: isolate; }
-.subsession-window-maximized { border: 2px solid #3b82f6; box-shadow: 0 0 0 1px rgba(96,165,250,0.45), 0 8px 32px rgba(0,0,0,0.6); box-sizing: border-box; }
+.subsession-window { display: flex; flex-direction: column; background: #0f1117; border: 1px solid var(--subsession-accent-color, #38bdf8); border-radius: 8px; box-shadow: 0 8px 32px rgba(0,0,0,0.6); overflow: hidden; min-width: 300px; min-height: 200px; isolation: isolate; }
+.subsession-window-maximized { border: 2px solid var(--subsession-accent-color, #38bdf8); box-shadow: 0 0 0 1px rgba(15,23,42,0.75), 0 8px 32px rgba(0,0,0,0.6); box-sizing: border-box; }
 .subsession-header { display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: #1a2233; border-bottom: 1px solid #1e293b; cursor: move; user-select: none; flex-shrink: 0; }
 .subsession-drag-icon { color: #475569; font-size: 16px; cursor: grab; }
 .subsession-title { font-size: 12px; color: #94a3b8; font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

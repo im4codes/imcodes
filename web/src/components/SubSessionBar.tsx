@@ -29,6 +29,10 @@ import {
   createSubSessionEntryGestureController,
   type SubSessionEntryGestureController,
 } from '../subsession-entry-gesture.js';
+import {
+  DEFAULT_SUBSESSION_ACCENT_COLOR,
+  getSubSessionAccentColorMap,
+} from '../subsession-accent-colors.js';
 
 interface DaemonStats {
   daemonVersion?: string | null;
@@ -50,6 +54,7 @@ type DiscussionSummary = P2pProgressDiscussion & {
 
 interface CollapsedSubSessionButtonProps {
   sub: SubSession;
+  accentColor: string;
   isOpen: boolean;
   idleFlashToken: number;
   usage?: { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string };
@@ -95,6 +100,7 @@ interface Props {
   focusedSubId?: string | null;
   collapsed?: boolean;
   onCollapsedChange?: (collapsed: boolean) => void;
+  onVisualOrderChange?: (ids: string[]) => void;
   /** Quick data for compact SessionControls in cards. */
   quickData?: import('./QuickInputPanel.js').UseQuickDataResult;
   /** All sessions — for @ picker. */
@@ -131,7 +137,7 @@ function formatUptime(seconds: number): string {
   return d > 0 ? `${d}d ${h}h` : `${h}h`;
 }
 
-function CollapsedSubSessionButton({ sub, isOpen, idleFlashToken, usage, inP2p, onEntryPointerDown, onEntryClick, onEntryDoubleClick, t, detectedModel }: CollapsedSubSessionButtonProps) {
+function CollapsedSubSessionButton({ sub, accentColor, isOpen, idleFlashToken, usage, inP2p, onEntryPointerDown, onEntryClick, onEntryDoubleClick, t, detectedModel }: CollapsedSubSessionButtonProps) {
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
@@ -159,6 +165,7 @@ function CollapsedSubSessionButton({ sub, isOpen, idleFlashToken, usage, inP2p, 
       onClick={(event) => onEntryClick(sub.id, event)}
       onDblClick={(event) => onEntryDoubleClick(sub.id, event)}
       title={label + (model ? ` · ${model}` : '') + (ctxPct > 0 ? ` · ctx ${ctxPct.toFixed(0)}%` : '')}
+      style={{ '--subsession-accent-color': accentColor } as JSX.CSSProperties}
     >
       {activeIdleFlashToken ? <IdleFlashLayer key={`subbutton-idle-${activeIdleFlashToken}`} variant="frame" /> : null}
       <span class="subsession-card-icon">{abbr}</span>
@@ -176,7 +183,7 @@ function CollapsedSubSessionButton({ sub, isOpen, idleFlashToken, usage, inP2p, 
   );
 }
 
-export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, idleFlashTokens, onOpen, onClose, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
+export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, idleFlashTokens, onOpen, onClose, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
   const { t } = useTranslation();
   const isMobile = !desktopLayoutCapable;
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
@@ -302,10 +309,16 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     const sessionMap = new Map(subSessions.map((s) => [s.id, s]));
     return dragOrder.map((id) => sessionMap.get(id)).filter(Boolean) as SubSession[];
   }, [subSessions, dragOrder]);
+  const accentColorsById = useMemo(() => getSubSessionAccentColorMap(orderedSessions), [orderedSessions]);
+  const orderedSessionIds = useMemo(() => orderedSessions.map((sub) => sub.id), [orderedSessions]);
   const orderedSessionsRef = useRef(orderedSessions);
   orderedSessionsRef.current = orderedSessions;
   const dragOrderRef = useRef(dragOrder);
   dragOrderRef.current = dragOrder;
+
+  useEffect(() => {
+    onVisualOrderChange?.(orderedSessionIds);
+  }, [onVisualOrderChange, orderedSessionIds]);
 
   useEffect(() => {
     save(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY, collapsed);
@@ -659,6 +672,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
             <CollapsedSubSessionButton
               key={sub.id}
               sub={sub}
+              accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
               isOpen={openIds.has(sub.id)}
               idleFlashToken={idleFlashTokens?.get(sub.sessionName) ?? 0}
               usage={subUsages?.get(`deck_sub_${sub.id}`)}
@@ -738,6 +752,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                 serverId={serverId}
                 onTransportConfigSaved={onSubTransportConfigSaved}
                 inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
+                accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
               />
             </div>
           ))}

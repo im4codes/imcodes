@@ -4,6 +4,7 @@
  * Right-edge drag handle lets user resize width independently per card.
  */
 import { useRef, useState, useCallback, useMemo, useEffect } from 'preact/hooks';
+import type { JSX } from 'preact';
 import { useTranslation } from 'react-i18next';
 import { ChatView } from './ChatView.js';
 import { resolveContextWindow } from '../model-context.js';
@@ -24,6 +25,7 @@ import { extractLatestUsage } from '../usage-data.js';
 import { USAGE_CONTEXT_WINDOW_SOURCES } from '@shared/usage-context-window.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
+import { DEFAULT_SUBSESSION_ACCENT_COLOR } from '../subsession-accent-colors.js';
 
 const TYPE_ICON: Record<string, string> = {
   'claude-code': '⚡',
@@ -71,6 +73,7 @@ interface Props {
   onTransportConfigSaved?: (subId: string, transportConfig: Record<string, unknown> | null) => void;
   /** Whether this sub-session is participating in an active P2P discussion. */
   inP2p?: boolean;
+  accentColor?: string;
 }
 
 function loadCardW(id: string, fallback: number): number {
@@ -109,7 +112,7 @@ function buildCompactSessionInfo(sub: SubSession): SessionInfo {
   };
 }
 
-export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlashToken, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId, onTransportConfigSaved, inP2p }: Props) {
+export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlashToken, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId, onTransportConfigSaved, inP2p, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR }: Props) {
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const isShell = sub.type === 'shell' || sub.type === 'script';
@@ -323,7 +326,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   return (
     <div
       class={`subcard${isOpen ? ' subcard-open' : ''}${isFocused ? ' subcard-focused' : ''}${busy ? ' subcard-running-pulse' : ''}${quickPanelOpen ? ' subcard-quick-open' : ''}${overlayOpen ? ' subcard-overlay-open' : ''}`}
-      style={{ width: effectiveW, height: cardH, minWidth: effectiveW, position: 'relative' }}
+      style={{ width: effectiveW, height: cardH, minWidth: effectiveW, position: 'relative', '--subsession-accent-color': accentColor } as JSX.CSSProperties}
       onClick={() => { if (!draggingRef.current) onOpen(); }}
     >
       {activeIdleFlashToken ? <IdleFlashLayer key={`subcard-idle-${activeIdleFlashToken}`} variant="frame" /> : null}
