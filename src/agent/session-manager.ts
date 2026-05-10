@@ -1381,6 +1381,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
       let systemPrompt: string | undefined;
       let transportSettings: string | Record<string, unknown> | undefined;
       let effectiveRequestedModel = requestedTransportModel;
+      let restoredPresetContextWindow = s.presetContextWindow;
       const resolveRuntimeContextBootstrap = () => resolveTransportContextBootstrap({
         projectDir: s.projectDir,
         transportConfig: getSession(s.name)?.transportConfig ?? s.transportConfig ?? {},
@@ -1398,11 +1399,14 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         const { getQwenPresetTransportConfig } = await import('../daemon/cc-presets.js');
         const presetConfig = await getQwenPresetTransportConfig(s.ccPreset);
         extraEnv = { ...(extraEnv ?? {}), ...presetConfig.env };
-        if (presetConfig.availableModels?.length) availableQwenModels = presetConfig.availableModels;
-        if (!effectiveRequestedModel || (availableQwenModels.length > 0 && !availableQwenModels.includes(effectiveRequestedModel))) {
-          effectiveRequestedModel = presetConfig.model ?? availableQwenModels[0] ?? effectiveRequestedModel;
+        const presetModels = presetConfig.availableModels ?? [];
+        if (presetModels.length) availableQwenModels = presetModels;
+        const presetPreferredModel = presetConfig.model ?? presetModels[0];
+        if (presetPreferredModel && (!effectiveRequestedModel || !presetModels.length || !presetModels.includes(effectiveRequestedModel))) {
+          effectiveRequestedModel = presetPreferredModel;
         }
         transportSettings = presetConfig.settings;
+        restoredPresetContextWindow = presetConfig.contextWindow ?? restoredPresetContextWindow;
         // Override the qwen CLI's built-in "I am Qwen Code" identity with the
         // preset's runtime-facts prompt — without this, the model introduces
         // itself as Qwen / 通义千问 even when the turn is served by MiniMax.
@@ -1473,6 +1477,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
           ? undefined
           : (qwenRuntime?.authLimit ?? s.qwenAuthLimit),
         ...(availableQwenModels.length > 0 ? { qwenAvailableModels: availableQwenModels } : {}),
+        ...(restoredPresetContextWindow ? { presetContextWindow: restoredPresetContextWindow } : {}),
         ...getQwenDisplayMetadata({
           model: effectiveRequestedModel,
           authType: (s.providerId === 'qwen' && s.ccPreset)
