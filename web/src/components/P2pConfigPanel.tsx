@@ -75,6 +75,27 @@ export interface P2pConfigPanelCapabilitySource {
   getSnapshot(): P2pConfigPanelCapabilitySnapshot | null;
   /** Subscribe to snapshot changes; returns an unsubscribe function. */
   subscribe(listener: () => void): () => void;
+  /**
+   * Audit fix (7c2570e9 follow-up to e940d73f-a8e / N4) — single source
+   * of truth for "is the daemon capability state currently stale?".
+   *
+   * The panel previously computed staleness inline via
+   * `Date.now() - capabilitySnapshot.observedAt > TTL`. That broke the
+   * N4 fix because `observedAt` is set only on `daemon.hello`, which
+   * fires once at WS connect and on capability change — never on
+   * routine heartbeats. Long-lived browser pages tripped TTL forever.
+   *
+   * The WsClient implementation now keys staleness on a separate
+   * `daemonLastSeenAt` clock that is bumped by every daemon-originated
+   * message (whitelisted in `DAEMON_ORIGIN_MESSAGE_TYPES`). Routing
+   * panel staleness through this method ensures the panel and the WS
+   * client agree.
+   *
+   * Optional for backwards compatibility with tests that pass a plain
+   * object source — the panel falls back to the inline observedAt
+   * check when this method is absent.
+   */
+  isStale?(now?: number): boolean;
 }
 
 interface Props {
@@ -565,11 +586,21 @@ export function P2pConfigPanel({
   }, [daemonCapabilitySource]);
   useEffect(() => {
     if (!capabilitySnapshot) return;
-    const elapsed = Date.now() - capabilitySnapshot.observedAt;
-    const remaining = P2P_CAPABILITY_FRESHNESS_TTL_MS - elapsed;
-    if (remaining <= 0) return;
-    const timer = setTimeout(() => setCapabilityClockTick((tick) => tick + 1), remaining);
-    return () => clearTimeout(timer);
+    // Audit fix (7c2570e9 follow-up to e940d73f-a8e / N4) — re-evaluate
+    // freshness on a steady poll instead of a single timeout pinned to
+    // `observedAt`. Now that staleness is derived from the WS client's
+    // `daemonLastSeenAt` (which bumps on every daemon-originated message)
+    // the panel must re-render periodically so it picks up the moving
+    // freshness signal even when the snapshot object itself has not
+    // changed since the first `daemon.hello`.
+    //
+    // Poll cadence is half the TTL so the worst-case lag between daemon
+    // going silent and the banner appearing is bounded by `TTL + TTL/2`.
+    const interval = setInterval(
+      () => setCapabilityClockTick((tick) => tick + 1),
+      Math.max(1_000, Math.floor(P2P_CAPABILITY_FRESHNESS_TTL_MS / 2)),
+    );
+    return () => clearInterval(interval);
   }, [capabilitySnapshot]);
 
   const advancedEnvelopePreview = useMemo(() => {
@@ -609,8 +640,18 @@ export function P2pConfigPanel({
     return [...required];
   }, [advancedEnvelopePreview, hasAdvancedConfig]);
 
-  const capabilityStale = !capabilitySnapshot
-    || (Date.now() - capabilitySnapshot.observedAt) > P2P_CAPABILITY_FRESHNESS_TTL_MS;
+  // Audit fix (7c2570e9 follow-up to e940d73f-a8e / N4) — prefer the
+  // capability source's own `isStale()` so the panel and the WS client
+  // share one definition of staleness. Falls back to the legacy inline
+  // check (snapshot.observedAt + TTL) only when the source does not
+  // implement the new method (test fixtures that pass plain objects).
+  const capabilityStale = (() => {
+    if (!capabilitySnapshot) return true;
+    if (daemonCapabilitySource && typeof daemonCapabilitySource.isStale === 'function') {
+      return daemonCapabilitySource.isStale();
+    }
+    return (Date.now() - capabilitySnapshot.observedAt) > P2P_CAPABILITY_FRESHNESS_TTL_MS;
+  })();
   const missingCapabilities = useMemo(() => {
     if (!hasAdvancedConfig || capabilityStale || !capabilitySnapshot) return [] as string[];
     const have = new Set(capabilitySnapshot.capabilities);

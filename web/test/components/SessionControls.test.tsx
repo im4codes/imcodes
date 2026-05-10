@@ -253,6 +253,7 @@ const makeWs = (overrides: { capabilitySnapshot?: { daemonId: string; capabiliti
     }),
     getDaemonCapabilitySnapshot: vi.fn(() => capabilitySnapshot),
     onDaemonCapabilitySnapshot: vi.fn(() => () => {}),
+    isDaemonCapabilityStale: vi.fn(() => false),
     emit: (msg: unknown) => {
       handlers.forEach((handler) => handler(msg));
     },

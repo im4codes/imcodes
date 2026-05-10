@@ -3633,6 +3633,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         daemonCapabilitySource={ws ? {
           getSnapshot: () => ws.getDaemonCapabilitySnapshot(),
           subscribe: (listener) => ws.onDaemonCapabilitySnapshot(listener),
+          // Audit fix (7c2570e9 follow-up to e940d73f-a8e / N4) — expose
+          // the WS client's staleness judgment so the panel does not
+          // recompute it from `observedAt` (which only refreshes on
+          // `daemon.hello`). The WS client tracks a separate
+          // `daemonLastSeenAt` that is bumped on every daemon-originated
+          // message; this is the only definition that stays accurate
+          // during long-lived sessions.
+          isStale: (now) => ws.isDaemonCapabilityStale(now),
         } : null}
       />
     )}
