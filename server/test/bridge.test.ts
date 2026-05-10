@@ -2136,6 +2136,66 @@ describe('WsBridge', () => {
       expect(bridge.getDaemonP2pWorkflowCapabilities()).toBeNull();
     });
 
+    /*
+     * R3 v2 PR-σ — User feedback: "daemon 是正常的 一直报失联". The
+     * daemon only sends `daemon.hello` on (a) WS connect/reconnect and
+     * (b) capability change. The bridge forwarded each as it arrived
+     * but never replayed cached state, so any browser that opened
+     * AFTER the daemon's most recent hello never received one and its
+     * 30 s `capability_stale` TTL fired as a false-positive
+     * "lost contact with the daemon" banner — even though the daemon
+     * was healthy. The bridge now replays the cached hello to every
+     * newly-connected browser so the capability picture is consistent
+     * across late-joiners.
+     */
+    it('R3 v2 PR-σ — replays cached daemon.hello to a browser that connects AFTER the daemon hello arrived', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      // Daemon publishes capabilities BEFORE any browser connects.
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: serverId,
+        capabilities: [P2P_WORKFLOW_CAPABILITY_V1],
+        helloEpoch: 1,
+        sentAt: 555,
+      }));
+      await flushAsync();
+
+      // Now a browser connects — it must receive the cached hello as
+      // an opening message.
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'late-user', makeDb('valid-hash'));
+      await flushAsync();
+
+      const helloMessages = browserWs.sentStrings
+        .map((raw) => JSON.parse(raw))
+        .filter((msg) => msg.type === P2P_WORKFLOW_MSG.DAEMON_HELLO);
+      expect(helloMessages).toHaveLength(1);
+      expect(helloMessages[0]).toMatchObject({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: serverId,
+        capabilities: [P2P_WORKFLOW_CAPABILITY_V1],
+        helloEpoch: 1,
+        sentAt: 555,
+      });
+    });
+
+    it('R3 v2 PR-σ — does NOT replay daemon.hello when no daemon is connected yet', async () => {
+      const bridge = WsBridge.get(serverId);
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'first-user', makeDb('valid-hash'));
+      await flushAsync();
+
+      const helloMessages = browserWs.sentStrings
+        .map((raw) => JSON.parse(raw))
+        .filter((msg) => msg.type === P2P_WORKFLOW_MSG.DAEMON_HELLO);
+      expect(helloMessages).toHaveLength(0);
+    });
+
     it('forwards p2p.config.save from browser to daemon and registers a pending response', async () => {
       // PR-E: p2p.config.save must be registered alongside workflow messages
       // so the bridge default-deny no longer drops it. The browser ingress

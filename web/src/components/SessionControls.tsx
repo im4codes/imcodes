@@ -171,7 +171,26 @@ type ModelChoice = 'opus[1M]' | 'sonnet' | 'haiku';
 
 const INLINE_PASTE_TEXT_CHAR_LIMIT = 1200;
 
-type ComposerAttachment = { path: string; name: string };
+/*
+ * R3 v2 PR-ρ — Composer attachments now carry a per-composer sequence
+ * number `seq` (1, 2, 3, ...) so the user can reference them in chat
+ * text via short tags like `#1`, `#2`. The badge UI surfaces the tag
+ * (`#1 screenshot.png`) and the send-payload text-prepend uses
+ * `#1: screenshot.png` (mapping the short tag to the filename in one
+ * line) so the LLM sees both the short reference and the file identity
+ * once. The counter resets naturally on send because `clearComposer`
+ * clears the attachments array.
+ */
+type ComposerAttachment = { path: string; name: string; seq: number };
+
+/**
+ * Renumber attachments so `seq` is `1..N` in array order. Used after
+ * removing a middle attachment so the remaining ones renumber to stay
+ * consecutive (otherwise `#1`, `#3`, `#5` gaps would confuse users).
+ */
+function renumberAttachments(list: ComposerAttachment[]): ComposerAttachment[] {
+  return list.map((entry, index) => ({ ...entry, seq: index + 1 }));
+}
 
 function buildComposerDraftScope(activeSession: SessionInfo | null, subSessionId?: string): string | null {
   if (subSessionId && subSessionId.trim()) return `sub:${subSessionId.trim()}`;
@@ -193,7 +212,14 @@ function parseStoredComposerAttachments(raw: string | null): ComposerAttachment[
   try {
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed.flatMap((entry) => {
+    /*
+     * R3 v2 PR-ρ — Backward-compat: pre-PR-ρ stored entries have
+     * `{ path, name }` only (no `seq`). We renumber the surviving
+     * entries 1..N in array order so the badge labels stay
+     * consecutive across reloads even when the old entries lack
+     * `seq`.
+     */
+    const list: ComposerAttachment[] = parsed.flatMap((entry) => {
       if (!entry || typeof entry !== 'object') return [];
       const path = typeof (entry as { path?: unknown }).path === 'string'
         ? (entry as { path: string }).path.trim()
@@ -202,8 +228,9 @@ function parseStoredComposerAttachments(raw: string | null): ComposerAttachment[
         ? (entry as { name: string }).name.trim()
         : '';
       if (!path || !name) return [];
-      return [{ path, name }];
+      return [{ path, name, seq: 0 }];
     });
+    return renumberAttachments(list);
   } catch {
     return [];
   }
@@ -1718,9 +1745,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       const quoteBlock = quotes.map((q) => `> ${q.replace(/\n/g, '\n> ')}`).join('\n\n');
       text = text ? `${quoteBlock}\n\n${text}` : quoteBlock;
     }
-    // Prepend attachment references
+    // Prepend attachment references.
+    // R3 v2 PR-ρ — Replaced the verbose `@${path}` per-file prefix with
+    // a compact `#N: name` mapping line. The LLM sees the short tag
+    // (`#1`, `#2`, ...) and the filename once, so subsequent text
+    // references like "compare #1 and #2" resolve naturally. The full
+    // file content is still attached via the structured `attachments`
+    // payload field; the text prefix exists ONLY so the LLM can read
+    // the tag→filename mapping in-band.
     if (attachments.length > 0) {
-      const refs = attachments.map((a) => `@${a.path}`).join(' ');
+      const refs = attachments.map((a) => `#${a.seq}: ${a.name}`).join(' ');
       text = text ? `${refs} ${text}` : refs;
     }
     return { text, extra };
@@ -2176,7 +2210,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         const result = await uploadFile(serverId, file, (pct) => setUploadProgress(pct));
         if (result.attachment?.daemonPath) {
           uploadedAny = true;
-          setAttachments((prev) => [...prev, { path: result.attachment!.daemonPath, name: file.name }]);
+          // R3 v2 PR-ρ — Assign the next sequential `seq` so the badge
+          // and the text-prepend reference (#N) match the upload order.
+          setAttachments((prev) => [
+            ...prev,
+            { path: result.attachment!.daemonPath, name: file.name, seq: prev.length + 1 },
+          ]);
         }
       } catch (err) {
         console.error('[upload] failed:', err);
@@ -3091,12 +3130,24 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       {attachments.length > 0 && (
         <div class="attachment-badges">
           {attachments.map((a, i) => (
-            <span key={a.path} class="attachment-badge" title={a.path}>
-              <span class="attachment-badge-icon">📎</span>
+            <span
+              key={a.path}
+              class="attachment-badge"
+              title={`#${a.seq} ${a.path}`}
+              data-attachment-seq={a.seq}
+            >
+              {/*
+                * R3 v2 PR-ρ — Surface the per-composer sequence number
+                * as a `#N` prefix so the user can reference the file in
+                * chat text via the same short tag (`#1`, `#2`, ...). The
+                * counter resets on send (the attachments array is wiped
+                * by `clearComposer`).
+                */}
+              <span class="attachment-badge-icon" data-testid={`attachment-tag-${a.seq}`}>#{a.seq}</span>
               <span class="attachment-badge-name">{a.name}</span>
               <button
                 class="attachment-badge-remove"
-                onClick={() => setAttachments((prev) => prev.filter((_, j) => j !== i))}
+                onClick={() => setAttachments((prev) => renumberAttachments(prev.filter((_, j) => j !== i)))}
                 title={t('common.delete')}
               >×</button>
             </span>

@@ -2294,6 +2294,145 @@ describe('p2p-workflow reverse-regression', () => {
    *      verbose generic — anchored on the actionable phrase
    *      "saved configs still work" so it doesn't drift back.
    */
+  /*
+   * Reverse-regression #81 (R3 v2 PR-ρ — User feedback: "上传或者文件
+   * 的时候, 要增加个 id-[number] 的功能, 方便发文字的时候引用那个
+   * 文件" + "id 还是原来的 id 只是加一个下划线和数字, 每次上传递增.
+   * 发送后从 1 重新开始. #1 图片 #2 图片 这样 llm 可以快速理解并
+   * 引用图片"). Each composer attachment now carries a sequential
+   * `seq` (1, 2, 3, ...) surfaced as a `#N` prefix in the badge AND
+   * folded into the send-payload text as `#N: name` so the LLM has a
+   * short reference tag for each attached file. The counter resets on
+   * send because `clearComposer` wipes the attachments array.
+   *
+   * Locked invariants:
+   *   1. `ComposerAttachment` type declares `seq: number`.
+   *   2. `renumberAttachments` helper exists so removal renumbers the
+   *      surviving entries 1..N consecutively (no gaps).
+   *   3. `setAttachments` upload path appends with
+   *      `seq: prev.length + 1`.
+   *   4. The badge UI renders the seq via testid `attachment-tag-${seq}`
+   *      with text `#N`.
+   *   5. The send-payload text-prepend uses `#${seq}: ${name}` (NOT the
+   *      legacy `@${path}`).
+   */
+  /*
+   * Reverse-regression #82 (R3 v2 PR-σ — User feedback: "canvas 要全宽,
+   * daemon 是正常的 一直报失联").
+   *
+   * Two unrelated fixes shipped together:
+   *
+   * A. Canvas full-width — PR-ο capped the SVG at `CANVAS_VIEW_WIDTH`
+   *    (720 px) which left a permanent empty gutter to the right of
+   *    the canvas. The fix: ResizeObserver-driven viewBox extents
+   *    that track the measured container width, so the canvas fills
+   *    the panel's full width AND nodes stay at the authored
+   *    132×62 px (1 viewBox unit = 1 screen pixel at zoom=1).
+   *
+   * B. False-positive `capability_stale` banner — the daemon only
+   *    sent `daemon.hello` on (a) WS connect/reconnect and (b)
+   *    capability change, and the server bridge never replayed cached
+   *    state to newly-connected browsers. Browsers that opened AFTER
+   *    the daemon's most recent hello never received one and the 30 s
+   *    TTL fired as "lost contact" even though the daemon was healthy.
+   *    The bridge now replays the cached hello in
+   *    `handleBrowserConnection`.
+   *
+   * Locked invariants:
+   *   1. Canvas: `containerRef` + `containerWidth` state + ResizeObserver
+   *      effect; viewBox extents derived from `containerWidth / clampedZoom`;
+   *      legacy `maxWidth: CANVAS_VIEW_WIDTH` cap is GONE.
+   *   2. Server: `handleBrowserConnection` checks
+   *      `this.daemonP2pWorkflowCapabilities` and replays a
+   *      `P2P_WORKFLOW_MSG.DAEMON_HELLO` to the new browser when one
+   *      is cached.
+   */
+  it('#82 canvas full-width via ResizeObserver + bridge replays cached hello (R3 v2 PR-σ)', () => {
+    // (A) Canvas full-width via ResizeObserver.
+    const canvas = read('web/src/components/AdvancedWorkflowCanvasEditor.tsx');
+    expect(
+      /containerRef\s*=\s*useRef<HTMLDivElement\s*\|\s*null>\(null\)/.test(canvas.text),
+      'Canvas must declare a containerRef for ResizeObserver to track',
+    ).toBe(true);
+    expect(
+      /\[containerWidth,\s*setContainerWidth\]\s*=\s*useState<number>/.test(canvas.text),
+      'Canvas must hold containerWidth in useState for the dynamic viewBox',
+    ).toBe(true);
+    expect(
+      /new\s+ResizeObserver\(/.test(canvas.text),
+      'Canvas must use ResizeObserver to track the parent container width',
+    ).toBe(true);
+    // viewBox extents derived from containerWidth (modulo zoom).
+    expect(
+      /Math\.max\(CANVAS_VIEW_WIDTH,\s*containerWidth\)\s*\/\s*clampedZoom/.test(canvas.text),
+      'Canvas viewBox width must derive from max(CANVAS_VIEW_WIDTH, containerWidth) / clampedZoom',
+    ).toBe(true);
+    // The PR-ο maxWidth cap MUST be gone.
+    expect(
+      /maxWidth:\s*CANVAS_VIEW_WIDTH/.test(canvas.text),
+      'Legacy `maxWidth: CANVAS_VIEW_WIDTH` cap MUST be removed so the canvas fills the panel',
+    ).toBe(false);
+
+    // (B) Bridge replays cached hello on browser connect.
+    const bridge = read('server/src/ws/bridge.ts');
+    const handlerAnchor = bridge.text.indexOf('handleBrowserConnection(ws: WebSocket');
+    expect(handlerAnchor, 'handleBrowserConnection must exist in bridge').toBeGreaterThan(0);
+    const handlerWindow = bridge.text.slice(handlerAnchor, handlerAnchor + 4000);
+    expect(
+      /this\.daemonP2pWorkflowCapabilities/.test(handlerWindow),
+      'handleBrowserConnection must inspect the cached daemon capabilities',
+    ).toBe(true);
+    expect(
+      /type:\s*P2P_WORKFLOW_MSG\.DAEMON_HELLO/.test(handlerWindow),
+      'handleBrowserConnection must replay a DAEMON_HELLO message to the new browser',
+    ).toBe(true);
+  });
+
+  it('#81 composer attachments MUST carry a sequential #N tag wired through badge + text-prepend (R3 v2 PR-ρ)', () => {
+    const file = read('web/src/components/SessionControls.tsx');
+
+    // (1) Type declares `seq: number`.
+    expect(
+      /type\s+ComposerAttachment\s*=\s*\{\s*path:\s*string;\s*name:\s*string;\s*seq:\s*number\s*\}/.test(file.text),
+      'ComposerAttachment must declare seq: number',
+    ).toBe(true);
+
+    // (2) renumberAttachments helper exists.
+    expect(
+      /function\s+renumberAttachments\(/.test(file.text),
+      'renumberAttachments helper must exist for delete-and-renumber semantics',
+    ).toBe(true);
+
+    // (3) Upload path assigns next seq.
+    expect(
+      /seq:\s*prev\.length\s*\+\s*1/.test(file.text),
+      'Upload path must assign seq = prev.length + 1 to keep upload order = tag order',
+    ).toBe(true);
+
+    // (4) Badge renders the seq via testid.
+    expect(
+      /data-testid=\{`attachment-tag-\$\{a\.seq\}`\}/.test(file.text),
+      'Attachment badge must render data-testid="attachment-tag-${a.seq}"',
+    ).toBe(true);
+    expect(
+      /#\{a\.seq\}/.test(file.text),
+      'Attachment badge text must include #${a.seq}',
+    ).toBe(true);
+
+    // (5) Text-prepend uses the new #N: name format (not the legacy
+    // @${a.path}).
+    expect(
+      /attachments\.map\(\(a\)\s*=>\s*`#\$\{a\.seq\}:\s*\$\{a\.name\}`\)/.test(file.text),
+      'Send-payload text-prepend must use `#${a.seq}: ${a.name}` (not the legacy @${a.path})',
+    ).toBe(true);
+    // Defense: the legacy `@${a.path}` literal must NOT survive in the
+    // text-prepend block (would produce both forms in the prompt).
+    expect(
+      /attachments\.map\(\(a\)\s*=>\s*`@\$\{a\.path\}`\)/.test(file.text),
+      'Legacy attachment text-prepend `@${a.path}` MUST be removed',
+    ).toBe(false);
+  });
+
   it('#80 canvas zoom + capability_stale i18n must be wired (R3 v2 PR-π)', () => {
     const file = read('web/src/components/AdvancedWorkflowCanvasEditor.tsx');
     for (const symbol of ['CANVAS_ZOOM_MIN', 'CANVAS_ZOOM_MAX', 'CANVAS_ZOOM_DEFAULT', 'CANVAS_ZOOM_STEP']) {
@@ -2340,25 +2479,34 @@ describe('p2p-workflow reverse-regression', () => {
     }
   });
 
-  it('#79 canvas SVG width MUST be capped at CANVAS_VIEW_WIDTH so nodes do not auto-scale (R3 v2 PR-ο)', () => {
+  /*
+   * Reverse-regression #79 (originally PR-ο, superseded by PR-σ) —
+   * the viewBox cap that made nodes render at authored 1:1 pixel size
+   * has been replaced with a ResizeObserver-driven viewBox that
+   * achieves the SAME goal (1:1 pixel mapping, no auto-scale) but
+   * also lets the canvas fill the panel's full width. The remaining
+   * invariants worth locking from PR-ο are:
+   *   1. `CANVAS_VIEW_WIDTH` stays an exported module-level constant
+   *      (it now serves as the MIN viewBox width, not a hard cap).
+   *   2. The viewBox extents must reference `clampedZoom` so the
+   *      pinch/wheel zoom (PR-π) keeps working.
+   * The actual "width tracks container" assertion lives in #82.
+   */
+  it('#79 canvas viewBox MUST stay zoom-aware (R3 v2 PR-ο/σ)', () => {
     const file = read('web/src/components/AdvancedWorkflowCanvasEditor.tsx');
-    expect(
-      /maxWidth:\s*CANVAS_VIEW_WIDTH/.test(file.text),
-      'Canvas SVG must set style.maxWidth = CANVAS_VIEW_WIDTH to stop auto-scaling with the panel',
-    ).toBe(true);
-    // The viewBox-driven render must still be the source of truth, so
-    // CANVAS_VIEW_WIDTH must be exported (callers + tests need it) and
-    // reachable from the SVG props.
     expect(
       /export\s+const\s+CANVAS_VIEW_WIDTH\s*=/.test(file.text),
       'CANVAS_VIEW_WIDTH must remain an exported module-level constant',
     ).toBe(true);
-    // R3 v2 PR-π — viewBox now divides extents by `clampedZoom` so the
-    // user can pinch/wheel zoom. Match either the original literal
-    // form OR the new zoom-divided form.
     expect(
-      /viewBox=\{`0 0 \$\{CANVAS_VIEW_WIDTH(?:\s*\/\s*clampedZoom)?\}/.test(file.text),
-      'Canvas SVG viewBox must be derived from CANVAS_VIEW_WIDTH',
+      /viewBox=\{`0 0 \$\{viewBoxWidth\}\s+\$\{viewBoxHeight\}`\}/.test(file.text),
+      'Canvas SVG viewBox must use the dynamic `viewBoxWidth`/`viewBoxHeight` derivation',
+    ).toBe(true);
+    // The derivation itself must include `clampedZoom` so wheel/pinch
+    // zoom keeps working.
+    expect(
+      /viewBoxWidth\s*=\s*[\s\S]{0,80}\/\s*clampedZoom/.test(file.text),
+      'viewBoxWidth must be divided by clampedZoom so wheel/pinch zoom still scales the canvas',
     ).toBe(true);
   });
 

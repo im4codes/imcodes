@@ -212,6 +212,40 @@ export function AdvancedWorkflowCanvasEditor({ value, onChange, readOnly }: Adva
       return Math.max(CANVAS_ZOOM_MIN, Math.min(CANVAS_ZOOM_MAX, next));
     });
   };
+
+  /*
+   * R3 v2 PR-σ — User feedback: "canvas 要全宽". PR-ο capped the SVG at
+   * `CANVAS_VIEW_WIDTH` (720 px) to stop nodes auto-scaling when the
+   * panel grew to 1400 px, but the side-effect was a permanent empty
+   * gutter to the right of the canvas. The right answer is to let the
+   * SVG fill the parent's full width AND set the viewBox extent to the
+   * MEASURED container width (in pixels) divided by zoom — that way 1
+   * viewBox unit always equals 1 screen pixel, so node geometry stays
+   * at the authored 132×62 px regardless of how wide the panel gets.
+   * The canvas now uses every pixel of horizontal space the panel
+   * grants.
+   */
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [containerWidth, setContainerWidth] = useState<number>(CANVAS_VIEW_WIDTH);
+  useEffect(() => {
+    const node = containerRef.current;
+    if (!node || typeof ResizeObserver === 'undefined') return;
+    const update = () => {
+      const width = node.clientWidth;
+      if (width > 0) setContainerWidth(width);
+    };
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+  // Effective viewBox extent in viewBox units. Width tracks the
+  // measured container so the canvas fills the panel; height stays at
+  // CANVAS_VIEW_HEIGHT so the canvas does not become a tall scroll
+  // strip on narrow panels. Both are divided by zoom so wheel/pinch
+  // still scales node geometry around the screen-pixel basis.
+  const viewBoxWidth = Math.max(CANVAS_VIEW_WIDTH, containerWidth) / clampedZoom;
+  const viewBoxHeight = CANVAS_VIEW_HEIGHT / clampedZoom;
   const onCanvasWheel = (event: WheelEvent) => {
     // Mac touchpad pinch arrives as wheel + ctrlKey = true. Plain wheel
     // also zooms when over the canvas (vs page-scrolling) so the
@@ -658,36 +692,28 @@ export function AdvancedWorkflowCanvasEditor({ value, onChange, readOnly }: Adva
         </div>
       </div>
 
+      <div ref={containerRef} style={{ width: '100%' }}>
       <svg
         ref={(element) => { svgRef.current = element ?? null; }}
         /*
-         * R3 v2 PR-π — viewBox extent inversely scaled by zoom: smaller
-         * viewBox = same screen size shows less area = "zoomed in"
-         * (nodes appear bigger). Because `getScreenCTM().inverse()`
-         * already accounts for the viewBox, drag math in
-         * `beginNodeDrag` / `beginEdgeCreate` keeps working without
-         * manual zoom-divides.
+         * R3 v2 PR-σ — viewBox width tracks the MEASURED container
+         * width (via ResizeObserver), divided by `clampedZoom`. This
+         * gives every viewBox unit a 1:1 mapping to a screen pixel at
+         * zoom=1.0 regardless of how wide the panel grows, so node
+         * geometry stays at the authored 132×62 px AND the canvas
+         * fills the panel's full width — fixing the empty gutter the
+         * old hard width cap (PR-ο) introduced.
          */
-        viewBox={`0 0 ${CANVAS_VIEW_WIDTH / clampedZoom} ${CANVAS_VIEW_HEIGHT / clampedZoom}`}
+        viewBox={`0 0 ${viewBoxWidth} ${viewBoxHeight}`}
+        preserveAspectRatio="xMinYMin meet"
         width="100%"
         style={{
           display: 'block', background: '#070d1a', border: '1px solid #1e293b',
           borderRadius: 6, touchAction: 'none', userSelect: 'none',
           minHeight: 320,
-          /*
-           * R3 v2 PR-ο — Cap the SVG visual width to its native viewBox
-           * width. Without this cap the SVG stretches to fill the parent
-           * (which became 1400 px wide under PR-λ), and because SVGs with
-           * a viewBox preserve aspect ratio, the node geometry scales up
-           * with the width — nodes ended up ~80% bigger than the
-           * 168×78 px designed size. Capping at `CANVAS_VIEW_WIDTH` keeps
-           * the canvas at 1:1 scale so nodes render at their authored
-           * pixel size; the empty space to the right of the canvas
-           * becomes panel breathing room for the inspector etc.
-           */
-          maxWidth: CANVAS_VIEW_WIDTH,
         }}
         data-canvas-zoom={clampedZoom.toFixed(2)}
+        data-canvas-container-width={Math.round(containerWidth)}
         data-testid="p2p-editor-canvas"
         data-canvas-width={CANVAS_VIEW_WIDTH}
         data-canvas-height={CANVAS_VIEW_HEIGHT}
@@ -841,6 +867,7 @@ export function AdvancedWorkflowCanvasEditor({ value, onChange, readOnly }: Adva
           );
         })}
       </svg>
+      </div>
 
       {inspectorBody}
 

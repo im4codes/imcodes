@@ -3203,9 +3203,138 @@ afterEach(() => {
     });
 
     fireEvent.click(screen.getByRole('button', { name: /send/i }));
+    // R3 v2 PR-ρ — attachment text-prefix changed from `@${path}` to
+    // `#N: name` so the LLM has a short reference tag.
     expectSendPayload(ws, {
       sessionName: 'my-session',
-      text: '@/tmp/pasted-text.txt',
+      text: expect.stringMatching(/^#1: pasted-text-.*\.txt$/) as unknown as string,
+    });
+  });
+
+  /*
+   * R3 v2 PR-ρ — User feedback: "上传或者文件的时候, 要增加个 id-[number]
+   * 的功能, 方便发文字的时候引用那个文件" + "id 还是原来的 id 只是加一
+   * 个下划线和数字, 每次上传递增. 发送后从1重新开始. #1图片 #2图片
+   * 这样 llm 可以快速理解并引用图片". Each composer attachment now
+   * carries a sequential `seq` (1, 2, 3, ...) surfaced as a `#N`
+   * prefix in the badge AND folded into the send-payload text as
+   * `#N: name` so the LLM has a short reference tag for each file.
+   * Counter resets on send (the attachments array is wiped by
+   * `clearComposer`).
+   */
+  it('R3 v2 PR-ρ — multi-attachment uploads get sequential #N tags + #N: name text references', async () => {
+    let nextDaemonPath = '/tmp/file-a.png';
+    uploadFileMock.mockImplementation(async () => ({ attachment: { daemonPath: nextDaemonPath } }));
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    // Upload via paste — same code path as the file input but the
+    // ClipboardEvent lets us deliver fresh File objects on each call
+    // without re-defining a non-configurable `files` property on the
+    // hidden file input.
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.focus();
+
+    const fileA = new File(['aaa'], 'screenshot.png', { type: 'image/png' });
+    fireEvent.paste(input, {
+      clipboardData: {
+        files: [fileA],
+        getData: () => '',
+      },
+    });
+    await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => {
+      expect(screen.getByTestId('attachment-tag-1').textContent).toBe('#1');
+    });
+
+    nextDaemonPath = '/tmp/file-b.png';
+    const fileB = new File(['bbb'], 'logs.txt', { type: 'text/plain' });
+    fireEvent.paste(input, {
+      clipboardData: {
+        files: [fileB],
+        getData: () => '',
+      },
+    });
+    await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(2));
+    await waitFor(() => {
+      expect(screen.getByTestId('attachment-tag-2').textContent).toBe('#2');
+    });
+
+    // Send → text should carry both #N: name references in upload order.
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+    expectSendPayload(ws, {
+      sessionName: 'my-session',
+      text: '#1: screenshot.png #2: logs.txt',
+    });
+
+    // After send the attachments array is wiped → counter naturally resets.
+    await waitFor(() => {
+      expect(screen.queryByTestId('attachment-tag-1')).toBeNull();
+    });
+    nextDaemonPath = '/tmp/file-c.png';
+    const fileC = new File(['ccc'], 'next.md', { type: 'text/markdown' });
+    fireEvent.paste(input, {
+      clipboardData: {
+        files: [fileC],
+        getData: () => '',
+      },
+    });
+    await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(3));
+    await waitFor(() => {
+      expect(screen.getByTestId('attachment-tag-1').textContent).toBe('#1');
+    });
+  });
+
+  it('R3 v2 PR-ρ — removing a middle attachment renumbers the remaining tags consecutively', async () => {
+    let nextDaemonPath = '/tmp/x1.png';
+    uploadFileMock.mockImplementation(async () => ({ attachment: { daemonPath: nextDaemonPath } }));
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.focus();
+
+    // Upload three files via paste → #1, #2, #3.
+    for (const [i, name] of [[0, 'a.png'], [1, 'b.png'], [2, 'c.png']] as const) {
+      nextDaemonPath = `/tmp/x${i + 1}.png`;
+      fireEvent.paste(input, {
+        clipboardData: {
+          files: [new File([name], name)],
+          getData: () => '',
+        },
+      });
+      await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(i + 1));
+    }
+    await waitFor(() => expect(screen.getByTestId('attachment-tag-3').textContent).toBe('#3'));
+
+    // Remove the middle one (#2 → b.png) by clicking its remove button.
+    const badges = document.querySelectorAll('.attachment-badge');
+    expect(badges).toHaveLength(3);
+    const middleRemove = badges[1].querySelector('.attachment-badge-remove') as HTMLButtonElement;
+    fireEvent.click(middleRemove);
+
+    // Survivors renumber: a.png → #1, c.png → #2.
+    await waitFor(() => {
+      const remaining = document.querySelectorAll('.attachment-badge');
+      expect(remaining).toHaveLength(2);
+      expect(remaining[0].querySelector('[data-testid="attachment-tag-1"]')?.textContent).toBe('#1');
+      expect(remaining[0].querySelector('.attachment-badge-name')?.textContent).toBe('a.png');
+      expect(remaining[1].querySelector('[data-testid="attachment-tag-2"]')?.textContent).toBe('#2');
+      expect(remaining[1].querySelector('.attachment-badge-name')?.textContent).toBe('c.png');
     });
   });
 

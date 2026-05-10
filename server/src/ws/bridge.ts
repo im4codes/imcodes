@@ -1147,6 +1147,28 @@ export class WsBridge {
     for (const [providerId, sessions] of this.providerRemoteSessions) {
       safeSend(ws, JSON.stringify({ type: TRANSPORT_MSG.SESSIONS_RESPONSE, providerId, sessions }));
     }
+    /*
+     * R3 v2 PR-σ — Replay the cached `daemon.hello` to newly-connected
+     * browsers. Previously the daemon only sent hello on (a) WS
+     * connect/reconnect and (b) capability change, and the bridge
+     * forwarded it as it arrived but never replayed cached state. Any
+     * browser that opened AFTER the daemon's most recent hello would
+     * never receive one and its `capability_stale` 30 s TTL would
+     * fire as a false-positive "lost contact with the daemon" banner
+     * even though the daemon was healthy. Replaying the cached snapshot
+     * here gives every newly-connected browser the same starting
+     * capability picture as one that was open during the original
+     * hello broadcast.
+     */
+    if (this.daemonP2pWorkflowCapabilities) {
+      safeSend(ws, JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: this.daemonP2pWorkflowCapabilities.daemonId,
+        capabilities: this.daemonP2pWorkflowCapabilities.capabilities,
+        helloEpoch: this.daemonP2pWorkflowCapabilities.helloEpoch,
+        sentAt: this.daemonP2pWorkflowCapabilities.sentAt,
+      }));
+    }
 
     ws.on('message', async (data) => {
       const raw = (data as Buffer).toString();
