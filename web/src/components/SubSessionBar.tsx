@@ -86,6 +86,15 @@ interface Props {
   onViewCron?: () => void;
 
   discussions?: DiscussionSummary[];
+  /**
+   * Total number of in-progress P2P discussions across the whole
+   * daemon (NOT scoped to the active session). The scoped
+   * `discussions` array shows only those relevant to the current
+   * session view; this number is rendered as a badge on the
+   * "View Discussions" (📋) button so the user can see at a glance
+   * that more runs exist elsewhere even when this session has none.
+   */
+  totalRunningDiscussions?: number;
   onStopDiscussion?: (id: string) => void;
   ws: WsClient | null;
   connected: boolean;
@@ -183,7 +192,7 @@ function CollapsedSubSessionButton({ sub, accentColor, isOpen, idleFlashToken, u
   );
 }
 
-export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, idleFlashTokens, onOpen, onClose, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
+export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, idleFlashTokens, onOpen, onClose, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
   const { t } = useTranslation();
   const isMobile = !desktopLayoutCapable;
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
@@ -584,8 +593,60 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         })()}
         <button class="subcard-toolbar-add" data-onboarding="new-sub-session" onClick={onNew} title={t('subsessionBar.new_sub_session')}>+</button>
         {onViewDiscussions && (
-          <button class="subcard-toolbar-btn" data-onboarding="discussion-history" onClick={onViewDiscussions} title={t('subsessionBar.p2p_discussions')} style={{ marginLeft: 4, fontSize: 11 }}>
+          <button
+            class="subcard-toolbar-btn"
+            data-onboarding="discussion-history"
+            data-running-discussions={totalRunningDiscussions}
+            onClick={onViewDiscussions}
+            // Tooltip: "View P2P discussions" with running count when > 0,
+            // so the user knows how many runs exist daemon-wide even
+            // when this session's bar shows none (the scoped
+            // discussions list filters to participants only).
+            title={
+              totalRunningDiscussions > 0
+                ? t(
+                    'subsessionBar.p2p_discussions_with_running',
+                    {
+                      count: totalRunningDiscussions,
+                      defaultValue: '{{count}} running discussions — view all',
+                    },
+                  )
+                : t('subsessionBar.p2p_discussions')
+            }
+            style={{ marginLeft: 4, fontSize: 11, position: 'relative' }}
+          >
             📋
+            {totalRunningDiscussions > 0 && (
+              <span
+                data-testid="p2p-discussions-running-badge"
+                aria-label={t(
+                  'subsessionBar.p2p_running_count_aria',
+                  {
+                    count: totalRunningDiscussions,
+                    defaultValue: '{{count}} P2P discussions running',
+                  },
+                )}
+                style={{
+                  position: 'absolute',
+                  top: -4,
+                  right: -4,
+                  minWidth: 14,
+                  height: 14,
+                  padding: '0 3px',
+                  borderRadius: 7,
+                  background: '#3b82f6',
+                  color: '#fff',
+                  fontSize: 9,
+                  fontWeight: 700,
+                  lineHeight: '14px',
+                  textAlign: 'center',
+                  pointerEvents: 'none',
+                  boxSizing: 'border-box',
+                }}
+              >
+                {totalRunningDiscussions > 99 ? '99+' : totalRunningDiscussions}
+              </span>
+            )}
           </button>
         )}
         {onViewRepo && (

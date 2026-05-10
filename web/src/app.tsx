@@ -3773,6 +3773,12 @@ export function App() {
                   }
                   return false;
                 })}
+                // Daemon-wide running count (NOT scoped to this
+                // session) so the View Discussions (📋) button shows
+                // a badge even when the user is viewing a session
+                // unrelated to the running discussions. Lets the user
+                // notice and click through without losing track.
+                totalRunningDiscussions={discussions.filter((d) => d.state !== 'done').length}
                 onStopDiscussion={(id) => {
                   if (id.startsWith('p2p_')) {
                     // P2P runs use p2p.cancel with the actual run ID (strip p2p_ prefix)

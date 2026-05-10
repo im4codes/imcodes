@@ -400,4 +400,54 @@ describe('SubSessionBar', () => {
     expect(card.title).not.toContain('ctx 11%');
   });
 
+  // Audit fix (P2P bar scoping follow-up) — pin the contract that the
+  // View Discussions (📋) button shows a numeric badge when there are
+  // running discussions ANYWHERE on the daemon, not just in this
+  // session's bar. Without it, scoping the bar to a single session
+  // hides the existence of runs in other sessions and the user loses
+  // track.
+  describe('totalRunningDiscussions badge on view-discussions button', () => {
+    const renderBarWithBadge = (totalRunningDiscussions: number) => render(
+      <SubSessionBar
+        subSessions={[]}
+        openIds={new Set()}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        onViewDiscussions={vi.fn()}
+        totalRunningDiscussions={totalRunningDiscussions}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    it('does NOT render the badge when no discussions are running', () => {
+      const view = renderBarWithBadge(0);
+      expect(view.container.querySelector('[data-testid="p2p-discussions-running-badge"]')).toBeNull();
+    });
+
+    it('renders the badge with the running count when there are 1+ running discussions', () => {
+      const view = renderBarWithBadge(3);
+      const badge = view.container.querySelector('[data-testid="p2p-discussions-running-badge"]');
+      expect(badge).not.toBeNull();
+      expect(badge?.textContent).toBe('3');
+    });
+
+    it('caps the displayed count at 99+ for runaway daemons', () => {
+      const view = renderBarWithBadge(120);
+      expect(
+        view.container.querySelector('[data-testid="p2p-discussions-running-badge"]')?.textContent,
+      ).toBe('99+');
+    });
+
+    it('exposes the running count via data attribute for screen-reader-friendly tooling', () => {
+      const view = renderBarWithBadge(2);
+      const button = view.container.querySelector('[data-onboarding="discussion-history"]') as HTMLButtonElement;
+      expect(button.getAttribute('data-running-discussions')).toBe('2');
+    });
+  });
+
 });
