@@ -70,6 +70,8 @@ const MOUNT_BACKFILL_COOLDOWN_MS = 60_000;
  * this gate.
  */
 const ACTIVE_REFRESH_COOLDOWN_MS = 15_000;
+const RECONNECT_REFRESH_COOLDOWN_MS = 15_000;
+const FORWARD_HISTORY_TIMEOUT_MS = 8_000;
 
 function resetBackfillCooldowns(): void {
   lastHttpBackfillOkAt.clear();
@@ -605,6 +607,8 @@ export function useTimeline(
   const [historyStatus, setHistoryStatus] = useState<TimelineHistoryStatus>(() => createIdleHistoryStatus());
   const loadingOlderRef = useRef(false); // Synchronous guard against duplicate pagination requests
   const httpBackfillInFlightRef = useRef(0);
+  const httpBackfillTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const httpBackfillTimerDueAtRef = useRef(0);
   const epochRef = useRef<number>(0);
   const seqRef = useRef<number>(0);
   const replayRequestIdRef = useRef<string | null>(null);
@@ -612,6 +616,9 @@ export function useTimeline(
   const olderRequestIdRef = useRef<string | null>(null);
   const historyLoadedRef = useRef<string | null>(null); // tracks which session has been loaded
   const historyRetryRef = useRef(0); // retry count for empty history responses
+  const historyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectRefreshInFlightRef = useRef(false);
+  const lastReconnectRefreshAtRef = useRef(0);
 
   const updateHistoryStep = useCallback((
     step: TimelineHistoryStepKey,
@@ -625,6 +632,60 @@ export function useTimeline(
         [step]: state,
       },
     }));
+  }, []);
+
+  const clearForwardHistoryTimeout = useCallback(() => {
+    if (!historyTimeoutRef.current) return;
+    clearTimeout(historyTimeoutRef.current);
+    historyTimeoutRef.current = null;
+  }, []);
+
+  const armForwardHistoryTimeout = useCallback((requestId: string, phase: Exclude<TimelineHistoryPhase, 'idle'>) => {
+    clearForwardHistoryTimeout();
+    historyTimeoutRef.current = setTimeout(() => {
+      if (historyRequestIdRef.current !== requestId) return;
+      historyRequestIdRef.current = null;
+      reconnectRefreshInFlightRef.current = false;
+      updateHistoryStep('daemon', 'done', phase);
+      setRefreshing(false);
+    }, FORWARD_HISTORY_TIMEOUT_MS);
+  }, [clearForwardHistoryTimeout, updateHistoryStep]);
+
+  const sendForwardHistoryRequest = useCallback((
+    phase: Exclude<TimelineHistoryPhase, 'idle'>,
+    args?: { limit?: number; afterTs?: number },
+  ) => {
+    if (!ws || !sessionId) return null;
+    const requestId = args?.limit === undefined && args?.afterTs === undefined
+      ? ws.sendTimelineHistoryRequest(sessionId)
+      : args?.afterTs === undefined
+        ? ws.sendTimelineHistoryRequest(sessionId, args?.limit ?? MAX_MEMORY_EVENTS)
+        : ws.sendTimelineHistoryRequest(sessionId, args.limit ?? MAX_MEMORY_EVENTS, args.afterTs);
+    historyRequestIdRef.current = requestId;
+    armForwardHistoryTimeout(requestId, phase);
+    return requestId;
+  }, [armForwardHistoryTimeout, sessionId, ws]);
+
+  const beginReconnectRefresh = useCallback((source: 'daemon' | 'browser') => {
+    const now = Date.now();
+    if (reconnectRefreshInFlightRef.current) {
+      backfillDebug('reconnect refresh: already in flight', { sessionId, source });
+      return false;
+    }
+    if (now - lastReconnectRefreshAtRef.current < RECONNECT_REFRESH_COOLDOWN_MS) {
+      backfillDebug('reconnect refresh: cooldown skip', { sessionId, source });
+      return false;
+    }
+    reconnectRefreshInFlightRef.current = true;
+    lastReconnectRefreshAtRef.current = now;
+    return true;
+  }, [sessionId]);
+
+  const clearHttpBackfillTimer = useCallback(() => {
+    if (!httpBackfillTimerRef.current) return;
+    clearTimeout(httpBackfillTimerRef.current);
+    httpBackfillTimerRef.current = null;
+    httpBackfillTimerDueAtRef.current = 0;
   }, []);
 
   useEffect(() => {
@@ -643,6 +704,10 @@ export function useTimeline(
       setHttpRefreshing(false);
       setHistoryStatus(createIdleHistoryStatus());
       httpBackfillInFlightRef.current = 0;
+      clearHttpBackfillTimer();
+      clearForwardHistoryTimeout();
+      historyRequestIdRef.current = null;
+      reconnectRefreshInFlightRef.current = false;
       resetOlderState();
       return;
     }
@@ -653,6 +718,10 @@ export function useTimeline(
       setHttpRefreshing(false);
       setHistoryStatus(createIdleHistoryStatus());
       httpBackfillInFlightRef.current = 0;
+      clearHttpBackfillTimer();
+      clearForwardHistoryTimeout();
+      historyRequestIdRef.current = null;
+      reconnectRefreshInFlightRef.current = false;
       resetOlderState();
       setHasOlderHistory(false);
       historyLoadedRef.current = cacheKeyRef.current;
@@ -666,6 +735,10 @@ export function useTimeline(
       canHttp: false,
     }));
     httpBackfillInFlightRef.current = 0;
+    clearHttpBackfillTimer();
+    clearForwardHistoryTimeout();
+    historyRequestIdRef.current = null;
+    reconnectRefreshInFlightRef.current = false;
     resetOlderState();
     setHasOlderHistory(true);
 
@@ -704,9 +777,7 @@ export function useTimeline(
       } else {
         markDaemonHistoryBackground();
       }
-      historyRequestIdRef.current = limit === undefined
-        ? ws.sendTimelineHistoryRequest(sessionId)
-        : ws.sendTimelineHistoryRequest(sessionId, limit);
+      sendForwardHistoryRequest('bootstrap', limit === undefined ? undefined : { limit });
     };
 
     // 1. Module-level memory cache — instant restore (e.g. window reopen)
@@ -812,7 +883,7 @@ export function useTimeline(
     };
     load().catch(() => {});
     return () => { cancelled = true; };
-  }, [cacheKey, disableHistory, isActiveSession, sessionId, ws, wsConnected]);
+  }, [cacheKey, clearForwardHistoryTimeout, clearHttpBackfillTimer, disableHistory, isActiveSession, sendForwardHistoryRequest, sessionId, ws, wsConnected]);
 
   // Map of commandId → optimistic eventId for O(1) lookup on command.ack / dedup.
   const optimisticIdsByCommandRef = useRef(new Map<string, string>());
@@ -1428,12 +1499,36 @@ export function useTimeline(
     const retryAttempt = opts?._retryAttempt ?? 0;
     const backfillSessionId = sessionId;
     const backfillCacheKey = cacheKey;
-    setTimeout(() => {
+    const dueAt = Date.now() + Math.max(0, delayMs);
+    if (httpBackfillTimerRef.current && httpBackfillTimerDueAtRef.current <= dueAt) {
+      backfillDebug('fireHttpBackfill: coalesced', {
+        sessionId: backfillSessionId,
+        hasTimer: true,
+        inFlight: httpBackfillInFlightRef.current,
+      });
+      if (visible) updateHistoryStep('http', 'done', phase);
+      return;
+    }
+    if (httpBackfillTimerRef.current) clearHttpBackfillTimer();
+    if (httpBackfillInFlightRef.current > 0) {
+      backfillDebug('fireHttpBackfill: coalesced', {
+        sessionId: backfillSessionId,
+        hasTimer: false,
+        inFlight: httpBackfillInFlightRef.current,
+      });
+      if (visible) updateHistoryStep('http', 'done', phase);
+      return;
+    }
+    httpBackfillTimerDueAtRef.current = dueAt;
+    httpBackfillTimerRef.current = setTimeout(() => {
+      httpBackfillTimerRef.current = null;
+      httpBackfillTimerDueAtRef.current = 0;
       if (cacheKeyRef.current !== backfillCacheKey) return;
       if (backfillCacheKey && cooldownMs > 0) {
         const lastOk = lastHttpBackfillOkAt.get(backfillCacheKey);
         if (lastOk !== undefined && Date.now() - lastOk < cooldownMs) {
           backfillDebug('fireHttpBackfill: cooldown skip', { sessionId: backfillSessionId, lastOk, cooldownMs });
+          if (visible) updateHistoryStep('http', 'done', phase);
           return;
         }
       }
@@ -1492,7 +1587,7 @@ export function useTimeline(
           }
         });
     }, delayMs);
-  }, [disableHistory, isActiveSession, serverId, sessionId, cacheKey, mergeEvents, idbPutEvents, settleOptimisticByCommandAckEvent, settleOptimisticByTimelineProgress, updateHistoryStep]);
+  }, [clearHttpBackfillTimer, disableHistory, isActiveSession, serverId, sessionId, cacheKey, mergeEvents, idbPutEvents, settleOptimisticByCommandAckEvent, settleOptimisticByTimelineProgress, updateHistoryStep]);
 
   // Stable indirection — lets the session-mount effect below call the latest
   // `fireHttpBackfill` without having to list it (and transitively its five
@@ -1745,6 +1840,11 @@ export function useTimeline(
         // requests; dropping the earlier response can leave the UI stuck on old
         // cache if the newest request never completes. Since history merges by
         // eventId and ts, older batches cannot delete newer events.
+        const isCurrentForwardHistoryResponse = !msg.requestId || msg.requestId === historyRequestIdRef.current;
+        if (isCurrentForwardHistoryResponse) {
+          clearForwardHistoryTimeout();
+          reconnectRefreshInFlightRef.current = false;
+        }
         if (!olderRequestIdRef.current || msg.requestId !== olderRequestIdRef.current) {
           if (!historyRequestIdRef.current || msg.requestId === historyRequestIdRef.current) {
             historyRequestIdRef.current = null;
@@ -1785,9 +1885,7 @@ export function useTimeline(
             // Re-check the flag at fire time — the user may have switched
             // away in the 1-2s delay window.
             if (!isActiveSessionRef.current) return;
-            if (ws?.connected && sessionId) {
-              historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
-            }
+            if (ws?.connected && sessionId) sendForwardHistoryRequest('bootstrap', { limit: MAX_MEMORY_EVENTS });
           }, 1000 * historyRetryRef.current);
         }
         setLoading(false);
@@ -1839,6 +1937,7 @@ export function useTimeline(
         // reconcile confirmed sends by commandId/text, and the existing timeout
         // still marks genuinely unconfirmed sends as retryable.
         if (ws && sessionId) {
+          if (!beginReconnectRefresh('daemon')) return;
           setHistoryStatus({
             phase: 'refresh',
             steps: {
@@ -1850,7 +1949,7 @@ export function useTimeline(
             },
           });
           setRefreshing(true);
-          historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
+          sendForwardHistoryRequest('refresh', { limit: MAX_MEMORY_EVENTS });
           fireHttpBackfillRef.current(600, { phase: 'refresh', visible: true });
         }
       }
@@ -1882,13 +1981,14 @@ export function useTimeline(
         // re-sync happens when the user next activates that card.
         if (!isActiveSessionRef.current) return;
         if (ws && sessionId) {
+          if (!beginReconnectRefresh('browser')) return;
           setHistoryStatus({
             phase: 'refresh',
             steps: {
               cache: 'done',
               textTail: 'skipped',
               daemon: 'running',
-              http: serverId ? 'pending' : 'skipped',
+              http: 'skipped',
               older: 'skipped',
             },
           });
@@ -1905,7 +2005,7 @@ export function useTimeline(
             replayRequestIdRef.current = null;
           }
           const afterTs = getTimelineHistoryAfterTs(current);
-          historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS, afterTs);
+          sendForwardHistoryRequest('refresh', { limit: MAX_MEMORY_EVENTS, afterTs });
 
           // Fire HTTP backfill with a ~600ms delay to let the bridge's async
           // `terminal.subscribe` ownership-check race resolve; any live
@@ -1913,6 +2013,9 @@ export function useTimeline(
           // `sendToSessionSubscribers`, finds the browser not-yet-subscribed,
           // and gets silently dropped. The HTTP path reads daemon store
           // directly (unicast request-response, no subscription routing).
+          // Keep this HTTP leg out of the visible stepper: ordinary browser
+          // focus/probe reconnects can happen repeatedly on mobile, and the
+          // daemon history step already communicates that a refresh is active.
           fireHttpBackfillRef.current(600, { phase: 'refresh' });
         }
       }
@@ -1988,12 +2091,21 @@ export function useTimeline(
 
     const unsub = ws.onMessage(handler);
     return unsub;
-  }, [disableHistory, isActiveSession, ws, sessionId, appendEvent, clearOptimisticTimer, loading, markOptimisticFailed, mergeEvents, reconcileQueuedOptimisticMessages, rememberSettledCommandId, replaceEvents, scheduleAutoRetry, serverId, settleOptimisticByCommandAck, settleOptimisticByCommandAckEvent, settleOptimisticByTimelineProgress, updateHistoryStep]);
+  }, [beginReconnectRefresh, clearForwardHistoryTimeout, disableHistory, isActiveSession, ws, sessionId, appendEvent, clearOptimisticTimer, loading, markOptimisticFailed, mergeEvents, reconcileQueuedOptimisticMessages, rememberSettledCommandId, replaceEvents, scheduleAutoRetry, sendForwardHistoryRequest, serverId, settleOptimisticByCommandAck, settleOptimisticByCommandAckEvent, settleOptimisticByTimelineProgress, updateHistoryStep]);
 
   useEffect(() => {
     if (loading || refreshing || httpRefreshing || loadingOlder) return;
     setHistoryStatus((prev) => (prev.phase === 'idle' ? prev : createIdleHistoryStatus()));
   }, [httpRefreshing, loading, loadingOlder, refreshing]);
+
+  useEffect(() => {
+    return () => {
+      clearForwardHistoryTimeout();
+      clearHttpBackfillTimer();
+      reconnectRefreshInFlightRef.current = false;
+      httpBackfillInFlightRef.current = 0;
+    };
+  }, [clearForwardHistoryTimeout, clearHttpBackfillTimer, sessionId]);
 
   // Clear outstanding optimistic timers on unmount / session change so that a
   // dismissed chat window can't fire a delayed markOptimisticFailed into an
