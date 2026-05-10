@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG } from '../../shared/p2p-config-events.js';
@@ -7,9 +7,9 @@ import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG } from '../../shared/p2p-config-events
 // ── Hoisted mocks ─────────────────────────────────────────────────────────────
 
 const MOCK_SESSIONS = [
-  { name: 'deck_proj_brain', agentType: 'claude-code', state: 'running', projectName: 'proj' },
-  { name: 'deck_proj_w1', agentType: 'codex', state: 'running', projectName: 'proj' },
-  { name: 'deck_proj_w2', agentType: 'gemini', state: 'idle', projectName: 'proj' },
+  { name: 'deck_proj_brain', agentType: 'claude-code', state: 'running', projectName: 'proj', projectDir: '/tmp/imcodes-parser-brain' },
+  { name: 'deck_proj_w1', agentType: 'codex', state: 'running', projectName: 'proj', projectDir: '/tmp/imcodes-parser-w1' },
+  { name: 'deck_proj_w2', agentType: 'gemini', state: 'idle', projectName: 'proj', projectDir: '/tmp/imcodes-parser-w2' },
 ];
 vi.mock('../../src/store/session-store.js', () => ({
   listSessions: () => MOCK_SESSIONS,
@@ -113,7 +113,7 @@ vi.mock('../../src/util/logger.js', () => ({
 }));
 
 vi.mock('../../src/util/imc-dir.js', () => ({
-  ensureImcDir: vi.fn().mockResolvedValue('/tmp/imc'),
+  ensureImcDir: vi.fn().mockImplementation(async () => process.env.IMCODES_TEST_REFS_DIR ?? '/tmp/imc'),
   imcSubDir: vi.fn((dir: string, sub: string) => `${dir}/.imc/${sub}`),
 }));
 
@@ -565,6 +565,46 @@ describe('structured P2P routing via WS fields', () => {
     );
     expect(ackCall).toBeDefined();
     expect((ackCall![2] as Record<string, unknown>).status).toBe('accepted');
+  });
+
+  it('rewrites #N:(~/.imcodes upload path) references into project refs for sandboxed agents', async () => {
+    const originalHome = process.env.HOME;
+    const originalRefsDir = process.env.IMCODES_TEST_REFS_DIR;
+    const homeDir = await mkdtemp(join(tmpdir(), 'imcodes-parser-home-'));
+    const uploadDir = join(homeDir, '.imcodes', 'uploads');
+    const sourcePath = join(uploadDir, 'image.png');
+    const refsDir = join(homeDir, 'project-refs');
+
+    await mkdir(uploadDir, { recursive: true });
+    await mkdir(refsDir, { recursive: true });
+    await writeFile(sourcePath, 'fake image bytes', 'utf8');
+    process.env.HOME = homeDir;
+    process.env.IMCODES_TEST_REFS_DIR = refsDir;
+
+    try {
+      handleWebCommand({
+        type: 'session.send',
+        sessionName: 'deck_proj_w2',
+        text: `#1:(${sourcePath}) please inspect #1`,
+        commandId: 'cmd-attachment-path-rewrite',
+      }, mockServerLink as any);
+
+      await vi.waitFor(() => {
+        expect(sendKeysDelayedEnter).toHaveBeenCalled();
+      });
+
+      const sentText = vi.mocked(sendKeysDelayedEnter).mock.calls.at(-1)?.[1] as string;
+      expect(sentText).toContain(`#1:(${refsDir}/`);
+      expect(sentText).toContain('image.png)');
+      expect(sentText).toContain('please inspect #1');
+      expect(sentText).not.toContain(sourcePath);
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalRefsDir === undefined) delete process.env.IMCODES_TEST_REFS_DIR;
+      else process.env.IMCODES_TEST_REFS_DIR = originalRefsDir;
+      await rm(homeDir, { recursive: true, force: true });
+    }
   });
 
 

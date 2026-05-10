@@ -732,8 +732,9 @@ async function syncSubSessionIfNeeded(sessionName: string, serverLink: ServerLin
 /**
  * For sandboxed agents (Gemini, Codex): copy files from ~/.imcodes/ to
  * the session's project .imc/refs/ so the agent can access them.
- * Rewrites @paths in the message text. Auto-deletes copies after 30 min and
- * persists cleanup metadata in ~/.imcodes/temp-files.json.
+ * Rewrites @paths and `#N:(path)` attachment references in the message text.
+ * Auto-deletes copies after 30 min and persists cleanup metadata in
+ * ~/.imcodes/temp-files.json.
  */
 async function rewritePathsForSandbox(sessionName: string, text: string): Promise<string> {
   const record = getSession(sessionName);
@@ -741,17 +742,23 @@ async function rewritePathsForSandbox(sessionName: string, text: string): Promis
   if (!projectDir) return text;
 
   const imcodesDir = nodePath.join(homedir(), '.imcodes');
-  // Match @paths that point into ~/.imcodes/
-  const pathRegex = new RegExp(`@(${imcodesDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[/\\\\][^\\s]+)`, 'g');
+  const escapedImcodesDir = imcodesDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const legacyAtPathRegex = new RegExp(`@(${escapedImcodesDir}[/\\\\][^\\s)]+)`, 'g');
+  const taggedPathRegex = new RegExp(`#\\d+:\\((${escapedImcodesDir}[/\\\\][^)]+)\\)`, 'g');
 
   let result = text;
-  const matches = [...text.matchAll(pathRegex)];
-  if (matches.length === 0) return text;
+  const paths = new Set<string>();
+  for (const match of text.matchAll(legacyAtPathRegex)) {
+    if (match[1]) paths.add(match[1]);
+  }
+  for (const match of text.matchAll(taggedPathRegex)) {
+    if (match[1]) paths.add(match[1]);
+  }
+  if (paths.size === 0) return text;
 
   const refsDir = await ensureImcDir(projectDir, 'refs');
 
-  for (const match of matches) {
-    const srcPath = match[1];
+  for (const srcPath of paths) {
     const filename = nodePath.basename(srcPath);
     // Unique prefix prevents collision when multiple sessions copy the same file concurrently
     const uniqueName = `${Date.now()}_${Math.random().toString(36).slice(2, 6)}_${filename}`;
@@ -765,12 +772,14 @@ async function rewritePathsForSandbox(sessionName: string, text: string): Promis
         expiresAt: now + (30 * 60_000),
         reason: 'sandbox-ref-copy',
       });
-      result = result.replace(`@${srcPath}`, `@${destPath}`);
+      result = result.replaceAll(`@${srcPath}`, `@${destPath}`);
+      result = result.replaceAll(`(${srcPath})`, `(${destPath})`);
       // Auto-delete after 30 minutes
-      setTimeout(async () => {
+      const cleanupTimer = setTimeout(async () => {
         try { const { unlink } = await import('node:fs/promises'); await unlink(destPath); } catch { /* already deleted */ }
         try { await removeTrackedTempFile(destPath); } catch { /* ignore */ }
       }, 30 * 60_000);
+      cleanupTimer.unref?.();
     } catch (err) {
       logger.warn({ src: srcPath, dest: destPath, err }, 'Failed to copy file for sandboxed agent');
     }

@@ -3203,11 +3203,11 @@ afterEach(() => {
     });
 
     fireEvent.click(screen.getByRole('button', { name: /send/i }));
-    // R3 v2 PR-ρ — attachment text-prefix changed from `@${path}` to
-    // `#N: name` so the LLM has a short reference tag.
+    // R3 v2 PR-ρ/υ — attachment text-prefix keeps the short tag and
+    // maps it to the full daemon path so the LLM can open the file.
     expectSendPayload(ws, {
       sessionName: 'my-session',
-      text: expect.stringMatching(/^#1: pasted-text-.*\.txt$/) as unknown as string,
+      text: '#1:(/tmp/pasted-text.txt)',
     });
   });
 
@@ -3218,11 +3218,11 @@ afterEach(() => {
    * 这样 llm 可以快速理解并引用图片". Each composer attachment now
    * carries a sequential `seq` (1, 2, 3, ...) surfaced as a `#N`
    * prefix in the badge AND folded into the send-payload text as
-   * `#N: name` so the LLM has a short reference tag for each file.
-   * Counter resets on send (the attachments array is wiped by
-   * `clearComposer`).
+   * `#N:(full path)` so the LLM can resolve each short reference to
+   * an actual readable file path. Counter resets on send (the
+   * attachments array is wiped by `clearComposer`).
    */
-  it('R3 v2 PR-ρ — multi-attachment uploads get sequential #N tags + #N: name text references', async () => {
+  it('R3 v2 PR-ρ/υ — multi-attachment uploads get sequential #N tags + full-path text references', async () => {
     let nextDaemonPath = '/tmp/file-a.png';
     uploadFileMock.mockImplementation(async () => ({ attachment: { daemonPath: nextDaemonPath } }));
     const ws = makeWs();
@@ -3267,11 +3267,14 @@ afterEach(() => {
       expect(screen.getByTestId('attachment-tag-2').textContent).toBe('#2');
     });
 
-    // Send → text should carry both #N: name references in upload order.
+    input.textContent = 'compare #1 and #2';
+    fireEvent.input(input);
+
+    // Send → text should carry both #N:(full path) references in upload order.
     fireEvent.click(screen.getByRole('button', { name: /send/i }));
     expectSendPayload(ws, {
       sessionName: 'my-session',
-      text: '#1: screenshot.png #2: logs.txt',
+      text: '#1:(/tmp/file-a.png) #2:(/tmp/file-b.png) compare #1 and #2',
     });
 
     // After send the attachments array is wiped → counter naturally resets.

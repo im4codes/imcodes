@@ -2301,9 +2301,10 @@ describe('p2p-workflow reverse-regression', () => {
    * 发送后从 1 重新开始. #1 图片 #2 图片 这样 llm 可以快速理解并
    * 引用图片"). Each composer attachment now carries a sequential
    * `seq` (1, 2, 3, ...) surfaced as a `#N` prefix in the badge AND
-   * folded into the send-payload text as `#N: name` so the LLM has a
-   * short reference tag for each attached file. The counter resets on
-   * send because `clearComposer` wipes the attachments array.
+   * folded into the send-payload text as `#N:(full path)` so the LLM
+   * has a short reference tag and the exact file path for each
+   * attached file. The counter resets on send because `clearComposer`
+   * wipes the attachments array.
    *
    * Locked invariants:
    *   1. `ComposerAttachment` type declares `seq: number`.
@@ -2313,8 +2314,8 @@ describe('p2p-workflow reverse-regression', () => {
    *      `seq: prev.length + 1`.
    *   4. The badge UI renders the seq via testid `attachment-tag-${seq}`
    *      with text `#N`.
-   *   5. The send-payload text-prepend uses `#${seq}: ${name}` (NOT the
-   *      legacy `@${path}`).
+   *   5. The send-payload text-prepend uses `#${seq}:(${path})` (NOT
+   *      the legacy `@${path}` and not basename-only `#${seq}: ${name}`).
    */
   /*
    * Reverse-regression #82 (R3 v2 PR-σ — User feedback: "canvas 要全宽,
@@ -2444,7 +2445,7 @@ describe('p2p-workflow reverse-regression', () => {
     ).toBe(true);
   });
 
-  it('#81 composer attachments MUST carry a sequential #N tag wired through badge + text-prepend (R3 v2 PR-ρ)', () => {
+  it('#81 composer attachments MUST carry a sequential #N tag wired through badge + full-path text-prepend (R3 v2 PR-ρ/υ)', () => {
     const file = read('web/src/components/SessionControls.tsx');
 
     // (1) Type declares `seq: number`.
@@ -2475,12 +2476,16 @@ describe('p2p-workflow reverse-regression', () => {
       'Attachment badge text must include #${a.seq}',
     ).toBe(true);
 
-    // (5) Text-prepend uses the new #N: name format (not the legacy
-    // @${a.path}).
+    // (5) Text-prepend uses the #N:(full path) format (not the legacy
+    // @${a.path}, and not basename-only #N: name).
+    expect(
+      /attachments\.map\(\(a\)\s*=>\s*`#\$\{a\.seq\}:\(\$\{a\.path\}\)`\)/.test(file.text),
+      'Send-payload text-prepend must use `#${a.seq}:(${a.path})` so the LLM receives the full daemon path',
+    ).toBe(true);
     expect(
       /attachments\.map\(\(a\)\s*=>\s*`#\$\{a\.seq\}:\s*\$\{a\.name\}`\)/.test(file.text),
-      'Send-payload text-prepend must use `#${a.seq}: ${a.name}` (not the legacy @${a.path})',
-    ).toBe(true);
+      'Basename-only attachment text-prepend `#${a.seq}: ${a.name}` MUST NOT survive',
+    ).toBe(false);
     // Defense: the legacy `@${a.path}` literal must NOT survive in the
     // text-prepend block (would produce both forms in the prompt).
     expect(

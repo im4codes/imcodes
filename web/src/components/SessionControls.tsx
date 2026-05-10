@@ -176,10 +176,9 @@ const INLINE_PASTE_TEXT_CHAR_LIMIT = 1200;
  * number `seq` (1, 2, 3, ...) so the user can reference them in chat
  * text via short tags like `#1`, `#2`. The badge UI surfaces the tag
  * (`#1 screenshot.png`) and the send-payload text-prepend uses
- * `#1: screenshot.png` (mapping the short tag to the filename in one
- * line) so the LLM sees both the short reference and the file identity
- * once. The counter resets naturally on send because `clearComposer`
- * clears the attachments array.
+ * `#1:(/full/daemon/path)` so the LLM sees the short reference and the
+ * exact path it can read. The counter resets naturally on send because
+ * `clearComposer` clears the attachments array.
  */
 type ComposerAttachment = { path: string; name: string; seq: number };
 
@@ -1746,15 +1745,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       text = text ? `${quoteBlock}\n\n${text}` : quoteBlock;
     }
     // Prepend attachment references.
-    // R3 v2 PR-ρ — Replaced the verbose `@${path}` per-file prefix with
-    // a compact `#N: name` mapping line. The LLM sees the short tag
-    // (`#1`, `#2`, ...) and the filename once, so subsequent text
-    // references like "compare #1 and #2" resolve naturally. The full
-    // file content is still attached via the structured `attachments`
-    // payload field; the text prefix exists ONLY so the LLM can read
-    // the tag→filename mapping in-band.
+    // R3 v2 PR-ρ/υ — Keep the compact user-facing tag (`#1`, `#2`, ...)
+    // but map it to the full daemon path, not just the display filename.
+    // The path is what the receiving LLM can actually open.
     if (attachments.length > 0) {
-      const refs = attachments.map((a) => `#${a.seq}: ${a.name}`).join(' ');
+      const refs = attachments.map((a) => `#${a.seq}:(${a.path})`).join(' ');
       text = text ? `${refs} ${text}` : refs;
     }
     return { text, extra };
