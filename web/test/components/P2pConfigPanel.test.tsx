@@ -1664,6 +1664,66 @@ describe('P2pConfigPanel', () => {
       expect(screen.queryByTestId('p2p-allowed-executables-empty')).toBeNull();
     });
 
+    it('shows "Required for script nodes" warning when workflow has a script node but allowedExecutables is empty (7f112b6e... screenshot)', async () => {
+      /*
+       * Regression for the user's 7f112b6e... screenshot, which
+       * showed "脚本节点必须配置" (Required for script nodes)
+       * next to the disclosure toggle. The warning is gated by
+       * (workflowHasScriptNode && allowedExecutables.length === 0)
+       * — both conditions must be true. This test pins the badge
+       * is rendered in that exact state and removed once an entry
+       * is added, so the user gets a clear "needs config" hint at
+       * a glance without expanding the section.
+       */
+      getUserPrefMock.mockResolvedValue(JSON.stringify(makeSavedConfigWithScriptNode()));
+      renderPanel({ initialTab: 'advanced' });
+      await flush();
+      // Locate the section first, then assert the warning text is
+      // present somewhere in its rendered toggle row.
+      const section = screen.getByTestId('p2p-allowed-executables-section');
+      expect(section).toBeDefined();
+      expect(section.textContent ?? '').toContain('Required for script nodes');
+      // Adding an entry should clear the warning (the gate flips to
+      // `allowedExecutables.length === 0 → false`).
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-allowed-executables-toggle'));
+      });
+      await flush();
+      const input = screen.getByTestId('p2p-allowed-executables-input') as HTMLInputElement;
+      await act(async () => {
+        fireEvent.input(input, { target: { value: '/usr/bin/jq' } });
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-allowed-executables-add'));
+      });
+      await flush();
+      // Re-read section content — the warning span must be gone now.
+      expect(section.textContent ?? '').not.toContain('Required for script nodes');
+    });
+
+    it('does NOT show "Required for script nodes" warning for LLM-only workflows', async () => {
+      /*
+       * Symmetric guarantee: an LLM-only workflow that happens to
+       * have an allowedExecutables entry (so the section IS visible)
+       * MUST NOT show the "Required for script nodes" warning,
+       * because no script node depends on the allowlist.
+       */
+      getUserPrefMock.mockResolvedValue(JSON.stringify({
+        ...makeSavedConfigWithDraft(),
+        allowedExecutables: ['/usr/bin/jq'],
+      }));
+      renderPanel({ initialTab: 'advanced' });
+      await flush();
+      // The section is visible (because the entry exists), but the
+      // warning must NOT appear — no script node needs it.
+      const section = screen.queryByTestId('p2p-allowed-executables-section');
+      // Section may or may not exist depending on the gate's exact
+      // condition; the warning must NOT exist either way.
+      if (section) {
+        expect(section.textContent ?? '').not.toContain('Required for script nodes');
+      }
+    });
+
     it('R3 v2 PR-ξ — clicking the disclosure toggle expands the body and shows the input + empty state', async () => {
       getUserPrefMock.mockResolvedValue(JSON.stringify(makeSavedConfigWithScriptNode()));
       renderPanel({ initialTab: 'advanced' });

@@ -721,10 +721,31 @@ export function AdvancedWorkflowCanvasEditor({ value, onChange, readOnly }: Adva
                     // reject a `logic+discuss+analysis_only` or
                     // `script+discuss+*` node on the very next render. See
                     // alignNodeForKind() at the top of this file.
-                    (kind) => updateNode(node.id, (current) => ({
-                      ...current,
-                      ...alignNodeForKind(current, kind as P2pNodeKind),
-                    })))}
+                    //
+                    // Audit fix (7f112b6e-... follow-up) — also drop
+                    // kind-specific fields when transitioning AWAY from
+                    // their owning nodeKind. The validator's
+                    // `validateNodeDraft` rejects a `script` field on
+                    // non-script kinds with `invalid_script_contract`,
+                    // so a user who configured argv on a script node
+                    // and then flipped nodeKind to llm would be stuck
+                    // with a permanently-invalid draft. Same applies
+                    // to `logic` for non-logic kinds.
+                    (kind) => updateNode(node.id, (current) => {
+                      const next = { ...current, ...alignNodeForKind(current, kind as P2pNodeKind) };
+                      let cleaned: P2pWorkflowNodeDraft = next;
+                      if (kind !== 'script' && cleaned.script !== undefined) {
+                        const { script: _dropScript, ...rest } = cleaned;
+                        void _dropScript;
+                        cleaned = rest as P2pWorkflowNodeDraft;
+                      }
+                      if (kind !== 'logic' && cleaned.logic !== undefined) {
+                        const { logic: _dropLogic, ...rest } = cleaned;
+                        void _dropLogic;
+                        cleaned = rest as P2pWorkflowNodeDraft;
+                      }
+                      return cleaned;
+                    }))}
                 </label>
                 <label style={labelStyle}>
                   <span>{t('p2p.workflow.editor.node.permission_scope_label', 'Permission scope')}</span>
