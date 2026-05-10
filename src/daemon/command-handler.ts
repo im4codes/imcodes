@@ -37,7 +37,7 @@ import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, typ
 import { buildSessionList } from './session-list.js';
 import { supervisionAutomation } from './supervision-automation.js';
 import { getComboRoundCount, parseModePipeline, P2P_CONFIG_MODE, isP2pSavedConfig, type P2pSessionConfig } from '../../shared/p2p-modes.js';
-import type { P2pAdvancedRound, P2pContextReducerConfig } from '../../shared/p2p-advanced.js';
+import type { P2pAdvancedRound, P2pContextReducerConfig, P2pRoundPreset } from '../../shared/p2p-advanced.js';
 import { CRON_MSG } from '../../shared/cron-types.js';
 import { executeCronJob } from './cron-executor.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
@@ -73,6 +73,29 @@ import { MEMORY_WS } from '../../shared/memory-ws.js';
 import { FS_WRITE_ERROR } from '../shared/transport/fs.js';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG, MAX_P2P_PARTICIPANTS } from '../../shared/p2p-config-events.js';
 import { p2pScopedSessionKey } from '../../shared/p2p-config-scope.js';
+import { P2P_WORKFLOW_SCHEMA_VERSION } from '../../shared/p2p-workflow-constants.js';
+import { makeP2pWorkflowDiagnostic, type P2pWorkflowDiagnostic } from '../../shared/p2p-workflow-diagnostics.js';
+import { compileP2pWorkflowDraft } from '../../shared/p2p-workflow-compiler.js';
+import { materializeOldAdvancedConfigToWorkflowDraft } from '../../shared/p2p-workflow-materialize.js';
+import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
+import { buildDefaultP2pStaticPolicy } from '../../shared/p2p-workflow-policy.js';
+import {
+  validateP2pWorkflowDraft,
+  validateP2pWorkflowLaunchEnvelope,
+} from '../../shared/p2p-workflow-validators.js';
+import type {
+  P2pBindRuntimeContext,
+  P2pBoundWorkflow,
+  P2pCompiledEdge,
+  P2pCompiledNode,
+  P2pCompiledWorkflow,
+  P2pStaticPolicy,
+  P2pWorkflowDraft,
+  P2pWorkflowLaunchEnvelope,
+  P2pWorkflowNodeDraft,
+} from '../../shared/p2p-workflow-types.js';
+import { bindP2pCompiledWorkflow } from './p2p-workflow-bind.js';
+import { readP2pDiscussionWithOffset } from './p2p-workflow-discussion-offsets.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import {
   CLAUDE_SDK_EFFORT_LEVELS,
@@ -1360,10 +1383,10 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case 'discussion.status':
       handleDiscussionStatus(cmd, serverLink);
       break;
-    case 'p2p.list_discussions':
+    case P2P_WORKFLOW_MSG.LIST_DISCUSSIONS:
       void handleP2pListDiscussions(cmd, serverLink);
       break;
-    case 'p2p.read_discussion':
+    case P2P_WORKFLOW_MSG.READ_DISCUSSION:
       void handleP2pReadDiscussion(cmd, serverLink);
       break;
     case 'discussion.stop':
@@ -1431,10 +1454,10 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case 'fs.write':
       void handleFsWrite(cmd, serverLink);
       break;
-    case 'p2p.cancel':
+    case P2P_WORKFLOW_MSG.CANCEL:
       void handleP2pCancel(cmd, serverLink);
       break;
-    case 'p2p.status':
+    case P2P_WORKFLOW_MSG.STATUS:
       void handleP2pStatus(cmd, serverLink);
       break;
     case CC_PRESET_MSG.LIST:
@@ -2008,6 +2031,388 @@ function resolveSingleTargetMode(
   return configuredMode && configuredMode !== 'skip' ? configuredMode : 'discuss';
 }
 
+type PreparedAdvancedWorkflowLaunch =
+  | {
+      ok: true;
+      advancedRounds: P2pAdvancedRound[];
+      advancedRunTimeoutMs?: number;
+      contextReducer?: P2pContextReducerConfig;
+      diagnostics: P2pWorkflowDiagnostic[];
+      /**
+       * Audit:V-1 / N-H1 — when present, the bound workflow flowed through
+       * compile + bind. Caller MUST pass `advanced: { kind: 'envelope_compiled', bound, ... }`
+       * to `startP2pRun` so the orchestrator surfaces capabilitySnapshot/policy
+       * on the run state. Absent on legacy passthrough (no envelope).
+       */
+      bound?: P2pBoundWorkflow;
+    }
+  | { ok: false; diagnostics: P2pWorkflowDiagnostic[] };
+
+function hasOldAdvancedLaunchFields(cmd: Record<string, unknown>): boolean {
+  return cmd.p2pAdvancedPresetKey != null
+    || cmd.p2pAdvancedRounds != null
+    || cmd.p2pAdvancedRunTimeoutMinutes != null
+    || cmd.p2pContextReducer != null;
+}
+
+function roundPresetFromWorkflowPreset(node: Pick<P2pWorkflowNodeDraft, 'preset'>): P2pRoundPreset {
+  if (
+    node.preset === 'openspec_propose'
+    || node.preset === 'proposal_audit'
+    || node.preset === 'implementation'
+    || node.preset === 'implementation_audit'
+    || node.preset === 'custom'
+  ) {
+    return node.preset;
+  }
+  return 'discussion';
+}
+
+/**
+ * R3 PR-α (A2 / Cu1-N3) — order compiled nodes for legacy executor traversal.
+ *
+ * The previous implementation sorted by `node.id.localeCompare`, which made
+ * round execution order depend on lexical id spelling rather than the
+ * compiled `rootNodeId` + edges topology. That violated spec
+ * "Workflow rootNodeId SHALL define execution start" and produced
+ * non-deterministic order across renames. We now traverse from
+ * `workflow.rootNodeId` along DEFAULT edges, then append any unreachable
+ * nodes in declaration order so the legacy projection still surfaces them.
+ */
+export function orderCompiledNodesForExecution(workflow: P2pCompiledWorkflow): P2pCompiledNode[] {
+  const nodesById = new Map(workflow.nodes.map((node) => [node.id, node]));
+  const visited = new Set<string>();
+  const ordered: P2pCompiledNode[] = [];
+  const visit = (nodeId: string): void => {
+    if (visited.has(nodeId)) return;
+    const node = nodesById.get(nodeId);
+    if (!node) return;
+    visited.add(nodeId);
+    ordered.push(node);
+    const outgoing = workflow.edges
+      .filter((edge) => edge.fromNodeId === nodeId && edge.edgeKind === 'default')
+      .map((edge) => edge.toNodeId);
+    for (const next of outgoing) visit(next);
+  };
+  if (workflow.rootNodeId) visit(workflow.rootNodeId);
+  // Defensive: append any unreachable nodes in declaration order so the
+  // legacy projection still surfaces them. Compiler MUST reject unreachable
+  // graphs; this is just a safety net for adapter consumers.
+  for (const node of workflow.nodes) {
+    if (!visited.has(node.id)) ordered.push(node);
+  }
+  return ordered;
+}
+
+/**
+ * R3 PR-α (Cu1-N3) — Map a single compiled outgoing conditional edge to the
+ * legacy `jumpRule` shape. Returns undefined when the node has no conditional
+ * outgoing edge or when no loop budget is registered. Marker preserves the
+ * raw `condition.equals` string instead of compressing every non-`PASS`
+ * marker to `'REWORK'`; non-`PASS|REWORK` markers fall back to `'REWORK'`
+ * because the legacy `P2pVerdictMarker` union accepts only those two values.
+ * The new envelope_compiled executor (PR-β) bypasses this adapter entirely
+ * and reads `condition` directly, so the legacy compression is bounded to
+ * oldAdvanced surfaces.
+ */
+export function mapConditionalEdgeToJumpRule(
+  conditionalEdge: P2pCompiledEdge | undefined,
+  loopBudgets: Record<string, number>,
+): { jumpRule: P2pAdvancedRound['jumpRule']; verdictPolicy: P2pAdvancedRound['verdictPolicy'] } {
+  if (!conditionalEdge) return { jumpRule: undefined, verdictPolicy: 'none' };
+  const loopBudget = loopBudgets[conditionalEdge.id];
+  const rawMarker = conditionalEdge.condition?.equals;
+  const marker: 'PASS' | 'REWORK' = rawMarker === 'PASS' ? 'PASS' : 'REWORK';
+  if (loopBudget === undefined) {
+    // No registered loop budget → emit `forced_rework` policy without a
+    // jumpRule so the legacy projection records routing intent without
+    // letting orchestrator loop indefinitely.
+    return { jumpRule: undefined, verdictPolicy: 'forced_rework' };
+  }
+  return {
+    jumpRule: {
+      targetRoundId: conditionalEdge.toNodeId,
+      marker,
+      minTriggers: 0,
+      maxTriggers: loopBudget,
+    },
+    verdictPolicy: 'forced_rework',
+  };
+}
+
+/**
+ * R3 PR-α (A1 / W3 / Cu1-N3) — Map a compiled node to a legacy
+ * `P2pAdvancedRound`, preserving `nodeKind`, `script`, `routingAuthority`,
+ * and `artifactConvention` so the orchestrator can dispatch / recheck without
+ * a sidecar `bound.compiled.nodes.find(...)` lookup.
+ */
+export function mapCompiledNodeToLegacyRound(
+  node: P2pCompiledNode,
+  workflow: P2pCompiledWorkflow,
+): P2pAdvancedRound {
+  const conditionalEdge = workflow.edges.find((edge) => edge.fromNodeId === node.id && edge.edgeKind === 'conditional');
+  const { jumpRule, verdictPolicy } = mapConditionalEdgeToJumpRule(conditionalEdge, workflow.loopBudgets);
+  // R3 PR-α (W3) — preserve the FIRST artifact contract's convention so the
+  // orchestrator can decide between `openspec_convention` (per-file sha256
+  // baseline + frozen identity) and `explicit_paths` (legacy sha256 listing).
+  // Multi-contract nodes are not allowed in v1a; compiler enforces.
+  const artifactConvention: 'none' | 'explicit' | 'openspec_convention' | undefined =
+    node.artifacts.length > 0
+      ? (node.artifacts[0].convention as 'explicit' | 'openspec_convention')
+      : undefined;
+  return {
+    id: node.id,
+    title: node.title ?? node.id,
+    preset: roundPresetFromWorkflowPreset(node),
+    executionMode: node.dispatchStyle === 'multi_dispatch' ? 'multi_dispatch' : 'single_main',
+    permissionScope: node.permissionScope,
+    ...(node.promptAppend ? { promptAppend: node.promptAppend } : {}),
+    ...(node.artifacts.length > 0 ? { artifactOutputs: node.artifacts.flatMap((artifact) => artifact.paths).sort() } : {}),
+    verdictPolicy,
+    ...(jumpRule ? { jumpRule } : {}),
+    // R3 PR-α (A1 / W3) — compiled-node carriers preserved on the legacy
+    // round model so downstream consumers can read authoritative semantics.
+    nodeKind: node.nodeKind,
+    ...(node.script ? { script: node.script } : {}),
+    ...(node.routingAuthority ? { routingAuthority: node.routingAuthority } : {}),
+    ...(artifactConvention ? { artifactConvention } : {}),
+  } satisfies P2pAdvancedRound;
+}
+
+function compiledWorkflowToLegacyAdvancedRounds(workflow: P2pCompiledWorkflow): P2pAdvancedRound[] {
+  // R3 PR-α — replaced lexical sort with topological traversal so the
+  // execution order honours `rootNodeId` + DEFAULT edges (A2). Field
+  // preservation lives in `mapCompiledNodeToLegacyRound` (A1 / W3); jump rule
+  // mapping lives in `mapConditionalEdgeToJumpRule` (Cu1-N3 split). Each
+  // helper is independently unit-tested.
+  return orderCompiledNodesForExecution(workflow).map((node) => mapCompiledNodeToLegacyRound(node, workflow));
+}
+
+function buildAdvancedLaunchEnvelopeFromCommand(
+  cmd: Record<string, unknown>,
+  launchContext: P2pWorkflowLaunchEnvelope['launchContext'],
+): P2pWorkflowLaunchEnvelope | null {
+  const explicitEnvelope = cmd.p2pWorkflowLaunchEnvelope ?? cmd.workflowLaunchEnvelope;
+  if (isPlainRecord(explicitEnvelope)) {
+    return explicitEnvelope as unknown as P2pWorkflowLaunchEnvelope;
+  }
+  if (!hasOldAdvancedLaunchFields(cmd)) return null;
+  return {
+    workflowSchemaVersion: P2P_WORKFLOW_SCHEMA_VERSION,
+    workflowKind: 'advanced',
+    oldAdvanced: {
+      ...(typeof cmd.p2pAdvancedPresetKey === 'string' ? { advancedPresetKey: cmd.p2pAdvancedPresetKey } : {}),
+      ...(Array.isArray(cmd.p2pAdvancedRounds) ? { advancedRounds: cmd.p2pAdvancedRounds as Array<Record<string, unknown>> } : {}),
+      ...(typeof cmd.p2pAdvancedRunTimeoutMinutes === 'number' ? { advancedRunTimeoutMinutes: cmd.p2pAdvancedRunTimeoutMinutes } : {}),
+      ...(isPlainRecord(cmd.p2pContextReducer) ? { contextReducer: cmd.p2pContextReducer } : {}),
+    },
+    migrationPolicy: { kind: 'materialize_old_advanced' },
+    launchContext,
+  };
+}
+
+// `getCurrentDaemonWorkflowCapabilities` is the single entry point for
+// "what capabilities does this daemon currently advertise?". v1a fix
+// (audit:N-H2): the fallback when `serverLink.getP2pWorkflowCapabilities` is
+// missing now returns `[]` (fail-closed) — previously it returned all three
+// dangerous caps as a hardcoded permissive default, which was a fail-OPEN
+// authorisation bug. The function itself lives in the daemon static-policy
+// module so compile/bind/recheck all share one source.
+import {
+  loadDaemonP2pStaticPolicy,
+  readCachedHelloSnapshot,
+} from './p2p-workflow-static-policy.js';
+
+function makeBindRuntimeContext(
+  options: {
+    runId: string;
+    requestId?: string;
+    repoRoot: string;
+    serverLink: ServerLink;
+    policySnapshot: P2pStaticPolicy;
+    initiatorSession: string;
+    targets: P2pTarget[];
+    accepted: boolean;
+  },
+): P2pBindRuntimeContext {
+  const helloSnapshot = readCachedHelloSnapshot(options.serverLink);
+  return {
+    runId: options.runId,
+    requestId: options.requestId,
+    repoRoot: options.repoRoot,
+    participants: [
+      { sessionName: options.initiatorSession },
+      ...options.targets.map((target) => ({ sessionName: target.session, roleLabel: target.mode })),
+    ],
+    launchScope: {
+      serverId: typeof options.serverLink.getServerId === 'function' ? options.serverLink.getServerId() : undefined,
+      sessionName: options.initiatorSession,
+    },
+    // Real hello snapshot, not synthesised placeholder (audit:N2). When the
+    // daemon hasn't sent a hello yet (`helloEpoch === 0` AND `sentAt === 0`),
+    // we still record the actual values so projection consumers can detect
+    // "pre-hello bind" instead of being fed a fake `Date.now()` timestamp.
+    capabilitySnapshot: helloSnapshot,
+    // Audit:R3 PR-α — full P2pStaticPolicy snapshot replaces the previous
+    // ad-hoc { allowScript / allowImplementation / ... } subset. The clone
+    // ensures runtime mutations to the loaded policy never bleed into a run
+    // that was already bound under a different policy version.
+    policySnapshot: structuredClone(options.policySnapshot),
+    concurrencyAdmission: options.accepted ? { accepted: true } : { accepted: false, reason: 'daemon_busy' },
+  };
+}
+
+// Audit:R3 hardening / task 10.2 — exported so the cron dispatcher (and any
+// future automation entry point) can drive the same envelope→compile→bind
+// pipeline as `handleSend`. Keeping a single launch authority is the only way
+// to ensure cron and manual launches share `daemon_busy` admission, capability
+// gating, and `static_policy_mismatch_recompiled` emission.
+export async function prepareAdvancedWorkflowLaunch(options: {
+  cmd: Record<string, unknown>;
+  sessionName: string;
+  targets: P2pTarget[];
+  userText: string;
+  locale?: string;
+  projectDir: string;
+  commandId: string;
+  serverLink: ServerLink;
+}): Promise<PreparedAdvancedWorkflowLaunch> {
+  const envelope = buildAdvancedLaunchEnvelopeFromCommand(options.cmd, {
+    requestId: options.commandId,
+    sessionName: options.sessionName,
+    projectRoot: options.projectDir,
+    userText: options.userText,
+    locale: options.locale,
+  });
+  if (!envelope) return { ok: true, advancedRounds: [], diagnostics: [] };
+  if ((options.cmd.p2pWorkflowLaunchEnvelope || options.cmd.workflowLaunchEnvelope) && hasOldAdvancedLaunchFields(options.cmd)) {
+    return { ok: false, diagnostics: [makeP2pWorkflowDiagnostic('mixed_advanced_schema_fields', 'parse')] };
+  }
+  const envelopeValidation = validateP2pWorkflowLaunchEnvelope(envelope);
+  if (!envelopeValidation.ok) return { ok: false, diagnostics: envelopeValidation.diagnostics };
+
+  let draft: P2pWorkflowDraft | undefined = envelope.advancedDraft;
+  let contextReducer: P2pContextReducerConfig | undefined;
+  if (!draft && envelope.oldAdvanced) {
+    if (envelope.migrationPolicy?.kind !== 'materialize_old_advanced') {
+      return { ok: false, diagnostics: [makeP2pWorkflowDiagnostic('invalid_launch_envelope', 'parse', { fieldPath: 'migrationPolicy' })] };
+    }
+    try {
+      draft = materializeOldAdvancedConfigToWorkflowDraft({
+        advancedPresetKey: envelope.oldAdvanced.advancedPresetKey,
+        advancedRounds: envelope.oldAdvanced.advancedRounds as P2pAdvancedRound[] | undefined,
+        advancedRunTimeoutMinutes: envelope.oldAdvanced.advancedRunTimeoutMinutes,
+      });
+      contextReducer = envelope.oldAdvanced.contextReducer as P2pContextReducerConfig | undefined;
+    } catch (err) {
+      return {
+        ok: false,
+        diagnostics: [makeP2pWorkflowDiagnostic('invalid_launch_envelope', 'parse', {
+          summary: err instanceof Error ? err.message : String(err),
+        })],
+      };
+    }
+  }
+  if (!draft) {
+    return { ok: false, diagnostics: [makeP2pWorkflowDiagnostic('invalid_launch_envelope', 'parse', { fieldPath: 'advancedDraft' })] };
+  }
+  const draftValidation = validateP2pWorkflowDraft(draft);
+  if (!draftValidation.ok) return { ok: false, diagnostics: draftValidation.diagnostics };
+
+  // Audit:N4 — staticPolicy must derive from the daemon's actual capability
+  // advertisement, not from hardcoded permissive overrides. `loadDaemonP2pStaticPolicy`
+  // is the single source of truth: allow-flags reflect daemon hello capabilities,
+  // and `concurrency.maxAdvancedRuns` / `concurrency.maxScripts` come from the
+  // policy default (P2P_WORKFLOW_MAX_ACTIVE_RUNS / P2P_WORKFLOW_MAX_ACTIVE_SCRIPTS).
+  const baseStaticPolicy = loadDaemonP2pStaticPolicy(options.serverLink);
+  // R3 PR-α follow-up — UI-driven allowlist. When the envelope carries an
+  // `allowedExecutables` list (configured in `P2pConfigPanel`), rebuild
+  // the policy with that list and recompute the hash so bind validation
+  // sees the user-supplied executables. Daemon-side default is `[]`; the
+  // envelope is the SOLE source for non-empty allowlists in this product.
+  // Removes the previous `~/.imcodes/p2p-policy.json` JSON-file workflow
+  // (off-product for a UI-driven IM client).
+  const envelopeAllowedExecutables = Array.isArray(envelope.allowedExecutables)
+    ? [...new Set(envelope.allowedExecutables.filter((entry) => typeof entry === 'string'))].sort()
+    : [];
+  const staticPolicy = envelopeAllowedExecutables.length > 0
+    ? buildDefaultP2pStaticPolicy({ ...baseStaticPolicy, allowedExecutables: envelopeAllowedExecutables })
+    : baseStaticPolicy;
+  // Audit:R3 PR-γ / N-M5 / V-4 — when the envelope carries a saved
+  // `expectedStaticPolicyHash` (compiled against an earlier policy version)
+  // and the daemon's CURRENT policy hash differs, emit
+  // `static_policy_mismatch_recompiled` (warning severity) so callers know
+  // the preview's compilation result is no longer authoritative. The daemon
+  // proceeds with the current policy regardless; this diagnostic only
+  // documents that a recompile occurred.
+  const policyMismatchDiagnostics: P2pWorkflowDiagnostic[] = [];
+  if (
+    typeof envelope.expectedStaticPolicyHash === 'string'
+    && envelope.expectedStaticPolicyHash.length > 0
+    && envelope.expectedStaticPolicyHash !== staticPolicy.policyHash
+  ) {
+    policyMismatchDiagnostics.push(makeP2pWorkflowDiagnostic('static_policy_mismatch_recompiled', 'bind', {
+      fieldPath: 'expectedStaticPolicyHash',
+      summary: `Launch envelope referenced static policy ${envelope.expectedStaticPolicyHash} but daemon recompiled with current policy ${staticPolicy.policyHash ?? '<unhashed>'}.`,
+    }));
+  }
+  const compileResult = compileP2pWorkflowDraft(draft, staticPolicy);
+  if (!compileResult.ok) {
+    return { ok: false, diagnostics: [...policyMismatchDiagnostics, ...compileResult.diagnostics] };
+  }
+
+  // Audit:N-H3 — admission cap reads `staticPolicy.concurrency.maxAdvancedRuns`
+  // rather than the bare `P2P_WORKFLOW_MAX_ACTIVE_RUNS` constant, so future
+  // policy customisation (cron multi-run, supervision, env override) only has
+  // to update one place.
+  const activeAdvancedRuns = listP2pRuns().filter((run) => run.advancedP2pEnabled && !P2P_TERMINAL_RUN_STATUSES.has(run.status));
+  const bindContext = makeBindRuntimeContext({
+    runId: randomUUID(),
+    requestId: options.commandId,
+    repoRoot: options.projectDir,
+    serverLink: options.serverLink,
+    policySnapshot: staticPolicy,
+    initiatorSession: options.sessionName,
+    targets: options.targets,
+    accepted: activeAdvancedRuns.length < staticPolicy.concurrency.maxAdvancedRuns,
+  });
+  // Audit:N5 / Q5 (binder API single shape). `bindP2pCompiledWorkflow` always
+  // returns the `P2pBindResult` discriminated union — there is no legacy "no
+  // ok field" branch. Use the discriminant directly; the dead `else` branch
+  // that previously inspected `diagnostics.some(severity==='error')` has been
+  // removed. The reverse-regression suite blocks its reintroduction.
+  const bindResult = bindP2pCompiledWorkflow(compileResult.workflow, bindContext);
+  const bindDiagnostics = bindResult.diagnostics;
+  if (!bindResult.ok) {
+    // R3 PR-δ (A5 / Cu1-M1) — bind-fail must include any
+    // `policyMismatchDiagnostics` so callers learn that the daemon
+    // recompiled with the current policy before bind rejected it. Earlier
+    // versions returned only `bindDiagnostics`, hiding the
+    // `static_policy_mismatch_recompiled` warning from observers.
+    return { ok: false, diagnostics: [...policyMismatchDiagnostics, ...bindDiagnostics] };
+  }
+
+  return {
+    ok: true,
+    advancedRounds: compiledWorkflowToLegacyAdvancedRounds(compileResult.workflow),
+    advancedRunTimeoutMs: envelope.oldAdvanced?.advancedRunTimeoutMinutes != null
+      ? envelope.oldAdvanced.advancedRunTimeoutMinutes * 60_000
+      : undefined,
+    contextReducer,
+    bound: bindResult.bound,
+    diagnostics: [
+      ...envelopeValidation.diagnostics,
+      ...policyMismatchDiagnostics,
+      ...compileResult.diagnostics,
+      ...bindDiagnostics,
+    ],
+  };
+}
+
+function summarizeP2pWorkflowDiagnostics(diagnostics: P2pWorkflowDiagnostic[]): string {
+  return diagnostics.map((diagnostic) => diagnostic.code).join(', ') || 'invalid_launch_envelope';
+}
+
 async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const sessionName = (cmd.sessionName ?? cmd.session) as string | undefined;
   const text = cmd.text as string | undefined;
@@ -2324,23 +2729,8 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         cancelP2pRun(existingRun.id, serverLink);
       }
 
-      const fileContents: Array<{ path: string; content: string }> = [];
       const record = getSession(sessionName);
       const projectDir = record?.projectDir ?? '';
-      for (const fp of tokens.files.slice(0, MAX_P2P_FILE_PULL_COUNT)) {
-        try {
-          const absPath = nodePath.isAbsolute(fp) ? fp : nodePath.join(projectDir, fp);
-          // Check for binary content (null bytes anywhere in the capped content)
-          const content = await fsReadFileRaw(absPath, 'utf8');
-          const capped = content.slice(0, 50_000);
-          if (capped.includes('\0')) {
-            // Binary file (image, etc.) — include path reference so agents can read it
-            fileContents.push({ path: absPath, content: '' });
-            continue;
-          }
-          fileContents.push({ path: fp, content: capped }); // cap at 50KB
-        } catch { /* ignore unreadable files */ }
-      }
       // Auto-append language instruction based on the user's selected i18n locale
       if (p2pLocale && !p2pExtraPrompt?.match(/语言|language|lang|中文|日本語|한국어|español|русский/i)) {
         const LOCALE_NAMES: Record<string, string> = {
@@ -2352,6 +2742,62 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         const langInstr = `Use the user's selected i18n language (${langName}) for the discussion.`;
         p2pExtraPrompt = p2pExtraPrompt ? `${p2pExtraPrompt}\n${langInstr}` : langInstr;
       }
+      const advancedLaunchRequested = hasOldAdvancedLaunchFields(cmd)
+        || isPlainRecord((cmd as Record<string, unknown>).p2pWorkflowLaunchEnvelope)
+        || isPlainRecord((cmd as Record<string, unknown>).workflowLaunchEnvelope);
+      if (advancedLaunchRequested && tokens.files.length > 0) {
+        const diagnostic = makeP2pWorkflowDiagnostic('invalid_launch_envelope', 'parse', {
+          fieldPath: 'tokens.files',
+          summary: 'Advanced workflow launch requires explicit startContext file references.',
+        });
+        const errMsg = summarizeP2pWorkflowDiagnostics([diagnostic]);
+        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
+        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
+        return;
+      }
+      const preparedAdvanced = await prepareAdvancedWorkflowLaunch({
+        cmd,
+        sessionName,
+        targets: tokens.agents,
+        userText: tokens.cleanText,
+        locale: p2pLocale,
+        projectDir,
+        commandId: effectiveId,
+        serverLink,
+      });
+      if (!preparedAdvanced.ok) {
+        const errMsg = summarizeP2pWorkflowDiagnostics(preparedAdvanced.diagnostics);
+        logger.warn({ sessionName, diagnostics: preparedAdvanced.diagnostics }, 'P2P advanced workflow launch rejected');
+        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
+        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
+        return;
+      }
+      const fileContents: Array<{ path: string; content: string }> = [];
+      if (!advancedLaunchRequested) {
+        for (const fp of tokens.files.slice(0, MAX_P2P_FILE_PULL_COUNT)) {
+          try {
+            const absPath = nodePath.isAbsolute(fp) ? fp : nodePath.join(projectDir, fp);
+            // Check for binary content (null bytes anywhere in the capped content)
+            const content = await fsReadFileRaw(absPath, 'utf8');
+            const capped = content.slice(0, 50_000);
+            if (capped.includes('\0')) {
+              // Binary file (image, etc.) — include path reference so agents can read it
+              fileContents.push({ path: absPath, content: '' });
+              continue;
+            }
+            fileContents.push({ path: fp, content: capped }); // cap at 50KB
+          } catch { /* ignore unreadable files */ }
+        }
+      }
+      // Audit:V-1 / N-H1 — when the prepared advanced launch carries a `bound`
+      // workflow (envelope path), funnel it through the typed
+      // `advanced: { kind: 'envelope_compiled', bound, advancedRounds }`
+      // discriminated union so the orchestrator stores capabilitySnapshot &
+      // currentDaemonPolicy on the run state. Pure-legacy launches (no
+      // envelope, no compiled rounds) fall back to the deprecated top-level
+      // `advancedPresetKey`/`advancedRounds` passthrough until v1b.
+      const compiledFromEnvelope = preparedAdvanced.bound !== undefined
+        && preparedAdvanced.advancedRounds.length > 0;
       const run = await startP2pRun({
         initiatorSession: sessionName,
         targets: tokens.agents,
@@ -2363,10 +2809,27 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         extraPrompt: p2pExtraPrompt,
         modeOverride: resolvedMode || undefined,
         hopTimeoutMs: p2pHopTimeoutMs,
-        advancedPresetKey: p2pAdvancedPresetKey,
-        advancedRounds: p2pAdvancedRounds,
-        advancedRunTimeoutMs: p2pAdvancedRunTimeoutMinutes != null ? p2pAdvancedRunTimeoutMinutes * 60_000 : undefined,
-        contextReducer: p2pContextReducer,
+        ...(compiledFromEnvelope
+          ? {
+              advanced: {
+                kind: 'envelope_compiled' as const,
+                bound: preparedAdvanced.bound!,
+                advancedRounds: preparedAdvanced.advancedRounds,
+                ...(preparedAdvanced.advancedRunTimeoutMs !== undefined
+                  ? { advancedRunTimeoutMs: preparedAdvanced.advancedRunTimeoutMs }
+                  : {}),
+                ...(preparedAdvanced.contextReducer
+                  ? { contextReducer: preparedAdvanced.contextReducer }
+                  : {}),
+              },
+              advancedPresetKey: 'openspec',
+            }
+          : {
+              advancedPresetKey: p2pAdvancedPresetKey,
+              advancedRounds: p2pAdvancedRounds,
+              advancedRunTimeoutMs: p2pAdvancedRunTimeoutMinutes != null ? p2pAdvancedRunTimeoutMinutes * 60_000 : undefined,
+              contextReducer: p2pContextReducer,
+            }),
       });
       // NOTE: do NOT emit a `user.message` on the initiator timeline here.
       // A P2P send is a COMMAND to start a discussion, not a chat message to
@@ -3842,73 +4305,193 @@ async function handleAskAnswer(cmd: Record<string, unknown>): Promise<void> {
 
 // ── P2P discussion file listing ────────────────────────────────────────────
 
-async function handleP2pListDiscussions(_cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
-  // Collect unique project dirs from all sessions
-  const projectDirs = new Set<string>();
-  for (const s of listSessions()) {
-    if (s.projectDir) projectDirs.add(s.projectDir);
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function stringField(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+async function canonicalProjectDir(projectDir: string): Promise<string> {
+  try {
+    return await fsRealpath(projectDir);
+  } catch {
+    return nodePath.resolve(projectDir);
   }
-  const discussions: Array<{ id: string; fileName: string; path: string; preview: string; mtime: number }> = [];
-  for (const projectDir of projectDirs) {
-    const dir = imcSubDir(projectDir, 'discussions');
-    try {
-      const entries = await fsReaddir(dir);
-      const files = entries.filter((entry) => {
-        if (!entry.endsWith('.md')) return false;
-        // Keep only canonical discussion documents in the history list.
-        // Intermediate hop artifacts and reducer snapshots are implementation
-        // details and should not crowd out the main discussion file.
-        if (/\.round\d+\.hop\d+\.md$/i.test(entry)) return false;
-        if (/\.reducer\.\d+\.md$/i.test(entry)) return false;
-        return true;
-      });
-      for (const f of files) {
-        try {
-          const fullPath = nodePath.join(dir, f);
-          const s = await fsStat(fullPath);
-          const content = await fsReadFileRaw(fullPath, 'utf8');
-          const reqMatch = content.match(/## User Request\s*\n+(.+)/);
-          const preview = reqMatch?.[1]?.trim().slice(0, 120) || f;
-          discussions.push({ id: f.replace('.md', ''), fileName: f, path: fullPath, preview, mtime: s.mtimeMs });
-        } catch { /* skip unreadable */ }
-      }
-    } catch { /* dir may not exist */ }
+}
+
+async function collectKnownProjectDirs(): Promise<Map<string, string>> {
+  const dirs = new Map<string, string>();
+  for (const session of listSessions()) {
+    if (!session.projectDir) continue;
+    const canonical = await canonicalProjectDir(session.projectDir);
+    dirs.set(canonical, session.projectDir);
   }
+  return dirs;
+}
+
+async function resolveP2pDiscussionProjectScope(cmd: Record<string, unknown>): Promise<{ projectDir: string; canonicalProjectDir: string } | null> {
+  const scope = isPlainRecord(cmd.scope) ? cmd.scope : {};
+  const requestedSession = stringField(scope, 'sessionName') ?? stringField(cmd, 'sessionName');
+  if (requestedSession) {
+    const session = getSession(requestedSession);
+    if (!session?.projectDir) return null;
+    return {
+      projectDir: session.projectDir,
+      canonicalProjectDir: await canonicalProjectDir(session.projectDir),
+    };
+  }
+
+  const requestedProjectDir = stringField(scope, 'projectDir')
+    ?? stringField(scope, 'cwd')
+    ?? stringField(cmd, 'projectDir')
+    ?? stringField(cmd, 'cwd');
+  const knownProjectDirs = await collectKnownProjectDirs();
+  if (requestedProjectDir) {
+    const requestedCanonical = await canonicalProjectDir(requestedProjectDir);
+    const known = knownProjectDirs.get(requestedCanonical);
+    return known
+      ? { projectDir: known, canonicalProjectDir: requestedCanonical }
+      : null;
+  }
+
+  if (knownProjectDirs.size === 1) {
+    const [canonical, projectDir] = [...knownProjectDirs.entries()][0]!;
+    return { projectDir, canonicalProjectDir: canonical };
+  }
+
+  return null;
+}
+
+function isPathUnderDir(filePath: string, dir: string): boolean {
+  const relative = nodePath.relative(dir, nodePath.resolve(filePath));
+  return relative === '' || (!!relative && !relative.startsWith('..') && !nodePath.isAbsolute(relative));
+}
+
+async function handleP2pListDiscussions(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = cmd.requestId as string | undefined;
+  const scope = await resolveP2pDiscussionProjectScope(cmd);
+  if (!scope) {
+    serverLink.send({ type: P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE, requestId, discussions: [], error: 'missing_or_invalid_scope' });
+    return;
+  }
+  const discussions: Array<{ id: string; fileName: string; preview: string; mtime: number }> = [];
+  const dir = imcSubDir(scope.projectDir, 'discussions');
+  try {
+    const entries = await fsReaddir(dir);
+    const files = entries.filter((entry) => {
+      if (!entry.endsWith('.md')) return false;
+      // Keep only canonical discussion documents in the history list.
+      // Intermediate hop artifacts and reducer snapshots are implementation
+      // details and should not crowd out the main discussion file.
+      if (/\.round\d+\.hop\d+\.md$/i.test(entry)) return false;
+      if (/\.reducer\.\d+\.md$/i.test(entry)) return false;
+      return true;
+    });
+    for (const f of files) {
+      try {
+        const fullPath = nodePath.join(dir, f);
+        const s = await fsStat(fullPath);
+        const content = await fsReadFileRaw(fullPath, 'utf8');
+        const reqMatch = content.match(/## User Request\s*\n+(.+)/);
+        const preview = reqMatch?.[1]?.trim().slice(0, 120) || f;
+        discussions.push({ id: f.replace('.md', ''), fileName: f, preview, mtime: s.mtimeMs });
+      } catch { /* skip unreadable */ }
+    }
+  } catch { /* dir may not exist */ }
   // Sort by mtime descending, cap at 50
   discussions.sort((a, b) => b.mtime - a.mtime);
-  serverLink.send({ type: 'p2p.list_discussions_response', discussions: discussions.slice(0, 50) });
+  serverLink.send({ type: P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE, requestId, discussions: discussions.slice(0, 50) });
 }
 
 async function handleP2pReadDiscussion(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const id = cmd.id as string | undefined;
   const requestId = cmd.requestId as string | undefined;
-  if (!id) { serverLink.send({ type: 'p2p.read_discussion_response', requestId, error: 'missing_id' }); return; }
+  if (!id) { serverLink.send({ type: P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE, requestId, error: 'missing_id' }); return; }
+  if (id.includes('/') || id.includes('\\') || id.includes('\0') || id === '.' || id === '..') {
+    serverLink.send({ type: P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE, id, requestId, error: 'invalid_id' });
+    return;
+  }
+  const scope = await resolveP2pDiscussionProjectScope(cmd);
+  if (!scope) {
+    serverLink.send({ type: P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE, id, requestId, error: 'missing_or_invalid_scope' });
+    return;
+  }
+  const discussionsDir = nodePath.resolve(imcSubDir(scope.projectDir, 'discussions'));
+
+  // Tasks 5.4 / 12.4 — when the responder is reading on behalf of an active
+  // run (`runId` supplied), use the per-(run, source) offset tracker so
+  // repeated reads only return new bytes appended after the prior offset.
+  // Callers that don't supply a runId keep the historical full-file read
+  // semantics for backward compatibility (e.g. discussions list UI).
+  const runId = typeof cmd.runId === 'string' && cmd.runId ? cmd.runId : undefined;
+  const rawPolicy = typeof cmd.offsetMismatchPolicy === 'string' ? cmd.offsetMismatchPolicy : undefined;
+  const policy: 'fail' | 'reset' = rawPolicy === 'fail' ? 'fail' : 'reset';
+
+  async function respondWithOffset(filePath: string): Promise<boolean> {
+    if (!runId) return false;
+    try {
+      const result = await readP2pDiscussionWithOffset({ runId, sourceKey: id!, filePath, policy });
+      serverLink.send({
+        type: P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE,
+        id,
+        requestId,
+        content: result.content,
+        offset: { ...result.newOffset },
+        offsetReset: result.reset,
+        ...(result.diagnostics.length ? { diagnostics: result.diagnostics } : {}),
+      });
+      return true;
+    } catch (err) {
+      const wrapped = err as Error & {
+        code?: string;
+        diagnostic?: P2pWorkflowDiagnostic;
+        result?: { newOffset?: unknown; diagnostics?: P2pWorkflowDiagnostic[] };
+      };
+      if (wrapped?.code === 'discussion_read_offset_mismatch') {
+        serverLink.send({
+          type: P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE,
+          id,
+          requestId,
+          error: 'offset_mismatch',
+          offsetReset: 'mismatch_fail_closed',
+          ...(wrapped.result?.newOffset ? { offset: wrapped.result.newOffset } : {}),
+          ...(wrapped.result?.diagnostics?.length ? { diagnostics: wrapped.result.diagnostics } : {}),
+        });
+        return true;
+      }
+      // Any other read error (ENOENT etc.) → caller falls back to legacy paths.
+      return false;
+    }
+  }
 
   // 1. Check active P2P runs first (in-memory, always fresh)
   for (const run of listP2pRuns()) {
     if (run.id === id || run.discussionId === id) {
+      if (!isPathUnderDir(run.contextFilePath, discussionsDir)) continue;
+      if (await respondWithOffset(run.contextFilePath)) return;
       try {
         const content = await fsReadFileRaw(run.contextFilePath, 'utf8');
-        serverLink.send({ type: 'p2p.read_discussion_response', id, requestId, content });
+        serverLink.send({ type: P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE, id, requestId, content });
         return;
       } catch { /* file may not exist yet */ }
     }
   }
 
-  // 2. Search across all known project .imc/discussions/ directories
-  const projectDirs = new Set<string>();
-  for (const s of listSessions()) {
-    if (s.projectDir) projectDirs.add(s.projectDir);
+  const filePath = nodePath.join(discussionsDir, `${id}.md`);
+  if (!isPathUnderDir(filePath, discussionsDir)) {
+    serverLink.send({ type: P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE, id, requestId, error: 'invalid_id' });
+    return;
   }
-  for (const projectDir of projectDirs) {
-    const filePath = nodePath.join(imcSubDir(projectDir, 'discussions'), `${id}.md`);
-    try {
-      const content = await fsReadFileRaw(filePath, 'utf8');
-      serverLink.send({ type: 'p2p.read_discussion_response', id, requestId, content });
-      return;
-    } catch { /* try next project */ }
-  }
-  serverLink.send({ type: 'p2p.read_discussion_response', id, requestId, error: 'not_found' });
+  if (await respondWithOffset(filePath)) return;
+  try {
+    const content = await fsReadFileRaw(filePath, 'utf8');
+    serverLink.send({ type: P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE, id, requestId, content });
+    return;
+  } catch { /* not found */ }
+  serverLink.send({ type: P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE, id, requestId, error: 'not_found' });
 }
 
 // ── Discussion handlers ────────────────────────────────────────────────────
@@ -5003,17 +5586,55 @@ async function handleP2pCancel(cmd: Record<string, unknown>, serverLink: ServerL
   const runId = cmd.runId as string | undefined;
   if (!runId) return;
   const ok = await cancelP2pRun(runId, serverLink);
-  try { serverLink.send({ type: 'p2p.cancel_response', runId, ok }); } catch { /* ignore */ }
+  try { serverLink.send({ type: P2P_WORKFLOW_MSG.CANCEL_RESPONSE, runId, ok }); } catch { /* ignore */ }
 }
 
 async function handleP2pStatus(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const runId = cmd.runId as string | undefined;
+  const requestId = cmd.requestId as string | undefined;
+  // Resolve scope mirror of handleP2pListDiscussions/handleP2pReadDiscussion: every
+  // p2p.status request must be tied to a project context. Without scope we fail
+  // closed (empty list / null run) so a browser viewer of project A cannot
+  // observe runs belonging to project B that happens to share this daemon.
+  const scope = await resolveP2pDiscussionProjectScope(cmd);
+  if (!scope) {
+    if (runId) {
+      try { serverLink.send({ type: P2P_WORKFLOW_MSG.STATUS_RESPONSE, requestId, runId, run: null, error: 'missing_or_invalid_scope' }); } catch { /* ignore */ }
+    } else {
+      try { serverLink.send({ type: P2P_WORKFLOW_MSG.STATUS_RESPONSE, requestId, runs: [], error: 'missing_or_invalid_scope' }); } catch { /* ignore */ }
+    }
+    return;
+  }
+  const resolvedScope = scope;
+  const discussionsDir = nodePath.resolve(imcSubDir(resolvedScope.projectDir, 'discussions'));
+  // A run belongs to scope when its discussion file lives inside that project's
+  // .imc/discussions directory. We also require initiatorSession (when set) to
+  // resolve to the same canonical project — this catches edge cases where a run
+  // was started against an external file path but the session itself is in a
+  // different project.
+  async function runMatchesScope(run: ReturnType<typeof getP2pRun>): Promise<boolean> {
+    if (!run) return false;
+    if (run.contextFilePath && isPathUnderDir(run.contextFilePath, discussionsDir)) return true;
+    if (run.initiatorSession) {
+      const initRecord = getSession(run.initiatorSession);
+      if (initRecord?.projectDir) {
+        const canon = await canonicalProjectDir(initRecord.projectDir);
+        if (canon === resolvedScope.canonicalProjectDir) return true;
+      }
+    }
+    return false;
+  }
   if (runId) {
     const run = getP2pRun(runId);
-    try { serverLink.send({ type: 'p2p.status_response', runId, run: run ? serializeP2pRun(run) : null }); } catch { /* ignore */ }
+    const inScope = await runMatchesScope(run);
+    try { serverLink.send({ type: P2P_WORKFLOW_MSG.STATUS_RESPONSE, requestId, runId, run: inScope && run ? serializeP2pRun(run) : null }); } catch { /* ignore */ }
   } else {
     const runs = listP2pRuns();
-    try { serverLink.send({ type: 'p2p.status_response', runs: runs.map((run) => serializeP2pRun(run)) }); } catch { /* ignore */ }
+    const filtered: typeof runs = [];
+    for (const run of runs) {
+      if (await runMatchesScope(run)) filtered.push(run);
+    }
+    try { serverLink.send({ type: P2P_WORKFLOW_MSG.STATUS_RESPONSE, requestId, runs: filtered.map((run) => serializeP2pRun(run)) }); } catch { /* ignore */ }
   }
 }
 

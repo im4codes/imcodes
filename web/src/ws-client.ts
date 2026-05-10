@@ -8,6 +8,8 @@ import type { TimelineEvent } from '../../src/shared/timeline/types.js';
 import { REPO_MSG } from '@shared/repo-types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
+import { P2P_WORKFLOW_MSG, isP2pWorkflowRequestId } from '@shared/p2p-workflow-messages.js';
+import { P2P_CAPABILITY_FRESHNESS_TTL_MS } from '@shared/p2p-workflow-constants.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import { DAEMON_COMMAND_TYPES } from '@shared/daemon-command-types.js';
 import { CC_PRESET_MSG, type CcPreset, type CcPresetModelInfo } from '@shared/cc-presets.js';
@@ -38,6 +40,25 @@ import type {
 } from '../../src/shared/transport/fs.js';
 
 export type MessageHandler = (msg: ServerMessage) => void;
+
+export interface P2pWorkflowRequestScope {
+  sessionName?: string;
+  projectDir?: string;
+  cwd?: string;
+}
+
+/** Snapshot of the most recent `daemon.hello` capability handshake the browser
+ *  has observed. `observedAt` is the local clock at receipt — staleness is
+ *  computed against `Date.now() - observedAt > P2P_CAPABILITY_FRESHNESS_TTL_MS`.
+ *  Cleared on disconnect so a stale snapshot from a previous session can never
+ *  authorise an advanced launch after the daemon goes offline. */
+export interface DaemonCapabilitySnapshot {
+  daemonId: string;
+  capabilities: string[];
+  helloEpoch: number;
+  sentAt: number;
+  observedAt: number;
+}
 
 export interface TransportUpgradeBlockedSession {
   name: string;
@@ -90,17 +111,18 @@ export type ServerMessage =
   | FsReadResponse
   | FsGitStatusResponse
   | { type: 'file.search_response'; requestId: string; results: string[]; error?: string }
-  | { type: 'p2p.run_update'; run: any }
+  | { type: typeof P2P_WORKFLOW_MSG.DAEMON_HELLO; daemonId: string; capabilities: string[]; helloEpoch: number; sentAt: number }
+  | { type: typeof P2P_WORKFLOW_MSG.RUN_UPDATE; run: any }
   | { type: typeof P2P_CONFIG_MSG.SAVE_RESPONSE; requestId: string; scopeSession: string; ok: boolean; error?: string }
-  | { type: 'p2p.conflict'; existingRunId: string; initiatorSession: string; commandId: string }
+  | { type: typeof P2P_WORKFLOW_MSG.CONFLICT; existingRunId: string; initiatorSession: string; commandId: string }
   | { type: 'subsession.created'; id: string; sessionName: string; sessionType: string; cwd?: string; label?: string; parentSession?: string; state?: string; runtimeType?: 'process' | 'transport' | null; providerId?: string | null; providerSessionId?: string | null; requestedModel?: string | null; activeModel?: string | null; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace'] | null; contextNamespaceDiagnostics?: string[] | null; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextRetryExhausted?: boolean | null; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride | null; transportConfig?: Record<string, unknown> | null; qwenModel?: string | null; qwenAuthType?: string | null; qwenAvailableModels?: string[] | null; codexAvailableModels?: string[] | null; modelDisplay?: string | null; planLabel?: string | null; permissionLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null }
   | { type: 'subsession.sync'; id: string; sessionName?: string; state?: string; cwd?: string; label?: string; requestedModel?: string | null; activeModel?: string | null; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace'] | null; contextNamespaceDiagnostics?: string[] | null; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextRetryExhausted?: boolean | null; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride | null; transportConfig?: Record<string, unknown> | null; qwenModel?: string | null; codexAvailableModels?: string[] | null; modelDisplay?: string | null; planLabel?: string | null; permissionLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null }
   | { type: 'subsession.removed'; id: string; sessionName: string }
-  | { type: 'p2p.run_started'; runId: string; session: string }
-  | { type: 'p2p.cancel_response'; runId: string; ok: boolean }
-  | { type: 'p2p.status_response'; runId?: string; run?: any; runs?: any[] }
-  | { type: 'p2p.list_discussions_response'; discussions: Array<{ id: string; fileName: string; path?: string; preview: string; mtime: number }> }
-  | { type: 'p2p.read_discussion_response'; id?: string; requestId?: string; content?: string; error?: string }
+  | { type: typeof P2P_WORKFLOW_MSG.RUN_STARTED; runId: string; session: string }
+  | { type: typeof P2P_WORKFLOW_MSG.CANCEL_RESPONSE; runId: string; ok: boolean }
+  | { type: typeof P2P_WORKFLOW_MSG.STATUS_RESPONSE; requestId: string; runId?: string; run?: any; runs?: any[] }
+  | { type: typeof P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE; requestId: string; discussions: Array<{ id: string; fileName: string; path?: string; preview: string; mtime: number }> }
+  | { type: typeof P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE; id?: string; requestId: string; content?: string; error?: string }
   | { type: typeof CC_PRESET_MSG.LIST_RESPONSE; presets: CcPreset[] }
   | { type: typeof CC_PRESET_MSG.SAVE_RESPONSE; ok: boolean }
   | { type: typeof CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE; requestId?: string; presetName: string; ok: boolean; preset?: CcPreset; models?: CcPresetModelInfo[]; endpoint?: string; error?: string }
@@ -198,6 +220,7 @@ const PONG_MISSES_BEFORE_RECONNECT = 2;
 const WS_TICKET_TIMEOUT_MS = 15_000;
 const WS_OPEN_TIMEOUT_MS = 15_000;
 const RESUME_FORCE_STALE_PONG_MS = 30_000;
+const P2P_WORKFLOW_REQUEST_TIMEOUT_MS = 30_000;
 /** If we received a pong within this window, treat the socket as already
  *  proven alive and skip the resume probe. This eliminates UI churn (and the
  *  brief "disconnected" flash) when the user rapidly switches tabs / focuses
@@ -205,6 +228,23 @@ const RESUME_FORCE_STALE_PONG_MS = 30_000;
  *  liveness during normal use; foreground probes only need to fire after a
  *  genuine sleep/background gap. */
 const PROBE_FRESHNESS_MS = 5_000;
+
+function createP2pWorkflowRequestId(): string {
+  const requestId = globalThis.crypto?.randomUUID?.()
+    ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+  if (!isP2pWorkflowRequestId(requestId)) {
+    throw new Error('Generated invalid P2P workflow requestId');
+  }
+  return requestId;
+}
+
+function compactP2pWorkflowRequestScope(scope: P2pWorkflowRequestScope | null | undefined): P2pWorkflowRequestScope {
+  const compacted: P2pWorkflowRequestScope = {};
+  if (scope?.sessionName?.trim()) compacted.sessionName = scope.sessionName.trim();
+  if (scope?.projectDir?.trim()) compacted.projectDir = scope.projectDir.trim();
+  if (scope?.cwd?.trim()) compacted.cwd = scope.cwd.trim();
+  return compacted;
+}
 
 export class WsClient {
   private ws: WebSocket | null = null;
@@ -232,6 +272,13 @@ export class WsClient {
   private _missedHeartbeatPongs = 0;
   private _resumeProbeMisses = 0;
   private _onLatency: ((ms: number) => void) | null = null;
+  private p2pWorkflowPendingRequests = new Map<string, ReturnType<typeof setTimeout>>();
+  private p2pWorkflowRequestScope: P2pWorkflowRequestScope = {};
+  /** Last observed daemon capability handshake, or null if none received yet
+   *  (or cleared on disconnect). Read by the advanced workflow launch UI to
+   *  decide whether the launch button is enabled. */
+  private daemonCapabilitySnapshot: DaemonCapabilitySnapshot | null = null;
+  private daemonCapabilityListeners = new Set<(snapshot: DaemonCapabilitySnapshot | null) => void>();
 
   /** Per-session callbacks for raw PTY binary frames. Supports multiple subscribers per session. */
   private _terminalRawHandlers = new Map<string, Set<(data: Uint8Array) => void>>();
@@ -321,6 +368,7 @@ export class WsClient {
       this.ws = null;
     }
     this._connected = false;
+    this.setDaemonCapabilitySnapshot(null);
   }
 
   send(msg: object): void {
@@ -446,6 +494,7 @@ export class WsClient {
   }
 
   subscribeTerminal(sessionName: string, raw: boolean): void {
+    this.setP2pWorkflowRequestScope({ sessionName });
     this.terminalBaseSubscriptions.set(sessionName, raw);
     this.syncTerminalSubscription(sessionName);
   }
@@ -493,6 +542,7 @@ export class WsClient {
   /** Subscribe to transport chat events for a session (history replay + live approval/tool updates). */
   subscribeTransportSession(sessionId: string): void {
     if (!sessionId) return;
+    this.setP2pWorkflowRequestScope({ sessionName: sessionId });
     if (this.transportSubscriptions.has(sessionId)) return;
     this.transportSubscriptions.add(sessionId);
     if (!this._connected) return;
@@ -515,6 +565,10 @@ export class WsClient {
   }
 
   sendSessionCommand(command: 'start' | 'stop' | 'send' | 'restart' | 'cancel', payload: object = {}): void {
+    const sessionName = (payload as { sessionName?: unknown }).sessionName;
+    if (typeof sessionName === 'string' && sessionName.trim()) {
+      this.setP2pWorkflowRequestScope({ sessionName });
+    }
     this.send({ type: command === 'cancel' ? DAEMON_COMMAND_TYPES.SESSION_CANCEL : `session.${command}`, ...payload });
   }
 
@@ -610,12 +664,114 @@ export class WsClient {
     this.send({ type: 'discussion.stop', discussionId });
   }
 
+  /**
+   * @deprecated Use {@link p2pListDiscussions} instead. The legacy
+   * `discussion.list` daemon command predates the project-scoped p2p workflow
+   * messages and is not enforced by the daemon's scope guards. All app
+   * call sites were migrated to `p2pListDiscussions(scope)`. Kept on the
+   * client only until the daemon-side `discussion.list` route is retired.
+   */
   discussionList(): void {
     this.send({ type: 'discussion.list' });
   }
 
-  p2pStatus(runId?: string): void {
-    this.send(runId ? { type: 'p2p.status', runId } : { type: 'p2p.status' });
+  setP2pWorkflowRequestScope(scope: P2pWorkflowRequestScope | null | undefined): void {
+    this.p2pWorkflowRequestScope = {
+      ...this.p2pWorkflowRequestScope,
+      ...compactP2pWorkflowRequestScope(scope),
+    };
+  }
+
+  /** Return the most recent `daemon.hello` snapshot (or null if none/stale-cleared). */
+  getDaemonCapabilitySnapshot(): DaemonCapabilitySnapshot | null {
+    return this.daemonCapabilitySnapshot
+      ? { ...this.daemonCapabilitySnapshot, capabilities: [...this.daemonCapabilitySnapshot.capabilities] }
+      : null;
+  }
+
+  /** True when no capability snapshot has been observed, or the latest
+   *  snapshot is older than `P2P_CAPABILITY_FRESHNESS_TTL_MS`. The advanced
+   *  workflow launch UI uses this to disable the launch action. */
+  isDaemonCapabilityStale(now = Date.now()): boolean {
+    if (!this.daemonCapabilitySnapshot) return true;
+    return now - this.daemonCapabilitySnapshot.observedAt > P2P_CAPABILITY_FRESHNESS_TTL_MS;
+  }
+
+  /** Subscribe to capability snapshot changes (incl. disconnect-driven clears).
+   *  Fires synchronously with the current snapshot once and again whenever the
+   *  cached value changes. Returns an unsubscribe function. */
+  onDaemonCapabilitySnapshot(listener: (snapshot: DaemonCapabilitySnapshot | null) => void): () => void {
+    this.daemonCapabilityListeners.add(listener);
+    listener(this.getDaemonCapabilitySnapshot());
+    return () => {
+      this.daemonCapabilityListeners.delete(listener);
+    };
+  }
+
+  private setDaemonCapabilitySnapshot(snapshot: DaemonCapabilitySnapshot | null): void {
+    this.daemonCapabilitySnapshot = snapshot;
+    const view = this.getDaemonCapabilitySnapshot();
+    for (const listener of this.daemonCapabilityListeners) {
+      try {
+        listener(view);
+      } catch {
+        // ignore listener errors
+      }
+    }
+  }
+
+  private handleDaemonHelloMessage(msg: ServerMessage): void {
+    if (msg.type !== P2P_WORKFLOW_MSG.DAEMON_HELLO) return;
+    const daemonId = typeof msg.daemonId === 'string' ? msg.daemonId.trim() : '';
+    const helloEpoch = typeof msg.helloEpoch === 'number' && Number.isFinite(msg.helloEpoch) ? msg.helloEpoch : null;
+    const sentAt = typeof msg.sentAt === 'number' && Number.isFinite(msg.sentAt) ? msg.sentAt : null;
+    const capabilities = Array.isArray(msg.capabilities)
+      ? msg.capabilities.filter((cap): cap is string => typeof cap === 'string')
+      : null;
+    if (!daemonId || helloEpoch === null || sentAt === null || !capabilities) return;
+    const existing = this.daemonCapabilitySnapshot;
+    // Drop stale epoch from the same daemon (out-of-order delivery). A new
+    // daemonId always wins — the previous daemon is gone.
+    if (existing && existing.daemonId === daemonId && helloEpoch < existing.helloEpoch) return;
+    this.setDaemonCapabilitySnapshot({
+      daemonId,
+      capabilities: [...new Set(capabilities)].sort(),
+      helloEpoch,
+      sentAt,
+      observedAt: Date.now(),
+    });
+  }
+
+  private buildP2pWorkflowRequestPayload(scope: P2pWorkflowRequestScope | null | undefined): P2pWorkflowRequestScope {
+    return {
+      ...compactP2pWorkflowRequestScope(this.p2pWorkflowRequestScope),
+      ...compactP2pWorkflowRequestScope(scope),
+    };
+  }
+
+  p2pStatus(runIdOrScope?: string | P2pWorkflowRequestScope, scope?: P2pWorkflowRequestScope): string {
+    const requestId = createP2pWorkflowRequestId();
+    const runId = typeof runIdOrScope === 'string' ? runIdOrScope : undefined;
+    const requestScope = typeof runIdOrScope === 'object' ? runIdOrScope : scope;
+    this.send(runId
+      ? { type: P2P_WORKFLOW_MSG.STATUS, requestId, runId, ...this.buildP2pWorkflowRequestPayload(requestScope) }
+      : { type: P2P_WORKFLOW_MSG.STATUS, requestId, ...this.buildP2pWorkflowRequestPayload(requestScope) });
+    this.trackP2pWorkflowRequest(requestId);
+    return requestId;
+  }
+
+  p2pListDiscussions(scope?: P2pWorkflowRequestScope): string {
+    const requestId = createP2pWorkflowRequestId();
+    this.send({ type: P2P_WORKFLOW_MSG.LIST_DISCUSSIONS, requestId, ...this.buildP2pWorkflowRequestPayload(scope) });
+    this.trackP2pWorkflowRequest(requestId);
+    return requestId;
+  }
+
+  p2pReadDiscussion(id: string, scope?: P2pWorkflowRequestScope): string {
+    const requestId = createP2pWorkflowRequestId();
+    this.send({ type: P2P_WORKFLOW_MSG.READ_DISCUSSION, requestId, id, ...this.buildP2pWorkflowRequestPayload(scope) });
+    this.trackP2pWorkflowRequest(requestId);
+    return requestId;
   }
 
   /** Request timeline event replay from the daemon for reconnection gap-fill. */
@@ -1050,6 +1206,11 @@ export class WsClient {
   private clearSocketTimers(): void {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.clearPongWatchdog();
+    this.clearP2pWorkflowPendingRequests();
+    // Capability state belongs to a single daemon WS; on socket teardown
+    // the cached snapshot is no longer authoritative and must be cleared
+    // so the UI re-disables advanced launch until a fresh hello arrives.
+    this.setDaemonCapabilitySnapshot(null);
     if (this._resumeProbeTimer) clearTimeout(this._resumeProbeTimer);
     if (this._visibilityListener && typeof document !== 'undefined') {
       document.removeEventListener('visibilitychange', this._visibilityListener);
@@ -1214,6 +1375,10 @@ export class WsClient {
   }
 
   private dispatch(msg: ServerMessage): void {
+    this.settleP2pWorkflowRequest(msg);
+    if (msg.type === P2P_WORKFLOW_MSG.DAEMON_HELLO) {
+      this.handleDaemonHelloMessage(msg);
+    }
     for (const h of this.handlers) {
       try {
         h(msg);
@@ -1221,5 +1386,36 @@ export class WsClient {
         // ignore handler errors
       }
     }
+  }
+
+  private trackP2pWorkflowRequest(requestId: string): void {
+    this.clearP2pWorkflowPendingRequest(requestId);
+    const timer = setTimeout(() => {
+      this.p2pWorkflowPendingRequests.delete(requestId);
+    }, P2P_WORKFLOW_REQUEST_TIMEOUT_MS);
+    this.p2pWorkflowPendingRequests.set(requestId, timer);
+  }
+
+  private settleP2pWorkflowRequest(msg: ServerMessage): void {
+    if (
+      msg.type === P2P_WORKFLOW_MSG.STATUS_RESPONSE ||
+      msg.type === P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE ||
+      msg.type === P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE
+    ) {
+      this.clearP2pWorkflowPendingRequest(msg.requestId);
+    }
+  }
+
+  private clearP2pWorkflowPendingRequest(requestId: string): void {
+    const timer = this.p2pWorkflowPendingRequests.get(requestId);
+    if (timer) clearTimeout(timer);
+    this.p2pWorkflowPendingRequests.delete(requestId);
+  }
+
+  private clearP2pWorkflowPendingRequests(): void {
+    for (const timer of this.p2pWorkflowPendingRequests.values()) {
+      clearTimeout(timer);
+    }
+    this.p2pWorkflowPendingRequests.clear();
   }
 }

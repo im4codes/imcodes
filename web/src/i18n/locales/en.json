@@ -648,6 +648,77 @@
       "more_agents": "@ More",
       "send_anyway": "Send Anyway",
       "tip_history": "Multi-agent discussions share files and keep fuller history. One-to-one discussions are treated as one-off discussions."
+    },
+    "settings_workflow_migration_title": "Workflow migration",
+    "settings_workflow_migration_body": "This saved advanced config uses the old rounds format. Save to create a workflow launch envelope before launching advanced P2P.",
+    "settings_workflow_migration_ready": "A workflow launch envelope is ready for advanced P2P launches.",
+    "settings_workflow_migration_error": "Advanced workflow migration failed. Review the saved rounds before launching.",
+    "workflow": {
+      "diagnostics": {
+        "forbidden_envelope_field": "The launch envelope contains a forbidden private field.",
+        "unsupported_schema_version": "This workflow schema version is not supported.",
+        "unknown_future_schema_read_only": "This future workflow version is read-only here.",
+        "mixed_advanced_schema_fields": "Old and new advanced workflow fields are mixed.",
+        "static_policy_mismatch_recompiled": "Daemon policy changed, so the workflow was recompiled.",
+        "missing_required_capability": "The daemon is missing a required workflow capability.",
+        "capability_stale": "Daemon workflow capability information is stale.",
+        "capability_downgraded_during_run": "A required capability was downgraded during the run.",
+        "invalid_launch_envelope": "The workflow launch envelope is invalid.",
+        "invalid_workflow_graph": "The workflow graph is invalid.",
+        "invalid_routing_authority": "The workflow routing authority is invalid.",
+        "invalid_edge_condition": "A workflow edge condition is invalid.",
+        "loop_budget_exhausted": "The workflow loop budget was exhausted.",
+        "invalid_workflow_variable": "A workflow variable is invalid.",
+        "invalid_prompt_append": "A workflow prompt append is invalid.",
+        "missing_context_source": "A required workflow context source is missing.",
+        "context_source_too_large": "A workflow context source is too large.",
+        "unsafe_artifact_path": "A workflow artifact path is unsafe.",
+        "artifact_identity_collision_resolved": "An artifact identity collision was resolved.",
+        "artifact_baseline_too_large": "An artifact baseline is too large.",
+        "artifact_baseline_mismatch": "An artifact baseline did not match.",
+        "artifact_contract_not_satisfied": "An artifact contract was not satisfied.",
+        "invalid_script_contract": "A workflow script contract is invalid.",
+        "script_executable_denied": "The script executable is not allowed.",
+        "script_machine_output_invalid": "Script machine output is invalid.",
+        "script_timeout": "The script timed out.",
+        "script_cancelled": "The script was cancelled.",
+        "daemon_busy": "The daemon is busy with other advanced workflows.",
+        "workflow_stale_after_restart": "The workflow became stale after daemon restart.",
+        "private_projection_field_dropped": "A private projection field was dropped.",
+        "legacy_progress_snapshot_sanitized": "A legacy progress snapshot was sanitized.",
+        "unknown_p2p_message": "An unknown P2P workflow message was ignored.",
+        "unmatched_edge_route": "No outgoing conditional edge matched the route and no default edge exists."
+      },
+      "editor": {
+        "title": "Advanced workflow draft",
+        "add_node": "Add node",
+        "remove_node": "Remove node",
+        "remove_edge": "Remove edge",
+        "diagnostics_header": "Diagnostics",
+        "read_only_notice": "This workflow uses a future schema and is read-only here.",
+        "canvas_hint": "Drag nodes to position. Drag from the right anchor (●) to another node to create an edge.",
+        "inspector_empty": "Select a node or edge to edit its properties.",
+        "node": {
+          "section_label": "Node",
+          "preset_label": "Preset",
+          "permission_scope_label": "Permission scope"
+        },
+        "edge": {
+          "section_label": "Edge",
+          "from_label": "From",
+          "to_label": "To",
+          "condition_label": "Condition value"
+        }
+      },
+      "allowed_executables": {
+        "title": "Allowed script executables",
+        "hint": "Script nodes may only spawn executables listed here. Use absolute paths (e.g. /usr/bin/jq) or PATH-relative names. Empty list disables script execution for this config.",
+        "placeholder": "/usr/bin/jq",
+        "input_label": "New executable path",
+        "add": "Add",
+        "remove": "Remove",
+        "empty": "No executables allowed yet. Script nodes will be rejected at bind time."
+      }
     }
   },
   "openspec": {

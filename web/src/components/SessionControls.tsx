@@ -12,7 +12,12 @@ import { useSwipeBack } from '../hooks/useSwipeBack.js';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
 import { AtPicker } from './AtPicker.js';
-import { P2pConfigPanel } from './P2pConfigPanel.js';
+import { P2pConfigPanel, buildP2pWorkflowLaunchEnvelopeFromConfig } from './P2pConfigPanel.js';
+import { isFutureWorkflowSchema } from '@shared/p2p-workflow-validators.js';
+import {
+  P2P_CAPABILITY_FRESHNESS_TTL_MS,
+  P2P_WORKFLOW_CAPABILITY_V1,
+} from '@shared/p2p-workflow-constants.js';
 import { useP2pCustomCombos } from './p2p-combos.js';
 import { parseBooleanish, usePref } from '../hooks/usePref.js';
 import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
@@ -286,13 +291,6 @@ function getAnchoredOverlayStyle(
   return style;
 }
 
-type OptionalP2pAdvancedConfig = {
-  advancedPresetKey?: unknown;
-  advancedRounds?: unknown;
-  advancedRunTimeoutMinutes?: unknown;
-  contextReducer?: unknown;
-};
-
 interface PendingAtTarget {
   session: string;
   mode: string;
@@ -346,14 +344,56 @@ type PendingTransportApproval = {
   tool?: string;
 };
 
-function appendOptionalAdvancedP2pConfig(extra: Record<string, unknown>, config: P2pSavedConfig): void {
-  const advanced = config as P2pSavedConfig & OptionalP2pAdvancedConfig;
-  if (advanced.advancedPresetKey) extra.p2pAdvancedPresetKey = advanced.advancedPresetKey;
-  if (advanced.advancedRounds) extra.p2pAdvancedRounds = advanced.advancedRounds;
-  if (advanced.advancedRunTimeoutMinutes != null) {
-    extra.p2pAdvancedRunTimeoutMinutes = advanced.advancedRunTimeoutMinutes;
+/** Compute the launch-time capability gate from the live WS client + saved
+ *  config. Returns `stale=true` when no daemon.hello has been observed (or the
+ *  cached snapshot has aged past `P2P_CAPABILITY_FRESHNESS_TTL_MS`),
+ *  `missing` is the set of required capabilities not present, and
+ *  `futureSchema=true` if the saved draft/envelope encodes a workflow schema
+ *  this client cannot speak. The launch path uses these to decide whether to
+ *  attach the envelope. */
+function computeAdvancedLaunchCapabilityGate(
+  ws: WsClient | null,
+  config: P2pSavedConfig,
+): { stale: boolean; missing: string[]; futureSchema: boolean } {
+  const futureSchema = (config.workflowLaunchEnvelope && isFutureWorkflowSchema(config.workflowLaunchEnvelope))
+    || (config.workflowDraft && isFutureWorkflowSchema(config.workflowDraft))
+    || false;
+  const snapshot = ws?.getDaemonCapabilitySnapshot() ?? null;
+  const stale = !snapshot
+    || (Date.now() - snapshot.observedAt) > P2P_CAPABILITY_FRESHNESS_TTL_MS;
+  const required = new Set<string>([P2P_WORKFLOW_CAPABILITY_V1]);
+  const envelopeCaps = config.workflowLaunchEnvelope?.requiredDaemonCapabilities;
+  if (Array.isArray(envelopeCaps)) {
+    for (const cap of envelopeCaps) if (typeof cap === 'string' && cap) required.add(cap);
   }
-  if (advanced.contextReducer) extra.p2pContextReducer = advanced.contextReducer;
+  const have = stale ? new Set<string>() : new Set(snapshot?.capabilities ?? []);
+  const missing = stale ? [...required] : [...required].filter((cap) => !have.has(cap));
+  return { stale, missing, futureSchema };
+}
+
+function appendOptionalAdvancedP2pConfig(
+  extra: Record<string, unknown>,
+  config: P2pSavedConfig,
+  launchContext?: { sessionName?: string; projectDir?: string; cwd?: string; userText?: string; locale?: string },
+  capabilityGate?: { stale: boolean; missing: string[]; futureSchema: boolean },
+): void {
+  const hasNewWorkflowConfig = Boolean(config.workflowDraft || config.workflowLaunchEnvelope);
+  const hasLegacyAdvancedConfig = Boolean(
+    config.advancedPresetKey ||
+    config.advancedRounds?.length ||
+    config.advancedRunTimeoutMinutes != null ||
+    config.contextReducer,
+  );
+  if (!hasNewWorkflowConfig && !hasLegacyAdvancedConfig) return;
+  // smart-p2p-upgrade 9.5–9.7: refuse to attach the launch envelope when the
+  // daemon's capability state is stale, the required capability is missing,
+  // or the saved config encodes a future schema this client cannot speak.
+  // The panel surfaces the matching diagnostic banner; here we just no-op so
+  // the daemon never receives an unsupported launch.
+  if (capabilityGate?.stale || capabilityGate?.futureSchema) return;
+  if ((capabilityGate?.missing.length ?? 0) > 0) return;
+  const envelope = buildP2pWorkflowLaunchEnvelopeFromConfig(config, launchContext);
+  if (envelope) extra.p2pWorkflowLaunchEnvelope = envelope;
 }
 
 // Enter moved after ↓ arrow
@@ -1562,15 +1602,20 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return { orderedTargets, cleanText };
   };
 
-  const applySavedP2pConfigSelection = useCallback((extra: Record<string, unknown>, mode: string) => {
+  const applySavedP2pConfigSelection = useCallback((extra: Record<string, unknown>, mode: string, userText?: string) => {
     if (!p2pSavedConfig || (mode !== P2P_CONFIG_MODE && !isComboMode(mode))) return;
     const selection = buildP2pConfigSelection(p2pSavedConfig, mode);
     extra.p2pSessionConfig = selection.config.sessions;
     extra.p2pRounds = selection.rounds;
     if (selection.config.extraPrompt) extra.p2pExtraPrompt = selection.config.extraPrompt;
     if (selection.config.hopTimeoutMinutes != null) extra.p2pHopTimeoutMs = Math.min(selection.config.hopTimeoutMinutes * 60_000, 600_000);
-    if (mode === P2P_CONFIG_MODE) appendOptionalAdvancedP2pConfig(extra, selection.config);
-  }, [p2pSavedConfig]);
+    if (mode === P2P_CONFIG_MODE) appendOptionalAdvancedP2pConfig(extra, selection.config, {
+      sessionName: activeSession?.name,
+      projectDir: activeSession?.projectDir,
+      userText,
+      locale: i18n?.language ?? 'en',
+    }, computeAdvancedLaunchCapabilityGate(ws, selection.config));
+  }, [activeSession?.name, activeSession?.projectDir, i18n?.language, p2pSavedConfig, ws]);
 
   const buildSendPayload = useCallback((options?: string | BuildSendPayloadOptions): PendingSendPayload | null => {
     const normalizedOptions: BuildSendPayloadOptions =
@@ -1611,7 +1656,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           extra.p2pRounds = override?.rounds ?? cfg.rounds ?? 1;
           if (cfg.extraPrompt) extra.p2pExtraPrompt = cfg.extraPrompt;
           if (cfg.hopTimeoutMinutes != null) extra.p2pHopTimeoutMs = Math.min(cfg.hopTimeoutMinutes * 60_000, 600_000);
-          if (!override?.modeOverride || override.modeOverride === P2P_CONFIG_MODE) appendOptionalAdvancedP2pConfig(extra, cfg);
+          if (!override?.modeOverride || override.modeOverride === P2P_CONFIG_MODE) appendOptionalAdvancedP2pConfig(extra, cfg, {
+            sessionName: activeSession?.name,
+            projectDir: activeSession?.projectDir,
+            userText: text,
+            locale: i18n?.language ?? 'en',
+          }, computeAdvancedLaunchCapabilityGate(ws, cfg));
         }
         // For non-config mode overrides (single or combo), send as p2pMode so the daemon uses it
         if (override?.modeOverride && override.modeOverride !== 'config') {
@@ -1631,7 +1681,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           extra.p2pMode = effectiveMode;
           if (p2pExcludeSameType) extra.p2pExcludeSameType = true;
         }
-        applySavedP2pConfigSelection(extra, effectiveMode);
+        applySavedP2pConfigSelection(extra, effectiveMode, text);
       }
     }
 
@@ -1668,7 +1718,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     } else if (effectiveMode !== 'solo' && !text.includes('@@')) {
       extra.p2pMode = effectiveMode === P2P_CONFIG_MODE ? 'config' : effectiveMode;
       if (p2pExcludeSameType && effectiveMode !== P2P_CONFIG_MODE) extra.p2pExcludeSameType = true;
-      applySavedP2pConfigSelection(extra, effectiveMode);
+      applySavedP2pConfigSelection(extra, effectiveMode, cleanText);
     }
 
     if (extra.p2pAtTargets || extra.p2pMode) {
@@ -3380,6 +3430,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         onSave={(cfg) => {
           setP2pSavedConfig(cfg);
         }}
+        daemonCapabilitySource={ws ? {
+          getSnapshot: () => ws.getDaemonCapabilitySnapshot(),
+          subscribe: (listener) => ws.onDaemonCapabilitySnapshot(listener),
+        } : null}
       />
     )}
     </>

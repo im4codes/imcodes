@@ -9,9 +9,22 @@ import { p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../cons
 import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p-config-pref.js';
 import { P2pComboManager } from './P2pComboManager.js';
 import { useP2pCustomCombos } from './p2p-combos.js';
+import { AdvancedWorkflowCanvasEditor } from './AdvancedWorkflowCanvasEditor.js';
 import type { P2pSavedConfig, P2pSessionConfig } from '@shared/p2p-modes.js';
 import { BUILT_IN_ADVANCED_PRESETS } from '@shared/p2p-advanced.js';
 import { MAX_P2P_PARTICIPANTS } from '@shared/p2p-config-events.js';
+import { materializeOldAdvancedConfigToWorkflowDraft } from '@shared/p2p-workflow-materialize.js';
+import {
+  P2P_CAPABILITY_FRESHNESS_TTL_MS,
+  P2P_FORBIDDEN_ENVELOPE_FIELD_NAMES,
+  P2P_WORKFLOW_CAPABILITY_V1,
+  P2P_WORKFLOW_SCHEMA_VERSION,
+} from '@shared/p2p-workflow-constants.js';
+import type {
+  P2pWorkflowDraft,
+  P2pWorkflowLaunchEnvelope,
+} from '@shared/p2p-workflow-types.js';
+import { isFutureWorkflowSchema } from '@shared/p2p-workflow-validators.js';
 import type {
   P2pAdvancedPresetKey,
   P2pAdvancedRound,
@@ -33,6 +46,25 @@ interface SubSessionRow {
   state: string;
 }
 
+/** Daemon capability snapshot view used by the panel to gate advanced launch.
+ *  Mirrors the structure of `DaemonCapabilitySnapshot` in `web/src/ws-client.ts`,
+ *  but is declared here so the component does not depend on the WS client at
+ *  type level (tests can pass a plain object). */
+export interface P2pConfigPanelCapabilitySnapshot {
+  daemonId: string;
+  capabilities: string[];
+  helloEpoch: number;
+  sentAt: number;
+  observedAt: number;
+}
+
+export interface P2pConfigPanelCapabilitySource {
+  /** Read the most recent daemon.hello snapshot, or null if none seen. */
+  getSnapshot(): P2pConfigPanelCapabilitySnapshot | null;
+  /** Subscribe to snapshot changes; returns an unsubscribe function. */
+  subscribe(listener: () => void): () => void;
+}
+
 interface Props {
   sessions: SessionRow[];
   subSessions: SubSessionRow[];
@@ -44,12 +76,163 @@ interface Props {
   onClose: () => void;
   onSave: (config: P2pSavedConfig) => void;
   onPersistDaemonConfig?: (scopeSession: string, config: P2pSavedConfig) => Promise<{ ok: boolean; error?: string }> | { ok: boolean; error?: string };
+  /** Optional source of daemon capability snapshots (from WsClient). When
+   *  omitted, the panel treats capability state as stale and disables advanced
+   *  launch — that is the safe default until the caller wires up a source. */
+  daemonCapabilitySource?: P2pConfigPanelCapabilitySource | null;
 }
 
 const EXCLUDED_TYPES = new Set(['shell', 'script']);
 const SESSION_MODES = ['audit', 'review', 'plan', 'brainstorm', 'discuss', 'skip'] as const;
 const ROUND_OPTIONS = [1, 2, 3, 5] as const;
 type AgentFlavorFilter = 'sdk' | 'cli';
+
+export interface P2pWorkflowLaunchContextInput {
+  sessionName?: string;
+  projectDir?: string;
+  cwd?: string;
+  userText?: string;
+  locale?: string;
+}
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function hasOldAdvancedConfig(config: P2pSavedConfig): boolean {
+  return Boolean(config.advancedPresetKey || config.advancedRounds?.length || config.advancedRunTimeoutMinutes != null || config.contextReducer);
+}
+
+const FORBIDDEN_ENVELOPE_FIELDS = new Set<string>(P2P_FORBIDDEN_ENVELOPE_FIELD_NAMES);
+
+function findForbiddenEnvelopeField(value: unknown): string | null {
+  if (!isRecord(value) && !Array.isArray(value)) return null;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findForbiddenEnvelopeField(item);
+      if (found) return found;
+    }
+    return null;
+  }
+  for (const [key, nested] of Object.entries(value)) {
+    const normalized = key.toLowerCase();
+    if (
+      FORBIDDEN_ENVELOPE_FIELDS.has(key) ||
+      normalized.endsWith('token') ||
+      normalized.endsWith('secret') ||
+      normalized.endsWith('apikey') ||
+      normalized === 'env' ||
+      normalized === 'environment'
+    ) {
+      return key;
+    }
+    const found = findForbiddenEnvelopeField(nested);
+    if (found) return found;
+  }
+  return null;
+}
+
+function isLaunchableDraft(value: unknown): value is P2pWorkflowDraft {
+  if (!isRecord(value)) return false;
+  return value.schemaVersion === P2P_WORKFLOW_SCHEMA_VERSION &&
+    typeof value.id === 'string' &&
+    Array.isArray(value.nodes) &&
+    value.nodes.length > 0 &&
+    Array.isArray(value.edges);
+}
+
+function isLaunchableEnvelope(value: unknown): value is P2pWorkflowLaunchEnvelope {
+  if (!isRecord(value) || findForbiddenEnvelopeField(value)) return false;
+  return value.workflowSchemaVersion === P2P_WORKFLOW_SCHEMA_VERSION &&
+    value.workflowKind === 'advanced' &&
+    (value.advancedDraft === undefined || isLaunchableDraft(value.advancedDraft));
+}
+
+function compactLaunchContext(input: P2pWorkflowLaunchContextInput | undefined): P2pWorkflowLaunchEnvelope['launchContext'] | undefined {
+  const projectRoot = input?.projectDir?.trim() || input?.cwd?.trim();
+  const launchContext: NonNullable<P2pWorkflowLaunchEnvelope['launchContext']> = {};
+  if (input?.sessionName?.trim()) launchContext.sessionName = input.sessionName.trim();
+  if (projectRoot) launchContext.projectRoot = projectRoot;
+  if (input?.userText?.trim()) launchContext.userText = input.userText.trim();
+  if (input?.locale?.trim()) launchContext.locale = input.locale.trim();
+  return Object.keys(launchContext).length > 0 ? launchContext : undefined;
+}
+
+export function buildP2pWorkflowLaunchEnvelopeFromConfig(
+  config: P2pSavedConfig,
+  launchContextInput?: P2pWorkflowLaunchContextInput,
+): P2pWorkflowLaunchEnvelope | null {
+  const launchContext = compactLaunchContext(launchContextInput);
+  // R3 PR-α follow-up — UI-managed allowlist. The authoritative list is
+  // owned by `config.allowedExecutables` (edited in `P2pConfigPanel`).
+  // We surface it on every fresh envelope build AND patch it onto a
+  // pre-saved envelope when the user has edited the list since the
+  // envelope was first computed (so the saved envelope path doesn't drift
+  // from the latest UI state).
+  const allowedExecutables = sanitizeAllowedExecutables(config.allowedExecutables);
+  const savedEnvelope = config.workflowLaunchEnvelope ? cloneJson(config.workflowLaunchEnvelope) : null;
+  if (savedEnvelope) {
+    const candidate = {
+      ...savedEnvelope,
+      ...(launchContext ? { launchContext: { ...(savedEnvelope.launchContext ?? {}), ...launchContext } } : {}),
+      ...(allowedExecutables.length > 0 ? { allowedExecutables } : {}),
+    };
+    if (isLaunchableEnvelope(candidate)) return candidate;
+  }
+
+  let draft: P2pWorkflowDraft | null = config.workflowDraft ? cloneJson(config.workflowDraft) : null;
+  if (!draft && hasOldAdvancedConfig(config)) {
+    try {
+      draft = materializeOldAdvancedConfigToWorkflowDraft({
+        advancedPresetKey: config.advancedPresetKey,
+        advancedRounds: config.advancedRounds,
+        advancedRunTimeoutMinutes: config.advancedRunTimeoutMinutes,
+      });
+    } catch {
+      draft = null;
+    }
+  }
+  if (!draft) return null;
+  if (!isLaunchableDraft(draft) || findForbiddenEnvelopeField(draft)) return null;
+  const envelope: P2pWorkflowLaunchEnvelope = {
+    workflowSchemaVersion: P2P_WORKFLOW_SCHEMA_VERSION,
+    workflowKind: 'advanced',
+    advancedDraft: draft,
+    requiredDaemonCapabilities: [P2P_WORKFLOW_CAPABILITY_V1],
+    ...(launchContext ? { launchContext } : {}),
+    ...(allowedExecutables.length > 0 ? { allowedExecutables } : {}),
+  };
+  return isLaunchableEnvelope(envelope) ? envelope : null;
+}
+
+/**
+ * R3 PR-α follow-up — UI-side hygiene before the envelope hits the wire.
+ * Server-side validator (`validateP2pWorkflowLaunchEnvelope.allowedExecutables`)
+ * enforces the same shape, but doing it client-side avoids round-tripping
+ * obviously-bad entries.
+ */
+function sanitizeAllowedExecutables(input: unknown): string[] {
+  if (!Array.isArray(input)) return [];
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const entry of input) {
+    if (typeof entry !== 'string') continue;
+    const trimmed = entry.trim();
+    if (trimmed.length === 0 || trimmed.length > 256) continue;
+    // Reject any character outside visible ASCII (matches
+    // `P2P_REQUEST_ID_ASCII_PATTERN` server-side).
+    if (!/^[\x21-\x7e]+$/.test(trimmed)) continue;
+    if (seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    result.push(trimmed);
+    if (result.length >= 64) break;
+  }
+  return result.sort();
+}
 
 function getAgentFlavor(agentType: string): AgentFlavorFilter {
   if (agentType === 'claude-code' || agentType === 'codex' || agentType === 'gemini' || agentType === 'opencode') return 'cli';
@@ -237,6 +420,7 @@ export function P2pConfigPanel({
   onClose,
   onSave,
   onPersistDaemonConfig,
+  daemonCapabilitySource,
 }: Props) {
   const { t } = useTranslation();
   const [agentFlavorFilter, setAgentFlavorFilter] = useState<AgentFlavorFilter>('sdk');
@@ -294,12 +478,117 @@ export function P2pConfigPanel({
   const [contextReducerMode, setContextReducerMode] = useState<P2pContextReducerMode | ''>('');
   const [contextReducerSession, setContextReducerSession] = useState('');
   const [contextReducerTemplate, setContextReducerTemplate] = useState('');
+  const [workflowDraft, setWorkflowDraft] = useState<P2pWorkflowDraft | undefined>(undefined);
+  const [workflowLaunchEnvelope, setWorkflowLaunchEnvelope] = useState<P2pWorkflowLaunchEnvelope | undefined>(undefined);
+  // R3 PR-α follow-up — UI-managed script executable allowlist. Round-trips
+  // through `P2pSavedConfig.allowedExecutables` (userPref) and is written
+  // into every advanced launch envelope via
+  // `buildP2pWorkflowLaunchEnvelopeFromConfig`. The daemon merges this
+  // into the bind-time `P2pStaticPolicy.allowedExecutables`.
+  const [allowedExecutables, setAllowedExecutables] = useState<string[]>([]);
+  const [allowedExecutableDraft, setAllowedExecutableDraft] = useState('');
+  const [advancedMigrationNeeded, setAdvancedMigrationNeeded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saveWarning, setSaveWarning] = useState<string | null>(null);
   const showAdvancedWorkflowSettings = false;
   const formDirtyRef = useRef(false);
   const seededConfigKeyRef = useRef<string | null>(null);
+
+  // ── Daemon capability tracking ───────────────────────────────────────────
+  // Subscribe to daemon.hello snapshots; absent or stale snapshots disable
+  // advanced launch. Never trust a stale snapshot — TTL is enforced per
+  // `P2P_CAPABILITY_FRESHNESS_TTL_MS` from shared constants.
+  const [capabilitySnapshot, setCapabilitySnapshot] = useState<P2pConfigPanelCapabilitySnapshot | null>(
+    () => daemonCapabilitySource?.getSnapshot() ?? null,
+  );
+  // Tick used to re-evaluate freshness when no message arrives but the TTL
+  // window elapses; without it a stale snapshot would still appear valid in
+  // the rendered UI until the next external state change.
+  const [, setCapabilityClockTick] = useState(0);
+  useEffect(() => {
+    if (!daemonCapabilitySource) {
+      setCapabilitySnapshot(null);
+      return;
+    }
+    setCapabilitySnapshot(daemonCapabilitySource.getSnapshot());
+    const unsubscribe = daemonCapabilitySource.subscribe(() => {
+      setCapabilitySnapshot(daemonCapabilitySource.getSnapshot());
+    });
+    return unsubscribe;
+  }, [daemonCapabilitySource]);
+  useEffect(() => {
+    if (!capabilitySnapshot) return;
+    const elapsed = Date.now() - capabilitySnapshot.observedAt;
+    const remaining = P2P_CAPABILITY_FRESHNESS_TTL_MS - elapsed;
+    if (remaining <= 0) return;
+    const timer = setTimeout(() => setCapabilityClockTick((tick) => tick + 1), remaining);
+    return () => clearTimeout(timer);
+  }, [capabilitySnapshot]);
+
+  const advancedEnvelopePreview = useMemo(() => {
+    if (!workflowLaunchEnvelope && !workflowDraft && !advancedPresetKey) return null;
+    const draft: P2pSavedConfig = {
+      sessions: {},
+      rounds,
+      updatedAt: Date.now(),
+      hopTimeoutMinutes,
+      extraPrompt: extraPrompt.trim() || undefined,
+      advancedPresetKey: advancedPresetKey || undefined,
+      advancedRounds,
+      advancedRunTimeoutMinutes: advancedPresetKey ? advancedRunTimeoutMinutes : undefined,
+      workflowDraft,
+      workflowLaunchEnvelope,
+      ...(allowedExecutables.length > 0 ? { allowedExecutables } : {}),
+    };
+    return buildP2pWorkflowLaunchEnvelopeFromConfig(draft, { sessionName: scopeSession ?? undefined });
+  }, [advancedPresetKey, advancedRounds, advancedRunTimeoutMinutes, allowedExecutables, extraPrompt, hopTimeoutMinutes, rounds, scopeSession, workflowDraft, workflowLaunchEnvelope]);
+
+  const hasAdvancedConfig = Boolean(advancedPresetKey || workflowDraft || workflowLaunchEnvelope);
+  const futureSchemaDetected = useMemo(() => {
+    if (workflowLaunchEnvelope && isFutureWorkflowSchema(workflowLaunchEnvelope)) return true;
+    if (workflowDraft && isFutureWorkflowSchema(workflowDraft)) return true;
+    if (advancedEnvelopePreview && isFutureWorkflowSchema(advancedEnvelopePreview)) return true;
+    return false;
+  }, [advancedEnvelopePreview, workflowDraft, workflowLaunchEnvelope]);
+
+  const requiredCapabilities = useMemo(() => {
+    if (!hasAdvancedConfig) return [] as string[];
+    const required = new Set<string>([P2P_WORKFLOW_CAPABILITY_V1]);
+    const envelopeCaps = advancedEnvelopePreview?.requiredDaemonCapabilities;
+    if (Array.isArray(envelopeCaps)) {
+      for (const cap of envelopeCaps) if (typeof cap === 'string' && cap) required.add(cap);
+    }
+    return [...required];
+  }, [advancedEnvelopePreview, hasAdvancedConfig]);
+
+  const capabilityStale = !capabilitySnapshot
+    || (Date.now() - capabilitySnapshot.observedAt) > P2P_CAPABILITY_FRESHNESS_TTL_MS;
+  const missingCapabilities = useMemo(() => {
+    if (!hasAdvancedConfig || capabilityStale || !capabilitySnapshot) return [] as string[];
+    const have = new Set(capabilitySnapshot.capabilities);
+    return requiredCapabilities.filter((cap) => !have.has(cap));
+  }, [capabilitySnapshot, capabilityStale, hasAdvancedConfig, requiredCapabilities]);
+  const missingRequiredCapability = missingCapabilities.length > 0;
+
+  /** Save-time block. Future schemas cannot be safely re-serialised by an
+   *  older client, so refuse the Save action entirely. Capability staleness
+   *  and unaccepted migration are surfaced as banners but do NOT block Save —
+   *  Save is the migration-acceptance action and configures (not launches)
+   *  the workflow. The actual launch path (`appendOptionalAdvancedP2pConfig`
+   *  in `SessionControls`) is gated separately when the envelope is sent. */
+  const saveBlocked = hasAdvancedConfig && futureSchemaDetected;
+
+  /** Aggregate launch-disabled signal exposed via a data attribute and used
+   *  for assistive text. Kept as a single boolean to mirror the design's
+   *  "advancedLaunchDisabled" gate. Aligns with smart-p2p-upgrade 9.5–9.7. */
+  const advancedLaunchDisabled = hasAdvancedConfig && (
+    advancedMigrationNeeded
+    || futureSchemaDetected
+    || capabilityStale
+    || missingRequiredCapability
+  );
+  const readOnlyMode = futureSchemaDetected;
 
   const markFormDirty = () => {
     formDirtyRef.current = true;
@@ -338,8 +627,25 @@ export function P2pConfigPanel({
     setContextReducerMode(parsed.contextReducer?.mode ?? '');
     setContextReducerSession(parsed.contextReducer?.sessionName ?? '');
     setContextReducerTemplate(parsed.contextReducer?.templateSession ?? '');
-    setAdvancedExpanded(Boolean(parsed.advancedPresetKey || parsed.contextReducer || parsed.advancedRunTimeoutMinutes != null));
-  }, [configKey, p2pConfigPref.value]);
+    setAllowedExecutables(Array.isArray(parsed.allowedExecutables)
+      ? parsed.allowedExecutables.filter((entry): entry is string => typeof entry === 'string')
+      : []);
+    setAllowedExecutableDraft('');
+    const materializedEnvelope = buildP2pWorkflowLaunchEnvelopeFromConfig(parsed, {
+      sessionName: scopeSession ?? undefined,
+    });
+    setWorkflowDraft(parsed.workflowDraft ?? materializedEnvelope?.advancedDraft);
+    setWorkflowLaunchEnvelope(parsed.workflowLaunchEnvelope ?? materializedEnvelope ?? undefined);
+    const needsMigration = hasOldAdvancedConfig(parsed) && !parsed.workflowDraft && !parsed.workflowLaunchEnvelope;
+    setAdvancedMigrationNeeded(needsMigration);
+    setAdvancedExpanded(Boolean(
+      parsed.advancedPresetKey ||
+      parsed.workflowDraft ||
+      parsed.workflowLaunchEnvelope ||
+      parsed.contextReducer ||
+      parsed.advancedRunTimeoutMinutes != null,
+    ));
+  }, [configKey, p2pConfigPref.value, scopeSession]);
 
   useEffect(() => {
     if (contextReducerMode === 'reuse_existing_session') {
@@ -420,6 +726,14 @@ export function P2pConfigPanel({
   };
 
   const handleSave = async () => {
+    // Hard gate: a future-version draft/projection cannot be safely re-saved
+    // by this client — it would silently re-serialise unknown fields. Refuse
+    // and surface a translated diagnostic. The Save button is also disabled
+    // in the UI; this is defense in depth.
+    if (saveBlocked) {
+      setSaveError(t('p2p.workflow.diagnostics.unsupported_schema_version'));
+      return;
+    }
     setSaving(true);
     setSaveError(null);
     setSaveWarning(null);
@@ -452,7 +766,7 @@ export function P2pConfigPanel({
     const resolvedAdvancedRounds = advancedPresetKey
       ? (advancedRounds ? JSON.parse(JSON.stringify(advancedRounds)) as P2pAdvancedRound[] : JSON.parse(JSON.stringify(BUILT_IN_ADVANCED_PRESETS[advancedPresetKey])) as P2pAdvancedRound[])
       : undefined;
-    const cfg: P2pSavedConfig = {
+    const oldAdvancedCfg: P2pSavedConfig = {
       sessions: merged,
       rounds,
       updatedAt: Date.now(),
@@ -462,6 +776,29 @@ export function P2pConfigPanel({
       advancedRounds: resolvedAdvancedRounds,
       advancedRunTimeoutMinutes: advancedPresetKey ? advancedRunTimeoutMinutes : undefined,
       contextReducer,
+      workflowDraft,
+      workflowLaunchEnvelope,
+      ...(allowedExecutables.length > 0 ? { allowedExecutables } : {}),
+    };
+    const envelope = buildP2pWorkflowLaunchEnvelopeFromConfig(oldAdvancedCfg, {
+      sessionName: scopeSession ?? undefined,
+    });
+    if ((advancedPresetKey || workflowDraft || workflowLaunchEnvelope) && !envelope) {
+      setSaveError(t('p2p.settings_workflow_migration_error'));
+      setSaving(false);
+      return;
+    }
+    const cfg: P2pSavedConfig = {
+      sessions: merged,
+      rounds,
+      updatedAt: oldAdvancedCfg.updatedAt,
+      hopTimeoutMinutes,
+      extraPrompt: oldAdvancedCfg.extraPrompt,
+      ...(envelope ? { workflowDraft: envelope.advancedDraft, workflowLaunchEnvelope: envelope } : {}),
+      // R3 PR-α follow-up — Persist the UI-managed allowlist so it
+      // round-trips through userPref and is available to the next
+      // envelope build.
+      ...(allowedExecutables.length > 0 ? { allowedExecutables } : {}),
     };
     try {
       if (configKey) await p2pConfigPref.save(cfg);
@@ -496,10 +833,14 @@ export function P2pConfigPanel({
       setContextReducerMode('');
       setContextReducerSession('');
       setContextReducerTemplate('');
+      setWorkflowDraft(undefined);
+      setWorkflowLaunchEnvelope(undefined);
+      setAdvancedMigrationNeeded(false);
       return;
     }
     setAdvancedRounds((prev) => prev ?? (JSON.parse(JSON.stringify(BUILT_IN_ADVANCED_PRESETS[nextPreset])) as P2pAdvancedRound[]));
     setAdvancedRunTimeoutMinutes((prev) => (prev > 0 ? prev : 30));
+    setAdvancedMigrationNeeded(true);
   };
 
   const updateAdvancedRound = (roundId: string, updater: (round: P2pAdvancedRound) => P2pAdvancedRound) => {
@@ -535,7 +876,7 @@ export function P2pConfigPanel({
 
   return (
     <div style={overlayStyle} onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
-      <div style={panelStyle}>
+      <div style={panelStyle} data-readonly-mode={readOnlyMode ? 'true' : 'false'}>
         {/* Header */}
         <div style={headerStyle}>
           <h2 style={titleStyle}>{t('p2p.settings_title')}</h2>
@@ -696,6 +1037,209 @@ export function P2pConfigPanel({
                     }}
                   />
                 </div>
+
+                {(advancedMigrationNeeded || workflowLaunchEnvelope) && (
+                  <div style={{ ...sectionCardStyle, marginTop: 12, borderColor: advancedMigrationNeeded ? '#f59e0b' : '#334155' }}>
+                    <div style={{ ...sectionLabelStyle, marginTop: 0 }}>
+                      {t('p2p.settings_workflow_migration_title')}
+                    </div>
+                    <div style={{ fontSize: 12, color: '#cbd5e1', lineHeight: 1.5 }}>
+                      {advancedMigrationNeeded
+                        ? t('p2p.settings_workflow_migration_body')
+                        : t('p2p.settings_workflow_migration_ready')}
+                    </div>
+                  </div>
+                )}
+
+                {workflowDraft && (
+                  <AdvancedWorkflowCanvasEditor
+                    value={workflowDraft}
+                    readOnly={readOnlyMode}
+                    onChange={(next) => {
+                      markFormDirty();
+                      setWorkflowDraft(next);
+                      // Strip the launch envelope so Save will re-derive a
+                      // fresh one from the edited draft. Keeps the editor as
+                      // the single source of truth while the dialog is open.
+                      setWorkflowLaunchEnvelope(undefined);
+                    }}
+                  />
+                )}
+
+                {/*
+                 * R3 PR-α follow-up — UI-managed script executable allowlist.
+                 * Replaces the previous `~/.imcodes/p2p-policy.json` daemon-side
+                 * file (off-product for a UI-driven IM client). Entries are
+                 * round-tripped through `P2pSavedConfig.allowedExecutables`
+                 * and written into every advanced launch envelope. The
+                 * daemon merges them into the bind-time
+                 * `P2pStaticPolicy.allowedExecutables` so script bind sees
+                 * exactly what the user authored.
+                 */}
+                {workflowDraft && (
+                  <div
+                    style={{ ...sectionCardStyle, marginTop: 12 }}
+                    data-testid="p2p-allowed-executables-section"
+                    data-readonly={readOnlyMode ? 'true' : 'false'}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                      <div style={{ ...sectionLabelStyle, marginTop: 0, marginBottom: 0 }}>
+                        {t('p2p.workflow.allowed_executables.title', 'Allowed script executables')}
+                      </div>
+                    </div>
+                    <div style={{ fontSize: 11, color: '#94a3b8', lineHeight: 1.5, marginTop: 6 }}>
+                      {t('p2p.workflow.allowed_executables.hint', 'Script nodes may only spawn executables listed here. Use absolute paths (e.g. /usr/bin/jq) or PATH-relative names. Empty list disables script execution for this config.')}
+                    </div>
+                    {!readOnlyMode && (
+                      <div
+                        style={{ display: 'flex', gap: 6, marginTop: 8 }}
+                        data-testid="p2p-allowed-executables-add-row"
+                      >
+                        <input
+                          type="text"
+                          value={allowedExecutableDraft}
+                          placeholder={t('p2p.workflow.allowed_executables.placeholder', '/usr/bin/jq')}
+                          onInput={(event) => setAllowedExecutableDraft((event.target as HTMLInputElement).value)}
+                          onKeyDown={(event) => {
+                            if (event.key === 'Enter') {
+                              event.preventDefault();
+                              const trimmed = allowedExecutableDraft.trim();
+                              if (!trimmed) return;
+                              if (allowedExecutables.includes(trimmed)) { setAllowedExecutableDraft(''); return; }
+                              if (allowedExecutables.length >= 64) return;
+                              if (trimmed.length > 256) return;
+                              if (!/^[\x21-\x7e]+$/.test(trimmed)) return;
+                              setAllowedExecutables([...allowedExecutables, trimmed].sort());
+                              setAllowedExecutableDraft('');
+                              markFormDirty();
+                              // Force the saved envelope to be re-derived
+                              // from the latest UI state on Save.
+                              setWorkflowLaunchEnvelope(undefined);
+                            }
+                          }}
+                          style={{
+                            flex: 1, background: '#0f172a', border: '1px solid #334155', borderRadius: 5,
+                            color: '#e2e8f0', fontSize: 12, padding: '6px 8px', outline: 'none',
+                          }}
+                          aria-label={t('p2p.workflow.allowed_executables.input_label', 'New executable path')}
+                          data-testid="p2p-allowed-executables-input"
+                          maxLength={256}
+                        />
+                        <button
+                          type="button"
+                          style={{
+                            padding: '4px 10px', borderRadius: 5, border: '1px solid #475569',
+                            background: '#1e293b', color: '#cbd5e1', fontSize: 11, cursor: 'pointer',
+                          }}
+                          data-testid="p2p-allowed-executables-add"
+                          disabled={
+                            allowedExecutableDraft.trim().length === 0
+                            || allowedExecutables.length >= 64
+                            || allowedExecutables.includes(allowedExecutableDraft.trim())
+                          }
+                          onClick={() => {
+                            const trimmed = allowedExecutableDraft.trim();
+                            if (!trimmed) return;
+                            if (allowedExecutables.includes(trimmed)) { setAllowedExecutableDraft(''); return; }
+                            if (allowedExecutables.length >= 64) return;
+                            if (trimmed.length > 256) return;
+                            if (!/^[\x21-\x7e]+$/.test(trimmed)) return;
+                            setAllowedExecutables([...allowedExecutables, trimmed].sort());
+                            setAllowedExecutableDraft('');
+                            markFormDirty();
+                            setWorkflowLaunchEnvelope(undefined);
+                          }}
+                        >
+                          {t('p2p.workflow.allowed_executables.add', 'Add')}
+                        </button>
+                      </div>
+                    )}
+                    {allowedExecutables.length === 0 ? (
+                      <div
+                        style={{ marginTop: 8, fontSize: 11, color: '#64748b' }}
+                        data-testid="p2p-allowed-executables-empty"
+                      >
+                        {t('p2p.workflow.allowed_executables.empty', 'No executables allowed yet. Script nodes will be rejected at bind time.')}
+                      </div>
+                    ) : (
+                      <ul
+                        style={{ margin: '8px 0 0', padding: 0, listStyle: 'none', display: 'grid', gap: 4 }}
+                        data-testid="p2p-allowed-executables-list"
+                      >
+                        {allowedExecutables.map((entry) => (
+                          <li
+                            key={entry}
+                            data-testid={`p2p-allowed-executables-entry-${entry}`}
+                            style={{
+                              display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6,
+                              background: '#0b1220', border: '1px solid #1e293b', borderRadius: 5, padding: '4px 8px',
+                            }}
+                          >
+                            <span style={{ fontFamily: 'monospace', fontSize: 12, color: '#e2e8f0', wordBreak: 'break-all' }}>{entry}</span>
+                            {!readOnlyMode && (
+                              <button
+                                type="button"
+                                style={{
+                                  padding: '2px 7px', borderRadius: 4, border: '1px solid #475569',
+                                  background: '#1e293b', color: '#cbd5e1', fontSize: 11, cursor: 'pointer',
+                                }}
+                                aria-label={t('p2p.workflow.allowed_executables.remove', 'Remove')}
+                                data-testid={`p2p-allowed-executables-remove-${entry}`}
+                                onClick={() => {
+                                  setAllowedExecutables(allowedExecutables.filter((value) => value !== entry));
+                                  markFormDirty();
+                                  setWorkflowLaunchEnvelope(undefined);
+                                }}
+                              >×</button>
+                            )}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
+
+                {hasAdvancedConfig && futureSchemaDetected && (
+                  <div
+                    style={{ ...sectionCardStyle, marginTop: 12, borderColor: '#f97316' }}
+                    role="alert"
+                    data-testid="p2p-future-schema-banner"
+                  >
+                    <div style={{ ...sectionLabelStyle, marginTop: 0, color: '#fdba74' }}>
+                      {t('p2p.workflow.diagnostics.unsupported_schema_version')}
+                    </div>
+                    <div style={{ fontSize: 12, color: '#cbd5e1', lineHeight: 1.5 }}>
+                      {t('p2p.workflow.diagnostics.unknown_future_schema_read_only')}
+                    </div>
+                  </div>
+                )}
+
+                {hasAdvancedConfig && !futureSchemaDetected && capabilityStale && (
+                  <div
+                    style={{ ...sectionCardStyle, marginTop: 12, borderColor: '#f59e0b' }}
+                    role="alert"
+                    data-testid="p2p-capability-stale-banner"
+                  >
+                    <div style={{ ...sectionLabelStyle, marginTop: 0, color: '#fcd34d' }}>
+                      {t('p2p.workflow.diagnostics.capability_stale')}
+                    </div>
+                  </div>
+                )}
+
+                {hasAdvancedConfig && !futureSchemaDetected && !capabilityStale && missingRequiredCapability && (
+                  <div
+                    style={{ ...sectionCardStyle, marginTop: 12, borderColor: '#f87171' }}
+                    role="alert"
+                    data-testid="p2p-missing-capability-banner"
+                  >
+                    <div style={{ ...sectionLabelStyle, marginTop: 0, color: '#fca5a5' }}>
+                      {t('p2p.workflow.diagnostics.missing_required_capability')}
+                    </div>
+                    <div style={{ fontSize: 12, color: '#cbd5e1', lineHeight: 1.5 }}>
+                      {missingCapabilities.join(', ')}
+                    </div>
+                  </div>
+                )}
 
                 {showAdvancedWorkflowSettings && <div style={{ ...sectionCardStyle, marginTop: 12 }}>
                   <button
@@ -1043,9 +1587,11 @@ export function P2pConfigPanel({
           )}
           <button style={btnSecondaryStyle} onClick={onClose}>{t('p2p.settings_close')}</button>
           <button
-            style={{ ...btnPrimaryStyle, opacity: saving ? 0.6 : 1 }}
+            style={{ ...btnPrimaryStyle, opacity: saving || saveBlocked ? 0.6 : 1, cursor: saveBlocked ? 'not-allowed' : 'pointer' }}
             onClick={() => { void handleSave(); }}
-            disabled={saving || loading}
+            disabled={saving || loading || saveBlocked}
+            data-advanced-launch-disabled={advancedLaunchDisabled ? 'true' : 'false'}
+            data-save-blocked={saveBlocked ? 'true' : 'false'}
           >
             {t('p2p.settings_save')}
           </button>
@@ -1054,3 +1600,9 @@ export function P2pConfigPanel({
     </div>
   );
 }
+
+// `AdvancedWorkflowDraftEditor` was the v1a list-based editor. R3 follow-up
+// (87fd4db8-ff5) folded the visual canvas editor into v1a per user request
+// "no toggle, no two surfaces". The list editor has been removed entirely;
+// `AdvancedWorkflowCanvasEditor` (in `./AdvancedWorkflowCanvasEditor.tsx`)
+// is the single authoring surface.

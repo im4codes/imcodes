@@ -1,4 +1,59 @@
 import { mapP2pStatusToUiState, type P2pActivePhase, type P2pProgressNodeStatus } from '@shared/p2p-status.js';
+import {
+  P2P_WORKFLOW_DIAGNOSTIC_CODES,
+  P2P_WORKFLOW_DIAGNOSTIC_PHASES,
+  P2P_WORKFLOW_DIAGNOSTIC_SEVERITIES,
+  type P2pWorkflowDiagnostic,
+  type P2pWorkflowDiagnosticCode,
+  type P2pWorkflowDiagnosticPhase,
+  type P2pWorkflowDiagnosticSeverity,
+} from '@shared/p2p-workflow-diagnostics.js';
+
+const DIAGNOSTIC_CODES = new Set<string>(P2P_WORKFLOW_DIAGNOSTIC_CODES);
+const DIAGNOSTIC_PHASES = new Set<string>(P2P_WORKFLOW_DIAGNOSTIC_PHASES);
+const DIAGNOSTIC_SEVERITIES = new Set<string>(P2P_WORKFLOW_DIAGNOSTIC_SEVERITIES);
+
+function isString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function mapDiagnostic(raw: unknown): P2pWorkflowDiagnostic | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  const code = typeof r.code === 'string' ? r.code : '';
+  if (!DIAGNOSTIC_CODES.has(code)) return null;
+  const phase = typeof r.phase === 'string' && DIAGNOSTIC_PHASES.has(r.phase)
+    ? r.phase as P2pWorkflowDiagnosticPhase
+    : 'sanitize';
+  const severity = typeof r.severity === 'string' && DIAGNOSTIC_SEVERITIES.has(r.severity)
+    ? r.severity as P2pWorkflowDiagnosticSeverity
+    : 'error';
+  const diagnostic: P2pWorkflowDiagnostic = {
+    code: code as P2pWorkflowDiagnosticCode,
+    phase,
+    severity,
+    messageKey: `p2p.workflow.diagnostics.${code as P2pWorkflowDiagnosticCode}`,
+  };
+  if (isString(r.summary)) diagnostic.summary = r.summary;
+  if (isString(r.nodeId)) diagnostic.nodeId = r.nodeId;
+  if (isString(r.runId)) diagnostic.runId = r.runId;
+  if (isString(r.fieldPath)) diagnostic.fieldPath = r.fieldPath;
+  return diagnostic;
+}
+
+function extractDiagnostics(source: Record<string, any>): P2pWorkflowDiagnostic[] {
+  const projection = source.workflow_projection as Record<string, unknown> | undefined;
+  const projectionDiags = projection && Array.isArray(projection.diagnostics)
+    ? projection.diagnostics
+    : null;
+  const fallbackDiags = Array.isArray(source.diagnostics) ? source.diagnostics : null;
+  const candidates = projectionDiags ?? fallbackDiags ?? [];
+  return candidates
+    .map(mapDiagnostic)
+    .filter((d): d is P2pWorkflowDiagnostic => d !== null);
+}
+
+export type { P2pWorkflowDiagnostic } from '@shared/p2p-workflow-diagnostics.js';
 
 function parseTimestamp(value: unknown): number | undefined {
   if (typeof value === 'number' && Number.isFinite(value)) return value;
@@ -62,6 +117,7 @@ function mapAdvancedNodes(source: Record<string, any>) {
 export function mapP2pRunToDiscussion(r: Record<string, any>) {
   const snapshot = parseSnapshot(r.progress_snapshot);
   const source = { ...r, ...snapshot } as Record<string, any>;
+  const diagnostics = extractDiagnostics(source);
   const receivedAt = Date.now();
   const advancedEnabled = source.advanced_p2p_enabled === true;
   const id = `p2p_${source.id}`;
@@ -136,6 +192,7 @@ export function mapP2pRunToDiscussion(r: Record<string, any>) {
       source.updated_at ?? source.updatedAt,
       receivedAt,
     ),
+    diagnostics,
   };
 }
 

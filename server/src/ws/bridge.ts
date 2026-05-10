@@ -93,7 +93,25 @@ import { PUSH_TIMELINE_EVENT_MAX_AGE_MS, TIMELINE_SUPPRESS_PUSH_FIELD } from '..
 import {
   DAEMON_UPGRADE_DELIVERY_STATUS,
 } from '../../../shared/daemon-upgrade.js';
+import {
+  P2P_WORKFLOW_MSG,
+  isP2pWorkflowRequestId,
+  parseP2pWorkflowMessageType,
+  type P2pWorkflowMessageDescriptor,
+  type P2pWorkflowMessageType,
+} from '../../../shared/p2p-workflow-messages.js';
+import {
+  P2P_BRIDGE_ERROR_CODES,
+  P2P_BRIDGE_PENDING_REQUEST_TIMEOUT_MS,
+  P2P_BRIDGE_PENDING_REQUESTS_GLOBAL,
+  P2P_BRIDGE_PENDING_REQUESTS_PER_SOCKET,
+  P2P_CAPABILITY_FRESHNESS_TTL_MS,
+} from '../../../shared/p2p-workflow-constants.js';
 import { DaemonUpgradeCoordinator, type DaemonUpgradeSource, type RequestDaemonUpgradeResult } from './daemon-upgrade-coordinator.js';
+import {
+  sanitizeP2pRunForPersistAndBroadcast,
+  sanitizeP2pRunUpdateForBroadcast,
+} from '../p2p-workflow-sanitize.js';
 
 const AUTH_TIMEOUT_MS = 5000;
 const MAX_QUEUE_SIZE = 100;
@@ -231,6 +249,14 @@ type WatchActiveSubSessionRow = {
   label?: string;
 };
 
+interface DaemonP2pWorkflowCapabilities {
+  daemonId: string;
+  capabilities: string[];
+  helloEpoch: number;
+  sentAt: number;
+  receivedAt: number;
+}
+
 type PendingPreviewRequest = {
   readable: ReadableStream<Uint8Array>;
   controller: ReadableStreamDefaultController<Uint8Array> | null;
@@ -241,6 +267,14 @@ type PendingPreviewRequest = {
   timerMode: 'start' | 'idle';
   resolveStart: (payload: PreviewStartPayload) => void;
   rejectStart: (err: Error) => void;
+};
+
+type PendingP2pWorkflowRequest = {
+  socket: WebSocket;
+  timer: ReturnType<typeof setTimeout>;
+  requestType: P2pWorkflowMessageType;
+  expectedResponseType: P2pWorkflowMessageType;
+  createdAt: number;
 };
 
 // ── WS tunnel state ───────────────────────────────────────────────────────────
@@ -349,6 +383,8 @@ export class WsBridge {
 
   /** Cached provider connection status — pushed to browsers on connect, persisted to DB. */
   private providerStatus = new Map<string, boolean>();
+  /** Cached advanced P2P capabilities for the current authenticated daemon socket. */
+  private daemonP2pWorkflowCapabilities: DaemonP2pWorkflowCapabilities | null = null;
   /** Cached remote sessions from providers — pushed to browsers on connect, persisted to DB. */
   private providerRemoteSessions = new Map<string, unknown[]>();
 
@@ -376,6 +412,9 @@ export class WsBridge {
 
   /** Per-request timeline.history / timeline.replay pending map — routes responses via requestId unicast. */
   private pendingTimelineRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
+
+  /** Per-request P2P workflow pending map — routes request-scoped responses via requestId unicast. */
+  private pendingP2pWorkflowRequests = new Map<string, PendingP2pWorkflowRequest>();
 
   /** Per-request memory management pending map — routes sensitive admin responses via requestId unicast. */
   private pendingMemoryManagementRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
@@ -992,6 +1031,11 @@ export class WsBridge {
         return;
       }
 
+      if (msg.type === P2P_WORKFLOW_MSG.DAEMON_HELLO) {
+        this.handleDaemonP2pWorkflowHello(msg);
+        return;
+      }
+
       if (msg.type === 'heartbeat') {
         const heartbeatDaemonVersion = typeof msg.daemonVersion === 'string'
           ? msg.daemonVersion
@@ -1058,6 +1102,7 @@ export class WsBridge {
           this.broadcastToBrowsers(JSON.stringify({ type: TRANSPORT_MSG.PROVIDER_STATUS, providerId, connected: false }));
         }
         this.providerStatus.clear();
+        this.daemonP2pWorkflowCapabilities = null;
         this.broadcastToBrowsers(JSON.stringify({ type: DAEMON_MSG.DISCONNECTED }));
         void clearProviderStatus(db, this.serverId).catch(() => {});
         updateServerStatus(db, this.serverId, 'offline').catch((err) =>
@@ -1158,6 +1203,34 @@ export class WsBridge {
 
       if (typeof msg.type !== 'string') {
         return;
+      }
+
+      const p2pBrowserMessage = parseP2pWorkflowMessageType(msg.type);
+      if (p2pBrowserMessage.kind === 'drop' && p2pBrowserMessage.reason === 'unknown_p2p_message') {
+        incrementCounter('p2p.bridge.unknown_message_drop', { direction: 'browser_to_daemon' });
+        logger.warn({ serverId: this.serverId, type: msg.type }, 'unknown browser p2p message — dropped');
+        return;
+      }
+      if (p2pBrowserMessage.kind === 'known') {
+        const descriptor = p2pBrowserMessage.descriptor;
+        if (
+          !descriptor.allowedIngress.includes('browser')
+          || descriptor.response
+          || descriptor.serverHandling !== 'forward_to_daemon'
+        ) {
+          incrementCounter('p2p.bridge.wrong_peer_drop', { direction: 'browser_to_daemon', type: msg.type });
+          logger.warn({ serverId: this.serverId, type: msg.type }, 'browser attempted disallowed p2p route — dropped');
+          safeSend(ws, JSON.stringify({
+            type: 'error',
+            code: P2P_BRIDGE_ERROR_CODES.WRONG_PEER,
+            originalType: msg.type,
+            requestId: msg.requestId,
+          }));
+          return;
+        }
+        if (descriptor.requestScoped && !this.registerP2pWorkflowRequest(ws, msg, descriptor)) {
+          return;
+        }
       }
 
       if (this.isBrowserForbiddenDaemonCommandType(msg.type)) {
@@ -1308,6 +1381,89 @@ export class WsBridge {
     });
   }
 
+  private registerP2pWorkflowRequest(
+    ws: WebSocket,
+    msg: Record<string, unknown>,
+    descriptor: P2pWorkflowMessageDescriptor,
+  ): boolean {
+    if (!isP2pWorkflowRequestId(msg.requestId)) {
+      incrementCounter('p2p.bridge.invalid_request_id_drop', { type: descriptor.type });
+      logger.warn({ serverId: this.serverId, type: descriptor.type }, 'p2p request missing valid requestId — dropped');
+      safeSend(ws, JSON.stringify({
+        type: 'error',
+        code: P2P_BRIDGE_ERROR_CODES.INVALID_REQUEST_ID,
+        originalType: descriptor.type,
+        requestId: msg.requestId,
+      }));
+      return false;
+    }
+    const expectedResponseType = descriptor.expectedResponseType;
+    if (!expectedResponseType) {
+      incrementCounter('p2p.bridge.route_policy_drop', { direction: 'browser_to_daemon', type: descriptor.type });
+      logger.warn({ serverId: this.serverId, type: descriptor.type }, 'p2p request missing expected response policy — dropped');
+      safeSend(ws, JSON.stringify({
+        type: 'error',
+        code: P2P_BRIDGE_ERROR_CODES.ROUTE_POLICY_ERROR,
+        originalType: descriptor.type,
+        requestId: msg.requestId,
+      }));
+      return false;
+    }
+
+    const requestId = msg.requestId;
+    const existing = this.pendingP2pWorkflowRequests.get(requestId);
+    if (existing) {
+      incrementCounter('p2p.bridge.duplicate_request_id_drop', { type: descriptor.type });
+      logger.warn({ serverId: this.serverId, type: descriptor.type, requestId }, 'p2p duplicate active requestId — dropped');
+      safeSend(ws, JSON.stringify({
+        type: 'error',
+        code: P2P_BRIDGE_ERROR_CODES.DUPLICATE_REQUEST_ID,
+        originalType: descriptor.type,
+        requestId,
+      }));
+      return false;
+    }
+
+    let socketPendingCount = 0;
+    for (const pending of this.pendingP2pWorkflowRequests.values()) {
+      if (pending.socket === ws) socketPendingCount += 1;
+    }
+    if (socketPendingCount >= P2P_BRIDGE_PENDING_REQUESTS_PER_SOCKET) {
+      incrementCounter('p2p.bridge.pending_request_cap_drop', { scope: 'socket', type: descriptor.type });
+      logger.warn({ serverId: this.serverId, type: descriptor.type, requestId }, 'p2p per-socket pending cap exceeded — dropped');
+      safeSend(ws, JSON.stringify({
+        type: 'error',
+        code: P2P_BRIDGE_ERROR_CODES.PENDING_LIMIT_EXCEEDED,
+        scope: 'socket',
+        originalType: descriptor.type,
+        requestId,
+      }));
+      return false;
+    }
+    if (this.pendingP2pWorkflowRequests.size >= P2P_BRIDGE_PENDING_REQUESTS_GLOBAL) {
+      incrementCounter('p2p.bridge.pending_request_cap_drop', { scope: 'global', type: descriptor.type });
+      logger.warn({ serverId: this.serverId, type: descriptor.type, requestId }, 'p2p global pending cap exceeded — dropped');
+      safeSend(ws, JSON.stringify({
+        type: 'error',
+        code: P2P_BRIDGE_ERROR_CODES.PENDING_LIMIT_EXCEEDED,
+        scope: 'global',
+        originalType: descriptor.type,
+        requestId,
+      }));
+      return false;
+    }
+
+    const timer = setTimeout(() => this.pendingP2pWorkflowRequests.delete(requestId), P2P_BRIDGE_PENDING_REQUEST_TIMEOUT_MS);
+    this.pendingP2pWorkflowRequests.set(requestId, {
+      socket: ws,
+      timer,
+      requestType: descriptor.type,
+      expectedResponseType,
+      createdAt: Date.now(),
+    });
+    return true;
+  }
+
   // ── Relay helpers ──────────────────────────────────────────────────────────
 
   /**
@@ -1318,6 +1474,49 @@ export class WsBridge {
    */
   private relayToBrowsers(msg: Record<string, unknown>): void {
     const type = msg.type as string;
+
+    const p2pDaemonMessage = parseP2pWorkflowMessageType(type);
+    if (p2pDaemonMessage.kind === 'known' && !p2pDaemonMessage.descriptor.allowedIngress.includes('daemon')) {
+      incrementCounter('p2p.bridge.wrong_peer_drop', { direction: 'daemon_to_browser', type });
+      logger.warn({ serverId: this.serverId, type }, 'daemon attempted disallowed p2p route — dropped');
+      return;
+    }
+    if (p2pDaemonMessage.kind === 'known' && p2pDaemonMessage.descriptor.response && p2pDaemonMessage.descriptor.requestScoped) {
+      const requestId = msg.requestId;
+      if (!isP2pWorkflowRequestId(requestId)) {
+        incrementCounter('p2p.bridge.unrouted_response_drop', { type });
+        logger.warn({ serverId: this.serverId, type, requestId }, 'p2p response missing valid requestId — dropped');
+        return;
+      }
+      const pending = this.pendingP2pWorkflowRequests.get(requestId);
+      if (!pending) {
+        incrementCounter('p2p.bridge.unrouted_response_drop', { type });
+        logger.warn({ serverId: this.serverId, type, requestId }, 'p2p response missing pending request — dropped');
+        return;
+      }
+      if (pending.expectedResponseType !== type) {
+        incrementCounter('p2p.bridge.response_type_mismatch_drop', {
+          expected: pending.expectedResponseType,
+          received: type,
+          requestType: pending.requestType,
+        });
+        logger.warn({
+          serverId: this.serverId,
+          requestId,
+          requestType: pending.requestType,
+          expectedResponseType: pending.expectedResponseType,
+          receivedResponseType: type,
+          createdAt: pending.createdAt,
+        }, 'p2p response type mismatch — dropped without clearing pending request');
+        return;
+      }
+      clearTimeout(pending.timer);
+      this.pendingP2pWorkflowRequests.delete(requestId);
+      if (pending.socket.readyState === WebSocket.OPEN) {
+        pending.socket.send(JSON.stringify(msg));
+      }
+      return;
+    }
 
     // ── Preview WS tunnel control messages ──────────────────────────────────
     if (type === PREVIEW_MSG.WS_OPENED) {
@@ -1775,7 +1974,7 @@ export class WsBridge {
     }
 
     // ── P2P conflict → broadcast to browsers ────────────────────────────────
-    if (type === 'p2p.conflict') {
+    if (type === P2P_WORKFLOW_MSG.CONFLICT) {
       this.broadcastToBrowsers(JSON.stringify(msg));
       return;
     }
@@ -1826,27 +2025,70 @@ export class WsBridge {
     }
 
     // ── P2P orchestration run persistence + broadcast ────────────────────────
-    if (type === 'p2p.run_save' && this.db) {
-      const run = { ...(msg.run as Record<string, unknown>), progress_snapshot: JSON.stringify(msg.run) };
-      void upsertOrchestrationRun(this.db, run as any).catch(() => {});
-      this.broadcastToBrowsers(JSON.stringify({ type: 'p2p.run_update', run: msg.run }));
+    // For RUN_SAVE/RUN_COMPLETE/RUN_ERROR we sanitize ONCE and reuse the same
+    // workflow_projection (and the same JSON progress_snapshot bytes) for both
+    // the DB upsert and the browser broadcast. This guarantees the diagnostic
+    // code set the browser sees matches what gets persisted.
+    if (type === P2P_WORKFLOW_MSG.RUN_SAVE) {
+      const { persisted, broadcast } = sanitizeP2pRunForPersistAndBroadcast(msg.run, { serverId: this.serverId });
+      if (this.db) void upsertOrchestrationRun(this.db, persisted).catch(() => {});
+      this.broadcastToBrowsers(JSON.stringify({
+        type: P2P_WORKFLOW_MSG.RUN_UPDATE,
+        run: broadcast,
+      }));
       return;
     }
-    if (type === 'p2p.run_complete' && this.db) {
-      const run = msg.run as any;
-      run.status = 'completed';
-      run.completed_at = new Date().toISOString();
-      run.progress_snapshot = JSON.stringify(run);
-      void upsertOrchestrationRun(this.db, run).catch(() => {});
-      this.broadcastToBrowsers(JSON.stringify({ type: 'p2p.run_update', run }));
+    if (type === P2P_WORKFLOW_MSG.RUN_COMPLETE) {
+      const completedAt = new Date().toISOString();
+      const overrides = {
+        serverId: this.serverId,
+        status: 'completed',
+        completedAt,
+        updatedAt: completedAt,
+      };
+      const { persisted, broadcast } = sanitizeP2pRunForPersistAndBroadcast(msg.run, overrides);
+      if (this.db) void upsertOrchestrationRun(this.db, persisted).catch(() => {});
+      this.broadcastToBrowsers(JSON.stringify({
+        type: P2P_WORKFLOW_MSG.RUN_UPDATE,
+        run: broadcast,
+      }));
       return;
     }
-    if (type === 'p2p.run_error' && this.db) {
-      const run = msg.run as any;
-      run.updated_at = new Date().toISOString();
-      run.progress_snapshot = JSON.stringify(run);
-      void upsertOrchestrationRun(this.db, run).catch(() => {});
-      this.broadcastToBrowsers(JSON.stringify({ type: 'p2p.run_update', run }));
+    if (type === P2P_WORKFLOW_MSG.RUN_ERROR) {
+      const updatedAt = new Date().toISOString();
+      const overrides = {
+        serverId: this.serverId,
+        updatedAt,
+      };
+      const { persisted, broadcast } = sanitizeP2pRunForPersistAndBroadcast(msg.run, overrides);
+      if (this.db) void upsertOrchestrationRun(this.db, persisted).catch(() => {});
+      this.broadcastToBrowsers(JSON.stringify({
+        type: P2P_WORKFLOW_MSG.RUN_UPDATE,
+        run: broadcast,
+      }));
+      return;
+    }
+    if (type === P2P_WORKFLOW_MSG.RUN_UPDATE) {
+      const run = sanitizeP2pRunUpdateForBroadcast(msg.run, { serverId: this.serverId });
+      this.broadcastToBrowsers(JSON.stringify({ type: P2P_WORKFLOW_MSG.RUN_UPDATE, run }));
+      return;
+    }
+    if (
+      p2pDaemonMessage.kind === 'known'
+      && p2pDaemonMessage.descriptor.serverHandling === 'broadcast_to_browsers'
+      && p2pDaemonMessage.descriptor.browserDelivery === 'broadcast'
+    ) {
+      this.broadcastToBrowsers(JSON.stringify(msg));
+      return;
+    }
+    if (p2pDaemonMessage.kind === 'drop' && p2pDaemonMessage.reason === 'unknown_p2p_message') {
+      incrementCounter('p2p.bridge.unknown_message_drop', { direction: 'daemon_to_browser' });
+      logger.warn({ serverId: this.serverId, type }, 'unknown daemon p2p message — dropped');
+      return;
+    }
+    if (p2pDaemonMessage.kind === 'known') {
+      incrementCounter('p2p.bridge.route_policy_drop', { direction: 'daemon_to_browser', type });
+      logger.warn({ serverId: this.serverId, type }, 'known daemon p2p message had no bridge route — dropped');
       return;
     }
 
@@ -1914,6 +2156,48 @@ export class WsBridge {
 
     // ── Default-allow: forward unrecognised types to all browsers ─────────────
     this.broadcastToBrowsers(JSON.stringify(msg));
+  }
+
+  private handleDaemonP2pWorkflowHello(msg: Record<string, unknown>): void {
+    const daemonId = typeof msg.daemonId === 'string' ? msg.daemonId : null;
+    const helloEpoch = typeof msg.helloEpoch === 'number' && Number.isFinite(msg.helloEpoch)
+      ? msg.helloEpoch
+      : null;
+    const sentAt = typeof msg.sentAt === 'number' && Number.isFinite(msg.sentAt)
+      ? msg.sentAt
+      : null;
+    const capabilities = Array.isArray(msg.capabilities)
+      ? msg.capabilities.filter((capability): capability is string => typeof capability === 'string')
+      : null;
+    if (!daemonId || helloEpoch === null || sentAt === null || !capabilities) {
+      incrementCounter('p2p.bridge.invalid_daemon_hello_drop');
+      logger.warn({ serverId: this.serverId }, 'invalid daemon.hello — dropped');
+      return;
+    }
+    const existing = this.daemonP2pWorkflowCapabilities;
+    if (existing && helloEpoch < existing.helloEpoch) {
+      incrementCounter('p2p.bridge.stale_daemon_hello_drop');
+      logger.warn({ serverId: this.serverId, helloEpoch, currentEpoch: existing.helloEpoch }, 'stale daemon.hello — dropped');
+      return;
+    }
+    const sortedCapabilities = [...new Set(capabilities)].sort();
+    this.daemonP2pWorkflowCapabilities = {
+      daemonId,
+      capabilities: sortedCapabilities,
+      helloEpoch,
+      sentAt,
+      receivedAt: Date.now(),
+    };
+    // Forward a sanitized snapshot to all browsers connected to this serverId
+    // so the web capability gate can react to missing/stale/downgraded caps.
+    // Per the message registry this is `browserDelivery: 'broadcast'`.
+    this.broadcastToBrowsers(JSON.stringify({
+      type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+      daemonId,
+      capabilities: sortedCapabilities,
+      helloEpoch,
+      sentAt,
+    }));
   }
 
   private routeBinaryFrame(data: Buffer): void {
@@ -2236,6 +2520,12 @@ export class WsBridge {
       if (pending.socket === ws) {
         clearTimeout(pending.timer);
         this.pendingMemoryManagementRequests.delete(reqId);
+      }
+    }
+    for (const [reqId, pending] of this.pendingP2pWorkflowRequests) {
+      if (pending.socket === ws) {
+        clearTimeout(pending.timer);
+        this.pendingP2pWorkflowRequests.delete(reqId);
       }
     }
   }
@@ -2577,6 +2867,7 @@ export class WsBridge {
       try { this.daemonWs.close(4001, 'token_rotated'); } catch { /* ignore */ }
       this.daemonWs = null;
       this.authenticated = false;
+      this.daemonP2pWorkflowCapabilities = null;
     }
   }
 
@@ -3397,5 +3688,16 @@ export class WsBridge {
 
   get isAuthenticated(): boolean {
     return this.authenticated;
+  }
+
+  getDaemonP2pWorkflowCapabilities(now = Date.now()): DaemonP2pWorkflowCapabilities | null {
+    if (!this.daemonP2pWorkflowCapabilities) return null;
+    if (now - this.daemonP2pWorkflowCapabilities.receivedAt > P2P_CAPABILITY_FRESHNESS_TTL_MS) {
+      return null;
+    }
+    return {
+      ...this.daemonP2pWorkflowCapabilities,
+      capabilities: [...this.daemonP2pWorkflowCapabilities.capabilities],
+    };
   }
 }

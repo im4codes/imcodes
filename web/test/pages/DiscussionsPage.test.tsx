@@ -25,9 +25,13 @@ describe('DiscussionsPage', () => {
   let handler: ((msg: ServerMessage) => void) | null = null;
   let ws: WsClient;
   let clipboardWriteText: ReturnType<typeof vi.fn>;
+  let nextP2pRequestIndex = 0;
 
   beforeEach(() => {
     clipboardWriteText = vi.fn().mockResolvedValue(undefined);
+    nextP2pRequestIndex = 0;
+    const nextP2pRequestId = () => `p2p-test-${++nextP2pRequestIndex}`;
+    const send = vi.fn();
     let rafTime = 0;
     vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) => {
       rafTime += 120;
@@ -40,7 +44,17 @@ describe('DiscussionsPage', () => {
     });
 
     ws = {
-      send: vi.fn(),
+      send,
+      p2pListDiscussions: vi.fn((scope?: { sessionName?: string; projectDir?: string; cwd?: string }) => {
+        const requestId = nextP2pRequestId();
+        send({ type: 'p2p.list_discussions', requestId, ...scope });
+        return requestId;
+      }),
+      p2pReadDiscussion: vi.fn((id: string, scope?: { sessionName?: string; projectDir?: string; cwd?: string }) => {
+        const requestId = nextP2pRequestId();
+        send({ type: 'p2p.read_discussion', id, requestId, ...scope });
+        return requestId;
+      }),
       onMessage: (next: (msg: ServerMessage) => void) => {
         handler = next;
         return () => { handler = null; };
@@ -57,7 +71,11 @@ describe('DiscussionsPage', () => {
   it('defaults to auto-follow latest and scrolls to bottom when discussion content updates', async () => {
     const { container } = render(<DiscussionsPage ws={ws} />);
 
-    expect(ws.send).toHaveBeenCalledWith({ type: 'p2p.list_discussions' });
+    expect(ws.p2pListDiscussions).toHaveBeenCalledOnce();
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'p2p.list_discussions',
+      requestId: 'p2p-test-1',
+    }));
 
     await act(async () => {
       handler?.({
@@ -93,6 +111,33 @@ describe('DiscussionsPage', () => {
     await waitFor(() => expect(scrollEl.scrollTop).toBe(640));
     expect(screen.getByTitle('p2p.discussions.scroll_top')).toBeTruthy();
     expect(screen.getByTitle('p2p.discussions.scroll_bottom')).toBeTruthy();
+  });
+
+  it('passes discussion request scope into typed list and read helpers', async () => {
+    render(<DiscussionsPage ws={ws} requestScope={{ sessionName: 'deck_proj_brain', projectDir: '/repo/project' }} />);
+
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'p2p.list_discussions',
+      requestId: 'p2p-test-1',
+      sessionName: 'deck_proj_brain',
+      projectDir: '/repo/project',
+    }));
+
+    await act(async () => {
+      handler?.({
+        type: 'p2p.list_discussions_response',
+        requestId: 'p2p-test-1',
+        discussions: [{ id: 'disc-1', fileName: 'disc-1.md', preview: 'Topic 1', mtime: 100 }],
+      } as ServerMessage);
+    });
+
+    fireEvent.click(screen.getByText('Topic 1'));
+    expect(ws.send).toHaveBeenLastCalledWith(expect.objectContaining({
+      type: 'p2p.read_discussion',
+      id: 'disc-1',
+      sessionName: 'deck_proj_brain',
+      projectDir: '/repo/project',
+    }));
   });
 
   it('disables follow when unchecked, and re-enables it from the bottom arrow', async () => {
@@ -211,6 +256,24 @@ describe('DiscussionsPage', () => {
       expect(clipboardWriteText).toHaveBeenCalledWith('Current preview content');
     });
     expect(screen.getByTestId('discussion-preview').textContent).toBe('Current preview content');
+  });
+
+  it('refreshes via the typed p2pListDiscussions helper, never the legacy discussionList', async () => {
+    // PR-H regression: app.tsx and the DiscussionsPage must always go through
+    // the project-scoped `p2pListDiscussions` helper. The legacy
+    // `discussionList()` predates the daemon's scope guard and would yield
+    // empty/forbidden results under the new server-side enforcement.
+    const legacyDiscussionList = vi.fn();
+    const wsWithLegacy = {
+      ...(ws as unknown as Record<string, unknown>),
+      discussionList: legacyDiscussionList,
+    } as unknown as WsClient;
+
+    render(<DiscussionsPage ws={wsWithLegacy} requestScope={{ sessionName: 'deck_proj_brain' }} />);
+
+    expect(wsWithLegacy.p2pListDiscussions).toHaveBeenCalledTimes(1);
+    expect(wsWithLegacy.p2pListDiscussions).toHaveBeenCalledWith({ sessionName: 'deck_proj_brain' });
+    expect(legacyDiscussionList).not.toHaveBeenCalled();
   });
 
   it('renders copy and scroll controls in the top nav controls instead of inside the list', async () => {

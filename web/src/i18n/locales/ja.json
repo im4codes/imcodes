@@ -647,6 +647,77 @@
       "more_agents": "@ さらに追加",
       "send_anyway": "そのまま送信",
       "tip_history": "複数 Agent の議論はファイル共有があり、履歴もより完全に残ります。1 対 1 は単発の議論として扱われます。"
+    },
+    "settings_workflow_migration_title": "ワークフロー移行",
+    "settings_workflow_migration_body": "保存済みの高度な設定は古いラウンド形式です。高度な P2P を起動する前に保存して、ワークフロー起動エンベロープを作成してください。",
+    "settings_workflow_migration_ready": "高度な P2P 起動用のワークフロー起動エンベロープが準備できています。",
+    "settings_workflow_migration_error": "高度なワークフローの移行に失敗しました。起動前に保存済みラウンドを確認してください。",
+    "workflow": {
+      "diagnostics": {
+        "forbidden_envelope_field": "The launch envelope contains a forbidden private field.",
+        "unsupported_schema_version": "This workflow schema version is not supported.",
+        "unknown_future_schema_read_only": "This future workflow version is read-only here.",
+        "mixed_advanced_schema_fields": "Old and new advanced workflow fields are mixed.",
+        "static_policy_mismatch_recompiled": "Daemon policy changed, so the workflow was recompiled.",
+        "missing_required_capability": "The daemon is missing a required workflow capability.",
+        "capability_stale": "Daemon workflow capability information is stale.",
+        "capability_downgraded_during_run": "A required capability was downgraded during the run.",
+        "invalid_launch_envelope": "The workflow launch envelope is invalid.",
+        "invalid_workflow_graph": "The workflow graph is invalid.",
+        "invalid_routing_authority": "The workflow routing authority is invalid.",
+        "invalid_edge_condition": "A workflow edge condition is invalid.",
+        "loop_budget_exhausted": "The workflow loop budget was exhausted.",
+        "invalid_workflow_variable": "A workflow variable is invalid.",
+        "invalid_prompt_append": "A workflow prompt append is invalid.",
+        "missing_context_source": "A required workflow context source is missing.",
+        "context_source_too_large": "A workflow context source is too large.",
+        "unsafe_artifact_path": "A workflow artifact path is unsafe.",
+        "artifact_identity_collision_resolved": "An artifact identity collision was resolved.",
+        "artifact_baseline_too_large": "An artifact baseline is too large.",
+        "artifact_baseline_mismatch": "An artifact baseline did not match.",
+        "artifact_contract_not_satisfied": "An artifact contract was not satisfied.",
+        "invalid_script_contract": "A workflow script contract is invalid.",
+        "script_executable_denied": "The script executable is not allowed.",
+        "script_machine_output_invalid": "Script machine output is invalid.",
+        "script_timeout": "The script timed out.",
+        "script_cancelled": "The script was cancelled.",
+        "daemon_busy": "The daemon is busy with other advanced workflows.",
+        "workflow_stale_after_restart": "The workflow became stale after daemon restart.",
+        "private_projection_field_dropped": "A private projection field was dropped.",
+        "legacy_progress_snapshot_sanitized": "A legacy progress snapshot was sanitized.",
+        "unknown_p2p_message": "An unknown P2P workflow message was ignored.",
+        "unmatched_edge_route": "ルートに一致する条件付き出力エッジがなく、デフォルトのエッジも存在しません。"
+      },
+      "editor": {
+        "title": "詳細ワークフロー下書き",
+        "add_node": "ノードを追加",
+        "remove_node": "ノードを削除",
+        "remove_edge": "エッジを削除",
+        "diagnostics_header": "診断",
+        "read_only_notice": "このワークフローは将来のスキーマを使用しており、ここでは読み取り専用です。",
+        "canvas_hint": "ノードをドラッグして配置します。右のアンカー (●) から別のノードへドラッグするとエッジを作成できます。",
+        "inspector_empty": "プロパティを編集するノードまたはエッジを選択してください。",
+        "node": {
+          "section_label": "ノード",
+          "preset_label": "プリセット",
+          "permission_scope_label": "権限スコープ"
+        },
+        "edge": {
+          "section_label": "エッジ",
+          "from_label": "元",
+          "to_label": "先",
+          "condition_label": "条件値"
+        }
+      },
+      "allowed_executables": {
+        "title": "スクリプト実行ファイル許可リスト",
+        "hint": "スクリプトノードはここに記載された実行ファイルのみ起動できます。絶対パス（例: /usr/bin/jq）または PATH 相対名を使用します。空のリストはこの設定でのスクリプト実行を無効化します。",
+        "placeholder": "/usr/bin/jq",
+        "input_label": "新しい実行ファイルのパス",
+        "add": "追加",
+        "remove": "削除",
+        "empty": "まだ許可された実行ファイルはありません。スクリプトノードは bind 時に拒否されます。"
+      }
     }
   },
   "openspec": {

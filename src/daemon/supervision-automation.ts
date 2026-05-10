@@ -3,7 +3,9 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { getSession } from '../store/session-store.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
-import { startP2pRun, cancelP2pRun, getP2pRun } from './p2p-orchestrator.js';
+import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns } from './p2p-orchestrator.js';
+import { loadDaemonP2pStaticPolicy } from './p2p-workflow-static-policy.js';
+import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { supervisionBroker } from './supervision-broker.js';
@@ -876,15 +878,22 @@ class SupervisionAutomation {
     );
 
     try {
-      const started = await startP2pRun({
-        initiatorSession: current.sessionName,
-        targets: [],
+      // Audit:V-2 / Q1 — supervision auto-audit rounds are synthesised by the
+      // daemon itself (NOT user input), so they intentionally bypass envelope
+      // validation. The `advanced: { kind: 'supervision_internal', ... }`
+      // discriminant makes the bypass explicit in source review and
+      // reverse-regression checks instead of being detected by a path heuristic.
+      //
+      // Audit:R3 hardening / task 10.4 — supervision MUST honour the daemon
+      // advanced-run admission cap. If the daemon is at
+      // `P2P_WORKFLOW_MAX_ACTIVE_RUNS`, retry with bounded backoff before
+      // giving up. Default 3 attempts × 5 s; we don't expose this as
+      // configuration in v1a because supervision audit cadence is daemon-
+      // internal and rarely contended.
+      const started = await this.startSupervisionRunWithBusyRetry({
+        sessionName: current.sessionName,
         userText: baseline.userText,
         fileContents: baseline.fileContents,
-        serverLink: this.serverLink,
-        // modeOverride is intentionally omitted — resolveP2pRoundPlan ignores it
-        // whenever advancedRounds is non-empty, so leaving it undefined makes the
-        // single source of routing truth explicit.
         rounds: auditRounds.length,
         advancedRounds: auditRounds,
       });
@@ -896,6 +905,65 @@ class SupervisionAutomation {
       this.clearStatus(current.sessionName);
       throw error;
     }
+  }
+
+  /**
+   * Audit:R3 hardening / task 10.4 — supervision auto-audit launches MUST
+   * respect the daemon advanced-run admission cap. When the daemon is at
+   * capacity (`P2P_WORKFLOW_MAX_ACTIVE_RUNS` from `loadDaemonP2pStaticPolicy`),
+   * retry with bounded backoff. Throws on retry exhaustion so the calling
+   * `try/catch` in the dispatch path triggers normal cleanup.
+   */
+  private async startSupervisionRunWithBusyRetry(args: {
+    sessionName: string;
+    userText: string;
+    fileContents: ReturnType<typeof Object.fromEntries>;
+    rounds: number;
+    advancedRounds: import('../../shared/p2p-advanced.js').P2pAdvancedRound[];
+  }): Promise<{ id: string; discussionId: string }> {
+    const SUPERVISION_BUSY_ATTEMPTS = 3;
+    const SUPERVISION_BUSY_DELAY_MS = 5_000;
+    // `loadDaemonP2pStaticPolicy` only reads `getP2pWorkflowCapabilities` /
+    // hello accessors; null serverLink degrades gracefully (fail-closed
+    // policy with no allow flags). Cast keeps the helper's narrow signature.
+    const policy = loadDaemonP2pStaticPolicy((this.serverLink ?? { getP2pWorkflowCapabilities: () => [] }) as Parameters<typeof loadDaemonP2pStaticPolicy>[0]);
+    let attempt = 0;
+    let lastError: unknown = null;
+    while (attempt < SUPERVISION_BUSY_ATTEMPTS) {
+      attempt += 1;
+      const activeAdvancedRuns = listP2pRuns().filter(
+        (run) => run.advancedP2pEnabled && !P2P_TERMINAL_RUN_STATUSES.has(run.status),
+      );
+      if (activeAdvancedRuns.length >= policy.concurrency.maxAdvancedRuns) {
+        lastError = new Error(`daemon_busy: ${activeAdvancedRuns.length}/${policy.concurrency.maxAdvancedRuns} active advanced runs`);
+        if (attempt < SUPERVISION_BUSY_ATTEMPTS) {
+          logger.warn({ sessionName: args.sessionName, attempt, of: SUPERVISION_BUSY_ATTEMPTS }, 'supervision: daemon at advanced cap, retrying');
+          await new Promise((r) => setTimeout(r, SUPERVISION_BUSY_DELAY_MS));
+          continue;
+        }
+        throw new Error(`Supervision audit launch exhausted ${SUPERVISION_BUSY_ATTEMPTS} daemon_busy retries on session ${args.sessionName}`);
+      }
+      try {
+        return await startP2pRun({
+          initiatorSession: args.sessionName,
+          targets: [],
+          userText: args.userText,
+          fileContents: args.fileContents as unknown as Array<{ path: string; content: string }>,
+          serverLink: this.serverLink,
+          rounds: args.rounds,
+          advanced: {
+            kind: 'supervision_internal',
+            advancedRounds: args.advancedRounds,
+          },
+        });
+      } catch (err) {
+        lastError = err;
+        // startP2pRun throws are non-busy; surface immediately.
+        throw err;
+      }
+    }
+    // Exhausted retries without ever calling startP2pRun.
+    throw lastError ?? new Error('supervision: launch exhausted retries');
   }
 
   private startAuditPoller(sessionName: string, generation: number, runId: string): void {

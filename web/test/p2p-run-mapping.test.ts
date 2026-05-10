@@ -322,4 +322,103 @@ describe('mapP2pRunToDiscussion', () => {
     expect(merged.state).toBe('running');
     expect(merged.currentRound).toBe(1);
   });
+
+  it('exposes workflow_projection.diagnostics on the run model', () => {
+    // PR-D: the bridge now retains daemon-emitted workflow diagnostics inside
+    // workflow_projection. mapP2pRunToDiscussion MUST surface them so the
+    // progress card can render them with translated messageKey + summary.
+    const discussion = mapP2pRunToDiscussion({
+      id: 'run_with_diagnostics',
+      status: 'running',
+      mode_key: 'audit',
+      current_round: 1,
+      total_rounds: 1,
+      total_hops: 1,
+      active_phase: 'hop',
+      workflow_projection: {
+        projectionVersion: 1,
+        runId: 'run_with_diagnostics',
+        workflowId: 'audit',
+        status: 'running',
+        completedNodeIds: [],
+        diagnostics: [
+          {
+            code: 'daemon_busy',
+            phase: 'bind',
+            severity: 'error',
+            messageKey: 'p2p.workflow.diagnostics.daemon_busy',
+            summary: 'busy',
+            runId: 'run_with_diagnostics',
+          },
+          {
+            code: 'private_projection_field_dropped',
+            phase: 'sanitize',
+            severity: 'warning',
+            messageKey: 'p2p.workflow.diagnostics.private_projection_field_dropped',
+            summary: 'Sanitized oversized workflow payload',
+            runId: 'run_with_diagnostics',
+          },
+        ],
+        updatedAt: '2026-04-09T00:00:00.000Z',
+      },
+    });
+
+    expect(discussion.diagnostics).toBeDefined();
+    expect(discussion.diagnostics?.map((d) => d.code).sort()).toEqual([
+      'daemon_busy',
+      'private_projection_field_dropped',
+    ]);
+    const daemonBusy = discussion.diagnostics?.find((d) => d.code === 'daemon_busy');
+    expect(daemonBusy?.messageKey).toBe('p2p.workflow.diagnostics.daemon_busy');
+    expect(daemonBusy?.summary).toBe('busy');
+    expect(daemonBusy?.severity).toBe('error');
+  });
+
+  it('falls back to top-level diagnostics when workflow_projection is missing', () => {
+    const discussion = mapP2pRunToDiscussion({
+      id: 'run_legacy_diags',
+      status: 'running',
+      mode_key: 'audit',
+      current_round: 1,
+      total_rounds: 1,
+      total_hops: 1,
+      active_phase: 'hop',
+      diagnostics: [
+        {
+          code: 'missing_required_capability',
+          phase: 'bind',
+          severity: 'error',
+          messageKey: 'p2p.workflow.diagnostics.missing_required_capability',
+        },
+      ],
+    });
+
+    expect(discussion.diagnostics?.map((d) => d.code)).toEqual(['missing_required_capability']);
+  });
+
+  it('drops unknown diagnostic codes from the run mapping', () => {
+    const discussion = mapP2pRunToDiscussion({
+      id: 'run_bad_diags',
+      status: 'running',
+      mode_key: 'audit',
+      current_round: 1,
+      total_rounds: 1,
+      total_hops: 1,
+      active_phase: 'hop',
+      workflow_projection: {
+        projectionVersion: 1,
+        runId: 'run_bad_diags',
+        workflowId: 'audit',
+        status: 'running',
+        completedNodeIds: [],
+        diagnostics: [
+          { code: 'totally_made_up_code', phase: 'execute', severity: 'error' },
+          { code: 'daemon_busy', phase: 'bind', severity: 'error' },
+        ],
+        updatedAt: '2026-04-09T00:00:00.000Z',
+      },
+    });
+
+    expect(discussion.diagnostics?.map((d) => d.code)).toEqual(['daemon_busy']);
+  });
 });

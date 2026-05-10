@@ -1,5 +1,6 @@
 /** P2P Quick Discussion mode configuration. */
 import type { P2pAdvancedPresetKey, P2pAdvancedRound, P2pContextReducerConfig } from './p2p-advanced.js';
+import type { P2pWorkflowDraft, P2pWorkflowLaunchEnvelope } from './p2p-workflow-types.js';
 
 /** The "config" meta-mode — each session uses its own saved default mode. */
 export const P2P_CONFIG_MODE = 'config' as const;
@@ -29,6 +30,22 @@ export interface P2pSavedConfig {
   advancedRunTimeoutMinutes?: number;
   /** Optional context compression/helper config for advanced workflows. */
   contextReducer?: P2pContextReducerConfig;
+  /** Versioned advanced workflow draft for smart P2P workflow v1+. */
+  workflowDraft?: P2pWorkflowDraft;
+  /** Optional saved launch envelope for scheduled/supervised advanced workflow launch. */
+  workflowLaunchEnvelope?: P2pWorkflowLaunchEnvelope;
+  /**
+   * R3 PR-α follow-up — UI-managed allowlist of executable absolute paths
+   * (or `PATH`-relative basenames) that script nodes in this config's
+   * advanced workflow are permitted to spawn. Maintained in
+   * `P2pConfigPanel` → "Allowed executables" and round-tripped through
+   * the launch envelope (`P2pWorkflowLaunchEnvelope.allowedExecutables`).
+   *
+   * Empty list means script bind rejects every executable with
+   * `script_executable_denied`. Per-entry constraints (visible-ASCII,
+   * ≤256 bytes, ≤64 entries) live in `validateP2pWorkflowLaunchEnvelope`.
+   */
+  allowedExecutables?: string[];
 }
 
 
@@ -56,6 +73,8 @@ export function isP2pSavedConfig(value: unknown): value is P2pSavedConfig {
     advancedRounds?: unknown;
     advancedRunTimeoutMinutes?: unknown;
     contextReducer?: unknown;
+    workflowDraft?: unknown;
+    workflowLaunchEnvelope?: unknown;
   };
   if (!record.sessions || typeof record.sessions !== 'object' || Array.isArray(record.sessions)) return false;
   if (typeof record.rounds !== 'number' || !Number.isFinite(record.rounds)) return false;
@@ -66,6 +85,16 @@ export function isP2pSavedConfig(value: unknown): value is P2pSavedConfig {
   if (record.advancedRounds != null && !Array.isArray(record.advancedRounds)) return false;
   if (record.advancedRunTimeoutMinutes != null && (typeof record.advancedRunTimeoutMinutes !== 'number' || !Number.isFinite(record.advancedRunTimeoutMinutes))) return false;
   if (record.contextReducer != null && typeof record.contextReducer !== 'object') return false;
+  if (record.workflowDraft != null && (typeof record.workflowDraft !== 'object' || Array.isArray(record.workflowDraft))) return false;
+  if (record.workflowLaunchEnvelope != null && (typeof record.workflowLaunchEnvelope !== 'object' || Array.isArray(record.workflowLaunchEnvelope))) return false;
+  // R3 PR-α follow-up — UI-managed allowedExecutables. We perform only a
+  // shape check here; per-entry validation lives in
+  // `validateP2pWorkflowLaunchEnvelope` so the same rules apply on launch.
+  const allowedRaw = (record as { allowedExecutables?: unknown }).allowedExecutables;
+  if (allowedRaw != null) {
+    if (!Array.isArray(allowedRaw)) return false;
+    if (allowedRaw.some((entry) => typeof entry !== 'string')) return false;
+  }
   return Object.values(record.sessions as Record<string, unknown>).every(isP2pSessionEntry);
 }
 

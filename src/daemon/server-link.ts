@@ -7,6 +7,13 @@ import { setProviderRegistryServerLink } from '../agent/provider-registry.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
 import { getEmbeddingStatus } from '../context/embedding.js';
 import type { EmbeddingStatus } from '../../shared/embedding-status.js';
+import {
+  P2P_WORKFLOW_IMPLEMENTATION_CAPABILITY_V1,
+  P2P_WORKFLOW_CAPABILITY_V1,
+  P2P_WORKFLOW_OPENSPEC_ARTIFACTS_CAPABILITY_V1,
+  type P2pWorkflowCapability,
+} from '../../shared/p2p-workflow-constants.js';
+import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 
 interface SystemStats {
   cpu: number;
@@ -77,6 +84,13 @@ export class ServerLink {
   private readonly serverId: string;
   private readonly token: string;
   readonly daemonVersion = DAEMON_VERSION;
+  private helloEpoch = 0;
+  private lastHelloSentAt = 0;
+  private p2pWorkflowCapabilities: readonly string[] = [
+    P2P_WORKFLOW_CAPABILITY_V1,
+    P2P_WORKFLOW_OPENSPEC_ARTIFACTS_CAPABILITY_V1,
+    P2P_WORKFLOW_IMPLEMENTATION_CAPABILITY_V1,
+  ];
 
   constructor(opts: ServerLinkOpts) {
     this.workerUrl = opts.workerUrl;
@@ -124,6 +138,7 @@ export class ServerLink {
       // Send auth handshake immediately — server closes the socket if this is not
       // the first message or if credentials are invalid (5s timeout enforced server-side).
       ws.send(JSON.stringify({ type: 'auth', serverId: this.serverId, token: this.token, daemonVersion: this.daemonVersion }));
+      this.sendDaemonHello();
       // Wire transport relay so provider callbacks can send events to browsers via this socket.
       setTransportRelaySend((msg) => {
         try {
@@ -212,6 +227,52 @@ export class ServerLink {
     }
     this.seq++;
     this.ws.send(JSON.stringify({ ...((msg as object) ?? {}), seq: this.seq }));
+  }
+
+  updateP2pWorkflowCapabilities(capabilities: readonly (P2pWorkflowCapability | string)[]): void {
+    const next = [...new Set(capabilities)].sort();
+    if (
+      next.length === this.p2pWorkflowCapabilities.length &&
+      next.every((capability, index) => capability === this.p2pWorkflowCapabilities[index])
+    ) {
+      return;
+    }
+    this.p2pWorkflowCapabilities = next;
+    this.sendDaemonHello();
+  }
+
+  getP2pWorkflowCapabilities(): readonly string[] {
+    return [...this.p2pWorkflowCapabilities];
+  }
+
+  /**
+   * Most recent `daemon.hello` epoch sent by this daemon. Bind context stores
+   * this in `capabilitySnapshot.helloEpoch` so the projection records which
+   * capability advertisement governed the run, instead of synthesising `0`.
+   */
+  getHelloEpoch(): number {
+    return this.helloEpoch;
+  }
+
+  /**
+   * Wall-clock timestamp (ms) of the most recent `daemon.hello`. Returns 0
+   * when no hello has been sent yet (pre-`sendDaemonHello`).
+   */
+  getHelloSentAt(): number {
+    return this.lastHelloSentAt;
+  }
+
+  private sendDaemonHello(): void {
+    const sentAt = Date.now();
+    this.helloEpoch++;
+    this.lastHelloSentAt = sentAt;
+    this.send({
+      type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+      daemonId: this.serverId,
+      capabilities: [...this.p2pWorkflowCapabilities],
+      helloEpoch: this.helloEpoch,
+      sentAt,
+    });
   }
 
   /** Reports whether the underlying WebSocket is currently OPEN. */

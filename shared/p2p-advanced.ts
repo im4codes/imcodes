@@ -1,4 +1,15 @@
 import { isTransportSessionAgentType } from './agent-types.js';
+import type { P2pNodeKind } from './p2p-workflow-constants.js';
+// `p2p-workflow-types.ts` imports `P2pAdvancedRound` from this file. To avoid
+// a typed import cycle while still preserving structural information on the
+// adapter carriers, we use type-only imports for the compiled-node shapes.
+// TypeScript resolves type-only cycles cleanly because nothing is emitted
+// at runtime.
+import type {
+  P2pRoutingAuthority,
+  P2pScriptNodeContract,
+} from './p2p-workflow-types.js';
+import type { P2pWorkflowDiagnostic } from './p2p-workflow-diagnostics.js';
 
 const LEGACY_MODE_KEYS = new Set(['audit', 'review', 'plan', 'brainstorm', 'discuss']);
 const COMBO_SEPARATOR = '>';
@@ -43,6 +54,18 @@ export interface P2pAdvancedRound {
   promptAppend?: string;
   verdictPolicy?: P2pRoundVerdictPolicy;
   jumpRule?: P2pAdvancedJumpRule;
+  /**
+   * R3 PR-α (A1 / W3): the legacy `P2pAdvancedRound` model previously dropped
+   * envelope-only fields when adapting `P2pCompiledNode` → legacy round shape.
+   * Adding optional carriers preserves the compiled node semantics so
+   * orchestrator dispatch / dangerous-node recheck / artifact judging can read
+   * authoritative values without a sidecar `bound.compiled.nodes.find(...)`
+   * lookup. All fields are OPTIONAL to keep oldAdvanced fixtures unchanged.
+   */
+  nodeKind?: P2pNodeKind;
+  script?: P2pScriptNodeContract;
+  routingAuthority?: P2pRoutingAuthority;
+  artifactConvention?: 'none' | 'explicit' | 'openspec_convention';
 }
 
 export interface P2pParticipantSnapshotEntry {
@@ -57,13 +80,23 @@ export interface P2pHelperDiagnostic {
     | 'P2P_HELPER_FALLBACK_FAILED'
     | 'P2P_HELPER_CLEANUP_FAILED'
     | 'P2P_COMPRESSION_SKIPPED_NO_FALLBACK'
-    | 'P2P_VERDICT_MISSING';
+    | 'P2P_VERDICT_MISSING'
+    | 'P2P_DANGEROUS_NODE_RECHECK_FAILED'
+    | 'P2P_DISCUSSION_WRITE_FAILED'
+    | 'P2P_SCRIPT_SLOT_EXHAUSTED';
   attempt: number;
   sourceSession?: string | null;
   templateSession?: string | null;
   fallbackSession?: string | null;
   timestamp: number;
   message?: string;
+  /**
+   * R3 PR-α (B5 / D-O4) — preserve the structured workflow diagnostic so the
+   * 32-code closed enum survives the helper-diagnostic path. Web i18n,
+   * monitoring, and reverse-regression assertions can match on
+   * `workflowDiagnostic.code` instead of parsing free-form messages.
+   */
+  workflowDiagnostic?: P2pWorkflowDiagnostic;
 }
 
 export interface P2pResolvedRound {
@@ -87,6 +120,17 @@ export interface P2pResolvedRound {
   allowRouting: boolean;
   artifactOutputs: string[];
   artifactConvention: 'none' | 'explicit' | 'openspec_convention';
+  /**
+   * R3 PR-α (A1 / W3 / A4) — compiled-node fields propagated from
+   * `P2pAdvancedRound` after adapter widening. `nodeKind` enables
+   * `isRoundDangerous` to recognise script nodes regardless of permission
+   * scope; `script` lets `dispatchScriptRoundOrFail` read its contract
+   * without a sidecar `bound.compiled.nodes.find(...)` lookup;
+   * `routingAuthority` is plumbed for PR-β (envelope_compiled executor).
+   */
+  nodeKind?: P2pNodeKind;
+  script?: P2pScriptNodeContract;
+  routingAuthority?: P2pRoutingAuthority;
 }
 
 export interface ResolveP2pRoundPlanOptions {
@@ -244,9 +288,16 @@ function defaultArtifactConvention(round: P2pAdvancedRound): 'none' | 'explicit'
 
 function normalizeAdvancedRound(round: P2pAdvancedRound): P2pResolvedRound {
   const verdictPolicy = round.verdictPolicy ?? 'none';
-  const artifactConvention = defaultArtifactConvention(round);
+  // R3 PR-α (W3) — when the adapter preserves `artifactConvention` from a
+  // compiled node, prefer the carrier value over the preset-inferred default.
+  // This keeps user-declared `'explicit_paths'` artifacts from being silently
+  // upgraded to `'openspec_convention'` because the round preset happens to
+  // be `openspec_propose`.
+  const artifactConvention = round.artifactConvention ?? defaultArtifactConvention(round);
   const artifactOutputs = artifactConvention === 'openspec_convention'
-    ? ['openspec/changes']
+    ? (round.artifactOutputs && round.artifactOutputs.length > 0
+        ? [...round.artifactOutputs]
+        : ['openspec/changes'])
     : [...(round.artifactOutputs ?? [])];
   const synthesisStyle: P2pSynthesisStyle = round.executionMode === 'multi_dispatch' ? 'initiator_summary' : 'none';
   const requiresVerdict = verdictPolicy !== 'none';
@@ -275,6 +326,12 @@ function normalizeAdvancedRound(round: P2pAdvancedRound): P2pResolvedRound {
     allowRouting,
     artifactOutputs,
     artifactConvention,
+    // R3 PR-α (A1 / A4) — propagate the compiled-node carrier so executor /
+    // dangerous-node recheck can read authoritative values without sidecar
+    // lookups against `bound.compiled.nodes`.
+    ...(round.nodeKind ? { nodeKind: round.nodeKind } : {}),
+    ...(round.script ? { script: round.script } : {}),
+    ...(round.routingAuthority ? { routingAuthority: round.routingAuthority } : {}),
   };
 }
 

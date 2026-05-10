@@ -7,6 +7,17 @@ import {
 } from '../src/ws/daemon-upgrade-publication-gate.js';
 import * as dbQueries from '../src/db/queries.js';
 import { PUSH_TIMELINE_EVENT_MAX_AGE_MS, TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
+import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
+import { P2P_CONFIG_MSG } from '../../shared/p2p-config-events.js';
+import {
+  P2P_BRIDGE_ERROR_CODES,
+  P2P_BRIDGE_PENDING_REQUESTS_GLOBAL,
+  P2P_BRIDGE_PENDING_REQUESTS_PER_SOCKET,
+  P2P_CAPABILITY_FRESHNESS_TTL_MS,
+  P2P_SANITIZE_MAX_STRING_BYTES,
+  P2P_WORKFLOW_CAPABILITY_V1,
+  P2P_WORKFLOW_SCRIPT_ARGV_CAPABILITY_V1,
+} from '../../shared/p2p-workflow-constants.js';
 
 // ── Mock WebSocket ─────────────────────────────────────────────────────────────
 
@@ -1792,6 +1803,428 @@ describe('WsBridge', () => {
 
       expect(browserWs.sentStrings.length).toBeGreaterThan(0);
       expect(JSON.parse(browserWs.sentStrings[0]).type).toBe('p2p.conflict');
+    });
+
+    it('drops unknown p2p messages from daemon instead of broadcasting', async () => {
+      const { daemonWs, browserWs } = await setupAuthBridge();
+      browserWs.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'p2p.future_secret',
+        rawPrompt: 'do not leak',
+      }));
+      await flushAsync();
+
+      expect(browserWs.sentStrings).toHaveLength(0);
+    });
+
+    it('requires valid requestId before forwarding request-scoped p2p browser messages', async () => {
+      const { daemonWs, browserWs } = await setupAuthBridge();
+      daemonWs.sent.length = 0;
+
+      browserWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.STATUS,
+        requestId: 'é',
+      }));
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.some((raw) => JSON.parse(raw).type === P2P_WORKFLOW_MSG.STATUS)).toBe(false);
+      expect(browserWs.sentStrings.some((raw) => JSON.parse(raw).code === P2P_BRIDGE_ERROR_CODES.INVALID_REQUEST_ID)).toBe(true);
+    });
+
+    it('rejects browser p2p messages that are daemon-only or responses', async () => {
+      const { daemonWs, browserWs } = await setupAuthBridge();
+      daemonWs.sent.length = 0;
+
+      browserWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.RUN_UPDATE,
+        run: { rawPrompt: 'do not forward' },
+      }));
+      browserWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.STATUS_RESPONSE,
+        requestId: 'p2p-response-from-browser',
+        runs: [],
+      }));
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.some((raw) => JSON.parse(raw).type === P2P_WORKFLOW_MSG.RUN_UPDATE)).toBe(false);
+      expect(daemonWs.sentStrings.some((raw) => JSON.parse(raw).type === P2P_WORKFLOW_MSG.STATUS_RESPONSE)).toBe(false);
+      expect(browserWs.sentStrings.filter((raw) => JSON.parse(raw).code === P2P_BRIDGE_ERROR_CODES.WRONG_PEER)).toHaveLength(2);
+    });
+
+    it('single-casts request-scoped p2p responses to the pending requester only', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browser1 = new MockWs();
+      const browser2 = new MockWs();
+      bridge.handleBrowserConnection(browser1 as never, 'user-1', makeDb('valid-hash'));
+      bridge.handleBrowserConnection(browser2 as never, 'user-2', makeDb('valid-hash'));
+
+      browser1.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.READ_DISCUSSION,
+        requestId: 'p2p-read-1',
+        id: 'discussion-1',
+      }));
+      await flushAsync();
+      browser1.sent.length = 0;
+      browser2.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE,
+        requestId: 'p2p-read-1',
+        id: 'discussion-1',
+        content: 'private discussion',
+      }));
+      await flushAsync();
+
+      expect(browser1.sentStrings).toHaveLength(1);
+      expect(browser2.sentStrings).toHaveLength(0);
+      expect(JSON.parse(browser1.sentStrings[0])).toMatchObject({
+        type: P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE,
+        requestId: 'p2p-read-1',
+      });
+    });
+
+    it('drops mismatched p2p response types without clearing the pending request', async () => {
+      const { daemonWs, browserWs } = await setupAuthBridge();
+
+      browserWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.STATUS,
+        requestId: 'p2p-status-1',
+      }));
+      await flushAsync();
+      browserWs.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE,
+        requestId: 'p2p-status-1',
+        discussions: [],
+      }));
+      await flushAsync();
+
+      expect(browserWs.sentStrings).toHaveLength(0);
+
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.STATUS_RESPONSE,
+        requestId: 'p2p-status-1',
+        runs: [],
+      }));
+      await flushAsync();
+
+      expect(browserWs.sentStrings).toHaveLength(1);
+      expect(JSON.parse(browserWs.sentStrings[0]).type).toBe(P2P_WORKFLOW_MSG.STATUS_RESPONSE);
+    });
+
+    it('rejects duplicate active p2p requestIds without replacing the original requester', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browser1 = new MockWs();
+      const browser2 = new MockWs();
+      bridge.handleBrowserConnection(browser1 as never, 'user-1', makeDb('valid-hash'));
+      bridge.handleBrowserConnection(browser2 as never, 'user-2', makeDb('valid-hash'));
+
+      browser1.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.STATUS,
+        requestId: 'p2p-duplicate-1',
+      }));
+      browser2.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.STATUS,
+        requestId: 'p2p-duplicate-1',
+      }));
+      await flushAsync();
+
+      expect(browser2.sentStrings.some((raw) => JSON.parse(raw).code === P2P_BRIDGE_ERROR_CODES.DUPLICATE_REQUEST_ID)).toBe(true);
+      browser1.sent.length = 0;
+      browser2.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.STATUS_RESPONSE,
+        requestId: 'p2p-duplicate-1',
+        runs: [],
+      }));
+      await flushAsync();
+
+      expect(browser1.sentStrings).toHaveLength(1);
+      expect(browser2.sentStrings).toHaveLength(0);
+    });
+
+    it('drops request-scoped p2p responses without a pending requester', async () => {
+      const { daemonWs, browserWs } = await setupAuthBridge();
+      browserWs.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE,
+        requestId: 'p2p-missing',
+        discussions: [],
+      }));
+      await flushAsync();
+
+      expect(browserWs.sentStrings).toHaveLength(0);
+    });
+
+    it('enforces per-socket pending caps before forwarding p2p requests', async () => {
+      const { daemonWs, browserWs } = await setupAuthBridge();
+      daemonWs.sent.length = 0;
+
+      for (let i = 0; i < P2P_BRIDGE_PENDING_REQUESTS_PER_SOCKET + 1; i += 1) {
+        browserWs.emit('message', JSON.stringify({
+          type: P2P_WORKFLOW_MSG.STATUS,
+          requestId: `p2p-cap-${i}`,
+        }));
+      }
+      await flushAsync();
+
+      const forwarded = daemonWs.sentStrings
+        .map((raw) => JSON.parse(raw))
+        .filter((msg) => msg.type === P2P_WORKFLOW_MSG.STATUS);
+      expect(forwarded).toHaveLength(P2P_BRIDGE_PENDING_REQUESTS_PER_SOCKET);
+      expect(browserWs.sentStrings.some((raw) => JSON.parse(raw).code === P2P_BRIDGE_ERROR_CODES.PENDING_LIMIT_EXCEEDED)).toBe(true);
+    });
+
+    it('enforces the global pending cap before forwarding p2p requests', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      daemonWs.sent.length = 0;
+
+      const socketCount = Math.ceil(P2P_BRIDGE_PENDING_REQUESTS_GLOBAL / P2P_BRIDGE_PENDING_REQUESTS_PER_SOCKET);
+      for (let socketIndex = 0; socketIndex < socketCount; socketIndex += 1) {
+        const browserWs = new MockWs();
+        bridge.handleBrowserConnection(browserWs as never, `user-${socketIndex}`, makeDb('valid-hash'));
+        browserWs.sent.length = 0;
+        for (let requestIndex = 0; requestIndex < P2P_BRIDGE_PENDING_REQUESTS_PER_SOCKET; requestIndex += 1) {
+          browserWs.emit('message', JSON.stringify({
+            type: P2P_WORKFLOW_MSG.STATUS,
+            requestId: `p2p-global-${socketIndex}-${requestIndex}`,
+          }));
+        }
+      }
+      await flushAsync();
+
+      const extraBrowser = new MockWs();
+      bridge.handleBrowserConnection(extraBrowser as never, 'user-extra', makeDb('valid-hash'));
+      extraBrowser.sent.length = 0;
+      extraBrowser.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.STATUS,
+        requestId: 'p2p-global-overflow',
+      }));
+      await flushAsync();
+
+      const forwarded = daemonWs.sentStrings
+        .map((raw) => JSON.parse(raw))
+        .filter((msg) => msg.type === P2P_WORKFLOW_MSG.STATUS);
+      expect(forwarded).toHaveLength(P2P_BRIDGE_PENDING_REQUESTS_GLOBAL);
+      expect(extraBrowser.sentStrings.some((raw) => {
+        const msg = JSON.parse(raw);
+        return msg.code === P2P_BRIDGE_ERROR_CODES.PENDING_LIMIT_EXCEEDED && msg.scope === 'global';
+      })).toBe(true);
+    });
+
+    it('handles p2p.run_complete and p2p.run_error as registered daemon messages', async () => {
+      const { daemonWs, browserWs } = await setupAuthBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.RUN_COMPLETE,
+        run: { id: 'run-complete', status: 'running', mode_key: 'audit' },
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.RUN_ERROR,
+        run: { id: 'run-error', status: 'failed', mode_key: 'audit', error: 'failed' },
+      }));
+      await flushAsync();
+
+      const updates = browserWs.sentStrings.map((raw) => JSON.parse(raw));
+      expect(updates.filter((msg) => msg.type === P2P_WORKFLOW_MSG.RUN_UPDATE)).toHaveLength(2);
+      expect(updates.find((msg) => msg.run.id === 'run-complete')?.run.status).toBe('completed');
+      expect(updates.find((msg) => msg.run.id === 'run-error')?.run.error).toBe('failed');
+    });
+
+    it('writes the same diagnostic code set to DB upsert and to the browser broadcast', async () => {
+      // Regression for PR-D: the canonical sanitize result must be shared
+      // between the DB-bound `upsertOrchestrationRun` payload and the
+      // broadcast payload so the diagnostic code set the browser sees is
+      // byte-identical to what the DB row records.
+      const upsertSpy = vi.spyOn(dbQueries, 'upsertOrchestrationRun').mockResolvedValue();
+      try {
+        const { daemonWs, browserWs } = await setupAuthBridge();
+
+        // Force the bridge into the truncation branch via oversized routing_history.
+        const oversized = 'x'.repeat(P2P_SANITIZE_MAX_STRING_BYTES + 100);
+        daemonWs.emit('message', JSON.stringify({
+          type: P2P_WORKFLOW_MSG.RUN_SAVE,
+          run: {
+            id: 'run-parity',
+            discussion_id: 'disc-1',
+            mode_key: 'audit',
+            status: 'running',
+            diagnostics: [
+              { code: 'daemon_busy', phase: 'bind', severity: 'error', summary: 'busy' },
+              { code: 'missing_required_capability', phase: 'execute', summary: 'missing cap' },
+            ],
+            routing_history: Array.from({ length: 80 }, (_, idx) => ({
+              step: idx,
+              nested: { value: oversized },
+            })),
+          },
+        }));
+        await flushAsync();
+
+        expect(upsertSpy).toHaveBeenCalledTimes(1);
+        const persistedArg = upsertSpy.mock.calls[0]?.[1] as {
+          progress_snapshot: string;
+          workflow_projection: { diagnostics: Array<{ code: string }> };
+        };
+        const persistedSnap = JSON.parse(persistedArg.progress_snapshot) as {
+          diagnostics: Array<{ code: string }>;
+        };
+
+        const broadcasts = browserWs.sentStrings
+          .map((raw) => JSON.parse(raw))
+          .filter((msg) => msg.type === P2P_WORKFLOW_MSG.RUN_UPDATE);
+        expect(broadcasts).toHaveLength(1);
+        const broadcastDiagnostics = broadcasts[0].run.workflow_projection.diagnostics as Array<{ code: string }>;
+
+        const persistedCodes = [...persistedArg.workflow_projection.diagnostics.map((d) => d.code)].sort();
+        const persistedSnapCodes = [...persistedSnap.diagnostics.map((d) => d.code)].sort();
+        const broadcastCodes = [...broadcastDiagnostics.map((d) => d.code)].sort();
+
+        expect(broadcastCodes).toEqual(persistedCodes);
+        expect(broadcastCodes).toEqual(persistedSnapCodes);
+        expect(broadcastCodes).toContain('daemon_busy');
+        expect(broadcastCodes).toContain('missing_required_capability');
+        expect(broadcastCodes).toContain('private_projection_field_dropped');
+      } finally {
+        upsertSpy.mockRestore();
+      }
+    });
+
+    it('caches daemon.hello capabilities and clears stale/disconnected snapshots', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: serverId,
+        capabilities: [P2P_WORKFLOW_SCRIPT_ARGV_CAPABILITY_V1, P2P_WORKFLOW_CAPABILITY_V1],
+        helloEpoch: 2,
+        sentAt: 123,
+      }));
+      await flushAsync();
+
+      expect(bridge.getDaemonP2pWorkflowCapabilities()?.capabilities).toEqual([
+        P2P_WORKFLOW_SCRIPT_ARGV_CAPABILITY_V1,
+        P2P_WORKFLOW_CAPABILITY_V1,
+      ].sort());
+      expect(bridge.getDaemonP2pWorkflowCapabilities(Date.now() + P2P_CAPABILITY_FRESHNESS_TTL_MS + 1)).toBeNull();
+
+      daemonWs.close();
+      await flushAsync();
+
+      expect(bridge.getDaemonP2pWorkflowCapabilities()).toBeNull();
+    });
+
+    it('forwards p2p.config.save from browser to daemon and registers a pending response', async () => {
+      // PR-E: p2p.config.save must be registered alongside workflow messages
+      // so the bridge default-deny no longer drops it. The browser ingress
+      // forwards via the generic forward_to_daemon path, and a pending entry
+      // is created so the SAVE_RESPONSE can be singlecast back.
+      const { daemonWs, browserWs } = await setupAuthBridge();
+      daemonWs.sent.length = 0;
+
+      browserWs.emit('message', JSON.stringify({
+        type: P2P_CONFIG_MSG.SAVE,
+        requestId: 'p2p-config-save-1',
+        scopeSession: 'deck_demo_brain',
+        config: { participants: [] },
+      }));
+      await flushAsync();
+
+      const forwarded = daemonWs.sentStrings
+        .map((raw) => JSON.parse(raw))
+        .filter((msg) => msg.type === P2P_CONFIG_MSG.SAVE);
+      expect(forwarded).toHaveLength(1);
+      expect(forwarded[0]).toMatchObject({
+        type: P2P_CONFIG_MSG.SAVE,
+        requestId: 'p2p-config-save-1',
+        scopeSession: 'deck_demo_brain',
+      });
+      // Browser must not receive any error code (route policy / wrong peer / unknown).
+      expect(browserWs.sentStrings.some((raw) => 'code' in JSON.parse(raw))).toBe(false);
+    });
+
+    it('singlecasts p2p.config.save_response to the requesting browser only', async () => {
+      // PR-E: SAVE_RESPONSE flows through the generic singlecast_response
+      // handler — only the browser that registered the requestId receives it.
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browser1 = new MockWs();
+      const browser2 = new MockWs();
+      bridge.handleBrowserConnection(browser1 as never, 'user-1', makeDb('valid-hash'));
+      bridge.handleBrowserConnection(browser2 as never, 'user-2', makeDb('valid-hash'));
+
+      browser1.emit('message', JSON.stringify({
+        type: P2P_CONFIG_MSG.SAVE,
+        requestId: 'p2p-config-save-singlecast',
+        scopeSession: 'deck_demo_brain',
+        config: { participants: [] },
+      }));
+      await flushAsync();
+      browser1.sent.length = 0;
+      browser2.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_CONFIG_MSG.SAVE_RESPONSE,
+        requestId: 'p2p-config-save-singlecast',
+        scopeSession: 'deck_demo_brain',
+        ok: true,
+      }));
+      await flushAsync();
+
+      expect(browser1.sentStrings).toHaveLength(1);
+      expect(browser2.sentStrings).toHaveLength(0);
+      expect(JSON.parse(browser1.sentStrings[0])).toMatchObject({
+        type: P2P_CONFIG_MSG.SAVE_RESPONSE,
+        requestId: 'p2p-config-save-singlecast',
+        ok: true,
+      });
+    });
+
+    it('keeps unknown p2p.* messages dropped after registering p2p.config.*', async () => {
+      // Default-deny safeguard: registering p2p.config.* must NOT widen the
+      // bridge to forward arbitrary p2p.* messages. Any unregistered p2p.*
+      // type from the daemon still drops, no broadcast.
+      const { daemonWs, browserWs } = await setupAuthBridge();
+      browserWs.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'p2p.future_secret',
+        rawPrompt: 'do not leak',
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: 'p2p.config.future_secret',
+        scopeSession: 'deck_demo_brain',
+        ok: true,
+      }));
+      await flushAsync();
+
+      expect(browserWs.sentStrings).toHaveLength(0);
     });
   });
 

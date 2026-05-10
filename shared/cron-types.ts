@@ -21,6 +21,25 @@ export interface CronP2pAction {
   /** Discriminated participant list — supports both roles and direct session names. */
   participantEntries?: CronParticipant[];
   rounds?: number;
+  /**
+   * Audit:R3 hardening / task 10.2 — when present, the cron dispatcher routes
+   * this job through the daemon's advanced-workflow envelope path
+   * (`prepareAdvancedWorkflowLaunch`) instead of the legacy `startP2pRun`
+   * fallback. Carries the same shape as web-side
+   * `p2pWorkflowLaunchEnvelope`. Stored in DB as JSON; daemon validates +
+   * compiles + binds at dispatch time. v1a compatibility: legacy cron rows
+   * without this field continue to use the direct legacy path.
+   */
+  workflowLaunchEnvelope?: Record<string, unknown>;
+  /**
+   * Bounded retry budget for `daemon_busy` — `dispatchAttempts` total tries
+   * (default 3), `retryDelayMs` between each. After exhaustion the cron run
+   * is marked failed with a stable diagnostic. Task 10.3.
+   */
+  daemonBusyRetry?: {
+    attempts: number;
+    delayMs: number;
+  };
 }
 
 export type CronAction = CronCommandAction | CronP2pAction;

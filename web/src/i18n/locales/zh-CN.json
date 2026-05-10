@@ -648,6 +648,77 @@
       "more_agents": "@ 更多",
       "send_anyway": "仍然发送",
       "tip_history": "多 Agent 是共享文件、历史更完整的讨论；一对一则是一次性讨论。"
+    },
+    "settings_workflow_migration_title": "工作流迁移",
+    "settings_workflow_migration_body": "这个已保存的高级配置仍使用旧轮次格式。请保存以生成工作流启动信封，再启动高级 P2P。",
+    "settings_workflow_migration_ready": "高级 P2P 启动所需的工作流启动信封已就绪。",
+    "settings_workflow_migration_error": "高级工作流迁移失败。启动前请检查已保存的轮次。",
+    "workflow": {
+      "diagnostics": {
+        "forbidden_envelope_field": "The launch envelope contains a forbidden private field.",
+        "unsupported_schema_version": "This workflow schema version is not supported.",
+        "unknown_future_schema_read_only": "This future workflow version is read-only here.",
+        "mixed_advanced_schema_fields": "Old and new advanced workflow fields are mixed.",
+        "static_policy_mismatch_recompiled": "Daemon policy changed, so the workflow was recompiled.",
+        "missing_required_capability": "The daemon is missing a required workflow capability.",
+        "capability_stale": "Daemon workflow capability information is stale.",
+        "capability_downgraded_during_run": "A required capability was downgraded during the run.",
+        "invalid_launch_envelope": "The workflow launch envelope is invalid.",
+        "invalid_workflow_graph": "The workflow graph is invalid.",
+        "invalid_routing_authority": "The workflow routing authority is invalid.",
+        "invalid_edge_condition": "A workflow edge condition is invalid.",
+        "loop_budget_exhausted": "The workflow loop budget was exhausted.",
+        "invalid_workflow_variable": "A workflow variable is invalid.",
+        "invalid_prompt_append": "A workflow prompt append is invalid.",
+        "missing_context_source": "A required workflow context source is missing.",
+        "context_source_too_large": "A workflow context source is too large.",
+        "unsafe_artifact_path": "A workflow artifact path is unsafe.",
+        "artifact_identity_collision_resolved": "An artifact identity collision was resolved.",
+        "artifact_baseline_too_large": "An artifact baseline is too large.",
+        "artifact_baseline_mismatch": "An artifact baseline did not match.",
+        "artifact_contract_not_satisfied": "An artifact contract was not satisfied.",
+        "invalid_script_contract": "A workflow script contract is invalid.",
+        "script_executable_denied": "The script executable is not allowed.",
+        "script_machine_output_invalid": "Script machine output is invalid.",
+        "script_timeout": "The script timed out.",
+        "script_cancelled": "The script was cancelled.",
+        "daemon_busy": "The daemon is busy with other advanced workflows.",
+        "workflow_stale_after_restart": "The workflow became stale after daemon restart.",
+        "private_projection_field_dropped": "A private projection field was dropped.",
+        "legacy_progress_snapshot_sanitized": "A legacy progress snapshot was sanitized.",
+        "unknown_p2p_message": "An unknown P2P workflow message was ignored.",
+        "unmatched_edge_route": "没有匹配的条件出边，且不存在默认边。"
+      },
+      "editor": {
+        "title": "高级工作流草稿",
+        "add_node": "添加节点",
+        "remove_node": "删除节点",
+        "remove_edge": "删除边",
+        "diagnostics_header": "诊断",
+        "read_only_notice": "此工作流使用未来 schema,这里只读。",
+        "canvas_hint": "拖动节点调整位置，从右侧锚点 (●) 拖到另一节点即可创建边。",
+        "inspector_empty": "选择一个节点或边以编辑其属性。",
+        "node": {
+          "section_label": "节点",
+          "preset_label": "预设",
+          "permission_scope_label": "权限范围"
+        },
+        "edge": {
+          "section_label": "边",
+          "from_label": "起点",
+          "to_label": "终点",
+          "condition_label": "条件值"
+        }
+      },
+      "allowed_executables": {
+        "title": "脚本可执行文件白名单",
+        "hint": "脚本节点只能启动此列表中的可执行文件。使用绝对路径（如 /usr/bin/jq）或 PATH 相对名称。列表为空时此配置禁止脚本执行。",
+        "placeholder": "/usr/bin/jq",
+        "input_label": "新的可执行路径",
+        "add": "添加",
+        "remove": "移除",
+        "empty": "尚未允许任何可执行文件。脚本节点将在 bind 阶段被拒绝。"
+      }
     }
   },
   "openspec": {

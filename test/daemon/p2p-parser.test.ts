@@ -250,10 +250,22 @@ describe('parseAtTokens', () => {
 // ── Structured WS field routing (no inline @@tokens) ──────────────────────────
 
 describe('structured P2P routing via WS fields', () => {
+  // Audit:N-H2 / N4 — `getP2pWorkflowCapabilities` MUST be supplied so the
+  // daemon static policy reflects the dangerous capabilities required by
+  // the test's advanced launch (which uses preset 'implementation'). Without
+  // it, fail-closed fallback returns `[]` and compile rejects the implementation
+  // node — that is the desired production behavior.
   const mockServerLink = {
     send: vi.fn(),
     sendTimelineEvent: vi.fn(),
     getServerId: vi.fn(() => 'srv-main'),
+    getP2pWorkflowCapabilities: vi.fn(() => [
+      'p2p.workflow.v1',
+      'p2p.workflow.openspec-artifacts.v1',
+      'p2p.workflow.implementation.v1',
+    ]),
+    getHelloEpoch: vi.fn(() => 1),
+    getHelloSentAt: vi.fn(() => 1_700_000_000_000),
     daemonVersion: '0.1.0',
   };
 
@@ -604,18 +616,32 @@ describe('structured P2P routing via WS fields', () => {
 
     expect(startP2pRun).toHaveBeenCalledOnce();
     expect((startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0]).toHaveLength(1);
-    expect((startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]).toMatchObject({
+    // Audit:V-1 / N-H1 — old top-level advanced fields are materialized through
+    // `prepareAdvancedWorkflowLaunch`, then forwarded as the typed `advanced`
+    // discriminated union so the orchestrator surfaces capabilitySnapshot/policy
+    // on the run state. The compiled rounds end up under `advanced.advancedRounds`,
+    // and the legacy `advancedPresetKey` is set to 'openspec' to mark the
+    // compiled-from-envelope path inside the orchestrator's resolveP2pRoundPlan.
+    const startCall = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
+    expect(startCall).toMatchObject({
       initiatorSession: 'deck_proj_brain',
       targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
       userText: 'run advanced p2p',
       advancedPresetKey: 'openspec',
-      advancedRounds,
-      advancedRunTimeoutMs: 45 * 60_000,
-      contextReducer: {
-        mode: 'clone_sdk_session',
-        templateSession: 'deck_proj_brain',
+      advanced: {
+        kind: 'envelope_compiled',
+        advancedRunTimeoutMs: 45 * 60_000,
+        contextReducer: {
+          mode: 'clone_sdk_session',
+          templateSession: 'deck_proj_brain',
+        },
       },
     });
+    // Sanity: the bound workflow must be present so the orchestrator can store
+    // capabilitySnapshot / currentDaemonPolicy on the P2pRun.
+    expect(startCall?.advanced?.bound).toBeDefined();
+    // The compiled rounds match the input shape (single 'implementation' round).
+    expect(startCall?.advanced?.advancedRounds).toHaveLength(1);
   });
 
   it('forwards the selected i18n locale to the P2P run for final-summary prompting', async () => {

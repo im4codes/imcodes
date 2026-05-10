@@ -2,6 +2,7 @@ import { useMemo, useEffect, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import { memo } from 'preact/compat';
+import type { P2pWorkflowDiagnostic } from '@shared/p2p-workflow-diagnostics.js';
 
 export interface P2pProgressNode {
   label: string;
@@ -42,6 +43,8 @@ export interface P2pProgressDiscussion {
   startedAt?: number;
   /** Epoch ms when the current hop/phase started (server-provided for accurate elapsed) */
   hopStartedAt?: number;
+  /** Workflow diagnostics surfaced from sanitizer (parse/compile/bind/execute/sanitize phases) */
+  diagnostics?: P2pWorkflowDiagnostic[];
 }
 
 interface Props {
@@ -468,6 +471,27 @@ export const P2pProgressCard = memo(function P2pProgressCard({
               <span class="discussions-progress-node-label">{node.displayLabel ?? node.label}</span>
               {node.mode && <span class="discussions-progress-node-mode">{t(`p2p.mode.${node.mode}`, node.mode)}</span>}
               {node.phase && <span class="discussions-progress-node-phase">{t(`p2p.discussions.phase_${node.phase}`)}</span>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {discussion.diagnostics && discussion.diagnostics.length > 0 && (
+        <div class="discussions-progress-diagnostics">
+          {discussion.diagnostics.map((d, idx) => (
+            <div
+              key={`${d.code}-${idx}`}
+              class={`discussions-progress-diagnostic discussions-progress-diagnostic-${d.severity}`}
+            >
+              <span class="discussions-progress-diagnostic-message">
+                {t(d.messageKey, { fieldPath: d.fieldPath ?? '', summary: d.summary ?? '' })}
+              </span>
+              {d.summary && (
+                <span class="discussions-progress-diagnostic-summary">{d.summary}</span>
+              )}
+              {d.fieldPath && (
+                <span class="discussions-progress-diagnostic-fieldpath">{d.fieldPath}</span>
+              )}
             </div>
           ))}
         </div>

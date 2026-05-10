@@ -1,9 +1,10 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import type { WsClient, ServerMessage } from '../ws-client.js';
+import type { WsClient, ServerMessage, P2pWorkflowRequestScope } from '../ws-client.js';
 import { P2pProgressCard } from '../components/P2pProgressCard.js';
 import type { P2pProgressDiscussion } from '../components/P2pProgressCard.js';
 import { FilePreviewPane } from '../components/FilePreviewPane.js';
+import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 
 interface P2pDiscussion {
   id: string;
@@ -17,6 +18,7 @@ interface Props {
   ws: WsClient | null;
   onBack?: () => void;
   initialSelectedId?: string | null;
+  requestScope?: P2pWorkflowRequestScope;
   /** Live discussion state from app (progress, nodes). */
   liveDiscussions?: P2pProgressDiscussion[];
   onStopDiscussion?: (id: string) => void;
@@ -24,7 +26,7 @@ interface Props {
 
 // Global marked config (breaks, gfm, target=_blank) is set in main.tsx
 
-export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], onStopDiscussion }: Props) {
+export function DiscussionsPage({ ws, initialSelectedId, requestScope, liveDiscussions = [], onStopDiscussion }: Props) {
   const { t } = useTranslation();
   const [progressHidden, setProgressHidden] = useState(false);
   const [discussions, setDiscussions] = useState<P2pDiscussion[]>([]);
@@ -107,15 +109,15 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
     scrollDetailTo(el.scrollHeight, mode);
   }, [scrollDetailTo]);
 
-  const sendReadDiscussion = useCallback((id: string, requestId: string) => {
-    ws?.send({ type: 'p2p.read_discussion', id, requestId });
-  }, [ws]);
+  const sendReadDiscussion = useCallback((id: string): string | null => {
+    return ws?.p2pReadDiscussion(id, requestScope) ?? null;
+  }, [requestScope, ws]);
 
   const loadList = useCallback(() => {
     if (!ws) return;
     setLoading(true);
-    ws.send({ type: 'p2p.list_discussions' });
-  }, [ws]);
+    ws.p2pListDiscussions(requestScope);
+  }, [requestScope, ws]);
 
   useEffect(() => { loadList(); }, [loadList]);
 
@@ -125,8 +127,7 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
     setAutoFollow(true);
     setCopyMenuId(null);
     pendingReadIdRef.current = id;
-    pendingReadRequestIdRef.current = crypto.randomUUID();
-    sendReadDiscussion(id, pendingReadRequestIdRef.current);
+    pendingReadRequestIdRef.current = sendReadDiscussion(id);
   }, [sendReadDiscussion]);
 
   const markCopied = useCallback((id: string) => {
@@ -159,10 +160,10 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
       await copyText(discussion.id, content);
       return;
     }
-    const requestId = crypto.randomUUID();
-    pendingCopyRef.current = { id: discussion.id, requestId };
+    const sentRequestId = sendReadDiscussion(discussion.id);
+    if (!sentRequestId) return;
+    pendingCopyRef.current = { id: discussion.id, requestId: sentRequestId };
     setCopyMenuId(null);
-    sendReadDiscussion(discussion.id, requestId);
   }, [content, copyText, selected, sendReadDiscussion]);
 
   // Auto-refresh selected discussion content every 5s (like file browser preview)
@@ -171,8 +172,7 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
     const timer = setInterval(() => {
       if (!pendingReadIdRef.current) {
         pendingReadIdRef.current = selected;
-        pendingReadRequestIdRef.current = crypto.randomUUID();
-        sendReadDiscussion(selected, pendingReadRequestIdRef.current);
+        pendingReadRequestIdRef.current = sendReadDiscussion(selected);
       }
     }, 5000);
     return () => clearInterval(timer);
@@ -194,19 +194,18 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
     // Even if not in list yet (active run), try to read directly
     if (selected === initialSelectedId && content === null && !pendingReadIdRef.current) {
       pendingReadIdRef.current = initialSelectedId;
-      pendingReadRequestIdRef.current = crypto.randomUUID();
-      sendReadDiscussion(initialSelectedId, pendingReadRequestIdRef.current);
+      pendingReadRequestIdRef.current = sendReadDiscussion(initialSelectedId);
     }
   }, [discussions, initialSelectedId, selected, content, sendReadDiscussion, selectDiscussion]);
 
   useEffect(() => {
     if (!ws) return;
     return ws.onMessage((msg: ServerMessage) => {
-      if (msg.type === 'p2p.list_discussions_response') {
+      if (msg.type === P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE) {
         setDiscussions((msg.discussions ?? []) as P2pDiscussion[]);
         setLoading(false);
       }
-      if (msg.type === 'p2p.read_discussion_response') {
+      if (msg.type === P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE) {
         const responseRequestId = msg.requestId;
         const pendingCopy = pendingCopyRef.current;
         if (pendingCopy && responseRequestId === pendingCopy.requestId) {
@@ -229,7 +228,7 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
         }
       }
       // Auto-refresh: when a P2P run updates and we're viewing that discussion, reload content
-      if (msg.type === 'p2p.run_update') {
+      if (msg.type === P2P_WORKFLOW_MSG.RUN_UPDATE) {
         const run = (msg as any).run;
         if (!run) return;
         // Refresh list to pick up new/updated discussions
@@ -240,8 +239,7 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
           // Debounce: don't reload if we already have a pending read
           if (!pendingReadIdRef.current) {
             pendingReadIdRef.current = selected;
-            pendingReadRequestIdRef.current = crypto.randomUUID();
-            sendReadDiscussion(selected, pendingReadRequestIdRef.current);
+            pendingReadRequestIdRef.current = sendReadDiscussion(selected);
           }
         }
       }

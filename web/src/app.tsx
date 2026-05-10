@@ -20,6 +20,7 @@ import {
   type FileBrowserPreviewUpdate,
 } from './components/file-browser-lazy.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
+import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 import { RECONNECT_GRACE_MS } from '@shared/ack-protocol.js';
 import type { UsageContextWindowSource } from '@shared/usage-context-window.js';
 import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate } from './p2p-run-mapping.js';
@@ -1726,8 +1727,19 @@ export function App() {
           setConnected(true);
           setConnecting(false);
           ws.requestSessionList();
-          ws.discussionList();
-          ws.p2pStatus();
+          // Migrate to scoped p2p list. The active session is captured via the
+          // ref to survive useEffect closure; the daemon will fail-closed and
+          // return [] if it cannot resolve a project scope from this session,
+          // matching the new server-side guard. The same scope is implicitly
+          // tracked inside the WS client via setP2pWorkflowRequestScope on
+          // terminal subscribe — passing it explicitly here just makes the
+          // scope source obvious at the call site.
+          {
+            const initialActive = activeSessionRef.current;
+            const initialScope = initialActive ? { sessionName: initialActive } : undefined;
+            ws.p2pListDiscussions(initialScope);
+            ws.p2pStatus(initialScope);
+          }
           requestActiveTimelineRefresh({ resetCooldowns: true });
           // Timeout: if session_list never arrives, stop blocking the UI
           if (sessionListRetryRef.current) clearTimeout(sessionListRetryRef.current);
@@ -2111,7 +2123,7 @@ export function App() {
         });
       }
       // ── P2P Quick Discussion progress → map to discussions state ──────────
-      if (msg.type === 'p2p.conflict') {
+      if (msg.type === P2P_WORKFLOW_MSG.CONFLICT) {
         // Active P2P run exists — notify user
         if (typeof window !== 'undefined') {
           window.alert(
@@ -2120,7 +2132,7 @@ export function App() {
           );
         }
       }
-      if (msg.type === 'p2p.run_update' && msg.run) {
+      if (msg.type === P2P_WORKFLOW_MSG.RUN_UPDATE && msg.run) {
         const entry = mapP2pRunToDiscussion(msg.run as Record<string, any>);
         setDiscussions((prev) => {
           const existing = prev.find((d) => d.id === entry.id);
@@ -2136,10 +2148,10 @@ export function App() {
           }, 120_000);
         }
       }
-      if (msg.type === 'p2p.cancel_response' && msg.ok && msg.runId) {
+      if (msg.type === P2P_WORKFLOW_MSG.CANCEL_RESPONSE && msg.ok && msg.runId) {
         setDiscussions((prev) => prev.filter((d) => d.id !== `p2p_${msg.runId}`));
       }
-      if (msg.type === 'p2p.status_response') {
+      if (msg.type === P2P_WORKFLOW_MSG.STATUS_RESPONSE) {
         const runs = Array.isArray(msg.runs)
           ? msg.runs
           : msg.run
@@ -2336,8 +2348,15 @@ export function App() {
           sessions: sessionsRef.current,
           subSessions: subSessionsRef.current,
         }));
-        // Refresh discussion list
-        ws.discussionList();
+        // Refresh discussion list — daemon now requires a project scope, so
+        // forward the active session as the scope source. Falls back to undefined
+        // (WS-client uses its tracked scope from terminal subscriptions) when the
+        // user has not picked an active session yet.
+        {
+          const reconnectActive = activeSessionRef.current;
+          const reconnectScope = reconnectActive ? { sessionName: reconnectActive } : undefined;
+          ws.p2pListDiscussions(reconnectScope);
+        }
       }
     });
 
@@ -3685,7 +3704,7 @@ export function App() {
                 onStopDiscussion={(id) => {
                   if (id.startsWith('p2p_')) {
                     // P2P runs use p2p.cancel with the actual run ID (strip p2p_ prefix)
-                    wsRef.current?.send({ type: 'p2p.cancel', runId: id.slice(4) });
+                    wsRef.current?.send({ type: P2P_WORKFLOW_MSG.CANCEL, runId: id.slice(4) });
                     // Remove from UI immediately
                     setDiscussions((prev) => prev.filter((d) => d.id !== id));
                   } else {
@@ -3912,7 +3931,7 @@ export function App() {
               liveDiscussions={discussions}
               onStopDiscussion={(id) => {
                 if (id.startsWith('p2p_')) {
-                  wsRef.current?.send({ type: 'p2p.cancel', runId: id.slice(4) });
+                  wsRef.current?.send({ type: P2P_WORKFLOW_MSG.CANCEL, runId: id.slice(4) });
                   setDiscussions((prev) => prev.filter((d) => d.id !== id));
                 } else {
                   wsRef.current?.discussionStop(id);

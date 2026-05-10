@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { WsClient } from '../src/ws-client.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
+import { P2P_WORKFLOW_MSG, isP2pWorkflowRequestId } from '@shared/p2p-workflow-messages.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import type { MessageHandler } from '../src/ws-client.js';
 
@@ -830,6 +831,105 @@ describe('WsClient', () => {
         approved: true,
       });
       client.disconnect();
+    });
+  });
+
+  describe('P2P workflow helpers', () => {
+    it('p2pStatus sends a request-scoped status payload without runId', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+
+      const requestId = client.p2pStatus();
+      const msg = JSON.parse(lastWs!.send.mock.calls[0][0] as string);
+
+      expect(isP2pWorkflowRequestId(requestId)).toBe(true);
+      expect(msg).toEqual({
+        type: P2P_WORKFLOW_MSG.STATUS,
+        requestId,
+      });
+      client.disconnect();
+    });
+
+    it('p2pStatus includes runId when provided', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+
+      const requestId = client.p2pStatus('run-123', { sessionName: 'deck_proj_brain' });
+      const msg = JSON.parse(lastWs!.send.mock.calls[0][0] as string);
+
+      expect(isP2pWorkflowRequestId(requestId)).toBe(true);
+      expect(msg).toEqual({
+        type: P2P_WORKFLOW_MSG.STATUS,
+        requestId,
+        runId: 'run-123',
+        sessionName: 'deck_proj_brain',
+      });
+      client.disconnect();
+    });
+
+    it('p2pListDiscussions sends a request-scoped list payload', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+
+      client.subscribeTerminal('deck_proj_brain', false);
+      lastWs!.send.mockClear();
+      const requestId = client.p2pListDiscussions({ projectDir: '/repo/project' });
+      const msg = JSON.parse(lastWs!.send.mock.calls[0][0] as string);
+
+      expect(isP2pWorkflowRequestId(requestId)).toBe(true);
+      expect(msg).toEqual({
+        type: P2P_WORKFLOW_MSG.LIST_DISCUSSIONS,
+        requestId,
+        sessionName: 'deck_proj_brain',
+        projectDir: '/repo/project',
+      });
+      client.disconnect();
+    });
+
+    it('p2pReadDiscussion sends a request-scoped read payload', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+
+      client.setP2pWorkflowRequestScope({ sessionName: 'deck_proj_w1', cwd: '/repo/project' });
+      const requestId = client.p2pReadDiscussion('discussion-1');
+      const msg = JSON.parse(lastWs!.send.mock.calls[0][0] as string);
+
+      expect(isP2pWorkflowRequestId(requestId)).toBe(true);
+      expect(msg).toEqual({
+        type: P2P_WORKFLOW_MSG.READ_DISCUSSION,
+        requestId,
+        id: 'discussion-1',
+        sessionName: 'deck_proj_w1',
+        cwd: '/repo/project',
+      });
+      client.disconnect();
+    });
+
+    it('cleans pending P2P workflow requests on response, timeout, and disconnect', async () => {
+      const client = await connectClient();
+      vi.useFakeTimers();
+      lastWs!.send.mockClear();
+
+      const listRequestId = client.p2pListDiscussions();
+      expect((client as any).p2pWorkflowPendingRequests.has(listRequestId)).toBe(true);
+      lastWs!.emit('message', {
+        data: JSON.stringify({
+          type: P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE,
+          requestId: listRequestId,
+          discussions: [],
+        }),
+      });
+      expect((client as any).p2pWorkflowPendingRequests.has(listRequestId)).toBe(false);
+
+      const statusRequestId = client.p2pStatus();
+      expect((client as any).p2pWorkflowPendingRequests.has(statusRequestId)).toBe(true);
+      vi.advanceTimersByTime(30_000);
+      expect((client as any).p2pWorkflowPendingRequests.has(statusRequestId)).toBe(false);
+
+      const readRequestId = client.p2pReadDiscussion('discussion-1');
+      expect((client as any).p2pWorkflowPendingRequests.has(readRequestId)).toBe(true);
+      client.disconnect();
+      expect((client as any).p2pWorkflowPendingRequests.size).toBe(0);
     });
   });
 

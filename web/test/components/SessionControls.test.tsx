@@ -205,20 +205,34 @@ function readBlobText(blob: Blob): Promise<string> {
 const TEST_OPENSPEC_ADVANCED_ROUNDS = [
   {
     id: 'initial_audit',
-    mode: 'audit',
-    rounds: 1,
-    summaryMode: 'append',
+    title: 'Initial audit',
+    preset: 'proposal_audit',
+    executionMode: 'multi_dispatch',
+    permissionScope: 'analysis_only',
+    timeoutMinutes: 5,
   },
   {
     id: 'implementation_plan',
-    mode: 'plan',
-    rounds: 1,
-    summaryMode: 'append',
+    title: 'Implementation plan',
+    preset: 'implementation',
+    executionMode: 'single_main',
+    permissionScope: 'implementation',
+    timeoutMinutes: 5,
   },
 ] as const;
 
-const makeWs = () => {
+const makeWs = (overrides: { capabilitySnapshot?: { daemonId: string; capabilities: string[]; helloEpoch: number; sentAt: number; observedAt: number } | null } = {}) => {
   const handlers = new Set<(msg: unknown) => void>();
+  // Default to a fresh capability snapshot so the advanced launch gate doesn't
+  // accidentally suppress envelopes in tests that don't care about it.
+  const defaultSnapshot = {
+    daemonId: 'daemon-test',
+    capabilities: ['p2p.workflow.v1'],
+    helloEpoch: 1,
+    sentAt: Date.now(),
+    observedAt: Date.now(),
+  };
+  const capabilitySnapshot = overrides.capabilitySnapshot === undefined ? defaultSnapshot : overrides.capabilitySnapshot;
   return {
     send: vi.fn(),
     sendSessionCommand: vi.fn(),
@@ -237,6 +251,8 @@ const makeWs = () => {
       handlers.add(handler);
       return () => handlers.delete(handler);
     }),
+    getDaemonCapabilitySnapshot: vi.fn(() => capabilitySnapshot),
+    onDaemonCapabilitySnapshot: vi.fn(() => () => {}),
     emit: (msg: unknown) => {
       handlers.forEach((handler) => handler(msg));
     },
@@ -569,7 +585,7 @@ afterEach(() => {
     expect(firstPayload.commandId).not.toBe(secondPayload.commandId);
   });
 
-  it('sends advanced p2p config fields when config mode is used', async () => {
+  it('sends an advanced p2p workflow envelope when config mode is used', async () => {
     const ws = makeWs();
     getUserPrefMock.mockImplementation(async (key: unknown) => {
       if (typeof key === 'string' && key.startsWith('p2p_session_config:')) {
@@ -621,15 +637,23 @@ afterEach(() => {
         'deck_sub_abc': { enabled: true, mode: 'review' },
       },
       p2pRounds: 3,
-      p2pAdvancedPresetKey: 'openspec',
-      p2pAdvancedRounds: TEST_OPENSPEC_ADVANCED_ROUNDS,
-      p2pAdvancedRunTimeoutMinutes: 45,
-      p2pContextReducer: {
-        mode: 'clone_sdk_session',
-        templateSession: 'my-session',
-      },
       p2pLocale: 'en',
     });
+    const sent = gatherSendCalls(ws).at(-1)!;
+    expect(sent.p2pWorkflowLaunchEnvelope).toEqual(expect.objectContaining({
+      workflowSchemaVersion: 1,
+      workflowKind: 'advanced',
+      launchContext: expect.objectContaining({
+        sessionName: 'my-session',
+        userText: 'ship it',
+        locale: 'en',
+      }),
+    }));
+    expect(JSON.stringify(sent.p2pWorkflowLaunchEnvelope)).not.toMatch(/compiledWorkflow|privateRuntimeState|rawPrompt|rawScriptOutput|artifactBaselines|token|env/i);
+    expect(sent).not.toHaveProperty('p2pAdvancedPresetKey');
+    expect(sent).not.toHaveProperty('p2pAdvancedRounds');
+    expect(sent).not.toHaveProperty('p2pAdvancedRunTimeoutMinutes');
+    expect(sent).not.toHaveProperty('p2pContextReducer');
   });
 
   it('keeps the p2p button in solo mode after triggering a combo from the dropdown', async () => {

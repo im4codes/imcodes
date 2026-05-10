@@ -647,6 +647,77 @@
       "more_agents": "@ 더 추가",
       "send_anyway": "그대로 보내기",
       "tip_history": "멀티 에이전트 토론은 파일을 공유하고 기록도 더 잘 남습니다. 1:1 토론은 일회성 토론으로 처리됩니다."
+    },
+    "settings_workflow_migration_title": "워크플로 마이그레이션",
+    "settings_workflow_migration_body": "저장된 고급 설정이 이전 라운드 형식을 사용합니다. 고급 P2P를 시작하기 전에 저장하여 워크플로 시작 엔벌로프를 만드세요.",
+    "settings_workflow_migration_ready": "고급 P2P 시작을 위한 워크플로 시작 엔벌로프가 준비되었습니다.",
+    "settings_workflow_migration_error": "고급 워크플로 마이그레이션에 실패했습니다. 시작 전에 저장된 라운드를 확인하세요.",
+    "workflow": {
+      "diagnostics": {
+        "forbidden_envelope_field": "The launch envelope contains a forbidden private field.",
+        "unsupported_schema_version": "This workflow schema version is not supported.",
+        "unknown_future_schema_read_only": "This future workflow version is read-only here.",
+        "mixed_advanced_schema_fields": "Old and new advanced workflow fields are mixed.",
+        "static_policy_mismatch_recompiled": "Daemon policy changed, so the workflow was recompiled.",
+        "missing_required_capability": "The daemon is missing a required workflow capability.",
+        "capability_stale": "Daemon workflow capability information is stale.",
+        "capability_downgraded_during_run": "A required capability was downgraded during the run.",
+        "invalid_launch_envelope": "The workflow launch envelope is invalid.",
+        "invalid_workflow_graph": "The workflow graph is invalid.",
+        "invalid_routing_authority": "The workflow routing authority is invalid.",
+        "invalid_edge_condition": "A workflow edge condition is invalid.",
+        "loop_budget_exhausted": "The workflow loop budget was exhausted.",
+        "invalid_workflow_variable": "A workflow variable is invalid.",
+        "invalid_prompt_append": "A workflow prompt append is invalid.",
+        "missing_context_source": "A required workflow context source is missing.",
+        "context_source_too_large": "A workflow context source is too large.",
+        "unsafe_artifact_path": "A workflow artifact path is unsafe.",
+        "artifact_identity_collision_resolved": "An artifact identity collision was resolved.",
+        "artifact_baseline_too_large": "An artifact baseline is too large.",
+        "artifact_baseline_mismatch": "An artifact baseline did not match.",
+        "artifact_contract_not_satisfied": "An artifact contract was not satisfied.",
+        "invalid_script_contract": "A workflow script contract is invalid.",
+        "script_executable_denied": "The script executable is not allowed.",
+        "script_machine_output_invalid": "Script machine output is invalid.",
+        "script_timeout": "The script timed out.",
+        "script_cancelled": "The script was cancelled.",
+        "daemon_busy": "The daemon is busy with other advanced workflows.",
+        "workflow_stale_after_restart": "The workflow became stale after daemon restart.",
+        "private_projection_field_dropped": "A private projection field was dropped.",
+        "legacy_progress_snapshot_sanitized": "A legacy progress snapshot was sanitized.",
+        "unknown_p2p_message": "An unknown P2P workflow message was ignored.",
+        "unmatched_edge_route": "경로와 일치하는 조건부 출력 엣지가 없고 기본 엣지도 존재하지 않습니다."
+      },
+      "editor": {
+        "title": "고급 워크플로 초안",
+        "add_node": "노드 추가",
+        "remove_node": "노드 제거",
+        "remove_edge": "엣지 제거",
+        "diagnostics_header": "진단",
+        "read_only_notice": "이 워크플로는 향후 스키마를 사용하며 여기에서는 읽기 전용입니다.",
+        "canvas_hint": "노드를 드래그하여 배치합니다. 오른쪽 앵커 (●)에서 다른 노드로 드래그하여 엣지를 만듭니다.",
+        "inspector_empty": "속성을 편집하려면 노드나 엣지를 선택하세요.",
+        "node": {
+          "section_label": "노드",
+          "preset_label": "프리셋",
+          "permission_scope_label": "권한 범위"
+        },
+        "edge": {
+          "section_label": "엣지",
+          "from_label": "출발",
+          "to_label": "도착",
+          "condition_label": "조건 값"
+        }
+      },
+      "allowed_executables": {
+        "title": "스크립트 실행 파일 허용 목록",
+        "hint": "스크립트 노드는 여기 나열된 실행 파일만 실행할 수 있습니다. 절대 경로(예: /usr/bin/jq) 또는 PATH 상대 이름을 사용하세요. 빈 목록은 이 설정에서 스크립트 실행을 비활성화합니다.",
+        "placeholder": "/usr/bin/jq",
+        "input_label": "새 실행 파일 경로",
+        "add": "추가",
+        "remove": "제거",
+        "empty": "아직 허용된 실행 파일이 없습니다. 스크립트 노드는 bind 단계에서 거부됩니다."
+      }
     }
   },
   "openspec": {

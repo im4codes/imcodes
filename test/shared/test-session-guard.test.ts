@@ -16,6 +16,8 @@ describe('test session guard', () => {
     expect(isKnownTestSessionName('deck_storecheckabc123_brain')).toBe(true);
     expect(isKnownTestSessionName('deck_shutdownabc123_probe')).toBe(true);
     expect(isKnownTestSessionName('deck_test_preview_abc123_brain')).toBe(true);
+    expect(isKnownTestSessionName('deck_test_p2p_workflow_abc123_brain')).toBe(true);
+    expect(isKnownTestSessionName('imcodes-test-p2p-workflow-abc123')).toBe(true);
     expect(isKnownTestSessionName('deck_realproj_brain')).toBe(false);
   });
 
@@ -26,8 +28,11 @@ describe('test session guard', () => {
     expect(isKnownTestProjectName('storecheckabc123')).toBe(true);
     expect(isKnownTestProjectName('shutdownabc123')).toBe(true);
     expect(isKnownTestProjectName('imcodes-test-preview-dist')).toBe(true);
+    expect(isKnownTestProjectName('imcodes-test-p2p-workflow-dist')).toBe(true);
     expect(isKnownTestProjectDir('/tmp/cxsdk-sub-e2e')).toBe(true);
     expect(isKnownTestProjectDir('/tmp/imcodes-test-preview-dist-abc123/project')).toBe(true);
+    expect(isKnownTestProjectDir('/tmp/imcodes-test-p2p-workflow-abc123/project')).toBe(true);
+    expect(isKnownTestProjectDir('/tmp/imc_p2p_wf_test_abc123/project')).toBe(true);
     expect(isKnownTestProjectDir('/Users/me/src/myapp')).toBe(false);
   });
 
