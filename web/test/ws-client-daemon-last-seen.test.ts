@@ -15,6 +15,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { WsClient } from '../src/ws-client.js';
 import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 import { P2P_CAPABILITY_FRESHNESS_TTL_MS } from '@shared/p2p-workflow-constants.js';
+import { REPO_MSG } from '@shared/repo-types.js';
 
 class MockWebSocket {
   static CONNECTING = 0;
@@ -120,6 +121,24 @@ describe('WsClient daemonLastSeenAt freshness whitelist (N4)', () => {
     // pins).
     const queryAt = baseTime + P2P_CAPABILITY_FRESHNESS_TTL_MS + 5_000;
     expect(client.isDaemonCapabilityStale(queryAt)).toBe(false);
+  });
+
+  it('repo.checkout_branch_response keeps the daemon connection fresh', async () => {
+    const { client, ws } = await connect();
+    const baseTime = 1_000_000_000_000;
+    vi.spyOn(Date, 'now').mockReturnValue(baseTime);
+    seedHello(ws);
+
+    vi.spyOn(Date, 'now').mockReturnValue(baseTime + P2P_CAPABILITY_FRESHNESS_TTL_MS - 1_000);
+    sendDaemonMsg(ws, REPO_MSG.CHECKOUT_BRANCH_RESPONSE, {
+      projectDir: '/repo/project',
+      currentBranch: 'feature/a',
+      repoGeneration: 2,
+      detectedAt: baseTime,
+      ok: true,
+    });
+
+    expect(client.isDaemonCapabilityStale(baseTime + P2P_CAPABILITY_FRESHNESS_TTL_MS + 5_000)).toBe(false);
   });
 
   it('server-synthesized pong does NOT keep the snapshot fresh', async () => {

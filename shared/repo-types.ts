@@ -61,7 +61,7 @@ export interface RepoCheckoutBranchRequest {
 
 export interface RepoCheckoutBranchResponse {
   type: typeof REPO_MSG.CHECKOUT_BRANCH_RESPONSE;
-  requestId?: string;
+  requestId: string;
   projectDir: string;
   ok: true;
   previousBranch?: string;

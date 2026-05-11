@@ -151,6 +151,9 @@ export class GitHubProvider implements RepoProvider {
         name: b.name,
         isDefault: b.name === defaultBranch,
         isCurrent: b.name === currentBranch,
+        remotePresent: true,
+        localPresent: false,
+        checkoutable: false,
         lastCommitDate: b.lastCommitDate,
       }));
 

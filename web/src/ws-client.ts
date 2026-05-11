@@ -143,6 +143,7 @@ export type ServerMessage =
   | { type: 'repo.branches_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
   | { type: 'repo.commits_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
   | { type: 'repo.actions_response'; requestId?: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
+  | { type: typeof REPO_MSG.CHECKOUT_BRANCH_RESPONSE; requestId: string; projectDir: string; ok: true; previousBranch?: string; currentBranch: string; repoGeneration: number; detectedAt: number }
   | { type: 'repo.action_detail_response'; requestId?: string; projectDir: string; detail: any }
   | { type: 'repo.commit_detail_response'; requestId?: string; projectDir: string; detail: any }
   | { type: 'repo.pr_detail_response'; requestId?: string; projectDir: string; detail: any }
@@ -802,7 +803,8 @@ export class WsClient {
     'daemon.stats',
     'timeline.event',
     'session_list',
-    'repo.detected',
+    REPO_MSG.DETECTED,
+    REPO_MSG.CHECKOUT_BRANCH_RESPONSE,
     TRANSPORT_MSG.PROVIDER_STATUS,
     TRANSPORT_MSG.CHAT_HISTORY,
     TRANSPORT_EVENT.CHAT_DELTA,
@@ -969,16 +971,29 @@ export class WsClient {
   }
 
   /** List branches for a project. Returns requestId. */
-  repoListBranches(projectDir: string): string {
+  repoListBranches(projectDir: string, opts?: { force?: boolean }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: REPO_MSG.LIST_BRANCHES, requestId, projectDir });
+    this.send({ type: REPO_MSG.LIST_BRANCHES, requestId, projectDir, ...(opts?.force ? { force: true } : {}) });
     return requestId;
   }
 
   /** List commits for a project. Returns requestId. */
-  repoListCommits(projectDir: string, opts?: { branch?: string; page?: number }): string {
+  repoListCommits(projectDir: string, opts?: { branch?: string; page?: number; force?: boolean }): string {
     const requestId = crypto.randomUUID();
     this.send({ type: REPO_MSG.LIST_COMMITS, requestId, projectDir, ...opts });
+    return requestId;
+  }
+
+  /** Switch to an existing local branch on the daemon host. Returns requestId. */
+  repoCheckoutBranch(projectDir: string, branch: string, opts?: { sessionId?: string | null }): string {
+    const requestId = crypto.randomUUID();
+    this.send({
+      type: REPO_MSG.CHECKOUT_BRANCH,
+      requestId,
+      projectDir,
+      branch,
+      ...(opts?.sessionId ? { sessionId: opts.sessionId } : {}),
+    });
     return requestId;
   }
 

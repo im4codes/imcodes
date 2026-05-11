@@ -44,6 +44,7 @@ import { StartDiscussionDialog, type DiscussionPrefs, type SubSessionOption } fr
 import { AskQuestionDialog, type PendingQuestion } from './components/AskQuestionDialog.js';
 import { ServerContextMenu, DeleteServerDialog } from './components/ServerContextMenu.js';
 import { RepoPage } from './pages/RepoPage.js';
+import { ingestSessionRepoContext } from './session-repo-context-store.js';
 import { FloatingPanel } from './components/FloatingPanel.js';
 import { SettingsPage } from './pages/SettingsPage.js';
 import { AdminPage } from './pages/AdminPage.js';
@@ -2263,7 +2264,6 @@ export function App() {
         const dir = msg.projectDir as string;
         if (dir) {
           // Normalize shape: repo.detected wraps in { context }, detect_response spreads at top level.
-          // Flatten so repoContext.status always works (SubSessionBar) AND repoContext.context.status works (effect).
           const context = (msg as any).context ?? msg;
           const normalized = { ...context, context, projectDir: dir };
           setRepoContexts((prev) => {
@@ -2271,6 +2271,20 @@ export function App() {
             next.set(dir, normalized);
             return next;
           });
+          const sessionIds = new Set<string>();
+          for (const session of sessionsRef.current) {
+            if (session.projectDir === dir) sessionIds.add(session.name);
+          }
+          for (const sub of subSessionsRef.current) {
+            if (sub.cwd === dir) sessionIds.add(sub.sessionName);
+          }
+          if (sessionIds.size === 0) {
+            ingestSessionRepoContext({ projectDir: dir, context });
+          } else {
+            for (const sessionId of sessionIds) {
+              ingestSessionRepoContext({ sessionId, projectDir: dir, context });
+            }
+          }
         }
       }
       if (msg.type === REPO_MSG.ERROR) {
@@ -3697,6 +3711,10 @@ export function App() {
                 onStopProject={handleStopProject}
                 onRenameSession={() => setRenameRequest(s.name)}
                 onSettings={() => setSettingsTarget({ sessionName: s.name, label: s.label || '', description: s.description || '', cwd: s.projectDir || '', type: s.agentType || '', parentSession: null, transportConfig: s.transportConfig ?? null })}
+                onViewRepo={() => {
+                  setActiveSession(s.name);
+                  setShowRepoPage(true);
+                }}
                 onTransportConfigSaved={(transportConfig) => {
                   setSessions((prev) => prev.map((session) => (
                     session.name === s.name ? { ...session, transportConfig } : session
@@ -4100,7 +4118,7 @@ export function App() {
 
       {showRepoPage && wsRef.current && activeSessionInfo?.projectDir && (
         <FloatingPanel id="repo" title="Repository" onClose={() => setShowRepoPage(false)} onPin={() => pinPanel('repopage', { sessionName: activeSession, projectDir: activeSessionInfo?.projectDir, serverId: selectedServerId }, () => setShowRepoPage(false))} pinTooltip={trans('sidebar.pin_to_sidebar')} defaultW={800} defaultH={600} zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.repo, 5050)} onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.repo)}>
-          <RepoPage ws={wsRef.current} projectDir={activeSessionInfo.projectDir} onBack={() => setShowRepoPage(false)} onCiEvent={(run) => {
+          <RepoPage ws={wsRef.current} sessionId={activeSession} projectDir={activeSessionInfo.projectDir} onBack={() => setShowRepoPage(false)} onCiEvent={(run) => {
             const id = Date.now();
             const icon = run.status === 'success' ? '✅' : '❌';
             const failurePath = [run.failedJobName, run.failedStepName].filter(Boolean).join(' → ');

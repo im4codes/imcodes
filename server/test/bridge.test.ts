@@ -78,6 +78,48 @@ function makeDb(tokenHash: string) {
   return db as unknown as import('../src/db/client.js').Database;
 }
 
+function makeRepoCheckoutDb(options: {
+  allowMain?: boolean;
+  allowSub?: boolean;
+  throwOnAuthorization?: boolean;
+} = {}) {
+  const db = {
+    queryOne: async (sql: string, params: unknown[]) => {
+      if (sql.includes('SELECT token_hash')) {
+        return { token_hash: 'valid-hash', user_id: 'test-user' };
+      }
+      if (options.throwOnAuthorization && (sql.includes('FROM sessions s') || sql.includes('FROM sub_sessions ss'))) {
+        throw new Error('authz unavailable');
+      }
+      if (sql.includes('FROM sessions s')) {
+        const [, sessionName, projectDir, userId] = params;
+        return options.allowMain
+          && sessionName === 'deck_proj_brain'
+          && projectDir === '/work/proj'
+          && userId === 'test-user'
+          ? { ok: 1 }
+          : null;
+      }
+      if (sql.includes('FROM sub_sessions ss')) {
+        const [, subId, projectDir, userId] = params;
+        return options.allowSub
+          && subId === 'abc123'
+          && projectDir === '/work/sub'
+          && userId === 'test-user'
+          ? { ok: 1 }
+          : null;
+      }
+      return null;
+    },
+    query: async () => [],
+    execute: async () => ({ changes: 1 }),
+    exec: async () => {},
+    transaction: async <T>(fn: (tx: import('../src/db/client.js').Database) => Promise<T>) => fn(db as unknown as import('../src/db/client.js').Database),
+    close: () => {},
+  };
+  return db as unknown as import('../src/db/client.js').Database;
+}
+
 // ── Mock crypto + push ─────────────────────────────────────────────────────────
 
 vi.mock('../src/security/crypto.js', () => ({
@@ -447,6 +489,123 @@ describe('WsBridge', () => {
       const { daemonWs, browserWs } = await setupBridge();
       browserWs.emit('message', JSON.stringify({ type: 'admin.shutdown' }));
       expect(daemonWs.sentStrings.some((s) => s.includes('admin.shutdown'))).toBe(true);
+    });
+
+    it('authorizes repo.checkout_branch against the browser user session/project binding before forwarding', async () => {
+      const bridge = WsBridge.get(serverId);
+      const db = makeRepoCheckoutDb({ allowMain: true });
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', db);
+      browserWs.emit('message', JSON.stringify({
+        type: REPO_MSG.CHECKOUT_BRANCH,
+        requestId: 'checkout-main',
+        projectDir: '/work/proj',
+        branch: 'feature/a',
+        sessionId: 'deck_proj_brain',
+      }));
+      await flushAsync();
+
+      const forwarded = daemonWs.sentStrings
+        .map((s) => { try { return JSON.parse(s) as Record<string, unknown>; } catch { return null; } })
+        .find((msg) => msg?.type === REPO_MSG.CHECKOUT_BRANCH);
+      expect(forwarded).toMatchObject({
+        requestId: 'checkout-main',
+        projectDir: '/work/proj',
+        branch: 'feature/a',
+        sessionId: 'deck_proj_brain',
+      });
+    });
+
+    it('authorizes repo.checkout_branch for a bound sub-session cwd', async () => {
+      const bridge = WsBridge.get(serverId);
+      const db = makeRepoCheckoutDb({ allowSub: true });
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', db);
+      browserWs.emit('message', JSON.stringify({
+        type: REPO_MSG.CHECKOUT_BRANCH,
+        requestId: 'checkout-sub',
+        projectDir: '/work/sub',
+        branch: 'feature/sub',
+        sessionId: 'deck_sub_abc123',
+      }));
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.some((s) => {
+        try {
+          const msg = JSON.parse(s) as Record<string, unknown>;
+          return msg.type === REPO_MSG.CHECKOUT_BRANCH && msg.requestId === 'checkout-sub';
+        } catch {
+          return false;
+        }
+      })).toBe(true);
+    });
+
+    it('rejects repo.checkout_branch for unbound projectDir before daemon forwarding', async () => {
+      const bridge = WsBridge.get(serverId);
+      const db = makeRepoCheckoutDb();
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', db);
+      browserWs.emit('message', JSON.stringify({
+        type: REPO_MSG.CHECKOUT_BRANCH,
+        requestId: 'checkout-denied',
+        projectDir: '/work/other',
+        branch: 'feature/a',
+        sessionId: 'deck_proj_brain',
+      }));
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.some((s) => {
+        try { return (JSON.parse(s) as Record<string, unknown>).type === REPO_MSG.CHECKOUT_BRANCH; } catch { return false; }
+      })).toBe(false);
+      expect(browserWs.sentStrings.some((s) => {
+        try {
+          const msg = JSON.parse(s) as Record<string, unknown>;
+          return msg.type === REPO_MSG.ERROR
+            && msg.requestId === 'checkout-denied'
+            && msg.projectDir === '/work/other'
+            && msg.error === 'unauthorized';
+        } catch {
+          return false;
+        }
+      })).toBe(true);
+    });
+
+    it('rejects malformed repo.checkout_branch requests before daemon forwarding', async () => {
+      const { daemonWs, browserWs } = await setupBridge();
+      browserWs.emit('message', JSON.stringify({
+        type: REPO_MSG.CHECKOUT_BRANCH,
+        projectDir: '/work/proj',
+        branch: 'feature/a',
+        sessionId: 'deck_proj_brain',
+      }));
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.some((s) => {
+        try { return (JSON.parse(s) as Record<string, unknown>).type === REPO_MSG.CHECKOUT_BRANCH; } catch { return false; }
+      })).toBe(false);
+      expect(browserWs.sentStrings.some((s) => {
+        try {
+          const msg = JSON.parse(s) as Record<string, unknown>;
+          return msg.type === REPO_MSG.ERROR && msg.error === 'invalid_params';
+        } catch {
+          return false;
+        }
+      })).toBe(true);
     });
 
     it('rejects browser raw daemon.upgrade commands', async () => {

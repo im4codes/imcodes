@@ -20,7 +20,7 @@ import { sha256Hex } from '../security/crypto.js';
 import { resolveServerRole } from '../security/authorization.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
-import { REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
+import { REPO_MSG, REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
 import { TRANSPORT_RELAY_TYPES, TRANSPORT_MSG } from '../../../shared/transport-events.js';
 import {
   MEMORY_WS,
@@ -1835,6 +1835,11 @@ export class WsBridge {
         return;
       }
 
+      if (msg.type === REPO_MSG.CHECKOUT_BRANCH) {
+        const authorized = await this.verifyRepoCheckoutAuthorization(ws, msg);
+        if (!authorized) return;
+      }
+
       // Track fs.ls requests for single-cast response routing
       if (msg.type === 'fs.ls' && typeof msg.requestId === 'string') {
         this.registerPendingFsRoute('fs.ls', ws, msg);
@@ -3388,6 +3393,72 @@ export class WsBridge {
     } catch (err) {
       logger.warn({ serverId: this.serverId, sessionName, err }, 'verifySessionOwnership: db error — denying');
       return false; // fail-closed: deny on transient DB errors to prevent unauthorized access
+    }
+  }
+
+  private async verifyRepoCheckoutAuthorization(ws: WebSocket, msg: Record<string, unknown>): Promise<boolean> {
+    const requestId = typeof msg.requestId === 'string' ? msg.requestId : undefined;
+    const sessionId = typeof msg.sessionId === 'string' ? msg.sessionId.trim() : '';
+    const projectDir = typeof msg.projectDir === 'string' ? msg.projectDir : '';
+    const sendRepoError = (error: 'invalid_params' | 'unauthorized') => {
+      safeSend(ws, JSON.stringify({
+        type: REPO_MSG.ERROR,
+        ...(requestId ? { requestId } : {}),
+        ...(projectDir ? { projectDir } : {}),
+        error,
+      }));
+    };
+
+    if (!requestId || !sessionId || !projectDir || typeof msg.branch !== 'string') {
+      sendRepoError('invalid_params');
+      return false;
+    }
+
+    if (!this.db) return true;
+
+    const userId = this.browserUserIds.get(ws)?.trim();
+    if (!userId) {
+      sendRepoError('unauthorized');
+      return false;
+    }
+
+    try {
+      const sessionRow = await this.db.queryOne<Record<string, unknown>>(
+        `SELECT 1
+           FROM sessions s
+           JOIN servers srv ON srv.id = s.server_id
+          WHERE s.server_id = $1
+            AND s.name = $2
+            AND s.project_dir = $3
+            AND srv.user_id = $4
+          LIMIT 1`,
+        [this.serverId, sessionId, projectDir, userId],
+      );
+      if (sessionRow) return true;
+
+      const subMatch = sessionId.match(/^deck_sub_([a-z0-9]+)$/);
+      if (subMatch) {
+        const subRow = await this.db.queryOne<Record<string, unknown>>(
+          `SELECT 1
+             FROM sub_sessions ss
+             JOIN servers srv ON srv.id = ss.server_id
+            WHERE ss.server_id = $1
+              AND ss.id = $2
+              AND ss.cwd = $3
+              AND ss.closed_at IS NULL
+              AND srv.user_id = $4
+            LIMIT 1`,
+          [this.serverId, subMatch[1], projectDir, userId],
+        );
+        if (subRow) return true;
+      }
+
+      sendRepoError('unauthorized');
+      return false;
+    } catch (err) {
+      logger.warn({ serverId: this.serverId, sessionId, projectDir, err }, 'repo.checkout_branch: authorization check failed');
+      sendRepoError('unauthorized');
+      return false;
     }
   }
 

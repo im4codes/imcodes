@@ -3,6 +3,7 @@ import { WsClient } from '../src/ws-client.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { P2P_WORKFLOW_MSG, isP2pWorkflowRequestId } from '@shared/p2p-workflow-messages.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
+import { REPO_MSG } from '@shared/repo-types.js';
 import type { MessageHandler } from '../src/ws-client.js';
 
 // Mock WebSocket implementation
@@ -830,6 +831,43 @@ describe('WsClient', () => {
         requestId: 'req-1',
         approved: true,
       });
+      client.disconnect();
+    });
+  });
+
+  describe('repo helpers', () => {
+    it('sends checkout with session binding and force-capable branch/commit requests', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+
+      const checkoutId = client.repoCheckoutBranch('/repo/project', 'feature/a', { sessionId: 'deck_proj_brain' });
+      const branchesId = client.repoListBranches('/repo/project', { force: true });
+      const commitsId = client.repoListCommits('/repo/project', { branch: 'feature/a', page: 2, force: true });
+      const messages = lastWs!.send.mock.calls.map((call) => JSON.parse(call[0] as string));
+
+      expect(messages).toEqual([
+        {
+          type: REPO_MSG.CHECKOUT_BRANCH,
+          requestId: checkoutId,
+          projectDir: '/repo/project',
+          branch: 'feature/a',
+          sessionId: 'deck_proj_brain',
+        },
+        {
+          type: REPO_MSG.LIST_BRANCHES,
+          requestId: branchesId,
+          projectDir: '/repo/project',
+          force: true,
+        },
+        {
+          type: REPO_MSG.LIST_COMMITS,
+          requestId: commitsId,
+          projectDir: '/repo/project',
+          branch: 'feature/a',
+          page: 2,
+          force: true,
+        },
+      ]);
       client.disconnect();
     });
   });

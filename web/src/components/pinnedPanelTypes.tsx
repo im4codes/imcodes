@@ -187,6 +187,7 @@ registerPanelType('repopage', {
       <RepoPage
         key={`${ctx.serverId}:${projectDir}`}
         ws={ctx.ws}
+        sessionId={ctx.activeSession ?? panel.props?.sessionName as string | undefined}
         projectDir={projectDir}
         onBack={() => {}}
         onCiEvent={ctx.onCiEvent ?? (() => {})}

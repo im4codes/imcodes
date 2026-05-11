@@ -1660,6 +1660,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case REPO_MSG.LIST_BRANCHES:
     case REPO_MSG.LIST_COMMITS:
     case REPO_MSG.LIST_ACTIONS:
+    case REPO_MSG.CHECKOUT_BRANCH:
     case REPO_MSG.ACTION_DETAIL:
     case REPO_MSG.COMMIT_DETAIL:
     case REPO_MSG.PR_DETAIL:

@@ -182,6 +182,9 @@ export class GitLabProvider implements RepoProvider {
       name: b.name,
       isDefault: b.default ?? false,
       isCurrent: b.name === currentBranch,
+      remotePresent: true,
+      localPresent: false,
+      checkoutable: false,
       lastCommitDate: b.commit?.committed_date
         ? new Date(b.commit.committed_date).getTime()
         : undefined,

@@ -7,12 +7,26 @@ import { detectRepo } from '../repo/detector.js';
 import { repoCache, RepoCache } from '../repo/cache.js';
 import { GitHubProvider } from '../repo/github-provider.js';
 import { GitLabProvider } from '../repo/gitlab-provider.js';
-import type { RepoContext, RepoError } from '../repo/types.js';
+import type { RepoBranch, RepoContext, RepoError, RepoListResult } from '../repo/types.js';
+import { isRepoErrorCode } from '../repo/types.js';
 import type { RepoProvider, ListOptions, CommitListOptions } from '../repo/provider.js';
 import { listSessions } from '../store/session-store.js';
 import type { ServerLink } from './server-link.js';
 import logger from '../util/logger.js';
 import { REPO_MSG } from '../shared/repo-types.js';
+import { bumpRepoGeneration, getRepoGenerationSnapshot } from '../repo/generation.js';
+import {
+  assertGitRepository,
+  detectInProgressOperation,
+  getCurrentBranch,
+  getLocalCommitDetail,
+  getWorktreeState,
+  listLocalBranches,
+  listLocalCommits,
+  resolveCheckoutTarget,
+  switchLocalBranch,
+  type LocalBranch,
+} from '../repo/local-git.js';
 
 // ---------------------------------------------------------------------------
 // Concurrency limiter — max 20 concurrent CLI calls per projectDir, 15s queue timeout
@@ -30,6 +44,18 @@ interface QueueEntry {
 
 const inflightCounts = new Map<string, number>();
 const queues = new Map<string, QueueEntry[]>();
+const checkoutLocks = new Set<string>();
+
+export function __setRepoInflightForTests(projectDir: string, count: number): void {
+  if (count <= 0) inflightCounts.delete(projectDir);
+  else inflightCounts.set(projectDir, count);
+}
+
+export function __clearRepoOperationStateForTests(): void {
+  inflightCounts.clear();
+  queues.clear();
+  checkoutLocks.clear();
+}
 
 async function withConcurrencyLimit(projectDir: string, fn: () => Promise<void>): Promise<void> {
   const current = inflightCounts.get(projectDir) ?? 0;
@@ -123,6 +149,12 @@ function validateProjectDir(projectDir: unknown): projectDir is string {
   return knownDirs.has(projectDir);
 }
 
+function validateCheckoutProjectContext(cmd: Record<string, unknown>, projectDir: string): boolean {
+  const sessionBinding = cmd.sessionName ?? cmd.sessionId ?? cmd.session ?? cmd.activeSessionName ?? cmd.activeSessionId;
+  if (typeof sessionBinding !== 'string' || !sessionBinding) return false;
+  return listSessions().some((session) => session.name === sessionBinding && session.projectDir === projectDir);
+}
+
 // ---------------------------------------------------------------------------
 // Provider factory from cached detection
 // ---------------------------------------------------------------------------
@@ -133,6 +165,69 @@ function createProvider(ctx: RepoContext, projectDir: string): RepoProvider | nu
   if (platform === 'github') return new GitHubProvider(owner, repo, projectDir);
   if (platform === 'gitlab') return new GitLabProvider(owner, repo, projectDir);
   return null;
+}
+
+async function getDetectionContext(projectDir: string): Promise<RepoContext> {
+  const detectKey = RepoCache.buildKey(projectDir, 'detect');
+  let ctx = repoCache.get<RepoContext>(detectKey);
+  if (!ctx) {
+    ctx = await detectRepo(projectDir);
+    repoCache.set(detectKey, ctx, projectDir, ctx.status !== 'ok');
+  }
+  return ctx;
+}
+
+async function getProviderIfAvailable(projectDir: string): Promise<RepoProvider | null> {
+  const ctx = await getDetectionContext(projectDir);
+  return createProvider(ctx, projectDir);
+}
+
+function getLocalCheckoutBlockReason(inProgress: boolean, dirty: boolean): RepoError | undefined {
+  if (inProgress) return 'git_operation_in_progress';
+  if (dirty) return 'dirty_worktree';
+  return undefined;
+}
+
+function mergeBranchInventory(
+  projectDir: string,
+  localBranches: LocalBranch[],
+  providerResult: RepoListResult<RepoBranch> | null,
+  defaultBranch: string | undefined,
+  checkoutBlockedReason: RepoError | undefined,
+): RepoListResult<RepoBranch> {
+  const byName = new Map<string, RepoBranch>();
+
+  for (const branch of providerResult?.items ?? []) {
+    byName.set(branch.name, {
+      ...branch,
+      isDefault: branch.isDefault || branch.name === defaultBranch,
+      localPresent: false,
+      remotePresent: true,
+      checkoutable: false,
+      checkoutBlockedReason: 'invalid_checkout_target',
+    });
+  }
+
+  for (const branch of localBranches) {
+    const existing = byName.get(branch.name);
+    byName.set(branch.name, {
+      ...existing,
+      name: branch.name,
+      isDefault: existing?.isDefault ?? branch.name === defaultBranch,
+      isCurrent: branch.isCurrent,
+      localPresent: true,
+      remotePresent: existing?.remotePresent ?? false,
+      checkoutable: checkoutBlockedReason === undefined,
+      checkoutBlockedReason,
+    });
+  }
+
+  return {
+    items: [...byName.values()],
+    page: providerResult?.page ?? 1,
+    hasMore: providerResult?.hasMore ?? false,
+    projectDir,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -232,12 +327,37 @@ async function handleListBranches(
     return;
   }
 
-  const provider = await getProvider(projectDir, requestId, serverLink);
-  if (!provider) return;
-
   try {
-    const result = await provider.listBranches();
-    repoCache.set(cacheKey, result, projectDir);
+    const [ctx, localResult, inProgressResult, worktreeResult] = await Promise.all([
+      getDetectionContext(projectDir),
+      listLocalBranches(projectDir).catch(() => [] as LocalBranch[]),
+      detectInProgressOperation(projectDir).catch(() => null),
+      getWorktreeState(projectDir).catch(() => ({
+        dirty: false,
+        staged: false,
+        unstaged: false,
+        untracked: false,
+        submoduleDirty: false,
+        entries: [],
+      })),
+    ]);
+    const provider = createProvider(ctx, projectDir);
+    const providerResult = provider ? await provider.listBranches().catch((err) => {
+      logger.debug({ err, projectDir }, 'repo branches: provider branch list unavailable, using local inventory');
+      return null;
+    }) : null;
+    const checkoutBlockedReason = getLocalCheckoutBlockReason(
+      inProgressResult !== null,
+      worktreeResult.dirty,
+    );
+    const result = mergeBranchInventory(
+      projectDir,
+      localResult,
+      providerResult,
+      ctx.info?.defaultBranch,
+      checkoutBlockedReason,
+    );
+    repoCache.set(cacheKey, result, projectDir, ctx.status !== 'ok' && !localResult.length);
     serverLink.send({ type: REPO_MSG.BRANCHES_RESPONSE, requestId, ...result });
   } catch (err) {
     sendError(serverLink, requestId, projectDir, 'cli_error', err);
@@ -252,7 +372,12 @@ async function handleListCommits(
   const requestId = cmd.requestId as string | undefined;
 
   const opts: CommitListOptions = {};
-  if (cmd.branch !== undefined) opts.branch = cmd.branch as string;
+  if (cmd.branch !== undefined) {
+    opts.branch = cmd.branch as string;
+  } else {
+    const currentBranch = await getCurrentBranch(projectDir);
+    if (currentBranch) opts.branch = currentBranch;
+  }
   if (cmd.page !== undefined) opts.page = cmd.page as number;
 
   const cacheKey = RepoCache.buildKey(projectDir, 'commits', { ...opts });
@@ -262,11 +387,11 @@ async function handleListCommits(
     return;
   }
 
-  const provider = await getProvider(projectDir, requestId, serverLink);
-  if (!provider) return;
-
   try {
-    const result = await provider.listCommits(opts);
+    const provider = await getProviderIfAvailable(projectDir);
+    const result = provider
+      ? await provider.listCommits(opts).catch(() => listLocalCommits(projectDir, opts.branch, opts.page))
+      : await listLocalCommits(projectDir, opts.branch, opts.page);
     repoCache.set(cacheKey, result, projectDir);
     serverLink.send({ type: REPO_MSG.COMMITS_RESPONSE, requestId, ...result });
   } catch (err) {
@@ -300,6 +425,84 @@ async function handleListActions(
     serverLink.send({ type: REPO_MSG.ACTIONS_RESPONSE, requestId, ...result });
   } catch (err) {
     sendError(serverLink, requestId, projectDir, 'cli_error', err);
+  }
+}
+
+async function handleCheckoutBranch(
+  cmd: Record<string, unknown>,
+  serverLink: ServerLink,
+): Promise<void> {
+  const projectDir = cmd.projectDir as string;
+  const requestId = cmd.requestId as string;
+  const branch = typeof cmd.branch === 'string' ? cmd.branch : '';
+
+  if (!branch.trim()) {
+    sendError(serverLink, requestId, projectDir, 'invalid_checkout_target');
+    return;
+  }
+
+  if (checkoutLocks.has(projectDir)) {
+    sendError(serverLink, requestId, projectDir, 'checkout_in_progress');
+    return;
+  }
+  if ((inflightCounts.get(projectDir) ?? 0) >= MAX_CONCURRENT) {
+    sendError(serverLink, requestId, projectDir, 'repo_busy');
+    return;
+  }
+
+  checkoutLocks.add(projectDir);
+  try {
+    await assertGitRepository(projectDir);
+    const previousBranch = await getCurrentBranch(projectDir);
+    if (!previousBranch) {
+      sendError(serverLink, requestId, projectDir, 'detached_head');
+      return;
+    }
+
+    if (branch === previousBranch) {
+      const marker = getRepoGenerationSnapshot(projectDir);
+      serverLink.send({
+        type: REPO_MSG.CHECKOUT_BRANCH_RESPONSE,
+        requestId,
+        projectDir,
+        ok: true,
+        previousBranch,
+        currentBranch: previousBranch,
+        ...marker,
+      });
+      return;
+    }
+
+    const target = await resolveCheckoutTarget(projectDir, branch);
+    const inProgress = await detectInProgressOperation(projectDir);
+    if (inProgress) {
+      sendError(serverLink, requestId, projectDir, 'git_operation_in_progress');
+      return;
+    }
+
+    const worktree = await getWorktreeState(projectDir);
+    if (worktree.dirty) {
+      sendError(serverLink, requestId, projectDir, 'dirty_worktree');
+      return;
+    }
+
+    await switchLocalBranch(projectDir, target);
+    const currentBranch = await getCurrentBranch(projectDir) ?? target.branch;
+    repoCache.invalidate(projectDir);
+    const marker = bumpRepoGeneration(projectDir);
+    serverLink.send({
+      type: REPO_MSG.CHECKOUT_BRANCH_RESPONSE,
+      requestId,
+      projectDir,
+      ok: true,
+      previousBranch,
+      currentBranch,
+      ...marker,
+    });
+  } catch (err) {
+    sendError(serverLink, requestId, projectDir, 'checkout_failed', err);
+  } finally {
+    checkoutLocks.delete(projectDir);
   }
 }
 
@@ -345,11 +548,11 @@ async function handleCommitDetail(
     return;
   }
 
-  const provider = await getProvider(projectDir, requestId, serverLink);
-  if (!provider) return;
-
   try {
-    const result = await provider.getCommitDetail(sha);
+    const provider = await getProviderIfAvailable(projectDir);
+    const result = provider
+      ? await provider.getCommitDetail(sha).catch(() => getLocalCommitDetail(projectDir, sha))
+      : await getLocalCommitDetail(projectDir, sha);
     repoCache.set(cacheKey, result, projectDir, false, Infinity);
     serverLink.send({ type: REPO_MSG.COMMIT_DETAIL_RESPONSE, requestId, projectDir, detail: result });
   } catch (err) {
@@ -421,12 +624,7 @@ async function getProvider(
   requestId: string | undefined,
   serverLink: ServerLink,
 ): Promise<RepoProvider | null> {
-  const detectKey = RepoCache.buildKey(projectDir, 'detect');
-  let ctx = repoCache.get<RepoContext>(detectKey);
-  if (!ctx) {
-    ctx = await detectRepo(projectDir);
-    repoCache.set(detectKey, ctx, projectDir, ctx.status !== 'ok');
-  }
+  const ctx = await getDetectionContext(projectDir);
 
   const provider = createProvider(ctx, projectDir);
   if (!provider) {
@@ -443,9 +641,10 @@ async function getProvider(
 
 /** Extract typed error code from provider errors, fall back to default. */
 function extractErrorCode(err: unknown, fallback: RepoError): RepoError {
-  if (typeof err === 'string') return err as RepoError;
+  if (isRepoErrorCode(err)) return err;
   if (err && typeof err === 'object' && 'code' in err && typeof (err as any).code === 'string') {
-    return (err as any).code as RepoError;
+    const code = (err as any).code;
+    return isRepoErrorCode(code) ? code : fallback;
   }
   return fallback;
 }
@@ -471,6 +670,7 @@ function sendError(
 export function handleRepoCommand(cmd: Record<string, unknown>, serverLink: ServerLink): void {
   const requestId = cmd.requestId as string | undefined;
   const projectDir = cmd.projectDir;
+  const isCheckout = cmd.type === REPO_MSG.CHECKOUT_BRANCH;
 
   // projectDir validation for all commands
   if (!validateProjectDir(projectDir)) {
@@ -484,7 +684,7 @@ export function handleRepoCommand(cmd: Record<string, unknown>, serverLink: Serv
     serverLink.send({ type: REPO_MSG.ERROR, requestId, projectDir, error: 'invalid_params' as RepoError });
     return;
   }
-  if (cmd.branch !== undefined && !isValidBranch(cmd.branch)) {
+  if (!isCheckout && cmd.branch !== undefined && !isValidBranch(cmd.branch)) {
     serverLink.send({ type: REPO_MSG.ERROR, requestId, projectDir, error: 'invalid_params' as RepoError });
     return;
   }
@@ -507,6 +707,22 @@ export function handleRepoCommand(cmd: Record<string, unknown>, serverLink: Serv
 
   // Strip any browser-sent provider field
   delete cmd.provider;
+
+  if (isCheckout) {
+    if (typeof cmd.requestId !== 'string' || !cmd.requestId.trim()) {
+      serverLink.send({ type: REPO_MSG.ERROR, requestId, projectDir, error: 'invalid_params' as RepoError });
+      return;
+    }
+    if (!validateCheckoutProjectContext(cmd, projectDir as string)) {
+      serverLink.send({ type: REPO_MSG.ERROR, requestId, projectDir, error: 'unauthorized' as RepoError });
+      return;
+    }
+    void handleCheckoutBranch(cmd, serverLink).catch((err) => {
+      logger.error({ err, type: cmd.type }, 'repo checkout handler failed');
+      sendError(serverLink, requestId, projectDir as string, 'checkout_failed', err);
+    });
+    return;
+  }
 
   // Force refresh: invalidate cache for this projectDir before re-fetching
   if (cmd.force === true) {
