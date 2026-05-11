@@ -2891,6 +2891,52 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   // Transport sessions — route directly to the provider runtime, bypassing tmux.
   const transportRuntime = getTransportRuntime(sessionName);
   const record = (await import('../store/session-store.js')).getSession(sessionName);
+
+  // F4 fix (audit f395d49c-78c) — fail closed when the session record is missing.
+  //
+  // Without this guard, the code below evaluates `isTransportSession` via
+  // `record?.runtimeType === 'transport' || (typeof record?.agentType ===
+  // 'string' && isTransportAgent(record.agentType))`. When `record` is
+  // undefined the expression resolves to false, so the message silently
+  // falls through to the process-agent / tmux path further down
+  // (around `sendProcessSessionMessage` ~line 3380+). That path uses
+  // `agentType='unknown'` and tries to `sendKeys` to a tmux session
+  // that does not exist; the failure is only logged, never surfaced to
+  // the client. The user sees an "accepted" command.ack while the
+  // message goes nowhere — bug 1 ("message bypasses queue, never
+  // reaches SDK").
+  //
+  // Additionally, the providerSessionId-null branch (~line 3022 area)
+  // would still emit `accepted` ack + queued state, but its
+  // `if (record)` guard skips the relaunch dispatch entirely — so the
+  // user receives an accepted ack with no actual recovery in flight.
+  //
+  // The safe behaviour for any record-missing send is the same
+  // regardless of the runtime state: emit an explicit error ack so the
+  // client surface can mark the message as failed and offer retry. We
+  // do not attempt to enqueue or relaunch because the launch metadata
+  // (agentType / projectDir / resume ids / transportConfig) only lives
+  // on the record itself.
+  if (!record) {
+    logger.warn(
+      { sessionName, commandId: effectiveId },
+      'handleSend: session record missing — emitting error ack instead of silent fallthrough',
+    );
+    timelineEmitter.emit(
+      sessionName,
+      'session.state',
+      { state: 'error', error: 'session_missing' },
+      { source: 'daemon', confidence: 'high' },
+    );
+    emitCommandAckReliable(serverLink, {
+      commandId: effectiveId,
+      sessionName,
+      status: 'error',
+      error: 'session_missing',
+    });
+    return;
+  }
+
   const preferenceUserId = preferenceUserIdForSend(cmd, record);
   const preferenceFeatureEnabled = isPreferenceFeatureEnabled();
   const preferenceIngest = processPreferenceLines({

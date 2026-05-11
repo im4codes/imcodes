@@ -601,6 +601,17 @@ export class TransportSessionRuntime implements SessionRuntime {
     const messages = this._pendingMessages.splice(0);
     const merged = messages.map((entry) => entry.text).join('\n\n');
     const attachments = messages.flatMap((entry) => entry.attachments ?? []);
+    // N1 defensive fix (audit f395d49c-78c) — set `_sending=true` BEFORE
+    // calling `_onDrain` so any synchronous re-entrant `runtime.send` from
+    // an onDrain listener queues into `_pendingMessages` instead of
+    // initiating a parallel dispatch. In Node's current synchronous
+    // EventEmitter contract, `timelineEmitter.emit` does not yield the
+    // event loop, so the race is not currently triggerable. But any
+    // future refactor that makes a listener async (await inside emit
+    // chain) would otherwise reintroduce a real race window between the
+    // splice and `_dispatchTurn`'s own `_sending = true` (line 462).
+    // `_dispatchTurn` will set the flag again — idempotent.
+    this._sending = true;
     this._onDrain?.(messages, merged, messages.length);
     this._dispatchTurn(
       merged,

@@ -393,6 +393,122 @@ describe('handleWebCommand transport queue behavior', () => {
     }
   });
 
+  // ── F4 regression suite (audit f395d49c-78c) ─────────────────────────────
+  //
+  // Before this fix, `handleSend` read `record = getSession(sessionName)` and
+  // computed `isTransportSession` via `record?.runtimeType === 'transport' ||
+  // (typeof record?.agentType === 'string' && isTransportAgent(...))`. When
+  // record was undefined, both clauses evaluated to false, the
+  // `!transportRuntime && isTransportSession` guard at line 2929 was skipped,
+  // and the message silently fell through to the process-agent / tmux path
+  // around line 3380+. `sendProcessSessionMessage` then ran with
+  // `agentType='unknown'` and tried to `sendKeys` to a tmux session that did
+  // not exist; the failure was only logged, never surfaced. The client saw
+  // an "accepted" command.ack while the message reached no backend.
+  //
+  // For `transportRuntime && !providerSessionId && !record` it was worse:
+  // `enqueueResend` + `emitAcceptedReceiptAck` ran, but `if (record)` guarded
+  // the relaunch dispatch, so the message was accepted into a queue with no
+  // scheduled recovery.
+  //
+  // T3/T4 lock the fail-closed contract: any record-missing session.send
+  // emits an explicit error ack, does NOT enqueue, does NOT invoke any
+  // process-agent / tmux path, and does NOT trigger a relaunch.
+
+  it('T3: handleSend with record=undefined (no runtime) emits session_missing error and does NOT fallthrough to process-agent / enqueue / launch', async () => {
+    // Override default beforeEach record return — simulate a session that
+    // was concurrently deleted (e.g. clone teardown race) or whose store
+    // entry was lost.
+    //
+    // Protocol note: the early `emitAcceptedReceiptAck()` at command-handler
+    // line ~2530 is a daemon-receipt ack ("daemon got your command", per
+    // CLAUDE.md transport command liveness contract) and runs BEFORE the
+    // F4 guard. The fail-closed error ack from F4 then signals "but
+    // delivery failed". This dual-ack pattern is intentional and
+    // documented; the web client treats the later error ack as the
+    // authoritative outcome.
+    getSessionMock.mockReturnValue(undefined);
+    getTransportRuntimeMock.mockReturnValue(undefined);
+
+    handleWebCommand(
+      { type: 'session.send', session: 'deck_missing_brain', text: 'hello', commandId: 'cmd-missing-1' },
+      serverLink as any,
+    );
+    await flushAsync();
+
+    // The F4 outcome ack carries error=session_missing.
+    expect(serverLink.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'command.ack',
+        commandId: 'cmd-missing-1',
+        session: 'deck_missing_brain',
+        status: 'error',
+        error: 'session_missing',
+      }),
+    );
+
+    // session.state error was broadcast (UI surfaces the failure).
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_missing_brain',
+      'session.state',
+      expect.objectContaining({ state: 'error', error: 'session_missing' }),
+      expect.any(Object),
+    );
+
+    // No user.message was emitted (message never reached any backend).
+    expect(emitMock).not.toHaveBeenCalledWith(
+      'deck_missing_brain',
+      'user.message',
+      expect.anything(),
+      expect.anything(),
+    );
+
+    // No transport relaunch / launch attempt — F4 prevents accepted-without-dispatch.
+    expect(launchTransportSessionMock).not.toHaveBeenCalled();
+  });
+
+  it('T4: handleSend with record=undefined AND runtime+null providerSessionId still emits session_missing error (no accepted-without-relaunch)', async () => {
+    // This is the second F4 path: a stale runtime entry without a provider
+    // session id can occur after a partial relaunch. Pre-fix behaviour:
+    // `enqueueResend` + `emitAcceptedReceiptAck` ran, but `if (record)`
+    // skipped relaunch — message landed in resend queue with no scheduled
+    // recovery.
+    const runtimeSendMock = vi.fn();
+    getSessionMock.mockReturnValue(undefined);
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: null,
+      send: runtimeSendMock,
+      pendingCount: 0,
+      pendingMessages: [],
+      pendingEntries: [],
+    });
+
+    handleWebCommand(
+      { type: 'session.send', session: 'deck_missing_brain', text: 'hello again', commandId: 'cmd-missing-2' },
+      serverLink as any,
+    );
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'command.ack',
+        commandId: 'cmd-missing-2',
+        status: 'error',
+        error: 'session_missing',
+      }),
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_missing_brain',
+      'session.state',
+      expect.objectContaining({ state: 'error', error: 'session_missing' }),
+      expect.any(Object),
+    );
+    // Critically: no relaunch attempted (the bug previously skipped this).
+    expect(launchTransportSessionMock).not.toHaveBeenCalled();
+    // Critically: runtime.send never reached.
+    expect(runtimeSendMock).not.toHaveBeenCalled();
+  });
+
   it('emits queued session.state for queued transport sends without adding a timeline row', async () => {
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: 'route-transport',

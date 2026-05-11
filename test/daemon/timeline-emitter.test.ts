@@ -233,3 +233,99 @@ describe('TimelineEmitter — on/off handlers', () => {
     expect(received).toHaveLength(0);
   });
 });
+
+/**
+ * NF1 regression suite (audit f395d49c-78c).
+ *
+ * Before the fix, `session.state` dedup compared only the `state` string,
+ * so successive `{state:'queued', pendingCount:1}`, `{state:'queued',
+ * pendingCount:2}`, `{state:'queued', pendingCount:3}` events broadcast
+ * only the first — UI saw stale queue counts. Bug 3 ("queue not empty
+ * but new messages appear in chat history") manifested because the
+ * daemon was queueing but the UI's authoritative queue snapshot stayed
+ * frozen at pendingCount=1.
+ *
+ * These tests pin the fixed contract:
+ *   T1 — queued events with changing pendingCount MUST all reach handlers.
+ *   T2 — plain idle/running events (no payload mutation) ARE still deduped.
+ *   T2b — events with `error` payload are NEVER deduped.
+ */
+describe('TimelineEmitter — session.state queue snapshot dedup (NF1 regression)', () => {
+  it('T1: successive queued events with changing pendingCount all reach handlers', () => {
+    const emitter = new TimelineEmitter();
+    const received: Array<Record<string, unknown>> = [];
+    emitter.on((e) => {
+      if (e.type === 'session.state') received.push(e.payload as Record<string, unknown>);
+    });
+
+    emitter.emit('session-q', 'session.state', { state: 'queued', pendingCount: 1, pendingMessageEntries: [{ clientMessageId: 'a', text: 'a' }] });
+    emitter.emit('session-q', 'session.state', { state: 'queued', pendingCount: 2, pendingMessageEntries: [{ clientMessageId: 'a', text: 'a' }, { clientMessageId: 'b', text: 'b' }] });
+    emitter.emit('session-q', 'session.state', { state: 'queued', pendingCount: 3, pendingMessageEntries: [{ clientMessageId: 'a', text: 'a' }, { clientMessageId: 'b', text: 'b' }, { clientMessageId: 'c', text: 'c' }] });
+
+    expect(received).toHaveLength(3);
+    expect(received[0].pendingCount).toBe(1);
+    expect(received[1].pendingCount).toBe(2);
+    expect(received[2].pendingCount).toBe(3);
+  });
+
+  it('T1b: queued events that only carry the state string (no pending fields) still broadcast each time', () => {
+    // Because `state === 'queued'` is itself treated as a mutation gate, the
+    // emitter must not silently dedup these even with identical payloads.
+    // This protects against future changes that emit lean queued events.
+    const emitter = new TimelineEmitter();
+    const received: Array<Record<string, unknown>> = [];
+    emitter.on((e) => { if (e.type === 'session.state') received.push(e.payload as Record<string, unknown>); });
+
+    emitter.emit('session-q', 'session.state', { state: 'queued' });
+    emitter.emit('session-q', 'session.state', { state: 'queued' });
+    expect(received).toHaveLength(2);
+  });
+
+  it('T2: successive idle (or running) events with no payload mutation are still deduped (avoid UI flicker)', () => {
+    const emitter = new TimelineEmitter();
+    const received: Array<Record<string, unknown>> = [];
+    emitter.on((e) => {
+      if (e.type === 'session.state') received.push(e.payload as Record<string, unknown>);
+    });
+
+    emitter.emit('session-i', 'session.state', { state: 'idle' });
+    emitter.emit('session-i', 'session.state', { state: 'idle' });
+    emitter.emit('session-i', 'session.state', { state: 'idle' });
+    // Only the first idle reaches the handler — original dedup intact for
+    // payloads that don't carry a queue snapshot or error.
+    expect(received).toHaveLength(1);
+
+    emitter.emit('session-r', 'session.state', { state: 'running' });
+    emitter.emit('session-r', 'session.state', { state: 'running' });
+    expect(received.filter((p) => p.state === 'running')).toHaveLength(1);
+  });
+
+  it('T2b: any session.state event carrying an `error` field bypasses dedup so failure updates always reach the UI', () => {
+    const emitter = new TimelineEmitter();
+    const received: Array<Record<string, unknown>> = [];
+    emitter.on((e) => { if (e.type === 'session.state') received.push(e.payload as Record<string, unknown>); });
+
+    emitter.emit('session-e', 'session.state', { state: 'idle' });
+    emitter.emit('session-e', 'session.state', { state: 'idle', error: 'transient' });
+    emitter.emit('session-e', 'session.state', { state: 'idle', error: 'transient' });
+    // First idle broadcast; second + third have error payloads so both pass.
+    expect(received).toHaveLength(3);
+    expect(received[1].error).toBe('transient');
+    expect(received[2].error).toBe('transient');
+  });
+
+  it('T2c: pendingMessageEntries as empty array is still treated as a snapshot (drain-to-zero broadcast)', () => {
+    // After a drain, daemon emits `session.state {state:'running', pendingCount:0,
+    // pendingMessageEntries:[]}` to tell the UI the queue is empty. The dedup
+    // gate must NOT silently swallow that just because `state` happens to
+    // match the previous one.
+    const emitter = new TimelineEmitter();
+    const received: Array<Record<string, unknown>> = [];
+    emitter.on((e) => { if (e.type === 'session.state') received.push(e.payload as Record<string, unknown>); });
+
+    emitter.emit('session-d', 'session.state', { state: 'running' });
+    emitter.emit('session-d', 'session.state', { state: 'running', pendingCount: 0, pendingMessageEntries: [] });
+    expect(received).toHaveLength(2);
+    expect(received[1].pendingCount).toBe(0);
+  });
+});
