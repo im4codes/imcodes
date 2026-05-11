@@ -18,6 +18,7 @@ import {
   P2P_WORKFLOW_CAPABILITY_V1,
   P2P_WORKFLOW_SCRIPT_ARGV_CAPABILITY_V1,
 } from '../../shared/p2p-workflow-constants.js';
+import { REPO_MSG } from '../../shared/repo-types.js';
 
 // ── Mock WebSocket ─────────────────────────────────────────────────────────────
 
@@ -1616,6 +1617,28 @@ describe('WsBridge', () => {
       const msg = JSON.parse(browserWs.sentStrings[0]);
       expect(msg.type).toBe('repo.commits_response');
       expect(msg.items[0].sha).toBe('abc123');
+    });
+
+    it('repo.checkout_branch_response reaches browser', async () => {
+      const { daemonWs, browserWs } = await setupBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: REPO_MSG.CHECKOUT_BRANCH_RESPONSE,
+        requestId: 'req-checkout',
+        projectDir: '/home/user/myproject',
+        ok: true,
+        previousBranch: 'main',
+        currentBranch: 'dev',
+        repoGeneration: 2,
+        detectedAt: 123456,
+      }));
+      await flushAsync();
+
+      const msg = JSON.parse(browserWs.sentStrings[0]);
+      expect(msg.type).toBe(REPO_MSG.CHECKOUT_BRANCH_RESPONSE);
+      expect(msg.previousBranch).toBe('main');
+      expect(msg.currentBranch).toBe('dev');
+      expect(msg.repoGeneration).toBe(2);
     });
 
     it('repo messages are broadcast to all connected browsers', async () => {

@@ -778,7 +778,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     setTimeout(unsub, 30_000);
   }, [serverId, ws]);
 
-  const pathClickHandler = ws && !preview && onPreviewFile ? handlePathClick : undefined;
+  const pathClickHandler = ws && !preview ? handlePathClick : undefined;
   const fileChangeOpenHandler = ws && !preview && onPreviewFile ? handleFileChangeOpen : undefined;
   const urlClickHandler = !preview ? handleUrlClick : undefined;
   const downloadHandler = serverId && ws ? handleDownload : undefined;

@@ -9,6 +9,36 @@ import { describe, it, expect } from 'vitest';
 import { REPO_MSG, REPO_RELAY_TYPES } from '../../shared/repo-types.js';
 
 describe('Repo message type contract', () => {
+  const responseTypes = [
+    REPO_MSG.DETECT_RESPONSE,
+    REPO_MSG.DETECTED,
+    REPO_MSG.ISSUES_RESPONSE,
+    REPO_MSG.PRS_RESPONSE,
+    REPO_MSG.BRANCHES_RESPONSE,
+    REPO_MSG.COMMITS_RESPONSE,
+    REPO_MSG.ACTIONS_RESPONSE,
+    REPO_MSG.CHECKOUT_BRANCH_RESPONSE,
+    REPO_MSG.ACTION_DETAIL_RESPONSE,
+    REPO_MSG.COMMIT_DETAIL_RESPONSE,
+    REPO_MSG.PR_DETAIL_RESPONSE,
+    REPO_MSG.ISSUE_DETAIL_RESPONSE,
+    REPO_MSG.ERROR,
+  ];
+
+  const requestTypes = [
+    REPO_MSG.DETECT,
+    REPO_MSG.LIST_ISSUES,
+    REPO_MSG.LIST_PRS,
+    REPO_MSG.LIST_BRANCHES,
+    REPO_MSG.LIST_COMMITS,
+    REPO_MSG.LIST_ACTIONS,
+    REPO_MSG.CHECKOUT_BRANCH,
+    REPO_MSG.ACTION_DETAIL,
+    REPO_MSG.COMMIT_DETAIL,
+    REPO_MSG.PR_DETAIL,
+    REPO_MSG.ISSUE_DETAIL,
+  ];
+
   it('REPO_MSG constants are non-empty strings', () => {
     for (const [key, value] of Object.entries(REPO_MSG)) {
       expect(typeof value).toBe('string');
@@ -18,40 +48,12 @@ describe('Repo message type contract', () => {
   });
 
   it('all response types are in REPO_RELAY_TYPES', () => {
-    const responseTypes = [
-      REPO_MSG.DETECT_RESPONSE,
-      REPO_MSG.DETECTED,
-      REPO_MSG.ISSUES_RESPONSE,
-      REPO_MSG.PRS_RESPONSE,
-      REPO_MSG.BRANCHES_RESPONSE,
-      REPO_MSG.COMMITS_RESPONSE,
-      REPO_MSG.ACTIONS_RESPONSE,
-      REPO_MSG.ACTION_DETAIL_RESPONSE,
-      REPO_MSG.COMMIT_DETAIL_RESPONSE,
-      REPO_MSG.PR_DETAIL_RESPONSE,
-      REPO_MSG.ISSUE_DETAIL_RESPONSE,
-      REPO_MSG.ERROR,
-    ];
-
     for (const t of responseTypes) {
       expect(REPO_RELAY_TYPES.has(t), `${t} should be in REPO_RELAY_TYPES`).toBe(true);
     }
   });
 
   it('request types are NOT in REPO_RELAY_TYPES (they go browser→daemon, not relayed back)', () => {
-    const requestTypes = [
-      REPO_MSG.DETECT,
-      REPO_MSG.LIST_ISSUES,
-      REPO_MSG.LIST_PRS,
-      REPO_MSG.LIST_BRANCHES,
-      REPO_MSG.LIST_COMMITS,
-      REPO_MSG.LIST_ACTIONS,
-      REPO_MSG.ACTION_DETAIL,
-      REPO_MSG.COMMIT_DETAIL,
-      REPO_MSG.PR_DETAIL,
-      REPO_MSG.ISSUE_DETAIL,
-    ];
-
     for (const t of requestTypes) {
       expect((REPO_RELAY_TYPES as Set<string>).has(t), `${t} should NOT be in REPO_RELAY_TYPES`).toBe(false);
     }
@@ -64,6 +66,7 @@ describe('Repo message type contract', () => {
     expect(REPO_MSG.BRANCHES_RESPONSE).toBe('repo.branches_response');
     expect(REPO_MSG.COMMITS_RESPONSE).toBe('repo.commits_response');
     expect(REPO_MSG.ACTIONS_RESPONSE).toBe('repo.actions_response');
+    expect(REPO_MSG.CHECKOUT_BRANCH_RESPONSE).toBe('repo.checkout_branch_response');
     expect(REPO_MSG.ACTION_DETAIL_RESPONSE).toBe('repo.action_detail_response');
     expect(REPO_MSG.COMMIT_DETAIL_RESPONSE).toBe('repo.commit_detail_response');
     expect(REPO_MSG.PR_DETAIL_RESPONSE).toBe('repo.pr_detail_response');
@@ -73,9 +76,11 @@ describe('Repo message type contract', () => {
     expect(REPO_MSG.LIST_ISSUES).toBe('repo.list_issues');
     expect(REPO_MSG.LIST_PRS).toBe('repo.list_prs');
     expect(REPO_MSG.LIST_ACTIONS).toBe('repo.list_actions');
+    expect(REPO_MSG.CHECKOUT_BRANCH).toBe('repo.checkout_branch');
   });
 
-  it('REPO_RELAY_TYPES has exactly 12 entries', () => {
-    expect(REPO_RELAY_TYPES.size).toBe(12);
+  it('REPO_RELAY_TYPES contains exactly the expected response types', () => {
+    expect(REPO_RELAY_TYPES.size).toBe(responseTypes.length);
+    expect(REPO_RELAY_TYPES).toEqual(new Set(responseTypes));
   });
 });
