@@ -27,7 +27,7 @@ import logger from '../util/logger.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID, MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
 import { homedir } from 'os';
-import { lstat as fsLstat, readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, stat as fsStat, unlink as fsUnlink, writeFile as fsWriteFile } from 'node:fs/promises';
+import { lstat as fsLstat, open as fsOpen, readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, stat as fsStat, unlink as fsUnlink, writeFile as fsWriteFile } from 'node:fs/promises';
 import * as nodePath from 'node:path';
 import { exec as execCb, execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -4544,6 +4544,98 @@ function isPathUnderDir(filePath: string, dir: string): boolean {
   return relative === '' || (!!relative && !relative.startsWith('..') && !nodePath.isAbsolute(relative));
 }
 
+const P2P_DISCUSSION_HISTORY_LIMIT = 50;
+const P2P_DISCUSSION_PREVIEW_BYTES = 64 * 1024;
+const P2P_DISCUSSION_FILE_STAT_CONCURRENCY = 24;
+const P2P_DISCUSSION_PREVIEW_CONCURRENCY = 8;
+
+interface P2pDiscussionHistoryCandidate {
+  id: string;
+  fileName: string;
+  fullPath: string;
+  mtime: number;
+  projectDir?: string;
+}
+
+interface P2pDiscussionHistoryEntry {
+  id: string;
+  fileName: string;
+  preview: string;
+  mtime: number;
+  projectDir?: string;
+}
+
+function isCanonicalDiscussionFileName(entry: string): boolean {
+  if (!entry.endsWith('.md')) return false;
+  // Keep only canonical discussion documents in the history list.
+  // Intermediate hop artifacts and reducer snapshots are implementation
+  // details and should not crowd out the main discussion file.
+  if (/\.round\d+\.hop\d+\.md$/i.test(entry)) return false;
+  if (/\.reducer\.\d+\.md$/i.test(entry)) return false;
+  return true;
+}
+
+async function readP2pDiscussionPreview(filePath: string, fallback: string): Promise<string> {
+  let fh: Awaited<ReturnType<typeof fsOpen>> | null = null;
+  try {
+    fh = await fsOpen(filePath, 'r');
+    const buffer = Buffer.allocUnsafe(P2P_DISCUSSION_PREVIEW_BYTES);
+    const { bytesRead } = await fh.read(buffer, 0, buffer.length, 0);
+    const snippet = buffer.subarray(0, bytesRead).toString('utf8');
+    const reqMatch = snippet.match(/## User Request\s*\n+(.+)/);
+    return reqMatch?.[1]?.trim().slice(0, 120) || fallback;
+  } catch {
+    return fallback;
+  } finally {
+    if (fh) await fh.close().catch(() => {});
+  }
+}
+
+async function listP2pDiscussionCandidatesForProject(
+  projectDir: string,
+  includeProjectDir: boolean,
+): Promise<P2pDiscussionHistoryCandidate[]> {
+  const dir = imcSubDir(projectDir, 'discussions');
+  let entries: string[];
+  try {
+    entries = await fsReaddir(dir);
+  } catch {
+    return [];
+  }
+
+  const files = entries.filter(isCanonicalDiscussionFileName);
+  const candidates = await mapWithConcurrency(files, P2P_DISCUSSION_FILE_STAT_CONCURRENCY, async (f) => {
+    const fullPath = nodePath.join(dir, f);
+    try {
+      const s = await fsStat(fullPath);
+      if (!s.isFile()) return null;
+      return {
+        id: f.replace(/\.md$/i, ''),
+        fileName: f,
+        fullPath,
+        mtime: s.mtimeMs,
+        ...(includeProjectDir ? { projectDir } : {}),
+      } satisfies P2pDiscussionHistoryCandidate;
+    } catch {
+      return null;
+    }
+  });
+  return candidates.filter((entry): entry is P2pDiscussionHistoryCandidate => entry !== null);
+}
+
+async function materializeP2pDiscussionHistoryEntry(
+  candidate: P2pDiscussionHistoryCandidate,
+): Promise<P2pDiscussionHistoryEntry> {
+  const preview = await readP2pDiscussionPreview(candidate.fullPath, candidate.fileName);
+  return {
+    id: candidate.id,
+    fileName: candidate.fileName,
+    preview,
+    mtime: candidate.mtime,
+    ...(candidate.projectDir ? { projectDir: candidate.projectDir } : {}),
+  };
+}
+
 async function handleP2pListDiscussions(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const requestId = cmd.requestId as string | undefined;
   const scope = await resolveP2pDiscussionProjectScope(cmd);
@@ -4561,47 +4653,22 @@ async function handleP2pListDiscussions(cmd: Record<string, unknown>, serverLink
     const known = await collectKnownProjectDirs();
     for (const projectDir of known.values()) projectsToScan.push({ projectDir });
   }
-  const discussions: Array<{ id: string; fileName: string; preview: string; mtime: number; projectDir?: string }> = [];
-  for (const { projectDir } of projectsToScan) {
-    const dir = imcSubDir(projectDir, 'discussions');
-    try {
-      const entries = await fsReaddir(dir);
-      const files = entries.filter((entry) => {
-        if (!entry.endsWith('.md')) return false;
-        // Keep only canonical discussion documents in the history list.
-        // Intermediate hop artifacts and reducer snapshots are implementation
-        // details and should not crowd out the main discussion file.
-        if (/\.round\d+\.hop\d+\.md$/i.test(entry)) return false;
-        if (/\.reducer\.\d+\.md$/i.test(entry)) return false;
-        return true;
-      });
-      for (const f of files) {
-        try {
-          const fullPath = nodePath.join(dir, f);
-          const s = await fsStat(fullPath);
-          const content = await fsReadFileRaw(fullPath, 'utf8');
-          const reqMatch = content.match(/## User Request\s*\n+(.+)/);
-          const preview = reqMatch?.[1]?.trim().slice(0, 120) || f;
-          discussions.push({
-            id: f.replace('.md', ''),
-            fileName: f,
-            preview,
-            mtime: s.mtimeMs,
-            // Tag with projectDir only when aggregating across multiple
-            // projects so the UI can render scope hints. Single-project
-            // (scope-resolved) responses keep the legacy shape.
-            ...(scope ? {} : { projectDir }),
-          });
-        } catch { /* skip unreadable */ }
-      }
-    } catch { /* dir may not exist */ }
-  }
-  // Sort by mtime descending, cap at 50
-  discussions.sort((a, b) => b.mtime - a.mtime);
+  const candidateLists = await mapWithConcurrency(projectsToScan, 4, ({ projectDir }) =>
+    listP2pDiscussionCandidatesForProject(projectDir, !scope),
+  );
+  const recentCandidates = candidateLists
+    .flat()
+    .sort((a, b) => b.mtime - a.mtime)
+    .slice(0, P2P_DISCUSSION_HISTORY_LIMIT);
+  const discussions = await mapWithConcurrency(
+    recentCandidates,
+    P2P_DISCUSSION_PREVIEW_CONCURRENCY,
+    materializeP2pDiscussionHistoryEntry,
+  );
   serverLink.send({
     type: P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE,
     requestId,
-    discussions: discussions.slice(0, 50),
+    discussions,
     // Surface to the caller that the list was aggregated across projects.
     // Old clients ignore unknown fields.
     ...(scope ? {} : { aggregated: true }),

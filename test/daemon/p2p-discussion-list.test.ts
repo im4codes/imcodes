@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -161,6 +161,30 @@ describe('p2p.list_discussions', () => {
     for (const entry of response.discussions) {
       expect(typeof entry.projectDir).toBe('string');
     }
+  });
+
+  it('limits list previews to the newest canonical discussion files', async () => {
+    const discussionsDir = imcSubDir(projectDir, 'discussions');
+    const oldPath = join(discussionsDir, 'run-old.md');
+    await writeFile(oldPath, `## User Request\nold request\n\n${'x'.repeat(70_000)}`, 'utf8');
+    await utimes(oldPath, new Date(1_000), new Date(1_000));
+    for (let i = 0; i < 50; i += 1) {
+      const path = join(discussionsDir, `run-new-${String(i).padStart(2, '0')}.md`);
+      await writeFile(path, `## User Request\nnew request ${i}\n`, 'utf8');
+      await utimes(path, new Date(10_000 + i), new Date(10_000 + i));
+    }
+
+    handleWebCommand({
+      type: P2P_WORKFLOW_MSG.LIST_DISCUSSIONS,
+      requestId: 'p2p-list-limit',
+      scope: { sessionName: 'deck_proj_brain' },
+    }, serverLink as any);
+    await waitForSentCount(1);
+
+    const response = sent[0] as { discussions: Array<{ id: string; preview: string }> };
+    expect(response.discussions).toHaveLength(50);
+    expect(response.discussions.some((entry) => entry.id === 'run-old')).toBe(false);
+    expect(response.discussions.every((entry) => entry.preview.startsWith('new request'))).toBe(true);
   });
 
   it('reads a discussion via cross-project file sweep when scope is omitted', async () => {

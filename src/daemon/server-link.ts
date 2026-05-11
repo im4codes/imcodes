@@ -7,6 +7,7 @@ import { setProviderRegistryServerLink } from '../agent/provider-registry.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
 import { getEmbeddingStatus } from '../context/embedding.js';
 import type { EmbeddingStatus } from '../../shared/embedding-status.js';
+import { recordDaemonServerLinkStatus } from '../util/daemon-status.js';
 import {
   P2P_WORKFLOW_IMPLEMENTATION_CAPABILITY_V1,
   P2P_WORKFLOW_CAPABILITY_V1,
@@ -132,6 +133,7 @@ export class ServerLink {
     P2P_WORKFLOW_OPENSPEC_ARTIFACTS_CAPABILITY_V1,
     P2P_WORKFLOW_IMPLEMENTATION_CAPABILITY_V1,
   ];
+  private lastRuntimeLinkStatusWriteAt = 0;
 
   constructor(opts: ServerLinkOpts) {
     this.workerUrl = opts.workerUrl;
@@ -167,6 +169,7 @@ export class ServerLink {
 
     const wsUrl = this.workerUrl.replace(/^http/, 'ws') + `/api/server/${this.serverId}/ws`;
     logger.info({ url: wsUrl }, 'ServerLink: connecting');
+    this.recordRuntimeLinkStatus({ state: 'connecting', workerUrl: this.workerUrl, serverId: this.serverId });
     this.reconnecting = false;
     const ws = new WebSocket(wsUrl);
     this.ws = ws;
@@ -200,6 +203,13 @@ export class ServerLink {
       logger.info('ServerLink: connected');
       this.backoffMs = INITIAL_BACKOFF_MS;
       this.lastPong = Date.now();
+      this.recordRuntimeLinkStatus({
+        state: 'connected',
+        workerUrl: this.workerUrl,
+        serverId: this.serverId,
+        lastConnectedAt: this.lastPong,
+        clearError: true,
+      });
       // Send auth handshake immediately — server closes the socket if this is not
       // the first message or if credentials are invalid (5s timeout enforced server-side).
       ws.send(JSON.stringify({ type: 'auth', serverId: this.serverId, token: this.token, daemonVersion: this.daemonVersion }));
@@ -243,7 +253,13 @@ export class ServerLink {
     ws.addEventListener('error', (event) => {
       if (this.ws !== ws) return; // stale socket — a newer connection already took over
       clearConnectTimeout();
-      logger.warn({ error: (event as ErrorEvent).message ?? 'unknown' }, 'ServerLink: error');
+      const errorMessage = (event as ErrorEvent).message ?? 'unknown';
+      logger.warn({ error: errorMessage }, 'ServerLink: error');
+      this.recordRuntimeLinkStatus({
+        state: 'disconnected',
+        lastDisconnectedAt: Date.now(),
+        lastError: errorMessage,
+      });
       // Close event *should* fire after error, but in edge cases (non-101 response,
       // DNS failure) it may not. Schedule reconnect as a safety net — scheduleReconnect()
       // is idempotent (guards with `this.reconnecting`), so no double-reconnect risk
@@ -261,6 +277,13 @@ export class ServerLink {
       }
       try {
         const msg = JSON.parse(event.data);
+        if (msg?.type === 'heartbeat_ack') {
+          this.recordRuntimeLinkStatus({
+            state: 'connected',
+            lastHeartbeatAckAt: this.lastPong,
+            clearError: true,
+          }, 10_000);
+        }
         for (const h of this.handlers) h(msg);
       } catch {
         // ignore parse errors
@@ -275,6 +298,11 @@ export class ServerLink {
       if (this.ws !== ws) return;
       clearConnectTimeout();
       logger.info({ code: event.code, reason: event.reason }, 'ServerLink: closed');
+      this.recordRuntimeLinkStatus({
+        state: 'disconnected',
+        lastDisconnectedAt: Date.now(),
+        lastError: event.reason || `closed:${event.code}`,
+      });
       this.stopHeartbeat();
       this.stopWatchdog();
       setTransportRelaySend(() => { /* disconnected — discard */ });
@@ -414,7 +442,13 @@ export class ServerLink {
   private startHeartbeat(): void {
     this.heartbeatTimer = setInterval(() => {
       if (this.ws?.readyState === WebSocket.OPEN) {
-        this.send({ type: 'heartbeat', daemonVersion: this.daemonVersion, ...collectSystemStats() });
+        const now = Date.now();
+        const sent = this.trySend({ type: 'heartbeat', daemonVersion: this.daemonVersion, ...collectSystemStats() });
+        this.recordRuntimeLinkStatus({
+          state: sent ? 'connected' : 'disconnected',
+          lastHeartbeatSentAt: now,
+          ...(sent ? {} : { lastSendFailedAt: now, lastError: 'heartbeat_send_failed' }),
+        }, 10_000);
       }
     }, HEARTBEAT_MS);
     // Stats updates more frequently than heartbeat
@@ -468,6 +502,11 @@ export class ServerLink {
     // Force-close existing socket (will trigger close event, but we handle reconnect ourselves)
     try { this.ws?.close(); } catch { /* ignore */ }
     this.ws = null;
+    this.recordRuntimeLinkStatus({
+      state: 'disconnected',
+      lastDisconnectedAt: Date.now(),
+      lastError: 'watchdog_forced_reconnect',
+    });
     // Reset backoff for forced reconnects — we want to come back fast
     this.backoffMs = INITIAL_BACKOFF_MS;
     this.scheduleReconnect();
@@ -489,5 +528,21 @@ export class ServerLink {
       this.connect();
       this.backoffMs = Math.min(this.backoffMs * 2, MAX_BACKOFF_MS);
     }, delayMs);
+  }
+
+  private recordRuntimeLinkStatus(
+    update: Parameters<typeof recordDaemonServerLinkStatus>[0],
+    minIntervalMs = 0,
+  ): void {
+    const now = update.nowMs ?? Date.now();
+    if (minIntervalMs > 0 && now - this.lastRuntimeLinkStatusWriteAt < minIntervalMs) return;
+    this.lastRuntimeLinkStatusWriteAt = now;
+    recordDaemonServerLinkStatus({
+      ...update,
+      nowMs: now,
+      version: this.daemonVersion,
+      workerUrl: update.workerUrl ?? this.workerUrl,
+      serverId: update.serverId ?? this.serverId,
+    });
   }
 }

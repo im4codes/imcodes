@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, statfsSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -16,6 +16,9 @@ const UTF8_STDIO_OPTIONS = {
 } as const;
 
 const RUNTIME_STATUS_FILE = 'daemon-runtime.json';
+export const DAEMON_SERVER_LINK_FRESH_MS = 30_000;
+export const DAEMON_STORAGE_CRITICAL_FREE_BYTES = 512 * 1024 * 1024;
+export const DAEMON_STORAGE_LOW_FREE_BYTES = 2 * 1024 * 1024 * 1024;
 
 export interface DaemonRuntimeStatus {
   pid: number;
@@ -23,6 +26,53 @@ export interface DaemonRuntimeStatus {
   updatedAt: number;
   restartCount: number;
   version?: string;
+  serverLink?: DaemonServerLinkRuntimeStatus;
+}
+
+export type DaemonServerLinkRuntimeState = 'connecting' | 'connected' | 'disconnected';
+
+export interface DaemonServerLinkRuntimeStatus {
+  state: DaemonServerLinkRuntimeState;
+  updatedAt: number;
+  serverId?: string;
+  workerUrl?: string;
+  lastConnectedAt?: number;
+  lastDisconnectedAt?: number;
+  lastHeartbeatAckAt?: number;
+  lastHeartbeatSentAt?: number;
+  lastSendFailedAt?: number;
+  lastError?: string;
+}
+
+export interface DaemonServerLinkRuntimeUpdate {
+  state: DaemonServerLinkRuntimeState;
+  nowMs?: number;
+  baseDir?: string;
+  pid?: number;
+  version?: string;
+  serverId?: string;
+  workerUrl?: string;
+  lastConnectedAt?: number;
+  lastDisconnectedAt?: number;
+  lastHeartbeatAckAt?: number;
+  lastHeartbeatSentAt?: number;
+  lastSendFailedAt?: number;
+  lastError?: string;
+  clearError?: boolean;
+}
+
+export type DaemonServerLinkFreshness =
+  | { status: 'unknown'; fresh: false; lastProofAt: null; staleMs: null }
+  | { status: 'connected'; fresh: true; lastProofAt: number; staleMs: number }
+  | { status: 'stale'; fresh: false; lastProofAt: number | null; staleMs: number | null }
+  | { status: 'connecting' | 'disconnected'; fresh: false; lastProofAt: number | null; staleMs: number | null };
+
+export interface DaemonFilesystemSpace {
+  path: string;
+  freeBytes: number;
+  totalBytes: number;
+  usedPercent: number;
+  status: 'ok' | 'low' | 'critical';
 }
 
 export function parsePsElapsedSeconds(raw: string): number | null {
@@ -210,12 +260,14 @@ export function readDaemonRuntimeStatus(baseDir: string = defaultDaemonRuntimeSt
     const updatedAt = coerceNonNegativeSafeInteger(parsed.updatedAt);
     const restartCount = coerceNonNegativeSafeInteger(parsed.restartCount);
     if (pid === null || startedAt === null || updatedAt === null || restartCount === null) return null;
+    const serverLink = parseDaemonServerLinkRuntimeStatus(parsed.serverLink);
     return {
       pid,
       startedAt,
       updatedAt,
       restartCount,
       ...(typeof parsed.version === 'string' && parsed.version ? { version: parsed.version } : {}),
+      ...(serverLink ? { serverLink } : {}),
     };
   } catch {
     return null;
@@ -245,13 +297,75 @@ export function recordDaemonStart(input: {
     ...(input.version ? { version: input.version } : {}),
   };
 
+  return writeDaemonRuntimeStatus(next, baseDir, nowMs);
+}
+
+export function recordDaemonServerLinkStatus(input: DaemonServerLinkRuntimeUpdate): DaemonRuntimeStatus | null {
+  const nowMs = input.nowMs ?? Date.now();
+  const baseDir = input.baseDir ?? defaultDaemonRuntimeStatusDir();
+  const pid = input.pid ?? process.pid;
+  if (!Number.isSafeInteger(pid) || pid <= 0 || !Number.isSafeInteger(nowMs) || nowMs < 0) return null;
+
+  const previous = readDaemonRuntimeStatus(baseDir);
+  const samePid = previous?.pid === pid;
+  const existingLink = samePid ? previous?.serverLink : undefined;
+  const nextLink: DaemonServerLinkRuntimeStatus = {
+    ...(existingLink ?? {}),
+    state: input.state,
+    updatedAt: nowMs,
+    ...definedString('serverId', input.serverId),
+    ...definedString('workerUrl', input.workerUrl),
+    ...definedNonNegativeInteger('lastConnectedAt', input.lastConnectedAt),
+    ...definedNonNegativeInteger('lastDisconnectedAt', input.lastDisconnectedAt),
+    ...definedNonNegativeInteger('lastHeartbeatAckAt', input.lastHeartbeatAckAt),
+    ...definedNonNegativeInteger('lastHeartbeatSentAt', input.lastHeartbeatSentAt),
+    ...definedNonNegativeInteger('lastSendFailedAt', input.lastSendFailedAt),
+    ...definedString('lastError', input.lastError),
+  };
+  if (input.clearError) delete nextLink.lastError;
+
+  const next: DaemonRuntimeStatus = {
+    pid,
+    startedAt: samePid && previous ? previous.startedAt : nowMs,
+    updatedAt: nowMs,
+    restartCount: samePid && previous ? previous.restartCount : previous?.restartCount ?? 0,
+    ...(input.version ?? previous?.version ? { version: input.version ?? previous?.version } : {}),
+    serverLink: nextLink,
+  };
+  return writeDaemonRuntimeStatus(next, baseDir, nowMs);
+}
+
+export function getDaemonServerLinkFreshness(
+  status: DaemonRuntimeStatus | null,
+  nowMs: number = Date.now(),
+  freshMs: number = DAEMON_SERVER_LINK_FRESH_MS,
+): DaemonServerLinkFreshness {
+  const link = status?.serverLink;
+  if (!link) return { status: 'unknown', fresh: false, lastProofAt: null, staleMs: null };
+  const lastProofAt = Math.max(link.lastHeartbeatAckAt ?? 0, link.lastConnectedAt ?? 0) || null;
+  const staleMs = lastProofAt === null ? null : Math.max(0, nowMs - lastProofAt);
+  if (link.state === 'connected') {
+    if (lastProofAt !== null && staleMs !== null && staleMs <= freshMs) {
+      return { status: 'connected', fresh: true, lastProofAt, staleMs };
+    }
+    return { status: 'stale', fresh: false, lastProofAt, staleMs };
+  }
+  return { status: link.state, fresh: false, lastProofAt, staleMs };
+}
+
+export function readDaemonFilesystemSpace(path: string = defaultDaemonRuntimeStatusDir()): DaemonFilesystemSpace | null {
   try {
-    mkdirSync(baseDir, { recursive: true });
-    const filePath = join(baseDir, RUNTIME_STATUS_FILE);
-    const tempPath = join(dirname(filePath), `${RUNTIME_STATUS_FILE}.${pid}.${nowMs}.tmp`);
-    writeFileSync(tempPath, JSON.stringify(next, null, 2), 'utf8');
-    renameSync(tempPath, filePath);
-    return next;
+    const stats = statfsSync(path);
+    const freeBytes = Number(stats.bavail) * Number(stats.bsize);
+    const totalBytes = Number(stats.blocks) * Number(stats.bsize);
+    if (!Number.isFinite(freeBytes) || !Number.isFinite(totalBytes) || totalBytes <= 0) return null;
+    const usedPercent = Math.max(0, Math.min(100, Math.round(((totalBytes - freeBytes) / totalBytes) * 100)));
+    const status: DaemonFilesystemSpace['status'] = freeBytes < DAEMON_STORAGE_CRITICAL_FREE_BYTES || usedPercent >= 98
+      ? 'critical'
+      : freeBytes < DAEMON_STORAGE_LOW_FREE_BYTES || usedPercent >= 95
+        ? 'low'
+        : 'ok';
+    return { path, freeBytes, totalBytes, usedPercent, status };
   } catch {
     return null;
   }
@@ -286,4 +400,47 @@ function coerceNonNegativeSafeInteger(value: unknown): number | null {
     return Number.isSafeInteger(parsed) ? parsed : null;
   }
   return null;
+}
+
+function writeDaemonRuntimeStatus(status: DaemonRuntimeStatus, baseDir: string, nowMs: number): DaemonRuntimeStatus | null {
+  try {
+    mkdirSync(baseDir, { recursive: true });
+    const filePath = join(baseDir, RUNTIME_STATUS_FILE);
+    const tempPath = join(dirname(filePath), `${RUNTIME_STATUS_FILE}.${status.pid}.${nowMs}.${process.pid}.tmp`);
+    writeFileSync(tempPath, JSON.stringify(status, null, 2), 'utf8');
+    renameSync(tempPath, filePath);
+    return status;
+  } catch {
+    return null;
+  }
+}
+
+function parseDaemonServerLinkRuntimeStatus(value: unknown): DaemonServerLinkRuntimeStatus | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  const state = raw.state;
+  if (state !== 'connecting' && state !== 'connected' && state !== 'disconnected') return null;
+  const updatedAt = coerceNonNegativeSafeInteger(raw.updatedAt);
+  if (updatedAt === null) return null;
+  return {
+    state,
+    updatedAt,
+    ...definedString('serverId', raw.serverId),
+    ...definedString('workerUrl', raw.workerUrl),
+    ...definedNonNegativeInteger('lastConnectedAt', raw.lastConnectedAt),
+    ...definedNonNegativeInteger('lastDisconnectedAt', raw.lastDisconnectedAt),
+    ...definedNonNegativeInteger('lastHeartbeatAckAt', raw.lastHeartbeatAckAt),
+    ...definedNonNegativeInteger('lastHeartbeatSentAt', raw.lastHeartbeatSentAt),
+    ...definedNonNegativeInteger('lastSendFailedAt', raw.lastSendFailedAt),
+    ...definedString('lastError', raw.lastError),
+  };
+}
+
+function definedString<K extends string>(key: K, value: unknown): { [P in K]?: string } {
+  return typeof value === 'string' && value ? { [key]: value } as { [P in K]?: string } : {};
+}
+
+function definedNonNegativeInteger<K extends string>(key: K, value: unknown): { [P in K]?: number } {
+  const parsed = coerceNonNegativeSafeInteger(value);
+  return parsed === null ? {} : { [key]: parsed } as { [P in K]?: number };
 }

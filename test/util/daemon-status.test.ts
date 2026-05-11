@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   formatDurationSeconds,
+  getDaemonServerLinkFreshness,
   parseWindowsWmicCreationDateEpochMs,
   parsePsElapsedSeconds,
   readDaemonRestartCount,
@@ -12,6 +13,7 @@ import {
   readProcessUptimeSeconds,
   readServiceRestartCount,
   recordDaemonStart,
+  recordDaemonServerLinkStatus,
 } from '../../src/util/daemon-status.js';
 
 describe('daemon status helpers', () => {
@@ -142,6 +144,75 @@ describe('daemon status helpers', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('records server link health without changing daemon restart count', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-daemon-status-'));
+    try {
+      recordDaemonStart({ pid: 400, nowMs: 10_000, baseDir: dir, version: '1.0.0' });
+      expect(recordDaemonServerLinkStatus({
+        pid: 400,
+        nowMs: 11_000,
+        baseDir: dir,
+        state: 'connected',
+        serverId: 'srv_1',
+        workerUrl: 'https://example.test',
+        lastConnectedAt: 11_000,
+        lastHeartbeatAckAt: 12_000,
+      })).toMatchObject({
+        pid: 400,
+        restartCount: 0,
+        serverLink: {
+          state: 'connected',
+          serverId: 'srv_1',
+          workerUrl: 'https://example.test',
+          lastConnectedAt: 11_000,
+          lastHeartbeatAckAt: 12_000,
+        },
+      });
+
+      expect(recordDaemonServerLinkStatus({
+        pid: 400,
+        nowMs: 13_000,
+        baseDir: dir,
+        state: 'disconnected',
+        lastDisconnectedAt: 13_000,
+        lastError: 'closed:1006',
+      })?.restartCount).toBe(0);
+      expect(readDaemonRuntimeStatus(dir)?.serverLink).toMatchObject({
+        state: 'disconnected',
+        serverId: 'srv_1',
+        lastDisconnectedAt: 13_000,
+        lastError: 'closed:1006',
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('classifies server link freshness from the last proof timestamp', () => {
+    expect(getDaemonServerLinkFreshness(null, 10_000)).toMatchObject({ status: 'unknown', fresh: false });
+    expect(getDaemonServerLinkFreshness({
+      pid: 1,
+      startedAt: 1,
+      updatedAt: 1,
+      restartCount: 0,
+      serverLink: { state: 'connected', updatedAt: 1_000, lastConnectedAt: 1_000, lastHeartbeatAckAt: 9_000 },
+    }, 10_000, 2_000)).toMatchObject({ status: 'connected', fresh: true, staleMs: 1_000 });
+    expect(getDaemonServerLinkFreshness({
+      pid: 1,
+      startedAt: 1,
+      updatedAt: 1,
+      restartCount: 0,
+      serverLink: { state: 'connected', updatedAt: 1_000, lastConnectedAt: 1_000, lastHeartbeatAckAt: 3_000 },
+    }, 10_000, 2_000)).toMatchObject({ status: 'stale', fresh: false, staleMs: 7_000 });
+    expect(getDaemonServerLinkFreshness({
+      pid: 1,
+      startedAt: 1,
+      updatedAt: 1,
+      restartCount: 0,
+      serverLink: { state: 'disconnected', updatedAt: 8_000, lastDisconnectedAt: 8_000 },
+    }, 10_000, 2_000)).toMatchObject({ status: 'disconnected', fresh: false });
   });
 
   it('uses persisted runtime status as restart count and uptime fallback', () => {
