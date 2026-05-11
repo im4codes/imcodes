@@ -108,9 +108,9 @@ describe('p2p.list_discussions', () => {
         }),
       ],
     });
-    const response = sent[0] as { discussions: Array<{ fileName: string }> };
+    const response = sent[0] as { discussions: Array<{ fileName: string; path?: string }> };
     expect(response.discussions.map((d) => d.fileName)).toEqual(['run-main.md']);
-    expect(response.discussions[0]).not.toHaveProperty('path');
+    expect(response.discussions[0]?.path).toBe(join(discussionsDir, 'run-main.md'));
   });
 
   it('does not list or read discussions across project scope', async () => {

@@ -4560,6 +4560,7 @@ interface P2pDiscussionHistoryCandidate {
 interface P2pDiscussionHistoryEntry {
   id: string;
   fileName: string;
+  path: string;
   preview: string;
   mtime: number;
   projectDir?: string;
@@ -4630,6 +4631,7 @@ async function materializeP2pDiscussionHistoryEntry(
   return {
     id: candidate.id,
     fileName: candidate.fileName,
+    path: candidate.fullPath,
     preview,
     mtime: candidate.mtime,
     ...(candidate.projectDir ? { projectDir: candidate.projectDir } : {}),
