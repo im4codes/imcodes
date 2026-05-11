@@ -42,7 +42,7 @@ import { isTransportAgent } from '../agent/detect.js';
 import { DAEMON_VERSION } from '../util/version.js';
 
 /** Get the last assistant.text from a session's timeline (for push notification context). */
-async function getLastAssistantText(sessionName: string): Promise<string | undefined> {
+export async function getLastAssistantText(sessionName: string): Promise<string | undefined> {
   try {
     const events = await timelineStore.readByTypesPreferred(sessionName, ['assistant.text'], { limit: 100 });
     for (let i = events.length - 1; i >= 0; i--) {
@@ -55,7 +55,7 @@ async function getLastAssistantText(sessionName: string): Promise<string | undef
   return undefined;
 }
 
-function resolvePushDisplayContext(sessionName: string, sessions: SessionRecord[]): {
+export function resolvePushDisplayContext(sessionName: string, sessions: SessionRecord[]): {
   project: string;
   label?: string;
   parentLabel?: string;
