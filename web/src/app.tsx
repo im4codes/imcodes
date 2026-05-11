@@ -150,7 +150,7 @@ const nativeCallback = typeof window !== 'undefined'
 
 type ViewMode = TerminalSubscribeViewMode;
 
-function isTextEntryElement(el: HTMLElement | null): boolean {
+export function isTextEntryElement(el: HTMLElement | null): boolean {
   if (!el) return false;
   const tag = el.tagName;
   return tag === 'INPUT'
@@ -169,7 +169,7 @@ type SharedContextDiagnosticsWindowState = {
   filePath?: string;
 };
 
-function buildSessionToastLabel(
+export function buildSessionToastLabel(
   sessionName: string,
   options: {
     label?: string | null;
@@ -203,7 +203,7 @@ export interface PinnedPanel {
   props: Record<string, unknown>;
 }
 
-function getFilePreviewInitialPath(request: FileBrowserPreviewRequest): string {
+export function getFilePreviewInitialPath(request: FileBrowserPreviewRequest): string {
   if (request.rootPath) return request.rootPath;
   const slash = request.path.lastIndexOf('/');
   const backslash = request.path.lastIndexOf('\\');
@@ -213,7 +213,7 @@ function getFilePreviewInitialPath(request: FileBrowserPreviewRequest): string {
   return '~';
 }
 
-function updateServerDaemonVersion<T extends { id: string; daemonVersion?: string | null }>(
+export function updateServerDaemonVersion<T extends { id: string; daemonVersion?: string | null }>(
   servers: T[],
   serverId: string | null | undefined,
   daemonVersion: string | null | undefined,

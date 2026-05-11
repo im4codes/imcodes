@@ -327,6 +327,15 @@ jobs:
         run: ./scripts/ci-npm-ci.sh server
       - run: npm run build
       - run: npm run test:coverage
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage/
+            !coverage/tmp/
+          if-no-files-found: error
       - name: Upload to Codecov
         if: ${{ env.CODECOV_TOKEN != '' }}
         uses: codecov/codecov-action@v4

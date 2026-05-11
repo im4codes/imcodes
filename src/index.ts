@@ -62,6 +62,7 @@ import { execSync } from 'child_process';
 import { homedir } from 'os';
 import { existsSync, realpathSync, readFileSync, writeFileSync } from 'fs';
 import { resolve, join, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../shared/imcodes-send.js';
 import { formatDurationSeconds, readDaemonRestartCount, readPersistedDaemonUptimeSeconds, readProcessUptimeSeconds } from './util/daemon-status.js';
 
@@ -126,6 +127,7 @@ function ensureServiceForeground(): void {
   }
 }
 
+export function createProgram(): Command {
 const program = new Command()
   .name('imcodes')
   .description('Remote AI coding agent controller')
@@ -970,6 +972,22 @@ memoryCmd
     }
   });
 
+return program;
+}
+
+export const program = createProgram();
+
+function isMainModule(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return realpathSync(entry) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return resolve(entry) === fileURLToPath(import.meta.url);
+  }
+}
+
+if (isMainModule()) {
 program.parseAsync(process.argv).catch((err: unknown) => {
   const exitCode = typeof err === 'object' && err && 'exitCode' in err
     ? Number((err as { exitCode?: unknown }).exitCode)
@@ -986,3 +1004,4 @@ program.parseAsync(process.argv).catch((err: unknown) => {
   logger.error({ err }, 'Fatal error');
   process.exit(exitCode && exitCode > 0 ? exitCode : 1);
 });
+}

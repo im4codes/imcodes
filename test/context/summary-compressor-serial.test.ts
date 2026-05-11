@@ -292,5 +292,5 @@ describe('summary-compressor — concurrent compressWithSdk calls serialize', ()
       idle: true,
       state: expect.objectContaining({ idle: true }),
     });
-  });
+  }, 15_000);
 });

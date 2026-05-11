@@ -23,7 +23,7 @@
  *   3. The serverLink passed in does not receive any spurious sends
  *      for inputs that are obviously not valid commands.
  */
-import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
+import { describe, expect, it, vi, beforeAll, beforeEach, afterEach } from 'vitest';
 
 // Mock the heavyweight modules the dispatcher transitively imports so we
 // can load the file under test without booting the entire daemon.
@@ -36,8 +36,13 @@ vi.mock('../../src/store/session-store.js', () => ({
 }));
 
 describe('handleWebCommand: malformed inputs do not crash', () => {
+  let handleWebCommand: (msg: unknown, serverLink: never) => void;
   let uncaughtExceptions: unknown[];
   let originalListener: ((err: Error) => void)[] | undefined;
+
+  beforeAll(async () => {
+    ({ handleWebCommand } = await import('../../src/daemon/command-handler.js'));
+  }, 30_000);
 
   beforeEach(() => {
     uncaughtExceptions = [];
@@ -68,7 +73,6 @@ describe('handleWebCommand: malformed inputs do not crash', () => {
   }
 
   it('non-object inputs are silently ignored', async () => {
-    const { handleWebCommand } = await import('../../src/daemon/command-handler.js');
     const link = makeFakeServerLink();
 
     // None of these should throw.
@@ -84,7 +88,6 @@ describe('handleWebCommand: malformed inputs do not crash', () => {
   });
 
   it('object with no .type field does not throw', async () => {
-    const { handleWebCommand } = await import('../../src/daemon/command-handler.js');
     const link = makeFakeServerLink();
     expect(() => handleWebCommand({}, link as never)).not.toThrow();
     expect(() => handleWebCommand({ foo: 'bar' }, link as never)).not.toThrow();
@@ -93,7 +96,6 @@ describe('handleWebCommand: malformed inputs do not crash', () => {
   });
 
   it('object with non-string .type does not throw', async () => {
-    const { handleWebCommand } = await import('../../src/daemon/command-handler.js');
     const link = makeFakeServerLink();
     expect(() => handleWebCommand({ type: 42 }, link as never)).not.toThrow();
     expect(() => handleWebCommand({ type: { nested: 'object' } }, link as never)).not.toThrow();
@@ -103,7 +105,6 @@ describe('handleWebCommand: malformed inputs do not crash', () => {
   });
 
   it('unknown .type strings are silently ignored', async () => {
-    const { handleWebCommand } = await import('../../src/daemon/command-handler.js');
     const link = makeFakeServerLink();
     expect(() => handleWebCommand({ type: 'not.a.real.command' }, link as never)).not.toThrow();
     expect(() => handleWebCommand({ type: 'session.this_does_not_exist' }, link as never)).not.toThrow();
@@ -117,7 +118,6 @@ describe('handleWebCommand: malformed inputs do not crash', () => {
     // crashes used to come from.  A malformed client can send the type
     // with no other fields; the handler must treat missing fields as
     // a no-op or a validation warning, NOT crash the dispatcher.
-    const { handleWebCommand } = await import('../../src/daemon/command-handler.js');
     const link = makeFakeServerLink();
 
     const types = [
@@ -145,7 +145,6 @@ describe('handleWebCommand: malformed inputs do not crash', () => {
     // Common shape: handler does `cmd.session as string` and then
     // `session.split(...)`.  If session is a number/object, that's
     // a TypeError synchronously — must be swallowed by the dispatcher.
-    const { handleWebCommand } = await import('../../src/daemon/command-handler.js');
     const link = makeFakeServerLink();
 
     expect(() => handleWebCommand({

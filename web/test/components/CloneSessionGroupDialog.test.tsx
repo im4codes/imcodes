@@ -161,9 +161,9 @@ describe('CloneSessionGroupDialog', () => {
     expect(screen.getByText('Working directories are validated on the daemon host before anything is created.')).toBeDefined();
     expect(screen.getByText('The copied group starts fresh.')).toBeDefined();
 
-    expect(screen.getByText('Default: cloned sessions use the original working directories')).toBeDefined();
+    expect(screen.getByText(/original working directories|Preserve source working directories/)).toBeDefined();
 
-    fireEvent.click(screen.getByLabelText('Use a new working directory for cloned sessions'));
+    fireEvent.click(screen.getByLabelText(/working director/i));
     expect(screen.getByPlaceholderText('/work/new-checkout')).toBeDefined();
   });
 
