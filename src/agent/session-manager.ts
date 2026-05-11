@@ -1386,6 +1386,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
       let transportSettings: string | Record<string, unknown> | undefined;
       let effectiveRequestedModel = requestedTransportModel;
       let restoredPresetContextWindow = s.presetContextWindow;
+      let qwenPresetUsesApiKey = false;
       const resolveRuntimeContextBootstrap = () => resolveTransportContextBootstrap({
         projectDir: s.projectDir,
         transportConfig: getSession(s.name)?.transportConfig ?? s.transportConfig ?? {},
@@ -1410,6 +1411,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
           effectiveRequestedModel = presetPreferredModel;
         }
         transportSettings = presetConfig.settings;
+        qwenPresetUsesApiKey = !!presetConfig.settings;
         restoredPresetContextWindow = presetConfig.contextWindow ?? restoredPresetContextWindow;
         // Override the qwen CLI's built-in "I am Qwen Code" identity with the
         // preset's runtime-facts prompt — without this, the model introduces
@@ -1417,6 +1419,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         if (presetConfig.systemPrompt) systemPrompt = presetConfig.systemPrompt;
       }
       if (s.providerId === 'qwen'
+        && !s.ccPreset
         && (!effectiveRequestedModel || (availableQwenModels.length > 0 && !availableQwenModels.includes(effectiveRequestedModel)))) {
         effectiveRequestedModel = availableQwenModels[0] ?? effectiveRequestedModel;
       }
@@ -1474,23 +1477,23 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         // against a user-provided API key (BYO tier). The user-level
         // `~/.qwen/settings.json` tier labels ("Free", "No longer available")
         // are misleading in that context, so override them for preset sessions.
-        qwenAuthType: (s.providerId === 'qwen' && s.ccPreset)
+        qwenAuthType: (s.providerId === 'qwen' && s.ccPreset && qwenPresetUsesApiKey)
           ? QWEN_AUTH_TYPES.API_KEY
           : (qwenRuntime?.authType ?? s.qwenAuthType),
-        qwenAuthLimit: (s.providerId === 'qwen' && s.ccPreset)
+        qwenAuthLimit: (s.providerId === 'qwen' && s.ccPreset && qwenPresetUsesApiKey)
           ? undefined
           : (qwenRuntime?.authLimit ?? s.qwenAuthLimit),
         ...(availableQwenModels.length > 0 ? { qwenAvailableModels: availableQwenModels } : {}),
         ...(restoredPresetContextWindow ? { presetContextWindow: restoredPresetContextWindow } : {}),
         ...getQwenDisplayMetadata({
           model: effectiveRequestedModel,
-          authType: (s.providerId === 'qwen' && s.ccPreset)
+          authType: (s.providerId === 'qwen' && s.ccPreset && qwenPresetUsesApiKey)
             ? QWEN_AUTH_TYPES.API_KEY
             : (qwenRuntime?.authType ?? s.qwenAuthType),
-          authLimit: (s.providerId === 'qwen' && s.ccPreset)
+          authLimit: (s.providerId === 'qwen' && s.ccPreset && qwenPresetUsesApiKey)
             ? undefined
             : (qwenRuntime?.authLimit ?? s.qwenAuthLimit),
-          quotaUsageLabel: (s.providerId === 'qwen' && s.ccPreset)
+          quotaUsageLabel: (s.providerId === 'qwen' && s.ccPreset && qwenPresetUsesApiKey)
             ? undefined
             : ((qwenRuntime?.authType ?? s.qwenAuthType) === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined),
         }),
@@ -1684,10 +1687,12 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
         presetContextWindow = presetConfig.contextWindow;
         if (presetConfig.settings) transportSettings = presetConfig.settings;
         if (presetConfig.systemPrompt) transportSystemPrompt = presetConfig.systemPrompt;
-      qwenAuthType = QWEN_AUTH_TYPES.API_KEY;
-      qwenAuthLimit = undefined;
+        if (presetConfig.settings) {
+          qwenAuthType = QWEN_AUTH_TYPES.API_KEY;
+          qwenAuthLimit = undefined;
+        }
     }
-    if (!requestedTransportModel || (availableQwenModels.length > 0 && !availableQwenModels.includes(requestedTransportModel))) {
+    if (!effectiveCcPreset && (!requestedTransportModel || (availableQwenModels.length > 0 && !availableQwenModels.includes(requestedTransportModel)))) {
       requestedTransportModel = availableQwenModels[0] ?? requestedTransportModel;
     }
     const stored = !opts.fresh ? existing?.providerSessionId : undefined;

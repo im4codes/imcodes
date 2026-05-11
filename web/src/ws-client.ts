@@ -131,7 +131,7 @@ export type ServerMessage =
   | { type: typeof P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE; requestId: string; discussions: Array<{ id: string; fileName: string; path?: string; preview: string; mtime: number }> }
   | { type: typeof P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE; id?: string; requestId: string; content?: string; error?: string }
   | { type: typeof CC_PRESET_MSG.LIST_RESPONSE; presets: CcPreset[] }
-  | { type: typeof CC_PRESET_MSG.SAVE_RESPONSE; ok: boolean }
+  | { type: typeof CC_PRESET_MSG.SAVE_RESPONSE; requestId?: string; ok: boolean; error?: string }
   | { type: typeof CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE; requestId?: string; presetName: string; ok: boolean; preset?: CcPreset; models?: CcPresetModelInfo[]; endpoint?: string; error?: string }
   | SessionGroupCloneEvent
   | FsGitDiffResponse

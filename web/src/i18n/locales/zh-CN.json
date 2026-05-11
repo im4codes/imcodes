@@ -486,7 +486,11 @@
     "api_provider": "API Provider",
     "api_provider_add_edit": "+ 新增 / 编辑",
     "api_provider_default": "默认（Anthropic）",
-    "api_provider_default_help": "默认（Anthropic）— 点击“+ 新增 / 编辑”进行配置"
+    "api_provider_default_help": "默认（Anthropic）— 点击“+ 新增 / 编辑”进行配置",
+    "api_provider_import_json": "导入 JSON",
+    "api_provider_export_json": "导出 JSON",
+    "api_provider_import_error": "无法从剪贴板导入 preset JSON",
+    "api_provider_export_error": "无法复制 preset JSON 到剪贴板"
   },
   "api_key": {
     "copy": "复制",

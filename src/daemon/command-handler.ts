@@ -68,7 +68,7 @@ import { mergeCodexDisplayMetadata } from '../agent/codex-display.js';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import { DAEMON_UPGRADE_TARGET_LATEST, normalizeDaemonUpgradeTargetVersion } from '../../shared/daemon-upgrade.js';
-import { CC_PRESET_MSG, type CcPreset } from '../../shared/cc-presets.js';
+import { CC_PRESET_MSG, normalizeCcPresetName, type CcPreset } from '../../shared/cc-presets.js';
 import { MEMORY_WS } from '../../shared/memory-ws.js';
 import { FS_WRITE_ERROR } from '../shared/transport/fs.js';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG, MAX_P2P_PARTICIPANTS } from '../../shared/p2p-config-events.js';
@@ -1549,7 +1549,9 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       void handleCcPresetsList(serverLink);
       break;
     case CC_PRESET_MSG.SAVE:
-      void handleCcPresetsSave(cmd, serverLink);
+      void handleCcPresetsSave(cmd, serverLink).catch((err) => {
+        logger.error({ err }, 'Unhandled CC preset save failure');
+      });
       break;
     case CC_PRESET_MSG.DISCOVER_MODELS:
       void handleCcPresetsDiscoverModels(cmd, serverLink);
@@ -7413,12 +7415,30 @@ async function handleCcPresetsList(serverLink: ServerLink): Promise<void> {
 }
 
 async function handleCcPresetsSave(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
-  const presets = cmd.presets as CcPreset[] | undefined;
-  if (!presets) return;
-  const { savePresets, invalidateCache } = await import('./cc-presets.js');
-  invalidateCache();
-  await savePresets(presets);
-  serverLink.send({ type: CC_PRESET_MSG.SAVE_RESPONSE, ok: true });
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
+  const presets = Array.isArray(cmd.presets) ? cmd.presets as CcPreset[] : undefined;
+  if (!presets) {
+    serverLink.send({
+      type: CC_PRESET_MSG.SAVE_RESPONSE,
+      ...(requestId ? { requestId } : {}),
+      ok: false,
+      error: 'presets is required',
+    });
+    return;
+  }
+  const { savePresets } = await import('./cc-presets.js');
+  try {
+    await savePresets(presets);
+    serverLink.send({ type: CC_PRESET_MSG.SAVE_RESPONSE, ...(requestId ? { requestId } : {}), ok: true });
+  } catch (err) {
+    logger.error({ err }, 'Failed to save CC presets');
+    serverLink.send({
+      type: CC_PRESET_MSG.SAVE_RESPONSE,
+      ...(requestId ? { requestId } : {}),
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 async function handleCcPresetsDiscoverModels(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
@@ -7436,7 +7456,6 @@ async function handleCcPresetsDiscoverModels(cmd: Record<string, unknown>, serve
   }
 
   const { discoverPresetModels, loadPresets, savePresets, getPreset } = await import('./cc-presets.js');
-  const presets = await loadPresets();
   const preset = await getPreset(presetName);
   if (!preset) {
     serverLink.send({
@@ -7449,20 +7468,22 @@ async function handleCcPresetsDiscoverModels(cmd: Record<string, unknown>, serve
     return;
   }
 
-  const normalizedName = preset.name.trim().toLowerCase();
+  const normalizedName = normalizeCcPresetName(preset.name);
   try {
     const discovered = await discoverPresetModels(preset);
+    const latestPresets = await loadPresets();
+    const latestPreset = latestPresets.find((item) => normalizeCcPresetName(item.name) === normalizedName) ?? preset;
     const updatedPreset: CcPreset = {
-      ...preset,
-      transportMode: preset.transportMode ?? 'qwen-compatible-api',
-      authType: preset.authType ?? 'anthropic',
+      ...latestPreset,
+      transportMode: latestPreset.transportMode ?? 'qwen-compatible-api',
+      authType: latestPreset.authType ?? 'anthropic',
       availableModels: discovered.availableModels,
       ...(discovered.defaultModel ? { defaultModel: discovered.defaultModel } : {}),
       lastDiscoveredAt: Date.now(),
       modelDiscoveryError: undefined,
     };
-    await savePresets(presets.map((item) => (
-      item.name.trim().toLowerCase() === normalizedName ? updatedPreset : item
+    await savePresets(latestPresets.map((item) => (
+      normalizeCcPresetName(item.name) === normalizedName ? updatedPreset : item
     )));
     serverLink.send({
       type: CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE,
@@ -7475,12 +7496,14 @@ async function handleCcPresetsDiscoverModels(cmd: Record<string, unknown>, serve
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    const latestPresets = await loadPresets();
+    const latestPreset = latestPresets.find((item) => normalizeCcPresetName(item.name) === normalizedName) ?? preset;
     const updatedPreset: CcPreset = {
-      ...preset,
+      ...latestPreset,
       modelDiscoveryError: message,
     };
-    await savePresets(presets.map((item) => (
-      item.name.trim().toLowerCase() === normalizedName ? updatedPreset : item
+    await savePresets(latestPresets.map((item) => (
+      normalizeCcPresetName(item.name) === normalizedName ? updatedPreset : item
     )));
     serverLink.send({
       type: CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE,

@@ -485,7 +485,11 @@
     "api_provider": "API Provider",
     "api_provider_add_edit": "+ 追加 / 編集",
     "api_provider_default": "既定（Anthropic）",
-    "api_provider_default_help": "既定（Anthropic）— 「+ 追加 / 編集」をクリックして設定"
+    "api_provider_default_help": "既定（Anthropic）— 「+ 追加 / 編集」をクリックして設定",
+    "api_provider_import_json": "JSONをインポート",
+    "api_provider_export_json": "JSONをエクスポート",
+    "api_provider_import_error": "クリップボードから preset JSON をインポートできませんでした",
+    "api_provider_export_error": "preset JSON をクリップボードにコピーできませんでした"
   },
   "api_key": {
     "copy": "コピー",

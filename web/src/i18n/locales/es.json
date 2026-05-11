@@ -485,7 +485,11 @@
     "api_provider": "Proveedor de API",
     "api_provider_add_edit": "+ Agregar / Editar",
     "api_provider_default": "Predeterminado (Anthropic)",
-    "api_provider_default_help": "Predeterminado (Anthropic) — haz clic en \"+ Agregar / Editar\" para configurarlo"
+    "api_provider_default_help": "Predeterminado (Anthropic) — haz clic en \"+ Agregar / Editar\" para configurarlo",
+    "api_provider_import_json": "Importar JSON",
+    "api_provider_export_json": "Exportar JSON",
+    "api_provider_import_error": "No se pudo importar el JSON del preset desde el portapapeles",
+    "api_provider_export_error": "No se pudo copiar el JSON del preset al portapapeles"
   },
   "api_key": {
     "copy": "Copiar",

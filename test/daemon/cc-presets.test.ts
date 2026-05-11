@@ -137,4 +137,64 @@ describe('cc presets', () => {
       },
     });
   });
+
+  it('keeps the preset-pinned model authoritative when discovered models are stale', async () => {
+    const { savePresets, getQwenPresetTransportConfig, getPresetAvailableModelIds } = await import('../../src/daemon/cc-presets.js');
+
+    await savePresets([
+      {
+        name: 'minimax',
+        env: {
+          ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+          ANTHROPIC_AUTH_TOKEN: 'test-token',
+          ANTHROPIC_MODEL: 'MiniMax-M2.7',
+        },
+        defaultModel: 'stale-discovered-default',
+        availableModels: [
+          { id: 'stale-discovered-default' },
+          { id: 'MiniMax-Text-01' },
+        ],
+      },
+    ]);
+
+    const result = await getQwenPresetTransportConfig('MiniMax');
+    expect(getPresetAvailableModelIds({
+      env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+      defaultModel: 'stale-discovered-default',
+      availableModels: [{ id: 'MiniMax-Text-01' }],
+    })).toEqual(['MiniMax-M2.7', 'stale-discovered-default', 'MiniMax-Text-01']);
+    expect(result.model).toBe('MiniMax-M2.7');
+    expect(result.availableModels).toEqual(['MiniMax-M2.7', 'stale-discovered-default', 'MiniMax-Text-01']);
+    expect(result.settings).toMatchObject({
+      model: { name: 'MiniMax-M2.7' },
+      modelProviders: {
+        anthropic: [
+          expect.objectContaining({ id: 'MiniMax-M2.7' }),
+          expect.objectContaining({ id: 'stale-discovered-default' }),
+          expect.objectContaining({ id: 'MiniMax-Text-01' }),
+        ],
+      },
+    });
+  });
+
+  it('deduplicates preset names case-insensitively and keeps the last saved reference', async () => {
+    const { savePresets, loadPresets, getPreset } = await import('../../src/daemon/cc-presets.js');
+
+    await savePresets([
+      {
+        name: 'minimax',
+        env: { ANTHROPIC_BASE_URL: 'https://old.example', ANTHROPIC_MODEL: 'old-model' },
+      },
+      {
+        name: 'MiniMax',
+        env: { ANTHROPIC_BASE_URL: 'https://new.example', ANTHROPIC_MODEL: 'new-model' },
+      },
+    ]);
+
+    expect(await loadPresets()).toHaveLength(1);
+    await expect(getPreset('minimax')).resolves.toMatchObject({
+      name: 'MiniMax',
+      env: { ANTHROPIC_BASE_URL: 'https://new.example', ANTHROPIC_MODEL: 'new-model' },
+    });
+  });
 });

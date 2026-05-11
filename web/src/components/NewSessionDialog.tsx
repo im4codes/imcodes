@@ -32,7 +32,12 @@ import {
   type CcPresetEntry,
 } from "./cc-preset-form.js";
 import { CC_PRESET_MSG } from "@shared/cc-presets.js";
-import type { CcPreset } from "@shared/cc-presets.js";
+import {
+  getCcPresetAvailableModelIds,
+  getCcPresetEffectiveModel,
+  normalizeCcPresetName,
+  type CcPreset,
+} from "@shared/cc-presets.js";
 import { CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions } from "../../../src/shared/models/options.js";
 import { loadCodexModelPreference } from "../codex-model-preference.js";
 
@@ -145,10 +150,11 @@ export function NewSessionDialog({
   });
   const persistPresetDraft = (): CcPresetEntry => {
     const preset = buildCcPresetFromDraft(buildCurrentPresetDraft());
-    const updated = [...ccPresets.filter((p) => p.name !== preset.name), preset];
+    const presetKey = normalizeCcPresetName(preset.name);
+    const updated = [...ccPresets.filter((p) => normalizeCcPresetName(p.name) !== presetKey), preset];
     setCcPresets(updated);
     try {
-      ws?.send({ type: CC_PRESET_MSG.SAVE, presets: updated });
+      ws?.send({ type: CC_PRESET_MSG.SAVE, requestId: `cc-preset-save-${Date.now()}`, presets: updated });
     } catch {}
     return preset;
   };
@@ -157,9 +163,33 @@ export function NewSessionDialog({
     [ccPreset, ccPresets],
   );
   const qwenPresetModels = useMemo(
-    () => selectedCcPreset?.availableModels?.map((item) => item.id) ?? [],
+    () => selectedCcPreset ? getCcPresetAvailableModelIds(selectedCcPreset) : [],
     [selectedCcPreset],
   );
+  const importPresetFromClipboard = async () => {
+    try {
+      if (!navigator.clipboard) throw new Error('Clipboard unavailable');
+      const parsed = JSON.parse(await navigator.clipboard.readText()) as CcPresetEntry;
+      if (!parsed || typeof parsed.name !== 'string' || !parsed.env || typeof parsed.env !== 'object') {
+        throw new Error('Invalid preset JSON');
+      }
+      applyPresetDraft(createCcPresetDraftFromPreset(parsed));
+      setCcPreset(parsed.name);
+      setShowPresetEditor(true);
+      setPresetError('');
+    } catch {
+      setPresetError(t('new_session.api_provider_import_error'));
+    }
+  };
+  const exportPresetToClipboard = async (preset: CcPresetEntry) => {
+    try {
+      if (!navigator.clipboard) throw new Error('Clipboard unavailable');
+      await navigator.clipboard.writeText(JSON.stringify(preset, null, 2));
+      setPresetError('');
+    } catch {
+      setPresetError(t('new_session.api_provider_export_error'));
+    }
+  };
 
   // OpenClaw-specific state
   const [ocMode, setOcMode] = useState<OpenClawMode>("new");
@@ -194,17 +224,17 @@ export function NewSessionDialog({
       if (msg.type === CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE) {
         setDiscoveringPreset(false);
         if (msg.preset) {
+          const presetKey = normalizeCcPresetName(msg.preset.name);
           setCcPresets((current) => [
-            ...current.filter((preset) => preset.name !== msg.preset?.name),
+            ...current.filter((preset) => normalizeCcPresetName(preset.name) !== presetKey),
             msg.preset,
           ].filter((preset): preset is CcPreset => preset !== undefined));
           if (newPresetName.trim().toLowerCase() === msg.preset.name.trim().toLowerCase()) {
             applyPresetDraft(createCcPresetDraftFromPreset(msg.preset));
           }
           if (ccPreset === msg.preset.name || !ccPreset) setCcPreset(msg.preset.name);
-          const nextModel = msg.preset.defaultModel
-            ?? msg.preset.availableModels?.[0]?.id
-            ?? msg.preset.env.ANTHROPIC_MODEL;
+          const nextModel = getCcPresetEffectiveModel(msg.preset)
+            ?? getCcPresetAvailableModelIds(msg.preset)[0];
           if (nextModel) setRequestedModel(nextModel);
         }
         setPresetError(msg.ok ? "" : (msg.error ?? "Failed to discover models"));
@@ -421,17 +451,14 @@ export function NewSessionDialog({
     : null;
   const transportModels = useTransportModels(ws, dynamicModelsAgentType);
   const modelSuggestions = useMemo(() => {
+    if (agentType === "qwen" && selectedCcPreset) return qwenPresetModels;
     if (transportModels.models.length > 0) {
       const dynamicModelIds = transportModels.models.map((m) => m.id);
       return agentType === "gemini-sdk"
         ? mergeModelSuggestions(GEMINI_SDK_MODEL_FALLBACK, dynamicModelIds)
         : dynamicModelIds;
     }
-    if (agentType === "qwen") {
-      return qwenPresetModels.length > 0
-        ? qwenPresetModels
-        : (selectedCcPreset?.defaultModel ? [selectedCcPreset.defaultModel] : []);
-    }
+    if (agentType === "qwen") return qwenPresetModels;
     if (agentType === "copilot-sdk") return [...COPILOT_SDK_MODEL_FALLBACK];
     if (agentType === "codex-sdk") return [...CODEX_SDK_MODEL_FALLBACK];
     if (agentType === "cursor-headless") return [...CURSOR_HEADLESS_MODEL_FALLBACK];
@@ -459,8 +486,7 @@ export function NewSessionDialog({
 
   useEffect(() => {
     if (agentType !== "qwen") return;
-    const fallbackModel =
-      selectedCcPreset?.defaultModel ?? selectedCcPreset?.env.ANTHROPIC_MODEL ?? "";
+    const fallbackModel = selectedCcPreset ? (getCcPresetEffectiveModel(selectedCcPreset) ?? "") : "";
     setRequestedModel((current) => {
       if (modelSuggestions.length === 0) {
         return current || fallbackModel;
@@ -758,14 +784,14 @@ export function NewSessionDialog({
                   <option value="">
                     {t("new_session.api_provider_default")}
                   </option>
-                  {ccPresets.map((p) => (
-                    <option key={p.name} value={p.name}>
-                      {p.name}
-                      {(p.defaultModel ?? p.env["ANTHROPIC_MODEL"])
-                        ? ` (${p.defaultModel ?? p.env["ANTHROPIC_MODEL"]})`
-                        : ""}
-                    </option>
-                  ))}
+	                  {ccPresets.map((p) => (
+	                    <option key={p.name} value={p.name}>
+	                      {p.name}
+	                      {getCcPresetEffectiveModel(p)
+	                        ? ` (${getCcPresetEffectiveModel(p)})`
+	                        : ""}
+	                    </option>
+	                  ))}
                 </select>
               )}
               {ccPresets.length === 0 && !showPresetEditor && (
@@ -1087,6 +1113,22 @@ export function NewSessionDialog({
                 </button>
                 <button
                   type="button"
+                  style={{
+                    background: "#334155",
+                    border: "none",
+                    color: "#fff",
+                    padding: "4px 12px",
+                    borderRadius: 4,
+                    cursor: "pointer",
+                    fontSize: 12,
+                    marginLeft: 8,
+                  }}
+                  onClick={() => { void importPresetFromClipboard(); }}
+                >
+                  {t('new_session.api_provider_import_json')}
+                </button>
+                <button
+                  type="button"
                   disabled={
                     discoveringPreset
                     || !newPresetName.trim()
@@ -1164,10 +1206,10 @@ export function NewSessionDialog({
                         }}
                       >
                         <span style={{ color: "#e2e8f0" }}>
-                          {p.name}{" "}
-                          <span style={{ color: "#475569" }}>
-                            {p.env["ANTHROPIC_MODEL"] ?? ""}
-                          </span>
+	                          {p.name}{" "}
+	                          <span style={{ color: "#475569" }}>
+	                            {getCcPresetEffectiveModel(p) ?? ""}
+	                          </span>
                         </span>
                         <div style={{ display: "flex", gap: 4 }}>
                           <button
@@ -1195,21 +1237,35 @@ export function NewSessionDialog({
                               cursor: "pointer",
                               fontSize: 11,
                             }}
-                            onClick={() => {
-                              const updated = ccPresets.filter(
-                                (x) => x.name !== p.name,
-                              );
+	                            onClick={() => {
+	                              const updated = ccPresets.filter(
+	                                (x) => normalizeCcPresetName(x.name) !== normalizeCcPresetName(p.name),
+	                              );
                               setCcPresets(updated);
                               try {
-                                ws?.send({
-                                  type: CC_PRESET_MSG.SAVE,
-                                  presets: updated,
-                                });
+	                                ws?.send({
+	                                  type: CC_PRESET_MSG.SAVE,
+	                                  requestId: `cc-preset-save-${Date.now()}`,
+	                                  presets: updated,
+	                                });
                               } catch {}
                               if (ccPreset === p.name) setCcPreset("");
                             }}
+	                          >
+	                            Delete
+	                          </button>
+                          <button
+                            type="button"
+                            style={{
+                              background: "none",
+                              border: "none",
+                              color: "#22c55e",
+                              cursor: "pointer",
+                              fontSize: 11,
+                            }}
+                            onClick={() => { void exportPresetToClipboard(p); }}
                           >
-                            Delete
+                            {t('new_session.api_provider_export_json')}
                           </button>
                         </div>
                       </div>

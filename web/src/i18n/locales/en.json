@@ -486,7 +486,11 @@
     "api_provider": "API Provider",
     "api_provider_add_edit": "+ Add / Edit",
     "api_provider_default": "Default (Anthropic)",
-    "api_provider_default_help": "Default (Anthropic) — click \"+ Add / Edit\" to configure"
+    "api_provider_default_help": "Default (Anthropic) — click \"+ Add / Edit\" to configure",
+    "api_provider_import_json": "Import JSON",
+    "api_provider_export_json": "Export JSON",
+    "api_provider_import_error": "Failed to import preset JSON from clipboard",
+    "api_provider_export_error": "Failed to copy preset JSON to clipboard"
   },
   "api_key": {
     "copy": "Copy",

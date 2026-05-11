@@ -485,7 +485,11 @@
     "api_provider": "Провайдер API",
     "api_provider_add_edit": "+ Добавить / Изменить",
     "api_provider_default": "По умолчанию (Anthropic)",
-    "api_provider_default_help": "По умолчанию (Anthropic) — нажмите \"+ Добавить / Изменить\", чтобы настроить"
+    "api_provider_default_help": "По умолчанию (Anthropic) — нажмите \"+ Добавить / Изменить\", чтобы настроить",
+    "api_provider_import_json": "Импорт JSON",
+    "api_provider_export_json": "Экспорт JSON",
+    "api_provider_import_error": "Не удалось импортировать JSON preset из буфера обмена",
+    "api_provider_export_error": "Не удалось скопировать JSON preset в буфер обмена"
   },
   "api_key": {
     "copy": "Копировать",
