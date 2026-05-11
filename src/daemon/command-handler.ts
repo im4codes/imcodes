@@ -28,6 +28,7 @@ import {
 import logger from '../util/logger.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID, MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
+import { TIMELINE_HISTORY_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
 import { homedir } from 'os';
 import { lstat as fsLstat, open as fsOpen, readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, stat as fsStat, unlink as fsUnlink, writeFile as fsWriteFile } from 'node:fs/promises';
 import * as nodePath from 'node:path';
@@ -4259,7 +4260,7 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
       result = await buildTimelineHistoryWithWorker(params);
     } catch (err) {
       const reason = err instanceof TimelineHistoryPoolError ? err.reason : 'unknown';
-      if (reason === 'projection_unavailable') {
+      if (reason === TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE) {
         logger.debug({ sessionName, requestId, reason }, 'timeline.history worker unavailable; falling back to projection client');
         result = await buildTimelineHistoryOnMain(params);
       } else {

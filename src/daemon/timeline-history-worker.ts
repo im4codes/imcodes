@@ -10,6 +10,7 @@ import type {
   TimelineHistoryWorkerResult,
   TimelineHistoryWorkerSuccess,
 } from './timeline-history-worker-types.js';
+import { TIMELINE_HISTORY_WORKER_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
@@ -111,7 +112,7 @@ export async function handleTimelineHistoryWorkerRequest(
   const tRead = Date.now();
   try {
     if (!sessionProjectionReady(message.sessionName)) {
-      return workerError(message, 'projection_unavailable');
+      return workerError(message, TIMELINE_HISTORY_WORKER_ERROR_REASONS.PROJECTION_UNAVAILABLE);
     }
 
     const limit = Math.max(1, Math.min(Math.trunc(message.limit), 2000));
@@ -166,7 +167,7 @@ export async function handleTimelineHistoryWorkerRequest(
     };
     return response;
   } catch {
-    return workerError(message, 'internal_error');
+    return workerError(message, TIMELINE_HISTORY_WORKER_ERROR_REASONS.INTERNAL_ERROR);
   }
 }
 

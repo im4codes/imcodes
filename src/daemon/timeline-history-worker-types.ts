@@ -1,4 +1,7 @@
 import type { TimelineEvent, TimelineEventType } from './timeline-event.js';
+import type { TimelineHistoryWorkerErrorReason } from '../../shared/timeline-history-errors.js';
+
+export type { TimelineHistoryWorkerErrorReason };
 
 export const DEFAULT_TIMELINE_HISTORY_WORKERS_TARGET = 2;
 export const MIN_TIMELINE_HISTORY_WORKERS_TARGET = 1;
@@ -25,10 +28,6 @@ export interface TimelineHistoryBuildJobInput {
 }
 
 export interface TimelineHistoryWorkerRequest extends TimelineHistoryBuildJobInput, TimelineHistoryWorkerIdentity {}
-
-export type TimelineHistoryWorkerErrorReason =
-  | 'projection_unavailable'
-  | 'internal_error';
 
 export interface TimelineHistoryWorkerSuccess extends TimelineHistoryWorkerIdentity {
   kind: 'success';

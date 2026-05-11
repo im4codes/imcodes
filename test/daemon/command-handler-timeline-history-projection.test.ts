@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { TIMELINE_HISTORY_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
 
 const {
   getSessionMock,
@@ -167,7 +168,9 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
   it('falls back to the projection client when the history worker reports projection_unavailable', async () => {
     shouldUseHistoryWorkerMock.mockReturnValue(true);
     getSessionMock.mockReturnValue({ name: 'deck_fallback', agentType: 'codex' });
-    historyWorkerDispatchMock.mockRejectedValue(new TimelineHistoryPoolErrorMock('projection_unavailable'));
+    historyWorkerDispatchMock.mockRejectedValue(new TimelineHistoryPoolErrorMock(
+      TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE,
+    ));
     readByTypesPreferredMock.mockImplementation(async (_session: string, types: string[]) => (
       types.includes('session.state')
         ? [

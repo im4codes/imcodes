@@ -1,6 +1,7 @@
 import { Worker } from 'node:worker_threads';
 import logger from '../util/logger.js';
 import { getProjectionDbPath } from './timeline-projection.js';
+import { TIMELINE_HISTORY_ERROR_REASONS, type TimelineHistoryErrorReason } from '../../shared/timeline-history-errors.js';
 import {
   DEFAULT_TIMELINE_HISTORY_POOL_QUEUE_CAP,
   DEFAULT_TIMELINE_HISTORY_WORKERS_TARGET,
@@ -18,14 +19,7 @@ import {
   type TimelineHistoryWorkerSuccess,
 } from './timeline-history-worker-types.js';
 
-export type TimelineHistoryPoolErrorReason =
-  | 'queue_full'
-  | 'unavailable'
-  | 'crashed'
-  | 'shutdown'
-  | 'timeout'
-  | 'projection_unavailable'
-  | 'internal_error';
+export type TimelineHistoryPoolErrorReason = TimelineHistoryErrorReason;
 
 export class TimelineHistoryPoolError extends Error {
   constructor(readonly reason: TimelineHistoryPoolErrorReason, message = reason) {
@@ -139,11 +133,11 @@ export class TimelineHistoryWorkerPool {
   }
 
   async dispatch(input: TimelineHistoryBuildJobInput, options: TimelineHistoryDispatchOptions = {}): Promise<TimelineHistoryWorkerSuccess> {
-    if (this.shuttingDown) throw new TimelineHistoryPoolError('shutdown');
+    if (this.shuttingDown) throw new TimelineHistoryPoolError(TIMELINE_HISTORY_ERROR_REASONS.SHUTDOWN);
     const deadlineAt = Number.isFinite(options.deadlineAt ?? NaN) ? Math.trunc(options.deadlineAt as number) : null;
-    if (deadlineAt !== null && deadlineAt <= this.clock.now()) throw new TimelineHistoryPoolError('timeout');
+    if (deadlineAt !== null && deadlineAt <= this.clock.now()) throw new TimelineHistoryPoolError(TIMELINE_HISTORY_ERROR_REASONS.TIMEOUT);
     this.ensureStarted();
-    if (this.queue.length >= this.queueCap) throw new TimelineHistoryPoolError('queue_full');
+    if (this.queue.length >= this.queueCap) throw new TimelineHistoryPoolError(TIMELINE_HISTORY_ERROR_REASONS.QUEUE_FULL);
     return await new Promise<TimelineHistoryWorkerSuccess>((resolve, reject) => {
       this.queue.push({ input, deadlineAt, resolve, reject });
       this.pump();
@@ -217,7 +211,7 @@ export class TimelineHistoryWorkerPool {
     const active = slot.currentJob;
     if (active) {
       this.clearActiveTimer(active);
-      active.reject(new TimelineHistoryPoolError('crashed'));
+      active.reject(new TimelineHistoryPoolError(TIMELINE_HISTORY_ERROR_REASONS.CRASHED));
     }
     slot.currentJob = null;
     slot.worker = null;
@@ -243,7 +237,7 @@ export class TimelineHistoryWorkerPool {
       const queued = this.queue.shift();
       if (!queued) return;
       if (queued.deadlineAt !== null && queued.deadlineAt <= this.clock.now()) {
-        queued.reject(new TimelineHistoryPoolError('timeout'));
+        queued.reject(new TimelineHistoryPoolError(TIMELINE_HISTORY_ERROR_REASONS.TIMEOUT));
         continue;
       }
       const identity: TimelineHistoryWorkerIdentity = {
@@ -260,7 +254,7 @@ export class TimelineHistoryWorkerPool {
       } catch (error) {
         this.clearActiveTimer(active);
         slot.currentJob = null;
-        queued.reject(new TimelineHistoryPoolError('unavailable'));
+        queued.reject(new TimelineHistoryPoolError(TIMELINE_HISTORY_ERROR_REASONS.UNAVAILABLE));
         this.handleWorkerFailure(slot, slot.generation, error instanceof Error ? error : new Error(String(error)));
       }
     }
@@ -293,7 +287,7 @@ export class TimelineHistoryWorkerPool {
     const active = slot.currentJob;
     if (!active || !sameIdentity(active.identity, identity)) return;
     this.clearActiveTimer(active);
-    active.reject(new TimelineHistoryPoolError('timeout'));
+    active.reject(new TimelineHistoryPoolError(TIMELINE_HISTORY_ERROR_REASONS.TIMEOUT));
     slot.currentJob = null;
     const worker = slot.worker;
     slot.worker = null;
@@ -311,13 +305,13 @@ export class TimelineHistoryWorkerPool {
     if (this.queue.length === 0) return;
     const hasLiveCapacity = this.slots.some((slot) => slot.state === 'idle' || slot.state === 'busy');
     if (hasLiveCapacity) return;
-    const error = new TimelineHistoryPoolError('unavailable');
+    const error = new TimelineHistoryPoolError(TIMELINE_HISTORY_ERROR_REASONS.UNAVAILABLE);
     while (this.queue.length > 0) this.queue.shift()?.reject(error);
   }
 
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
-    const error = new TimelineHistoryPoolError('shutdown');
+    const error = new TimelineHistoryPoolError(TIMELINE_HISTORY_ERROR_REASONS.SHUTDOWN);
     while (this.queue.length > 0) this.queue.shift()?.reject(error);
     const terminations: Promise<unknown>[] = [];
     for (const slot of this.slots) {

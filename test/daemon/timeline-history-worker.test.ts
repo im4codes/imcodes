@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 import type { TimelineEvent } from '../../src/daemon/timeline-event.js';
 import type { TimelineHistoryWorkerRequest } from '../../src/daemon/timeline-history-worker-types.js';
+import { TIMELINE_HISTORY_WORKER_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
@@ -185,7 +186,7 @@ describe('timeline history worker', () => {
 
     expect(result).toMatchObject({
       kind: 'error',
-      reason: 'projection_unavailable',
+      reason: TIMELINE_HISTORY_WORKER_ERROR_REASONS.PROJECTION_UNAVAILABLE,
       sanitized: true,
     });
   });

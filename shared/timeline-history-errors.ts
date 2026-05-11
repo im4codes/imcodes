@@ -1,0 +1,22 @@
+import { FS_GENERIC_ERROR_CODES } from './fs-error-codes.js';
+
+export const TIMELINE_HISTORY_ERROR_REASONS = {
+  QUEUE_FULL: 'queue_full',
+  UNAVAILABLE: 'unavailable',
+  CRASHED: 'crashed',
+  SHUTDOWN: 'shutdown',
+  TIMEOUT: 'timeout',
+  PROJECTION_UNAVAILABLE: 'projection_unavailable',
+  INTERNAL_ERROR: FS_GENERIC_ERROR_CODES.INTERNAL_ERROR,
+} as const;
+
+export type TimelineHistoryErrorReason =
+  (typeof TIMELINE_HISTORY_ERROR_REASONS)[keyof typeof TIMELINE_HISTORY_ERROR_REASONS];
+
+export const TIMELINE_HISTORY_WORKER_ERROR_REASONS = {
+  PROJECTION_UNAVAILABLE: TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE,
+  INTERNAL_ERROR: TIMELINE_HISTORY_ERROR_REASONS.INTERNAL_ERROR,
+} as const;
+
+export type TimelineHistoryWorkerErrorReason =
+  (typeof TIMELINE_HISTORY_WORKER_ERROR_REASONS)[keyof typeof TIMELINE_HISTORY_WORKER_ERROR_REASONS];
