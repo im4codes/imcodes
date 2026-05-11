@@ -30,6 +30,7 @@ import { isImeComposingKeyEvent } from '../ime-keyboard.js';
 import { isRunningSessionState } from '../thinking-utils.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { MSG_COMMAND_FAILED } from '@shared/ack-protocol.js';
+import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
 import { isLegacyTransportPendingMessageId, normalizeTransportPendingEntries } from '../transport-queue.js';
 import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 import {
@@ -136,6 +137,7 @@ interface Props {
 }
 
 const MAX_UPLOAD_SIZE_MB = Math.round(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE / (1024 * 1024));
+export const OPENSPEC_LIST_REQUEST_TIMEOUT_MS = 12_000;
 const TRANSPORT_QUEUE_HIDDEN_KEY_PREFIX = 'imcodes:transport-queue-hidden:';
 type LocalQueuedTransportEntry = {
   clientMessageId: string;
@@ -601,6 +603,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const openSpecAuditButtonRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
   const openSpecProposeButtonRef = useRef<HTMLButtonElement | null>(null);
   const openSpecRequestIdRef = useRef<string | null>(null);
+  const openSpecRequestTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const quickWrapRef = useRef<HTMLDivElement>(null);
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const showRunningSweep = !compact && isRunningSessionState(activeSession?.state);
@@ -626,6 +629,22 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     }
     return [...byId.values()];
   }, [incomingQueuedTransportEntries, optimisticQueuedEntries]);
+
+  const clearOpenSpecRequestTimer = useCallback(() => {
+    if (openSpecRequestTimerRef.current) {
+      clearTimeout(openSpecRequestTimerRef.current);
+      openSpecRequestTimerRef.current = null;
+    }
+  }, []);
+
+  const formatOpenSpecLoadError = useCallback((error?: string | null) => {
+    const raw = error?.trim();
+    if (!raw) return t('openspec.load_error');
+    if (raw === FS_READ_ERROR_CODES.PREVIEW_BRIDGE_TIMEOUT || raw === FS_READ_ERROR_CODES.FS_LIST_TIMEOUT) {
+      return t('openspec.load_timeout');
+    }
+    return raw;
+  }, [t]);
   const queuedTransportMessages = queuedTransportEntries.map((entry) => entry.text);
   const queuedTransportLatestMessage = queuedTransportMessages[queuedTransportMessages.length - 1] ?? '';
   const editingQueuedEntry = editingQueuedMessageId
@@ -1144,7 +1163,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setPendingComboSendConfirm(null);
     setRememberComboSendChoice(false);
   }, [activeSession?.name]);
+  useEffect(() => () => clearOpenSpecRequestTimer(), [clearOpenSpecRequestTimer]);
   useEffect(() => {
+    clearOpenSpecRequestTimer();
     setOpenSpecOpen(false);
     setOpenSpecChanges([]);
     setOpenSpecError(null);
@@ -1152,7 +1173,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setOpenSpecAuditMenu(null);
     setOpenSpecExpandedChange(null);
     openSpecRequestIdRef.current = null;
-  }, [activeSession?.projectDir]);
+  }, [activeSession?.projectDir, clearOpenSpecRequestTimer]);
 
   // Close menus when clicking outside
   useEffect(() => {
@@ -1381,11 +1402,35 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, []);
 
   const refreshOpenSpecChanges = useCallback(() => {
-    if (!ws || !openSpecChangesPath) return;
+    clearOpenSpecRequestTimer();
+    openSpecRequestIdRef.current = null;
+    if (!ws || !openSpecChangesPath) {
+      setOpenSpecLoading(false);
+      setOpenSpecChanges([]);
+      setOpenSpecError(null);
+      return;
+    }
     setOpenSpecLoading(true);
     setOpenSpecError(null);
-    openSpecRequestIdRef.current = ws.fsListDir(openSpecChangesPath, false, false);
-  }, [openSpecChangesPath, ws]);
+    let requestId: string;
+    try {
+      requestId = ws.fsListDir(openSpecChangesPath, false, false);
+    } catch {
+      setOpenSpecLoading(false);
+      setOpenSpecChanges([]);
+      setOpenSpecError(t('openspec.load_unavailable'));
+      return;
+    }
+    openSpecRequestIdRef.current = requestId;
+    openSpecRequestTimerRef.current = setTimeout(() => {
+      if (openSpecRequestIdRef.current !== requestId) return;
+      openSpecRequestIdRef.current = null;
+      openSpecRequestTimerRef.current = null;
+      setOpenSpecLoading(false);
+      setOpenSpecChanges([]);
+      setOpenSpecError(t('openspec.load_timeout'));
+    }, OPENSPEC_LIST_REQUEST_TIMEOUT_MS);
+  }, [clearOpenSpecRequestTimer, openSpecChangesPath, t, ws]);
 
   const insertOpenSpecPrompt = useCallback((kind: 'audit_implementation' | 'audit_spec' | 'implement' | 'propose_from_discussion' | 'propose_from_description', reference?: string) => {
     const prompt = kind === 'audit_implementation'
@@ -1471,7 +1516,19 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         >
           <div class="openspec-mobile-header">
             <span class="openspec-mobile-title">{t('openspec.title')}</span>
-            <button class="openspec-mobile-close" onClick={() => { setOpenSpecOpen(false); setOpenSpecAuditMenu(null); setOpenSpecProposeMenuOpen(false); }}>✕</button>
+            <button
+              class="openspec-mobile-close"
+              onClick={() => {
+                clearOpenSpecRequestTimer();
+                openSpecRequestIdRef.current = null;
+                setOpenSpecLoading(false);
+                setOpenSpecOpen(false);
+                setOpenSpecAuditMenu(null);
+                setOpenSpecProposeMenuOpen(false);
+              }}
+            >
+              ✕
+            </button>
           </div>
           {content}
         </div>
@@ -1488,7 +1545,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       </div>,
       document.body,
     );
-  }, [isOpenSpecMobile, openSpecDropdownStyle, t]);
+  }, [clearOpenSpecRequestTimer, isOpenSpecMobile, openSpecDropdownStyle, t]);
 
   useEffect(() => {
     if (!openSpecOpen || typeof window === 'undefined') return;
@@ -1592,6 +1649,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       }
       if (msg.type === DAEMON_MSG.DISCONNECTED) {
         rejectAllPendingP2pConfigSaves(P2P_CONFIG_ERROR.SAVE_TIMEOUT);
+        if (openSpecRequestIdRef.current) {
+          clearOpenSpecRequestTimer();
+          openSpecRequestIdRef.current = null;
+          setOpenSpecLoading(false);
+          setOpenSpecChanges([]);
+          setOpenSpecError(t('openspec.load_unavailable'));
+        }
         return;
       }
       if (msg.type === DAEMON_MSG.RECONNECTED) {
@@ -1603,21 +1667,23 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             }
           });
         }
+        if (openSpecOpen) refreshOpenSpecChanges();
         return;
       }
       const requestId = openSpecRequestIdRef.current;
       if (!requestId || msg.type !== 'fs.ls_response' || msg.requestId !== requestId) return;
       openSpecRequestIdRef.current = null;
+      clearOpenSpecRequestTimer();
       setOpenSpecLoading(false);
       if (msg.status === 'error') {
-        const errorText = msg.error ?? 'Unable to scan OpenSpec changes';
-        if (/enoent|not found|no such file/i.test(errorText)) {
+        const errorText = msg.error ?? null;
+        if (errorText === FS_READ_ERROR_CODES.FORBIDDEN_PATH || /enoent|not found|no such file/i.test(errorText ?? '')) {
           setOpenSpecChanges([]);
           setOpenSpecError(null);
           return;
         }
         setOpenSpecChanges([]);
-        setOpenSpecError(errorText);
+        setOpenSpecError(formatOpenSpecLoadError(errorText));
         return;
       }
       const changeNames = (msg.entries ?? [])
@@ -1627,7 +1693,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       setOpenSpecChanges(changeNames);
       setOpenSpecError(null);
     });
-  }, [persistP2pConfigToDaemon, p2pSavedConfig, rejectAllPendingP2pConfigSaves, resolvePendingP2pConfigSave, rootSession, serverId, ws]);
+  }, [clearOpenSpecRequestTimer, formatOpenSpecLoadError, openSpecOpen, persistP2pConfigToDaemon, p2pSavedConfig, refreshOpenSpecChanges, rejectAllPendingP2pConfigSaves, resolvePendingP2pConfigSave, rootSession, serverId, t, ws]);
 
   useEffect(() => {
     if (!hasConfiguredP2pParticipants && isComboMode(p2pMode)) {
@@ -2559,6 +2625,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 setOpenSpecOpen((open) => {
                   const next = !open;
                   if (!next) {
+                    clearOpenSpecRequestTimer();
+                    openSpecRequestIdRef.current = null;
+                    setOpenSpecLoading(false);
                     setOpenSpecAuditMenu(null);
                     setOpenSpecProposeMenuOpen(false);
                   }

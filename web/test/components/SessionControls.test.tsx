@@ -19,6 +19,9 @@ vi.mock('react-i18next', () => ({
       if (key === 'openspec.title') return 'OpenSpec';
       if (key === 'openspec.changes') return 'changes';
       if (key === 'openspec.empty') return 'empty';
+      if (key === 'openspec.load_timeout') return 'openspec_timeout';
+      if (key === 'openspec.load_unavailable') return 'openspec_unavailable';
+      if (key === 'openspec.load_error') return 'openspec_error';
       if (key === 'openspec.audit_action') return 'audit_action';
       if (key === 'openspec.audit_implementation_action') return 'audit_implementation_action';
       if (key === 'openspec.audit_spec_action') return 'audit_spec_action';
@@ -186,7 +189,7 @@ vi.mock('../../src/api.js', () => ({
   onUserPrefChanged: (...args: unknown[]) => onUserPrefChangedMock(...args as Parameters<typeof onUserPrefChangedMock>),
 }));
 
-import { SessionControls } from '../../src/components/SessionControls.js';
+import { OPENSPEC_LIST_REQUEST_TIMEOUT_MS, SessionControls } from '../../src/components/SessionControls.js';
 import type { SessionInfo } from '../../src/types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
@@ -1054,6 +1057,53 @@ afterEach(() => {
     fireEvent.click(screen.getByRole('button', { name: 'change-a' }));
 
     expect(screen.getByRole('textbox').textContent).toBe('@openspec/changes/change-a');
+  });
+
+  it('does not leave openspec changes loading when the list request cannot be sent', async () => {
+    const ws = makeWs();
+    ws.fsListDir.mockImplementation(() => {
+      throw new Error('WebSocket not connected');
+    });
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+
+    expect(screen.queryByText('loading')).toBeNull();
+    expect(screen.getByText('openspec_unavailable')).toBeDefined();
+    expect(screen.getByRole('button', { name: 'propose_action' })).toBeDefined();
+  });
+
+  it('times out openspec changes loading if the daemon never responds', async () => {
+    vi.useFakeTimers();
+    try {
+      const ws = makeWs();
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+          quickData={makeQuickData() as any}
+        />,
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+      expect(screen.getByText('loading')).toBeDefined();
+
+      await act(async () => {
+        vi.advanceTimersByTime(OPENSPEC_LIST_REQUEST_TIMEOUT_MS);
+      });
+
+      expect(screen.queryByText('loading')).toBeNull();
+      expect(screen.getByText('openspec_timeout')).toBeDefined();
+      expect(screen.getByRole('button', { name: 'propose_action' })).toBeDefined();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('inserts an openspec implementation-audit prompt without sending immediately', async () => {
