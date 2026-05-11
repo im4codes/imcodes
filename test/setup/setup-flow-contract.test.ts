@@ -100,7 +100,11 @@ describe('setupFlow contracts', () => {
     expect(commands).toContain('docker compose version');
     expect(commands).toContain('curl -sf --connect-timeout 3 --max-time 5 https://hub.docker.com/ -o /dev/null');
     expect(commands.some((cmd) => cmd.includes('exec -T postgres psql -U imcodes -d imcodes'))).toBe(true);
-    expect(commands).toContain('systemctl --user daemon-reload');
+    if (process.platform === 'linux') {
+      expect(commands).toContain('systemctl --user daemon-reload');
+    } else {
+      expect(commands.some((cmd) => cmd.startsWith('systemctl --user'))).toBe(false);
+    }
 
     const bootstrapCall = execSyncMock.mock.calls.find(([cmd]) => String(cmd).includes('exec -T postgres psql'));
     expect(String(bootstrapCall?.[1]?.input)).toContain('INSERT INTO api_keys');

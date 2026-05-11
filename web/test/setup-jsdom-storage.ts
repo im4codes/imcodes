@@ -43,6 +43,20 @@ const ensureStorage = (prop: 'localStorage' | 'sessionStorage') => {
 ensureStorage('localStorage');
 ensureStorage('sessionStorage');
 
+if (typeof globalThis.requestAnimationFrame !== 'function') {
+  Object.defineProperty(globalThis, 'requestAnimationFrame', {
+    value: (cb: FrameRequestCallback) => setTimeout(() => cb(Date.now()), 0),
+    configurable: true,
+  });
+}
+
+if (typeof globalThis.cancelAnimationFrame !== 'function') {
+  Object.defineProperty(globalThis, 'cancelAnimationFrame', {
+    value: (id: number) => clearTimeout(id),
+    configurable: true,
+  });
+}
+
 afterEach(async () => {
   await resetWebSharedCachesForTests();
 });
