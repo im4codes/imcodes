@@ -17,6 +17,7 @@ const {
   persistSessionRecordAwaitedMock,
   startSubSessionMock,
   stopSubSessionMock,
+  getPaneCwdMock,
 } = vi.hoisted(() => {
   const sessions = new Map<string, SessionRecord>();
   const p2pConfigs = new Map<string, import('../../shared/p2p-modes.js').P2pSavedConfig>();
@@ -38,6 +39,7 @@ const {
     persistSessionRecordAwaitedMock: vi.fn(),
     startSubSessionMock: vi.fn(),
     stopSubSessionMock: vi.fn(),
+    getPaneCwdMock: vi.fn(),
   };
 });
 
@@ -62,6 +64,10 @@ vi.mock('../../src/agent/session-manager.js', () => ({
 vi.mock('../../src/daemon/subsession-manager.js', () => ({
   startSubSession: startSubSessionMock,
   stopSubSession: stopSubSessionMock,
+}));
+
+vi.mock('../../src/agent/tmux.js', () => ({
+  getPaneCwd: getPaneCwdMock,
 }));
 
 vi.mock('../../src/store/p2p-config-store.js', () => ({
@@ -195,6 +201,7 @@ beforeEach(() => {
     return Promise.resolve();
   });
   installDefaultLaunchMocks();
+  getPaneCwdMock.mockRejectedValue(new Error('tmux unavailable'));
   persistSessionRecordAwaitedMock.mockResolvedValue(undefined);
 });
 
@@ -782,7 +789,7 @@ describe('daemon session group clone', () => {
       name: 'deck_sub_active',
       projectName: 'deck_sub_active',
       role: 'w1',
-      projectDir: sourceDir,
+      projectDir: '',
       parentSession: 'deck_cd_brain',
     }));
     const { link, sent } = makeServerLink();
@@ -799,6 +806,40 @@ describe('daemon session group clone', () => {
     expect(sessions.get('deck_cd_1_brain')?.projectDir).toBe(resolvedTargetDir);
     const clonedSub = [...sessions.values()].find((record) => record.parentSession === 'deck_cd_1_brain');
     expect(clonedSub?.projectDir).toBe(resolvedTargetDir);
+  });
+
+  it('uses the live process pane cwd when an active sub-session has no persisted cwd', async () => {
+    const mainDir = await makeDir('live-pane-main');
+    const liveSubDir = await makeDir('live-pane-sub');
+    sessions.set('deck_cd_brain', makeSession({
+      name: 'deck_cd_brain',
+      projectName: 'cd',
+      role: 'brain',
+      projectDir: mainDir,
+    }));
+    sessions.set('deck_sub_shell', makeSession({
+      name: 'deck_sub_shell',
+      projectName: 'deck_sub_shell',
+      role: 'w1',
+      agentType: 'shell',
+      projectDir: '',
+      parentSession: 'deck_cd_brain',
+      state: 'idle',
+    }));
+    getPaneCwdMock.mockResolvedValueOnce(liveSubDir);
+    const { link, sent } = makeServerLink();
+
+    await handleSessionGroupCloneCommand({
+      type: SESSION_GROUP_CLONE_MSG.START,
+      sourceMainSessionName: 'deck_cd_brain',
+      idempotencyKey: `idem-live-cwd-${unique++}`,
+    }, link as never);
+
+    const resolvedSubDir = await realpath(liveSubDir);
+    const clonedSub = [...sessions.values()].find((record) => record.parentSession === 'deck_cd_1_brain');
+    expect(sent.at(-1)?.state).toBe('succeeded');
+    expect(getPaneCwdMock).toHaveBeenCalledWith('deck_sub_shell');
+    expect(clonedSub?.projectDir).toBe(resolvedSubDir);
   });
 
   it('preserves source directories by default and reports non-active child skip reasons', async () => {

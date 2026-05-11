@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
-import { isSessionAgentType } from '../../shared/agent-types.js';
+import { getSessionRuntimeType, isSessionAgentType } from '../../shared/agent-types.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import { p2pScopedSessionKey } from '../../shared/p2p-config-scope.js';
 import {
@@ -33,6 +33,7 @@ import {
 import logger from '../util/logger.js';
 import type { ServerLink } from './server-link.js';
 import { startSubSession, stopSubSession } from './subsession-manager.js';
+import { getPaneCwd } from '../agent/tmux.js';
 
 const OPERATION_RETENTION_MS = 10 * 60 * 1000;
 
@@ -228,6 +229,31 @@ async function resolveUsableDirectory(rawPath: string, fieldPath: string): Promi
   return resolved;
 }
 
+async function resolveCloneableSubSessionCwd(
+  child: SessionRecord,
+  cwdOverride: string | null,
+): Promise<string> {
+  if (cwdOverride) return cwdOverride;
+
+  const persistedCwd = child.projectDir?.trim();
+  if (persistedCwd) return resolveUsableDirectory(persistedCwd, `${child.name}.cwd`);
+
+  if (getSessionRuntimeType(child.agentType) !== 'process') {
+    throw new SessionGroupCloneValidationError('incomplete_clone_spec', `Active sub-session ${child.name} is missing cwd`);
+  }
+
+  let paneCwd = '';
+  try {
+    paneCwd = (await getPaneCwd(child.name)).trim();
+  } catch {
+    throw new SessionGroupCloneValidationError('incomplete_clone_spec', `Active sub-session ${child.name} is missing cwd`);
+  }
+  if (!paneCwd) {
+    throw new SessionGroupCloneValidationError('incomplete_clone_spec', `Active sub-session ${child.name} is missing cwd`);
+  }
+  return resolveUsableDirectory(paneCwd, `${child.name}.cwd`);
+}
+
 function isActiveDirectChild(record: SessionRecord, sourceMainSessionName: string): boolean {
   return record.parentSession === sourceMainSessionName
     && !isHiddenSession(record)
@@ -340,10 +366,7 @@ async function buildCloneSpec(
 
   for (const child of activeDirectChildren) {
     assertCloneableAgent(child);
-    if (!child.projectDir) {
-      throw new SessionGroupCloneValidationError('incomplete_clone_spec', `Active sub-session ${child.name} is missing cwd`);
-    }
-    const cwd = cwdOverride ?? await resolveUsableDirectory(child.projectDir, `${child.name}.cwd`);
+    const cwd = await resolveCloneableSubSessionCwd(child, cwdOverride);
     const clonedId = newSubSessionId(existingNamesWithAllocated);
     const clonedSessionName = `deck_sub_${clonedId}`;
     existingNamesWithAllocated.add(clonedSessionName);
