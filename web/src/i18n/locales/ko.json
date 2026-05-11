@@ -489,6 +489,7 @@
     "api_provider_import_json": "JSON 가져오기",
     "api_provider_export_json": "JSON 내보내기",
     "api_provider_import_error": "클립보드에서 preset JSON을 가져오지 못했습니다",
+    "api_provider_export_success": "preset JSON을 클립보드에 복사했습니다",
     "api_provider_export_error": "preset JSON을 클립보드에 복사하지 못했습니다"
   },
   "api_key": {

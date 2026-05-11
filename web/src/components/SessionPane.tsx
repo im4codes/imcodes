@@ -23,6 +23,7 @@ import { useNowTicker } from '../hooks/useNowTicker.js';
 import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
+import type { FileBrowserPreviewRequest } from './file-browser-lazy.js';
 
 type ViewMode = 'terminal' | 'chat';
 
@@ -76,6 +77,8 @@ export interface SessionPaneProps {
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
   /** Called after shortcut/action button clicks — use to restore xterm focus. */
   onAfterAction?: () => void;
+  /** Open a file preview in the shared floating preview host. */
+  onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
   /** Mobile: whether the file browser overlay is open. */
   mobileFileBrowserOpen?: boolean;
   /** Mobile: called when the file browser overlay requests close. */
@@ -109,6 +112,7 @@ export function SessionPane({
   onSettings,
   onTransportConfigSaved,
   onAfterAction,
+  onPreviewFile,
   mobileFileBrowserOpen,
   onMobileFileBrowserClose,
   pendingPrefillText,
@@ -317,6 +321,7 @@ export function SessionPane({
           sessionState={session.state}
           onScrollBottomFn={setChatScrollFn}
           workdir={session.projectDir}
+          onPreviewFile={onPreviewFile}
           ws={connected ? ws : null}
           serverId={serverId}
           onQuote={addQuote}

@@ -490,6 +490,7 @@
     "api_provider_import_json": "导入 JSON",
     "api_provider_export_json": "导出 JSON",
     "api_provider_import_error": "无法从剪贴板导入 preset JSON",
+    "api_provider_export_success": "Preset JSON 已成功导出到剪贴板",
     "api_provider_export_error": "无法复制 preset JSON 到剪贴板"
   },
   "api_key": {

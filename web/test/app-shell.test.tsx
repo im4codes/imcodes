@@ -353,6 +353,9 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
       <button onClick={() => onCollapsedChange?.(true)}>subbar-collapse</button>
       <button onClick={onNew}>subbar-new</button>
       <button onClick={() => onOpen?.(subSessions?.[0]?.id)}>subbar-open</button>
+      {subSessions?.map((sub: any) => (
+        <button key={sub.id} onClick={() => onOpen?.(sub.id)}>subbar-open-{sub.id}</button>
+      ))}
       <button onClick={() => onOpenMaximized?.(subSessions?.[0]?.id)}>subbar-open-max</button>
       <button onClick={onViewCron}>subbar-cron</button>
       <button onClick={onViewDiscussions}>subbar-discussions</button>
@@ -363,7 +366,18 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
     </div>
   ),
 }));
-vi.mock('../src/components/SubSessionWindow.js', () => ({ SubSessionWindow: textComponent('sub-session-window') }));
+vi.mock('../src/components/SubSessionWindow.js', () => ({
+  SubSessionWindow: ({ sub, active, zIndex, onFocus }: any) => (
+    <div
+      data-testid={`sub-session-window-${sub?.id}`}
+      data-active={String(active)}
+      style={{ zIndex }}
+      onMouseDown={onFocus}
+    >
+      sub-session-window
+    </div>
+  ),
+}));
 vi.mock('../src/components/DesktopWindowMaximizeButton.js', () => ({
   DesktopWindowMaximizeButton: ({ onClick }: any) => <button onClick={onClick}>maximize-button</button>,
 }));
@@ -600,6 +614,111 @@ describe('App shell', () => {
     expect(view.container.textContent).toContain('session-pane:deck_alpha_brain');
     expect(view.container.textContent).toContain('session-tree');
     expect(ws.connect).toHaveBeenCalled();
+  }, 20_000);
+
+  it('brings a newly opened sub-session window above restored open sub-session windows', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    localStorage.setItem('rcc_open_subs_deck_alpha_brain', JSON.stringify(['sub-1']));
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-1',
+        sessionName: 'deck_sub_alpha_helper',
+        parentSession: 'deck_alpha_brain',
+        label: 'Helper',
+        description: 'Helper session',
+        cwd: '/work/alpha',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+      {
+        id: 'sub-2',
+        sessionName: 'deck_sub_alpha_reviewer',
+        parentSession: 'deck_alpha_brain',
+        label: 'Reviewer',
+        description: 'Reviewer session',
+        cwd: '/work/alpha',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+    const restored = await screen.findByTestId('sub-session-window-sub-1');
+    await waitFor(() => expect(restored.getAttribute('data-active')).toBe('true'));
+
+    fireEvent.click(screen.getByText('subbar-open-sub-2'));
+
+    const opened = await screen.findByTestId('sub-session-window-sub-2');
+    await waitFor(() => {
+      expect(opened.getAttribute('data-active')).toBe('true');
+      const restoredZ = Number((restored as HTMLElement).style.zIndex);
+      const openedZ = Number((opened as HTMLElement).style.zIndex);
+      expect(restoredZ).toBeGreaterThan(0);
+      expect(openedZ).toBeGreaterThan(restoredZ);
+    });
+  }, 20_000);
+
+  it('closes all open sub-session windows when clicking the active main session tab', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    localStorage.setItem('rcc_open_subs_deck_alpha_brain', JSON.stringify(['sub-1', 'sub-2']));
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-1',
+        sessionName: 'deck_sub_alpha_helper',
+        parentSession: 'deck_alpha_brain',
+        label: 'Helper',
+        description: 'Helper session',
+        cwd: '/work/alpha',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+      {
+        id: 'sub-2',
+        sessionName: 'deck_sub_alpha_reviewer',
+        parentSession: 'deck_alpha_brain',
+        label: 'Reviewer',
+        description: 'Reviewer session',
+        cwd: '/work/alpha',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+    const first = await screen.findByTestId('sub-session-window-sub-1');
+    const second = await screen.findByTestId('sub-session-window-sub-2');
+    await waitFor(() => {
+      expect(first.getAttribute('data-active')).toBe('true');
+      expect(second.getAttribute('data-active')).toBe('true');
+    });
+
+    fireEvent.click(screen.getByText('tabs-select'));
+
+    await waitFor(() => {
+      expect(first.getAttribute('data-active')).toBe('false');
+      expect(second.getAttribute('data-active')).toBe('false');
+      expect(localStorage.getItem('rcc_open_subs_deck_alpha_brain')).toBeNull();
+    });
   }, 20_000);
 
   it('executes app-level shell callbacks and websocket message reducers', async () => {

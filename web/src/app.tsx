@@ -151,6 +151,18 @@ const nativeCallback = typeof window !== 'undefined'
 
 type ViewMode = TerminalSubscribeViewMode;
 
+type AppToast = {
+  id: number;
+  sessionName?: string;
+  project?: string;
+  kind: 'idle' | 'notification' | 'success';
+  title?: string;
+  message?: string;
+  openRepoLatest?: boolean;
+  failedJobName?: string;
+  failedStepName?: string;
+};
+
 export function isTextEntryElement(el: HTMLElement | null): boolean {
   if (!el) return false;
   const tag = el.tagName;
@@ -845,7 +857,12 @@ export function App() {
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [idleAlerts, setIdleAlerts] = useState<Set<string>>(new Set());
   const [idleFlashTokens, setIdleFlashTokens] = useState<Map<string, number>>(() => new Map());
-  const [toasts, setToasts] = useState<Array<{ id: number; sessionName: string; project: string; kind: 'idle' | 'notification'; title?: string; message?: string; openRepoLatest?: boolean; failedJobName?: string; failedStepName?: string }>>([]);
+  const [toasts, setToasts] = useState<AppToast[]>([]);
+  const showSuccessToast = useCallback((title: string) => {
+    const id = Date.now() + Math.random();
+    setToasts((prev) => [...prev, { id, kind: 'success', title }]);
+    setTimeout(() => setToasts((prev) => prev.filter((toast) => toast.id !== id)), 4000);
+  }, []);
   const [detectedModels, setDetectedModels] = useState<Map<string, string>>(new Map());
   const detectedModelsRef = useRef<Map<string, string>>(new Map());
   const [subUsages, setSubUsages] = useState<Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string }>>(new Map());
@@ -882,19 +899,29 @@ export function App() {
     } catch { /* ignore */ }
     return new Set();
   });
+  const openSubIdsRef = useRef(openSubIds);
+  openSubIdsRef.current = openSubIds;
+  const persistOpenSubIds = useCallback((next: Set<string>) => {
+    const mainSession = localStorage.getItem('rcc_session');
+    if (!mainSession) return;
+    const ids = Array.from(next);
+    if (ids.length > 0) localStorage.setItem(`rcc_open_subs_${mainSession}`, JSON.stringify(ids));
+    else localStorage.removeItem(`rcc_open_subs_${mainSession}`);
+  }, []);
   const setOpenSubIds = useCallback((updater: Set<string> | ((prev: Set<string>) => Set<string>)) => {
+    if (typeof updater !== 'function') {
+      openSubIdsRef.current = updater;
+      persistOpenSubIds(updater);
+      setOpenSubIdsRaw(updater);
+      return;
+    }
     setOpenSubIdsRaw((prev) => {
-      const next = typeof updater === 'function' ? updater(prev) : updater;
-      // Persist open sub IDs for the current main session
-      const mainSession = localStorage.getItem('rcc_session');
-      if (mainSession) {
-        const ids = Array.from(next);
-        if (ids.length > 0) localStorage.setItem(`rcc_open_subs_${mainSession}`, JSON.stringify(ids));
-        else localStorage.removeItem(`rcc_open_subs_${mainSession}`);
-      }
+      const next = updater(prev);
+      openSubIdsRef.current = next;
+      persistOpenSubIds(next);
       return next;
     });
-  }, []);
+  }, [persistOpenSubIds]);
 
   // Panels pinned to the sidebar — synced to server, write-through cache
   const [pinnedPanels, setPinnedPanels] = useSyncedPreference<PinnedPanel[]>('sidebar_pinned_panels', [], 0);
@@ -970,8 +997,6 @@ export function App() {
   // (stable string) — never the stack object or the Set instance — so this
   // memo only invalidates on real ordering / membership changes.
   const openSubIdsKeyMemo = useMemo(() => openSubIdsKey(openSubIds), [openSubIds]);
-  const openSubIdsRef = useRef(openSubIds);
-  openSubIdsRef.current = openSubIds;
   const maximizedSubIdsRef = useRef(maximizedSubIds);
   maximizedSubIdsRef.current = maximizedSubIds;
   const focusedSubId = useMemo(
@@ -1034,7 +1059,7 @@ export function App() {
   const [showRepoPage, setShowRepoPage] = useState(false);
   const [repoFocusLatestAction, setRepoFocusLatestAction] = useState<{ token: number; failedJobName?: string; failedStepName?: string } | null>(null);
   const [pendingRepoToastSession, setPendingRepoToastSession] = useState<{ sessionName: string; focus: { token: number; failedJobName?: string; failedStepName?: string } } | null>(null);
-  /** Floating file preview request opened from pinned file browser. */
+  /** Floating file preview request opened from file panels and chat file links. */
   const [previewFileRequest, setPreviewFileRequest] = useState<FileBrowserPreviewRequest | null>(null);
   const [previewFileCache, setPreviewFileCache] = useState<Record<string, { preferDiff?: boolean; preview: FileBrowserPreviewState }>>({});
   const [repoContexts, setRepoContexts] = useState<Map<string, any>>(new Map());
@@ -1166,15 +1191,23 @@ export function App() {
    * sub-session does NOT bump the version — that is the load-bearing
    * render-stability guarantee.
    */
-  const bringSubToFront = useCallback((id: string) => {
-    if (isMobileRef.current) return;
+  const getSubSessionDesktopWindowMeta = useCallback((id: string): DesktopWindowMeta => {
     const sub = subSessionsRef.current.find((candidate) => candidate.id === id);
-    ensureDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id), {
+    return {
       kind: DESKTOP_WINDOW_KINDS.subSession,
       subId: id,
       serverId: sub?.serverId ?? selectedServerIdRef.current ?? undefined,
-    }, { bringToFront: true });
-  }, [ensureDesktopWindow]);
+    };
+  }, []);
+
+  const bringSubToFront = useCallback((id: string) => {
+    if (isMobileRef.current) return;
+    for (const openId of openSubIdsRef.current) {
+      if (openId === id) continue;
+      ensureDesktopWindow(DESKTOP_WINDOW_IDS.subSession(openId), getSubSessionDesktopWindowMeta(openId));
+    }
+    ensureDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id), getSubSessionDesktopWindowMeta(id), { bringToFront: true });
+  }, [ensureDesktopWindow, getSubSessionDesktopWindowMeta]);
 
   const setSubSessionMaximized = useCallback((id: string, maximized: boolean) => {
     setMaximizedSubIds((prev) => {
@@ -1229,34 +1262,24 @@ export function App() {
 
   const toggleSubSession = useCallback((id: string) => {
     const mobile = isMobileRef.current;
-    let willOpen = false;
-    setOpenSubIds((prev) => {
-      if (mobile) {
-        // Exclusive on mobile: close if already open, otherwise open only this one
-        if (prev.has(id)) {
-          clearSubSessionMaximized(id);
-          return new Set();
-        }
-        willOpen = true;
-        clearSubSessionMaximized(id);
-        return new Set([id]);
-      }
-      const next = new Set(prev);
-      if (next.has(id)) {
-        next.delete(id);
-        willOpen = false;
-        clearSubSessionMaximized(id);
-      } else {
-        next.add(id);
-        willOpen = true;
-        clearSubSessionMaximized(id);
-      }
-      return next;
-    });
-    if (willOpen) {
-      bringSubToFront(id);
-    } else {
+    const wasOpen = openSubIdsRef.current.has(id);
+    clearSubSessionMaximized(id);
+
+    if (mobile) {
+      setOpenSubIds(wasOpen ? new Set() : new Set([id]));
+      return;
+    }
+
+    if (wasOpen) {
+      const next = new Set(openSubIdsRef.current);
+      next.delete(id);
+      setOpenSubIds(next);
       removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id));
+    } else {
+      const next = new Set(openSubIdsRef.current);
+      next.add(id);
+      setOpenSubIds(next);
+      bringSubToFront(id);
     }
   }, [bringSubToFront, clearSubSessionMaximized, removeDesktopWindow, setOpenSubIds]);
 
@@ -1264,6 +1287,19 @@ export function App() {
   activeSessionRef.current = activeSession;
   const sessionsRef = useRef(sessions);
   sessionsRef.current = sessions;
+
+  const closeAllSubSessionWindows = useCallback(() => {
+    setMaximizedSubIds(new Set());
+    setOpenSubIds(new Set());
+    if (isMobileRef.current) return;
+    const stack = stackRef.current!;
+    let changed = false;
+    for (const entry of stack.getOrderForTests()) {
+      if (entry.meta.kind !== DESKTOP_WINDOW_KINDS.subSession) continue;
+      if (stack.removeWindow(entry.id)) changed = true;
+    }
+    if (changed) bumpStack();
+  }, [bumpStack, setOpenSubIds]);
 
   // ── Desktop window stack ↔ visibility-boolean sync ──────────────────────────
   // For each managed singleton floating window, mirror its show-boolean into
@@ -1363,26 +1399,6 @@ export function App() {
     }
   }, [previewFileRequest, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
 
-  // Sub-session stack cleanup: remove a sub-session's stack entry whenever it
-  // leaves `openSubIds` (close, minimize, pin, server switch, etc.). This is
-  // the single authoritative place that GCs sub-session stack memberships;
-  // user-action open paths (toggleSubSession, bringSubToFront) handle
-  // ensure+bring on the way in.
-  const openSubIdsKeyForEffect = openSubIdsKeyMemo;
-  useEffect(() => {
-    if (isMobileRef.current) return;
-    const currentlyOpen = new Set(openSubIdsRef.current);
-    const stack = stackRef.current!;
-    let changed = false;
-    for (const entry of stack.getOrderForTests()) {
-      if (entry.meta.kind !== DESKTOP_WINDOW_KINDS.subSession) continue;
-      if (entry.meta.subId && !currentlyOpen.has(entry.meta.subId)) {
-        if (stack.removeWindow(entry.id)) changed = true;
-      }
-    }
-    if (changed) bumpStack();
-  }, [openSubIdsKeyForEffect]);
-
   const setActiveSession = useCallback((name: string | null, opts?: { keepSubWindows?: boolean }) => {
     if (name) localStorage.setItem('rcc_session', name);
     else localStorage.removeItem('rcc_session');
@@ -1404,6 +1420,19 @@ export function App() {
     // scroll chat to bottom on session switch (rAF gives ChatView time to mount)
     if (name) requestAnimationFrame(() => chatScrollFnsRef.current.get(name)?.());
   }, [setOpenSubIds]);
+
+  const selectMainSessionTab = useCallback((name: string) => {
+    if (name === activeSessionRef.current) {
+      closeAllSubSessionWindows();
+    } else {
+      setActiveSession(name);
+    }
+    setIdleAlerts((prev) => {
+      const next = new Set(prev);
+      next.delete(name);
+      return next;
+    });
+  }, [closeAllSubSessionWindows, setActiveSession]);
 
   useEffect(() => {
     if (!auth || selectedServerId || !serversLoaded || servers.length === 0 || manualDashboard) return;
@@ -1567,6 +1596,43 @@ export function App() {
   // subSessionsRef itself is declared earlier (forward-declared before
   // bringSubToFront so the callback can close over it). Just sync each render.
   subSessionsRef.current = subSessions;
+  const visibleSubSessionStackKey = useMemo(
+    () => visibleSubSessions
+      .map((sub) => `${sub.id}:${sub.serverId ?? selectedServerId ?? ''}`)
+      .sort()
+      .join('|'),
+    [selectedServerId, visibleSubSessions],
+  );
+
+  // Sub-session stack sync: every rendered open sub-session must have a
+  // desktop-stack entry, including windows restored from localStorage on
+  // page/session load. Without this, restored windows fall back to z-index
+  // 6000 while newly opened managed windows start at the stack band (5010,
+  // 5020, ...), so the latest opened window can appear behind stale peers.
+  useEffect(() => {
+    if (isMobileRef.current) return;
+    const renderedSubIds = new Set(visibleSubSessions.map((sub) => sub.id));
+    const currentlyOpen = new Set(
+      Array.from(openSubIdsRef.current).filter((id) => renderedSubIds.has(id)),
+    );
+    const stack = stackRef.current!;
+    let changed = false;
+
+    for (const subId of currentlyOpen) {
+      if (stack.ensureWindow(DESKTOP_WINDOW_IDS.subSession(subId), getSubSessionDesktopWindowMeta(subId))) {
+        changed = true;
+      }
+    }
+
+    for (const entry of stack.getOrderForTests()) {
+      if (entry.meta.kind !== DESKTOP_WINDOW_KINDS.subSession) continue;
+      if (!entry.meta.subId || !currentlyOpen.has(entry.meta.subId)) {
+        if (stack.removeWindow(entry.id)) changed = true;
+      }
+    }
+
+    if (changed) bumpStack();
+  }, [bumpStack, getSubSessionDesktopWindowMeta, openSubIdsKeyMemo, visibleSubSessionStackKey, visibleSubSessions]);
 
   useEffect(() => {
     const liveSessionNames = new Set<string>([
@@ -3548,7 +3614,7 @@ export function App() {
               idleAlerts={idleAlerts}
               p2pSessionLabels={p2pSessionLabels}
               onAlertDismiss={(name) => setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; })}
-              onSelect={(name) => { setActiveSession(name); setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; }); }}
+              onSelect={selectMainSessionTab}
               onNewSession={() => setShowNewSession(true)}
               onStopProject={handleStopProject}
               onRestartProject={handleRestartProject}
@@ -3636,6 +3702,7 @@ export function App() {
                     session.name === s.name ? { ...session, transportConfig } : session
                   )));
                 }}
+                onPreviewFile={(request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: false })}
                 onAfterAction={focusTerminal}
                 mobileFileBrowserOpen={s.name === activeSession ? showMobileFileBrowser : false}
                 onMobileFileBrowserClose={() => setShowMobileFileBrowser(false)}
@@ -4265,6 +4332,7 @@ export function App() {
           onClose={() => setShowNewSession(false)}
           onSessionStarted={(name) => { setActiveSession(name); setShowNewSession(false); }}
           isProviderConnected={isProviderConnected}
+          onToast={showSuccessToast}
         />
       )}
 
@@ -4301,6 +4369,7 @@ export function App() {
               }}
               onSettings={() => setSettingsTarget({ sessionName: sub.sessionName, subId: sub.id, label: sub.label || '', description: sub.description || '', cwd: sub.cwd || '', type: sub.type, parentSession: sub.parentSession, transportConfig: sub.transportConfig ?? null })}
               onTransportConfigSaved={(transportConfig) => updateSubLocal(sub.id, { transportConfig })}
+              onPreviewFile={(request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: false })}
               zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.subSession(sub.id), 6000)}
               onFocus={() => bringSubToFront(sub.id)}
               desktopFileBrowserZIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id), getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.subSession(sub.id), 6000) + 1)}
@@ -4390,6 +4459,7 @@ export function App() {
           isProviderConnected={isProviderConnected}
           getRemoteSessions={getRemoteSessions}
           refreshSessions={refreshSessions}
+          onToast={showSuccessToast}
           onStart={async (type, shellBin, cwd, label, extra) => {
             setShowSubDialog(false);
             const sub = await createSubSession(type, shellBin, cwd, label, extra);
@@ -4474,14 +4544,22 @@ export function App() {
                     detail: { session: t.sessionName, serverId: selectedServerId },
                   }));
                 }
-                setIdleAlerts((prev) => { const s = new Set(prev); s.delete(t.sessionName); return s; });
+                if (t.sessionName) {
+                  setIdleAlerts((prev) => {
+                    const s = new Set(prev);
+                    s.delete(t.sessionName!);
+                    return s;
+                  });
+                }
                 setToasts((prev) => prev.filter((x) => x.id !== t.id));
               }}
             >
-              <span class="toast-icon">{t.kind === 'idle' ? '✓' : '🔔'}</span>
+              <span class="toast-icon">{t.kind === 'notification' ? '🔔' : '✓'}</span>
               <span class="toast-body">
                 {t.kind === 'idle' ? (
                   <><strong>{t.project}</strong> {trans('toast.finished')}</>
+                ) : t.kind === 'success' ? (
+                  <strong>{t.title}</strong>
                 ) : (
                   <><strong>{t.title || t.project}</strong>{t.message ? <> — {t.message}</> : null}</>
                 )}

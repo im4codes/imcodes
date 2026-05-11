@@ -489,6 +489,7 @@
     "api_provider_import_json": "JSONをインポート",
     "api_provider_export_json": "JSONをエクスポート",
     "api_provider_import_error": "クリップボードから preset JSON をインポートできませんでした",
+    "api_provider_export_success": "preset JSON をクリップボードにコピーしました",
     "api_provider_export_error": "preset JSON をクリップボードにコピーできませんでした"
   },
   "api_key": {

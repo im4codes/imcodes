@@ -53,6 +53,7 @@ interface Props {
   onClose: () => void;
   onSessionStarted: (sessionName: string) => void;
   isProviderConnected: (id: string) => boolean;
+  onToast?: (message: string) => void;
 }
 
 type AgentType =
@@ -84,6 +85,7 @@ export function NewSessionDialog({
   onClose,
   onSessionStarted,
   isProviderConnected: _isProviderConnected,
+  onToast,
 }: Props) {
   const { t } = useTranslation();
   const [project, setProject] = useState("");
@@ -186,6 +188,7 @@ export function NewSessionDialog({
       if (!navigator.clipboard) throw new Error('Clipboard unavailable');
       await navigator.clipboard.writeText(JSON.stringify(preset, null, 2));
       setPresetError('');
+      onToast?.(t('new_session.api_provider_export_success'));
     } catch {
       setPresetError(t('new_session.api_provider_export_error'));
     }

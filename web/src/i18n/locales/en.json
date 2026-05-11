@@ -490,6 +490,7 @@
     "api_provider_import_json": "Import JSON",
     "api_provider_export_json": "Export JSON",
     "api_provider_import_error": "Failed to import preset JSON from clipboard",
+    "api_provider_export_success": "Preset JSON copied to clipboard",
     "api_provider_export_error": "Failed to copy preset JSON to clipboard"
   },
   "api_key": {

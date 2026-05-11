@@ -9,7 +9,7 @@ import { recordCost } from '../cost-tracker.js';
 import { formatLabel } from '../format-label.js';
 import { TerminalView } from './TerminalView.js';
 import { ChatView } from './ChatView.js';
-import { FileBrowser } from './FileBrowser.js';
+import { FileBrowser, type FileBrowserPreviewRequest } from './FileBrowser.js';
 import { SessionControls } from './SessionControls.js';
 import { UsageFooter } from './UsageFooter.js';
 import { FloatingPanel } from './FloatingPanel.js';
@@ -62,6 +62,8 @@ interface Props {
   onRename: () => void;
   onSettings?: () => void;
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
+  /** Open a file preview in the shared floating preview host. */
+  onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
   zIndex: number;
   onFocus: () => void;
   /**
@@ -160,7 +162,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onTransportConfigSaved, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, detectedModelHint, inP2p, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR,
+  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onTransportConfigSaved, onPreviewFile, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, detectedModelHint, inP2p, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR,
 }: Props) {
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
@@ -632,6 +634,7 @@ export function SubSessionWindow({
             onScrollBottomFn={onChatScrollBottomFn}
             ws={ws}
             workdir={sub.cwd ?? null}
+            onPreviewFile={onPreviewFile}
             serverId={serverId}
             onQuote={addQuote}
             agentType={sessionInfo?.agentType ?? sub.type}

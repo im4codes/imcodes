@@ -42,11 +42,12 @@ interface Props {
   refreshSessions: (providerId: string) => void;
   onStart: (type: string, shellBin?: string, cwd?: string, label?: string, extra?: Record<string, unknown>) => void;
   onClose: () => void;
+  onToast?: (message: string) => void;
 }
 
 type OpenClawMode = 'new' | 'bind';
 
-export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _isProviderConnected, getRemoteSessions, refreshSessions, onStart, onClose }: Props) {
+export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _isProviderConnected, getRemoteSessions, refreshSessions, onStart, onClose, onToast }: Props) {
   const { t } = useTranslation();
   const [type, setType] = useState('claude-code-sdk');
   const [shells, setShells] = useState<string[]>([]);
@@ -139,6 +140,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
       if (!navigator.clipboard) throw new Error('Clipboard unavailable');
       await navigator.clipboard.writeText(JSON.stringify(preset, null, 2));
       setPresetError('');
+      onToast?.(t('new_session.api_provider_export_success'));
     } catch {
       setPresetError(t('new_session.api_provider_export_error'));
     }
