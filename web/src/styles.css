@@ -1022,6 +1022,7 @@ body {
 .subcard-size-input:focus { border-color: #3b82f6; }
 .subcard-toolbar-label { font-size: 11px; color: #475569; }
 .daemon-stats-inline { font-size: 11px; margin-left: 8px; white-space: nowrap; }
+.daemon-local-clock { color: #94a3b8; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .subcard-toolbar-add { background: none; border: 1px dashed #475569; border-radius: 4px; color: #64748b; cursor: pointer; font-size: 16px; padding: 0 8px; margin-left: auto; transition: all 0.12s; }
 .subcard-toolbar-add:hover { border-color: #3b82f6; color: #93c5fd; }
 .subcard-empty-state { padding: 8px 12px; font-size: 12px; color: #475569; }

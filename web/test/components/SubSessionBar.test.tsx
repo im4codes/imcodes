@@ -3,7 +3,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
-import { cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
+import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -59,6 +59,35 @@ function makeSubSession(overrides: Partial<SubSession> = {}): SubSession {
   };
 }
 
+function makeStatsWs() {
+  let handler: ((msg: any) => void) | null = null;
+  const ws = {
+    onMessage: vi.fn((next: (msg: any) => void) => {
+      handler = next;
+      return () => {
+        if (handler === next) handler = null;
+      };
+    }),
+  };
+  return {
+    ws,
+    emit: (msg: any) => handler?.(msg),
+  };
+}
+
+const daemonStatsMessage = {
+  type: 'daemon.stats',
+  daemonVersion: '2026.5.2161-dev.7',
+  cpu: 2,
+  memUsed: 9.9 * 1024 ** 3,
+  memTotal: 41.2 * 1024 ** 3,
+  load1: 0.8,
+  load5: 0.7,
+  load15: 0.6,
+  uptime: 3600,
+  embedding: null,
+};
+
 describe('SubSessionBar', () => {
   beforeEach(() => {
     localStorage.clear();
@@ -67,6 +96,7 @@ describe('SubSessionBar', () => {
 
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
   });
 
   it('can share collapsed state with an external fullscreen control', () => {
@@ -112,6 +142,71 @@ describe('SubSessionBar', () => {
     );
 
     expect(view.container.querySelector('.subsession-bar')).toBeTruthy();
+  });
+
+  it('shows a desktop local clock after compact daemon stats and updates it from the shared ticker', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 4, 12, 7, 8, 9));
+    const statsWs = makeStatsWs();
+    const view = render(
+      <SubSessionBar
+        subSessions={[makeSubSession()]}
+        openIds={new Set()}
+        collapsed={true}
+        desktopLayoutCapable={true}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={statsWs.ws as any}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(statsWs.ws.onMessage).toHaveBeenCalled());
+    act(() => {
+      statsWs.emit(daemonStatsMessage);
+    });
+
+    const getStatsText = () => view.container.querySelector('.daemon-stats-inline')?.textContent ?? '';
+    expect(getStatsText()).toContain('2026-05-12 07:08:09');
+
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
+
+    expect(getStatsText()).toContain('2026-05-12 07:08:10');
+  });
+
+  it('does not add the local clock to mobile daemon stats', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 4, 12, 7, 8, 9));
+    const statsWs = makeStatsWs();
+    const view = render(
+      <SubSessionBar
+        subSessions={[makeSubSession()]}
+        openIds={new Set()}
+        collapsed={true}
+        desktopLayoutCapable={false}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={statsWs.ws as any}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(statsWs.ws.onMessage).toHaveBeenCalled());
+    act(() => {
+      statsWs.emit(daemonStatsMessage);
+    });
+
+    expect(view.container.querySelector('.daemon-stats-inline')?.textContent).not.toContain('2026-05-12');
   });
 
   it('only applies the running pulse to collapsed mini cards while the sub-session is running', () => {

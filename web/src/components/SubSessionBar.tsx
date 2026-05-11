@@ -19,6 +19,7 @@ import { P2pProgressCard } from './P2pProgressCard.js';
 import type { P2pProgressDiscussion } from './P2pProgressCard.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
 import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
+import { useNowTicker } from '../hooks/useNowTicker.js';
 import { EmbeddingStatusIcon } from './EmbeddingStatusIcon.js';
 import type { EmbeddingStatus } from '@shared/embedding-status.js';
 import { formatDaemonVersionShort } from '../util/format-version.js';
@@ -150,6 +151,12 @@ function formatUptime(seconds: number): string {
   return d > 0 ? `${d}d ${h}h` : `${h}h`;
 }
 
+function formatLocalDateTime(timestamp: number): string {
+  const date = new Date(timestamp);
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
 function CollapsedSubSessionButton({ sub, accentColor, isOpen, idleFlashToken, usage, inP2p, draggable, onEntryPointerDown, onEntryClick, onEntryDoubleClick, onEntryDragStart, onEntryDragOver, onEntryDragEnd, t, detectedModel }: CollapsedSubSessionButtonProps) {
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
@@ -212,6 +219,8 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   const [draftW, setDraftW] = useState(String(cardSize.w));
   const [draftH, setDraftH] = useState(String(cardSize.h));
   const [stats, setStats] = useState<DaemonStats | null>(null);
+  const localClockNow = useNowTicker(desktopLayoutCapable && !!stats);
+  const localClockText = useMemo(() => formatLocalDateTime(localClockNow), [localClockNow]);
   // DB sort_order is the authority — subSessions arrive pre-sorted from server.
   // Local dragOrder only tracks in-session drag reorder (synced back to DB via reorderSubSessions).
   const [dragOrder, setDragOrder] = useState<string[] | null>(null);
@@ -595,7 +604,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
             <span class="subcard-toolbar-label">{t('subsessionBar.subs_count', { count: subSessions.length })}</span>
             {/* Desktop: full stats in expanded toolbar */}
             {stats && (
-              <span class="daemon-stats-inline" title={`${stats.daemonVersion ? `Daemon ${stats.daemonVersion} | ` : ''}Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}`}>
+              <span class="daemon-stats-inline" title={`${stats.daemonVersion ? `Daemon ${stats.daemonVersion} | ` : ''}Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}${desktopLayoutCapable ? ` | ${localClockText}` : ''}`}>
                 {stats.daemonVersion && (
                   <>
                     {/* Display the short form (strips trailing -dev.NNN counter); the
@@ -621,11 +630,17 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                 <span style={{ color: '#94a3b8' }}>
                   {formatUptime(stats.uptime)}
                 </span>
+                {desktopLayoutCapable && (
+                  <>
+                    <span style={{ color: '#94a3b8' }}> · </span>
+                    <span class="daemon-local-clock">{localClockText}</span>
+                  </>
+                )}
               </span>
             )}
           </>
         )}
-        {/* Mobile: compact stats in collapsed toolbar */}
+        {/* Collapsed toolbar: compact stats strip. */}
         {collapsed && stats && (() => {
           const totalGb = stats.memTotal / (1024 ** 3);
           const useG = totalGb >= 1;
@@ -635,7 +650,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
           const memTotal = useG ? totalGb.toFixed(1) : (stats.memTotal / div).toFixed(0);
           const ei = { fontSize: '0.65em', verticalAlign: 'middle' } as const;
           return (
-            <span class="daemon-stats-inline" title={`${stats.daemonVersion ? `v${stats.daemonVersion} | ` : ''}CPU ${stats.cpu}% | Mem ${memUsed}/${memTotal}${unit} | Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}`} style={{ whiteSpace: 'nowrap', fontSize: 10 }}>
+            <span class="daemon-stats-inline" title={`${stats.daemonVersion ? `v${stats.daemonVersion} | ` : ''}CPU ${stats.cpu}% | Mem ${memUsed}/${memTotal}${unit} | Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}${desktopLayoutCapable ? ` | ${localClockText}` : ''}`} style={{ whiteSpace: 'nowrap', fontSize: 10 }}>
               {/* Mobile-narrow stat strip — show short version; full string in title above. */}
               {stats.daemonVersion && <span style={{ color: '#94a3b8' }}>v{formatDaemonVersionShort(stats.daemonVersion)} </span>}
               <span style={{ color: stats.cpu > 80 ? '#f87171' : stats.cpu > 50 ? '#fbbf24' : '#4ade80' }}><span style={ei}>⚙️</span>{stats.cpu}%</span>
@@ -645,6 +660,12 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
               <span style={{ color: '#a78bfa' }}>≡{Number(stats.load1).toFixed(1)}</span>
               {' '}
               <EmbeddingStatusIcon status={stats.embedding} compact />
+              {desktopLayoutCapable && (
+                <>
+                  {' '}
+                  <span class="daemon-local-clock">{localClockText}</span>
+                </>
+              )}
             </span>
           );
         })()}
