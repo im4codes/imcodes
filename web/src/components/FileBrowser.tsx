@@ -317,6 +317,9 @@ function buildVideoStreamUrl(serverId: string, downloadId: string): string {
 }
 
 const REQUEST_TIMEOUT_MS = 15_000;
+const PREVIEW_REQUEST_TIMEOUT_MS = 22_000;
+const PREVIEW_REFRESH_INTERVAL_MS = 8_000;
+const PREVIEW_REFRESH_FAILURE_BACKOFF_MS = 30_000;
 
 function updateNode(nodes: FsNode[], targetId: string, patch: Partial<FsNode>): FsNode[] {
   return nodes.map((n) => {
@@ -326,7 +329,8 @@ function updateNode(nodes: FsNode[], targetId: string, patch: Partial<FsNode>): 
   });
 }
 
-type PendingPreviewRequest = { path: string; cycleId: number };
+type PendingPreviewReason = 'interactive' | 'refresh';
+type PendingPreviewRequest = { path: string; cycleId: number; reason?: PendingPreviewReason; startedAt?: number };
 type PendingPreviewDiff = PendingPreviewRequest & { diff: string; diffHtml: string };
 type PreviewScrollMode = Exclude<FileBrowserPreviewState['status'], 'idle' | 'ok'> | 'source' | 'diff' | 'edit';
 type PreviewScrollSnapshot = { key: string; scrollTop: number; scrollLeft: number };
@@ -461,6 +465,8 @@ export function FileBrowser({
   const pendingReadRef = useRef(new Map<string, PendingPreviewRequest>());
   const pendingGitStatusRef = useRef(new Map<string, string>()); // requestId → dirPath
   const pendingGitDiffRef = useRef(new Map<string, PendingPreviewRequest>());
+  const pendingPreviewTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  const previewRefreshBackoffUntilRef = useRef(0);
   const pendingPreviewDiffRef = useRef(new Map<string, PendingPreviewDiff>());
   const pendingMkdirRef = useRef(new Map<string, { parentPath: string; targetPath: string }>());
   const pendingCreateFileRef = useRef(new Map<string, { parentPath: string; targetPath: string }>());
@@ -485,6 +491,8 @@ export function FileBrowser({
       pendingReadRef.current.clear();
       pendingGitStatusRef.current.clear();
       pendingGitDiffRef.current.clear();
+      for (const timer of pendingPreviewTimersRef.current.values()) clearTimeout(timer);
+      pendingPreviewTimersRef.current.clear();
       pendingPreviewDiffRef.current.clear();
       pendingMkdirRef.current.clear();
       pendingCreateFileRef.current.clear();
@@ -517,6 +525,49 @@ export function FileBrowser({
     }
     return false;
   }, [getActivePreviewCycle]);
+
+  const clearPendingPreviewRequest = useCallback((kind: 'read' | 'diff', requestId: string): PendingPreviewRequest | null => {
+    const pending = kind === 'read' ? pendingReadRef.current : pendingGitDiffRef.current;
+    const request = pending.get(requestId) ?? null;
+    pending.delete(requestId);
+    const timer = pendingPreviewTimersRef.current.get(requestId);
+    if (timer) clearTimeout(timer);
+    pendingPreviewTimersRef.current.delete(requestId);
+    return request;
+  }, []);
+
+  const clearAllPendingPreviewRequests = useCallback(() => {
+    pendingReadRef.current.clear();
+    pendingGitDiffRef.current.clear();
+    for (const timer of pendingPreviewTimersRef.current.values()) clearTimeout(timer);
+    pendingPreviewTimersRef.current.clear();
+  }, []);
+
+  const handlePreviewRequestTimeout = useCallback((kind: 'read' | 'diff', requestId: string) => {
+    const request = clearPendingPreviewRequest(kind, requestId);
+    if (!request || !mountedRef.current) return;
+    if (request.reason === 'refresh') {
+      previewRefreshBackoffUntilRef.current = Date.now() + PREVIEW_REFRESH_FAILURE_BACKOFF_MS;
+      return;
+    }
+    if (kind === 'diff') return;
+    const active = getActivePreviewCycle();
+    if (!active || active.path !== request.path || active.cycleId !== request.cycleId) return;
+    activePreviewCycleRef.current = null;
+    setPreview({ status: 'error', path: request.path, error: t('file_browser.preview_error') });
+  }, [clearPendingPreviewRequest, getActivePreviewCycle, t]);
+
+  const trackPendingPreviewRequest = useCallback((
+    kind: 'read' | 'diff',
+    requestId: string,
+    request: PendingPreviewRequest,
+  ) => {
+    clearPendingPreviewRequest(kind, requestId);
+    const pending = kind === 'read' ? pendingReadRef.current : pendingGitDiffRef.current;
+    pending.set(requestId, { ...request, startedAt: Date.now() });
+    const timer = setTimeout(() => handlePreviewRequestTimeout(kind, requestId), PREVIEW_REQUEST_TIMEOUT_MS);
+    pendingPreviewTimersRef.current.set(requestId, timer);
+  }, [clearPendingPreviewRequest, handlePreviewRequestTimeout]);
 
   const fetchDir = useCallback((nodePath: string) => {
     if (loadedRef.current.has(nodePath)) return;
@@ -564,10 +615,13 @@ export function FileBrowser({
       if (msg.type === DAEMON_MSG.RECONNECTED || (msg.type === 'session.event' && (msg as any).event === 'connected')) {
         loadedRef.current.clear();
         pendingRef.current.clear();
-        pendingReadRef.current.clear();
-        pendingGitDiffRef.current.clear();
+        clearAllPendingPreviewRequests();
         pendingCreateFileRef.current.clear();
+        const loadingPath = previewRef.current.status === 'loading' ? previewRef.current.path : null;
         activePreviewCycleRef.current = null;
+        if (loadingPath) {
+          setPreview({ status: 'error', path: loadingPath, error: t('file_browser.preview_error') });
+        }
         // Re-fetch root and changes
         if (mountedRef.current) fetchDir(startPath);
         return;
@@ -637,7 +691,7 @@ export function FileBrowser({
       if (msg.type === 'fs.read_response') {
         const pending = pendingReadRef.current.get(msg.requestId);
         if (!pending) return;
-        pendingReadRef.current.delete(msg.requestId);
+        clearPendingPreviewRequest('read', msg.requestId);
         const active = getActivePreviewCycle();
         if (!active || active.path !== pending.path || active.cycleId !== pending.cycleId) return;
         const filePath = pending.path;
@@ -647,12 +701,17 @@ export function FileBrowser({
         const dlId = msg.downloadId;
 
         if (msg.status === 'error') {
+          if (pending.reason === 'refresh') {
+            previewRefreshBackoffUntilRef.current = Date.now() + PREVIEW_REFRESH_FAILURE_BACKOFF_MS;
+            return;
+          }
           const errKey = msg.error === FS_READ_ERROR_CODES.FILE_TOO_LARGE ? 'file_browser.preview_too_large'
             : msg.error === FS_READ_ERROR_CODES.FORBIDDEN_PATH ? 'file_browser.preview_error'
             : 'file_browser.preview_error';
           setPreview({ status: 'error', path: filePath, error: t(errKey), downloadId: dlId });
           return;
         }
+        previewRefreshBackoffUntilRef.current = 0;
 
         // Video preview — daemon signals stream-mode (no inline content) and
         // we let <video> fetch the bytes via the HTTP download endpoint.
@@ -764,7 +823,7 @@ export function FileBrowser({
       if (msg.type === 'fs.git_diff_response') {
         const pending = pendingGitDiffRef.current.get(msg.requestId);
         if (!pending) return;
-        pendingGitDiffRef.current.delete(msg.requestId);
+        clearPendingPreviewRequest('diff', msg.requestId);
         const active = getActivePreviewCycle();
         if (!active || active.path !== pending.path || active.cycleId !== pending.cycleId) return;
         const filePath = pending.path;
@@ -814,7 +873,7 @@ export function FileBrowser({
         return;
       }
     });
-  }, [fetchDir, getActivePreviewCycle, startPath, showHidden, highlightPath, t, ws]);
+  }, [clearAllPendingPreviewRequests, clearPendingPreviewRequest, fetchDir, getActivePreviewCycle, startPath, showHidden, highlightPath, t, ws]);
 
   const fetchPreview = useCallback((filePath: string, preferDiff = false) => {
     if (editDirtyRef.current) {
@@ -844,13 +903,13 @@ export function FileBrowser({
     onPreviewStateChange?.({ path: filePath, preferDiff, preview: loadingPreview });
     if (!hasPendingPreviewWork('read', filePath, cycleId)) {
       const requestId = ws.fsReadFile(filePath);
-      pendingReadRef.current.set(requestId, { path: filePath, cycleId });
+      trackPendingPreviewRequest('read', requestId, { path: filePath, cycleId, reason: 'interactive' });
     }
     if (!hasPendingPreviewWork('diff', filePath, cycleId)) {
       const diffId = ws.fsGitDiff(filePath);
-      pendingGitDiffRef.current.set(diffId, { path: filePath, cycleId });
+      trackPendingPreviewRequest('diff', diffId, { path: filePath, cycleId, reason: 'interactive' });
     }
-  }, [autoPreviewPath, getActivePreviewCycle, hasPendingPreviewWork, onPreviewFile, onPreviewStateChange, t, ws]);
+  }, [autoPreviewPath, getActivePreviewCycle, hasPendingPreviewWork, onPreviewFile, onPreviewStateChange, t, trackPendingPreviewRequest, ws]);
 
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set([startPath]));
 
@@ -936,8 +995,7 @@ export function FileBrowser({
       // Clear stale state from previous ws instance
       loadedRef.current.clear();
       pendingRef.current.clear();
-      pendingReadRef.current.clear();
-      pendingGitDiffRef.current.clear();
+      clearAllPendingPreviewRequests();
       pendingCreateFileRef.current.clear();
       pendingPreviewDiffRef.current.clear();
       activePreviewCycleRef.current = null;
@@ -949,7 +1007,7 @@ export function FileBrowser({
       setError(null);
     }
     fetchDir(startPath);
-  }, [fetchDir, includeFiles, serverId, showHidden, startPath]);
+  }, [clearAllPendingPreviewRequests, fetchDir, includeFiles, serverId, showHidden, startPath]);
 
   useEffect(() => {
     if (!changesRootPath) return;
@@ -1016,6 +1074,7 @@ export function FileBrowser({
     if (autoPreviewPath) dismissedAutoPreviewPathRef.current = autoPreviewPath;
     previewTabOverridePathRef.current = null;
     activePreviewCycleRef.current = null;
+    clearAllPendingPreviewRequests();
     pendingPreviewDiffRef.current.clear();
     setIsEditing(false);
     setEditDirty(false);
@@ -1023,9 +1082,9 @@ export function FileBrowser({
     if (autoPreviewPath && onClose) {
       onClose();
     }
-  }, [autoPreviewPath, editDirty, onClose, t]);
+  }, [autoPreviewPath, clearAllPendingPreviewRequests, editDirty, onClose, t]);
 
-  // Auto-refresh preview content every 5s when a file is being previewed (paused during editing)
+  // Auto-refresh preview content periodically when a file is being previewed (paused during editing).
   useEffect(() => {
     if (preview.status !== 'ok' && preview.status !== 'image') return;
     if (onPreviewFile) return; // external preview — don't poll here
@@ -1033,17 +1092,21 @@ export function FileBrowser({
     const path = (preview as { path: string }).path;
     const timer = setInterval(() => {
       if (!mountedRef.current) return;
+      if (Date.now() < previewRefreshBackoffUntilRef.current) return;
+      if (hasPendingPreviewWork('read', path) || hasPendingPreviewWork('diff', path)) return;
       try {
         const cycleId = nextPreviewCycleIdRef.current++;
         activePreviewCycleRef.current = { path, cycleId };
         const reqId = ws.fsReadFile(path);
-        pendingReadRef.current.set(reqId, { path, cycleId });
-        const diffId = ws.fsGitDiff(path);
-        pendingGitDiffRef.current.set(diffId, { path, cycleId });
+        trackPendingPreviewRequest('read', reqId, { path, cycleId, reason: 'refresh' });
+        if (showDiff) {
+          const diffId = ws.fsGitDiff(path);
+          trackPendingPreviewRequest('diff', diffId, { path, cycleId, reason: 'refresh' });
+        }
       } catch { /* ws disconnected */ }
-    }, 5000);
+    }, PREVIEW_REFRESH_INTERVAL_MS);
     return () => clearInterval(timer);
-  }, [preview.status, (preview as any).path, ws, onPreviewFile, isEditing]);
+  }, [preview.status, (preview as any).path, ws, onPreviewFile, isEditing, hasPendingPreviewWork, showDiff, trackPendingPreviewRequest]);
 
   // Rate-limited git status refresh for the changes panel
   const CHANGES_RATE_LIMIT_MS = 5_000;

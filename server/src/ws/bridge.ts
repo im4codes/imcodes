@@ -129,6 +129,7 @@ import {
 import { P2P_CONFIG_MSG } from '../../../shared/p2p-config-events.js';
 import { p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../../../shared/p2p-config-scope.js';
 import { isP2pSavedConfig, type P2pSavedConfig } from '../../../shared/p2p-modes.js';
+import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
 
 const AUTH_TIMEOUT_MS = 5000;
 const MAX_QUEUE_SIZE = 100;
@@ -143,6 +144,7 @@ const MAX_PENDING_MEMORY_MANAGEMENT_REQUESTS_PER_SOCKET = 32;
 // real abuse patterns send orders-of-magnitude more.
 const BROWSER_RATE_LIMIT = 300;
 const BROWSER_RATE_WINDOW = 10_000; // 10s
+const FS_PENDING_UNICAST_TIMEOUT_MS = 20_000;
 const SESSION_GROUP_CLONE_CONTEXT_TTL_MS = 10 * 60 * 1000;
 /**
  * Master switch for the per-browser rate limiter.
@@ -649,6 +651,24 @@ interface InflightCommand {
   timeoutTimer: ReturnType<typeof setTimeout> | null;
 }
 
+type FsPendingRouteKind =
+  | 'fs.ls'
+  | 'fs.read'
+  | 'fs.git_status'
+  | 'fs.git_diff'
+  | 'file.search'
+  | 'fs.write';
+
+interface PendingFsRoute {
+  socket: WebSocket;
+  timer: ReturnType<typeof setTimeout>;
+  kind: FsPendingRouteKind;
+  requestId: string;
+  path: string;
+}
+
+type PendingFsRouteMap = Map<string, PendingFsRoute>;
+
 // Periodic cleanup interval handle (module-level, shared across all bridge instances)
 let cleanupSweepHandle: ReturnType<typeof setInterval> | null = null;
 
@@ -715,27 +735,13 @@ export class WsBridge {
   /** Cached remote sessions from providers — pushed to browsers on connect, persisted to DB. */
   private providerRemoteSessions = new Map<string, unknown[]>();
 
-  /**
-   * Per-request fs.ls pending map: requestId → { socket, timer }.
-   * Used to single-cast fs.ls_response back to the requesting browser.
-   */
-  private pendingFsRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
-
-  /**
-   * Per-request fs.read pending map: requestId → { socket, timer }.
-   * Used to single-cast fs.read_response back to the requesting browser.
-   */
-  private pendingFsReadRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
-
-  /** Per-request fs.git_status pending map. */
-  private pendingFsGitStatusRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
-
-  /** Per-request fs.git_diff pending map. */
-  private pendingFsGitDiffRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
-  private pendingFileSearchRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
-
-  /** Per-request fs.write pending map. */
-  private pendingFsWriteRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
+  /** Per-request FS/search pending maps used to single-cast daemon responses. */
+  private pendingFsRequests: PendingFsRouteMap = new Map();
+  private pendingFsReadRequests: PendingFsRouteMap = new Map();
+  private pendingFsGitStatusRequests: PendingFsRouteMap = new Map();
+  private pendingFsGitDiffRequests: PendingFsRouteMap = new Map();
+  private pendingFileSearchRequests: PendingFsRouteMap = new Map();
+  private pendingFsWriteRequests: PendingFsRouteMap = new Map();
 
   /** Per-request timeline.history / timeline.replay pending map — routes responses via requestId unicast. */
   private pendingTimelineRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
@@ -829,6 +835,97 @@ export class WsBridge {
 
   static getAll(): Map<string, WsBridge> {
     return WsBridge.instances;
+  }
+
+  private pendingFsRouteMap(kind: FsPendingRouteKind): PendingFsRouteMap {
+    switch (kind) {
+      case 'fs.ls':
+        return this.pendingFsRequests;
+      case 'fs.read':
+        return this.pendingFsReadRequests;
+      case 'fs.git_status':
+        return this.pendingFsGitStatusRequests;
+      case 'fs.git_diff':
+        return this.pendingFsGitDiffRequests;
+      case 'file.search':
+        return this.pendingFileSearchRequests;
+      case 'fs.write':
+        return this.pendingFsWriteRequests;
+    }
+  }
+
+  private registerPendingFsRoute(kind: FsPendingRouteKind, ws: WebSocket, msg: Record<string, unknown>): void {
+    const requestId = typeof msg.requestId === 'string' ? msg.requestId : '';
+    if (!requestId) return;
+    const map = this.pendingFsRouteMap(kind);
+    const previous = map.get(requestId);
+    if (previous) {
+      clearTimeout(previous.timer);
+      logger.warn({ kind, requestId, serverId: this.serverId }, 'WsBridge: duplicate FS request id replaced');
+    }
+    const path = typeof msg.path === 'string' ? msg.path : '';
+    const timer = setTimeout(() => this.timeoutPendingFsRoute(kind, requestId), FS_PENDING_UNICAST_TIMEOUT_MS);
+    timer.unref?.();
+    map.set(requestId, { socket: ws, timer, kind, requestId, path });
+  }
+
+  private timeoutPendingFsRoute(kind: FsPendingRouteKind, requestId: string): void {
+    const map = this.pendingFsRouteMap(kind);
+    const pending = map.get(requestId);
+    if (!pending) return;
+    map.delete(requestId);
+    incrementCounter('ws_bridge_fs_pending_timeout', { kind });
+    safeSend(pending.socket, JSON.stringify(this.buildPendingFsTimeoutResponse(pending)));
+  }
+
+  private buildPendingFsTimeoutResponse(pending: PendingFsRoute): Record<string, unknown> {
+    const error = FS_READ_ERROR_CODES.PREVIEW_BRIDGE_TIMEOUT;
+    switch (pending.kind) {
+      case 'fs.ls':
+        return { type: 'fs.ls_response', requestId: pending.requestId, path: pending.path, status: 'error', error };
+      case 'fs.read':
+        return { type: 'fs.read_response', requestId: pending.requestId, path: pending.path, status: 'error', error };
+      case 'fs.git_status':
+        return { type: 'fs.git_status_response', requestId: pending.requestId, path: pending.path, status: 'error', files: [], error };
+      case 'fs.git_diff':
+        return { type: 'fs.git_diff_response', requestId: pending.requestId, path: pending.path, status: 'error', error };
+      case 'file.search':
+        return { type: 'file.search_response', requestId: pending.requestId, results: [], error };
+      case 'fs.write':
+        return { type: 'fs.write_response', requestId: pending.requestId, path: pending.path, status: 'error', error };
+    }
+  }
+
+  private forwardPendingFsRoute(kind: FsPendingRouteKind, requestId: string | undefined, msg: Record<string, unknown>): boolean {
+    if (!requestId) return false;
+    const map = this.pendingFsRouteMap(kind);
+    const pending = map.get(requestId);
+    if (!pending) {
+      incrementCounter('ws_bridge_fs_unrouted_response', { kind });
+      return false;
+    }
+    clearTimeout(pending.timer);
+    map.delete(requestId);
+    safeSend(pending.socket, JSON.stringify(msg));
+    return true;
+  }
+
+  private clearPendingFsRoutesForSocket(ws: WebSocket): void {
+    const maps = [
+      this.pendingFsRequests,
+      this.pendingFsReadRequests,
+      this.pendingFsGitStatusRequests,
+      this.pendingFsGitDiffRequests,
+      this.pendingFileSearchRequests,
+      this.pendingFsWriteRequests,
+    ];
+    for (const map of maps) {
+      for (const [requestId, pending] of map) {
+        if (pending.socket !== ws) continue;
+        clearTimeout(pending.timer);
+        map.delete(requestId);
+      }
+    }
   }
 
   private pruneSessionGroupCloneContexts(now = Date.now()): void {
@@ -1740,44 +1837,32 @@ export class WsBridge {
 
       // Track fs.ls requests for single-cast response routing
       if (msg.type === 'fs.ls' && typeof msg.requestId === 'string') {
-        const reqId = msg.requestId;
-        const timer = setTimeout(() => this.pendingFsRequests.delete(reqId), 20_000);
-        this.pendingFsRequests.set(reqId, { socket: ws, timer });
+        this.registerPendingFsRoute('fs.ls', ws, msg);
       }
 
       // Track fs.read requests for single-cast response routing
       if (msg.type === 'fs.read' && typeof msg.requestId === 'string') {
-        const reqId = msg.requestId;
-        const timer = setTimeout(() => this.pendingFsReadRequests.delete(reqId), 20_000);
-        this.pendingFsReadRequests.set(reqId, { socket: ws, timer });
+        this.registerPendingFsRoute('fs.read', ws, msg);
       }
 
       // Track fs.git_status requests for single-cast response routing
       if (msg.type === 'fs.git_status' && typeof msg.requestId === 'string') {
-        const reqId = msg.requestId;
-        const timer = setTimeout(() => this.pendingFsGitStatusRequests.delete(reqId), 20_000);
-        this.pendingFsGitStatusRequests.set(reqId, { socket: ws, timer });
+        this.registerPendingFsRoute('fs.git_status', ws, msg);
       }
 
       // Track fs.git_diff requests for single-cast response routing
       if (msg.type === 'fs.git_diff' && typeof msg.requestId === 'string') {
-        const reqId = msg.requestId;
-        const timer = setTimeout(() => this.pendingFsGitDiffRequests.delete(reqId), 20_000);
-        this.pendingFsGitDiffRequests.set(reqId, { socket: ws, timer });
+        this.registerPendingFsRoute('fs.git_diff', ws, msg);
       }
 
       // Track file.search requests for single-cast response routing
       if (msg.type === 'file.search' && typeof msg.requestId === 'string') {
-        const reqId = msg.requestId;
-        const timer = setTimeout(() => this.pendingFileSearchRequests.delete(reqId), 20_000);
-        this.pendingFileSearchRequests.set(reqId, { socket: ws, timer });
+        this.registerPendingFsRoute('file.search', ws, msg);
       }
 
       // Track fs.write requests for single-cast response routing
       if (msg.type === 'fs.write' && typeof msg.requestId === 'string') {
-        const reqId = msg.requestId;
-        const timer = setTimeout(() => this.pendingFsWriteRequests.delete(reqId), 20_000);
-        this.pendingFsWriteRequests.set(reqId, { socket: ws, timer });
+        this.registerPendingFsRoute('fs.write', ws, msg);
       }
 
       // Track timeline.history_request / timeline.replay_request for single-cast response routing
@@ -2367,97 +2452,37 @@ export class WsBridge {
 
     // ── fs.ls_response: single-cast back to requesting browser ────────────────
     if (type === 'fs.ls_response') {
-      const requestId = msg.requestId as string | undefined;
-      if (requestId) {
-        const pending = this.pendingFsRequests.get(requestId);
-        if (pending) {
-          clearTimeout(pending.timer);
-          this.pendingFsRequests.delete(requestId);
-          if (pending.socket.readyState === WebSocket.OPEN) {
-            pending.socket.send(JSON.stringify(msg));
-          }
-        }
-      }
+      this.forwardPendingFsRoute('fs.ls', msg.requestId as string | undefined, msg);
       return;
     }
 
     // ── fs.read_response: single-cast back to requesting browser ─────────────
     if (type === 'fs.read_response') {
-      const requestId = msg.requestId as string | undefined;
-      if (requestId) {
-        const pending = this.pendingFsReadRequests.get(requestId);
-        if (pending) {
-          clearTimeout(pending.timer);
-          this.pendingFsReadRequests.delete(requestId);
-          if (pending.socket.readyState === WebSocket.OPEN) {
-            pending.socket.send(JSON.stringify(msg));
-          }
-        }
-      }
+      this.forwardPendingFsRoute('fs.read', msg.requestId as string | undefined, msg);
       return;
     }
 
     // ── fs.git_status_response: single-cast back to requesting browser ────────
     if (type === 'fs.git_status_response') {
-      const requestId = msg.requestId as string | undefined;
-      if (requestId) {
-        const pending = this.pendingFsGitStatusRequests.get(requestId);
-        if (pending) {
-          clearTimeout(pending.timer);
-          this.pendingFsGitStatusRequests.delete(requestId);
-          if (pending.socket.readyState === WebSocket.OPEN) {
-            pending.socket.send(JSON.stringify(msg));
-          }
-        }
-      }
+      this.forwardPendingFsRoute('fs.git_status', msg.requestId as string | undefined, msg);
       return;
     }
 
     // ── fs.git_diff_response: single-cast back to requesting browser ──────────
     if (type === 'fs.git_diff_response') {
-      const requestId = msg.requestId as string | undefined;
-      if (requestId) {
-        const pending = this.pendingFsGitDiffRequests.get(requestId);
-        if (pending) {
-          clearTimeout(pending.timer);
-          this.pendingFsGitDiffRequests.delete(requestId);
-          if (pending.socket.readyState === WebSocket.OPEN) {
-            pending.socket.send(JSON.stringify(msg));
-          }
-        }
-      }
+      this.forwardPendingFsRoute('fs.git_diff', msg.requestId as string | undefined, msg);
       return;
     }
 
     // ── fs.write_response: single-cast back to requesting browser ────────────
     if (type === 'fs.write_response') {
-      const requestId = msg.requestId as string | undefined;
-      if (requestId) {
-        const pending = this.pendingFsWriteRequests.get(requestId);
-        if (pending) {
-          clearTimeout(pending.timer);
-          this.pendingFsWriteRequests.delete(requestId);
-          if (pending.socket.readyState === WebSocket.OPEN) {
-            pending.socket.send(JSON.stringify(msg));
-          }
-        }
-      }
+      this.forwardPendingFsRoute('fs.write', msg.requestId as string | undefined, msg);
       return;
     }
 
     // ── file.search_response: single-cast back to requesting browser ─────────
     if (type === 'file.search_response') {
-      const requestId = msg.requestId as string | undefined;
-      if (requestId) {
-        const pending = this.pendingFileSearchRequests.get(requestId);
-        if (pending) {
-          clearTimeout(pending.timer);
-          this.pendingFileSearchRequests.delete(requestId);
-          if (pending.socket.readyState === WebSocket.OPEN) {
-            pending.socket.send(JSON.stringify(msg));
-          }
-        }
-      }
+      this.forwardPendingFsRoute('file.search', msg.requestId as string | undefined, msg);
       return;
     }
 
@@ -3312,6 +3337,7 @@ export class WsBridge {
     this.browserSubscriptions.delete(ws);
     this.terminalSubscriptionRevisions.delete(ws);
     this.transportSubscriptions.delete(ws);
+    this.clearPendingFsRoutesForSocket(ws);
     // Clean up pending timeline requests for this socket
     for (const [reqId, pending] of this.pendingTimelineRequests) {
       if (pending.socket === ws) {

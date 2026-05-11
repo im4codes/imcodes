@@ -1590,7 +1590,37 @@ describe('FileBrowser', () => {
     expect(document.querySelector('.fb-preview-error')?.textContent).toBe('file_browser.preview_error');
   });
 
-  it('polls only for an active inline preview', async () => {
+  it('times out a missing preview read and allows same-file retry', async () => {
+    vi.useFakeTimers();
+    const { ws, respond } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/foo.ts"
+        onConfirm={vi.fn()}
+      />,
+    );
+    await act(async () => { respond([{ name: 'foo.ts', isDir: false }], '/home/user'); });
+
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(1);
+
+    await act(async () => {
+      vi.advanceTimersByTime(22_000);
+    });
+
+    expect(document.querySelector('.fb-preview-error')?.textContent).toBe('file_browser.preview_error');
+
+    const fileNode = document.querySelector('.fb-node.previewing') as HTMLElement;
+    await act(async () => { fireEvent.click(fileNode); });
+
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(2);
+    vi.useRealTimers();
+  });
+
+  it('polls only reads for an active inline preview unless diff view is active', async () => {
     vi.useFakeTimers();
     const { ws, respond, sendMsg } = makeWsFactory();
     render(
@@ -1614,11 +1644,11 @@ describe('FileBrowser', () => {
     expect((ws.fsGitDiff as any).mock.calls).toHaveLength(1);
 
     await act(async () => {
-      vi.advanceTimersByTime(5_000);
+      vi.advanceTimersByTime(8_000);
     });
 
     expect((ws.fsReadFile as any).mock.calls).toHaveLength(2);
-    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(2);
+    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(1);
     vi.useRealTimers();
   });
 
@@ -1648,7 +1678,7 @@ describe('FileBrowser', () => {
     fireEvent.scroll(previewContent);
 
     await act(async () => {
-      vi.advanceTimersByTime(5_000);
+      vi.advanceTimersByTime(8_000);
     });
 
     previewContent.scrollTop = 0;
