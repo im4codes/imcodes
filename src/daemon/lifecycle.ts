@@ -599,7 +599,23 @@ export async function startup(): Promise<DaemonContext> {
     // Push all active sessions from local store to DB on startup.
     // Covers the case where DB was cleared while the daemon was running
     // (or route was misconfigured and persists silently failed).
+    //
+    // F1 fix (audit cae1de69-826) — per-entry try/catch + warn-continue.
+    // Previously the loop ran `await persistSessionToWorker(...)` with no
+    // try/catch; after the session-group-clone PR (cf7d8196) made
+    // `persistSessionToWorker` throw on non-2xx / fetch failure, ANY
+    // single push failure (server 5xx, network blip, DB conflict) would
+    // abort the entire bootstrap function BEFORE `autoReconnectProviders`
+    // (~200 lines later) had a chance to run. The end result was a
+    // "half-started zombie" daemon with the WS up but no transport
+    // runtimes restored, which directly produced the "bot stays asleep,
+    // no SDK output" symptom reported by the user.
+    //
+    // Worker DB sync is a remote-visibility concern, not a local-runtime
+    // dependency. It must NEVER block transport runtime recovery.
     const localSessions = listSessions();
+    const nonStoppedCount = localSessions.filter((s) => s.state !== 'stopped').length;
+    let pushFailures = 0;
     for (const s of localSessions) {
       if (s.state !== 'stopped' && !isKnownTestSessionLike({
         name: s.name,
@@ -607,11 +623,22 @@ export async function startup(): Promise<DaemonContext> {
         projectDir: s.projectDir,
         parentSession: s.parentSession,
       })) {
-        await persistSessionToWorker(workerUrl!, serverId, token, s.name, s);
+        try {
+          await persistSessionToWorker(workerUrl!, serverId, token, s.name, s);
+        } catch (err) {
+          pushFailures += 1;
+          logger.warn(
+            { err, session: s.name },
+            'startup: persistSessionToWorker failed (continuing daemon bootstrap)',
+          );
+        }
       }
     }
-    if (localSessions.filter((s) => s.state !== 'stopped').length > 0) {
-      logger.info({ count: localSessions.filter((s) => s.state !== 'stopped').length }, 'Pushed local sessions to server DB on startup');
+    if (nonStoppedCount > 0) {
+      logger.info(
+        { count: nonStoppedCount, failures: pushFailures },
+        'Pushed local sessions to server DB on startup',
+      );
     }
     void replicatePendingProcessedContext({ workerUrl: workerUrl!, serverId, token }).catch((err) => {
       logger.warn({ err }, 'Initial processed-context replication failed');

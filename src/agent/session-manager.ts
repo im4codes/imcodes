@@ -1514,37 +1514,54 @@ export async function restoreTransportSessions(providerId: string): Promise<void
       // leave the optimistic pending bubble in place; it will be reconciled
       // once the turn actually fires.
       // Failures are logged and entries dropped to avoid retry loops.
+      //
+      // R-Drain fix (audit cae1de69-826) — `await drainResend(...)` instead
+      // of `void drainResend(...)`. The dispatcher is synchronous and
+      // `runtime.send()` synchronously sets `_sending=true` via
+      // `_dispatchTurn`, so the current race window is effectively zero
+      // (verified in transport-session-runtime.ts:376-462). The change is
+      // defensive: it ensures the resend queue has been fully transferred
+      // into either `_sending`/active state or `runtime._pendingMessages`
+      // before `restoreTransportSessions` returns. This protects against
+      // future refactors that might insert an `await` between
+      // `transportRuntimes.set` and `drainResend`, which WOULD reintroduce
+      // a real race window letting msg-2 arrive at `handleSend` while
+      // `_sending` is still false.
       const pendingCount = getResendCount(s.name);
       if (pendingCount > 0) {
         logger.info({ session: s.name, pendingCount }, 'Draining transport resend queue after reconnect');
-        void drainResend(s.name, (entry) => {
-          const attachments = entry.attachments ?? [];
-          const result = entry.messagePreamble
-            ? runtime.send(
-              entry.text,
-              entry.commandId,
-              attachments.length > 0 ? attachments : undefined,
-              entry.messagePreamble,
-            )
-            : (attachments.length > 0
-                ? runtime.send(entry.text, entry.commandId, attachments)
-                : runtime.send(entry.text, entry.commandId));
-          if (result === 'sent') {
-            timelineEmitter.emit(
-              s.name,
-              'user.message',
-              {
-                text: entry.text,
-                allowDuplicate: true,
-                commandId: entry.commandId,
-                clientMessageId: entry.commandId,
-                ...(attachments.length > 0 ? { attachments } : {}),
-              },
-              { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.commandId}` },
-            );
-          }
-          return result;
-        }).catch((err) => logger.warn({ err, session: s.name }, 'transport resend drain failed'));
+        try {
+          await drainResend(s.name, (entry) => {
+            const attachments = entry.attachments ?? [];
+            const result = entry.messagePreamble
+              ? runtime.send(
+                entry.text,
+                entry.commandId,
+                attachments.length > 0 ? attachments : undefined,
+                entry.messagePreamble,
+              )
+              : (attachments.length > 0
+                  ? runtime.send(entry.text, entry.commandId, attachments)
+                  : runtime.send(entry.text, entry.commandId));
+            if (result === 'sent') {
+              timelineEmitter.emit(
+                s.name,
+                'user.message',
+                {
+                  text: entry.text,
+                  allowDuplicate: true,
+                  commandId: entry.commandId,
+                  clientMessageId: entry.commandId,
+                  ...(attachments.length > 0 ? { attachments } : {}),
+                },
+                { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.commandId}` },
+              );
+            }
+            return result;
+          });
+        } catch (err) {
+          logger.warn({ err, session: s.name }, 'transport resend drain failed');
+        }
       }
     } catch (err) {
       logger.warn({ err, session: s.name }, 'Failed to restore transport session runtime');
@@ -1827,30 +1844,40 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   // Emits user.message on 'sent' for the same reason the reconnect drain
   // does: the enqueue path skipped the emit so the timeline doesn't lie,
   // and now the turn is actually firing.
+  //
+  // R-Drain fix (audit cae1de69-826) — `await drainResend(...)` so the
+  // launch promise (and the per-session relaunch lock held by
+  // `runExclusiveSessionRelaunch`) does not resolve until the resend
+  // queue has been fully transferred into the runtime. See the matching
+  // change in `restoreTransportSessions` above for the full rationale.
   const pendingResendCount = getResendCount(name);
   if (pendingResendCount > 0) {
     logger.info({ session: name, pendingCount: pendingResendCount }, 'Draining transport resend queue after launch');
-    void drainResend(name, (entry) => {
-      const attachments = entry.attachments ?? [];
-      const result = attachments.length > 0
-        ? runtime.send(entry.text, entry.commandId, attachments)
-        : runtime.send(entry.text, entry.commandId);
-      if (result === 'sent') {
-        timelineEmitter.emit(
-          name,
-          'user.message',
-          {
-            text: entry.text,
-            allowDuplicate: true,
-            commandId: entry.commandId,
-            clientMessageId: entry.commandId,
-            ...(attachments.length > 0 ? { attachments } : {}),
-          },
-          { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.commandId}` },
-        );
-      }
-      return result;
-    }).catch((err) => logger.warn({ err, session: name }, 'transport resend drain (launch) failed'));
+    try {
+      await drainResend(name, (entry) => {
+        const attachments = entry.attachments ?? [];
+        const result = attachments.length > 0
+          ? runtime.send(entry.text, entry.commandId, attachments)
+          : runtime.send(entry.text, entry.commandId);
+        if (result === 'sent') {
+          timelineEmitter.emit(
+            name,
+            'user.message',
+            {
+              text: entry.text,
+              allowDuplicate: true,
+              commandId: entry.commandId,
+              clientMessageId: entry.commandId,
+              ...(attachments.length > 0 ? { attachments } : {}),
+            },
+            { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.commandId}` },
+          );
+        }
+        return result;
+      });
+    } catch (err) {
+      logger.warn({ err, session: name }, 'transport resend drain (launch) failed');
+    }
   }
 }
 
