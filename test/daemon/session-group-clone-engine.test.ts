@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -113,6 +113,7 @@ afterEach(async () => {
 describe('daemon session group clone engine', () => {
   it('launches a fresh role-compatible main clone and keeps transportConfig out of events', async () => {
     const source = makeMain({ projectDir: tempDir, state: 'running' });
+    const resolvedTempDir = await realpath(tempDir);
     getSessionMock.mockImplementation((name: string) => name === source.name ? source : undefined);
     listSessionsMock.mockReturnValue([source]);
     launchSessionMock.mockImplementationOnce(async (opts) => {
@@ -152,7 +153,7 @@ describe('daemon session group clone engine', () => {
       projectName: 'p2p_design_review',
       role: 'brain',
       agentType: 'qwen',
-      projectDir: tempDir,
+      projectDir: resolvedTempDir,
       fresh: true,
       userCreated: true,
       label: 'Source Label',

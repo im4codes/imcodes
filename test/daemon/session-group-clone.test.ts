@@ -1,4 +1,4 @@
-import { mkdtemp, symlink } from 'node:fs/promises';
+import { mkdtemp, realpath, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -523,6 +523,7 @@ describe('daemon session group clone', () => {
 
   it('preserves current sub-session cloneable fields available on daemon records', async () => {
     const dir = await makeDir('sub-fields');
+    const resolvedDir = await realpath(dir);
     sessions.set('deck_cd_brain', makeSession({
       name: 'deck_cd_brain',
       projectName: 'cd',
@@ -557,7 +558,7 @@ describe('daemon session group clone', () => {
 
     expect(startSubSessionMock).toHaveBeenCalledWith(expect.objectContaining({
       type: 'shell',
-      cwd: dir,
+      cwd: resolvedDir,
       label: 'Shell Worker',
       description: 'keeps shell settings',
       requestedModel: 'shell-requested',
@@ -794,9 +795,10 @@ describe('daemon session group clone', () => {
     }, link as never);
 
     expect(sent.at(-1)?.state).toBe('succeeded');
-    expect(sessions.get('deck_cd_1_brain')?.projectDir).toBe(targetDir);
+    const resolvedTargetDir = await realpath(targetDir);
+    expect(sessions.get('deck_cd_1_brain')?.projectDir).toBe(resolvedTargetDir);
     const clonedSub = [...sessions.values()].find((record) => record.parentSession === 'deck_cd_1_brain');
-    expect(clonedSub?.projectDir).toBe(targetDir);
+    expect(clonedSub?.projectDir).toBe(resolvedTargetDir);
   });
 
   it('preserves source directories by default and reports non-active child skip reasons', async () => {
@@ -863,9 +865,11 @@ describe('daemon session group clone', () => {
       idempotencyKey: `idem-skipped-${unique++}`,
     }, link as never);
 
-    expect(sessions.get('deck_cd_1_brain')?.projectDir).toBe(mainDir);
+    const resolvedMainDir = await realpath(mainDir);
+    const resolvedSubDir = await realpath(subDir);
+    expect(sessions.get('deck_cd_1_brain')?.projectDir).toBe(resolvedMainDir);
     const clonedSub = [...sessions.values()].find((record) => record.parentSession === 'deck_cd_1_brain');
-    expect(clonedSub?.projectDir).toBe(subDir);
+    expect(clonedSub?.projectDir).toBe(resolvedSubDir);
     expect(sent.at(-1)?.result?.skippedMembers).toEqual(expect.arrayContaining([
       { sessionName: 'deck_sub_stopped', reason: 'stopped' },
       { sessionName: 'deck_sub_error', reason: 'error' },
