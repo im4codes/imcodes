@@ -1050,6 +1050,8 @@
     "subs_count": "Subs（{{count}}）",
     "new_sub_session": "新增子會話",
     "p2p_discussions": "P2P 討論",
+    "p2p_compact_show": "顯示 P2P 緊湊列",
+    "p2p_compact_hide": "收合 P2P 為緊湊列",
     "p2p_discussions_with_running_one": "{{count}} 個進行中的討論 — 檢視全部",
     "p2p_discussions_with_running_other": "{{count}} 個進行中的討論 — 檢視全部",
     "p2p_discussions_with_running": "{{count}} 個進行中的討論 — 檢視全部",

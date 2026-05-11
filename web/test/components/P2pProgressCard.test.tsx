@@ -85,6 +85,34 @@ describe('P2pProgressCard', () => {
     expect(onStopDiscussion).toHaveBeenCalledWith('p2p_run_failed');
   });
 
+  it('requires a second confirmation click before cancelling active discussions', () => {
+    const onStopDiscussion = vi.fn();
+
+    render(
+      <P2pProgressCard
+        discussion={{
+          id: 'p2p_run_active',
+          topic: 'P2P audit · brain',
+          state: 'running',
+          modeKey: 'audit',
+          currentRound: 1,
+          maxRounds: 1,
+          completedHops: 0,
+          totalHops: 1,
+          activePhase: 'hop',
+          nodes: [],
+        }}
+        onStopDiscussion={onStopDiscussion}
+      />,
+    );
+
+    fireEvent.click(screen.getByText(/cancel/i));
+    expect(onStopDiscussion).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByText(/confirm_cancel/i));
+    expect(onStopDiscussion).toHaveBeenCalledWith('p2p_run_active');
+  });
+
   it('keeps active progress highlighted but static once the discussion is no longer running', () => {
     const { container } = render(
       <P2pProgressCard

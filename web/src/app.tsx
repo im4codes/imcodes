@@ -109,6 +109,7 @@ import {
 import { onWatchCommand } from './watch-bridge.js';
 import { watchProjectionStore } from './watch-projection.js';
 import { isIdleSessionStateTimelineEvent, isRunningTimelineEvent } from './timeline-running.js';
+import { isP2pDiscussionVisibleInSubSessionBar } from './p2p-discussion-scope.js';
 import {
   extractTransportPendingMessages,
   mergeTransportPendingEntriesForIdleState,
@@ -1510,6 +1511,10 @@ export function App() {
   // preference subscription key.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeSession, subSessionParentSignature]);
+  const visibleSubSessionNames = useMemo(
+    () => visibleSubSessions.map((sub) => sub.sessionName),
+    [visibleSubSessions],
+  );
   const p2pConfigPref = usePref(
     activeRootSession ? p2pSessionConfigPrefKey(activeRootSession, selectedServerId) : null,
     {
@@ -3761,38 +3766,11 @@ export function App() {
                 onNew={() => setShowSubDialog(true)}
                 onViewDiscussions={() => { setDiscussionInitialId(null); setShowDiscussionsPage(true); }}
                 onViewDiscussion={(fileId) => { setDiscussionInitialId(fileId); setShowDiscussionsPage(true); }}
-                // Scope the P2P bar to discussions whose participants
-                // overlap the active session view. Without this filter
-                // every running P2P run renders its banner in every
-                // session's bar, creating cross-session noise.
-                //
-                // Match logic — a discussion is relevant when:
-                //   - its `mainSession` equals the active root session
-                //     (covers the common case: discussion launched
-                //     from the user's current session or any of its
-                //     sub-sessions, since `activeRootSession` resolves
-                //     sub→parent), OR
-                //   - any participant matches the active session or
-                //     its root (covers cases where the user navigates
-                //     into a sub-session that's a hop in another root
-                //     session's discussion).
-                //
-                // Legacy discussions without `mainSession` /
-                // `participantSessions` (e.g. mid-rollout state from
-                // before this commit) fall through and show
-                // unscoped — preserves the previous behaviour for
-                // those entries instead of hiding them entirely.
-                discussions={discussions.filter((d) => {
-                  if (d.state === 'done') return false;
-                  const hasScope = !!d.mainSession || (d.participantSessions && d.participantSessions.length > 0);
-                  if (!hasScope) return true; // legacy entry — show unscoped
-                  if (d.mainSession && activeRootSession && d.mainSession === activeRootSession) return true;
-                  if (d.participantSessions) {
-                    if (activeSession && d.participantSessions.includes(activeSession)) return true;
-                    if (activeRootSession && d.participantSessions.includes(activeRootSession)) return true;
-                  }
-                  return false;
-                })}
+                discussions={discussions.filter((d) => isP2pDiscussionVisibleInSubSessionBar(d, {
+                  activeSession,
+                  activeRootSession,
+                  visibleSubSessionNames,
+                }))}
                 // Daemon-wide running count (NOT scoped to this
                 // session) so the View Discussions (📋) button shows
                 // a badge even when the user is viewing a session

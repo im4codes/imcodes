@@ -126,11 +126,16 @@ function DiscussionActionButton({ active, compact, onAction }: ActionButtonProps
     );
   }
 
-  if (compact && confirming) {
+  if (confirming) {
     return (
       <button
         class="discussions-progress-stop"
-        style={{ padding: '2px 7px', fontSize: '10px', background: 'rgba(239,68,68,0.3)', borderColor: '#ef4444', color: '#f87171' }}
+        style={{
+          ...(compact ? { padding: '2px 7px', fontSize: '10px' } : {}),
+          background: 'rgba(239,68,68,0.3)',
+          borderColor: '#ef4444',
+          color: '#f87171',
+        }}
         onClick={(e) => {
           e.stopPropagation();
           onAction();
@@ -148,8 +153,7 @@ function DiscussionActionButton({ active, compact, onAction }: ActionButtonProps
       style={compact ? { padding: '2px 7px', fontSize: '10px' } : undefined}
       onClick={(e) => {
         e.stopPropagation();
-        if (compact) setConfirming(true);
-        else onAction();
+        setConfirming(true);
       }}
     >
       {t('common.cancel')}

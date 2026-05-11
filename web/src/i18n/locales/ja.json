@@ -1049,6 +1049,8 @@
     "subs_count": "Subs ({{count}})",
     "new_sub_session": "新しいサブセッション",
     "p2p_discussions": "P2P ディスカッション",
+    "p2p_compact_show": "コンパクトな P2P バーを表示",
+    "p2p_compact_hide": "P2P バーをコンパクト化",
     "p2p_discussions_with_running_one": "{{count}} 件の進行中のディスカッション — すべて表示",
     "p2p_discussions_with_running_other": "{{count}} 件の進行中のディスカッション — すべて表示",
     "p2p_discussions_with_running": "{{count}} 件の進行中のディスカッション — すべて表示",

@@ -212,6 +212,39 @@ describe('SubSessionBar', () => {
     expect((view.getByTestId('subsession-preview-sub-b') as HTMLElement).style.getPropertyValue('--subsession-accent-color')).toBe(SUBSESSION_ACCENT_COLORS[1]);
   });
 
+  it('toggles the mobile P2P compact bar from the toolbar', () => {
+    const view = render(
+      <SubSessionBar
+        subSessions={[makeSubSession()]}
+        openIds={new Set()}
+        desktopLayoutCapable={false}
+        discussions={[{
+          id: 'p2p_run_1',
+          topic: 'P2P audit',
+          state: 'running',
+          currentRound: 1,
+          maxRounds: 1,
+          completedHops: 0,
+          totalHops: 1,
+        }]}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    expect(view.getByTestId('p2p-hidden-state').textContent).toBe('visible');
+    fireEvent.click(view.getByTestId('p2p-compact-toggle'));
+    expect(view.getByTestId('p2p-hidden-state').textContent).toBe('hidden');
+    fireEvent.click(view.getByTestId('p2p-compact-toggle'));
+    expect(view.getByTestId('p2p-hidden-state').textContent).toBe('visible');
+  });
+
   it('recalculates accent colors and reports visual order after drag reorder', async () => {
     const onVisualOrderChange = vi.fn();
     const subSessions = [

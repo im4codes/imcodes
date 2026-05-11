@@ -1050,6 +1050,8 @@
     "subs_count": "Subs（{{count}}）",
     "new_sub_session": "新建子会话",
     "p2p_discussions": "P2P 讨论",
+    "p2p_compact_show": "显示 P2P 紧凑栏",
+    "p2p_compact_hide": "收起 P2P 为紧凑栏",
     "p2p_discussions_with_running_one": "{{count}} 个进行中的讨论 — 查看全部",
     "p2p_discussions_with_running_other": "{{count}} 个进行中的讨论 — 查看全部",
     "p2p_discussions_with_running": "{{count}} 个进行中的讨论 — 查看全部",

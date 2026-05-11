@@ -125,6 +125,8 @@ export interface SessionStore {
 }
 
 let writeTimer: ReturnType<typeof setTimeout> | null = null;
+let writeQueue: Promise<void> = Promise.resolve();
+let pendingWrite: Promise<void> | null = null;
 let store: SessionStore = { sessions: {} };
 
 function isPersistableSessionRecord(record: SessionRecord): boolean {
@@ -152,6 +154,7 @@ function pruneNonPersistableSessions(): boolean {
 }
 
 export async function loadStore(): Promise<SessionStore> {
+  await drainPendingWritesForRead();
   await mkdir(STORE_DIR, { recursive: true });
   try {
     const raw = await readFile(STORE_PATH, 'utf8');
@@ -236,16 +239,44 @@ async function probeSessionStates(): Promise<void> {
 
 function scheduleWrite(): void {
   if (writeTimer) clearTimeout(writeTimer);
-  writeTimer = setTimeout(async () => {
-    try {
-      await mkdir(STORE_DIR, { recursive: true });
-      await writeFile(STORE_PATH, serializeStore(), 'utf8');
-    } catch {
-      // Tests may tear down temp HOME dirs while a debounced write is pending.
-      // Losing that best-effort write is fine; a later flush/load will recreate it.
-    }
+  writeTimer = setTimeout(() => {
     writeTimer = null;
+    void enqueueWrite(true);
   }, DEBOUNCE_MS);
+}
+
+async function writeStoreToDisk(bestEffort: boolean): Promise<void> {
+  try {
+    await mkdir(STORE_DIR, { recursive: true });
+    await writeFile(STORE_PATH, serializeStore(), 'utf8');
+  } catch (error) {
+    if (!bestEffort) throw error;
+    // Tests may tear down temp HOME dirs while a debounced write is pending.
+    // Losing that best-effort write is fine; a later flush/load will recreate it.
+  }
+}
+
+function enqueueWrite(bestEffort: boolean): Promise<void> {
+  const queued = writeQueue.then(
+    () => writeStoreToDisk(bestEffort),
+    () => writeStoreToDisk(bestEffort),
+  );
+  const tracked = queued.finally(() => {
+    if (pendingWrite === tracked) pendingWrite = null;
+  });
+  pendingWrite = tracked;
+  writeQueue = tracked.catch(() => {});
+  return tracked;
+}
+
+async function drainPendingWritesForRead(): Promise<void> {
+  if (writeTimer) {
+    clearTimeout(writeTimer);
+    writeTimer = null;
+    void enqueueWrite(true);
+  }
+  if (pendingWrite) await pendingWrite.catch(() => {});
+  await writeQueue;
 }
 
 export function getSession(name: string): SessionRecord | undefined {
@@ -285,6 +316,5 @@ export async function flushStore(): Promise<void> {
     clearTimeout(writeTimer);
     writeTimer = null;
   }
-  await mkdir(STORE_DIR, { recursive: true });
-  await writeFile(STORE_PATH, serializeStore(), 'utf8');
+  await enqueueWrite(false);
 }

@@ -523,6 +523,17 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         <button class="subcard-toolbar-btn" onClick={() => setCollapsed(!collapsed)} title={collapsed ? t('subsessionBar.show') : t('subsessionBar.hide')}>
           {collapsed ? '▲' : '▼'}
         </button>
+        {isMobile && discussions.length > 0 && (
+          <button
+            class={`subcard-toolbar-btn${p2pHidden ? ' subcard-toolbar-btn-active' : ''}`}
+            data-testid="p2p-compact-toggle"
+            onClick={() => setP2pHidden((hidden) => !hidden)}
+            title={p2pHidden ? t('subsessionBar.p2p_compact_show') : t('subsessionBar.p2p_compact_hide')}
+            aria-label={p2pHidden ? t('subsessionBar.p2p_compact_show') : t('subsessionBar.p2p_compact_hide')}
+          >
+            P2P {p2pHidden ? '▾' : '▴'}
+          </button>
+        )}
         {!collapsed && (
           <>
             <button class="subcard-toolbar-btn" onClick={toggleLayout} title={layout === 'single' ? t('subsessionBar.layout_double') : t('subsessionBar.layout_single')}>
