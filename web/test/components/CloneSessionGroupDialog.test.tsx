@@ -20,8 +20,8 @@ vi.mock('react-i18next', () => ({
         'session.clone.targetProjectPlaceholder': 'my-project-copy',
         'session.clone.finalSessionName': 'Final session',
         'session.clone.previewUnavailable': 'Enter a project name',
-        'session.clone.preserveDirectories': 'Preserve source working directories',
-        'session.clone.overrideDirectories': 'Use one replacement working directory for the whole copied group',
+        'session.clone.preserveDirectories': 'Default: cloned sessions use the original working directories',
+        'session.clone.overrideDirectories': 'Use a new working directory for cloned sessions',
         'session.clone.cwdOverride': 'Replacement working directory',
         'session.clone.cwdOverridePlaceholder': '/work/new-checkout',
         'session.clone.browseCwd': 'Browse working directory',
@@ -160,7 +160,9 @@ describe('CloneSessionGroupDialog', () => {
     expect(screen.getByText('Working directories are validated on the daemon host before anything is created.')).toBeDefined();
     expect(screen.getByText('The copied group starts fresh.')).toBeDefined();
 
-    fireEvent.click(screen.getByLabelText('Preserve source working directories'));
+    expect(screen.getByText('Default: cloned sessions use the original working directories')).toBeDefined();
+
+    fireEvent.click(screen.getByLabelText('Use a new working directory for cloned sessions'));
     expect(screen.getByPlaceholderText('/work/new-checkout')).toBeDefined();
   });
 

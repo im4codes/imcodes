@@ -414,7 +414,7 @@ export function CloneSessionGroupDialog({
               color: '#cbd5e1',
               fontSize: 13,
               lineHeight: 1.4,
-              marginBottom: 10,
+              marginBottom: useCwdOverride ? 10 : 4,
             }}
           >
             <input
@@ -427,8 +427,21 @@ export function CloneSessionGroupDialog({
               }}
               style={{ marginTop: 2 }}
             />
-            <span>{t(useCwdOverride ? 'session.clone.overrideDirectories' : 'session.clone.preserveDirectories')}</span>
+            <span>{t('session.clone.overrideDirectories')}</span>
           </label>
+
+          {!useCwdOverride && (
+            <div
+              style={{
+                color: '#94a3b8',
+                fontSize: 12,
+                lineHeight: 1.4,
+                margin: '0 0 10px 28px',
+              }}
+            >
+              {t('session.clone.preserveDirectories')}
+            </div>
+          )}
 
           {useCwdOverride && (
             <div class="form-group">
