@@ -15,7 +15,22 @@ vi.mock('react-i18next', () => ({
 afterEach(() => {
   cleanup();
   localStorage.clear();
+  document.querySelectorAll('.tab-bar').forEach((node) => node.remove());
 });
+
+function rectWithBottom(bottom: number): DOMRect {
+  return {
+    x: 0,
+    y: 0,
+    width: 0,
+    height: bottom,
+    top: 0,
+    right: 0,
+    bottom,
+    left: 0,
+    toJSON: () => ({}),
+  };
+}
 
 describe('FloatingPanel', () => {
   it('renders with the supplied zIndex on desktop', () => {
@@ -79,6 +94,32 @@ describe('FloatingPanel', () => {
 
     const panel = screen.getByTestId('floating-panel-clamp-north') as HTMLElement;
     expect(panel.style.top).toBe('0px');
+  });
+
+  it('clamps upward drag to the session tab button bottom', () => {
+    const tabBar = document.createElement('div');
+    tabBar.className = 'tab-bar';
+    const tabButton = document.createElement('button');
+    tabButton.setAttribute('role', 'tab');
+    tabButton.getBoundingClientRect = () => rectWithBottom(44);
+    tabBar.appendChild(tabButton);
+    document.body.appendChild(tabBar);
+    localStorage.setItem('rcc_float_clamp-tab-bottom', JSON.stringify({ x: 100, y: 100, w: 700, h: 500 }));
+
+    render(
+      <FloatingPanel id="clamp-tab-bottom" title="Preview" onClose={() => {}}>
+        <div>content</div>
+      </FloatingPanel>,
+    );
+
+    fireEvent.mouseDown(screen.getByTestId('floating-bottom-drag'), { clientX: 200, clientY: 590 });
+    fireEvent.mouseMove(document, { clientX: 200, clientY: 100 });
+    fireEvent.mouseUp(document);
+
+    const panel = screen.getByTestId('floating-panel-clamp-tab-bottom') as HTMLElement;
+    expect(panel.style.top).toBe('44px');
+
+    tabBar.remove();
   });
 
   it('allows dragging the floating panel from the bottom frame strip', () => {

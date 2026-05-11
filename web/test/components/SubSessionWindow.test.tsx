@@ -3,7 +3,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
-import { cleanup, render, waitFor } from '@testing-library/preact';
+import { cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -132,6 +132,20 @@ function makeSubSession(overrides: Partial<SubSession> = {}): SubSession {
     sessionName: 'deck_sub_sub-1',
     state: 'running',
     ...overrides,
+  };
+}
+
+function rectWithBottom(bottom: number): DOMRect {
+  return {
+    x: 0,
+    y: 0,
+    width: 0,
+    height: bottom,
+    top: 0,
+    right: 0,
+    bottom,
+    left: 0,
+    toJSON: () => ({}),
   };
 }
 
@@ -482,12 +496,14 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
   beforeEach(() => {
     cleanup();
     vi.clearAllMocks();
+    localStorage.clear();
     vi.useFakeTimers();
   });
 
   afterEach(() => {
     vi.useRealTimers();
     cleanup();
+    document.querySelectorAll('.tab-bar').forEach((node) => node.remove());
   });
 
   it('on mobile leaves the main controls area visible below the sub-session window', async () => {
@@ -645,6 +661,51 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
       expect(panel?.style.left).toBe(`${window.innerWidth - 32}px`);
       expect(panel?.style.top).toBe(`${window.innerHeight - 100 - 480}px`);
     });
+  });
+
+  it('clamps upward drag to the session tab button bottom', async () => {
+    const tabBar = document.createElement('div');
+    tabBar.className = 'tab-bar';
+    const tabButton = document.createElement('button');
+    tabButton.setAttribute('role', 'tab');
+    tabButton.getBoundingClientRect = () => rectWithBottom(44);
+    tabBar.appendChild(tabButton);
+    document.body.appendChild(tabBar);
+    localStorage.setItem('rcc_subsession_sub-1', JSON.stringify({
+      geom: { x: 100, y: 120, w: 620, h: 480 },
+      viewMode: 'chat',
+    }));
+
+    const sub = makeSubSession();
+    const { container } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    const header = container.querySelector('.subsession-header') as HTMLElement | null;
+    expect(header).toBeTruthy();
+    fireEvent.mouseDown(header!, { clientX: 160, clientY: 130 });
+    fireEvent.mouseMove(document, { clientX: 160, clientY: -200 });
+    fireEvent.mouseUp(document);
+
+    await waitFor(() => {
+      const panel = container.querySelector('.subsession-window') as HTMLElement | null;
+      expect(panel?.style.top).toBe('44px');
+    });
+
+    tabBar.remove();
   });
 
   it('uses the taller default desktop height for new sub-session windows', async () => {

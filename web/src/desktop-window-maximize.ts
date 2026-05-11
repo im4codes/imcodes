@@ -28,6 +28,8 @@ export interface DomRectLike {
 export type StackOrderEntry = string | { id: string };
 
 export const DESKTOP_BOTTOM_WINDOW_RESERVE_PX = 100;
+const SESSION_TAB_BUTTON_SELECTOR = '.tab-bar [role="tab"]';
+const SESSION_TAB_BAR_SELECTOR = '.tab-bar';
 
 const DEFAULT_MIN_W = 1;
 const DEFAULT_MIN_H = 1;
@@ -75,6 +77,35 @@ export function reserveWorkspaceBottom(
   return {
     ...bounds,
     h: Math.max(0, finiteOr(bounds.h, 0) - reserve),
+  };
+}
+
+export function resolveSessionTabsBottom(doc: Document | null = typeof document === 'undefined' ? null : document): number {
+  if (!doc) return 0;
+  const tabButtons = Array.from(doc.querySelectorAll<HTMLElement>(SESSION_TAB_BUTTON_SELECTOR));
+  const tabButtonBottoms = tabButtons
+    .map((button) => finiteOr(button.getBoundingClientRect().bottom, 0))
+    .filter((bottom) => bottom > 0);
+  if (tabButtonBottoms.length > 0) return Math.max(...tabButtonBottoms);
+
+  const tabBar = doc.querySelector<HTMLElement>(SESSION_TAB_BAR_SELECTOR);
+  return tabBar ? Math.max(0, finiteOr(tabBar.getBoundingClientRect().bottom, 0)) : 0;
+}
+
+export function viewportWorkspaceBelowSessionTabs(options: {
+  viewportWidth: number;
+  viewportHeight: number;
+  minW: number;
+  minH: number;
+  doc?: Document | null;
+}): WorkspaceBounds {
+  const viewportHeight = Math.max(0, finiteOr(options.viewportHeight, 0));
+  const top = Math.min(resolveSessionTabsBottom(options.doc), viewportHeight);
+  return {
+    x: 0,
+    y: top,
+    w: Math.max(Math.max(1, options.minW), finiteOr(options.viewportWidth, 0)),
+    h: Math.max(Math.max(1, options.minH), viewportHeight - top),
   };
 }
 

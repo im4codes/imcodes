@@ -1,21 +1,41 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { SUPPORTED_LOCALES } from '../src/i18n/locales/index.js';
 import {
   clampGeometryToWorkspace,
   geometryFromWorkspace,
   normalizeWindowGeometry,
   reserveWorkspaceBottom,
+  resolveSessionTabsBottom,
   resolveFrontmostMaximized,
   shouldPersistGeometry,
+  viewportWorkspaceBelowSessionTabs,
   workspaceBoundsFromRect,
   type WindowGeometry,
   type WorkspaceBounds,
 } from '../src/desktop-window-maximize.js';
 
+function rectWithBottom(bottom: number): DOMRect {
+  return {
+    x: 0,
+    y: 0,
+    width: 0,
+    height: bottom,
+    top: 0,
+    right: 0,
+    bottom,
+    left: 0,
+    toJSON: () => ({}),
+  };
+}
+
 describe('desktop-window-maximize helpers', () => {
   const workspace: WorkspaceBounds = { x: 80, y: 48, w: 900, h: 640 };
+
+  afterEach(() => {
+    document.querySelectorAll('.tab-bar').forEach((node) => node.remove());
+  });
 
   it('converts workspace bounds into exact maximized geometry', () => {
     expect(geometryFromWorkspace(workspace)).toEqual({ x: 80, y: 48, w: 900, h: 640 });
@@ -37,6 +57,43 @@ describe('desktop-window-maximize helpers', () => {
       w: 560,
       h: 320,
     });
+  });
+
+  it('uses the session tab button bottom as the desktop floating window top bound', () => {
+    const tabBar = document.createElement('div');
+    tabBar.className = 'tab-bar';
+    tabBar.getBoundingClientRect = () => rectWithBottom(72);
+    const tabButton = document.createElement('button');
+    tabButton.setAttribute('role', 'tab');
+    tabButton.getBoundingClientRect = () => rectWithBottom(44);
+    tabBar.appendChild(tabButton);
+    document.body.appendChild(tabBar);
+
+    expect(resolveSessionTabsBottom()).toBe(44);
+    expect(viewportWorkspaceBelowSessionTabs({
+      viewportWidth: 1280,
+      viewportHeight: 900,
+      minW: 360,
+      minH: 280,
+    })).toEqual({
+      x: 0,
+      y: 44,
+      w: 1280,
+      h: 856,
+    });
+
+    tabBar.remove();
+  });
+
+  it('falls back to the session tab bar bottom when there are no tab buttons', () => {
+    const tabBar = document.createElement('div');
+    tabBar.className = 'tab-bar';
+    tabBar.getBoundingClientRect = () => rectWithBottom(38);
+    document.body.appendChild(tabBar);
+
+    expect(resolveSessionTabsBottom()).toBe(38);
+
+    tabBar.remove();
   });
 
   it('clamps restore geometry into the current workspace without forcing maximized size', () => {

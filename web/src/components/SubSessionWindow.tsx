@@ -33,6 +33,7 @@ import {
   normalizeWindowGeometry,
   reserveWorkspaceBottom,
   shouldPersistGeometry,
+  viewportWorkspaceBelowSessionTabs,
   type WindowGeometry,
   type WorkspaceBounds,
 } from '../desktop-window-maximize.js';
@@ -115,12 +116,12 @@ const MIN_H = 200;
 const DESKTOP_VISIBLE_MARGIN = 32;
 
 function currentDesktopBounds(): WorkspaceBounds {
-  return reserveWorkspaceBottom({
-    x: 0,
-    y: 0,
-    w: Math.max(MIN_W, window.innerWidth),
-    h: Math.max(MIN_H, window.innerHeight),
-  });
+  return reserveWorkspaceBottom(viewportWorkspaceBelowSessionTabs({
+    viewportWidth: window.innerWidth,
+    viewportHeight: window.innerHeight,
+    minW: MIN_W,
+    minH: MIN_H,
+  }));
 }
 
 function clampDesktopGeom(geom: WindowGeometry): WindowGeometry {
@@ -434,7 +435,12 @@ export function SubSessionWindow({
         if (dir.includes('e')) w = Math.max(MIN_W, startG.w + dx);
         if (dir.includes('s')) h = Math.max(MIN_H, startG.h + dy);
         if (dir.includes('w')) { w = Math.max(MIN_W, startG.w - dx); x = startG.x + (startG.w - w); }
-        if (dir.includes('n')) { h = Math.max(MIN_H, startG.h - dy); y = startG.y + (startG.h - h); }
+        if (dir.includes('n')) {
+          const bounds = currentDesktopBounds();
+          const startBottom = startG.y + startG.h;
+          y = Math.max(bounds.y, Math.min(startG.y + dy, startBottom - MIN_H));
+          h = startBottom - y;
+        }
         return clampDesktopGeom({ x, y, w, h });
       });
     };
