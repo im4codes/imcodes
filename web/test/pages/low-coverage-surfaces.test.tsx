@@ -172,7 +172,7 @@ describe('low-coverage page and component surfaces', () => {
     const calls = vi.mocked(fetch).mock.calls;
     expect(String(calls[0][0])).toBe('/api/server/srv-1/tracker/validate');
     expect(String(calls[1][0])).toBe('/api/server/srv-1/projects');
-    expect(onAdded).toHaveBeenCalledWith('alpha');
+    await waitFor(() => expect(onAdded).toHaveBeenCalledWith('alpha'));
   });
 
   it('ServerSetupPage adds, verifies, connects, and removes saved servers', async () => {
