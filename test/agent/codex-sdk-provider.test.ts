@@ -39,10 +39,19 @@ const childProcessMock = vi.hoisted(() => {
             childRecord.emits({ method: 'thread/started', params: { thread: { id: 'thread-1' } } });
           }
           if (msg.method === 'thread/resume' && typeof msg.id === 'number') {
-            childRecord.emits({
-              id: msg.id,
-              result: { thread: { id: msg.params?.threadId } },
-            });
+            if (msg.params?.threadId === 'thread-corrupt') {
+              childRecord.emits({
+                id: msg.id,
+                error: {
+                  message: 'failed to read thread: thread-store internal error: failed to load thread history: stream did not contain valid UTF-8',
+                },
+              });
+            } else {
+              childRecord.emits({
+                id: msg.id,
+                result: { thread: { id: msg.params?.threadId } },
+              });
+            }
           }
           if (msg.method === 'turn/start' && typeof msg.id === 'number') {
             childRecord.emits({
@@ -292,6 +301,29 @@ describe('CodexSdkProvider', () => {
     const child = childProcessMock.children[0];
     const resumeReq = child.requests.find((req) => req.method === 'thread/resume');
     expect(resumeReq?.params?.threadId).toBe('thread-existing');
+  });
+
+  it('starts a replacement thread when stored Codex history is unreadable', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-corrupt', cwd: '/tmp/project', resumeId: 'thread-corrupt' });
+
+    const errors: string[] = [];
+    const sessionInfo: Array<Record<string, unknown>> = [];
+    provider.onError((_sid, error) => errors.push(error.message));
+    provider.onSessionInfo?.((_sid, info) => sessionInfo.push(info as Record<string, unknown>));
+
+    await provider.send('route-corrupt', 'hello after corrupt history');
+
+    const child = childProcessMock.children[0];
+    const resumeReq = child.requests.find((req) => req.method === 'thread/resume');
+    const startReq = child.requests.find((req) => req.method === 'thread/start');
+    const turnReq = child.requests.find((req) => req.method === 'turn/start');
+    expect(resumeReq?.params?.threadId).toBe('thread-corrupt');
+    expect(startReq?.params?.cwd).toBe('/tmp/project');
+    expect(turnReq?.params?.threadId).toBe('thread-1');
+    expect(errors).toEqual([]);
+    expect(sessionInfo).toContainEqual({ resumeId: 'thread-1' });
   });
 
   // ── baseInstructions sourcing ──────────────────────────────────────────
