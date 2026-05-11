@@ -11,6 +11,7 @@ export const REPO_MSG = {
   LIST_BRANCHES: 'repo.list_branches',
   LIST_COMMITS: 'repo.list_commits',
   LIST_ACTIONS: 'repo.list_actions',
+  CHECKOUT_BRANCH: 'repo.checkout_branch',
   ACTION_DETAIL: 'repo.action_detail',
   COMMIT_DETAIL: 'repo.commit_detail',
   PR_DETAIL: 'repo.pr_detail',
@@ -24,6 +25,7 @@ export const REPO_MSG = {
   BRANCHES_RESPONSE: 'repo.branches_response',
   COMMITS_RESPONSE: 'repo.commits_response',
   ACTIONS_RESPONSE: 'repo.actions_response',
+  CHECKOUT_BRANCH_RESPONSE: 'repo.checkout_branch_response',
   ACTION_DETAIL_RESPONSE: 'repo.action_detail_response',
   COMMIT_DETAIL_RESPONSE: 'repo.commit_detail_response',
   PR_DETAIL_RESPONSE: 'repo.pr_detail_response',
@@ -40,9 +42,30 @@ export const REPO_RELAY_TYPES = new Set([
   REPO_MSG.BRANCHES_RESPONSE,
   REPO_MSG.COMMITS_RESPONSE,
   REPO_MSG.ACTIONS_RESPONSE,
+  REPO_MSG.CHECKOUT_BRANCH_RESPONSE,
   REPO_MSG.ACTION_DETAIL_RESPONSE,
   REPO_MSG.COMMIT_DETAIL_RESPONSE,
   REPO_MSG.PR_DETAIL_RESPONSE,
   REPO_MSG.ISSUE_DETAIL_RESPONSE,
   REPO_MSG.ERROR,
 ]);
+
+export type RepoMessageType = typeof REPO_MSG[keyof typeof REPO_MSG];
+
+export interface RepoCheckoutBranchRequest {
+  type: typeof REPO_MSG.CHECKOUT_BRANCH;
+  requestId: string;
+  projectDir: string;
+  branch: string;
+}
+
+export interface RepoCheckoutBranchResponse {
+  type: typeof REPO_MSG.CHECKOUT_BRANCH_RESPONSE;
+  requestId?: string;
+  projectDir: string;
+  ok: true;
+  previousBranch?: string;
+  currentBranch: string;
+  repoGeneration: number;
+  detectedAt: number;
+}
