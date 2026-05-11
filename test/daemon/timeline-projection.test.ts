@@ -195,6 +195,7 @@ describe('timeline projection', () => {
     timelineStore.append(makeEvent(sessionId, 2, 'assistant.text', { text: 'second' }, 1000));
     timelineStore.append(makeEvent(sessionId, 3, 'assistant.text', { text: 'third' }, 1000));
     timelineStore.append(makeEvent(sessionId, 4, 'assistant.text', { text: 'fourth' }, 1001));
+    await timelineStore.flushSession(sessionId);
 
     await timelineProjection.rebuildSession(sessionId);
 
@@ -227,6 +228,7 @@ describe('timeline projection', () => {
     timelineStore.append(makeEvent(sessionId, 3, 'assistant.text', { text: 'done', streaming: false }, 1002));
     timelineStore.append(makeEvent(sessionId, 4, 'assistant.text', { text: '   ', streaming: false }, 1003));
     timelineStore.append(makeEvent(sessionId, 5, 'tool.call', { tool: 'search' }, 1004));
+    await timelineStore.flushSession(sessionId);
 
     await timelineProjection.rebuildSession(sessionId);
 
@@ -248,6 +250,7 @@ describe('timeline projection', () => {
 
     timelineStore.append(makeEvent(sessionId, 1, 'assistant.text', { text: 'one' }, 1000));
     timelineStore.append(makeEvent(sessionId, 2, 'assistant.text', { text: 'two' }, 1001));
+    await timelineStore.flushSession(sessionId);
     await timelineProjection.rebuildSession(sessionId);
 
     appendFileSync(timelineFile, `${JSON.stringify(makeEvent(sessionId, 3, 'assistant.text', { text: 'three' }, 1002))}\n`);
@@ -258,7 +261,7 @@ describe('timeline projection', () => {
     const rebuilt = await timelineStore.readPreferred(sessionId, { limit: 10 });
     expect(rebuilt.map((event) => event.seq)).toEqual([1, 2, 3]);
 
-    timelineStore.truncate(sessionId, 2);
+    await timelineStore.truncate(sessionId, 2);
     await timelineProjection.pruneSessionToAuthoritative(sessionId, 2);
 
     const pruned = await timelineStore.readPreferred(sessionId, { limit: 10 });
@@ -280,6 +283,7 @@ describe('timeline projection', () => {
 
     timelineStore.append(makeEvent(sessionId, 1, 'assistant.text', { text: 'one' }, 1000));
     timelineStore.append(makeEvent(sessionId, 2, 'assistant.text', { text: 'two' }, 1001));
+    await timelineStore.flushSession(sessionId);
     await timelineProjection.rebuildSession(sessionId);
 
     appendFileSync(timelineFile, `${JSON.stringify(makeEvent(sessionId, 3, 'assistant.text', { text: 'three' }, 1002))}\n`);
@@ -305,6 +309,7 @@ describe('timeline projection', () => {
 
     timelineStore.append(makeEvent(sessionId, 1, 'assistant.text', { text: 'one' }, 1000));
     timelineStore.append(makeEvent(sessionId, 2, 'assistant.text', { text: 'two' }, 1001));
+    await timelineStore.flushSession(sessionId);
     await timelineProjection.rebuildSession(sessionId);
 
     appendFileSync(timelineFile, `${JSON.stringify(makeEvent(sessionId, 3, 'assistant.text', { text: 'three' }, 1002))}\n`);
@@ -325,6 +330,7 @@ describe('timeline projection', () => {
 
     timelineStore.append(makeEvent(sessionId, 1, 'assistant.text', { text: 'one' }, 1000));
     timelineStore.append(makeEvent(sessionId, 2, 'assistant.text', { text: 'two' }, 1001));
+    await timelineStore.flushSession(sessionId);
     await timelineProjection.rebuildSession(sessionId);
 
     const before = readSessionMeta(sessionId);

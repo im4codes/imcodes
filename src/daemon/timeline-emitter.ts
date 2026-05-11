@@ -4,7 +4,7 @@
  */
 
 import { createHash } from 'crypto';
-import { readFileSync } from 'fs';
+import { readFileSync, statSync } from 'fs';
 import { resolve, basename } from 'path';
 import { tmpdir } from 'os';
 import type { TimelineEvent, TimelineEventType, TimelineSource, TimelineConfidence } from './timeline-event.js';
@@ -12,9 +12,23 @@ import { timelineStore } from './timeline-store.js';
 import { preferTimelineEvent } from '../shared/timeline/merge.js';
 import { isMemoryNoiseTurn } from '../../shared/memory-noise-patterns.js';
 import { recordTurnUsage } from '../store/context-store.js';
+import logger from '../util/logger.js';
 
 /** Pattern matching temp file instruction: "Read and execute all instructions in @<path>" */
 const TEMP_FILE_RE = /^Read and execute all instructions in @(.+\.imcodes-prompt-[0-9a-f]+\.md)$/;
+/**
+ * Maximum size for inlining a temp-file user.message into the event payload.
+ *
+ * The `readFileSync` call below runs on the daemon main thread inside the
+ * high-frequency `emit()` hot path. For tiny prompt files (the common case)
+ * the cost is sub-millisecond, but pathological tmux paste paths can push
+ * many MB of text through this route. Cap at 64 KiB and fall back to the
+ * original `@<path>` ref text — web clients can resolve the body via the
+ * file-preview pool out-of-band. PR-B may extend this to push the read into
+ * the calling routers entirely; this guard alone removes the worst-case
+ * 50ms+ main-thread stall.
+ */
+const MAX_TEMP_FILE_INLINE_BYTES = 64 * 1024;
 /** Only allow reading temp files from /tmp or project directories (prevent path traversal). */
 function isTrustedTempPath(filePath: string): boolean {
   const resolved = resolve(filePath);
@@ -92,12 +106,30 @@ export class TimelineEmitter {
       const text = String(payload.text ?? '');
       const allowDuplicate = payload.allowDuplicate === true;
 
-      // Resolve temp file references: replace instruction with actual file content
+      // Resolve temp file references: replace instruction with actual file content.
+      // Guard with a `statSync` size check so an oversized paste does not block
+      // the emit() main thread on a multi-MB `readFileSync`. `statSync` itself
+      // is < 1ms — within our budget. PR-B follow-up: push the read fully
+      // into the caller (route handler) so emit() never reads files.
       const tempMatch = text.match(TEMP_FILE_RE);
       if (tempMatch && isTrustedTempPath(tempMatch[1])) {
         try {
-          const content = readFileSync(tempMatch[1], 'utf-8');
-          payload = { ...payload, text: content, tempFile: tempMatch[1] };
+          const tempPath = tempMatch[1];
+          const stat = statSync(tempPath);
+          if (stat.size > MAX_TEMP_FILE_INLINE_BYTES) {
+            logger.warn({
+              sessionId,
+              path: tempPath,
+              size: stat.size,
+              maxBytes: MAX_TEMP_FILE_INLINE_BYTES,
+            }, 'timeline-emitter: temp file exceeds inline size; keeping @ref text');
+            // Surface the ref so downstream consumers (UI / file-preview)
+            // can still resolve the body out-of-band.
+            payload = { ...payload, tempFile: tempPath, tempFileSize: stat.size };
+          } else {
+            const content = readFileSync(tempPath, 'utf-8');
+            payload = { ...payload, text: content, tempFile: tempPath };
+          }
         } catch { /* file already cleaned up or unreadable — keep original text */ }
       }
 
@@ -141,7 +173,18 @@ export class TimelineEmitter {
       ...(opts?.hidden ? { hidden: true } : {}),
     };
 
-    // Ring buffer — stable eventId events replace in-place (streaming delta updates)
+    // Ring buffer — stable eventId events replace in-place (streaming delta updates).
+    //
+    // Invariant: buffer is maintained in monotonically-non-decreasing seq order.
+    // `replay()` relies on `buf[0].seq` as the earliest available seq to decide
+    // ring-buffer vs JSONL fallback. If we left a replaced entry at its old
+    // index after merging in a higher-seq update, `buf[0].seq` could leap
+    // forward and force unnecessary JSONL reads — which became a latent
+    // correctness bug once `timelineStore.append` went async (PR-A C1):
+    // callers like supervision-automation reading via `replay()` would fall
+    // through to a JSONL file that hadn't been written yet. We therefore
+    // remove the replaced entry from its current index and push the merged
+    // event at the end so the buffer stays seq-sorted.
     let buf = this.buffer.get(sessionId);
     if (!buf) {
       buf = [];
@@ -151,7 +194,12 @@ export class TimelineEmitter {
     if (isStableUpdate) {
       const existingIdx = buf.findIndex((e) => e.eventId === eventId);
       if (existingIdx >= 0) {
-        buf[existingIdx] = preferTimelineEvent(buf[existingIdx]!, event);
+        const merged = preferTimelineEvent(buf[existingIdx]!, event);
+        // Splice out the old slot, then push the merged event so it lands at
+        // the tail. `seq` on the merged event is the higher of the two by
+        // `preferTimelineEvent`'s rules, which keeps the buffer sorted.
+        buf.splice(existingIdx, 1);
+        buf.push(merged);
       } else {
         buf.push(event);
       }
@@ -211,22 +259,49 @@ export class TimelineEmitter {
 
   /**
    * Replay events after a given seq for a session.
-   * Tries ring buffer first, falls back to file store for older events.
-   * Returns { events, truncated } where truncated=true if requested events fell off both buffer and file.
+   *
+   * Fast path: when the ring buffer's earliest entry already covers
+   * `afterSeq + 1`, serve directly from memory — no JSONL hit. This is
+   * the common case for tight WS reconnect windows and for in-process
+   * readers (e.g. supervision-automation) that emit and read in the
+   * same tick.
+   *
+   * Slow path: when older events were evicted from the buffer, read
+   * the JSONL tail and MERGE with the live buffer so callers see both
+   * historic events (from disk) and the still-in-buffer head — even
+   * when `timelineStore.append` writes are still in flight (PR-A C1
+   * made appends async; without this merge the slow path would lose
+   * any event whose JSONL write hadn't landed yet).
    */
   replay(sessionId: string, afterSeq: number): { events: TimelineEvent[]; truncated: boolean } {
     const buf = this.buffer.get(sessionId) ?? [];
 
-    // Try ring buffer first
+    // Fast path — buffer covers everything from afterSeq+1 forward.
     if (buf.length > 0 && (afterSeq + 1) >= buf[0].seq) {
-      // Ring buffer has all the requested events
       const events = buf.filter(e => e.seq > afterSeq);
       return { events, truncated: false };
     }
 
-    // Ring buffer doesn't have old enough events — read from file store
+    // Slow path — buffer alone can't satisfy the request. Read JSONL
+    // tail for the historic portion, then layer in any buffer event
+    // not already present on disk (handles async-append in-flight
+    // writes + buffer in-place stable-eventId updates).
     const fileEvents = timelineStore.read(sessionId, { epoch: this.epoch, afterSeq });
-    return { events: fileEvents, truncated: false };
+    if (buf.length === 0) {
+      return { events: fileEvents, truncated: false };
+    }
+    const seen = new Set<string>();
+    for (const e of fileEvents) seen.add(`${e.epoch}:${e.seq}`);
+    const merged: TimelineEvent[] = [...fileEvents];
+    for (const e of buf) {
+      if (e.seq <= afterSeq) continue;
+      const key = `${e.epoch}:${e.seq}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(e);
+    }
+    merged.sort((a, b) => a.seq - b.seq);
+    return { events: merged, truncated: false };
   }
 }
 

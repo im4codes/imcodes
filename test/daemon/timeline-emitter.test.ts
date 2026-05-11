@@ -123,20 +123,21 @@ describe('TimelineEmitter — ring buffer', () => {
     emitter = new TimelineEmitter();
   });
 
-  it('ring buffer caps at 500, evicting oldest events', () => {
+  it('ring buffer caps at 500, evicting oldest events and merging with file store', () => {
     const session = 'session-buf';
     for (let i = 0; i < 510; i++) {
       emitter.emit(session, 'assistant.text', { text: `msg-${i}` });
     }
 
-    // When ring buffer has all events, replay from 0 should return 500
+    // Buffer holds the last 500 events (seq 11..510). When replay falls
+    // back to the slow path (afterSeq=0 < buf[0].seq=11) it now MERGES
+    // the JSONL tail with any still-in-buffer events — the latter
+    // covers async-append in-flight writes (PR-A C1). With the mocked
+    // file store returning [], we get exactly the 500 buffer events.
     const { events } = emitter.replay(session, 0);
-    // File store mock returns [], so we get ring buffer events
-    // But replay now checks if afterSeq+1 >= buf[0].seq for ring buffer path
-    // afterSeq=0, buf[0].seq=11, so 1 < 11 → falls through to file store
-    // File store returns [] → events is empty
-    // This is correct behavior — file store would have them in production
-    expect(events).toHaveLength(0); // file store mock returns []
+    expect(events).toHaveLength(500);
+    expect(events[0]?.seq).toBe(11);
+    expect(events[events.length - 1]?.seq).toBe(510);
   });
 
   it('buffers for different sessions do not interfere', () => {

@@ -18,6 +18,7 @@ import { initTempFileStore } from '../store/temp-file-store.js';
 import { setupCCHooks } from '../agent/signal.js';
 import type http from 'http';
 import net from 'node:net';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { loadConfig, type Config } from '../config.js';
 import { loadCredentials } from '../bind/bind-flow.js';
 import { sendKeys } from '../agent/tmux.js';
@@ -353,9 +354,25 @@ export async function startup(): Promise<DaemonContext> {
   startCleanupTimer();
   logger.info('File transfer initialized');
 
-  // Clean up old timeline files (>7 days) and truncate oversized ones
-  timelineStore.cleanup();
-  timelineStore.truncateAll();
+  // Clean up old timeline files (>7 days) and truncate oversized ones.
+  //
+  // Both calls walk every JSONL file in ~/.imcodes/timeline. With a backlog
+  // of 50–100 oversized sessions (~5 MB each) the synchronous pre-R3 path
+  // blocked the daemon main thread for 5–20 s before `ready`. We now run
+  // them in the background, yielding the event loop between sessions, so
+  // the daemon comes up immediately and chip away at retention while WS /
+  // session restore proceeds in parallel. Both methods swallow internal
+  // errors; the surrounding handler logs anything that escapes.
+  void (async () => {
+    try {
+      const start = Date.now();
+      await timelineStore.cleanup();
+      await timelineStore.truncateAll();
+      logger.info({ elapsedMs: Date.now() - start }, 'TimelineStore: startup cleanup + truncateAll completed (background)');
+    } catch (err) {
+      logger.warn({ err }, 'TimelineStore: startup cleanup/truncateAll background failed');
+    }
+  })();
 
   // Archive stale local memory projections (recent_summary with no hits after 30 days)
   pruneLocalMemory();
@@ -829,6 +846,7 @@ export async function startup(): Promise<DaemonContext> {
   startContextReplicationPoller(workerUrl, serverId, token);
   startContextMaterializationPoller(liveContextIngestion);
   startGcPoller();
+  startEventLoopDelayMonitor();
 
   logger.info('Daemon started');
 
@@ -934,6 +952,25 @@ export async function shutdown(exitCode = 0): Promise<void> {
     logger.warn({ err }, 'Daemon shutdown memory drain failed');
   }
 
+  // Flush the async timeline pipeline before terminating the projection
+  // worker. `flushAll` waits for per-session JSONL append chains; `drain`
+  // then waits for SQLite mirror writes to settle. Both are bounded so a
+  // hung disk cannot block shutdown indefinitely (matches the
+  // `drainMasterCompactions(5_000)` style above).
+  try {
+    const { timelineProjection } = await import('./timeline-projection.js');
+    const timelineFlushStart = Date.now();
+    await timelineStore.flushAll(5_000);
+    await timelineProjection.drain(2_000);
+    logger.info({
+      elapsedMs: Date.now() - timelineFlushStart,
+      pendingSessions: timelineStore.getPendingSessionCount(),
+      pendingProjection: timelineProjection.getPendingCount(),
+    }, 'Daemon shutdown: timeline pipeline drained');
+  } catch (err) {
+    logger.warn({ err }, 'Daemon shutdown timeline drain failed');
+  }
+
   try {
     const { disconnectAll } = await import('../agent/provider-registry.js');
     await disconnectAll();
@@ -952,6 +989,7 @@ export async function shutdown(exitCode = 0): Promise<void> {
     if (contextReplicationTimer) clearInterval(contextReplicationTimer);
     if (contextMaterializationTimer) clearInterval(contextMaterializationTimer);
     if (gcTimer) clearInterval(gcTimer);
+    if (eventLoopDelayTimer) clearInterval(eventLoopDelayTimer);
     hookServer?.close();
     ctx?.serverLink?.disconnect();
     configureSharedContextRuntime(null);
@@ -985,6 +1023,7 @@ let codexQuotaTimer: ReturnType<typeof setInterval> | null = null;
 let contextReplicationTimer: ReturnType<typeof setInterval> | null = null;
 let contextMaterializationTimer: ReturnType<typeof setInterval> | null = null;
 let gcTimer: ReturnType<typeof setInterval> | null = null;
+let eventLoopDelayTimer: ReturnType<typeof setInterval> | null = null;
 let hookServer: http.Server | null = null;
 
 /** Periodically check all running sessions; restart any that have disappeared or died. */
@@ -1111,6 +1150,43 @@ function startGcPoller(): void {
     }
   }, intervalMs);
   logger.info({ intervalMs }, 'GC poller: started');
+}
+
+/**
+ * Event-loop delay sampler. Emits a warn log every minute if the p99
+ * loop lag exceeds 50 ms in the last sampling window — a direct
+ * proxy for "is anything blocking the daemon main thread?". The
+ * histogram is `unref`'d so it never holds the process alive.
+ *
+ * After the async timeline refactor (PR-A), this metric should sit
+ * near zero except during cron / GC bursts. A persistently high p99
+ * signals that another sync I/O path slipped in.
+ */
+function startEventLoopDelayMonitor(): void {
+  let monitor: ReturnType<typeof monitorEventLoopDelay>;
+  try {
+    monitor = monitorEventLoopDelay({ resolution: 20 });
+    monitor.enable();
+  } catch (err) {
+    logger.debug({ err }, 'event-loop-delay: monitor unavailable (perf_hooks missing)');
+    return;
+  }
+  eventLoopDelayTimer = setInterval(() => {
+    const p99ms = monitor.percentile(99) / 1e6;
+    const meanMs = monitor.mean / 1e6;
+    if (p99ms > 50) {
+      logger.warn({
+        p99ms: Number(p99ms.toFixed(1)),
+        meanMs: Number(meanMs.toFixed(1)),
+        pendingSessions: timelineStore.getPendingSessionCount(),
+      }, 'event-loop-delay: high p99 (>50ms) — main thread blocked recently');
+    }
+    monitor.reset();
+  }, 60_000);
+  if (typeof eventLoopDelayTimer.unref === 'function') {
+    eventLoopDelayTimer.unref();
+  }
+  logger.info({ intervalMs: 60_000, warnThresholdMs: 50 }, 'event-loop-delay: monitor started');
 }
 
 function setupSignalHandlers(): void {
