@@ -173,6 +173,7 @@ async function findLatestJsonl(dir: string): Promise<string | null> {
 
 /** Main-thread fallback state (only used when worker disabled or failed). */
 const mainParseCtx: ParseContext = createParseContext();
+const JSONL_DRAIN_MAX_BYTES = 1024 * 1024;
 
 // ── Per-session watcher state ─────────────────────────────────────────────────
 
@@ -191,6 +192,10 @@ interface WatcherState {
   status: WatcherStatus;
   /** CC session UUID — used to look up preset contextWindow for usage events. */
   ccSessionId?: string;
+  /** Serializes poll/fs.watch/manual refresh work for this mutable state. */
+  runningWork?: Promise<void>;
+  /** Coalesces missed ticks/events into one follow-up poll after runningWork. */
+  rerunWork?: boolean;
   /**
    * Waiting-for-file state. When `startWatchingFile` can't find the target
    * JSONL within its 120s fast-poll, it leaves a slow `setInterval` probe
@@ -444,7 +449,7 @@ export async function startWatching(sessionName: string, workDir: string, ccSess
   }
 
   // Poll every 2s (uses pollTick so it can re-acquire a file if the claim changes).
-  state.pollTimer = setInterval(() => { void pollTick(sessionName, state); }, 2000);
+  state.pollTimer = setInterval(() => { void runSerializedWatcherWork(sessionName, state, () => pollTick(sessionName, state)); }, 2000);
   void watchDir(sessionName, state);
   return control;
 }
@@ -595,20 +600,49 @@ function startDrainPoll(sessionName: string, state: WatcherState): void {
   if (state.pollTimer) return; // already running
   let pollCount = 0;
   state.pollTimer = setInterval(async () => {
-    await drainNewLines(sessionName, state);
     pollCount++;
-    if (pollCount % 5 === 0 && state.activeFile) {
-      try {
-        const latest = await findLatestJsonl(state.projectDir);
-        if (latest && latest !== state.activeFile && isTrackedClaudeFile(state, latest) && canClaim(sessionName, latest)) {
-          logger.info({ sessionName, oldFile: basename(state.activeFile), newFile: basename(latest) },
-            'jsonl-watcher: newer file detected (poll fallback), switching (CC rotation)');
-          await activateFile(sessionName, state, latest);
-          state.status = 'active';
-        }
-      } catch { /* ignore */ }
-    }
+    await runSerializedWatcherWork(sessionName, state, () => pollTick(sessionName, state, pollCount % 5 === 0));
   }, 2000);
+}
+
+async function maybeRotateToLatest(sessionName: string, state: WatcherState): Promise<void> {
+  if (!state.activeFile) return;
+  try {
+    const latest = await findLatestJsonl(state.projectDir);
+    if (latest && latest !== state.activeFile && isTrackedClaudeFile(state, latest) && canClaim(sessionName, latest)) {
+      logger.info({ sessionName, oldFile: basename(state.activeFile), newFile: basename(latest) },
+        'jsonl-watcher: newer file detected (poll fallback), switching (CC rotation)');
+      await activateFile(sessionName, state, latest);
+      state.status = 'active';
+    }
+  } catch { /* ignore */ }
+}
+
+async function runSerializedWatcherWork(
+  sessionName: string,
+  state: WatcherState,
+  work: () => Promise<void>,
+): Promise<void> {
+  if (state.runningWork) {
+    state.rerunWork = true;
+    await state.runningWork.catch(() => { /* already logged at call site */ });
+    return;
+  }
+
+  state.runningWork = (async () => {
+    try {
+      await work();
+      while (state.rerunWork && !state.stopped) {
+        state.rerunWork = false;
+        await pollTick(sessionName, state, true);
+      }
+    } finally {
+      state.runningWork = undefined;
+      state.rerunWork = false;
+    }
+  })();
+
+  await state.runningWork;
 }
 
 async function watchFile(sessionName: string, state: WatcherState, filePath: string): Promise<void> {
@@ -621,24 +655,26 @@ async function watchFile(sessionName: string, state: WatcherState, filePath: str
 
       const changedFile = join(dir, event.filename);
 
-      if (changedFile === state.activeFile) {
-        await drainNewLines(sessionName, state);
-      } else if (isTrackedClaudeFile(state, changedFile) && canClaim(sessionName, changedFile)) {
-        // A different JSONL file is being written — CC may have rotated (context overflow).
-        // Only switch if the new file is actually newer to avoid grabbing another session's file
-        // whose claim was momentarily released (matches watchDir's checkNewer guard).
-        const isNewer = await checkNewer(changedFile, state.activeFile);
-        if (isNewer || !state.activeFile) {
-          logger.info({ sessionName, oldFile: basename(state.activeFile ?? ''), newFile: event.filename },
-            'jsonl-watcher: new file detected via fs.watch, switching (CC rotation)');
-          try {
-            await activateFile(sessionName, state, changedFile);
-            state.status = 'active';
-          } catch {
-            logger.warn({ sessionName, file: changedFile }, 'jsonl-watcher: failed to switch to newer file');
+      await runSerializedWatcherWork(sessionName, state, async () => {
+        if (changedFile === state.activeFile) {
+          await drainNewLines(sessionName, state);
+        } else if (isTrackedClaudeFile(state, changedFile) && canClaim(sessionName, changedFile)) {
+          // A different JSONL file is being written — CC may have rotated (context overflow).
+          // Only switch if the new file is actually newer to avoid grabbing another session's file
+          // whose claim was momentarily released (matches watchDir's checkNewer guard).
+          const isNewer = await checkNewer(changedFile, state.activeFile);
+          if (isNewer || !state.activeFile) {
+            logger.info({ sessionName, oldFile: basename(state.activeFile ?? ''), newFile: event.filename },
+              'jsonl-watcher: new file detected via fs.watch, switching (CC rotation)');
+            try {
+              await activateFile(sessionName, state, changedFile);
+              state.status = 'active';
+            } catch {
+              logger.warn({ sessionName, file: changedFile }, 'jsonl-watcher: failed to switch to newer file');
+            }
           }
         }
-      }
+      });
     }
   } catch (err) {
     if (!state.stopped) {
@@ -678,22 +714,24 @@ async function watchDir(sessionName: string, state: WatcherState): Promise<void>
 
       // If a new file appeared that is newer than our active file, switch to it.
       // Skip if another session has already claimed it.
-      if (changedFile !== state.activeFile) {
-        if (!isTrackedClaudeFile(state, changedFile)) continue;
-        if (!canClaim(sessionName, changedFile)) continue; // claimed by another session
-        const isNewer = await checkNewer(changedFile, state.activeFile);
-        if (isNewer || !state.activeFile) {
-          logger.debug({ sessionName, file: event.filename }, 'jsonl-watcher: switching to new JSONL file');
-          // Use activateFile for consistent claim/history-replay/offset init
-          state.pendingPartialLine = '';
-          await activateFile(sessionName, state, changedFile);
-          state.status = 'active';
-        } else {
-          continue; // older file, ignore
+      await runSerializedWatcherWork(sessionName, state, async () => {
+        if (changedFile !== state.activeFile) {
+          if (!isTrackedClaudeFile(state, changedFile)) return;
+          if (!canClaim(sessionName, changedFile)) return; // claimed by another session
+          const isNewer = await checkNewer(changedFile, state.activeFile);
+          if (isNewer || !state.activeFile) {
+            logger.debug({ sessionName, file: event.filename }, 'jsonl-watcher: switching to new JSONL file');
+            // Use activateFile for consistent claim/history-replay/offset init
+            state.pendingPartialLine = '';
+            await activateFile(sessionName, state, changedFile);
+            state.status = 'active';
+          } else {
+            return; // older file, ignore
+          }
         }
-      }
 
-      await drainNewLines(sessionName, state);
+        await drainNewLines(sessionName, state);
+      });
     }
   } catch (err) {
     if (!state.stopped) {
@@ -717,7 +755,7 @@ async function checkNewer(candidate: string, current: string | null): Promise<bo
  * Poll tick for startWatching — drains new lines and re-acquires a file if activeFile was released.
  * Separate from drainNewLines so startWatchingFile's poll timer stays simple.
  */
-async function pollTick(sessionName: string, state: WatcherState): Promise<void> {
+async function pollTick(sessionName: string, state: WatcherState, checkRotation = false): Promise<void> {
   // If active file was stolen by another session, try to find a claimable replacement
   if (!state.activeFile) {
     try {
@@ -749,6 +787,9 @@ async function pollTick(sessionName: string, state: WatcherState): Promise<void>
       state.status = 'degraded';
     }
   }
+  if (checkRotation) {
+    await maybeRotateToLatest(sessionName, state);
+  }
   await drainNewLines(sessionName, state);
 }
 
@@ -760,7 +801,7 @@ async function pollTick(sessionName: string, state: WatcherState): Promise<void>
 export async function refreshTrackedSession(sessionName: string): Promise<boolean> {
   const state = watchers.get(sessionName);
   if (!state || state.stopped) return false;
-  await pollTick(sessionName, state);
+  await runSerializedWatcherWork(sessionName, state, () => pollTick(sessionName, state, true));
   return true;
 }
 
@@ -780,7 +821,8 @@ async function drainNewLines(sessionName: string, state: WatcherState): Promise<
     const fileStat = await fh.stat();
     if (fileStat.size <= state.fileOffset) return;
 
-    const buf = Buffer.allocUnsafe(fileStat.size - state.fileOffset);
+    const readSize = Math.min(fileStat.size - state.fileOffset, JSONL_DRAIN_MAX_BYTES);
+    const buf = Buffer.allocUnsafe(readSize);
     const { bytesRead } = await fh.read(buf, 0, buf.length, state.fileOffset);
     if (bytesRead === 0) return;
 
@@ -788,6 +830,9 @@ async function drainNewLines(sessionName: string, state: WatcherState): Promise<
     // Always advance fileOffset by what we read — pending partial is held in memory,
     // not re-read from the file.
     state.fileOffset += bytesRead;
+    if (fileStat.size > state.fileOffset) {
+      state.rerunWork = true;
+    }
 
     const chunk = buf.subarray(0, bytesRead).toString('utf8');
     // Prepend any partial line carried over from the previous drain

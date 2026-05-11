@@ -39,6 +39,7 @@ vi.mock('../../src/daemon/file-preview-read-coordinator.js', () => ({
 // ── Pull the handler function out of command-handler indirectly ────────────
 // We test via handleWebCommand to keep the test at the public API level.
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
+import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 
 // Helper: make a Dirent-like object
 function makeDirent(name: string, isDir: boolean) {
@@ -391,6 +392,36 @@ describe('fs.ls handler', () => {
       status: 'error',
       error: 'EACCES: permission denied',
     });
+  });
+
+  it('does not send a late ok response after fs.ls times out', async () => {
+    vi.useFakeTimers();
+    const testDir = path.join(homedir(), 'slow-dir');
+    let resolveReaddir!: (value: fsp.Dirent<string>[]) => void;
+    mockRealpath.mockResolvedValue(testDir as unknown as string);
+    mockReaddir.mockReturnValue(new Promise((resolve) => {
+      resolveReaddir = resolve as (value: fsp.Dirent<string>[]) => void;
+    }) as unknown as ReturnType<typeof fsp.readdir>);
+
+    try {
+      handleWebCommand({ type: 'fs.ls', path: testDir, requestId: 'req-timeout', includeFiles: true }, mockServerLink as any);
+      await vi.advanceTimersByTimeAsync(10_001);
+      await Promise.resolve();
+
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).toMatchObject({
+        type: 'fs.ls_response',
+        requestId: 'req-timeout',
+        status: 'error',
+        error: FS_GENERIC_ERROR_CODES.FS_LIST_TIMEOUT,
+      });
+
+      resolveReaddir([makeDirent('late.txt', false)] as unknown as fsp.Dirent<string>[]);
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+      expect(sent).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('expands ~ to homedir', async () => {

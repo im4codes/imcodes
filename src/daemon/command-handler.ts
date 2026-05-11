@@ -414,7 +414,7 @@ function schedulePreferencePersistence(input: {
  * timeline-visible (process path) or not (some P2P internal paths).
  */
 function emitCommandAckReliable(
-  serverLink: Pick<ServerLink, 'send'> | undefined,
+  serverLink: (Pick<ServerLink, 'send'> & Partial<Pick<ServerLink, 'trySend'>>) | undefined,
   params: {
     commandId: string;
     sessionName: string;
@@ -434,24 +434,52 @@ function emitCommandAckReliable(
     .catch((err) =>
       logger.error({ commandId: params.commandId, err }, 'ackOutbox.enqueue failed'),
     );
-  try {
-    serverLink?.send({
-      type: MSG_COMMAND_ACK,
-      commandId: params.commandId,
-      status: params.status,
-      session: params.sessionName,
-      ...(params.error ? { error: params.error } : {}),
-    });
+  const sent = trySendCommandAck(serverLink, {
+    commandId: params.commandId,
+    sessionName: params.sessionName,
+    status: params.status,
+    error: params.error,
+  });
+  if (sent) {
     outbox
       .markAcked(params.commandId)
       .catch((err) =>
         logger.warn({ commandId: params.commandId, err }, 'ackOutbox.markAcked failed'),
       );
-  } catch (err) {
+  } else {
     logger.warn(
-      { commandId: params.commandId, err },
-      'command.ack send failed, queued for retry via outbox',
+      { commandId: params.commandId },
+      'command.ack not sent, queued for retry via outbox',
     );
+  }
+}
+
+function trySendCommandAck(
+  serverLink: (Pick<ServerLink, 'send'> & Partial<Pick<ServerLink, 'trySend'>>) | undefined,
+  params: {
+    commandId: string;
+    sessionName: string;
+    status: string;
+    error?: string;
+  },
+): boolean {
+  if (!serverLink) return false;
+  const wireMsg: Record<string, unknown> = {
+    type: MSG_COMMAND_ACK,
+    commandId: params.commandId,
+    status: params.status,
+    session: params.sessionName,
+  };
+  if (params.error) wireMsg.error = params.error;
+  if (typeof serverLink.trySend === 'function') {
+    return serverLink.trySend(wireMsg);
+  }
+  try {
+    serverLink.send(wireMsg);
+    return true;
+  } catch (err) {
+    logger.warn({ commandId: params.commandId, err }, 'command.ack send failed');
+    return false;
   }
 }
 
@@ -1000,7 +1028,7 @@ function sendP2pTargetError(
   timelineMessage: string,
 ): void {
   timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: timelineMessage });
-  try { serverLink.send({ type: 'command.ack', commandId, status: 'error', session: sessionName, error }); } catch {}
+  emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error });
 }
 
 // Session names: alphanumeric + underscore only (matches deck_{project}_{role} and deck_sub_{id} patterns)
@@ -1134,6 +1162,54 @@ function getMutex(sessionName: string): AsyncMutex {
     sessionMutexes.set(sessionName, mutex);
   }
   return mutex;
+}
+
+const PROCESS_MEMORY_RECALL_DEADLINE_MS = 2_500;
+
+async function withDeadline<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+interface ProcessDeliveryTurn {
+  waitForTurn(): Promise<void>;
+  releaseTurn(): void;
+}
+
+const processDeliveryChains = new Map<string, Promise<void>>();
+
+function reserveProcessDeliveryTurn(sessionName: string): ProcessDeliveryTurn {
+  const previous = processDeliveryChains.get(sessionName) ?? Promise.resolve();
+  let releaseCurrent!: () => void;
+  const current = new Promise<void>((resolve) => {
+    releaseCurrent = resolve;
+  });
+  const chain = previous.catch(() => { /* keep the delivery chain alive */ }).then(() => current);
+  processDeliveryChains.set(sessionName, chain);
+  let released = false;
+  return {
+    waitForTurn: () => previous.catch(() => { /* earlier delivery failure is surfaced elsewhere */ }),
+    releaseTurn: () => {
+      if (released) return;
+      released = true;
+      releaseCurrent();
+      void chain.finally(() => {
+        if (processDeliveryChains.get(sessionName) === chain) {
+          processDeliveryChains.delete(sessionName);
+        }
+      });
+    },
+  };
 }
 
 // ── CommandId dedup cache (100 entries / 5 min TTL per session) ──────────────
@@ -2677,7 +2753,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   if (tokens.hadDiscussTokens) {
     logger.warn({ sessionName }, 'P2P: all @@discuss tokens had invalid session names — none matched session store');
     timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: 'No valid P2P targets — session names not found' });
-    try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: 'no_valid_targets' }); } catch {}
+    emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: 'no_valid_targets' });
     return;
   }
 
@@ -2740,7 +2816,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
             commandId: effectiveId,
           });
           // Send command.ack so pending message state clears
-          serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'conflict', session: sessionName });
+          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'conflict' });
         } catch { /* not connected */ }
         return;
       }
@@ -3159,15 +3235,13 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         }, { source: 'daemon', confidence: 'high' });
         const clearStatus = isLegacy ? 'accepted_legacy' : 'accepted';
         timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: clearStatus });
-        try {
-          serverLink.send({ type: 'command.ack', commandId: effectiveId, status: clearStatus, session: sessionName });
-        } catch { /* */ }
+        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: clearStatus });
       } catch (err) {
         const errMsg = describeTransportSendError(err);
         logger.error({ sessionName, err }, 'session.clear (transport) failed');
         timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Clear failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
-        try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg }); } catch { /* */ }
+        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
       }
       return;
     }
@@ -3204,7 +3278,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
               memoryExcluded: true,
             }, { source: 'daemon', confidence: 'high' });
             timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Qwen model: ${nextModel}${authHint}` });
-            try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: `Unknown Qwen model: ${nextModel}${authHint}` }); } catch { /* */ }
+            emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: `Unknown Qwen model: ${nextModel}${authHint}` });
             return;
           }
           transportRuntime.setAgentId(nextModel);
@@ -3245,7 +3319,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
             memoryExcluded: true,
           }, { source: 'daemon', confidence: 'high' });
           timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-          try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted', session: sessionName }); } catch { /* */ }
+          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
           return;
       }
       if (record?.agentType === 'claude-code-sdk' && modelMatch) {
@@ -3255,7 +3329,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           emitTransportUserMessage(text);
           timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Unknown Claude model: ${requestedModel}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
           timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Claude model: ${requestedModel}` });
-          try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: `Unknown Claude model: ${requestedModel}` }); } catch {}
+          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: `Unknown Claude model: ${requestedModel}` });
           return;
         }
         transportRuntime.setAgentId(normalizeClaudeSdkModelForProvider(selectedModel));
@@ -3281,7 +3355,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           memoryExcluded: true,
         }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-        try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted', session: sessionName }); } catch {}
+        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
         return;
       }
       if (record?.agentType === 'codex-sdk' && modelMatch) {
@@ -3297,7 +3371,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           emitTransportUserMessage(text);
           timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Unknown Codex model: ${nextModel}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
           timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Codex model: ${nextModel}` });
-          try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: `Unknown Codex model: ${nextModel}` }); } catch {}
+          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: `Unknown Codex model: ${nextModel}` });
           return;
         }
         transportRuntime.setAgentId(nextModel);
@@ -3323,7 +3397,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           memoryExcluded: true,
         }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-        try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted', session: sessionName }); } catch {}
+        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
         return;
       }
       if ((record?.agentType === 'copilot-sdk' || record?.agentType === 'cursor-headless' || record?.agentType === 'gemini-sdk') && modelMatch) {
@@ -3349,7 +3423,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           memoryExcluded: true,
         }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-        try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted', session: sessionName }); } catch {}
+        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
         return;
       }
       if (supportsEffort(record?.agentType) && effortMatch) {
@@ -3364,7 +3438,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
             memoryExcluded: true,
           }, { source: 'daemon', confidence: 'high' });
           timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unsupported thinking level: ${nextEffort}` });
-          try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: `Unsupported thinking level: ${nextEffort}` }); } catch {}
+          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: `Unsupported thinking level: ${nextEffort}` });
           return;
         }
         transportRuntime.setEffort(nextEffort);
@@ -3385,7 +3459,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           memoryExcluded: true,
         }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-        try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted', session: sessionName }); } catch {}
+        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
         return;
       }
       if (record?.agentType === 'qwen' && record.qwenAuthType === 'qwen-oauth') {
@@ -3479,13 +3553,13 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       }, { source: 'daemon', confidence: 'high' });
       const clearStatus = isLegacy ? 'accepted_legacy' : 'accepted';
       timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: clearStatus });
-      try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: clearStatus, session: sessionName }); } catch {}
+      emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: clearStatus });
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       logger.error({ sessionName, err }, 'session.clear failed');
       timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Clear failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
       timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
-      try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg }); } catch {}
+      emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
     }
     return;
   }
@@ -3528,7 +3602,7 @@ function emitCommandAck(
   commandId: string,
   status: 'accepted' | 'accepted_legacy' | 'error',
   error: string | undefined,
-  serverLink: Pick<ServerLink, 'send'> | undefined,
+  serverLink: (Pick<ServerLink, 'send'> & Partial<Pick<ServerLink, 'trySend'>>) | undefined,
 ): void {
   const ackPayload: Record<string, unknown> = { commandId, status };
   if (error) ackPayload.error = error;
@@ -3543,15 +3617,13 @@ function emitCommandAck(
   }).catch((err) => {
     logger.error({ commandId, err }, 'ackOutbox.enqueue failed');
   });
-  try {
-    const wireMsg: Record<string, unknown> = { type: MSG_COMMAND_ACK, commandId, status, session: sessionName };
-    if (error) wireMsg.error = error;
-    serverLink?.send(wireMsg);
+  const sent = trySendCommandAck(serverLink, { commandId, sessionName, status, error });
+  if (sent) {
     outbox.markAcked(commandId).catch((err) => {
       logger.warn({ commandId, err }, 'ackOutbox.markAcked failed');
     });
-  } catch (err) {
-    logger.warn({ commandId, err }, 'command.ack send failed, queued for retry');
+  } else {
+    logger.warn({ commandId }, 'command.ack not sent, queued for retry');
   }
 }
 
@@ -3581,70 +3653,68 @@ async function sendProcessSessionMessage(
     emitCommandAck(sessionName, options.commandId, status, undefined, options.serverLink);
   }
 
-  // ── Step 2: Acquire per-session mutex to serialize tmux delivery ────────────
-  // The mutex preserves message ordering when multiple sends queue up. The ack
-  // above is already out — the user no longer waits on this lock.
-  const release = await getMutex(sessionName).acquire();
-  try {
-    const agentType = getSession(sessionName)?.agentType ?? 'unknown';
+  const deliveryTurn = reserveProcessDeliveryTurn(sessionName);
+  const agentType = getSession(sessionName)?.agentType ?? 'unknown';
 
-    let sendText = finalText;
+  // ── Step 2: Prepare advisory context outside the per-session delivery lock ──
+  // Path sandboxing and memory recall can touch disk/SQLite/embedding state.
+  // They must not block earlier queued tmux writes any longer than necessary.
+  let sendText = finalText;
+  try {
     if (agentType === 'gemini' || agentType === 'codex') {
       sendText = await rewritePathsForSandbox(sessionName, finalText);
     }
+  } catch (rewriteErr) {
+    logger.warn({ sessionName, err: rewriteErr }, 'sandbox path rewrite failed — sending original message');
+    sendText = finalText;
+  }
 
-    // ── Step 3: Memory recall — best-effort, NO deadline ─────────────────────
-    // Recall is purely advisory; it augments the prompt with related past work
-    // when available. A slow or failing recall MUST NOT delay the message —
-    // the user only cares that the agent gets the prompt. If recall succeeds
-    // we prepend; otherwise we send the raw text.
-    let memoryContext: Awaited<ReturnType<typeof prependLocalMemory>> = { text: sendText };
+  let memoryContext: Awaited<ReturnType<typeof prependLocalMemory>> = { text: sendText };
+  try {
+    const deadlineAt = Date.now() + PROCESS_MEMORY_RECALL_DEADLINE_MS;
+    memoryContext = await withDeadline(
+      prependLocalMemory(sendText, sessionName, { deadlineAt }),
+      PROCESS_MEMORY_RECALL_DEADLINE_MS,
+      'memory_recall_timeout',
+    );
+    sendText = memoryContext.text;
+  } catch (recallErr) {
+    logger.warn({ sessionName, timeoutMs: PROCESS_MEMORY_RECALL_DEADLINE_MS, err: recallErr }, 'memory recall skipped — sending without memory injection');
+  }
+
+  // ── Step 3: Serialize only the actual stdin write ──────────────────────────
+  // The delivery turn is reserved before async preparation, so parallel recall
+  // cannot reorder two user messages for the same process session.
+  await deliveryTurn.waitForTurn();
+  const release = await getMutex(sessionName).acquire();
+  try {
+    await sendShellAwareCommand(sessionName, sendText, agentType);
+  } catch (sendErr) {
+    const errMsg = sendErr instanceof Error ? sendErr.message : String(sendErr);
+    logger.error({ sessionName, err: sendErr }, 'sendShellAwareCommand failed after ack');
     try {
-      memoryContext = await prependLocalMemory(sendText, sessionName);
-      sendText = memoryContext.text;
-    } catch (recallErr) {
-      logger.warn({ sessionName, err: recallErr }, 'memory recall failed — sending without memory injection');
-      // Fall through with the original sendText. Agent still gets the message;
-      // user just doesn't get the related-past-work block.
-    }
-
-    // ── Step 4: Deliver to tmux. Failures here surface as inline errors ──────
-    try {
-      await sendShellAwareCommand(sessionName, sendText, agentType);
-    } catch (sendErr) {
-      const errMsg = sendErr instanceof Error ? sendErr.message : String(sendErr);
-      logger.error({ sessionName, err: sendErr }, 'sendShellAwareCommand failed after ack');
-      try {
-        emitSessionInlineError(sessionName, `Failed to deliver message to agent: ${errMsg}`);
-      } catch { /* best-effort */ }
-      throw sendErr;
-    }
-
-    // ── Step 5: Post-delivery — emit memory.context + record hits ────────────
-    // Order matters — memory.context comes AFTER user.message and AFTER
-    // successful agent delivery so a failed send doesn't pollute recall
-    // analytics.
-    if (memoryContext.timelinePayload && userEvent) {
-      timelineEmitter.emit(sessionName, 'memory.context', {
-        ...memoryContext.timelinePayload,
-        relatedToEventId: userEvent.eventId,
-      });
-      if (memoryContext.hitIds && memoryContext.hitIds.length > 0) {
-        try { recordMemoryHits(memoryContext.hitIds); } catch { /* non-fatal */ }
-      }
-    }
-
-    if (agentType === 'opencode') {
-      const { scheduleCatchup } = await import('./opencode-watcher.js');
-      scheduleCatchup(sessionName);
-    }
-  } catch (err) {
-    // The ack is already out (status: accepted). Surface failures as inline
-    // session errors via the path above; we do NOT downgrade the ack to error
-    // because the user has already been told their message was received.
-    throw err;
+      emitSessionInlineError(sessionName, `Failed to deliver message to agent: ${errMsg}`);
+    } catch { /* best-effort */ }
+    throw sendErr;
   } finally {
     release();
+    deliveryTurn.releaseTurn();
+  }
+
+  // ── Step 4: Post-delivery — emit memory.context + record hits ──────────────
+  if (memoryContext.timelinePayload && userEvent) {
+    timelineEmitter.emit(sessionName, 'memory.context', {
+      ...memoryContext.timelinePayload,
+      relatedToEventId: userEvent.eventId,
+    });
+    if (memoryContext.hitIds && memoryContext.hitIds.length > 0) {
+      try { recordMemoryHits(memoryContext.hitIds); } catch { /* non-fatal */ }
+    }
+  }
+
+  if (agentType === 'opencode') {
+    const { scheduleCatchup } = await import('./opencode-watcher.js');
+    scheduleCatchup(sessionName);
   }
 }
 
@@ -3703,7 +3773,7 @@ async function handleEditQueuedTransportMessage(cmd: Record<string, unknown>, se
   const record = getSession(sessionName);
   if (!runtime || record?.runtimeType !== 'transport') {
     timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: 'Transport session unavailable' });
-    try { serverLink.send({ type: 'command.ack', commandId, status: 'error', session: sessionName, error: 'Transport session unavailable' }); } catch {}
+    emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error: 'Transport session unavailable' });
     return;
   }
   const release = await getMutex(sessionName).acquire();
@@ -3711,7 +3781,7 @@ async function handleEditQueuedTransportMessage(cmd: Record<string, unknown>, se
     const edited = runtime.editPendingMessage(clientMessageId, text);
     if (!edited) {
       timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: 'Queued message not found' });
-      try { serverLink.send({ type: 'command.ack', commandId, status: 'error', session: sessionName, error: 'Queued message not found' }); } catch {}
+      emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error: 'Queued message not found' });
       return;
     }
     supervisionAutomation.updateQueuedTaskIntent(sessionName, clientMessageId, text);
@@ -3722,7 +3792,7 @@ async function handleEditQueuedTransportMessage(cmd: Record<string, unknown>, se
       pendingMessageEntries: runtime.pendingEntries,
     }, { source: 'daemon', confidence: 'high' });
     timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
-    try { serverLink.send({ type: 'command.ack', commandId, status: 'accepted', session: sessionName }); } catch {}
+    emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
   } finally {
     release();
   }
@@ -3739,7 +3809,7 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
   const record = getSession(sessionName);
   if (!runtime || record?.runtimeType !== 'transport') {
     timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: 'Transport session unavailable' });
-    try { serverLink.send({ type: 'command.ack', commandId, status: 'error', session: sessionName, error: 'Transport session unavailable' }); } catch {}
+    emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error: 'Transport session unavailable' });
     return;
   }
   const release = await getMutex(sessionName).acquire();
@@ -3747,7 +3817,7 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
     const removed = runtime.removePendingMessage(clientMessageId);
     if (!removed) {
       timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: 'Queued message not found' });
-      try { serverLink.send({ type: 'command.ack', commandId, status: 'error', session: sessionName, error: 'Queued message not found' }); } catch {}
+      emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error: 'Queued message not found' });
       return;
     }
     supervisionAutomation.removeQueuedTaskIntent(sessionName, clientMessageId);
@@ -3758,7 +3828,7 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
       pendingMessageEntries: runtime.pendingEntries,
     }, { source: 'daemon', confidence: 'high' });
     timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
-    try { serverLink.send({ type: 'command.ack', commandId, status: 'accepted', session: sessionName }); } catch {}
+    emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
   } finally {
     release();
   }
@@ -5918,6 +5988,19 @@ const FILE_SEARCH_EXCLUDES = new Set([
 ]);
 
 const FILE_SEARCH_MAX = 20;
+const FILE_SEARCH_MAX_INDEXED_PATHS = 20_000;
+const FILE_SEARCH_CACHE_TTL_MS = 5_000;
+const FILE_SEARCH_CACHE_MAX_ENTRIES = 32;
+
+interface FileSearchSnapshot {
+  root: string;
+  dirSignature: string;
+  paths: string[];
+}
+
+const fileSearchCache = new Map<string, { expiresAt: number; value: FileSearchSnapshot }>();
+const fileSearchInflight = new Map<string, Promise<FileSearchSnapshot>>();
+const fileSearchGenerations = new Map<string, number>();
 
 export function getActiveP2pRunsBlockingDaemonUpgrade(runs = listP2pRuns()) {
   return runs.filter((run) => !P2P_TERMINAL_RUN_STATUSES.has(run.status));
@@ -6040,36 +6123,22 @@ async function handleFileSearch(cmd: Record<string, unknown>, serverLink: Server
   if (!requestId || !projectDir) return;
 
   try {
-    // 1. Crawl all files/dirs
-    const allPaths: string[] = [];
-    async function walk(dir: string, rel: string): Promise<void> {
-      if (allPaths.length >= 20000) return;
-      let entries: import('fs').Dirent[];
-      try { entries = await fsReaddir(dir, { withFileTypes: true }); } catch { return; }
-      for (const entry of entries) {
-        if (FILE_SEARCH_EXCLUDES.has(entry.name)) continue;
-        const relPath = rel ? `${rel}/${entry.name}` : entry.name;
-        if (entry.isDirectory()) {
-          if (entry.name.startsWith('.') && entry.name !== '.github') continue;
-          allPaths.push(relPath + '/');
-          await walk(nodePath.join(dir, entry.name), relPath);
-        } else if (entry.isFile()) {
-          allPaths.push(relPath);
-        }
-      }
+    const canonical = await resolveCanonical(projectDir, 'strict');
+    if (!canonical) {
+      try { serverLink.send({ type: 'file.search_response', requestId, results: [], error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
+      return;
     }
-    await walk(projectDir, '');
+    const allPaths = (await getFileSearchSnapshot(canonical.realPath)).paths;
 
     let top: string[];
     if (!query) {
       // No query — return first files alphabetically
-      allPaths.sort();
-      top = allPaths.slice(0, FILE_SEARCH_MAX);
+      top = [...allPaths].sort().slice(0, FILE_SEARCH_MAX);
     } else {
       // 2. Fuzzy search via fzf
       const { Fzf } = await import('fzf');
       const fzf = new Fzf(allPaths, {
-        fuzzy: allPaths.length > 20000 ? 'v1' : 'v2',
+        fuzzy: allPaths.length >= FILE_SEARCH_MAX_INDEXED_PATHS ? 'v1' : 'v2',
         forward: false,
         casing: 'case-insensitive',
         tiebreakers: [fileSearchByBasenamePrefix, fileSearchByMatchPosFromEnd, fileSearchByLengthAsc],
@@ -6084,8 +6153,85 @@ async function handleFileSearch(cmd: Record<string, unknown>, serverLink: Server
   }
 }
 
+async function loadFileSearchSnapshot(root: string): Promise<FileSearchSnapshot> {
+  const paths: string[] = [];
+  async function walk(dir: string, rel: string): Promise<void> {
+    if (paths.length >= FILE_SEARCH_MAX_INDEXED_PATHS) return;
+    let entries: import('fs').Dirent[];
+    try { entries = await fsReaddir(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      if (paths.length >= FILE_SEARCH_MAX_INDEXED_PATHS) return;
+      if (FILE_SEARCH_EXCLUDES.has(entry.name)) continue;
+      const relPath = rel ? `${rel}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        if (entry.name.startsWith('.') && entry.name !== '.github') continue;
+        paths.push(`${relPath}/`);
+        await walk(nodePath.join(dir, entry.name), relPath);
+      } else if (entry.isFile()) {
+        paths.push(relPath);
+      }
+    }
+  }
+  await walk(root, '');
+  return {
+    root,
+    dirSignature: await safeStatSignature(root),
+    paths,
+  };
+}
+
+async function getFileSearchSnapshot(root: string): Promise<FileSearchSnapshot> {
+  sweepExpiredCache(fileSearchCache);
+  const dirSignature = await safeStatSignature(root);
+  const cached = fileSearchCache.get(root);
+  if (cached && cached.expiresAt > Date.now() && cached.value.dirSignature === dirSignature) {
+    fileSearchCache.delete(root);
+    fileSearchCache.set(root, cached);
+    return cached.value;
+  }
+
+  const generation = getResourceGeneration(fileSearchGenerations, root);
+  const inflightKey = `${root}::${generation}`;
+  const inflight = fileSearchInflight.get(inflightKey);
+  if (inflight) return await inflight;
+
+  const promise = loadFileSearchSnapshot(root)
+    .then(async (value) => {
+      const currentSignature = await safeStatSignature(root);
+      if (getResourceGeneration(fileSearchGenerations, root) === generation && currentSignature === value.dirSignature) {
+        setBoundedCache(fileSearchCache, root, { value, expiresAt: Date.now() + FILE_SEARCH_CACHE_TTL_MS }, FILE_SEARCH_CACHE_MAX_ENTRIES);
+      }
+      return value;
+    })
+    .finally(() => {
+      fileSearchInflight.delete(inflightKey);
+    });
+  fileSearchInflight.set(inflightKey, promise);
+  return await promise;
+}
+
+function invalidateFileSearchCachesForPath(targetPath: string): void {
+  const normalized = normalizeFsPath(targetPath);
+  const roots = new Set<string>([
+    ...fileSearchCache.keys(),
+    ...fileSearchGenerations.keys(),
+    ...[...fileSearchInflight.keys()].map((key) => key.split('::')[0] ?? ''),
+  ]);
+  for (const root of roots) {
+    if (!root) continue;
+    if (!isPathInside(root, normalized) && !isPathInside(normalized, root)) continue;
+    bumpResourceGeneration(fileSearchGenerations, root);
+    fileSearchCache.delete(root);
+    for (const key of fileSearchInflight.keys()) {
+      if (key.startsWith(`${root}::`)) fileSearchInflight.delete(key);
+    }
+  }
+}
+
 const FS_LIST_DEADLINE_MS = 10_000;
 const FS_LIST_CACHE_TTL_MS = 5_000;
+const FS_LIST_CACHE_MAX_ENTRIES = 128;
+const FS_LIST_METADATA_CONCURRENCY = 32;
 
 interface FsLsSnapshot {
   resolvedPath: string;
@@ -6093,9 +6239,55 @@ interface FsLsSnapshot {
   entries: Array<Record<string, unknown>>;
 }
 
+interface FsListRequestContext {
+  readonly terminal: boolean;
+  markTerminal(): void;
+  send(message: Record<string, unknown>): boolean;
+}
+
 const fsListCache = new Map<string, { expiresAt: number; value: FsLsSnapshot }>();
 const fsListInflight = new Map<string, Promise<FsLsSnapshot>>();
 const fsListGenerations = new Map<string, number>();
+
+function sweepExpiredCache<T>(cache: Map<string, { expiresAt: number; value: T }>, now = Date.now()): void {
+  for (const [key, entry] of cache) {
+    if (entry.expiresAt <= now) cache.delete(key);
+  }
+}
+
+function setBoundedCache<T>(
+  cache: Map<string, { expiresAt: number; value: T }>,
+  key: string,
+  entry: { expiresAt: number; value: T },
+  maxEntries: number,
+): void {
+  cache.delete(key);
+  cache.set(key, entry);
+  while (cache.size > maxEntries) {
+    const oldestKey = cache.keys().next().value;
+    if (typeof oldestKey !== 'string') break;
+    cache.delete(oldestKey);
+  }
+}
+
+async function mapWithConcurrency<T, U>(
+  items: readonly T[],
+  limit: number,
+  mapper: (item: T, index: number) => Promise<U>,
+): Promise<U[]> {
+  if (items.length === 0) return [];
+  const results = new Array<U>(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const index = nextIndex++;
+      if (index >= items.length) return;
+      results[index] = await mapper(items[index], index);
+    }
+  }));
+  return results;
+}
 
 function getFsListCacheKey(realPath: string, includeFiles: boolean, includeMetadata: boolean, allowDownloadHandles: boolean): string {
   const metadataMode = includeMetadata
@@ -6104,27 +6296,60 @@ function getFsListCacheKey(realPath: string, includeFiles: boolean, includeMetad
   return `${realPath}::${includeFiles ? 'files' : 'dirs'}::${metadataMode}`;
 }
 
+function createFsListRequestContext(serverLink: ServerLink): FsListRequestContext {
+  let terminal = false;
+  let sent = false;
+  return {
+    get terminal() {
+      return terminal;
+    },
+    markTerminal() {
+      terminal = true;
+    },
+    send(message: Record<string, unknown>): boolean {
+      if (terminal || sent) return false;
+      sent = true;
+      terminal = true;
+      try {
+        serverLink.send(message);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  };
+}
+
 async function loadFsListSnapshot(real: string, includeFiles: boolean, includeMetadata: boolean, allowDownloadHandles: boolean): Promise<FsLsSnapshot> {
   const dirents = await fsReaddir(real, { withFileTypes: true });
   const filtered = dirents.filter((d) => d.isDirectory() || (includeFiles && d.isFile()));
 
-  const entries = await Promise.all(filtered.map(async (d) => {
-    const entry: Record<string, unknown> = { name: d.name, path: nodePath.join(real, d.name), isDir: d.isDirectory(), hidden: d.name.startsWith('.') };
-    if (includeMetadata && !d.isDirectory()) {
-      try {
-        const filePath = nodePath.join(real, d.name);
-        const fileStat = await fsStat(filePath);
-        entry.size = fileStat.size;
-        const ext = nodePath.extname(d.name).toLowerCase().slice(1);
-        entry.mime = MIME_MAP[ext] || undefined;
-        if (allowDownloadHandles) {
-          const handle = await tryCreateProjectFileHandle(filePath, d.name, entry.mime as string | undefined, fileStat.size);
-          if (handle) entry.downloadId = handle.id;
-        }
-      } catch { /* stat failed, skip metadata */ }
-    }
-    return entry;
-  }));
+  const buildBasicEntry = (d: import('fs').Dirent): Record<string, unknown> => ({
+    name: d.name,
+    path: nodePath.join(real, d.name),
+    isDir: d.isDirectory(),
+    hidden: d.name.startsWith('.'),
+  });
+
+  const entries = includeMetadata
+    ? await mapWithConcurrency(filtered, FS_LIST_METADATA_CONCURRENCY, async (d) => {
+      const entry = buildBasicEntry(d);
+      if (!d.isDirectory()) {
+        try {
+          const filePath = nodePath.join(real, d.name);
+          const fileStat = await fsStat(filePath);
+          entry.size = fileStat.size;
+          const ext = nodePath.extname(d.name).toLowerCase().slice(1);
+          entry.mime = MIME_MAP[ext] || undefined;
+          if (allowDownloadHandles) {
+            const handle = await tryCreateProjectFileHandle(filePath, d.name, entry.mime as string | undefined, fileStat.size);
+            if (handle) entry.downloadId = handle.id;
+          }
+        } catch { /* stat failed, skip metadata */ }
+      }
+      return entry;
+    })
+    : filtered.map(buildBasicEntry);
 
   entries.sort((a, b) => {
     if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
@@ -6140,10 +6365,13 @@ async function loadFsListSnapshot(real: string, includeFiles: boolean, includeMe
 }
 
 async function getFsListSnapshot(real: string, includeFiles: boolean, includeMetadata: boolean, allowDownloadHandles: boolean): Promise<FsLsSnapshot> {
+  sweepExpiredCache(fsListCache);
   const dirSignature = await safeStatSignature(real);
   const cacheKey = getFsListCacheKey(real, includeFiles, includeMetadata, allowDownloadHandles);
   const cached = fsListCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now() && cached.value.dirSignature === dirSignature) {
+    fsListCache.delete(cacheKey);
+    fsListCache.set(cacheKey, cached);
     return cached.value;
   }
 
@@ -6156,7 +6384,7 @@ async function getFsListSnapshot(real: string, includeFiles: boolean, includeMet
     .then(async (value) => {
       const currentSignature = await safeStatSignature(real);
       if (getResourceGeneration(fsListGenerations, real) === generation && currentSignature === value.dirSignature) {
-        fsListCache.set(cacheKey, { value, expiresAt: Date.now() + FS_LIST_CACHE_TTL_MS });
+        setBoundedCache(fsListCache, cacheKey, { value, expiresAt: Date.now() + FS_LIST_CACHE_TTL_MS }, FS_LIST_CACHE_MAX_ENTRIES);
       }
       return value;
     })
@@ -6200,28 +6428,30 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
     ? rawPath
     : (rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath);
   const resolved = isDrivesSentinel ? rawPath : nodePath.resolve(expanded);
+  const requestContext = createFsListRequestContext(serverLink);
 
   let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
   const deadline = new Promise<never>((_, reject) => {
-    deadlineTimer = setTimeout(() => reject(new Error('fs_list_timeout')), FS_LIST_DEADLINE_MS);
+    deadlineTimer = setTimeout(() => reject(new Error(FS_GENERIC_ERROR_CODES.FS_LIST_TIMEOUT)), FS_LIST_DEADLINE_MS);
     deadlineTimer.unref?.();
   });
 
   try {
-    await Promise.race([handleFsListInner(resolved, rawPath, requestId, includeFiles, includeMetadata, serverLink), deadline]);
+    await Promise.race([handleFsListInner(resolved, rawPath, requestId, includeFiles, includeMetadata, requestContext), deadline]);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (msg === 'fs_list_timeout') {
-      try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: 'fs_list_timeout' }); } catch { /* ignore */ }
+    if (msg === FS_GENERIC_ERROR_CODES.FS_LIST_TIMEOUT) {
+      requestContext.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FS_LIST_TIMEOUT });
     } else {
-      try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: msg }); } catch { /* ignore */ }
+      requestContext.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: msg });
     }
   } finally {
     if (deadlineTimer) clearTimeout(deadlineTimer);
+    requestContext.markTerminal();
   }
 }
 
-async function handleFsListInner(resolved: string, rawPath: string, requestId: string, includeFiles: boolean, includeMetadata: boolean, serverLink: ServerLink): Promise<void> {
+async function handleFsListInner(resolved: string, rawPath: string, requestId: string, includeFiles: boolean, includeMetadata: boolean, requestContext: FsListRequestContext): Promise<void> {
   // Windows drive picker — only triggered by the explicit `:drives:` path,
   // NOT by `~` (which always means the user's home directory on every OS).
   if (process.platform === 'win32' && rawPath === WINDOWS_DRIVES_PATH) {
@@ -6237,28 +6467,26 @@ async function handleFsListInner(resolved: string, rawPath: string, requestId: s
           }
         }),
     );
-    try {
-      serverLink.send({
-        type: 'fs.ls_response',
-        requestId,
-        path: rawPath,
-        resolvedPath: WINDOWS_DRIVES_ROOT,
-        status: 'ok',
-        entries: entries.filter(Boolean),
-      });
-    } catch { /* ignore */ }
+    requestContext.send({
+      type: 'fs.ls_response',
+      requestId,
+      path: rawPath,
+      resolvedPath: WINDOWS_DRIVES_ROOT,
+      status: 'ok',
+      entries: entries.filter(Boolean),
+    });
     return;
   }
 
   const canonical = await resolveCanonical(resolved, includeMetadata ? 'lenient' : 'strict');
   if (!canonical) {
-    try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
+    requestContext.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH });
     return;
   }
 
   const snapshot = await getFsListSnapshot(canonical.realPath, includeFiles, includeMetadata, !canonical.usedFallback);
 
-  try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: snapshot.resolvedPath, status: 'ok', entries: snapshot.entries }); } catch { /* ignore */ }
+  requestContext.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: snapshot.resolvedPath, status: 'ok', entries: snapshot.entries });
 }
 
 const REPO_CONTEXT_CACHE_TTL_MS = 5_000;
@@ -6687,6 +6915,12 @@ function invalidateGitCachesForPath(targetPath: string): void {
 
 export function __resetFsGitCachesForTests(): void {
   void __resetPreviewReadCoordinatorForTests();
+  fsListCache.clear();
+  fsListInflight.clear();
+  fsListGenerations.clear();
+  fileSearchCache.clear();
+  fileSearchInflight.clear();
+  fileSearchGenerations.clear();
   repoContextCache.clear();
   repoSignatureCache.clear();
   gitStatusCache.clear();
@@ -6791,7 +7025,7 @@ async function handleFsMkdir(cmd: Record<string, unknown>, serverLink: ServerLin
       return;
     }
   } catch {
-    try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: 'parent_not_found' }); } catch { /* ignore */ }
+    try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.PARENT_NOT_FOUND }); } catch { /* ignore */ }
     return;
   }
 
@@ -6800,6 +7034,7 @@ async function handleFsMkdir(cmd: Record<string, unknown>, serverLink: ServerLin
     await mkdir(resolved, { recursive: true });
     const real = await fsRealpath(resolved);
     invalidateFsListCachesForPath(real);
+    invalidateFileSearchCachesForPath(real);
     try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, resolvedPath: real, status: 'ok' }); } catch { /* ignore */ }
   } catch (err) {
     try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: err instanceof Error ? err.message : String(err) }); } catch { /* ignore */ }
@@ -6811,7 +7046,7 @@ function getFsWriteErrorCode(err: unknown): string {
   const code = typeof err === 'object' && err !== null && 'code' in err ? String((err as { code?: unknown }).code) : '';
   const message = err instanceof Error ? err.message : String(err);
   if (code === 'EEXIST' || message.includes('EEXIST') || message.includes('file already exists')) return FS_WRITE_ERROR.FILE_EXISTS;
-  if (code === 'ENOENT' || code === 'ENOTDIR' || message.includes('ENOENT') || message.includes('no such file')) return 'parent_not_found';
+  if (code === 'ENOENT' || code === 'ENOTDIR' || message.includes('ENOENT') || message.includes('no such file')) return FS_GENERIC_ERROR_CODES.PARENT_NOT_FOUND;
   return FS_GENERIC_ERROR_CODES.INTERNAL_ERROR;
 }
 
@@ -6883,6 +7118,7 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
       await fsWriteFile(real, content, 'utf-8');
       const newStats = await fsStat(real);
       invalidateFsListCachesForPath(real);
+      invalidateFileSearchCachesForPath(real);
       invalidateGitCachesForPath(real);
       try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', mtime: newStats.mtimeMs }); } catch { /* ignore */ }
     } catch (err) {
@@ -6913,6 +7149,7 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
       const newStats = await fsStat(resolved);
       const real = await fsRealpath(resolved);
       invalidateFsListCachesForPath(real);
+      invalidateFileSearchCachesForPath(real);
       invalidateGitCachesForPath(real);
       try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', mtime: newStats.mtimeMs }); } catch { /* ignore */ }
     } catch (err) {
@@ -8842,6 +9079,7 @@ async function handleMemoryDelete(cmd: Record<string, unknown>, serverLink: Serv
 async function prependLocalMemory(
   prompt: string,
   sessionName: string,
+  options?: { deadlineAt?: number },
 ): Promise<{
   text: string;
   timelinePayload?: Omit<MemoryContextTimelinePayload, 'relatedToEventId'>;
@@ -8889,6 +9127,12 @@ async function prependLocalMemory(
       repo: recallContext.repo,
       limit: 10,
     });
+    if (typeof options?.deadlineAt === 'number' && Date.now() > options.deadlineAt) {
+      return {
+        text: prompt,
+        timelinePayload: buildMemoryContextStatusPayload(query, 'failed'),
+      };
+    }
     // 1) Template-origin legacy summaries never surface through recall.
     const notTemplate = searchResult.items.filter(
       (item) => !isTemplateOriginSummary(item.summary),

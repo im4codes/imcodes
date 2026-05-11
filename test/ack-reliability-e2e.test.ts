@@ -150,6 +150,7 @@ describe('Ack reliability — daemon ↔ server integration', () => {
     const sender = Object.assign(
       (msg: Record<string, unknown>) => {
         daemonWs2.emit('message', Buffer.from(JSON.stringify(msg)));
+        return true;
       },
       { isConnected: () => true },
     );
@@ -412,7 +413,7 @@ describe('Ack reliability — daemon ↔ server integration', () => {
     expect(outbox2.size()).toBe(1);
 
     const sender = Object.assign(
-      (msg: Record<string, unknown>) => { daemonWs2.emit('message', Buffer.from(JSON.stringify(msg))); },
+      (msg: Record<string, unknown>) => { daemonWs2.emit('message', Buffer.from(JSON.stringify(msg))); return true; },
       { isConnected: () => true },
     );
     await outbox2.flushOnReconnect(sender as never);

@@ -70,12 +70,24 @@ describe('AckOutbox', () => {
     await outbox.enqueue(makeEntry({ commandId: 'C_early', ts: t0 }));
 
     const sent: string[] = [];
-    const sender = (msg: { commandId: string }) => { sent.push(msg.commandId); };
+    const sender = (msg: { commandId: string }) => { sent.push(msg.commandId); return true; };
     (sender as unknown as { isConnected: () => boolean }).isConnected = () => true;
 
     await outbox.flushOnReconnect(sender as never);
     expect(sent).toEqual(['C_early', 'C_late']);
     expect(outbox.size()).toBe(0);
+    await outbox.close();
+  });
+
+  test('flushOnReconnect keeps entry when sender reports not sent', async () => {
+    const outbox = new AckOutbox(outboxFile);
+    await outbox.init(0);
+    await outbox.enqueue(makeEntry({ commandId: 'C_unsent' }));
+    const sender = (_msg: unknown) => false;
+    (sender as unknown as { isConnected: () => boolean }).isConnected = () => true;
+    await outbox.flushOnReconnect(sender as never);
+    expect(outbox.size()).toBe(1);
+    expect(outbox.snapshot()[0].attempts).toBe(1);
     await outbox.close();
   });
 

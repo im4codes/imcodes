@@ -47,7 +47,7 @@ export interface AckOutboxSender {
     status: string;
     session: string;
     error?: string;
-  }): void;
+  }): boolean;
   isConnected?: () => boolean;
 }
 
@@ -143,17 +143,18 @@ export class AckOutbox {
 
       entry.attempts += 1;
       try {
-        send({
+        const sent = send({
           type: MSG_COMMAND_ACK,
           commandId: entry.commandId,
           status: entry.status,
           session: entry.sessionName,
           ...(entry.error ? { error: entry.error } : {}),
         });
+        if (!sent) {
+          await this.appendRecord({ kind: 'entry', entry });
+          return;
+        }
         // Successful enqueue-for-send; server dedup handles duplicate receipt.
-        // We do NOT immediately markAcked — that is done in the normal path by
-        // the caller when send() succeeds. For flushOnReconnect we optimistically
-        // treat send() returning without throwing as delivered (server has LRU).
         await this.markAcked(entry.commandId);
       } catch (err) {
         // Keep entry; persist incremented attempts so we honor the cap after

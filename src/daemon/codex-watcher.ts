@@ -367,6 +367,7 @@ interface WatcherState {
   projectDir: string;
   activeFile: string | null;
   fileOffset: number;
+  pendingPartialLine?: string;
   abort: AbortController;
   stopped: boolean;
   pollTimer?: ReturnType<typeof setInterval>;
@@ -374,6 +375,8 @@ interface WatcherState {
   _lastRotationCheck?: number;
   turnHadAssistantText?: boolean;
   noTextRetrackAttempted?: boolean;
+  runningWork?: Promise<boolean>;
+  rerunWork?: boolean;
   /**
    * Slow stat-probe kept alive by `startWatchingById` when the rollout
    * file doesn't materialise in the initial 30s fast window. Cleared by
@@ -383,6 +386,7 @@ interface WatcherState {
 }
 
 const watchers = new Map<string, WatcherState>();
+const CODEX_DRAIN_MAX_BYTES = 1024 * 1024;
 
 function watcherControl(sessionName: string): WatcherControl {
   return {
@@ -687,9 +691,39 @@ export function isWatching(sessionName: string): boolean { return watchers.has(s
  * Force the registered watcher to immediately run its existing drain/rotation logic
  * for this session. Uses the watcher's bound rollout/session identity only.
  */
+async function runSerializedCodexWork(
+  sessionName: string,
+  state: WatcherState,
+  work: () => Promise<boolean>,
+): Promise<boolean> {
+  if (state.runningWork) {
+    state.rerunWork = true;
+    await state.runningWork.catch(() => false);
+    return !state.stopped;
+  }
+
+  state.runningWork = (async () => {
+    let result = await work();
+    while (state.rerunWork && !state.stopped) {
+      state.rerunWork = false;
+      result = (await refreshTrackedSessionInner(sessionName, state).catch(() => false)) || result;
+    }
+    return result;
+  })().finally(() => {
+    state.runningWork = undefined;
+    state.rerunWork = false;
+  });
+
+  return await state.runningWork;
+}
+
 export async function refreshTrackedSession(sessionName: string): Promise<boolean> {
   const state = watchers.get(sessionName);
   if (!state || state.stopped) return false;
+  return await runSerializedCodexWork(sessionName, state, () => refreshTrackedSessionInner(sessionName, state));
+}
+
+async function refreshTrackedSessionInner(sessionName: string, state: WatcherState): Promise<boolean> {
   await drainNewLines(sessionName, state);
   state._lastRotationCheck = Date.now();
   const uuid = state.activeFile ? extractUuidFromPath(state.activeFile) : null;
@@ -701,6 +735,7 @@ export async function refreshTrackedSession(sessionName: string): Promise<boolea
     state.activeFile = latestPath;
     state.workDir = latestPath.substring(0, latestPath.lastIndexOf('/'));
     state.fileOffset = 0;
+    state.pendingPartialLine = '';
     claimedFiles.set(latestPath, sessionName);
     void watchDir(sessionName, state, state.workDir);
   } else if (uuid) {
@@ -716,6 +751,7 @@ export async function refreshTrackedSession(sessionName: string): Promise<boolea
           state.activeFile = newPath;
           state.workDir = dir;
           state.fileOffset = 0;
+          state.pendingPartialLine = '';
           claimedFiles.set(newPath, sessionName);
           void watchDir(sessionName, state, dir);
           break;
@@ -730,6 +766,10 @@ export async function refreshTrackedSession(sessionName: string): Promise<boolea
 export async function retrackLatestRollout(sessionName: string): Promise<boolean> {
   const state = watchers.get(sessionName);
   if (!state || state.stopped) return false;
+  return await runSerializedCodexWork(sessionName, state, () => retrackLatestRolloutInner(sessionName, state));
+}
+
+async function retrackLatestRolloutInner(sessionName: string, state: WatcherState): Promise<boolean> {
   const projectDir = state.projectDir || (state.activeFile ? await readCwd(state.activeFile) : null);
   if (!projectDir) return false;
   const currentUuid = state.activeFile ? extractUuidFromPath(state.activeFile) : null;
@@ -742,6 +782,7 @@ export async function retrackLatestRollout(sessionName: string): Promise<boolean
   state.activeFile = latestPath;
   state.workDir = latestPath.substring(0, latestPath.lastIndexOf('/'));
   state.fileOffset = 0;
+  state.pendingPartialLine = '';
   claimedFiles.set(latestPath, sessionName);
   void watchDir(sessionName, state, state.workDir);
   await drainNewLines(sessionName, state);
@@ -773,8 +814,11 @@ async function watchDir(sessionName: string, state: WatcherState, dir: string): 
       if (state.stopped) break;
       if (!event.filename?.startsWith('rollout-') || !event.filename.endsWith('.jsonl')) continue;
       const changedPath = join(dir, event.filename);
-      await maybeSwitchActiveFile(sessionName, state, changedPath);
-      await drainNewLines(sessionName, state);
+      await runSerializedCodexWork(sessionName, state, async () => {
+        await maybeSwitchActiveFile(sessionName, state, changedPath);
+        await drainNewLines(sessionName, state);
+        return true;
+      });
     }
   } catch {}
 }
@@ -801,6 +845,7 @@ async function maybeSwitchActiveFile(sessionName: string, state: WatcherState, c
   if (state.activeFile) claimedFiles.delete(state.activeFile);
   state.activeFile = candidatePath;
   state.fileOffset = 0;
+  state.pendingPartialLine = '';
   claimedFiles.set(candidatePath, sessionName);
 }
 
@@ -811,10 +856,17 @@ async function drainNewLines(sessionName: string, state: WatcherState): Promise<
     fh = await open(state.activeFile, 'r');
     const s = await fh.stat();
     if (s.size <= state.fileOffset) return;
-    const buf = Buffer.allocUnsafe(s.size - state.fileOffset);
+    const readSize = Math.min(s.size - state.fileOffset, CODEX_DRAIN_MAX_BYTES);
+    const buf = Buffer.allocUnsafe(readSize);
     const { bytesRead } = await fh.read(buf, 0, buf.length, state.fileOffset);
     state.fileOffset += bytesRead;
+    if (s.size > state.fileOffset) {
+      state.rerunWork = true;
+    }
     const chunk = buf.subarray(0, bytesRead).toString('utf8');
-    for (const line of chunk.split('\n')) { if (state.stopped) break; parseLine(sessionName, line, state.model); }
+    const fullChunk = (state.pendingPartialLine ?? '') + chunk;
+    const lines = fullChunk.split('\n');
+    state.pendingPartialLine = lines.pop() ?? '';
+    for (const line of lines) { if (state.stopped) break; parseLine(sessionName, line, state.model); }
   } catch {} finally { if (fh) await fh.close().catch(() => {}); }
 }

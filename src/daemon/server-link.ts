@@ -220,10 +220,10 @@ export class ServerLink {
       // The outbox handles ordering, attempt caps, TTL, and isConnected() gating.
       const outbox = getDefaultAckOutbox();
       const sender = Object.assign(
-        (msg: Parameters<typeof this.send>[0]) => this.send(msg),
+        (msg: Parameters<typeof this.send>[0]) => this.trySend(msg),
         { isConnected: () => this.isConnected() },
       );
-      outbox.flushOnReconnect(sender as never).catch((err) => {
+      outbox.flushOnReconnect(sender).catch((err) => {
         logger.warn({ err }, 'AckOutbox flush on reconnect failed');
       });
 
@@ -283,6 +283,10 @@ export class ServerLink {
   }
 
   send(msg: unknown): void {
+    this.trySend(msg);
+  }
+
+  trySend(msg: unknown): boolean {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       // Best-effort: silently drop messages when the link isn't up. Throwing
       // here would become an unhandled rejection in any fire-and-forget
@@ -290,10 +294,16 @@ export class ServerLink {
       // since the daemon must never die from transient disconnects.
       // Callers that need delivery confirmation should check isConnected()
       // or await a response event before acting on `send()`.
-      return;
+      return false;
     }
-    this.seq++;
-    this.ws.send(JSON.stringify({ ...((msg as object) ?? {}), seq: this.seq }));
+    try {
+      this.seq++;
+      this.ws.send(JSON.stringify({ ...((msg as object) ?? {}), seq: this.seq }));
+      return true;
+    } catch (err) {
+      logger.warn({ err }, 'ServerLink: send failed');
+      return false;
+    }
   }
 
   updateP2pWorkflowCapabilities(capabilities: readonly (P2pWorkflowCapability | string)[]): void {
@@ -356,8 +366,18 @@ export class ServerLink {
 
   /** Send a binary WebSocket frame (raw PTY data). Best-effort: no throw on disconnect. */
   sendBinary(data: Buffer): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    this.ws.send(data);
+    this.trySendBinary(data);
+  }
+
+  trySendBinary(data: Buffer): boolean {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+    try {
+      this.ws.send(data);
+      return true;
+    } catch (err) {
+      logger.warn({ err }, 'ServerLink: binary send failed');
+      return false;
+    }
   }
 
   /** Send a timeline event to connected browsers via the server relay. */
