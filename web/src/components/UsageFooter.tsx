@@ -175,16 +175,6 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
           <div class="session-ctx-input" style={{ width: `${newPct}%`, left: `${cachePct}%` }} />
         </div>
       )}
-      {projectDir && (
-        <div class="session-repo-branch-summary-row">
-          <SessionRepoBranchSummary
-            sessionId={sessionName}
-            projectDir={projectDir}
-            onOpenRepo={onViewRepo}
-            className="session-repo-branch-summary-footer"
-          />
-        </div>
-      )}
       {codexQuotaLines.length > 0 && (
         <div class="session-usage-codex-quota">
           {codexQuotaLines.map((line) => (
@@ -204,6 +194,14 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
             {liveStatusMode === 'idle' && <span class="session-live-status-emoji sleep">💤</span>}
             {showInlineStatusText && <span class="session-live-status-text">{liveStatusText}</span>}
           </span>
+        )}
+        {projectDir && (
+          <SessionRepoBranchSummary
+            sessionId={sessionName}
+            projectDir={projectDir}
+            onOpenRepo={onViewRepo}
+            className="session-repo-branch-summary-footer"
+          />
         )}
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
           <span class="shortcut-btn-tools-wrapper">

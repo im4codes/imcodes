@@ -62,7 +62,7 @@ afterEach(() => {
 });
 
 describe('UsageFooter', () => {
-  it('renders repo branch summary below ctx bar and above live status', () => {
+  it('renders repo branch summary in the live status row without hiding robot status', () => {
     const onViewRepo = vi.fn();
     ingestSessionRepoContext({
       sessionId: 'deck_test_brain',
@@ -91,17 +91,19 @@ describe('UsageFooter', () => {
 
     const footer = container.querySelector('.session-usage-footer') as HTMLDivElement;
     const ctxBar = container.querySelector('.session-ctx-bar');
-    const branchRow = container.querySelector('.session-repo-branch-summary-row');
+    const branchHost = container.querySelector('.session-repo-branch-summary-footer');
     const statsRow = container.querySelector('.session-usage-stats');
     const liveStatus = container.querySelector('.session-live-status-inline.running');
     const children = Array.from(footer.children);
+    const statsChildren = Array.from(statsRow?.children ?? []);
 
-    expect(branchRow?.textContent).toContain('feature/a');
+    expect(branchHost?.textContent).toContain('feature/a');
     expect(liveStatus?.textContent).toContain('🤖');
     expect(liveStatus?.textContent).toContain('⚙️');
     expect(liveStatus?.textContent).toContain('Agent working...');
-    expect(children.indexOf(ctxBar as Element)).toBeLessThan(children.indexOf(branchRow as Element));
-    expect(children.indexOf(branchRow as Element)).toBeLessThan(children.indexOf(statsRow as Element));
+    expect(statsRow?.contains(branchHost as Element)).toBe(true);
+    expect(children.indexOf(ctxBar as Element)).toBeLessThan(children.indexOf(statsRow as Element));
+    expect(statsChildren.indexOf(liveStatus as Element)).toBeLessThan(statsChildren.indexOf(branchHost as Element));
 
     fireEvent.click(screen.getByText('feature/a'));
     expect(onViewRepo).toHaveBeenCalledTimes(1);
