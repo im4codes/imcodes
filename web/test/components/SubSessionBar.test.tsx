@@ -33,10 +33,11 @@ vi.mock('../../src/components/P2pProgressCard.js', () => ({
 }));
 
 vi.mock('../../src/api.js', () => ({
-  reorderSubSessions: vi.fn(),
+  reorderSubSessions: vi.fn().mockResolvedValue(undefined),
 }));
 
 import { SubSessionBar } from '../../src/components/SubSessionBar.js';
+import { reorderSubSessions } from '../../src/api.js';
 import type { SubSession } from '../../src/hooks/useSubSessions.js';
 import { SUBSESSION_ACCENT_COLORS } from '../../src/subsession-accent-colors.js';
 
@@ -278,6 +279,50 @@ describe('SubSessionBar', () => {
       expect((view.getByTestId('subsession-preview-sub-b') as HTMLElement).style.getPropertyValue('--subsession-accent-color')).toBe(SUBSESSION_ACCENT_COLORS[0]);
       expect((view.getByTestId('subsession-preview-sub-a') as HTMLElement).style.getPropertyValue('--subsession-accent-color')).toBe(SUBSESSION_ACCENT_COLORS[1]);
       expect(onVisualOrderChange).toHaveBeenLastCalledWith(['sub-b', 'sub-a']);
+    });
+  });
+
+  it('reorders collapsed desktop buttons with drag and persists the order', async () => {
+    const onVisualOrderChange = vi.fn();
+    const subSessions = [
+      makeSubSession({ id: 'sub-a', sessionName: 'deck_sub_sub-a', label: 'a' }),
+      makeSubSession({ id: 'sub-b', sessionName: 'deck_sub_sub-b', label: 'b' }),
+    ];
+
+    const view = render(
+      <SubSessionBar
+        subSessions={subSessions}
+        openIds={new Set()}
+        collapsed={true}
+        serverId="srv-1"
+        onVisualOrderChange={onVisualOrderChange}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    const dataTransfer = { effectAllowed: '', dropEffect: '', setData: vi.fn() };
+    const first = view.container.querySelector('[data-sub-id="sub-a"]') as HTMLElement;
+    const second = view.container.querySelector('[data-sub-id="sub-b"]') as HTMLElement;
+
+    fireEvent.dragStart(first, { dataTransfer });
+    fireEvent.dragOver(second, { dataTransfer });
+
+    await waitFor(() => {
+      expect(Array.from(view.container.querySelectorAll('.subsession-card')).map((node) => (node as HTMLElement).dataset.subId)).toEqual(['sub-b', 'sub-a']);
+      expect(onVisualOrderChange).toHaveBeenLastCalledWith(['sub-b', 'sub-a']);
+    });
+
+    fireEvent.dragEnd(view.container.querySelector('[data-sub-id="sub-a"]') as HTMLElement, { dataTransfer });
+
+    await waitFor(() => {
+      expect(vi.mocked(reorderSubSessions)).toHaveBeenCalledWith('srv-1', ['sub-b', 'sub-a']);
     });
   });
 

@@ -60,9 +60,13 @@ interface CollapsedSubSessionButtonProps {
   usage?: { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string };
   detectedModel?: string;
   inP2p: boolean;
+  draggable?: boolean;
   onEntryPointerDown: (id: string, event: JSX.TargetedPointerEvent<HTMLButtonElement>) => void;
   onEntryClick: (id: string, event: JSX.TargetedMouseEvent<HTMLButtonElement>) => void;
   onEntryDoubleClick: (id: string, event: JSX.TargetedMouseEvent<HTMLButtonElement>) => void;
+  onEntryDragStart: (id: string, event: JSX.TargetedDragEvent<HTMLButtonElement>) => void;
+  onEntryDragOver: (id: string, event: JSX.TargetedDragEvent<HTMLButtonElement>) => void;
+  onEntryDragEnd: (id: string, event: JSX.TargetedDragEvent<HTMLButtonElement>) => void;
   t: (key: string, vars?: Record<string, unknown>) => string;
 }
 
@@ -146,7 +150,7 @@ function formatUptime(seconds: number): string {
   return d > 0 ? `${d}d ${h}h` : `${h}h`;
 }
 
-function CollapsedSubSessionButton({ sub, accentColor, isOpen, idleFlashToken, usage, inP2p, onEntryPointerDown, onEntryClick, onEntryDoubleClick, t, detectedModel }: CollapsedSubSessionButtonProps) {
+function CollapsedSubSessionButton({ sub, accentColor, isOpen, idleFlashToken, usage, inP2p, draggable, onEntryPointerDown, onEntryClick, onEntryDoubleClick, onEntryDragStart, onEntryDragOver, onEntryDragEnd, t, detectedModel }: CollapsedSubSessionButtonProps) {
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
@@ -170,9 +174,13 @@ function CollapsedSubSessionButton({ sub, accentColor, isOpen, idleFlashToken, u
       key={sub.id}
       data-sub-id={sub.id}
       class={`subsession-card${isOpen ? ' open' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}`}
+      draggable={draggable}
       onPointerDown={(event) => onEntryPointerDown(sub.id, event)}
       onClick={(event) => onEntryClick(sub.id, event)}
       onDblClick={(event) => onEntryDoubleClick(sub.id, event)}
+      onDragStart={(event) => onEntryDragStart(sub.id, event)}
+      onDragOver={(event) => onEntryDragOver(sub.id, event)}
+      onDragEnd={(event) => onEntryDragEnd(sub.id, event)}
       title={label + (model ? ` · ${model}` : '') + (ctxPct > 0 ? ` · ctx ${ctxPct.toFixed(0)}%` : '')}
       style={{ '--subsession-accent-color': accentColor } as JSX.CSSProperties}
     >
@@ -325,6 +333,54 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   const dragOrderRef = useRef(dragOrder);
   dragOrderRef.current = dragOrder;
 
+  const moveSubSessionInDragOrder = useCallback((draggedId: string, overId: string) => {
+    if (draggedId === overId) return;
+    setDragOrder((prev) => {
+      const ids = prev ?? orderedSessionsRef.current.map((s) => s.id);
+      const from = ids.indexOf(draggedId);
+      const to = ids.indexOf(overId);
+      if (from === -1 || to === -1) return prev;
+      const next = [...ids];
+      next.splice(from, 1);
+      next.splice(to, 0, draggedId);
+      return next;
+    });
+  }, []);
+
+  const handleCollapsedEntryDragStart = useCallback((id: string, event: JSX.TargetedDragEvent<HTMLElement>) => {
+    if (!desktopLayoutCapableRef.current) {
+      event.preventDefault();
+      return;
+    }
+    dragIdRef.current = id;
+    suppressEntryClickRef.current = true;
+    getEntryGestureController(id).cancelPendingSingleClick();
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = 'move';
+      try { event.dataTransfer.setData('text/plain', id); } catch { /* ignore */ }
+    }
+    (event.currentTarget as HTMLElement).style.opacity = '0.5';
+    setDragOrder(orderedSessionsRef.current.map((s) => s.id));
+  }, [getEntryGestureController]);
+
+  const handleCollapsedEntryDragOver = useCallback((id: string, event: JSX.TargetedDragEvent<HTMLElement>) => {
+    if (!desktopLayoutCapableRef.current) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+    const draggedId = dragIdRef.current;
+    if (!draggedId) return;
+    moveSubSessionInDragOrder(draggedId, id);
+  }, [moveSubSessionInDragOrder]);
+
+  const handleCollapsedEntryDragEnd = useCallback((id: string, event: JSX.TargetedDragEvent<HTMLElement>) => {
+    getEntryGestureController(id).cancelPendingSingleClick();
+    dragIdRef.current = null;
+    setTimeout(() => { suppressEntryClickRef.current = false; }, 0);
+    (event.currentTarget as HTMLElement).style.opacity = '';
+    const ids = dragOrderRef.current;
+    if (ids) syncOrderToServer(ids);
+  }, [getEntryGestureController, syncOrderToServer]);
+
   useEffect(() => {
     onVisualOrderChange?.(orderedSessionIds);
   }, [onVisualOrderChange, orderedSessionIds]);
@@ -343,8 +399,8 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     save('rcc_subcard_p2p_hidden', p2pHidden);
   }, [p2pHidden]);
 
-  // Touch-based reorder for collapsed bar — must use addEventListener({ passive: false })
-  // so touchmove can preventDefault (passive listeners can't).
+  // Touch-based reorder for collapsed bar — desktop collapsed buttons use HTML5 drag events below.
+  // The touch path must use addEventListener({ passive: false }) so touchmove can preventDefault.
   useEffect(() => {
     const el = collapsedBarRef.current;
     if (!el) return;
@@ -378,17 +434,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       const targetEl = document.elementFromPoint(touch.clientX, touch.clientY);
       const overId = findBtnId(targetEl);
       if (overId && overId !== td.id) {
-        const draggedId = td.id;
-        setDragOrder((prev) => {
-          const ids = prev ?? orderedSessionsRef.current.map((s) => s.id);
-          const from = ids.indexOf(draggedId);
-          const to = ids.indexOf(overId);
-          if (from === -1 || to === -1) return prev;
-          const next = [...ids];
-          next.splice(from, 1);
-          next.splice(to, 0, draggedId);
-          return next;
-        });
+        moveSubSessionInDragOrder(td.id, overId);
       }
     };
 
@@ -420,7 +466,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       el.removeEventListener('touchcancel', onEnd);
       el.removeEventListener('contextmenu', onContext);
     };
-  }, [collapsed, syncOrderToServer]);
+  }, [collapsed, moveSubSessionInDragOrder, syncOrderToServer]);
 
   useEffect(() => {
     const installHorizontalEdgeGuard = (el: HTMLDivElement | null) => {
@@ -737,7 +783,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         </div>
       )}
 
-      {/* Collapsed: compact buttons (all platforms) — long-press to reorder */}
+      {/* Collapsed: compact buttons (all platforms) — drag on desktop, long-press on touch */}
       {collapsed && subSessions.length > 0 && (
         <div class="subsession-bar" style={{ borderTop: 'none' }} ref={collapsedBarRef}>
           {orderedSessions.map((sub) => (
@@ -750,9 +796,13 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
               usage={subUsages?.get(`deck_sub_${sub.id}`)}
               detectedModel={detectedModels?.get(sub.sessionName)}
               inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
+              draggable={desktopLayoutCapable}
               onEntryPointerDown={handleEntryPointerDown}
               onEntryClick={handleEntryClick}
               onEntryDoubleClick={handleEntryDoubleClick}
+              onEntryDragStart={handleCollapsedEntryDragStart}
+              onEntryDragOver={handleCollapsedEntryDragOver}
+              onEntryDragEnd={handleCollapsedEntryDragEnd}
               t={t}
             />
           ))}
