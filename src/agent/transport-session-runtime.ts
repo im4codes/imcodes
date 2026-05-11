@@ -378,7 +378,28 @@ export class TransportSessionRuntime implements SessionRuntime {
       return 'queued';
     }
 
-    this._dispatchTurn(message, entry.clientMessageId, attachments, [entry]);
+    // N-R8 defense-in-depth (audit 0419d1ac-1f4) — wrap direct dispatch so a
+    // synchronous prologue throw inside `_dispatchTurn` (e.g. some future
+    // listener regression in `setStatus → _onStatusChange`) cannot leave
+    // `_sending` true with no in-flight turn. After C1b isolates
+    // `setStatus`, this path's sync prologue rarely throws, but the
+    // exception path must reset state and rethrow so the caller's error
+    // handling (`command-handler.ts` send try/catch) emits the proper
+    // error ack instead of silently looking like a successful send.
+    try {
+      this._dispatchTurn(message, entry.clientMessageId, attachments, [entry]);
+    } catch (err) {
+      logger.error(
+        { err, providerSessionId: this._providerSessionId, clientMessageId: entry.clientMessageId },
+        'runtime.send: _dispatchTurn synchronous prologue threw — rethrowing for caller error path',
+      );
+      // _dispatchTurn may have partially advanced state before throwing.
+      // Reset so the runtime is usable for the next send.
+      this._sending = false;
+      this._activeTurn = null;
+      this._activeDispatchEntries = [];
+      throw err;
+    }
     return 'sent';
   }
 
@@ -438,7 +459,23 @@ export class TransportSessionRuntime implements SessionRuntime {
   private setStatus(status: AgentStatus): void {
     if (this._status === status) return;
     this._status = status;
-    this._onStatusChange?.(status);
+    if (!this._onStatusChange) return;
+    // Cx1 §2 / observer-isolation fix (audit 0419d1ac-1f4) — the status
+    // observer is an external callback (registered by
+    // `wireTransportCallbacks` in session-manager.ts) that synchronously
+    // emits timeline events. State-machine progress MUST NOT depend on
+    // observer success: a throwing listener used to propagate through
+    // `setStatus` and abort `_dispatchTurn`'s sync prologue (N-R7),
+    // leaving runtime wedged. Catch + warn; never let observer exceptions
+    // tear down the state machine.
+    try {
+      this._onStatusChange(status);
+    } catch (err) {
+      logger.warn(
+        { err, providerSessionId: this._providerSessionId, status },
+        'setStatus: onStatusChange listener threw',
+      );
+    }
   }
 
   /** Dispatch a single turn to the provider. Assumes _sending is false. */
@@ -604,21 +641,51 @@ export class TransportSessionRuntime implements SessionRuntime {
     // N1 defensive fix (audit f395d49c-78c) — set `_sending=true` BEFORE
     // calling `_onDrain` so any synchronous re-entrant `runtime.send` from
     // an onDrain listener queues into `_pendingMessages` instead of
-    // initiating a parallel dispatch. In Node's current synchronous
-    // EventEmitter contract, `timelineEmitter.emit` does not yield the
-    // event loop, so the race is not currently triggerable. But any
-    // future refactor that makes a listener async (await inside emit
-    // chain) would otherwise reintroduce a real race window between the
-    // splice and `_dispatchTurn`'s own `_sending = true` (line 462).
-    // `_dispatchTurn` will set the flag again — idempotent.
+    // initiating a parallel dispatch.
     this._sending = true;
-    this._onDrain?.(messages, merged, messages.length);
-    this._dispatchTurn(
-      merged,
-      messages.length === 1 ? messages[0]?.clientMessageId : undefined,
-      attachments.length > 0 ? attachments : undefined,
-      messages,
-    );
+    // N-R1 fix (audit 0419d1ac-1f4) — isolate `_onDrain` so an observer
+    // exception does NOT skip `_dispatchTurn`. Before this fix, the
+    // sequence `_sending=true` → `_onDrain throws` → propagation aborted
+    // `_dispatchTurn` AND left `_sending` permanently true with
+    // `_pendingMessages` already spliced empty — runtime stuck forever,
+    // user-visible as bug 2 "bot stays asleep".
+    try {
+      this._onDrain?.(messages, merged, messages.length);
+    } catch (err) {
+      logger.warn(
+        { err, providerSessionId: this._providerSessionId, count: messages.length },
+        '_drainPending: onDrain listener threw',
+      );
+    }
+    // N-R7 fix (audit 0419d1ac-1f4) — `_dispatchTurn` synchronous prologue
+    // (`_history.push`, `setStatus`, `_activeTurn` setup) can in principle
+    // throw via the `setStatus → _onStatusChange → timelineEmitter.emit`
+    // chain. After C1b isolates `setStatus`, this becomes much harder to
+    // trigger, but defense-in-depth: if the sync prologue ever throws,
+    // we MUST reset `_sending` and surface an error status, otherwise the
+    // runtime is wedged at `_sending=true` with no in-flight turn.
+    try {
+      this._dispatchTurn(
+        merged,
+        messages.length === 1 ? messages[0]?.clientMessageId : undefined,
+        attachments.length > 0 ? attachments : undefined,
+        messages,
+      );
+    } catch (err) {
+      logger.error(
+        { err, providerSessionId: this._providerSessionId, count: messages.length },
+        '_drainPending: _dispatchTurn synchronous prologue threw — resetting runtime state',
+      );
+      this._sending = false;
+      this._activeTurn = null;
+      this._activeDispatchEntries = [];
+      // Last-resort status update; `setStatus` itself is isolated post-C1b
+      // but wrap defensively in case future code regresses that contract.
+      try { this.setStatus('error'); } catch { /* swallow */ }
+      // Note: `messages` are NOT restored to `_pendingMessages`. Restoring
+      // would create a tight retry loop against the same failing path.
+      // The user must resend; the error status notifies them.
+    }
     return true;
   }
 

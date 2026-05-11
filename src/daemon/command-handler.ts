@@ -2990,12 +2990,31 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       { sessionName, providerId: record.providerId, commandId: effectiveId },
       'session.send: transport session has no runtime — queuing for resend after reconnect',
     );
-    enqueueResend(sessionName, {
+    const enqueueResult = enqueueResend(sessionName, {
       text: displayText,
       ...(preferenceMessagePreamble ? { messagePreamble: preferenceMessagePreamble } : {}),
       commandId: effectiveId,
       queuedAt: Date.now(),
     });
+    // N-R3 fix (audit 0419d1ac-1f4) — surface a user-visible warning when
+    // the resend queue overflow drops the oldest entry. Previously the
+    // drop only logged at warn-level on the daemon, and the dropped
+    // entry's clientMessageId was already inside `settledCommandIdsRef`
+    // on the web (via `reconcileQueuedOptimisticMessages`), so a per-entry
+    // `command.ack error` would have been swallowed. An `assistant.text`
+    // summary is the only path the user actually sees.
+    if (enqueueResult.droppedOldest) {
+      timelineEmitter.emit(
+        sessionName,
+        'assistant.text',
+        {
+          text: '⚠️ 排队消息已满（上限 10 条），最旧消息已被丢弃。请稍后重新发送。',
+          streaming: false,
+          memoryExcluded: true,
+        },
+        { source: 'daemon', confidence: 'high' },
+      );
+    }
     if (shouldTrackSupervisionTaskRun) {
       supervisionAutomation.queueTaskIntent(sessionName, effectiveId, displayText, supervisionSnapshot);
     }
@@ -3054,12 +3073,26 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       { sessionName, providerId: record?.providerId, commandId: effectiveId },
       'session.send: transport runtime missing provider session id — queuing and auto-resuming',
     );
-    enqueueResend(sessionName, {
+    const enqueueResultMissingSid = enqueueResend(sessionName, {
       text: displayText,
       ...(preferenceMessagePreamble ? { messagePreamble: preferenceMessagePreamble } : {}),
       commandId: effectiveId,
       queuedAt: Date.now(),
     });
+    // N-R3 fix (audit 0419d1ac-1f4) — surface droppedOldest the same way as
+    // the no-runtime branch above.
+    if (enqueueResultMissingSid.droppedOldest) {
+      timelineEmitter.emit(
+        sessionName,
+        'assistant.text',
+        {
+          text: '⚠️ 排队消息已满（上限 10 条），最旧消息已被丢弃。请稍后重新发送。',
+          streaming: false,
+          memoryExcluded: true,
+        },
+        { source: 'daemon', confidence: 'high' },
+      );
+    }
     if (shouldTrackSupervisionTaskRun) {
       supervisionAutomation.queueTaskIntent(sessionName, effectiveId, displayText, supervisionSnapshot);
     }

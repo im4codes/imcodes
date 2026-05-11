@@ -1558,6 +1558,26 @@ export async function restoreTransportSessions(providerId: string): Promise<void
               );
             }
             return result;
+          },
+          // N-R6 fix (audit 0419d1ac-1f4) — surface a single user-visible
+          // summary when one or more queued messages were dropped because
+          // they exceeded RESEND_EXPIRY_MS. The web client's queued
+          // reconciliation has already added these commandIds to
+          // `settledCommandIdsRef`, so a per-entry `command.ack error`
+          // would be swallowed by `markOptimisticFailed`'s settle guard.
+          // The `assistant.text` summary is the only path the user sees.
+          ({ expiredCount }) => {
+            const minutes = Math.round((5 * 60 * 1000) / 60_000); // RESEND_EXPIRY_MS / minute
+            timelineEmitter.emit(
+              s.name,
+              'assistant.text',
+              {
+                text: `⚠️ ${expiredCount} 条排队消息超过 ${minutes} 分钟未送达，已丢弃。请重新发送。`,
+                streaming: false,
+                memoryExcluded: true,
+              },
+              { source: 'daemon', confidence: 'high' },
+            );
           });
         } catch (err) {
           logger.warn({ err, session: s.name }, 'transport resend drain failed');
@@ -1874,6 +1894,22 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
           );
         }
         return result;
+      },
+      // N-R6 fix (audit 0419d1ac-1f4) — same TTL-expired summary as the
+      // restoreTransportSessions caller above. See that callsite for the
+      // full rationale.
+      ({ expiredCount }) => {
+        const minutes = Math.round((5 * 60 * 1000) / 60_000);
+        timelineEmitter.emit(
+          name,
+          'assistant.text',
+          {
+            text: `⚠️ ${expiredCount} 条排队消息超过 ${minutes} 分钟未送达，已丢弃。请重新发送。`,
+            streaming: false,
+            memoryExcluded: true,
+          },
+          { source: 'daemon', confidence: 'high' },
+        );
       });
     } catch (err) {
       logger.warn({ err, session: name }, 'transport resend drain (launch) failed');

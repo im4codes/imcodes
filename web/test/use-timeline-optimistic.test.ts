@@ -1128,3 +1128,117 @@ describe('useTimeline optimistic send flow', () => {
 // Local mirror of the hook's CLIENT_RETRY_DELAYS_MS sum (800+2000+3200=6000)
 // plus 1s buffer for the HTTP rejection promise to settle.
 const CLIENT_RETRY_DELAYS_SUM_PLUS_BUFFER_MS = 7_000;
+
+/**
+ * Dual-ack regression suite (audit 0419d1ac-1f4 / N-R2).
+ *
+ * Before this fix, `markOptimisticAccepted` called `rememberSettledCommandId`
+ * unconditionally. So when daemon's F4 path (record missing) emitted
+ * `command.ack` accepted at the early-receipt boundary and then
+ * `command.ack` error after the record check, the error was swallowed
+ * by `markOptimisticFailed`'s `settledCommandIdsRef.has()` short-circuit
+ * — bubble stayed `acked: true, failed: false`, looking sent.
+ *
+ * Fixed behaviour:
+ *   - `accepted` no longer settles the commandId; bubble becomes
+ *     `acked: true` but not terminal.
+ *   - A subsequent `error` / `conflict` ack can flip bubble to `failed`.
+ *   - After `failed`, a LATE `accepted` receipt is ignored (guard at top
+ *     of `markOptimisticAccepted` checks settled set).
+ */
+describe('useTimeline dual-ack (audit 0419d1ac-1f4 / N-R2)', () => {
+  beforeEach(() => {
+    __resetTimelineCacheForTests();
+    __clearPersistedTimelineSnapshotsForTests();
+    cleanup();
+    vi.useFakeTimers();
+    sendSessionViaHttpMock.mockReset();
+    sendSessionViaHttpMock.mockRejectedValue(new Error('http unavailable in test'));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it('T-N2a: accepted → error sequence flips bubble to failed (daemon F4 record-missing scenario)', async () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_dual_ack_a' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('hi', 'cmd-dual-1');
+    });
+
+    // First: daemon-receipt accepted ack (early boundary, before record check).
+    act(() => {
+      handlerBox.fn?.({
+        type: 'command.ack',
+        commandId: 'cmd-dual-1',
+        status: 'accepted',
+        session: 'deck_dual_ack_a',
+      } as unknown as ServerMessage);
+    });
+    expect(ref.current!.events[0].payload.pending).toBe(false);
+    expect(ref.current!.events[0].payload.acked).toBe(true);
+    expect(ref.current!.events[0].payload.failed).toBeFalsy();
+
+    // Then: error ack arrives (daemon F4 record-missing path).
+    act(() => {
+      handlerBox.fn?.({
+        type: 'command.ack',
+        commandId: 'cmd-dual-1',
+        status: 'error',
+        error: 'session_missing',
+        session: 'deck_dual_ack_a',
+      } as unknown as ServerMessage);
+    });
+
+    // Bubble MUST flip to failed. Pre-fix this assertion failed because
+    // `settledCommandIdsRef.has('cmd-dual-1')` short-circuited
+    // markOptimisticFailed.
+    await waitFor(() => {
+      expect(ref.current!.events[0].payload.failed).toBe(true);
+    });
+    expect(ref.current!.events[0].payload.failureReason).toBe('session_missing');
+  });
+
+  it('T-N2b: error → accepted sequence keeps bubble failed (terminal state is sticky)', async () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_dual_ack_b' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('hello', 'cmd-dual-2');
+    });
+
+    // Error first.
+    act(() => {
+      handlerBox.fn?.({
+        type: 'command.ack',
+        commandId: 'cmd-dual-2',
+        status: 'error',
+        error: 'duplicate_command_id',
+        session: 'deck_dual_ack_b',
+      } as unknown as ServerMessage);
+    });
+    await waitFor(() => {
+      expect(ref.current!.events[0].payload.failed).toBe(true);
+    });
+
+    // Late accepted receipt (unusual: server replayed/duplicated).
+    act(() => {
+      handlerBox.fn?.({
+        type: 'command.ack',
+        commandId: 'cmd-dual-2',
+        status: 'accepted',
+        session: 'deck_dual_ack_b',
+      } as unknown as ServerMessage);
+    });
+
+    // Bubble MUST stay failed — terminal state is sticky.
+    expect(ref.current!.events[0].payload.failed).toBe(true);
+  });
+});

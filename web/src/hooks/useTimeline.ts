@@ -974,6 +974,15 @@ export function useTimeline(
       const updated = [...base];
       updated[idx] = { ...existing, payload };
       if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, updated);
+      // N-R2 fix (audit 0419d1ac-1f4) — settle commandId only after
+      // SUCCESSFULLY flipping the bubble to failed. This pairs with
+      // `markOptimisticAccepted`'s new top-of-function settle guard:
+      // once terminal-failed, a late `accepted` receipt must NOT revive
+      // the bubble. Without this `rememberSettledCommandId` call here
+      // (the previous code only settled on the confirmed-echo path at
+      // line 962), an error→accepted sequence would leave the bubble
+      // as `acked: true, failed: false` — the inverse of bug 1.
+      rememberSettledCommandId(commandId);
       return updated;
     });
   }, [clearAutoRetryState, clearOptimisticTimer, rememberSettledCommandId]);
@@ -1149,10 +1158,30 @@ export function useTimeline(
 
   const markOptimisticAccepted = useCallback((commandId: string) => {
     if (!commandId) return;
+    // N-R2 fix (audit 0419d1ac-1f4 / O2 选项 D) — `accepted` is a daemon-
+    // receipt ack ("I got your command"), NOT a terminal outcome. Two
+    // sub-changes make the dual-ack pattern correct:
+    //
+    //   1. Skip if the commandId is ALREADY terminal-settled (i.e. an
+    //      `error` / `conflict` ack arrived first). A late `accepted`
+    //      receipt must not reset a previously-failed bubble back to
+    //      acked. Without this guard the order error→accepted would
+    //      revive a failed bubble.
+    //
+    //   2. Don't add this commandId to `settledCommandIdsRef`. Without
+    //      this change a subsequent `error` ack was silently swallowed
+    //      by `markOptimisticFailed`'s `settledCommandIdsRef.has()`
+    //      short-circuit (line ~941) — bug 1 manifested as "message
+    //      bypasses queue / shows as sent" even though the daemon
+    //      refused it via the F4 record-missing path.
+    //
+    // Together these make terminal acks (error / conflict / confirmed
+    // echo) the only path that writes to `settledCommandIdsRef` — the
+    // intended terminal-state semantic.
+    if (settledCommandIdsRef.current.has(commandId)) return;
     const eventId = optimisticIdsByCommandRef.current.get(commandId);
     clearOptimisticTimer(commandId);
     clearAutoRetryState(commandId);
-    rememberSettledCommandId(commandId);
     if (!eventId) return;
     setEvents((prev) => {
       const base = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
