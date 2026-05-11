@@ -170,7 +170,7 @@
       "browseCwd": "瀏覽工作目錄",
       "daemonHostValidation": "工作目錄會先在 daemon 主機上驗證，然後才會建立任何資源。",
       "runningWarning": "複製後的群組會從全新狀態開始。來源的待傳送訊息、終端歷史和正在執行的工作不會被複製。",
-      "capabilityMissing": "連線中的 daemon 需要升級以支援 {{capability}}，才能複製工作階段群組。",
+      "capabilityMissing": "目前連線中的 daemon 尚未回報支援複製工作階段群組。請確認 daemon 已更新並重新連線。",
       "submit": "複製群組",
       "submitting": "正在複製...",
       "blankProject": "目標專案名稱為必填。",
@@ -208,7 +208,7 @@
       "errorCode": {
         "invalid_request": "複製請求無效。",
         "forbidden": "只有擁有者和管理員可以複製工作階段群組。",
-        "unsupported_command": "複製工作階段群組前需要升級 daemon。",
+        "unsupported_command": "daemon 尚未回報支援複製工作階段群組。請更新或重新連線 daemon 後再試。",
         "source_not_found": "找不到來源工作階段。",
         "source_not_role_compatible": "只能複製角色相容的主 brain 工作階段。",
         "blank_target_project": "目標專案名稱為必填。",

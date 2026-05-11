@@ -170,7 +170,7 @@
       "browseCwd": "作業ディレクトリを参照",
       "daemonHostValidation": "作業ディレクトリは、リソース作成前に daemon ホスト上で検証されます。",
       "runningWarning": "コピーされたグループは新しい状態から始まります。コピー元の保留メッセージ、ターミナル履歴、実行中の作業はコピーされません。",
-      "capabilityMissing": "セッショングループをコピーするには、接続中の daemon を {{capability}} 対応版へ更新してください。",
+      "capabilityMissing": "接続中の daemon はまだセッショングループコピー対応を報告していません。daemon を更新または再接続してから再試行してください。",
       "submit": "グループをコピー",
       "submitting": "コピー中...",
       "blankProject": "コピー先プロジェクト名は必須です。",
@@ -208,7 +208,7 @@
       "errorCode": {
         "invalid_request": "コピーリクエストが無効です。",
         "forbidden": "セッショングループをコピーできるのはオーナーと管理者のみです。",
-        "unsupported_command": "セッショングループをコピーする前に daemon の更新が必要です。",
+        "unsupported_command": "daemon はまだセッショングループコピー対応を報告していません。更新または再接続してから再試行してください。",
         "source_not_found": "コピー元セッションが見つかりません。",
         "source_not_role_compatible": "ロール互換のメイン brain セッションのみコピーできます。",
         "blank_target_project": "コピー先プロジェクト名は必須です。",

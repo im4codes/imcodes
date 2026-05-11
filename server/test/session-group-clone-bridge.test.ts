@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import { WsBridge } from '../src/ws/bridge.js';
 import { P2P_CONFIG_MSG } from '../../shared/p2p-config-events.js';
 import { p2pSessionConfigPrefKey } from '../../shared/p2p-config-scope.js';
+import { P2P_CAPABILITY_FRESHNESS_TTL_MS } from '../../shared/p2p-workflow-constants.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import {
   SESSION_GROUP_CLONE_CAPABILITY_V1,
@@ -615,5 +616,21 @@ describe('WsBridge session group clone routing', () => {
       originalType: SESSION_GROUP_CLONE_MSG.START,
       missingCapability: SESSION_GROUP_CLONE_CAPABILITY_V1,
     }));
+  });
+
+  it('keeps static clone capability usable after the P2P workflow freshness window while daemon remains connected', async () => {
+    const { bridge, daemon } = await setup([SESSION_GROUP_CLONE_CAPABILITY_V1]);
+    const afterP2pFreshnessWindow = Date.now() + P2P_CAPABILITY_FRESHNESS_TTL_MS + 1;
+
+    expect(bridge.getDaemonP2pWorkflowCapabilities(afterP2pFreshnessWindow)).toBeNull();
+    expect(bridge.hasDaemonCapability(
+      SESSION_GROUP_CLONE_CAPABILITY_V1,
+      afterP2pFreshnessWindow,
+    )).toBe(true);
+
+    daemon.close();
+    await flush();
+
+    expect(bridge.hasDaemonCapability(SESSION_GROUP_CLONE_CAPABILITY_V1)).toBe(false);
   });
 });

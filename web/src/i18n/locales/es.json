@@ -170,7 +170,7 @@
       "browseCwd": "Explorar directorio de trabajo",
       "daemonHostValidation": "Los directorios de trabajo se validan en el host del daemon antes de crear recursos.",
       "runningWarning": "El grupo copiado empieza desde cero. No se copian mensajes pendientes, historial de terminal ni trabajo en ejecución del origen.",
-      "capabilityMissing": "El daemon conectado debe actualizarse para admitir {{capability}} antes de copiar grupos de sesiones.",
+      "capabilityMissing": "El daemon conectado aún no informó compatibilidad para copiar grupos de sesiones. Actualiza o reconecta el daemon e inténtalo de nuevo.",
       "submit": "Copiar grupo",
       "submitting": "Copiando...",
       "blankProject": "El nombre del proyecto destino es obligatorio.",
@@ -208,7 +208,7 @@
       "errorCode": {
         "invalid_request": "La solicitud de copia no es válida.",
         "forbidden": "Solo propietarios y administradores pueden copiar grupos de sesiones.",
-        "unsupported_command": "El daemon debe actualizarse antes de copiar grupos de sesiones.",
+        "unsupported_command": "El daemon aún no informó compatibilidad para copiar grupos de sesiones. Actualízalo o reconéctalo e inténtalo de nuevo.",
         "source_not_found": "No se encontró la sesión origen.",
         "source_not_role_compatible": "Solo se pueden copiar sesiones principales brain compatibles con el rol.",
         "blank_target_project": "El nombre del proyecto destino es obligatorio.",

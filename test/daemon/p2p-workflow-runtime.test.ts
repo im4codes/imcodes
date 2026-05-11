@@ -184,6 +184,12 @@ describe('ServerLink P2P workflow hello', () => {
       P2P_WORKFLOW_CAPABILITY_V1,
       P2P_WORKFLOW_OPENSPEC_ARTIFACTS_CAPABILITY_V1,
       P2P_WORKFLOW_IMPLEMENTATION_CAPABILITY_V1,
+    ]);
+
+    expect(link.getDaemonCapabilities()).toEqual([
+      P2P_WORKFLOW_CAPABILITY_V1,
+      P2P_WORKFLOW_OPENSPEC_ARTIFACTS_CAPABILITY_V1,
+      P2P_WORKFLOW_IMPLEMENTATION_CAPABILITY_V1,
       SESSION_GROUP_CLONE_CAPABILITY_V1,
     ]);
 
@@ -197,6 +203,12 @@ describe('ServerLink P2P workflow hello', () => {
       P2P_WORKFLOW_CAPABILITY_V1,
       P2P_WORKFLOW_SCRIPT_ARGV_CAPABILITY_V1,
     ].sort());
+    expect(link.getDaemonCapabilities()).toEqual([
+      P2P_WORKFLOW_CAPABILITY_V1,
+      P2P_WORKFLOW_SCRIPT_ARGV_CAPABILITY_V1,
+    ].sort().concat([
+      SESSION_GROUP_CLONE_CAPABILITY_V1,
+    ]));
   });
 
   it('sends daemon.hello after auth with current base capabilities', async () => {
@@ -324,6 +336,7 @@ describe('ServerLink P2P workflow hello', () => {
       capabilities: [
         P2P_WORKFLOW_CAPABILITY_V1,
         P2P_WORKFLOW_SCRIPT_ARGV_CAPABILITY_V1,
+        SESSION_GROUP_CLONE_CAPABILITY_V1,
       ].sort(),
       helloEpoch: 2,
       sentAt: Date.parse('2026-05-09T12:05:00.000Z'),

@@ -27,6 +27,7 @@ vi.mock('react-i18next', () => ({
         'session.clone.browseCwd': 'Browse working directory',
         'session.clone.daemonHostValidation': 'Working directories are validated on the daemon host before anything is created.',
         'session.clone.runningWarning': 'The copied group starts fresh.',
+        'session.clone.capabilityMissing': 'The daemon has not reported copy support yet.',
         'session.clone.submit': 'Copy group',
         'session.clone.submitting': 'Copying...',
         'session.clone.blankProject': 'Target project name is required.',
@@ -50,7 +51,7 @@ vi.mock('react-i18next', () => ({
         'session.clone.state.creating_subs': 'Creating sub-sessions',
         'session.clone.state.cleanup_required': 'Cleanup required',
         'session.clone.state.failed': 'Failed',
-        'session.clone.errorCode.unsupported_command': 'Upgrade the daemon before copying.',
+        'session.clone.errorCode.unsupported_command': 'The daemon has not reported copy support.',
         'session.clone.errorCode.forbidden': 'Only owners and admins can copy groups.',
         'session.clone.errorCode.invalid_cwd': 'The working directory is invalid on the daemon host.',
         'session.clone.errorCode.name_taken': 'That target session name is already in use.',
@@ -173,6 +174,27 @@ describe('CloneSessionGroupDialog', () => {
 
     expect(screen.getByText('Target project name is required.')).toBeDefined();
     expect(ws.cloneSessionGroup).not.toHaveBeenCalled();
+  });
+
+  it('shows a non-technical capability message when clone support is not reported', () => {
+    const ws = makeWs();
+    ws.getDaemonCapabilitySnapshot.mockReturnValue({
+      daemonId: 'daemon-test',
+      capabilities: [],
+      helloEpoch: 1,
+      sentAt: Date.now(),
+      observedAt: Date.now(),
+    });
+    renderDialog(ws);
+
+    expect(screen.getByText('The daemon has not reported copy support yet.')).toBeDefined();
+    expect(screen.queryByText(SESSION_GROUP_CLONE_CAPABILITY_V1)).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Copy group' }));
+
+    expect(ws.cloneSessionGroup).not.toHaveBeenCalled();
+    expect(screen.getAllByText('The daemon has not reported copy support yet.')).toHaveLength(2);
+    expect(screen.queryByText(SESSION_GROUP_CLONE_CAPABILITY_V1)).toBeNull();
   });
 
   it('submits once with an idempotency key', () => {
@@ -362,7 +384,7 @@ describe('CloneSessionGroupDialog', () => {
 
   it('shows localized failure text for supported clone failure codes', () => {
     const cases = [
-      ['unsupported_command', 'Upgrade the daemon before copying.'],
+      ['unsupported_command', 'The daemon has not reported copy support.'],
       ['forbidden', 'Only owners and admins can copy groups.'],
       ['invalid_cwd', 'The working directory is invalid on the daemon host.'],
       ['name_taken', 'That target session name is already in use.'],

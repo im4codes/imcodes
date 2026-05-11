@@ -4505,7 +4505,12 @@ export class WsBridge {
     };
   }
 
-  hasDaemonCapability(capability: string, now = Date.now()): boolean {
-    return this.getDaemonP2pWorkflowCapabilities(now)?.capabilities.includes(capability) ?? false;
+  hasDaemonCapability(capability: string, _now = Date.now()): boolean {
+    // Static feature gates (for example session-group clone) should remain
+    // true while the daemon socket that sent the hello is still connected.
+    // P2P workflow launch freshness continues to use
+    // getDaemonP2pWorkflowCapabilities(now).
+    if (!this.daemonWs || this.daemonWs.readyState !== WebSocket.OPEN) return false;
+    return this.daemonP2pWorkflowCapabilities?.capabilities.includes(capability) ?? false;
   }
 }

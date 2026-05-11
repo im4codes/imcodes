@@ -170,7 +170,7 @@
       "browseCwd": "浏览工作目录",
       "daemonHostValidation": "工作目录会先在 daemon 主机上验证，然后才会创建任何资源。",
       "runningWarning": "复制后的组会从全新状态开始。源会话的待发送消息、终端历史和正在运行的工作不会被复制。",
-      "capabilityMissing": "连接的 daemon 需要升级以支持 {{capability}}，才能复制会话组。",
+      "capabilityMissing": "当前连接的 daemon 尚未报告支持复制会话组。请确认 daemon 已更新并已重连。",
       "submit": "复制组",
       "submitting": "正在复制...",
       "blankProject": "目标项目名不能为空。",
@@ -208,7 +208,7 @@
       "errorCode": {
         "invalid_request": "复制请求无效。",
         "forbidden": "只有所有者和管理员可以复制会话组。",
-        "unsupported_command": "复制会话组前需要升级 daemon。",
+        "unsupported_command": "daemon 尚未报告支持复制会话组。请更新或重连 daemon 后再试。",
         "source_not_found": "未找到源会话。",
         "source_not_role_compatible": "只能复制角色兼容的主 brain 会话。",
         "blank_target_project": "目标项目名不能为空。",

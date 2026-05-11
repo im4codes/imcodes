@@ -92,6 +92,9 @@ const CONNECT_TIMEOUT_MS = 8_000;
 const RECONNECT_JITTER_RATIO = 0.4;
 const WATCHDOG_MS = 15_000;           // check connection health every 15s
 const PONG_TIMEOUT_MS = 10_000;       // if no pong within 10s, connection is dead
+const DAEMON_STATIC_CAPABILITIES = [
+  SESSION_GROUP_CLONE_CAPABILITY_V1,
+] as const;
 
 export interface ServerLinkOpts {
   workerUrl: string;
@@ -128,7 +131,6 @@ export class ServerLink {
     P2P_WORKFLOW_CAPABILITY_V1,
     P2P_WORKFLOW_OPENSPEC_ARTIFACTS_CAPABILITY_V1,
     P2P_WORKFLOW_IMPLEMENTATION_CAPABILITY_V1,
-    SESSION_GROUP_CLONE_CAPABILITY_V1,
   ];
 
   constructor(opts: ServerLinkOpts) {
@@ -310,6 +312,13 @@ export class ServerLink {
     return [...this.p2pWorkflowCapabilities];
   }
 
+  getDaemonCapabilities(): readonly string[] {
+    return [...new Set([
+      ...this.p2pWorkflowCapabilities,
+      ...DAEMON_STATIC_CAPABILITIES,
+    ])];
+  }
+
   /**
    * Most recent `daemon.hello` epoch sent by this daemon. Bind context stores
    * this in `capabilitySnapshot.helloEpoch` so the projection records which
@@ -334,7 +343,7 @@ export class ServerLink {
     this.send({
       type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
       daemonId: this.serverId,
-      capabilities: [...this.p2pWorkflowCapabilities],
+      capabilities: this.getDaemonCapabilities(),
       helloEpoch: this.helloEpoch,
       sentAt,
     });

@@ -170,7 +170,7 @@
       "browseCwd": "Browse working directory",
       "daemonHostValidation": "Working directories are validated on the daemon host before anything is created.",
       "runningWarning": "The copied group starts fresh. Pending messages, terminal history, and running work from the source are not copied.",
-      "capabilityMissing": "The connected daemon must be upgraded to support {{capability}} before session groups can be copied.",
+      "capabilityMissing": "The connected daemon has not reported session group copy support yet. Update or reconnect the daemon, then try again.",
       "submit": "Copy group",
       "submitting": "Copying...",
       "blankProject": "Target project name is required.",
@@ -208,7 +208,7 @@
       "errorCode": {
         "invalid_request": "The copy request was invalid.",
         "forbidden": "Only owners and admins can copy session groups.",
-        "unsupported_command": "The daemon must be upgraded before session groups can be copied.",
+        "unsupported_command": "The daemon has not reported session group copy support. Update or reconnect it, then try again.",
         "source_not_found": "The source session was not found.",
         "source_not_role_compatible": "Only role-compatible main brain sessions can be copied.",
         "blank_target_project": "Target project name is required.",
