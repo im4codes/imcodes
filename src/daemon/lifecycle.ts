@@ -984,6 +984,13 @@ export async function shutdown(exitCode = 0): Promise<void> {
   }
 
   try {
+    const { shutdownDefaultTimelineHistoryWorkerPoolForDaemon } = await import('./timeline-history-pool.js');
+    await shutdownDefaultTimelineHistoryWorkerPoolForDaemon();
+  } catch (err) {
+    logger.warn({ errorKind: err instanceof Error ? err.name : typeof err }, 'Daemon shutdown timeline history worker drain failed');
+  }
+
+  try {
     if (healthTimer) clearInterval(healthTimer);
     if (codexQuotaTimer) clearInterval(codexQuotaTimer);
     if (contextReplicationTimer) clearInterval(contextReplicationTimer);

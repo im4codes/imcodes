@@ -11,7 +11,9 @@ import { terminalStreamer, type StreamSubscriber } from './terminal-streamer.js'
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { timelineStore } from './timeline-store.js';
-import { TIMELINE_HISTORY_CONTENT_TYPES, TIMELINE_HISTORY_STATE_TYPES, type MemoryContextTimelinePayload } from '../shared/timeline/types.js';
+import { getDefaultTimelineHistoryWorkerPool, shouldUseTimelineHistoryWorkerPool, TimelineHistoryPoolError } from './timeline-history-pool.js';
+import { sanitizeTimelineHistoryEventsForTransport } from './timeline-history-sanitize.js';
+import { TIMELINE_HISTORY_CONTENT_TYPES, TIMELINE_HISTORY_STATE_TYPES, type MemoryContextTimelinePayload, type TimelineEvent } from '../shared/timeline/types.js';
 import { emitSessionInlineError } from './session-error.js';
 import { enqueueResend, getResendEntries, clearResend } from './transport-resend-queue.js';
 import {
@@ -4099,6 +4101,139 @@ async function recoverOpenCodeSessionRecord(record: SessionRecord | undefined): 
   }
 }
 
+interface TimelineHistoryRequestParams {
+  sessionName: string;
+  requestId?: string;
+  limit: number;
+  afterTs?: number;
+  beforeTs?: number;
+}
+
+interface TimelineHistoryBuildResult {
+  events: TimelineEvent[];
+  eventsRead: number;
+  payloadBytes: number;
+  droppedEvents: number;
+  truncatedEvents: number;
+  readMs: number;
+  synthesizeMs: number;
+  sanitizeMs: number;
+  source: string;
+}
+
+function emptyTimelineHistoryResult(source: string): TimelineHistoryBuildResult {
+  return {
+    events: [],
+    eventsRead: 0,
+    payloadBytes: 2,
+    droppedEvents: 0,
+    truncatedEvents: 0,
+    readMs: 0,
+    synthesizeMs: 0,
+    sanitizeMs: 0,
+    source,
+  };
+}
+
+async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams): Promise<TimelineHistoryBuildResult> {
+  let readMs = 0;
+  let synthesizeMs = 0;
+
+  // Query content by type instead of over-reading and filtering in JS. SQLite
+  // has (session_id, type, ts) indexes; using them keeps the common path near
+  // O(requested rows) instead of decoding thousands of unrelated state events.
+  // Do NOT filter by epoch — history should include events across daemon restarts.
+  const tRead0 = Date.now();
+  const substantive = await timelineStore.readByTypesPreferred(
+    params.sessionName,
+    [...TIMELINE_HISTORY_CONTENT_TYPES],
+    { limit: params.limit, afterTs: params.afterTs, beforeTs: params.beforeTs },
+  );
+  let stateEvents: TimelineEvent[] = [];
+  if (substantive.length > 0) {
+    const cutoffTs = substantive[0]!.ts;
+    const stateAfterTs = params.afterTs === undefined ? cutoffTs - 1 : Math.max(params.afterTs, cutoffTs - 1);
+    stateEvents = await timelineStore.readByTypesPreferred(
+      params.sessionName,
+      [...TIMELINE_HISTORY_STATE_TYPES],
+      { limit: Math.max(params.limit * 2, 100), afterTs: stateAfterTs, beforeTs: params.beforeTs },
+    );
+  }
+  const events = [...substantive, ...stateEvents].sort((a, b) => a.ts - b.ts);
+  readMs = Date.now() - tRead0;
+
+  // Content-aware limit: session.state events don't count toward the budget.
+  // This prevents idle↔running oscillation storms from crowding out user.message events.
+  const trimmedSubstantive = substantive.length > params.limit ? substantive.slice(substantive.length - params.limit) : substantive;
+  let trimmed: TimelineEvent[];
+  if (trimmedSubstantive.length > 0 && stateEvents.length > 0) {
+    const cutoffTs = trimmedSubstantive[0]!.ts;
+    const relevantState = stateEvents.filter((event) => event.ts >= cutoffTs);
+    trimmed = [...trimmedSubstantive, ...relevantState].sort((a, b) => a.ts - b.ts);
+  } else {
+    trimmed = trimmedSubstantive;
+  }
+
+  const record = await recoverOpenCodeSessionRecord(getSession(params.sessionName));
+  if (record?.agentType === 'opencode' && record.projectDir && record.opencodeSessionId) {
+    const tSyn0 = Date.now();
+    try {
+      const { exportOpenCodeSession, buildTimelineEventsFromOpenCodeExport } = await import('./opencode-history.js');
+      const exportData = await exportOpenCodeSession(record.projectDir, record.opencodeSessionId);
+      const synthesizedAfterTs = getOpenCodeSynthesizedAfterTs(params.afterTs);
+      const synthesized = buildTimelineEventsFromOpenCodeExport(params.sessionName, exportData, timelineEmitter.epoch)
+        .filter((event) => synthesizedAfterTs === undefined || event.ts > synthesizedAfterTs)
+        .filter((event) => params.beforeTs === undefined || event.ts < params.beforeTs);
+      const synthesizedTrimmed = synthesized.length > params.limit ? synthesized.slice(synthesized.length - params.limit) : synthesized;
+      if (
+        !hasSubstantiveTimelineHistory(trimmed)
+        || countSubstantiveTimelineEvents(synthesizedTrimmed) > countSubstantiveTimelineEvents(trimmed)
+      ) {
+        trimmed = synthesizedTrimmed;
+      }
+    } catch (err) {
+      logger.debug({ err, sessionName: params.sessionName, opencodeSessionId: record.opencodeSessionId }, 'Failed to synthesize OpenCode timeline history');
+    }
+    synthesizeMs = Date.now() - tSyn0;
+  }
+
+  const tSanitize = Date.now();
+  const sanitized = sanitizeTimelineHistoryEventsForTransport(trimmed);
+  return {
+    events: sanitized.events,
+    eventsRead: events.length,
+    payloadBytes: sanitized.payloadBytes,
+    droppedEvents: sanitized.droppedEvents,
+    truncatedEvents: sanitized.truncatedEvents,
+    readMs,
+    synthesizeMs,
+    sanitizeMs: Date.now() - tSanitize,
+    source: 'main',
+  };
+}
+
+async function buildTimelineHistoryWithWorker(params: TimelineHistoryRequestParams): Promise<TimelineHistoryBuildResult> {
+  const result = await getDefaultTimelineHistoryWorkerPool().dispatch({
+    sessionName: params.sessionName,
+    limit: params.limit,
+    afterTs: params.afterTs,
+    beforeTs: params.beforeTs,
+    contentTypes: [...TIMELINE_HISTORY_CONTENT_TYPES],
+    stateTypes: [...TIMELINE_HISTORY_STATE_TYPES],
+  }, { deadlineAt: Date.now() + 4_500 });
+  return {
+    events: result.events,
+    eventsRead: result.eventsRead,
+    payloadBytes: result.payloadBytes,
+    droppedEvents: result.droppedEvents,
+    truncatedEvents: result.truncatedEvents,
+    readMs: result.readMs,
+    synthesizeMs: 0,
+    sanitizeMs: result.sanitizeMs,
+    source: 'worker',
+  };
+}
+
 async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const sessionName = cmd.sessionName as string | undefined;
   const requestId = cmd.requestId as string | undefined;
@@ -4114,71 +4249,26 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
     return;
   }
 
-  // Instrumentation: measure disk-read + parse + synthesize + serialize so
-  // we can watch p95/p99 of user-visible history-pull latency over time.
-  // (Was previously unmeasured — see daemon.log grep for empty results.)
+  const params: TimelineHistoryRequestParams = { sessionName, requestId, limit, afterTs, beforeTs };
   const tStart = Date.now();
-  let readMs = 0;
-  let synthesizeMs = 0;
+  const initialRecord = getSession(sessionName);
+  let result: TimelineHistoryBuildResult;
 
-  // Query content by type instead of over-reading and filtering in JS. SQLite
-  // has (session_id, type, ts) indexes; using them keeps the common path near
-  // O(requested rows) instead of decoding thousands of unrelated state events.
-  // Do NOT filter by epoch — history should include events across daemon restarts.
-  const tRead0 = Date.now();
-  const substantive = await timelineStore.readByTypesPreferred(
-    sessionName,
-    [...TIMELINE_HISTORY_CONTENT_TYPES],
-    { limit, afterTs, beforeTs },
-  );
-  let stateEvents: typeof substantive = [];
-  if (substantive.length > 0) {
-    const cutoffTs = substantive[0]!.ts;
-    const stateAfterTs = afterTs === undefined ? cutoffTs - 1 : Math.max(afterTs, cutoffTs - 1);
-    stateEvents = await timelineStore.readByTypesPreferred(
-      sessionName,
-      [...TIMELINE_HISTORY_STATE_TYPES],
-      { limit: Math.max(limit * 2, 100), afterTs: stateAfterTs, beforeTs },
-    );
-  }
-  const events = [...substantive, ...stateEvents].sort((a, b) => a.ts - b.ts);
-  readMs = Date.now() - tRead0;
-
-  // Content-aware limit: session.state events don't count toward the budget.
-  // This prevents idle↔running oscillation storms from crowding out user.message events.
-  // Trim substantive to the requested limit
-  const trimmedSubstantive = substantive.length > limit ? substantive.slice(substantive.length - limit) : substantive;
-  // Interleave state events that fall within the trimmed time range
-  let trimmed: typeof events;
-  if (trimmedSubstantive.length > 0 && stateEvents.length > 0) {
-    const cutoffTs = trimmedSubstantive[0].ts;
-    const relevantState = stateEvents.filter((e) => e.ts >= cutoffTs);
-    trimmed = [...trimmedSubstantive, ...relevantState].sort((a, b) => a.ts - b.ts);
-  } else {
-    trimmed = trimmedSubstantive;
-  }
-
-  const record = await recoverOpenCodeSessionRecord(getSession(sessionName));
-  if (record?.agentType === 'opencode' && record.projectDir && record.opencodeSessionId) {
-    const tSyn0 = Date.now();
+  if (shouldUseTimelineHistoryWorkerPool() && initialRecord?.agentType !== 'opencode') {
     try {
-      const { exportOpenCodeSession, buildTimelineEventsFromOpenCodeExport } = await import('./opencode-history.js');
-      const exportData = await exportOpenCodeSession(record.projectDir, record.opencodeSessionId);
-      const synthesizedAfterTs = getOpenCodeSynthesizedAfterTs(afterTs);
-      const synthesized = buildTimelineEventsFromOpenCodeExport(sessionName, exportData, timelineEmitter.epoch)
-        .filter((event) => synthesizedAfterTs === undefined || event.ts > synthesizedAfterTs)
-        .filter((event) => beforeTs === undefined || event.ts < beforeTs);
-      const synthesizedTrimmed = synthesized.length > limit ? synthesized.slice(synthesized.length - limit) : synthesized;
-      if (
-        !hasSubstantiveTimelineHistory(trimmed)
-        || countSubstantiveTimelineEvents(synthesizedTrimmed) > countSubstantiveTimelineEvents(trimmed)
-      ) {
-        trimmed = synthesizedTrimmed;
-      }
+      result = await buildTimelineHistoryWithWorker(params);
     } catch (err) {
-      logger.debug({ err, sessionName, opencodeSessionId: record.opencodeSessionId }, 'Failed to synthesize OpenCode timeline history');
+      const reason = err instanceof TimelineHistoryPoolError ? err.reason : 'unknown';
+      if (reason === 'projection_unavailable') {
+        logger.debug({ sessionName, requestId, reason }, 'timeline.history worker unavailable; falling back to projection client');
+        result = await buildTimelineHistoryOnMain(params);
+      } else {
+        logger.warn({ sessionName, requestId, reason }, 'timeline.history worker failed; returning empty history response');
+        result = emptyTimelineHistoryResult(`worker_${reason}`);
+      }
     }
-    synthesizeMs = Date.now() - tSyn0;
+  } else {
+    result = await buildTimelineHistoryOnMain(params);
   }
 
   try {
@@ -4186,25 +4276,26 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
       type: 'timeline.history',
       sessionName,
       requestId,
-      events: trimmed,
+      events: result.events,
       epoch: timelineEmitter.epoch,
     });
   } catch { /* not connected */ }
 
-  // One line per pull. Fields: server-side disk/parse time, opencode
-  // synthesis time (0 for normal sessions), total handler time, counts.
-  // Hot-enough path that info-level is appropriate — expect ~1 pull per
-  // user session-open event, bounded by web-side cooldown.
   const totalMs = Date.now() - tStart;
   logger.info({
     sessionName,
     requestId,
     limit,
     afterTs,
-    eventsReturned: trimmed.length,
-    eventsRead: events.length,
-    readMs,
-    synthesizeMs,
+    source: result.source,
+    eventsReturned: result.events.length,
+    eventsRead: result.eventsRead,
+    eventsDropped: result.droppedEvents,
+    truncatedEvents: result.truncatedEvents,
+    payloadBytes: result.payloadBytes,
+    readMs: result.readMs,
+    synthesizeMs: result.synthesizeMs,
+    sanitizeMs: result.sanitizeMs,
     totalMs,
   }, 'timeline.history served');
 }

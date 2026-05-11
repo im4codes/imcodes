@@ -25,7 +25,7 @@ export type TimelineProjectionStatus = 'missing' | 'building' | 'ready' | 'stale
 const DEFAULT_QUERY_TIMEOUT_MS = 500;
 const DEFAULT_WRITE_TIMEOUT_MS = 2_000;
 
-function getProjectionDbPath(): string {
+export function getProjectionDbPath(): string {
   return process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH?.trim()
     || join(homedir(), '.imcodes', 'timeline.sqlite');
 }

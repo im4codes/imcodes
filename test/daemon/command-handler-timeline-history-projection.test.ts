@@ -8,6 +8,9 @@ const {
   exportOpenCodeSessionMock,
   buildTimelineEventsFromOpenCodeExportMock,
   buildSessionListMock,
+  historyWorkerDispatchMock,
+  shouldUseHistoryWorkerMock,
+  TimelineHistoryPoolErrorMock,
 } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
   upsertSessionMock: vi.fn(),
@@ -16,6 +19,17 @@ const {
   exportOpenCodeSessionMock: vi.fn(),
   buildTimelineEventsFromOpenCodeExportMock: vi.fn(),
   buildSessionListMock: vi.fn(async () => []),
+  historyWorkerDispatchMock: vi.fn(),
+  shouldUseHistoryWorkerMock: vi.fn(() => false),
+  TimelineHistoryPoolErrorMock: class TimelineHistoryPoolErrorMock extends Error {
+    readonly reason: string;
+
+    constructor(reason: string) {
+      super(reason);
+      this.name = 'TimelineHistoryPoolError';
+      this.reason = reason;
+    }
+  },
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -62,6 +76,11 @@ vi.mock('../../src/daemon/timeline-store.js', () => ({
     clear: vi.fn(),
   },
 }));
+vi.mock('../../src/daemon/timeline-history-pool.js', () => ({
+  getDefaultTimelineHistoryWorkerPool: vi.fn(() => ({ dispatch: historyWorkerDispatchMock })),
+  shouldUseTimelineHistoryWorkerPool: shouldUseHistoryWorkerMock,
+  TimelineHistoryPoolError: TimelineHistoryPoolErrorMock,
+}));
 vi.mock('../../src/daemon/subsession-manager.js', () => ({ startSubSession: vi.fn(), stopSubSession: vi.fn(), rebuildSubSessions: vi.fn(), detectShells: vi.fn().mockResolvedValue([]), readSubSessionResponse: vi.fn(), subSessionName: (id: string) => `deck_sub_${id}` }));
 vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({ startP2pRun: vi.fn(), cancelP2pRun: vi.fn(), getP2pRun: vi.fn(() => undefined), listP2pRuns: vi.fn(() => []), serializeP2pRun: vi.fn() }));
 vi.mock('../../src/daemon/session-list.js', () => ({ buildSessionList: buildSessionListMock }));
@@ -95,9 +114,88 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
     vi.clearAllMocks();
     readPreferredMock.mockReset();
     readByTypesPreferredMock.mockReset();
+    historyWorkerDispatchMock.mockReset();
+    shouldUseHistoryWorkerMock.mockReset();
+    shouldUseHistoryWorkerMock.mockReturnValue(false);
     getSessionMock.mockReturnValue(undefined);
     buildTimelineEventsFromOpenCodeExportMock.mockReturnValue([]);
     exportOpenCodeSessionMock.mockResolvedValue({});
+  });
+
+  it('uses the timeline history worker pool for regular non-OpenCode history requests', async () => {
+    shouldUseHistoryWorkerMock.mockReturnValue(true);
+    getSessionMock.mockReturnValue({ name: 'deck_worker', agentType: 'codex' });
+    historyWorkerDispatchMock.mockResolvedValue({
+      events: [
+        { eventId: 'u-worker', sessionId: 'deck_worker', ts: 1010, seq: 1, epoch: 1, source: 'daemon', confidence: 'high', type: 'user.message', payload: { text: 'from worker' } },
+      ],
+      eventsRead: 1,
+      payloadBytes: 120,
+      droppedEvents: 0,
+      truncatedEvents: 0,
+      readMs: 4,
+      sanitizeMs: 1,
+    });
+
+    handleWebCommand({
+      type: 'timeline.history_request',
+      sessionName: 'deck_worker',
+      requestId: 'hist-worker',
+      limit: 25,
+      afterTs: 100,
+      beforeTs: 200,
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(readByTypesPreferredMock).not.toHaveBeenCalled();
+    expect(historyWorkerDispatchMock).toHaveBeenCalledWith(expect.objectContaining({
+      sessionName: 'deck_worker',
+      limit: 25,
+      afterTs: 100,
+      beforeTs: 200,
+      contentTypes: expect.arrayContaining(['user.message', 'assistant.text', 'tool.result']),
+      stateTypes: ['session.state'],
+    }), expect.objectContaining({ deadlineAt: expect.any(Number) }));
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'timeline.history',
+      sessionName: 'deck_worker',
+      requestId: 'hist-worker',
+      events: [expect.objectContaining({ eventId: 'u-worker' })],
+    }));
+  });
+
+  it('falls back to the projection client when the history worker reports projection_unavailable', async () => {
+    shouldUseHistoryWorkerMock.mockReturnValue(true);
+    getSessionMock.mockReturnValue({ name: 'deck_fallback', agentType: 'codex' });
+    historyWorkerDispatchMock.mockRejectedValue(new TimelineHistoryPoolErrorMock('projection_unavailable'));
+    readByTypesPreferredMock.mockImplementation(async (_session: string, types: string[]) => (
+      types.includes('session.state')
+        ? [
+          { eventId: 's-fallback', sessionId: 'deck_fallback', ts: 1020, seq: 2, epoch: 1, source: 'daemon', confidence: 'high', type: 'session.state', payload: { state: 'running' } },
+        ]
+        : [
+          { eventId: 'u-fallback', sessionId: 'deck_fallback', ts: 1010, seq: 1, epoch: 1, source: 'daemon', confidence: 'high', type: 'user.message', payload: { text: 'fallback' } },
+        ]
+    ));
+
+    handleWebCommand({
+      type: 'timeline.history_request',
+      sessionName: 'deck_fallback',
+      requestId: 'hist-fallback',
+      limit: 5,
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(historyWorkerDispatchMock).toHaveBeenCalledTimes(1);
+    expect(readByTypesPreferredMock).toHaveBeenCalledTimes(2);
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'timeline.history',
+      requestId: 'hist-fallback',
+      events: [
+        expect.objectContaining({ eventId: 'u-fallback' }),
+        expect.objectContaining({ eventId: 's-fallback' }),
+      ],
+    }));
   });
 
   it('uses type-filtered reads and preserves substantive budgeting plus session.state interleaving', async () => {
