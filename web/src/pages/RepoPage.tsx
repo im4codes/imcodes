@@ -78,9 +78,12 @@ interface Props {
   focusLatestAction?: { token: number; failedJobName?: string; failedStepName?: string } | null;
   /** Called when a CI/CD run completes (success/failure). */
   onCiEvent?: (run: { name: string; status: string; conclusion?: string; url: string; failedJobName?: string; failedStepName?: string }) => void;
+  initialTab?: RepoPageTabKey;
+  initialTabToken?: number;
 }
 
-type TabKey = 'issues' | 'prs' | 'branches' | 'commits' | 'actions';
+export type RepoPageTabKey = 'issues' | 'prs' | 'branches' | 'commits' | 'actions';
+type TabKey = RepoPageTabKey;
 
 interface RepoContext {
   provider?: string; // 'github' | 'gitlab' | ...
@@ -181,13 +184,14 @@ function isTransientWsSendError(err: unknown): boolean {
 
 // ── Component ────────────────────────────────────────────────────────────────
 
-export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEvent }: Props) {
+export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEvent, initialTab, initialTabToken }: Props) {
   const { t } = useTranslation();
 
   const [context, setContext] = useState<RepoContext | null>(null);
   const [detectLoading, setDetectLoading] = useState(true);
   const [detectError, setDetectError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<TabKey>(() => {
+    if (initialTab) return initialTab;
     const saved = localStorage.getItem('repo-active-tab');
     return saved && ['issues', 'prs', 'branches', 'commits', 'actions'].includes(saved) ? saved as TabKey : 'issues';
   });
@@ -234,6 +238,12 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
   const [focusedActionTargetReplayClass, setFocusedActionTargetReplayClass] = useState<'repo-action-focus-a' | 'repo-action-focus-b'>('repo-action-focus-a');
   const contextRef = useRef<RepoContext | null>(null);
   const tabsRef = useRef(tabs);
+
+  useEffect(() => {
+    if (!initialTab) return;
+    setActiveTab(initialTab);
+    localStorage.setItem('repo-active-tab', initialTab);
+  }, [initialTab, initialTabToken]);
 
   useEffect(() => {
     contextRef.current = context;

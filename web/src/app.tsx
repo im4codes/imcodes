@@ -43,7 +43,7 @@ import { SessionSettingsDialog } from './components/SessionSettingsDialog.js';
 import { StartDiscussionDialog, type DiscussionPrefs, type SubSessionOption } from './components/StartDiscussionDialog.js';
 import { AskQuestionDialog, type PendingQuestion } from './components/AskQuestionDialog.js';
 import { ServerContextMenu, DeleteServerDialog } from './components/ServerContextMenu.js';
-import { RepoPage } from './pages/RepoPage.js';
+import { RepoPage, type RepoPageTabKey } from './pages/RepoPage.js';
 import { ingestSessionRepoContext } from './session-repo-context-store.js';
 import { FloatingPanel } from './components/FloatingPanel.js';
 import { SettingsPage } from './pages/SettingsPage.js';
@@ -258,6 +258,13 @@ interface WatchSessionRow {
   previewUpdatedAt?: number;
   isSubSession?: boolean;
 }
+
+type RepoPanelTarget = {
+  sessionId: string | null;
+  projectDir: string;
+  initialTab?: RepoPageTabKey;
+  initialTabToken: number;
+};
 
 export function App() {
   const { t: trans } = useTranslation();
@@ -1058,8 +1065,9 @@ export function App() {
 
   // ── Repo ────────────────────────────────────────────────────────────────────
   const [showRepoPage, setShowRepoPage] = useState(false);
+  const [repoPanelTarget, setRepoPanelTarget] = useState<RepoPanelTarget | null>(null);
+  const repoPanelOpenTokenRef = useRef(0);
   const [repoFocusLatestAction, setRepoFocusLatestAction] = useState<{ token: number; failedJobName?: string; failedStepName?: string } | null>(null);
-  const [pendingRepoToastSession, setPendingRepoToastSession] = useState<{ sessionName: string; focus: { token: number; failedJobName?: string; failedStepName?: string } } | null>(null);
   /** Floating file preview request opened from file panels and chat file links. */
   const [previewFileRequest, setPreviewFileRequest] = useState<FileBrowserPreviewRequest | null>(null);
   const [previewFileCache, setPreviewFileCache] = useState<Record<string, { preferDiff?: boolean; preview: FileBrowserPreviewState }>>({});
@@ -1717,6 +1725,16 @@ export function App() {
     if (panel.type === 'filebrowser' || panel.type === 'repo') {
       setShowDesktopFileBrowser(true);
     } else if (panel.type === 'repopage') {
+      const projectDir = typeof panel.props?.projectDir === 'string' ? panel.props.projectDir : undefined;
+      const sessionId = typeof panel.props?.sessionName === 'string' ? panel.props.sessionName : activeSession ?? null;
+      if (projectDir) {
+        repoPanelOpenTokenRef.current += 1;
+        setRepoPanelTarget({
+          sessionId,
+          projectDir,
+          initialTabToken: repoPanelOpenTokenRef.current,
+        });
+      }
       setShowRepoPage(true);
     } else if (panel.type === 'cronmanager') {
       setShowCronManager(true);
@@ -1744,7 +1762,7 @@ export function App() {
         bringSubToFront(sub.id);
       }
     }
-  }, [setPinnedPanels, subSessions, bringSubToFront]);
+  }, [activeSession, setPinnedPanels, subSessions, bringSubToFront]);
 
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   isMobileRef.current = isMobile;
@@ -3043,6 +3061,34 @@ export function App() {
 
   const activeSessionInfo = sessions.find((s) => s.name === activeSession) ?? null;
 
+  const resolveRepoProjectDir = useCallback((sessionId?: string | null) => {
+    if (!sessionId) return activeSessionInfo?.projectDir ?? undefined;
+    const mainSession = sessions.find((s) => s.name === sessionId);
+    if (mainSession?.projectDir) return mainSession.projectDir;
+    const subSession = subSessions.find((s) => s.sessionName === sessionId);
+    return subSession?.cwd ?? activeSessionInfo?.projectDir ?? undefined;
+  }, [activeSessionInfo?.projectDir, sessions, subSessions]);
+
+  const openRepoPage = useCallback((target?: { sessionId?: string | null; projectDir?: string | null; initialTab?: RepoPageTabKey }) => {
+    const sessionId = target?.sessionId ?? activeSession ?? null;
+    const projectDir = target?.projectDir ?? resolveRepoProjectDir(sessionId);
+    if (!projectDir) return;
+    repoPanelOpenTokenRef.current += 1;
+    setRepoPanelTarget({
+      sessionId,
+      projectDir,
+      ...(target?.initialTab ? { initialTab: target.initialTab } : {}),
+      initialTabToken: repoPanelOpenTokenRef.current,
+    });
+    if (target?.initialTab !== 'actions') {
+      setRepoFocusLatestAction(null);
+    }
+    setShowRepoPage(true);
+  }, [activeSession, resolveRepoProjectDir]);
+
+  const repoPanelSessionId = repoPanelTarget?.sessionId ?? activeSession ?? null;
+  const repoPanelProjectDir = repoPanelTarget?.projectDir ?? activeSessionInfo?.projectDir;
+
   // Audit fix (DiscussionsPage spam-fetch loop) — memoize the
   // request-scope object so its identity stays stable across parent
   // renders. Without this `useMemo`, every parent render of `App`
@@ -3156,14 +3202,6 @@ export function App() {
       index++;
     }
   }
-
-  useEffect(() => {
-    if (!pendingRepoToastSession) return;
-    if (activeSession !== pendingRepoToastSession.sessionName) return;
-    setShowRepoPage(true);
-    setRepoFocusLatestAction(pendingRepoToastSession.focus);
-    setPendingRepoToastSession(null);
-  }, [activeSession, pendingRepoToastSession]);
 
   // Memoized sub-session mappings — avoids creating new arrays on every render,
   // which would defeat memo() on child components (SessionPane, SessionTree, pinned panels).
@@ -3713,7 +3751,7 @@ export function App() {
                 onSettings={() => setSettingsTarget({ sessionName: s.name, label: s.label || '', description: s.description || '', cwd: s.projectDir || '', type: s.agentType || '', parentSession: null, transportConfig: s.transportConfig ?? null })}
                 onViewRepo={() => {
                   setActiveSession(s.name);
-                  setShowRepoPage(true);
+                  openRepoPage({ sessionId: s.name, projectDir: s.projectDir, initialTab: 'branches' });
                 }}
                 onTransportConfigSaved={(transportConfig) => {
                   setSessions((prev) => prev.map((session) => (
@@ -3877,7 +3915,7 @@ export function App() {
                 onDiff={registerDiffApplyer}
                 onHistory={registerHistoryApplyer}
                 serverId={selectedServerId}
-                onViewRepo={() => setShowRepoPage(true)}
+                onViewRepo={() => openRepoPage()}
                 onViewCron={() => setShowCronManager(true)}
                 subUsages={subUsages}
                 detectedModels={detectedModels}
@@ -4116,16 +4154,16 @@ export function App() {
         </FloatingPanel>
       )}
 
-      {showRepoPage && wsRef.current && activeSessionInfo?.projectDir && (
-        <FloatingPanel id="repo" title="Repository" onClose={() => setShowRepoPage(false)} onPin={() => pinPanel('repopage', { sessionName: activeSession, projectDir: activeSessionInfo?.projectDir, serverId: selectedServerId }, () => setShowRepoPage(false))} pinTooltip={trans('sidebar.pin_to_sidebar')} defaultW={800} defaultH={600} zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.repo, 5050)} onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.repo)}>
-          <RepoPage ws={wsRef.current} sessionId={activeSession} projectDir={activeSessionInfo.projectDir} onBack={() => setShowRepoPage(false)} onCiEvent={(run) => {
+      {showRepoPage && wsRef.current && repoPanelProjectDir && (
+        <FloatingPanel id="repo" title="Repository" onClose={() => setShowRepoPage(false)} onPin={() => pinPanel('repopage', { sessionName: repoPanelSessionId, projectDir: repoPanelProjectDir, serverId: selectedServerId }, () => setShowRepoPage(false))} pinTooltip={trans('sidebar.pin_to_sidebar')} defaultW={800} defaultH={600} zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.repo, 5050)} onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.repo)}>
+          <RepoPage ws={wsRef.current} sessionId={repoPanelSessionId} projectDir={repoPanelProjectDir} initialTab={repoPanelTarget?.initialTab} initialTabToken={repoPanelTarget?.initialTabToken} onBack={() => setShowRepoPage(false)} onCiEvent={(run) => {
             const id = Date.now();
             const icon = run.status === 'success' ? '✅' : '❌';
             const failurePath = [run.failedJobName, run.failedStepName].filter(Boolean).join(' → ');
             const message = failurePath || run.conclusion || run.status;
             setToasts((prev) => [...prev, {
               id,
-              sessionName: activeSession ?? '',
+              sessionName: repoPanelSessionId ?? '',
               project: `${icon} ${run.name}`,
               kind: 'notification',
               title: run.status === 'success' ? 'CI Passed' : 'CI Failed',
@@ -4386,6 +4424,7 @@ export function App() {
                 if (label !== null) renameSubSession(sub.id, label);
               }}
               onSettings={() => setSettingsTarget({ sessionName: sub.sessionName, subId: sub.id, label: sub.label || '', description: sub.description || '', cwd: sub.cwd || '', type: sub.type, parentSession: sub.parentSession, transportConfig: sub.transportConfig ?? null })}
+              onViewRepo={() => openRepoPage({ sessionId: sub.sessionName, projectDir: sub.cwd, initialTab: 'branches' })}
               onTransportConfigSaved={(transportConfig) => updateSubLocal(sub.id, { transportConfig })}
               onPreviewFile={(request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: false })}
               zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.subSession(sub.id), 6000)}
@@ -4548,13 +4587,8 @@ export function App() {
                     failedJobName: t.failedJobName,
                     failedStepName: t.failedStepName,
                   };
-                  localStorage.setItem('repo-active-tab', 'actions');
-                  if (t.sessionName && t.sessionName !== activeSession) {
-                    setPendingRepoToastSession({ sessionName: t.sessionName, focus });
-                  } else {
-                    setShowRepoPage(true);
-                    setRepoFocusLatestAction(focus);
-                  }
+                  openRepoPage({ sessionId: t.sessionName || activeSession, initialTab: 'actions' });
+                  setRepoFocusLatestAction(focus);
                 }
                 if (t.sessionName) {
                   // Reuse push notification navigation — handles sub-sessions, parent activation, etc.

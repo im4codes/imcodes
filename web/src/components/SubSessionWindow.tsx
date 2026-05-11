@@ -61,6 +61,7 @@ interface Props {
   onRestart: () => void;
   onRename: () => void;
   onSettings?: () => void;
+  onViewRepo?: () => void;
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
   /** Open a file preview in the shared floating preview host. */
   onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
@@ -162,7 +163,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onTransportConfigSaved, onPreviewFile, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, detectedModelHint, inP2p, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR,
+  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onViewRepo, onTransportConfigSaved, onPreviewFile, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, detectedModelHint, inP2p, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR,
 }: Props) {
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
@@ -644,7 +645,7 @@ export function SubSessionWindow({
       </div>
 
       {/* Usage footer — shared component */}
-      {(lastUsage || activeThinkingTs || activeToolCall || statusText || liveSessionState === 'running' || liveSessionState === 'idle' || sessionInfo?.planLabel || sessionInfo?.quotaLabel || sessionInfo?.quotaUsageLabel || sessionInfo?.quotaMeta) && (
+      {!isShell && (
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sub.sessionName}
@@ -655,6 +656,8 @@ export function SubSessionWindow({
           quotaLabel={sessionInfo?.quotaLabel}
           quotaUsageLabel={(sessionInfo?.agentType === 'codex' || sessionInfo?.agentType === 'codex-sdk') ? undefined : sessionInfo?.quotaUsageLabel}
           quotaMeta={sessionInfo?.quotaMeta}
+          projectDir={sub.cwd}
+          onViewRepo={onViewRepo}
           showCost={!!lastCostEvent}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}

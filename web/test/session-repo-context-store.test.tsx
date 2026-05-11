@@ -111,7 +111,7 @@ describe('session repo context store and summary', () => {
     expect(getSessionRepoContext('deck_proj_brain', '/repo/project')?.currentBranch).toBe('feature/a');
   });
 
-  it('renders a branch-only compact summary and opens repo info on click', () => {
+  it('renders a branch-only compact summary without an inline repo popover', () => {
     ingestSessionRepoContext({
       sessionId: 'deck_proj_brain',
       projectDir: '/repo/project',
@@ -136,9 +136,9 @@ describe('session repo context store and summary', () => {
     expect(screen.queryByText('main')).toBeNull();
 
     fireEvent.click(screen.getByRole('button'));
-    expect(screen.getByText('Repository information')).toBeDefined();
-    expect(screen.getByText('acme/widgets')).toBeDefined();
-    expect(screen.getByText('main')).toBeDefined();
+    expect(screen.queryByText('Repository information')).toBeNull();
+    expect(screen.queryByText('acme/widgets')).toBeNull();
+    expect(screen.queryByText('main')).toBeNull();
   });
 
   it('delegates click to repo panel opener when provided', () => {

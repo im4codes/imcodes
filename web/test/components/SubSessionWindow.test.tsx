@@ -212,6 +212,39 @@ describe('SubSessionWindow metadata wiring', () => {
     });
   });
 
+  it('keeps the usage footer mounted for idle-looking agent sub-sessions without usage', async () => {
+    const sub = makeSubSession({
+      type: 'codex-sdk',
+      runtimeType: 'transport' as any,
+      state: 'stopped',
+      modelDisplay: undefined,
+      quotaLabel: undefined,
+      planLabel: undefined,
+    } as any);
+
+    render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const footer = document.querySelector('[data-testid="usage-footer"]') as HTMLElement | null;
+      expect(footer?.dataset.state).toBe('stopped');
+    });
+  });
+
   it('passes detected timeline model to the usage footer when session metadata has no modelDisplay', async () => {
     timelineEventsMock = [
       { type: 'usage.update', payload: { model: 'gpt-5.5' } },

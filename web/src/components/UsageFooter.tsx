@@ -12,6 +12,7 @@ import { formatProviderQuotaLabel, type ProviderQuotaMeta } from '@shared/provid
 import { USAGE_CONTEXT_WINDOW_SOURCES } from '@shared/usage-context-window.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
 import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
+import { SessionRepoBranchSummary } from './SessionRepoBranchSummary.js';
 
 interface Props {
   usage: UsageData;
@@ -23,6 +24,8 @@ interface Props {
   quotaLabel?: string | null;
   quotaUsageLabel?: string | null;
   quotaMeta?: ProviderQuotaMeta | null;
+  projectDir?: string | null;
+  onViewRepo?: () => void;
   /** Show cost tracking (requires costUsd events to have been recorded). */
   showCost?: boolean;
   /** Active thinking timestamp — shows elapsed time spinner. */
@@ -40,7 +43,7 @@ const fmt = (n: number) =>
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
-export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, now }: Props) {
+export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, projectDir, onViewRepo, showCost, activeThinkingTs, statusText, activeToolCall, now }: Props) {
   const { t } = useTranslation();
   const isCodexFamily = agentType === 'codex' || agentType === 'codex-sdk';
   // Wrench pill: tri-state toggle for "show developer details in chat timeline".
@@ -73,7 +76,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   // etc. Skip the live-work UI entirely for these session types.
   const isAgentless = agentType === 'shell' || agentType === 'script';
   const hasActiveLiveWork = !isAgentless && (!!activeToolCall || !!activeThinkingTs);
-  const showLiveStatus = !isAgentless && (sessionState === 'running' || sessionState === 'idle' || hasActiveLiveWork);
+  const showLiveStatus = !isAgentless;
   const [quotaNow, setQuotaNow] = useState(() => Date.now());
 
   const displayModel = modelOverride ?? usage.model;
@@ -145,21 +148,20 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     ? null
     : hasActiveLiveWork
       ? (activeToolCall ? 'tool' : 'thinking')
-      : sessionState === 'running'
+      : sessionState === 'running' || sessionState === 'queued'
         ? 'running'
-        : sessionState === 'idle'
-          ? (statusText ? (/^(?:supervised|auto):/i.test(statusText) ? 'result' : 'waiting') : 'idle')
-          : null;
+        : statusText
+          ? (/^(?:supervised|auto):/i.test(statusText) ? 'result' : 'waiting')
+          : 'idle';
   const liveStatusText = useMemo(() => {
     if (isAgentless) return null;
-    if (hasActiveLiveWork || sessionState === 'running') {
+    if (hasActiveLiveWork || sessionState === 'running' || sessionState === 'queued') {
       if (activeToolCall) return statusText || 'Tool running...';
       if (activeThinkingTs) return t('chat.thinking_running', { sec: Math.max(0, Math.round(((now ?? Date.now()) - activeThinkingTs) / 1000)) });
       return 'Agent working...';
     }
-    if (sessionState === 'idle' && statusText) return statusText;
-    if (sessionState === 'idle') return 'Agent idle — waiting for input';
-    return null;
+    if (statusText) return statusText;
+    return 'Agent idle — waiting for input';
   }, [activeThinkingTs, activeToolCall, hasActiveLiveWork, isAgentless, now, sessionState, statusText, t]);
   const showInlineStatusText = liveStatusMode === 'running' || liveStatusMode === 'thinking' || liveStatusMode === 'tool' || liveStatusMode === 'waiting' || liveStatusMode === 'result';
   const codexQuotaLines = (agentType === 'codex' || agentType === 'codex-sdk')
@@ -171,6 +173,16 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
         <div class="session-ctx-bar">
           <div class="session-ctx-cache" style={{ width: `${cachePct}%` }} />
           <div class="session-ctx-input" style={{ width: `${newPct}%`, left: `${cachePct}%` }} />
+        </div>
+      )}
+      {projectDir && (
+        <div class="session-repo-branch-summary-row">
+          <SessionRepoBranchSummary
+            sessionId={sessionName}
+            projectDir={projectDir}
+            onOpenRepo={onViewRepo}
+            className="session-repo-branch-summary-footer"
+          />
         </div>
       )}
       {codexQuotaLines.length > 0 && (

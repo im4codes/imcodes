@@ -9,7 +9,6 @@ import { getNavigableHistory } from './QuickInputPanel.js';
 import type { UseQuickDataResult } from './QuickInputPanel.js';
 import { FileBrowser } from './file-browser-lazy.js';
 import { CloneSessionGroupDialog } from './CloneSessionGroupDialog.js';
-import { SessionRepoBranchSummary } from './SessionRepoBranchSummary.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
@@ -77,8 +76,6 @@ interface Props {
   onRenameSession?: () => void;
   /** Called when Settings is selected in the menu. */
   onSettings?: () => void;
-  /** Opens the repository information surface for this session. */
-  onViewRepo?: () => void;
   /** Sub-session id when the active control surface belongs to a sub-session. */
   subSessionId?: string;
   /** Display name (rename label) for the active session — shown in placeholder. */
@@ -537,7 +534,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onViewRepo, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved }: Props) {
   const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -2526,13 +2523,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     <div class={`controls-wrapper${showRunningSweep ? ' controls-wrapper-running' : ''}${mobileComposerExpanded ? ' controls-wrapper-mobile-expanded' : ''}`}>
       {/* Header control row — compact mode keeps meta controls but still hides terminal shortcuts */}
       {!hideShortcuts && (!compact || showCompactMetaControls) && <div class="shortcuts-row">
-        {activeSession?.projectDir && (
-          <SessionRepoBranchSummary
-            sessionId={activeSession.name}
-            projectDir={activeSession.projectDir}
-            onOpenRepo={onViewRepo}
-          />
-        )}
         {!compact && <div class="shortcuts">
           {/* Quick input trigger — shown here (before Esc) when shell terminal hides input row */}
           {isShellLike && (

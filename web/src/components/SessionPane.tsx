@@ -217,18 +217,7 @@ export function SessionPane({
   // working..." text when raw bytes flow (idle detection fires session.state
   // 'running' on any pipe-pane output, not just real agent activity).
   const isAgentlessSession = session.agentType === 'shell' || session.agentType === 'script';
-  const shouldShowFooter = !isAgentlessSession && !!(
-    lastUsage
-    || activeThinkingTs
-    || activeToolCall
-    || statusText
-    || liveSessionState === 'running'
-    || liveSessionState === 'idle'
-    || session.planLabel
-    || session.quotaLabel
-    || session.quotaUsageLabel
-    || session.quotaMeta
-  );
+  const shouldShowFooter = !isAgentlessSession;
 
   const thinkingNow = useNowTicker(!!activeThinkingTs);
 
@@ -344,6 +333,8 @@ export function SessionPane({
           quotaLabel={session.quotaLabel}
           quotaUsageLabel={session.quotaUsageLabel}
           quotaMeta={session.quotaMeta}
+          projectDir={session.projectDir}
+          onViewRepo={onViewRepo}
           showCost={!!lastCostEvent}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}
@@ -393,7 +384,6 @@ export function SessionPane({
           onStopProject={onStopProject}
           onRenameSession={onRenameSession}
           onSettings={onSettings}
-          onViewRepo={onViewRepo}
           onTransportConfigSaved={onTransportConfigSaved}
           sessionDisplayName={session.label ? formatLabel(session.label) : (session.project ?? null)}
           quickData={quickData}

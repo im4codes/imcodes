@@ -376,6 +376,19 @@ describe('RepoPage', () => {
     expect(screen.getByText('Bug A')).toBeDefined();
   });
 
+  it('opens and fetches the requested initial tab', async () => {
+    const { ws, respondDetect, repoListIssues, repoListBranches } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} initialTab="branches" initialTabToken={1} onBack={vi.fn()} />);
+
+    await act(async () => {
+      respondDetect({ provider: 'github', owner: 'acme', repo: 'widgets' });
+    });
+
+    expect(repoListBranches).toHaveBeenCalledTimes(1);
+    expect(repoListIssues).not.toHaveBeenCalled();
+    expect(localStorage.getItem('repo-active-tab')).toBe('branches');
+  });
+
   // 3. Loading state
   it('shows loading indicator before detect response arrives', () => {
     const { ws } = makeWs();

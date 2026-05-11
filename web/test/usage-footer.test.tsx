@@ -49,14 +49,99 @@ vi.mock('../src/hooks/usePref.js', () => ({
 
 import { UsageFooter } from '../src/components/UsageFooter.js';
 import { USAGE_CONTEXT_WINDOW_SOURCES } from '@shared/usage-context-window.js';
+import {
+  __resetSessionRepoContextStoreForTests,
+  ingestSessionRepoContext,
+} from '../src/session-repo-context-store.js';
 
 afterEach(() => {
   cleanup();
   toolPref.value = true;
   toolPref.save.mockClear();
+  __resetSessionRepoContextStoreForTests();
 });
 
 describe('UsageFooter', () => {
+  it('renders repo branch summary below ctx bar and above live status', () => {
+    const onViewRepo = vi.fn();
+    ingestSessionRepoContext({
+      sessionId: 'deck_test_brain',
+      projectDir: '/repo/project',
+      context: {
+        status: 'ok',
+        info: { currentBranch: 'feature/a' },
+        repoGeneration: 1,
+      },
+    });
+
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 1000,
+          cacheTokens: 2000,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
+        sessionName="deck_test_brain"
+        sessionState="running"
+        projectDir="/repo/project"
+        onViewRepo={onViewRepo}
+      />,
+    );
+
+    const footer = container.querySelector('.session-usage-footer') as HTMLDivElement;
+    const ctxBar = container.querySelector('.session-ctx-bar');
+    const branchRow = container.querySelector('.session-repo-branch-summary-row');
+    const statsRow = container.querySelector('.session-usage-stats');
+    const liveStatus = container.querySelector('.session-live-status-inline.running');
+    const children = Array.from(footer.children);
+
+    expect(branchRow?.textContent).toContain('feature/a');
+    expect(liveStatus?.textContent).toContain('🤖');
+    expect(liveStatus?.textContent).toContain('⚙️');
+    expect(liveStatus?.textContent).toContain('Agent working...');
+    expect(children.indexOf(ctxBar as Element)).toBeLessThan(children.indexOf(branchRow as Element));
+    expect(children.indexOf(branchRow as Element)).toBeLessThan(children.indexOf(statsRow as Element));
+
+    fireEvent.click(screen.getByText('feature/a'));
+    expect(onViewRepo).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the robot status visible for idle or unknown agent states', () => {
+    const { container, rerender } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 0,
+          cacheTokens: 0,
+          contextWindow: 0,
+        }}
+        sessionName="deck_test_brain"
+      />,
+    );
+
+    let status = container.querySelector('.session-live-status-inline.idle') as HTMLSpanElement | null;
+    expect(status?.textContent).toContain('🤖');
+    expect(status?.textContent).toContain('💤');
+    expect(status?.getAttribute('aria-label')).toContain('Agent idle');
+
+    rerender(
+      <UsageFooter
+        usage={{
+          inputTokens: 0,
+          cacheTokens: 0,
+          contextWindow: 0,
+        }}
+        sessionName="deck_test_brain"
+        sessionState="stopped"
+      />,
+    );
+
+    status = container.querySelector('.session-live-status-inline.idle') as HTMLSpanElement | null;
+    expect(status?.textContent).toContain('🤖');
+    expect(status?.textContent).toContain('💤');
+    expect(status?.getAttribute('aria-label')).toContain('Agent idle');
+  });
+
   it('defaults the tools/thinking toggle on while undecided and first click turns it off', () => {
     toolPref.value = null;
 
