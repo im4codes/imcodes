@@ -108,6 +108,17 @@ async function waitForStatus(
   return predicate();
 }
 
+async function writeExecutionMarkerFromPrompt(prompt: string): Promise<boolean> {
+  if (!prompt.includes('Execution proof required')) return false;
+  const markerPath = prompt.match(/write this exact JSON marker to: ([^\n]+)/)?.[1]?.trim();
+  const markerBody = prompt.match(/Completed marker:\n```json\n([\s\S]*?)\n```/)?.[1];
+  if (!markerPath || !markerBody) throw new Error(`No execution marker contract found in prompt: ${prompt}`);
+  JSON.parse(markerBody);
+  const { writeFile } = await import('node:fs/promises');
+  await writeFile(markerPath, `${markerBody.trim()}\n`, 'utf8');
+  return true;
+}
+
 // ── Setup ────────────────────────────────────────────────────────────────────
 
 beforeEach(async () => {
@@ -134,6 +145,10 @@ beforeEach(async () => {
 
   // Simulate agent writing output to discussion file when prompted
   sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 50);
+      return;
+    }
     const pathMatch = prompt.match(/\/[^\s]*.imc\/discussions\/[^\s]+\.md/);
     if (pathMatch) {
       const { appendFile } = await import('node:fs/promises');
