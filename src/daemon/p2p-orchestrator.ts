@@ -321,6 +321,9 @@ const P2P_POST_SUMMARY_EXECUTE_TEMPLATES: Record<string, string> = {
   ru: ruLocale.p2p.post_summary_execute_prompt,
 };
 
+const P2P_PREVIOUS_CYCLE_AUDIT_SCOPE_TAIL_BYTES = 12 * 1024;
+const P2P_PREVIOUS_CYCLE_AUDIT_SCOPE_MAX_CHARS = 8_000;
+
 export interface PostSummaryExecutionPromptSpec extends P2pExecutionMarkerSpec {
   markerPath: string;
 }
@@ -1248,6 +1251,8 @@ async function appendPostSummaryExecutionAudit(
     `Status: ${marker.status}`,
     `Attempts: ${attempts}`,
     marker.summary ? `Summary: ${marker.summary}` : null,
+    marker.changedFiles?.length ? `Changed files: ${marker.changedFiles.join(', ')}` : null,
+    marker.tests?.length ? `Tests: ${marker.tests.join(', ')}` : null,
     marker.completedAt ? `Completed at: ${marker.completedAt}` : null,
     '',
   ].filter((line): line is string => line !== null);
@@ -1257,6 +1262,57 @@ async function appendPostSummaryExecutionAudit(
   } catch (err) {
     logger.warn({ runId: run.id, markerPath: spec.markerPath, err }, 'P2P: failed to append post-summary execution audit');
   }
+}
+
+async function readDiscussionTail(filePath: string, maxBytes: number): Promise<string> {
+  let fh: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    fh = await open(filePath, 'r');
+    const { size } = await fh.stat();
+    if (size <= 0) return '';
+    const length = Math.min(maxBytes, size);
+    const buffer = Buffer.alloc(length);
+    await fh.read(buffer, 0, length, size - length);
+    return buffer.toString('utf8');
+  } finally {
+    await fh?.close().catch(() => {});
+  }
+}
+
+async function buildPreviousCycleAuditScopeInstruction(
+  run: P2pRun,
+  previousCycleIndex: number,
+  cycleTotal: number,
+): Promise<string> {
+  let previousOutputExcerpt = '';
+  try {
+    previousOutputExcerpt = (await readDiscussionTail(run.contextFilePath, P2P_PREVIOUS_CYCLE_AUDIT_SCOPE_TAIL_BYTES))
+      .slice(-P2P_PREVIOUS_CYCLE_AUDIT_SCOPE_MAX_CHARS)
+      .trim();
+  } catch (err) {
+    logger.warn({ runId: run.id, contextFilePath: run.contextFilePath, err }, 'P2P: failed to read previous cycle audit scope');
+  }
+
+  const scopeLines = [
+    `Previous cycle audit scope:`,
+    `- This is a new complete flow cycle. Treat cycle ${previousCycleIndex}/${cycleTotal} outputs as the primary audit scope for this initial analysis.`,
+    `- The previous cycle scope includes discussion evidence, the cycle summary, and the original-request execution result already appended to the discussion file.`,
+    `- First audit those previous outputs against the user's original request, then identify what the next participants should verify, deepen, or fix.`,
+  ];
+
+  if (previousOutputExcerpt) {
+    scopeLines.push(
+      '',
+      `Previous cycle output excerpt:`,
+      '```markdown',
+      previousOutputExcerpt,
+      '```',
+    );
+  } else {
+    scopeLines.push(`- If the excerpt is unavailable, read the full discussion file and audit the latest completed cycle before continuing.`);
+  }
+
+  return scopeLines.join('\n');
 }
 
 async function dispatchPostSummaryExecutionAttempt(
@@ -1454,11 +1510,19 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
     if (isFlowCycleStart) {
       if (run._cancelled) return;
       run.activePhase = 'initial';
+      const currentFlowCycle = Math.ceil(run.currentRound / pipelineLength);
+      const flowCycleTotal = Math.ceil(run.rounds / pipelineLength);
+      const previousCycleAuditScope = currentFlowCycle > 1
+        ? await buildPreviousCycleAuditScopeInstruction(run, currentFlowCycle - 1, flowCycleTotal)
+        : '';
       const initialHeader = `${discussionParticipantNameWithMode(run.initiatorSession, roundModeKey)} — Initial Analysis${roundLabel}`;
       const initialPrompt = buildHopPrompt(run, roundModeConfig, {
         session: run.initiatorSession,
         sectionHeader: initialHeader,
-        instruction: 'Read the discussion file and provide your initial analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.',
+        instruction: [
+          previousCycleAuditScope,
+          'Read the discussion file and provide your initial analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.',
+        ].filter(Boolean).join('\n\n'),
         isInitial: true,
       }, rp);
       const initialOk = await dispatchHop(run, run.initiatorSession, initialPrompt, serverLink, { sectionHeader: initialHeader, required: true });

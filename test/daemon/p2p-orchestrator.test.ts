@@ -304,6 +304,55 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(executionPrompts.every((prompt) => prompt.includes('implement after every full combo cycle'))).toBe(true);
   });
 
+  it('includes the previous cycle output as the next cycle initial audit scope', async () => {
+    const initialPrompts: string[] = [];
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+      if (session === 'deck_proj_brain' && /Add a new heading "## [^"]+ — Initial Analysis/.test(prompt)) {
+        initialPrompts.push(prompt);
+      }
+      if (prompt.includes('Execution proof required')) {
+        const markerPath = prompt.match(/write this exact JSON marker to: ([^\n]+)/)?.[1]?.trim();
+        const markerBody = prompt.match(/Completed marker:\n```json\n([\s\S]*?)\n```/)?.[1];
+        if (!markerPath || !markerBody) throw new Error(`No execution marker contract found in prompt: ${prompt}`);
+        const marker = JSON.parse(markerBody) as Record<string, unknown>;
+        marker.summary = `Cycle ${marker.cycleIndex} execution result`;
+        marker.changedFiles = [`src/cycle-${marker.cycleIndex}.ts`];
+        marker.tests = [`vitest cycle ${marker.cycleIndex}`];
+        await writeFile(markerPath, `${JSON.stringify(marker, null, 2)}\n`, 'utf8');
+        setTimeout(() => notifySessionIdle(session), 20);
+        return;
+      }
+      if (prompt.includes('[P2P Discussion Task')) {
+        const filePath = pathFromPrompt(prompt);
+        const heading = headingFromPrompt(prompt);
+        await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session} for ${heading}.\n`, 'utf8');
+      }
+      setTimeout(() => notifySessionIdle(session), 20);
+    });
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'audit each previous cycle result',
+      [],
+      serverLinkMock as any,
+      2,
+      undefined,
+      undefined,
+      240,
+    );
+
+    await waitForStatus(run.id, ['completed'], 5000);
+    expect(initialPrompts).toHaveLength(2);
+    expect(initialPrompts[0]).not.toContain('Previous cycle audit scope');
+    expect(initialPrompts[1]).toContain('Previous cycle audit scope');
+    expect(initialPrompts[1]).toContain('Treat cycle 1/2 outputs as the primary audit scope');
+    expect(initialPrompts[1]).toContain('P2P Original Request Execution Confirmed (cycle 1/2)');
+    expect(initialPrompts[1]).toContain('Summary: Cycle 1 execution result');
+    expect(initialPrompts[1]).toContain('Changed files: src/cycle-1.ts');
+    expect(initialPrompts[1]).toContain('Tests: vitest cycle 1');
+  });
+
   it('times out instead of hanging when the post-summary execution turn never returns idle', async () => {
     autoWriteExecutionMarkers = false;
     let waitingOnExecution = false;
