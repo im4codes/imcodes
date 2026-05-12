@@ -33,6 +33,7 @@ import {
 import logger from '../util/logger.js';
 import type { ServerLink } from './server-link.js';
 import { startSubSession, stopSubSession } from './subsession-manager.js';
+import { sendSubSessionSync } from './subsession-sync.js';
 import { getPaneCwd } from '../agent/tmux.js';
 
 const OPERATION_RETENTION_MS = 10 * 60 * 1000;
@@ -540,6 +541,7 @@ async function launchCloneMembers(
     const clonedSubRecord = patchClonedSubSessionRecord(sub, spec.main.targetMainSessionName);
     recordsToPersist.push(clonedSubRecord);
     pushProviderSessionResource(resources, clonedSubRecord);
+    await sendSubSessionSync(serverLink, sub.clonedId, clonedSubRecord);
     subSessionsCreated += 1;
     transition(serverLink, operation, 'creating_subs', {
       clonedMainSessionName: spec.main.targetMainSessionName,

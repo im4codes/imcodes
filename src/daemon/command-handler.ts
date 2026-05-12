@@ -25,6 +25,7 @@ import {
   subSessionName,
   type SubSessionRecord,
 } from './subsession-manager.js';
+import { sendSubSessionSync } from './subsession-sync.js';
 import logger from '../util/logger.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID, MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
@@ -484,96 +485,6 @@ function trySendCommandAck(
     logger.warn({ commandId: params.commandId, err }, 'command.ack send failed');
     return false;
   }
-}
-
-/**
- * Build a unified subsession.sync payload from the session store record.
- * Ensures all fields (including Qwen metadata) are always sent — no more
- * scattered inline objects with different field subsets.
- *
- * For Qwen sub-sessions, display metadata (planLabel, quotaLabel, quotaUsageLabel)
- * is computed FRESH (same as buildSessionList for main sessions) rather than
- * reading stale values from the session store.
- */
-async function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord>): Promise<Record<string, unknown> | null> {
-  const sessionName = subSessionName(id);
-  const record = getSession(sessionName);
-  const r = { ...record, ...overrides };
-  if (!r?.agentType) {
-    logger.warn({ id, sessionName }, 'Skipping subsession.sync without agentType');
-    return null;
-  }
-
-  // Compute transport display metadata fresh — matches session-list.ts hydration logic.
-  // The session store may have stale or missing metadata during early launch/update windows.
-  const freshDisplay: Partial<Pick<SessionRecord, 'modelDisplay' | 'codexAvailableModels' | 'planLabel' | 'quotaLabel' | 'quotaUsageLabel' | 'quotaMeta'>> = r?.agentType === 'qwen'
-    ? getQwenDisplayMetadata({
-        model: r?.qwenModel,
-        authType: r?.qwenAuthType,
-        authLimit: r?.qwenAuthLimit,
-        quotaUsageLabel: r?.qwenAuthType === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,
-      })
-    : r?.agentType === 'claude-code-sdk'
-      ? await getClaudeSdkRuntimeConfig().catch(() => ({}))
-      : (r?.agentType === 'codex' || r?.agentType === 'codex-sdk')
-        ? mergeCodexDisplayMetadata(await getCodexRuntimeConfig().catch(() => ({})), r)
-    : {};
-
-  return {
-    type: 'subsession.sync',
-    id,
-    // Current state (idle/running/queued/stopped/error) — the web side (see
-    // `useSubSessions.ts subsession.sync/created handlers`) already reads
-    // this field, but the daemon previously sent metadata only, which left
-    // freshly-loaded sub-sessions stuck with `state: 'unknown'` → gray dot
-    // in the sidebar until the next live `session.state` event arrived.
-    // For an idle session with no recent state change, that next event
-    // might never come, so the dot could stay gray indefinitely.
-    state: r?.state ?? null,
-    sessionType: r.agentType,
-    cwd: r?.projectDir ?? null,
-    shellBin: null,
-    ccSessionId: r?.ccSessionId ?? null,
-    geminiSessionId: r?.geminiSessionId ?? null,
-    parentSession: r?.parentSession ?? null,
-    ccPresetId: r?.ccPreset ?? null,
-    description: r?.description ?? null,
-    label: r?.label ?? null,
-    runtimeType: r?.runtimeType ?? null,
-    providerId: r?.providerId ?? null,
-    providerSessionId: r?.providerSessionId ?? null,
-    requestedModel: r?.requestedModel ?? null,
-    activeModel: r?.activeModel ?? r?.modelDisplay ?? null,
-    contextNamespace: r?.contextNamespace ?? null,
-    contextNamespaceDiagnostics: r?.contextNamespaceDiagnostics ?? null,
-    contextRemoteProcessedFreshness: r?.contextRemoteProcessedFreshness ?? null,
-    contextLocalProcessedFreshness: r?.contextLocalProcessedFreshness ?? null,
-    contextRetryExhausted: r?.contextRetryExhausted ?? null,
-    contextSharedPolicyOverride: r?.contextSharedPolicyOverride ?? null,
-    transportConfig: r?.transportConfig ?? null,
-    // Qwen metadata — freshly computed display fields + stored config fields
-    qwenModel: r?.qwenModel ?? null,
-    qwenAuthType: r?.qwenAuthType ?? null,
-    qwenAuthLimit: r?.qwenAuthLimit ?? null,
-    qwenAvailableModels: r?.qwenAvailableModels ?? null,
-    codexAvailableModels: freshDisplay.codexAvailableModels ?? r?.codexAvailableModels ?? null,
-    modelDisplay: freshDisplay.modelDisplay ?? r?.modelDisplay ?? null,
-    planLabel: freshDisplay.planLabel ?? r?.planLabel ?? null,
-    quotaLabel: freshDisplay.quotaLabel ?? r?.quotaLabel ?? null,
-    quotaUsageLabel: freshDisplay.quotaUsageLabel ?? r?.quotaUsageLabel ?? null,
-    quotaMeta: freshDisplay.quotaMeta ?? r?.quotaMeta ?? null,
-    effort: r?.effort ?? null,
-  };
-}
-
-async function sendSubSessionSync(
-  serverLink: ServerLink,
-  id: string,
-  overrides?: Partial<SessionRecord>,
-): Promise<void> {
-  const payload = await buildSubSessionSync(id, overrides);
-  if (!payload) return;
-  serverLink.send(payload);
 }
 
 function normalizeTransportConfigUpdate(value: unknown): Record<string, unknown> | undefined {

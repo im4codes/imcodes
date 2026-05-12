@@ -98,12 +98,15 @@ function makeSession(partial: Partial<SessionRecord> & Pick<SessionRecord, 'name
 
 function makeServerLink() {
   const sent: SessionGroupCloneEvent[] = [];
+  const messages: object[] = [];
   return {
     sent,
+    messages,
     link: {
       daemonVersion: 'test',
       getServerId: () => 'server-1',
       send: (msg: object) => {
+        messages.push(msg);
         if ((msg as { type?: string }).type === SESSION_GROUP_CLONE_MSG.EVENT) {
           sent.push(msg as SessionGroupCloneEvent);
         }
@@ -270,7 +273,7 @@ describe('daemon session group clone', () => {
         sessionName: 'deck_sub_active',
       },
     });
-    const { link, sent } = makeServerLink();
+    const { link, sent, messages } = makeServerLink();
 
     await handleSessionGroupCloneCommand({
       type: SESSION_GROUP_CLONE_MSG.START,
@@ -302,6 +305,14 @@ describe('daemon session group clone', () => {
       userCreated: true,
     });
     expect(clonedSub?.providerSessionId).not.toBe('source-provider-sub');
+    expect(messages).toContainEqual(expect.objectContaining({
+      type: 'subsession.sync',
+      id: clonedSub!.name.replace(/^deck_sub_/, ''),
+      sessionType: clonedSub!.agentType,
+      parentSession: 'deck_cd_1_brain',
+      cwd: clonedSub!.projectDir,
+      label: 'Worker A',
+    }));
     expect(sent.at(-1)?.state).toBe('succeeded');
     expect(sent.at(-1)?.result?.skippedMembers).toEqual(expect.arrayContaining([
       { sessionName: 'deck_sub_stopped', reason: 'stopped' },
@@ -317,6 +328,64 @@ describe('daemon session group clone', () => {
     expect(eventText).not.toContain('SECRET_SUB_KEY');
     expect(eventText).not.toContain('authorization');
     expect(eventText).not.toContain('transportConfig');
+  });
+
+  it('syncs every cloned active direct child through the sub-session DB path', async () => {
+    const dir = await makeDir('sync-every-child');
+    sessions.set('deck_cd_brain', makeSession({
+      name: 'deck_cd_brain',
+      projectName: 'cd',
+      role: 'brain',
+      projectDir: dir,
+    }));
+    sessions.set('deck_sub_shell', makeSession({
+      name: 'deck_sub_shell',
+      projectName: 'deck_sub_shell',
+      role: 'w1',
+      agentType: 'shell',
+      projectDir: dir,
+      parentSession: 'deck_cd_brain',
+      label: 'Sh1',
+    }));
+    sessions.set('deck_sub_codex', makeSession({
+      name: 'deck_sub_codex',
+      projectName: 'deck_sub_codex',
+      role: 'w1',
+      agentType: 'codex-sdk',
+      projectDir: dir,
+      parentSession: 'deck_cd_brain',
+      label: 'Cx1',
+    }));
+    sessions.set('deck_sub_qwen', makeSession({
+      name: 'deck_sub_qwen',
+      projectName: 'deck_sub_qwen',
+      role: 'w1',
+      agentType: 'qwen',
+      projectDir: dir,
+      parentSession: 'deck_cd_brain',
+      label: 'Qw1',
+      qwenModel: 'glm-5.1',
+      requestedModel: 'glm-5.1',
+    }));
+    const { link, sent, messages } = makeServerLink();
+
+    await handleSessionGroupCloneCommand({
+      type: SESSION_GROUP_CLONE_MSG.START,
+      sourceMainSessionName: 'deck_cd_brain',
+      idempotencyKey: `idem-sync-${unique++}`,
+    }, link as never);
+
+    const result = sent.at(-1)?.result;
+    const syncMessages = messages.filter((msg): msg is Record<string, unknown> =>
+      (msg as { type?: string }).type === 'subsession.sync',
+    );
+    expect(result?.copiedSubSessionIds).toHaveLength(3);
+    expect(syncMessages).toHaveLength(3);
+    expect(syncMessages.map((msg) => msg.id).sort()).toEqual(
+      result!.copiedSubSessionIds.map((entry) => entry.clonedId).sort(),
+    );
+    expect(syncMessages.every((msg) => msg.parentSession === 'deck_cd_1_brain')).toBe(true);
+    expect(syncMessages.map((msg) => msg.sessionType).sort()).toEqual(['codex-sdk', 'qwen', 'shell']);
   });
 
   it('rejects blank targets, explicit target conflicts, and source role mismatches before creation', async () => {
