@@ -2,13 +2,17 @@
  * @vitest-environment jsdom
  */
 import { h } from 'preact';
-import { render, waitFor, cleanup, fireEvent } from '@testing-library/preact';
+import { render, waitFor, cleanup, fireEvent, screen } from '@testing-library/preact';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { ChatView } from '../../src/components/ChatView.js';
 import {
   SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
   SESSION_CONTROL_TIMELINE_STATE_STOPPING,
 } from '../../../shared/session-control-commands.js';
+import {
+  __resetSessionRepoContextStoreForTests,
+  ingestSessionRepoContext,
+} from '../../src/session-repo-context-store.js';
 
 const chatMarkdownRenderSpy = vi.hoisted(() => vi.fn());
 const showToolCallsPref = vi.hoisted(() => ({
@@ -106,6 +110,7 @@ describe('ChatView', () => {
     clipboardWriteText.mockClear();
     visualViewportMock.height = 800;
     visualViewportListeners.clear();
+    __resetSessionRepoContextStoreForTests();
   });
 
   afterAll(() => {
@@ -141,6 +146,43 @@ describe('ChatView', () => {
       expect(container.textContent ?? '').not.toContain('chat.thinking_done');
       unmount();
     }
+  });
+
+  it('renders the repo branch summary beside the font settings control', () => {
+    const onViewRepo = vi.fn();
+    ingestSessionRepoContext({
+      sessionId: 'deck_test_brain',
+      projectDir: '/repo/project',
+      context: {
+        status: 'ok',
+        info: { currentBranch: 'feature/a' },
+        repoGeneration: 1,
+      },
+    });
+
+    const { container } = render(
+      <ChatView
+        events={[] as any}
+        loading={false}
+        sessionId="deck_test_brain"
+        workdir="/repo/project"
+        onViewRepo={onViewRepo}
+      />,
+    );
+
+    const titlebar = container.querySelector('.chat-titlebar') as HTMLDivElement | null;
+    const fontButton = screen.getByRole('button', { name: 'Aa' });
+    const branchHost = container.querySelector('.session-repo-branch-summary-chat-titlebar') as HTMLSpanElement | null;
+    const branchButton = screen.getByText('feature/a').closest('button') as HTMLButtonElement | null;
+    const titlebarChildren = Array.from(titlebar?.children ?? []);
+
+    expect(titlebar).toBeTruthy();
+    expect(branchHost?.textContent).toContain('feature/a');
+    expect(titlebar?.contains(branchHost as Element)).toBe(true);
+    expect(titlebarChildren.indexOf(fontButton.parentElement as Element)).toBeLessThan(titlebarChildren.indexOf(branchHost as Element));
+
+    fireEvent.click(branchButton!);
+    expect(onViewRepo).toHaveBeenCalledTimes(1);
   });
 
   it('keeps preview mode pinned to the bottom during streaming updates with the same timestamp', async () => {

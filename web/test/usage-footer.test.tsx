@@ -49,31 +49,15 @@ vi.mock('../src/hooks/usePref.js', () => ({
 
 import { UsageFooter } from '../src/components/UsageFooter.js';
 import { USAGE_CONTEXT_WINDOW_SOURCES } from '@shared/usage-context-window.js';
-import {
-  __resetSessionRepoContextStoreForTests,
-  ingestSessionRepoContext,
-} from '../src/session-repo-context-store.js';
 
 afterEach(() => {
   cleanup();
   toolPref.value = true;
   toolPref.save.mockClear();
-  __resetSessionRepoContextStoreForTests();
 });
 
 describe('UsageFooter', () => {
-  it('renders repo branch summary in the live status row without hiding robot status', () => {
-    const onViewRepo = vi.fn();
-    ingestSessionRepoContext({
-      sessionId: 'deck_test_brain',
-      projectDir: '/repo/project',
-      context: {
-        status: 'ok',
-        info: { currentBranch: 'feature/a' },
-        repoGeneration: 1,
-      },
-    });
-
+  it('keeps the robot status row visible without hosting the repo branch summary', () => {
     const { container } = render(
       <UsageFooter
         usage={{
@@ -84,29 +68,20 @@ describe('UsageFooter', () => {
         }}
         sessionName="deck_test_brain"
         sessionState="running"
-        projectDir="/repo/project"
-        onViewRepo={onViewRepo}
       />,
     );
 
     const footer = container.querySelector('.session-usage-footer') as HTMLDivElement;
     const ctxBar = container.querySelector('.session-ctx-bar');
-    const branchHost = container.querySelector('.session-repo-branch-summary-footer');
     const statsRow = container.querySelector('.session-usage-stats');
     const liveStatus = container.querySelector('.session-live-status-inline.running');
     const children = Array.from(footer.children);
-    const statsChildren = Array.from(statsRow?.children ?? []);
 
-    expect(branchHost?.textContent).toContain('feature/a');
     expect(liveStatus?.textContent).toContain('🤖');
     expect(liveStatus?.textContent).toContain('⚙️');
     expect(liveStatus?.textContent).toContain('Agent working...');
-    expect(statsRow?.contains(branchHost as Element)).toBe(true);
+    expect(container.querySelector('.session-repo-branch-summary')).toBeNull();
     expect(children.indexOf(ctxBar as Element)).toBeLessThan(children.indexOf(statsRow as Element));
-    expect(statsChildren.indexOf(liveStatus as Element)).toBeLessThan(statsChildren.indexOf(branchHost as Element));
-
-    fireEvent.click(screen.getByText('feature/a'));
-    expect(onViewRepo).toHaveBeenCalledTimes(1);
   });
 
   it('keeps the robot status visible for idle or unknown agent states', () => {

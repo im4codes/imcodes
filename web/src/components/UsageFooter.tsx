@@ -12,7 +12,6 @@ import { formatProviderQuotaLabel, type ProviderQuotaMeta } from '@shared/provid
 import { USAGE_CONTEXT_WINDOW_SOURCES } from '@shared/usage-context-window.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
 import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
-import { SessionRepoBranchSummary } from './SessionRepoBranchSummary.js';
 
 interface Props {
   usage: UsageData;
@@ -24,8 +23,6 @@ interface Props {
   quotaLabel?: string | null;
   quotaUsageLabel?: string | null;
   quotaMeta?: ProviderQuotaMeta | null;
-  projectDir?: string | null;
-  onViewRepo?: () => void;
   /** Show cost tracking (requires costUsd events to have been recorded). */
   showCost?: boolean;
   /** Active thinking timestamp — shows elapsed time spinner. */
@@ -43,7 +40,7 @@ const fmt = (n: number) =>
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
-export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, projectDir, onViewRepo, showCost, activeThinkingTs, statusText, activeToolCall, now }: Props) {
+export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, now }: Props) {
   const { t } = useTranslation();
   const isCodexFamily = agentType === 'codex' || agentType === 'codex-sdk';
   // Wrench pill: tri-state toggle for "show developer details in chat timeline".
@@ -194,14 +191,6 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
             {liveStatusMode === 'idle' && <span class="session-live-status-emoji sleep">💤</span>}
             {showInlineStatusText && <span class="session-live-status-text">{liveStatusText}</span>}
           </span>
-        )}
-        {projectDir && (
-          <SessionRepoBranchSummary
-            sessionId={sessionName}
-            projectDir={projectDir}
-            onOpenRepo={onViewRepo}
-            className="session-repo-branch-summary-footer"
-          />
         )}
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
           <span class="shortcut-btn-tools-wrapper">

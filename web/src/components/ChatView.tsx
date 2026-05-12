@@ -14,6 +14,7 @@ import { parseUnifiedDiff } from '@shared/unified-diff.js';
 import { FileBrowser, type FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
 import { FontPrefsDropdown, useFontPrefs, DEFAULT_CHAT_FONT } from './FontPrefsDropdown.js';
+import { SessionRepoBranchSummary } from './SessionRepoBranchSummary.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
 import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 import type { TimelineHistoryStatus, TimelineHistoryStepKey } from '../hooks/useTimeline.js';
@@ -47,6 +48,8 @@ interface Props {
   onInsertPath?: (path: string) => void;
   /** Session working directory — used to resolve relative paths clicked in chat */
   workdir?: string | null;
+  /** Opens the repository view for this session/project. */
+  onViewRepo?: () => void;
   /** Called when user quotes selected text. */
   onQuote?: (text: string) => void;
   agentType?: string | null;
@@ -610,7 +613,7 @@ function findScrollParent(start: HTMLElement): HTMLElement {
   return start;
 }
 
-export function ChatView({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, serverId, onQuote, agentType: _agentType, onResendFailed }: Props) {
+export function ChatView({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onQuote, agentType: _agentType, onResendFailed }: Props) {
   const { t } = useTranslation();
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -1375,6 +1378,12 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
               prefs={chatFontPrefs}
               onChange={setChatFontPrefs}
               variant="compact"
+            />
+            <SessionRepoBranchSummary
+              sessionId={sessionId}
+              projectDir={workdir}
+              onOpenRepo={onViewRepo}
+              className="session-repo-branch-summary-chat-titlebar"
             />
           </div>
         )}

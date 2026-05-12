@@ -312,6 +312,7 @@ export function SessionPane({
           sessionState={session.state}
           onScrollBottomFn={setChatScrollFn}
           workdir={session.projectDir}
+          onViewRepo={onViewRepo}
           onPreviewFile={onPreviewFile}
           ws={connected ? ws : null}
           serverId={serverId}
@@ -333,8 +334,6 @@ export function SessionPane({
           quotaLabel={session.quotaLabel}
           quotaUsageLabel={session.quotaUsageLabel}
           quotaMeta={session.quotaMeta}
-          projectDir={session.projectDir}
-          onViewRepo={onViewRepo}
           showCost={!!lastCostEvent}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}

@@ -641,6 +641,7 @@ export function SubSessionWindow({
             onScrollBottomFn={onChatScrollBottomFn}
             ws={ws}
             workdir={sub.cwd ?? null}
+            onViewRepo={onViewRepo}
             onPreviewFile={onPreviewFile}
             serverId={serverId}
             onQuote={addQuote}
@@ -662,8 +663,6 @@ export function SubSessionWindow({
           quotaLabel={sessionInfo?.quotaLabel}
           quotaUsageLabel={(sessionInfo?.agentType === 'codex' || sessionInfo?.agentType === 'codex-sdk') ? undefined : sessionInfo?.quotaUsageLabel}
           quotaMeta={sessionInfo?.quotaMeta}
-          projectDir={sub.cwd}
-          onViewRepo={onViewRepo}
           showCost={!!lastCostEvent}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}
