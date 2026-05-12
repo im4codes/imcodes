@@ -51,7 +51,7 @@ body {
 .tab:hover { color: #c9d1d9; background: #161b22; }
 .tab.active { color: #e6edf3; background: #161b22; border-top-color: #3b82f6; border-bottom-color: transparent; }
 .tab.brain { color: #9e7ff0; }
-.tab.brain.active { color: #c4b5fd; border-top-color: #8b5cf6; border-top-width: 4px; }
+.tab.brain.active { color: #c4b5fd; border-top-color: transparent; border-top-width: 2px; border-bottom-color: #8b5cf6; border-bottom-width: 4px; }
 .tab.idle::after { content: '●'; margin-left: 5px; color: #3fb950; font-size: 7px; vertical-align: middle; }
 .tab.busy::after { content: '◌'; margin-left: 5px; color: #e3b341; font-size: 7px; vertical-align: middle; animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }

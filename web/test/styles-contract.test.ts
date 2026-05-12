@@ -58,11 +58,12 @@ describe('styles.css regression contracts', () => {
     expect(maximizedWindowRule![0]).toMatch(/border:\s*2px solid var\(--subsession-accent-color/);
   });
 
-  it('active brain session tab keeps a thicker purple top border', () => {
+  it('active brain session tab keeps a thicker purple bottom border', () => {
     const activeBrainRule = css.match(/\.tab\.brain\.active\s*\{[^}]*\}/);
     expect(activeBrainRule).not.toBeNull();
-    expect(activeBrainRule![0]).toMatch(/border-top-color:\s*#8b5cf6/);
-    expect(activeBrainRule![0]).toMatch(/border-top-width:\s*4px/);
+    expect(activeBrainRule![0]).toMatch(/border-top-color:\s*transparent/);
+    expect(activeBrainRule![0]).toMatch(/border-bottom-color:\s*#8b5cf6/);
+    expect(activeBrainRule![0]).toMatch(/border-bottom-width:\s*4px/);
   });
 
   it('.fb-changes-section must NOT cap height — list must scroll past 10 items', () => {
