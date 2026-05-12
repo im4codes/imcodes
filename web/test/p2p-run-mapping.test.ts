@@ -59,6 +59,29 @@ describe('mapP2pRunToDiscussion', () => {
     expect(discussion.flowStepTotal).toBe(2);
   });
 
+  it('preserves execution phase and marker-gate progress fields', () => {
+    const discussion = mapP2pRunToDiscussion({
+      id: 'run_execution_phase',
+      status: 'running',
+      mode_key: 'plan',
+      current_round: 2,
+      total_rounds: 2,
+      flow_cycle_current: 1,
+      flow_cycle_total: 1,
+      active_phase: 'execution',
+      execution_attempt: 2,
+      execution_cycle_current: 1,
+      execution_cycle_total: 1,
+      all_nodes: [
+        { label: 'brain', agentType: 'claude-code', status: 'done', phase: 'summary' },
+        { label: 'brain', agentType: 'claude-code', status: 'active', phase: 'execution' },
+      ],
+    });
+
+    expect(discussion.activePhase).toBe('execution');
+    expect(discussion.nodes?.find((node) => node.phase === 'execution')?.status).toBe('active');
+  });
+
   it('maps advanced payloads to logical rounds instead of raw execution steps', () => {
     const discussion = mapP2pRunToDiscussion({
       id: 'run_advanced',

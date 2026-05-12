@@ -81,6 +81,9 @@ export type SanitizedP2pOrchestrationRun = {
   active_hop_number?: number | null;
   active_round_hop_number?: number | null;
   active_phase?: string;
+  execution_attempt?: number | null;
+  execution_cycle_current?: number | null;
+  execution_cycle_total?: number | null;
   current_round_mode?: string;
   current_target_label?: string | null;
   initiator_label?: string | null;
@@ -107,6 +110,9 @@ const SAFE_LEGACY_RUN_UPDATE_FIELDS = [
   'completed_round_hops_count',
   'skipped_hops',
   'active_phase',
+  'execution_attempt',
+  'execution_cycle_current',
+  'execution_cycle_total',
   'hop_started_at',
   'active_hop_number',
   'active_round_hop_number',
@@ -706,6 +712,9 @@ export function sanitizeP2pOrchestrationRunForBridge(raw: unknown, overrides: {
   addOptional(sanitized, 'active_hop_number', nullableNumber(source.active_hop_number));
   addOptional(sanitized, 'active_round_hop_number', nullableNumber(source.active_round_hop_number));
   addOptional(sanitized, 'active_phase', stringValue(source.active_phase) ?? undefined);
+  addOptional(sanitized, 'execution_attempt', nullableNumber(source.execution_attempt));
+  addOptional(sanitized, 'execution_cycle_current', nullableNumber(source.execution_cycle_current));
+  addOptional(sanitized, 'execution_cycle_total', nullableNumber(source.execution_cycle_total));
   addOptional(sanitized, 'current_round_mode', stringValue(source.current_round_mode) ?? undefined);
   addOptional(sanitized, 'current_target_label', nullableString(source.current_target_label));
   addOptional(sanitized, 'initiator_label', nullableString(source.initiator_label));

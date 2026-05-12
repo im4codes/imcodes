@@ -645,6 +645,7 @@
       "phase_initial": "Inicial",
       "phase_hop": "Salto",
       "phase_summary": "Resumen",
+      "phase_execution": "Ejecutar",
       "phase_queued": "En cola",
       "round_label": "Ronda",
       "hop_label": "Salto",

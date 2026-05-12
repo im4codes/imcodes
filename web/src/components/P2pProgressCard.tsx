@@ -10,7 +10,7 @@ export interface P2pProgressNode {
   agentType: string;
   ccPreset?: string | null;
   mode?: string;
-  phase?: 'initial' | 'hop' | 'summary';
+  phase?: 'initial' | 'hop' | 'summary' | 'execution';
   status: 'done' | 'active' | 'pending' | 'skipped';
 }
 
@@ -43,7 +43,7 @@ export interface P2pProgressDiscussion {
   totalHops?: number;
   activeHop?: number | null;
   activeRoundHop?: number | null;
-  activePhase?: 'queued' | 'initial' | 'hop' | 'summary';
+  activePhase?: 'queued' | 'initial' | 'hop' | 'summary' | 'execution';
   conclusion?: string;
   error?: string;
   nodes?: P2pProgressNode[];

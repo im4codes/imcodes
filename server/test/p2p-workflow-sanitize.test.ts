@@ -38,10 +38,13 @@ describe('p2p workflow server sanitizer', () => {
   });
 
   it('drops malicious and private keys from browser run_update while preserving safe legacy fields', () => {
-    const poisoned = JSON.parse('{"id":"run-2","status":"running","mode_key":"audit","active_phase":"hop","hop_counts":{"completed":1},"nested":{"constructor":{"polluted":true}},"token":"secret"}');
+    const poisoned = JSON.parse('{"id":"run-2","status":"running","mode_key":"audit","active_phase":"execution","execution_attempt":2,"execution_cycle_current":1,"execution_cycle_total":3,"hop_counts":{"completed":1},"nested":{"constructor":{"polluted":true}},"token":"secret"}');
     const run = sanitizeP2pRunUpdateForBroadcast(poisoned, { serverId: 'server-1' });
 
-    expect(run.active_phase).toBe('hop');
+    expect(run.active_phase).toBe('execution');
+    expect(run.execution_attempt).toBe(2);
+    expect(run.execution_cycle_current).toBe(1);
+    expect(run.execution_cycle_total).toBe(3);
     expect(run.hop_counts).toEqual({ completed: 1 });
     expect('token' in run).toBe(false);
     expect('nested' in run).toBe(false);

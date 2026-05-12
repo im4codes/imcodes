@@ -645,6 +645,7 @@
       "phase_initial": "初期",
       "phase_hop": "ホップ",
       "phase_summary": "要約",
+      "phase_execution": "実行",
       "phase_queued": "待機中",
       "round_label": "ラウンド",
       "hop_label": "ホップ",

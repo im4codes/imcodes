@@ -1125,7 +1125,7 @@ export function App() {
     totalHops: number;
     activeHop?: number | null;
     activeRoundHop?: number | null;
-    activePhase?: 'queued' | 'initial' | 'hop' | 'summary';
+    activePhase?: 'queued' | 'initial' | 'hop' | 'summary' | 'execution';
     initiatorLabel?: string;
     currentSpeaker?: string;
     conclusion?: string;
@@ -1136,7 +1136,7 @@ export function App() {
       agentType: string;
       ccPreset?: string | null;
       mode?: string;
-      phase?: 'initial' | 'hop' | 'summary';
+      phase?: 'initial' | 'hop' | 'summary' | 'execution';
       status: 'done' | 'active' | 'pending' | 'skipped';
     }>;
     hopStates?: Array<{

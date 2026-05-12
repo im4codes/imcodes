@@ -85,6 +85,13 @@ import {
   type P2pRunUpdatePayload,
   type P2pSummaryPhase,
 } from '../../shared/p2p-status.js';
+import {
+  buildP2pExecutionMarker,
+  stringifyP2pExecutionMarker,
+  validateP2pExecutionMarkerContent,
+  type P2pExecutionMarker,
+  type P2pExecutionMarkerSpec,
+} from '../../shared/p2p-execution-marker.js';
 import enLocale from '../../web/src/i18n/locales/en.json' with { type: 'json' };
 import zhCNLocale from '../../web/src/i18n/locales/zh-CN.json' with { type: 'json' };
 import zhTWLocale from '../../web/src/i18n/locales/zh-TW.json' with { type: 'json' };
@@ -187,6 +194,11 @@ export interface P2pRun {
   extraPrompt: string;
   /** Epoch ms when the current hop/phase started — used by the UI for hop-level elapsed timer. */
   hopStartedAt: number;
+  /** Post-summary original-request execution proof, reset for each cycle/final execution gate. */
+  executionAttempt?: number;
+  executionCycleCurrent?: number | null;
+  executionCycleTotal?: number | null;
+  executionMarkerPath?: string | null;
   /** Parallel hop runtime state across all rounds. */
   hopStates: P2pHopRuntime[];
   activeTargetSessions: string[];
@@ -309,11 +321,50 @@ const P2P_POST_SUMMARY_EXECUTE_TEMPLATES: Record<string, string> = {
   ru: ruLocale.p2p.post_summary_execute_prompt,
 };
 
-export function buildPostSummaryExecutionPrompt(run: Pick<P2pRun, 'contextFilePath' | 'userText' | 'locale'>): string {
+export interface PostSummaryExecutionPromptSpec extends P2pExecutionMarkerSpec {
+  markerPath: string;
+}
+
+export function buildPostSummaryExecutionPrompt(
+  run: Pick<P2pRun, 'contextFilePath' | 'userText' | 'locale'>,
+  markerSpec?: PostSummaryExecutionPromptSpec,
+  options: { attempt?: number; deadlineAt?: number } = {},
+): string {
   const template = P2P_POST_SUMMARY_EXECUTE_TEMPLATES[run.locale ?? ''] ?? P2P_POST_SUMMARY_EXECUTE_TEMPLATES.en;
-  return template
+  const basePrompt = template
     .replaceAll('{{discussionFile}}', run.contextFilePath)
     .replaceAll('{{request}}', run.userText);
+  if (!markerSpec) return basePrompt;
+
+  const successMarker = stringifyP2pExecutionMarker(buildP2pExecutionMarker(markerSpec, 'completed')).trimEnd();
+  const failureMarker = stringifyP2pExecutionMarker({
+    ...buildP2pExecutionMarker(markerSpec, 'failed'),
+    error: 'short reason',
+  }).trimEnd();
+  const deadlineLine = typeof options.deadlineAt === 'number'
+    ? `\nDeadline: ${new Date(options.deadlineAt).toISOString()}`
+    : '';
+  const attemptLine = options.attempt && options.attempt > 1
+    ? `\nThis is retry attempt ${options.attempt}; the required marker has not been observed yet.`
+    : '';
+
+  return `${basePrompt}
+
+Execution proof required before the P2P workflow can continue:
+- After you have directly executed the original request, write this exact JSON marker to: ${markerSpec.markerPath}
+- Keep runId, cycleIndex, cycleTotal, nonce, and status exactly as shown. Do not write the marker before doing the work.
+- If you cannot complete the request, write the failed marker instead and include a short error field.
+- The daemon will retry this prompt while the marker is missing; idling without the marker does not count as success.${deadlineLine}${attemptLine}
+
+Completed marker:
+\`\`\`json
+${successMarker}
+\`\`\`
+
+Failed marker:
+\`\`\`json
+${failureMarker}
+\`\`\``;
 }
 
 /*
@@ -378,7 +429,12 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
     (hop.status === 'running' || hop.status === 'dispatched'),
   );
   const currentHopState = activeHopStates[0] ?? null;
-  const currentHop = currentHopState?.session ?? run.activeTargetSessions[0] ?? run.currentTargetSession;
+  const currentHop = currentHopState?.session
+    ?? run.activeTargetSessions[0]
+    ?? run.currentTargetSession
+    ?? (run.activePhase === 'initial' || run.activePhase === 'summary' || run.activePhase === 'execution'
+      ? run.initiatorSession
+      : null);
   const hopCounts = countHopStates(run.hopStates);
   const legacyPipelineLength = !run.advancedP2pEnabled && isComboMode(run.mode)
     ? Math.max(1, parseModePipeline(run.mode).length)
@@ -438,6 +494,9 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
     flow_step_total: legacyFlowStepTotal ?? undefined,
     skipped_hops: run.skippedHops,
     active_phase: run.activePhase,
+    execution_attempt: run.executionAttempt ?? null,
+    execution_cycle_current: run.executionCycleCurrent ?? null,
+    execution_cycle_total: run.executionCycleTotal ?? null,
     hop_started_at: run.hopStartedAt || null,
     active_hop_number: currentHopState ? currentHopState.hop_index : null,
     active_round_hop_number: currentHopState && run.totalTargets > 0
@@ -511,11 +570,11 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
         agentType: string;
         ccPreset: string | null;
         mode: string;
-        phase: 'initial' | 'hop' | 'summary';
+        phase: 'initial' | 'hop' | 'summary' | 'execution';
         status: 'done' | 'active' | 'pending' | 'skipped';
       };
       const nodes: NodeInfo[] = [];
-      const getInfo = (s: string, mode: string, phase: 'initial' | 'hop' | 'summary') => {
+      const getInfo = (s: string, mode: string, phase: 'initial' | 'hop' | 'summary' | 'execution') => {
         const r = getSession(s);
         const label = r?.label || shortName(s);
         const agentType = r?.agentType ?? 'unknown';
@@ -574,11 +633,17 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
         nodes.push({ session: t.session, ...info, status: 'pending' });
       }
 
-      const summaryDone = run.status === 'completed';
+      const summaryDone = run.status === 'completed' || run.summaryPhase === 'completed';
       const summaryActive = run.activePhase === 'summary' && !summaryDone;
       const lastMode = combo ? resolveMode(run.rounds) : run.mode;
       const summary = getInfo(run.initiatorSession, lastMode, 'summary');
       nodes.push({ session: run.initiatorSession, ...summary, status: summaryDone ? 'done' : summaryActive ? 'active' : 'pending' });
+      const executionActive = run.activePhase === 'execution' && !isTerminal(run.status);
+      if (executionActive || run.executionCycleCurrent != null || run.status === 'completed') {
+        const execution = getInfo(run.initiatorSession, lastMode, 'execution');
+        const executionDone = run.status === 'completed' || !isTerminal(run.status);
+        nodes.push({ session: run.initiatorSession, ...execution, status: executionActive ? 'active' : executionDone ? 'done' : 'skipped' });
+      }
       return nodes;
     })(),
   };
@@ -856,6 +921,10 @@ export async function startP2pRun(...args:
     allTargets: [...targets],
     extraPrompt: extraPrompt ?? '',
     hopStartedAt: Date.now(),
+    executionAttempt: 0,
+    executionCycleCurrent: null,
+    executionCycleTotal: null,
+    executionMarkerPath: null,
     hopStates: [],
     activeTargetSessions: [],
     advancedP2pEnabled: resolvedPlan.advanced,
@@ -1135,82 +1204,69 @@ async function cleanupRoundHopArtifacts(roundHops: P2pHopRuntime[]): Promise<voi
   }));
 }
 
-interface PostSummaryExecutionOptions {
-  waitForCompletion?: boolean;
+interface PostSummaryExecutionGateOptions {
+  cycleIndex: number;
+  cycleTotal: number;
   timeoutMs?: number;
 }
 
-async function waitForPostSummaryExecutionCompletion(
-  run: P2pRun,
-  session: string,
-  timeoutMs: number,
-  idleEventState: { received: boolean },
-): Promise<boolean> {
-  const startedAt = Date.now();
-  const deadline = startedAt + Math.max(1, timeoutMs);
-  const eventTrustMs = Math.min(MIN_PROCESSING_MS, 1_000);
-  let observedTransportBusy = false;
-
-  while (Date.now() < deadline) {
-    if (run._cancelled) return false;
-    await sleep(IDLE_POLL_MS);
-    if (run._cancelled) return false;
-
-    const transportRuntime = getTransportRuntime(session);
-    if (transportRuntime) {
-      const status = transportRuntime.getStatus();
-      if (transportRuntime.sending || transportRuntime.pendingCount > 0 || (status !== 'idle' && status !== 'error')) {
-        observedTransportBusy = true;
-      }
-      if (status === 'error' && !transportRuntime.sending && transportRuntime.pendingCount === 0) return false;
-      if (
-        !transportRuntime.sending &&
-        transportRuntime.pendingCount === 0 &&
-        status === 'idle' &&
-        (observedTransportBusy || idleEventState.received || (Date.now() - startedAt) >= eventTrustMs)
-      ) {
-        return true;
-      }
-      continue;
-    }
-
-    const elapsed = Date.now() - startedAt;
-    const canTrustIdle = idleEventState.received
-      ? elapsed >= eventTrustMs
-      : elapsed >= MIN_PROCESSING_MS;
-    if (!canTrustIdle) continue;
-
-    let idleConfirmed = false;
-    const record = getSession(session);
-    const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
-    const useStoreState = agentType === 'gemini';
-    try {
-      idleConfirmed = useStoreState
-        ? record?.state === 'idle'
-        : await detectStatusAsync(session, agentType) === 'idle';
-    } catch {
-      idleConfirmed = idleEventState.received;
-    }
-    if (idleConfirmed) return true;
-  }
-
-  logger.warn({ runId: run.id, session, timeoutMs }, 'P2P: post-summary execution prompt timed out');
-  return false;
+interface PostSummaryExecutionRuntimeSpec extends PostSummaryExecutionPromptSpec {
+  markerPath: string;
 }
 
-async function dispatchPostSummaryExecutionPrompt(
+function createPostSummaryExecutionSpec(run: P2pRun, options: PostSummaryExecutionGateOptions): PostSummaryExecutionRuntimeSpec {
+  return {
+    runId: run.id,
+    cycleIndex: options.cycleIndex,
+    cycleTotal: options.cycleTotal,
+    nonce: randomUUID(),
+    markerPath: join(dirname(run.contextFilePath), `${run.id}.cycle${options.cycleIndex}.execution-marker.json`),
+  };
+}
+
+async function readPostSummaryExecutionMarker(spec: PostSummaryExecutionRuntimeSpec): Promise<ReturnType<typeof validateP2pExecutionMarkerContent> | null> {
+  try {
+    return validateP2pExecutionMarkerContent(await readFile(spec.markerPath, 'utf8'), spec);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
+    logger.warn({ markerPath: spec.markerPath, err }, 'P2P: failed to read post-summary execution marker');
+    return { ok: false, reason: 'marker_read_failed' };
+  }
+}
+
+async function appendPostSummaryExecutionAudit(
   run: P2pRun,
-  options: PostSummaryExecutionOptions = {},
+  spec: PostSummaryExecutionRuntimeSpec,
+  marker: P2pExecutionMarker,
+  attempts: number,
+): Promise<void> {
+  const lines = [
+    '',
+    `## P2P Original Request Execution Confirmed (cycle ${spec.cycleIndex}/${spec.cycleTotal})`,
+    '',
+    `Marker file: ${spec.markerPath}`,
+    `Status: ${marker.status}`,
+    `Attempts: ${attempts}`,
+    marker.summary ? `Summary: ${marker.summary}` : null,
+    marker.completedAt ? `Completed at: ${marker.completedAt}` : null,
+    '',
+  ].filter((line): line is string => line !== null);
+  try {
+    await flushP2pDiscussionWriteQueue(run.contextFilePath);
+    await appendFile(run.contextFilePath, `\n${lines.join('\n')}`, 'utf8');
+  } catch (err) {
+    logger.warn({ runId: run.id, markerPath: spec.markerPath, err }, 'P2P: failed to append post-summary execution audit');
+  }
+}
+
+async function dispatchPostSummaryExecutionAttempt(
+  run: P2pRun,
+  spec: PostSummaryExecutionRuntimeSpec,
+  attempt: number,
+  deadlineAt: number,
 ): Promise<boolean> {
-  const prompt = buildPostSummaryExecutionPrompt(run);
+  const prompt = buildPostSummaryExecutionPrompt(run, spec, { attempt, deadlineAt });
   const session = run.initiatorSession;
-  const idleEventState = { received: false };
-  const waitForCompletion = options.waitForCompletion !== false;
-  const timeoutMs = options.timeoutMs ?? (run.timeoutMs * 3);
-  const idleWaiter = waitForCompletion ? waitForIdleEvent(session, timeoutMs) : null;
-  idleWaiter?.promise.then((ok) => {
-    if (ok) idleEventState.received = true;
-  });
   try {
     const transportRuntime = getTransportRuntime(session);
     if (transportRuntime) {
@@ -1219,20 +1275,126 @@ async function dispatchPostSummaryExecutionPrompt(
     } else {
       await sendKeysDelayedEnter(session, prompt);
     }
+    return true;
   } catch (err) {
-    idleWaiter?.cancel();
-    logger.warn({ runId: run.id, session, err }, 'P2P: failed to dispatch post-summary execution prompt');
+    logger.warn({ runId: run.id, session, attempt, err }, 'P2P: failed to dispatch post-summary execution prompt');
     return false;
   }
-  if (!waitForCompletion) {
-    idleWaiter?.cancel();
-    return true;
+}
+
+async function isPostSummaryExecutionRetryReady(
+  run: P2pRun,
+  session: string,
+  startedAt: number,
+  idleEventReceived: boolean,
+): Promise<boolean> {
+  const transportRuntime = getTransportRuntime(session);
+  if (transportRuntime) {
+    const status = transportRuntime.getStatus();
+    if (status === 'error' && !transportRuntime.sending && transportRuntime.pendingCount === 0) return true;
+    return !transportRuntime.sending && transportRuntime.pendingCount === 0 && status === 'idle';
   }
+
+  const elapsed = Date.now() - startedAt;
+  if (!idleEventReceived && elapsed < MIN_PROCESSING_MS) return false;
+
+  const record = getSession(session);
+  const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
+  const useStoreState = agentType === 'gemini';
   try {
-    return await waitForPostSummaryExecutionCompletion(run, session, timeoutMs, idleEventState);
-  } finally {
-    idleWaiter?.cancel();
+    return useStoreState
+      ? record?.state === 'idle'
+      : await detectStatusAsync(session, agentType) === 'idle';
+  } catch (err) {
+    logger.debug({ runId: run.id, session, err }, 'P2P: idle detection failed while waiting for post-summary execution marker');
+    return idleEventReceived;
   }
+}
+
+async function runPostSummaryExecutionGate(
+  run: P2pRun,
+  serverLink: ServerLink | null,
+  options: PostSummaryExecutionGateOptions,
+): Promise<boolean> {
+  const session = run.initiatorSession;
+  const timeoutMs = Math.max(1, options.timeoutMs ?? (run.timeoutMs * 3));
+  const deadlineAt = Date.now() + timeoutMs;
+  const spec = createPostSummaryExecutionSpec(run, options);
+  let attempt = 0;
+  let lastDispatchAt = 0;
+  let idleEventReceived = false;
+  let idleWaiter: IdleWaiterHandle | undefined;
+
+  const armIdleWaiter = () => {
+    if (idleWaiter) idleWaiter.cancel();
+    idleEventReceived = false;
+    idleWaiter = waitForIdleEvent(session, Math.max(1, deadlineAt - Date.now()));
+    idleWaiter.promise.then((ok) => {
+      if (ok) idleEventReceived = true;
+    });
+  };
+
+  const sendAttempt = async () => {
+    attempt += 1;
+    lastDispatchAt = Date.now();
+    run.runPhase = 'executing_original_request';
+    run.activePhase = 'execution';
+    run.hopStartedAt = lastDispatchAt;
+    run.executionAttempt = attempt;
+    run.executionCycleCurrent = spec.cycleIndex;
+    run.executionCycleTotal = spec.cycleTotal;
+    run.executionMarkerPath = spec.markerPath;
+    pushState(run, serverLink);
+    armIdleWaiter();
+    return dispatchPostSummaryExecutionAttempt(run, spec, attempt, deadlineAt);
+  };
+
+  await sendAttempt();
+  const retryDelayMs = Math.max(IDLE_POLL_MS, Math.min(MIN_PROCESSING_MS, 5_000));
+  let lastInvalidMarkerReason: string | null = null;
+
+  try {
+    while (Date.now() < deadlineAt) {
+      if (run._cancelled || isTerminal(run.status)) return false;
+      if (!ensureRunDeadline(run, serverLink)) return false;
+
+      const markerState = await readPostSummaryExecutionMarker(spec);
+      if (markerState?.ok) {
+        await appendPostSummaryExecutionAudit(run, spec, markerState.marker, attempt);
+        logger.info({ runId: run.id, cycleIndex: spec.cycleIndex, cycleTotal: spec.cycleTotal, attempts: attempt }, 'P2P: post-summary execution marker confirmed');
+        return true;
+      }
+      if (markerState && !markerState.ok) {
+        lastInvalidMarkerReason = markerState.reason;
+        if (markerState.failedByAgent) {
+          failRun(run, 'post_summary_execution_failed', markerState.reason, serverLink);
+          return false;
+        }
+      }
+
+      await sleep(Math.min(IDLE_POLL_MS, Math.max(1, deadlineAt - Date.now())));
+      if (run._cancelled || isTerminal(run.status)) return false;
+      if (!ensureRunDeadline(run, serverLink)) return false;
+
+      if (Date.now() - lastDispatchAt < retryDelayMs) continue;
+      const retryReady = await isPostSummaryExecutionRetryReady(run, session, lastDispatchAt, idleEventReceived);
+      if (!retryReady || Date.now() >= deadlineAt) continue;
+      logger.warn({
+        runId: run.id,
+        session,
+        attempt,
+        markerPath: spec.markerPath,
+        lastInvalidMarkerReason,
+      }, 'P2P: initiator idle before execution marker; retrying post-summary execution prompt');
+      await sendAttempt();
+    }
+  } finally {
+    if (idleWaiter) idleWaiter.cancel();
+  }
+
+  logger.warn({ runId: run.id, session, timeoutMs, markerPath: spec.markerPath }, 'P2P: post-summary execution marker timed out');
+  failRun(run, 'timed_out', 'post_summary_execution_timeout', serverLink);
+  return false;
 }
 
 function scheduleRoundHopArtifactCleanup(roundHops: P2pHopRuntime[]): void {
@@ -1375,15 +1537,13 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
       run.summaryPhase = summaryOk ? 'completed' : 'failed';
       if (run._cancelled || isTerminal(run.status)) return;
       if (isFlowCycleEnd) {
-        const executionOk = await dispatchPostSummaryExecutionPrompt(run, {
-          waitForCompletion: true,
+        const executionOk = await runPostSummaryExecutionGate(run, serverLink, {
+          cycleIndex: Math.ceil(run.currentRound / pipelineLength),
+          cycleTotal: Math.ceil(run.rounds / pipelineLength),
           timeoutMs: run.timeoutMs * 3,
         });
         if (run._cancelled || isTerminal(run.status)) return;
-        if (!executionOk) {
-          failRun(run, 'timed_out', 'post_summary_execution_timeout', serverLink);
-          return;
-        }
+        if (!executionOk) return;
       }
     } finally {
       scheduleRoundHopArtifactCleanup(roundHops);
@@ -2909,6 +3069,14 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
   });
   if (!summaryOk && (run._cancelled || isTerminal(run.status))) return;
   run.summaryPhase = summaryOk ? 'completed' : 'failed';
+  if (run._cancelled || isTerminal(run.status)) return;
+
+  const executionOk = await runPostSummaryExecutionGate(run, serverLink, {
+    cycleIndex: 1,
+    cycleTotal: 1,
+    timeoutMs: run.timeoutMs * 3,
+  });
+  if (!executionOk || run._cancelled || isTerminal(run.status)) return;
 
   // R3 v1b (W2) — flush the discussion write queue before reading so the
   // result summary captures every queued segment instead of an
@@ -2921,7 +3089,6 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
   } catch { /* ignore */ }
   run.completedAt = new Date().toISOString();
   transition(run, 'completed', serverLink);
-  await dispatchPostSummaryExecutionPrompt(run, { waitForCompletion: false });
   // A3: `activeRuns.delete` is now scheduled by
   // `scheduleP2pRunTerminalCleanup` (called from `transition('completed')`
   // above), so no explicit timer here.

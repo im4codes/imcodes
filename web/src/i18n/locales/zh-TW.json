@@ -646,6 +646,7 @@
       "phase_initial": "初始",
       "phase_hop": "傳遞",
       "phase_summary": "總結",
+      "phase_execution": "執行",
       "phase_queued": "排隊中",
       "round_label": "輪次",
       "hop_label": "跳轉",

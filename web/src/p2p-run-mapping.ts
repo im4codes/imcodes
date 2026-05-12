@@ -96,7 +96,7 @@ function mapLegacyNodes(source: Record<string, any>) {
     agentType: String(n.agentType ?? ''),
     ccPreset: n.ccPreset ?? n.cc_preset ?? null,
     mode: typeof n.mode === 'string' ? n.mode : undefined,
-    phase: typeof n.phase === 'string' ? n.phase as 'initial' | 'hop' | 'summary' : undefined,
+    phase: typeof n.phase === 'string' ? n.phase as 'initial' | 'hop' | 'summary' | 'execution' : undefined,
     status: String(n.status ?? 'pending') as P2pProgressNodeStatus,
   })) : undefined;
 }

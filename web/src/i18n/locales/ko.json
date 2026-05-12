@@ -645,6 +645,7 @@
       "phase_initial": "초기",
       "phase_hop": "홉",
       "phase_summary": "요약",
+      "phase_execution": "실행",
       "phase_queued": "대기열",
       "round_label": "라운드",
       "hop_label": "홉",

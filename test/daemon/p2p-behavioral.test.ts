@@ -199,6 +199,31 @@ describe('buildHopPrompt — production function', () => {
     expect(prompt).toContain('根据讨论结果真正完成这个需求');
     expect(prompt).toContain('不要再次停留在讨论总结');
   });
+
+  it('adds marker-file execution proof instructions when a marker spec is supplied', () => {
+    const prompt = buildPostSummaryExecutionPrompt(makeRun({
+      contextFilePath: '/tmp/test-discussion.md',
+      userText: 'implement the requested feature',
+    }), {
+      runId: 'run_marker',
+      cycleIndex: 1,
+      cycleTotal: 2,
+      nonce: 'nonce_marker',
+      markerPath: '/tmp/run_marker.cycle1.execution-marker.json',
+    }, {
+      attempt: 2,
+      deadlineAt: Date.parse('2026-05-12T00:00:00.000Z'),
+    });
+
+    expect(prompt).toContain('Execution proof required');
+    expect(prompt).toContain('/tmp/run_marker.cycle1.execution-marker.json');
+    expect(prompt).toContain('"runId": "run_marker"');
+    expect(prompt).toContain('"cycleIndex": 1');
+    expect(prompt).toContain('"cycleTotal": 2');
+    expect(prompt).toContain('"nonce": "nonce_marker"');
+    expect(prompt).toContain('idling without the marker does not count as success');
+    expect(prompt).toContain('retry attempt 2');
+  });
 });
 
 // ── Rounds clamping (via P2P_MAX_ROUNDS constant in orchestrator) ─────────────

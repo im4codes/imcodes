@@ -38,6 +38,7 @@ export const P2P_RUN_PHASE_VALUES = [
   'preparing',
   'round_execution',
   'summarizing',
+  'executing_original_request',
   'completed',
   'failed',
   'cancelled',
@@ -50,6 +51,7 @@ export const P2P_ACTIVE_PHASE_VALUES = [
   'initial',
   'hop',
   'summary',
+  'execution',
 ] as const;
 
 export type P2pActivePhase = (typeof P2P_ACTIVE_PHASE_VALUES)[number];
@@ -76,6 +78,7 @@ export const P2P_PROGRESS_NODE_PHASE_VALUES = [
   'initial',
   'hop',
   'summary',
+  'execution',
 ] as const;
 
 export type P2pProgressNodePhase = (typeof P2P_PROGRESS_NODE_PHASE_VALUES)[number];
@@ -163,6 +166,9 @@ export interface P2pRunUpdatePayload {
   active_hop_number?: number | null;
   active_round_hop_number?: number | null;
   active_phase?: P2pActivePhase;
+  execution_attempt?: number | null;
+  execution_cycle_current?: number | null;
+  execution_cycle_total?: number | null;
   hop_started_at?: number | null;
   initiator_label?: string | null;
   current_target_session?: string | null;

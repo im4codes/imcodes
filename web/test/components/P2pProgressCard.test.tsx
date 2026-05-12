@@ -116,6 +116,31 @@ describe('P2pProgressCard', () => {
     expect(screen.getByText('S2/2')).toBeTruthy();
   });
 
+  it('shows execution phase while waiting for original-request marker proof', () => {
+    render(
+      <P2pProgressCard
+        discussion={{
+          id: 'p2p_run_execution_marker',
+          topic: 'P2P plan · brain',
+          state: 'running',
+          modeKey: 'plan',
+          currentRound: 1,
+          maxRounds: 1,
+          flowCycleCurrent: 1,
+          flowCycleTotal: 1,
+          completedHops: 1,
+          totalHops: 1,
+          activePhase: 'execution',
+          nodes: [
+            { label: 'brain', agentType: 'codex', status: 'active', phase: 'execution' },
+          ],
+        }}
+      />,
+    );
+
+    expect(screen.getAllByText('phase_execution').length).toBeGreaterThan(0);
+  });
+
   it('shows a close action for failed discussions', () => {
     const onStopDiscussion = vi.fn();
 

@@ -646,6 +646,7 @@
       "phase_initial": "Initial",
       "phase_hop": "Hop",
       "phase_summary": "Summary",
+      "phase_execution": "Execute",
       "phase_queued": "Queued",
       "round_label": "Round",
       "hop_label": "Hop",

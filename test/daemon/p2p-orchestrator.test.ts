@@ -75,6 +75,7 @@ import {
 } from '../../src/daemon/p2p-orchestrator.js';
 
 let tempProjectDir: string;
+let autoWriteExecutionMarkers = true;
 
 function pathFromPrompt(prompt: string): string {
   const match = prompt.match(/\/\S+?\.md/);
@@ -86,6 +87,27 @@ function pathFromPrompt(prompt: string): string {
 function headingFromPrompt(prompt: string): string {
   const match = prompt.match(/Add a new heading "## ([^"]+)"/) ?? prompt.match(/under "?## ([^"\n]+)"?/);
   return match?.[1] ?? 'Automated Test Output';
+}
+
+async function writeExecutionMarkerFromPrompt(prompt: string, force = false): Promise<boolean> {
+  if ((!autoWriteExecutionMarkers && !force) || !prompt.includes('Execution proof required')) return false;
+  const markerPath = prompt.match(/write this exact JSON marker to: ([^\n]+)/)?.[1]?.trim();
+  const markerBody = prompt.match(/Completed marker:\n```json\n([\s\S]*?)\n```/)?.[1];
+  if (!markerPath || !markerBody) throw new Error(`No execution marker contract found in prompt: ${prompt}`);
+  JSON.parse(markerBody);
+  await writeFile(markerPath, `${markerBody.trim()}\n`, 'utf8');
+  return true;
+}
+
+async function writeFailedExecutionMarkerFromPrompt(prompt: string, error = 'agent failed'): Promise<boolean> {
+  if (!prompt.includes('Execution proof required')) return false;
+  const markerPath = prompt.match(/write this exact JSON marker to: ([^\n]+)/)?.[1]?.trim();
+  const markerBody = prompt.match(/Failed marker:\n```json\n([\s\S]*?)\n```/)?.[1];
+  if (!markerPath || !markerBody) throw new Error(`No failed execution marker contract found in prompt: ${prompt}`);
+  const parsed = JSON.parse(markerBody) as Record<string, unknown>;
+  parsed.error = error;
+  await writeFile(markerPath, `${JSON.stringify(parsed, null, 2)}\n`, 'utf8');
+  return true;
 }
 
 async function waitForStatus(runId: string, expected: P2pRunStatus[], maxMs = 10000): Promise<P2pRun> {
@@ -121,6 +143,7 @@ beforeEach(async () => {
   _setMinProcessingMs(0);
   _setFileSettleCycles(1);
   _setRoundHopCleanupDelayMs(0);
+  autoWriteExecutionMarkers = true;
 
   tempProjectDir = join(tmpdir(), `p2p-par-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
   await mkdir(tempProjectDir, { recursive: true });
@@ -137,6 +160,10 @@ beforeEach(async () => {
   detectStatusAsyncMock.mockResolvedValue('idle');
 
   sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
     const filePath = pathFromPrompt(prompt);
     const heading = headingFromPrompt(prompt);
     await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
@@ -246,12 +273,17 @@ describe('P2P orchestrator — parallel rounds', () => {
   it('runs the post-summary execution prompt after each complete legacy combo cycle', async () => {
     const executionPrompts: string[] = [];
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+      if (!prompt.includes('[P2P Discussion Task') && session === 'deck_proj_brain') {
+        executionPrompts.push(prompt);
+      }
+      if (await writeExecutionMarkerFromPrompt(prompt)) {
+        setTimeout(() => notifySessionIdle(session), 20);
+        return;
+      }
       if (prompt.includes('[P2P Discussion Task')) {
         const filePath = pathFromPrompt(prompt);
         const heading = headingFromPrompt(prompt);
         await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
-      } else if (session === 'deck_proj_brain') {
-        executionPrompts.push(prompt);
       }
       setTimeout(() => notifySessionIdle(session), 20);
     });
@@ -273,11 +305,16 @@ describe('P2P orchestrator — parallel rounds', () => {
   });
 
   it('times out instead of hanging when the post-summary execution turn never returns idle', async () => {
+    autoWriteExecutionMarkers = false;
     let waitingOnExecution = false;
     detectStatusAsyncMock.mockImplementation(async (session: string) => (
       session === 'deck_proj_brain' && waitingOnExecution ? 'thinking' : 'idle'
     ));
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       if (prompt.includes('[P2P Discussion Task')) {
         const filePath = pathFromPrompt(prompt);
         const heading = headingFromPrompt(prompt);
@@ -302,6 +339,81 @@ describe('P2P orchestrator — parallel rounds', () => {
 
     const done = await waitForStatus(run.id, ['timed_out'], 3000);
     expect(done.error).toContain('post_summary_execution_timeout');
+  });
+
+  it('retries the post-summary execution prompt after idle until the marker appears', async () => {
+    autoWriteExecutionMarkers = false;
+    let executionAttempts = 0;
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
+      if (prompt.includes('[P2P Discussion Task')) {
+        const filePath = pathFromPrompt(prompt);
+        const heading = headingFromPrompt(prompt);
+        await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
+        setTimeout(() => notifySessionIdle(session), 20);
+        return;
+      }
+      executionAttempts += 1;
+      if (executionAttempts >= 2) {
+        await writeExecutionMarkerFromPrompt(prompt, true);
+      }
+      setTimeout(() => notifySessionIdle(session), 20);
+    });
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'retry execution until marker exists',
+      [],
+      serverLinkMock as any,
+      1,
+      undefined,
+      undefined,
+      240,
+    );
+
+    const done = await waitForStatus(run.id, ['completed'], 5000);
+    expect(executionAttempts).toBeGreaterThanOrEqual(2);
+    expect(done.executionAttempt).toBeGreaterThanOrEqual(2);
+    const content = await readFile(done.contextFilePath, 'utf8');
+    expect(content).toContain('P2P Original Request Execution Confirmed');
+  });
+
+  it('fails closed when the initiator writes a matching failed execution marker', async () => {
+    autoWriteExecutionMarkers = false;
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
+      if (prompt.includes('[P2P Discussion Task')) {
+        const filePath = pathFromPrompt(prompt);
+        const heading = headingFromPrompt(prompt);
+        await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
+      } else {
+        await writeFailedExecutionMarkerFromPrompt(prompt, 'implementation failed');
+      }
+      setTimeout(() => notifySessionIdle(session), 20);
+    });
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'failed marker should fail run',
+      [],
+      serverLinkMock as any,
+      1,
+      undefined,
+      undefined,
+      240,
+    );
+
+    const done = await waitForStatus(run.id, ['failed'], 5000);
+    expect(done.error).toContain('post_summary_execution_failed');
+    expect(done.error).toContain('implementation failed');
   });
 
   it.skipIf(isDarwin)('cleans stale orphan hop artifacts when a new run starts', async () => {
@@ -357,6 +469,10 @@ describe('P2P orchestrator — parallel rounds', () => {
     detectStatusAsyncMock.mockImplementation(async (session: string) => (idleSessions.has(session) ? 'idle' : 'running'));
 
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       idleSessions.delete(session);
       recordEvent(session, 'dispatch');
       const filePath = pathFromPrompt(prompt);
@@ -402,6 +518,10 @@ describe('P2P orchestrator — parallel rounds', () => {
 
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
       prompts.push({ session, prompt });
+      if (await writeExecutionMarkerFromPrompt(prompt)) {
+        setTimeout(() => notifySessionIdle(session), 20);
+        return;
+      }
       if (prompt.includes('[P2P Discussion Task')) {
         const filePath = pathFromPrompt(prompt);
         const heading = headingFromPrompt(prompt);
@@ -430,6 +550,10 @@ describe('P2P orchestrator — parallel rounds', () => {
 
   it('retains completed hop evidence with best-effort fallback when exact baseline slicing is not possible', async () => {
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       if (session === 'deck_proj_w1') {
@@ -456,6 +580,10 @@ describe('P2P orchestrator — parallel rounds', () => {
 
   it('collects completed hop evidence into the main file in hop order before summary', async () => {
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       const body = session === 'deck_proj_w1'
@@ -488,6 +616,10 @@ describe('P2P orchestrator — parallel rounds', () => {
 
   it('still enters summary when zero hops complete in a round', async () => {
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       if (session === 'deck_proj_brain') {
@@ -525,6 +657,10 @@ describe('P2P orchestrator — parallel rounds', () => {
       session === 'deck_proj_w1' ? 'running' : 'idle'
     ));
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       if (session === 'deck_proj_w1') return;
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
@@ -555,6 +691,10 @@ describe('P2P orchestrator — parallel rounds', () => {
 
   it('preserves completed evidence and still summarizes on partial hop failure', async () => {
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       if (session === 'deck_proj_w2') {
@@ -593,6 +733,10 @@ describe('P2P orchestrator — parallel rounds', () => {
 
   it('does not fail the whole run when the initiator goes idle without writing', async () => {
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       if (session === 'deck_proj_brain') {
@@ -633,6 +777,10 @@ describe('P2P orchestrator — parallel rounds', () => {
     });
 
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       await appendFile(filePath, `\n## ${heading}\n\nCROSS-PROJECT-${session}\n`, 'utf8');
@@ -659,6 +807,10 @@ describe('P2P orchestrator — parallel rounds', () => {
 
   it('cancellation preserves completed hop outcomes and cancels unfinished hops', async () => {
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       if (session === 'deck_proj_w1') {
@@ -707,6 +859,10 @@ describe('P2P orchestrator — parallel rounds', () => {
 
   it('treats cancel on a terminal run as close and removes it from memory', async () => {
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       if (session === 'deck_proj_w1') return;
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
@@ -759,6 +915,10 @@ describe('P2P orchestrator — parallel rounds', () => {
   it('preserves the active run phase when an advanced whole-run timeout fires', async () => {
     let runId = '';
     sendKeysDelayedEnterMock.mockImplementationOnce(async (session: string, prompt: string) => {
+      if (await writeExecutionMarkerFromPrompt(prompt)) {
+        setTimeout(() => notifySessionIdle(session), 20);
+        return;
+      }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       await appendFile(filePath, `\n## ${heading}\n\nSlow output from ${session}.\n`, 'utf8');
@@ -1086,6 +1246,10 @@ describe('P2P orchestrator — parallel rounds', () => {
     });
 
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       if (prompt.includes('[P2P Helper Task') && session === 'deck_proj_brain') {
         throw new Error('primary reducer unavailable');
       }
@@ -1167,6 +1331,10 @@ describe('P2P orchestrator — parallel rounds', () => {
     });
 
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       const filePath = [...prompt.matchAll(/\/\S+?\.md/g)].at(-1)?.[0] ?? pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
@@ -1208,6 +1376,10 @@ describe('P2P orchestrator — parallel rounds', () => {
     });
 
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       if (prompt.includes('[P2P Helper Task')) {
         throw new Error(`helper failed for ${session}`);
       }
@@ -1348,6 +1520,10 @@ describe('P2P orchestrator — parallel rounds', () => {
     });
 
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       const filePath = [...prompt.matchAll(/\/\S+?\.md/g)].at(-1)?.[0] ?? pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
@@ -1395,6 +1571,10 @@ describe('P2P orchestrator — parallel rounds', () => {
     });
 
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       const body = heading.includes('Implementation Audit')
@@ -1451,6 +1631,10 @@ describe('P2P orchestrator — parallel rounds', () => {
 
     let auditCount = 0;
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       let body = `Output from ${session}.`;
@@ -1508,6 +1692,10 @@ describe('P2P orchestrator — parallel rounds', () => {
     });
 
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       const body = heading.includes('Implementation Audit')
@@ -1564,6 +1752,10 @@ describe('P2P orchestrator — parallel rounds', () => {
 
     let auditCount = 0;
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       let body = `Implementation output ${session}.`;
@@ -1624,6 +1816,10 @@ describe('P2P orchestrator — parallel rounds', () => {
     });
 
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       let body = `Output from ${session}.`;
@@ -1712,6 +1908,10 @@ describe('P2P orchestrator — parallel rounds', () => {
   it('times out if the whole-run deadline expires during final summary dispatch', async () => {
     let activeRunId = '';
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
@@ -1764,6 +1964,10 @@ describe('P2P orchestrator — parallel rounds', () => {
     await writeFile(stalePath, 'stale artifact\n', 'utf8');
 
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
@@ -1802,6 +2006,10 @@ describe('P2P orchestrator — parallel rounds', () => {
 
     let auditCount = 0;
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       let body = `Output from ${session}.`;
@@ -1850,6 +2058,10 @@ describe('P2P orchestrator — parallel rounds', () => {
 
     let auditCount = 0;
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       let body = `Output from ${session}.`;
@@ -1907,6 +2119,10 @@ describe('P2P orchestrator — parallel rounds', () => {
 
   it('applies per-round timeout budgets for advanced rounds', async () => {
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       await appendFile(filePath, `\n## ${heading}\n\nSlow output from ${session}.\n`, 'utf8');
@@ -1986,6 +2202,10 @@ describe('P2P orchestrator — parallel rounds', () => {
     let auditCount = 0;
     let finalSummaryCount = 0;
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       let body = `Output from ${session}.`;
@@ -2060,6 +2280,10 @@ describe('P2P orchestrator — parallel rounds', () => {
     const implementationPrompts: string[] = [];
     let auditCount = 0;
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       const helperPath = [...prompt.matchAll(/\/\S+?\.md/g)].at(-1)?.[0];
       const heading = headingFromPrompt(prompt);
       if (prompt.includes('[P2P Helper Task')) {
@@ -2135,6 +2359,10 @@ describe('P2P orchestrator — parallel rounds', () => {
 
     let auditCount = 0;
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       let body = `Output from ${session}.`;
@@ -2192,6 +2420,10 @@ describe('P2P orchestrator — parallel rounds', () => {
     });
 
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       if (heading.includes('Implementation Synthesis')) {
