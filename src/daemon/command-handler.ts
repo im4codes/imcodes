@@ -11,6 +11,7 @@ import { terminalStreamer, type StreamSubscriber } from './terminal-streamer.js'
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { timelineStore } from './timeline-store.js';
+import { traceCommandAsync, traceSync, traceWebCommandReceived } from './latency-tracer.js';
 import { getDefaultTimelineHistoryWorkerPool, shouldUseTimelineHistoryWorkerPool, TimelineHistoryPoolError } from './timeline-history-pool.js';
 import { sanitizeTimelineHistoryEventsForTransport } from './timeline-history-sanitize.js';
 import { TIMELINE_HISTORY_CONTENT_TYPES, TIMELINE_HISTORY_STATE_TYPES, type MemoryContextTimelinePayload, type TimelineEvent } from '../shared/timeline/types.js';
@@ -1197,6 +1198,7 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     return;
   }
   const cmd = msg as Record<string, unknown>;
+  traceWebCommandReceived(cmd);
 
   // Top-level isolation: any synchronous throw inside a handler — e.g.
   // a TypeError from `cmd.foo.bar` when `foo` is undefined, or a
@@ -1216,7 +1218,11 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
   // browsers, but the daemon does not crash.  Individual handlers
   // already do their own try/catch where input validation matters.
   try {
-    dispatchWebCommand(cmd, serverLink);
+    traceSync('web_command.dispatch_sync', {
+      type: typeof cmd.type === 'string' ? cmd.type : '<non-string>',
+      commandId: typeof cmd.commandId === 'string' ? cmd.commandId : undefined,
+      sessionName: typeof cmd.sessionName === 'string' ? cmd.sessionName : undefined,
+    }, () => dispatchWebCommand(cmd, serverLink));
   } catch (err) {
     logger.warn(
       { err, type: typeof cmd.type === 'string' ? cmd.type : '<non-string>' },
@@ -1282,7 +1288,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       handleTimelineReplay(cmd, serverLink);
       break;
     case 'timeline.history_request':
-      void handleTimelineHistory(cmd, serverLink);
+      void traceCommandAsync(cmd, 'web_command.timeline_history', () => handleTimelineHistory(cmd, serverLink));
       break;
     case 'chat.subscribe':
       void handleChatSubscribeReplay(cmd, serverLink);
@@ -1412,10 +1418,10 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       }
       break;
     case 'file.search':
-      void handleFileSearch(cmd, serverLink);
+      void traceCommandAsync(cmd, 'web_command.file_search', () => handleFileSearch(cmd, serverLink));
       break;
     case MEMORY_WS.SEARCH:
-      void handleMemorySearch(cmd, serverLink);
+      void traceCommandAsync(cmd, 'web_command.memory_search', () => handleMemorySearch(cmd, serverLink));
       break;
     case MEMORY_WS.ARCHIVE:
       void handleMemoryArchive(cmd, serverLink);
@@ -1436,16 +1442,16 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       void handleMemoryDelete(cmd, serverLink);
       break;
     case 'fs.ls':
-      void handleFsList(cmd, serverLink);
+      void traceCommandAsync(cmd, 'web_command.fs_ls', () => handleFsList(cmd, serverLink));
       break;
     case 'fs.read':
       void handleFsRead(cmd, serverLink);
       break;
     case 'fs.git_status':
-      void handleFsGitStatus(cmd, serverLink);
+      void traceCommandAsync(cmd, 'web_command.fs_git_status', () => handleFsGitStatus(cmd, serverLink));
       break;
     case 'fs.git_diff':
-      void handleFsGitDiff(cmd, serverLink);
+      void traceCommandAsync(cmd, 'web_command.fs_git_diff', () => handleFsGitDiff(cmd, serverLink));
       break;
     case 'fs.mkdir':
       void handleFsMkdir(cmd, serverLink);
@@ -1489,7 +1495,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       handleMemoryFeaturesSet(cmd, serverLink);
       break;
     case MEMORY_WS.PREF_QUERY:
-      void handleMemoryPreferencesQuery(cmd, serverLink);
+      void traceCommandAsync(cmd, 'web_command.memory_pref_query', () => handleMemoryPreferencesQuery(cmd, serverLink));
       break;
     case MEMORY_WS.PREF_CREATE:
       void handleMemoryPreferenceCreate(cmd, serverLink);
@@ -1501,7 +1507,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       void handleMemoryPreferenceDelete(cmd, serverLink);
       break;
     case MEMORY_WS.SKILL_QUERY:
-      void handleMemorySkillsQuery(cmd, serverLink);
+      void traceCommandAsync(cmd, 'web_command.memory_skill_query', () => handleMemorySkillsQuery(cmd, serverLink));
       break;
     case MEMORY_WS.SKILL_REBUILD:
       void handleMemorySkillsRebuild(cmd, serverLink);
@@ -1516,7 +1522,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       void handleMemoryMarkdownIngestRun(cmd, serverLink);
       break;
     case MEMORY_WS.OBSERVATION_QUERY:
-      void handleMemoryObservationsQuery(cmd, serverLink);
+      void traceCommandAsync(cmd, 'web_command.memory_observation_query', () => handleMemoryObservationsQuery(cmd, serverLink));
       break;
     case MEMORY_WS.OBSERVATION_UPDATE:
       void handleMemoryObservationUpdate(cmd, serverLink);

@@ -10,6 +10,7 @@ import { notifySessionIdle, listP2pRuns, serializeP2pRun } from './p2p-orchestra
 import { handlePreviewBinaryFrame } from './preview-relay.js';
 import { buildSessionList } from './session-list.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import { startLatencyTracer } from './latency-tracer.js';
 import { supervisionAutomation } from './supervision-automation.js';
 import { timelineStore } from './timeline-store.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
@@ -847,6 +848,7 @@ export async function startup(): Promise<DaemonContext> {
   startContextMaterializationPoller(liveContextIngestion);
   startGcPoller();
   startEventLoopDelayMonitor();
+  startLatencyTracer();
 
   logger.info('Daemon started');
 

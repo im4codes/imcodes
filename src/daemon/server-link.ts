@@ -1,4 +1,5 @@
 import os from 'node:os';
+import { performance } from 'node:perf_hooks';
 import type { TimelineEvent } from './timeline-event.js';
 import logger from '../util/logger.js';
 import { DAEMON_VERSION } from '../util/version.js';
@@ -16,6 +17,7 @@ import {
 } from '../../shared/p2p-workflow-constants.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { SESSION_GROUP_CLONE_CAPABILITY_V1 } from '../../shared/session-group-clone.js';
+import { recordServerSend, stringifyForServerSend } from './latency-tracer.js';
 
 interface SystemStats {
   cpu: number;
@@ -326,9 +328,27 @@ export class ServerLink {
     }
     try {
       this.seq++;
-      this.ws.send(JSON.stringify({ ...((msg as object) ?? {}), seq: this.seq }));
+      const serialized = stringifyForServerSend(msg, this.seq);
+      const sendStart = performance.now();
+      this.ws.send(serialized.payload);
+      recordServerSend({
+        msgType: serialized.msgType,
+        commandId: serialized.commandId,
+        jsonBytes: serialized.jsonBytes,
+        stringifyMs: serialized.stringifyMs,
+        wsSendMs: performance.now() - sendStart,
+        success: true,
+      });
       return true;
     } catch (err) {
+      recordServerSend({
+        msgType: typeof (msg as { type?: unknown })?.type === 'string' ? (msg as { type: string }).type : undefined,
+        commandId: typeof (msg as { commandId?: unknown })?.commandId === 'string' ? (msg as { commandId: string }).commandId : undefined,
+        jsonBytes: 0,
+        stringifyMs: 0,
+        wsSendMs: 0,
+        success: false,
+      });
       logger.warn({ err }, 'ServerLink: send failed');
       return false;
     }

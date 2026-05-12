@@ -7,12 +7,14 @@ import { createHash } from 'crypto';
 import { readFileSync, statSync } from 'fs';
 import { resolve, basename } from 'path';
 import { tmpdir } from 'os';
+import { performance } from 'node:perf_hooks';
 import type { TimelineEvent, TimelineEventType, TimelineSource, TimelineConfidence } from './timeline-event.js';
 import { timelineStore } from './timeline-store.js';
 import { preferTimelineEvent } from '../shared/timeline/merge.js';
 import { isMemoryNoiseTurn } from '../../shared/memory-noise-patterns.js';
 import { recordTurnUsage } from '../store/context-store.js';
 import logger from '../util/logger.js';
+import { recordTimelineEmit } from './latency-tracer.js';
 
 /** Pattern matching temp file instruction: "Read and execute all instructions in @<path>" */
 const TEMP_FILE_RE = /^Read and execute all instructions in @(.+\.imcodes-prompt-[0-9a-f]+\.md)$/;
@@ -62,6 +64,31 @@ export class TimelineEmitter {
     payload: Record<string, unknown>,
     opts?: { source?: TimelineSource; confidence?: TimelineConfidence; eventId?: string; ts?: number; hidden?: boolean },
   ): TimelineEvent | null {
+    const traceStart = performance.now();
+    let traceTempFileMs = 0;
+    let traceEventIdHashMs = 0;
+    let traceEventIdPayloadBytes: number | undefined;
+    let traceAppendScheduleMs = 0;
+    let traceUsageMs = 0;
+    let traceHandlersMs = 0;
+    let traceHandlerCount = 0;
+    const finishTrace = (result: 'event' | 'null' | 'synthetic') => {
+      recordTimelineEmit({
+        sessionId,
+        type,
+        result,
+        durationMs: performance.now() - traceStart,
+        ...(traceTempFileMs > 0 ? { tempFileMs: Number(traceTempFileMs.toFixed(3)) } : {}),
+        ...(traceEventIdHashMs > 0 ? { eventIdHashMs: Number(traceEventIdHashMs.toFixed(3)) } : {}),
+        ...(traceEventIdPayloadBytes !== undefined ? { eventIdPayloadBytes: traceEventIdPayloadBytes } : {}),
+        ...(traceAppendScheduleMs > 0 ? { appendScheduleMs: Number(traceAppendScheduleMs.toFixed(3)) } : {}),
+        ...(traceUsageMs > 0 ? { usageMs: Number(traceUsageMs.toFixed(3)) } : {}),
+        ...(traceHandlersMs > 0 ? { handlersMs: Number(traceHandlersMs.toFixed(3)) } : {}),
+        handlerCount: traceHandlerCount,
+        stableEventId: opts?.eventId != null,
+      });
+    };
+
     // Deduplicate session.state — skip repeated same-state events to avoid UI flicker,
     // but still return a synthetic event so callers (store updates, idle callbacks) proceed.
     //
@@ -89,6 +116,7 @@ export class TimelineEmitter {
       if (!hasPendingMutation && this.lastSessionState.get(sessionId) === state) {
         // State unchanged AND no queue/error snapshot — don't emit to
         // handlers/UI, but still return synthetic event for caller.
+        finishTrace('synthetic');
         return { eventId: '', sessionId, ts: Date.now(), seq: 0, epoch: this.epoch, source: opts?.source ?? 'daemon', confidence: opts?.confidence ?? 'high', type, payload } as TimelineEvent;
       }
       this.lastSessionState.set(sessionId, state);
@@ -113,6 +141,7 @@ export class TimelineEmitter {
       // into the caller (route handler) so emit() never reads files.
       const tempMatch = text.match(TEMP_FILE_RE);
       if (tempMatch && isTrustedTempPath(tempMatch[1])) {
+        const tempStart = performance.now();
         try {
           const tempPath = tempMatch[1];
           const stat = statSync(tempPath);
@@ -131,6 +160,9 @@ export class TimelineEmitter {
             payload = { ...payload, text: content, tempFile: tempPath };
           }
         } catch { /* file already cleaned up or unreadable — keep original text */ }
+        finally {
+          traceTempFileMs += performance.now() - tempStart;
+        }
       }
 
       const key = sessionId;
@@ -138,7 +170,10 @@ export class TimelineEmitter {
       if (!allowDuplicate) {
         const prev = this.recentUserMsg.get(key);
         const now = Date.now();
-        if (prev && prev.text === resolvedText && now - prev.ts < 5_000) return null;
+        if (prev && prev.text === resolvedText && now - prev.ts < 5_000) {
+          finishTrace('null');
+          return null;
+        }
         this.recentUserMsg.set(key, { text: resolvedText, ts: now });
       }
     }
@@ -155,10 +190,19 @@ export class TimelineEmitter {
     this.seqMap.set(sessionId, seq);
 
     const ts = opts?.ts ?? Date.now();
-    const eventId = opts?.eventId ?? createHash('sha1')
-      .update(`${sessionId}\0${type}\0${ts}\0${JSON.stringify(payload)}`)
-      .digest('hex')
-      .slice(0, 24);
+    let eventId: string;
+    if (opts?.eventId) {
+      eventId = opts.eventId;
+    } else {
+      const hashStart = performance.now();
+      const payloadJson = JSON.stringify(payload);
+      traceEventIdPayloadBytes = Buffer.byteLength(payloadJson);
+      eventId = createHash('sha1')
+        .update(`${sessionId}\0${type}\0${ts}\0${payloadJson}`)
+        .digest('hex')
+        .slice(0, 24);
+      traceEventIdHashMs += performance.now() - hashStart;
+    }
 
     const event: TimelineEvent = {
       eventId,
@@ -214,7 +258,9 @@ export class TimelineEmitter {
     // to avoid JSONL bloat; the final version (streaming: false) will be persisted by onComplete
     const isStreamingDelta = isStableUpdate && payload.streaming === true;
     if (!isStreamingDelta) {
+      const appendStart = performance.now();
       timelineStore.append(event);
+      traceAppendScheduleMs += performance.now() - appendStart;
       // Mirror per-turn `usage.update` into SQLite so operators can query
       // historical token spend without parsing JSONL. Best-effort — failures
       // never escape (recordTurnUsage swallows internally + extra try/catch).
@@ -227,6 +273,7 @@ export class TimelineEmitter {
       // `eventId` lets the partial UNIQUE index swallow replay duplicates
       // (e.g. gemini-watcher's deterministic stableId on daemon restart).
       if (type === 'usage.update') {
+        const usageStart = performance.now();
         try {
           recordTurnUsage({
             createdAt: ts,
@@ -241,14 +288,21 @@ export class TimelineEmitter {
             eventId,
           });
         } catch { /* swallow — telemetry must never escape */ }
+        finally {
+          traceUsageMs += performance.now() - usageStart;
+        }
       }
     }
 
     // Notify handlers
+    const handlersStart = performance.now();
     for (const h of this.handlers) {
+      traceHandlerCount += 1;
       try { h(event); } catch { /* ignore */ }
     }
+    traceHandlersMs += performance.now() - handlersStart;
 
+    finishTrace('event');
     return event;
   }
 
