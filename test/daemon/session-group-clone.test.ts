@@ -18,6 +18,10 @@ const {
   startSubSessionMock,
   stopSubSessionMock,
   getPaneCwdMock,
+  getCodexRuntimeConfigMock,
+  getClaudeSdkRuntimeConfigMock,
+  getQwenDisplayMetadataMock,
+  getQwenOAuthQuotaUsageLabelMock,
 } = vi.hoisted(() => {
   const sessions = new Map<string, SessionRecord>();
   const p2pConfigs = new Map<string, import('../../shared/p2p-modes.js').P2pSavedConfig>();
@@ -40,6 +44,10 @@ const {
     startSubSessionMock: vi.fn(),
     stopSubSessionMock: vi.fn(),
     getPaneCwdMock: vi.fn(),
+    getCodexRuntimeConfigMock: vi.fn(async () => ({})),
+    getClaudeSdkRuntimeConfigMock: vi.fn(async () => ({})),
+    getQwenDisplayMetadataMock: vi.fn(() => ({})),
+    getQwenOAuthQuotaUsageLabelMock: vi.fn(() => undefined),
   };
 });
 
@@ -68,6 +76,22 @@ vi.mock('../../src/daemon/subsession-manager.js', () => ({
 
 vi.mock('../../src/agent/tmux.js', () => ({
   getPaneCwd: getPaneCwdMock,
+}));
+
+vi.mock('../../src/agent/codex-runtime-config.js', () => ({
+  getCodexRuntimeConfig: getCodexRuntimeConfigMock,
+}));
+
+vi.mock('../../src/agent/sdk-runtime-config.js', () => ({
+  getClaudeSdkRuntimeConfig: getClaudeSdkRuntimeConfigMock,
+}));
+
+vi.mock('../../src/agent/provider-display.js', () => ({
+  getQwenDisplayMetadata: getQwenDisplayMetadataMock,
+}));
+
+vi.mock('../../src/agent/provider-quota.js', () => ({
+  getQwenOAuthQuotaUsageLabel: getQwenOAuthQuotaUsageLabelMock,
 }));
 
 vi.mock('../../src/store/p2p-config-store.js', () => ({
