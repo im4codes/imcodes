@@ -715,7 +715,7 @@ describe('P2pConfigPanel', () => {
     expect(typeof jsonArg).toBe('string');
     const parsed = JSON.parse(jsonArg);
     expect(parsed).toHaveProperty('sessions');
-    expect(parsed).toHaveProperty('rounds');
+    expect(parsed.rounds).toBe(1);
   });
 
   it('persists the saved config to the daemon authority path', async () => {

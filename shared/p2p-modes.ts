@@ -154,7 +154,7 @@ export function buildP2pConfigSelection(
     : modeOverride;
   return {
     config: buildEffectiveP2pConfig(config, effectiveMode),
-    rounds: getComboRoundCount(modeOverride) ?? rounds,
+    rounds,
     modeOverride,
   };
 }
@@ -329,6 +329,26 @@ export function getModeForRound(mode: string, round: number): P2pMode | undefine
   const pipeline = parseModePipeline(mode);
   const idx = Math.min(round - 1, pipeline.length - 1);
   return getP2pMode(pipeline[idx]);
+}
+
+/** Get the mode key for a legacy execution step, wrapping combo pipelines for each user-selected cycle. */
+export function getLegacyModeKeyForExecutionRound(mode: string, round: number): string {
+  const pipeline = parseModePipeline(mode);
+  if (pipeline.length === 0) return mode;
+  const normalizedRound = Math.max(1, Math.floor(round || 1));
+  return pipeline[(normalizedRound - 1) % pipeline.length] ?? mode;
+}
+
+/** Get the mode config for a legacy execution step, wrapping combo pipelines for each user-selected cycle. */
+export function getLegacyModeForExecutionRound(mode: string, round: number): P2pMode | undefined {
+  return getP2pMode(getLegacyModeKeyForExecutionRound(mode, round));
+}
+
+/** Convert user-selected full-flow cycles into legacy executor step count. */
+export function getLegacyExecutionRoundCount(mode: string, cycles = 1): number {
+  const pipelineLength = Math.max(1, parseModePipeline(mode).length);
+  const normalizedCycles = Math.max(1, Math.floor(cycles || 1));
+  return pipelineLength * normalizedCycles;
 }
 
 /** Get the recommended round count for a mode (pipeline length for combos, undefined for single modes). */

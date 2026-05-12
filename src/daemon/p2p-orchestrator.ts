@@ -14,7 +14,17 @@ import { sendKeysDelayedEnter } from '../agent/tmux.js';
 import { detectStatusAsync } from '../agent/detect.js';
 import { getSession } from '../store/session-store.js';
 import { getTransportRuntime, launchTransportSession, stopTransportRuntimeSession } from '../agent/session-manager.js';
-import { P2P_BASELINE_PROMPT, getP2pMode, getModeForRound, isComboMode, parseModePipeline, roundPrompt, type P2pMode } from '../../shared/p2p-modes.js';
+import {
+  P2P_BASELINE_PROMPT,
+  getLegacyExecutionRoundCount,
+  getLegacyModeForExecutionRound,
+  getLegacyModeKeyForExecutionRound,
+  getP2pMode,
+  isComboMode,
+  parseModePipeline,
+  roundPrompt,
+  type P2pMode,
+} from '../../shared/p2p-modes.js';
 import {
   resolveP2pRoundPlan,
   type P2pAdvancedRound,
@@ -358,17 +368,31 @@ export function getP2pRun(id: string): P2pRun | undefined { return activeRuns.ge
 export function listP2pRuns(): P2pRun[] { return [...activeRuns.values()]; }
 
 export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
+  const projectedCurrentRound = Math.min(Math.max(1, run.currentRound), Math.max(1, run.rounds));
   const completedHopCount = run.hopStates.filter((hop) => hop.status === 'completed').length;
   const currentRoundCompletedHopCount = run.hopStates.filter(
-    (hop) => hop.round_index === run.currentRound && hop.status === 'completed',
+    (hop) => hop.round_index === projectedCurrentRound && hop.status === 'completed',
   ).length;
   const activeHopStates = run.hopStates.filter((hop) =>
-    hop.round_index === run.currentRound &&
+    hop.round_index === projectedCurrentRound &&
     (hop.status === 'running' || hop.status === 'dispatched'),
   );
   const currentHopState = activeHopStates[0] ?? null;
   const currentHop = currentHopState?.session ?? run.activeTargetSessions[0] ?? run.currentTargetSession;
   const hopCounts = countHopStates(run.hopStates);
+  const legacyPipelineLength = !run.advancedP2pEnabled && isComboMode(run.mode)
+    ? Math.max(1, parseModePipeline(run.mode).length)
+    : 1;
+  const legacyFlowCycleCurrent = !run.advancedP2pEnabled
+    ? Math.max(1, Math.ceil(projectedCurrentRound / legacyPipelineLength))
+    : null;
+  const legacyFlowCycleTotal = !run.advancedP2pEnabled
+    ? Math.max(1, Math.ceil(Math.max(1, run.rounds) / legacyPipelineLength))
+    : null;
+  const legacyFlowStepCurrent = !run.advancedP2pEnabled
+    ? (((projectedCurrentRound - 1) % legacyPipelineLength) + 1)
+    : null;
+  const legacyFlowStepTotal = !run.advancedP2pEnabled ? legacyPipelineLength : null;
   const routingHistory = Array.isArray(run.routingHistory) ? run.routingHistory : [];
   const latestStepByRoundId = routingHistory.reduce<Record<string, number>>((acc, entry) => {
     if (typeof entry.toRoundId === 'string' && typeof entry.atStep === 'number') {
@@ -387,7 +411,7 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
     final_return_session: run.finalReturnSession,
     remaining_targets: JSON.stringify(run.remainingTargets),
     mode_key: run.mode,
-    current_round_mode: isComboMode(run.mode) ? (getModeForRound(run.mode, run.currentRound)?.key ?? run.mode) : run.mode,
+    current_round_mode: isComboMode(run.mode) ? getLegacyModeKeyForExecutionRound(run.mode, projectedCurrentRound) : run.mode,
     status: run.status,
     run_phase: run.runPhase,
     summary_phase: run.summaryPhase,
@@ -406,8 +430,12 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
     remaining_count: run.remainingTargets.length,
     completed_hops_count: completedHopCount,
     completed_round_hops_count: currentRoundCompletedHopCount,
-    current_round: run.currentRound,
+    current_round: projectedCurrentRound,
     total_rounds: run.rounds,
+    flow_cycle_current: legacyFlowCycleCurrent ?? undefined,
+    flow_cycle_total: legacyFlowCycleTotal ?? undefined,
+    flow_step_current: legacyFlowStepCurrent ?? undefined,
+    flow_step_total: legacyFlowStepTotal ?? undefined,
     skipped_hops: run.skippedHops,
     active_phase: run.activePhase,
     hop_started_at: run.hopStartedAt || null,
@@ -512,14 +540,14 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
       const pipeline = combo ? parseModePipeline(run.mode) : null;
       const resolveMode = (round: number) => {
         if (!pipeline) return run.mode;
-        return pipeline[Math.min(round - 1, pipeline.length - 1)];
+        return pipeline[(Math.max(1, round) - 1) % Math.max(1, pipeline.length)] ?? run.mode;
       };
 
       const initMode = resolveMode(1);
       const init = getInfo(run.initiatorSession, initMode, 'initial');
       const phase1Done = run.currentRound > 1 || hopCounts.completed > 0 || run.status === 'completed';
       const phase1Active = run.activePhase === 'initial';
-      nodes.push({ session: run.initiatorSession, ...init, status: phase1Done ? 'done' : phase1Active ? 'active' : 'pending' });
+      nodes.push({ session: run.initiatorSession, ...init, status: phase1Active ? 'active' : phase1Done ? 'done' : 'pending' });
 
       for (const hop of run.hopStates.filter((item) => item.status === 'completed' || item.status === 'timed_out' || item.status === 'failed' || item.status === 'cancelled')) {
         const t = { session: hop.session, mode: hop.mode };
@@ -797,7 +825,7 @@ export async function startP2pRun(...args:
   const P2P_MAX_ROUNDS = 6;
   const totalRounds = resolvedPlan.advanced
     ? resolvedPlan.rounds.length
-    : Math.min(P2P_MAX_ROUNDS, Math.max(1, rounds ?? 1));
+    : getLegacyExecutionRoundCount(mode, Math.min(P2P_MAX_ROUNDS, Math.max(1, rounds ?? 1)));
   const run: P2pRun = {
     id: runId,
     discussionId,
@@ -1107,9 +1135,82 @@ async function cleanupRoundHopArtifacts(roundHops: P2pHopRuntime[]): Promise<voi
   }));
 }
 
-async function dispatchPostSummaryExecutionPrompt(run: P2pRun): Promise<void> {
+interface PostSummaryExecutionOptions {
+  waitForCompletion?: boolean;
+  timeoutMs?: number;
+}
+
+async function waitForPostSummaryExecutionCompletion(
+  run: P2pRun,
+  session: string,
+  timeoutMs: number,
+  idleEventState: { received: boolean },
+): Promise<boolean> {
+  const startedAt = Date.now();
+  const deadline = startedAt + Math.max(1, timeoutMs);
+  const eventTrustMs = Math.min(MIN_PROCESSING_MS, 1_000);
+  let observedTransportBusy = false;
+
+  while (Date.now() < deadline) {
+    if (run._cancelled) return false;
+    await sleep(IDLE_POLL_MS);
+    if (run._cancelled) return false;
+
+    const transportRuntime = getTransportRuntime(session);
+    if (transportRuntime) {
+      const status = transportRuntime.getStatus();
+      if (transportRuntime.sending || transportRuntime.pendingCount > 0 || (status !== 'idle' && status !== 'error')) {
+        observedTransportBusy = true;
+      }
+      if (status === 'error' && !transportRuntime.sending && transportRuntime.pendingCount === 0) return false;
+      if (
+        !transportRuntime.sending &&
+        transportRuntime.pendingCount === 0 &&
+        status === 'idle' &&
+        (observedTransportBusy || idleEventState.received || (Date.now() - startedAt) >= eventTrustMs)
+      ) {
+        return true;
+      }
+      continue;
+    }
+
+    const elapsed = Date.now() - startedAt;
+    const canTrustIdle = idleEventState.received
+      ? elapsed >= eventTrustMs
+      : elapsed >= MIN_PROCESSING_MS;
+    if (!canTrustIdle) continue;
+
+    let idleConfirmed = false;
+    const record = getSession(session);
+    const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
+    const useStoreState = agentType === 'gemini';
+    try {
+      idleConfirmed = useStoreState
+        ? record?.state === 'idle'
+        : await detectStatusAsync(session, agentType) === 'idle';
+    } catch {
+      idleConfirmed = idleEventState.received;
+    }
+    if (idleConfirmed) return true;
+  }
+
+  logger.warn({ runId: run.id, session, timeoutMs }, 'P2P: post-summary execution prompt timed out');
+  return false;
+}
+
+async function dispatchPostSummaryExecutionPrompt(
+  run: P2pRun,
+  options: PostSummaryExecutionOptions = {},
+): Promise<boolean> {
   const prompt = buildPostSummaryExecutionPrompt(run);
   const session = run.initiatorSession;
+  const idleEventState = { received: false };
+  const waitForCompletion = options.waitForCompletion !== false;
+  const timeoutMs = options.timeoutMs ?? (run.timeoutMs * 3);
+  const idleWaiter = waitForCompletion ? waitForIdleEvent(session, timeoutMs) : null;
+  idleWaiter?.promise.then((ok) => {
+    if (ok) idleEventState.received = true;
+  });
   try {
     const transportRuntime = getTransportRuntime(session);
     if (transportRuntime) {
@@ -1119,7 +1220,18 @@ async function dispatchPostSummaryExecutionPrompt(run: P2pRun): Promise<void> {
       await sendKeysDelayedEnter(session, prompt);
     }
   } catch (err) {
+    idleWaiter?.cancel();
     logger.warn({ runId: run.id, session, err }, 'P2P: failed to dispatch post-summary execution prompt');
+    return false;
+  }
+  if (!waitForCompletion) {
+    idleWaiter?.cancel();
+    return true;
+  }
+  try {
+    return await waitForPostSummaryExecutionCompletion(run, session, timeoutMs, idleEventState);
+  } finally {
+    idleWaiter?.cancel();
   }
 }
 
@@ -1154,14 +1266,15 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
 
   // ── Multi-round loop ──
   const combo = isComboMode(run.mode);
+  const pipelineLength = combo ? Math.max(1, parseModePipeline(run.mode).length) : 1;
   for (; run.currentRound <= run.rounds; run.currentRound++) {
     if (run._cancelled || isTerminal(run.status)) return;
     run.runPhase = 'round_execution';
     run.summaryPhase = null;
 
     // For combo pipelines, resolve this round's mode; for single modes, use the fixed config
-    const roundModeConfig = combo ? getModeForRound(run.mode, run.currentRound) : modeConfig;
-    const roundModeKey = combo ? (parseModePipeline(run.mode)[Math.min(run.currentRound - 1, parseModePipeline(run.mode).length - 1)]) : run.mode;
+    const roundModeConfig = combo ? getLegacyModeForExecutionRound(run.mode, run.currentRound) : modeConfig;
+    const roundModeKey = combo ? getLegacyModeKeyForExecutionRound(run.mode, run.currentRound) : run.mode;
     const rp = roundPrompt(run.currentRound, run.rounds, combo ? roundModeKey : undefined);
     const roundLabel = run.rounds > 1 ? ` (round ${run.currentRound}/${run.rounds})` : '';
 
@@ -1173,8 +1286,10 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
 
     const targets = [...run.remainingTargets];
 
-    // ── Phase 1: Initiator initial analysis (first round only) ──
-    if (run.currentRound === 1) {
+    const isFlowCycleStart = ((run.currentRound - 1) % pipelineLength) === 0;
+
+    // ── Phase 1: Initiator initial analysis (first step of each complete flow cycle) ──
+    if (isFlowCycleStart) {
       if (run._cancelled) return;
       run.activePhase = 'initial';
       const initialHeader = `${discussionParticipantNameWithMode(run.initiatorSession, roundModeKey)} — Initial Analysis${roundLabel}`;
@@ -1235,8 +1350,9 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
       run.summaryPhase = 'running';
       run.activePhase = 'summary';
       const isLastRound = run.currentRound === run.rounds;
+      const isFlowCycleEnd = (run.currentRound % pipelineLength) === 0;
       const summaryModeConfig = isLastRound && combo
-        ? getModeForRound(run.mode, run.rounds) // last pipeline mode for final summary
+        ? getLegacyModeForExecutionRound(run.mode, run.rounds) // last pipeline mode for final summary
         : roundModeConfig;
       const roundSummaryHeader = isLastRound
         ? `${discussionParticipantNameWithMode(run.initiatorSession, roundModeKey)} — Final Summary`
@@ -1258,6 +1374,17 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
       if (!summaryOk && (run._cancelled || isTerminal(run.status))) return;
       run.summaryPhase = summaryOk ? 'completed' : 'failed';
       if (run._cancelled || isTerminal(run.status)) return;
+      if (isFlowCycleEnd) {
+        const executionOk = await dispatchPostSummaryExecutionPrompt(run, {
+          waitForCompletion: true,
+          timeoutMs: run.timeoutMs * 3,
+        });
+        if (run._cancelled || isTerminal(run.status)) return;
+        if (!executionOk) {
+          failRun(run, 'timed_out', 'post_summary_execution_timeout', serverLink);
+          return;
+        }
+      }
     } finally {
       scheduleRoundHopArtifactCleanup(roundHops);
     }
@@ -1303,7 +1430,6 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
     p2pDiscussionId: run.discussionId,
     skippedHops: run.skippedHops,
   }, { source: 'daemon' });
-  await dispatchPostSummaryExecutionPrompt(run);
 
   // Keep in memory for a bit so status queries work, then clean up run entry only.
   // Discussion files are kept on disk (in .imc/discussions/) for history access.
@@ -2795,7 +2921,7 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
   } catch { /* ignore */ }
   run.completedAt = new Date().toISOString();
   transition(run, 'completed', serverLink);
-  await dispatchPostSummaryExecutionPrompt(run);
+  await dispatchPostSummaryExecutionPrompt(run, { waitForCompletion: false });
   // A3: `activeRuns.delete` is now scheduled by
   // `scheduleP2pRunTerminalCleanup` (called from `transition('completed')`
   // above), so no explicit timer here.

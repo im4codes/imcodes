@@ -40,7 +40,7 @@ const execFileAsync = promisify(execFileCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, type P2pTarget } from './p2p-orchestrator.js';
 import { buildSessionList } from './session-list.js';
 import { supervisionAutomation } from './supervision-automation.js';
-import { getComboRoundCount, parseModePipeline, P2P_CONFIG_MODE, isP2pSavedConfig, type P2pSessionConfig } from '../../shared/p2p-modes.js';
+import { parseModePipeline, P2P_CONFIG_MODE, isP2pSavedConfig, type P2pSessionConfig } from '../../shared/p2p-modes.js';
 import type { P2pAdvancedRound, P2pContextReducerConfig, P2pRoundPreset } from '../../shared/p2p-advanced.js';
 import { CRON_MSG } from '../../shared/cron-types.js';
 import { executeCronJob } from './cron-executor.js';
@@ -2659,12 +2659,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     if (roundsMatch) p2pRounds = Math.min(parseInt(roundsMatch[1], 10), 6);
   }
 
-  // For combo pipelines, auto-set rounds to match pipeline length if not explicitly overridden
+  // For combo pipelines, `p2pRounds` is the user-selected number of complete
+  // flow cycles. The orchestrator expands each cycle into the full pipeline.
   const resolvedMode = p2pModeField ?? tokens.agents[0]?.mode ?? '';
-  const comboRounds = getComboRoundCount(resolvedMode);
-  if (comboRounds && !p2pRounds) {
-    p2pRounds = comboRounds;
-  }
 
   // All @@discuss tokens were rejected — sessions not found in store
   if (tokens.hadDiscussTokens) {

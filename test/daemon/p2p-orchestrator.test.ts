@@ -210,7 +210,7 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(done.remainingTargets).toEqual([]);
   });
 
-  it('preserves legacy combo-mode sequencing without advanced fields', async () => {
+  it('restarts the full legacy combo pipeline for each selected cycle without advanced fields', async () => {
     const run = await startP2pRun(
       'deck_proj_brain',
       [{ session: 'deck_proj_w1', mode: 'brainstorm>discuss' as any }],
@@ -226,12 +226,82 @@ describe('P2P orchestrator — parallel rounds', () => {
     const comboHops = done.hopStates.filter((hop) => hop.session === 'deck_proj_w1');
 
     expect(done.advancedP2pEnabled).toBe(false);
-    expect(comboHops.map((hop) => hop.round_index)).toEqual([1, 2]);
-    expect(comboHops.map((hop) => hop.mode)).toEqual(['brainstorm', 'discuss']);
-    expect(done.completedHops.map((hop) => hop.session)).toEqual(['deck_proj_w1', 'deck_proj_w1']);
+    expect(comboHops.map((hop) => hop.round_index)).toEqual([1, 2, 3, 4]);
+    expect(comboHops.map((hop) => hop.mode)).toEqual(['brainstorm', 'discuss', 'brainstorm', 'discuss']);
+    expect(done.completedHops.map((hop) => hop.session)).toEqual(['deck_proj_w1', 'deck_proj_w1', 'deck_proj_w1', 'deck_proj_w1']);
     expect(done.skippedHops).toEqual([]);
     expect(done.remainingTargets).toEqual([]);
     expect(done.resultSummary).toContain('Final Summary');
+    const payload = serializeP2pRun(done);
+    expect(payload.current_round).toBe(4);
+    expect(payload.total_rounds).toBe(4);
+    expect(payload.flow_cycle_current).toBe(2);
+    expect(payload.flow_cycle_total).toBe(2);
+    expect(payload.flow_step_current).toBe(2);
+    expect(payload.flow_step_total).toBe(2);
+    const content = await readFile(done.contextFilePath, 'utf8');
+    expect(content.match(/Initial Analysis/g)?.length).toBe(2);
+  });
+
+  it('runs the post-summary execution prompt after each complete legacy combo cycle', async () => {
+    const executionPrompts: string[] = [];
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+      if (prompt.includes('[P2P Discussion Task')) {
+        const filePath = pathFromPrompt(prompt);
+        const heading = headingFromPrompt(prompt);
+        await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
+      } else if (session === 'deck_proj_brain') {
+        executionPrompts.push(prompt);
+      }
+      setTimeout(() => notifySessionIdle(session), 20);
+    });
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'brainstorm>discuss' as any }],
+      'implement after every full combo cycle',
+      [],
+      serverLinkMock as any,
+      2,
+      undefined,
+      'brainstorm>discuss',
+    );
+
+    await waitForStatus(run.id, ['completed']);
+    expect(executionPrompts).toHaveLength(2);
+    expect(executionPrompts.every((prompt) => prompt.includes('implement after every full combo cycle'))).toBe(true);
+  });
+
+  it('times out instead of hanging when the post-summary execution turn never returns idle', async () => {
+    let waitingOnExecution = false;
+    detectStatusAsyncMock.mockImplementation(async (session: string) => (
+      session === 'deck_proj_brain' && waitingOnExecution ? 'thinking' : 'idle'
+    ));
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+      if (prompt.includes('[P2P Discussion Task')) {
+        const filePath = pathFromPrompt(prompt);
+        const heading = headingFromPrompt(prompt);
+        await appendFile(filePath, `\n## ${heading}\n\n${'Output '.repeat(120)} from ${session}.\n`, 'utf8');
+        setTimeout(() => notifySessionIdle(session), 20);
+        return;
+      }
+      waitingOnExecution = true;
+    });
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'execution never idles',
+      [],
+      serverLinkMock as any,
+      1,
+      undefined,
+      undefined,
+      120,
+    );
+
+    const done = await waitForStatus(run.id, ['timed_out'], 3000);
+    expect(done.error).toContain('post_summary_execution_timeout');
   });
 
   it.skipIf(isDarwin)('cleans stale orphan hop artifacts when a new run starts', async () => {

@@ -267,7 +267,7 @@ const SUMMARY_PROMPTS: Partial<Record<P2pRoundPreset, string>> = {
 
 function buildLegacyResolvedRound(mode: string, roundIndex: number, totalRounds: number, hopTimeoutMinutes?: number): P2pResolvedRound {
   const pipeline = parseModePipeline(mode);
-  const modeKey = pipeline[Math.min(roundIndex - 1, pipeline.length - 1)] ?? mode;
+  const modeKey = pipeline[(Math.max(1, roundIndex) - 1) % Math.max(1, pipeline.length)] ?? mode;
   return {
     id: `legacy_${roundIndex}`,
     title: `Round ${roundIndex}`,
@@ -451,8 +451,9 @@ export function resolveP2pRoundPlan(options: ResolveP2pRoundPlanOptions): P2pRes
   if (!advancedRequested) {
     const mode = modeOverride ?? 'discuss';
     validateLegacyMode(mode);
-    const comboRounds = parseModePipeline(mode).length;
-    const totalRounds = Math.max(1, roundsOverride ?? comboRounds);
+    const pipelineRounds = Math.max(1, parseModePipeline(mode).length);
+    const cycleCount = Math.max(1, Math.floor(roundsOverride ?? 1));
+    const totalRounds = pipelineRounds * cycleCount;
     return {
       advanced: false,
       rounds: Array.from({ length: totalRounds }, (_, index) => buildLegacyResolvedRound(mode, index + 1, totalRounds, hopTimeoutMinutes)),

@@ -293,10 +293,11 @@ describe('structured P2P routing via WS fields', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(startP2pRun).toHaveBeenCalledTimes(1);
-    const [{ targets }] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
+    const [{ targets, rounds }] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(targets).toEqual([
       { session: 'deck_proj_w1', mode: 'brainstorm>discuss' },
     ]);
+    expect(rounds).toBeUndefined();
   });
 
   it('config mode still uses per-session configured modes', async () => {

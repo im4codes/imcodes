@@ -17,7 +17,7 @@ describe('resolveP2pRoundPlan', () => {
     expect(plan.rounds[0]?.timeoutMinutes).toBe(8);
   });
 
-  it('preserves legacy combo behavior when advanced config is absent', () => {
+  it('treats legacy combo roundsOverride as complete flow cycles', () => {
     const plan = resolveP2pRoundPlan({
       modeOverride: 'brainstorm>discuss',
       roundsOverride: 2,
@@ -25,8 +25,8 @@ describe('resolveP2pRoundPlan', () => {
     });
 
     expect(plan.advanced).toBe(false);
-    expect(plan.rounds).toHaveLength(2);
-    expect(plan.rounds.map((round) => round.modeKey)).toEqual(['brainstorm', 'discuss']);
+    expect(plan.rounds).toHaveLength(4);
+    expect(plan.rounds.map((round) => round.modeKey)).toEqual(['brainstorm', 'discuss', 'brainstorm', 'discuss']);
     expect(plan.rounds.every((round) => round.timeoutMinutes === 8)).toBe(true);
   });
 

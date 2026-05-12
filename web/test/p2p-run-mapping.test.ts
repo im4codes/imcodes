@@ -35,6 +35,30 @@ describe('mapP2pRunToDiscussion', () => {
     expect(discussion.currentSpeaker).toBe('w1');
   });
 
+  it('preserves legacy flow cycle progress separately from execution steps', () => {
+    const discussion = mapP2pRunToDiscussion({
+      id: 'run_combo_cycle_progress',
+      status: 'running',
+      mode_key: 'brainstorm>discuss',
+      current_round_mode: 'brainstorm',
+      current_round: 3,
+      total_rounds: 4,
+      flow_cycle_current: 2,
+      flow_cycle_total: 2,
+      flow_step_current: 1,
+      flow_step_total: 2,
+      total_hops: 1,
+      active_phase: 'hop',
+    });
+
+    expect(discussion.currentRound).toBe(3);
+    expect(discussion.maxRounds).toBe(4);
+    expect(discussion.flowCycleCurrent).toBe(2);
+    expect(discussion.flowCycleTotal).toBe(2);
+    expect(discussion.flowStepCurrent).toBe(1);
+    expect(discussion.flowStepTotal).toBe(2);
+  });
+
   it('maps advanced payloads to logical rounds instead of raw execution steps', () => {
     const discussion = mapP2pRunToDiscussion({
       id: 'run_advanced',

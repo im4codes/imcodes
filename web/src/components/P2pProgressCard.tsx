@@ -34,6 +34,10 @@ export interface P2pProgressDiscussion {
   modeKey?: string;
   currentRound: number;
   maxRounds: number;
+  flowCycleCurrent?: number;
+  flowCycleTotal?: number;
+  flowStepCurrent?: number;
+  flowStepTotal?: number;
   completedHops?: number;
   completedRoundHops?: number;
   totalHops?: number;
@@ -291,7 +295,18 @@ export const P2pProgressCard = memo(function P2pProgressCard({
     }
     return `H${visibleRoundHop ?? completedRoundHops}/${discussion.totalHops}`;
   }, [activeHopCount, activeHopRange, completedRoundHops, discussion.totalHops, visibleRoundHop]);
-  const roundText = `R${discussion.currentRound}/${discussion.maxRounds}`;
+  const logicalRound = typeof discussion.flowCycleCurrent === 'number' && discussion.flowCycleCurrent > 0
+    ? discussion.flowCycleCurrent
+    : discussion.currentRound;
+  const logicalMaxRounds = typeof discussion.flowCycleTotal === 'number' && discussion.flowCycleTotal > 0
+    ? discussion.flowCycleTotal
+    : discussion.maxRounds;
+  const roundText = `R${logicalRound}/${logicalMaxRounds}`;
+  const stepText = typeof discussion.flowStepCurrent === 'number'
+    && typeof discussion.flowStepTotal === 'number'
+    && discussion.flowStepTotal > 1
+    ? `S${discussion.flowStepCurrent}/${discussion.flowStepTotal}`
+    : null;
 
   const phaseLabel = useMemo(() => (
     discussion.activePhase ? t(`p2p.discussions.phase_${discussion.activePhase}`) : null
@@ -312,6 +327,7 @@ export const P2pProgressCard = memo(function P2pProgressCard({
         <div class="discussions-progress-mobile-row">
           <span class="discussions-progress-kicker">P2P</span>
           <span class="discussions-progress-badge">{roundText}</span>
+          {stepText && <span class="discussions-progress-badge">{stepText}</span>}
           {hopText && <span class="discussions-progress-badge">{hopText}</span>}
           <ElapsedTimer timerKey={runKey} startMs={discussion.startedAt} active={isRunning} className="p2p-timer p2p-timer-compact" />
           {phaseLabel && <span class="discussions-progress-badge discussions-progress-badge-phase">{phaseLabel}</span>}
@@ -351,18 +367,18 @@ export const P2pProgressCard = memo(function P2pProgressCard({
   // ── Desktop / standard rendering ───────────────────────────────────────
 
   const roundSegments = useMemo(() => (
-    Array.from({ length: Math.max(0, discussion.maxRounds) }, (_, idx) => {
+    Array.from({ length: Math.max(0, logicalMaxRounds) }, (_, idx) => {
       const roundNum = idx + 1;
       const status = discussion.state === 'done'
         ? 'done'
-        : roundNum < discussion.currentRound
+        : roundNum < logicalRound
           ? 'done'
-          : roundNum === discussion.currentRound
+          : roundNum === logicalRound
             ? 'active'
             : 'pending';
       return { roundNum, status };
     })
-  ), [discussion.currentRound, discussion.maxRounds, discussion.state]);
+  ), [discussion.state, logicalMaxRounds, logicalRound]);
 
   const nodesRef = useRef<HTMLDivElement>(null);
   const activeNodeIdx = useMemo(() => nodes.findIndex((n) => n.status === 'active'), [nodes]);
@@ -422,6 +438,7 @@ export const P2pProgressCard = memo(function P2pProgressCard({
           </span>
         )}
         <span class="discussions-progress-badge">{roundText}</span>
+        {stepText && <span class="discussions-progress-badge">{stepText}</span>}
         {hopText && <span class="discussions-progress-badge">{hopText}</span>}
         <HopElapsedTimer hopKey={hopKey} startMs={discussion.hopStartedAt} active={isRunning} className="p2p-timer p2p-timer-hop" />
         {phaseLabel && (
@@ -440,7 +457,7 @@ export const P2pProgressCard = memo(function P2pProgressCard({
               <div
                 key={seg.roundNum}
                 class={`discussions-progress-segment ${progressStatusClassName(seg.status as P2pProgressNode['status'], isRunning)}`}
-                title={`${t('p2p.discussions.round_label')} ${seg.roundNum}/${discussion.maxRounds}`}
+                title={`${t('p2p.discussions.round_label')} ${seg.roundNum}/${logicalMaxRounds}`}
               >
                 <span class="discussions-progress-segment-index">{seg.roundNum}</span>
               </div>

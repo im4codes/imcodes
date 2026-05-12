@@ -906,6 +906,26 @@ afterEach(() => {
     expect(screen.getByText(/mode_audit→mode_plan/i)).toBeDefined();
   });
 
+  it('puts the global rounds selector at the top of the P2P dropdown and saves changes', async () => {
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
+
+    const menu = screen.getByTestId('p2p-dropdown');
+    const rounds = within(menu).getByTestId('p2p-dropdown-rounds');
+    const solo = within(menu).getByRole('button', { name: /P2P$/i });
+    expect(rounds.compareDocumentPosition(solo) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    fireEvent.click(within(rounds).getByTestId('p2p-dropdown-round-2'));
+    await flushAsync();
+
+    expect(saveUserPrefMock).toHaveBeenCalledWith(
+      'p2p_session_config:my-session',
+      expect.stringContaining('"rounds":2'),
+    );
+  });
+
   it('updates the p2p dropdown when custom combos are created without a page refresh', async () => {
     const ws = makeWs();
     render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
@@ -958,7 +978,7 @@ afterEach(() => {
       p2pSessionConfig: {
         'my-session': { enabled: true, mode: 'audit' },
       },
-      p2pRounds: 2,
+      p2pRounds: 3,
       p2pLocale: 'en',
     });
     expect(saveUserPrefMock).toHaveBeenCalledWith('p2p_combo_direct_send_skip_confirm', true);
@@ -979,7 +999,7 @@ afterEach(() => {
       p2pSessionConfig: {
         'my-session': { enabled: true, mode: 'audit' },
       },
-      p2pRounds: 2,
+      p2pRounds: 3,
       p2pLocale: 'en',
     });
   });
@@ -1009,7 +1029,7 @@ afterEach(() => {
       p2pSessionConfig: {
         'my-session': { enabled: true, mode: 'audit' },
       },
-      p2pRounds: 2,
+      p2pRounds: 3,
       p2pLocale: 'en',
     });
   });

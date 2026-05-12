@@ -206,6 +206,10 @@ export function mapP2pRunToDiscussion(r: Record<string, any>) {
     maxRounds: useAdvancedNodes
       ? advancedNodes.length
       : (source.total_rounds ?? 1),
+    flowCycleCurrent: typeof source.flow_cycle_current === 'number' ? source.flow_cycle_current : undefined,
+    flowCycleTotal: typeof source.flow_cycle_total === 'number' ? source.flow_cycle_total : undefined,
+    flowStepCurrent: typeof source.flow_step_current === 'number' ? source.flow_step_current : undefined,
+    flowStepTotal: typeof source.flow_step_total === 'number' ? source.flow_step_total : undefined,
     completedHops: source.completed_hops_count ?? 0,
     completedRoundHops: typeof source.completed_round_hops_count === 'number' ? source.completed_round_hops_count : undefined,
     totalHops: useAdvancedNodes

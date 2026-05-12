@@ -153,6 +153,10 @@ export interface P2pRunUpdatePayload {
   current_round_mode?: string;
   current_round: number;
   total_rounds: number;
+  flow_cycle_current?: number;
+  flow_cycle_total?: number;
+  flow_step_current?: number;
+  flow_step_total?: number;
   total_count?: number;
   total_hops?: number;
   completed_hops_count?: number;

@@ -248,6 +248,7 @@ const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
 const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
 const GEMINI_SDK_MODEL_SUGGESTIONS = [...GEMINI_MODEL_IDS] as const;
 const P2P_BASE_MODES = ['solo', 'audit', 'review', 'plan', 'brainstorm', 'discuss', P2P_CONFIG_MODE] as const;
+const P2P_DROPDOWN_ROUND_OPTIONS = [1, 2, 3, 5] as const;
 const P2P_MODE_I18N: Record<string, string> = { solo: 'p2p.mode_solo', audit: 'p2p.mode_audit', review: 'p2p.mode_review', plan: 'p2p.mode_plan', brainstorm: 'p2p.mode_brainstorm', discuss: 'p2p.mode_discuss', [P2P_CONFIG_MODE]: 'p2p.mode_config' };
 const P2P_SINGLE_COLORS: Record<string, string> = { solo: '#dbe7f5', audit: '#f59e0b', review: '#3b82f6', plan: '#06b6d4', brainstorm: '#a78bfa', discuss: '#22c55e', [P2P_CONFIG_MODE]: '#94a3b8' };
 
@@ -1619,6 +1620,20 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       }
     });
   }, [resolvePendingP2pConfigSave, ws]);
+
+  const handleP2pDropdownRoundsChange = useCallback((nextRounds: number) => {
+    const cfg: P2pSavedConfig = {
+      ...(p2pSavedConfig ?? { sessions: {}, rounds: 1 }),
+      rounds: nextRounds,
+      updatedAt: Date.now(),
+    };
+    setP2pSavedConfig(cfg);
+    void p2pSavedConfigPref.save(cfg).catch(() => {});
+    if (rootSession) {
+      void persistP2pConfigToDaemon(rootSession, cfg, { awaitAck: false });
+    }
+  }, [p2pSavedConfig, p2pSavedConfigPref, persistP2pConfigToDaemon, rootSession]);
+
   useEffect(() => {
     setP2pSavedConfig(p2pSavedConfigPref.value);
   }, [p2pSavedConfigPref.value]);
@@ -2975,6 +2990,43 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           </button>
           {p2pOpen && (
             <div class="menu-dropdown menu-dropdown-p2p" data-testid="p2p-dropdown">
+              <div
+                class="p2p-dropdown-rounds"
+                data-testid="p2p-dropdown-rounds"
+                style={{ padding: '8px 10px 6px', display: 'grid', gap: 6 }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                  <span class="p2p-menu-section-label" style={{ padding: 0 }}>{t('p2p.settings_rounds')}</span>
+                  <span style={{ fontSize: 10, color: '#64748b', whiteSpace: 'normal', textAlign: 'right' }}>{t('p2p.settings_rounds_hint')}</span>
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: `repeat(${P2P_DROPDOWN_ROUND_OPTIONS.length}, minmax(0, 1fr))`, gap: 6 }}>
+                  {P2P_DROPDOWN_ROUND_OPTIONS.map((roundOption) => {
+                    const active = (p2pSavedConfig?.rounds ?? 1) === roundOption;
+                    return (
+                      <button
+                        key={roundOption}
+                        type="button"
+                        class={`menu-item p2p-dropdown-round ${active ? 'menu-item-active' : ''}`}
+                        data-testid={`p2p-dropdown-round-${roundOption}`}
+                        data-active={active ? 'true' : 'false'}
+                        onClick={() => handleP2pDropdownRoundsChange(roundOption)}
+                        style={{
+                          padding: '5px 0',
+                          textAlign: 'center',
+                          borderRadius: 4,
+                          fontSize: 12,
+                          fontWeight: active ? 700 : 600,
+                          color: active ? '#bfdbfe' : '#cbd5e1',
+                          background: active ? '#1d4ed840' : '#0f172a80',
+                        }}
+                      >
+                        {roundOption}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+              <div class="menu-divider" />
               <button
                 class={`menu-item ${p2pMode === 'solo' ? 'menu-item-active' : ''}`}
                 onClick={() => {

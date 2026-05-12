@@ -118,6 +118,7 @@ interface Props {
 const EXCLUDED_TYPES = new Set(['shell', 'script']);
 const SESSION_MODES = ['audit', 'review', 'plan', 'brainstorm', 'discuss', 'skip'] as const;
 const ROUND_OPTIONS = [1, 2, 3, 5] as const;
+const DEFAULT_P2P_ROUNDS = 1;
 type AgentFlavorFilter = 'sdk' | 'cli';
 
 export interface P2pWorkflowLaunchContextInput {
@@ -488,7 +489,7 @@ export function P2pConfigPanel({
 
   // Local config state: per-session enabled + mode
   const [sessionCfg, setSessionCfg] = useState<P2pSessionConfig>({});
-  const [rounds, setRounds] = useState(3);
+  const [rounds, setRounds] = useState(DEFAULT_P2P_ROUNDS);
   const [hopTimeoutMinutes, setHopTimeoutMinutes] = useState(8);
   const [extraPrompt, setExtraPrompt] = useState('');
   // R3 v2 PR-θ — these state vars retain saved-config compatibility for
@@ -706,7 +707,7 @@ export function P2pConfigPanel({
     seededConfigKeyRef.current = configKey;
     formDirtyRef.current = false;
     setSessionCfg(parsed.sessions ?? {});
-    setRounds(parsed.rounds ?? 3);
+    setRounds(parsed.rounds ?? DEFAULT_P2P_ROUNDS);
     setHopTimeoutMinutes(parsed.hopTimeoutMinutes ?? 8);
     setExtraPrompt(parsed.extraPrompt ?? '');
     setAdvancedPresetKey(parsed.advancedPresetKey ?? '');
