@@ -4,6 +4,7 @@ import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { P2P_WORKFLOW_MSG, isP2pWorkflowRequestId } from '@shared/p2p-workflow-messages.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import { REPO_MSG } from '@shared/repo-types.js';
+import { TIMELINE_MESSAGES } from '@shared/timeline-protocol.js';
 import type { MessageHandler } from '../src/ws-client.js';
 
 // Mock WebSocket implementation
@@ -361,6 +362,7 @@ describe('WsClient', () => {
     const secondWs = lastWs!;
     expect(secondWs).not.toBe(firstWs);
     secondWs.emit('open');
+    await vi.advanceTimersByTimeAsync(200);
 
     expect(secondWs.send).toHaveBeenCalledWith(expect.stringContaining('"type":"terminal.subscribe"'));
     expect(secondWs.send).toHaveBeenCalledWith(expect.stringContaining('"type":"chat.subscribe"'));
@@ -586,11 +588,18 @@ describe('WsClient', () => {
 
   describe('terminal subscription modes', () => {
     it('subscribeTerminal sends an explicit raw flag', async () => {
-      const client = await connectClient();
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
       lastWs!.send.mockClear();
 
       client.subscribeTerminal('chat-session', false);
       client.subscribeTerminal('terminal-session', true);
+
+      expect(lastWs!.send).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(200);
 
       expect(lastWs!.send).toHaveBeenCalledTimes(2);
       expect(JSON.parse(lastWs!.send.mock.calls[0][0] as string)).toEqual({
@@ -604,13 +613,19 @@ describe('WsClient', () => {
         raw: true,
       });
       client.disconnect();
+      vi.useRealTimers();
     });
 
     it('keeps raw mode while a raw hold is active despite passive resubscribe', async () => {
-      const client = await connectClient();
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
       lastWs!.send.mockClear();
 
       client.subscribeTerminal('shell-card', false);
+      await vi.advanceTimersByTimeAsync(80);
       expect(JSON.parse(lastWs!.send.mock.calls.at(-1)?.[0] as string)).toEqual({
         type: 'terminal.subscribe',
         session: 'shell-card',
@@ -618,20 +633,20 @@ describe('WsClient', () => {
       });
 
       const release = client.holdTerminalRaw('shell-card');
+      await vi.advanceTimersByTimeAsync(80);
       expect(JSON.parse(lastWs!.send.mock.calls.at(-1)?.[0] as string)).toEqual({
         type: 'terminal.subscribe',
         session: 'shell-card',
         raw: true,
       });
 
+      const callsBeforePassiveResubscribe = lastWs!.send.mock.calls.length;
       client.subscribeTerminal('shell-card', false);
-      expect(JSON.parse(lastWs!.send.mock.calls.at(-1)?.[0] as string)).toEqual({
-        type: 'terminal.subscribe',
-        session: 'shell-card',
-        raw: true,
-      });
+      await vi.advanceTimersByTimeAsync(80);
+      expect(lastWs!.send).toHaveBeenCalledTimes(callsBeforePassiveResubscribe);
 
       release();
+      await vi.advanceTimersByTimeAsync(80);
       expect(JSON.parse(lastWs!.send.mock.calls.at(-1)?.[0] as string)).toEqual({
         type: 'terminal.subscribe',
         session: 'shell-card',
@@ -639,9 +654,44 @@ describe('WsClient', () => {
       });
 
       client.disconnect();
+      vi.useRealTimers();
     });
 
-    it('replays remembered terminal subscriptions immediately after reconnect', async () => {
+    it('debounces rapid terminal subscribe/unsubscribe churn to the final state', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      lastWs!.send.mockClear();
+
+      client.subscribeTerminal('storm-session', false);
+      client.unsubscribeTerminal('storm-session');
+      client.subscribeTerminal('storm-session', true);
+      client.unsubscribeTerminal('empty-session');
+
+      expect(lastWs!.send).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(120);
+
+      const messages = lastWs!.send.mock.calls.map((call) => JSON.parse(call[0] as string));
+      expect(messages).toEqual([
+        { type: 'terminal.subscribe', session: 'storm-session', raw: true },
+      ]);
+
+      lastWs!.send.mockClear();
+      client.unsubscribeTerminal('storm-session');
+      client.subscribeTerminal('storm-session', false);
+      await vi.advanceTimersByTimeAsync(120);
+
+      expect(lastWs!.send.mock.calls.map((call) => JSON.parse(call[0] as string))).toEqual([
+        { type: 'terminal.subscribe', session: 'storm-session', raw: false },
+      ]);
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('replays remembered terminal subscriptions after reconnect', async () => {
       vi.useFakeTimers();
       const client = new WsClient('http://localhost:8787', 'srv-1');
       client.connect();
@@ -661,6 +711,8 @@ describe('WsClient', () => {
       expect(secondWs).not.toBe(firstWs);
 
       secondWs.emit('open');
+
+      await vi.advanceTimersByTimeAsync(200);
 
       expect(secondWs.send).toHaveBeenCalledTimes(3);
       expect(JSON.parse(secondWs.send.mock.calls[0][0] as string)).toEqual({ type: 'ping' });
@@ -833,6 +885,76 @@ describe('WsClient', () => {
       });
       client.disconnect();
     });
+  });
+
+  it('stages reconnect-storm work without delaying timeline gap-fill requests', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    lastWs!.send.mockClear();
+
+    client.subscribeTerminal('deck_storm_brain', false);
+    client.unsubscribeTerminal('deck_storm_brain');
+    client.subscribeTerminal('deck_storm_brain', true);
+    const historyRequestId = client.sendTimelineHistoryRequest('deck_storm_brain', 300, 999);
+    const replayRequestId = client.sendTimelineReplayRequest('deck_storm_brain', 42, 7);
+    const fsRequestId = client.fsListDir('/tmp/deck_storm_project');
+    const gitRequestId = client.fsGitStatus('/tmp/deck_storm_project');
+    client.send({
+      type: 'transport.list_models',
+      agentType: 'codex-sdk',
+      requestId: 'models-storm',
+    });
+
+    let messages = lastWs!.send.mock.calls.map((call) => JSON.parse(call[0] as string));
+    expect(messages).toEqual([
+      {
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName: 'deck_storm_brain',
+        requestId: historyRequestId,
+        limit: 300,
+        afterTs: 999,
+      },
+      {
+        type: TIMELINE_MESSAGES.REPLAY_REQUEST,
+        sessionName: 'deck_storm_brain',
+        requestId: replayRequestId,
+        afterSeq: 42,
+        epoch: 7,
+      },
+    ]);
+
+    await vi.advanceTimersByTimeAsync(120);
+    messages = lastWs!.send.mock.calls.map((call) => JSON.parse(call[0] as string));
+    expect(messages).toContainEqual({ type: 'terminal.subscribe', session: 'deck_storm_brain', raw: true });
+    expect(messages.some((msg) => msg.type === 'fs.ls')).toBe(false);
+    expect(messages.some((msg) => msg.type === 'fs.git_status')).toBe(false);
+    expect(messages.some((msg) => msg.type === 'transport.list_models')).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(400);
+    messages = lastWs!.send.mock.calls.map((call) => JSON.parse(call[0] as string));
+    expect(messages).toContainEqual({
+      type: 'fs.ls',
+      path: '/tmp/deck_storm_project',
+      requestId: fsRequestId,
+      includeFiles: false,
+      includeMetadata: false,
+    });
+    expect(messages).toContainEqual({
+      type: 'fs.git_status',
+      path: '/tmp/deck_storm_project',
+      requestId: gitRequestId,
+    });
+    expect(messages).toContainEqual({
+      type: 'transport.list_models',
+      agentType: 'codex-sdk',
+      requestId: 'models-storm',
+    });
+
+    client.disconnect();
+    vi.useRealTimers();
   });
 
   describe('repo helpers', () => {
@@ -1047,8 +1169,14 @@ describe('WsClient', () => {
     }
 
     it('sends fs.ls message with path and requestId', async () => {
-      const client = await connectClient();
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      lastWs!.send.mockClear();
       const requestId = client.fsListDir('/home/user/projects');
+      await vi.advanceTimersByTimeAsync(300);
       expect(lastWs!.send).toHaveBeenCalled();
       const msg = JSON.parse(lastWs!.send.mock.calls.at(-1)[0]);
       expect(msg.type).toBe('fs.ls');
@@ -1056,14 +1184,22 @@ describe('WsClient', () => {
       expect(msg.requestId).toBe(requestId);
       expect(msg.includeFiles).toBe(false);
       client.disconnect();
+      vi.useRealTimers();
     });
 
     it('sets includeFiles=true when requested', async () => {
-      const client = await connectClient();
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      lastWs!.send.mockClear();
       client.fsListDir('/home/user', true);
+      await vi.advanceTimersByTimeAsync(300);
       const msg = JSON.parse(lastWs!.send.mock.calls.at(-1)[0]);
       expect(msg.includeFiles).toBe(true);
       client.disconnect();
+      vi.useRealTimers();
     });
 
     it('returns a unique UUID as requestId', async () => {

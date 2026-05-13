@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
 import { TIMELINE_HISTORY_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
+import { TIMELINE_MESSAGES, TIMELINE_RESPONSE_STATUS, TIMELINE_RESPONSE_SOURCES } from '../../shared/timeline-protocol.js';
 
 const {
   getSessionMock,
@@ -128,7 +130,18 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
     getSessionMock.mockReturnValue({ name: 'deck_worker', agentType: 'codex' });
     historyWorkerDispatchMock.mockResolvedValue({
       events: [
-        { eventId: 'u-worker', sessionId: 'deck_worker', ts: 1010, seq: 1, epoch: 1, source: 'daemon', confidence: 'high', type: 'user.message', payload: { text: 'from worker' } },
+        { eventId: 'u-worker', sessionId: 'deck_worker', ts: 1010, seq: 1, epoch: 1, source: 'daemon', confidence: 'high', type: 'user.message', payload: { text: 'from worker', detailRefs: [{ detailId: 'preview-only', eventId: 'u-worker', fieldPath: 'payload.text' }] } },
+      ],
+      detailCandidates: [
+        {
+          sessionName: 'deck_worker',
+          epoch: 1,
+          eventId: 'u-worker',
+          fieldPath: 'payload.text',
+          value: 'full worker detail',
+          previewBytes: 1024,
+          mediaType: 'text/plain',
+        },
       ],
       eventsRead: 1,
       payloadBytes: 120,
@@ -154,14 +167,26 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
       limit: 25,
       afterTs: 100,
       beforeTs: 200,
+      maxResponseBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE,
       contentTypes: expect.arrayContaining(['user.message', 'assistant.text', 'tool.result']),
       stateTypes: ['session.state'],
     }), expect.objectContaining({ deadlineAt: expect.any(Number) }));
     expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'timeline.history',
+      type: TIMELINE_MESSAGES.HISTORY,
       sessionName: 'deck_worker',
       requestId: 'hist-worker',
+      status: TIMELINE_RESPONSE_STATUS.OK,
+      source: TIMELINE_RESPONSE_SOURCES.WORKER_SQLITE,
+      payloadBytes: 120,
+      payloadTruncated: false,
       events: [expect.objectContaining({ eventId: 'u-worker' })],
+      detailRefs: [expect.objectContaining({
+        sessionName: 'deck_worker',
+        epoch: 1,
+        detailStoreGeneration: expect.any(String),
+        eventId: 'u-worker',
+        fieldPath: 'payload.text',
+      })],
     }));
   });
 
@@ -192,8 +217,10 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
     expect(historyWorkerDispatchMock).toHaveBeenCalledTimes(1);
     expect(readByTypesPreferredMock).toHaveBeenCalledTimes(2);
     expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'timeline.history',
+      type: TIMELINE_MESSAGES.HISTORY,
       requestId: 'hist-fallback',
+      status: TIMELINE_RESPONSE_STATUS.OK,
+      source: TIMELINE_RESPONSE_SOURCES.MAIN_SQLITE,
       events: [
         expect.objectContaining({ eventId: 'u-fallback' }),
         expect.objectContaining({ eventId: 's-fallback' }),
@@ -228,15 +255,62 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
     expect(readByTypesPreferredMock.mock.calls[1][1]).toEqual(['session.state']);
     expect(readByTypesPreferredMock.mock.calls[1][2]).toEqual({ limit: 100, afterTs: 1009, beforeTs: undefined });
     expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'timeline.history',
+      type: TIMELINE_MESSAGES.HISTORY,
       sessionName: 'deck_hist',
       requestId: 'hist-1',
       epoch: 99,
+      status: TIMELINE_RESPONSE_STATUS.OK,
       events: [
         expect.objectContaining({ eventId: 'u1' }),
         expect.objectContaining({ eventId: 's1' }),
         expect.objectContaining({ eventId: 'a1' }),
       ],
+    }));
+  });
+
+  it('honors timeline.page_request cursor and explicit page response budget', async () => {
+    shouldUseHistoryWorkerMock.mockReturnValue(true);
+    getSessionMock.mockReturnValue({ name: 'deck_page', agentType: 'codex' });
+    historyWorkerDispatchMock.mockResolvedValue({
+      events: [
+        { eventId: 'page-older', sessionId: 'deck_page', ts: 900, seq: 9, epoch: 99, source: 'daemon', confidence: 'high', type: 'assistant.text', payload: { text: 'older', streaming: false } },
+      ],
+      eventsRead: 1,
+      payloadBytes: 512,
+      droppedEvents: 0,
+      truncatedEvents: 0,
+      readMs: 3,
+      sanitizeMs: 1,
+    });
+
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.PAGE_REQUEST,
+      sessionName: 'deck_page',
+      requestId: 'page-1',
+      limit: 50,
+      budgetBytes: 2 * TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL,
+      cursor: {
+        epoch: 99,
+        beforeTs: 1000,
+        direction: 'older',
+      },
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(historyWorkerDispatchMock).toHaveBeenCalledWith(expect.objectContaining({
+      sessionName: 'deck_page',
+      limit: 50,
+      beforeTs: 1000,
+      maxResponseBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL,
+    }), expect.objectContaining({ deadlineAt: expect.any(Number) }));
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: TIMELINE_MESSAGES.PAGE,
+      sessionName: 'deck_page',
+      requestId: 'page-1',
+      status: TIMELINE_RESPONSE_STATUS.OK,
+      source: TIMELINE_RESPONSE_SOURCES.WORKER_SQLITE,
+      payloadBytes: 512,
+      events: [expect.objectContaining({ eventId: 'page-older' })],
     }));
   });
 
@@ -267,8 +341,9 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
     expect(readByTypesPreferredMock.mock.calls[1][1]).toEqual(['session.state']);
     expect(readByTypesPreferredMock.mock.calls[1][2]).toEqual({ limit: 100, afterTs: 1009, beforeTs: undefined });
     expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'timeline.history',
+      type: TIMELINE_MESSAGES.HISTORY,
       requestId: 'hist-state-storm',
+      status: TIMELINE_RESPONSE_STATUS.OK,
       events: [
         expect.objectContaining({ eventId: 'u1' }),
         expect.objectContaining({ eventId: 's1' }),
@@ -277,7 +352,40 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
     }));
   });
 
-  it('keeps existing OpenCode synthesis/replacement behavior after SQLite-backed base retrieval', async () => {
+  it('defers OpenCode initial history synthesis instead of exporting on the daemon main thread', async () => {
+    readByTypesPreferredMock.mockImplementation(async (_session: string, types: string[]) => (
+      types.includes('session.state')
+        ? [{ eventId: 's0', sessionId: 'deck_oc_initial', ts: 1000, seq: 1, epoch: 1, source: 'daemon', confidence: 'high', type: 'session.state', payload: { state: 'idle' } }]
+        : []
+    ));
+    getSessionMock.mockReturnValue({
+      name: 'deck_oc_initial',
+      agentType: 'opencode',
+      projectDir: '/tmp/project',
+      opencodeSessionId: 'oc-1',
+    });
+
+    handleWebCommand({
+      type: 'timeline.history_request',
+      sessionName: 'deck_oc_initial',
+      requestId: 'hist-oc-initial',
+      limit: 5,
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(exportOpenCodeSessionMock).not.toHaveBeenCalled();
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: TIMELINE_MESSAGES.HISTORY,
+      sessionName: 'deck_oc_initial',
+      requestId: 'hist-oc-initial',
+      status: TIMELINE_RESPONSE_STATUS.DEFERRED,
+      source: TIMELINE_RESPONSE_SOURCES.DEFERRED,
+      errorReason: TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE,
+      events: [],
+    }));
+  });
+
+  it('keeps bounded OpenCode synthesis/replacement behavior for incremental history retrieval', async () => {
     readByTypesPreferredMock.mockImplementation(async (_session: string, types: string[]) => (
       types.includes('session.state')
         ? [{ eventId: 's0', sessionId: 'deck_oc', ts: 1000, seq: 1, epoch: 1, source: 'daemon', confidence: 'high', type: 'session.state', payload: { state: 'idle' } }]
@@ -299,19 +407,78 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
       sessionName: 'deck_oc',
       requestId: 'hist-oc',
       limit: 5,
+      afterTs: 900,
     }, serverLink as any);
     await flushAsync();
 
-    expect(readByTypesPreferredMock).toHaveBeenCalledWith('deck_oc', expect.arrayContaining(['user.message', 'assistant.text']), { limit: 5, afterTs: undefined, beforeTs: undefined });
+    expect(readByTypesPreferredMock).toHaveBeenCalledWith('deck_oc', expect.arrayContaining(['user.message', 'assistant.text']), { limit: 5, afterTs: 900, beforeTs: undefined });
     expect(exportOpenCodeSessionMock).toHaveBeenCalledWith('/tmp/project', 'oc-1');
     expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'timeline.history',
+      type: TIMELINE_MESSAGES.HISTORY,
       sessionName: 'deck_oc',
       requestId: 'hist-oc',
+      status: TIMELINE_RESPONSE_STATUS.OK,
+      source: TIMELINE_RESPONSE_SOURCES.OPENCODE_EXPORT,
       events: [
         expect.objectContaining({ eventId: 'u1' }),
         expect.objectContaining({ eventId: 'a1' }),
       ],
+    }));
+  });
+
+  it('returns a terminal error response when the history worker queue is full', async () => {
+    shouldUseHistoryWorkerMock.mockReturnValue(true);
+    getSessionMock.mockReturnValue({ name: 'deck_queue_full', agentType: 'codex' });
+    historyWorkerDispatchMock.mockRejectedValue(new TimelineHistoryPoolErrorMock(
+      TIMELINE_HISTORY_ERROR_REASONS.QUEUE_FULL,
+    ));
+
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+      sessionName: 'deck_queue_full',
+      requestId: 'hist-queue-full',
+      limit: 5,
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(readByTypesPreferredMock).not.toHaveBeenCalled();
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: TIMELINE_MESSAGES.HISTORY,
+      sessionName: 'deck_queue_full',
+      requestId: 'hist-queue-full',
+      status: TIMELINE_RESPONSE_STATUS.ERROR,
+      errorReason: TIMELINE_HISTORY_ERROR_REASONS.QUEUE_FULL,
+      source: `worker_${TIMELINE_HISTORY_ERROR_REASONS.QUEUE_FULL}`,
+      events: [],
+      hasMore: false,
+    }));
+  });
+
+  it('returns a terminal error response when the history worker times out', async () => {
+    shouldUseHistoryWorkerMock.mockReturnValue(true);
+    getSessionMock.mockReturnValue({ name: 'deck_worker_timeout', agentType: 'codex' });
+    historyWorkerDispatchMock.mockRejectedValue(new TimelineHistoryPoolErrorMock(
+      TIMELINE_HISTORY_ERROR_REASONS.TIMEOUT,
+    ));
+
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+      sessionName: 'deck_worker_timeout',
+      requestId: 'hist-worker-timeout',
+      limit: 5,
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(readByTypesPreferredMock).not.toHaveBeenCalled();
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: TIMELINE_MESSAGES.HISTORY,
+      sessionName: 'deck_worker_timeout',
+      requestId: 'hist-worker-timeout',
+      status: TIMELINE_RESPONSE_STATUS.ERROR,
+      errorReason: TIMELINE_HISTORY_ERROR_REASONS.TIMEOUT,
+      source: `worker_${TIMELINE_HISTORY_ERROR_REASONS.TIMEOUT}`,
+      events: [],
+      hasMore: false,
     }));
   });
 });

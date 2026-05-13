@@ -243,7 +243,7 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     });
 
     expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
-    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300);
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300, 999);
 
     await act(async () => { await vi.advanceTimersByTimeAsync(650); });
     expect(fetchSpy).toHaveBeenCalledTimes(1);

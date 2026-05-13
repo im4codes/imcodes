@@ -1,7 +1,9 @@
 import type { TimelineEvent, TimelineEventType } from './timeline-event.js';
+import type { TimelineHistoryDetailCandidate } from './timeline-history-sanitize.js';
 import type { TimelineHistoryWorkerErrorReason } from '../../shared/timeline-history-errors.js';
 
 export type { TimelineHistoryWorkerErrorReason };
+export type TimelineHistoryWorkerDetailCandidate = TimelineHistoryDetailCandidate;
 
 export const DEFAULT_TIMELINE_HISTORY_WORKERS_TARGET = 2;
 export const MIN_TIMELINE_HISTORY_WORKERS_TARGET = 1;
@@ -23,6 +25,7 @@ export interface TimelineHistoryBuildJobInput {
   limit: number;
   afterTs?: number;
   beforeTs?: number;
+  maxResponseBytes?: number;
   contentTypes: TimelineEventType[];
   stateTypes: TimelineEventType[];
 }
@@ -32,6 +35,7 @@ export interface TimelineHistoryWorkerRequest extends TimelineHistoryBuildJobInp
 export interface TimelineHistoryWorkerSuccess extends TimelineHistoryWorkerIdentity {
   kind: 'success';
   events: TimelineEvent[];
+  detailCandidates: TimelineHistoryWorkerDetailCandidate[];
   eventsRead: number;
   payloadBytes: number;
   droppedEvents: number;

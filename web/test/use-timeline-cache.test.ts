@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, cleanup, act, waitFor } from '@testing-library/preact';
 import { h } from 'preact';
 import type { ServerMessage, TimelineEvent, WsClient } from '../src/ws-client.js';
+import { TIMELINE_CURSOR_DIRECTIONS, TIMELINE_MESSAGES, TIMELINE_RESPONSE_STATUS } from '../../shared/timeline-protocol.js';
+import { TIMELINE_DETAIL_ERROR_REASONS, TIMELINE_HISTORY_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
 import { TimelineDB } from '../src/timeline-db.js';
 import { mergeTimelineEvents } from '../../src/shared/timeline/merge.js';
 const fetchHistorySpy = vi.hoisted(() => vi.fn());
@@ -49,6 +51,7 @@ describe('useTimeline global cache bounds', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
@@ -485,6 +488,684 @@ describe('useTimeline global cache bounds', () => {
     });
   });
 
+  it('does not retry explicit queue-full timeline history errors during bootstrap', async () => {
+    const sessionName = `deck_queue_full_history_${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const sendTimelineHistoryRequest = vi.fn(() => 'history-queue-full');
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest,
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { loading, refreshing, historyStatus } = useTimeline(sessionName, ws);
+      return h('div', {
+        'data-testid': 'probe',
+        'data-loading': String(loading),
+        'data-refreshing': String(refreshing),
+        'data-response': historyStatus.response?.state ?? '',
+        'data-key': historyStatus.response?.i18nKey ?? '',
+      }, 'probe');
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
+    });
+
+    await act(async () => {
+      handler?.({
+        type: 'timeline.history',
+        sessionName,
+        requestId: 'history-queue-full',
+        epoch: 1,
+        events: [],
+        status: TIMELINE_RESPONSE_STATUS.ERROR,
+        errorReason: TIMELINE_HISTORY_ERROR_REASONS.QUEUE_FULL,
+        recoverable: false,
+      } as ServerMessage);
+      await vi.advanceTimersByTimeAsync(2_500);
+    });
+
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId('probe').getAttribute('data-loading')).toBe('false');
+    expect(screen.getByTestId('probe').getAttribute('data-refreshing')).toBe('false');
+    expect(screen.getByTestId('probe').getAttribute('data-response')).toBe('error');
+    expect(screen.getByTestId('probe').getAttribute('data-key')).toBe('chat.timelineStatus.queueFull');
+  });
+
+  it('does not blindly retry non-recoverable worker timeout or unavailable history errors', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+
+    const cases = [
+      {
+        reason: TIMELINE_HISTORY_ERROR_REASONS.TIMEOUT,
+        expectedKey: 'chat.timelineStatus.timeout',
+      },
+      {
+        reason: TIMELINE_HISTORY_ERROR_REASONS.UNAVAILABLE,
+        expectedKey: 'chat.timelineStatus.unavailable',
+      },
+    ] as const;
+
+    for (const { reason, expectedKey } of cases) {
+      cleanup();
+      __resetTimelineCacheForTests();
+      __clearPersistedTimelineSnapshotsForTests();
+
+      const sessionName = `deck_worker_error_${reason}_${Date.now()}`;
+      const requestId = `history-${reason}`;
+      let handler: ((msg: ServerMessage) => void) | null = null;
+      const sendTimelineHistoryRequest = vi.fn(() => requestId);
+      const ws: WsClient = {
+        connected: true,
+        onMessage: (next: (msg: ServerMessage) => void) => {
+          handler = next;
+          return () => { handler = null; };
+        },
+        sendTimelineHistoryRequest,
+      } as unknown as WsClient;
+
+      function Probe() {
+        const { loading, refreshing, historyStatus } = useTimeline(sessionName, ws);
+        return h('div', {
+          'data-testid': 'probe',
+          'data-loading': String(loading),
+          'data-refreshing': String(refreshing),
+          'data-response': historyStatus.response?.state ?? '',
+          'data-key': historyStatus.response?.i18nKey ?? '',
+        }, 'probe');
+      }
+
+      render(h(Probe));
+
+      await waitFor(() => {
+        expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
+      });
+
+      await act(async () => {
+        handler?.({
+          type: TIMELINE_MESSAGES.HISTORY,
+          sessionName,
+          requestId,
+          epoch: 1,
+          events: [],
+          status: TIMELINE_RESPONSE_STATUS.ERROR,
+          errorReason: reason,
+          recoverable: false,
+        } as ServerMessage);
+        await vi.advanceTimersByTimeAsync(2_500);
+      });
+
+      expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
+      expect(screen.getByTestId('probe').getAttribute('data-loading')).toBe('false');
+      expect(screen.getByTestId('probe').getAttribute('data-refreshing')).toBe('false');
+      expect(screen.getByTestId('probe').getAttribute('data-response')).toBe('error');
+      expect(screen.getByTestId('probe').getAttribute('data-key')).toBe(expectedKey);
+    }
+  });
+
+  it('keeps legacy replay-gap truncated separate from payload truncation', async () => {
+    const sessionName = `deck_replay_truncation_${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const sendSnapshotRequest = vi.fn();
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest: vi.fn(() => 'history-replay-truncation'),
+      sendSnapshotRequest,
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { historyStatus } = useTimeline(sessionName, ws);
+      return h('div', {
+        'data-testid': 'probe',
+        'data-key': historyStatus.response?.i18nKey ?? '',
+      }, 'probe');
+    }
+
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(ws.sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName);
+    });
+
+    await act(async () => {
+      handler?.({
+        type: TIMELINE_MESSAGES.REPLAY,
+        sessionName,
+        epoch: 1,
+        events: [],
+        status: TIMELINE_RESPONSE_STATUS.PARTIAL,
+        payloadTruncated: true,
+      } as ServerMessage);
+    });
+
+    expect(sendSnapshotRequest).not.toHaveBeenCalled();
+    expect(screen.getByTestId('probe').getAttribute('data-key')).toBe('chat.timelineStatus.payloadTruncated');
+
+    await act(async () => {
+      handler?.({
+        type: TIMELINE_MESSAGES.REPLAY,
+        sessionName,
+        epoch: 1,
+        events: [],
+        truncated: true,
+      } as ServerMessage);
+    });
+
+    expect(sendSnapshotRequest).toHaveBeenCalledTimes(1);
+    expect(sendSnapshotRequest).toHaveBeenCalledWith(sessionName);
+  });
+
+  it('keeps older pagination open on partial empty pages and follows nextCursor', async () => {
+    const sessionName = `deck_partial_older_${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    let requestSeq = 0;
+    let lastRequestId = '';
+    const sendTimelineHistoryRequest = vi.fn(() => {
+      requestSeq += 1;
+      lastRequestId = `history-${requestSeq}`;
+      return lastRequestId;
+    });
+    const sendTimelinePageRequest = vi.fn(() => {
+      requestSeq += 1;
+      lastRequestId = `page-${requestSeq}`;
+      return lastRequestId;
+    });
+
+    __setTimelineCacheForTests(sessionName, [{
+      eventId: `${sessionName}-seed`,
+      sessionId: sessionName,
+      ts: 1000,
+      epoch: 1,
+      seq: 10,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'seed' },
+    }]);
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest,
+      sendTimelinePageRequest,
+    } as unknown as WsClient;
+
+    function Probe() {
+      const timeline = useTimeline(sessionName, ws);
+      return h('button', {
+        type: 'button',
+        'data-testid': 'older',
+        'data-older': String(timeline.hasOlderHistory),
+        'data-loading': String(timeline.loadingOlder),
+        'data-events': String(timeline.events.length),
+        'data-text': timeline.events.map((event) => String(event.payload.text ?? '')).join('|'),
+        onClick: timeline.loadOlderEvents,
+      }, 'older');
+    }
+
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('older').getAttribute('data-events')).toBe('1');
+      expect(sendTimelineHistoryRequest).toHaveBeenCalled();
+    });
+    sendTimelineHistoryRequest.mockClear();
+
+    await act(async () => {
+      screen.getByTestId('older').click();
+    });
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300, undefined, 1000);
+    const olderRequestId = lastRequestId;
+
+    await act(async () => {
+      handler?.({
+        type: 'timeline.history',
+        sessionName,
+        requestId: olderRequestId,
+        epoch: 1,
+        events: [],
+        status: TIMELINE_RESPONSE_STATUS.PARTIAL,
+        payloadTruncated: true,
+        hasMore: true,
+        nextCursor: { epoch: 1, beforeTs: 500, direction: TIMELINE_CURSOR_DIRECTIONS.OLDER },
+      } as ServerMessage);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('older').getAttribute('data-loading')).toBe('false');
+      expect(screen.getByTestId('older').getAttribute('data-older')).toBe('true');
+    });
+
+    sendTimelineHistoryRequest.mockClear();
+    sendTimelinePageRequest.mockClear();
+    await act(async () => {
+      screen.getByTestId('older').click();
+    });
+
+    expect(sendTimelinePageRequest).toHaveBeenCalledWith(
+      sessionName,
+      { epoch: 1, beforeTs: 500, direction: TIMELINE_CURSOR_DIRECTIONS.OLDER },
+      300,
+    );
+    expect(sendTimelineHistoryRequest).not.toHaveBeenCalled();
+
+    const pageRequestId = lastRequestId;
+    await act(async () => {
+      handler?.({
+        type: TIMELINE_MESSAGES.PAGE,
+        sessionName,
+        requestId: pageRequestId,
+        epoch: 1,
+        events: [{
+          eventId: `${sessionName}-older-page`,
+          sessionId: sessionName,
+          ts: 400,
+          epoch: 1,
+          seq: 4,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'assistant.text',
+          payload: { text: 'older-page' },
+        }],
+        status: TIMELINE_RESPONSE_STATUS.PARTIAL,
+        payloadTruncated: true,
+        hasMore: false,
+      } as ServerMessage);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('older').getAttribute('data-events')).toBe('2');
+      expect(screen.getByTestId('older').getAttribute('data-text')).toBe('older-page|seed');
+      expect(screen.getByTestId('older').getAttribute('data-loading')).toBe('false');
+      expect(screen.getByTestId('older').getAttribute('data-older')).toBe('true');
+    });
+  });
+
+  it('does not let bounded preview history overwrite a full cached event', async () => {
+    const sessionName = `deck_full_cache_preview_${Date.now()}`;
+    const eventId = `${sessionName}-tool-result`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const sendTimelineHistoryRequest = vi.fn(() => 'history-preview');
+
+    __setTimelineCacheForTests(sessionName, [{
+      eventId,
+      sessionId: sessionName,
+      ts: 10,
+      epoch: 1,
+      seq: 10,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'tool.result',
+      payload: { text: 'complete cached output', completeness: 'full' },
+    }]);
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest,
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, ws);
+      return h('div', {
+        'data-testid': 'probe',
+        'data-events': String(events.length),
+      }, events.map((event) => String(event.payload.text ?? '')).join('|'));
+    }
+
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('complete cached output');
+      expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300, 9);
+    });
+
+    await act(async () => {
+      handler?.({
+        type: TIMELINE_MESSAGES.HISTORY,
+        sessionName,
+        requestId: 'history-preview',
+        epoch: 1,
+        events: [{
+          eventId,
+          sessionId: sessionName,
+          ts: 11,
+          epoch: 1,
+          seq: 11,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'tool.result',
+          payload: {
+            text: 'preview output',
+            completeness: 'preview',
+            detailRefs: [{ detailId: 'td_preview', eventId, fieldPath: 'payload.text' }],
+          },
+        }],
+        status: TIMELINE_RESPONSE_STATUS.PARTIAL,
+        payloadTruncated: true,
+      } as ServerMessage);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').getAttribute('data-events')).toBe('1');
+      expect(screen.getByTestId('probe').textContent).toBe('complete cached output');
+    });
+  });
+
+  it('keeps rendered preview usable after missing or expired detail errors and recovers with a full page', async () => {
+    const sessionName = `deck_detail_recovery_${Date.now()}`;
+    const eventId = `${sessionName}-large-detail`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const sendTimelineHistoryRequest = vi.fn(() => 'history-detail-recovery');
+
+    __setTimelineCacheForTests(sessionName, [{
+      eventId,
+      sessionId: sessionName,
+      ts: 10,
+      epoch: 1,
+      seq: 10,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'tool.result',
+      payload: {
+        text: 'preview stays visible',
+        completeness: 'preview',
+        detailRefs: [{ detailId: 'td_old', eventId, fieldPath: 'payload.text' }],
+      },
+    }]);
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest,
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events, historyStatus } = useTimeline(sessionName, ws);
+      return h('div', {
+        'data-testid': 'probe',
+        'data-key': historyStatus.response?.i18nKey ?? '',
+        'data-response': historyStatus.response?.state ?? '',
+      }, events.map((event) => String(event.payload.text ?? '')).join('|'));
+    }
+
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('preview stays visible');
+    });
+
+    await act(async () => {
+      handler?.({
+        type: TIMELINE_MESSAGES.DETAIL,
+        sessionName,
+        requestId: 'detail-expired',
+        detailId: 'td_old',
+        eventId,
+        fieldPath: 'payload.text',
+        status: TIMELINE_RESPONSE_STATUS.ERROR,
+        errorReason: TIMELINE_DETAIL_ERROR_REASONS.EXPIRED,
+        recoverable: false,
+      } as ServerMessage);
+    });
+
+    expect(screen.getByTestId('probe').textContent).toBe('preview stays visible');
+    expect(screen.getByTestId('probe').getAttribute('data-response')).toBe('error');
+    expect(screen.getByTestId('probe').getAttribute('data-key')).toBe('chat.timelineStatus.detailExpired');
+
+    await act(async () => {
+      handler?.({
+        type: TIMELINE_MESSAGES.DETAIL,
+        sessionName,
+        requestId: 'detail-missing',
+        detailId: 'td_old',
+        eventId,
+        fieldPath: 'payload.text',
+        status: TIMELINE_RESPONSE_STATUS.ERROR,
+        errorReason: TIMELINE_DETAIL_ERROR_REASONS.MISSING,
+        recoverable: false,
+      } as ServerMessage);
+    });
+
+    expect(screen.getByTestId('probe').textContent).toBe('preview stays visible');
+    expect(screen.getByTestId('probe').getAttribute('data-response')).toBe('error');
+    expect(screen.getByTestId('probe').getAttribute('data-key')).toBe('chat.timelineStatus.detailMissing');
+
+    await act(async () => {
+      handler?.({
+        type: TIMELINE_MESSAGES.HISTORY,
+        sessionName,
+        requestId: 'history-detail-recovery',
+        epoch: 1,
+        events: [{
+          eventId,
+          sessionId: sessionName,
+          ts: 11,
+          epoch: 1,
+          seq: 11,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'tool.result',
+          payload: { text: 'full output recovered', completeness: 'full' },
+        }],
+        status: TIMELINE_RESPONSE_STATUS.OK,
+      } as ServerMessage);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('full output recovered');
+      expect(screen.getByTestId('probe').getAttribute('data-response')).toBe('ok');
+      expect(screen.getByTestId('probe').getAttribute('data-key')).toBe('chat.timelineStatus.ok');
+    });
+  });
+
+  it('hydrates detail success without reporting empty history and maps terminal detail errors', async () => {
+    const sessionName = `deck_detail_status_${Date.now()}`;
+    const eventId = `${sessionName}-preview`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const sendTimelineHistoryRequest = vi.fn(() => 'history-detail-status');
+
+    __setTimelineCacheForTests(sessionName, [{
+      eventId,
+      sessionId: sessionName,
+      ts: 10,
+      epoch: 1,
+      seq: 10,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'tool.result',
+      payload: {
+        text: 'preview survives detail status',
+        completeness: 'preview',
+        detailRefs: [{ detailId: 'td_status', eventId, fieldPath: 'payload.text' }],
+      },
+    }]);
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest,
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events, historyStatus } = useTimeline(sessionName, ws);
+      return h('div', {
+        'data-testid': 'probe',
+        'data-key': historyStatus.response?.i18nKey ?? '',
+        'data-response': historyStatus.response?.state ?? '',
+      }, events.map((event) => String(event.payload.text ?? '')).join('|'));
+    }
+
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('preview survives detail status');
+    });
+
+    await act(async () => {
+      handler?.({
+        type: TIMELINE_MESSAGES.DETAIL,
+        sessionName,
+        requestId: 'detail-ok',
+        detailId: 'td_status',
+        eventId,
+        fieldPath: 'payload.text',
+        status: TIMELINE_RESPONSE_STATUS.OK,
+        value: 'full detail payload',
+        payloadBytes: 512,
+        payloadTruncated: false,
+      } as ServerMessage);
+    });
+
+    expect(screen.getByTestId('probe').textContent).toBe('full detail payload');
+    expect(screen.getByTestId('probe').getAttribute('data-response')).toBe('detail');
+    expect(screen.getByTestId('probe').getAttribute('data-key')).toBe('chat.timelineStatus.detailHydrated');
+
+    const cases = [
+      [TIMELINE_DETAIL_ERROR_REASONS.UNAUTHORIZED, 'chat.timelineStatus.detailUnauthorized'],
+      [TIMELINE_DETAIL_ERROR_REASONS.OVERSIZED, 'chat.timelineStatus.detailOversized'],
+      [TIMELINE_DETAIL_ERROR_REASONS.MALFORMED, 'chat.timelineStatus.detailMalformed'],
+    ] as const;
+
+    for (const [errorReason, key] of cases) {
+      await act(async () => {
+        handler?.({
+          type: TIMELINE_MESSAGES.DETAIL,
+          sessionName,
+          requestId: `detail-${errorReason}`,
+          detailId: 'td_status',
+          eventId,
+          fieldPath: 'payload.text',
+          status: TIMELINE_RESPONSE_STATUS.ERROR,
+          errorReason,
+          recoverable: false,
+        } as ServerMessage);
+      });
+
+      expect(screen.getByTestId('probe').textContent).toBe('full detail payload');
+      expect(screen.getByTestId('probe').getAttribute('data-response')).toBe('error');
+      expect(screen.getByTestId('probe').getAttribute('data-key')).toBe(key);
+    }
+  });
+
+  it('rejects unsafe, unknown, and cross-event detail field paths', async () => {
+    const sessionName = `deck_detail_safety_${Date.now()}`;
+    const eventId = `${sessionName}-preview`;
+    const otherEventId = `${sessionName}-other`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+
+    __setTimelineCacheForTests(sessionName, [{
+      eventId,
+      sessionId: sessionName,
+      ts: 10,
+      epoch: 1,
+      seq: 10,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'tool.result',
+      payload: {
+        text: 'safe preview',
+        completeness: 'preview',
+        detailRefs: [{ detailId: 'td_safe', eventId, fieldPath: 'payload.text' }],
+      },
+    }, {
+      eventId: otherEventId,
+      sessionId: sessionName,
+      ts: 11,
+      epoch: 1,
+      seq: 11,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'tool.result',
+      payload: {
+        text: 'other preview',
+        completeness: 'preview',
+        detailRefs: [{ detailId: 'td_other', eventId: otherEventId, fieldPath: 'payload.text' }],
+      },
+    }]);
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest: vi.fn(() => 'history-detail-safety'),
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, ws);
+      return h('div', { 'data-testid': 'probe' }, events.map((event) => String(event.payload.text ?? '')).join('|'));
+    }
+
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('safe preview|other preview');
+    });
+
+    const rejected = [
+      { detailId: 'td_safe', eventId, fieldPath: 'payload.__proto__' },
+      { detailId: 'td_safe', eventId, fieldPath: 'payload.constructor' },
+      { detailId: 'td_safe', eventId, fieldPath: 'payload.detail.raw' },
+      { detailId: 'td_other', eventId, fieldPath: 'payload.text' },
+    ];
+
+    for (const detail of rejected) {
+      await act(async () => {
+        handler?.({
+          type: TIMELINE_MESSAGES.DETAIL,
+          sessionName,
+          requestId: `detail-${detail.fieldPath}`,
+          status: TIMELINE_RESPONSE_STATUS.OK,
+          value: 'polluted',
+          ...detail,
+        } as ServerMessage);
+      });
+      expect(screen.getByTestId('probe').textContent).toBe('safe preview|other preview');
+      expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+    }
+
+    await act(async () => {
+      handler?.({
+        type: TIMELINE_MESSAGES.DETAIL,
+        sessionName,
+        requestId: 'detail-safe',
+        detailId: 'td_safe',
+        eventId,
+        fieldPath: 'payload.text',
+        status: TIMELINE_RESPONSE_STATUS.OK,
+        value: 'hydrated safely',
+      } as ServerMessage);
+    });
+
+    expect(screen.getByTestId('probe').textContent).toBe('hydrated safely|other preview');
+  });
+
   it('renders immediately from globally ingested timeline events before the first history request returns', async () => {
     const sessionName = `deck_sub_codex_sdk_${Date.now()}`;
     const serverId = `srv-${Date.now()}`;
@@ -523,7 +1204,7 @@ describe('useTimeline global cache bounds', () => {
     await waitFor(() => {
       expect(screen.getByTestId('probe').textContent).toBe('live cached text');
     });
-    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300);
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300, 0);
 
     await act(async () => {
       handler?.({
@@ -893,8 +1574,9 @@ describe('useTimeline global cache bounds', () => {
       expect(screen.getByTestId('probe').textContent).toBe('mounted');
     });
 
-    // Initial mount triggers a blank full-history request.
-    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300);
+    // Initial mount already has cached cursor state, so it asks only for the
+    // missed tail instead of re-downloading a full recent-history snapshot.
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300, 4999);
     sendTimelineHistoryRequest.mockClear();
 
     // Simulate browser WS reconnect. useTimeline should now gap-fill using

@@ -993,6 +993,20 @@ export async function shutdown(exitCode = 0): Promise<void> {
   }
 
   try {
+    const { shutdownDefaultFsListWorkerPoolForDaemon } = await import('./fs-list-pool.js');
+    await shutdownDefaultFsListWorkerPoolForDaemon();
+  } catch (err) {
+    logger.warn({ errorKind: err instanceof Error ? err.name : typeof err }, 'Daemon shutdown fs list worker drain failed');
+  }
+
+  try {
+    const { shutdownDefaultFsGitStatusWorkerPoolForDaemon } = await import('./fs-git-status-pool.js');
+    await shutdownDefaultFsGitStatusWorkerPoolForDaemon();
+  } catch (err) {
+    logger.warn({ errorKind: err instanceof Error ? err.name : typeof err }, 'Daemon shutdown fs git status worker drain failed');
+  }
+
+  try {
     if (healthTimer) clearInterval(healthTimer);
     if (codexQuotaTimer) clearInterval(codexQuotaTimer);
     if (contextReplicationTimer) clearInterval(contextReplicationTimer);

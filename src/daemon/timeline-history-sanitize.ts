@@ -1,13 +1,19 @@
 import type { TimelineEvent } from './timeline-event.js';
+import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
+import {
+  TIMELINE_DETAIL_FIELD_PATHS,
+  type TimelineDetailFieldPath,
+  type TimelineDetailRef,
+} from '../../shared/timeline-protocol.js';
 
-export const DEFAULT_TIMELINE_HISTORY_MAX_EVENT_BYTES = 32 * 1024;
-export const DEFAULT_TIMELINE_HISTORY_MAX_RESPONSE_BYTES = 1024 * 1024;
+export const DEFAULT_TIMELINE_HISTORY_MAX_EVENT_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_EVENT;
+export const DEFAULT_TIMELINE_HISTORY_MAX_RESPONSE_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE;
 
-const NORMAL_STRING_BYTES = 16 * 1024;
-const TIGHT_STRING_BYTES = 4 * 1024;
-const TOOL_OUTPUT_BYTES = 12 * 1024;
-const TOOL_RAW_BYTES = 4 * 1024;
-const TEXT_EVENT_BYTES = 24 * 1024;
+const NORMAL_STRING_BYTES = 4 * 1024;
+const TIGHT_STRING_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.FIELD_PREVIEW;
+const TOOL_OUTPUT_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.FIELD_PREVIEW;
+const TOOL_RAW_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.FIELD_PREVIEW;
+const TEXT_EVENT_BYTES = 4 * 1024;
 
 interface ValuePolicy {
   maxStringBytes: number;
@@ -23,6 +29,30 @@ interface MutableSanitizeStats {
 export interface TimelineHistorySanitizeOptions {
   maxEventBytes?: number;
   maxResponseBytes?: number;
+  detailSink?: TimelineHistoryDetailSink;
+  collectDetailRefs?: boolean;
+}
+
+export interface TimelineHistoryDetailSink {
+  put(input: {
+    sessionName: string;
+    epoch: number;
+    eventId: string;
+    fieldPath: string;
+    value: string;
+    previewBytes?: number;
+    mediaType?: string;
+  }): TimelineDetailRef | undefined;
+}
+
+export interface TimelineHistoryDetailCandidate {
+  sessionName: string;
+  epoch: number;
+  eventId: string;
+  fieldPath: TimelineDetailFieldPath;
+  value: string;
+  previewBytes: number;
+  mediaType?: string;
 }
 
 export interface TimelineHistorySanitizeResult {
@@ -30,6 +60,7 @@ export interface TimelineHistorySanitizeResult {
   payloadBytes: number;
   droppedEvents: number;
   truncatedEvents: number;
+  detailRefs: TimelineDetailRef[];
 }
 
 const NORMAL_POLICY: ValuePolicy = {
@@ -59,6 +90,62 @@ function jsonBytes(value: unknown): number {
   } catch {
     return Number.MAX_SAFE_INTEGER;
   }
+}
+
+function estimateJsonBytesBounded(
+  value: unknown,
+  limit = TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL,
+  depth = 0,
+): number {
+  if (value === null) return 4;
+  if (value === undefined) return 0;
+  if (typeof value === 'string') return Math.min(limit + 1, value.length * 4 + 2);
+  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
+    return Math.min(limit + 1, String(value).length + 2);
+  }
+  if (typeof value !== 'object') return Math.min(limit + 1, String(value).length + 2);
+  if (depth >= 5) return limit + 1;
+
+  let total = Array.isArray(value) ? 2 : 2;
+  let count = 0;
+  const add = (bytes: number): boolean => {
+    total += bytes;
+    return total <= limit;
+  };
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      if (count >= 100) return limit + 1;
+      if (!add((count > 0 ? 1 : 0) + estimateJsonBytesBounded(item, Math.max(1, limit - total), depth + 1))) return limit + 1;
+      count += 1;
+    }
+    return total;
+  }
+
+  for (const key in value as Record<string, unknown>) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+    if (count >= 100) return limit + 1;
+    if (!add((count > 0 ? 1 : 0) + key.length * 4 + 3)) return limit + 1;
+    if (!add(estimateJsonBytesBounded((value as Record<string, unknown>)[key], Math.max(1, limit - total), depth + 1))) return limit + 1;
+    count += 1;
+  }
+  return total;
+}
+
+function eventWithPayload(event: TimelineEvent, payload: Record<string, unknown>): TimelineEvent {
+  const next: TimelineEvent = {
+    eventId: event.eventId,
+    sessionId: event.sessionId,
+    ts: event.ts,
+    seq: event.seq,
+    epoch: event.epoch,
+    source: event.source,
+    confidence: event.confidence,
+    type: event.type,
+    payload,
+  };
+  if (event.hidden !== undefined) next.hidden = event.hidden;
+  return next;
 }
 
 export function truncateStringByUtf8Bytes(value: string, maxBytes: number): string {
@@ -104,12 +191,14 @@ function sanitizeValue(
     }
     const out: Record<string, unknown> = {};
     let count = 0;
-    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    const record = value as Record<string, unknown>;
+    for (const key in record) {
+      if (!Object.prototype.hasOwnProperty.call(record, key)) continue;
       if (count >= policy.maxObjectKeys) {
         stats.truncatedValues += 1;
         break;
       }
-      out[key] = sanitizeValue(child, policy, stats, depth + 1);
+      out[key] = sanitizeValue(record[key], policy, stats, depth + 1);
       count += 1;
     }
     return out;
@@ -122,7 +211,15 @@ function sanitizeToolDetail(detail: unknown, stats: MutableSanitizeStats): unkno
     return sanitizeValue(detail, NORMAL_POLICY, stats);
   }
   const out: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(detail as Record<string, unknown>)) {
+  const record = detail as Record<string, unknown>;
+  let count = 0;
+  for (const key in record) {
+    if (!Object.prototype.hasOwnProperty.call(record, key)) continue;
+    if (count >= NORMAL_POLICY.maxObjectKeys) {
+      stats.truncatedValues += 1;
+      break;
+    }
+    const value = record[key];
     if (key === 'raw') {
       out[key] = sanitizeValue(value, RAW_POLICY, stats);
     } else if (key === 'output') {
@@ -132,6 +229,7 @@ function sanitizeToolDetail(detail: unknown, stats: MutableSanitizeStats): unkno
     } else {
       out[key] = sanitizeValue(value, NORMAL_POLICY, stats);
     }
+    count += 1;
   }
   return out;
 }
@@ -140,7 +238,14 @@ function sanitizePayload(event: TimelineEvent, stats: MutableSanitizeStats, poli
   const payload = event.payload ?? {};
   if (event.type === 'tool.call' || event.type === 'tool.result') {
     const out: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(payload)) {
+    let count = 0;
+    for (const key in payload) {
+      if (!Object.prototype.hasOwnProperty.call(payload, key)) continue;
+      if (count >= policy.maxObjectKeys) {
+        stats.truncatedValues += 1;
+        break;
+      }
+      const value = payload[key];
       if (key === 'detail') {
         out[key] = sanitizeToolDetail(value, stats);
       } else if (key === 'output') {
@@ -150,6 +255,7 @@ function sanitizePayload(event: TimelineEvent, stats: MutableSanitizeStats, poli
       } else {
         out[key] = sanitizeValue(value, policy, stats);
       }
+      count += 1;
     }
     return out;
   }
@@ -168,7 +274,7 @@ function minimalPayload(event: TimelineEvent, originalPayloadBytes: number, stat
   const payload = event.payload ?? {};
   const out: Record<string, unknown> = {
     historyPayloadTruncated: true,
-    originalPayloadBytes,
+    originalPayloadBytesBucket: bucketBytes(originalPayloadBytes),
   };
   if (typeof payload.text === 'string') out.text = truncateStringByUtf8Bytes(payload.text, TEXT_EVENT_BYTES);
   if (typeof payload.tool === 'string') out.tool = payload.tool;
@@ -178,39 +284,102 @@ function minimalPayload(event: TimelineEvent, originalPayloadBytes: number, stat
   return out;
 }
 
+function detailStringAtPath(event: TimelineEvent, fieldPath: string): string | undefined {
+  const parts = fieldPath.split('.');
+  let current: unknown = event as unknown;
+  for (const part of parts) {
+    if (!current || typeof current !== 'object' || Array.isArray(current)) return undefined;
+    current = (current as Record<string, unknown>)[part];
+  }
+  return typeof current === 'string' ? current : undefined;
+}
+
+export function collectTimelineHistoryDetailCandidates(event: TimelineEvent): TimelineHistoryDetailCandidate[] {
+  const fieldCandidates: Array<{ fieldPath: TimelineDetailFieldPath; previewBytes: number; mediaType?: string }> = [
+    { fieldPath: TIMELINE_DETAIL_FIELD_PATHS.PAYLOAD_TEXT, previewBytes: TEXT_EVENT_BYTES, mediaType: 'text/plain' },
+    { fieldPath: TIMELINE_DETAIL_FIELD_PATHS.PAYLOAD_OUTPUT, previewBytes: TOOL_OUTPUT_BYTES, mediaType: 'text/plain' },
+    { fieldPath: TIMELINE_DETAIL_FIELD_PATHS.PAYLOAD_ERROR, previewBytes: TIGHT_STRING_BYTES, mediaType: 'text/plain' },
+    { fieldPath: TIMELINE_DETAIL_FIELD_PATHS.PAYLOAD_DETAIL_OUTPUT, previewBytes: TOOL_OUTPUT_BYTES, mediaType: 'text/plain' },
+  ];
+  const candidates: TimelineHistoryDetailCandidate[] = [];
+  const seen = new Set<string>();
+  for (const candidate of fieldCandidates) {
+    const value = detailStringAtPath(event, candidate.fieldPath);
+    if (value === undefined) continue;
+    if (Buffer.byteLength(value, 'utf8') <= candidate.previewBytes) continue;
+    const duplicateKey = `${Buffer.byteLength(value, 'utf8')}:${value.slice(0, 128)}:${value.slice(-128)}`;
+    if (seen.has(duplicateKey)) continue;
+    seen.add(duplicateKey);
+    candidates.push({
+      sessionName: event.sessionId,
+      epoch: event.epoch,
+      eventId: event.eventId,
+      fieldPath: candidate.fieldPath,
+      value,
+      previewBytes: candidate.previewBytes,
+      mediaType: candidate.mediaType,
+    });
+  }
+  return candidates;
+}
+
+function collectDetailRefs(event: TimelineEvent, sink: TimelineHistoryDetailSink | undefined): TimelineDetailRef[] {
+  if (!sink) return [];
+  const refs: TimelineDetailRef[] = [];
+  for (const candidate of collectTimelineHistoryDetailCandidates(event)) {
+    const ref = sink.put({
+      sessionName: candidate.sessionName,
+      epoch: candidate.epoch,
+      eventId: candidate.eventId,
+      fieldPath: candidate.fieldPath,
+      value: candidate.value,
+      previewBytes: candidate.previewBytes,
+      mediaType: candidate.mediaType,
+    });
+    if (ref) refs.push(ref);
+  }
+  return refs;
+}
+
+function bucketBytes(bytes: number): string {
+  if (bytes < 1024) return '<1KiB';
+  if (bytes < 4 * 1024) return '1-4KiB';
+  if (bytes < 16 * 1024) return '4-16KiB';
+  if (bytes < 64 * 1024) return '16-64KiB';
+  if (bytes < 256 * 1024) return '64-256KiB';
+  if (bytes < 1024 * 1024) return '256KiB-1MiB';
+  return '>1MiB';
+}
+
 export function sanitizeTimelineHistoryEventForTransport(
   event: TimelineEvent,
   options: TimelineHistorySanitizeOptions = {},
-): { event: TimelineEvent; bytes: number; truncated: boolean } {
+): { event: TimelineEvent; bytes: number; truncated: boolean; detailRefs: TimelineDetailRef[] } {
   const maxEventBytes = Math.max(1024, Math.trunc(options.maxEventBytes ?? DEFAULT_TIMELINE_HISTORY_MAX_EVENT_BYTES));
   const stats: MutableSanitizeStats = { truncatedValues: 0 };
-  const originalPayloadBytes = jsonBytes(event.payload);
+  const originalPayloadBytes = estimateJsonBytesBounded(event.payload);
   const beforeTruncations = stats.truncatedValues;
 
-  let next: TimelineEvent = {
-    ...event,
-    payload: sanitizePayload(event, stats),
-  };
+  let next = eventWithPayload(event, sanitizePayload(event, stats));
   let bytes = jsonBytes(next);
 
   if (bytes > maxEventBytes) {
-    next = {
-      ...event,
-      payload: sanitizePayload(next, stats, TIGHT_POLICY),
-    };
+    next = eventWithPayload(event, sanitizePayload(next, stats, TIGHT_POLICY));
     bytes = jsonBytes(next);
   }
 
   if (bytes > maxEventBytes) {
-    next = {
-      ...event,
-      payload: minimalPayload(event, originalPayloadBytes, stats),
-    };
+    next = eventWithPayload(event, minimalPayload(event, originalPayloadBytes, stats));
     bytes = jsonBytes(next);
   }
 
-  const truncated = stats.truncatedValues > beforeTruncations || bytes < jsonBytes(event);
-  return { event: next, bytes, truncated };
+  const truncated = stats.truncatedValues > beforeTruncations || originalPayloadBytes > maxEventBytes;
+  return {
+    event: next,
+    bytes,
+    truncated,
+    detailRefs: options.collectDetailRefs === false ? [] : collectDetailRefs(event, options.detailSink),
+  };
 }
 
 export function sanitizeTimelineHistoryEventsForTransport(
@@ -218,23 +387,33 @@ export function sanitizeTimelineHistoryEventsForTransport(
   options: TimelineHistorySanitizeOptions = {},
 ): TimelineHistorySanitizeResult {
   const maxResponseBytes = Math.max(64 * 1024, Math.trunc(options.maxResponseBytes ?? DEFAULT_TIMELINE_HISTORY_MAX_RESPONSE_BYTES));
-  const sanitized = events.map((event) => sanitizeTimelineHistoryEventForTransport(event, options));
-  let truncatedEvents = sanitized.filter((entry) => entry.truncated).length;
-  const selected: TimelineEvent[] = [];
+  const selectedEntries: Array<ReturnType<typeof sanitizeTimelineHistoryEventForTransport>> = [];
   let payloadBytes = 2;
   let droppedEvents = 0;
+  let truncatedEvents = 0;
 
-  for (let index = sanitized.length - 1; index >= 0; index -= 1) {
-    const entry = sanitized[index]!;
-    const nextBytes = payloadBytes + entry.bytes + (selected.length > 0 ? 1 : 0);
-    if (nextBytes > maxResponseBytes && selected.length > 0) {
-      droppedEvents += 1;
-      continue;
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const entry = sanitizeTimelineHistoryEventForTransport(events[index]!, {
+      ...options,
+      collectDetailRefs: false,
+    });
+    const nextBytes = payloadBytes + entry.bytes + (selectedEntries.length > 0 ? 1 : 0);
+    if (nextBytes > maxResponseBytes && selectedEntries.length > 0) {
+      droppedEvents += index + 1;
+      break;
     }
-    selected.push(entry.event);
+    selectedEntries.push(entry);
     payloadBytes = nextBytes;
+    if (entry.truncated) truncatedEvents += 1;
   }
-  selected.reverse();
+  selectedEntries.reverse();
+  const selected = selectedEntries.map((entry) => entry.event);
+  const selectedEventIds = new Set(selected.map((event) => event.eventId));
+  const detailRefs = options.detailSink
+    ? events
+      .filter((event) => selectedEventIds.has(event.eventId))
+      .flatMap((event) => collectDetailRefs(event, options.detailSink))
+    : [];
 
   if (droppedEvents > 0) truncatedEvents += droppedEvents;
   return {
@@ -242,5 +421,6 @@ export function sanitizeTimelineHistoryEventsForTransport(
     payloadBytes,
     droppedEvents,
     truncatedEvents,
+    detailRefs,
   };
 }

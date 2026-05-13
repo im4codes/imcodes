@@ -13,6 +13,7 @@
  */
 
 import WebSocket from 'ws';
+import { performance } from 'node:perf_hooks';
 import type { Database } from '../db/client.js';
 import type { Env } from '../env.js';
 import { MemoryRateLimiter } from './rate-limiter.js';
@@ -130,6 +131,16 @@ import { P2P_CONFIG_MSG } from '../../../shared/p2p-config-events.js';
 import { p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../../../shared/p2p-config-scope.js';
 import { isP2pSavedConfig, type P2pSavedConfig } from '../../../shared/p2p-modes.js';
 import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
+import {
+  TIMELINE_MESSAGES,
+  TIMELINE_RESPONSE_SOURCES,
+  TIMELINE_RESPONSE_STATUS,
+} from '../../../shared/timeline-protocol.js';
+import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../../shared/timeline-payload-budget.js';
+import {
+  TIMELINE_DETAIL_ERROR_REASONS,
+  TIMELINE_REQUEST_ERROR_REASONS,
+} from '../../../shared/timeline-history-errors.js';
 
 const AUTH_TIMEOUT_MS = 5000;
 const MAX_QUEUE_SIZE = 100;
@@ -329,9 +340,63 @@ type PendingHttpTimelineRequest = {
   timer: ReturnType<typeof setTimeout>;
 };
 
+type PendingTimelineRequest = {
+  socket: WebSocket;
+  timer: ReturnType<typeof setTimeout>;
+};
+
+type TimelineDataPlaneRoute = 'browser_request' | 'http_request' | 'subscriber_fallback';
+
+type TimelineDataPlaneSendMeta = {
+  type: string;
+  route: TimelineDataPlaneRoute;
+  recipientCount: number;
+  requestIdFanoutCount: number;
+  httpCallerCount: number;
+  broadcastRecipientCount: number;
+  chunkCount: number;
+};
+
+type TimelineDataPlaneQueueMetrics = {
+  backlogAgeMs: number;
+  queueDepthAtEnqueue: number;
+  queueDepthBeforeDrain: number;
+  queuedBehindCount: number;
+};
+
+type TimelineDataPlaneJob = {
+  meta: TimelineDataPlaneSendMeta;
+  enqueuedAt: number;
+  queueDepthAtEnqueue: number;
+  queuedBehindCount: number;
+  work: (queue: TimelineDataPlaneQueueMetrics) => void | Promise<void>;
+};
+
 const WATCH_RECENT_TEXT_CAP = 5;
 const WATCH_RECENT_TEXT_MAX_CHARS = 160;
 const HTTP_TIMELINE_TIMEOUT_MS = 15_000;
+const TIMELINE_PENDING_UNICAST_TIMEOUT_MS = 30_000;
+const BRIDGE_TIMELINE_LARGE_PAYLOAD_LOG_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE;
+const BRIDGE_TIMELINE_SLOW_SEND_LOG_MS = 50;
+const TIMELINE_REQUEST_TYPES = new Set<string>([
+  TIMELINE_MESSAGES.HISTORY_REQUEST,
+  TIMELINE_MESSAGES.REPLAY_REQUEST,
+  TIMELINE_MESSAGES.PAGE_REQUEST,
+  TIMELINE_MESSAGES.DETAIL_REQUEST,
+]);
+const TIMELINE_RESPONSE_TYPES = new Set<string>([
+  TIMELINE_MESSAGES.HISTORY,
+  TIMELINE_MESSAGES.REPLAY,
+  TIMELINE_MESSAGES.PAGE,
+  TIMELINE_MESSAGES.DETAIL,
+]);
+
+const TIMELINE_RESPONSE_TYPE_BY_REQUEST = new Map<string, string>([
+  [TIMELINE_MESSAGES.HISTORY_REQUEST, TIMELINE_MESSAGES.HISTORY],
+  [TIMELINE_MESSAGES.REPLAY_REQUEST, TIMELINE_MESSAGES.REPLAY],
+  [TIMELINE_MESSAGES.PAGE_REQUEST, TIMELINE_MESSAGES.PAGE],
+  [TIMELINE_MESSAGES.DETAIL_REQUEST, TIMELINE_MESSAGES.DETAIL],
+]);
 
 function normalizeRecentText(text: unknown): string | null {
   if (typeof text !== 'string') return null;
@@ -377,6 +442,28 @@ function optionalString(value: unknown): string | undefined {
 
 function optionalNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function timelineResponseRequestIds(msg: Record<string, unknown>): string[] {
+  const ids: string[] = [];
+  const primary = optionalString(msg.requestId);
+  if (primary) ids.push(primary);
+  const fanout = Array.isArray(msg.requestIds) ? msg.requestIds : [];
+  for (const item of fanout) {
+    if (typeof item !== 'string' || item.length === 0 || ids.includes(item)) continue;
+    ids.push(item);
+  }
+  return ids;
+}
+
+function timelineResponseForRequestId(msg: Record<string, unknown>, requestId: string): Record<string, unknown> {
+  const response: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(msg)) {
+    if (key === 'requestIds') continue;
+    response[key] = value;
+  }
+  response.requestId = requestId;
+  return response;
 }
 
 function optionalBoolean(value: unknown): boolean | undefined {
@@ -743,8 +830,8 @@ export class WsBridge {
   private pendingFileSearchRequests: PendingFsRouteMap = new Map();
   private pendingFsWriteRequests: PendingFsRouteMap = new Map();
 
-  /** Per-request timeline.history / timeline.replay pending map — routes responses via requestId unicast. */
-  private pendingTimelineRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
+  /** Per-request timeline pending map — routes responses via requestId unicast. */
+  private pendingTimelineRequests = new Map<string, PendingTimelineRequest>();
 
   /** Per-request P2P workflow pending map — routes request-scoped responses via requestId unicast. */
   private pendingP2pWorkflowRequests = new Map<string, PendingP2pWorkflowRequest>();
@@ -755,6 +842,9 @@ export class WsBridge {
   /** Per-request HTTP timeline/history relay pending map. */
   private pendingHttpTimelineRequests = new Map<string, PendingHttpTimelineRequest>();
   private pendingRecentTextBackfills = new Map<string, Promise<WatchRecentTextRow[]>>();
+
+  private timelineDataPlaneQueue: TimelineDataPlaneJob[] = [];
+  private timelineDataPlaneScheduled = false;
 
   /** Lightweight per-session hot cache for Watch first-paint text. */
   private recentTextBySession = new Map<string, WatchRecentTextRow[]>();
@@ -926,6 +1016,324 @@ export class WsBridge {
         map.delete(requestId);
       }
     }
+  }
+
+  private registerPendingTimelineRequest(ws: WebSocket, msg: Record<string, unknown>): void {
+    const requestId = optionalString(msg.requestId);
+    if (!requestId) return;
+    const previous = this.pendingTimelineRequests.get(requestId);
+    if (previous) {
+      clearTimeout(previous.timer);
+      logger.warn({ requestId, serverId: this.serverId, type: msg.type }, 'WsBridge: duplicate timeline request id replaced');
+    }
+    const timer = setTimeout(() => this.pendingTimelineRequests.delete(requestId), TIMELINE_PENDING_UNICAST_TIMEOUT_MS);
+    timer.unref?.();
+    this.pendingTimelineRequests.set(requestId, { socket: ws, timer });
+  }
+
+  private sendTimelineRequestError(
+    ws: WebSocket,
+    msg: Record<string, unknown>,
+    errorReason: string,
+  ): void {
+    const responseType = typeof msg.type === 'string'
+      ? TIMELINE_RESPONSE_TYPE_BY_REQUEST.get(msg.type)
+      : undefined;
+    if (!responseType) return;
+    const requestId = optionalString(msg.requestId);
+    const sessionName = optionalString(msg.sessionName);
+    safeSend(ws, JSON.stringify({
+      type: responseType,
+      ...(requestId ? { requestId } : {}),
+      ...(sessionName ? { sessionName } : {}),
+      status: TIMELINE_RESPONSE_STATUS.ERROR,
+      source: TIMELINE_RESPONSE_SOURCES.ERROR,
+      errorReason,
+      events: responseType === TIMELINE_MESSAGES.DETAIL ? undefined : [],
+    }));
+  }
+
+  private async verifyTimelineBrowserRequest(ws: WebSocket, msg: Record<string, unknown>): Promise<boolean> {
+    const sessionName = optionalString(msg.sessionName);
+    if (!sessionName) {
+      this.sendTimelineRequestError(ws, msg, TIMELINE_REQUEST_ERROR_REASONS.MALFORMED_REQUEST);
+      return false;
+    }
+    const allowed = await this.verifySessionOwnership(sessionName);
+    if (!allowed) {
+      logger.warn({ serverId: this.serverId, sessionName, type: msg.type }, 'timeline request: session not owned by this server — rejected');
+      this.sendTimelineRequestError(ws, msg, TIMELINE_DETAIL_ERROR_REASONS.UNAUTHORIZED);
+      return false;
+    }
+    return true;
+  }
+
+  private enqueueTimelineDataPlaneDelivery(
+    meta: TimelineDataPlaneSendMeta,
+    work: (queue: TimelineDataPlaneQueueMetrics) => void | Promise<void>,
+  ): void {
+    const queuedBehindCount = this.timelineDataPlaneQueue.length;
+    const queueDepthAtEnqueue = queuedBehindCount + 1;
+    this.timelineDataPlaneQueue.push({
+      meta,
+      work,
+      enqueuedAt: performance.now(),
+      queueDepthAtEnqueue,
+      queuedBehindCount,
+    });
+    incrementCounter('ws_bridge_timeline_data_plane_enqueue', {
+      type: meta.type,
+      route: meta.route,
+      backlog: queuedBehindCount > 0 ? 'queued' : 'empty',
+    });
+    if (this.timelineDataPlaneScheduled) return;
+    this.timelineDataPlaneScheduled = true;
+    setImmediate(() => this.drainTimelineDataPlaneQueue());
+  }
+
+  private drainTimelineDataPlaneQueue(): void {
+    this.timelineDataPlaneScheduled = false;
+    const queueDepthBeforeDrain = this.timelineDataPlaneQueue.length;
+    const job = this.timelineDataPlaneQueue.shift();
+    if (!job) return;
+    const queueMetrics: TimelineDataPlaneQueueMetrics = {
+      backlogAgeMs: performance.now() - job.enqueuedAt,
+      queueDepthAtEnqueue: job.queueDepthAtEnqueue,
+      queueDepthBeforeDrain,
+      queuedBehindCount: job.queuedBehindCount,
+    };
+    void Promise.resolve()
+      .then(() => job.work(queueMetrics))
+      .catch((err) => {
+        logger.warn({ serverId: this.serverId, err, type: job.meta.type, route: job.meta.route }, 'WsBridge timeline data-plane delivery failed');
+      })
+      .finally(() => {
+        if (this.timelineDataPlaneQueue.length > 0 && !this.timelineDataPlaneScheduled) {
+          this.timelineDataPlaneScheduled = true;
+          setImmediate(() => this.drainTimelineDataPlaneQueue());
+        }
+      });
+  }
+
+  private stringifyTimelineDataPlaneResponse(
+    msg: Record<string, unknown>,
+    meta: TimelineDataPlaneSendMeta,
+  ): { json: string; jsonBytes: number; stringifyMs: number } | null {
+    const stringifyStart = performance.now();
+    try {
+      const json = JSON.stringify(msg);
+      const stringifyMs = performance.now() - stringifyStart;
+      const jsonBytes = Buffer.byteLength(json, 'utf8');
+      return { json, jsonBytes, stringifyMs };
+    } catch (err) {
+      incrementCounter('ws_bridge_timeline_data_plane_serialize_error', { type: meta.type, route: meta.route });
+      logger.warn({ serverId: this.serverId, err, type: meta.type, route: meta.route }, 'WsBridge failed to serialize timeline data-plane response');
+      return null;
+    }
+  }
+
+  private logTimelineDataPlaneSend(
+    meta: TimelineDataPlaneSendMeta,
+    timing: {
+      jsonBytes?: number;
+      stringifyMs?: number;
+      sendWaitMs?: number;
+      failed?: boolean;
+      queue?: TimelineDataPlaneQueueMetrics;
+    },
+  ): void {
+    incrementCounter('ws_bridge_timeline_data_plane_send', {
+      type: meta.type,
+      route: meta.route,
+      result: timing.failed ? 'failed' : 'ok',
+    });
+
+    const jsonBytes = timing.jsonBytes ?? 0;
+    const stringifyMs = timing.stringifyMs ?? 0;
+    const sendWaitMs = timing.sendWaitMs ?? 0;
+    const shouldLog = timing.failed
+      || jsonBytes >= BRIDGE_TIMELINE_LARGE_PAYLOAD_LOG_BYTES
+      || stringifyMs >= BRIDGE_TIMELINE_SLOW_SEND_LOG_MS
+      || sendWaitMs >= BRIDGE_TIMELINE_SLOW_SEND_LOG_MS;
+    if (!shouldLog) return;
+
+    const payload = {
+      serverId: this.serverId,
+      type: meta.type,
+      route: meta.route,
+      dataPlaneClass: 'timeline',
+      jsonBytes: timing.jsonBytes,
+      stringifyMs: timing.stringifyMs,
+      sendWaitMs: timing.sendWaitMs,
+      recipientCount: meta.recipientCount,
+      requestIdFanoutCount: meta.requestIdFanoutCount,
+      httpCallerCount: meta.httpCallerCount,
+      broadcastRecipientCount: meta.broadcastRecipientCount,
+      chunkCount: meta.chunkCount,
+      backlogAgeMs: timing.queue?.backlogAgeMs,
+      queueDepthAtEnqueue: timing.queue?.queueDepthAtEnqueue,
+      queueDepthBeforeDrain: timing.queue?.queueDepthBeforeDrain,
+      queuedBehindCount: timing.queue?.queuedBehindCount,
+    };
+    if (timing.failed) logger.warn(payload, 'WsBridge timeline data-plane send failed');
+    else logger.info(payload, 'WsBridge timeline data-plane send');
+  }
+
+  private enqueueTimelineDataPlaneSocketSend(
+    socket: WebSocket,
+    msg: Record<string, unknown>,
+    meta: TimelineDataPlaneSendMeta,
+  ): void {
+    this.enqueueTimelineDataPlaneDelivery(meta, (queue) => {
+      const serialized = this.stringifyTimelineDataPlaneResponse(msg, meta);
+      if (!serialized) return;
+      const sendStart = performance.now();
+      return new Promise<void>((resolve) => {
+        safeSend(socket, serialized.json, (err) => {
+          this.logTimelineDataPlaneSend(meta, {
+            jsonBytes: serialized.jsonBytes,
+            stringifyMs: serialized.stringifyMs,
+            sendWaitMs: performance.now() - sendStart,
+            failed: !!err,
+            queue,
+          });
+          resolve();
+        });
+      });
+    });
+  }
+
+  private enqueueTimelineDataPlaneHttpResolve(
+    pending: PendingHttpTimelineRequest,
+    msg: Record<string, unknown>,
+    meta: TimelineDataPlaneSendMeta,
+  ): void {
+    this.enqueueTimelineDataPlaneDelivery(meta, (queue) => {
+      pending.resolve(msg);
+      this.logTimelineDataPlaneSend(meta, {
+        jsonBytes: optionalNumber(msg.payloadBytes),
+        stringifyMs: 0,
+        sendWaitMs: 0,
+        queue,
+      });
+    });
+  }
+
+  private collectTimelineSubscriberSockets(sessionName: string): WebSocket[] {
+    const sockets: WebSocket[] = [];
+    const seen = new Set<WebSocket>();
+    for (const [ws, sessions] of this.browserSubscriptions) {
+      if (!sessions.has(sessionName) || seen.has(ws)) continue;
+      seen.add(ws);
+      sockets.push(ws);
+    }
+    for (const [ws, sessions] of this.transportSubscriptions) {
+      if (!sessions.has(sessionName) || seen.has(ws)) continue;
+      seen.add(ws);
+      sockets.push(ws);
+    }
+    return sockets;
+  }
+
+  private enqueueTimelineDataPlaneSubscriberSend(sessionName: string, msg: Record<string, unknown>, type: string): void {
+    const sockets = this.collectTimelineSubscriberSockets(sessionName);
+    if (sockets.length === 0) return;
+    const meta: TimelineDataPlaneSendMeta = {
+      type,
+      route: 'subscriber_fallback',
+      recipientCount: sockets.length,
+      requestIdFanoutCount: 0,
+      httpCallerCount: 0,
+      broadcastRecipientCount: sockets.length,
+      chunkCount: 1,
+    };
+    this.enqueueTimelineDataPlaneDelivery(meta, (queue) => {
+      const serialized = this.stringifyTimelineDataPlaneResponse(msg, meta);
+      if (!serialized) return;
+      const sendStart = performance.now();
+      let pendingCallbacks = sockets.length;
+      let failed = false;
+      return new Promise<void>((resolve) => {
+        for (const socket of sockets) {
+          safeSend(socket, serialized.json, (err) => {
+            pendingCallbacks -= 1;
+            failed = failed || !!err;
+            if (pendingCallbacks !== 0) return;
+            this.logTimelineDataPlaneSend(meta, {
+              jsonBytes: serialized.jsonBytes,
+              stringifyMs: serialized.stringifyMs,
+              sendWaitMs: performance.now() - sendStart,
+              failed,
+              queue,
+            });
+            resolve();
+          });
+        }
+      });
+    });
+  }
+
+  private handleTimelineDataPlaneResponse(msg: Record<string, unknown>, type: string): void {
+    const requestIds = timelineResponseRequestIds(msg);
+    if (requestIds.length > 0) {
+      const socketDeliveries: Array<{ requestId: string; pending: PendingTimelineRequest }> = [];
+      const httpDeliveries: Array<{ requestId: string; pending: PendingHttpTimelineRequest }> = [];
+      for (const requestId of requestIds) {
+        const pendingHttp = this.pendingHttpTimelineRequests.get(requestId);
+        if (pendingHttp) {
+          clearTimeout(pendingHttp.timer);
+          this.pendingHttpTimelineRequests.delete(requestId);
+          httpDeliveries.push({ requestId, pending: pendingHttp });
+        }
+
+        const pending = this.pendingTimelineRequests.get(requestId);
+        if (pending) {
+          clearTimeout(pending.timer);
+          this.pendingTimelineRequests.delete(requestId);
+          socketDeliveries.push({ requestId, pending });
+        }
+      }
+
+      const recipientCount = socketDeliveries.length + httpDeliveries.length;
+      if (recipientCount === 0) {
+        incrementCounter('ws_bridge_timeline_unrouted_response', { type });
+        logger.warn({ serverId: this.serverId, type, requestIdCount: requestIds.length }, 'timeline response missing pending request - dropped');
+        return;
+      }
+
+      for (const { requestId, pending } of httpDeliveries) {
+        this.enqueueTimelineDataPlaneHttpResolve(pending, timelineResponseForRequestId(msg, requestId), {
+          type,
+          route: 'http_request',
+          recipientCount,
+          requestIdFanoutCount: requestIds.length,
+          httpCallerCount: httpDeliveries.length,
+          broadcastRecipientCount: 0,
+          chunkCount: 1,
+        });
+      }
+
+      for (const { requestId, pending } of socketDeliveries) {
+        this.enqueueTimelineDataPlaneSocketSend(pending.socket, timelineResponseForRequestId(msg, requestId), {
+          type,
+          route: 'browser_request',
+          recipientCount,
+          requestIdFanoutCount: requestIds.length,
+          httpCallerCount: httpDeliveries.length,
+          broadcastRecipientCount: 0,
+          chunkCount: 1,
+        });
+      }
+      return;
+    }
+
+    const sessionName = optionalString(msg.sessionName);
+    if (!sessionName) {
+      logger.warn({ serverId: this.serverId, type }, 'timeline message missing sessionName - discarded');
+      return;
+    }
+
+    this.enqueueTimelineDataPlaneSubscriberSend(sessionName, msg, type);
   }
 
   private pruneSessionGroupCloneContexts(now = Date.now()): void {
@@ -1597,7 +2005,7 @@ export class WsBridge {
           );
         }
         // Timeline events: session.state(idle) and ask.question
-        if (pushType === 'timeline.event') {
+        if (pushType === TIMELINE_MESSAGES.EVENT) {
           const event = (msg as Record<string, unknown>).event as Record<string, unknown> | undefined;
           if (event?.type === 'ask.question') {
             this.dispatchEventPush(db, env, {
@@ -1870,13 +2278,14 @@ export class WsBridge {
         this.registerPendingFsRoute('fs.write', ws, msg);
       }
 
-      // Track timeline.history_request / timeline.replay_request for single-cast response routing
+      // Validate and track timeline request ids for single-cast response routing.
       // This eliminates the race where terminal.subscribe's async ownership check hasn't completed
-      // before the daemon responds with timeline.history — without this, the response is silently dropped.
-      if ((msg.type === 'timeline.history_request' || msg.type === 'timeline.replay_request') && typeof msg.requestId === 'string') {
-        const reqId = msg.requestId;
-        const timer = setTimeout(() => this.pendingTimelineRequests.delete(reqId), 30_000);
-        this.pendingTimelineRequests.set(reqId, { socket: ws, timer });
+      // before the daemon responds with timeline data - without this, the response is silently dropped.
+      if (TIMELINE_REQUEST_TYPES.has(msg.type)) {
+        if (!await this.verifyTimelineBrowserRequest(ws, msg)) return;
+        if (typeof msg.requestId === 'string') {
+          this.registerPendingTimelineRequest(ws, msg);
+        }
       }
 
       // Track terminal subscriptions for binary routing + ref-counted daemon forwarding
@@ -2531,11 +2940,11 @@ export class WsBridge {
     }
 
     // ── Timeline events: session-scoped ───────────────────────────────────────
-    if (type === 'timeline.event') {
+    if (type === TIMELINE_MESSAGES.EVENT) {
       const rawEvent = msg.event as Record<string, unknown> | undefined;
       const sessionId = rawEvent?.sessionId as string | undefined;
       if (!rawEvent || !sessionId) {
-        logger.warn({ serverId: this.serverId }, 'timeline.event missing sessionId — discarded');
+        logger.warn({ serverId: this.serverId }, 'timeline event missing sessionId - discarded');
         return;
       }
       if (rawEvent.type === 'user.message') {
@@ -2559,36 +2968,11 @@ export class WsBridge {
       return;
     }
 
-    // Timeline history/replay: route via requestId unicast (eliminates subscription race),
-    // falling back to session subscribers for legacy/live replay without requestId.
-    if (type === 'timeline.history' || type === 'timeline.replay') {
-      const requestId = msg.requestId as string | undefined;
-      if (requestId) {
-        const pendingHttp = this.pendingHttpTimelineRequests.get(requestId);
-        if (pendingHttp) {
-          clearTimeout(pendingHttp.timer);
-          this.pendingHttpTimelineRequests.delete(requestId);
-          pendingHttp.resolve(msg);
-          return;
-        }
-        const pending = this.pendingTimelineRequests.get(requestId);
-        if (pending) {
-          clearTimeout(pending.timer);
-          this.pendingTimelineRequests.delete(requestId);
-          if (pending.socket.readyState === WebSocket.OPEN) {
-            pending.socket.send(JSON.stringify(msg));
-          }
-          return;
-        }
-      }
-      // Fallback: no requestId or no pending request — use session subscribers
-      const sessionName = msg.sessionName as string | undefined;
-      if (!sessionName) {
-        logger.warn({ serverId: this.serverId, type }, 'timeline message missing sessionName — discarded');
-        return;
-      }
-      // Control-plane: bypass the PTY queue (see sendJsonToSessionSubscribers).
-      this.sendJsonToSessionSubscribers(sessionName, JSON.stringify(msg));
+    // Timeline history/replay/page/detail responses are data-plane. Defer
+    // stringify/send so later control-plane messages can jump ahead, while
+    // requestId responses remain unicast to browser or HTTP callers.
+    if (TIMELINE_RESPONSE_TYPES.has(type)) {
+      this.handleTimelineDataPlaneResponse(msg, type);
       return;
     }
 
@@ -3379,7 +3763,7 @@ export class WsBridge {
       if (row) return true;
 
       // Check sub-sessions: name is deck_sub_{id}
-      const subMatch = sessionName.match(/^deck_sub_([a-z0-9]+)$/);
+      const subMatch = sessionName.match(/^deck_sub_(.+)$/);
       if (subMatch) {
         const subId = subMatch[1];
         const subRow = await this.db.queryOne<Record<string, unknown>>(
@@ -3814,6 +4198,8 @@ export class WsBridge {
     limit?: number;
     beforeTs?: number;
     afterTs?: number;
+    budgetBytes?: number;
+    includeDetails?: boolean;
     timeoutMs?: number;
   }): Promise<Record<string, unknown>> {
     if (!this.isDaemonConnected()) {
@@ -3828,17 +4214,20 @@ export class WsBridge {
         this.pendingHttpTimelineRequests.delete(requestId);
         reject(new Error('timeout'));
       }, timeoutMs);
+      timer.unref?.();
 
       this.pendingHttpTimelineRequests.set(requestId, { resolve, reject, timer });
 
       try {
         this.daemonWs!.send(JSON.stringify({
-          type: 'timeline.history_request',
+          type: TIMELINE_MESSAGES.HISTORY_REQUEST,
           sessionName: params.sessionName,
           requestId,
           ...(typeof params.limit === 'number' ? { limit: params.limit } : {}),
           ...(typeof params.beforeTs === 'number' ? { beforeTs: params.beforeTs } : {}),
           ...(typeof params.afterTs === 'number' ? { afterTs: params.afterTs } : {}),
+          ...(typeof params.budgetBytes === 'number' ? { budgetBytes: params.budgetBytes } : {}),
+          ...(typeof params.includeDetails === 'boolean' ? { includeDetails: params.includeDetails } : {}),
         }));
       } catch (err) {
         this.pendingHttpTimelineRequests.delete(requestId);

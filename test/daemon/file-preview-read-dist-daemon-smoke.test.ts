@@ -12,8 +12,9 @@ const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const distCommandHandlerPath = join(repoRoot, 'dist/src/daemon/command-handler.js');
 const distCoordinatorPath = join(repoRoot, 'dist/src/daemon/file-preview-read-coordinator.js');
+const distFsListPoolPath = join(repoRoot, 'dist/src/daemon/fs-list-pool.js');
 const distBootstrapPath = join(repoRoot, 'dist/src/daemon/file-preview-read-worker-bootstrap.mjs');
-const distReady = existsSync(distCommandHandlerPath) && existsSync(distCoordinatorPath) && existsSync(distBootstrapPath);
+const distReady = existsSync(distCommandHandlerPath) && existsSync(distCoordinatorPath) && existsSync(distFsListPoolPath) && existsSync(distBootstrapPath);
 const distRequired = process.env.PREVIEW_DIST_REQUIRED === '1';
 
 if (!distReady && distRequired) {
@@ -107,6 +108,7 @@ if (!distReady && distRequired) {
       const script = `
         import { handleWebCommand } from ${JSON.stringify(`file://${distCommandHandlerPath}`)};
         import { shutdownDefaultPreviewReadCoordinatorForDaemon } from ${JSON.stringify(`file://${distCoordinatorPath}`)};
+        import { shutdownDefaultFsListWorkerPoolForDaemon } from ${JSON.stringify(`file://${distFsListPoolPath}`)};
         const startedAt = Date.now();
         const responses = [];
         const serverLink = {
@@ -134,6 +136,7 @@ if (!distReady && distRequired) {
         await waitFor(() => responses.find((message) => message.type === 'fs.ls_response'), 'fs.ls');
         await waitFor(() => responses.filter((message) => message.type === 'fs.read_response').length >= 2, 'fs.read responses');
         await shutdownDefaultPreviewReadCoordinatorForDaemon();
+        await shutdownDefaultFsListWorkerPoolForDaemon();
         console.log(JSON.stringify(responses));
       `;
       await writeFile(runner, script);

@@ -1,5 +1,18 @@
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
+import {
+  TIMELINE_CURSOR_DIRECTIONS,
+  TIMELINE_MESSAGES,
+  TIMELINE_RESPONSE_STATUS,
+  type TimelineCursor,
+  type TimelinePayloadMetadata,
+} from '@shared/timeline-protocol.js';
+import {
+  TIMELINE_DETAIL_ERROR_REASONS,
+  TIMELINE_HISTORY_ERROR_REASONS,
+  TIMELINE_PAGE_ERROR_REASONS,
+  TIMELINE_REQUEST_ERROR_REASONS,
+} from '@shared/timeline-history-errors.js';
 import i18next from 'i18next';
 import {
   MSG_COMMAND_FAILED,
@@ -33,7 +46,12 @@ function localizedAckFailureReason(reason: AckFailureReason): string {
 import { useEffect, useRef, useState, useCallback } from 'preact/hooks';
 import type { WsClient, TimelineEvent, ServerMessage } from '../ws-client.js';
 import { TimelineDB } from '../timeline-db.js';
-import { mergeTimelineEvents, preferTimelineEvent } from '../../../src/shared/timeline/merge.js';
+import {
+  TIMELINE_DETAIL_FIELD_PATHS,
+  mergeTimelineEvents,
+  preferTimelineEvent,
+  type TimelineDetailFieldPath,
+} from '../../../src/shared/timeline/merge.js';
 import { fetchTimelineHistoryHttp, sendSessionViaHttp } from '../api.js';
 import { normalizeTransportPendingEntries } from '../transport-queue.js';
 
@@ -550,10 +568,25 @@ export interface UseTimelineOptions {
 export type TimelineHistoryPhase = 'idle' | 'bootstrap' | 'refresh' | 'older';
 export type TimelineHistoryStepState = 'pending' | 'running' | 'done' | 'skipped';
 export type TimelineHistoryStepKey = 'cache' | 'textTail' | 'daemon' | 'http' | 'older';
+export type TimelineHistoryResponseState = 'ok' | 'empty' | 'partial' | 'deferred' | 'error' | 'detail';
+
+export interface TimelineHistoryResponseNotice {
+  state: TimelineHistoryResponseState;
+  i18nKey: string;
+  localizedMessage: string;
+  recoverable: boolean;
+  errorReason?: string;
+  source?: string;
+  payloadBytes?: number;
+  payloadTruncated?: boolean;
+  hasMore?: boolean;
+  cursorReset?: boolean;
+}
 
 export interface TimelineHistoryStatus {
   phase: TimelineHistoryPhase;
   steps: Record<TimelineHistoryStepKey, TimelineHistoryStepState>;
+  response: TimelineHistoryResponseNotice | null;
 }
 
 export function createIdleHistoryStatus(): TimelineHistoryStatus {
@@ -566,6 +599,7 @@ export function createIdleHistoryStatus(): TimelineHistoryStatus {
       http: 'skipped',
       older: 'skipped',
     },
+    response: null,
   };
 }
 
@@ -579,7 +613,236 @@ function createBootstrapHistoryStatus(opts: { canDaemon: boolean; canHttp: boole
       http: opts.canHttp ? 'pending' : 'skipped',
       older: 'skipped',
     },
+    response: null,
   };
+}
+
+type TimelineProtocolServerMessage = Extract<
+  ServerMessage,
+  {
+    type:
+      | typeof TIMELINE_MESSAGES.HISTORY
+      | typeof TIMELINE_MESSAGES.REPLAY
+      | typeof TIMELINE_MESSAGES.PAGE
+      | typeof TIMELINE_MESSAGES.DETAIL;
+  }
+>;
+
+type TimelineEventsServerMessage = Extract<
+  ServerMessage,
+  {
+    type:
+      | typeof TIMELINE_MESSAGES.HISTORY
+      | typeof TIMELINE_MESSAGES.REPLAY
+      | typeof TIMELINE_MESSAGES.PAGE;
+  }
+>;
+
+const TIMELINE_NOTICE_FALLBACKS: Record<string, string> = {
+  'chat.timelineStatus.ok': 'History updated',
+  'chat.timelineStatus.empty': 'No earlier timeline events',
+  'chat.timelineStatus.partial': 'Timeline loaded partially',
+  'chat.timelineStatus.deferred': 'Timeline is still being prepared',
+  'chat.timelineStatus.payloadTruncated': 'Timeline was shortened for faster loading',
+  'chat.timelineStatus.cursorReset': 'Timeline position changed; refresh history',
+  'chat.timelineStatus.queueFull': 'Timeline worker is busy',
+  'chat.timelineStatus.timeout': 'Timeline worker timed out',
+  'chat.timelineStatus.unavailable': 'Timeline history is unavailable',
+  'chat.timelineStatus.projectionUnavailable': 'Timeline index is unavailable',
+  'chat.timelineStatus.malformedRequest': 'Timeline request was invalid',
+  'chat.timelineStatus.internalError': 'Timeline history failed',
+  'chat.timelineStatus.detailMissing': 'Timeline detail is no longer available',
+  'chat.timelineStatus.detailExpired': 'Timeline detail expired',
+  'chat.timelineStatus.detailUnauthorized': 'Timeline detail is unavailable for this session',
+  'chat.timelineStatus.detailOversized': 'Timeline detail is too large',
+  'chat.timelineStatus.detailMalformed': 'Timeline detail request was invalid',
+  'chat.timelineStatus.detailHydrated': 'Timeline detail loaded',
+  'chat.timelineStatus.pageCursorReset': 'Timeline page expired; refresh history',
+  'chat.timelineStatus.pageMalformed': 'Timeline page request was invalid',
+  'chat.timelineStatus.error': 'Timeline history failed',
+};
+
+function localizedTimelineNotice(key: string): string {
+  const fallback = TIMELINE_NOTICE_FALLBACKS[key] ?? TIMELINE_NOTICE_FALLBACKS['chat.timelineStatus.error']!;
+  const value = i18next.t(key, fallback);
+  return typeof value === 'string' && value.trim() ? value : fallback;
+}
+
+function getTimelineEvents(msg: TimelineProtocolServerMessage): TimelineEvent[] {
+  return 'events' in msg && Array.isArray(msg.events) ? msg.events : [];
+}
+
+function hasExplicitTimelineOutcome(msg: TimelinePayloadMetadata): boolean {
+  return msg.status !== undefined
+    || msg.errorReason !== undefined
+    || msg.payloadTruncated !== undefined
+    || msg.cursorReset === true;
+}
+
+function getTimelineNoticeKey(msg: TimelinePayloadMetadata, state: TimelineHistoryResponseState): string {
+  const reason = msg.errorReason;
+  if (reason === TIMELINE_HISTORY_ERROR_REASONS.QUEUE_FULL) return 'chat.timelineStatus.queueFull';
+  if (reason === TIMELINE_HISTORY_ERROR_REASONS.TIMEOUT) return 'chat.timelineStatus.timeout';
+  if (
+    reason === TIMELINE_HISTORY_ERROR_REASONS.UNAVAILABLE
+    || reason === TIMELINE_HISTORY_ERROR_REASONS.CRASHED
+    || reason === TIMELINE_HISTORY_ERROR_REASONS.SHUTDOWN
+  ) return 'chat.timelineStatus.unavailable';
+  if (reason === TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE) return 'chat.timelineStatus.projectionUnavailable';
+  if (reason === TIMELINE_REQUEST_ERROR_REASONS.MALFORMED_REQUEST) return 'chat.timelineStatus.malformedRequest';
+  if (reason === TIMELINE_DETAIL_ERROR_REASONS.MISSING) return 'chat.timelineStatus.detailMissing';
+  if (reason === TIMELINE_DETAIL_ERROR_REASONS.EXPIRED) return 'chat.timelineStatus.detailExpired';
+  if (reason === TIMELINE_DETAIL_ERROR_REASONS.UNAUTHORIZED) return 'chat.timelineStatus.detailUnauthorized';
+  if (reason === TIMELINE_DETAIL_ERROR_REASONS.OVERSIZED) return 'chat.timelineStatus.detailOversized';
+  if (reason === TIMELINE_DETAIL_ERROR_REASONS.MALFORMED) return 'chat.timelineStatus.detailMalformed';
+  if (reason === TIMELINE_PAGE_ERROR_REASONS.CURSOR_RESET) return 'chat.timelineStatus.pageCursorReset';
+  if (reason === TIMELINE_PAGE_ERROR_REASONS.MALFORMED) return 'chat.timelineStatus.pageMalformed';
+  if (reason === TIMELINE_HISTORY_ERROR_REASONS.INTERNAL_ERROR || reason === TIMELINE_DETAIL_ERROR_REASONS.INTERNAL_ERROR || reason === TIMELINE_PAGE_ERROR_REASONS.INTERNAL_ERROR) {
+    return 'chat.timelineStatus.internalError';
+  }
+  if (state === 'deferred') return 'chat.timelineStatus.deferred';
+  if (msg.cursorReset) return 'chat.timelineStatus.cursorReset';
+  if (msg.payloadTruncated) return 'chat.timelineStatus.payloadTruncated';
+  if (state === 'detail') return 'chat.timelineStatus.detailHydrated';
+  if (state === 'partial') return 'chat.timelineStatus.partial';
+  if (state === 'empty') return 'chat.timelineStatus.empty';
+  if (state === 'ok') return 'chat.timelineStatus.ok';
+  return 'chat.timelineStatus.error';
+}
+
+function getTimelineResponseState(
+  msg: TimelineProtocolServerMessage,
+): TimelineHistoryResponseState {
+  if (msg.status === TIMELINE_RESPONSE_STATUS.ERROR || msg.errorReason) return 'error';
+  if (msg.status === TIMELINE_RESPONSE_STATUS.DEFERRED) return 'deferred';
+  if (msg.status === TIMELINE_RESPONSE_STATUS.PARTIAL || msg.payloadTruncated) return 'partial';
+  if (msg.type === TIMELINE_MESSAGES.DETAIL) return 'detail';
+  return getTimelineEvents(msg).length === 0 ? 'empty' : 'ok';
+}
+
+function createTimelineHistoryResponseNotice(msg: TimelineProtocolServerMessage): TimelineHistoryResponseNotice {
+  const state = getTimelineResponseState(msg);
+  const i18nKey = getTimelineNoticeKey(msg, state);
+  return {
+    state,
+    i18nKey,
+    localizedMessage: localizedTimelineNotice(i18nKey),
+    recoverable: msg.recoverable === true,
+    errorReason: msg.errorReason,
+    source: typeof msg.source === 'string' ? msg.source : undefined,
+    payloadBytes: msg.payloadBytes,
+    payloadTruncated: msg.payloadTruncated,
+    hasMore: msg.hasMore,
+    cursorReset: msg.cursorReset,
+  };
+}
+
+function shouldRetryTimelineHistoryResponse(msg: TimelineEventsServerMessage, hasRenderedEvents: boolean): boolean {
+  if (getTimelineEvents(msg).length > 0 || hasRenderedEvents) return false;
+  if (msg.recoverable === true) return true;
+  return !hasExplicitTimelineOutcome(msg);
+}
+
+function getOlderTimelineCursor(msg: TimelineEventsServerMessage): TimelineCursor | null {
+  const cursor = msg.nextCursor;
+  if (!cursor || typeof cursor !== 'object') return null;
+  if (cursor.direction !== TIMELINE_CURSOR_DIRECTIONS.OLDER) return null;
+  return typeof cursor.beforeTs === 'number' ? cursor : null;
+}
+
+const TIMELINE_DETAIL_FIELD_PATH_SET = new Set<string>(TIMELINE_DETAIL_FIELD_PATHS);
+
+function isTimelineRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isAllowedTimelineDetailFieldPath(fieldPath: unknown): fieldPath is TimelineDetailFieldPath {
+  return typeof fieldPath === 'string'
+    && TIMELINE_DETAIL_FIELD_PATH_SET.has(fieldPath)
+    && !fieldPath.split('.').some((part) => part === '__proto__' || part === 'prototype' || part === 'constructor');
+}
+
+function detailRefsForEvent(event: TimelineEvent): Array<Record<string, unknown>> {
+  const refs = [
+    event.payload.detailRefs,
+    (event as unknown as Record<string, unknown>).detailRefs,
+  ];
+  for (const refsValue of refs) {
+    if (Array.isArray(refsValue)) return refsValue.filter((ref): ref is Record<string, unknown> => !!ref && typeof ref === 'object' && !Array.isArray(ref));
+  }
+  return [];
+}
+
+function timelineDetailValue(msg: Extract<TimelineProtocolServerMessage, { type: typeof TIMELINE_MESSAGES.DETAIL }>): unknown {
+  if ('value' in msg) return msg.value;
+  if ('content' in msg) return msg.content;
+  if ('detail' in msg) return msg.detail;
+  return undefined;
+}
+
+function hasMatchingDetailRef(
+  event: TimelineEvent,
+  msg: Extract<TimelineProtocolServerMessage, { type: typeof TIMELINE_MESSAGES.DETAIL }>,
+  fieldPath: TimelineDetailFieldPath,
+): boolean {
+  const refs = detailRefsForEvent(event);
+  if (refs.length === 0) return false;
+  return refs.some((ref) => {
+    if (typeof msg.detailId === 'string' && ref.detailId !== msg.detailId) return false;
+    if (typeof ref.eventId === 'string' && ref.eventId !== event.eventId) return false;
+    return ref.fieldPath === fieldPath;
+  });
+}
+
+function withoutHydratedDetailRef(
+  refsValue: unknown,
+  msg: Extract<TimelineProtocolServerMessage, { type: typeof TIMELINE_MESSAGES.DETAIL }>,
+  fieldPath: TimelineDetailFieldPath,
+): unknown {
+  if (!Array.isArray(refsValue)) return refsValue;
+  return refsValue.filter((ref) => {
+    if (!ref || typeof ref !== 'object' || Array.isArray(ref)) return true;
+    const record = ref as Record<string, unknown>;
+    if (record.fieldPath !== fieldPath) return true;
+    if (typeof msg.detailId === 'string' && record.detailId !== msg.detailId) return true;
+    return false;
+  });
+}
+
+function hydrateTimelineDetailEvent(
+  events: TimelineEvent[],
+  msg: Extract<TimelineProtocolServerMessage, { type: typeof TIMELINE_MESSAGES.DETAIL }>,
+): TimelineEvent[] {
+  if (msg.status !== TIMELINE_RESPONSE_STATUS.OK) return events;
+  if (typeof msg.eventId !== 'string') return events;
+  if (!isAllowedTimelineDetailFieldPath(msg.fieldPath)) return events;
+
+  const idx = events.findIndex((event) => event.eventId === msg.eventId);
+  if (idx < 0) return events;
+  const existing = events[idx]!;
+  if (msg.sessionName && existing.sessionId !== msg.sessionName) return events;
+  if (!hasMatchingDetailRef(existing, msg, msg.fieldPath)) return events;
+
+  const value = timelineDetailValue(msg);
+  const payload: Record<string, unknown> = { ...existing.payload };
+  if (msg.fieldPath === 'payload.text') payload.text = value;
+  else if (msg.fieldPath === 'payload.output') payload.output = value;
+  else if (msg.fieldPath === 'payload.error') payload.error = value;
+  else if (msg.fieldPath === 'payload.detail.output') {
+    const detail = isTimelineRecord(payload.detail) ? { ...payload.detail } : {};
+    detail.output = value;
+    payload.detail = detail;
+  } else {
+    return events;
+  }
+  payload.completeness = 'hydrated';
+  payload.detailRefs = withoutHydratedDetailRef(payload.detailRefs, msg, msg.fieldPath);
+  if (Array.isArray(payload.detailRefs) && payload.detailRefs.length === 0) delete payload.detailRefs;
+
+  const updatedEvent = { ...existing, payload };
+  const next = [...events];
+  next[idx] = preferTimelineEvent(existing, updatedEvent);
+  return next[idx] === existing ? events : next;
 }
 
 export function useTimeline(
@@ -614,6 +877,7 @@ export function useTimeline(
   const replayRequestIdRef = useRef<string | null>(null);
   const historyRequestIdRef = useRef<string | null>(null);
   const olderRequestIdRef = useRef<string | null>(null);
+  const olderCursorRef = useRef<TimelineCursor | null>(null);
   const historyLoadedRef = useRef<string | null>(null); // tracks which session has been loaded
   const historyRetryRef = useRef(0); // retry count for empty history responses
   const historyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -626,11 +890,24 @@ export function useTimeline(
     phase?: Exclude<TimelineHistoryPhase, 'idle'>,
   ) => {
     setHistoryStatus((prev) => ({
+      ...prev,
       phase: phase ?? prev.phase,
       steps: {
         ...prev.steps,
         [step]: state,
       },
+    }));
+  }, []);
+
+  const recordTimelineResponse = useCallback((
+    msg: TimelineProtocolServerMessage,
+    phase?: Exclude<TimelineHistoryPhase, 'idle'>,
+  ) => {
+    const response = createTimelineHistoryResponseNotice(msg);
+    setHistoryStatus((prev) => ({
+      ...prev,
+      phase: phase ?? prev.phase,
+      response,
     }));
   }, []);
 
@@ -665,6 +942,17 @@ export function useTimeline(
     armForwardHistoryTimeout(requestId, phase);
     return requestId;
   }, [armForwardHistoryTimeout, sessionId, ws]);
+
+  const buildForwardHistoryArgs = useCallback((
+    limit?: number,
+    sourceEvents: TimelineEvent[] = eventsRef.current,
+  ): { limit?: number; afterTs?: number } | undefined => {
+    const afterTs = getTimelineHistoryAfterTs(sourceEvents);
+    if (afterTs !== undefined) {
+      return { limit: limit ?? MAX_MEMORY_EVENTS, afterTs };
+    }
+    return limit === undefined ? undefined : { limit };
+  }, []);
 
   const beginReconnectRefresh = useCallback((source: 'daemon' | 'browser') => {
     const now = Date.now();
@@ -708,6 +996,7 @@ export function useTimeline(
       clearForwardHistoryTimeout();
       historyRequestIdRef.current = null;
       reconnectRefreshInFlightRef.current = false;
+      olderCursorRef.current = null;
       resetOlderState();
       return;
     }
@@ -722,6 +1011,7 @@ export function useTimeline(
       clearForwardHistoryTimeout();
       historyRequestIdRef.current = null;
       reconnectRefreshInFlightRef.current = false;
+      olderCursorRef.current = null;
       resetOlderState();
       setHasOlderHistory(false);
       historyLoadedRef.current = cacheKeyRef.current;
@@ -739,6 +1029,7 @@ export function useTimeline(
     clearForwardHistoryTimeout();
     historyRequestIdRef.current = null;
     reconnectRefreshInFlightRef.current = false;
+    olderCursorRef.current = null;
     resetOlderState();
     setHasOlderHistory(true);
 
@@ -749,7 +1040,7 @@ export function useTimeline(
       setRefreshing(false);
     };
 
-    const requestDaemonHistory = (visible: boolean, limit?: number): void => {
+    const requestDaemonHistory = (visible: boolean, limit?: number, sourceEvents?: TimelineEvent[]): void => {
       if (!wsConnected || !ws) return;
       // Gate WS-side timeline.history_request behind isActiveSession the same
       // way fireHttpBackfill is gated. SubSessionCard mounts one useTimeline
@@ -777,7 +1068,7 @@ export function useTimeline(
       } else {
         markDaemonHistoryBackground();
       }
-      sendForwardHistoryRequest('bootstrap', limit === undefined ? undefined : { limit });
+      sendForwardHistoryRequest('bootstrap', buildForwardHistoryArgs(limit, sourceEvents));
     };
 
     // 1. Module-level memory cache — instant restore (e.g. window reopen)
@@ -786,7 +1077,7 @@ export function useTimeline(
       updateHistoryStep('cache', 'done', 'bootstrap');
       setEvents(memCached);
       setLoading(false);
-      requestDaemonHistory(false, MAX_MEMORY_EVENTS);
+      requestDaemonHistory(false, MAX_MEMORY_EVENTS, memCached);
       // Background HTTP backfill — catches events missed while this window
       // was minimized/backgrounded since the memory cache can be stale.
       // Kept short (~200ms) because the UI is already visible; this is
@@ -806,7 +1097,7 @@ export function useTimeline(
       setCachedEvents(cacheKey!, localSnapshot);
       setEvents((prev) => (prev === localSnapshot ? prev : localSnapshot));
       setLoading(false);
-      requestDaemonHistory(false, MAX_MEMORY_EVENTS);
+      requestDaemonHistory(false, MAX_MEMORY_EVENTS, localSnapshot);
       if (isActiveSession) {
         fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' });
       }
@@ -848,7 +1139,7 @@ export function useTimeline(
         setEvents((prev) => (prev === restored ? prev : restored));
         setLoading(false);
         historyLoadedRef.current = cacheKeyRef.current;
-        requestDaemonHistory(false, MAX_MEMORY_EVENTS);
+        requestDaemonHistory(false, MAX_MEMORY_EVENTS, restored);
         // Background HTTP backfill — IDB is authoritative only up to the
         // last time a WS event landed; if the user closed the tab mid-chat
         // and reopened later there may be a gap between IDB and daemon.
@@ -883,7 +1174,7 @@ export function useTimeline(
     };
     load().catch(() => {});
     return () => { cancelled = true; };
-  }, [cacheKey, clearForwardHistoryTimeout, clearHttpBackfillTimer, disableHistory, isActiveSession, sendForwardHistoryRequest, sessionId, ws, wsConnected]);
+  }, [buildForwardHistoryArgs, cacheKey, clearForwardHistoryTimeout, clearHttpBackfillTimer, disableHistory, isActiveSession, sendForwardHistoryRequest, sessionId, ws, wsConnected]);
 
   // Map of commandId → optimistic eventId for O(1) lookup on command.ack / dedup.
   const optimisticIdsByCommandRef = useRef(new Map<string, string>());
@@ -1389,7 +1680,7 @@ export function useTimeline(
     const key = cacheKeyRef.current;
     const cached = key ? getCachedEvents(key) : undefined;
     if (!cached || cached.length === 0) return;
-    const oldestTs = Math.min(...cached.map((e) => e.ts));
+    const oldestTs = olderCursorRef.current?.beforeTs ?? Math.min(...cached.map((e) => e.ts));
     loadingOlderRef.current = true;
     setHistoryStatus({
       phase: 'older',
@@ -1400,9 +1691,12 @@ export function useTimeline(
         http: 'skipped',
         older: 'running',
       },
+      response: null,
     });
     setLoadingOlder(true);
-    olderRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS, undefined, oldestTs);
+    olderRequestIdRef.current = olderCursorRef.current
+      ? ws.sendTimelinePageRequest(sessionId, olderCursorRef.current, MAX_MEMORY_EVENTS)
+      : ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS, undefined, oldestTs);
     // Timeout: if response never arrives (packet loss, disconnect), reset after 10s
     if (olderTimeoutRef.current) clearTimeout(olderTimeoutRef.current);
     olderTimeoutRef.current = setTimeout(resetOlderState, 10_000);
@@ -1465,7 +1759,13 @@ export function useTimeline(
   const idbPutEvents = useCallback((evts: TimelineEvent[]) => {
     const key = cacheKeyRef.current;
     if (!key) return;
-    persistTimelineEvents(key, evts);
+    const cached = getCachedEvents(key) ?? eventsRef.current;
+    const cachedById = new Map(cached.map((event) => [event.eventId, event]));
+    const preferred = evts.map((event) => {
+      const existing = cachedById.get(event.eventId);
+      return existing ? preferTimelineEvent(existing, event) : event;
+    });
+    persistTimelineEvents(key, preferred);
   }, []);
 
   /**
@@ -1706,7 +2006,7 @@ export function useTimeline(
 
     const handler = (msg: ServerMessage) => {
       // ── Real-time event ──
-      if (msg.type === 'timeline.event') {
+      if (msg.type === TIMELINE_MESSAGES.EVENT) {
         const event = msg.event;
         if (event.sessionId !== sessionId) return;
         if (event.type === 'session.state' && event.payload?.state === 'queued') {
@@ -1848,17 +2148,29 @@ export function useTimeline(
       }
 
       // ── History response (full load from daemon file store) ──
-      if (msg.type === 'timeline.history') {
+      if (msg.type === TIMELINE_MESSAGES.HISTORY || msg.type === TIMELINE_MESSAGES.PAGE) {
         if (msg.sessionName !== sessionId) return;
+        const responseState = getTimelineResponseState(msg);
+        const isTerminalError = responseState === 'error' || responseState === 'deferred';
 
         // Handle backward pagination response
         if (msg.requestId && msg.requestId === olderRequestIdRef.current) {
           updateHistoryStep('older', 'done', 'older');
           resetOlderState();
+          recordTimelineResponse(msg, 'older');
+          const olderCursor = getOlderTimelineCursor(msg);
+          if (olderCursor) olderCursorRef.current = olderCursor;
           if (msg.events.length > 0) {
             mergeEvents(msg.events, MAX_HISTORY_EVENTS);
             idbPutEvents(msg.events);
-          } else {
+          }
+          if (isTerminalError) {
+            return;
+          }
+          if (msg.hasMore === true || msg.payloadTruncated === true || responseState === 'partial' || olderCursor) {
+            setHasOlderHistory(true);
+          } else if (msg.hasMore === false || msg.events.length === 0) {
+            olderCursorRef.current = null;
             setHasOlderHistory(false);
           }
           return;
@@ -1880,6 +2192,7 @@ export function useTimeline(
           }
         }
         updateHistoryStep('daemon', 'done', loading ? 'bootstrap' : 'refresh');
+        recordTimelineResponse(msg, loading ? 'bootstrap' : 'refresh');
         historyLoadedRef.current = cacheKeyRef.current;
 
         epochRef.current = msg.epoch;
@@ -1904,9 +2217,11 @@ export function useTimeline(
             settleOptimisticByTimelineProgress(historyEvent);
           }
           idbPutEvents(msg.events);
-        } else if (historyRetryRef.current < 2 && ws?.connected && eventsRef.current.length === 0 && isActiveSessionRef.current) {
-          // Empty response with no cached events — retry once after a short delay
-          // (defense-in-depth for transient bridge/daemon failures).
+        } else if (historyRetryRef.current < 2 && ws?.connected && isActiveSessionRef.current && shouldRetryTimelineHistoryResponse(msg, eventsRef.current.length > 0)) {
+          // Legacy empty response with no cached events — retry once after a
+          // short delay. Explicit protocol outcomes (empty success, deferred,
+          // queue-full, timeout, unavailable, malformed, internal, etc.) are
+          // terminal unless the daemon marks the response recoverable.
           // Gate by isActiveSession so non-focused SubSessionCards don't keep
           // retrying forever when their backing session has no events yet.
           historyRetryRef.current++;
@@ -1914,7 +2229,7 @@ export function useTimeline(
             // Re-check the flag at fire time — the user may have switched
             // away in the 1-2s delay window.
             if (!isActiveSessionRef.current) return;
-            if (ws?.connected && sessionId) sendForwardHistoryRequest('bootstrap', { limit: MAX_MEMORY_EVENTS });
+            if (ws?.connected && sessionId) sendForwardHistoryRequest('bootstrap', buildForwardHistoryArgs(MAX_MEMORY_EVENTS));
           }, 1000 * historyRetryRef.current);
         }
         setLoading(false);
@@ -1922,17 +2237,18 @@ export function useTimeline(
       }
 
       // ── Replay response (gap-fill after reconnect) ──
-      if (msg.type === 'timeline.replay') {
+      if (msg.type === TIMELINE_MESSAGES.REPLAY) {
         if (msg.sessionName !== sessionId) return;
         if (msg.requestId && msg.requestId !== replayRequestIdRef.current) return;
         replayRequestIdRef.current = null;
         updateHistoryStep('daemon', 'done', 'refresh');
+        recordTimelineResponse(msg, 'refresh');
         const { events: replayEvents, truncated, epoch } = msg;
 
         // Update epoch — don't clear events, ts-sort handles cross-epoch order
         epochRef.current = epoch;
 
-        if (truncated && ws) {
+        if (truncated === true && ws) {
           ws.sendSnapshotRequest(sessionId);
         }
 
@@ -1947,6 +2263,27 @@ export function useTimeline(
           idbPutEvents(replayEvents);
         }
         setRefreshing(false);
+      }
+
+      if (msg.type === TIMELINE_MESSAGES.DETAIL) {
+        if (msg.sessionName && msg.sessionName !== sessionId) return;
+        if (msg.status === TIMELINE_RESPONSE_STATUS.OK) {
+          let hydrated: TimelineEvent | null = null;
+          setEvents((prev) => {
+            const base = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
+            const next = hydrateTimelineDetailEvent(base, msg);
+            if (next === base) return base;
+            hydrated = next.find((event) => event.eventId === msg.eventId) ?? null;
+            if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, next);
+            return next;
+          });
+          if (hydrated) {
+            recordTimelineResponse(msg, loading ? 'bootstrap' : 'refresh');
+            idbPutEvents([hydrated]);
+          }
+          return;
+        }
+        recordTimelineResponse(msg, loading ? 'bootstrap' : 'refresh');
       }
 
       // ── Reconnect: daemon restarted → epoch changed, replay is useless. Request only new events. ──
@@ -1976,9 +2313,10 @@ export function useTimeline(
               http: serverId ? 'pending' : 'skipped',
               older: 'skipped',
             },
+            response: null,
           });
           setRefreshing(true);
-          sendForwardHistoryRequest('refresh', { limit: MAX_MEMORY_EVENTS });
+          sendForwardHistoryRequest('refresh', buildForwardHistoryArgs(MAX_MEMORY_EVENTS));
           fireHttpBackfillRef.current(600, { phase: 'refresh', visible: true });
         }
       }
@@ -2020,6 +2358,7 @@ export function useTimeline(
               http: 'skipped',
               older: 'skipped',
             },
+            response: null,
           });
           const current = eventsRef.current;
           const replayAfterSeq = seqRef.current > 0
@@ -2120,11 +2459,11 @@ export function useTimeline(
 
     const unsub = ws.onMessage(handler);
     return unsub;
-  }, [beginReconnectRefresh, clearForwardHistoryTimeout, disableHistory, isActiveSession, ws, sessionId, appendEvent, clearOptimisticTimer, loading, markOptimisticFailed, mergeEvents, reconcileQueuedOptimisticMessages, rememberSettledCommandId, replaceEvents, scheduleAutoRetry, sendForwardHistoryRequest, serverId, settleOptimisticByCommandAck, settleOptimisticByCommandAckEvent, settleOptimisticByTimelineProgress, updateHistoryStep]);
+  }, [beginReconnectRefresh, buildForwardHistoryArgs, clearForwardHistoryTimeout, disableHistory, isActiveSession, ws, sessionId, appendEvent, clearOptimisticTimer, idbPutEvents, loading, markOptimisticFailed, mergeEvents, reconcileQueuedOptimisticMessages, recordTimelineResponse, rememberSettledCommandId, replaceEvents, resetOlderState, scheduleAutoRetry, sendForwardHistoryRequest, serverId, settleOptimisticByCommandAck, settleOptimisticByCommandAckEvent, settleOptimisticByTimelineProgress, updateHistoryStep]);
 
   useEffect(() => {
     if (loading || refreshing || httpRefreshing || loadingOlder) return;
-    setHistoryStatus((prev) => (prev.phase === 'idle' ? prev : createIdleHistoryStatus()));
+    setHistoryStatus((prev) => (prev.phase === 'idle' ? prev : { ...createIdleHistoryStatus(), response: prev.response }));
   }, [httpRefreshing, loading, loadingOlder, refreshing]);
 
   useEffect(() => {

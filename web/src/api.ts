@@ -7,6 +7,11 @@
 import { COOKIE_SESSION, COOKIE_CSRF, HEADER_CSRF } from '@shared/cookie-names.js';
 import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM } from '@shared/preview-types.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
+import type {
+  TimelineCursor,
+  TimelineDetailRef,
+  TimelinePayloadMetadata,
+} from '@shared/timeline-protocol.js';
 import type { ContextMemoryView, ContextModelConfig } from '@shared/context-types.js';
 import type { AuthoredContextScope } from '@shared/memory-scope.js';
 import type { SharedContextRuntimeConfigSnapshot } from '@shared/shared-context-runtime-config.js';
@@ -780,7 +785,17 @@ export async function fetchTimelineHistoryHttp(
   serverId: string,
   sessionName: string,
   opts: { afterTs?: number; beforeTs?: number; limit?: number } = {},
-): Promise<{ events: unknown[]; epoch: number | null; hasMore: boolean; nextCursor: number | null } | null> {
+): Promise<(
+  Omit<TimelinePayloadMetadata, 'nextCursor' | 'detailRefs'>
+  & {
+    events: unknown[];
+    epoch: number | null;
+    hasMore: boolean;
+    nextCursor: TimelineCursor | null;
+    legacyBeforeTs?: number;
+    detailRefs?: TimelineDetailRef[];
+  }
+) | null> {
   const params = new URLSearchParams();
   params.set('sessionName', sessionName);
   if (typeof opts.afterTs === 'number' && Number.isFinite(opts.afterTs)) params.set('afterTs', String(opts.afterTs));
@@ -792,8 +807,20 @@ export async function fetchTimelineHistoryHttp(
       sessionName: string;
       epoch: number | null;
       events: unknown[];
-      hasMore: boolean;
-      nextCursor: number | null;
+      hasMore?: boolean;
+      nextCursor?: TimelineCursor | number | null;
+      legacyBeforeTs?: number;
+      earliestTs?: number;
+      status?: TimelinePayloadMetadata['status'];
+      errorReason?: string;
+      source?: TimelinePayloadMetadata['source'];
+      payloadBytes?: number;
+      payloadTruncated?: boolean;
+      cursorReset?: boolean;
+      droppedEvents?: number;
+      truncatedEvents?: number;
+      detailRefs?: TimelineDetailRef[];
+      recoverable?: boolean;
     }>(`/api/server/${encodeURIComponent(serverId)}/timeline/history/full?${params.toString()}`, {
       method: 'GET',
       signal: timeout.signal,
@@ -802,7 +829,24 @@ export async function fetchTimelineHistoryHttp(
       events: Array.isArray(result.events) ? result.events : [],
       epoch: result.epoch ?? null,
       hasMore: !!result.hasMore,
-      nextCursor: result.nextCursor ?? null,
+      nextCursor: result.nextCursor && typeof result.nextCursor === 'object' ? result.nextCursor : null,
+      legacyBeforeTs: typeof result.nextCursor === 'number'
+        ? result.nextCursor
+        : typeof result.legacyBeforeTs === 'number'
+          ? result.legacyBeforeTs
+          : typeof result.earliestTs === 'number'
+            ? result.earliestTs
+            : undefined,
+      status: result.status,
+      errorReason: result.errorReason,
+      source: result.source,
+      payloadBytes: result.payloadBytes,
+      payloadTruncated: result.payloadTruncated,
+      cursorReset: result.cursorReset,
+      droppedEvents: result.droppedEvents,
+      truncatedEvents: result.truncatedEvents,
+      detailRefs: Array.isArray(result.detailRefs) ? result.detailRefs : undefined,
+      recoverable: result.recoverable,
     };
   } catch (err) {
     // 401/403 → let it propagate (auth handler already runs in apiFetch).

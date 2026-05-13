@@ -101,6 +101,28 @@ const CLONE_SKIPPED_REASONS = [
   'unsupported',
   'incomplete_spec',
 ] as const;
+const TIMELINE_STATUS_KEYS = [
+  'ok',
+  'empty',
+  'partial',
+  'deferred',
+  'payloadTruncated',
+  'cursorReset',
+  'queueFull',
+  'timeout',
+  'unavailable',
+  'projectionUnavailable',
+  'malformedRequest',
+  'internalError',
+  'detailMissing',
+  'detailExpired',
+  'detailUnauthorized',
+  'detailOversized',
+  'detailMalformed',
+  'pageCursorReset',
+  'pageMalformed',
+  'error',
+] as const;
 
 describe('generic i18n coverage guard', () => {
   it('keeps memory post-1.1 translation keys present in every locale', () => {
@@ -146,6 +168,18 @@ describe('generic i18n coverage guard', () => {
       }
       for (const reason of CLONE_SKIPPED_REASONS) {
         expect(clone?.skippedReason?.[reason], `${locale}: session.clone.skippedReason.${reason}`).toEqual(expect.any(String));
+      }
+    }
+  });
+
+  it('keeps timeline status translation keys present in every locale', () => {
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as {
+        chat?: { timelineStatus?: Record<string, string> };
+      };
+      for (const key of TIMELINE_STATUS_KEYS) {
+        expect(messages.chat?.timelineStatus?.[key], `${locale}: chat.timelineStatus.${key}`).toEqual(expect.any(String));
+        expect(messages.chat?.timelineStatus?.[key]?.trim().length, `${locale}: chat.timelineStatus.${key}`).toBeGreaterThan(0);
       }
     }
   });

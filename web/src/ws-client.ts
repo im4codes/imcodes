@@ -19,6 +19,11 @@ import {
   type SessionGroupCloneEvent,
   type SessionGroupCloneRequest,
 } from '@shared/session-group-clone.js';
+import {
+  TIMELINE_MESSAGES,
+  type TimelineCursor,
+  type TimelinePayloadMetadata,
+} from '@shared/timeline-protocol.js';
 import { CC_PRESET_MSG, type CcPreset, type CcPresetModelInfo } from '@shared/cc-presets.js';
 import { MEMORY_WS } from '@shared/memory-ws.js';
 import type {
@@ -78,6 +83,49 @@ export interface TransportUpgradeBlockedSession {
   } | null;
 }
 
+export type TimelineEventMessage = {
+  type: typeof TIMELINE_MESSAGES.EVENT;
+  event: TimelineEvent;
+};
+
+export type TimelineReplayResponseMessage = TimelinePayloadMetadata & {
+  type: typeof TIMELINE_MESSAGES.REPLAY;
+  sessionName: string;
+  requestId?: string;
+  events: TimelineEvent[];
+  truncated?: boolean;
+  epoch: number;
+};
+
+export type TimelineHistoryResponseMessage = TimelinePayloadMetadata & {
+  type: typeof TIMELINE_MESSAGES.HISTORY;
+  sessionName: string;
+  requestId?: string;
+  events: TimelineEvent[];
+  epoch: number;
+};
+
+export type TimelinePageResponseMessage = TimelinePayloadMetadata & {
+  type: typeof TIMELINE_MESSAGES.PAGE;
+  sessionName: string;
+  requestId?: string;
+  events: TimelineEvent[];
+  epoch: number;
+};
+
+export type TimelineDetailResponseMessage = TimelinePayloadMetadata & {
+  type: typeof TIMELINE_MESSAGES.DETAIL;
+  sessionName?: string;
+  requestId?: string;
+  detailId?: string;
+  eventId?: string;
+  fieldPath?: string;
+  value?: unknown;
+  detail?: unknown;
+  content?: unknown;
+  epoch?: number;
+};
+
 export type ServerMessage =
   | { type: 'terminal.diff'; diff: TerminalDiff }
   | { type: 'terminal.history'; sessionName: string; content: string }
@@ -97,9 +145,11 @@ export type ServerMessage =
   | { type: 'daemon.error'; kind: 'uncaughtException' | 'unhandledRejection' | 'warning'; message: string; stack?: string; ts: number }
   | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; project: string; role: string; agentType: string; agentVersion?: string; state: string; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; userCreated?: boolean; qwenModel?: string; requestedModel?: string; activeModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; copilotAvailableModels?: string[]; cursorAvailableModels?: string[]; codexAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; permissionLabel?: string; quotaLabel?: string; quotaUsageLabel?: string; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace']; contextNamespaceDiagnostics?: string[]; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextRetryExhausted?: boolean; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride; transportConfig?: Record<string, unknown> | null; transportPendingMessages?: string[]; transportPendingMessageEntries?: Array<{ clientMessageId: string; text: string }> }> }
   | { type: 'outbound'; platform: string; channelId: string; content: string }
-  | { type: 'timeline.event'; event: TimelineEvent }
-  | { type: 'timeline.replay'; sessionName: string; requestId?: string; events: TimelineEvent[]; truncated: boolean; epoch: number }
-  | { type: 'timeline.history'; sessionName: string; requestId?: string; events: TimelineEvent[]; epoch: number }
+  | TimelineEventMessage
+  | TimelineReplayResponseMessage
+  | TimelineHistoryResponseMessage
+  | TimelinePageResponseMessage
+  | TimelineDetailResponseMessage
   | { type: 'command.ack'; commandId: string; status: string; session: string }
   | { type: typeof MSG_COMMAND_FAILED; commandId: string; session: string; reason: AckFailureReason; retryable: boolean }
   | { type: typeof MSG_DAEMON_ONLINE }
@@ -207,6 +257,12 @@ export type {
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30000;
 const HEARTBEAT_MS = 10000; // lowered from 25s for faster dead-connection detection
+const TERMINAL_SUBSCRIPTION_DEBOUNCE_MS = 50;
+const TERMINAL_SUBSCRIPTION_STAGGER_MS = 30;
+const TERMINAL_RECONNECT_REPLAY_STAGGER_MS = 90;
+const POST_CONNECT_NON_CRITICAL_WINDOW_MS = 1_000;
+const POST_CONNECT_NON_CRITICAL_BASE_DELAY_MS = 250;
+const POST_CONNECT_NON_CRITICAL_STAGGER_MS = 90;
 /** If no pong arrives within this window after a ping, assume the socket is a
  *  half-open zombie (iOS/Android commonly leave the TCP open after aggressive
  *  background eviction) and force a fresh reconnect.
@@ -315,9 +371,16 @@ export class WsClient {
   private terminalBaseSubscriptions = new Map<string, boolean>();
   /** Raw-mode holds used by embedded live terminal surfaces that must not be downgraded by passive subscriptions. */
   private terminalRawHolds = new Map<string, number>();
+  private sentTerminalSubscriptions = new Map<string, boolean>();
+  private terminalSubscriptionTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private terminalSubscriptionNextFlushAt = 0;
 
   /** Desired transport-chat subscriptions per session. Replayed on browser reconnect. */
   private transportSubscriptions = new Set<string>();
+
+  private postConnectNonCriticalUntil = 0;
+  private postConnectNonCriticalSlots = 0;
+  private nonCriticalSendTimers = new Set<ReturnType<typeof setTimeout>>();
 
   /** Per-session stream reset recovery state.
    *  - lastSnapshotAt: rate-limits snapshot requests to avoid hammering the
@@ -398,6 +461,15 @@ export class WsClient {
   }
 
   send(msg: object): void {
+    const json = this.serializeOutboundMessage(msg);
+    if (this.shouldStaggerNonCriticalMessage(msg)) {
+      this.enqueueNonCriticalSend(json);
+      return;
+    }
+    this.sendJsonNow(json);
+  }
+
+  private serializeOutboundMessage(msg: object): string {
     if (!this._connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
       throw new Error('WebSocket not connected');
     }
@@ -405,7 +477,44 @@ export class WsClient {
     if (json.length > 60_000) {
       throw new Error('Message too large');
     }
+    return json;
+  }
+
+  private sendJsonNow(json: string): void {
+    if (!this._connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error('WebSocket not connected');
+    }
     this.ws.send(json);
+  }
+
+  private shouldStaggerNonCriticalMessage(msg: object): boolean {
+    if (this.postConnectNonCriticalUntil <= Date.now()) return false;
+    const type = (msg as { type?: unknown }).type;
+    if (type === 'transport.list_models') {
+      return (msg as { force?: unknown }).force !== true;
+    }
+    return type === 'fs.ls' || type === 'fs.git_status';
+  }
+
+  private enqueueNonCriticalSend(json: string): void {
+    const now = Date.now();
+    const elapsedSinceConnect = POST_CONNECT_NON_CRITICAL_WINDOW_MS
+      - Math.max(0, this.postConnectNonCriticalUntil - now);
+    const baseDelay = Math.max(0, POST_CONNECT_NON_CRITICAL_BASE_DELAY_MS - elapsedSinceConnect);
+    const delay = baseDelay + (this.postConnectNonCriticalSlots * POST_CONNECT_NON_CRITICAL_STAGGER_MS);
+    this.postConnectNonCriticalSlots += 1;
+
+    const timer = setTimeout(() => {
+      this.nonCriticalSendTimers.delete(timer);
+      if (this._destroyed || !this._connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+      try {
+        this.sendJsonNow(json);
+      } catch {
+        // The caller already has a request-level timeout path; stale queued
+        // non-critical work should not resurrect a broken socket.
+      }
+    }, delay);
+    this.nonCriticalSendTimers.add(timer);
   }
 
   /**
@@ -532,8 +641,7 @@ export class WsClient {
       return;
     }
     this.terminalSubscriptions.delete(sessionName);
-    if (!this._connected) return;
-    this.send({ type: 'terminal.unsubscribe', session: sessionName });
+    this.queueTerminalSubscriptionSync(sessionName);
   }
 
   holdTerminalRaw(sessionName: string): () => void {
@@ -556,13 +664,49 @@ export class WsClient {
       || (this.terminalRawHolds.get(sessionName) ?? 0) > 0;
     if (!hasBase && !raw) {
       this.terminalSubscriptions.delete(sessionName);
-      if (!this._connected) return;
-      this.send({ type: 'terminal.unsubscribe', session: sessionName });
+      this.queueTerminalSubscriptionSync(sessionName);
       return;
     }
     this.terminalSubscriptions.set(sessionName, raw);
-    if (!this._connected) return;
-    this.send({ type: 'terminal.subscribe', session: sessionName, raw });
+    this.queueTerminalSubscriptionSync(sessionName);
+  }
+
+  private queueTerminalSubscriptionSync(
+    sessionName: string,
+    minDelayMs = TERMINAL_SUBSCRIPTION_DEBOUNCE_MS,
+  ): void {
+    const existing = this.terminalSubscriptionTimers.get(sessionName);
+    if (existing) clearTimeout(existing);
+    this.terminalSubscriptionTimers.delete(sessionName);
+    if (!this._connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+    const now = Date.now();
+    const earliest = now + minDelayMs;
+    const scheduledAt = Math.max(earliest, this.terminalSubscriptionNextFlushAt);
+    this.terminalSubscriptionNextFlushAt = scheduledAt + TERMINAL_SUBSCRIPTION_STAGGER_MS;
+
+    const timer = setTimeout(() => {
+      this.terminalSubscriptionTimers.delete(sessionName);
+      this.flushTerminalSubscription(sessionName);
+    }, Math.max(0, scheduledAt - now));
+    this.terminalSubscriptionTimers.set(sessionName, timer);
+  }
+
+  private flushTerminalSubscription(sessionName: string): void {
+    if (!this._connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+    const desiredRaw = this.terminalSubscriptions.get(sessionName);
+    const sentRaw = this.sentTerminalSubscriptions.get(sessionName);
+    if (desiredRaw === undefined) {
+      if (sentRaw === undefined) return;
+      this.sendJsonNow(JSON.stringify({ type: 'terminal.unsubscribe', session: sessionName }));
+      this.sentTerminalSubscriptions.delete(sessionName);
+      return;
+    }
+
+    if (sentRaw === desiredRaw) return;
+    this.sendJsonNow(JSON.stringify({ type: 'terminal.subscribe', session: sessionName, raw: desiredRaw }));
+    this.sentTerminalSubscriptions.set(sessionName, desiredRaw);
   }
 
   /** Subscribe to transport chat events for a session (history replay + live approval/tool updates). */
@@ -801,7 +945,11 @@ export class WsClient {
     P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE,
     P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE,
     'daemon.stats',
-    'timeline.event',
+    TIMELINE_MESSAGES.EVENT,
+    TIMELINE_MESSAGES.REPLAY,
+    TIMELINE_MESSAGES.HISTORY,
+    TIMELINE_MESSAGES.PAGE,
+    TIMELINE_MESSAGES.DETAIL,
     'session_list',
     REPO_MSG.DETECTED,
     REPO_MSG.CHECKOUT_BRANCH_RESPONSE,
@@ -885,7 +1033,7 @@ export class WsClient {
   /** Request timeline event replay from the daemon for reconnection gap-fill. */
   sendTimelineReplayRequest(sessionName: string, afterSeq: number, epoch: number): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'timeline.replay_request', sessionName, afterSeq, epoch, requestId });
+    this.send({ type: TIMELINE_MESSAGES.REPLAY_REQUEST, sessionName, afterSeq, epoch, requestId });
     return requestId;
   }
 
@@ -1037,7 +1185,45 @@ export class WsClient {
    *  beforeTs: for backward pagination — server returns only older events. */
   sendTimelineHistoryRequest(sessionName: string, limit = 500, afterTs?: number, beforeTs?: number): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'timeline.history_request', sessionName, requestId, limit, ...(afterTs !== undefined ? { afterTs } : {}), ...(beforeTs !== undefined ? { beforeTs } : {}) });
+    this.send({
+      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+      sessionName,
+      requestId,
+      limit,
+      ...(afterTs !== undefined ? { afterTs } : {}),
+      ...(beforeTs !== undefined ? { beforeTs } : {}),
+    });
+    return requestId;
+  }
+
+  /** Request a bounded explicit timeline page. */
+  sendTimelinePageRequest(sessionName: string, cursor: TimelineCursor, limit = 500): string {
+    const requestId = crypto.randomUUID();
+    this.send({
+      type: TIMELINE_MESSAGES.PAGE_REQUEST,
+      sessionName,
+      requestId,
+      limit,
+      cursor,
+      ...(cursor.afterTs !== undefined ? { afterTs: cursor.afterTs } : {}),
+      ...(cursor.beforeTs !== undefined ? { beforeTs: cursor.beforeTs } : {}),
+      ...(cursor.afterSeq !== undefined ? { afterSeq: cursor.afterSeq } : {}),
+      epoch: cursor.epoch,
+    });
+    return requestId;
+  }
+
+  /** Request a bounded timeline detail payload by opaque detail id. */
+  sendTimelineDetailRequest(sessionName: string, detailId: string, opts?: { eventId?: string; fieldPath?: string }): string {
+    const requestId = crypto.randomUUID();
+    this.send({
+      type: TIMELINE_MESSAGES.DETAIL_REQUEST,
+      sessionName,
+      requestId,
+      detailId,
+      ...(opts?.eventId ? { eventId: opts.eventId } : {}),
+      ...(opts?.fieldPath ? { fieldPath: opts.fieldPath } : {}),
+    });
     return requestId;
   }
 
@@ -1114,6 +1300,10 @@ export class WsClient {
       this._connected = true;
       this.clearReconnectTimer();
       this.reconnectAttempt = 0;
+      this.sentTerminalSubscriptions.clear();
+      this.terminalSubscriptionNextFlushAt = 0;
+      this.postConnectNonCriticalUntil = Date.now() + POST_CONNECT_NON_CRITICAL_WINDOW_MS;
+      this.postConnectNonCriticalSlots = 0;
       this.startHeartbeat();
       // Reset per-session stream-reset bookkeeping on reconnect. Stale pending
       // snapshot timers from the old socket are cleared so they don't fire
@@ -1122,12 +1312,10 @@ export class WsClient {
         if (state.pendingSnapshot) clearTimeout(state.pendingSnapshot);
       }
       this.resetState.clear();
-      for (const [session, raw] of this.terminalSubscriptions) {
-        try {
-          this.send({ type: 'terminal.subscribe', session, raw });
-        } catch {
-          break;
-        }
+      let terminalReplayIndex = 0;
+      for (const session of this.terminalSubscriptions.keys()) {
+        this.queueTerminalSubscriptionSync(session, terminalReplayIndex * TERMINAL_RECONNECT_REPLAY_STAGGER_MS);
+        terminalReplayIndex++;
       }
       for (const sessionId of this.transportSubscriptions) {
         try {
@@ -1331,6 +1519,8 @@ export class WsClient {
   private clearSocketTimers(): void {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.clearPongWatchdog();
+    this.clearTerminalSubscriptionTimers();
+    this.clearNonCriticalSendTimers();
     this.clearP2pWorkflowPendingRequests();
     // Capability state belongs to a single daemon WS; on socket teardown
     // the cached snapshot is no longer authoritative and must be cleared
@@ -1347,6 +1537,24 @@ export class WsClient {
     this._pingSentAt = null;
     this._missedHeartbeatPongs = 0;
     this._resumeProbeMisses = 0;
+  }
+
+  private clearTerminalSubscriptionTimers(): void {
+    for (const timer of this.terminalSubscriptionTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.terminalSubscriptionTimers.clear();
+    this.sentTerminalSubscriptions.clear();
+    this.terminalSubscriptionNextFlushAt = 0;
+  }
+
+  private clearNonCriticalSendTimers(): void {
+    for (const timer of this.nonCriticalSendTimers) {
+      clearTimeout(timer);
+    }
+    this.nonCriticalSendTimers.clear();
+    this.postConnectNonCriticalUntil = 0;
+    this.postConnectNonCriticalSlots = 0;
   }
 
   private detachCurrentSocket(code: number, reason: string): void {

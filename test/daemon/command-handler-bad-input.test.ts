@@ -24,6 +24,8 @@
  *      for inputs that are obviously not valid commands.
  */
 import { describe, expect, it, vi, beforeAll, beforeEach, afterEach } from 'vitest';
+import { TIMELINE_REQUEST_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
+import { TIMELINE_MESSAGES, TIMELINE_RESPONSE_STATUS } from '../../shared/timeline-protocol.js';
 
 // Mock the heavyweight modules the dispatcher transitively imports so we
 // can load the file under test without booting the entire daemon.
@@ -166,6 +168,26 @@ describe('handleWebCommand: malformed inputs do not crash', () => {
     }, link as never)).not.toThrow();
 
     expect(uncaughtExceptions).toEqual([]);
+  });
+
+  it('malformed timeline replay request returns a terminal protocol error when routable', async () => {
+    const link = makeFakeServerLink();
+
+    expect(() => handleWebCommand({
+      type: TIMELINE_MESSAGES.REPLAY_REQUEST,
+      sessionName: 'deck_bad_replay',
+      requestId: 'replay-bad',
+    }, link as never)).not.toThrow();
+
+    expect(uncaughtExceptions).toEqual([]);
+    expect(link.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: TIMELINE_MESSAGES.REPLAY,
+      sessionName: 'deck_bad_replay',
+      requestId: 'replay-bad',
+      status: TIMELINE_RESPONSE_STATUS.ERROR,
+      errorReason: TIMELINE_REQUEST_ERROR_REASONS.MALFORMED_REQUEST,
+      events: [],
+    }));
   });
 
   it('source code retains the dispatch try/catch wrapper', async () => {

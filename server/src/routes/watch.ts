@@ -14,6 +14,7 @@ import {
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { WsBridge } from '../ws/bridge.js';
 import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
+import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../../shared/timeline-payload-budget.js';
 import { getPodIdentity } from '../util/pod-identity.js';
 import logger from '../util/logger.js';
 
@@ -81,6 +82,7 @@ async function backfillSessionTextTailFromDaemon(
       sessionName,
       limit: TEXT_TAIL_HISTORY_PAGE_LIMIT,
       timeoutMs: TEXT_TAIL_HISTORY_TIMEOUT_MS,
+      budgetBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE,
       ...(beforeTs !== undefined ? { beforeTs } : {}),
     });
     const rawEvents = Array.isArray(response.events)
@@ -145,6 +147,49 @@ function sanitizeWatchTimelineEvent(raw: unknown): {
     type,
     payload: text !== undefined ? { text } : {},
   };
+}
+
+function timelineResponseMetadata(response: Record<string, unknown>): Record<string, unknown> {
+  const metadata: Record<string, unknown> = {};
+  for (const key of ['status', 'errorReason', 'source'] as const) {
+    if (typeof response[key] === 'string') metadata[key] = response[key];
+  }
+  for (const key of ['payloadBytes', 'actualPayloadBytes', 'droppedEvents', 'truncatedEvents'] as const) {
+    if (typeof response[key] === 'number' && Number.isFinite(response[key])) metadata[key] = response[key];
+  }
+  for (const key of ['payloadTruncated', 'cursorReset'] as const) {
+    if (typeof response[key] === 'boolean') metadata[key] = response[key];
+  }
+  if (Array.isArray(response.detailRefs)) metadata.detailRefs = response.detailRefs;
+  if (response.nextCursor && typeof response.nextCursor === 'object') metadata.timelineCursor = response.nextCursor;
+  return metadata;
+}
+
+async function verifyWatchSessionOwnership(db: Env['DB'], serverId: string, sessionName: string): Promise<boolean> {
+  try {
+    const mainRow = await db.queryOne<Record<string, unknown>>(
+      'SELECT 1 FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
+      [serverId, sessionName],
+    );
+    if (mainRow) return true;
+
+    const subMatch = sessionName.match(/^deck_sub_(.+)$/);
+    if (!subMatch) return false;
+    const subRow = await db.queryOne<Record<string, unknown>>(
+      'SELECT 1 FROM sub_sessions WHERE server_id = $1 AND id = $2 LIMIT 1',
+      [serverId, subMatch[1]],
+    );
+    return !!subRow;
+  } catch (err) {
+    logger.warn({ serverId, sessionName, err }, 'watch timeline session ownership check failed');
+    return false;
+  }
+}
+
+function structuredTimelineCursor(response: Record<string, unknown>): Record<string, unknown> | null {
+  return response.nextCursor && typeof response.nextCursor === 'object' && !Array.isArray(response.nextCursor)
+    ? response.nextCursor as Record<string, unknown>
+    : null;
 }
 
 
@@ -292,6 +337,9 @@ watchRoutes.get('/server/:id/timeline/history', requireAuth(), async (c) => {
 
   const sessionName = c.req.query('sessionName')?.trim();
   if (!sessionName) return c.json({ error: 'session_name_required' }, 400);
+  if (!await verifyWatchSessionOwnership(c.env.DB, serverId, sessionName)) {
+    return c.json({ error: 'forbidden' }, 403);
+  }
 
   const rawLimit = Number(c.req.query('limit') ?? '50');
   const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.trunc(rawLimit), 200) : 50;
@@ -304,6 +352,7 @@ watchRoutes.get('/server/:id/timeline/history', requireAuth(), async (c) => {
     const response = await WsBridge.get(serverId).requestTimelineHistory({
       sessionName,
       limit,
+      budgetBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE,
       ...(beforeTs !== undefined && Number.isFinite(beforeTs) ? { beforeTs } : {}),
       ...(afterTs !== undefined && Number.isFinite(afterTs) ? { afterTs } : {}),
     });
@@ -316,13 +365,18 @@ watchRoutes.get('/server/:id/timeline/history', requireAuth(), async (c) => {
       ? events[0].ts
       : null;
     const hasMore = earliestTs !== null && events.length >= limit;
+    const responseHasMore = typeof response.hasMore === 'boolean' ? response.hasMore : hasMore;
+    const nextCursor = structuredTimelineCursor(response);
 
     return c.json({
       sessionName,
       epoch: typeof response.epoch === 'number' ? response.epoch : null,
       events,
-      hasMore,
-      nextCursor: hasMore ? earliestTs : null,
+      ...timelineResponseMetadata(response),
+      hasMore: responseHasMore,
+      nextCursor,
+      earliestTs,
+      legacyBeforeTs: responseHasMore ? earliestTs : null,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -333,14 +387,14 @@ watchRoutes.get('/server/:id/timeline/history', requireAuth(), async (c) => {
 });
 
 /**
- * Web-facing full-fidelity variant of the Watch timeline/history endpoint.
+ * Web-facing full-shape variant of the Watch timeline/history endpoint.
  *
  * The Watch endpoint above deliberately strips TimelineEvent down to
  * {eventId, sessionId, ts, type, payload.text} for bandwidth/complexity
- * on tiny Watch UIs. The web client needs the full event shape (tool.call
- * payloads, session.state fields, user.message pending flags, etc.) so it
- * can dedup via `mergeTimelineEvents` and render the same way as live
- * WS timeline.event messages.
+ * on tiny Watch UIs. The web client needs the shaped event records
+ * (tool previews, session.state fields, user.message pending flags, etc.)
+ * so it can dedup via `mergeTimelineEvents` and render the same way as live
+ * websocket timeline events.
  *
  * Why a separate HTTP path when WS `timeline.history_request` already exists:
  * the WS request rides on the same socket whose subscription may still be
@@ -351,8 +405,9 @@ watchRoutes.get('/server/:id/timeline/history', requireAuth(), async (c) => {
  * directly and recovers those events — dedup by eventId makes it safe to
  * merge alongside the WS path.
  *
- * Response schema mirrors the Watch variant except `events[]` contains the
- * raw, unsanitized TimelineEvent records the daemon persisted.
+ * Response schema mirrors the Watch variant except `events[]` preserves the
+ * daemon-shaped TimelineEvent fields. It is still a bounded data-plane page,
+ * not a raw unbounded history dump.
  */
 watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
@@ -362,6 +417,9 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
 
   const sessionName = c.req.query('sessionName')?.trim();
   if (!sessionName) return c.json({ error: 'session_name_required' }, 400);
+  if (!await verifyWatchSessionOwnership(c.env.DB, serverId, sessionName)) {
+    return c.json({ error: 'forbidden' }, 403);
+  }
 
   const rawLimit = Number(c.req.query('limit') ?? '50');
   const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.trunc(rawLimit), 500) : 50;
@@ -379,6 +437,8 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
     const response = await WsBridge.get(serverId).requestTimelineHistory({
       sessionName,
       limit,
+      budgetBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL,
+      includeDetails: true,
       ...(beforeTs !== undefined && Number.isFinite(beforeTs) ? { beforeTs } : {}),
       ...(afterTs !== undefined && Number.isFinite(afterTs) ? { afterTs } : {}),
     });
@@ -400,11 +460,15 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
       ? events[0].ts as number
       : null;
     const hasMore = earliestTs !== null && events.length >= limit;
+    const responseHasMore = typeof response.hasMore === 'boolean' ? response.hasMore : hasMore;
+    const nextCursor = structuredTimelineCursor(response);
 
     const totalMs = Date.now() - tStart;
     logger.info({
       serverId, sessionName, limit, afterTs, beforeTs,
       eventsReturned: events.length,
+      payloadBytes: typeof response.payloadBytes === 'number' ? response.payloadBytes : undefined,
+      payloadTruncated: typeof response.payloadTruncated === 'boolean' ? response.payloadTruncated : undefined,
       bridgeMs, totalMs,
     }, 'timeline.history/full served');
 
@@ -412,8 +476,11 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
       sessionName,
       epoch: typeof response.epoch === 'number' ? response.epoch : null,
       events,
-      hasMore,
-      nextCursor: hasMore ? earliestTs : null,
+      ...timelineResponseMetadata(response),
+      hasMore: responseHasMore,
+      nextCursor,
+      earliestTs,
+      legacyBeforeTs: responseHasMore ? earliestTs : null,
     });
   } catch (err) {
     const bridgeMs = Date.now() - tStart;
@@ -433,6 +500,9 @@ watchRoutes.get('/server/:id/timeline/text-tail', requireAuth(), async (c) => {
 
   const sessionName = c.req.query('sessionName')?.trim();
   if (!sessionName) return c.json({ error: 'session_name_required' }, 400);
+  if (!await verifyWatchSessionOwnership(c.env.DB, serverId, sessionName)) {
+    return c.json({ error: 'forbidden' }, 403);
+  }
 
   try {
     const cached = await getSessionTextTailCache(c.env.DB, serverId, sessionName);

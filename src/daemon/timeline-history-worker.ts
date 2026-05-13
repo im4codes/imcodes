@@ -3,8 +3,10 @@ import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { TimelineEvent } from './timeline-event.js';
-import { sanitizeTimelineHistoryEventsForTransport } from './timeline-history-sanitize.js';
+import { shapeTimelineEventsForTransport } from './timeline-response-shaper.js';
+import { collectTimelineHistoryDetailCandidates } from './timeline-history-sanitize.js';
 import type {
+  TimelineHistoryWorkerDetailCandidate,
   TimelineHistoryWorkerError,
   TimelineHistoryWorkerRequest,
   TimelineHistoryWorkerResult,
@@ -106,6 +108,27 @@ function queryByTypes(
   return rows.reverse().map(rowToEvent);
 }
 
+export function collectSelectedDetailCandidates(
+  originalEvents: readonly TimelineEvent[],
+  selectedEvents: readonly TimelineEvent[],
+): TimelineHistoryWorkerDetailCandidate[] {
+  if (selectedEvents.length === 0) return [];
+  const selectedIds = new Set(selectedEvents.map((event) => event.eventId));
+  const candidates: TimelineHistoryWorkerDetailCandidate[] = [];
+  const seen = new Set<string>();
+
+  for (const event of originalEvents) {
+    if (!selectedIds.has(event.eventId)) continue;
+    for (const candidate of collectTimelineHistoryDetailCandidates(event)) {
+      const key = `${candidate.eventId}:${candidate.fieldPath}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      candidates.push(candidate);
+    }
+  }
+  return candidates;
+}
+
 export async function handleTimelineHistoryWorkerRequest(
   message: TimelineHistoryWorkerRequest,
 ): Promise<TimelineHistoryWorkerResult> {
@@ -149,7 +172,10 @@ export async function handleTimelineHistoryWorkerRequest(
     }
 
     const tSanitize = Date.now();
-    const sanitized = sanitizeTimelineHistoryEventsForTransport(trimmed);
+    const sanitized = shapeTimelineEventsForTransport(trimmed, {
+      maxResponseBytes: message.maxResponseBytes,
+    });
+    const detailCandidates = collectSelectedDetailCandidates(trimmed, sanitized.events);
     const sanitizeMs = Date.now() - tSanitize;
 
     const response: TimelineHistoryWorkerSuccess = {
@@ -158,6 +184,7 @@ export async function handleTimelineHistoryWorkerRequest(
       workerGeneration: message.workerGeneration,
       kind: 'success',
       events: sanitized.events,
+      detailCandidates,
       eventsRead: events.length,
       payloadBytes: sanitized.payloadBytes,
       droppedEvents: sanitized.droppedEvents,

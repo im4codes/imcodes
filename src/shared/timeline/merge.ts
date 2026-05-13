@@ -1,7 +1,48 @@
 import type { TimelineEvent } from './types.js';
+import {
+  TIMELINE_DETAIL_FIELD_PATHS as SHARED_TIMELINE_DETAIL_FIELD_PATHS,
+  type TimelineDetailFieldPath,
+} from '../../../shared/timeline-protocol.js';
+
+export const TIMELINE_DETAIL_FIELD_PATHS = Object.values(SHARED_TIMELINE_DETAIL_FIELD_PATHS) as TimelineDetailFieldPath[];
+export type { TimelineDetailFieldPath };
 
 function isStreaming(event: TimelineEvent): boolean {
   return event.payload.streaming === true;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function hasDetailRefs(value: unknown): boolean {
+  return Array.isArray(value) && value.length > 0;
+}
+
+function getCompletenessRank(event: TimelineEvent): number {
+  const eventRecord = event as unknown as Record<string, unknown>;
+  const payload = event.payload;
+  const completeness = payload.completeness ?? payload.timelineCompleteness ?? eventRecord.completeness ?? eventRecord.timelineCompleteness;
+  if (completeness === 'hydrated') return 2;
+  if (completeness === 'full') return 1;
+  if (payload.historyPayloadTruncated === true) return 0;
+  if (payload.payloadTruncated === true) return 0;
+  if (payload.timelinePayloadTruncated === true) return 0;
+  if (payload.completeness === 'preview') return 0;
+  if (payload.timelineCompleteness === 'preview') return 0;
+  if (eventRecord.completeness === 'preview') return 0;
+  if (eventRecord.timelineCompleteness === 'preview') return 0;
+  if (hasDetailRefs(payload.detailRefs)) return 0;
+  if (hasDetailRefs(eventRecord.detailRefs)) return 0;
+  if (isRecord(payload.detail) && payload.detail.truncated === true) return 0;
+  return 1;
+}
+
+function compareCompleteness(existing: TimelineEvent, incoming: TimelineEvent): number {
+  const existingRank = getCompletenessRank(existing);
+  const incomingRank = getCompletenessRank(incoming);
+  if (existingRank === incomingRank) return 0;
+  return incomingRank > existingRank ? 1 : -1;
 }
 
 function compareNumbers(a: number | undefined, b: number | undefined): number {
@@ -15,13 +56,17 @@ function compareNumbers(a: number | undefined, b: number | undefined): number {
  * Resolve same-eventId conflicts deterministically.
  *
  * Preference order:
- * 1. terminal/non-streaming over streaming
- * 2. newer epoch
- * 3. newer seq
- * 4. newer ts
- * 5. incoming as tie-breaker
+ * 1. full events over preview events
+ * 2. terminal/non-streaming over streaming
+ * 3. newer epoch
+ * 4. newer seq
+ * 5. newer ts
+ * 6. incoming as tie-breaker
  */
 export function preferTimelineEvent(existing: TimelineEvent, incoming: TimelineEvent): TimelineEvent {
+  const completenessCmp = compareCompleteness(existing, incoming);
+  if (completenessCmp !== 0) return completenessCmp > 0 ? incoming : existing;
+
   const existingStreaming = isStreaming(existing);
   const incomingStreaming = isStreaming(incoming);
   if (existingStreaming !== incomingStreaming) {

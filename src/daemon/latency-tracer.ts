@@ -1,8 +1,10 @@
 import { createWriteStream, existsSync, mkdirSync, renameSync, statSync, unlinkSync, type WriteStream } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir, loadavg } from 'node:os';
-import { monitorEventLoopDelay, performance } from 'node:perf_hooks';
+import { PerformanceObserver, monitorEventLoopDelay, performance } from 'node:perf_hooks';
 import logger from '../util/logger.js';
+import { MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
+import { TIMELINE_MESSAGES } from '../../shared/timeline-protocol.js';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -17,7 +19,14 @@ interface RecentSpan {
   name: string;
   durationMs: number;
   endedAt: number;
+  startedAt: number;
   meta?: JsonRecord;
+}
+
+interface GcMarker {
+  kind: number;
+  durationMs: number;
+  endedAt: number;
 }
 
 const TRUE_RE = /^(1|true|yes|on|debug)$/i;
@@ -35,12 +44,17 @@ let started = false;
 let sampleTimer: ReturnType<typeof setInterval> | null = null;
 let driftTimer: ReturnType<typeof setInterval> | null = null;
 let eventLoopMonitor: ReturnType<typeof monitorEventLoopDelay> | null = null;
+let gcObserver: PerformanceObserver | null = null;
 let lastCpu = process.cpuUsage();
 let lastCpuAt = performance.now();
 let lastElu = performance.eventLoopUtilization();
 let expectedDriftAt = 0;
 const commandReceipts = new Map<string, CommandReceipt>();
-let recentHeavySpan: RecentSpan | null = null;
+const activeSpanStack: RecentSpan[] = [];
+const recentSpans: RecentSpan[] = [];
+const recentGcMarkers: GcMarker[] = [];
+const RECENT_SPAN_MAX = 64;
+const RECENT_GC_MAX = 32;
 
 function envFlag(name: string): boolean {
   return TRUE_RE.test(String(process.env[name] ?? ''));
@@ -163,16 +177,48 @@ function cleanupCommandReceipts(now = performance.now()): void {
   }
 }
 
-function maybeRecordSpan(name: string, durationMs: number, meta: JsonRecord | undefined, thresholdMs: number, force = false): void {
+function rememberRecentSpan(span: RecentSpan): void {
+  recentSpans.push(span);
+  if (recentSpans.length > RECENT_SPAN_MAX) recentSpans.splice(0, recentSpans.length - RECENT_SPAN_MAX);
+}
+
+function rememberGcMarker(marker: GcMarker): void {
+  recentGcMarkers.push(marker);
+  if (recentGcMarkers.length > RECENT_GC_MAX) recentGcMarkers.splice(0, recentGcMarkers.length - RECENT_GC_MAX);
+}
+
+function findRecentSpan(now: number): RecentSpan | null {
+  for (let index = recentSpans.length - 1; index >= 0; index -= 1) {
+    const span = recentSpans[index]!;
+    if (now - span.endedAt < 2_000) return span;
+  }
+  return null;
+}
+
+function findRecentGc(now: number): GcMarker | null {
+  for (let index = recentGcMarkers.length - 1; index >= 0; index -= 1) {
+    const marker = recentGcMarkers[index]!;
+    if (now - marker.endedAt < 2_000) return marker;
+  }
+  return null;
+}
+
+function removeActiveSpan(span: RecentSpan): void {
+  const index = activeSpanStack.lastIndexOf(span);
+  if (index >= 0) activeSpanStack.splice(index, 1);
+}
+
+function maybeRecordSpan(name: string, durationMs: number, meta: JsonRecord | undefined, thresholdMs: number, force = false, startedAt = performance.now() - durationMs): void {
   if (!enabled) return;
   const duration = roundMs(durationMs);
   if (durationMs >= thresholdMs) {
-    recentHeavySpan = {
+    rememberRecentSpan({
       name,
       durationMs: duration,
       endedAt: performance.now(),
+      startedAt,
       ...(meta ? { meta } : {}),
-    };
+    });
   }
   if (!force && durationMs < thresholdMs) return;
   writeTrace('span', {
@@ -209,6 +255,23 @@ export function startLatencyTracer(): void {
     eventLoopMonitor.enable();
   } catch (err) {
     logger.debug({ err }, 'latency-tracer: monitorEventLoopDelay unavailable');
+  }
+
+  try {
+    gcObserver = new PerformanceObserver((list) => {
+      for (const entry of list.getEntries()) {
+        const detail = entry as unknown as { kind?: number };
+        rememberGcMarker({
+          kind: typeof detail.kind === 'number' ? detail.kind : 0,
+          durationMs: roundMs(entry.duration),
+          endedAt: performance.now(),
+        });
+      }
+    });
+    gcObserver.observe({ entryTypes: ['gc'] });
+  } catch (err) {
+    gcObserver = null;
+    logger.debug({ err }, 'latency-tracer: gc PerformanceObserver unavailable');
   }
 
   const sampleMs = sampleIntervalMs();
@@ -264,14 +327,27 @@ export function startLatencyTracer(): void {
     const drift = now - expectedDriftAt;
     expectedDriftAt = now + driftMs;
     if (drift < driftThresholdMs()) return;
-    const recent = recentHeavySpan && now - recentHeavySpan.endedAt < 2_000 ? recentHeavySpan : null;
+    const active = activeSpanStack.at(-1) ?? null;
+    const recent = findRecentSpan(now);
+    const recentGc = findRecentGc(now);
+    const reason = active ? 'active_span' : recent ? 'recent_span' : recentGc ? 'gc' : 'unknown';
     writeTrace('event_loop_block', {
       driftMs: roundMs(drift),
       thresholdMs: driftThresholdMs(),
+      attributionReason: reason,
+      attributed: reason !== 'unknown',
+      ...(active ? {
+        likelyActiveSpan: active.name,
+        likelyActiveSpanMeta: active.meta,
+      } : {}),
       ...(recent ? {
         likelyRecentSpan: recent.name,
         likelyRecentSpanDurationMs: recent.durationMs,
         likelyRecentSpanMeta: recent.meta,
+      } : {}),
+      ...(recentGc ? {
+        likelyGcKind: recentGc.kind,
+        likelyGcDurationMs: recentGc.durationMs,
       } : {}),
     });
   }, driftMs);
@@ -283,20 +359,28 @@ export function startLatencyTracer(): void {
 export function traceSync<T>(name: string, meta: JsonRecord | undefined, fn: () => T, options?: { thresholdMs?: number; force?: boolean }): T {
   if (!enabled) return fn();
   const start = performance.now();
+  const span: RecentSpan = { name, durationMs: 0, startedAt: start, endedAt: start, ...(meta ? { meta } : {}) };
+  activeSpanStack.push(span);
   try {
     return fn();
   } finally {
-    maybeRecordSpan(name, performance.now() - start, meta, options?.thresholdMs ?? spanThresholdMs(), options?.force);
+    const duration = performance.now() - start;
+    removeActiveSpan(span);
+    maybeRecordSpan(name, duration, meta, options?.thresholdMs ?? spanThresholdMs(), options?.force, start);
   }
 }
 
 export async function traceAsync<T>(name: string, meta: JsonRecord | undefined, fn: () => Promise<T>, options?: { thresholdMs?: number; force?: boolean }): Promise<T> {
   if (!enabled) return fn();
   const start = performance.now();
+  const span: RecentSpan = { name, durationMs: 0, startedAt: start, endedAt: start, ...(meta ? { meta } : {}) };
+  activeSpanStack.push(span);
   try {
     return await fn();
   } finally {
-    maybeRecordSpan(name, performance.now() - start, meta, options?.thresholdMs ?? asyncThresholdMs(), options?.force);
+    const duration = performance.now() - start;
+    removeActiveSpan(span);
+    maybeRecordSpan(name, duration, meta, options?.thresholdMs ?? asyncThresholdMs(), options?.force, start);
   }
 }
 
@@ -357,17 +441,26 @@ export function stringifyForServerSend(msg: unknown, seq: number): { payload: st
   };
 }
 
+export type ServerSendPlane = 'control' | 'data' | 'unknown';
+
 export function recordServerSend(input: {
   msgType?: string;
   commandId?: string;
   jsonBytes: number;
   stringifyMs: number;
   wsSendMs: number;
+  bufferedAmountBefore?: number;
+  bufferedAmountAfter?: number;
+  sendBacklogAgeMs?: number;
+  outboundQueueDepth?: number;
+  outboundQueueAgeMs?: number;
+  recipientCount?: number;
   success: boolean;
 }): void {
   if (!enabled) return;
   const sendTotalMs = input.stringifyMs + input.wsSendMs;
-  const isAck = input.msgType === 'command.ack';
+  const isAck = input.msgType === MSG_COMMAND_ACK;
+  const plane = classifyServerSendPlane(input.msgType);
   let ackLatencyMs: number | undefined;
   let commandType: string | undefined;
   let sessionName: string | undefined;
@@ -395,12 +488,43 @@ export function recordServerSend(input: {
     stringifyMs: roundMs(input.stringifyMs),
     wsSendMs: roundMs(input.wsSendMs),
     totalMs: roundMs(sendTotalMs),
+    plane,
+    ...(input.bufferedAmountBefore !== undefined ? { bufferedAmountBefore: input.bufferedAmountBefore } : {}),
+    ...(input.bufferedAmountAfter !== undefined ? { bufferedAmountAfter: input.bufferedAmountAfter } : {}),
+    ...(input.sendBacklogAgeMs !== undefined ? { sendBacklogAgeMs: roundMs(input.sendBacklogAgeMs) } : {}),
+    ...(input.outboundQueueDepth !== undefined ? { outboundQueueDepth: input.outboundQueueDepth } : {}),
+    ...(input.outboundQueueAgeMs !== undefined ? { outboundQueueAgeMs: roundMs(input.outboundQueueAgeMs) } : {}),
+    ...(input.recipientCount !== undefined ? { recipientCount: input.recipientCount } : {}),
     success: input.success,
     ...(ackLatencyMs !== undefined ? { ackLatencyMs: roundMs(ackLatencyMs), ackSlowThresholdMs: ackSlowMs() } : {}),
   });
 }
 
+export function classifyServerSendPlane(msgType: string | undefined): ServerSendPlane {
+  if (!msgType) return 'unknown';
+  if (
+    msgType === MSG_COMMAND_ACK
+    || msgType === 'command.error'
+    || msgType.endsWith('.cancel_response')
+    || msgType === 'session.idle'
+    || msgType === 'daemon.hello'
+    || msgType === 'daemon.stats'
+    || msgType === 'heartbeat'
+  ) {
+    return 'control';
+  }
+  if (
+    (Object.values(TIMELINE_MESSAGES) as string[]).includes(msgType)
+    || msgType.startsWith('fs.')
+    || msgType === 'transport.models_response'
+    || msgType === 'chat.history'
+    || msgType === 'diagnostics.response'
+  ) {
+    return 'data';
+  }
+  return 'unknown';
+}
+
 export function recordTimelineEmit(input: JsonRecord & { durationMs: number; type: string; sessionId: string }): void {
   maybeRecordSpan('timeline.emit', input.durationMs, input, spanThresholdMs(), false);
 }
-

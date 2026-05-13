@@ -6,9 +6,11 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import {
+  TRANSPORT_HISTORY_REPLAY_BUDGET_BYTES,
   TRANSPORT_HISTORY_TOOL_RESULT_PREVIEW_BYTES,
   appendTransportEvent,
   replayTransportHistory,
+  trimTransportHistoryEventsToReplayBudget,
 } from '../../src/daemon/transport-history.js';
 
 // Use a unique session ID per test run to avoid cross-test file system collisions.
@@ -256,6 +258,7 @@ describe('transport-history', () => {
   });
 
   it('returns exactly MAX_REPLAY_LINES entries even when each line is large (reverse-chunk scans back as far as needed)', async () => {
+    // Synthetic-only JSONL: never copy real user transport logs into tests.
     // Adversarial shape: fewer lines, but each line is 6 KB. 200 tail
     // lines therefore need ~1.2 MB of file window — greater than any
     // fixed-byte "read last 1 MiB" strategy would cover. A simple
@@ -285,7 +288,7 @@ describe('transport-history', () => {
     // the trailing ~1 MiB, and returns the last 200 parsed entries.
     const session = `${TS}-large-jsonl`;
 
-    // Write 5000 entries, each with ~5KB of payload → ~25 MB file — well
+    // Write synthetic entries only: 5000 rows, each with ~5KB of payload → ~25 MB file — well
     // above the old "small fixture" but small enough to keep the test
     // itself fast. Each entry encodes its index so we can verify the tail.
     const BIG_PAYLOAD = 'x'.repeat(5000);
@@ -309,5 +312,32 @@ describe('transport-history', () => {
     const lastIdx = events[events.length - 1]['idx'] as number;
     expect(lastIdx).toBe(4999);
     expect(firstIdx).toBe(4800);
+  });
+
+  it('keeps default chat.history replay under 128KiB for subscribe bursts', async () => {
+    // Synthetic subscribe burst. This intentionally avoids real transcripts.
+    const session = `${TS}-bounded-chat-history`;
+    const output = 'x'.repeat(5_000);
+    for (let i = 0; i < 220; i++) {
+      await appendTransportEvent(session, {
+        type: 'assistant.text',
+        sessionId: session,
+        idx: i,
+        text: output,
+      });
+    }
+
+    const replayed = await replayTransportHistory(session);
+    expect(replayed).toHaveLength(200);
+
+    const events = trimTransportHistoryEventsToReplayBudget(session, replayed);
+    const envelopeBytes = Buffer.byteLength(JSON.stringify({ type: 'chat.history', sessionId: session, events }), 'utf8');
+
+    expect(envelopeBytes).toBeLessThanOrEqual(TRANSPORT_HISTORY_REPLAY_BUDGET_BYTES);
+    expect(events.length).toBeGreaterThan(0);
+    expect(events[events.length - 1]['idx']).toBe(219);
+    expect(events[0]['idx']).toBeGreaterThan(19);
+    expect(events.every((event) => event.type === 'assistant.text')).toBe(true);
+    expect(events.every((event) => event.detail === undefined)).toBe(true);
   });
 });

@@ -13,7 +13,12 @@ import { timelineEmitter } from './timeline-emitter.js';
 import { timelineStore } from './timeline-store.js';
 import { traceCommandAsync, traceSync, traceWebCommandReceived } from './latency-tracer.js';
 import { getDefaultTimelineHistoryWorkerPool, shouldUseTimelineHistoryWorkerPool, TimelineHistoryPoolError } from './timeline-history-pool.js';
-import { sanitizeTimelineHistoryEventsForTransport } from './timeline-history-sanitize.js';
+import { FsListPoolError, getDefaultFsListWorkerPool, shouldUseFsListWorkerPool } from './fs-list-pool.js';
+import { scanFsListSnapshot } from './fs-list-worker.js';
+import { FsGitStatusPoolError, getDefaultFsGitStatusWorkerPool, shouldUseFsGitStatusWorkerPool, __resetFsGitStatusWorkerPoolForTests } from './fs-git-status-pool.js';
+import { scanFsGitStatusSnapshot } from './fs-git-status-worker.js';
+import { shapeTimelineDetailValueForTransport, shapeTimelineEventsForTransport } from './timeline-response-shaper.js';
+import { getDefaultTimelineDetailStore } from './timeline-detail-store.js';
 import { TIMELINE_HISTORY_CONTENT_TYPES, TIMELINE_HISTORY_STATE_TYPES, type MemoryContextTimelinePayload, type TimelineEvent } from '../shared/timeline/types.js';
 import { emitSessionInlineError } from './session-error.js';
 import { enqueueResend, getResendEntries, clearResend } from './transport-resend-queue.js';
@@ -30,7 +35,17 @@ import { sendSubSessionSync } from './subsession-sync.js';
 import logger from '../util/logger.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID, MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
-import { TIMELINE_HISTORY_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
+import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
+import { TIMELINE_DETAIL_ERROR_REASONS, TIMELINE_HISTORY_ERROR_REASONS, TIMELINE_REQUEST_ERROR_REASONS, type TimelineRequestErrorReason } from '../../shared/timeline-history-errors.js';
+import {
+  TIMELINE_CURSOR_DIRECTIONS,
+  TIMELINE_MESSAGES,
+  TIMELINE_RESPONSE_SOURCES,
+  TIMELINE_RESPONSE_STATUS,
+  type TimelinePayloadMetadata,
+  type TimelineResponseSource,
+  type TimelineResponseStatus,
+} from '../../shared/timeline-protocol.js';
 import { homedir } from 'os';
 import { lstat as fsLstat, open as fsOpen, readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, stat as fsStat, unlink as fsUnlink, writeFile as fsWriteFile } from 'node:fs/promises';
 import * as nodePath from 'node:path';
@@ -833,22 +848,6 @@ export async function refreshCodexQuotaMetadata(serverLink?: ServerLink): Promis
   }
 }
 
-// ── Common MIME map for file metadata ────────────────────────────────────────
-
-const MIME_MAP: Record<string, string> = {
-  ts: 'text/typescript', tsx: 'text/typescript', js: 'text/javascript', jsx: 'text/javascript',
-  mjs: 'text/javascript', cjs: 'text/javascript', json: 'application/json', md: 'text/markdown',
-  txt: 'text/plain', html: 'text/html', css: 'text/css', xml: 'text/xml', yaml: 'text/yaml',
-  yml: 'text/yaml', toml: 'text/toml', sh: 'text/x-shellscript', py: 'text/x-python',
-  rb: 'text/x-ruby', go: 'text/x-go', rs: 'text/x-rust', java: 'text/x-java',
-  kt: 'text/x-kotlin', swift: 'text/x-swift', c: 'text/x-c', cpp: 'text/x-c++',
-  h: 'text/x-c', hpp: 'text/x-c++', sql: 'text/x-sql', lua: 'text/x-lua',
-  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
-  webp: 'image/webp', svg: 'image/svg+xml', ico: 'image/x-icon', bmp: 'image/bmp',
-  pdf: 'application/pdf', zip: 'application/zip', gz: 'application/gzip',
-  tar: 'application/x-tar', wasm: 'application/wasm',
-};
-
 // ── @@ token parsing ─────────────────────────────────────────────────────────
 
 /**
@@ -1276,22 +1275,35 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       handleGetSessions(serverLink);
       break;
     case 'terminal.subscribe':
-      handleSubscribe(cmd, serverLink);
+      traceSync('web_command.terminal_subscribe', {
+        sessionName: typeof cmd.sessionName === 'string' ? cmd.sessionName : undefined,
+      }, () => handleSubscribe(cmd, serverLink));
       break;
     case 'terminal.unsubscribe':
-      handleUnsubscribe(cmd);
+      traceSync('web_command.terminal_unsubscribe', {
+        sessionName: typeof cmd.sessionName === 'string' ? cmd.sessionName : undefined,
+      }, () => handleUnsubscribe(cmd));
       break;
     case 'terminal.snapshot_request':
       handleSnapshotRequest(cmd);
       break;
-    case 'timeline.replay_request':
-      handleTimelineReplay(cmd, serverLink);
+    case TIMELINE_MESSAGES.REPLAY_REQUEST:
+      void traceCommandAsync(cmd, 'web_command.timeline_replay', () => handleTimelineReplay(cmd, serverLink));
       break;
-    case 'timeline.history_request':
+    case TIMELINE_MESSAGES.HISTORY_REQUEST:
       void traceCommandAsync(cmd, 'web_command.timeline_history', () => handleTimelineHistory(cmd, serverLink));
       break;
+    case TIMELINE_MESSAGES.PAGE_REQUEST:
+      void traceCommandAsync(cmd, 'web_command.timeline_page', () => handleTimelineHistory(cmd, serverLink));
+      break;
+    case TIMELINE_MESSAGES.DETAIL_REQUEST:
+      traceSync('web_command.timeline_detail', {
+        sessionName: typeof cmd.sessionName === 'string' ? cmd.sessionName : undefined,
+        requestId: typeof cmd.requestId === 'string' ? cmd.requestId : undefined,
+      }, () => handleTimelineDetailRequest(cmd, serverLink));
+      break;
     case 'chat.subscribe':
-      void handleChatSubscribeReplay(cmd, serverLink);
+      void traceCommandAsync(cmd, 'web_command.chat_subscribe', () => handleChatSubscribeReplay(cmd, serverLink));
       break;
     case TRANSPORT_MSG.APPROVAL_RESPONSE:
       void handleTransportApprovalResponse(cmd, serverLink);
@@ -1309,7 +1321,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       void handleSubSessionTransportConfigUpdate(cmd, serverLink);
       break;
     case 'subsession.rebuild_all':
-      void handleSubSessionRebuildAll(cmd, serverLink);
+      void traceCommandAsync(cmd, 'web_command.subsession_rebuild_all', () => handleSubSessionRebuildAll(cmd, serverLink));
       break;
     case 'subsession.detect_shells':
       void handleSubSessionDetectShells(serverLink);
@@ -1389,10 +1401,10 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       handleDiscussionStatus(cmd, serverLink);
       break;
     case P2P_WORKFLOW_MSG.LIST_DISCUSSIONS:
-      void handleP2pListDiscussions(cmd, serverLink);
+      void traceCommandAsync(cmd, 'web_command.p2p_list_discussions', () => handleP2pListDiscussions(cmd, serverLink));
       break;
     case P2P_WORKFLOW_MSG.READ_DISCUSSION:
-      void handleP2pReadDiscussion(cmd, serverLink);
+      void traceCommandAsync(cmd, 'web_command.p2p_read_discussion', () => handleP2pReadDiscussion(cmd, serverLink));
       break;
     case 'discussion.stop':
       void handleDiscussionStop(cmd);
@@ -1463,7 +1475,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       void handleP2pCancel(cmd, serverLink);
       break;
     case P2P_WORKFLOW_MSG.STATUS:
-      void handleP2pStatus(cmd, serverLink);
+      void traceCommandAsync(cmd, 'web_command.p2p_status', () => handleP2pStatus(cmd, serverLink));
       break;
     case CC_PRESET_MSG.LIST:
       void handleCcPresetsList(serverLink);
@@ -1572,9 +1584,11 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       })();
       break;
     case 'transport.list_models':
-      void handleTransportListModels(cmd, serverLink);
+      void traceCommandAsync(cmd, 'web_command.transport_list_models', () => handleTransportListModels(cmd, serverLink));
       break;
     case REPO_MSG.DETECT:
+      void traceCommandAsync(cmd, 'web_command.repo_detect', async () => { handleRepoCommand(cmd, serverLink); });
+      break;
     case REPO_MSG.LIST_ISSUES:
     case REPO_MSG.LIST_PRS:
     case REPO_MSG.LIST_BRANCHES:
@@ -3914,45 +3928,299 @@ function handleSnapshotRequest(cmd: Record<string, unknown>): void {
   logger.debug({ sessionName }, 'Snapshot requested via web');
 }
 
-function handleTimelineReplay(cmd: Record<string, unknown>, serverLink: ServerLink): void {
+function timelineStatusFromPayload(droppedEvents: number, truncatedEvents: number): TimelineResponseStatus {
+  return droppedEvents > 0 || truncatedEvents > 0
+    ? TIMELINE_RESPONSE_STATUS.PARTIAL
+    : TIMELINE_RESPONSE_STATUS.OK;
+}
+
+function optionalFiniteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function timelineHistoryResponseTypeForRequest(cmd: Record<string, unknown>): typeof TIMELINE_MESSAGES.HISTORY | typeof TIMELINE_MESSAGES.PAGE {
+  return cmd.type === TIMELINE_MESSAGES.PAGE_REQUEST ? TIMELINE_MESSAGES.PAGE : TIMELINE_MESSAGES.HISTORY;
+}
+
+function resolveTimelineHistoryBudgetBytes(cmd: Record<string, unknown>): number {
+  const explicit = cmd.type === TIMELINE_MESSAGES.PAGE_REQUEST || cmd.includeDetails === true;
+  const cap = explicit
+    ? TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL
+    : TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE;
+  const requested = optionalFiniteNumber(cmd.budgetBytes);
+  if (requested === undefined || requested <= 0) return cap;
+  return Math.max(64 * 1024, Math.min(Math.trunc(requested), cap));
+}
+
+function buildTimelineNextCursor(
+  events: readonly TimelineEvent[],
+  epoch: number,
+  direction: 'newer' | 'older' = TIMELINE_CURSOR_DIRECTIONS.OLDER,
+): TimelinePayloadMetadata['nextCursor'] | undefined {
+  if (events.length === 0) return undefined;
+  if (direction === TIMELINE_CURSOR_DIRECTIONS.NEWER) {
+    const last = events[events.length - 1]!;
+    return { epoch, afterSeq: last.seq, afterTs: last.ts, direction };
+  }
+  const first = events[0]!;
+  return { epoch, beforeTs: first.ts, direction };
+}
+
+function withTimelineActualPayloadBytes<T extends Record<string, unknown>>(message: T): T & { actualPayloadBytes: number } {
+  let actualPayloadBytes = 0;
+  let next = { ...message, actualPayloadBytes };
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const encodedBytes = Buffer.byteLength(JSON.stringify(next), 'utf8');
+    if (encodedBytes === actualPayloadBytes) break;
+    actualPayloadBytes = encodedBytes;
+    next = { ...message, actualPayloadBytes };
+  }
+  return next as T & { actualPayloadBytes: number };
+}
+
+function sendTimelineMessage(serverLink: ServerLink, message: Record<string, unknown>): void {
+  serverLink.send(withTimelineActualPayloadBytes(message));
+}
+
+function sendTimelineReplayError(
+  serverLink: ServerLink,
+  sessionName: string | undefined,
+  requestId: string | undefined,
+  errorReason: TimelineRequestErrorReason,
+): void {
+  try {
+    sendTimelineMessage(serverLink, {
+      type: TIMELINE_MESSAGES.REPLAY,
+      sessionName,
+      requestId,
+      events: [],
+      truncated: false,
+      epoch: timelineEmitter.epoch,
+      status: TIMELINE_RESPONSE_STATUS.ERROR,
+      errorReason,
+      source: TIMELINE_RESPONSE_SOURCES.ERROR,
+      payloadBytes: 2,
+      payloadTruncated: false,
+      hasMore: false,
+      droppedEvents: 0,
+      truncatedEvents: 0,
+    });
+  } catch { /* not connected */ }
+}
+
+interface TimelineReplayRequestParams {
+  sessionName: string;
+  afterSeq: number;
+  requestEpoch: number;
+}
+
+interface TimelineReplayBuildResult {
+  events: TimelineEvent[];
+  truncated: boolean;
+  epoch: number;
+  status: TimelineResponseStatus;
+  source: TimelineResponseSource | string;
+  payloadBytes: number;
+  payloadTruncated: boolean;
+  hasMore: boolean;
+  nextCursor?: TimelinePayloadMetadata['nextCursor'];
+  cursorReset?: boolean;
+  droppedEvents: number;
+  truncatedEvents: number;
+  detailRefs?: TimelinePayloadMetadata['detailRefs'];
+}
+
+const timelineReplayInflight = new Map<string, Promise<TimelineReplayBuildResult>>();
+
+function timelineReplayInflightKey(params: TimelineReplayRequestParams): string {
+  return JSON.stringify({
+    sessionName: params.sessionName,
+    afterSeq: params.afterSeq,
+    requestEpoch: params.requestEpoch,
+    epoch: timelineEmitter.epoch,
+  });
+}
+
+function buildTimelineReplay(params: TimelineReplayRequestParams): TimelineReplayBuildResult {
+  if (params.requestEpoch !== timelineEmitter.epoch) {
+    // Epoch mismatch — serve current epoch events from file store, fallback to all epochs.
+    let events = timelineStore.read(params.sessionName, { epoch: timelineEmitter.epoch });
+    if (events.length === 0) {
+      events = timelineStore.read(params.sessionName, {});
+    }
+    const shaped = shapeTimelineEventsForTransport(events, {
+      detailSink: getDefaultTimelineDetailStore(),
+    });
+    const payloadTruncated = shaped.droppedEvents > 0 || shaped.truncatedEvents > 0;
+    return {
+      events: shaped.events,
+      truncated: false,
+      epoch: timelineEmitter.epoch,
+      status: timelineStatusFromPayload(shaped.droppedEvents, shaped.truncatedEvents),
+      source: TIMELINE_RESPONSE_SOURCES.JSONL_TAIL,
+      payloadBytes: shaped.payloadBytes,
+      payloadTruncated,
+      hasMore: shaped.droppedEvents > 0,
+      nextCursor: buildTimelineNextCursor(shaped.events, timelineEmitter.epoch),
+      cursorReset: true,
+      droppedEvents: shaped.droppedEvents,
+      truncatedEvents: shaped.truncatedEvents,
+      detailRefs: shaped.detailRefs.length > 0 ? shaped.detailRefs : undefined,
+    };
+  }
+
+  const { events, truncated } = timelineEmitter.replay(params.sessionName, params.afterSeq);
+  const shaped = shapeTimelineEventsForTransport(events, {
+    detailSink: getDefaultTimelineDetailStore(),
+  });
+  const payloadTruncated = shaped.droppedEvents > 0 || shaped.truncatedEvents > 0;
+  return {
+    events: shaped.events,
+    truncated,
+    epoch: timelineEmitter.epoch,
+    status: timelineStatusFromPayload(shaped.droppedEvents, shaped.truncatedEvents),
+    source: TIMELINE_RESPONSE_SOURCES.RING_BUFFER,
+    payloadBytes: shaped.payloadBytes,
+    payloadTruncated,
+    hasMore: shaped.droppedEvents > 0,
+    nextCursor: buildTimelineNextCursor(shaped.events, timelineEmitter.epoch, TIMELINE_CURSOR_DIRECTIONS.NEWER),
+    droppedEvents: shaped.droppedEvents,
+    truncatedEvents: shaped.truncatedEvents,
+    detailRefs: shaped.detailRefs.length > 0 ? shaped.detailRefs : undefined,
+  };
+}
+
+function getTimelineReplayResult(params: TimelineReplayRequestParams): Promise<TimelineReplayBuildResult> {
+  const key = timelineReplayInflightKey(params);
+  const existing = timelineReplayInflight.get(key);
+  if (existing) return existing;
+  const promise = new Promise<TimelineReplayBuildResult>((resolve, reject) => {
+    setImmediate(() => {
+      try {
+        resolve(buildTimelineReplay(params));
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }).finally(() => {
+    timelineReplayInflight.delete(key);
+  });
+  timelineReplayInflight.set(key, promise);
+  return promise;
+}
+
+async function handleTimelineReplay(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const sessionName = cmd.sessionName as string | undefined;
   const afterSeq = cmd.afterSeq as number | undefined;
   const requestEpoch = cmd.epoch as number | undefined;
   const requestId = cmd.requestId as string | undefined;
 
   if (!sessionName || afterSeq === undefined || requestEpoch === undefined) {
-    logger.warn('timeline.replay_request: missing fields');
+    logger.warn({ sessionName, requestId }, 'timeline.replay_request: missing fields');
+    sendTimelineReplayError(serverLink, sessionName, requestId, TIMELINE_REQUEST_ERROR_REASONS.MALFORMED_REQUEST);
     return;
   }
 
-  if (requestEpoch !== timelineEmitter.epoch) {
-    // Epoch mismatch — serve current epoch events from file store, fallback to all epochs
-    let events = timelineStore.read(sessionName, { epoch: timelineEmitter.epoch });
-    if (events.length === 0) {
-      events = timelineStore.read(sessionName, {});
-    }
-    try {
-      serverLink.send({
-        type: 'timeline.replay',
-        sessionName,
-        requestId,
-        events,
-        truncated: false,
-        epoch: timelineEmitter.epoch,
-      });
-    } catch { /* not connected */ }
-    return;
-  }
-
-  const { events, truncated } = timelineEmitter.replay(sessionName, afterSeq);
   try {
-    serverLink.send({
-      type: 'timeline.replay',
+    const result = await getTimelineReplayResult({ sessionName, afterSeq, requestEpoch });
+    sendTimelineMessage(serverLink, {
+      type: TIMELINE_MESSAGES.REPLAY,
       sessionName,
       requestId,
-      events,
-      truncated,
-      epoch: timelineEmitter.epoch,
+      ...result,
+    });
+  } catch (err) {
+    logger.warn({ err, sessionName, requestId }, 'timeline.replay_request failed');
+    sendTimelineReplayError(serverLink, sessionName, requestId, TIMELINE_REQUEST_ERROR_REASONS.INTERNAL_ERROR);
+  }
+}
+
+function handleTimelineDetailRequest(cmd: Record<string, unknown>, serverLink: ServerLink): void {
+  const sessionName = cmd.sessionName as string | undefined;
+  const requestId = cmd.requestId as string | undefined;
+  const detailId = cmd.detailId as string | undefined;
+  const eventId = cmd.eventId as string | undefined;
+  const fieldPath = cmd.fieldPath as string | undefined;
+  const epoch = optionalFiniteNumber(cmd.epoch);
+  const detailStoreGeneration = typeof cmd.detailStoreGeneration === 'string'
+    ? cmd.detailStoreGeneration
+    : undefined;
+  const sendError = (errorReason: string): void => {
+    try {
+      sendTimelineMessage(serverLink, {
+        type: TIMELINE_MESSAGES.DETAIL,
+        sessionName,
+        requestId,
+        detailId,
+        eventId,
+        fieldPath,
+        status: TIMELINE_RESPONSE_STATUS.ERROR,
+        errorReason,
+        source: TIMELINE_RESPONSE_SOURCES.ERROR,
+        payloadBytes: 2,
+        payloadTruncated: false,
+        hasMore: false,
+      });
+    } catch { /* not connected */ }
+  };
+  if (!sessionName || !detailId) {
+    sendError(TIMELINE_DETAIL_ERROR_REASONS.MALFORMED);
+    return;
+  }
+  if (!getSession(sessionName)) {
+    sendError(TIMELINE_DETAIL_ERROR_REASONS.MISSING);
+    return;
+  }
+  let result;
+  try {
+    result = getDefaultTimelineDetailStore().get({
+      sessionName,
+      epoch: epoch ?? timelineEmitter.epoch,
+      detailId,
+      detailStoreGeneration,
+      eventId,
+      fieldPath,
+    });
+  } catch (err) {
+    logger.warn({ err, sessionName, requestId }, 'timeline.detail_request failed');
+    sendError(TIMELINE_DETAIL_ERROR_REASONS.INTERNAL_ERROR);
+    return;
+  }
+  if (!result.ok) {
+    sendError(result.reason);
+    return;
+  }
+  const detailValue = result.entry.value;
+  if (typeof detailValue !== 'string') {
+    sendError(TIMELINE_DETAIL_ERROR_REASONS.OVERSIZED);
+    return;
+  }
+  const responseEnvelope = {
+    type: TIMELINE_MESSAGES.DETAIL,
+    sessionName,
+    requestId,
+    detailId: result.entry.detailId,
+    eventId: result.entry.eventId,
+    fieldPath: result.entry.fieldPath,
+    status: TIMELINE_RESPONSE_STATUS.OK,
+    source: TIMELINE_RESPONSE_SOURCES.CACHE,
+    mediaType: result.entry.mediaType,
+    epoch: result.entry.epoch,
+    detailStoreGeneration: result.entry.generation,
+  };
+  const shaped = shapeTimelineDetailValueForTransport(detailValue, responseEnvelope);
+  if (!shaped.ok) {
+    sendError(shaped.errorReason);
+    return;
+  }
+  try {
+    sendTimelineMessage(serverLink, {
+      ...responseEnvelope,
+      payloadBytes: shaped.payloadBytes,
+      actualPayloadBytes: shaped.payloadBytes,
+      payloadTruncated: shaped.payloadTruncated,
+      hasMore: false,
+      value: shaped.value,
     });
   } catch { /* not connected */ }
 }
@@ -4022,6 +4290,7 @@ interface TimelineHistoryRequestParams {
   limit: number;
   afterTs?: number;
   beforeTs?: number;
+  maxResponseBytes: number;
 }
 
 interface TimelineHistoryBuildResult {
@@ -4033,10 +4302,16 @@ interface TimelineHistoryBuildResult {
   readMs: number;
   synthesizeMs: number;
   sanitizeMs: number;
-  source: string;
+  source: TimelineResponseSource | string;
+  status: TimelineResponseStatus;
+  errorReason?: TimelineRequestErrorReason | string;
+  cursorReset?: boolean;
+  detailRefs: TimelinePayloadMetadata['detailRefs'];
 }
 
-function emptyTimelineHistoryResult(source: string): TimelineHistoryBuildResult {
+const timelineHistoryInflight = new Map<string, Promise<TimelineHistoryBuildResult>>();
+
+function timelineHistoryErrorResult(source: string, errorReason: TimelineRequestErrorReason | string): TimelineHistoryBuildResult {
   return {
     events: [],
     eventsRead: 0,
@@ -4047,7 +4322,47 @@ function emptyTimelineHistoryResult(source: string): TimelineHistoryBuildResult 
     synthesizeMs: 0,
     sanitizeMs: 0,
     source,
+    status: TIMELINE_RESPONSE_STATUS.ERROR,
+    errorReason,
+    detailRefs: [],
   };
+}
+
+function timelineHistoryInflightKey(params: TimelineHistoryRequestParams): string {
+  return JSON.stringify({
+    sessionName: params.sessionName,
+    limit: params.limit,
+    afterTs: params.afterTs ?? null,
+    beforeTs: params.beforeTs ?? null,
+    maxResponseBytes: params.maxResponseBytes,
+  });
+}
+
+function buildTimelineHistory(params: TimelineHistoryRequestParams): Promise<TimelineHistoryBuildResult> {
+  const initialRecord = getSession(params.sessionName);
+  if (shouldUseTimelineHistoryWorkerPool() && initialRecord?.agentType !== 'opencode') {
+    return buildTimelineHistoryWithWorker(params).catch(async (err) => {
+      const reason = err instanceof TimelineHistoryPoolError ? err.reason : 'unknown';
+      if (reason === TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE) {
+        logger.debug({ sessionName: params.sessionName, requestId: params.requestId, reason }, 'timeline.history worker unavailable; falling back to projection client');
+        return await buildTimelineHistoryOnMain(params);
+      }
+      logger.warn({ sessionName: params.sessionName, requestId: params.requestId, reason }, 'timeline.history worker failed; returning terminal error response');
+      return timelineHistoryErrorResult(`worker_${reason}`, reason);
+    });
+  }
+  return buildTimelineHistoryOnMain(params);
+}
+
+function getTimelineHistoryResult(params: TimelineHistoryRequestParams): Promise<TimelineHistoryBuildResult> {
+  const key = timelineHistoryInflightKey(params);
+  const existing = timelineHistoryInflight.get(key);
+  if (existing) return existing;
+  const promise = buildTimelineHistory(params).finally(() => {
+    timelineHistoryInflight.delete(key);
+  });
+  timelineHistoryInflight.set(key, promise);
+  return promise;
 }
 
 async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams): Promise<TimelineHistoryBuildResult> {
@@ -4090,30 +4405,44 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
   }
 
   const record = await recoverOpenCodeSessionRecord(getSession(params.sessionName));
+  let opencodeInitialDeferred = false;
+  let opencodeSynthesized = false;
   if (record?.agentType === 'opencode' && record.projectDir && record.opencodeSessionId) {
-    const tSyn0 = Date.now();
-    try {
-      const { exportOpenCodeSession, buildTimelineEventsFromOpenCodeExport } = await import('./opencode-history.js');
-      const exportData = await exportOpenCodeSession(record.projectDir, record.opencodeSessionId);
-      const synthesizedAfterTs = getOpenCodeSynthesizedAfterTs(params.afterTs);
-      const synthesized = buildTimelineEventsFromOpenCodeExport(params.sessionName, exportData, timelineEmitter.epoch)
-        .filter((event) => synthesizedAfterTs === undefined || event.ts > synthesizedAfterTs)
-        .filter((event) => params.beforeTs === undefined || event.ts < params.beforeTs);
-      const synthesizedTrimmed = synthesized.length > params.limit ? synthesized.slice(synthesized.length - params.limit) : synthesized;
-      if (
-        !hasSubstantiveTimelineHistory(trimmed)
-        || countSubstantiveTimelineEvents(synthesizedTrimmed) > countSubstantiveTimelineEvents(trimmed)
-      ) {
-        trimmed = synthesizedTrimmed;
+    const initialHistoryRequest = params.afterTs === undefined && params.beforeTs === undefined;
+    if (initialHistoryRequest) {
+      opencodeInitialDeferred = !hasSubstantiveTimelineHistory(trimmed);
+    } else {
+      const tSyn0 = Date.now();
+      try {
+        const { exportOpenCodeSession, buildTimelineEventsFromOpenCodeExport } = await import('./opencode-history.js');
+        const exportData = await exportOpenCodeSession(record.projectDir, record.opencodeSessionId);
+        opencodeSynthesized = true;
+        const synthesizedAfterTs = getOpenCodeSynthesizedAfterTs(params.afterTs);
+        const synthesized = buildTimelineEventsFromOpenCodeExport(params.sessionName, exportData, timelineEmitter.epoch)
+          .filter((event) => synthesizedAfterTs === undefined || event.ts > synthesizedAfterTs)
+          .filter((event) => params.beforeTs === undefined || event.ts < params.beforeTs);
+        const synthesizedTrimmed = synthesized.length > params.limit ? synthesized.slice(synthesized.length - params.limit) : synthesized;
+        if (
+          !hasSubstantiveTimelineHistory(trimmed)
+          || countSubstantiveTimelineEvents(synthesizedTrimmed) > countSubstantiveTimelineEvents(trimmed)
+        ) {
+          trimmed = synthesizedTrimmed;
+        }
+      } catch (err) {
+        logger.debug({ err, sessionName: params.sessionName, opencodeSessionId: record.opencodeSessionId }, 'Failed to synthesize OpenCode timeline history');
       }
-    } catch (err) {
-      logger.debug({ err, sessionName: params.sessionName, opencodeSessionId: record.opencodeSessionId }, 'Failed to synthesize OpenCode timeline history');
+      synthesizeMs = Date.now() - tSyn0;
     }
-    synthesizeMs = Date.now() - tSyn0;
   }
 
   const tSanitize = Date.now();
-  const sanitized = sanitizeTimelineHistoryEventsForTransport(trimmed);
+  const sanitized = shapeTimelineEventsForTransport(trimmed, {
+    maxResponseBytes: params.maxResponseBytes,
+    detailSink: getDefaultTimelineDetailStore(),
+  });
+  const status = opencodeInitialDeferred
+    ? TIMELINE_RESPONSE_STATUS.DEFERRED
+    : timelineStatusFromPayload(sanitized.droppedEvents, sanitized.truncatedEvents);
   return {
     events: sanitized.events,
     eventsRead: events.length,
@@ -4123,7 +4452,14 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
     readMs,
     synthesizeMs,
     sanitizeMs: Date.now() - tSanitize,
-    source: 'main',
+    source: opencodeInitialDeferred
+      ? TIMELINE_RESPONSE_SOURCES.DEFERRED
+      : opencodeSynthesized
+      ? TIMELINE_RESPONSE_SOURCES.OPENCODE_EXPORT
+      : TIMELINE_RESPONSE_SOURCES.MAIN_SQLITE,
+    status,
+    errorReason: opencodeInitialDeferred ? TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE : undefined,
+    detailRefs: sanitized.detailRefs,
   };
 }
 
@@ -4133,9 +4469,13 @@ async function buildTimelineHistoryWithWorker(params: TimelineHistoryRequestPara
     limit: params.limit,
     afterTs: params.afterTs,
     beforeTs: params.beforeTs,
+    maxResponseBytes: params.maxResponseBytes,
     contentTypes: [...TIMELINE_HISTORY_CONTENT_TYPES],
     stateTypes: [...TIMELINE_HISTORY_STATE_TYPES],
   }, { deadlineAt: Date.now() + 4_500 });
+  const detailRefs = (result.detailCandidates ?? [])
+    .map((candidate) => getDefaultTimelineDetailStore().put(candidate))
+    .filter((ref): ref is NonNullable<typeof ref> => ref !== undefined);
   return {
     events: result.events,
     eventsRead: result.eventsRead,
@@ -4145,7 +4485,9 @@ async function buildTimelineHistoryWithWorker(params: TimelineHistoryRequestPara
     readMs: result.readMs,
     synthesizeMs: 0,
     sanitizeMs: result.sanitizeMs,
-    source: 'worker',
+    source: TIMELINE_RESPONSE_SOURCES.WORKER_SQLITE,
+    status: timelineStatusFromPayload(result.droppedEvents, result.truncatedEvents),
+    detailRefs,
   };
 }
 
@@ -4154,65 +4496,98 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
   const requestId = cmd.requestId as string | undefined;
   const rawLimit = cmd.limit;
   const limit = typeof rawLimit === 'number' && Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 2000) : 500;
-  const rawAfterTs = cmd.afterTs;
-  const afterTs = typeof rawAfterTs === 'number' && Number.isFinite(rawAfterTs) ? rawAfterTs : undefined;
-  const rawBeforeTs = cmd.beforeTs;
-  const beforeTs = typeof rawBeforeTs === 'number' && Number.isFinite(rawBeforeTs) ? rawBeforeTs : undefined;
+  const cursor = cmd.cursor && typeof cmd.cursor === 'object' && !Array.isArray(cmd.cursor)
+    ? cmd.cursor as Record<string, unknown>
+    : undefined;
+  const afterTs = optionalFiniteNumber(cmd.afterTs) ?? optionalFiniteNumber(cursor?.afterTs);
+  const beforeTs = optionalFiniteNumber(cmd.beforeTs) ?? optionalFiniteNumber(cursor?.beforeTs);
+  const maxResponseBytes = resolveTimelineHistoryBudgetBytes(cmd);
 
   if (!sessionName) {
-    logger.warn('timeline.history_request: missing sessionName');
+    logger.warn({ requestId }, 'timeline.history_request: missing sessionName');
+    try {
+      sendTimelineMessage(serverLink, {
+        type: timelineHistoryResponseTypeForRequest(cmd),
+        sessionName,
+        requestId,
+        events: [],
+        epoch: timelineEmitter.epoch,
+        status: TIMELINE_RESPONSE_STATUS.ERROR,
+        errorReason: TIMELINE_REQUEST_ERROR_REASONS.MALFORMED_REQUEST,
+        source: TIMELINE_RESPONSE_SOURCES.ERROR,
+        payloadBytes: 2,
+        payloadTruncated: false,
+        hasMore: false,
+        droppedEvents: 0,
+        truncatedEvents: 0,
+      });
+    } catch { /* not connected */ }
     return;
   }
 
-  const params: TimelineHistoryRequestParams = { sessionName, requestId, limit, afterTs, beforeTs };
+  const params: TimelineHistoryRequestParams = { sessionName, requestId, limit, afterTs, beforeTs, maxResponseBytes };
   const tStart = Date.now();
-  const initialRecord = getSession(sessionName);
-  let result: TimelineHistoryBuildResult;
-
-  if (shouldUseTimelineHistoryWorkerPool() && initialRecord?.agentType !== 'opencode') {
-    try {
-      result = await buildTimelineHistoryWithWorker(params);
-    } catch (err) {
-      const reason = err instanceof TimelineHistoryPoolError ? err.reason : 'unknown';
-      if (reason === TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE) {
-        logger.debug({ sessionName, requestId, reason }, 'timeline.history worker unavailable; falling back to projection client');
-        result = await buildTimelineHistoryOnMain(params);
-      } else {
-        logger.warn({ sessionName, requestId, reason }, 'timeline.history worker failed; returning empty history response');
-        result = emptyTimelineHistoryResult(`worker_${reason}`);
-      }
-    }
-  } else {
-    result = await buildTimelineHistoryOnMain(params);
-  }
-
   try {
-    serverLink.send({
-      type: 'timeline.history',
+    const result = await getTimelineHistoryResult(params);
+    sendTimelineMessage(serverLink, {
+      type: timelineHistoryResponseTypeForRequest(cmd),
       sessionName,
       requestId,
       events: result.events,
       epoch: timelineEmitter.epoch,
+      status: result.status,
+      errorReason: result.errorReason,
+      source: result.source,
+      payloadBytes: result.payloadBytes,
+      payloadTruncated: result.droppedEvents > 0 || result.truncatedEvents > 0,
+      hasMore: result.droppedEvents > 0,
+      nextCursor: buildTimelineNextCursor(result.events, timelineEmitter.epoch),
+      cursorReset: result.cursorReset,
+      droppedEvents: result.droppedEvents,
+      truncatedEvents: result.truncatedEvents,
+      detailRefs: result.detailRefs && result.detailRefs.length > 0 ? result.detailRefs : undefined,
     });
-  } catch { /* not connected */ }
-
-  const totalMs = Date.now() - tStart;
-  logger.info({
-    sessionName,
-    requestId,
-    limit,
-    afterTs,
-    source: result.source,
-    eventsReturned: result.events.length,
-    eventsRead: result.eventsRead,
-    eventsDropped: result.droppedEvents,
-    truncatedEvents: result.truncatedEvents,
-    payloadBytes: result.payloadBytes,
-    readMs: result.readMs,
-    synthesizeMs: result.synthesizeMs,
-    sanitizeMs: result.sanitizeMs,
-    totalMs,
-  }, 'timeline.history served');
+    const totalMs = Date.now() - tStart;
+    logger.info({
+      sessionName,
+      requestId,
+      limit,
+      afterTs,
+      beforeTs,
+      maxResponseBytes,
+      source: result.source,
+      eventsReturned: result.events.length,
+      eventsRead: result.eventsRead,
+      eventsDropped: result.droppedEvents,
+      truncatedEvents: result.truncatedEvents,
+      payloadBytes: result.payloadBytes,
+      readMs: result.readMs,
+      synthesizeMs: result.synthesizeMs,
+      sanitizeMs: result.sanitizeMs,
+      totalMs,
+    }, 'timeline.history served');
+    return;
+  } catch (err) {
+    logger.warn({ err, sessionName, requestId }, 'timeline.history_request failed');
+    try {
+      sendTimelineMessage(serverLink, {
+        type: timelineHistoryResponseTypeForRequest(cmd),
+        sessionName,
+        requestId,
+        events: [],
+        epoch: timelineEmitter.epoch,
+        status: TIMELINE_RESPONSE_STATUS.ERROR,
+        errorReason: TIMELINE_REQUEST_ERROR_REASONS.INTERNAL_ERROR,
+        source: TIMELINE_RESPONSE_SOURCES.ERROR,
+        payloadBytes: 2,
+        payloadTruncated: false,
+        hasMore: false,
+        droppedEvents: 0,
+        truncatedEvents: 0,
+      });
+    } catch { /* not connected */ }
+    return;
+  }
 }
 
 // ── Sub-session handlers ──────────────────────────────────────────────────
@@ -6308,8 +6683,21 @@ function invalidateFileSearchCachesForPath(targetPath: string): void {
 
 const FS_LIST_DEADLINE_MS = 10_000;
 const FS_LIST_CACHE_TTL_MS = 5_000;
+const FS_LIST_STALE_CACHE_TTL_MS = 30_000;
 const FS_LIST_CACHE_MAX_ENTRIES = 128;
+const FS_LIST_INFLIGHT_FANOUT_CAP = 32;
 const FS_LIST_METADATA_CONCURRENCY = 32;
+
+interface FreshnessCacheEntry<T> {
+  expiresAt: number;
+  staleUntil?: number;
+  value: T;
+}
+
+interface InflightWork<T> {
+  promise: Promise<T>;
+  attached: number;
+}
 
 interface FsLsSnapshot {
   resolvedPath: string;
@@ -6323,20 +6711,20 @@ interface FsListRequestContext {
   send(message: Record<string, unknown>): boolean;
 }
 
-const fsListCache = new Map<string, { expiresAt: number; value: FsLsSnapshot }>();
-const fsListInflight = new Map<string, Promise<FsLsSnapshot>>();
+const fsListCache = new Map<string, FreshnessCacheEntry<FsLsSnapshot>>();
+const fsListInflight = new Map<string, InflightWork<FsLsSnapshot>>();
 const fsListGenerations = new Map<string, number>();
 
-function sweepExpiredCache<T>(cache: Map<string, { expiresAt: number; value: T }>, now = Date.now()): void {
+function sweepExpiredCache<T, E extends FreshnessCacheEntry<T>>(cache: Map<string, E>, now = Date.now()): void {
   for (const [key, entry] of cache) {
-    if (entry.expiresAt <= now) cache.delete(key);
+    if ((entry.staleUntil ?? entry.expiresAt) <= now) cache.delete(key);
   }
 }
 
-function setBoundedCache<T>(
-  cache: Map<string, { expiresAt: number; value: T }>,
+function setBoundedCache<T, E extends FreshnessCacheEntry<T>>(
+  cache: Map<string, E>,
   key: string,
-  entry: { expiresAt: number; value: T },
+  entry: E,
   maxEntries: number,
 ): void {
   cache.delete(key);
@@ -6398,46 +6786,64 @@ function createFsListRequestContext(serverLink: ServerLink): FsListRequestContex
   };
 }
 
+function fsListErrorCode(error: unknown): string {
+  if (error instanceof FsListPoolError) {
+    if (error.reason === 'queue_full') return FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_QUEUE_FULL;
+    if (error.reason === 'timeout') return FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_TIMEOUT;
+    if (error.reason === 'unavailable' || error.reason === 'crashed' || error.reason === 'shutdown') {
+      return FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_UNAVAILABLE;
+    }
+    return FS_GENERIC_ERROR_CODES.INTERNAL_ERROR;
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
+function canUseFsListStaleCache(error: unknown): boolean {
+  return error instanceof FsListPoolError
+    && (
+      error.reason === 'queue_full'
+      || error.reason === 'timeout'
+      || error.reason === 'unavailable'
+      || error.reason === 'crashed'
+      || error.reason === 'shutdown'
+    );
+}
+
+function getCachedFsListSnapshot(cacheKey: string, dirSignature: string, allowStale: boolean): FsLsSnapshot | null {
+  const cached = fsListCache.get(cacheKey);
+  if (!cached || cached.value.dirSignature !== dirSignature) return null;
+  const now = Date.now();
+  const usableUntil = allowStale ? (cached.staleUntil ?? cached.expiresAt) : cached.expiresAt;
+  if (usableUntil <= now) return null;
+  fsListCache.delete(cacheKey);
+  fsListCache.set(cacheKey, cached);
+  return cached.value;
+}
+
 async function loadFsListSnapshot(real: string, includeFiles: boolean, includeMetadata: boolean, allowDownloadHandles: boolean): Promise<FsLsSnapshot> {
-  const dirents = await fsReaddir(real, { withFileTypes: true });
-  const filtered = dirents.filter((d) => d.isDirectory() || (includeFiles && d.isFile()));
-
-  const buildBasicEntry = (d: import('fs').Dirent): Record<string, unknown> => ({
-    name: d.name,
-    path: nodePath.join(real, d.name),
-    isDir: d.isDirectory(),
-    hidden: d.name.startsWith('.'),
-  });
-
-  const entries = includeMetadata
-    ? await mapWithConcurrency(filtered, FS_LIST_METADATA_CONCURRENCY, async (d) => {
-      const entry = buildBasicEntry(d);
-      if (!d.isDirectory()) {
-        try {
-          const filePath = nodePath.join(real, d.name);
-          const fileStat = await fsStat(filePath);
-          entry.size = fileStat.size;
-          const ext = nodePath.extname(d.name).toLowerCase().slice(1);
-          entry.mime = MIME_MAP[ext] || undefined;
-          if (allowDownloadHandles) {
-            const handle = await tryCreateProjectFileHandle(filePath, d.name, entry.mime as string | undefined, fileStat.size);
-            if (handle) entry.downloadId = handle.id;
-          }
-        } catch { /* stat failed, skip metadata */ }
-      }
-      return entry;
+  const snapshot = shouldUseFsListWorkerPool()
+    ? await getDefaultFsListWorkerPool().dispatch({
+      realPath: real,
+      includeFiles,
+      includeMetadata,
     })
-    : filtered.map(buildBasicEntry);
+    : await scanFsListSnapshot({ realPath: real, includeFiles, includeMetadata });
 
-  entries.sort((a, b) => {
-    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
-    if (a.hidden !== b.hidden) return (a.hidden ? 1 : 0) - (b.hidden ? 1 : 0);
-    return (a.name as string).localeCompare(b.name as string);
-  });
+  const entries: Array<Record<string, unknown>> = snapshot.entries.map((entry) => ({ ...entry }));
+  if (includeMetadata && allowDownloadHandles) {
+    await mapWithConcurrency(entries, FS_LIST_METADATA_CONCURRENCY, async (entry) => {
+      if (entry.isDir === true || typeof entry.path !== 'string' || typeof entry.name !== 'string') return entry;
+      const size = typeof entry.size === 'number' ? entry.size : undefined;
+      const mime = typeof entry.mime === 'string' ? entry.mime : undefined;
+      const handle = await tryCreateProjectFileHandle(entry.path, entry.name, mime, size);
+      if (handle) entry.downloadId = handle.id;
+      return entry;
+    });
+  }
 
   return {
-    resolvedPath: real,
-    dirSignature: await safeStatSignature(real),
+    resolvedPath: snapshot.resolvedPath,
+    dirSignature: snapshot.dirSignature,
     entries,
   };
 }
@@ -6446,30 +6852,48 @@ async function getFsListSnapshot(real: string, includeFiles: boolean, includeMet
   sweepExpiredCache(fsListCache);
   const dirSignature = await safeStatSignature(real);
   const cacheKey = getFsListCacheKey(real, includeFiles, includeMetadata, allowDownloadHandles);
-  const cached = fsListCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now() && cached.value.dirSignature === dirSignature) {
-    fsListCache.delete(cacheKey);
-    fsListCache.set(cacheKey, cached);
-    return cached.value;
-  }
+  const cached = getCachedFsListSnapshot(cacheKey, dirSignature, false);
+  if (cached) return cached;
+  const staleCached = getCachedFsListSnapshot(cacheKey, dirSignature, true);
 
   const generation = getResourceGeneration(fsListGenerations, real);
-  const inflightKey = `${cacheKey}::${generation}`;
+  const inflightKey = `${cacheKey}::${dirSignature}::${generation}`;
   const inflight = fsListInflight.get(inflightKey);
-  if (inflight) return await inflight;
+  if (inflight) {
+    if (inflight.attached >= FS_LIST_INFLIGHT_FANOUT_CAP) throw new FsListPoolError('queue_full');
+    inflight.attached += 1;
+    return await inflight.promise;
+  }
 
   const promise = loadFsListSnapshot(real, includeFiles, includeMetadata, allowDownloadHandles)
     .then(async (value) => {
       const currentSignature = await safeStatSignature(real);
-      if (getResourceGeneration(fsListGenerations, real) === generation && currentSignature === value.dirSignature) {
-        setBoundedCache(fsListCache, cacheKey, { value, expiresAt: Date.now() + FS_LIST_CACHE_TTL_MS }, FS_LIST_CACHE_MAX_ENTRIES);
+      if (
+        getResourceGeneration(fsListGenerations, real) === generation
+        && currentSignature === dirSignature
+        && value.dirSignature === dirSignature
+      ) {
+        setBoundedCache(
+          fsListCache,
+          cacheKey,
+          {
+            value,
+            expiresAt: Date.now() + FS_LIST_CACHE_TTL_MS,
+            staleUntil: Date.now() + FS_LIST_STALE_CACHE_TTL_MS,
+          },
+          FS_LIST_CACHE_MAX_ENTRIES,
+        );
       }
       return value;
+    })
+    .catch((error) => {
+      if (staleCached && canUseFsListStaleCache(error)) return staleCached;
+      throw error;
     })
     .finally(() => {
       fsListInflight.delete(inflightKey);
     });
-  fsListInflight.set(inflightKey, promise);
+  fsListInflight.set(inflightKey, { promise, attached: 1 });
   return await promise;
 }
 
@@ -6517,7 +6941,10 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
   try {
     await Promise.race([handleFsListInner(resolved, rawPath, requestId, includeFiles, includeMetadata, requestContext), deadline]);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg = fsListErrorCode(err);
+    if (msg === FS_GENERIC_ERROR_CODES.FS_LIST_TIMEOUT || msg === FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_TIMEOUT) {
+      invalidateFsListCachesForPath(resolved);
+    }
     if (msg === FS_GENERIC_ERROR_CODES.FS_LIST_TIMEOUT) {
       requestContext.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FS_LIST_TIMEOUT });
     } else {
@@ -6574,6 +7001,10 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
 }
 
 const GIT_STATUS_CACHE_TTL_MS = 5_000;
+const GIT_STATUS_STALE_CACHE_TTL_MS = 30_000;
+const GIT_STATUS_CACHE_MAX_ENTRIES = 128;
+const GIT_STATUS_DEADLINE_MS = 10_000;
+const GIT_STATUS_INFLIGHT_FANOUT_CAP = 32;
 const GIT_DIFF_CACHE_TTL_MS = 5_000;
 
 type GitStatusFile = { path: string; code: string; additions?: number; deletions?: number };
@@ -6609,6 +7040,14 @@ interface GitNumstatSnapshot {
   stats: Map<string, { additions?: number; deletions?: number }>;
 }
 
+interface GitStatusResponseSnapshot {
+  repoRoot: string;
+  repoSignature: string;
+  requestedPath: string;
+  includeStats: boolean;
+  files: GitStatusFile[];
+}
+
 interface GitDiffSnapshot {
   logicalPath: string;
   repoRoot: string;
@@ -6623,6 +7062,8 @@ const gitStatusCache = new Map<string, { expiresAt: number; value: GitStatusSnap
 const gitStatusInflight = new Map<string, Promise<GitStatusSnapshot>>();
 const gitNumstatCache = new Map<string, { expiresAt: number; value: GitNumstatSnapshot }>();
 const gitNumstatInflight = new Map<string, Promise<GitNumstatSnapshot>>();
+const gitStatusResponseCache = new Map<string, FreshnessCacheEntry<GitStatusResponseSnapshot>>();
+const gitStatusResponseInflight = new Map<string, InflightWork<GitStatusResponseSnapshot>>();
 const gitDiffCache = new Map<string, { expiresAt: number; value: GitDiffSnapshot }>();
 const gitDiffInflight = new Map<string, Promise<GitDiffSnapshot>>();
 const gitRepoGenerations = new Map<string, number>();
@@ -6884,6 +7325,134 @@ async function getRepoGitNumstatSnapshot(startPath: string): Promise<GitNumstatS
   return await promise;
 }
 
+function getGitStatusResponseCacheKey(repoRoot: string, requestedPath: string, includeStats: boolean): string {
+  return `${repoRoot}::${requestedPath}::${includeStats ? 'stats' : 'plain'}`;
+}
+
+function fsGitStatusErrorCode(error: unknown): string {
+  if (error instanceof FsGitStatusPoolError) {
+    if (error.reason === 'queue_full') return FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_QUEUE_FULL;
+    if (error.reason === 'timeout') return FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_TIMEOUT;
+    if (
+      error.reason === 'unavailable'
+      || error.reason === 'crashed'
+      || error.reason === 'shutdown'
+      || error.reason === 'git_unavailable'
+    ) {
+      return FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_UNAVAILABLE;
+    }
+    return FS_GENERIC_ERROR_CODES.INTERNAL_ERROR;
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
+function canUseGitStatusStaleCache(error: unknown): boolean {
+  return error instanceof FsGitStatusPoolError
+    && (
+      error.reason === 'queue_full'
+      || error.reason === 'timeout'
+      || error.reason === 'unavailable'
+      || error.reason === 'crashed'
+      || error.reason === 'shutdown'
+      || error.reason === 'git_unavailable'
+    );
+}
+
+function getCachedGitStatusResponseSnapshot(cacheKey: string, repoSignature: string, allowStale: boolean): GitStatusResponseSnapshot | null {
+  const cached = gitStatusResponseCache.get(cacheKey);
+  if (!cached || cached.value.repoSignature !== repoSignature) return null;
+  const now = Date.now();
+  const usableUntil = allowStale ? (cached.staleUntil ?? cached.expiresAt) : cached.expiresAt;
+  if (usableUntil <= now) return null;
+  gitStatusResponseCache.delete(cacheKey);
+  gitStatusResponseCache.set(cacheKey, cached);
+  return cached.value;
+}
+
+async function loadRepoGitStatusResponseSnapshot(
+  context: RepoContext,
+  requestedPath: string,
+  includeStats: boolean,
+): Promise<GitStatusResponseSnapshot> {
+  if (shouldUseFsGitStatusWorkerPool()) {
+    const snapshot = await getDefaultFsGitStatusWorkerPool().dispatch({
+      repoRoot: context.repoRoot,
+      repoSignature: context.repoSignature,
+      requestedPath,
+      includeStats,
+    });
+    return {
+      repoRoot: snapshot.repoRoot,
+      repoSignature: snapshot.repoSignature,
+      requestedPath: snapshot.requestedPath,
+      includeStats: snapshot.includeStats,
+      files: snapshot.files,
+    };
+  }
+
+  const [snapshot, numstat] = await Promise.all([
+    loadRepoGitStatusSnapshot(context.repoRoot, context.repoSignature),
+    includeStats ? loadRepoGitNumstatSnapshot(context.repoRoot, context.repoSignature) : Promise.resolve(null),
+  ]);
+  const files = filterRepoFilesForPath(snapshot.files, requestedPath).map((file) => {
+    const stats = numstat?.stats.get(file.path);
+    return stats ? { ...file, ...stats } : file;
+  });
+  return {
+    repoRoot: context.repoRoot,
+    repoSignature: context.repoSignature,
+    requestedPath,
+    includeStats,
+    files,
+  };
+}
+
+async function getRepoGitStatusResponseSnapshot(startPath: string, includeStats: boolean): Promise<GitStatusResponseSnapshot | null> {
+  const context = await resolveRepoContext(startPath);
+  if (!context) return null;
+  const cacheKey = getGitStatusResponseCacheKey(context.repoRoot, startPath, includeStats);
+  const cached = getCachedGitStatusResponseSnapshot(cacheKey, context.repoSignature, false);
+  if (cached) return cached;
+  const staleCached = getCachedGitStatusResponseSnapshot(cacheKey, context.repoSignature, true);
+  const generation = getResourceGeneration(gitRepoGenerations, context.repoRoot);
+  const inflightKey = `${cacheKey}::${context.repoSignature}::${generation}`;
+  const inflight = gitStatusResponseInflight.get(inflightKey);
+  if (inflight) {
+    if (inflight.attached >= GIT_STATUS_INFLIGHT_FANOUT_CAP) throw new FsGitStatusPoolError('queue_full');
+    inflight.attached += 1;
+    return await inflight.promise;
+  }
+  const promise = loadRepoGitStatusResponseSnapshot(context, startPath, includeStats)
+    .then(async (value) => {
+      const currentSignature = await getRepoSignature(context.repoRoot, context.gitDir);
+      if (
+        getResourceGeneration(gitRepoGenerations, context.repoRoot) === generation
+        && currentSignature === value.repoSignature
+      ) {
+        setBoundedCache(
+          gitStatusResponseCache,
+          cacheKey,
+          {
+            value,
+            expiresAt: Date.now() + GIT_STATUS_CACHE_TTL_MS,
+            staleUntil: Date.now() + GIT_STATUS_STALE_CACHE_TTL_MS,
+          },
+          GIT_STATUS_CACHE_MAX_ENTRIES,
+        );
+      }
+      return value;
+    })
+    .catch((error) => {
+      if (staleCached && canUseGitStatusStaleCache(error)) return staleCached;
+      throw error;
+    })
+    .finally(() => {
+      gitStatusResponseInflight.delete(inflightKey);
+    });
+  gitStatusResponseInflight.set(inflightKey, { promise, attached: 1 });
+  return await promise;
+}
+
 async function loadFileGitDiffSnapshot(logicalPath: string, repoRoot: string, repoSignature: string, fileSignature: string): Promise<GitDiffSnapshot> {
   let diff = '';
   const repoRelativePath = nodePath.relative(repoRoot, logicalPath).split(nodePath.sep).join('/');
@@ -6954,6 +7523,13 @@ function collectAffectedRepoRoots(targetPath: string): Set<string> {
     const repoRoot = key.split('::')[0] ?? '';
     if (repoRoot && isPathInside(repoRoot, targetPath)) affected.add(repoRoot);
   }
+  for (const entry of gitStatusResponseCache.values()) {
+    if (isPathInside(entry.value.repoRoot, targetPath)) affected.add(entry.value.repoRoot);
+  }
+  for (const key of gitStatusResponseInflight.keys()) {
+    const repoRoot = key.split('::')[0] ?? '';
+    if (repoRoot && isPathInside(repoRoot, targetPath)) affected.add(repoRoot);
+  }
   for (const entry of repoContextCache.values()) {
     const repoRoot = entry.value?.repoRoot;
     if (repoRoot && isPathInside(repoRoot, targetPath)) affected.add(repoRoot);
@@ -6983,11 +7559,17 @@ function invalidateGitCachesForPath(targetPath: string): void {
     if (isPathInside(key, normalized)) gitNumstatCache.delete(key);
     if (isPathInside(key, normalized)) repoSignatureCache.delete(key);
   }
+  for (const [key, entry] of gitStatusResponseCache) {
+    if (isPathInside(entry.value.repoRoot, normalized)) gitStatusResponseCache.delete(key);
+  }
   for (const key of gitStatusInflight.keys()) {
     if (isPathInside(key.split('::')[0] ?? '', normalized)) gitStatusInflight.delete(key);
   }
   for (const key of gitNumstatInflight.keys()) {
     if (isPathInside(key.split('::')[0] ?? '', normalized)) gitNumstatInflight.delete(key);
+  }
+  for (const key of gitStatusResponseInflight.keys()) {
+    if (isPathInside(key.split('::')[0] ?? '', normalized)) gitStatusResponseInflight.delete(key);
   }
 }
 
@@ -7005,10 +7587,13 @@ export function __resetFsGitCachesForTests(): void {
   gitStatusInflight.clear();
   gitNumstatCache.clear();
   gitNumstatInflight.clear();
+  gitStatusResponseCache.clear();
+  gitStatusResponseInflight.clear();
   gitDiffCache.clear();
   gitDiffInflight.clear();
   gitRepoGenerations.clear();
   gitDiffGenerations.clear();
+  __resetFsGitStatusWorkerPoolForTests();
 }
 
 function filterRepoFilesForPath(files: GitStatusFile[], requestedPath: string): GitStatusFile[] {
@@ -7024,29 +7609,51 @@ async function handleFsGitStatus(cmd: Record<string, unknown>, serverLink: Serve
 
   const expanded = rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath;
   const resolved = nodePath.resolve(expanded);
+  const requestContext = createFsListRequestContext(serverLink);
 
+  let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+  const deadline = new Promise<never>((_, reject) => {
+    deadlineTimer = setTimeout(() => reject(new FsGitStatusPoolError('timeout')), GIT_STATUS_DEADLINE_MS);
+    deadlineTimer.unref?.();
+  });
   try {
-    const real = await fsRealpath(resolved);
-    const allowed = isPathAllowed(real);
-    if (!allowed) {
-      try { serverLink.send({ type: 'fs.git_status_response', requestId, path: rawPath, status: 'error', error: FS_READ_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
-      return;
-    }
-    const [snapshot, numstat] = await Promise.all([
-      getRepoGitStatusSnapshot(real),
-      includeStats ? getRepoGitNumstatSnapshot(real) : Promise.resolve(null),
-    ]);
-    const files = snapshot ? filterRepoFilesForPath(snapshot.files, real).map((file) => {
-      const stats = numstat?.stats.get(file.path);
-      return stats ? { ...file, ...stats } : file;
-    }) : [];
-    try { serverLink.send({ type: 'fs.git_status_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', files }); } catch { /* ignore */ }
+    await Promise.race([handleFsGitStatusInner(resolved, rawPath, requestId, includeStats, requestContext), deadline]);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg = fsGitStatusErrorCode(err);
+    if (msg === FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_TIMEOUT) {
+      invalidateGitCachesForPath(resolved);
+    }
     // git not available or not a repo — return empty ok (not an error for the UI)
     const isNotRepo = msg.includes('not a git repository') || msg.includes('128');
-    try { serverLink.send({ type: 'fs.git_status_response', requestId, path: rawPath, status: isNotRepo ? 'ok' : 'error', files: [], error: isNotRepo ? undefined : msg }); } catch { /* ignore */ }
+    requestContext.send({ type: 'fs.git_status_response', requestId, path: rawPath, status: isNotRepo ? 'ok' : 'error', files: [], error: isNotRepo ? undefined : msg });
+  } finally {
+    if (deadlineTimer) clearTimeout(deadlineTimer);
+    requestContext.markTerminal();
   }
+}
+
+async function handleFsGitStatusInner(
+  resolved: string,
+  rawPath: string,
+  requestId: string,
+  includeStats: boolean,
+  requestContext: FsListRequestContext,
+): Promise<void> {
+  const real = await fsRealpath(resolved);
+  const allowed = isPathAllowed(real);
+  if (!allowed) {
+    requestContext.send({ type: 'fs.git_status_response', requestId, path: rawPath, status: 'error', error: FS_READ_ERROR_CODES.FORBIDDEN_PATH });
+    return;
+  }
+  const snapshot = await getRepoGitStatusResponseSnapshot(real, includeStats);
+  requestContext.send({
+    type: 'fs.git_status_response',
+    requestId,
+    path: rawPath,
+    resolvedPath: real,
+    status: 'ok',
+    files: snapshot?.files ?? [],
+  });
 }
 
 /** fs.git_diff — return git diff for a specific file */
@@ -7299,8 +7906,8 @@ async function handleChatSubscribeReplay(cmd: Record<string, unknown>, serverLin
   const sessionId = cmd.sessionId as string | undefined;
   if (!sessionId) return;
   try {
-    const { replayTransportHistory } = await import('./transport-history.js');
-    const events = await replayTransportHistory(sessionId);
+    const { replayTransportHistory, trimTransportHistoryEventsToReplayBudget } = await import('./transport-history.js');
+    const events = trimTransportHistoryEventsToReplayBudget(sessionId, await replayTransportHistory(sessionId));
     if (events.length === 0) return;
     // Send history as a batch so the browser can render them before live events
     serverLink.send({ type: TRANSPORT_MSG.CHAT_HISTORY, sessionId, events });
@@ -7351,29 +7958,105 @@ async function handleTransportListModels(
     } catch { /* not connected */ }
   };
   try {
-    const { getProvider, ensureProviderConnected } = await import('../agent/provider-registry.js');
-    let provider = getProvider(agentType);
-
-    // Auto-connect local providers if missing, so we can probe for models
-    if (!provider && (agentType === 'gemini-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless')) {
-      try {
-        provider = await ensureProviderConnected(agentType, {});
-      } catch (err) {
-        logger.debug({ provider: agentType, err }, 'Auto-connect for model listing failed');
-      }
-    }
-
-    if (provider && typeof provider.listModels === 'function') {
-      const result = await provider.listModels(force);
-      reply(result);
-      return;
-    }
-    reply({ models: [], error: `Unsupported agentType: ${agentType || '(missing)'}` });
+    const result = await getTransportListModels(cmd, agentType, force);
+    reply(result);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     logger.warn({ err, agentType }, 'transport.list_models failed');
     reply({ models: [], error: message });
   }
+}
+
+const TRANSPORT_LIST_MODELS_DEFAULT_TTL_MS = 5_000;
+const TRANSPORT_LIST_MODELS_MAX_TTL_MS = 60_000;
+const TRANSPORT_LIST_MODELS_TTL_ENV = 'IMCODES_TRANSPORT_LIST_MODELS_CACHE_TTL_MS';
+
+type TransportListModelsResult = {
+  models: Array<{ id: string; name?: string; supportsReasoningEffort?: boolean }>;
+  defaultModel?: string;
+  isAuthenticated?: boolean;
+  error?: string;
+};
+
+const transportListModelsCache = new Map<string, { expiresAt: number; value: TransportListModelsResult }>();
+const transportListModelsInflight = new Map<string, Promise<TransportListModelsResult>>();
+
+function resolveTransportListModelsCacheTtlMs(): number {
+  const raw = process.env[TRANSPORT_LIST_MODELS_TTL_ENV];
+  if (raw === undefined || raw.trim() === '') return TRANSPORT_LIST_MODELS_DEFAULT_TTL_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return TRANSPORT_LIST_MODELS_DEFAULT_TTL_MS;
+  return Math.min(Math.trunc(parsed), TRANSPORT_LIST_MODELS_MAX_TTL_MS);
+}
+
+function transportListModelsCacheKey(cmd: Record<string, unknown>, agentType: string): string {
+  const provider = typeof cmd.provider === 'string'
+    ? cmd.provider
+    : typeof cmd.providerId === 'string'
+      ? cmd.providerId
+      : '';
+  return `${agentType}\0${provider}`;
+}
+
+async function loadTransportListModels(agentType: string, force: boolean): Promise<TransportListModelsResult> {
+  const { getProvider, ensureProviderConnected } = await import('../agent/provider-registry.js');
+  let provider = getProvider(agentType);
+
+  // Auto-connect local providers if missing, so we can probe for models
+  if (!provider && (agentType === 'gemini-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless')) {
+    try {
+      provider = await ensureProviderConnected(agentType, {});
+    } catch (err) {
+      logger.debug({ provider: agentType, err }, 'Auto-connect for model listing failed');
+    }
+  }
+
+  if (provider && typeof provider.listModels === 'function') {
+    return await provider.listModels(force);
+  }
+  return { models: [], error: `Unsupported agentType: ${agentType || '(missing)'}` };
+}
+
+async function getTransportListModels(
+  cmd: Record<string, unknown>,
+  agentType: string,
+  force: boolean,
+): Promise<TransportListModelsResult> {
+  const cacheKey = transportListModelsCacheKey(cmd, agentType);
+  const now = Date.now();
+  const ttlMs = resolveTransportListModelsCacheTtlMs();
+  if (!force && ttlMs > 0) {
+    const cached = transportListModelsCache.get(cacheKey);
+    if (cached && cached.expiresAt > now) return cached.value;
+  }
+
+  const inflightKey = `${cacheKey}\0${force ? 'force' : 'normal'}`;
+  const inflight = transportListModelsInflight.get(inflightKey);
+  if (inflight) return await inflight;
+
+  const promise = loadTransportListModels(agentType, force)
+    .then((value) => {
+      if (ttlMs > 0 && !value.error) {
+        transportListModelsCache.set(cacheKey, { value, expiresAt: Date.now() + ttlMs });
+      } else {
+        transportListModelsCache.delete(cacheKey);
+      }
+      return value;
+    })
+    .finally(() => {
+      transportListModelsInflight.delete(inflightKey);
+    });
+  transportListModelsInflight.set(inflightKey, promise);
+  return await promise;
+}
+
+export function __resetTransportListModelsCacheForTests(): void {
+  transportListModelsCache.clear();
+  transportListModelsInflight.clear();
+}
+
+export function __resolveTransportListModelsCacheTtlMsForTests(): number {
+  return resolveTransportListModelsCacheTtlMs();
 }
 
 // ── File search tiebreakers for fzf (exported for unit testing) ──────────────

@@ -17,7 +17,8 @@ import {
 } from '../../shared/p2p-workflow-constants.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { SESSION_GROUP_CLONE_CAPABILITY_V1 } from '../../shared/session-group-clone.js';
-import { recordServerSend, stringifyForServerSend } from './latency-tracer.js';
+import { TIMELINE_PROTOCOL_CAPABILITY } from '../../shared/timeline-protocol.js';
+import { classifyServerSendPlane, recordServerSend, stringifyForServerSend } from './latency-tracer.js';
 
 interface SystemStats {
   cpu: number;
@@ -56,6 +57,7 @@ function collectSystemStats(): SystemStats {
 
 const HEARTBEAT_MS = 5_000;
 const STATS_MS = 5_000; // daemon.stats update interval (separate from heartbeat)
+const DATA_PLANE_SEND_QUEUE_CAP = 256; // max queued data-plane messages; overflow is logged not dropped
 /**
  * Audit fix (94b9b837-822 / A6) — reconnect tuning.
  *
@@ -97,6 +99,7 @@ const WATCHDOG_MS = 15_000;           // check connection health every 15s
 const PONG_TIMEOUT_MS = 10_000;       // if no pong within 10s, connection is dead
 const DAEMON_STATIC_CAPABILITIES = [
   SESSION_GROUP_CLONE_CAPABILITY_V1,
+  TIMELINE_PROTOCOL_CAPABILITY,
 ] as const;
 
 export interface ServerLinkOpts {
@@ -130,6 +133,10 @@ export class ServerLink {
   readonly daemonVersion = DAEMON_VERSION;
   private helloEpoch = 0;
   private lastHelloSentAt = 0;
+  private sendBacklogStartedAt: number | null = null;
+  private dataPlaneSendQueue: unknown[] = [];
+  private dataPlaneSendScheduled = false;
+  private dataPlaneQueueStartedAt: number | null = null;
   private p2pWorkflowCapabilities: readonly string[] = [
     P2P_WORKFLOW_CAPABILITY_V1,
     P2P_WORKFLOW_OPENSPEC_ARTIFACTS_CAPABILITY_V1,
@@ -313,6 +320,18 @@ export class ServerLink {
   }
 
   send(msg: unknown): void {
+    if (this.shouldDeferDataPlaneSend(msg)) {
+      this.dataPlaneSendQueue.push(msg);
+      this.dataPlaneQueueStartedAt ??= performance.now();
+      if (this.dataPlaneSendQueue.length > DATA_PLANE_SEND_QUEUE_CAP) {
+        // Log overflow but do NOT drop — the message is already in the queue.
+        // This is observable telemetry, not silent data loss.
+        const overflow = this.dataPlaneSendQueue.length - DATA_PLANE_SEND_QUEUE_CAP;
+        logger.warn({ overflow, queueDepth: this.dataPlaneSendQueue.length }, 'ServerLink: data-plane queue overflow');
+      }
+      this.scheduleDataPlaneFlush();
+      return;
+    }
     this.trySend(msg);
   }
 
@@ -329,14 +348,30 @@ export class ServerLink {
     try {
       this.seq++;
       const serialized = stringifyForServerSend(msg, this.seq);
+      const bufferedAmountBefore = typeof this.ws.bufferedAmount === 'number' ? this.ws.bufferedAmount : undefined;
       const sendStart = performance.now();
+      const sendBacklogAgeMs = this.updateSendBacklogAge(bufferedAmountBefore, sendStart);
+      const outboundQueueDepth = this.dataPlaneSendQueue.length;
+      const outboundQueueAgeMs = this.dataPlaneQueueStartedAt === null ? 0 : sendStart - this.dataPlaneQueueStartedAt;
       this.ws.send(serialized.payload);
+      const bufferedAmountAfter = typeof this.ws.bufferedAmount === 'number' ? this.ws.bufferedAmount : undefined;
+      if ((bufferedAmountAfter ?? 0) > 0 && this.sendBacklogStartedAt === null) {
+        this.sendBacklogStartedAt = sendStart;
+      } else if ((bufferedAmountAfter ?? 0) === 0) {
+        this.sendBacklogStartedAt = null;
+      }
       recordServerSend({
         msgType: serialized.msgType,
         commandId: serialized.commandId,
         jsonBytes: serialized.jsonBytes,
         stringifyMs: serialized.stringifyMs,
         wsSendMs: performance.now() - sendStart,
+        bufferedAmountBefore,
+        bufferedAmountAfter,
+        sendBacklogAgeMs,
+        outboundQueueDepth,
+        outboundQueueAgeMs,
+        recipientCount: 1,
         success: true,
       });
       return true;
@@ -347,11 +382,50 @@ export class ServerLink {
         jsonBytes: 0,
         stringifyMs: 0,
         wsSendMs: 0,
+        bufferedAmountBefore: undefined,
+        bufferedAmountAfter: undefined,
+        sendBacklogAgeMs: undefined,
+        outboundQueueDepth: this.dataPlaneSendQueue.length,
+        outboundQueueAgeMs: this.dataPlaneQueueStartedAt === null ? 0 : performance.now() - this.dataPlaneQueueStartedAt,
+        recipientCount: 1,
         success: false,
       });
       logger.warn({ err }, 'ServerLink: send failed');
       return false;
     }
+  }
+
+  private updateSendBacklogAge(bufferedAmountBefore: number | undefined, now: number): number | undefined {
+    if (bufferedAmountBefore === undefined) return undefined;
+    if (bufferedAmountBefore <= 0) return 0;
+    this.sendBacklogStartedAt ??= now;
+    return now - this.sendBacklogStartedAt;
+  }
+
+  private shouldDeferDataPlaneSend(msg: unknown): boolean {
+    const msgType = typeof (msg as { type?: unknown })?.type === 'string'
+      ? (msg as { type: string }).type
+      : undefined;
+    return classifyServerSendPlane(msgType) === 'data';
+  }
+
+  private scheduleDataPlaneFlush(): void {
+    if (this.dataPlaneSendScheduled) return;
+    this.dataPlaneSendScheduled = true;
+    setImmediate(() => {
+      this.dataPlaneSendScheduled = false;
+      const msg = this.dataPlaneSendQueue.shift();
+      if (msg === undefined) {
+        this.dataPlaneQueueStartedAt = null;
+        return;
+      }
+      this.trySend(msg);
+      if (this.dataPlaneSendQueue.length === 0) {
+        this.dataPlaneQueueStartedAt = null;
+        return;
+      }
+      this.scheduleDataPlaneFlush();
+    });
   }
 
   updateP2pWorkflowCapabilities(capabilities: readonly (P2pWorkflowCapability | string)[]): void {

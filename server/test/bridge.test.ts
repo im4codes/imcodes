@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { WsBridge } from '../src/ws/bridge.js';
+import { getCounter, resetMetricsForTests } from '../src/util/metrics.js';
 import {
   markDaemonUpgradeTargetVersionPublishedForTest,
   resetDaemonUpgradePublicationGateForTest,
@@ -19,6 +20,13 @@ import {
   P2P_WORKFLOW_SCRIPT_ARGV_CAPABILITY_V1,
 } from '../../shared/p2p-workflow-constants.js';
 import { REPO_MSG } from '../../shared/repo-types.js';
+import {
+  TIMELINE_MESSAGES,
+  TIMELINE_RESPONSE_SOURCES,
+  TIMELINE_RESPONSE_STATUS,
+} from '../../shared/timeline-protocol.js';
+import { TIMELINE_DETAIL_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
+import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
 
 // ── Mock WebSocket ─────────────────────────────────────────────────────────────
 
@@ -50,6 +58,30 @@ class MockWs extends EventEmitter {
   /** Sent strings only (excludes binary frames) */
   get sentStrings(): string[] {
     return this.sent.filter((s): s is string => typeof s === 'string');
+  }
+}
+
+class SlowMockWs extends MockWs {
+  private pendingSendCallbacks: Array<(err?: Error) => void> = [];
+
+  override send(data: string | Buffer, _opts?: unknown, callback?: (err?: Error) => void) {
+    if (this.closed) {
+      const err = new Error('socket closed');
+      if (callback) { callback(err); return; }
+      throw err;
+    }
+    this.sent.push(data);
+    if (callback) this.pendingSendCallbacks.push(callback);
+  }
+
+  releaseNextSend(err?: Error): void {
+    this.pendingSendCallbacks.shift()?.(err);
+  }
+
+  releaseAllSends(err?: Error): void {
+    while (this.pendingSendCallbacks.length > 0) {
+      this.releaseNextSend(err);
+    }
   }
 }
 
@@ -120,6 +152,44 @@ function makeRepoCheckoutDb(options: {
   return db as unknown as import('../src/db/client.js').Database;
 }
 
+function makeTimelineOwnershipDb(options: {
+  allowMain?: boolean;
+  allowSub?: boolean;
+  throwOnOwnership?: boolean;
+} = {}) {
+  const db = {
+    queryOne: async (sql: string, params: unknown[]) => {
+      if (sql.includes('SELECT token_hash')) {
+        return { token_hash: 'valid-hash', user_id: 'test-user' };
+      }
+      if (options.throwOnOwnership && (sql.includes('FROM sessions WHERE') || sql.includes('FROM sub_sessions WHERE'))) {
+        throw new Error('ownership db down');
+      }
+      if (sql.includes('FROM sessions WHERE')) {
+        return options.allowMain
+          && params[0] === 'srv-owned'
+          && params[1] === 'deck_proj_brain'
+          ? { ok: 1 }
+          : null;
+      }
+      if (sql.includes('FROM sub_sessions WHERE')) {
+        return options.allowSub
+          && params[0] === 'srv-owned'
+          && params[1] === 'abc-123'
+          ? { ok: 1 }
+          : null;
+      }
+      return null;
+    },
+    query: async () => [],
+    execute: async () => ({ changes: 1 }),
+    exec: async () => {},
+    transaction: async <T>(fn: (tx: import('../src/db/client.js').Database) => Promise<T>) => fn(db as unknown as import('../src/db/client.js').Database),
+    close: () => {},
+  };
+  return db as unknown as import('../src/db/client.js').Database;
+}
+
 // ── Mock crypto + push ─────────────────────────────────────────────────────────
 
 vi.mock('../src/security/crypto.js', () => ({
@@ -136,6 +206,20 @@ async function flushAsync() {
   for (let i = 0; i < 5; i++) await new Promise((r) => process.nextTick(r));
 }
 
+async function flushBridgeDataPlane() {
+  await flushAsync();
+  for (let i = 0; i < 5; i++) {
+    await new Promise((r) => setImmediate(r));
+    await flushAsync();
+  }
+}
+
+async function flushOneBridgeDataPlaneTurn() {
+  await flushAsync();
+  await new Promise((r) => setImmediate(r));
+  await flushAsync();
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('WsBridge', () => {
@@ -146,11 +230,13 @@ describe('WsBridge', () => {
     resetDaemonUpgradePublicationGateForTest();
     markDaemonUpgradeTargetVersionPublishedForTest('2026.4.905-dev.877');
     markDaemonUpgradeTargetVersionPublishedForTest('2026.4.905');
+    resetMetricsForTests();
   });
 
   afterEach(() => {
     WsBridge.getAll().clear();
     resetDaemonUpgradePublicationGateForTest();
+    resetMetricsForTests();
     vi.clearAllMocks();
   });
 
@@ -1420,9 +1506,9 @@ describe('WsBridge', () => {
     }
 
     const sessionScopedCases: Array<[string, Record<string, unknown>, string]> = [
-      ['timeline.history', { type: 'timeline.history', sessionName: 'session-a', events: [{ eventId: 'e1' }], epoch: 1 }, 'session-a'],
-      ['timeline.replay', { type: 'timeline.replay', sessionName: 'session-a', events: [], truncated: false, epoch: 1 }, 'session-a'],
-      ['timeline.event', { type: 'timeline.event', event: { sessionId: 'session-a', eventId: 'e2', type: 'test' } }, 'session-a'],
+      [TIMELINE_MESSAGES.HISTORY, { type: TIMELINE_MESSAGES.HISTORY, sessionName: 'session-a', events: [{ eventId: 'e1' }], epoch: 1 }, 'session-a'],
+      [TIMELINE_MESSAGES.REPLAY, { type: TIMELINE_MESSAGES.REPLAY, sessionName: 'session-a', events: [], truncated: false, epoch: 1 }, 'session-a'],
+      [TIMELINE_MESSAGES.EVENT, { type: TIMELINE_MESSAGES.EVENT, event: { sessionId: 'session-a', eventId: 'e2', type: 'test' } }, 'session-a'],
       ['command.ack', { type: 'command.ack', session: 'session-a', commandId: 'c1', status: 'ok' }, 'session-a'],
       ['subsession.response', { type: 'subsession.response', sessionName: 'session-a', status: 'idle' }, 'session-a'],
       ['session.idle', { type: 'session.idle', session: 'session-a', project: 'p', agentType: 'claude-code' }, 'session-a'],
@@ -1435,7 +1521,11 @@ describe('WsBridge', () => {
         const { daemonWs, browserA, browserB } = await setupTwoBrowsers();
 
         daemonWs.emit('message', JSON.stringify(daemonMsg));
-        await flushAsync();
+        if (label === TIMELINE_MESSAGES.HISTORY || label === TIMELINE_MESSAGES.REPLAY) {
+          await flushBridgeDataPlane();
+        } else {
+          await flushAsync();
+        }
 
         // browserA (subscribed to session-a) must receive it
         expect(browserA.sentStrings.length).toBeGreaterThan(0);
@@ -1448,9 +1538,9 @@ describe('WsBridge', () => {
       const { daemonWs, browserA, browserB } = await setupTwoBrowsers();
 
       daemonWs.emit('message', JSON.stringify({
-        type: 'timeline.history', sessionName: 'session-b', events: [{ secret: 'data' }], epoch: 1,
+        type: TIMELINE_MESSAGES.HISTORY, sessionName: 'session-b', events: [{ secret: 'data' }], epoch: 1,
       }));
-      await flushAsync();
+      await flushBridgeDataPlane();
 
       expect(browserA.sentStrings.length).toBe(0); // session-a browser must be silent
       expect(browserB.sentStrings.length).toBeGreaterThan(0);
@@ -3364,7 +3454,7 @@ describe('WsBridge', () => {
 
       // Browser sends timeline.history_request with requestId — NO terminal.subscribe first
       browserWs.emit('message', JSON.stringify({
-        type: 'timeline.history_request',
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
         sessionName: 'deck_sub_qwen',
         requestId: 'req-123',
         limit: 500,
@@ -3373,20 +3463,95 @@ describe('WsBridge', () => {
 
       // Daemon responds with timeline.history
       daemonWs.emit('message', JSON.stringify({
-        type: 'timeline.history',
+        type: TIMELINE_MESSAGES.HISTORY,
         sessionName: 'deck_sub_qwen',
         requestId: 'req-123',
         events: [{ type: 'user.message', text: 'hello', ts: 1000 }],
         epoch: 1,
       }));
-      await flushAsync();
+      await flushBridgeDataPlane();
 
       // Browser should receive the response (routed by requestId, not subscription)
       const received = browserWs.sentStrings.filter((s) => {
-        try { return (JSON.parse(s) as { type: string }).type === 'timeline.history'; } catch { return false; }
+        try { return (JSON.parse(s) as { type: string }).type === TIMELINE_MESSAGES.HISTORY; } catch { return false; }
       });
       expect(received).toHaveLength(1);
       expect(JSON.parse(received[0]).requestId).toBe('req-123');
+    });
+
+    it('rejects unauthorized browser timeline requests with a request-scoped error and does not forward daemon', async () => {
+      serverId = 'srv-owned';
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeTimelineOwnershipDb({ allowMain: true }), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeTimelineOwnershipDb({ allowMain: true }));
+      daemonWs.sent.length = 0;
+
+      browserWs.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName: 'deck_other_brain',
+        requestId: 'unauthorized-history',
+        limit: 50,
+      }));
+      await flushAsync();
+
+      expect(daemonWs.sentStrings).toHaveLength(0);
+      const responses = browserWs.sentStrings.map((s) => JSON.parse(s) as Record<string, unknown>);
+      expect(responses).toEqual([{
+        type: TIMELINE_MESSAGES.HISTORY,
+        requestId: 'unauthorized-history',
+        sessionName: 'deck_other_brain',
+        status: TIMELINE_RESPONSE_STATUS.ERROR,
+        source: TIMELINE_RESPONSE_SOURCES.ERROR,
+        errorReason: TIMELINE_DETAIL_ERROR_REASONS.UNAUTHORIZED,
+        events: [],
+      }]);
+    });
+
+    it('checks deck_sub ownership before forwarding browser timeline page/detail requests', async () => {
+      serverId = 'srv-owned';
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      const db = makeTimelineOwnershipDb({ allowSub: true });
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', db);
+      daemonWs.sent.length = 0;
+
+      browserWs.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.PAGE_REQUEST,
+        sessionName: 'deck_sub_abc-123',
+        requestId: 'page-ok',
+      }));
+      browserWs.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.DETAIL_REQUEST,
+        sessionName: 'deck_sub_other',
+        requestId: 'detail-denied',
+      }));
+      await flushAsync();
+
+      const forwarded = daemonWs.sentStrings.map((s) => JSON.parse(s) as Record<string, unknown>);
+      expect(forwarded).toEqual([{
+        type: TIMELINE_MESSAGES.PAGE_REQUEST,
+        sessionName: 'deck_sub_abc-123',
+        requestId: 'page-ok',
+      }]);
+      const responses = browserWs.sentStrings.map((s) => JSON.parse(s) as Record<string, unknown>);
+      expect(responses).toEqual([{
+        type: TIMELINE_MESSAGES.DETAIL,
+        requestId: 'detail-denied',
+        sessionName: 'deck_sub_other',
+        status: TIMELINE_RESPONSE_STATUS.ERROR,
+        source: TIMELINE_RESPONSE_SOURCES.ERROR,
+        errorReason: TIMELINE_DETAIL_ERROR_REASONS.UNAUTHORIZED,
+      }]);
     });
 
     it('routes timeline.replay response via requestId', async () => {
@@ -3395,25 +3560,61 @@ describe('WsBridge', () => {
       bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
 
       browserWs.emit('message', JSON.stringify({
-        type: 'timeline.replay_request',
+        type: TIMELINE_MESSAGES.REPLAY_REQUEST,
         sessionName: 'deck_sub_qwen',
         requestId: 'replay-456',
       }));
       await flushAsync();
 
       daemonWs.emit('message', JSON.stringify({
-        type: 'timeline.replay',
+        type: TIMELINE_MESSAGES.REPLAY,
         sessionName: 'deck_sub_qwen',
         requestId: 'replay-456',
         events: [],
         epoch: 1,
       }));
-      await flushAsync();
+      await flushBridgeDataPlane();
 
       const received = browserWs.sentStrings.filter((s) => {
-        try { return (JSON.parse(s) as { type: string }).type === 'timeline.replay'; } catch { return false; }
+        try { return (JSON.parse(s) as { type: string }).type === TIMELINE_MESSAGES.REPLAY; } catch { return false; }
       });
       expect(received).toHaveLength(1);
+    });
+
+    it('routes timeline.page and timeline.detail responses via requestId', async () => {
+      const { daemonWs } = await setupAuth();
+      const browserWs = new MockWs();
+      const bridge = WsBridge.get(serverId);
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+
+      const cases = [
+        [TIMELINE_MESSAGES.PAGE_REQUEST, TIMELINE_MESSAGES.PAGE, 'page-1'],
+        [TIMELINE_MESSAGES.DETAIL_REQUEST, TIMELINE_MESSAGES.DETAIL, 'detail-1'],
+      ] as const;
+
+      for (const [requestType, responseType, requestId] of cases) {
+        browserWs.emit('message', JSON.stringify({
+          type: requestType,
+          sessionName: 'deck_sub_qwen',
+          requestId,
+        }));
+        await flushAsync();
+
+        daemonWs.emit('message', JSON.stringify({
+          type: responseType,
+          sessionName: 'deck_sub_qwen',
+          requestId,
+          events: responseType === TIMELINE_MESSAGES.PAGE ? [] : undefined,
+          detail: responseType === TIMELINE_MESSAGES.DETAIL ? { text: 'ok' } : undefined,
+          epoch: 1,
+        }));
+        await flushBridgeDataPlane();
+
+        const received = browserWs.sentStrings
+          .map((s) => JSON.parse(s) as { type: string; requestId?: string })
+          .filter((msg) => msg.type === responseType && msg.requestId === requestId);
+        expect(received).toHaveLength(1);
+      }
     });
 
     it('cleans up pending request after 30s timeout', async () => {
@@ -3423,7 +3624,7 @@ describe('WsBridge', () => {
       bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
 
       browserWs.emit('message', JSON.stringify({
-        type: 'timeline.history_request',
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
         sessionName: 'deck_sub_qwen',
         requestId: 'req-timeout',
         limit: 500,
@@ -3435,7 +3636,7 @@ describe('WsBridge', () => {
 
       // Late response after timeout — should NOT reach browser
       daemonWs.emit('message', JSON.stringify({
-        type: 'timeline.history',
+        type: TIMELINE_MESSAGES.HISTORY,
         sessionName: 'deck_sub_qwen',
         requestId: 'req-timeout',
         events: [{ type: 'user.message', text: 'late', ts: 2000 }],
@@ -3444,7 +3645,7 @@ describe('WsBridge', () => {
       await flushAsync();
 
       const received = browserWs.sentStrings.filter((s) => {
-        try { return (JSON.parse(s) as { type: string }).type === 'timeline.history'; } catch { return false; }
+        try { return (JSON.parse(s) as { type: string }).type === TIMELINE_MESSAGES.HISTORY; } catch { return false; }
       });
       expect(received).toHaveLength(0);
       vi.useRealTimers();
@@ -3456,7 +3657,7 @@ describe('WsBridge', () => {
       bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
 
       browserWs.emit('message', JSON.stringify({
-        type: 'timeline.history_request',
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
         sessionName: 'deck_sub_qwen',
         requestId: 'req-close',
         limit: 500,
@@ -3469,7 +3670,7 @@ describe('WsBridge', () => {
 
       // Response arrives after close — should NOT throw
       daemonWs.emit('message', JSON.stringify({
-        type: 'timeline.history',
+        type: TIMELINE_MESSAGES.HISTORY,
         sessionName: 'deck_sub_qwen',
         requestId: 'req-close',
         events: [],
@@ -3479,7 +3680,7 @@ describe('WsBridge', () => {
 
       // No crash, no sent messages
       expect(browserWs.sentStrings.filter((s) => {
-        try { return (JSON.parse(s) as { type: string }).type === 'timeline.history'; } catch { return false; }
+        try { return (JSON.parse(s) as { type: string }).type === TIMELINE_MESSAGES.HISTORY; } catch { return false; }
       })).toHaveLength(0);
     });
 
@@ -3496,17 +3697,262 @@ describe('WsBridge', () => {
 
       // Daemon sends timeline.history WITHOUT requestId (legacy)
       daemonWs.emit('message', JSON.stringify({
-        type: 'timeline.history',
+        type: TIMELINE_MESSAGES.HISTORY,
         sessionName: 'deck_sub_qwen',
         events: [{ type: 'assistant.text', text: 'hi', ts: 1000 }],
         epoch: 1,
       }));
-      await flushAsync();
+      await flushBridgeDataPlane();
 
       const received = browserWs.sentStrings.filter((s) => {
-        try { return (JSON.parse(s) as { type: string }).type === 'timeline.history'; } catch { return false; }
+        try { return (JSON.parse(s) as { type: string }).type === TIMELINE_MESSAGES.HISTORY; } catch { return false; }
       });
       expect(received).toHaveLength(1);
+    });
+
+    it('fans out a coalesced timeline response to browser and HTTP requestIds without subscriber leakage', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+      const browserA = new MockWs();
+      const browserB = new MockWs();
+      const unrelatedSubscriber = new MockWs();
+      bridge.handleBrowserConnection(browserA as never, 'test-user', makeDb('valid-hash'));
+      bridge.handleBrowserConnection(browserB as never, 'test-user', makeDb('valid-hash'));
+      bridge.handleBrowserConnection(unrelatedSubscriber as never, 'test-user', makeDb('valid-hash'));
+
+      unrelatedSubscriber.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'deck_sub_qwen' }));
+      await flushAsync();
+      unrelatedSubscriber.sent.length = 0;
+
+      browserA.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName: 'deck_sub_qwen',
+        requestId: 'browser-a',
+        limit: 50,
+      }));
+      browserB.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName: 'deck_sub_qwen',
+        requestId: 'browser-b',
+        limit: 50,
+      }));
+      const httpPending = bridge.requestTimelineHistory({
+        sessionName: 'deck_sub_qwen',
+        limit: 50,
+        budgetBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE,
+      });
+      await flushAsync();
+
+      const httpOutbound = daemonWs.sentStrings
+        .map((s) => JSON.parse(s) as { type?: string; requestId?: string })
+        .find((msg) => msg.type === TIMELINE_MESSAGES.HISTORY_REQUEST && msg.requestId?.startsWith('watch-hist-'));
+      expect(httpOutbound?.requestId).toBeTruthy();
+      const httpRequestId = httpOutbound!.requestId!;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY,
+        sessionName: 'deck_sub_qwen',
+        requestIds: ['browser-a', 'browser-b', httpRequestId],
+        events: [{ eventId: 'e1', sessionId: 'deck_sub_qwen', ts: 100, type: 'assistant.text', payload: { text: 'hi' } }],
+        epoch: 2,
+      }));
+      await flushBridgeDataPlane();
+
+      for (const [socket, requestId] of [[browserA, 'browser-a'], [browserB, 'browser-b']] as const) {
+        const responses = socket.sentStrings
+          .map((s) => JSON.parse(s) as { type: string; requestId?: string })
+          .filter((msg) => msg.type === TIMELINE_MESSAGES.HISTORY);
+        expect(responses).toHaveLength(1);
+        expect(responses[0].requestId).toBe(requestId);
+      }
+      await expect(httpPending).resolves.toMatchObject({
+        type: TIMELINE_MESSAGES.HISTORY,
+        requestId: httpRequestId,
+        epoch: 2,
+      });
+      expect(unrelatedSubscriber.sentStrings.some((s) => {
+        try { return (JSON.parse(s) as { type: string }).type === TIMELINE_MESSAGES.HISTORY; } catch { return false; }
+      })).toBe(false);
+    });
+
+    it('serializes coalesced timeline fan-out one browser payload at a time and records backlog metrics', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+      const slowBrowser = new SlowMockWs();
+      const fastBrowser = new MockWs();
+      bridge.handleBrowserConnection(slowBrowser as never, 'test-user', makeDb('valid-hash'));
+      bridge.handleBrowserConnection(fastBrowser as never, 'test-user', makeDb('valid-hash'));
+
+      slowBrowser.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'deck_sub_qwen' }));
+      fastBrowser.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'deck_sub_qwen' }));
+      await flushAsync();
+
+      slowBrowser.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName: 'deck_sub_qwen',
+        requestId: 'slow-browser-history',
+      }));
+      fastBrowser.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName: 'deck_sub_qwen',
+        requestId: 'fast-browser-history',
+      }));
+      const httpPending = bridge.requestTimelineHistory({
+        sessionName: 'deck_sub_qwen',
+        budgetBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE,
+      });
+      await flushAsync();
+
+      const httpOutbound = daemonWs.sentStrings
+        .map((s) => JSON.parse(s) as { type?: string; requestId?: string })
+        .find((msg) => msg.type === TIMELINE_MESSAGES.HISTORY_REQUEST && msg.requestId?.startsWith('watch-hist-'));
+      expect(httpOutbound?.requestId).toBeTruthy();
+
+      slowBrowser.sent.length = 0;
+      fastBrowser.sent.length = 0;
+
+      const largeText = 'x'.repeat(TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE + 2048);
+      const rawCoalescedResponse = JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY,
+        sessionName: 'deck_sub_qwen',
+        requestIds: ['slow-browser-history', 'fast-browser-history', httpOutbound!.requestId],
+        payloadBytes: Buffer.byteLength(largeText, 'utf8'),
+        events: [{
+          eventId: 'large-fanout-e1',
+          sessionId: 'deck_sub_qwen',
+          ts: 100,
+          type: 'assistant.text',
+          payload: { text: largeText },
+        }],
+        epoch: 4,
+      });
+      const consoleLogSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const stringifySpy = vi.spyOn(JSON, 'stringify');
+      const historyStringifyCalls = () => stringifySpy.mock.calls.filter(([value]) => {
+        const msg = value as { type?: unknown; events?: unknown } | null;
+        return msg?.type === TIMELINE_MESSAGES.HISTORY && Array.isArray(msg.events);
+      });
+
+      try {
+        daemonWs.emit('message', rawCoalescedResponse);
+        await flushAsync();
+
+        expect(historyStringifyCalls()).toHaveLength(0);
+        expect(getCounter('ws_bridge_timeline_data_plane_enqueue', {
+          type: TIMELINE_MESSAGES.HISTORY,
+          route: 'http_request',
+          backlog: 'empty',
+        })).toBe(1);
+        expect(getCounter('ws_bridge_timeline_data_plane_enqueue', {
+          type: TIMELINE_MESSAGES.HISTORY,
+          route: 'browser_request',
+          backlog: 'queued',
+        })).toBe(2);
+
+        await flushOneBridgeDataPlaneTurn();
+        await expect(httpPending).resolves.toMatchObject({
+          type: TIMELINE_MESSAGES.HISTORY,
+          requestId: httpOutbound!.requestId,
+        });
+        expect(historyStringifyCalls()).toHaveLength(0);
+
+        await flushOneBridgeDataPlaneTurn();
+        expect(historyStringifyCalls()).toHaveLength(1);
+        expect(slowBrowser.sentStrings.some((s) => JSON.parse(s).type === TIMELINE_MESSAGES.HISTORY)).toBe(true);
+        expect(fastBrowser.sentStrings.some((s) => JSON.parse(s).type === TIMELINE_MESSAGES.HISTORY)).toBe(false);
+
+        daemonWs.emit('message', JSON.stringify({
+          type: 'command.ack',
+          session: 'deck_sub_qwen',
+          commandId: 'cmd-during-slow-fanout',
+          status: 'ok',
+        }));
+        await flushAsync();
+
+        expect(fastBrowser.sentStrings.map((s) => JSON.parse(s).type)).toEqual(['command.ack']);
+
+        slowBrowser.releaseNextSend();
+        await flushOneBridgeDataPlaneTurn();
+        expect(historyStringifyCalls()).toHaveLength(2);
+        expect(fastBrowser.sentStrings.map((s) => JSON.parse(s).type)).toEqual(['command.ack', TIMELINE_MESSAGES.HISTORY]);
+
+        expect(getCounter('ws_bridge_timeline_data_plane_send', {
+          type: TIMELINE_MESSAGES.HISTORY,
+          route: 'http_request',
+          result: 'ok',
+        })).toBe(1);
+        expect(getCounter('ws_bridge_timeline_data_plane_send', {
+          type: TIMELINE_MESSAGES.HISTORY,
+          route: 'browser_request',
+          result: 'ok',
+        })).toBe(2);
+
+        const sendLogs = consoleLogSpy.mock.calls.flatMap(([line]) => {
+          if (typeof line !== 'string') return [];
+          try {
+            const entry = JSON.parse(line) as Record<string, unknown>;
+            return entry.msg === 'WsBridge timeline data-plane send' && entry.type === TIMELINE_MESSAGES.HISTORY ? [entry] : [];
+          } catch {
+            return [];
+          }
+        });
+        const browserBacklogLog = sendLogs.find((entry) => entry.route === 'browser_request' && entry.queuedBehindCount === 1);
+        expect(browserBacklogLog).toMatchObject({
+          dataPlaneClass: 'timeline',
+          recipientCount: 3,
+          requestIdFanoutCount: 3,
+          httpCallerCount: 1,
+          queueDepthAtEnqueue: 2,
+          queueDepthBeforeDrain: 2,
+        });
+        expect(typeof browserBacklogLog?.backlogAgeMs).toBe('number');
+      } finally {
+        slowBrowser.releaseAllSends();
+        stringifySpy.mockRestore();
+        consoleLogSpy.mockRestore();
+      }
+    });
+
+    it('defers large timeline data-plane sends so command.ack can pass first', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'deck_sub_qwen' }));
+      browserWs.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName: 'deck_sub_qwen',
+        requestId: 'large-history',
+        limit: 50,
+      }));
+      await flushAsync();
+      browserWs.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY,
+        sessionName: 'deck_sub_qwen',
+        requestId: 'large-history',
+        events: [{
+          eventId: 'large-e1',
+          sessionId: 'deck_sub_qwen',
+          ts: 100,
+          type: 'assistant.text',
+          payload: { text: 'x'.repeat(TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE + 1024) },
+        }],
+        epoch: 3,
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: 'command.ack',
+        session: 'deck_sub_qwen',
+        commandId: 'cmd-after-large',
+        status: 'ok',
+      }));
+      await flushAsync();
+
+      let sentTypes = browserWs.sentStrings.map((s) => JSON.parse(s) as { type: string });
+      expect(sentTypes.map((msg) => msg.type)).toEqual(['command.ack']);
+
+      await flushBridgeDataPlane();
+      sentTypes = browserWs.sentStrings.map((s) => JSON.parse(s) as { type: string });
+      expect(sentTypes.map((msg) => msg.type)).toEqual(['command.ack', TIMELINE_MESSAGES.HISTORY]);
     });
   });
 

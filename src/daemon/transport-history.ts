@@ -11,6 +11,7 @@ import logger from '../util/logger.js';
 
 const TRANSPORT_DIR = join(homedir(), '.imcodes', 'transport');
 const MAX_REPLAY_LINES = 200;
+export const TRANSPORT_HISTORY_REPLAY_BUDGET_BYTES = 128 * 1024;
 /**
  * Reverse-read chunk size for the tail-N-lines scan. Small enough to
  * short-circuit on sessions with tiny messages, large enough to cover a
@@ -142,6 +143,24 @@ export function sanitizeTransportHistoryEvent(event: Record<string, unknown>): R
   preserveTruncationMetadata(event, out, truncatedFields);
 
   return out;
+}
+
+function chatHistoryEnvelopeBytes(sessionId: string, events: readonly Record<string, unknown>[]): number {
+  return Buffer.byteLength(JSON.stringify({ type: 'chat.history', sessionId, events }), 'utf8');
+}
+
+export function trimTransportHistoryEventsToReplayBudget(sessionId: string, events: Record<string, unknown>[]): Record<string, unknown>[] {
+  if (events.length === 0) return events;
+  if (chatHistoryEnvelopeBytes(sessionId, events) <= TRANSPORT_HISTORY_REPLAY_BUDGET_BYTES) return events;
+  const kept: Record<string, unknown>[] = [];
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    kept.unshift(events[index]!);
+    if (chatHistoryEnvelopeBytes(sessionId, kept) > TRANSPORT_HISTORY_REPLAY_BUDGET_BYTES) {
+      kept.shift();
+      break;
+    }
+  }
+  return kept;
 }
 
 /** Append a transport event to the session's JSONL file. */

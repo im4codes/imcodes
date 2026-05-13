@@ -3171,6 +3171,8 @@ export function App() {
   function scheduleResubscribe(items: Array<{ name: string; mode?: ViewMode }>) {
     const ws = wsRef.current;
     if (!ws?.connected || items.length === 0) return;
+    for (const timer of resubscribeTimersRef.current) clearTimeout(timer);
+    resubscribeTimersRef.current.clear();
 
     const unique = new Map<string, { name: string; mode?: ViewMode }>();
     for (const item of items) {
