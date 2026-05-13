@@ -247,3 +247,23 @@ export function mergeP2pDiscussionUpdate<T extends { startedAt?: number; hopStar
     hopStartedAt: incoming.hopStartedAt ?? existing.hopStartedAt,
   };
 }
+
+export function mergeP2pStatusResponseDiscussions<T extends { id: string; startedAt?: number; hopStartedAt?: number }>(
+  existing: readonly T[],
+  incoming: readonly T[],
+  options: { runId?: string; runFound?: boolean } = {},
+): T[] {
+  const explicitMissingRunId = options.runId && options.runFound === false
+    ? `p2p_${options.runId}`
+    : null;
+  const merged = explicitMissingRunId
+    ? existing.filter((d) => d.id !== explicitMissingRunId)
+    : [...existing];
+
+  for (const entry of incoming) {
+    const idx = merged.findIndex((d) => d.id === entry.id);
+    if (idx >= 0) merged[idx] = mergeP2pDiscussionUpdate(merged[idx], entry);
+    else merged.push(entry);
+  }
+  return merged;
+}

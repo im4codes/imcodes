@@ -1,6 +1,10 @@
 import { describe, expect, it, vi, afterEach } from 'vitest';
 
-import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate } from '../src/p2p-run-mapping.js';
+import {
+  mapP2pRunToDiscussion,
+  mergeP2pDiscussionUpdate,
+  mergeP2pStatusResponseDiscussions,
+} from '../src/p2p-run-mapping.js';
 
 afterEach(() => {
   vi.useRealTimers();
@@ -368,6 +372,63 @@ describe('mapP2pRunToDiscussion', () => {
     expect(merged.hopStartedAt).toBe(existing.hopStartedAt);
     expect(merged.state).toBe('running');
     expect(merged.currentRound).toBe(1);
+  });
+
+  it('keeps existing P2P entries that are absent from a scoped status response', () => {
+    const existing = [
+      {
+        id: 'p2p_run_alpha',
+        topic: 'P2P audit · alpha',
+        state: 'running',
+        currentRound: 1,
+        maxRounds: 2,
+        completedHops: 0,
+        totalHops: 2,
+      },
+      {
+        id: 'p2p_run_beta',
+        topic: 'P2P review · beta',
+        state: 'running',
+        currentRound: 1,
+        maxRounds: 1,
+        completedHops: 0,
+        totalHops: 1,
+      },
+    ];
+
+    const merged = mergeP2pStatusResponseDiscussions(existing, []);
+
+    expect(merged.map((d) => d.id)).toEqual(['p2p_run_alpha', 'p2p_run_beta']);
+  });
+
+  it('removes only an explicitly missing status run', () => {
+    const existing = [
+      {
+        id: 'p2p_run_alpha',
+        topic: 'P2P audit · alpha',
+        state: 'running',
+        currentRound: 1,
+        maxRounds: 2,
+        completedHops: 0,
+        totalHops: 2,
+      },
+      {
+        id: 'p2p_run_beta',
+        topic: 'P2P review · beta',
+        state: 'running',
+        currentRound: 1,
+        maxRounds: 1,
+        completedHops: 0,
+        totalHops: 1,
+      },
+    ];
+
+    const merged = mergeP2pStatusResponseDiscussions(existing, [], {
+      runId: 'run_alpha',
+      runFound: false,
+    });
+
+    expect(merged.map((d) => d.id)).toEqual(['p2p_run_beta']);
   });
 
   it('exposes workflow_projection.diagnostics on the run model', () => {

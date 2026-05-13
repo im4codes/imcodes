@@ -23,7 +23,7 @@ import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 import { RECONNECT_GRACE_MS } from '@shared/ack-protocol.js';
 import type { UsageContextWindowSource } from '@shared/usage-context-window.js';
-import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate } from './p2p-run-mapping.js';
+import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate, mergeP2pStatusResponseDiscussions } from './p2p-run-mapping.js';
 import { useTranslation } from 'react-i18next';
 import { ErrorBoundary } from './components/ErrorBoundary.js';
 import { LanguageSwitcher } from './components/LanguageSwitcher.js';
@@ -2263,20 +2263,10 @@ export function App() {
             ? [msg.run]
             : [];
         const mapped = runs.map((run) => mapP2pRunToDiscussion(run as Record<string, any>));
-        const activeIds = new Set(mapped.map((d) => d.id));
-        setDiscussions((prev) => {
-          const retained = prev.filter((d) => {
-            if (!d.id.startsWith('p2p_')) return true;
-            return activeIds.has(d.id);
-          });
-          const merged = [...retained];
-          for (const entry of mapped) {
-            const idx = merged.findIndex((d) => d.id === entry.id);
-            if (idx >= 0) merged[idx] = mergeP2pDiscussionUpdate(merged[idx], entry);
-            else merged.push(entry);
-          }
-          return merged;
-        });
+        setDiscussions((prev) => mergeP2pStatusResponseDiscussions(prev, mapped, {
+          runId: typeof msg.runId === 'string' ? msg.runId : undefined,
+          runFound: !!msg.run,
+        }));
       }
       if (msg.type === REPO_MSG.DETECTED || msg.type === REPO_MSG.DETECT_RESPONSE) {
         const dir = msg.projectDir as string;
