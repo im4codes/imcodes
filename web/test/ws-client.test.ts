@@ -355,6 +355,7 @@ describe('WsClient', () => {
       event: 'disconnected',
       session: '',
       state: 'disconnected',
+      reason: 'socket_closed',
     });
     expect(() => client.send({ type: 'session.send', sessionName: 's', text: 'lost guard' })).toThrow('WebSocket not connected');
     await vi.advanceTimersByTimeAsync(0);
@@ -375,7 +376,7 @@ describe('WsClient', () => {
     vi.useRealTimers();
   });
 
-  it('foreground probe blocks sends until pong confirms the socket', async () => {
+  it('foreground probe blocks direct sends without tearing down live UI subscriptions', async () => {
     vi.useFakeTimers();
     const client = new WsClient('http://localhost:8787', 'srv-1');
     const handler = vi.fn();
@@ -392,10 +393,12 @@ describe('WsClient', () => {
     expect(client.connected).toBe(false);
     expect(handler).toHaveBeenCalledWith({
       type: 'session.event',
-      event: 'disconnected',
+      event: 'probing',
       session: '',
-      state: 'disconnected',
+      state: 'probing',
+      reason: 'probe_start',
     });
+    expect(handler).not.toHaveBeenCalledWith(expect.objectContaining({ event: 'disconnected' }));
     expect(JSON.parse(socket.send.mock.calls[0][0] as string)).toEqual({ type: 'ping' });
     expect(() => client.send({ type: 'session.send', sessionName: 's', text: 'guarded' })).toThrow('WebSocket not connected');
 
@@ -406,13 +409,14 @@ describe('WsClient', () => {
       event: 'connected',
       session: '',
       state: 'connected',
+      reason: 'probe_recovered',
     });
 
     client.disconnect();
     vi.useRealTimers();
   });
 
-  it('replays remembered live subscriptions after foreground probe recovery', async () => {
+  it('does not replay already-sent live subscriptions after foreground probe recovery', async () => {
     vi.useFakeTimers();
     const client = new WsClient('http://localhost:8787', 'srv-1');
     client.connect();
@@ -433,8 +437,7 @@ describe('WsClient', () => {
     await vi.advanceTimersByTimeAsync(0);
 
     const messages = socket.send.mock.calls.map((call) => JSON.parse(call[0] as string));
-    expect(messages).toContainEqual({ type: 'chat.subscribe', sessionId: 'live-session' });
-    expect(messages).toContainEqual({ type: 'terminal.subscribe', session: 'live-session', raw: false });
+    expect(messages).toEqual([]);
 
     client.disconnect();
     vi.useRealTimers();
@@ -461,14 +464,45 @@ describe('WsClient', () => {
     await vi.advanceTimersByTimeAsync(0);
 
     const messages = socket.send.mock.calls.map((call) => JSON.parse(call[0] as string));
-    expect(messages).toContainEqual({ type: 'chat.subscribe', sessionId: 'pending-session' });
+    expect(messages).toContainEqual({ type: 'chat.subscribe', sessionId: 'pending-session', forceHistory: true });
     expect(messages).toContainEqual({ type: 'terminal.subscribe', session: 'pending-session', raw: true });
 
     client.disconnect();
     vi.useRealTimers();
   });
 
-  it('restores chat subscription before connected handlers request history refresh', async () => {
+  it('sends pending live unsubscriptions after foreground probe recovery', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const socket = lastWs!;
+
+    client.subscribeTerminal('gone-session', false);
+    await vi.advanceTimersByTimeAsync(60);
+    client.subscribeTransportSession('gone-session');
+    socket.send.mockClear();
+
+    client.probeConnection();
+    socket.send.mockClear();
+
+    client.unsubscribeTerminal('gone-session');
+    client.unsubscribeTransportSession('gone-session');
+    expect(socket.send).not.toHaveBeenCalled();
+
+    socket.emit('message', { data: JSON.stringify({ type: 'pong' }) });
+    await vi.advanceTimersByTimeAsync(0);
+
+    const messages = socket.send.mock.calls.map((call) => JSON.parse(call[0] as string));
+    expect(messages).toContainEqual({ type: 'chat.unsubscribe', sessionId: 'gone-session' });
+    expect(messages).toContainEqual({ type: 'terminal.unsubscribe', session: 'gone-session' });
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('does not run reconnect history refresh on foreground probe recovery', async () => {
     vi.useFakeTimers();
     const client = new WsClient('http://localhost:8787', 'srv-1');
     client.connect();
@@ -479,6 +513,7 @@ describe('WsClient', () => {
     client.subscribeTransportSession('history-session');
     client.onMessage((msg) => {
       if (msg.type === 'session.event' && msg.event === 'connected') {
+        if (msg.reason === 'probe_recovered') return;
         client.sendTimelineHistoryRequest('history-session', 25);
       }
     });
@@ -489,15 +524,7 @@ describe('WsClient', () => {
     socket.emit('message', { data: JSON.stringify({ type: 'pong' }) });
 
     const messages = socket.send.mock.calls.map((call) => JSON.parse(call[0] as string));
-    expect(messages.map((message) => message.type)).toEqual([
-      'chat.subscribe',
-      TIMELINE_MESSAGES.HISTORY_REQUEST,
-    ]);
-    expect(messages[1]).toMatchObject({
-      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
-      sessionName: 'history-session',
-      limit: 25,
-    });
+    expect(messages).toEqual([]);
 
     client.disconnect();
     vi.useRealTimers();
@@ -948,6 +975,7 @@ describe('WsClient', () => {
       expect(JSON.parse(firstWs.send.mock.calls.at(-1)[0] as string)).toEqual({
         type: 'chat.subscribe',
         sessionId: 'transport-session',
+        forceHistory: true,
       });
 
       firstWs.send.mockClear();

@@ -1831,6 +1831,7 @@ export function App() {
         if (msg.event === 'connected') {
           setConnected(true);
           setConnecting(false);
+          if (msg.reason === 'probe_recovered') return;
           ws.requestSessionList();
           // Migrate to scoped p2p list. The active session is captured via the
           // ref to survive useEffect closure; the daemon will fail-closed and

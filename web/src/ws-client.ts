@@ -103,11 +103,17 @@ export type TimelineHistoryResponseMessage = TimelineHistoryResponse<TimelineEve
 export type TimelinePageResponseMessage = TimelinePageResponse<TimelineEvent>;
 export type TimelineDetailResponseMessage = TimelineDetailResponse;
 
+export type SessionEventReason =
+  | 'socket_open'
+  | 'probe_start'
+  | 'probe_recovered'
+  | 'socket_closed';
+
 export type ServerMessage =
   | { type: 'terminal.diff'; diff: TerminalDiff }
   | { type: 'terminal.history'; sessionName: string; content: string }
   | { type: 'terminal.stream_reset'; session: string; reason: string }
-  | { type: 'session.event'; event: string; session: string; state: string }
+  | { type: 'session.event'; event: string; session: string; state: string; reason?: SessionEventReason }
   | { type: 'session.error'; project: string; message: string }
   | { type: 'session.idle'; session: string; project: string; agentType: string; label?: string; parentLabel?: string }
   | { type: 'session.notification'; session: string; project: string; title: string; message: string; agentType?: string; label?: string; parentLabel?: string }
@@ -354,6 +360,8 @@ export class WsClient {
 
   /** Desired transport-chat subscriptions per session. Replayed on browser reconnect. */
   private transportSubscriptions = new Set<string>();
+  /** Transport-chat subscriptions confirmed sent on the current browser WS. */
+  private sentTransportSubscriptions = new Set<string>();
 
   private postConnectNonCriticalUntil = 0;
   private postConnectNonCriticalSlots = 0;
@@ -545,8 +553,10 @@ export class WsClient {
    *      no extra ping. Rapid visibility/focus toggles do not churn the UI.
    *   2. If a probe is already in flight (`_resumeProbeTimer` armed), don't
    *      restart it; the in-flight probe will resolve on its own.
-   *   3. Otherwise mark the socket unverified, dispatch `disconnected` so
-   *      `send()` callers can't push into a possibly-dead pipe, and ping.
+   *   3. Otherwise mark the socket unverified for direct sends, but keep the
+   *      UI logically online. Probe state is not a disconnect: React effects
+   *      must not tear down live subscriptions while the same socket is being
+   *      verified.
    */
   probeConnection(timeoutMs = RESUME_PROBE_TIMEOUT_MS): void {
     if (this._destroyed) return;
@@ -567,7 +577,13 @@ export class WsClient {
     const wasConnected = this._connected;
     this._connected = false;
     if (wasConnected) {
-      this.dispatch({ type: 'session.event', event: 'disconnected', session: '', state: 'disconnected' });
+      this.dispatch({
+        type: 'session.event',
+        event: 'probing',
+        session: '',
+        state: 'probing',
+        reason: 'probe_start',
+      });
     }
 
     this.clearPongWatchdog();
@@ -686,8 +702,9 @@ export class WsClient {
     this.sentTerminalSubscriptions.set(sessionName, desiredRaw);
   }
 
-  private replayLiveSubscriptionsAfterConnect(): void {
+  private replayAllSubscriptionsForNewSocket(): void {
     this.sentTerminalSubscriptions.clear();
+    this.sentTransportSubscriptions.clear();
     this.terminalSubscriptionNextFlushAt = 0;
 
     let terminalReplayIndex = 0;
@@ -697,11 +714,57 @@ export class WsClient {
     }
 
     for (const sessionId of this.transportSubscriptions) {
-      try {
-        this.send({ type: TRANSPORT_MSG.CHAT_SUBSCRIBE, sessionId });
-      } catch {
-        break;
+      if (!this.sendTransportSubscribe(sessionId, true)) break;
+    }
+  }
+
+  private flushSubscriptionDiffAfterProbeRecovery(): void {
+    this.terminalSubscriptionNextFlushAt = 0;
+    let terminalReplayIndex = 0;
+    const terminalSessions = new Set([
+      ...this.terminalSubscriptions.keys(),
+      ...this.sentTerminalSubscriptions.keys(),
+    ]);
+    for (const session of terminalSessions) {
+      this.queueTerminalSubscriptionSync(session, terminalReplayIndex * TERMINAL_RECONNECT_REPLAY_STAGGER_MS);
+      terminalReplayIndex++;
+    }
+
+    for (const sessionId of Array.from(this.sentTransportSubscriptions)) {
+      if (!this.transportSubscriptions.has(sessionId)) {
+        if (!this.sendTransportUnsubscribe(sessionId)) break;
       }
+    }
+    for (const sessionId of this.transportSubscriptions) {
+      if (!this.sentTransportSubscriptions.has(sessionId)) {
+        if (!this.sendTransportSubscribe(sessionId, true)) break;
+      }
+    }
+  }
+
+  private sendTransportSubscribe(sessionId: string, forceHistory: boolean): boolean {
+    if (!this._connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+    try {
+      this.send({
+        type: TRANSPORT_MSG.CHAT_SUBSCRIBE,
+        sessionId,
+        ...(forceHistory ? { forceHistory: true } : {}),
+      });
+      this.sentTransportSubscriptions.add(sessionId);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private sendTransportUnsubscribe(sessionId: string): boolean {
+    if (!this._connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+    try {
+      this.send({ type: TRANSPORT_MSG.CHAT_UNSUBSCRIBE, sessionId });
+      this.sentTransportSubscriptions.delete(sessionId);
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -709,19 +772,22 @@ export class WsClient {
   subscribeTransportSession(sessionId: string): void {
     if (!sessionId) return;
     this.setP2pWorkflowRequestScope({ sessionName: sessionId });
-    if (this.transportSubscriptions.has(sessionId)) return;
+    const wasDesired = this.transportSubscriptions.has(sessionId);
     this.transportSubscriptions.add(sessionId);
     if (!this._connected) return;
-    this.send({ type: TRANSPORT_MSG.CHAT_SUBSCRIBE, sessionId });
+    if (!wasDesired || !this.sentTransportSubscriptions.has(sessionId)) {
+      this.sendTransportSubscribe(sessionId, true);
+    }
   }
 
   /** Unsubscribe from transport chat events for a session. */
   unsubscribeTransportSession(sessionId: string): void {
     if (!sessionId) return;
-    if (!this.transportSubscriptions.has(sessionId)) return;
-    this.transportSubscriptions.delete(sessionId);
+    const wasDesired = this.transportSubscriptions.delete(sessionId);
+    const wasSent = this.sentTransportSubscriptions.has(sessionId);
+    if (!wasDesired && !wasSent) return;
     if (!this._connected) return;
-    this.send({ type: TRANSPORT_MSG.CHAT_UNSUBSCRIBE, sessionId });
+    if (wasSent) this.sendTransportUnsubscribe(sessionId);
   }
 
   /** Respond to a transport approval request. */
@@ -1336,8 +1402,14 @@ export class WsClient {
         if (state.pendingSnapshot) clearTimeout(state.pendingSnapshot);
       }
       this.resetState.clear();
-      this.replayLiveSubscriptionsAfterConnect();
-      this.dispatch({ type: 'session.event', event: 'connected', session: '', state: 'connected' });
+      this.replayAllSubscriptionsForNewSocket();
+      this.dispatch({
+        type: 'session.event',
+        event: 'connected',
+        session: '',
+        state: 'connected',
+        reason: 'socket_open',
+      });
     });
 
     socket.addEventListener('message', (ev) => {
@@ -1369,8 +1441,14 @@ export class WsClient {
             this._resumeProbeTimer = null;
             if (!this._connected) {
               this._connected = true;
-              this.replayLiveSubscriptionsAfterConnect();
-              this.dispatch({ type: 'session.event', event: 'connected', session: '', state: 'connected' });
+              this.flushSubscriptionDiffAfterProbeRecovery();
+              this.dispatch({
+                type: 'session.event',
+                event: 'connected',
+                session: '',
+                state: 'connected',
+                reason: 'probe_recovered',
+              });
             }
           }
           return;
@@ -1398,7 +1476,13 @@ export class WsClient {
       this.ws = null;
       this.clearSocketTimers();
       if (wasConnected) {
-        this.dispatch({ type: 'session.event', event: 'disconnected', session: '', state: 'disconnected' });
+        this.dispatch({
+          type: 'session.event',
+          event: 'disconnected',
+          session: '',
+          state: 'disconnected',
+          reason: 'socket_closed',
+        });
       }
       if (!this._destroyed) this.scheduleReconnect();
     });
@@ -1559,6 +1643,7 @@ export class WsClient {
     }
     this.terminalSubscriptionTimers.clear();
     this.sentTerminalSubscriptions.clear();
+    this.sentTransportSubscriptions.clear();
     this.terminalSubscriptionNextFlushAt = 0;
   }
 
@@ -1579,7 +1664,13 @@ export class WsClient {
     this._connecting = false;
     this.clearSocketTimers();
     if (wasConnected) {
-      this.dispatch({ type: 'session.event', event: 'disconnected', session: '', state: 'disconnected' });
+      this.dispatch({
+        type: 'session.event',
+        event: 'disconnected',
+        session: '',
+        state: 'disconnected',
+        reason: 'socket_closed',
+      });
     }
     if (socket && socket.readyState !== WebSocket.CLOSED) {
       try { socket.close(code, reason); } catch { /* ignore */ }

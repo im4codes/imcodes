@@ -2371,6 +2371,7 @@ export function useTimeline(
       // window. If we have no local events (first connect / fresh tab) we omit
       // afterTs and get the standard recent window.
       if (msg.type === 'session.event' && (msg as { event: string }).event === 'connected') {
+        if ((msg as { reason?: string }).reason === 'probe_recovered') return;
         // Same gate as the DAEMON_MSG.RECONNECTED path — restrict the
         // browser-WS reconnect refresh to the active card's hook so we
         // don't herd the daemon with N timeline.history_request +

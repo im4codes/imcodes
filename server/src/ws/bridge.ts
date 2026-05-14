@@ -2579,6 +2579,8 @@ export class WsBridge {
       // Track transport (chat) subscriptions for session-scoped transport event delivery
       if (msg.type === TRANSPORT_MSG.CHAT_SUBSCRIBE && typeof msg.sessionId === 'string') {
         const sessionId = msg.sessionId;
+        const forceHistory = (msg as { forceHistory?: unknown }).forceHistory === true;
+        const alreadySubscribed = this.transportSubscriptions.get(ws)?.has(sessionId) ?? false;
         const revision = this.bumpTransportSubscriptionRevision(ws, sessionId);
         void this.verifySessionOwnership(sessionId).then((allowed) => {
           if (!allowed) {
@@ -2588,8 +2590,13 @@ export class WsBridge {
           if (!this.isCurrentTransportSubscriptionRevision(ws, sessionId, revision)) return;
           if (ws.readyState !== WebSocket.OPEN) return;
           this.transportSubscriptions.get(ws)?.add(sessionId);
-          // Forward to daemon so it can replay cached history.
-          this.sendToDaemon(raw);
+          // Only first subscribe, explicit reconnect replay, or caller-forced
+          // history should reach daemon. Browser foreground probes can resend
+          // subscription state on the same socket; forwarding every duplicate
+          // triggers chat.history storms and starves live delta/typewriter UI.
+          if (!alreadySubscribed || forceHistory) {
+            this.sendToDaemon(raw);
+          }
         });
         return;
       }

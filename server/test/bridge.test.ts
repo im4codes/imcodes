@@ -3204,6 +3204,47 @@ describe('WsBridge', () => {
       expect(browserWs.sentStrings.filter(s => JSON.parse(s).type === 'chat.delta')).toHaveLength(0);
     });
 
+    it('does not forward duplicate chat.subscribe history replays unless forced', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+      daemonWs.sent.length = 0;
+
+      browserWs.emit('message', JSON.stringify({ type: 'chat.subscribe', sessionId: 'ts-repeat' }));
+      await flushAsync();
+      expect(daemonWs.sentStrings.filter((s) => JSON.parse(s).type === 'chat.subscribe')).toHaveLength(1);
+      daemonWs.sent.length = 0;
+
+      browserWs.emit('message', JSON.stringify({ type: 'chat.subscribe', sessionId: 'ts-repeat' }));
+      await flushAsync();
+      expect(daemonWs.sentStrings.filter((s) => JSON.parse(s).type === 'chat.subscribe')).toHaveLength(0);
+
+      browserWs.emit('message', JSON.stringify({
+        type: 'chat.subscribe',
+        sessionId: 'ts-repeat',
+        forceHistory: true,
+      }));
+      await flushAsync();
+      const forced = daemonWs.sentStrings
+        .map((s) => JSON.parse(s))
+        .filter((msg) => msg.type === 'chat.subscribe');
+      expect(forced).toEqual([{ type: 'chat.subscribe', sessionId: 'ts-repeat', forceHistory: true }]);
+    });
+
+    it('forwards chat.subscribe again after unsubscribe', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+      daemonWs.sent.length = 0;
+
+      browserWs.emit('message', JSON.stringify({ type: 'chat.subscribe', sessionId: 'ts-resub' }));
+      await flushAsync();
+      daemonWs.sent.length = 0;
+
+      browserWs.emit('message', JSON.stringify({ type: 'chat.unsubscribe', sessionId: 'ts-resub' }));
+      await flushAsync();
+      browserWs.emit('message', JSON.stringify({ type: 'chat.subscribe', sessionId: 'ts-resub' }));
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.filter((s) => JSON.parse(s).type === 'chat.subscribe')).toHaveLength(1);
+    });
+
     it('relays chat.complete events to subscribed browsers', async () => {
       const { daemonWs, browserWs } = await setupAuthenticatedBridge();
       browserWs.emit('message', JSON.stringify({ type: 'chat.subscribe', sessionId: 'ts-complete' }));

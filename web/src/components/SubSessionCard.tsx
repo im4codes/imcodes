@@ -212,7 +212,10 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     if (!text || !ws || !connected) return;
     try {
       ws.sendSessionCommand('send', { sessionName: sub.sessionName, text });
-    } catch { /* ignore */ }
+    } catch (err) {
+      console.warn('sub-session send failed; preserving draft for retry', err);
+      return;
+    }
     cardInputRef.current!.value = '';
     requestAnimationFrame(() => { forceFollowLatest(); });
   }, [ws, connected, sub.sessionName, forceFollowLatest]);
