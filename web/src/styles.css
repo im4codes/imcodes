@@ -421,6 +421,12 @@ body {
 .openspec-submenu { z-index: 2147483647; }
 .openspec-submenu-inline { position: static; width: 100%; min-width: 0; max-width: none; max-height: none; margin-top: 6px; overflow: visible; }
 .menu-dropdown-p2p { z-index: 10001; width: max-content; min-width: 240px; max-width: min(560px, calc(100vw - 24px)); max-height: none; overflow-y: visible; }
+.menu-dropdown-p2p .p2p-dropdown-rounds { display: grid; gap: 6px; padding: 8px 10px 6px; margin: 4px 6px 6px; background: linear-gradient(180deg, rgba(29, 78, 216, 0.46), rgba(30, 64, 175, 0.34)); border: 1px solid #22c55e; border-radius: 8px; box-shadow: inset 0 0 0 1px rgba(96, 165, 250, 0.18), 0 0 0 1px rgba(34, 197, 94, 0.12); }
+.menu-dropdown-p2p .p2p-dropdown-rounds .p2p-menu-section-label { color: #86efac; }
+.p2p-dropdown-rounds-hint { color: #bfdbfe; }
+.p2p-dropdown-round { padding: 5px 0; text-align: center; border: 1px solid rgba(34, 197, 94, 0.48); border-radius: 4px; background: rgba(30, 64, 175, 0.48); color: #dbeafe; font-size: 12px; font-weight: 600; }
+.p2p-dropdown-round:hover { background: #1d4ed8; border-color: #4ade80; color: #ffffff; }
+.p2p-dropdown-round.menu-item-active { background: #1d4ed8 !important; border-color: #22c55e; color: #eff6ff; font-weight: 700; box-shadow: inset 0 0 12px rgba(59, 130, 246, 0.35), 0 0 0 1px rgba(34, 197, 94, 0.28); }
 .menu-item { display: block; width: 100%; padding: 9px 14px; background: none; border: none; color: #cbd5e1; font-size: 13px; font-family: inherit; text-align: left; cursor: pointer; transition: background 0.1s; }
 .menu-dropdown-p2p .menu-item,
 .menu-dropdown-p2p .menu-divider,
@@ -547,8 +553,10 @@ body {
     position: sticky;
     top: 0;
     z-index: 1;
-    background: #1e293b;
-    border-bottom: 1px solid rgba(148, 163, 184, 0.16);
+    margin: 0 0 6px;
+    border-radius: 0 0 10px 10px;
+    background: linear-gradient(180deg, rgba(29, 78, 216, 0.54), rgba(30, 64, 175, 0.42));
+    border-color: #22c55e;
   }
   .menu-dropdown-p2p .menu-item,
   .menu-dropdown-p2p .menu-divider,

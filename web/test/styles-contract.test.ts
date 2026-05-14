@@ -66,6 +66,18 @@ describe('styles.css regression contracts', () => {
     expect(activeBrainRule![0]).toMatch(/border-bottom-width:\s*4px/);
   });
 
+  it('P2P dropdown rounds selector uses a blue background with green borders', () => {
+    const selectorRule = css.match(/\.menu-dropdown-p2p \.p2p-dropdown-rounds\s*\{[^}]*\}/);
+    expect(selectorRule).not.toBeNull();
+    expect(selectorRule![0]).toMatch(/background:\s*linear-gradient\([^;]*rgba\(29,\s*78,\s*216/);
+    expect(selectorRule![0]).toMatch(/border:\s*1px solid #22c55e/);
+
+    const roundButtonRule = css.match(/\.p2p-dropdown-round\s*\{[^}]*\}/);
+    expect(roundButtonRule).not.toBeNull();
+    expect(roundButtonRule![0]).toMatch(/background:\s*rgba\(30,\s*64,\s*175/);
+    expect(roundButtonRule![0]).toMatch(/border:\s*1px solid rgba\(34,\s*197,\s*94/);
+  });
+
   it('.fb-changes-section must NOT cap height — list must scroll past 10 items', () => {
     // User reported: file browser changes list silently hides items
     // beyond ~10 even though the DOM has them. Root cause:

@@ -2993,13 +2993,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               <div
                 class="p2p-dropdown-rounds"
                 data-testid="p2p-dropdown-rounds"
-                style={{ padding: '8px 10px 6px', display: 'grid', gap: 6 }}
               >
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
                   <span class="p2p-menu-section-label" style={{ padding: 0 }}>{t('p2p.settings_rounds')}</span>
                   <span
+                    class="p2p-dropdown-rounds-hint"
                     title={t('p2p.settings_rounds_explanation')}
-                    style={{ fontSize: 10, color: '#64748b', whiteSpace: 'normal', textAlign: 'right' }}
+                    style={{ fontSize: 10, whiteSpace: 'normal', textAlign: 'right' }}
                   >
                     {t('p2p.settings_rounds_hint')}
                   </span>
@@ -3015,15 +3015,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                         data-testid={`p2p-dropdown-round-${roundOption}`}
                         data-active={active ? 'true' : 'false'}
                         onClick={() => handleP2pDropdownRoundsChange(roundOption)}
-                        style={{
-                          padding: '5px 0',
-                          textAlign: 'center',
-                          borderRadius: 4,
-                          fontSize: 12,
-                          fontWeight: active ? 700 : 600,
-                          color: active ? '#bfdbfe' : '#cbd5e1',
-                          background: active ? '#1d4ed840' : '#0f172a80',
-                        }}
                       >
                         {roundOption}
                       </button>
