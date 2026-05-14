@@ -983,6 +983,18 @@ body {
 .chat-sel-menu { position: absolute; z-index: 20; pointer-events: auto; display: flex; flex-wrap: wrap; gap: 4px; max-width: calc(100% - 16px); box-sizing: border-box; }
 /* Mobile: disable native text selection/callout in chat — custom long-press timer handles Copy/Quote. */
 @media (pointer: coarse) { .chat-view { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; } }
+/* Mobile bubbles use `touch-action: manipulation` so that a second short
+   tap reaches our touchend handler quickly. Without this, iOS Safari waits
+   ~300ms after the first tap to see if the user is starting a double-tap
+   zoom gesture, which both adds perceived latency and can mask the second
+   touchend behind synthetic events. Viewport `user-scalable=no` already
+   suppresses the zoom itself; this just hands the event to JS sooner. */
+@media (pointer: coarse) {
+  .chat-event.chat-assistant,
+  .chat-event.chat-user {
+    touch-action: manipulation;
+  }
+}
 .chat-sel-btn { background: #1e293b; border: 1px solid #475569; color: #e2e8f0; font-size: 13px; padding: 5px 14px; border-radius: 6px; cursor: pointer; font-family: inherit; white-space: nowrap; box-shadow: 0 4px 12px rgba(0,0,0,0.4); transition: background 0.15s; }
 .chat-sel-btn:hover { background: #334155; }
 .chat-sel-btn.copied { background: #166534; border-color: #16a34a; color: #86efac; }

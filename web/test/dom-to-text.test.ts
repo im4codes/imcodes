@@ -89,6 +89,32 @@ describe('domNodeToPlainText', () => {
     expect(domNodeToPlainText(el)).toBe('see this link please');
   });
 
+  it('extracts a full assistant chat-event including timestamp (timestamp dropped)', () => {
+    // Mirrors what ChatView's right-click context menu hands to
+    // `extractChatEventText` — a `.chat-event.chat-assistant` element with
+    // a `.chat-rich-text` body and a trailing `.chat-bubble-time`.
+    const el = makeEl(
+      '<div class="chat-event chat-assistant">' +
+        '<div class="chat-rich-text">' +
+          '<p><span>First paragraph.</span></p>' +
+          '<p><span>Second paragraph.</span></p>' +
+        '</div>' +
+        '<div class="chat-bubble-time">12:34</div>' +
+      '</div>',
+    );
+    expect(domNodeToPlainText(el)).toBe('First paragraph.\n\nSecond paragraph.');
+  });
+
+  it('extracts a full user chat-event including the bubble wrapper', () => {
+    const el = makeEl(
+      '<div class="chat-event chat-user">' +
+        '<div class="chat-bubble-content"><span>hello\nworld</span></div>' +
+        '<div class="chat-bubble-time">12:34</div>' +
+      '</div>',
+    );
+    expect(domNodeToPlainText(el)).toBe('hello\nworld');
+  });
+
   it('round-trips a marked-style multi-paragraph assistant message', () => {
     // Shape mirrors what ChatMarkdown renders for:
     //   First paragraph.

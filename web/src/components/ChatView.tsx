@@ -81,6 +81,12 @@ interface AssistantBlockProps {
   text: string;
   automation?: boolean;
   ts: number;
+  /** Stable identifier for this merged block. Wired through to a
+   *  `data-event-id` attribute so the mobile double-tap detector can pair
+   *  taps by event id instead of HTMLElement reference — DOM nodes are
+   *  recycled by Preact when the merged block grows, which would otherwise
+   *  break a `===` comparison between consecutive taps. */
+  eventId?: string;
   onPathClick?: (p: string) => void;
   onUrlClick?: (url: string) => void;
   onDownload?: (path: string) => void;
@@ -572,10 +578,15 @@ const FILE_PANEL_MIN = 220;
 const FILE_PANEL_MAX_RATIO = 0.6; // 60% of viewport width
 const FILE_PANEL_DEFAULT = 340;
 /** Two short taps within this many ms on the same chat bubble open the zoom
- *  modal. 320ms is comfortably below the 500ms iOS double-tap-to-zoom
- *  reflex so single taps don't accidentally pair, but long enough that
- *  users on a moving train don't have to hit a 200ms window. */
-const DOUBLE_TAP_THRESHOLD_MS = 320;
+ *  modal. 450ms is wider than the strict iOS double-click window because
+ *  fingers on a phone are slower than mouse buttons, and we want this to
+ *  feel forgiving — single taps still don't pair because the chat view
+ *  has no other tap action that would accidentally satisfy the predicate. */
+const DOUBLE_TAP_THRESHOLD_MS = 450;
+/** A touch this much movement (px) from the start point still counts as a
+ *  tap (rather than a scroll). 15px gives finger-tremor headroom; smaller
+ *  values miss double-taps where the second tap drifted slightly. */
+const TAP_MOVE_TOLERANCE_PX = 15;
 /** Long-press timer for the mobile Copy/Quote context menu. Matches the
  *  iOS callout heuristic so users with muscle memory from native chat
  *  apps see the menu at the expected moment. */
@@ -1291,9 +1302,10 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // The same handler also detects double-taps on text bubbles
   // (`.chat-assistant` / `.chat-user`) and opens the ZoomedTextDialog so the
   // user can re-enable native selection and copy a specific portion. Tap
-  // bookkeeping: each touch that ends as a "short tap" (timer still active,
-  // finger didn't move >10px) records its target + timestamp; a second short
-  // tap on the same bubble within DOUBLE_TAP_THRESHOLD_MS triggers the zoom.
+  // pairing is keyed off `data-event-id` (a string), not the HTMLElement —
+  // streaming assistant messages re-render between taps and Preact may
+  // replace the DOM node even when the logical bubble is unchanged, which
+  // would defeat a `===` ref check.
   useEffect(() => {
     if (!isTouchDevice || preview) return;
     const container = scrollRef.current;
@@ -1301,8 +1313,8 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     let timer: ReturnType<typeof setTimeout> | null = null;
     let startX = 0, startY = 0;
     let startTarget: HTMLElement | null = null;
+    let lastTapEventId = '';
     let lastTapTs = 0;
-    let lastTapTarget: HTMLElement | null = null;
 
     // Telegram pattern: eat the touchend + subsequent click after menu opens
     const cancelEvent = (e: Event) => { e.preventDefault(); e.stopPropagation(); };
@@ -1311,7 +1323,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       if (e.touches.length > 1) {
         // multi-touch → cancel any in-flight tap tracking; this is a pinch/scroll
         if (timer) { clearTimeout(timer); timer = null; }
-        lastTapTarget = null; lastTapTs = 0;
+        lastTapEventId = ''; lastTapTs = 0;
         return;
       }
       const t = e.touches[0];
@@ -1330,10 +1342,10 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     const onTouchMove = (e: TouchEvent) => {
       if (!timer) return;
       const t = e.touches[0];
-      if (Math.abs(t.clientX - startX) > 10 || Math.abs(t.clientY - startY) > 10) {
+      if (Math.abs(t.clientX - startX) > TAP_MOVE_TOLERANCE_PX || Math.abs(t.clientY - startY) > TAP_MOVE_TOLERANCE_PX) {
         clearTimeout(timer); timer = null;
-        // Any drag cancels the pending double-tap pairing — scrolling shouldn't zoom.
-        lastTapTarget = null; lastTapTs = 0;
+        // Scroll/drag — cancel pending double-tap pairing too.
+        lastTapEventId = ''; lastTapTs = 0;
       }
     };
 
@@ -1344,22 +1356,23 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
         // Long-press fired or finger moved — neither counts as a tap, so
         // reset pairing to avoid a stale tap accidentally pairing with the
         // next clean tap.
-        lastTapTarget = null; lastTapTs = 0;
+        lastTapEventId = ''; lastTapTs = 0;
         return;
       }
       const bubble = startTarget?.closest?.('.chat-assistant, .chat-user') as HTMLElement | null;
-      if (!bubble) {
-        lastTapTarget = null; lastTapTs = 0;
+      const id = bubble?.dataset?.eventId ?? '';
+      if (!bubble || !id) {
+        lastTapEventId = ''; lastTapTs = 0;
         return;
       }
       const now = Date.now();
-      if (lastTapTarget === bubble && now - lastTapTs < DOUBLE_TAP_THRESHOLD_MS) {
+      if (lastTapEventId === id && now - lastTapTs < DOUBLE_TAP_THRESHOLD_MS) {
         // Double-tap → open zoom modal with format-preserving text.
         const text = extractChatEventText(bubble);
         if (text) setZoomText(text);
-        lastTapTarget = null; lastTapTs = 0;
+        lastTapEventId = ''; lastTapTs = 0;
       } else {
-        lastTapTarget = bubble; lastTapTs = now;
+        lastTapEventId = id; lastTapTs = now;
       }
     };
 
@@ -1590,6 +1603,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
               return (
                 <AssistantBlock
                   key={item.key}
+                  eventId={item.key}
                   text={item.text!}
                   automation={item.assistantAutomation === true}
                   ts={item.lastTs ?? item.ts ?? 0}
@@ -1871,12 +1885,16 @@ const AssistantBlock = memo(function AssistantBlock({
   text,
   automation,
   ts,
+  eventId,
   onPathClick,
   onUrlClick,
   onDownload,
 }: AssistantBlockProps) {
   return (
-    <div class={`chat-event chat-assistant${automation ? ' chat-assistant-automation' : ''}`}>
+    <div
+      class={`chat-event chat-assistant${automation ? ' chat-assistant-automation' : ''}`}
+      data-event-id={eventId}
+    >
       <ChatMarkdown text={text} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} />
       <ChatTime ts={ts} />
     </div>
