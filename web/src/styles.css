@@ -1013,14 +1013,12 @@ body {
 .chat-bubble-content { white-space: pre-wrap; word-break: break-word; }
 .chat-bubble-time { font-size: 10px; color: #64748b; margin-top: 2px; }
 .chat-sel-menu { position: absolute; z-index: 20; pointer-events: auto; display: flex; flex-wrap: wrap; gap: 4px; max-width: calc(100% - 16px); box-sizing: border-box; }
-/* Mobile-like layout: disable native text selection/callout in chat — our
-   custom long-press timer handles Copy/Quote. The predicate must match the
-   `useMobileLikeChatLayout` hook in ChatView.tsx so CSS and JS agree on
-   whether the chat is in mobile mode (pointer-coarse OR narrow viewport).
-   The width branch catches narrow desktop windows where the user is on a
-   small laptop in mouse mode — they get the mobile gesture set too, which
-   matches what the layout looks like at that width. */
-@media (pointer: coarse), (max-width: 768px) {
+/* Touch-pointer layout: disable native text selection/callout in chat so our
+   custom long-press timer handles Copy/Quote. This intentionally does NOT use
+   viewport width: desktop users can run narrow windows and still need native
+   selection plus the Copy/Quote popup. Keep in sync with ChatView.tsx's
+   TOUCH_GESTURE_MEDIA_QUERY. */
+@media (pointer: coarse) {
   .chat-view { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
   /* `touch-action: manipulation` hands the second short tap to JS without
      iOS Safari's ~300ms double-tap-zoom probe. Viewport user-scalable=no
@@ -2425,6 +2423,7 @@ body {
   backdrop-filter: blur(6px);
 }
 .zoom-text-dialog {
+  position: relative;
   width: min(640px, calc(100vw - 24px));
   max-height: calc(100vh - var(--sat, 0px) - env(safe-area-inset-bottom, 0px) - 32px);
   display: flex;
@@ -2473,6 +2472,7 @@ body {
   user-select: text !important;
   -webkit-touch-callout: default !important;
 }
+.zoom-text-selection-menu { z-index: 2; }
 .zoom-text-hint { font-size: 11px; color: #64748b; line-height: 1.4; flex-shrink: 0; }
 .zoom-text-actions { display: flex; justify-content: flex-end; gap: 8px; flex-shrink: 0; }
 .zoom-text-btn {

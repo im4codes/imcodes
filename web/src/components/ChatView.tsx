@@ -587,30 +587,26 @@ const DOUBLE_TAP_THRESHOLD_MS = 500;
  *  tap (rather than a scroll). 15px gives finger-tremor headroom; smaller
  *  values miss double-taps where the second tap drifted slightly. */
 const TAP_MOVE_TOLERANCE_PX = 15;
-/** Viewport width below which we treat the device as a phone-class layout
- *  regardless of the pointer kind. Chosen to match common phone+small-tablet
- *  cutoffs (e.g. iPad mini portrait ≈ 768px). The chat-gesture predicate is
- *  pointer-coarse OR width-below — either signal flips us into mobile mode. */
-const MOBILE_LIKE_MAX_WIDTH_PX = 768;
-const MOBILE_LIKE_MEDIA_QUERY = `(pointer: coarse), (max-width: ${MOBILE_LIKE_MAX_WIDTH_PX}px)`;
+const TOUCH_GESTURE_MEDIA_QUERY = '(pointer: coarse)';
 
-/** Track whether the viewport currently matches the mobile-like media query
- *  so chat gestures (long-press menu, double-tap zoom) flip on/off when the
- *  user resizes a window between large-desktop and narrow-tablet layouts.
+/** Track whether the current primary pointer is coarse so chat gestures
+ *  (long-press menu, double-tap zoom) flip on/off when the input mode changes.
+ *  Do not include viewport width here: desktop users can run narrow windows,
+ *  and they still expect native selection plus the Copy/Quote popup.
  *  Falls back to plain `'ontouchstart' in window` when matchMedia isn't
  *  available (older browsers / non-DOM test environments). */
-function useMobileLikeChatLayout(): boolean {
+function useTouchChatGestures(): boolean {
   const compute = (): boolean => {
     if (typeof window === 'undefined') return false;
     if (typeof window.matchMedia === 'function') {
-      return window.matchMedia(MOBILE_LIKE_MEDIA_QUERY).matches;
+      return window.matchMedia(TOUCH_GESTURE_MEDIA_QUERY).matches;
     }
     return 'ontouchstart' in window;
   };
   const [isMobile, setIsMobile] = useState(compute);
   useEffect(() => {
     if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
-    const mq = window.matchMedia(MOBILE_LIKE_MEDIA_QUERY);
+    const mq = window.matchMedia(TOUCH_GESTURE_MEDIA_QUERY);
     const onChange = () => setIsMobile(mq.matches);
     // Safari < 14 only supports the legacy `addListener` API.
     if (typeof mq.addEventListener === 'function') {
@@ -1224,14 +1220,9 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     return () => ro.disconnect();
   }, [preview]);
 
-  // What counts as "mobile" for chat gestures (long-press menu + double-tap
-  // zoom)? `'ontouchstart' in window` was too loose — it returns true on
-  // Windows touch laptops where the user is driving with a mouse and
-  // expects desktop selection behaviour. Pair pointer-coarse with a
-  // viewport-width cutoff so a Surface in mouse mode lands on the desktop
-  // path, while phones (iOS Safari + Android Chrome) and narrow tablets
-  // get the mobile path.
-  const isTouchDevice = useMobileLikeChatLayout();
+  // Touch gesture mode is based on pointer coarseness only. Narrow desktop
+  // windows still need native selection and the Copy/Quote popup.
+  const isTouchDevice = useTouchChatGestures();
   const getActionMenuContainerRect = useCallback(() => {
     const container = scrollRef.current;
     if (!container) return null;
@@ -1289,13 +1280,19 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       // on what `Selection.toString()` does at block boundaries (Safari often
       // flattens), which is the bug that was dropping newlines from copied
       // multi-paragraph assistant messages.
-      const text = selectionToPlainText(sel);
+      const text = selectionToPlainText(sel) || sel.toString().trim();
       if (!text) { setSelMenu(null); return; }
-      const selRect = range.getBoundingClientRect();
+      const selRect = typeof range.getBoundingClientRect === 'function'
+        ? range.getBoundingClientRect()
+        : null;
       const mainEl = container.closest('.chat-main') as HTMLElement | null;
       const mainRect = (mainEl ?? container).getBoundingClientRect();
-      const anchorClientX = selRect.left + selRect.width / 2;
-      const anchorClientY = selRect.top;
+      const anchorClientX = selRect && selRect.width > 0
+        ? selRect.left + selRect.width / 2
+        : mainRect.left + mainRect.width / 2;
+      const anchorClientY = selRect && selRect.height > 0
+        ? selRect.top
+        : mainRect.top + 12;
       const position = positionChatActionMenu(anchorClientX, anchorClientY, mainRect);
       setSelMenu({
         ...position,
@@ -1817,7 +1814,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
           devices, so the user can re-enable native text selection and copy a
           specific portion. */}
       {zoomText && (
-        <ZoomedTextDialog text={zoomText} onClose={() => setZoomText(null)} />
+        <ZoomedTextDialog text={zoomText} onClose={() => setZoomText(null)} onQuote={onQuote} />
       )}
       {/* External link confirm dialog */}
       {pendingUrl && (
